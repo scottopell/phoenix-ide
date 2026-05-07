@@ -5,7 +5,7 @@
 --
 -- Scope: pipe-backed shell command execution with in-memory job-handle
 -- persistence (single Phoenix process lifetime).
--- Includes: spawn lifecycle, wait_seconds semantics, peek/wait/kill handle
+-- Includes: run lifecycle, wait_seconds semantics, peek/wait/kill handle
 --           operations, ring buffer, in-memory tombstone demotion on exit,
 --           per-conversation handle cap, Phoenix startup subreaper +
 --           shutdown kill-tree, command safety checks (delegated to
@@ -67,7 +67,7 @@ value RingLine {
                           -- replacement-character runs
 }
 
--- A peek/wait/spawn response carries this read window over the lines field.
+-- A peek/wait/run response carries this read window over the lines field.
 -- start_offset and end_offset bound the lines that were returned; the agent
 -- can use end_offset as the next call's `since` value to stream incrementally.
 value ReadWindow {
@@ -88,6 +88,7 @@ value ReadArgs {
 value LiveHandleEntry {
     handle:      String
     cmd:         String
+    label:       String?     -- echoes Handle.label when set
     age_seconds: Integer
     status:      HandleStatus
 }
@@ -141,14 +142,17 @@ enum KillSignal {
     TERM | KILL
 }
 
--- Operation kinds for the tool surface. Used in mutual-exclusion enforcement
--- (REQ-BASH-010): exactly one per call.
+-- Operation kinds for the tool surface. The agent picks exactly one per call
+-- via the required `op` discriminator (REQ-BASH-010). `run` was previously
+-- named `spawn`; the rename happened because models pattern-matched "spawn"
+-- onto a fork/fire-and-forget prior, while the operation is in fact a
+-- run-and-optionally-yield-a-handle.
 enum OperationKind {
-    spawn | peek | wait | kill
+    run | peek | wait | kill
 }
 
--- Outcome of a wait window race. Used as a response-shape variant; the
--- handle's actual lifecycle status is governed by HandleStatus.
+-- Outcome of a wait window race (used by run and wait responses; the
+-- handle's actual lifecycle status is governed by HandleStatus).
 enum WaitOutcome {
     completed
     | timed_out
@@ -183,6 +187,13 @@ entity Handle {
     -- error reporting, the cap-reached response, and the tombstone.
     cmd: String
 
+    -- Optional human-readable annotation supplied at run-time. Echoed on
+    -- every response that carries the handle, and on each entry of the
+    -- live_handles array in the handle_cap_reached error. Lets the agent
+    -- distinguish concurrent handles without having to remember which id
+    -- was which ("b-3 = dev server, b-4 = test runner").
+    label: String?
+
     -- Lifecycle state.
     status: HandleStatus
 
@@ -202,7 +213,7 @@ entity Handle {
         -- exit does the handle reach exited or killed.
     }
 
-    -- Spawn-time fields. pid/pgid are present whenever the OS process is
+    -- Run-time fields. pid/pgid are present whenever the OS process is
     -- alive — that includes kill_pending_kernel, because the process is
     -- by definition still running in that state. The cascade rule and
     -- HandleKilledOnKillPendingKernel both need pgid to send signals.
@@ -275,6 +286,10 @@ config {
 
     default_peek_lines: Integer = 200
     -- Lines returned by peek when neither lines= nor since= is supplied.
+
+    max_label_length: Integer = 64
+    -- Soft cap on Handle.label length. Labels longer than this are
+    -- rejected with `error: "label_too_long"`.
 }
 
 ------------------------------------------------------------
@@ -318,21 +333,24 @@ rule PhoenixKillsLiveHandlesOnShutdown {
 }
 
 ------------------------------------------------------------
--- Rules — spawn
+-- Rules — run
 ------------------------------------------------------------
 
--- REQ-BASH-001, REQ-BASH-002, REQ-BASH-005, REQ-BASH-011: a successful spawn.
+-- REQ-BASH-001, REQ-BASH-002, REQ-BASH-005, REQ-BASH-011: a successful run.
 -- Creates the Handle entity in status=running. The wait-window race is
--- modelled by the response-shaping rules (SpawnExitsWithinWait,
--- SpawnExceedsWait).
+-- modelled by the response-shaping rules (RunExitsWithinWait,
+-- RunExceedsWait). "Run" is the agent operation; the system event it
+-- triggers (the OS-level fork/exec) is still called "spawn" in code paths
+-- where that distinction matters.
 rule HandleSpawned {
-    when: AgentCallsBashSpawn(conversation, cmd, wait_seconds)
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
 
     requires: count(Handle{conversation: conversation, status: running})
               < config.live_handle_cap
     requires: 0 <= wait_seconds
     requires: wait_seconds <= config.max_wait_seconds
     requires: bash_check_passes(cmd)
+    requires: label = null or len(label) <= config.max_label_length
 
     let h_id = next_handle_id(conversation)
 
@@ -340,6 +358,7 @@ rule HandleSpawned {
         conversation:     conversation,
         handle_id:        h_id,
         cmd:              cmd,
+        label:            label,
         status:           running,
         started_at:       now(),
         ring_bytes_used:  0,
@@ -348,14 +367,14 @@ rule HandleSpawned {
     ensures: ChildProcessSpawned(conversation, h_id, cmd)
 
     @guidance
-        -- Spawn sequence (in src/tools/bash.rs):
-        --   1. Validate inputs (mutual exclusion in REQ-BASH-010, range
-        --      checks).
+        -- Run sequence (in src/tools/bash/operations.rs):
+        --   1. Validate inputs (op discriminator and required fields per
+        --      REQ-BASH-010, range checks, label length cap).
         --   2. Run bash_check::check(cmd). On reject, return
         --      command_safety_rejected WITHOUT spawning;
-        --      HandleSpawnRejectedBySafety governs.
+        --      RunRejectedBySafety governs.
         --   3. Check live cap. On reject, return handle_cap_reached;
-        --      HandleSpawnRejectedByCap governs.
+        --      RunRejectedByCap governs.
         --   4. Allocate handle_id (next sequential within conversation).
         --   5. Spawn child via Command::new("bash").args(["-c", cmd]) with
         --      pre_exec(setpgid(0,0)) so the child becomes its own process
@@ -369,14 +388,14 @@ rule HandleSpawned {
         --      HandleProcessExited / HandleProcessSignaled (depending on
         --      whether the kernel reported a status code or only a signal
         --      number).
-        --   8. The agent's response is shaped by SpawnExitsWithinWait or
-        --      SpawnExceedsWait, depending on which event fires first.
+        --   8. The agent's response is shaped by RunExitsWithinWait or
+        --      RunExceedsWait, depending on which event fires first.
 }
 
--- REQ-BASH-005: spawn rejected because the conversation is at its cap.
+-- REQ-BASH-005: run rejected because the conversation is at its cap.
 -- No handle is created.
-rule HandleSpawnRejectedByCap {
-    when: AgentCallsBashSpawn(conversation, cmd, wait_seconds)
+rule RunRejectedByCap {
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
 
     requires: count(Handle{conversation: conversation, status: running})
               >= config.live_handle_cap
@@ -385,13 +404,13 @@ rule HandleSpawnRejectedByCap {
         error: "handle_cap_reached",
         cap: config.live_handle_cap,
         live_handles: live_handle_summary(conversation),
-        hint: "kill or wait on a handle before spawning more, or use the tmux tool for long-runners"
+        hint: "kill or wait on a handle before running more, or use the tmux tool for long-runners"
     )
 }
 
--- REQ-BASH-011: spawn rejected because bash_check found a dangerous pattern.
-rule HandleSpawnRejectedBySafety {
-    when: AgentCallsBashSpawn(conversation, cmd, wait_seconds)
+-- REQ-BASH-011: run rejected because bash_check found a dangerous pattern.
+rule RunRejectedBySafety {
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
 
     requires: not bash_check_passes(cmd)
 
@@ -403,9 +422,9 @@ rule HandleSpawnRejectedBySafety {
     )
 }
 
--- REQ-BASH-002: spawn argument out of range.
-rule HandleSpawnRejectedByRange {
-    when: AgentCallsBashSpawn(conversation, cmd, wait_seconds)
+-- REQ-BASH-002: run argument out of range.
+rule RunRejectedByRange {
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
 
     requires: wait_seconds < 0 or wait_seconds > config.max_wait_seconds
 
@@ -415,24 +434,37 @@ rule HandleSpawnRejectedByRange {
     )
 }
 
+-- REQ-BASH-010: label exceeds the configured cap.
+rule RunRejectedByLabelLength {
+    when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
+
+    requires: label != null and len(label) > config.max_label_length
+
+    ensures: AgentReceivesError(
+        error: "label_too_long",
+        max_label_length: config.max_label_length
+    )
+}
+
 ------------------------------------------------------------
--- Rules — spawn response shape
+-- Rules — run response shape
 ------------------------------------------------------------
 
 -- REQ-BASH-002: process exited within the wait window. The response uses
 -- the live status verbatim (exited / killed) rather than tombstoned —
--- the agent's spawn call returned successfully and saw the process
+-- the agent's run call returned successfully and saw the process
 -- finish, so it's not "looking up a finished handle later," it's
 -- "this handle just finished." Distinguishes from a later peek that
 -- would see status: "tombstoned" (REQ-BASH-006 / REQ-BASH-003).
-rule SpawnExitsWithinWait {
-    when: SpawnWaitOutcome(handle, completed)
+rule RunExitsWithinWait {
+    when: RunWaitOutcome(handle, completed)
 
     requires: handle.status in { exited, killed }
 
-    ensures: AgentReceivesSpawnResponse(
+    ensures: AgentReceivesRunResponse(
         status:        handle.status,
         handle_id:     handle.handle_id,
+        label:         handle.label,
         exit_code:     handle.exit_code,
         signal_number: handle.signal_number,
         duration_ms:   handle.duration_ms,
@@ -442,15 +474,16 @@ rule SpawnExitsWithinWait {
 
 -- REQ-BASH-002: wait window elapsed before exit. Handle stays running; the
 -- agent receives the still_running variant with the same handle_id.
-rule SpawnExceedsWait {
-    when: SpawnWaitOutcome(handle, timed_out)
+rule RunExceedsWait {
+    when: RunWaitOutcome(handle, timed_out)
 
     requires: handle.status = running
 
-    ensures: AgentReceivesSpawnResponse(
+    ensures: AgentReceivesRunResponse(
         status:    "still_running",
         handle_id: handle.handle_id,
-        waited_ms: spawn_wait_seconds(handle) * 1000,
+        label:     handle.label,
+        waited_ms: run_wait_seconds(handle) * 1000,
         window:    live_window(handle, default_read_args())
     )
 }
@@ -488,7 +521,7 @@ rule HandleProcessExited {
         --   1. Snapshot the live ring's tail (last TOMBSTONE_TAIL_LINES).
         --   2. Populate tombstone fields under the handle's RwLock.
         --   3. Pulse the watch::channel exit signal so any in-flight
-        --      wait/spawn response shapers observe the terminal state.
+        --      wait/run response shapers observe the terminal state.
         -- There is no observable state where status = exited but
         -- final_tail is unset; the RwLock<Arc<HandleState>> swap
         -- transitions both fields together within a single write.
@@ -904,35 +937,24 @@ rule HandlesRemovedByConversationDelete {
 -- Rules — schema enforcement
 ------------------------------------------------------------
 
--- REQ-BASH-010: exactly one of cmd / peek / wait / kill must be provided.
-rule OperationKindMutuallyExclusive {
+-- REQ-BASH-010: `op` is the required discriminator. The four-sibling legacy
+-- shape (`cmd` / `peek` / `wait` / `kill` as top-level operation keys) was
+-- retired alongside the run rename: with `op` required, current LLMs
+-- conform to the schema each turn and the legacy inference defended only
+-- against in-flight history that is never replayed. The `mode` parameter,
+-- the `command` alias for `cmd`, and empty-string-as-absent tolerance on
+-- the legacy keys were retired for the same reason. `deny_unknown_fields`
+-- on the input deserializer surfaces any caller still emitting them as a
+-- structured parse error rather than silent acceptance.
+rule OpDiscriminatorRequired {
     when: AgentCallsBashRaw(conversation, args)
 
-    requires: provided_op_count(args) != 1
+    requires: not has_op(args) or op(args) not in { run, peek, wait, kill }
 
     ensures: AgentReceivesError(
         error:    "mutually_exclusive_modes",
-        provided: provided_op_keys(args)
-    )
-}
-
--- REQ-BASH-010: mode and wait_seconds cannot both be supplied. The
--- deprecated mode alias is honored only when wait_seconds is absent.
--- Reuses `mutually_exclusive_modes` rather than introducing a distinct
--- error code; the structured `conflicting_args` field tells the agent
--- which keys conflict and the message recommends dropping `mode`.
-rule ModeAndWaitSecondsConflict {
-    when: AgentCallsBashRaw(conversation, args)
-
-    requires: mode_supplied(args)
-    requires: wait_seconds_supplied(args)
-
-    ensures: AgentReceivesError(
-        error:              "mutually_exclusive_modes",
-        conflicting_args:   { "mode", "wait_seconds" },
-        recommended_action: "remove the deprecated 'mode' parameter; pass 'wait_seconds' alone",
-        mode:               mode_value(args),
-        wait_seconds:       wait_seconds_value(args)
+        provided: provided_op_keys(args),
+        recommended_action: "set op to one of: run, peek, wait, kill"
     )
 }
 
@@ -988,15 +1010,17 @@ surface AgentBashAccess {
     exposes:
         Handle.handle_id
         Handle.cmd
+        Handle.label
         Handle.status
         Handle.exit_code
         Handle.duration_ms
         Handle.final_cause
 
     provides:
-        AgentCallsBashSpawn(conversation, cmd, wait_seconds)
+        AgentCallsBashRun(conversation, cmd, wait_seconds, label)
             when bash_check_passes(cmd)
             and 0 <= wait_seconds and wait_seconds <= config.max_wait_seconds
+            and (label = null or len(label) <= config.max_label_length)
             and count(Handle{conversation: conversation, status: running})
                 < config.live_handle_cap
 
@@ -1061,7 +1085,7 @@ deferred BashHandleOutputDiskSpill
 
 deferred BashHandleCrossRestartPersistence
     -- v1 deliberately does NOT persist handles across Phoenix restart;
-    -- agents see handle_not_found and re-spawn. The earlier draft proposed
+    -- agents see handle_not_found and re-run. The earlier draft proposed
     -- a SQLite shadow store with `lost_in_restart` tombstones; the panel
     -- review surfaced that the structured response wasn't worth the
     -- complexity (7-column schema, reconciliation logic, unbounded growth

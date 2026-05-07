@@ -23,14 +23,16 @@ in-memory only — they do not survive Phoenix restart.
   "type": "object",
   "required": ["op"],
   "properties": {
-    "op":     { "type": "string", "enum": ["spawn", "peek", "wait", "kill"],
+    "op":     { "type": "string", "enum": ["run", "peek", "wait", "kill"],
                 "description": "Operation to perform." },
     "cmd":    { "type": "string",
-                "description": "Shell command to execute via bash -c (op=spawn). The bash wrapper stays alive as the parent of the user command; on exit the bash wrapper relays the user command's signal info through ExitStatus (`WIFSIGNALED` directly, or via the 128+signum exit-code convention when bash itself was not signaled — see REQ-BASH-006)." },
+                "description": "Shell command to execute via bash -c (op=run). The bash wrapper stays alive as the parent of the user command; on exit the bash wrapper relays the user command's signal info through ExitStatus (`WIFSIGNALED` directly, or via the 128+signum exit-code convention when bash itself was not signaled — see REQ-BASH-006)." },
     "handle": { "type": "string",
                 "description": "Handle id (op=peek|wait|kill)." },
+    "label":  { "type": "string",
+                "description": "Optional human-readable annotation (op=run); echoed on every response carrying the handle and on `live_handles[]` in the cap-reached error." },
     "wait_seconds": { "type": "integer", "minimum": 0, "maximum": 900,
-                      "description": "How long this single tool call blocks before handing back a handle (default 30; op=spawn|wait). NOT a process kill timeout: the process is NEVER killed when wait_seconds elapses; it keeps running and you receive a handle. Use op=kill to actually terminate." },
+                      "description": "How long this single tool call blocks before handing back a handle (default 30; op=run|wait). NOT a process kill timeout: the process is NEVER killed when wait_seconds elapses; it keeps running and you receive a handle. Use op=kill to actually terminate." },
     "signal": { "type": "string", "enum": ["TERM", "KILL"],
                 "description": "Signal to send (op=kill only); default TERM. Sent exactly once; no auto-escalation." },
     "lines":  { "type": "integer", "minimum": 1,
@@ -42,50 +44,57 @@ in-memory only — they do not survive Phoenix restart.
 ```
 
 `op` is a single discriminator. Anthropic's tool API rejects `oneOf` at the
-top level, so per-operation field requirements (e.g. spawn requires `cmd`,
+top level, so per-operation field requirements (e.g. run requires `cmd`,
 peek requires `handle`) are validated at runtime. The schema-level surface
 stays clean: every advertised field is optional except `op` itself.
 
 ### Tolerance rules
 
-The parser accepts more than the schema advertises so in-flight conversations
-that predate the discriminator continue to work, and so OpenAI Responses API
-models — which default-fill optional string properties with `""` — don't
-fail on the operation-key check. Specifically:
+The parser is strict about its inputs (`#[serde(deny_unknown_fields)]` on
+`RawBashInput`); legacy keys outside the advertised schema surface as
+structured parse errors rather than being silently absorbed. Two narrow
+tolerances remain, defending against active GPT default-fill on the
+*current* schema (each emits a `tracing::debug!` line so the tolerance is
+auditable in logs):
 
-- WHEN `op` is absent, infer it from the single non-empty legacy field
-  among `{cmd, peek, wait, kill}`. Multiple non-empty legacy fields →
-  `mutually_exclusive_modes`.
-- Empty strings on any legacy operation-key field are treated as absent.
-- Empty `cmd` is treated as absent (op=spawn requires a non-empty value).
-- `since=0` is treated as absent (semantically equivalent to a large
-  `lines` value on a bounded ring; was a default-fill emission from the
-  prior `minimum: 0` schema).
-- `mode` is no longer in the schema. The parser still accepts it: silently
-  dropped when `wait_seconds` is also set; mapped to its canonical
-  `wait_seconds` value with a `deprecation_notice` when set alone.
+- `since=0` is treated as absent. The schema advertises `minimum: 1` but
+  current OpenAI Responses-API models still emit `0` as a default-fill on
+  optional integers. Treating it as absent routes through the default
+  `lines` window.
+- WHEN both `lines` and `since` are supplied, prefer `lines` and silently
+  drop `since`. Models on structured-output APIs default-fill optional
+  integers with their schema minimums; for short command output `since=1`
+  returns nothing while the request default `lines=200` returns the actual
+  tail.
+
+### Retired affordances (revision 3)
+
+The following tolerances existed in revision 2 to defend in-flight
+conversation history that predates the `op` discriminator. They are now
+retired — LLMs see the current tool definition each turn and conform to
+the current schema, so pre-discriminator history is inert text from the
+model's perspective. The fields are no longer accepted; `deny_unknown_fields`
+turns any caller still emitting them into a structured parse error.
+
+- Four-sibling legacy operation-key inference (`peek="b-3"`, `wait="b-3"`,
+  `kill="b-3"`, bare `cmd` with no `op`).
+- Empty-string-as-absent tolerance on the legacy operation keys.
+- The `mode` parameter (`mode="default"|"slow"|"background"`) and the
+  associated `deprecation_notice` response field. The agent now passes
+  `wait_seconds` directly.
+- The `command` field as an alias for `cmd`.
+- `op="spawn"` as an alias for `op="run"` — the rename is hard, with no
+  alias, so the wrong fork/fire-and-forget prior cannot creep back in via
+  description text or error messages.
 
 ### Operation Modes
 
 | `op` value | Required peers | Optional peers |
 |---|---|---|
-| `spawn` | `cmd` | `wait_seconds`, `lines`/`since` (response window) |
+| `run`   | `cmd` | `wait_seconds`, `label`, `lines`/`since` (response window) |
 | `peek`  | `handle` | `lines` xor `since` |
 | `wait`  | `handle` | `wait_seconds`, `lines` xor `since` |
 | `kill`  | `handle` | `signal` (default TERM) |
-
-Legacy `mode` mapping when honored alone (no `wait_seconds`):
-
-| `mode` value | Equivalent `wait_seconds` |
-|---|---|
-| `default` | 30 |
-| `slow` | 900 |
-| `background` | 0 |
-
-The `deprecation_notice` field name is deliberately not underscore-prefixed
-(no `_deprecation`): leading-underscore is widely read by LLMs as "metadata;
-ignore," which is the opposite of the signal we want — the agent should
-attend to this field and migrate.
 
 ### Description Template (REQ-BASH-009, REQ-BASH-010)
 
@@ -93,48 +102,60 @@ attend to this field and migrate.
 Executes shell commands via bash -c, capturing combined stdout/stderr.
 Bash state changes (working dir, variables, aliases) don't persist between calls.
 
-Modes (exactly one per call):
+Common patterns:
+  Run synchronously:    op="run", cmd="...", wait_seconds=30
+  Start in background:  op="run", cmd="...", wait_seconds=0   (returns a handle immediately)
+  Inspect progress:     op="peek", handle="b-3"
+  Wait for completion:  op="wait", handle="b-3", wait_seconds=60
 
-  cmd=<string>     Spawn a new command. wait_seconds (default 30) is NOT a
-                   timeout — the process is NEVER killed when wait_seconds
-                   elapses. wait_seconds only controls how long this single
-                   tool call blocks before handing you back a handle so you
-                   can do other work. The process keeps running in the
-                   background until it exits naturally or you call
-                   kill=<handle>. A response with status="still_running"
-                   means the process is alive and will stay alive — peek
-                   it later, wait on it, or kill it explicitly.
+Pick one operation via `op`:
 
-  peek=<handle>    Return the current ring buffer state for a handle.
-                   Use lines=N for the last N lines, or since=K for lines
-                   after offset K. status="tombstoned" in the response
-                   means the handle's process has finished — the
-                   final_cause field tells you how (exited normally, or
-                   killed by signal). status="kill_pending_kernel" means
-                   the kill signal you sent was delivered but the process
-                   is in uninterruptible kernel sleep — peek again later;
-                   sending kill again with the same signal does NOT
-                   compound (signals don't queue that way), but you can
-                   escalate by sending kill with signal=KILL.
+  op="run"    Run a shell command. If it finishes within wait_seconds you
+              get its full output and exit code — same as if you'd run it
+              in a shell. If wait_seconds elapses first, the process keeps
+              running and you receive a handle to peek/wait/kill later.
+              op="run" does NOT detach: the handle is minted only when
+              wait_seconds elapses; for short commands you'll just get the
+              result. wait_seconds is NOT a process kill timeout: the
+              process is NEVER killed when wait_seconds elapses; it keeps
+              running and you receive a handle. Use op="kill" to actually
+              terminate. Set wait_seconds=0 to start a process and get its
+              handle back immediately without waiting for output. Pass an
+              optional label=<string> to annotate the handle (echoed on
+              every later response and visible in the cap-reached error).
 
-  wait=<handle>    Block up to wait_seconds for an existing handle to exit.
-                   If wait_seconds elapses first, the SAME handle is
-                   returned with status="still_running" — never accumulate
-                   handles by repeated waits. If the handle has already
-                   finished, returns immediately with status="tombstoned".
+  op="peek"   Return the current ring buffer state for a handle. Required:
+              handle=<id>. Use lines=N for the last N lines, or since=K
+              for lines after offset K. status="tombstoned" in the
+              response means the handle's process has finished — the
+              final_cause field tells you how (exited normally, or killed
+              by signal). status="kill_pending_kernel" means the kill
+              signal you sent was delivered but the process is in
+              uninterruptible kernel sleep — peek again later; sending
+              kill again with the same signal does NOT compound (signals
+              don't queue that way), but you can escalate by sending
+              op="kill" with signal=KILL.
 
-  kill=<handle>    Terminate a handle. Default signal is TERM; signal=KILL
-                   for immediate. The signal is sent EXACTLY ONCE; this
-                   tool does not auto-escalate TERM to KILL after a grace
-                   period. If your TERM doesn't take effect within
-                   ~30 seconds, the response is status="kill_pending_kernel"
-                   and you decide whether to escalate by calling kill
-                   again with signal=KILL. (Don't retry with signal=TERM:
-                   the kernel doesn't queue duplicate signals; the original
-                   TERM is still pending and a second TERM is a no-op.)
+  op="wait"   Block up to wait_seconds for an existing handle to exit.
+              Required: handle=<id>. If wait_seconds elapses first, the
+              SAME handle is returned with status="still_running" — never
+              accumulate handles by repeated waits. If the handle has
+              already finished, returns immediately with
+              status="tombstoned".
+
+  op="kill"   Terminate a handle. Required: handle=<id>. Default signal
+              is TERM; signal=KILL for immediate. The signal is sent
+              EXACTLY ONCE; this tool does not auto-escalate TERM to
+              KILL after a grace period. If your TERM doesn't take effect
+              within ~30 seconds, the response is
+              status="kill_pending_kernel" and you decide whether to
+              escalate by calling op="kill" again with signal=KILL.
+              (Don't retry with signal=TERM: the kernel doesn't queue
+              duplicate signals; the original TERM is still pending and
+              a second TERM is a no-op.)
 
 If you peek a handle and get error="handle_not_found", it likely means
-Phoenix restarted between when you spawned the process and now — bash
+Phoenix restarted between when you ran the command and now — bash
 handles do NOT survive Phoenix process restart. For processes that need
 to survive Phoenix restart, that need a TTY, that need stdin, or that
 are interactive REPLs, use the tmux tool instead.
@@ -145,10 +166,13 @@ For complex scripts, write them to a file first and execute the file.
 <pwd>{working_directory}</pwd>
 ```
 
-The negation-based framing (`NOT a timeout` … `is NEVER killed` … `EXACTLY
-ONCE` … `does not auto-escalate`) is load-bearing. Affirmative descriptions
-get pattern-matched into the POSIX `timeout(1)` / `kill PID` priors;
-explicit negations override those priors.
+The negation-based framing (`does NOT detach` … `NOT a timeout` …
+`is NEVER killed` … `EXACTLY ONCE` … `does not auto-escalate`) is
+load-bearing. Affirmative descriptions get pattern-matched into the POSIX
+`fork(2)` / `timeout(1)` / `kill PID` priors; explicit negations override
+those priors. The cookbook block above the per-op detail surfaces the
+`wait_seconds=0` "give me a handle now" affordance, which would otherwise
+be buried inside the run paragraph.
 
 ## ToolContext Extension (REQ-BASH-014)
 
@@ -303,15 +327,14 @@ subscriber sees the most recent value. `OnceLock<ExitState>` would also
 work; `watch` was picked because in-flight wait responses use
 `changed().await` naturally.
 
-## Spawn Flow (REQ-BASH-001, REQ-BASH-002, REQ-BASH-005, REQ-BASH-011)
+## Run Flow (REQ-BASH-001, REQ-BASH-002, REQ-BASH-005, REQ-BASH-011)
 
 ```
 agent → BashTool::run(input, ctx)
-        ├─ parse + validate input (oneOf, mode-vs-wait_seconds conflict, ranges)
-        ├─ if mode supplied (and wait_seconds absent): map to wait_seconds + set deprecation_notice
-        ├─ if not spawn: dispatch to peek/wait/kill handlers
+        ├─ parse + validate input (op discriminator required, ranges, label cap)
+        ├─ if op != run: dispatch to peek/wait/kill handlers
         │
-        └─ spawn path:
+        └─ run path:
             ├─ bash_check::check(cmd) — REQ-BASH-011
             │     ┌─ reject → command_safety_rejected error
             │     └─ ok    → continue
@@ -329,7 +352,7 @@ agent → BashTool::run(input, ctx)
             │     waiter:        Child::wait().await → run demotion → publish exit on watch
             ├─ race tokio::select! between:
             │     waiter exit_observer.changed() → SpawnExitsWithinWait
-            │     sleep(wait_seconds) → SpawnExceedsWait
+            │     sleep(wait_seconds) → RunExceedsWait
             │     ctx.cancel.cancelled() → respond_cancel
             └─ return response (handle remains live regardless of which arm won)
 ```
@@ -337,7 +360,7 @@ agent → BashTool::run(input, ctx)
 Pseudocode:
 
 ```rust
-async fn spawn(&self, cmd: &str, wait_seconds: u64, ctx: &ToolContext) -> ToolOutput {
+async fn run(&self, cmd: &str, wait_seconds: u64, label: Option<&str>, ctx: &ToolContext) -> ToolOutput {
     if let Err(reason) = bash_check::check(cmd) {
         return ToolOutput::error("command_safety_rejected", reason);
     }
@@ -504,7 +527,7 @@ and final_tail.
 
 ### Watch-channel rule
 
-Each `wait` / `spawn` call MUST clone a fresh receiver from
+Each `wait` / `run` call MUST clone a fresh receiver from
 `handle.exit_observer` at call time and use that single receiver in
 its `tokio::select!`. **Never reuse a receiver across calls** —
 `watch::Receiver::changed()` only fires on transitions; if a receiver
@@ -682,10 +705,10 @@ in-memory tombstones are dropped along with the registry entry.
 All error identifiers (per REQ-BASH-008): `handle_not_found`,
 `handle_cap_reached`, `wait_seconds_out_of_range`,
 `peek_args_mutually_exclusive`, `command_safety_rejected`,
-`spawn_failed`, `mutually_exclusive_modes`. The dual-pass case
-(`mode` + `wait_seconds`) is folded into `mutually_exclusive_modes`
-with structured `conflicting_args` and `recommended_action` fields
-rather than carrying its own stable id.
+`spawn_failed`, `mutually_exclusive_modes`, `label_too_long`.
+`mutually_exclusive_modes` is the catch-all for input-shape failures the
+schema didn't catch (missing `op`, missing required peer field for the
+chosen op, invalid `lines` value, etc.).
 
 Error-specific fields (representative subset):
 
@@ -696,7 +719,7 @@ Error-specific fields (representative subset):
   "error_message": "this conversation has reached the cap of 8 live handles",
   "cap": 8,
   "live_handles": [
-    { "handle": "b-3", "cmd": "cargo test", "age_seconds": 1820, "status": "running" }
+    { "handle": "b-3", "cmd": "cargo test", "label": "tests", "age_seconds": 1820, "status": "running" }
   ],
   "hint": "kill or wait on a handle, or use the tmux tool for long-runners"
 }
@@ -714,22 +737,19 @@ Error-specific fields (representative subset):
   "error_message": "specify exactly one of lines or since"
 }
 
-// mutually_exclusive_modes — operation-key conflict (cmd + peek, etc.)
+// mutually_exclusive_modes — missing or invalid op discriminator
 {
   "error": "mutually_exclusive_modes",
-  "error_message": "exactly one of cmd, peek, wait, kill must be provided",
-  "conflicting_args": ["cmd", "peek"],
-  "recommended_action": "remove one of the operation keys"
+  "error_message": "op is required and must be one of: run, peek, wait, kill",
+  "conflicting_args": [],
+  "recommended_action": "set op to one of: run, peek, wait, kill"
 }
 
-// mutually_exclusive_modes — mode/wait_seconds dual-pass
+// label_too_long
 {
-  "error": "mutually_exclusive_modes",
-  "error_message": "the deprecated 'mode' parameter cannot be used with 'wait_seconds'; pass wait_seconds alone",
-  "conflicting_args": ["mode", "wait_seconds"],
-  "recommended_action": "remove the deprecated 'mode' parameter; pass 'wait_seconds' alone",
-  "mode": "background",
-  "wait_seconds": 30
+  "error": "label_too_long",
+  "error_message": "label exceeds the 64-character cap",
+  "max_label_length": 64
 }
 
 // handle_not_found — with hint about Phoenix restart
@@ -751,14 +771,14 @@ distinguishes by checking for the `error` key versus the `status` key.
 The display-simplification rules from the prior revision (strip redundant
 `cd <path> &&` prefix when path matches the conversation's working
 directory; preserve `||` operator suffixes) apply unchanged to the `cmd`
-field on spawn responses.
+field on run responses.
 
-For non-spawn operations, the UI displays a synthetic command label rather
+For non-run operations, the UI displays a synthetic command label rather
 than a real shell command:
 
 | Operation | Display |
 |---|---|
-| spawn       | `<simplified cmd>` |
+| run         | `<simplified cmd>` |
 | peek (live) | `peek b-7` |
 | peek (tomb) | `peek b-7 (exited 22.0s, code 0)` |
 | wait        | `wait b-7 (up to 30s)` |
@@ -773,7 +793,7 @@ input layer.
 
 Unchanged from the prior revision. `src/tools/bash_check.rs` parses the
 command via `brush-parser` and walks the AST for dangerous patterns. The
-spawn path calls `bash_check::check(cmd)` before reserving a handle slot;
+run path calls `bash_check::check(cmd)` before reserving a handle slot;
 peek/wait/kill paths bypass this check (they operate on already-spawned
 handles whose original command was already vetted).
 
@@ -842,7 +862,7 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
   in-memory entries gone.
 - Phoenix shutdown with live handles → kill-tree pass SIGKILLs all groups;
   reaper bit is set so escapees are caught.
-- Cap rejection: spawn while at cap returns `handle_cap_reached` with the
+- Cap rejection: run while at cap returns `handle_cap_reached` with the
   full live-handles list.
 - Cross-conversation handle access: a handle id from conv A used in conv B
   returns `handle_not_found` (does not leak existence).
@@ -850,7 +870,7 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
 ### Property tests
 - `peek(since=end_offset)` after any sequence of writes never re-reads
   content (offset monotonicity).
-- For any sequence of spawn/peek/wait/kill within `LIVE_HANDLE_CAP`, the
+- For any sequence of run/peek/wait/kill within `LIVE_HANDLE_CAP`, the
   in-memory state is consistent (live count never exceeds cap, terminal
   state implies tombstone, no live handle has both representations).
 - `read_window` over a partially-evicted ring sets `truncated_before=true`
@@ -859,7 +879,7 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
 ### Command Safety Tests (REQ-BASH-011)
 Unchanged: 42 unit tests covering git add, git push, rm patterns, sudo
 handling, pipelines, compound commands, edge cases. 4 integration tests
-verifying the check runs before spawn:
+verifying the check runs before run:
 - `test_blocked_git_add`
 - `test_blocked_rm_rf_root`
 - `test_blocked_git_push_force`
@@ -869,7 +889,7 @@ verifying the check runs before spawn:
 
 ```
 src/tools/
-├── bash.rs              # BashTool dispatch (spawn/peek/wait/kill)
+├── bash.rs              # BashTool dispatch (run/peek/wait/kill)
 ├── bash/
 │   ├── handle.rs        # Handle, LiveData, Tombstone, RwLock<Arc<HandleState>> swap
 │   ├── ring.rs          # RingBuffer, RingLine, eviction

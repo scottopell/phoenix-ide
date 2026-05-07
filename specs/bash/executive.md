@@ -48,6 +48,11 @@ the exit signal so in-flight wait calls observe the transition.
 Spawn races the wait window against the exit signal in a `tokio::select!`;
 peek is a snapshot read of the current state; wait blocks the same way as
 spawn but on an existing handle and returns the *same* handle id on
+re-timeout (no handle proliferation). The agent operation is `op="run"`;
+the internal OS-level fork/exec is still called "spawn" where the
+distinction matters. Optional `label` annotation is attached at run time
+and echoed on every later response carrying the handle, plus on each
+entry of `live_handles[]` in the cap-reached error.
 re-timeout (no handle proliferation). Kill sends a signal to the process
 group leader (set via `pre_exec` setpgid), waits up to
 `KILL_RESPONSE_TIMEOUT_SECONDS` (30) for exit, and either returns the
@@ -57,7 +62,7 @@ so a late-arriving exit still demotes correctly.
 
 Command safety checks (`brush-parser` AST walk for blind git-add,
 force-push, dangerous rm) and Landlock enforcement for Explore mode are
-unchanged from the prior revision; both run on the spawn path only.
+unchanged from the prior revision; both run on the run path only.
 
 ## Status Summary
 
@@ -72,7 +77,7 @@ unchanged from the prior revision; both run on the spawn path only.
 | **REQ-BASH-007:** Child Process Reaper | ❌ New | `PR_SET_CHILD_SUBREAPER` at startup + SIGKILL kill-tree at shutdown |
 | **REQ-BASH-008:** Error Reporting | 🔄 Rewrite | Stable error ids, structured envelopes; non-zero exit is not an error |
 | **REQ-BASH-009:** No TTY Attached | 🔄 Carry-forward | Existing behavior; tool description points at `tmux` |
-| **REQ-BASH-010:** Tool Schema and Mutual Exclusion | 🔄 Rewrite | New `cmd`/`peek`/`wait`/`kill` shape with `oneOf`; `mode` deprecated with explicit removal version |
+| **REQ-BASH-010:** Tool Schema and Mutual Exclusion | 🔄 Rewrite (rev 3) | `op` discriminator with `run`/`peek`/`wait`/`kill`; `label` field added; legacy four-sibling inference, `mode` shim, `command` alias, and empty-string-as-absent tolerance retired (`deny_unknown_fields`); two narrow tolerances retained for active GPT default-fill (`since=0`, `lines+since`) |
 | **REQ-BASH-011:** Command Safety Checks | ✅ Carry-forward | `brush-parser` AST walk unchanged |
 | **REQ-BASH-012:** Landlock Enforcement | 🔄 Renumbered | Was REQ-BASH-008; behavior unchanged |
 | **REQ-BASH-013:** Graceful Degradation Without Landlock | 🔄 Renumbered | Was REQ-BASH-009; behavior unchanged |
@@ -102,7 +107,7 @@ The corresponding Allium spec is `specs/bash/bash.allium`. It models:
   arriving exit paths.
 - Response shape: `status: "tombstoned"` for any peek/wait/kill on a
   finished handle, with `final_cause` carrying the underlying terminal
-  cause; `status: "still_running"` for spawn/wait responses where the
+  cause; `status: "still_running"` for run/wait responses where the
   wait window elapsed; `status: "kill_pending_kernel"` for handles
   whose process didn't exit within the kill response window.
 - Reaper rules: `PhoenixSetsSubreaperOnStartup` and

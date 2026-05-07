@@ -50,7 +50,7 @@ returned."
 
 ### REQ-BASH-002: Wait Semantics
 
-WHEN agent calls `bash(cmd=<command>, wait_seconds=N)`
+WHEN agent calls `bash(op="run", cmd=<command>, wait_seconds=N)`
 THE SYSTEM SHALL block up to N seconds for the command to exit
 
 WHEN the command exits within N seconds
@@ -63,7 +63,7 @@ THE SYSTEM SHALL return `status: "still_running"` with `handle`, `waited_ms`,
 AND keep the process running, accepting subsequent peek/wait/kill operations on
 the handle
 
-WHEN agent calls bash with `wait_seconds=0`
+WHEN agent calls bash with `op="run"` and `wait_seconds=0`
 THE SYSTEM SHALL spawn the process and return immediately with `status:
 "still_running"` and a handle, without waiting for any output
 
@@ -74,6 +74,12 @@ WHEN `wait_seconds` exceeds `MAX_WAIT_SECONDS` (default 900)
 THE SYSTEM SHALL reject the call with `error: "wait_seconds_out_of_range"`
 AND state the bound in the error
 
+WHEN agent supplies `label=<string>` on the run call
+THE SYSTEM SHALL attach the label to the handle
+AND echo it on every response that carries the handle (`still_running`,
+`exited`, `tombstoned`, `kill_pending_kernel`) and on each entry of the
+`live_handles[]` array in the `handle_cap_reached` error response
+
 THE tool description SHALL state explicitly that `wait_seconds` is **NOT** a
 process-kill timeout: the process is **never** killed when `wait_seconds`
 elapses; it keeps running and the agent receives a handle. This negation is
@@ -81,15 +87,32 @@ load-bearing — language models trained on POSIX `timeout(1)` and similar APIs
 default to the kill-on-timeout intuition; affirmative descriptions get
 pattern-matched into that prior, and explicit negations override it.
 
+THE tool description SHALL similarly state explicitly that `op="run"` does
+**NOT** detach: when the command finishes within `wait_seconds`, the agent
+receives a normal synchronous result. The handle is minted only when
+`wait_seconds` elapses first. This negation overrides the `fork(2)` /
+fire-and-forget prior that the previous name `spawn` invoked; without it,
+models treat `run` as if it always backgrounded.
+
 **Rationale:** The renamed parameter (`wait_seconds`, replacing `timeout`)
 removes the "kill" connotation that the old name carried. The hard distinction
 between `status: "exited"` and `status: "still_running"` makes the
 "timed-out-but-process-still-running" case unmistakable to the agent — pit of
 success on the read side. The `MAX_WAIT_SECONDS` cap exists so the agent cannot
 inadvertently park a request for hours: long-running operations should yield a
-handle and resume via `wait` calls. The explicit-negation rule in the tool
-description was added in revision 2 after a panel review found that the rename
-alone was insufficient signal.
+handle and resume via `wait` calls. The explicit-negation rules in the tool
+description were added cumulatively across revisions: the rename of `timeout`
+→ `wait_seconds` was insufficient signal alone (revision 2 added the
+load-bearing "NOT a timeout" wording), and the rename of `op=spawn` →
+`op=run` similarly required an explicit "does NOT detach" line (revision 3)
+because the new name still co-exists with the fire-and-forget prior in
+training data.
+
+The optional `label` field exists because agents juggling concurrent
+handles cannot otherwise distinguish them across responses: `b-3` and
+`b-4` are opaque, while `"dev-server"` and `"test-runner"` are not.
+Labels surface in the cap-reached error so the agent has the information
+it needs to choose which handle to retire.
 
 ---
 
@@ -99,7 +122,7 @@ WHEN agent calls `bash(peek=<handle>, ...)`
 THE SYSTEM SHALL return the current state of the handle, including:
 - `status`:
   - `"running"` — process is alive, no kill signal sent
-  - `"still_running"` — used only on spawn/wait responses when the
+  - `"still_running"` — used only on run/wait responses when the
     wait window elapsed; not a peek response
   - `"kill_pending_kernel"` — Phoenix sent a kill signal but the
     response timer expired before exit (D-state hang). The process is
@@ -202,7 +225,7 @@ or eviction occurred since the agent's prior peek (tail mode)
 THE SYSTEM SHALL set `truncated_before: true` in the response
 AND otherwise set it to `false`
 
-EVERY peek/wait/spawn response SHALL include `start_offset`, `end_offset`, and
+EVERY peek/wait/run response SHALL include `start_offset`, `end_offset`, and
 `truncated_before` for the lines returned
 
 **Rationale:** Caller-controlled offsets keep the server stateless on read
@@ -227,7 +250,7 @@ THE SYSTEM SHALL reject the call with:
 
 WHEN a handle transitions out of `running` (exit, kill, signal)
 THE SYSTEM SHALL decrement the live count
-AND a subsequent spawn from the same conversation MAY succeed if it brings the
+AND a subsequent run from the same conversation MAY succeed if it brings the
 live count under the cap
 
 **Rationale:** A hard refusal is the pit-of-success failure mode. LRU eviction
@@ -281,7 +304,7 @@ AND make no attempt to persist tombstones across the restart
 THE in-memory tombstone store SHALL NOT be backed by SQLite. Tombstones live
 only as long as the Phoenix process. A subsequent agent peek on a handle that
 predates the current Phoenix process returns `handle_not_found` — the agent
-re-spawns, or the agent should have used the `tmux` tool if it needed
+re-runs, or the agent should have used the `tmux` tool if it needed
 persistence across restart.
 
 **Rationale:** Demoting the ring to a final-tail tombstone bounds memory while
@@ -423,78 +446,94 @@ to coerce bash into doing something it cannot.
 
 THE SYSTEM SHALL provide the bash tool schema with these properties:
 
-- `op` (required enum: `spawn` | `peek` | `wait` | `kill`): operation
+- `op` (required enum: `run` | `peek` | `wait` | `kill`): operation
   discriminator. The single source of truth for which operation to dispatch.
-- `cmd` (optional string): shell command to execute. Required when `op=spawn`.
+- `cmd` (optional string): shell command to execute. Required when `op=run`.
 - `handle` (optional string): handle id. Required when `op=peek|wait|kill`.
+- `label` (optional string): human-readable annotation for the spawned
+  handle. Used with `op=run`. Echoed on every response that carries the
+  handle (`still_running`, `exited`, `tombstoned`, `kill_pending_kernel`)
+  and on each entry of `live_handles[]` in `handle_cap_reached`. Length
+  capped at `MAX_LABEL_LENGTH` (default 64); over-cap labels are rejected
+  with `error: "label_too_long"`.
 - `wait_seconds` (optional integer, default 30): time to block for the
-  foreground answer. Range [0, MAX_WAIT_SECONDS]. Used with `op=spawn` and
+  foreground answer. Range [0, MAX_WAIT_SECONDS]. Used with `op=run` and
   `op=wait`.
 - `signal` (optional enum: `TERM` | `KILL`, default `TERM`): used with
   `op=kill`.
 - `lines` (optional integer, minimum 1): tail-mode read window — return the
   last N lines. Mutually exclusive with `since`.
 - `since` (optional integer, minimum 1): incremental-mode read window —
-  return lines after offset K. Mutually exclusive with `lines`. Note: the
-  schema's `minimum: 1` is intentional. `since=0` is semantically equivalent
-  to a large `lines` value on a bounded ring and was a frequent default-fill
-  emission from OpenAI Responses API models; the parser SHALL silently
-  treat `since=0` as absent for tolerance with legacy/in-flight history.
+  return lines after offset K. Mutually exclusive with `lines`.
 
-THE SYSTEM SHALL determine the operation from `op` when set. WHEN `op` is
-absent, THE SYSTEM SHALL infer the operation from a single non-empty
-legacy field among `{cmd, peek, wait, kill}` for backward compatibility
-with in-flight conversation history that predates the discriminator.
+THE SYSTEM SHALL determine the operation strictly from `op`. WHEN `op` is
+absent, malformed, or carries a value outside the advertised enum, THE
+SYSTEM SHALL reject the call with `error: "mutually_exclusive_modes"` and
+a `recommended_action` directing the agent to set `op` to one of the
+advertised operations.
 
-THE SYSTEM SHALL treat empty strings on legacy operation-key fields
-(`peek=""`, `wait=""`, `kill=""`, `cmd=""`) as absent. This tolerance is
-required because OpenAI Responses API models default-fill every optional
-string property to `""`; without it, every bash call from a GPT model
-would trip the operation-key check.
+THE SYSTEM SHALL deserialise the input with `deny_unknown_fields`. Top-
+level keys outside the advertised schema (notably the retired affordances:
+`mode`, `command` as an alias for `cmd`, and bare `peek` / `wait` / `kill`
+as legacy operation keys) SHALL surface as a structured parse error rather
+than being silently absorbed.
 
-WHEN inference cannot determine a unique operation (zero non-empty legacy
-fields, or two or more), THE SYSTEM SHALL reject the call with
-`error: "mutually_exclusive_modes"` and a `conflicting_args` field listing
-the conflicting keys.
-
-THE SYSTEM SHALL silently drop `mode` when `wait_seconds` is also set;
-WHEN `mode` is set alone, the parser SHALL map it to its canonical
-`wait_seconds` value and emit a `deprecation_notice` field in the
-response. `mode` is no longer advertised in the schema.
+THE SYSTEM SHALL apply two narrow tolerances against current GPT models'
+default-fill behaviour on the *current* schema:
+- `since=0` SHALL be treated as absent. `0` is below the advertised
+  `minimum: 1`; current OpenAI Responses-API models still emit it as a
+  default-fill on optional integers. Treating it as absent routes through
+  the default `lines` window. The parser SHALL emit a `tracing::debug!`
+  line naming the dropped value so the tolerance is auditable in logs.
+- WHEN both `lines` and `since` are supplied, the parser SHALL prefer
+  `lines` and silently drop `since`. Models on structured-output APIs
+  default-fill optional integers with their schema minimums (`lines=1`,
+  `since=1`); for short command output, `since=1` returns nothing while
+  `lines=200` (the request default) returns the actual tail. The drop
+  SHALL emit a `tracing::debug!` line.
 
 THE SYSTEM SHALL include the conversation's working directory in the tool
-description, as the prior revision did.
+description, as the prior revision did. The description SHALL lead with a
+compact cookbook block (foreground / background / inspect / wait) so the
+`wait_seconds=0` "give me a handle now" affordance is discoverable.
 
-**Rationale:** The original schema (revision 2) used four sibling optional
-string fields (`cmd`, `peek`, `wait`, `kill`) with mutual exclusion enforced
-only at runtime, because Anthropic's tool-use API rejects top-level
-`oneOf`/`anyOf`/`allOf`. This worked for Anthropic-trained models, which
-omit unused optional fields. It collapsed for OpenAI Responses API models,
-which default-fill every optional string property with `""` — every bash
-call from a GPT model emitted all four operation keys with three of them
-empty, tripping the mutex. Production audit (May 2026) found 100% of bash
-calls in a GPT-5 conversation failed this way.
+**Rationale:** This requirement passed through three revisions. The
+original four-sibling shape (`cmd`, `peek`, `wait`, `kill` as parallel
+optional strings, runtime mutex) collapsed under OpenAI Responses-API
+default-fill of optional strings. Revision 2 introduced the `op`
+discriminator and a long list of tolerances (legacy four-sibling
+inference, empty-string-as-absent on the legacy keys, `mode` parameter
+shim, `command` alias for `cmd`) defending in-flight conversation
+history. Revision 3 (this one) retired the in-flight-history tolerances:
+LLMs see the current tool definition each turn and conform to the current
+schema, so pre-discriminator history is inert text from the model's
+perspective. Maintaining those tolerances costs code, tests, and prose
+for protection that real call paths don't need; deleting them is a
+structural simplification.
 
-The fix is structural: a single required `op` discriminator replaces the
-4-sibling pattern. `handle` is a single field whose meaning is determined
-by `op`, not encoded by which sibling was set. Empty strings on the now-
-legacy fields are tolerated for in-flight history. `mode` is dropped from
-the schema because GPT default-fills `mode="default"` alongside explicit
-`wait_seconds`, which the prior dual-pass rejection turned into a hard
-error; silently honoring the canonical `wait_seconds` is strictly better
-than failing the call.
+The two surviving tolerances (`since=0`-as-absent and `lines+since`
+collision resolution) are different in kind: they defend against active
+GPT default-fill on the *current* schema, where the model emits values
+below the advertised minimums. `tracing::debug!` makes both visible in
+logs.
 
-The dual-pass rationale from revision 2 (older model snapshots passing
-`mode=background` + `wait_seconds=30` "to be safe", with opposite intents)
-no longer applies once `mode` is off the schema and `wait_seconds` is the
-canonical knob. Mode collisions are now informational drift, not user
-intent ambiguity.
+The `op=spawn` rename to `op=run` happened because `spawn` carries a
+`fork(2)` / fire-and-forget prior in the model's training data: the
+operation is in fact a run-and-optionally-yield-a-handle. "Run" matches
+the agent's mental model. The same kind of fix as the prior
+`timeout` → `wait_seconds` rename. No legacy alias is kept; `op="spawn"`
+is a parse error like any unknown enum value.
+
+The `label` field exists because agents juggling concurrent handles cannot
+otherwise distinguish `b-3` from `b-4` without external bookkeeping. The
+cap-reached error already shows `cmd` per handle; the label gives the
+agent a stable annotation across all responses.
 
 ---
 
 ### REQ-BASH-011: Command Safety Checks
 
-WHEN bash command is submitted for execution (spawn path only)
+WHEN bash command is submitted for execution (run path only)
 THE SYSTEM SHALL parse the command using a shell syntax parser
 (`brush-parser`)
 AND check for dangerous patterns before execution
@@ -516,7 +555,7 @@ WHEN command appears in a pipeline or compound command
 THE SYSTEM SHALL check all command components
 
 **Rationale:** Unchanged from the prior revision. Safety checks remain UX
-guardrails, not security boundaries. The check runs only on spawn, not on
+guardrails, not security boundaries. The check runs only on run, not on
 peek/wait/kill, since those operate on already-spawned handles.
 
 ---
@@ -641,8 +680,8 @@ THE SYSTEM SHALL show the operation kind and handle ID (e.g., `peek b-7`,
 `kill b-7 (TERM)`) rather than attempting to display a fictitious command
 string
 
-**Rationale:** Unchanged for spawn calls. Extended for the new handle
-operations so the UI has a sensible display for non-spawn calls.
+**Rationale:** Unchanged for run calls. Extended for the new handle
+operations so the UI has a sensible display for non-run calls.
 
 ---
 
@@ -657,4 +696,5 @@ operations so the UI has a sensible display for non-spawn calls.
 | `SHUTDOWN_KILL_GRACE_SECONDS` | 2 | Time Phoenix waits at shutdown for SIGKILL'd groups to exit |
 | `TOMBSTONE_TAIL_LINES` | 2000 | Lines retained in `final_tail` after exit demotion |
 | `DEFAULT_PEEK_LINES` | 200 | Lines returned when peek has no read modifier |
+| `MAX_LABEL_LENGTH` | 64 | Soft cap on `label` length; over-cap labels rejected with `error: "label_too_long"` |
 | `DEFAULT_WAIT_SECONDS` | 30 | Default `wait_seconds` when omitted |
