@@ -75,6 +75,15 @@ pub struct RuntimeManager {
     /// Active PTY terminal sessions — threaded into `ToolContext` for `read_terminal`.
     pub terminals: crate::terminal::ActiveTerminals,
     runtimes: RwLock<HashMap<String, ConversationHandle>>,
+    /// Broadcasters from evicted runtimes, waiting to be inherited by a
+    /// replacement runtime created by the next `get_or_create` call.
+    ///
+    /// `evict_runtime` deposits the old broadcaster here instead of dropping
+    /// it, so existing SSE clients remain subscribed to the same channel and
+    /// continue receiving events once the new runtime starts broadcasting on
+    /// it. Without inheritance the clients would sit on a dead channel until
+    /// the axum keep-alive ping eventually expired or the user refreshed.
+    evicted_broadcasters: RwLock<HashMap<String, SseBroadcaster>>,
     /// Channel for sub-agent spawn requests
     spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
     spawn_rx: RwLock<Option<mpsc::Receiver<SubAgentSpawnRequest>>>,
@@ -101,6 +110,12 @@ pub struct ConversationHandle {
     /// it). This makes the "every SSE event carries a monotonic `sequence_id`" contract
     /// structurally enforceable rather than a matter of caller discipline.
     pub broadcast_tx: SseBroadcaster,
+    /// Opaque per-instance identity used by cleanup tasks to guard against
+    /// removing a _replacement_ entry that was created after eviction. Each
+    /// call to `get_or_create` allocates a fresh `Arc<()>`; all clones of a
+    /// handle share the same pointer so `Arc::ptr_eq` is a reliable identity
+    /// check even across cheap clones.
+    identity: Arc<()>,
 }
 
 /// Capacity of the per-conversation SSE broadcast channel.
@@ -192,6 +207,14 @@ impl SseBroadcaster {
     /// Subscribe to the SSE broadcast stream.
     pub fn subscribe(&self) -> broadcast::Receiver<SseEvent> {
         self.tx.subscribe()
+    }
+
+    /// Number of active receivers on the underlying broadcast channel.
+    /// Used for diagnostics — a count of 0 when broadcasting means events
+    /// are being sent to a channel with no SSE clients subscribed
+    /// (possible indicator of the "spinner-forever" stranding scenario).
+    pub fn receiver_count(&self) -> usize {
+        self.tx.receiver_count()
     }
 
     /// Send an event that has already been stamped with a `sequence_id`.
@@ -459,6 +482,7 @@ impl RuntimeManager {
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
+            evicted_broadcasters: RwLock::new(HashMap::new()),
             spawn_tx,
             spawn_rx: RwLock::new(Some(spawn_rx)),
             cancel_tx,
@@ -735,11 +759,13 @@ impl RuntimeManager {
         .with_credential_helper(self.credential_helper.clone());
 
         // 7. Store handle
+        let sub_agent_identity = Arc::new(());
         self.runtimes.write().await.insert(
             conv.id.clone(),
             ConversationHandle {
                 event_tx: event_tx.clone(),
                 broadcast_tx: broadcaster.clone(),
+                identity: sub_agent_identity.clone(),
             },
         );
 
@@ -783,12 +809,22 @@ impl RuntimeManager {
             // Cancel timeout — sub-agent finished before its limit
             timeout_task.abort();
 
-            // Remove the handle from runtimes so its event_tx sender is dropped.
-            // Without this the channel never closes and any other executor holding
-            // only its own internal sender would loop forever waiting for recv().
-            manager_for_cleanup.runtimes.write().await.remove(&conv_id);
-
-            tracing::info!(conv_id = %conv_id, "Sub-agent runtime finished and cleaned up");
+            // Only remove this sub-agent's entry. The identity check guards
+            // against the (unlikely) case where a replacement was inserted
+            // under the same key between run() finishing and this write lock.
+            let mut runtimes = manager_for_cleanup.runtimes.write().await;
+            if runtimes
+                .get(&conv_id)
+                .is_some_and(|h| Arc::ptr_eq(&h.identity, &sub_agent_identity))
+            {
+                runtimes.remove(&conv_id);
+                tracing::info!(conv_id = %conv_id, "Sub-agent runtime finished and cleaned up");
+            } else {
+                tracing::debug!(
+                    conv_id = %conv_id,
+                    "Sub-agent cleanup: entry was replaced, skipping remove"
+                );
+            }
         });
     }
 
@@ -838,6 +874,7 @@ impl RuntimeManager {
                 return Ok(ConversationHandle {
                     event_tx: handle.event_tx.clone(),
                     broadcast_tx: handle.broadcast_tx.clone(),
+                    identity: handle.identity.clone(),
                 });
             }
         }
@@ -885,16 +922,29 @@ impl RuntimeManager {
         };
 
         let (event_tx, event_rx) = mpsc::channel(32);
-        // Seed the broadcaster's sequence_id counter from the highest seq
-        // already persisted for this conversation. Without this, a resumed
-        // conversation would allocate sequence_ids starting from 1 and collide
-        // with ids the client may have already observed in a previous session.
-        let initial_last_seq = self
-            .db
-            .get_last_sequence_id(conversation_id)
-            .await
-            .unwrap_or(0);
-        let broadcaster = SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq);
+        // Inherit the broadcaster from an eviction if available (e.g. model
+        // upgrade). This keeps existing SSE clients subscribed to the same
+        // channel so they receive events from the new runtime without needing
+        // to reconnect. If no evicted broadcaster exists, create a fresh one
+        // seeded from the DB's highest sequence_id to avoid collisions.
+        let broadcaster = {
+            let mut evicted = self.evicted_broadcasters.write().await;
+            if let Some(b) = evicted.remove(conversation_id) {
+                tracing::debug!(
+                    conv_id = %conversation_id,
+                    receivers = b.receiver_count(),
+                    "New runtime inheriting evicted broadcaster; SSE clients stay connected"
+                );
+                b
+            } else {
+                let initial_last_seq = self
+                    .db
+                    .get_last_sequence_id(conversation_id)
+                    .await
+                    .unwrap_or(0);
+                SseBroadcaster::new(SSE_BROADCAST_CAPACITY, initial_last_seq)
+            }
+        };
 
         // Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
@@ -992,21 +1042,35 @@ impl RuntimeManager {
         // Start runtime in background
         let conv_id = conversation_id.to_string();
         let manager_for_cleanup = Arc::clone(self);
+        // Unique token for this runtime instance. Cleanup guards against
+        // removing a replacement entry created after eviction.
+        let identity = Arc::new(());
+        let cleanup_identity = identity.clone();
         tokio::spawn(async move {
             runtime.run().await;
 
-            // Remove the handle so its event_tx sender is dropped.
-            // Without this, the channel stays open and the handle persists after
-            // the executor exits (FM-5). A new runtime will be created by
-            // get_or_create if the conversation is resumed.
-            manager_for_cleanup.runtimes.write().await.remove(&conv_id);
-
-            tracing::info!(conv_id = %conv_id, "Conversation runtime finished and cleaned up");
+            // Only remove this runtime's HashMap entry. After evict_runtime()
+            // a new runtime may have been inserted under the same key; we must
+            // not evict that replacement.
+            let mut runtimes = manager_for_cleanup.runtimes.write().await;
+            if runtimes
+                .get(&conv_id)
+                .is_some_and(|h| Arc::ptr_eq(&h.identity, &cleanup_identity))
+            {
+                runtimes.remove(&conv_id);
+                tracing::info!(conv_id = %conv_id, "Conversation runtime finished and cleaned up");
+            } else {
+                tracing::debug!(
+                    conv_id = %conv_id,
+                    "Runtime cleanup: entry replaced after eviction, skipping remove"
+                );
+            }
         });
 
         let handle = ConversationHandle {
             event_tx: event_tx.clone(),
             broadcast_tx: broadcaster.clone(),
+            identity: identity.clone(),
         };
 
         // Store handle
@@ -1015,17 +1079,45 @@ impl RuntimeManager {
             ConversationHandle {
                 event_tx,
                 broadcast_tx: broadcaster,
+                identity,
             },
         );
 
         Ok(handle)
     }
 
-    /// Send an event to a conversation
     /// Evict an active runtime so it gets recreated with fresh config on next access.
     /// Used after model upgrades to pick up the new model and context window.
+    ///
+    /// The old broadcaster is preserved in `evicted_broadcasters` so the new
+    /// runtime can inherit it — existing SSE clients remain subscribed to the
+    /// same channel without needing to reconnect. A `Shutdown` event is sent
+    /// to the old runtime so it exits cleanly and releases its broadcaster
+    /// clone, completing the hand-off.
     pub async fn evict_runtime(&self, conversation_id: &str) {
-        self.runtimes.write().await.remove(conversation_id);
+        let old = {
+            let mut runtimes = self.runtimes.write().await;
+            runtimes.remove(conversation_id)
+        };
+
+        if let Some(handle) = old {
+            let receivers = handle.broadcast_tx.receiver_count();
+            // Preserve broadcaster for the incoming runtime. The new runtime
+            // inherits it in get_or_create so SSE clients stay connected.
+            self.evicted_broadcasters
+                .write()
+                .await
+                .insert(conversation_id.to_string(), handle.broadcast_tx);
+
+            // Signal old runtime to exit cleanly. It drops its broadcaster
+            // clone on exit, completing the reference hand-off.
+            let _ = handle.event_tx.send(Event::Shutdown).await;
+            tracing::info!(
+                conv_id = %conversation_id,
+                sse_receivers = receivers,
+                "Runtime evicted; shutdown signal sent, broadcaster preserved for new runtime"
+            );
+        }
     }
 
     pub async fn send_event(
@@ -1113,6 +1205,7 @@ impl RuntimeManager {
         runtimes.get(conversation_id).map(|h| ConversationHandle {
             event_tx: h.event_tx.clone(),
             broadcast_tx: h.broadcast_tx.clone(),
+            identity: h.identity.clone(),
         })
     }
 

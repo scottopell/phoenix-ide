@@ -167,6 +167,13 @@ pub enum Event {
     CancelSteerMessage {
         message_id: String,
     },
+
+    /// Sent by `RuntimeManager::evict_runtime` (e.g. after a model upgrade)
+    /// to cleanly terminate a running runtime that is being replaced.
+    /// The executor returns from `run()` immediately on receipt, which drops
+    /// the broadcaster and allows connected SSE clients to detect the closed
+    /// stream and reconnect to the new runtime.
+    Shutdown,
 }
 
 impl Event {
@@ -196,6 +203,7 @@ impl Event {
             Event::TaskResolved { .. } => "TaskResolved",
             Event::SteerMessage { .. } => "SteerMessage",
             Event::CancelSteerMessage { .. } => "CancelSteerMessage",
+            Event::Shutdown => "Shutdown",
         }
     }
 }
@@ -438,10 +446,12 @@ impl TryFrom<Event> for ParentEvent {
                 repo_root,
             })),
             // Sub-agent-only events are invalid for parent;
-            // SteerMessage and CancelSteerMessage are intercepted by the executor before conversion
+            // SteerMessage, CancelSteerMessage, and Shutdown are intercepted by
+            // the executor before reaching the state-machine conversion.
             Event::GraceTurnExhausted { .. }
             | Event::SteerMessage { .. }
-            | Event::CancelSteerMessage { .. } => Err(EventConversionError {
+            | Event::CancelSteerMessage { .. }
+            | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "ParentEvent",
             }),
@@ -540,14 +550,16 @@ impl TryFrom<Event> for SubAgentEvent {
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
             )),
             // Parent-only events are invalid for sub-agent;
-            // SteerMessage and CancelSteerMessage are intercepted by the executor before conversion
+            // SteerMessage, CancelSteerMessage, and Shutdown are intercepted by
+            // the executor before reaching the state-machine conversion.
             Event::TaskApprovalResponse { .. }
             | Event::UserQuestionResponse { .. }
             | Event::CredentialBecameAvailable
             | Event::CredentialHelperFailed { .. }
             | Event::TaskResolved { .. }
             | Event::SteerMessage { .. }
-            | Event::CancelSteerMessage { .. } => Err(EventConversionError {
+            | Event::CancelSteerMessage { .. }
+            | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",
             }),

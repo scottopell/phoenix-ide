@@ -1345,6 +1345,13 @@ async fn stream_conversation(
         .get_or_create(&id)
         .await
         .map_err(AppError::Internal)?;
+    // Diagnostic: log current receiver count so we can detect the
+    // "spinner-forever" scenario where clients subscribe to a dead channel.
+    tracing::debug!(
+        conv_id = %id,
+        receivers_before = handle.broadcast_tx.receiver_count(),
+        "SSE client subscribing"
+    );
     let broadcast_rx = handle.broadcast_tx.subscribe();
 
     // Compute initial commits_behind for Work conversations.

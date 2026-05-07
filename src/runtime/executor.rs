@@ -300,6 +300,16 @@ where
 
             tokio::select! {
                 Some(event) = self.event_rx.recv() => {
+                    // Eviction shutdown signal — exit cleanly so the broadcaster
+                    // is dropped and connected SSE clients detect the closed
+                    // stream and trigger a reconnect to the new runtime.
+                    if matches!(event, Event::Shutdown) {
+                        tracing::info!(
+                            conv_id = %self.context.conversation_id,
+                            "Runtime shutdown signal received; exiting executor loop"
+                        );
+                        return;
+                    }
                     if let Err(e) = self.process_event(event).await {
                         // process_event already broadcast a typed
                         // SseEvent::Error at the source if appropriate

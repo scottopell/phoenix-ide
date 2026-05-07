@@ -26,6 +26,7 @@ import {
   TransitionContext,
   transition,
   initialState,
+  OFFLINE_THRESHOLD,
   RECONNECTED_DISPLAY_MS,
 } from './connectionMachine';
 
@@ -463,6 +464,16 @@ export function useConnection({
               });
               return; // Don't treat as connection error
             }
+            // Native connection drop — log for diagnosing spinner-forever scenarios.
+            // This is the path that triggers SSE reconnect logic.
+            if (import.meta.env.DEV) {
+              console.warn('[sse] native connection error (no data); scheduling reconnect', {
+                convId,
+                epoch,
+                attempt: machineStateRef.current.attempt,
+                readyState: (e.target as EventSource | null)?.readyState,
+              });
+            }
             dispatchMachineRef.current({ type: 'SSE_ERROR' });
           });
           break;
@@ -486,6 +497,17 @@ export function useConnection({
 
           const seconds = Math.ceil(effect.delayMs / 1000);
           setCountdownSeconds(seconds);
+
+          // Warn when entering offline-escalation territory. After
+          // OFFLINE_THRESHOLD attempts the machine moves to 'offline' and
+          // stops auto-retrying (requires BROWSER_ONLINE / tab focus).
+          // This fires in prod too — helps diagnose the spinner-forever bug.
+          if (machineStateRef.current.attempt >= OFFLINE_THRESHOLD) {
+            console.warn('[sse] connection failed', machineStateRef.current.attempt, 'times; entered offline state', {
+              convId: conversationIdRef.current,
+              epoch: machineStateRef.current.epoch,
+            });
+          }
 
           const ownerConvId = conversationIdRef.current;
           const ownerEpoch = machineStateRef.current.epoch;

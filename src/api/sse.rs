@@ -48,17 +48,16 @@ pub fn sse_stream(
         );
 
     let broadcasts = BroadcastStream::new(broadcast_rx)
-        .take_while(move |result| {
-            if let Err(BroadcastStreamRecvError::Lagged(n)) = result {
+        .take_while(move |result| match result {
+            Err(BroadcastStreamRecvError::Lagged(n)) => {
                 tracing::warn!(
                     conv_id = %conv_id,
                     lagged_by = n,
                     "SSE broadcast lagged; closing stream so client reconnects and resyncs"
                 );
                 false
-            } else {
-                true
             }
+            _ => true,
         })
         .filter_map(|result| match result {
             Ok(event) => Some(Ok(sse_event_to_axum(event))),
