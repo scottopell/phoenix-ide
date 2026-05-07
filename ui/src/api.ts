@@ -89,10 +89,9 @@ export interface Conversation {
    *  this absent or null. The sidebar falls back to the root conversation's
    *  slug when this is null/absent. */
   chain_name?: string | null;
-  /** Server-computed: true when this conversation needs user attention —
-   *  context_exhausted without a continuation, or awaiting task/user approval.
-   *  Use getConvDisplayState(conv) instead of reading this directly. */
-  requires_action?: boolean;
+  /** Server-computed presentation mode: idle | working | needs_action | error | done.
+   *  Single source of truth for which visual indicator to render. */
+  presentation_mode?: string;
 }
 
 export interface Project {
@@ -151,9 +150,9 @@ export type ConversationState =
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
   | { type: 'terminal' };
 
-export type DisplayState = 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval';
-
-function getDisplayState(stateType: string | undefined): DisplayState {
+/** Derive the coarse display category from a conversation's raw state type string.
+ *  Internal fallback — prefer `getConvDisplayState` which reads `presentation_mode`. */
+function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval' {
   switch (stateType) {
     case 'idle': return 'idle';
     case 'terminal': return 'terminal';
@@ -165,13 +164,20 @@ function getDisplayState(stateType: string | undefined): DisplayState {
   }
 }
 
-/** Single canonical function for determining a conversation's display state.
- *  All status dot rendering must go through this — do not read conv.state.type
- *  or conv.requires_action directly at call sites. */
-export function getConvDisplayState(conv: Conversation | undefined): DisplayState {
-  if (conv?.requires_action) return 'awaiting_approval';
-  return getDisplayState(conv?.state?.type);
+/** Derive the coarse display category for a conversation.
+ *  Reads `presentation_mode` from the server when available; falls back to
+ *  `state.type` for SSE-only views that may not have received a REST snapshot. */
+export function getConvDisplayState(conv: Conversation | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval' {
+  switch (conv?.presentation_mode) {
+    case 'idle': return 'idle';
+    case 'working': return 'working';
+    case 'needs_action': return 'awaiting_approval';
+    case 'error': return 'error';
+    case 'done': return 'terminal';
+    default: return getDisplayState(conv?.state?.type);
+  }
 }
+
 
 export interface ToolCall {
   id: string;
@@ -435,7 +441,7 @@ export const api = {
     return (await resp.json()).conversation;
   },
 
-  async getConversationBySlug(slug: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean; display_state: string; context_window_size: number }> {
+  async getConversationBySlug(slug: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean; presentation_mode: string; context_window_size: number }> {
     const resp = await fetch(`/api/conversations/by-slug/${encodeURIComponent(slug)}`);
     if (!resp.ok) {
       if (resp.status === 404) throw new Error('Conversation not found');
@@ -781,7 +787,7 @@ export const api = {
     conversation: Conversation;
     messages: Message[];
     agent_working: boolean;
-    display_state: string;
+    presentation_mode: string;
     context_window_size: number;
   }> {
     const resp = await fetch(`/api/share/${encodeURIComponent(token)}/conversation`);

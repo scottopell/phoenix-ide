@@ -208,7 +208,7 @@ pub enum SseWireEvent {
         #[ts(type = "Array<unknown>")]
         messages: Vec<EnrichedMessage>,
         agent_working: bool,
-        display_state: String,
+        presentation_mode: String,
         last_sequence_id: i64,
         context_window_size: u64,
         breadcrumbs: Vec<SseBreadcrumb>,
@@ -247,7 +247,7 @@ pub enum SseWireEvent {
         sequence_id: i64,
         #[ts(type = "unknown")]
         state: Value,
-        display_state: String,
+        presentation_mode: String,
     },
     /// Ephemeral streaming token (LLM delta).
     Token {
@@ -315,7 +315,7 @@ impl From<SseEvent> for SseWireEvent {
                 conversation,
                 messages,
                 agent_working,
-                display_state,
+                presentation_mode,
                 last_sequence_id,
                 context_window_size,
                 breadcrumbs,
@@ -327,7 +327,7 @@ impl From<SseEvent> for SseWireEvent {
                 conversation,
                 messages: messages.iter().map(EnrichedMessage::from).collect(),
                 agent_working,
-                display_state,
+                presentation_mode,
                 last_sequence_id,
                 context_window_size,
                 breadcrumbs,
@@ -364,11 +364,11 @@ impl From<SseEvent> for SseWireEvent {
             SseEvent::StateChange {
                 sequence_id,
                 state,
-                display_state,
+                presentation_mode,
             } => SseWireEvent::StateChange {
                 sequence_id,
                 state: serde_json::to_value(&state).unwrap_or(Value::Null),
-                display_state,
+                presentation_mode,
             },
             SseEvent::Token {
                 sequence_id,

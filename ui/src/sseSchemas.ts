@@ -170,7 +170,7 @@ export type SseBreadcrumb = v.InferOutput<typeof SseBreadcrumbSchema>;
  *  (the snapshot's own place in the total order equals the highest-ever-
  *  emitted id at subscribe time). Both are required.
  *
- *  `display_state` is `string` (not optional) in the Rust wire type — task
+ *  `presentation_mode` is `string` (not optional) in the Rust wire type — task
  *  02677 tightened this field from the previously-optional schema shape
  *  after the generated type surfaced the actual wire contract. */
 export const SseInitDataSchema = v.looseObject({
@@ -179,7 +179,7 @@ export const SseInitDataSchema = v.looseObject({
   messages: v.array(MessageSchema),
   agent_working: v.boolean(),
   last_sequence_id: v.number(),
-  display_state: v.string(),
+  presentation_mode: v.string(),
   context_window_size: v.number(),
   breadcrumbs: v.array(SseBreadcrumbSchema),
   commits_behind: v.number(),
@@ -220,7 +220,7 @@ export const SseMessageUpdatedDataSchema = v.looseObject({
 export const SseStateChangeDataSchema = v.looseObject({
   sequence_id: v.number(),
   state: v.unknown(),
-  display_state: v.string(),
+  presentation_mode: v.string(),
 }) satisfies v.GenericSchema<unknown, WireStateChangeData>;
 
 /** `token`: ephemeral streaming delta during an LLM request. */

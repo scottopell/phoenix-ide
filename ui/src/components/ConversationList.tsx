@@ -174,7 +174,7 @@ export function ConversationList({
               className={`conv-state-dot ${getConvDisplayState(conv)}`}
               title={(() => {
                 if (conv.state?.type === 'context_exhausted') {
-                  return conv.requires_action ? 'Context full' : 'Continued';
+                  return conv.presentation_mode === 'needs_action' ? 'Context full' : 'Continued';
                 }
                 switch (getConvDisplayState(conv)) {
                   case 'idle': return 'Ready';

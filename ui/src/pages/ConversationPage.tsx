@@ -347,7 +347,7 @@ function ConversationPageContent() {
                 messages: result.messages,
                 phase: result.conversation.state
                   ? parseConversationState(result.conversation.state)
-                  : result.display_state === 'working'
+                  : result.presentation_mode === 'working'
                     ? { type: 'awaiting_llm' }
                     : { type: 'idle' },
                 contextWindow: {

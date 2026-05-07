@@ -30,7 +30,7 @@ conversation: unknown,
  * valibot schema validates each element against `MessageSchema`
  * and transforms to `Message` at that boundary.
  */
-messages: Array<unknown>, agent_working: boolean, display_state: string, last_sequence_id: number, context_window_size: number, breadcrumbs: Array<SseBreadcrumb>, commits_behind: number, commits_ahead: number, project_name: string | null, } | { "type": "message", sequence_id: number, 
+messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, breadcrumbs: Array<SseBreadcrumb>, commits_behind: number, commits_ahead: number, project_name: string | null, } | { "type": "message", sequence_id: number, 
 /**
  * See the note on `Init.messages` — the message payload is
  * validated against `MessageSchema` and transformed to the UI's
@@ -42,7 +42,7 @@ message: unknown, } | { "type": "message_updated", sequence_id: number, message_
  * `MessageUpdated` event is emitted for a tool-result message;
  * absent (`undefined` on the TS side) for all other update paths.
  */
-duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: unknown, display_state: string, } | { "type": "token", sequence_id: number, text: string, request_id: string, } | { "type": "agent_done", sequence_id: number, } | { "type": "conversation_became_terminal", sequence_id: number, } | { "type": "conversation_update", sequence_id: number, conversation: unknown, } | { "type": "error", sequence_id: number, message: string, 
+duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: unknown, presentation_mode: string, } | { "type": "token", sequence_id: number, text: string, request_id: string, } | { "type": "agent_done", sequence_id: number, } | { "type": "conversation_became_terminal", sequence_id: number, } | { "type": "conversation_update", sequence_id: number, conversation: unknown, } | { "type": "error", sequence_id: number, message: string, 
 /**
  * Generated as `unknown` — the existing UI reads only the flat
  * `message` field. Kind-aware consumers can narrow against

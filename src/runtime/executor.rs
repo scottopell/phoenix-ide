@@ -1035,7 +1035,7 @@ where
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
                     sequence_id: seq,
                     state: self.state.clone(),
-                    display_state: self.state.display_state().as_str().to_string(),
+                    presentation_mode: self.state.presentation_mode().to_string(),
                 });
                 Ok(None)
             }
@@ -1070,7 +1070,7 @@ where
                         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
                             sequence_id: seq,
                             state: self.state.clone(),
-                            display_state: self.state.display_state().as_str().to_string(),
+                            presentation_mode: self.state.presentation_mode().to_string(),
                         });
                     }
                     _ => {}
@@ -1183,7 +1183,7 @@ where
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
                     sequence_id: seq,
                     state: ConvState::ContextExhausted { summary },
-                    display_state: self.state.display_state().as_str().to_string(),
+                    presentation_mode: "needs_action".to_string(),
                 });
                 Ok(None)
             }
@@ -2008,7 +2008,7 @@ where
         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
             sequence_id: seq,
             state: ConvState::Terminal,
-            display_state: ConvState::Terminal.display_state().as_str().to_string(),
+            presentation_mode: ConvState::Terminal.presentation_mode().to_string(),
         });
         let _ = self
             .broadcast_tx

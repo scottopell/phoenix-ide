@@ -993,17 +993,6 @@ pub enum DisplayState {
     AwaitingApproval,
 }
 
-impl DisplayState {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            DisplayState::Idle => "idle",
-            DisplayState::Working => "working",
-            DisplayState::Error => "error",
-            DisplayState::Terminal => "terminal",
-            DisplayState::AwaitingApproval => "awaiting_approval",
-        }
-    }
-}
 
 /// Executor lifecycle signal — forces explicit handling of terminal states (FM-5 prevention).
 ///
@@ -1118,6 +1107,32 @@ impl ConvState {
             | ConvState::AwaitingContinuation { .. }
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. } => StepResult::Continue,
+        }
+    }
+
+    /// Typed presentation mode for the frontend.
+    ///
+    /// Maps states to the 5 presentation variants the UI renders.
+    /// Note: `ContextExhausted` always returns `"needs_action"` here.
+    /// Callers that have a full `Conversation` and want the `"done"` variant
+    /// for the case where `continued_in_conv_id.is_some()` must override this.
+    pub fn presentation_mode(&self) -> &'static str {
+        match self {
+            ConvState::Idle => "idle",
+            ConvState::Error { .. } => "error",
+            ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+            | ConvState::ContextExhausted { .. } => "needs_action",
+            ConvState::Terminal
+            | ConvState::Completed { .. }
+            | ConvState::Failed { .. } => "done",
+            ConvState::LlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingContinuation { .. } => "working",
         }
     }
 

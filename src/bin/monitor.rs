@@ -67,7 +67,7 @@ struct ApiConversation {
     slug: Option<String>,
     #[allow(dead_code)]
     title: Option<String>,
-    display_state: String,
+    presentation_mode: String,
     conv_mode_label: Option<String>,
     message_count: Option<i64>,
     model: Option<String>,
@@ -91,7 +91,7 @@ struct ConversationDetailResponse {
     conversation: Value,
     messages: Vec<Value>,
     #[allow(dead_code)]
-    display_state: String,
+    presentation_mode: String,
     context_window_size: Option<u64>,
 }
 
@@ -616,20 +616,22 @@ impl App {
 // Rendering helpers
 // ============================================================
 
-fn state_color(display_state: &str) -> Color {
-    match display_state {
+fn state_color(presentation_mode: &str) -> Color {
+    match presentation_mode {
         "working" => Color::Green,
         "error" => Color::Red,
-        "terminal" => Color::DarkGray,
+        "done" => Color::DarkGray,
+        "needs_action" => Color::Magenta,
         _ => Color::Cyan,
     }
 }
 
-fn state_dot(display_state: &str) -> &'static str {
-    match display_state {
+fn state_dot(presentation_mode: &str) -> &'static str {
+    match presentation_mode {
         "working" => "●",
         "error" => "✗",
-        "terminal" => "◌",
+        "done" => "◌",
+        "needs_action" => "◉",
         _ => "○",
     }
 }
@@ -703,8 +705,8 @@ fn render_conv_list(f: &mut Frame, area: Rect, app: &mut App) {
         .conversations
         .iter()
         .map(|c| {
-            let dot = state_dot(&c.display_state);
-            let color = state_color(&c.display_state);
+            let dot = state_dot(&c.presentation_mode);
+            let color = state_color(&c.presentation_mode);
             let slug = c.slug.as_deref().unwrap_or(&c.id);
             let slug_short = slug_truncate(slug, 20);
             let mode = c.conv_mode_label.as_deref().unwrap_or("?");
@@ -737,12 +739,12 @@ fn render_conv_list(f: &mut Frame, area: Rect, app: &mut App) {
     let working = app
         .conversations
         .iter()
-        .filter(|c| c.display_state == "working")
+        .filter(|c| c.presentation_mode == "working")
         .count();
     let idle = app
         .conversations
         .iter()
-        .filter(|c| c.display_state == "idle")
+        .filter(|c| c.presentation_mode == "idle")
         .count();
 
     let focused = app.focus == Focus::List;
@@ -830,7 +832,7 @@ fn render_state_tab(lines: &mut Vec<Line>, detail: &ConversationDetailResponse) 
     let fields = [
         "id",
         "slug",
-        "display_state",
+        "presentation_mode",
         "conv_mode_label",
         "model",
         "message_count",
@@ -1495,14 +1497,14 @@ fn headless_conversations() {
             let total = convs.len();
             let working: Vec<_> = convs
                 .iter()
-                .filter(|c| c.display_state == "working")
+                .filter(|c| c.presentation_mode == "working")
                 .collect();
-            let idle = convs.iter().filter(|c| c.display_state == "idle").count();
+            let idle = convs.iter().filter(|c| c.presentation_mode == "idle").count();
             let terminal = convs
                 .iter()
-                .filter(|c| c.display_state == "terminal")
+                .filter(|c| c.presentation_mode == "done")
                 .count();
-            let error = convs.iter().filter(|c| c.display_state == "error").count();
+            let error = convs.iter().filter(|c| c.presentation_mode == "error").count();
 
             println!(
                 "Phoenix IDE — {total} conversations  idle:{idle} working:{} terminal:{terminal} error:{error}",
@@ -1530,7 +1532,7 @@ fn headless_conversations() {
 
             println!("ALL:");
             for c in &convs {
-                let dot = state_dot(&c.display_state);
+                let dot = state_dot(&c.presentation_mode);
                 let slug = c.slug.as_deref().unwrap_or(&c.id);
                 let mode = c.conv_mode_label.as_deref().unwrap_or("?");
                 let msgs = c.message_count.unwrap_or(0);
@@ -1563,7 +1565,7 @@ fn print_conv_detail(d: &ConversationDetailResponse) {
     print_field("id:", "id");
     print_field("slug:", "slug");
     print_field("title:", "title");
-    print_field("state:", "display_state");
+    print_field("state:", "presentation_mode");
     print_field("mode:", "conv_mode_label");
     print_field("model:", "model");
     print_field("messages:", "message_count");

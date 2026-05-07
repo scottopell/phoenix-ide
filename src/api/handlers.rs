@@ -338,17 +338,33 @@ async fn enrich_conversation_with_seed(
     enriched
 }
 
-/// Serialize a conversation to JSON with `display_state` included.
+/// Compute the full `presentation_mode` for a conversation, including the
+/// `ContextExhausted` + `continued_in_conv_id` check.
+///
+/// - `ContextExhausted` with a continuation → `"done"` (read-only, continued elsewhere)
+/// - `ContextExhausted` without a continuation → `"needs_action"` (user must act)
+/// - All other states → delegate to `ConvState::presentation_mode()`
+fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
+    if matches!(conv.state, crate::state_machine::ConvState::ContextExhausted { .. }) {
+        if conv.continued_in_conv_id.is_some() {
+            return "done";
+        }
+        return "needs_action";
+    }
+    conv.state.presentation_mode()
+}
+
+/// Serialize a conversation to JSON with `presentation_mode` included.
 ///
 /// Used by endpoints that return `serde_json::Value` (conversation list, etc.).
-/// `display_state` is injected here (not on `EnrichedConversation`) so REST
+/// `presentation_mode` is injected here (not on `EnrichedConversation`) so REST
 /// clients still receive it while the typed struct stays clean.
 fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
     let mut val = serde_json::to_value(enrich_conversation(conv)).unwrap_or(Value::Null);
     if let Value::Object(ref mut map) = val {
         map.insert(
-            "display_state".to_string(),
-            Value::String(conv.state.display_state().as_str().to_string()),
+            "presentation_mode".to_string(),
+            Value::String(conv_presentation_mode(conv).to_string()),
         );
         map.insert("requires_action".to_string(), Value::Bool(conv_requires_action(conv)));
     }
@@ -364,8 +380,8 @@ async fn conversation_to_json_with_seed(state: &AppState, conv: &crate::db::Conv
     let mut val = serde_json::to_value(enriched).unwrap_or(Value::Null);
     if let Value::Object(ref mut map) = val {
         map.insert(
-            "display_state".to_string(),
-            Value::String(conv.state.display_state().as_str().to_string()),
+            "presentation_mode".to_string(),
+            Value::String(conv_presentation_mode(conv).to_string()),
         );
         map.insert("requires_action".to_string(), Value::Bool(conv_requires_action(conv)));
     }
@@ -1001,7 +1017,7 @@ async fn get_conversation(
         conversation: conversation_to_json_with_seed(&state, &conversation).await,
         messages: json_msgs,
         agent_working: conversation.is_agent_working(),
-        display_state: conversation.state.display_state().as_str().to_string(),
+        presentation_mode: conv_presentation_mode(&conversation).to_string(),
         context_window_size,
     }))
 }
@@ -1382,7 +1398,7 @@ async fn stream_conversation(
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
         messages,
         agent_working: conversation.is_agent_working(),
-        display_state: conversation.state.display_state().as_str().to_string(),
+        presentation_mode: conv_presentation_mode(&conversation).to_string(),
         last_sequence_id: init_seq,
         context_window_size,
         breadcrumbs,
@@ -2246,7 +2262,7 @@ async fn get_by_slug(
         conversation: conversation_to_json_with_seed(&state, &conversation).await,
         messages: json_msgs,
         agent_working: conversation.is_agent_working(),
-        display_state: conversation.state.display_state().as_str().to_string(),
+        presentation_mode: conv_presentation_mode(&conversation).to_string(),
         context_window_size,
     }))
 }
@@ -3239,7 +3255,7 @@ async fn get_shared_conversation(
         conversation: conversation_to_json_with_seed(&state, &conversation).await,
         messages: json_msgs,
         agent_working: conversation.is_agent_working(),
-        display_state: conversation.state.display_state().as_str().to_string(),
+        presentation_mode: conv_presentation_mode(&conversation).to_string(),
         context_window_size,
     }))
 }
@@ -3312,7 +3328,7 @@ async fn shared_sse_stream(
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
         messages,
         agent_working: conversation.is_agent_working(),
-        display_state: conversation.state.display_state().as_str().to_string(),
+        presentation_mode: conv_presentation_mode(&conversation).to_string(),
         last_sequence_id: init_seq,
         context_window_size,
         breadcrumbs,

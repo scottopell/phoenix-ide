@@ -113,7 +113,7 @@ mod tests {
                 conversation,
                 messages,
                 agent_working,
-                display_state,
+                presentation_mode,
                 last_sequence_id,
                 context_window_size,
                 breadcrumbs,
@@ -129,7 +129,7 @@ mod tests {
                     "conversation": conversation,
                     "messages": enriched_msgs,
                     "agent_working": agent_working,
-                    "display_state": display_state,
+                    "presentation_mode": presentation_mode,
                     "last_sequence_id": last_sequence_id,
                     "context_window_size": context_window_size,
                     "breadcrumbs": breadcrumbs,
@@ -169,12 +169,12 @@ mod tests {
             SseEvent::StateChange {
                 sequence_id,
                 state,
-                display_state,
+                presentation_mode,
             } => json!({
                 "type": "state_change",
                 "sequence_id": sequence_id,
                 "state": serde_json::to_value(state).unwrap_or(Value::Null),
-                "display_state": display_state,
+                "presentation_mode": presentation_mode,
             }),
             SseEvent::Token {
                 sequence_id,
@@ -354,7 +354,7 @@ mod tests {
             conversation: Box::new(fixture_enriched_conversation()),
             messages: vec![fixture_user_message(), fixture_agent_message_with_bash()],
             agent_working: false,
-            display_state: "idle".to_string(),
+            presentation_mode: "idle".to_string(),
             last_sequence_id: 42,
             context_window_size: 2048,
             breadcrumbs: fixture_breadcrumbs(),
@@ -465,7 +465,7 @@ mod tests {
         let event = SseEvent::StateChange {
             sequence_id: 13,
             state: ConvState::Idle,
-            display_state: "idle".to_string(),
+            presentation_mode: "idle".to_string(),
         };
         assert_parity(&event);
     }
@@ -475,7 +475,7 @@ mod tests {
         let event = SseEvent::StateChange {
             sequence_id: 14,
             state: ConvState::LlmRequesting { attempt: 1 },
-            display_state: "working".to_string(),
+            presentation_mode: "working".to_string(),
         };
         assert_parity(&event);
     }

@@ -311,8 +311,8 @@ pub enum SseEvent {
         conversation: Box<EnrichedConversation>,
         messages: Vec<crate::db::Message>,
         agent_working: bool,
-        /// Semantic state category for UI display (idle/working/error/terminal)
-        display_state: String,
+        /// Presentation mode for UI display (`idle`/`working`/`needs_action`/`error`/`done`)
+        presentation_mode: String,
         /// Highest `sequence_id` ever emitted for this conversation — what the
         /// client seeds `atom.lastSequenceId` with so subsequent
         /// `applyIfNewer` checks start at the right floor.
@@ -354,8 +354,8 @@ pub enum SseEvent {
         sequence_id: i64,
         /// Full typed conversation state
         state: ConvState,
-        /// Semantic state category for UI display (idle/working/error/terminal)
-        display_state: String,
+        /// Presentation mode for UI display (`idle`/`working`/`needs_action`/`error`/`done`)
+        presentation_mode: String,
     },
     /// Ephemeral streaming token. Not persisted, but still carries a
     /// `sequence_id` from the same counter so reconnects don't strand tokens
