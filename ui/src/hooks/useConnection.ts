@@ -258,28 +258,26 @@ export function useConnection({
             eventSourceRef.current = null;
           }
 
-          // Task 08683: stamp every dispatched action with the connection's
-          // epoch so the atom can drop events from a stale generation.
-          // `epoch` is captured in closure here; the handlers below each
-          // see the epoch that was current when *this* OPEN_SSE ran, even
-          // if a later OPEN_SSE has minted a fresher epoch in the meantime.
           const epoch = effect.epoch;
           const stampedDispatch = epochStampedDispatch(dispatchRef.current, epoch);
 
-          // Lift the atom's `connectionEpoch` to the new generation before
-          // any wire event lands. Without this, the very first stamped
-          // action (e.g. `connection_state: 'live'` from the init handler)
-          // would still pass `isStaleEpoch` (atom.connectionEpoch === null)
-          // but every subsequent stamped action from a *different* slug's
-          // stale connection would also pass — which is exactly the
-          // contamination scenario this task closes.
           dispatchRef.current({ type: 'connection_opened', epoch });
 
           const url = `/api/conversations/${convId}/stream`;
           const es = new EventSource(url);
           eventSourceRef.current = es;
+          const isCurrentOwner = () =>
+            conversationIdRef.current === convId &&
+            machineStateRef.current.epoch === epoch &&
+            eventSourceRef.current === es;
+          const on = (type: string, handler: (e: Event) => void) => {
+            es.addEventListener(type, (e) => {
+              if (!isCurrentOwner()) return;
+              handler(e);
+            });
+          };
 
-          es.addEventListener('init', (e) => {
+          on('init', (e) => {
             const res = parseEvent(SseInitDataSchema, e, 'init', stampedDispatch);
             if (!res.ok) return;
 
@@ -288,10 +286,9 @@ export function useConnection({
               type: 'sse_init',
               payload: transformInitData(res.data),
             });
-            stampedDispatch({ type: 'connection_state', state: 'live' });
           });
 
-          es.addEventListener('message', (e) => {
+          on('message', (e) => {
             const res = parseEvent(SseMessageDataSchema, e, 'message', stampedDispatch);
             if (!res.ok) return;
             const msg = res.data.message;
@@ -302,7 +299,7 @@ export function useConnection({
             });
           });
 
-          es.addEventListener('message_updated', (e) => {
+          on('message_updated', (e) => {
             const res = parseEvent(
               SseMessageUpdatedDataSchema,
               e,
@@ -321,7 +318,7 @@ export function useConnection({
             });
           });
 
-          es.addEventListener('state_change', (e) => {
+          on('state_change', (e) => {
             const res = parseEvent(
               SseStateChangeDataSchema,
               e,
@@ -338,7 +335,7 @@ export function useConnection({
             });
           });
 
-          es.addEventListener('agent_done', (e) => {
+          on('agent_done', (e) => {
             const res = parseEvent(
               SseAgentDoneDataSchema,
               e,
@@ -352,7 +349,7 @@ export function useConnection({
           // Terminal subsystem lifecycle event — wired up fully in Task 5.
           // Still validated so a future server change that adds teardown
           // detail cannot slip past this no-op without a schema update.
-          es.addEventListener('conversation_became_terminal', (e) => {
+          on('conversation_became_terminal', (e) => {
             parseEvent(
               SseConversationBecameTerminalDataSchema,
               e,
@@ -362,7 +359,7 @@ export function useConnection({
             // no-op until terminal PTY teardown is implemented
           });
 
-          es.addEventListener('conversation_update', (e) => {
+          on('conversation_update', (e) => {
             const res = parseEvent(
               SseConversationUpdateDataSchema,
               e,
@@ -381,7 +378,7 @@ export function useConnection({
           // counter, so the old per-connection `tokenSequence` closure is
           // gone. The reducer's `applyIfNewer` guard sees strictly
           // increasing ids across reconnects and never stalls.
-          es.addEventListener('token', (e) => {
+          on('token', (e) => {
             const res = parseEvent(SseTokenDataSchema, e, 'token', stampedDispatch);
             if (!res.ok) return;
             stampedDispatch({
@@ -395,7 +392,7 @@ export function useConnection({
           // BrowserSessionManager. Authoritative for whether the UI shows
           // the browser-view affordances; the reducer mutates
           // `conversation.browser_session_active` directly.
-          es.addEventListener('browser_session_state', (e) => {
+          on('browser_session_state', (e) => {
             const res = parseEvent(
               SseBrowserSessionStateDataSchema,
               e,
@@ -415,7 +412,7 @@ export function useConnection({
           // sidebar (cross-tab) by dispatching a window event so the
           // DesktopLayout can refresh its conversation list immediately
           // — without waiting for the 5s polling tick.
-          es.addEventListener('conversation_hard_deleted', (e) => {
+          on('conversation_hard_deleted', (e) => {
             const res = parseEvent(
               SseConversationHardDeletedDataSchema,
               e,
@@ -430,7 +427,7 @@ export function useConnection({
             );
           });
 
-          es.addEventListener('error', (e) => {
+          on('error', (e) => {
             // Backend application errors arrive as SSE event type "error" WITH data.
             // Native EventSource connection errors fire with NO data — those are
             // not a schema concern and take the connection-error path below.
@@ -451,7 +448,6 @@ export function useConnection({
               return; // Don't treat as connection error
             }
             dispatchMachineRef.current({ type: 'SSE_ERROR' });
-            stampedDispatch({ type: 'connection_state', state: 'reconnecting' });
           });
           break;
         }
@@ -461,16 +457,6 @@ export function useConnection({
             eventSourceRef.current.close();
             eventSourceRef.current = null;
           }
-          // Stamp with the current machine epoch (the connection generation
-          // that just closed). After a slug change this epoch will not
-          // match the freshly-navigated atom's `connectionEpoch`, so the
-          // 'connecting' state from the old conversation's close cannot
-          // leak into the new conversation's atom.
-          dispatchRef.current({
-            type: 'connection_state',
-            state: 'connecting',
-            epoch: machineStateRef.current.epoch,
-          });
           break;
         }
 
@@ -485,8 +471,20 @@ export function useConnection({
           const seconds = Math.ceil(effect.delayMs / 1000);
           setCountdownSeconds(seconds);
 
+          const ownerConvId = conversationIdRef.current;
+          const ownerEpoch = machineStateRef.current.epoch;
+          const isCurrentTimerOwner = () =>
+            conversationIdRef.current === ownerConvId && machineStateRef.current.epoch === ownerEpoch;
+
           let remaining = seconds;
           countdownIntervalRef.current = window.setInterval(() => {
+            if (!isCurrentTimerOwner()) {
+              if (countdownIntervalRef.current !== null) {
+                clearInterval(countdownIntervalRef.current);
+                countdownIntervalRef.current = null;
+              }
+              return;
+            }
             remaining--;
             setCountdownSeconds(remaining > 0 ? remaining : null);
             if (remaining <= 0 && countdownIntervalRef.current !== null) {
@@ -497,14 +495,10 @@ export function useConnection({
 
           retryTimeoutRef.current = window.setTimeout(() => {
             retryTimeoutRef.current = null;
+            if (!isCurrentTimerOwner()) return;
             dispatchMachineRef.current({ type: 'RETRY_TIMER_FIRED' });
           }, effect.delayMs);
 
-          dispatchRef.current({
-            type: 'connection_state',
-            state: 'reconnecting',
-            epoch: machineStateRef.current.epoch,
-          });
           break;
         }
 
@@ -512,8 +506,13 @@ export function useConnection({
           if (reconnectedTimeoutRef.current !== null) {
             clearTimeout(reconnectedTimeoutRef.current);
           }
+          const ownerConvId = conversationIdRef.current;
+          const ownerEpoch = machineStateRef.current.epoch;
           reconnectedTimeoutRef.current = window.setTimeout(() => {
             reconnectedTimeoutRef.current = null;
+            if (conversationIdRef.current !== ownerConvId || machineStateRef.current.epoch !== ownerEpoch) {
+              return;
+            }
             dispatchMachineRef.current({ type: 'RECONNECTED_DISPLAY_DONE' });
           }, RECONNECTED_DISPLAY_MS);
           break;

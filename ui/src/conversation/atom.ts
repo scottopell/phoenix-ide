@@ -22,7 +22,6 @@ export interface ConversationAtom {
   contextWindow: { used: number };
   systemPrompt: string | null;
   lastSequenceId: number;
-  connectionState: 'connecting' | 'live' | 'reconnecting' | 'failed';
   streamingBuffer: StreamingBuffer | null;
   uiError: UIError | null;
   /** `Date.now()` when the current `tool_executing` phase began. Reset on
@@ -30,12 +29,10 @@ export interface ConversationAtom {
    *  `null` when not in `tool_executing`. Used by StateBar to render a live
    *  elapsed-time counter. */
   toolExecutingStartedAt: number | null;
-  /** Per-machine connection generation that produced the events this atom
-   *  has accepted. `null` until `connection_opened` lands. Wire-originated
-   *  actions tagged with a non-matching `epoch` are dropped at the reducer
-   *  boundary — the cross-conversation contamination guard from task 08683.
-   *  Updated monotonically: a stale `connection_opened` from an older
-   *  generation cannot regress the value. */
+  /** Per-connection generation that produced the events this atom has accepted.
+   *  `null` until `connection_opened` lands. Wire-originated actions tagged
+   *  with a non-matching `epoch` are dropped at the reducer boundary — the
+   *  cross-conversation contamination guard from task 08683. */
   connectionEpoch: number | null;
 }
 
@@ -54,15 +51,13 @@ export interface InitPayload {
 // one through a single `applyIfNewer` guard — see the comment on that helper
 // for the contract.
 //
-// Task 08683: every action whose origin is the `useConnection` hook (wire
-// events plus the synthesized `connection_state` + parse-failure `sse_error`)
-// also carries an `epoch` matching the `OPEN_SSE` generation that produced
-// it. The reducer rejects such actions when `epoch !== atom.connectionEpoch`,
-// closing the cross-conversation contamination window where a stale
-// EventSource fires into a freshly-navigated atom. Client-originated
-// actions (`local_phase_change`, `local_conversation_update`,
-// `set_initial_data`, `set_system_prompt`, `clear_error`) carry no epoch
-// and apply unconditionally.
+// Task 08683: every wire-originated SSE action carries the `epoch` matching
+// the `OPEN_SSE` generation that produced it. The reducer rejects such
+// actions when `epoch !== atom.connectionEpoch`, closing the
+// cross-conversation contamination window where a stale EventSource fires into
+// a freshly-navigated atom. Client-originated actions (`local_phase_change`,
+// `local_conversation_update`, `set_initial_data`, `set_system_prompt`,
+// `clear_error`) carry no epoch and apply unconditionally.
 export type SSEAction =
   | { type: 'sse_init'; payload: InitPayload; epoch?: number }
   | { type: 'sse_message'; message: Message; sequenceId: number; epoch?: number }
@@ -89,13 +84,10 @@ export type SSEAction =
   // of the server's total order and apply unconditionally.
   | { type: 'sse_error'; error: UIError; sequenceId?: number; epoch?: number }
   | { type: 'clear_error' }
-  | { type: 'connection_state'; state: ConversationAtom['connectionState']; epoch?: number }
   // Synthesized by `useConnection` when an `OPEN_SSE` effect fires.
   // Carries the connection generation that just opened, so the atom can
   // start accepting events stamped with that epoch and reject events
-  // stamped with any prior generation. Monotonic: a smaller epoch than
-  // the atom's current value is dropped (a stale `OPEN_SSE` executor
-  // closure must not regress a newer connection's epoch).
+  // stamped with any prior generation.
   | { type: 'connection_opened'; epoch: number }
   // Client-originated optimistic phase change. No sequence_id — not part of
   // the server's total order. Mutates `phase` only; does not touch
@@ -125,7 +117,6 @@ export function createInitialAtom(): ConversationAtom {
     contextWindow: { used: 0 },
     systemPrompt: null,
     lastSequenceId: 0,
-    connectionState: 'connecting',
     streamingBuffer: null,
     uiError: null,
     toolExecutingStartedAt: null,
@@ -252,17 +243,15 @@ function applyIfNewer(
 /**
  * Task 08683: cross-conversation contamination guard.
  *
- * Wire-originated actions and the synthesized `connection_state` action
- * carry the `epoch` of the `useConnection` `OPEN_SSE` generation that
- * produced them. When that epoch doesn't match the atom's current
- * `connectionEpoch`, the action is from a stale connection — typically
+ * Wire-originated actions carry the `epoch` of the `useConnection` `OPEN_SSE`
+ * generation that produced them. When that epoch doesn't match the atom's
+ * current `connectionEpoch`, the action is from a stale connection — typically
  * an EventSource that was opened for a different slug and hasn't fully
  * closed yet. Drop it.
  *
  * Returns true when the action should be dropped. Logs in dev so silent
  * drops are observable. Always returns false for actions without an
- * `epoch` field (client-originated, or the bootstrap `connection_opened`
- * which has its own monotonic check inside the reducer).
+ * `epoch` field (client-originated, or the bootstrap `connection_opened`).
  */
 function isStaleEpoch(atom: ConversationAtom, action: SSEAction): boolean {
   // `connection_opened` carries the new epoch as data; it must not be
@@ -539,25 +528,8 @@ export function conversationReducer(
     case 'clear_error':
       return { ...atom, uiError: null };
 
-    case 'connection_state':
-      return { ...atom, connectionState: action.state };
-
-    case 'connection_opened': {
-      // Monotonic update only. A stale `OPEN_SSE` executor closure
-      // running after a newer connection has already advanced the atom
-      // must not regress `connectionEpoch` — doing so would re-open the
-      // contamination window for events that should now be rejected.
-      if (atom.connectionEpoch !== null && action.epoch <= atom.connectionEpoch) {
-        if (import.meta.env.DEV) {
-          console.debug('[sse] dropping stale connection_opened', {
-            actionEpoch: action.epoch,
-            atomConnectionEpoch: atom.connectionEpoch,
-          });
-        }
-        return atom;
-      }
+    case 'connection_opened':
       return { ...atom, connectionEpoch: action.epoch };
-    }
 
     case 'local_phase_change':
       // Optimistic client-side phase update — does NOT bump lastSequenceId.

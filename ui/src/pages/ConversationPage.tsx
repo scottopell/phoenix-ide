@@ -136,9 +136,6 @@ function ConversationPageContent() {
 
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
-  const [conversationIdForSSE, setConversationIdForSSE] = useState<string | undefined>(
-    undefined
-  );
 
   // File explorer context (shared with desktop panel)
   const fileExplorer = useFileExplorer();
@@ -267,7 +264,6 @@ function ConversationPageContent() {
     setLastSlug(slug);
     // useState resets — React batches these into the same render.
     setError(null);
-    setConversationIdForSSE(undefined);
     setShowFileBrowser(false);
     setMobileProseFile(null);
     setImages([]);
@@ -312,7 +308,7 @@ function ConversationPageContent() {
   );
 
   const connectionInfo = useConnection({
-    conversationId: conversationIdForSSE,
+    conversationId,
     dispatch,
   });
 
@@ -406,24 +402,6 @@ function ConversationPageContent() {
       cancelled = true;
     };
   }, [slug, navigate, dispatch]);
-
-  // Defer SSE connection to not block initial render
-  useEffect(() => {
-    const convId = atom.conversationId;
-    if (!convId) {
-      setConversationIdForSSE(undefined);
-      return;
-    }
-
-    const timer = setTimeout(() => {
-      setConversationIdForSSE(convId);
-    }, 100);
-
-    return () => {
-      clearTimeout(timer);
-      setConversationIdForSSE(undefined);
-    };
-  }, [atom.conversationId]);
 
   // Fetch system prompt once when conversationId is known
   useEffect(() => {

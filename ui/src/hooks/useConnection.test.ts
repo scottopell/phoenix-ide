@@ -141,7 +141,6 @@ describe('useConnection epoch stamping (task 08683)', () => {
     const wireActions = captured.filter(
       (a) =>
         a.type === 'sse_init' ||
-        a.type === 'connection_state' ||
         a.type === 'sse_message' ||
         a.type === 'sse_state_change' ||
         a.type === 'connection_opened',
@@ -181,7 +180,6 @@ describe('useConnection epoch stamping (task 08683)', () => {
     const atomAAfterInit = store.getSnapshot(slugA);
     expect(atomAAfterInit.connectionEpoch).toBe(1);
     expect(atomAAfterInit.conversationId).toBe('conv-A');
-    expect(atomAAfterInit.connectionState).toBe('live');
 
     // Navigate to B. ConversationPage swaps the slug-bound dispatch BEFORE
     // the cleanup effect fires CLOSE_SSE; useConnection's `dispatchRef` is
@@ -226,9 +224,77 @@ describe('useConnection epoch stamping (task 08683)', () => {
     const atomBAfterLeak = store.getSnapshot(slugB);
     expect(atomBAfterLeak.messages.length).toBe(messagesBefore);
     expect(atomBAfterLeak.messages.find((m) => m.message_id === 'leaked-msg-from-A')).toBeUndefined();
-    // The atom reference should be unchanged (reducer returned `atom`
-    // verbatim on the stale-epoch drop).
+    // The stale handler is owner-guarded and returns before dispatching.
     expect(atomBAfterLeak).toBe(atomBAfterInit);
+  });
+
+  it('ignores stale init after switching conversation before it can mark current connection connected', () => {
+    const dispatch = vi.fn();
+    const { rerender, result } = renderHook(
+      ({ convId }: { convId: string }) => useConnection({ conversationId: convId, dispatch }),
+      { initialProps: { convId: 'conv-A' } },
+    );
+
+    const esA = FakeEventSource.instances[0]!;
+    rerender({ convId: 'conv-B' });
+    expect(FakeEventSource.instances).toHaveLength(2);
+    expect(result.current.state).toBe('connecting');
+
+    act(() => {
+      esA.emit('init', makeInitPayload('conv-A', 'slug-A'));
+    });
+
+    expect(result.current.state).toBe('connecting');
+  });
+
+  it('ignores stale native error after switching conversation before it can show reconnecting', () => {
+    const dispatch = vi.fn();
+    const { rerender, result } = renderHook(
+      ({ convId }: { convId: string }) => useConnection({ conversationId: convId, dispatch }),
+      { initialProps: { convId: 'conv-A' } },
+    );
+
+    const esA = FakeEventSource.instances[0]!;
+    rerender({ convId: 'conv-B' });
+    expect(FakeEventSource.instances).toHaveLength(2);
+    expect(result.current.state).toBe('connecting');
+
+    act(() => {
+      esA.emit('error', '');
+    });
+
+    expect(result.current.state).toBe('connecting');
+    expect(FakeEventSource.instances).toHaveLength(2);
+  });
+
+  it('cancels stale retry timer after switching conversation', () => {
+    vi.useFakeTimers();
+    try {
+      const dispatch = vi.fn();
+      const { rerender, result } = renderHook(
+        ({ convId }: { convId: string }) => useConnection({ conversationId: convId, dispatch }),
+        { initialProps: { convId: 'conv-A' } },
+      );
+
+      const esA = FakeEventSource.instances[0]!;
+      act(() => {
+        esA.emit('error', '');
+      });
+      expect(result.current.state).toBe('reconnecting');
+
+      rerender({ convId: 'conv-B' });
+      expect(FakeEventSource.instances).toHaveLength(2);
+      expect(result.current.state).toBe('connecting');
+
+      act(() => {
+        vi.advanceTimersByTime(1500);
+      });
+
+      expect(FakeEventSource.instances).toHaveLength(2);
+      expect(result.current.state).toBe('connecting');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('mints a strictly increasing epoch on each OPEN_SSE', () => {

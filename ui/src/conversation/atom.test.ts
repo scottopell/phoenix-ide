@@ -968,16 +968,6 @@ describe('conversationReducer', () => {
     });
   });
 
-  describe('connection_state', () => {
-    it('updates connectionState', () => {
-      const atom = createInitialAtom();
-
-      const next = dispatch(atom, { type: 'connection_state', state: 'live' });
-
-      expect(next.connectionState).toBe('live');
-    });
-  });
-
   describe('connection epoch (task 08683)', () => {
     it('createInitialAtom() starts with connectionEpoch=null', () => {
       expect(createInitialAtom().connectionEpoch).toBeNull();
@@ -989,28 +979,16 @@ describe('conversationReducer', () => {
       expect(next.connectionEpoch).toBe(1);
     });
 
-    it('connection_opened advances epoch monotonically', () => {
-      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 1 });
-      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 5 });
-      expect(a2.connectionEpoch).toBe(5);
-    });
-
-    it('connection_opened drops a regression (stale OPEN_SSE closure)', () => {
+    it('connection_opened replaces epoch', () => {
       const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 5 });
-      // A stale OPEN_SSE executor running after a newer one already advanced
-      // the atom must not roll the epoch back — doing so would re-open the
-      // contamination window.
-      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 3 });
-      expect(a2).toBe(a1);
-      expect(a2.connectionEpoch).toBe(5);
+      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 1 });
+      expect(a2.connectionEpoch).toBe(1);
     });
 
-    it('connection_opened drops an equal epoch as a no-op', () => {
-      // Strictly monotonic. Repeating the same epoch is treated as a stale
-      // duplicate dispatch and does not produce a new atom reference.
-      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 4 });
-      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 4 });
-      expect(a2).toBe(a1);
+    it('connection_opened accepts equal epoch from a remounted hook', () => {
+      const a1 = dispatch(createInitialAtom(), { type: 'connection_opened', epoch: 1 });
+      const a2 = dispatch(a1, { type: 'connection_opened', epoch: 1 });
+      expect(a2.connectionEpoch).toBe(1);
     });
 
     it('first stamped action passes when atom epoch is null (bootstrap)', () => {
@@ -1021,11 +999,12 @@ describe('conversationReducer', () => {
       // this branch only covers the malformed-init edge case.
       const atom = createInitialAtom();
       const next = dispatch(atom, {
-        type: 'connection_state',
-        state: 'live',
+        type: 'sse_message',
+        message: makeMessage(1),
+        sequenceId: 1,
         epoch: 1,
       });
-      expect(next.connectionState).toBe('live');
+      expect(next.messages).toHaveLength(1);
     });
 
     it('rejects stamped action when epoch does not match (cross-conv contamination)', () => {
@@ -1036,30 +1015,30 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         connectionEpoch: 7,
-        connectionState: 'live',
       };
       const next = dispatch(atom, {
-        type: 'connection_state',
-        state: 'connecting',
+        type: 'sse_message',
+        message: makeMessage(100),
+        sequenceId: 100,
         epoch: 5,
       });
       // Atom unchanged: same reference, no state mutation.
       expect(next).toBe(atom);
-      expect(next.connectionState).toBe('live');
+      expect(next.messages).toHaveLength(0);
     });
 
     it('accepts stamped action when epoch matches', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
         connectionEpoch: 3,
-        connectionState: 'connecting',
       };
       const next = dispatch(atom, {
-        type: 'connection_state',
-        state: 'live',
+        type: 'sse_message',
+        message: makeMessage(1),
+        sequenceId: 1,
         epoch: 3,
       });
-      expect(next.connectionState).toBe('live');
+      expect(next.messages).toHaveLength(1);
     });
 
     it('rejects a stale-epoch sse_message even if its sequence_id is fresh', () => {

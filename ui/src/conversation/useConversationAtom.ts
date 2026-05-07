@@ -55,9 +55,6 @@ export function useConversationSelectors(slug: string) {
     currentTool,
     streamingText: atom.streamingBuffer?.text ?? null,
     breadcrumbs: atom.breadcrumbs,
-    isOffline:
-      atom.connectionState === 'reconnecting' || atom.connectionState === 'failed',
-    isLive: atom.connectionState === 'live',
   };
 }
 
