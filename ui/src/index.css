@@ -9135,8 +9135,8 @@ html * {
 /* ============================================================================
  * Bash + tmux typed tool-result rendering (task 02697 / REQ-BASH-002 /
  * REQ-TMUX-012). Status pill in the header conveys live vs terminal state
- * inline; deprecation notices are visible (no leading underscore so the
- * agent attends to them — see REQ-BASH-010 rationale).
+ * inline; agent-supplied `label` (REQ-BASH-002) shows alongside the handle
+ * id for distinguishing concurrent handles.
  * ============================================================================ */
 
 .bash-response,
@@ -9206,6 +9206,14 @@ html * {
   color: var(--text-primary);
 }
 
+.bash-label {
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent-blue, #4299e1) 12%, var(--bg-secondary));
+  color: var(--text-primary);
+  font-style: italic;
+}
+
 .bash-exit-code,
 .bash-signal-number,
 .bash-kill-signal,
@@ -9256,15 +9264,6 @@ html * {
   overflow-y: auto;
   font-family: var(--font-mono);
   font-size: 12px;
-}
-
-.bash-deprecation-notice {
-  margin-top: 8px;
-  padding: 6px 10px;
-  background: color-mix(in srgb, var(--accent-yellow, #d69e2e) 12%, var(--bg-primary));
-  border-left: 3px solid var(--accent-yellow, #d69e2e);
-  font-size: 11px;
-  color: var(--text-primary);
 }
 
 .bash-error-message,

@@ -4,7 +4,13 @@
  * One entry of the live-handle snapshot returned with `handle_cap_reached`
  * (REQ-BASH-005).
  */
-export type BashLiveHandleSummary = { handle: string, cmd: string, age_seconds: number, 
+export type BashLiveHandleSummary = { handle: string, cmd: string, 
+/**
+ * Optional handle label set on the run call (REQ-BASH-002). Echoed
+ * here so the agent has something stable to identify the handle by
+ * even when many concurrent commands share similar `cmd` prefixes.
+ */
+label?: string | null, age_seconds: number, 
 /**
  * Always `"running"` today; reserved for future state-aware listings.
  */

@@ -600,8 +600,8 @@ function tryParseJson(text: string): Record<string, unknown> | null {
 
 // REQ-BASH-002 / REQ-BASH-003 / REQ-BASH-006: render the typed bash tool
 // response. Renders a status pill, optional kill-pending badge, the line
-// tail, and the (unprefixed) `deprecation_notice` if present so the agent
-// and the user notice it.
+// tail, and (when present) the agent-supplied `label` so concurrent
+// handles are distinguishable at a glance.
 function BashResponseView({ response }: { response: Record<string, unknown> }) {
   // Error envelope branch (REQ-BASH-008): `error` field present.
   if (typeof response['error'] === 'string') {
@@ -609,6 +609,7 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
   }
   const status = String(response['status'] ?? '');
   const handle = typeof response['handle'] === 'string' ? response['handle'] : null;
+  const label = typeof response['label'] === 'string' ? response['label'] : null;
   const finalCause = typeof response['final_cause'] === 'string' ? response['final_cause'] : null;
   const exitCode = response['exit_code'];
   const signalNumber = response['signal_number'];
@@ -618,8 +619,6 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
   const waitedMs = typeof response['waited_ms'] === 'number' ? response['waited_ms'] : null;
   const durationMs = typeof response['duration_ms'] === 'number' ? response['duration_ms'] : null;
   const truncatedBefore = response['truncated_before'] === true;
-  const deprecationNotice =
-    typeof response['deprecation_notice'] === 'string' ? response['deprecation_notice'] : null;
   const lines = Array.isArray(response['lines'])
     ? (response['lines'] as Array<{ offset?: number; bytes?: string }>)
     : [];
@@ -651,6 +650,7 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
                       : status}
         </span>
         {handle && <span className="bash-handle">{handle}</span>}
+        {label && <span className="bash-label" title="agent-supplied handle label">{label}</span>}
         {(isExited || isTombstone) && exitCode !== undefined && exitCode !== null && (
           <span className="bash-exit-code">exit code {String(exitCode)}</span>
         )}
@@ -692,11 +692,6 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
         <div className="bash-truncated-notice">[output truncated before this view]</div>
       )}
       {text && <pre className="bash-lines">{text}</pre>}
-      {deprecationNotice && (
-        <div className="bash-deprecation-notice">
-          <strong>deprecated:</strong> {deprecationNotice}
-        </div>
-      )}
     </div>
   );
 }
@@ -796,7 +791,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
 
   // For bash/tmux, the tool result is a structured JSON envelope (REQ-BASH-002 /
   // REQ-TMUX-012). Decode it once so the renderer below can branch on
-  // status / running state / deprecation notice rather than show the raw JSON.
+  // status / running state / label rather than show the raw JSON.
   const bashResponse = name === 'bash' ? tryParseJson(rawResultText) : null;
   const tmuxResponse = name === 'tmux' ? tryParseJson(rawResultText) : null;
 

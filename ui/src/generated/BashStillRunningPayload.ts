@@ -3,8 +3,12 @@ import type { BashRingLine } from "./BashRingLine";
 
 /**
  * `still_running` response payload. Distinguished from `running` by the
- * `waited_ms` field and the absence of a `display` label (spawn / wait
+ * `waited_ms` field and the absence of a `display` label (run / wait
  * re-timeout responses don't synthesize a label — REQ-BASH-002 /
  * REQ-BASH-015).
  */
-export type BashStillRunningPayload = { handle: string, cmd: string, waited_ms: number, kill_signal_sent?: string | null, kill_attempted_at?: string | null, deprecation_notice?: string | null, start_offset: number, end_offset: number, truncated_before: boolean, lines: Array<BashRingLine>, };
+export type BashStillRunningPayload = { handle: string, cmd: string, 
+/**
+ * Optional handle label set on the run call (REQ-BASH-002).
+ */
+label?: string | null, waited_ms: number, kill_signal_sent?: string | null, kill_attempted_at?: string | null, start_offset: number, end_offset: number, truncated_before: boolean, lines: Array<BashRingLine>, };

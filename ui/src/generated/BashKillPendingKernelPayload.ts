@@ -6,7 +6,11 @@ import type { BashRingLine } from "./BashRingLine";
  * response timer expired before the kernel delivered the exit; the
  * process is still alive and the handle stays subscribable.
  */
-export type BashKillPendingKernelPayload = { handle: string, cmd: string, kill_signal_sent: string, kill_attempted_at: string, display: string, 
+export type BashKillPendingKernelPayload = { handle: string, cmd: string, 
+/**
+ * Optional handle label set on the run call (REQ-BASH-002).
+ */
+label?: string | null, kill_signal_sent: string, kill_attempted_at: string, display: string, 
 /**
  * Echoes the signal sent on this kill call (`TERM` / `KILL`).
  */

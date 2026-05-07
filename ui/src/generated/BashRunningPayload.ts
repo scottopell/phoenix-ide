@@ -6,6 +6,12 @@ import type { BashRingLine } from "./BashRingLine";
  */
 export type BashRunningPayload = { handle: string, cmd: string, 
 /**
+ * Optional handle label set on the run call. Echoed verbatim on every
+ * response carrying the handle so the agent can distinguish concurrent
+ * handles (REQ-BASH-002).
+ */
+label?: string | null, 
+/**
  * Set when a kill has been issued and is in flight against this
  * otherwise-still-live handle (`kill_pending_kernel` is reached only
  * after the response window expires; until then `running` carries
@@ -19,4 +25,4 @@ display: string,
 /**
  * Optional kill-response top-level field (kill response only).
  */
-signal_sent?: string | null, deprecation_notice?: string | null, start_offset: number, end_offset: number, truncated_before: boolean, lines: Array<BashRingLine>, };
+signal_sent?: string | null, start_offset: number, end_offset: number, truncated_before: boolean, lines: Array<BashRingLine>, };
