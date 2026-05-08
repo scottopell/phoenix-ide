@@ -617,7 +617,13 @@ impl TestRuntimeBuilder<MockLlmClient, MockToolExecutor> {
         let llm = Arc::new(self.llm.unwrap_or_else(|| MockLlmClient::new("test-model")));
         let tools = Arc::new(self.tools.unwrap_or_default());
 
-        let context = ConvContext::new(&self.conv_id, self.working_dir, "test-model", 200_000, 16_384);
+        let context = ConvContext::new(
+            &self.conv_id,
+            self.working_dir,
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcaster = crate::runtime::SseBroadcaster::new(128, 0);
         let broadcast_rx = broadcaster.subscribe();
@@ -915,7 +921,13 @@ mod tests {
         let tools = Arc::new(MockToolExecutor::new());
         let request_started = llm.request_started.clone();
 
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000, 16_384);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -1033,7 +1045,13 @@ mod tests {
         let execution_started = tools.execution_started.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000, 16_384);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -1134,7 +1152,13 @@ mod tests {
         let execution_started = tools.execution_started.clone();
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000, 16_384);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();
@@ -1557,7 +1581,13 @@ mod tests {
         use std::path::PathBuf;
 
         // Parent context (not sub-agent)
-        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000, 16_384);
+        let context = ConvContext::new(
+            "parent-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
 
         let state = ConvState::LlmRequesting { attempt: 1 };
 
@@ -1610,7 +1640,13 @@ mod tests {
 
         let tools = Arc::new(MockToolExecutor::new());
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("parent-conv", PathBuf::from("/tmp"), "test-model", 200_000, 16_384);
+        let context = ConvContext::new(
+            "parent-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let _broadcast_rx = broadcast_tx.subscribe();
@@ -1692,7 +1728,13 @@ mod tests {
         ));
 
         let storage = Arc::new(InMemoryStorage::new());
-        let context = ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000, 16_384);
+        let context = ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        );
         let (event_tx, event_rx) = mpsc::channel(32);
         let broadcast_tx = crate::runtime::SseBroadcaster::new(128, 0);
         let mut broadcast_rx = broadcast_tx.subscribe();

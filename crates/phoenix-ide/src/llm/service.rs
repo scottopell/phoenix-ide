@@ -178,7 +178,10 @@ impl LlmServiceImpl {
                 .iter()
                 .any(|(k, _)| k.eq_ignore_ascii_case("provider"))
             {
-                headers.push(("provider".to_string(), self.spec.provider_prefix().to_string()));
+                headers.push((
+                    "provider".to_string(),
+                    self.spec.provider_prefix().to_string(),
+                ));
             }
         }
         if let Some(ref cred) = self.codex_credential {

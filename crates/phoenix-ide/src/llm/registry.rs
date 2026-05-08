@@ -473,9 +473,12 @@ impl ModelRegistry {
     pub async fn new_with_discovery(config: &LlmConfig) -> Self {
         // Build discovery config from available settings
         let Some((discovery, is_gateway_mode)) = Self::build_discovery_config(config).await else {
-            // No gateway/helper configured, OR helper hasn't authenticated yet.
-            // If the user did configure auth, trust the intent and report Healthy
-            // so the UI doesn't lie just because the helper is still warming up.
+            // `Healthy` here means "a gateway/helper is configured" — NOT "we
+            // probed it." When the credential helper is set but hasn't yet
+            // authenticated (lazy first-call), discovery is skipped; treating
+            // that as Healthy avoids a misleading "not configured" UI banner.
+            // If the gateway is genuinely down, the first inference attempt
+            // will surface the failure.
             let status = if config.credential_helper.is_some() || config.gateway.is_some() {
                 GatewayStatus::Healthy
             } else {
@@ -714,7 +717,7 @@ impl ModelRegistry {
     pub fn max_output_tokens(&self, model_id: &str) -> u32 {
         self.specs
             .get(model_id)
-            .map_or(crate::state_machine::state::DEFAULT_MAX_OUTPUT_TOKENS, |spec| {
+            .map_or(super::DEFAULT_MAX_OUTPUT_TOKENS, |spec| {
                 spec.max_output_tokens
             })
     }

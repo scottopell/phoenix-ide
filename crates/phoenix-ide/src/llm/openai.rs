@@ -1558,6 +1558,47 @@ mod tests {
         assert_eq!(json["tags"]["disable_data_logging"], "true");
         assert_eq!(json["tags"]["foo"], "bar");
     }
+
+    #[test]
+    fn chat_stream_surfaces_inline_error_chunk() {
+        // Some gateways stream errors as data events with `{"error": {...}}`
+        // and a 200 HTTP status, then emit `[DONE]`. Without explicit handling,
+        // the accumulator would parse the chunk (no choices, no tool_calls),
+        // see `[DONE]`, and report "empty response" — masking the real cause.
+        // Regression guard for the Qwen3.5-4B context-overflow case.
+        let mut acc = ChatStreamAccumulator::new();
+        let (chunk_tx, _chunk_rx) = tokio::sync::broadcast::channel(8);
+        let payload = r#"{"error": {"message": "context limit exceeded", "code": 400}}"#;
+
+        let result = acc.process_event(payload, &chunk_tx);
+
+        let err = result.expect_err("error chunk must propagate as Err, not be swallowed");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("context limit exceeded"),
+            "error message must include gateway-provided text; got: {msg}"
+        );
+        assert!(
+            msg.contains("400"),
+            "error message should include the gateway code; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn chat_stream_done_with_no_data_still_errors_as_empty() {
+        // A normal (non-error) empty stream should still produce the
+        // "empty response" error path — surfaced from `into_response`.
+        let mut acc = ChatStreamAccumulator::new();
+        let (chunk_tx, _chunk_rx) = tokio::sync::broadcast::channel(8);
+        acc.process_event("[DONE]", &chunk_tx).unwrap();
+
+        let result = acc.into_response();
+        let err = result.expect_err("empty stream must produce an error");
+        assert!(
+            format!("{err}").contains("empty response"),
+            "expected 'empty response' wording; got: {err}"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -1797,7 +1797,11 @@ pub fn transition_sub_agent(
             }),
         ) => {
             // Context exhaustion check first (sub-agent fails immediately)
-            if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
+            if should_trigger_continuation(
+                &usage_data,
+                context.context_window,
+                context.max_output_tokens,
+            ) {
                 let tr = handle_context_exhaustion(context, content, tool_calls, usage_data);
                 return Ok(SubAgentTransitionResult {
                     new_state: SubAgentState::try_from(tr.new_state)
@@ -2229,7 +2233,13 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_context() -> ConvContext {
-        ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000, 16_384)
+        ConvContext::new(
+            "test-conv",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            16_384,
+        )
     }
 
     #[test]

@@ -18,7 +18,13 @@ use std::path::PathBuf;
 // ============================================================================
 
 pub(crate) fn test_context() -> ConvContext {
-    ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000, 16_384)
+    ConvContext::new(
+        "test-conv",
+        PathBuf::from("/tmp"),
+        "test-model",
+        200_000,
+        16_384,
+    )
 }
 
 /// Build an `AssistantMessage` with `ToolUse` content blocks for the given tool IDs.

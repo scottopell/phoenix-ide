@@ -1256,7 +1256,7 @@ pub struct ConvContext {
     /// Model's context window size in tokens
     pub context_window: usize,
     /// Model's max output tokens per turn — used both when building LLM
-    /// requests and when sizing the ContextExhausted threshold.
+    /// requests and when sizing the `ContextExhausted` threshold.
     pub max_output_tokens: u32,
     /// How this conversation handles context exhaustion
     pub context_exhaustion_behavior: ContextExhaustionBehavior,
@@ -1272,9 +1272,6 @@ pub struct ConvContext {
 
 /// Default context window for unknown models (conservative)
 pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
-/// Default per-turn output cap for unknown models. Same value Phoenix has
-/// historically requested for every turn.
-pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
 
 impl ConvContext {
     pub fn new(

@@ -96,6 +96,11 @@ impl ModelSpec {
     }
 }
 
+/// Default per-turn output cap. Used by every hardcoded `ModelSpec` unless it
+/// has a specific reason to deviate (e.g. small-context models that need more
+/// input headroom). Tune in one place.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
+
 /// Get all available model specifications
 #[allow(clippy::too_many_lines)]
 pub fn all_models() -> Vec<ModelSpec> {
@@ -109,7 +114,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Anthropic,
             description: "Claude Opus 4.7 (most capable, slower)".into(),
             context_window: 200_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: true,
             supports_tool_search: true,
         },
@@ -120,7 +125,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Anthropic,
             description: "Claude Opus 4.7 (1M context)".into(),
             context_window: 1_000_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: false,
             supports_tool_search: true,
         },
@@ -131,7 +136,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Anthropic,
             description: "Claude Opus 4.6 (legacy)".into(),
             context_window: 200_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: false,
             supports_tool_search: true,
         },
@@ -142,7 +147,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Anthropic,
             description: "Claude Sonnet 4.6 (balanced performance)".into(),
             context_window: 200_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: true,
             supports_tool_search: true,
         },
@@ -153,7 +158,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Anthropic,
             description: "Claude Haiku 4.5 (fast, efficient)".into(),
             context_window: 200_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: true,
             supports_tool_search: false,
         },
@@ -164,7 +169,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Anthropic,
             description: "Claude Opus 4.6 (1M context, legacy)".into(),
             context_window: 1_000_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: false,
             supports_tool_search: true,
         },
@@ -175,7 +180,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Anthropic,
             description: "Claude Sonnet 4.6 (1M context)".into(),
             context_window: 1_000_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: false,
             supports_tool_search: true,
         },
@@ -186,7 +191,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Anthropic,
             description: "Claude Opus 4.5 (legacy)".into(),
             context_window: 200_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: false,
             supports_tool_search: true,
         },
@@ -199,7 +204,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::OpenAI,
             description: "GPT-5.5 (frontier, 1M context)".into(),
             context_window: 1_000_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: true,
             supports_tool_search: false,
         },
@@ -210,7 +215,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::OpenAI,
             description: "GPT-5.4 (frontier, native computer use)".into(),
             context_window: 400_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: false,
             supports_tool_search: false,
         },
@@ -221,7 +226,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::OpenAI,
             description: "GPT-5.4 Mini (fast, efficient)".into(),
             context_window: 400_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: true,
             supports_tool_search: false,
         },
@@ -233,7 +238,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::OpenAI,
             description: "GPT-5.3 Codex (latest code model)".into(),
             context_window: 200_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: true,
             supports_tool_search: false,
         },
@@ -245,7 +250,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Gateway,
             description: "Gemini 2.5 Flash (fast, 1M context)".into(),
             context_window: 1_000_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: true,
             supports_tool_search: false,
         },
@@ -256,7 +261,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Gateway,
             description: "Kimi K2 (Moonshot AI, strong at coding/reasoning)".into(),
             context_window: 131_072,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: true,
             supports_tool_search: false,
         },
@@ -267,7 +272,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::Gateway,
             description: "Qwen3 Coder Next (Alibaba, code-specialized)".into(),
             context_window: 131_072,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: true,
             supports_tool_search: false,
         },
@@ -292,9 +297,92 @@ pub fn all_models() -> Vec<ModelSpec> {
             auth_family: AuthFamily::None,
             description: "Mock (lorem ipsum for UI dev)".into(),
             context_window: 200_000,
-            max_output_tokens: 16_384,
+            max_output_tokens: DEFAULT_MAX_OUTPUT_TOKENS,
             recommended: false,
             supports_tool_search: false,
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Lock the 1:1 coupling between `auth_family` and `api_format()`.
+    /// If a future model genuinely needs a different combination, both
+    /// this test AND `ModelSpec::api_format()` must change — promoting
+    /// `api_format` back to a stored field is the explicit hatch.
+    #[test]
+    fn api_format_matches_auth_family_for_every_model() {
+        for spec in all_models() {
+            let expected = match spec.auth_family {
+                AuthFamily::Anthropic | AuthFamily::None => ApiFormat::Anthropic,
+                AuthFamily::OpenAI => ApiFormat::OpenAIResponses,
+                AuthFamily::Gateway => ApiFormat::OpenAIChat,
+            };
+            assert_eq!(
+                spec.api_format(),
+                expected,
+                "auth_family/api_format mismatch for model {}",
+                spec.id
+            );
+        }
+    }
+
+    /// `provider_prefix()` is load-bearing for both inference header
+    /// injection AND discovery name matching. Lock the rules for every
+    /// hardcoded model.
+    #[test]
+    fn provider_prefix_for_every_model() {
+        for spec in all_models() {
+            let prefix = spec.provider_prefix();
+            assert!(
+                !prefix.is_empty(),
+                "provider_prefix must be non-empty for {}",
+                spec.id
+            );
+
+            // If api_name has a slash, the prefix is the part before it.
+            if let Some((expected, _)) = spec.api_name.split_once('/') {
+                assert_eq!(
+                    prefix, expected,
+                    "model {} api_name '{}' should yield prefix '{}', got '{}'",
+                    spec.id, spec.api_name, expected, prefix
+                );
+            } else {
+                // Bare api_name → fall back to auth_family default.
+                let expected = match spec.auth_family {
+                    AuthFamily::Anthropic => "anthropic",
+                    AuthFamily::OpenAI | AuthFamily::Gateway => "openai",
+                    AuthFamily::None => "mock",
+                };
+                assert_eq!(
+                    prefix, expected,
+                    "model {} (auth={:?}) should default to prefix '{}', got '{}'",
+                    spec.id, spec.auth_family, expected, prefix
+                );
+            }
+        }
+    }
+
+    /// Sanity bounds — every model's max_output_tokens fits in its
+    /// context_window with at least the safety margin the threshold
+    /// check uses (2_000). Catches obvious misconfigurations early.
+    #[test]
+    fn max_output_fits_in_context_window() {
+        const MIN_HEADROOM: u32 = 2_000;
+        for spec in all_models() {
+            let window: u32 = spec
+                .context_window
+                .try_into()
+                .expect("context_window should fit u32 for sanity check");
+            assert!(
+                spec.max_output_tokens + MIN_HEADROOM <= window,
+                "model {} max_output_tokens ({}) leaves no room (window={})",
+                spec.id,
+                spec.max_output_tokens,
+                window
+            );
+        }
+    }
 }
