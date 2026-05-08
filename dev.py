@@ -745,16 +745,28 @@ CREATE TABLE IF NOT EXISTS projects (
 # seeder pre-applies (because the seeder INSERTs into the columns they create).
 # Pre-stamping the `_migrations` row prevents Phoenix's `run_pending_migrations`
 # from re-applying them at next startup, which would fail with "duplicate column
-# name" since the column is already there. Add new entries here only when the
-# seeder actually inserts into a column added by a future versioned migration.
+# name" since the column is already there.
+#
+# Only stamp a versioned migration when the seeder reproduces ALL of its
+# side-effects -- not just the column-add. (Migration 5, for example, adds
+# `conversations.chain_name` AND creates the `chain_qa` table; pre-stamping
+# it would skip the table creation and Phoenix would crash on first
+# `chain_qa` query. So we don't pre-add `chain_name` either; let migration 5
+# run normally on first startup.)
 _SEED_PRESTAMPED_MIGRATIONS = [
     (3, "add_continued_in_conv_id_column"),
-    (5, "add_chain_name_and_chain_qa"),
 ]
 
 # Each ALTER TABLE may already be applied by a prior Phoenix startup. We catch
 # OperationalError ("duplicate column name") and continue -- same pattern as the
 # Rust side (`let _ = sqlx::raw_sql(...).await;`).
+#
+# Only list ALTERs that correspond to UNCONDITIONAL idempotent ALTERs in
+# Phoenix's `run_migrations` (the ones using `let _ = sqlx::raw_sql(...).await;`)
+# OR to versioned migrations whose ENTIRE effect we replicate here (currently
+# only migration 3, the single-column add for `continued_in_conv_id`). Adding
+# columns from versioned migrations whose other side-effects we don't reproduce
+# is unsafe -- see `_SEED_PRESTAMPED_MIGRATIONS`.
 _SEED_SCHEMA_ALTERS = [
     "ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id)",
     "ALTER TABLE conversations ADD COLUMN conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}'",
@@ -763,7 +775,6 @@ _SEED_SCHEMA_ALTERS = [
     "ALTER TABLE conversations ADD COLUMN seed_parent_id TEXT",
     "ALTER TABLE conversations ADD COLUMN seed_label TEXT",
     "ALTER TABLE conversations ADD COLUMN continued_in_conv_id TEXT",
-    "ALTER TABLE conversations ADD COLUMN chain_name TEXT",
     "ALTER TABLE conversations ADD COLUMN steering_queue TEXT NOT NULL DEFAULT '[]'",
 ]
 
