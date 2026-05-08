@@ -313,7 +313,7 @@ pub struct EnrichedConversation {
 /// `#[ts(optional)]` tells ts-rs to mirror that by generating `field?: T`
 /// (undefined when absent) rather than the default `field: T | null`.
 #[derive(Debug, Clone, serde::Serialize, ts_rs::TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct SseBreadcrumb {
     #[serde(rename = "type")]
     #[ts(rename = "type")]
@@ -1216,10 +1216,7 @@ impl RuntimeManager {
     /// this window the broadcaster is not reachable via `try_get_handle`, so any
     /// caller that needs to push a final event — most notably the hard-delete cascade
     /// — must also check here.
-    pub async fn take_evicted_broadcaster(
-        &self,
-        conversation_id: &str,
-    ) -> Option<SseBroadcaster> {
+    pub async fn take_evicted_broadcaster(&self, conversation_id: &str) -> Option<SseBroadcaster> {
         self.evicted_broadcasters
             .write()
             .await

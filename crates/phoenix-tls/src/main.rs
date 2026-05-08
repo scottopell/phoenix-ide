@@ -1,6 +1,4 @@
-#[path = "../tls_certs.rs"]
-mod tls_certs;
-
+use phoenix_tls::{ensure_ca, issue_leaf};
 use std::{env, error::Error, path::PathBuf};
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -17,7 +15,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 fn cmd_ca(args: &[String]) -> Result<(), Box<dyn Error>> {
     let dir = value_arg(args, "--dir")?;
-    let ca = tls_certs::ensure_ca(&PathBuf::from(dir))?;
+    let ca = ensure_ca(&PathBuf::from(dir))?;
     println!("cert={}", ca.cert_path.display());
     println!("key={}", ca.key_path.display());
     Ok(())
@@ -32,7 +30,7 @@ fn cmd_issue(args: &[String]) -> Result<(), Box<dyn Error>> {
         return Err("issue requires at least one --host".into());
     }
 
-    let issued = tls_certs::issue_leaf(&ca_dir, &cert, &key, &hosts)?;
+    let issued = issue_leaf(&ca_dir, &cert, &key, &hosts)?;
     println!("cert={}", issued.cert_path.display());
     println!("key={}", issued.key_path.display());
     println!("hosts={}", hosts.join(","));

@@ -1,0 +1,20 @@
+[package]
+name = "phoenix-tls"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Local TLS certificate authority and leaf-cert issuance for Phoenix IDE."
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "phoenix-tls"
+path = "src/main.rs"
+
+[dependencies]
+rcgen = { version = "0.14", features = ["x509-parser"] }
+time = "0.3"
+
+[lints]
+workspace = true

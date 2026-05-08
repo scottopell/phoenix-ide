@@ -18,7 +18,6 @@ mod system_prompt;
 mod terminal;
 mod title_generator;
 mod tls;
-mod tls_certs;
 mod tools;
 
 use api::{create_router, AppState};

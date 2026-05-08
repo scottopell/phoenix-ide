@@ -11,7 +11,7 @@ use rust_embed::Embed;
 use std::path::PathBuf;
 
 #[derive(Embed)]
-#[folder = "ui/dist"]
+#[folder = "../../ui/dist"]
 struct Assets;
 
 /// Serve embedded static files, with filesystem fallback for development

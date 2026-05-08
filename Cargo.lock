@@ -1971,6 +1971,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "phoenix-tls"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "time",
+]
+
+[[package]]
 name = "phoenix_ide"
 version = "0.6.0"
 dependencies = [
@@ -1993,11 +2001,11 @@ dependencies = [
  "mime_guess",
  "nix",
  "nucleo-matcher",
+ "phoenix-tls",
  "proptest",
  "pulldown-cmark",
  "rand 0.8.5",
  "ratatui",
- "rcgen",
  "regex",
  "reqwest",
  "rusqlite",
@@ -2013,7 +2021,6 @@ dependencies = [
  "taskmd-core",
  "tempfile",
  "thiserror 1.0.69",
- "time",
  "tokio",
  "tokio-rustls",
  "tokio-stream",

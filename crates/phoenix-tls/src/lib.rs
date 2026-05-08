@@ -14,25 +14,37 @@ const LEAF_VALID_DAYS: i64 = 397;
 const CA_VALID_DAYS: i64 = 3_650;
 
 #[derive(Debug, Clone)]
-pub(crate) struct CertKeyPaths {
+pub struct CertKeyPaths {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct CaPaths {
+pub struct CaPaths {
     pub cert_path: PathBuf,
     pub key_path: PathBuf,
 }
 
-pub(crate) fn ca_paths(dir: &Path) -> CaPaths {
+/// Compute the canonical paths for the local CA's cert and private key inside
+/// `dir`. Returns the paths regardless of whether the files exist.
+#[must_use]
+pub fn ca_paths(dir: &Path) -> CaPaths {
     CaPaths {
         cert_path: dir.join("phoenix-local-ca.pem"),
         key_path: dir.join("phoenix-local-ca-key.pem"),
     }
 }
 
-pub(crate) fn ensure_ca(dir: &Path) -> Result<CaPaths, Box<dyn Error>> {
+/// Ensure the local CA cert + key exist in `dir`, generating a fresh CA if
+/// neither file is present and returning the canonical paths in either case.
+///
+/// # Errors
+///
+/// - The directory cannot be created or read.
+/// - Exactly one of the cert/key files exists (refuses to silently overwrite
+///   a half-deleted CA).
+/// - Key generation, serialisation, or atomic write fails.
+pub fn ensure_ca(dir: &Path) -> Result<CaPaths, Box<dyn Error>> {
     fs::create_dir_all(dir)?;
     let paths = ca_paths(dir);
     match (paths.cert_path.exists(), paths.key_path.exists()) {
@@ -49,7 +61,17 @@ pub(crate) fn ensure_ca(dir: &Path) -> Result<CaPaths, Box<dyn Error>> {
     }
 }
 
-pub(crate) fn issue_leaf(
+/// Issue a leaf TLS certificate signed by the CA in `ca_dir`, writing the
+/// cert and key PEM files to the provided paths. The CA is created on demand
+/// if missing.
+///
+/// # Errors
+///
+/// - `hosts` is empty.
+/// - The CA cannot be ensured (see [`ensure_ca`]).
+/// - The cert/key parent directories cannot be created.
+/// - Cert generation, signing, or atomic write fails.
+pub fn issue_leaf(
     ca_dir: &Path,
     cert_path: &Path,
     key_path: &Path,

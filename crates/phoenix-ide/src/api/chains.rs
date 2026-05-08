@@ -59,7 +59,7 @@ const CHAIN_NAME_MAX_CHARS: usize = 200;
 /// `current_total_messages` let the UI compute staleness against each
 /// stored Q&A's snapshot integers (REQ-CHN-005) without a second roundtrip.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ChainView {
     pub root_conv_id: String,
     pub chain_name: Option<String>,
@@ -82,7 +82,7 @@ pub struct ChainView {
 /// uses this to render an accurate worktree count without loading every
 /// conversation client-side.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ChainMemberSummary {
     pub conv_id: String,
     pub slug: Option<String>,
@@ -101,7 +101,7 @@ pub struct ChainMemberSummary {
 /// practice). All other intermediate members are `Continuation`.
 #[derive(Debug, Clone, Copy, Serialize, TS, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum ChainPosition {
     Root,
     Continuation,
@@ -118,7 +118,7 @@ pub struct SubmitChainQaRequest {
 /// the SSE stream demux key — subscribers filter incoming events on this id
 /// to render only their own question's tokens (REQ-CHN-006).
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct SubmitChainQaResponse {
     pub chain_qa_id: String,
 }

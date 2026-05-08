@@ -251,7 +251,7 @@ fn hosts_from_env() -> Vec<String> {
 fn ensure_managed_cert(dir: &Path, hosts: &[String]) -> Result<Paths, Box<dyn Error>> {
     let cert_path = dir.join("phoenix-local-server.pem");
     let key_path = dir.join("phoenix-local-server-key.pem");
-    let issued = crate::tls_certs::issue_leaf(dir, &cert_path, &key_path, hosts)?;
+    let issued = phoenix_tls::issue_leaf(dir, &cert_path, &key_path, hosts)?;
     Ok(Paths {
         cert_path: issued.cert_path,
         key_path: issued.key_path,

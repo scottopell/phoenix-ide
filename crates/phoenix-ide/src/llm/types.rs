@@ -279,7 +279,7 @@ impl LlmResponse {
 /// Usage statistics
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, ts_rs::TS)]
 #[allow(clippy::struct_field_names)] // tokens suffix is meaningful
-#[ts(export, export_to = "../ui/src/generated/", rename = "UsageData")]
+#[ts(export, export_to = "../../../ui/src/generated/", rename = "UsageData")]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,

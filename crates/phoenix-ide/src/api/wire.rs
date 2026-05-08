@@ -71,7 +71,7 @@ use crate::runtime::{
 /// `content` and `display_data` stay as `serde_json::Value` — see the module
 /// docs for the rationale.
 #[derive(Debug, Clone, Serialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct EnrichedMessage {
     pub message_id: String,
     pub conversation_id: String,
@@ -186,7 +186,7 @@ fn merge_bash_displays_into_content(content: &mut Value, display_data: &Value) {
 /// consume.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum SseWireEvent {
     /// Full state snapshot at connect / reconnect.
     Init {
@@ -456,7 +456,7 @@ impl From<SseEvent> for SseWireEvent {
 #[allow(dead_code, clippy::enum_variant_names)] // Phase 4 wires API handlers; ChainQa* prefix mirrors the wire tag domain.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(tag = "type", rename_all = "snake_case")]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum ChainSseWireEvent {
     /// Streaming token chunk for an in-flight Q&A. Subscribers filter on
     /// `chain_qa_id` to demultiplex concurrent questions on the same chain
@@ -633,7 +633,7 @@ mod chain_wire_tests {
 /// discriminator.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "status", rename_all = "snake_case")]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum BashResponse {
     /// Live handle observed via peek (no kill in flight).
     Running(BashRunningPayload),
@@ -655,7 +655,7 @@ pub enum BashResponse {
 /// Common ring-buffer view returned alongside any handle response
 /// (REQ-BASH-004).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashRingWindow {
     pub start_offset: u64,
     pub end_offset: u64,
@@ -666,7 +666,7 @@ pub struct BashRingWindow {
 /// Single ring line; `bytes` is the line contents as a (lossy) UTF-8
 /// string, matching what the JSON wire emits today.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashRingLine {
     pub offset: u64,
     pub bytes: String,
@@ -674,7 +674,7 @@ pub struct BashRingLine {
 
 /// `running` response payload. Spec REQ-BASH-003.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashRunningPayload {
     pub handle: String,
     pub cmd: String,
@@ -705,7 +705,7 @@ pub struct BashRunningPayload {
 /// re-timeout responses don't synthesize a label — REQ-BASH-002 /
 /// REQ-BASH-015).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashStillRunningPayload {
     pub handle: String,
     pub cmd: String,
@@ -725,7 +725,7 @@ pub struct BashStillRunningPayload {
 /// response timer expired before the kernel delivered the exit; the
 /// process is still alive and the handle stays subscribable.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashKillPendingKernelPayload {
     pub handle: String,
     pub cmd: String,
@@ -744,7 +744,7 @@ pub struct BashKillPendingKernelPayload {
 /// `tombstoned` response payload (REQ-BASH-006). Served on peek/wait/kill
 /// for handles that have reached a terminal state.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashTombstonedPayload {
     pub handle: String,
     pub cmd: String,
@@ -774,7 +774,7 @@ pub struct BashTombstonedPayload {
 /// from [`BashTombstonedPayload`] by the absence of the synthesized
 /// `display` label — run responses carry the original `cmd` instead.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashRunTombstonePayload {
     pub handle: String,
     pub cmd: String,
@@ -799,7 +799,7 @@ pub struct BashRunTombstonePayload {
 /// waiter task panicked; carries enough info for the agent to abandon
 /// the handle.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashWaiterPanickedPayload {
     pub handle: String,
     pub cmd: String,
@@ -814,7 +814,7 @@ pub struct BashWaiterPanickedPayload {
 /// vary by error id.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(tag = "error", rename_all = "snake_case")]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum BashErrorResponse {
     HandleNotFound {
         error_message: String,
@@ -863,7 +863,7 @@ pub enum BashErrorResponse {
 /// One entry of the live-handle snapshot returned with `handle_cap_reached`
 /// (REQ-BASH-005).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashLiveHandleSummary {
     pub handle: String,
     pub cmd: String,
@@ -882,7 +882,7 @@ pub struct BashLiveHandleSummary {
 /// separately because tmux subcommands emit structured CLI output where
 /// the distinction matters (see `specs/tmux-integration/design.md`).
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct TmuxToolResponse {
     /// `ok` (subprocess exited normally), `timed_out` (Phoenix-side
     /// `wait_seconds` expired), or `cancelled` (turn cancellation token).
@@ -898,7 +898,7 @@ pub struct TmuxToolResponse {
 /// `wait_seconds_out_of_range`, `tmux_binary_unavailable`,
 /// `tmux_server_unavailable`, `tmux_spawn_failed`, `tmux_wait_failed`.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
-#[ts(export, export_to = "../ui/src/generated/")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct TmuxErrorResponse {
     pub error: String,
     pub message: String,
