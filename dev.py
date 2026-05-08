@@ -9,6 +9,7 @@
 
 import argparse
 import dataclasses
+import datetime
 import fcntl
 import hashlib
 import json
@@ -636,6 +637,15 @@ def cmd_up(
     print()
     
     build_rust(release=True)
+
+    # Seed BEFORE Phoenix starts so the seeder runs offline against the DB
+    # (no contention with a live runtime that owns the same conversation rows).
+    # On a fresh DB the seeder bootstraps the schema itself; subsequent ups
+    # just see an idempotent no-op.
+    if not no_seed:
+        cmd_seed(quiet_if_populated=True)
+        print()
+
     phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
     start_vite(port=vite_port, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
     api_scheme = "https" if phoenix_tls else "http"
@@ -644,25 +654,36 @@ def cmd_up(
     print(f"        API: {api_scheme}://localhost:{phoenix_port}")
     print(f"        Log: {LOG_FILE}")
 
-    if not no_seed:
-        print()
-        cmd_seed(phoenix_port=phoenix_port, quiet_if_populated=True, scheme=api_scheme)
-
 
 # ---------------------------------------------------------------------------
-# Seed
+# Seed (offline)
 # ---------------------------------------------------------------------------
 #
-# Representative conversations for UI development and QA. Covers:
-#   - Direct mode (no git required): standalones + multi-level chains
-#   - Explore mode (managed, read-only): uses ROOT as cwd (a git repo)
-#   - Branch mode (existing branch worktree): uses ROOT + 'main' branch
-#   - Work mode: NOT seeded — only reachable via propose_plan → user approval
-#     (human-in-the-loop by design; cannot be faked without real git commit).
+# The seed runs OFFLINE: writes directly to SQLite, requires Phoenix NOT to
+# be running against this DB. Earlier versions ran against a live Phoenix
+# via HTTP and used a direct SQL UPDATE to force ContextExhausted state on
+# rows the runtime had already loaded into memory; the runtime's next
+# checkpoint flushed its in-memory state back over the seed write, leaving
+# `/continue` rejecting the parent with `parent_not_context_exhausted`.
 #
-# The seed is idempotent: if any conversations exist the operation is a no-op.
-# `./dev.py up` calls it automatically after startup; `./dev.py seed` runs it
-# on demand (useful after `./dev.py restart` or on a pre-populated worktree).
+# Stop the runtime, write, restart. That's the rule: the system is the
+# authority for the data when it's running, so the seeder can't share
+# that authority. Either Phoenix is running and the seed defers to the
+# API (which has no API for forcing ContextExhausted -- by design), or
+# Phoenix is down and the seed has unambiguous ownership of the DB.
+#
+# `./dev.py up` calls this BEFORE starting Phoenix; `./dev.py seed`
+# refuses if a Phoenix PID file is alive on the worktree.
+#
+# Representative conversations:
+#   - Direct mode (no git required): standalones + 3-member and 2-member chains
+#   - Explore mode (managed, read-only) chain
+#   - Branch mode: NOT seeded -- requires real `git worktree add` plumbing.
+#     Use the UI's "Branch mode" picker for those scenarios.
+#   - Work mode: NOT seeded -- only reachable via propose_task / approval
+#     (human-in-the-loop by design; cannot be faked without a real commit).
+#
+# Idempotent: if any active conversations exist the seeder skips.
 
 _SEED_DIRECT_STANDALONES = [
     "Review the recent changes to the authentication middleware and identify any security concerns",
@@ -675,169 +696,355 @@ _SEED_CHAIN_3_TEXT = (
 )
 _SEED_CHAIN_2_TEXT = "Debug memory leak in the background worker service"
 _SEED_EXPLORE_TEXT = "Analyze the project structure and summarise the key architectural components"
-_SEED_BRANCH_TEXT  = "Review and tidy the open PR branch — fix lint warnings and update tests"
+
+_SEED_CONTEXT_SUMMARY = "Context limit reached after extended session"
+
+# Minimal schema bootstrap for the seeder. Mirrors the idempotent CREATE/ALTER
+# sequence Phoenix runs at startup (see crates/phoenix-ide/src/db/schema.rs and
+# crates/phoenix-ide/src/db.rs::run_migrations). When Phoenix later starts it
+# re-runs everything; CREATE TABLE IF NOT EXISTS and ADD COLUMN are no-ops on
+# an already-bootstrapped DB. If a column the seeder INSERTs into is later
+# renamed/removed, the seeder fails loud with `no such column` on the next run
+# -- that's the canary, not a bug.
+_SEED_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    slug TEXT UNIQUE,
+    cwd TEXT NOT NULL,
+    parent_conversation_id TEXT,
+    user_initiated BOOLEAN NOT NULL,
+    state TEXT NOT NULL DEFAULT '{"type":"idle"}',
+    state_data TEXT,
+    state_updated_at TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    archived BOOLEAN NOT NULL DEFAULT 0,
+    model TEXT,
+    FOREIGN KEY (parent_conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS messages (
+    message_id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    sequence_id INTEGER NOT NULL,
+    message_type TEXT NOT NULL,
+    content TEXT NOT NULL,
+    display_data TEXT,
+    usage_data TEXT,
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+);
+CREATE TABLE IF NOT EXISTS projects (
+    id TEXT PRIMARY KEY,
+    canonical_path TEXT UNIQUE NOT NULL,
+    main_ref TEXT NOT NULL DEFAULT 'main',
+    created_at TEXT NOT NULL
+);
+"""
+
+# Versioned migrations from crates/phoenix-ide/src/db/migrations.rs that the
+# seeder pre-applies (because the seeder INSERTs into the columns they create).
+# Pre-stamping the `_migrations` row prevents Phoenix's `run_pending_migrations`
+# from re-applying them at next startup, which would fail with "duplicate column
+# name" since the column is already there. Add new entries here only when the
+# seeder actually inserts into a column added by a future versioned migration.
+_SEED_PRESTAMPED_MIGRATIONS = [
+    (3, "add_continued_in_conv_id_column"),
+    (5, "add_chain_name_and_chain_qa"),
+]
+
+# Each ALTER TABLE may already be applied by a prior Phoenix startup. We catch
+# OperationalError ("duplicate column name") and continue -- same pattern as the
+# Rust side (`let _ = sqlx::raw_sql(...).await;`).
+_SEED_SCHEMA_ALTERS = [
+    "ALTER TABLE conversations ADD COLUMN project_id TEXT REFERENCES projects(id)",
+    "ALTER TABLE conversations ADD COLUMN conv_mode TEXT NOT NULL DEFAULT '{\"mode\":\"Explore\"}'",
+    "ALTER TABLE conversations ADD COLUMN title TEXT",
+    "ALTER TABLE conversations ADD COLUMN desired_base_branch TEXT",
+    "ALTER TABLE conversations ADD COLUMN seed_parent_id TEXT",
+    "ALTER TABLE conversations ADD COLUMN seed_label TEXT",
+    "ALTER TABLE conversations ADD COLUMN continued_in_conv_id TEXT",
+    "ALTER TABLE conversations ADD COLUMN chain_name TEXT",
+    "ALTER TABLE conversations ADD COLUMN steering_queue TEXT NOT NULL DEFAULT '[]'",
+]
 
 
-def cmd_seed(
-    phoenix_port: int | None = None,
-    quiet_if_populated: bool = False,
-    scheme: str = "http",
-) -> None:
-    """Populate the dev DB with representative conversations for UI/QA testing."""
-    import urllib.request
-    import urllib.error
+def _slug_from_text(text: str, max_words: int = 6) -> str:
+    """Mirror crates/phoenix-ide/src/api/handlers.rs::slugify_label.
+
+    Lowercase, alphanumerics-only, dash-separated, trimmed. Keep first
+    `max_words` to keep the slug compact for UI display.
+    """
+    out: list[str] = []
+    word: list[str] = []
+    for ch in text:
+        if ch.isascii() and ch.isalnum():
+            word.append(ch.lower())
+        elif word:
+            out.append("".join(word))
+            word = []
+            if len(out) >= max_words:
+                break
+    if word and len(out) < max_words:
+        out.append("".join(word))
+    return "-".join(out)
+
+
+def _title_from_slug(slug: str) -> str:
+    """Mirror crates/phoenix-ide/src/db/schema.rs::title_from_slug."""
+    return " ".join(w[:1].upper() + w[1:] for w in slug.split("-") if w)
+
+
+def cmd_seed(quiet_if_populated: bool = False) -> None:
+    """Populate the dev DB with representative conversations.
+
+    Runs OFFLINE -- writes directly to SQLite while Phoenix is not running
+    against this worktree's DB. Refuses if a live Phoenix is detected on
+    the PID file (its in-memory runtime would clobber seed writes).
+
+    Idempotent: if any active conversations exist the seeder is a no-op.
+    """
+    import sqlite3
     import uuid as _uuid
-    import ssl
 
-    default_phoenix, _ = get_default_ports()
-    port = phoenix_port or default_phoenix
-    api  = f"{scheme}://localhost:{port}/api"
-    db   = get_db_path()
-    ssl_context = ssl._create_unverified_context() if scheme == "https" else None
+    db_path = get_db_path()
 
-    # ------------------------------------------------------------------ helpers
+    # ----------------------------------------------------- liveness guard
 
-    def _get(path: str) -> dict:
-        with urllib.request.urlopen(f"{api}{path}", timeout=5, context=ssl_context) as r:
-            return json.loads(r.read())
-
-    def _post(path: str, body: dict | None = None) -> dict:
-        data = json.dumps(body).encode() if body else b"{}"
-        req  = urllib.request.Request(
-            f"{api}{path}",
-            data=data,
-            headers={"Content-Type": "application/json"},
-            method="POST",
+    live_pid = get_pid(PHOENIX_PID_FILE)
+    if live_pid is not None:
+        print(
+            f"✗ Phoenix is running (pid {live_pid}) against this DB.\n"
+            f"  The seeder is offline-only — a live runtime would clobber seed\n"
+            f"  writes when it next checkpoints in-memory state to disk.\n"
+            f"  Run './dev.py down' first, or use './dev.py up' (which\n"
+            f"  seeds before starting Phoenix).",
+            file=sys.stderr,
         )
-        with urllib.request.urlopen(req, timeout=20, context=ssl_context) as r:
-            return json.loads(r.read())
-
-    def _wait_done(conv_id: str, timeout: float = 15.0) -> str:
-        """Poll until the conversation is no longer actively running.
-
-        Uses `display_state` (the simplified enum the API always sends)
-        rather than the raw `state.type` field, because `display_state`
-        maps all in-flight variants (llm_requesting, tool_executing, …)
-        to the single value "working".
-        """
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            try:
-                conv = _get(f"/conversations/{conv_id}")["conversation"]
-                if conv.get("display_state") != "working":
-                    return str(conv.get("display_state", "unknown"))
-            except Exception:
-                pass
-            time.sleep(0.3)
-        return "timeout"
-
-    def _new_conv(
-        text: str,
-        *,
-        mode: str | None = None,
-        base_branch: str | None = None,
-        cwd: str | None = None,
-        seed_label: str | None = None,
-    ) -> str:
-        """POST /api/conversations/new, wait for mock completion, return conv id."""
-        body: dict = {
-            "cwd":        cwd or str(ROOT),
-            "model":      "mock",
-            "text":       text,
-            "message_id": str(_uuid.uuid4()),
-        }
-        if mode:        body["mode"]         = mode
-        if base_branch: body["base_branch"]  = base_branch
-        if seed_label:  body["seed_label"]   = seed_label
-        resp    = _post("/conversations/new", body)
-        conv_id = resp["conversation"]["id"]
-        if text:  # empty-text seeded convs never enter 'working'
-            _wait_done(conv_id)
-        return conv_id
-
-    def _exhaust(conv_id: str) -> None:
-        """Force ContextExhausted state via Python sqlite3 — no API for this by design."""
-        import sqlite3 as _sqlite3
-        summary = "Context limit reached after extended session"
-        state   = json.dumps({"type": "context_exhausted", "summary": summary})
-        with _sqlite3.connect(str(db), timeout=10) as conn:
-            conn.execute(
-                "UPDATE conversations SET state = ? WHERE id = ?",
-                (state, conv_id),
-            )
-            conn.commit()
-
-    def _continue(conv_id: str) -> str:
-        """POST /api/conversations/{id}/continue, return new conv id."""
-        return _post(f"/conversations/{conv_id}/continue")["conversation_id"]
-
-    # --------------------------------------------------------- idempotency check
-
-    try:
-        existing = _get("/conversations")["conversations"]
-    except Exception:
-        print("✗ Cannot reach Phoenix — is the server running? (./dev.py up)", file=sys.stderr)
         sys.exit(1)
 
-    # Idempotency: if any active conversations exist, skip. Archived-only DBs
-    # are treated as empty for seed purposes — the seed creates active convs
-    # and running it again on an archived-only DB is harmless.
-    if existing:
-        if not quiet_if_populated:
-            print(f"✓ Dev DB already populated ({len(existing)} conversations) — skipping seed.")
-        return
+    # ----------------------------------------------------- helpers
 
-    # ---------------------------------------------------------------- seed data
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    now = datetime.datetime.now(datetime.timezone.utc).isoformat()
 
-    print("Seeding dev DB with representative conversations...")
-
-    # -- Direct mode: three standalone conversations -------------------------
-    print("  [1/4] Direct standalones")
-    for text in _SEED_DIRECT_STANDALONES:
-        _new_conv(text)
-
-    # -- Direct mode: 3-member chain -----------------------------------------
-    print("  [2/4] Direct chains (3-member + 2-member)")
-    id1 = _new_conv(_SEED_CHAIN_3_TEXT)
-    _exhaust(id1)
-    id2 = _continue(id1)
-    _wait_done(id2)
-    _exhaust(id2)
-    _continue(id2)
-
-    # -- Direct mode: 2-member chain -----------------------------------------
-    id_a = _new_conv(_SEED_CHAIN_2_TEXT)
-    _exhaust(id_a)
-    _continue(id_a)
-
-    # -- Explore mode (managed / read-only) ----------------------------------
-    # ROOT is a git repo; sends a real message with mode="managed" so the
-    # mock model runs and the conversation appears with realistic metadata.
-    # Two convs make a minimal Explore chain visible in the list.
-    print("  [3/4] Explore mode (managed)")
-    try:
-        eid1 = _new_conv(_SEED_EXPLORE_TEXT, mode="managed")
-        _exhaust(eid1)
-        _continue(eid1)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  (Explore seed skipped — {exc})")
-
-    # -- Branch mode (existing branch, immediate worktree) -------------------
-    # ROOT is a git repo (a linked worktree of the main checkout). Branch mode
-    # needs a branch that isn't currently checked out anywhere. We create a
-    # lightweight demo branch pointing at HEAD — just a git ref write, no
-    # commit, no signing required. `--force` refreshes it on re-seed.
-    print("  [4/4] Branch mode")
-    try:
-        _demo_branch = "seed-branch-demo"
-        subprocess.run(
-            ["git", "-C", str(ROOT), "branch", "--force", _demo_branch, "HEAD"],
-            check=True,
-            capture_output=True,
+    def _ensure_schema(conn: sqlite3.Connection) -> None:
+        conn.executescript(_SEED_SCHEMA_SQL)
+        for stmt in _SEED_SCHEMA_ALTERS:
+            try:
+                conn.execute(stmt)
+            except sqlite3.OperationalError as e:
+                # "duplicate column name" -- column already exists. Anything
+                # else is a real schema problem worth surfacing.
+                if "duplicate column name" not in str(e):
+                    raise
+        # Stamp the versioned migrations whose columns we pre-added, so
+        # Phoenix's `run_pending_migrations` skips them on next startup
+        # (re-applying would fail with "duplicate column name" because the
+        # versioned migrations don't swallow errors).
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _migrations ("
+            " version INTEGER PRIMARY KEY,"
+            " name TEXT NOT NULL,"
+            " applied_at TEXT NOT NULL DEFAULT (datetime('now')))"
         )
-        _new_conv(_SEED_BRANCH_TEXT, mode="branch", base_branch=_demo_branch)
-    except Exception as exc:  # noqa: BLE001
-        print(f"  (Branch seed skipped \u2014 {exc})")
+        for version, name in _SEED_PRESTAMPED_MIGRATIONS:
+            conn.execute(
+                "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?, ?)",
+                (version, name),
+            )
+        conn.commit()
+
+    def _existing_active_count(conn: sqlite3.Connection) -> int:
+        return conn.execute(
+            "SELECT COUNT(*) FROM conversations WHERE archived = 0"
+        ).fetchone()[0]
+
+    def _find_or_create_project(conn: sqlite3.Connection, canonical_path: str) -> str:
+        row = conn.execute(
+            "SELECT id FROM projects WHERE canonical_path = ?", (canonical_path,)
+        ).fetchone()
+        if row is not None:
+            return row[0]
+        proj_id = str(_uuid.uuid4())
+        conn.execute(
+            "INSERT INTO projects (id, canonical_path, main_ref, created_at)"
+            " VALUES (?, ?, 'main', ?)",
+            (proj_id, canonical_path, now),
+        )
+        return proj_id
+
+    def _insert_conv(
+        conn: sqlite3.Connection,
+        *,
+        text: str,
+        conv_mode: dict,
+        cwd: str,
+        project_id: str | None,
+        state: dict | None = None,
+    ) -> tuple[str, str]:
+        """Insert one conversation row + its single user message. Returns (id, slug)."""
+        conv_id = str(_uuid.uuid4())
+        base_slug = _slug_from_text(text) or "seed-conv"
+        # Random suffix to dodge the slug UNIQUE constraint without a retry loop.
+        # (Production code retries on collision; the seed runs once per fresh
+        # DB so a single suffix is plenty.)
+        slug = f"{base_slug}-{conv_id[:4]}"
+        title = _title_from_slug(base_slug)
+        state_json = json.dumps(state if state is not None else {"type": "idle"})
+        mode_json = json.dumps(conv_mode)
+        conn.execute(
+            "INSERT INTO conversations ("
+            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
+            " state, state_updated_at, created_at, updated_at, archived,"
+            " model, project_id, conv_mode, desired_base_branch,"
+            " seed_parent_id, seed_label"
+            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, NULL)",
+            (conv_id, slug, title, cwd, state_json, now, now, now, project_id, mode_json),
+        )
+        # One user message so the conv looks lived-in (message_count > 0).
+        msg_id = str(_uuid.uuid4())
+        user_content = json.dumps({"text": text, "images": []})
+        conn.execute(
+            "INSERT INTO messages ("
+            " message_id, conversation_id, sequence_id, message_type,"
+            " content, created_at"
+            ") VALUES (?, ?, 0, 'user', ?, ?)",
+            (msg_id, conv_id, user_content, now),
+        )
+        return conv_id, slug
+
+    def _link_continuation(
+        conn: sqlite3.Connection,
+        *,
+        parent_id: str,
+        parent_slug: str,
+        chain_index: int,
+        conv_mode: dict,
+        cwd: str,
+        project_id: str | None,
+    ) -> tuple[str, str]:
+        """Insert a continuation conversation and update parent.continued_in_conv_id.
+
+        Mirrors crates/phoenix-ide/src/db.rs::continue_conversation: the parent
+        is forced to ContextExhausted by `_exhaust_state`, then a child row is
+        inserted with a sequential `{root_slug}-{N}` slug.
+        """
+        new_id = str(_uuid.uuid4())
+        # `parent_slug` already includes a random suffix from `_insert_conv`
+        # for the chain root, so use the chain index against the raw root
+        # slug for human-readable continuation slugs (root, root-2, root-3...).
+        # Strip the trailing -<hex> suffix added by `_insert_conv` to find the root.
+        root_slug = "-".join(parent_slug.split("-")[:-1]) or parent_slug
+        new_slug = f"{root_slug}-{chain_index}-{new_id[:4]}"
+        new_title = _title_from_slug(root_slug)
+        idle_state = json.dumps({"type": "idle"})
+        mode_json = json.dumps(conv_mode)
+        conn.execute(
+            "INSERT INTO conversations ("
+            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
+            " state, state_updated_at, created_at, updated_at, archived,"
+            " model, project_id, conv_mode, desired_base_branch,"
+            " seed_parent_id, seed_label, continued_in_conv_id"
+            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, NULL, NULL)",
+            (new_id, new_slug, new_title, cwd, idle_state, now, now, now, project_id, mode_json),
+        )
+        # Continuation summary message bridges parent -> child in the UI.
+        msg_id = str(_uuid.uuid4())
+        cont_content = json.dumps({"summary": _SEED_CONTEXT_SUMMARY})
+        conn.execute(
+            "INSERT INTO messages ("
+            " message_id, conversation_id, sequence_id, message_type,"
+            " content, created_at"
+            ") VALUES (?, ?, 0, 'continuation', ?, ?)",
+            (msg_id, new_id, cont_content, now),
+        )
+        # Wire parent -> child.
+        conn.execute(
+            "UPDATE conversations SET continued_in_conv_id = ? WHERE id = ?",
+            (new_id, parent_id),
+        )
+        return new_id, new_slug
+
+    def _exhaust_state(conn: sqlite3.Connection, conv_id: str) -> None:
+        state_json = json.dumps(
+            {"type": "context_exhausted", "summary": _SEED_CONTEXT_SUMMARY}
+        )
+        conn.execute(
+            "UPDATE conversations SET state = ?, state_updated_at = ?, updated_at = ?"
+            " WHERE id = ?",
+            (state_json, now, now, conv_id),
+        )
+
+    # ----------------------------------------------------- the seed
+
+    direct_mode = {"mode": "Direct"}
+    explore_mode = {"mode": "Explore"}
+
+    with sqlite3.connect(str(db_path), timeout=10) as conn:
+        conn.execute("PRAGMA foreign_keys = ON")
+        _ensure_schema(conn)
+
+        if _existing_active_count(conn) > 0:
+            if not quiet_if_populated:
+                count = _existing_active_count(conn)
+                print(f"✓ Dev DB already populated ({count} conversations) — skipping seed.")
+            return
+
+        print("Seeding dev DB with representative conversations...")
+
+        project_id = _find_or_create_project(conn, str(ROOT))
+
+        # [1/3] Direct standalones
+        print("  [1/3] Direct standalones")
+        for text in _SEED_DIRECT_STANDALONES:
+            _insert_conv(
+                conn,
+                text=text,
+                conv_mode=direct_mode,
+                cwd=str(ROOT),
+                project_id=project_id,
+            )
+
+        # [2/3] Direct chains (3-member + 2-member)
+        print("  [2/3] Direct chains (3-member + 2-member)")
+        id1, slug1 = _insert_conv(
+            conn, text=_SEED_CHAIN_3_TEXT, conv_mode=direct_mode,
+            cwd=str(ROOT), project_id=project_id,
+        )
+        _exhaust_state(conn, id1)
+        id2, slug2 = _link_continuation(
+            conn, parent_id=id1, parent_slug=slug1, chain_index=2,
+            conv_mode=direct_mode, cwd=str(ROOT), project_id=project_id,
+        )
+        _exhaust_state(conn, id2)
+        _link_continuation(
+            conn, parent_id=id2, parent_slug=slug2, chain_index=3,
+            conv_mode=direct_mode, cwd=str(ROOT), project_id=project_id,
+        )
+
+        id_a, slug_a = _insert_conv(
+            conn, text=_SEED_CHAIN_2_TEXT, conv_mode=direct_mode,
+            cwd=str(ROOT), project_id=project_id,
+        )
+        _exhaust_state(conn, id_a)
+        _link_continuation(
+            conn, parent_id=id_a, parent_slug=slug_a, chain_index=2,
+            conv_mode=direct_mode, cwd=str(ROOT), project_id=project_id,
+        )
+
+        # [3/3] Explore mode chain
+        print("  [3/3] Explore mode chain (2-member)")
+        eid1, eslug1 = _insert_conv(
+            conn, text=_SEED_EXPLORE_TEXT, conv_mode=explore_mode,
+            cwd=str(ROOT), project_id=project_id,
+        )
+        _exhaust_state(conn, eid1)
+        _link_continuation(
+            conn, parent_id=eid1, parent_slug=eslug1, chain_index=2,
+            conv_mode=explore_mode, cwd=str(ROOT), project_id=project_id,
+        )
+
+        conn.commit()
 
     print("✓ Seed complete.")
 
@@ -3095,9 +3302,8 @@ def main():
     # codegen
     sub.add_parser("codegen", help="Regenerate ui/src/generated/ from Rust types (task 02677)")
 
-    # seed
-    seed_parser = sub.add_parser("seed", help="Populate dev DB with representative conversations (idempotent)")
-    seed_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto)")
+    # seed (offline)
+    sub.add_parser("seed", help="Populate dev DB with representative conversations (offline; refuses if Phoenix is running)")
 
     # tls
     tls_parser = sub.add_parser("tls", help="Manage Phoenix HTTPS certificates")
@@ -3165,7 +3371,7 @@ def main():
         if not cmd_codegen():
             sys.exit(1)
     elif args.command == "seed":
-        cmd_seed(phoenix_port=args.port)
+        cmd_seed()
     elif args.command == "tls":
         if args.tls_command == "ca":
             cmd_tls_ca(args.dir)
