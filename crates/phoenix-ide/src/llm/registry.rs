@@ -360,12 +360,13 @@ fn parse_request_tags(raw: &str) -> std::collections::BTreeMap<String, String> {
 }
 
 fn spec_discovery_names(spec: &super::ModelSpec) -> Vec<String> {
-    let mut names = vec![spec.id.clone(), spec.api_name.clone()];
-    if let Some(provider) = spec.gateway_provider_header() {
-        names.push(format!("{provider}/{}", spec.id));
-        names.push(format!("{provider}/{}", spec.api_name));
-    }
-    names
+    let provider = spec.provider_prefix();
+    vec![
+        spec.id.clone(),
+        spec.api_name.clone(),
+        format!("{provider}/{}", spec.id),
+        format!("{provider}/{}", spec.api_name),
+    ]
 }
 
 /// Derive a `/v1/models` URL from a base URL like `/v1/messages` or `/v1/responses`.
@@ -472,7 +473,15 @@ impl ModelRegistry {
     pub async fn new_with_discovery(config: &LlmConfig) -> Self {
         // Build discovery config from available settings
         let Some((discovery, is_gateway_mode)) = Self::build_discovery_config(config).await else {
-            return Self::new(config);
+            // No gateway/helper configured, OR helper hasn't authenticated yet.
+            // If the user did configure auth, trust the intent and report Healthy
+            // so the UI doesn't lie just because the helper is still warming up.
+            let status = if config.credential_helper.is_some() || config.gateway.is_some() {
+                GatewayStatus::Healthy
+            } else {
+                GatewayStatus::NotConfigured
+            };
+            return Self::new_with_status(config, status);
         };
 
         // Gateway mode: probe reachability first
@@ -562,44 +571,31 @@ impl ModelRegistry {
     /// or `None` when no gateway or `credential_helper` is configured.
     async fn build_discovery_config(config: &LlmConfig) -> Option<(DiscoveryConfig, bool)> {
         if let Some(ref gw) = config.gateway {
-            // Legacy gateway mode — construct URLs from gateway base
+            // Legacy gateway mode — single un-headered query against gateway root.
             let base = gw.trim_end_matches('/');
             Some((
                 DiscoveryConfig {
-                    anthropic_models_url: Some(format!("{base}/anthropic/v1/models")),
-                    openai_models_url: Some(format!("{base}/openai/v1/models")),
-                    extra_models_urls: vec![(
-                        "google".to_string(),
-                        format!("{base}/google/v1/models"),
-                    )],
+                    models_url: format!("{base}/v1/models"),
                     auth_token: None, // Gateway handles auth
                     custom_headers: vec![],
                 },
                 true,
             ))
         } else if let Some(ref helper) = config.credential_helper {
-            // Direct auth mode — derive models URLs from base URL overrides
+            // Direct auth mode — derive models URL from configured base URL.
             let auth_token = helper.get().await;
             // Helper not yet authenticated — skip discovery, fall back to hardcoded models
             auth_token.as_ref()?;
             let headers = config.custom_headers.clone();
+            let models_url = config
+                .openai_base_url
+                .as_deref()
+                .or(config.anthropic_base_url.as_deref())
+                .and_then(derive_models_url)?;
 
             Some((
                 DiscoveryConfig {
-                    anthropic_models_url: config
-                        .anthropic_base_url
-                        .as_deref()
-                        .and_then(derive_models_url),
-                    openai_models_url: config
-                        .openai_base_url
-                        .as_deref()
-                        .and_then(derive_models_url),
-                    extra_models_urls: config
-                        .openai_base_url
-                        .as_deref()
-                        .and_then(derive_models_url)
-                        .map(|url| vec![("google".to_string(), url)])
-                        .unwrap_or_default(),
+                    models_url,
                     auth_token,
                     custom_headers: headers,
                 },
@@ -711,6 +707,16 @@ impl ModelRegistry {
             crate::state_machine::state::DEFAULT_CONTEXT_WINDOW,
             |spec| spec.context_window,
         )
+    }
+
+    /// Max output tokens to request per turn for the given model.
+    /// Falls back to a conservative default when the model is unknown.
+    pub fn max_output_tokens(&self, model_id: &str) -> u32 {
+        self.specs
+            .get(model_id)
+            .map_or(crate::state_machine::state::DEFAULT_MAX_OUTPUT_TOKENS, |spec| {
+                spec.max_output_tokens
+            })
     }
 
     /// List all available model IDs

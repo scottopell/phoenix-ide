@@ -1534,7 +1534,7 @@ pub fn transition_parent(
             }
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
-            if should_trigger_continuation(&usage_data, context.context_window) {
+            if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
                 let tr = handle_context_exhaustion(context, content, tool_calls, usage_data);
                 return Ok(ParentTransitionResult {
                     new_state: ParentState::try_from(tr.new_state)
@@ -1797,7 +1797,7 @@ pub fn transition_sub_agent(
             }),
         ) => {
             // Context exhaustion check first (sub-agent fails immediately)
-            if should_trigger_continuation(&usage_data, context.context_window) {
+            if should_trigger_continuation(&usage_data, context.context_window, context.max_output_tokens) {
                 let tr = handle_context_exhaustion(context, content, tool_calls, usage_data);
                 return Ok(SubAgentTransitionResult {
                     new_state: SubAgentState::try_from(tr.new_state)
@@ -2074,19 +2074,25 @@ fn current_attempt(state: &ConvState) -> u32 {
 
 // Helper functions
 
-/// Threshold as fraction of context window for triggering continuation (REQ-BED-019)
-const CONTINUATION_THRESHOLD: f64 = 0.90;
+/// Safety margin reserved on top of `max_output_tokens` when sizing the
+/// continuation threshold. Covers small variations in input-token estimation
+/// and avoids 1-token-over failures like the one fixed for Qwen3.5-4B.
+const CONTINUATION_SAFETY_MARGIN: u64 = 2_000;
 
-/// Check if context usage has exceeded the continuation threshold (REQ-BED-019)
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_sign_loss,
-    clippy::cast_possible_truncation
-)]
-fn should_trigger_continuation(usage: &UsageData, context_window: usize) -> bool {
+/// Check whether the conversation has reached the point where the next
+/// request would not fit. We reserve `max_output_tokens` plus a small safety
+/// margin, since the next request will ask for that many output tokens and
+/// fail at the gateway if `input + max_output > context_window`.
+fn should_trigger_continuation(
+    usage: &UsageData,
+    context_window: usize,
+    max_output_tokens: u32,
+) -> bool {
     let used = usage.context_window_used();
-    let threshold = (context_window as f64 * CONTINUATION_THRESHOLD) as u64;
-    used >= threshold
+    let cap = (context_window as u64)
+        .saturating_sub(u64::from(max_output_tokens))
+        .saturating_sub(CONTINUATION_SAFETY_MARGIN);
+    used >= cap
 }
 
 /// Handle context exhaustion based on conversation type (REQ-BED-019, REQ-BED-024)
@@ -2223,7 +2229,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn test_context() -> ConvContext {
-        ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+        ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000, 16_384)
     }
 
     #[test]
@@ -2381,24 +2387,70 @@ mod tests {
     // Context Exhaustion Tests (REQ-BED-019 through REQ-BED-024)
     // ========================================================================
 
+    // Threshold semantics: trigger when remaining room < max_output + safety_margin.
+    // For 100k window, 16_384 max_output, 2_000 margin: cap = 81_616.
+
     #[test]
     fn test_threshold_boundary_below() {
-        // 89.9% should NOT trigger continuation
         let usage = UsageData {
-            input_tokens: 89_900,
+            input_tokens: 81_500,
             output_tokens: 0,
             cache_read_tokens: 0,
             cache_creation_tokens: 0,
         };
         assert!(
-            !should_trigger_continuation(&usage, 100_000),
-            "89.9% should not trigger continuation"
+            !should_trigger_continuation(&usage, 100_000, 16_384),
+            "81_500 used (below 81_616 cap) should not trigger continuation"
         );
     }
 
     #[test]
     fn test_threshold_boundary_at() {
-        // Exactly 90% SHOULD trigger continuation
+        let usage = UsageData {
+            input_tokens: 81_616,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert!(
+            should_trigger_continuation(&usage, 100_000, 16_384),
+            "exactly at cap should trigger continuation"
+        );
+    }
+
+    #[test]
+    fn test_threshold_boundary_above() {
+        let usage = UsageData {
+            input_tokens: 82_000,
+            output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert!(
+            should_trigger_continuation(&usage, 100_000, 16_384),
+            "above cap should trigger continuation"
+        );
+    }
+
+    #[test]
+    fn test_threshold_with_output_tokens() {
+        // 40k input + 45k output = 85k > 81_616 cap
+        let usage = UsageData {
+            input_tokens: 40_000,
+            output_tokens: 45_000,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
+        };
+        assert!(
+            should_trigger_continuation(&usage, 100_000, 16_384),
+            "Combined tokens should count toward threshold"
+        );
+    }
+
+    #[test]
+    fn test_threshold_scales_with_smaller_max_output() {
+        // Same 100k window but tighter max_output gives more headroom.
+        // cap = 100_000 - 4_096 - 2_000 = 93_904
         let usage = UsageData {
             input_tokens: 90_000,
             output_tokens: 0,
@@ -2406,38 +2458,8 @@ mod tests {
             cache_creation_tokens: 0,
         };
         assert!(
-            should_trigger_continuation(&usage, 100_000),
-            "90% should trigger continuation"
-        );
-    }
-
-    #[test]
-    fn test_threshold_boundary_above() {
-        // 90.1% should trigger continuation
-        let usage = UsageData {
-            input_tokens: 90_100,
-            output_tokens: 0,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-        };
-        assert!(
-            should_trigger_continuation(&usage, 100_000),
-            "90.1% should trigger continuation"
-        );
-    }
-
-    #[test]
-    fn test_threshold_with_output_tokens() {
-        // 45k input + 45k output = 90k total >= 90% of 100k
-        let usage = UsageData {
-            input_tokens: 45_000,
-            output_tokens: 45_000,
-            cache_read_tokens: 0,
-            cache_creation_tokens: 0,
-        };
-        assert!(
-            should_trigger_continuation(&usage, 100_000),
-            "Combined tokens should count toward threshold"
+            !should_trigger_continuation(&usage, 100_000, 4_096),
+            "90k used should not trigger when max_output is small"
         );
     }
 
@@ -2455,6 +2477,7 @@ mod tests {
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 100_000,
+            max_output_tokens: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -2571,6 +2594,7 @@ mod tests {
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
+            max_output_tokens: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -2672,6 +2696,7 @@ mod tests {
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
+            max_output_tokens: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,
@@ -2720,6 +2745,7 @@ mod tests {
             model_id: "test-model".to_string(),
             is_sub_agent: true,
             context_window: 200_000,
+            max_output_tokens: 16_384,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             max_turns: 0,
             desired_base_branch: None,

@@ -1,26 +1,22 @@
 //! Dynamic model discovery from LLM gateway
 //!
-//! Queries gateway endpoints to discover available models at runtime,
-//! validating which hardcoded models are available.
+//! Queries a single un-headered `/v1/models` endpoint to discover available
+//! models at runtime, validating which hardcoded models the gateway proxies.
 
 use serde::Deserialize;
 use std::collections::HashSet;
 
 /// Configuration for model discovery
 pub struct DiscoveryConfig {
-    /// URL for Anthropic models endpoint
-    pub anthropic_models_url: Option<String>,
-    /// URL for `OpenAI` models endpoint
-    pub openai_models_url: Option<String>,
-    /// Additional provider model endpoints: (provider header, URL)
-    pub extra_models_urls: Vec<(String, String)>,
+    /// URL for the gateway's `/v1/models` endpoint
+    pub models_url: String,
     /// Auth token to send as Authorization: Bearer (if any)
     pub auth_token: Option<String>,
-    /// Custom headers to inject on discovery requests
+    /// Custom headers to inject on the discovery request
     pub custom_headers: Vec<(String, String)>,
 }
 
-/// `/v1/models` response — works for both Anthropic and `OpenAI`.
+/// `/v1/models` response — works for both Anthropic and `OpenAI`-compatible gateways.
 #[derive(Debug, Deserialize)]
 struct ModelsResponse {
     data: Vec<ModelData>,
@@ -68,97 +64,40 @@ pub async fn probe_gateway(
 /// Returns a set of model IDs that the gateway reports as available.
 /// Used to validate which hardcoded models are actually reachable.
 pub async fn discover_models(config: &DiscoveryConfig) -> HashSet<String> {
-    let mut models = HashSet::new();
-
-    if let Some(ref url) = config.anthropic_models_url {
-        match discover_provider(
-            url,
-            "anthropic",
-            config.auth_token.as_deref(),
-            &config.custom_headers,
-            &[("anthropic-version", "2023-06-01")],
-        )
-        .await
-        {
-            Ok(m) => models.extend(m),
-            Err(e) => tracing::warn!(provider = "anthropic", error = %e, "Discovery failed"),
-        }
-    }
-
-    if let Some(ref url) = config.openai_models_url {
-        match discover_provider(
-            url,
-            "openai",
-            config.auth_token.as_deref(),
-            &config.custom_headers,
-            &[],
-        )
-        .await
-        {
-            Ok(m) => models.extend(m),
-            Err(e) => tracing::warn!(provider = "openai", error = %e, "Discovery failed"),
-        }
-    }
-
-    for (provider, url) in &config.extra_models_urls {
-        match discover_provider(
-            url,
-            provider,
-            config.auth_token.as_deref(),
-            &config.custom_headers,
-            &[],
-        )
-        .await
-        {
-            Ok(m) => models.extend(m),
-            Err(e) => tracing::warn!(provider = provider.as_str(), error = %e, "Discovery failed"),
-        }
-    }
-
-    models
-}
-
-/// Discover model IDs from a single provider endpoint.
-async fn discover_provider(
-    url: &str,
-    provider_name: &str,
-    auth_token: Option<&str>,
-    custom_headers: &[(String, String)],
-    extra_headers: &[(&str, &str)],
-) -> Result<HashSet<String>, Box<dyn std::error::Error>> {
     let client = reqwest::Client::new();
     let mut request = client
-        .get(url)
-        .header("provider", provider_name)
+        .get(&config.models_url)
         .timeout(std::time::Duration::from_secs(5));
 
-    for &(key, value) in extra_headers {
-        request = request.header(key, value);
-    }
-    if let Some(token) = auth_token {
+    if let Some(ref token) = config.auth_token {
         request = request.header("Authorization", format!("Bearer {token}"));
     }
-    for (key, value) in custom_headers {
+    for (key, value) in &config.custom_headers {
         request = request.header(key.as_str(), value.as_str());
     }
 
-    let response = request.send().await?;
+    let response = match request.send().await {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(error = %e, "Model discovery request failed");
+            return HashSet::new();
+        }
+    };
 
     if !response.status().is_success() {
-        return Err(format!(
-            "{provider_name} models endpoint returned {}",
-            response.status()
-        )
-        .into());
+        tracing::warn!(status = %response.status(), "Models endpoint returned non-success");
+        return HashSet::new();
     }
 
-    let models_response: ModelsResponse = response.json().await?;
-    let ids: HashSet<String> = models_response.data.into_iter().map(|m| m.id).collect();
+    let parsed: ModelsResponse = match response.json().await {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to parse models response");
+            return HashSet::new();
+        }
+    };
 
-    tracing::info!(
-        "Discovered {} {} models from gateway",
-        ids.len(),
-        provider_name
-    );
-    Ok(ids)
+    let ids: HashSet<String> = parsed.data.into_iter().map(|m| m.id).collect();
+    tracing::info!("Discovered {} models from gateway", ids.len());
+    ids
 }

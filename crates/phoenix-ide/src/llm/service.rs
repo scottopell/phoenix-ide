@@ -178,13 +178,7 @@ impl LlmServiceImpl {
                 .iter()
                 .any(|(k, _)| k.eq_ignore_ascii_case("provider"))
             {
-                headers.push((
-                    "provider".to_string(),
-                    self.spec
-                        .gateway_provider_header()
-                        .unwrap_or("openai")
-                        .to_string(),
-                ));
+                headers.push(("provider".to_string(), self.spec.provider_prefix().to_string()));
             }
         }
         if let Some(ref cred) = self.codex_credential {
@@ -221,7 +215,7 @@ impl LlmServiceImpl {
     }
 
     async fn complete_inner(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        match self.spec.api_format {
+        match self.spec.api_format() {
             ApiFormat::Anthropic => {
                 let resolved = self.resolve_auth().await?;
                 // Build headers AFTER resolve so any per-request state the
@@ -263,7 +257,7 @@ impl LlmServiceImpl {
         request: &LlmRequest,
         chunk_tx: &broadcast::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
-        match self.spec.api_format {
+        match self.spec.api_format() {
             ApiFormat::Anthropic => {
                 let resolved = self.resolve_auth().await?;
                 let headers = self.headers_for_provider();

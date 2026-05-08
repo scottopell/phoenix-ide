@@ -1408,6 +1408,7 @@ where
         let working_dir = self.context.working_dir.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
+        let max_output_tokens = self.context.max_output_tokens;
 
         // Token streaming channel (REQ-BED-025).
         //
@@ -1491,7 +1492,7 @@ where
                 system: vec![SystemContent::cached(&system_prompt)],
                 messages,
                 tools,
-                max_tokens: Some(16_384),
+                max_tokens: Some(max_output_tokens),
                 // Every turn in a conversation reuses the same prefix
                 // (system prompt + earlier turns), so all turns share one key.
                 cache_key: PromptCacheKey::stable(&conv_id),
@@ -3242,7 +3243,7 @@ mod context_exhausted_preserves_worktree_tests {
         ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
         broadcast::Receiver<SseEvent>,
     ) {
-        let context = ConvContext::new(conv_id, working_dir, "test-model", 200_000);
+        let context = ConvContext::new(conv_id, working_dir, "test-model", 200_000, 16_384);
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);

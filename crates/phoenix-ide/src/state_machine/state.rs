@@ -1255,6 +1255,9 @@ pub struct ConvContext {
     pub is_sub_agent: bool,
     /// Model's context window size in tokens
     pub context_window: usize,
+    /// Model's max output tokens per turn — used both when building LLM
+    /// requests and when sizing the ContextExhausted threshold.
+    pub max_output_tokens: u32,
     /// How this conversation handles context exhaustion
     pub context_exhaustion_behavior: ContextExhaustionBehavior,
     /// Conversation mode context for system prompt (stable per mode, updated on Explore->Work)
@@ -1269,6 +1272,9 @@ pub struct ConvContext {
 
 /// Default context window for unknown models (conservative)
 pub const DEFAULT_CONTEXT_WINDOW: usize = 128_000;
+/// Default per-turn output cap for unknown models. Same value Phoenix has
+/// historically requested for every turn.
+pub const DEFAULT_MAX_OUTPUT_TOKENS: u32 = 16_384;
 
 impl ConvContext {
     pub fn new(
@@ -1276,6 +1282,7 @@ impl ConvContext {
         working_dir: PathBuf,
         model_id: impl Into<String>,
         context_window: usize,
+        max_output_tokens: u32,
     ) -> Self {
         let id = conversation_id.into();
         Self {
@@ -1285,6 +1292,7 @@ impl ConvContext {
             model_id: model_id.into(),
             is_sub_agent: false,
             context_window,
+            max_output_tokens,
             context_exhaustion_behavior: ContextExhaustionBehavior::ThresholdBasedContinuation,
             mode_context: None,
             max_turns: 0,
@@ -1299,6 +1307,7 @@ impl ConvContext {
         working_dir: PathBuf,
         model_id: impl Into<String>,
         context_window: usize,
+        max_output_tokens: u32,
         root_conversation_id: impl Into<String>,
     ) -> Self {
         Self {
@@ -1308,6 +1317,7 @@ impl ConvContext {
             model_id: model_id.into(),
             is_sub_agent: true,
             context_window,
+            max_output_tokens,
             context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
             mode_context: None,
             max_turns: 0,

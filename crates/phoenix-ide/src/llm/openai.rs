@@ -18,7 +18,7 @@ fn resolve_endpoint(
     gateway: Option<&str>,
     base_url_override: Option<&str>,
 ) -> String {
-    let suffix = match spec.api_format {
+    let suffix = match spec.api_format() {
         ApiFormat::OpenAIResponses => "responses",
         ApiFormat::OpenAIChat => "chat/completions",
         ApiFormat::Anthropic => {
@@ -32,7 +32,7 @@ fn resolve_endpoint(
 
     match gateway {
         Some(gw) => {
-            let provider = spec.gateway_provider_header().unwrap_or("openai");
+            let provider = spec.provider_prefix();
             format!("{}/{provider}/v1/{suffix}", gw.trim_end_matches('/'))
         }
         None => format!("https://api.openai.com/v1/{suffix}"),
@@ -80,7 +80,7 @@ pub async fn complete(
     }
 
     let url = resolve_endpoint(spec, gateway, base_url_override);
-    if spec.api_format == ApiFormat::OpenAIChat {
+    if spec.api_format() == ApiFormat::OpenAIChat {
         return complete_chat_api(spec, api_key, &url, custom_headers, request_tags, request).await;
     }
 
@@ -281,7 +281,7 @@ pub async fn complete_streaming(
     use futures::StreamExt;
 
     let url = resolve_endpoint(spec, gateway, base_url_override);
-    if spec.api_format == ApiFormat::OpenAIChat {
+    if spec.api_format() == ApiFormat::OpenAIChat {
         return complete_streaming_chat_api(
             spec,
             api_key,
@@ -749,6 +749,20 @@ impl ChatStreamAccumulator {
         let event: ChatStreamChunk = serde_json::from_str(data).map_err(|e| {
             LlmError::invalid_response(format!("Failed to parse chat SSE data: {e}"))
         })?;
+        if let Some(err) = event.error {
+            let msg = err
+                .message
+                .unwrap_or_else(|| "gateway returned error chunk".to_string());
+            // 4xx-shaped errors (context length, bad request) shouldn't be
+            // retried; treat as invalid_response so the runtime surfaces them.
+            return Err(LlmError::invalid_response(format!(
+                "Gateway error: {msg}{}",
+                err.code
+                    .as_ref()
+                    .map(|c| format!(" (code: {c})"))
+                    .unwrap_or_default()
+            )));
+        }
         self.usage = event.usage.or(self.usage.take());
         for choice in event.choices {
             if let Some(delta) = choice.delta.content {
@@ -780,6 +794,13 @@ impl ChatStreamAccumulator {
     }
 
     fn into_response(self) -> Result<LlmResponse, LlmError> {
+        if self.content.is_empty() && self.tool_calls.is_empty() {
+            tracing::warn!(
+                done = self.done,
+                usage = ?self.usage,
+                "Chat stream produced no content and no tool_calls"
+            );
+        }
         let message = ChatResponseMessage {
             content: if self.content.is_empty() {
                 None
@@ -1204,6 +1225,20 @@ struct ChatStreamChunk {
     choices: Vec<ChatStreamChoice>,
     #[serde(default)]
     usage: Option<ChatUsage>,
+    /// Some gateways stream errors as data events with `{"error": {...}}`
+    /// instead of failing the HTTP request. Capture them so we can surface
+    /// the real cause (e.g. context-length exceeded) rather than reporting
+    /// an empty response.
+    #[serde(default)]
+    error: Option<ChatStreamError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatStreamError {
+    #[serde(default)]
+    message: Option<String>,
+    #[serde(default)]
+    code: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1392,7 +1427,7 @@ pub(crate) struct ResponsesApiUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::models::{ApiFormat, AuthFamily, GatewayRoute, ModelFamily, ModelSpec};
+    use crate::llm::models::{AuthFamily, ModelFamily, ModelSpec};
     use crate::llm::types::{LlmMessage, LlmRequest, PromptCacheKey, ToolDefinition};
 
     fn empty_request() -> LlmRequest {
@@ -1411,10 +1446,9 @@ mod tests {
             api_name: "google/gemini-2.5-flash".into(),
             family: ModelFamily::Google,
             auth_family: AuthFamily::Gateway,
-            gateway_route: Some(GatewayRoute::new("google")),
-            api_format: ApiFormat::OpenAIChat,
             description: "test".into(),
             context_window: 1_000_000,
+            max_output_tokens: 16_384,
             recommended: false,
             supports_tool_search: false,
         }

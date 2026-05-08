@@ -1074,7 +1074,7 @@ pub(crate) struct AnthropicUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm::models::{ApiFormat, AuthFamily, GatewayRoute, ModelFamily, ModelSpec};
+    use crate::llm::models::{AuthFamily, ModelFamily, ModelSpec};
     use crate::llm::types::{LlmRequest, PromptCacheKey, ToolDefinition};
 
     fn test_spec(supports_tool_search: bool) -> ModelSpec {
@@ -1083,10 +1083,9 @@ mod tests {
             api_name: "test-model-api".into(),
             family: ModelFamily::Anthropic,
             auth_family: AuthFamily::Anthropic,
-            gateway_route: Some(GatewayRoute::new("anthropic")),
-            api_format: ApiFormat::Anthropic,
             description: "test".into(),
             context_window: 200_000,
+            max_output_tokens: 16_384,
             recommended: false,
             supports_tool_search,
         }
