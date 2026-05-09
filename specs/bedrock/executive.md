@@ -28,8 +28,8 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-014:** Conversation Mode | ⏭️ Deprecated | Replaced by REQ-BED-027. Restricted/Unrestricted model superseded by Explore/Work with git worktrees |
 | **REQ-BED-015:** Mode Upgrade Request | ⏭️ Deprecated | Replaced by REQ-PROJ-003/004 + REQ-BED-028. `request_mode_upgrade` tool replaced by `propose_plan` flow |
 | **REQ-BED-016:** Mode Downgrade | ⏭️ Deprecated | Replaced by REQ-PROJ-009/010. Mode return now tied to task merge or abandon |
-| **REQ-BED-017:** Mode Communication | ❌ Not Started | Updated: Explore/Work terminology; `propose_plan` as path to write access |
-| **REQ-BED-018:** Sub-Agent Mode Enforcement | ❌ Not Started | Updated: sub-agents inherit parent worktree; Work sub-agents allowed one-at-a-time |
+| **REQ-BED-017:** Mode Communication | ✅ Complete | Mode-aware tool errors in `crates/phoenix-ide/src/tools.rs:479`; system prompt directs Explore agents to `propose_task` (`system_prompt.rs:578`) |
+| **REQ-BED-018:** Sub-Agent Mode Enforcement | ✅ Complete | Sub-agent tool sets restricted by mode in `crates/phoenix-ide/src/tools.rs:647-677` (tested); sub-agents inherit parent worktree |
 | **REQ-BED-019:** Context Continuation Threshold | ✅ Complete | Check at 90%, reject tools, trigger continuation |
 | **REQ-BED-020:** Continuation Summary Generation | ✅ Complete | Tool-less LLM request, fallback on failure |
 | **REQ-BED-021:** Context Exhausted State | ✅ Complete | Read-only terminal state |
@@ -38,11 +38,11 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-024:** Sub-Agent Context Exhaustion | ✅ Complete | Fail immediately, no continuation flow |
 | **REQ-BED-025:** Token-by-Token LLM Output | ✅ Complete | Task 582. Fire-and-forget `StreamToken` effects via SSE |
 | **REQ-BED-026:** Sub-Agent Timeout Enforcement | ✅ Complete | Task 578. Mandatory `timeout: Duration`, deadline in executor `select!` |
-| **REQ-BED-027:** Explore, Work, and Direct Conversation Modes | ❌ Not Started | `ConvMode` as conversation-level field; replaces REQ-BED-014. `Direct` absorbed the former `Standalone` mode (see REQ-PROJ-018) |
-| **REQ-BED-028:** Task Approval State | ❌ Not Started | `AwaitingTaskApproval` state; replaces REQ-BED-015 |
-| **REQ-BED-029:** Conversation Terminal State on Task Resolution | ❌ Not Started | Work conversations go to Terminal on complete or abandon; replaces REQ-BED-016 |
+| **REQ-BED-027:** Explore, Work, and Direct Conversation Modes | ✅ Complete | `ConvMode` enum + DB column (migration in `db.rs:130-138`); UI surfaces via `conv_mode_label`; replaces REQ-BED-014. `Direct` absorbed the former `Standalone` mode (see REQ-PROJ-018) |
+| **REQ-BED-028:** Task Approval State | ✅ Complete | `ConvState::AwaitingTaskApproval` (`state.rs:454,992`); `propose_task` interception; git ops in `effect.rs:148` / `executor.rs:2143`; UI overlay in `ui/src/components/TaskApprovalReader.tsx`; replaces REQ-BED-015 |
+| **REQ-BED-029:** Conversation Terminal State on Task Resolution | ✅ Complete | `ConvState::Terminal` transitions on complete/abandon (`runtime/executor.rs:2091,2121`); task resolution events in `state_machine/event.rs:139`; UI handles `phase.type === 'terminal'`; replaces REQ-BED-016 |
 | **REQ-BED-030:** Context Continuation Inherits Parent Environment | ✅ Complete | Task 24696. Worktree ownership transfers via `continued_in_conv_id` pointer; mode mapping W→W/B→B/E→E/D→D; idempotent `POST /api/conversations/:id/continue`. Obsoletes task 08678 |
 | **REQ-BED-031:** Exhausted Parent Post-Handoff Behavior | ✅ Complete | Task 24696. Auto-cleanup removed; `reconcile_worktrees` skips context-exhausted + continued rows; abandon/mark-as-merged gated on `continued_in_conv_id = NULL`; typed `continuation_id` on 409 response |
-| **REQ-BED-032:** Conversation Hard-Delete Cascade | ❌ Not Started | New. `ConversationHardDeleted` lifecycle event for `specs/bash/` REQ-BASH-006 + `specs/tmux-integration/` REQ-TMUX-007 to subscribe to. Replaces the current one-line `delete_conversation` handler in `src/api/handlers.rs` with a cascade orchestrator. Subscribers run before row delete; best-effort cleanup with logged failures |
+| **REQ-BED-032:** Conversation Hard-Delete Cascade | ✅ Complete | `ConversationHardDeleted` lifecycle event emitted from `runtime.rs:426,1198`; bash + tmux subscribers wired; `RejectHardDeleteWhileBusy` enforced (see `bedrock.allium:899-958`) |
 
-**Progress:** 23 of 32 complete (3 deprecated, not counted)
+**Progress:** 29 of 32 complete (3 deprecated, not counted)
