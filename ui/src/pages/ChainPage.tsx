@@ -133,6 +133,42 @@ export function ChainPage() {
     };
   }, [rootConvId, dispatch]);
 
+  // Hydrate the draft from localStorage on chain mount so a refresh / iOS
+  // PWA cold reload mid-typing doesn't lose the user's in-progress
+  // question. Mirrors the conversation draft pattern in useDraft. Uses
+  // DRAFT_SET (not DRAFT_CHANGED — they're identical reducer-side today
+  // but DRAFT_SET semantically signals a non-keystroke source).
+  useEffect(() => {
+    if (!rootConvId) return;
+    let saved: string | null = null;
+    try {
+      saved = localStorage.getItem(`phoenix:chain-draft:${rootConvId}`);
+    } catch {
+      // storage disabled — degrade gracefully
+    }
+    if (saved) {
+      dispatch({ type: 'DRAFT_SET', value: saved });
+    }
+  }, [rootConvId, dispatch]);
+
+  // Persist the draft to localStorage whenever it changes (debounced).
+  // OPTIMISTIC_INFLIGHT_ADD clears the draft on send — the empty-string
+  // path below removes the key so we don't restore a "send me again"
+  // ghost on the next mount.
+  useEffect(() => {
+    if (!rootConvId) return undefined;
+    const key = `phoenix:chain-draft:${rootConvId}`;
+    const timer = window.setTimeout(() => {
+      try {
+        if (draft === '') localStorage.removeItem(key);
+        else localStorage.setItem(key, draft);
+      } catch {
+        // storage full — degrade gracefully
+      }
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [rootConvId, draft]);
+
   // SSE subscription. We open one EventSource for the chain and demux events
   // by chain_qa_id against the atom's in-flight buffer. Close on unmount or
   // root change so leaving the page tears down the connection cleanly.
