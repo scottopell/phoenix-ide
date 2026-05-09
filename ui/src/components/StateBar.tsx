@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { FolderTree } from 'lucide-react';
-import type { Conversation, ConversationState, ModelInfo } from '../api';
+import { api, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 import type { ConnectionState } from '../hooks';
 import { useIsMobile } from '../hooks';
 import { getStateDescription } from '../utils';
@@ -86,6 +86,45 @@ function getProjectName(conversation: Conversation): string | null {
   return parts[parts.length - 1] || null;
 }
 
+function prBadgeClass(pr: PrStatusResponse): string {
+  if (pr.display_state === 'merged') return 'pr-badge pr-badge--merged';
+  if (pr.display_state === 'closed') return 'pr-badge pr-badge--failing';
+  if (pr.display_state === 'draft') return 'pr-badge pr-badge--pending';
+  switch (pr.check_state) {
+    case 'passing': return 'pr-badge pr-badge--passing';
+    case 'failing': return 'pr-badge pr-badge--failing';
+    case 'pending': return 'pr-badge pr-badge--pending';
+    default: return 'pr-badge pr-badge--unknown';
+  }
+}
+
+function prBadgeLabel(pr: PrStatusResponse): string {
+  const n = pr.number ? `#${pr.number}` : 'PR';
+  if (pr.display_state === 'merged') return `${n} merged`;
+  if (pr.display_state === 'closed') return `${n} closed`;
+  if (pr.display_state === 'draft') return `${n} draft`;
+  if (pr.check_state === 'passing') return `${n} checks ✓`;
+  if (pr.check_state === 'failing') return `${n} checks ✗`;
+  if (pr.check_state === 'pending') return `${n} checks ...`;
+  return n;
+}
+
+function prTooltip(pr: PrStatusResponse): string {
+  const title = pr.title ? ` — ${pr.title}` : '';
+  const state = pr.display_state ?? 'unknown';
+  const checks = pr.check_state ?? 'unknown';
+  return `PR #${pr.number}${title}\nState: ${state}\nChecks: ${checks}`;
+}
+
+function unavailablePrHint(reason: PrStatusResponse['unavailable_reason']): string | null {
+  switch (reason) {
+    case 'gh_missing': return 'gh missing';
+    case 'not_authenticated': return 'gh auth';
+    case 'command_failed': return 'PR status unavailable';
+    default: return null;
+  }
+}
+
 /** Format elapsed seconds as a compact duration string.
  *  < 60s  -> "4s"
  *  >= 60s -> "1m 4s" (seconds part omitted when 0: "2m")
@@ -114,6 +153,8 @@ export function StateBar({
 }: StateBarProps) {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
+  const [prStatus, setPrStatus] = useState<PrStatusResponse | null>(null);
+  const [prLoading, setPrLoading] = useState(false);
   // Mobile breakpoint mirrors the @media (max-width: 768px) block in index.css.
   const isMobile = useIsMobile();
   const [mobileExpanded, setMobileExpanded] = useState(false);
@@ -321,6 +362,52 @@ export function StateBar({
   const baseBranch = conversation?.base_branch;
   const branchName = conversation?.branch_name;
   const taskTitle = conversation?.task_title;
+  const prHint = prStatus && !prStatus.found ? unavailablePrHint(prStatus.unavailable_reason) : null;
+
+  useEffect(() => {
+    if (!conversation?.id || !branchName) {
+      setPrStatus(null);
+      setPrLoading(false);
+      return;
+    }
+
+    let cancelled = false;
+    let timeout: number | null = null;
+
+    const fetchStatus = async () => {
+      setPrLoading(true);
+      try {
+        const status = await api.getPrStatus(conversation.id);
+        if (!cancelled) setPrStatus(status);
+      } catch {
+        if (!cancelled) setPrStatus({ found: false, unavailable_reason: 'command_failed' });
+      } finally {
+        if (!cancelled) setPrLoading(false);
+      }
+    };
+
+    const schedule = () => {
+      if (timeout != null) window.clearTimeout(timeout);
+      timeout = window.setTimeout(async () => {
+        await fetchStatus();
+        if (!cancelled) schedule();
+      }, 60_000);
+    };
+
+    void fetchStatus();
+    schedule();
+
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void fetchStatus();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+
+    return () => {
+      cancelled = true;
+      if (timeout != null) window.clearTimeout(timeout);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [conversation?.id, branchName]);
 
   const showMobileCollapsed = isMobile && !mobileExpanded;
   const headerProps = showMobileCollapsed
@@ -445,11 +532,31 @@ export function StateBar({
                       <span className="git-base">{baseBranch}</span>
                       <span className="git-arrow">&larr;</span>
                       <span className="git-branch">{branchName}</span>
+                      {prStatus?.found && prStatus.url && (
+                        <a className={prBadgeClass(prStatus)} href={prStatus.url} target="_blank" rel="noreferrer" title={prTooltip(prStatus)}>
+                          {prBadgeLabel(prStatus)}
+                        </a>
+                      )}
+                      {prHint && !prLoading && (
+                        <span className="pr-hint" title="Install and authenticate GitHub CLI to enable PR tracking">
+                          {prHint}
+                        </span>
+                      )}
                     </span>
                   )}
                   {branchName && !baseBranch && (
                     <span className="git-branch-solo" title={`Branch: ${branchName}`}>
                       {branchName}
+                      {prStatus?.found && prStatus.url && (
+                        <a className={prBadgeClass(prStatus)} href={prStatus.url} target="_blank" rel="noreferrer" title={prTooltip(prStatus)}>
+                          {prBadgeLabel(prStatus)}
+                        </a>
+                      )}
+                      {prHint && !prLoading && (
+                        <span className="pr-hint" title="Install and authenticate GitHub CLI to enable PR tracking">
+                          {prHint}
+                        </span>
+                      )}
                     </span>
                   )}
                   {ahead != null && ahead > 0 && (

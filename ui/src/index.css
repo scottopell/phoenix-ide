@@ -2503,13 +2503,16 @@ pre:hover .copy-btn {
 }
 
 .git-branch-solo {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   font-family: var(--font-mono);
   font-size: 10px;
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 220px;
+  max-width: 320px;
 }
 
 /* Git delta badges */
@@ -2535,7 +2538,53 @@ pre:hover .copy-btn {
   background: color-mix(in srgb, var(--accent-yellow) 12%, transparent);
 }
 
-/* Project name -- right-aligned via margin-left auto */
+.pr-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  font-size: 10px;
+  font-family: var(--font-mono);
+  padding: 0 5px;
+  border-radius: 999px;
+  line-height: 1.5;
+  text-decoration: none;
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.pr-badge--merged {
+  color: #c084fc;
+  background: color-mix(in srgb, #a855f7 18%, transparent);
+}
+
+.pr-badge--passing {
+  color: var(--accent-green);
+  background: color-mix(in srgb, var(--accent-green) 14%, transparent);
+}
+
+.pr-badge--pending,
+.pr-badge--unknown {
+  color: var(--accent-yellow);
+  background: color-mix(in srgb, var(--accent-yellow) 14%, transparent);
+}
+
+.pr-badge--failing {
+  color: var(--accent-red);
+  background: color-mix(in srgb, var(--accent-red) 14%, transparent);
+}
+
+.pr-badge:hover {
+  text-decoration: none;
+  filter: brightness(1.15);
+}
+
+.pr-hint {
+  font-size: 10px;
+  color: var(--text-muted);
+  opacity: 0.75;
+  white-space: nowrap;
+}
 .statebar-project {
   margin-left: auto;
   color: var(--text-muted);
@@ -5479,7 +5528,8 @@ html * {
   .statebar-chevron {
     background: none;
     border: 0;
-    color: var(--text-muted);
+ .work-actions-abandon {
+  color: var(--text-muted);
     font-size: 12px;
     width: 32px;
     height: 32px;
@@ -7167,6 +7217,14 @@ html * {
   border-color: var(--accent-green, #22c55e);
 }
 
+.work-actions-pr-note {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.work-actions-pr-note--warning {
+  color: var(--accent-yellow, #eab308);
+}
 .work-actions-abandon {
   color: var(--text-muted);
   border-color: transparent;

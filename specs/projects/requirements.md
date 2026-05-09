@@ -686,6 +686,10 @@ AND transition the conversation to terminal state
 THE SYSTEM SHALL NOT offer "Complete (squash-merge)" for Branch mode conversations
 THE SYSTEM SHALL NOT push to origin on the user's behalf (push is the agent's
 responsibility, run through the bash tool when the user requests it)
+THE SYSTEM SHALL use the GitHub CLI, when available, to observe PR state for the
+branch and guide the cleanup action
+THE SYSTEM SHALL treat a user-asserted manual "Mark as merged" action as a
+fallback when PR state is unavailable, not as the preferred happy path
 
 **Rationale:** Branch mode conversations track the PR lifecycle, not the task
 lifecycle. The agent commits and pushes from bash on the user's instruction;
@@ -719,7 +723,10 @@ works with protected branches, and aligns with how teams actually ship code.
 The task file lives on the task branch alongside the code changes, keeping the
 task branch self-contained. Phoenix never pushes on the user's behalf — the
 agent runs `git push` from bash if and when instructed; Phoenix observes no
-push event and gates no lifecycle on it. On "Mark as merged," Phoenix cleans
+push event and gates no lifecycle on it. When `gh` can observe a PR for the
+branch, Phoenix uses that state to make merged PR cleanup the happy path and to
+discourage local cleanup while the PR is still open, draft, failing, pending, or
+closed-unmerged. On "Mark as merged" / merged-PR cleanup, Phoenix cleans
 up both the worktree and the task branch (since Phoenix created it). On
 abandon, same cleanup -- the task branch was a Phoenix artifact that the user
 is discarding.

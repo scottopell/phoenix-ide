@@ -58,12 +58,15 @@ vi.mock('../api', () => ({
     abandonTask: vi.fn().mockResolvedValue({ success: true }),
     markMerged: vi.fn().mockResolvedValue({ success: true }),
     getConversationDiff: vi.fn(),
+    getPrStatus: vi.fn().mockResolvedValue({ found: false }),
   },
 }));
 
 describe('WorkActions — continuation gate (REQ-BED-031)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    const { api } = await import('../api');
+    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ found: false });
   });
 
   it('disables Abandon and Mark-as-Merged when continuedInConvId is set', async () => {
@@ -116,11 +119,39 @@ describe('WorkActions — continuation gate (REQ-BED-031)', () => {
     fireEvent.click(mark);
     expect(api.markMerged).toHaveBeenCalledWith('conv-1');
   });
+  it('requires an explicit manual fallback click when gh is unavailable', async () => {
+    const { api } = await import('../api');
+    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({
+      found: false,
+      unavailable_reason: 'not_authenticated',
+    });
+
+    renderWithProviders(
+      <WorkActions
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        branchName="feat/x"
+        baseBranch="main"
+        continuedInConvId={null}
+      />
+    );
+
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    await waitFor(() => expect(mark.textContent).toMatch(/manual fallback/i));
+    fireEvent.click(mark);
+    expect(api.markMerged).not.toHaveBeenCalled();
+    await waitFor(() => expect(mark.textContent).toMatch(/mark as merged/i));
+    fireEvent.click(mark);
+    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
+  });
 });
 
 describe('WorkActions — View Diff (task 08641 + 08654 follow-on)', () => {
-  beforeEach(() => {
+  beforeEach(async () => {
     vi.clearAllMocks();
+    const { api } = await import('../api');
+    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ found: false });
   });
 
   it('fetches the diff and publishes the payload to DiffViewerStateContext', async () => {

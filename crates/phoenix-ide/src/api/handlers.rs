@@ -7,7 +7,7 @@ use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, set_chain_name, stream_chain,
     submit_chain_question, unarchive_chain_handler,
 };
-use super::git_handlers::{get_conversation_diff, list_git_branches};
+use super::git_handlers::{get_conversation_diff, get_conversation_pr_status, list_git_branches};
 use super::lifecycle_handlers::{
     abandon_task, approve_task, mark_merged, reject_task, task_feedback,
 };
@@ -185,8 +185,9 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/upgrade-model",
             post(upgrade_conversation_model),
         )
-        // Per-conversation worktree diff (Work/Branch-mode "View diff" action)
+        // Per-conversation worktree diff and PR state
         .route("/api/conversations/:id/diff", get(get_conversation_diff))
+        .route("/api/conversations/:id/pr-status", get(get_conversation_pr_status))
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
         // Environment info

@@ -4,6 +4,7 @@
 use super::handlers::AppError;
 use super::types::{
     ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
+    PrCheckState, PrDisplayState, PrStatusResponse, PrUnavailableReason,
 };
 use super::AppState;
 use crate::db::ConvMode;
@@ -13,7 +14,9 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
+use serde::Deserialize;
 use std::path::PathBuf;
+use std::time::Duration;
 
 pub(crate) async fn list_git_branches(
     State(state): State<AppState>,
@@ -327,6 +330,265 @@ fn ls_remote_cached(cwd: &std::path::Path) -> Result<Vec<String>, AppError> {
     Ok(refs)
 }
 
+pub(crate) async fn get_conversation_pr_status(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PrStatusResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let (branch_name, cwd) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            ..
+        }
+        | ConvMode::Branch {
+            branch_name,
+            worktree_path,
+            ..
+        } => (branch_name.to_string(), worktree_path.to_string()),
+        _ => {
+            return Ok(Json(PrStatusResponse::unavailable(
+                PrUnavailableReason::NotGitRepo,
+            )));
+        }
+    };
+
+    let cwd = PathBuf::from(cwd);
+    if !cwd.is_dir() {
+        return Ok(Json(PrStatusResponse::unavailable(
+            PrUnavailableReason::NotGitRepo,
+        )));
+    }
+
+    tokio::task::spawn_blocking(move || get_pr_status_for_branch(&cwd, &branch_name))
+        .await
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+        .map(Json)
+}
+
+fn get_pr_status_for_branch(
+    cwd: &std::path::Path,
+    branch_name: &str,
+) -> Result<PrStatusResponse, AppError> {
+    if run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_err() {
+        return Ok(PrStatusResponse::unavailable(
+            PrUnavailableReason::NotGitRepo,
+        ));
+    }
+
+    let list_output = match run_gh(
+        cwd,
+        &[
+            "pr",
+            "list",
+            "--head",
+            branch_name,
+            "--state",
+            "all",
+            "--limit",
+            "1",
+            "--json",
+            "number,title,url,state,isDraft,baseRefName,headRefName",
+        ],
+    ) {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::debug!(branch = %branch_name, error = %e.message, "gh pr list failed");
+            return Ok(PrStatusResponse::unavailable(e.reason));
+        }
+    };
+
+    let mut prs: Vec<GhPrListItem> = match serde_json::from_str(&list_output) {
+        Ok(prs) => prs,
+        Err(e) => {
+            tracing::debug!(branch = %branch_name, output = %list_output, error = %e, "failed to parse gh pr list JSON");
+            return Ok(PrStatusResponse::unavailable(
+                PrUnavailableReason::CommandFailed,
+            ));
+        }
+    };
+
+    let Some(pr) = prs.pop() else {
+        return Ok(PrStatusResponse::not_found());
+    };
+
+    let checks_state = fetch_pr_checks_state(cwd, pr.number);
+    let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
+
+    Ok(PrStatusResponse {
+        found: true,
+        unavailable_reason: None,
+        number: Some(pr.number),
+        title: Some(pr.title),
+        url: Some(pr.url),
+        state: Some(pr.state),
+        draft: Some(pr.is_draft),
+        base: Some(pr.base_ref_name),
+        head: Some(pr.head_ref_name),
+        check_state: Some(checks_state),
+        display_state: Some(display_state),
+    })
+}
+
+fn fetch_pr_checks_state(cwd: &std::path::Path, number: u64) -> PrCheckState {
+    let number = number.to_string();
+    let output = match run_gh(
+        cwd,
+        &[
+            "pr", "checks", &number, "--json", "name,state,bucket", "--watch=false",
+        ],
+    ) {
+        Ok(output) => output,
+        Err(e) => {
+            tracing::debug!(pr = %number, error = %e.message, "gh pr checks failed");
+            return PrCheckState::Unknown;
+        }
+    };
+
+    match serde_json::from_str::<Vec<GhPrCheck>>(&output) {
+        Ok(checks) => normalize_checks(&checks),
+        Err(e) => {
+            tracing::debug!(pr = %number, output = %output, error = %e, "failed to parse gh pr checks JSON");
+            PrCheckState::Unknown
+        }
+    }
+}
+
+#[derive(Debug)]
+struct GhError {
+    reason: PrUnavailableReason,
+    message: String,
+}
+
+fn run_gh(cwd: &std::path::Path, args: &[&str]) -> Result<String, GhError> {
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+
+    let mut child = Command::new("gh")
+        .args(args)
+        .current_dir(cwd)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| GhError {
+            reason: if e.kind() == std::io::ErrorKind::NotFound {
+                PrUnavailableReason::GhMissing
+            } else {
+                PrUnavailableReason::CommandFailed
+            },
+            message: format!("Failed to run gh {}: {e}", args.join(" ")),
+        })?;
+
+    let started = Instant::now();
+    loop {
+        if let Some(_status) = child.try_wait().map_err(|e| GhError {
+            reason: PrUnavailableReason::CommandFailed,
+            message: format!("gh {} wait failed: {e}", args.join(" ")),
+        })? {
+            break;
+        }
+        if started.elapsed() > Duration::from_secs(8) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(GhError {
+                reason: PrUnavailableReason::CommandFailed,
+                message: format!("gh {} timed out", args.join(" ")),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    let output = child.wait_with_output().map_err(|e| GhError {
+        reason: PrUnavailableReason::CommandFailed,
+        message: format!("gh {} output read failed: {e}", args.join(" ")),
+    })?;
+
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let lower = stderr.to_lowercase();
+        let reason = if lower.contains("not logged")
+            || lower.contains("not authenticated")
+            || lower.contains("authentication")
+            || lower.contains("gh auth login")
+        {
+            PrUnavailableReason::NotAuthenticated
+        } else {
+            PrUnavailableReason::CommandFailed
+        };
+        Err(GhError {
+            reason,
+            message: format!("gh {} failed: {stderr}", args.join(" ")),
+        })
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GhPrListItem {
+    number: u64,
+    title: String,
+    url: String,
+    state: String,
+    #[serde(rename = "isDraft")]
+    is_draft: bool,
+    #[serde(rename = "baseRefName")]
+    base_ref_name: String,
+    #[serde(rename = "headRefName")]
+    head_ref_name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhPrCheck {
+    state: Option<String>,
+    bucket: Option<String>,
+}
+
+fn normalize_pr_display_state(state: &str, draft: bool) -> PrDisplayState {
+    if draft {
+        return PrDisplayState::Draft;
+    }
+    match state.to_ascii_uppercase().as_str() {
+        "MERGED" => PrDisplayState::Merged,
+        "CLOSED" => PrDisplayState::Closed,
+        _ => PrDisplayState::Open,
+    }
+}
+
+fn normalize_checks(checks: &[GhPrCheck]) -> PrCheckState {
+    if checks.is_empty() {
+        return PrCheckState::Unknown;
+    }
+
+    let mut has_pending = false;
+    for check in checks {
+        let state = check.state.as_deref().unwrap_or_default().to_ascii_uppercase();
+        let bucket = check.bucket.as_deref().unwrap_or_default().to_ascii_uppercase();
+        if matches!(state.as_str(), "FAILURE" | "ERROR" | "CANCELLED" | "ACTION_REQUIRED")
+            || matches!(bucket.as_str(), "FAIL" | "CANCEL" | "ACTION_REQUIRED")
+        {
+            return PrCheckState::Failing;
+        }
+        if !matches!(state.as_str(), "SUCCESS" | "PASS" | "SKIPPED")
+            && !matches!(bucket.as_str(), "PASS" | "SKIP")
+        {
+            has_pending = true;
+        }
+    }
+
+    if has_pending {
+        PrCheckState::Pending
+    } else {
+        PrCheckState::Passing
+    }
+}
+
 /// `GET /api/conversations/:id/diff` — committed and uncommitted changes
 /// in the conversation's worktree, vs the base branch. Read-only; used by
 /// the Work/Branch-mode "View diff" action so users can review before
@@ -442,5 +704,55 @@ mod tests {
         // Saturated always reports the (lower-bound) total even if it
         // happens to equal stdout.len() — caller must show "≥X KiB" UI.
         assert_eq!(truncated_kib("x", 8 * 1024, true), Some(8));
+    }
+
+    #[test]
+    fn normalize_pr_display_state_prefers_draft() {
+        assert_eq!(
+            normalize_pr_display_state("OPEN", true),
+            PrDisplayState::Draft
+        );
+        assert_eq!(
+            normalize_pr_display_state("MERGED", false),
+            PrDisplayState::Merged
+        );
+        assert_eq!(
+            normalize_pr_display_state("CLOSED", false),
+            PrDisplayState::Closed
+        );
+        assert_eq!(
+            normalize_pr_display_state("OPEN", false),
+            PrDisplayState::Open
+        );
+    }
+
+    #[test]
+    fn normalize_checks_classifies_empty_as_unknown() {
+        assert_eq!(normalize_checks(&[]), PrCheckState::Unknown);
+    }
+
+    #[test]
+    fn normalize_checks_classifies_pass_pending_and_fail() {
+        assert_eq!(
+            normalize_checks(&[GhPrCheck {
+                state: Some("SUCCESS".to_string()),
+                bucket: Some("pass".to_string()),
+            }]),
+            PrCheckState::Passing
+        );
+        assert_eq!(
+            normalize_checks(&[GhPrCheck {
+                state: Some("PENDING".to_string()),
+                bucket: Some("pending".to_string()),
+            }]),
+            PrCheckState::Pending
+        );
+        assert_eq!(
+            normalize_checks(&[GhPrCheck {
+                state: Some("FAILURE".to_string()),
+                bucket: Some("fail".to_string()),
+            }]),
+            PrCheckState::Failing
+        );
     }
 }

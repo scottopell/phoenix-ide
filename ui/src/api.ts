@@ -100,6 +100,24 @@ export interface Conversation {
   browser_session_active: boolean;
 }
 
+export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';
+export type PrCheckState = 'passing' | 'pending' | 'failing' | 'unknown';
+export type PrDisplayState = 'open' | 'draft' | 'merged' | 'closed';
+
+export interface PrStatusResponse {
+  found: boolean;
+  unavailable_reason?: PrUnavailableReason;
+  number?: number;
+  title?: string;
+  url?: string;
+  state?: string;
+  draft?: boolean;
+  base?: string;
+  head?: string;
+  check_state?: PrCheckState;
+  display_state?: PrDisplayState;
+}
+
 export interface Project {
   id: string;
   canonical_path: string;
@@ -793,6 +811,12 @@ export const api = {
   async markMerged(conversationId: string): Promise<{ success: boolean }> {
     const resp = await fetch(`/api/conversations/${conversationId}/mark-merged`, { method: 'POST' });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to mark as merged'); }
+    return resp.json();
+  },
+
+  async getPrStatus(conversationId: string): Promise<PrStatusResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/pr-status`);
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to fetch PR status'); }
     return resp.json();
   },
 
