@@ -130,8 +130,10 @@ entity Terminal {
     }
 
     -- Fields present only while active (REQ-TERM-001, REQ-TERM-010).
-    master_fd:  OwnedFd            when status = active
-    child_pid:  Pid                when status = active
+    -- master_fd and child_pid are opaque OS handles (Rust types
+    -- OwnedFd / Pid; modelled as Integer for spec parsing).
+    master_fd:  Integer            when status = active
+    child_pid:  Integer            when status = active
     dimensions: TerminalDimensions when status = active
 
     -- Shell integration fields (REQ-TERM-015 through REQ-TERM-018).
@@ -165,7 +167,7 @@ entity Terminal {
 
     -- Working directory reported via OSC 7. None means "never reported";
     -- the HUD falls back to conversation.working_dir in that case.
-    reported_cwd: Path? when status = active
+    reported_cwd: String? when status = active
 }
 
 ------------------------------------------------------------
@@ -197,12 +199,12 @@ config {
 
 -- REQ-TERM-001, REQ-TERM-002: Terminal opened, PTY spawned
 rule TerminalOpened {
-    when: UserOpensTerminal(conversation)
+    when: UserOpensTerminal(terminal, conversation)
 
     requires: not conversation.is_terminal
-    requires: Terminal(conversation).status = absent
+    requires: terminal.status = absent
 
-    ensures: terminal: Terminal.status = active
+    ensures: terminal.status = active
     ensures: PtySpawned(terminal)
 
     @guidance
@@ -260,11 +262,11 @@ rule ShellEnvironmentConstructed {
 -- server-side kill. Reclaim evicts the sitting relay without tearing down
 -- the shell, then attaches the new WebSocket to the same handle.
 rule DuplicateConnectionReclaimsSession {
-    when: UserOpensTerminal(conversation)
+    when: UserOpensTerminal(terminal, conversation)
 
-    requires: Terminal(conversation).status = active
+    requires: terminal.status = active
 
-    ensures: Terminal(conversation).status = active
+    ensures: terminal.status = active
         -- Terminal stays active throughout reclaim — shell, master_fd,
         -- CommandTracker, and ring buffer are preserved.
     ensures: WebSocketAttached(conversation)
@@ -433,13 +435,13 @@ rule UserClosedTerminal {
 
 -- REQ-TERM-022: Agent reads most recent command record (success)
 rule AgentCallsTerminalLastCommand {
-    when: AgentCallsTerminalLastCommand(conversation)
+    when: AgentCallsTerminalLastCommand(terminal, conversation)
 
-    requires: Terminal(conversation).status = active
+    requires: terminal.status = active
     requires: terminal.shell_integration_status = detected
-    requires: terminal.command_records not empty
+    requires: not is_empty(terminal.command_records)
 
-    ensures: AgentReceivesCommandRecord(terminal.command_records.last())
+    ensures: AgentReceivesCommandRecord(last(terminal.command_records))
 
     @guidance
         -- Returns the most recently completed CommandRecord from the ring buffer.
@@ -450,9 +452,9 @@ rule AgentCallsTerminalLastCommand {
 
 -- REQ-TERM-022: Shell integration absent — terminal_last_command returns error
 rule AgentCallsTerminalLastCommandAbsent {
-    when: AgentCallsTerminalLastCommand(conversation)
+    when: AgentCallsTerminalLastCommand(terminal, conversation)
 
-    requires: Terminal(conversation).status = active
+    requires: terminal.status = active
     requires: terminal.shell_integration_status != detected
 
     ensures: AgentReceivesError("shell integration is not active for this terminal — install the shell integration snippet to enable command tracking")
@@ -460,25 +462,25 @@ rule AgentCallsTerminalLastCommandAbsent {
 
 -- REQ-TERM-022: Ring buffer empty — terminal_last_command returns error
 rule AgentCallsTerminalLastCommandEmpty {
-    when: AgentCallsTerminalLastCommand(conversation)
+    when: AgentCallsTerminalLastCommand(terminal, conversation)
 
-    requires: Terminal(conversation).status = active
+    requires: terminal.status = active
     requires: terminal.shell_integration_status = detected
-    requires: terminal.command_records is empty
+    requires: is_empty(terminal.command_records)
 
     ensures: AgentReceivesError("no commands have completed in this terminal session yet")
 }
 
 -- REQ-TERM-023: Agent reads command history (success)
 rule AgentCallsTerminalCommandHistory {
-    when: AgentCallsTerminalCommandHistory(conversation, count)
+    when: AgentCallsTerminalCommandHistory(terminal, conversation, count)
 
-    requires: Terminal(conversation).status = active
+    requires: terminal.status = active
     requires: terminal.shell_integration_status = detected
-    requires: terminal.command_records not empty
+    requires: not is_empty(terminal.command_records)
     requires: count >= 1 and count <= 5
 
-    ensures: AgentReceivesCommandRecords(terminal.command_records.last(count))
+    ensures: AgentReceivesCommandRecords(last_n(terminal.command_records, count))
         -- Returns up to `count` records newest-first. Default count = 3 when omitted.
 
     @guidance
@@ -489,9 +491,9 @@ rule AgentCallsTerminalCommandHistory {
 
 -- REQ-TERM-023: Shell integration absent — terminal_command_history returns error
 rule AgentCallsTerminalCommandHistoryAbsent {
-    when: AgentCallsTerminalCommandHistory(conversation, count)
+    when: AgentCallsTerminalCommandHistory(terminal, conversation, count)
 
-    requires: Terminal(conversation).status = active
+    requires: terminal.status = active
     requires: terminal.shell_integration_status != detected
 
     ensures: AgentReceivesError("shell integration is not active for this terminal — install the shell integration snippet to enable command tracking")
@@ -499,11 +501,11 @@ rule AgentCallsTerminalCommandHistoryAbsent {
 
 -- REQ-TERM-023: Ring buffer empty — terminal_command_history returns error
 rule AgentCallsTerminalCommandHistoryEmpty {
-    when: AgentCallsTerminalCommandHistory(conversation, count)
+    when: AgentCallsTerminalCommandHistory(terminal, conversation, count)
 
-    requires: Terminal(conversation).status = active
+    requires: terminal.status = active
     requires: terminal.shell_integration_status = detected
-    requires: terminal.command_records is empty
+    requires: is_empty(terminal.command_records)
 
     ensures: AgentReceivesError("no commands have completed in this terminal session yet")
 }
@@ -515,9 +517,13 @@ rule TerminalAbandonedWithConversation {
     -- (status enters { context_exhausted, terminal, completed, failed }).
     -- Using the named event rather than a cross-spec state-watch keeps the
     -- cross-spec contract explicit and navigable. See tasks/08658 for rationale.
-    when: bedrock/ConversationBecameTerminal(conversation)
+    when: ConversationBecameTerminal(terminal, conversation)
+    -- Subscribed to bedrock's lifecycle announcement. The implementation
+    -- wires this in the runtime executor; treated as a local event in
+    -- this spec since v3 grammar reserves `when:` triggers to local
+    -- event names.
 
-    requires: Terminal(conversation).status = active
+    requires: terminal.status = active
 
     ensures: MasterFdClosed(terminal)
         -- SIGHUP chain fires; shell exits; Task A observes EIO; waitpid() called.
@@ -534,7 +540,7 @@ rule TerminalAbandonedWithConversation {
 
 -- REQ-TERM-015 (revised): OSC 133 detection on first C marker
 rule ShellIntegrationDetected {
-    when: Osc133MarkerReceived(terminal, 'C', _payload)
+    when: Osc133MarkerReceived(terminal, "C", _payload)
 
     requires: terminal.status = active
     requires: terminal.shell_integration_status = unknown
@@ -555,7 +561,7 @@ rule ShellIntegrationDetected {
 
 -- REQ-TERM-015: detection window elapses without any marker
 rule ShellIntegrationDetectionTimedOut {
-    when: TerminalElapsedSinceSpawn(terminal) = config.shell_integration_detection_window
+    when: ShellIntegrationDetectionWindowElapsed(terminal)
 
     requires: terminal.status = active
     requires: terminal.shell_integration_status = unknown
@@ -572,7 +578,7 @@ rule ShellIntegrationDetectionTimedOut {
 
 -- REQ-TERM-016 (revised): OSC 133;C → start a command execution
 rule CommandExecutionStarted {
-    when: Osc133MarkerReceived(terminal, 'C', command_text)
+    when: Osc133MarkerReceived(terminal, "C", command_text)
 
     requires: terminal.status = active
     requires: terminal.shell_integration_status = detected
@@ -604,7 +610,7 @@ rule CommandExecutionStarted {
 
 -- REQ-TERM-016, REQ-TERM-021: OSC 133;D → finish the current command
 rule CommandExecutionFinished {
-    when: Osc133MarkerReceived(terminal, 'D', exit_code_opt)
+    when: Osc133MarkerReceived(terminal, "D", exit_code_opt)
 
     requires: terminal.status = active
     requires: terminal.shell_integration_status = detected
@@ -638,7 +644,7 @@ rule CommandExecutionFinished {
 
 -- REQ-TERM-016: OSC 133;D with no current_command → no-op
 rule CommandExecutionFinishedWithNoCurrent {
-    when: Osc133MarkerReceived(terminal, 'D', _exit_code_opt)
+    when: Osc133MarkerReceived(terminal, "D", _exit_code_opt)
 
     requires: terminal.status = active
     requires: terminal.shell_integration_status = detected
@@ -658,7 +664,7 @@ rule PromptBoundaryMarkerAccepted {
 
     requires: terminal.status = active
     requires: terminal.shell_integration_status = detected
-    requires: kind in ['A', 'B']
+    requires: kind in {"A", "B"}
 
     ensures: nothing
         -- Intentional no-op. A and B are preserved in the surface for
@@ -778,8 +784,8 @@ surface UserTerminalAccess {
         terminal.status
 
     provides:
-        UserOpensTerminal(conversation)
-            when Terminal(conversation).status = absent
+        UserOpensTerminal(terminal, conversation)
+            when terminal.status = absent
             and not conversation.is_terminal
 
         UserClosedTerminal(terminal)
@@ -790,6 +796,7 @@ surface UserTerminalAccess {
         -- The session is validated on the HTTP upgrade handshake, before
         -- the WebSocket is accepted and before any PTY is created.
         -- Mechanism: see design.md § WebSocket Authentication.
+}
 
 surface AgentTerminalAccess {
     facing agent: LlmAgent
@@ -830,19 +837,19 @@ surface ShellIntegrationProtocol {
         terminal.reported_cwd
 
     expects:
-        Osc133MarkerReceived(terminal, 'A')
+        Osc133MarkerReceived(terminal, "A")
             -- FTCS_PROMPT_START — shell is about to render a new prompt.
             -- Clears last_completed_command.
 
-        Osc133MarkerReceived(terminal, 'B')
+        Osc133MarkerReceived(terminal, "B")
             -- FTCS_COMMAND_START — prompt rendered, user input begins.
             -- Accepted for forward compatibility; no lifecycle rule uses it.
 
-        Osc133MarkerReceived(terminal, 'C', command_text)
+        Osc133MarkerReceived(terminal, "C", command_text)
             -- FTCS_COMMAND_EXECUTED — user pressed Enter; command begins.
             -- Payload is the typed command text (may be empty string).
 
-        Osc133MarkerReceived(terminal, 'D', exit_code?)
+        Osc133MarkerReceived(terminal, "D", exit_code?)
             -- FTCS_COMMAND_FINISHED — command completed.
             -- Optional payload is the exit code. None means "finished,
             -- exit code unknown"; do not substitute 0.
