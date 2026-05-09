@@ -35,8 +35,11 @@ interface StateBarProps {
   toolExecutingStartedAt?: number | null;
   /** Mobile/tablet-only: opens the file browser overlay. When omitted (e.g. on
    *  desktop where `FileExplorerPanel` provides the same affordance), the
-   *  button is not rendered. */
-  onOpenFiles?: () => void;
+   *  button is not rendered. The explicit `| undefined` is required under
+   *  `exactOptionalPropertyTypes: true`: ConversationPage's call site
+   *  assigns `undefined` from a ternary, which the strict mode rejects
+   *  without this annotation. */
+  onOpenFiles?: (() => void) | undefined;
 }
 
 /** Format a context window size in tokens for compact display (e.g. 200k, 1M). */
