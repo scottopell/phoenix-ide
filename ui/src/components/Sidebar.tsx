@@ -9,6 +9,8 @@ import { RenameDialog } from './RenameDialog';
 import { ThemeToggle } from './ThemeToggle';
 import { useTheme } from '../hooks';
 
+const PROJECT_FILTER_KEY = 'phoenix:sidebar-project-filter';
+
 const ChevronLeft = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <polyline points="15 18 9 12 15 6" />
@@ -49,12 +51,35 @@ export function Sidebar({
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
   const [renameError, setRenameError] = useState<string | undefined>();
   const [projects, setProjects] = useState<Project[]>([]);
-  const [activeProjectId, setActiveProjectId] = useState<string | null>(null);
+  const [activeProjectId, setActiveProjectIdState] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(PROJECT_FILTER_KEY);
+    } catch {
+      return null;
+    }
+  });
+  const setActiveProjectId = useCallback((id: string | null) => {
+    setActiveProjectIdState(id);
+    try {
+      if (id === null) localStorage.removeItem(PROJECT_FILTER_KEY);
+      else localStorage.setItem(PROJECT_FILTER_KEY, id);
+    } catch {
+      // storage full / disabled — degrade gracefully
+    }
+  }, []);
 
   // Fetch projects on mount
   useEffect(() => {
     api.getProjects().then(setProjects).catch(() => {});
   }, [conversations.length]); // re-fetch when conversation count changes
+
+  // Clear the persisted filter if the project no longer exists (e.g.,
+  // deleted server-side while the user was offline).
+  useEffect(() => {
+    if (activeProjectId && projects.length > 0 && !projects.some((p) => p.id === activeProjectId)) {
+      setActiveProjectId(null);
+    }
+  }, [activeProjectId, projects, setActiveProjectId]);
 
   // Filter conversations by selected project
   const filteredConversations = useMemo(() => {
