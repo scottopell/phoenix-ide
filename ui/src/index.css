@@ -6158,8 +6158,9 @@ html * {
   font-size: 12px;
 }
 
-/* --- Sidebar Inline New Form (REQ-CONV-018) --- */
-/* --- Desktop main area overrides --- */
+/* --- New Conversation Page styles (REQ-CONV-017, REQ-CONV-018) --- */
+/* The "+ New" sidebar entry navigates to /new; the page below renders
+   in the desktop main area and adapts to mobile via responsive CSS. */
 .desktop-main #app {
   height: 100%;
 }

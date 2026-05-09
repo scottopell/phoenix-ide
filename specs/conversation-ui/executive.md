@@ -27,7 +27,7 @@ Surfaces that do not yet have their own spec (TerminalPanel, TasksPanel, SkillsP
 
 ## Requirements Summary
 
-Within the scope above: a responsive interface for conversations with the AI agent across mobile and desktop. Users can view and manage conversations, compose messages with draft persistence, and monitor agent activity in real-time. The interface handles unreliable network connectivity gracefully with optimistic UI, automatic reconnection, and offline message queueing. Desktop users get a persistent sidebar layout with conversation list alongside the active chat. New conversation creation adapts to context: full-page route on desktop root, inline sidebar form when viewing a conversation, bottom sheet on mobile. All modes support "Send in Background" for spawning work without navigating away.
+Within the scope above: a responsive interface for conversations with the AI agent across mobile and desktop. Users can view and manage conversations, compose messages with draft persistence, and monitor agent activity in real-time. The interface handles unreliable network connectivity gracefully with optimistic UI, automatic reconnection, and offline message queueing. Desktop users get a persistent sidebar layout with conversation list alongside the active chat. New conversation creation goes through a single dedicated route (`/new`) regardless of entry point — sidebar "+ New" navigates there, the responsive layout inside the page adapts to viewport (full-page form on desktop, bottom-sheet styling on mobile). The form supports "Send in Background" for spawning work without navigating away from a previous conversation.
 
 ## Technical Summary
 

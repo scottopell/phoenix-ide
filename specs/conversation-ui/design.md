@@ -1,6 +1,6 @@
-# Web UI Design
+# Conversation UI Design
 
-This document describes the technical architecture implementing requirements in `specs/ui/requirements.md`.
+This document describes the technical architecture implementing requirements in `specs/conversation-ui/requirements.md`.
 
 ## Technology Stack
 
@@ -124,23 +124,30 @@ function Sidebar({ collapsed, onToggle }: SidebarProps) {
 }
 ```
 
-The "inline new form" mode (REQ-CONV-018) was originally implemented as
-an `SidebarNewForm` component embedded in the sidebar; the current
+The "inline new form" mode (REQ-CONV-018) was originally proposed as a
+`SidebarNewForm` component embedded in the sidebar; the current
 implementation routes to `/new` (a full `NewConversationPage`) regardless
 of the entry point, with mobile-specific layout switching inside that
-page. The functional outcome — a new-conversation entry point reachable
-from the sidebar without losing the active conversation — is satisfied
-by the route-based form.
+page via responsive CSS. The functional outcome — a new-conversation
+entry point reachable from the sidebar without losing the active
+conversation — is satisfied by the route-based form: the previous
+conversation remains in the React tree behind the route, so its SSE
+stream stays alive and a back-button click returns to it without a
+refetch.
 
-## New Conversation Flows (REQ-CONV-015, REQ-CONV-017, REQ-CONV-018)
+## New Conversation Flow (REQ-CONV-015, REQ-CONV-017, REQ-CONV-018)
 
-Three modes for creating conversations, all functionally equivalent:
+Every entry point — sidebar "+ New", direct URL, browser bookmark — routes
+to `/new`. The page renders the same form; responsive CSS swaps the
+layout (full-page on desktop, bottom-sheet styling on mobile).
 
-| Mode | Trigger | Location | Send Options |
-|------|---------|----------|-------------|
-| Mobile Bottom Sheet | "+ New" on mobile | Overlay on current view | Send, Send in Background |
-| Desktop Full Page | Navigate to `/` | Main content area | Send, Send in Background |
-| Desktop Inline Sidebar | "+ New" from `/c/:slug` | Top of sidebar | Send, Send in Background |
+| Trigger | Result | Notes |
+|---------|--------|-------|
+| Sidebar "+ New" while on `/c/:slug` | `navigate('/new')` | Previous conversation stays in React tree behind the route; back button restores it without refetch (REQ-CONV-018) |
+| Sidebar "+ New" while on `/` | `navigate('/new')` | Same target |
+| Sidebar "+ New" while on `/new` | No-op | Already on the form |
+| Direct navigation to `/new` | Renders `NewConversationPage` | Used for desktop full-page entry (REQ-CONV-017) |
+| Mobile "+ New" tap | `navigate('/new')` | Form layout adapts via `(max-width: 768px)` styles (REQ-CONV-015) |
 
 ### New Conversation Form (current implementation)
 

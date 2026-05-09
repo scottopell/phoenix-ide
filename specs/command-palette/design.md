@@ -24,7 +24,7 @@ The command palette is a React component with its own state machine, integrated 
 
 **Conversation data:** Already available. The app fetches conversations via `/api/conversations` and stores them in the `appMachine` XState context (`context.conversations`). The palette can read directly from this existing state—no new backend queries needed.
 
-**Conversation state:** Already exposed. Each `Conversation` object includes a `state` field with the full `ConvState` enum. The UI currently ignores this; the palette (and REQ-CONV-012 state indicators) will consume it.
+**Conversation state:** Already exposed. Each `Conversation` object includes a `state` field with the full `ConvState` enum. The conversation list already consumes it via `getConvDisplayState(conv)` to render the inline state-indicator dots (REQ-CONV-012); the palette reuses the same selector for its result rows.
 
 **Actions:** Client-side only. Actions like "New Conversation", "Archive Current" are handlers that already exist in page components. We'll extract these into a registry that the palette can query.
 
