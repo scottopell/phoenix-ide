@@ -60,7 +60,7 @@ purely-local UI flags. The state machines are formalised in
 The single-attach 409 from the backend (REQ-TERM-001) currently lands
 in `disconnected` indistinguishably from any other close reason. Spec
 target: a fifth state `conflict` with a "Reclaim" transition (see
-REQ-TPANEL-013).
+REQ-TPANEL-008).
 
 ### IntegrationDetection
 
@@ -92,7 +92,7 @@ known mirroring (see Open Questions).
   happened" slot).
 
 This machine drives the HUD's running and idle variants
-(REQ-TPANEL-006). It only runs when integration is detected; without
+(REQ-TPANEL-003). It only runs when integration is detected; without
 OSC 133, the panel cannot construct command boundaries.
 
 ### ActivitySampler
@@ -203,7 +203,8 @@ isDisconnected ? Disconnected
 
 The activity dot colour is computed independently from the same inputs
 plus the byte-activity sampler — but only when integration is absent,
-per the gating rule in REQ-TPANEL-007.
+per the rationale in REQ-TPANEL-003 (the system never makes up
+command outcomes the shell didn't report).
 
 ## Shell Integration Setup CTA
 
@@ -237,7 +238,7 @@ TerminalPanel.tsx:599-603 for the swallowed try/catch.
 
 ## Open Questions
 
-- **REQ-TPANEL-013 (409 conflict UX)**: target spec'd, implementation
+- **REQ-TPANEL-008 (409 conflict UX)**: target spec'd, implementation
   is a known gap. The reclaim flow needs a backend endpoint
   (`DELETE /api/conversations/:id/terminal` or similar) that revokes
   the existing session before this client reconnects. Coordinate with
@@ -253,7 +254,7 @@ TerminalPanel.tsx:599-603 for the swallowed try/catch.
   comment on each side pointing at the other. v1 takes option (b);
   re-evaluate when there's actual demand to change the window.
 
-- **Assist-setup error visibility (REQ-TPANEL-009)**: the `console.error`
+- **Assist-setup error visibility (REQ-TPANEL-006)**: the `console.error`
   fallback is the current implementation; the spec requires user-visible
   failure surfacing. Pick a mechanism — toast (specs/notifications/),
   modal-inline error, or banner on the panel header — and implement.

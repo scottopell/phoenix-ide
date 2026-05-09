@@ -29,9 +29,13 @@
 --     assist in flight) — these are local useState booleans with no
 --     transition graph worth modelling.
 --
--- Requirement traceability: REQ-TPANEL-002 / -004 / -005 / -007 / -013.
---   (-001, -003, -006, -008..-012 are render/lifecycle requirements
---   that don't carry a state machine.)
+-- Requirement traceability: this allium drives the user-visible
+-- behaviours in REQ-TPANEL-001 (open/use), REQ-TPANEL-002
+-- (disconnect + recover), REQ-TPANEL-003 (live command status),
+-- REQ-TPANEL-004 (cwd in header), REQ-TPANEL-006 (shell integration
+-- detection + CTA), and REQ-TPANEL-008 (conflict resolution target).
+-- REQ-TPANEL-005 (collapse + unread) and REQ-TPANEL-007 (theme) are
+-- render/lifecycle requirements with no state machine to model.
 
 ------------------------------------------------------------
 -- Config
@@ -58,7 +62,7 @@ enum WsStatus {
     connecting
     connected
     disconnected
-    -- conflict — REQ-TPANEL-013 target; not yet implemented. Today
+    -- conflict — REQ-TPANEL-008 target; not yet implemented. Today
     -- the panel folds 409 into disconnected. Adding `conflict` is the
     -- spec target for the reclaim flow.
 }
@@ -110,7 +114,7 @@ entity TerminalPanelInstance {
     activity: ActivityState
 
     -- Working directory reported via OSC 7. Falls back to the
-    -- conversation's cwd at render time when null (REQ-TPANEL-012).
+    -- conversation's cwd at render time when null (REQ-TPANEL-004).
     reported_cwd: String?
 
     -- WebSocket transitions. `connecting` is the initial post-mount
@@ -376,7 +380,7 @@ rule ReportedCwdUpdated {
 
     @guidance
         -- HUD renders reported_cwd if non-null, falls back to the
-        -- conversation's cwd prop otherwise (REQ-TPANEL-012). OSC 7
+        -- conversation's cwd prop otherwise (REQ-TPANEL-004). OSC 7
         -- arrives whenever the shell hooks chpwd; for shells without
         -- the hook, reported_cwd stays null and the static
         -- conversation cwd is shown.

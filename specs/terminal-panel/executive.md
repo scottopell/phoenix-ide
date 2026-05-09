@@ -6,20 +6,18 @@ This spec governs the **frontend `TerminalPanel.tsx` component** — the React s
 
 The companion backend spec — `specs/terminal/` — owns the PTY spawn, the WebSocket protocol, the server-side vt100 parser, the `read_terminal` agent tool, and the conversation-teardown cascade. That spec explicitly defers "UI panel placement" to the implementation; this document fills that gap.
 
-**In scope here:**
-- xterm.js mount/dispose lifecycle and theme integration
-- WebSocket connection state machine as the panel sees it
-- Browser-side OSC 133 parsing and the 5-second shell-integration detection window
-- Command lifecycle tracking (currentCommand, lastCompletedCommand)
-- HUD overlay variants (disconnected, unknown, absent, running, idle)
-- Fallback byte-activity sampler when shell integration is absent
-- Shell-integration-absent CTA: hint tooltip + snippet modal + "Let Phoenix set this up" seeded conversation
-- Collapse/expand state preservation and unread-line tracking
-- Reconnect affordance (manual, via header click)
-- OSC 7 cwd reporting and HUD fallback
+**In scope here (user-facing experiences):**
+- The terminal experience: connecting, typing into a real shell, seeing output as if I'd opened a local terminal
+- Knowing whether the terminal is alive, and recovering when it isn't (without losing the rest of my conversation)
+- Live command status: what's running, what just finished and how
+- The current working directory in the header, tracking `cd` when shell integration supports it
+- Output that survives across collapse/expand, with an unread hint when something happened while I was away
+- Being told when shell integration is missing, with a concrete path to enable it (snippet, copy, or a guided conversation)
+- A theme that matches the rest of the app
+- A specific recovery path when the same terminal is open in another tab — not a silent take-over
 
 **Owned by other specs:**
-- `specs/terminal/` — PTY lifecycle, WebSocket protocol, OSC 133 marker semantics on the server side, agent tools, single-attach 409 enforcement
+- `specs/terminal/` — the backend PTY session, WebSocket protocol, OSC marker semantics on the server side, the `read_terminal` agent tool, single-attach 409 enforcement
 - `specs/seeded-conversations/` — the route + draft-prefill mechanism the assist-setup CTA uses
 - `specs/conversation-ui/` — the parent layout that hosts the panel
 - `specs/keyboard-interaction/` — global keyboard shortcuts (panel doesn't define its own)
@@ -30,34 +28,31 @@ Phoenix's backend gives the agent and the user a real PTY-backed terminal per co
 
 ## Status Summary
 
+Status is per user-visible outcome. Code anchors point at the implementation that delivers each outcome — see `design.md` for the architecture across xterm.js, the WebSocket client, OSC parsing, and the HUD render.
+
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-TPANEL-001:** xterm.js Lifecycle & Container Management | ✅ Complete | `ui/src/components/TerminalPanel.tsx:341-359` (mount with FitAddon), `:596-607` (dispose) |
-| **REQ-TPANEL-002:** WebSocket Connection Lifecycle | ✅ Complete | `:481-547` (state transitions); single-attach conflict handling is incomplete — see REQ-TPANEL-013 |
-| **REQ-TPANEL-003:** Binary Frame Protocol | ✅ Complete | `:131-146` (encode/decode 0x00 data + 0x01 resize) |
-| **REQ-TPANEL-004:** OSC 133 Shell Integration Detection | ✅ Complete | `:123` (5s window const), `:365-387` (detected path), `:472-478` (timeout → absent), monotonic lock at `:366-369,390` |
-| **REQ-TPANEL-005:** Command Lifecycle Tracking | ✅ Complete | `:399-444` (OSC 133 A/B/C/D parse), `:268-273` (currentCommand + lastCompletedCommand state) |
-| **REQ-TPANEL-006:** HUD Overlay — Five Variants | ✅ Complete | `:789-873` (renderCollapsedHud); five paths: disconnected / unknown / absent / running / idle |
-| **REQ-TPANEL-007:** Fallback Byte-Activity Sampler | ✅ Complete | `:519-526` (500ms decay), gated on `integrationStatus !== 'detected'` per `:506-508` |
-| **REQ-TPANEL-008:** Shell Integration Absent-State CTA | ✅ Complete | Hint tooltip `:904-913`; snippet modal `:933-999`; copy + assist actions `:746,750-755,768-783` |
-| **REQ-TPANEL-009:** Seeded Conversation for Assist Setup | 🚧 Partial | `:184-225` builds the prompt, `:768-783` invokes the parent callback. Errors currently surface only to `console.error` — a user-visible toast is missing |
-| **REQ-TPANEL-010:** Theme Integration via CSS Variables | ✅ Complete | `:70-81` (read), `:343` (apply on mount), `:628-633` (re-apply on theme toggle) |
-| **REQ-TPANEL-011:** Collapse/Expand Preservation & Unread Tracking | ✅ Complete | `:299-301,930` (display:none preserves PTY/WS/scrollback); unread counter `:500-505,664-670,921-925` |
-| **REQ-TPANEL-012:** OSC 7 CWD Reporting | ✅ Complete | `:456` (parse), `:732` (HUD fallback to conversation cwd) |
-| **REQ-TPANEL-013:** Single-Attach Conflict Resolution (409) | ❌ Not Started | Backend rejects duplicate connections with 409 (REQ-TERM-001 / -003); frontend currently treats this as a generic connection error. Spec target: detect the 409 close code and offer a "Reclaim this terminal" action (or equivalent) instead of a silent retry loop |
+| **REQ-TPANEL-001:** Open and Use a Terminal | ✅ Complete | `ui/src/components/TerminalPanel.tsx:341-359` (xterm + FitAddon mount), `:481-547` (WebSocket I/O), `:131-146` (binary frame protocol), `:636-653` (resize handling) |
+| **REQ-TPANEL-002:** Disconnect Is Visible, Recovery Is Explicit | ✅ Complete | `:539-547` (disconnect state), `:790-797` (Disconnected HUD with click-to-reconnect), `:618-620` (reconnect bumps nonce, fresh PTY); explicit no-auto-retry policy |
+| **REQ-TPANEL-003:** Live Command Status in the Header | ✅ Complete | `:789-873` (HUD render across 5 variants), `:399-444` (OSC 133 A/B/C/D parse driving running/idle), `:519-526` (500ms byte-activity decay for the absent-integration fallback) |
+| **REQ-TPANEL-004:** Current Working Directory in the Header | ✅ Complete | `:456` (OSC 7 parse), `:732` (fallback to conversation cwd at render time) |
+| **REQ-TPANEL-005:** Output Survives Collapse, with Unread Hint | ✅ Complete | `:299-301,930` (display:none preserves PTY/WS/scrollback), `:500-505,664-670,921-925` (unread counter) |
+| **REQ-TPANEL-006:** Shell Integration Setup CTA | 🚧 Partial | Detection + hint + snippet modal complete (`:123,365-387,472-478,904-913,933-999`); the "Let Phoenix set this up" hand-off works (`:184-225,768-783`) but failures surface only via `console.error` instead of a user-visible toast |
+| **REQ-TPANEL-007:** Theme Matches the App | ✅ Complete | `:70-81` (read CSS vars), `:343` (apply on mount), `:628-633` (re-apply on theme toggle, no PTY teardown) |
+| **REQ-TPANEL-008:** Conflict Resolution When Already Open Elsewhere | ❌ Not Started | Backend rejects duplicate connections with 409 (REQ-TERM-001 / -003); frontend folds this into a generic "Connection error" today (`:539-547`) with no reclaim path. Spec target: distinguish the 409 close code and offer a "Reclaim this terminal" action |
 
-**Progress:** 11 of 13 complete, 1 partial, 1 not started. Implementation surface is mature; the gaps are in error visibility (REQ-TPANEL-009) and the unmodelled 409-conflict UX (REQ-TPANEL-013).
+**Progress:** 6 of 8 complete, 1 partial, 1 not started. The two gaps are visible-error surfacing in REQ-TPANEL-006 (one mechanism away from done) and the unmodelled conflict UX in REQ-TPANEL-008 (needs a backend reclaim endpoint coordinated with `specs/terminal/`).
 
 ## Behavioural Specification
 
-`specs/terminal-panel/terminal-panel.allium` models the four state machines that interact inside the panel:
+`specs/terminal-panel/terminal-panel.allium` models the four state machines that produce the user-visible behaviour above:
 
-- `WebSocketLifecycle`: `not_connected → connecting → connected → {disconnected}`. Disconnected is a terminal state until `reconnect()` is invoked, which increments a nonce and forces a fresh `not_connected` instance.
-- `IntegrationDetection`: `unknown → detected | absent` (monotonic; 5s window).
-- `CommandTracker`: `idle → running → completed`, fed by OSC 133 A/B/C/D markers.
-- `ActivitySampler`: `idle ↔ running`, fed by raw byte arrival; gated off when integration is `detected` (HUD uses CommandTracker instead) and locked to `disconnected` once the WS closes until the next nonce-bumped reconnect.
+- `WebSocketLifecycle` — drives REQ-TPANEL-001 (open and use) and REQ-TPANEL-002 (disconnect visibility + recovery). Disconnected is sticky until reconnect; no auto-retry, by design.
+- `IntegrationDetection` — drives REQ-TPANEL-006 (shell integration missing → CTA). Monotonic: once a 5-second window has settled to detected or absent, that state is final for the connection lifetime.
+- `CommandTracker` — drives REQ-TPANEL-003 (running command + last completed command). Fed by OSC 133 A/B/C/D markers from the shell.
+- `ActivitySampler` — fallback HUD source when `IntegrationDetection = absent`; the byte-arrival heuristic that produces the coarser "shell is producing output" / "shell is quiet" indicator REQ-TPANEL-003 references in its rationale.
 
-Open questions: see REQ-TPANEL-013 (409 conflict resolution) and the rationale block on `IntegrationDetectionWindowMirrored` (the 5-second window is hard-coded on both sides; a backend change would silently desynchronise).
+Open questions: see REQ-TPANEL-008 (409 conflict resolution) and the design.md note on the 5-second detection window being hard-coded on both sides (a backend change would silently desynchronise).
 
 ## Cross-Spec Cross-References
 
