@@ -1,0 +1,511 @@
+-- allium: 3
+-- viewer_slot.allium
+--
+-- Phoenix Conversation Viewer Slot: Behavioural Specification
+--
+-- Scope: The single-slot, user-action-driven viewer system that overlays
+--        or sits beside a conversation's chat column. Governs which
+--        viewer is open (prose / diff / browser), the data each viewer
+--        carries, and the mutex rules between them.
+-- Includes: Open / close transitions, browser-session edge auto-open
+--           and auto-close, conversation-change reset, the URL contract
+--           that lets a cold reload (iOS PWA kill, refresh) restore the
+--           exact viewer + data the user was looking at.
+-- Excludes:
+--   - Phase-driven overlays (TaskApprovalReader, QuestionPanel,
+--     ErrorBanner, CredentialHelperPanel, ContextExhaustedBanner,
+--     TerminalBanner). These layer ON TOP of the viewer slot per
+--     bedrock's phase transitions; they are not part of the slot's
+--     mutex. See bedrock.allium for their entry/exit triggers.
+--   - The chat column itself, the conversation atom, and any phase
+--     state. See bedrock.allium / conversation_atom.allium.
+--   - Responsive layout decisions (overlay vs full-screen vs
+--     split-pane based on viewport). The spec governs WHAT is open;
+--     CSS + ConversationPage decide HOW it's rendered. The slot is
+--     the same regardless of layout.
+--   - Per-viewer presentation: ProseReader's annotation/notes
+--     subsystem, DiffView's commit log rendering, BrowserViewPanel's
+--     CDP wire protocol. Viewers fetch their own payloads on mount.
+--   - The mobile FileBrowserOverlay (a file-picker drawer that lets
+--     the user choose a file to open). It is NOT a viewer; selecting
+--     a file from it transitions the slot to prose. The drawer's open
+--     state is component-local UI affordance, out of scope here.
+--
+-- Architecture: the slot is a discriminated union -- `kind` selects
+--   exactly one of {none, prose, diff, browser}, and the data each
+--   variant carries lives only in the variant that needs it. This
+--   makes "prose open without a file path" or "diff open without a
+--   comparator" structurally unrepresentable.
+--
+--   The URL is the source of truth. Search params encode the slot:
+--     ?viewer=prose&file=<absolute-path>&root=<absolute-path>
+--     ?viewer=diff&commit=<sha>&base=<ref>
+--     ?viewer=browser
+--   patchContext (modifiedLines: Set<Integer>) rides alongside in
+--   conversation-scoped state, not in the URL -- it is patch-
+--   provenance, not view identity. Loss on cold reload is acceptable.
+--
+-- Requirement traceability: REQ-VS-001 through REQ-VS-013
+
+use "./bedrock.allium" as bedrock
+
+-- Note: the URL search params are the persistence medium for the
+-- slot; the spec governs which params correspond to which slot
+-- state. Today the implementation reads/writes via react-router's
+-- useSearchParams in FileExplorerProvider; this widens to the
+-- unified slot provider per REQ-VS-002. URL access is described
+-- in the entity comment and @guidance blocks rather than modelled
+-- as a typed external entity -- the slot's state IS the URL truth,
+-- so a separate Url entity would be a parallel representation.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Identity of an open file in the prose reader. `path` is absolute;
+-- `root_dir` is the conversation's working directory and gates how
+-- the file is resolved server-side. patchContext is intentionally
+-- separate (see Entities below) -- it is provenance, not identity.
+value ProseFile {
+    path: String        -- non-empty, absolute
+    root_dir: String    -- non-empty, absolute
+}
+
+-- Identifier for what the diff viewer is showing. The full diff
+-- payload (committed_diff, uncommitted_diff, commit_log,
+-- truncation flags) is server-fetched on viewer mount and is NOT
+-- part of slot state -- two reasons: it is too large for a URL,
+-- and it is pure server data that re-fetches cheaply.
+value DiffComparator {
+    -- Free-form key the server understands. Today: a comparator
+    -- string ("HEAD..base", "<sha>..<sha>", etc.). Treated opaquely
+    -- by the slot; the diff endpoint owns its grammar.
+    key: String         -- non-empty
+}
+
+-- Patch provenance for an open prose file. Set when the user opens
+-- the file from a patch context (clicking a modified file in a
+-- message's patch summary). Drives the auto-scroll-to-first-modified-
+-- line affordance and the per-line "modified" highlight. NOT in the
+-- URL: cannot encode Set<Integer> sensibly, and re-deriving from the
+-- triggering message is cheaper than encoding it. Loss on cold
+-- reload is acceptable -- the file still opens, just without the
+-- highlights.
+value PatchContext {
+    modified_lines: Set<Integer>      -- non-empty
+    first_modified_line: Integer?     -- target for auto-scroll
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The four kinds of slot state. Encoded in URL as ?viewer=<kind>.
+-- `none` corresponds to "no ?viewer= param present."
+enum ViewerKind { none | prose | diff | browser }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The viewer slot for one conversation. There is exactly one per
+-- active Conversation (conversation row, not browser tab). The
+-- slot's state is derived from the URL on every render -- the
+-- in-memory representation is a cache of url-driven truth, never
+-- a source.
+entity ViewerSlot {
+    conversation: bedrock/Conversation
+
+    -- Discriminator. The variants below carry the per-kind data.
+    kind: ViewerKind
+
+    -- Variant data, scoped to the matching kind by `when` clauses.
+    -- These are non-null when the discriminator is set; the type
+    -- system enforces they are absent otherwise.
+    prose_file: ProseFile when kind = prose
+    diff_key:   DiffComparator when kind = diff
+    -- browser variant carries no data; conversation.browser_session_active
+    -- is the authoritative liveness signal.
+
+    -- patchContext is conversation-scoped, NOT slot-scoped: it
+    -- accompanies the prose file when set, but is preserved across
+    -- close-and-reopen of the same file within a conversation.
+    -- (Today: lives in FileExplorerContext's useScopedState, keyed by
+    -- conversation slug.) When the URL hydrates a file path on cold
+    -- reload, patchContext is null and the prose reader renders the
+    -- file without modified-line highlights. Spec'd as "may be present"
+    -- so the rule set covers both cases.
+    patch_context: PatchContext? when kind = prose
+
+    -- Slot transitions. Any kind can move to any other kind in one
+    -- step (user opens a file while diff was showing, etc.); none is
+    -- the start state and the universal close target.
+    transitions kind {
+        none   -> prose
+        none   -> diff
+        none   -> browser
+        prose  -> none
+        prose  -> diff
+        prose  -> browser
+        diff   -> none
+        diff   -> prose
+        diff   -> browser
+        browser -> none
+        browser -> prose
+        browser -> diff
+    }
+}
+
+------------------------------------------------------------
+-- Events (referenced inline by rules; not declared separately)
+------------------------------------------------------------
+
+-- User-driven events: clicking a file row, a View Diff button, the
+-- browser launcher, or the close button on the active viewer.
+--   UserOpensProse(slot, file, patch?)
+--   UserOpensDiff(slot, key)
+--   UserOpensBrowser(slot)
+--   UserClosesViewer(slot)
+--
+-- URL-driven event: the URL search params changed (back button,
+-- shared link click, programmatic navigate). Distinguished from
+-- UserOpens* because it is the same transition without the event
+-- having a single user click as its cause -- it might be route-
+-- restoration on mount, browser back, or another tab's pushState
+-- via storage events. Treating it as one event keeps the rule set
+-- tight; the implementation reads the URL once and dispatches.
+--   UrlSlotChanged(slot, next_kind, next_prose_file?, next_diff_key?)
+--
+-- Server-driven events: bedrock's Conversation.browser_session_active
+-- transitioned. The slot listens for the rising edge to auto-open
+-- (when slot is empty) and the falling edge to auto-close (when
+-- slot = browser). See REQ-VS-008 / REQ-VS-009.
+--   BrowserSessionActiveRose(slot)
+--   BrowserSessionActiveFell(slot)
+--
+-- Conversation navigation: the user navigated to a different
+-- conversation (slug change). The slot resets because URL params
+-- naturally don't survive a different /c/:slug path. Captured as
+-- an explicit event for clarity.
+--   ConversationChanged(slot)
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+-- ===========================================================
+-- VS 1. OPENING A VIEWER (REQ-VS-001, REQ-VS-002, REQ-VS-003)
+-- ===========================================================
+
+-- @guidance
+--   Opening any viewer is a write-through to the URL: the
+--   implementation calls setSearchParams({ viewer, ... }, { replace: true }).
+--   `replace` (vs push) keeps the back-button stack clean -- a user
+--   clicking through five files shouldn't accumulate five history
+--   entries. The slot's kind transition is computed from the URL on
+--   the next render, NOT mutated directly.
+rule UserOpensProseFile {
+    when: UserOpensProse(slot, file, patch?)
+    requires: not slot.conversation.is_terminal  -- no point opening a viewer on a terminal conversation; UI gates this too
+    ensures: slot.kind = prose
+    ensures: slot.prose_file = file
+    ensures: slot.patch_context = patch
+    -- Implicitly clears diff_key: the type system enforces
+    -- diff_key absent when kind != diff.
+}
+
+rule UserOpensDiffComparator {
+    when: UserOpensDiff(slot, key)
+    requires: not slot.conversation.is_terminal
+    ensures: slot.kind = diff
+    ensures: slot.diff_key = key
+}
+
+rule UserOpensBrowserViewer {
+    when: UserOpensBrowser(slot)
+    requires: slot.conversation.browser_session_active
+    -- The browser launcher button is gated on browser_session_active
+    -- in the UI; the spec rule reflects that gate. A user "opening"
+    -- the browser without an active session is a UI bug, not a
+    -- transition we need to model.
+    ensures: slot.kind = browser
+}
+
+-- ===========================================================
+-- VS 2. CLOSING A VIEWER (REQ-VS-004)
+-- ===========================================================
+
+rule UserClosesActiveViewer {
+    when: UserClosesViewer(slot)
+    requires: slot.kind != none
+    ensures: slot.kind = none
+    -- Variant data (prose_file, diff_key) is structurally cleared
+    -- by the kind transition.
+}
+
+-- ===========================================================
+-- VS 3. URL HYDRATION (REQ-VS-005, REQ-VS-006)
+-- ===========================================================
+
+-- @guidance
+--   These rules describe what happens when the URL is the trigger,
+--   not user click: page mount with non-empty search params (cold
+--   reload), browser back/forward, or a shared link being followed.
+--   The implementation listens to react-router's useSearchParams;
+--   the spec sees only the resulting transition.
+--
+--   patch_context is NOT in the URL -- on URL-driven hydration of
+--   prose, it is null. The prose reader still mounts; the file
+--   loads; the user just doesn't see the modified-line highlights.
+--   This is the correct trade for cold-reload restoration: keep
+--   identity (file path), drop ephemeral provenance (which lines
+--   were modified by the message that opened it).
+rule UrlHydratesNone {
+    when: UrlSlotChanged(slot, none, _, _)
+    ensures: slot.kind = none
+}
+
+rule UrlHydratesProse {
+    when: UrlSlotChanged(slot, prose, file, _)
+    requires: file != null
+    ensures: slot.kind = prose
+    ensures: slot.prose_file = file
+    ensures: slot.patch_context = null
+}
+
+rule UrlHydratesDiff {
+    when: UrlSlotChanged(slot, diff, _, key)
+    requires: key != null
+    ensures: slot.kind = diff
+    ensures: slot.diff_key = key
+}
+
+rule UrlHydratesBrowser {
+    when: UrlSlotChanged(slot, browser, _, _)
+    -- No requires on browser_session_active here: the URL might
+    -- restore ?viewer=browser after the session has died. The viewer
+    -- mount path renders an "ended" state when active=false; spec'd
+    -- as: the slot kind reflects URL truth even if the underlying
+    -- session is gone. The auto-close rule (REQ-VS-009) catches the
+    -- subsequent server signal.
+    ensures: slot.kind = browser
+}
+
+-- Defensive: the URL has ?viewer=prose but no file param (or vice
+-- versa). The implementation should normalize this away (treat as
+-- ?viewer=none), and the spec asserts this normalization rule for
+-- correctness.
+rule UrlMalformedNormalizesToNone {
+    when: UrlSlotChanged(slot, kind, file, key)
+    requires: (kind = prose and file = null)
+              or (kind = diff and key = null)
+    ensures: slot.kind = none
+    ensures: UrlNormalizationRequested(slot)  -- triggers a setSearchParams clearing the bogus params
+}
+
+-- ===========================================================
+-- VS 4. BROWSER SESSION EDGE TRIGGERS (REQ-VS-008, REQ-VS-009)
+-- ===========================================================
+
+-- @guidance
+--   browser_session_active is server-authoritative and lives on the
+--   Conversation entity (see bedrock.allium). Rising edge means a
+--   tool just spawned a browser session for this conversation;
+--   surface it. Falling edge means the session died (kill, idle
+--   cleanup); don't leave the user staring at a stale "no browser
+--   yet" overlay.
+--
+--   IMPORTANT: this is a ONE-WAY auto-open on the rising edge ONLY.
+--   A cold reload that mounts with browser_session_active = true
+--   does NOT auto-open the browser viewer; the spec relies on the
+--   URL being authoritative for that case. If the user wants the
+--   browser viewer back after a reload, the URL must say so. The
+--   ConversationPage launcher button is the manual entry point.
+rule BrowserSessionRoseAutoOpensSlot {
+    when: BrowserSessionActiveRose(slot)
+    requires: slot.kind = none
+    ensures: slot.kind = browser
+}
+
+-- @guidance: when the rising edge fires while slot.kind != none,
+-- no rule applies -- the user has prose or diff open and we do
+-- not steal their viewer. The launcher chip (rendered by
+-- ConversationPage when browser_session_active is true) is the
+-- manual entry point.
+
+rule BrowserSessionFellAutoClosesSlot {
+    when: BrowserSessionActiveFell(slot)
+    requires: slot.kind = browser
+    ensures: slot.kind = none
+}
+
+-- @guidance: when the falling edge fires while slot.kind != browser,
+-- no rule applies -- the slot doesn't change. The launcher chip
+-- naturally disappears because it's driven by
+-- conversation.browser_session_active, not by slot.kind.
+
+-- ===========================================================
+-- VS 5. CONVERSATION SWITCH (REQ-VS-010)
+-- ===========================================================
+
+-- @guidance
+--   When the user navigates from /c/A to /c/B, the URL path changes;
+--   search params are NOT carried (react-router's navigate() drops
+--   them by default). Even if they were, conversation B's slot
+--   should not inherit conversation A's viewer -- a file path from
+--   A's worktree won't resolve under B's worktree. The spec captures
+--   this as an explicit reset.
+--
+--   patch_context, which is conversation-scoped state (NOT URL-
+--   driven), is also cleared on conversation change. The
+--   FileExplorerProvider's useScopedState handles this in the
+--   implementation.
+rule ConversationChangeResetsSlot {
+    when: ConversationChanged(slot)
+    ensures: slot.kind = none
+}
+
+-- ===========================================================
+-- VS 6. PROSE PATCH CONTEXT (REQ-VS-011)
+-- ===========================================================
+
+-- @guidance
+--   Opening a file with a patch context vs without: same kind=prose
+--   transition; the patch_context field captures the difference.
+--   Re-opening the same file with a NEW patch context (e.g. user
+--   clicks a different message that touched the same file) replaces
+--   the previous patch_context atomically.
+--
+--   On URL-driven hydration of prose, patch_context is null (see
+--   UrlHydratesProse). It can only be populated by a UserOpensProse
+--   event that carries one.
+rule ProseOpenWithPatchContext {
+    when: UserOpensProse(slot, file, patch)
+    requires: patch != null
+    ensures: slot.kind = prose
+    ensures: slot.prose_file = file
+    ensures: slot.patch_context = patch
+}
+
+rule ProseOpenWithoutPatchContext {
+    when: UserOpensProse(slot, file, patch?)
+    requires: patch = null
+    ensures: slot.kind = prose
+    ensures: slot.prose_file = file
+    ensures: slot.patch_context = null
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The user surface for the viewer slot. Reuses bedrock/User as the
+-- actor because the viewer is a feature of the same authenticated
+-- conversation experience -- not a separate persona.
+--
+-- This surface declares the user-driven events; URL-driven and
+-- server-driven events (UrlSlotChanged, BrowserSessionActiveRose,
+-- BrowserSessionActiveFell, ConversationChanged) are implicit, the
+-- same way bedrock leaves ServerRestarted implicit -- they are
+-- system signals, not user actions.
+surface ConversationViewer {
+    facing user: bedrock/User
+
+    context slot: ViewerSlot
+
+    exposes:
+        slot.kind
+        slot.prose_file when slot.kind = prose
+        slot.diff_key when slot.kind = diff
+
+    provides:
+        UserOpensProse(slot, file, patch?)
+            when not slot.conversation.is_terminal
+        UserOpensDiff(slot, key)
+            when not slot.conversation.is_terminal
+        UserOpensBrowser(slot)
+            when slot.conversation.browser_session_active
+        UserClosesViewer(slot)
+            when slot.kind != none
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- @invariant VariantDataPresence
+--   prose_file is set iff kind = prose; diff_key is set iff kind =
+--   diff. The `when kind = ...` annotations on the entity fields
+--   are the structural enforcement; this invariant restates the
+--   contract for spec consumers (and gives `allium analyse` a
+--   target to verify against the rule set).
+invariant ProseDataPresentIffProseKind {
+    for s in ViewerSlot:
+        (s.kind = prose) implies (s.prose_file != null)
+}
+
+invariant ProseDataAbsentWhenNotProseKind {
+    for s in ViewerSlot:
+        (s.kind != prose) implies (s.prose_file = null)
+}
+
+invariant DiffDataPresentIffDiffKind {
+    for s in ViewerSlot:
+        (s.kind = diff) implies (s.diff_key != null)
+}
+
+invariant DiffDataAbsentWhenNotDiffKind {
+    for s in ViewerSlot:
+        (s.kind != diff) implies (s.diff_key = null)
+}
+
+-- @invariant PatchContextOnlyDuringProse
+--   patch_context can only be populated when kind = prose. Otherwise
+--   it is null. (The `when kind = prose` annotation enforces this
+--   structurally.)
+invariant PatchContextOnlyDuringProse {
+    for s in ViewerSlot:
+        (s.patch_context != null) implies (s.kind = prose)
+}
+
+-- SingleSlotKind is enforced structurally by the enum -- kind is
+-- a single field with values in { none, prose, diff, browser }.
+-- An invariant restating this would be tautological.
+
+-- UrlIsSourceOfTruth is documented in the entity comment and the
+-- @guidance blocks on the rules; it is an implementation contract
+-- (URL → state derivation runs every render) rather than a model
+-- invariant Allium can check, so it lives in prose. The
+-- corresponding test obligation: every transition that changes
+-- slot.kind has a sibling test that asserts the URL matches.
+
+------------------------------------------------------------
+-- Implementation Notes (non-normative)
+------------------------------------------------------------
+
+-- Today's implementation has the slot SPLIT across three sources of
+-- truth:
+--   - prose: URL via FileExplorerProvider (REQ-VS land in PR #47)
+--   - diff:  scoped React state via DiffViewerStateProvider
+--   - browser: scoped React state via BrowserViewStateProvider
+--
+-- The mutex rules (UserOpens* sets one and clears the others) are
+-- enforced by useEffects in ConversationPage.tsx -- three separate
+-- effects watching for the "two are open" condition and closing the
+-- losing one. This is what makes the current implementation fragile:
+-- adding a fourth viewer or changing the priority order requires
+-- editing N effects, and the "no two open at once" rule lives in
+-- imperative code rather than the type system.
+--
+-- The unified-slot work (task TBD) collapses these three providers
+-- into one. The state shape becomes the discriminated union spec'd
+-- above; the URL contract widens to ?viewer= covering all three
+-- kinds; the mutex effects in ConversationPage.tsx are deleted
+-- (replaced by the type system); and diff and browser join prose in
+-- surviving cold reload.
+--
+-- Test coverage for the migration: every transition in `transitions
+-- kind` should have a corresponding vitest case driving the URL and
+-- asserting the slot. The bedrock.allium spec's `transitions
+-- core_status` list serves the same generative purpose for the
+-- backend reducer.
