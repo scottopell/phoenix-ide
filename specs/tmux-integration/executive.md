@@ -97,21 +97,21 @@ implementation is unblocked.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-TMUX-001:** Per-Conversation Tmux Server (Socket Isolation) | ❌ Not Started | `-S <absolute-path>` selector |
-| **REQ-TMUX-002:** Lazy Server Spawn | ❌ Not Started | Triggered by tmux tool call OR terminal open |
-| **REQ-TMUX-003:** `tmux` Agent Tool — Pure Pass-Through | ❌ Not Started | New tool, pass-through dispatch |
-| **REQ-TMUX-004:** In-App Terminal Auto-Attaches When Tmux Available | ❌ Not Started | Modifies `src/terminal/spawn.rs` argv selection; single-attach constraint preserved |
-| **REQ-TMUX-005:** Server Survives Phoenix Process Restart | ❌ Not Started | Probe-based; no in-memory state to persist |
-| **REQ-TMUX-006:** Stale Socket Detection (System Reboot Recovery) | ❌ Not Started | Silent unlink + respawn (no breadcrumb) |
-| **REQ-TMUX-007:** Server Termination on Conversation Hard-Delete | ❌ Not Started | Cascade handler |
-| **REQ-TMUX-008:** Conversation Soft-State Does Not Affect Server | ❌ Not Started | Explicit no-op |
-| **REQ-TMUX-009:** Tool Description Communicates Two-Tier Persistence Model | ❌ Not Started | Static text in tool description |
-| **REQ-TMUX-010:** Tool Cancellation and Output Limits | ❌ Not Started | Timeout, cancellation, middle-truncate |
-| **REQ-TMUX-011:** Tool Surface Hardening — Phoenix-Injected Flag Authority | ❌ Not Started | Argument-list ordering |
-| **REQ-TMUX-012:** Output Capture Format | ❌ Not Started | Separate stdout/stderr response shape |
-| **REQ-TMUX-013:** Stateless Tool with Per-Conversation Server Registry | ❌ Not Started | Mirrors bash + browser registry patterns; matches `ctx.browser()` accessor shape |
+| **REQ-TMUX-001:** Per-Conversation Tmux Server (Socket Isolation) | ✅ Complete | `TmuxRegistry` + `TmuxServer` in `crates/phoenix-ide/src/tools/tmux/registry.rs`; deterministic socket path resolution at `tools.rs:142-143` and `runtime.rs:72` |
+| **REQ-TMUX-002:** Lazy Server Spawn | ✅ Complete | `ensure_live()` triggered by tmux tool call AND terminal open (`terminal/ws.rs:319-321`) |
+| **REQ-TMUX-003:** `tmux` Agent Tool — Pure Pass-Through | ✅ Complete | `crates/phoenix-ide/src/tools/tmux.rs:3-5` (module header anchors) + `tools/tmux/invoke.rs` dispatch |
+| **REQ-TMUX-004:** In-App Terminal Auto-Attaches When Tmux Available | ✅ Complete | `crates/phoenix-ide/src/terminal/spawn.rs:3,27,51,283`; argv branching done before fork; outer-tmux nesting refusal handled |
+| **REQ-TMUX-005:** Server Survives Phoenix Process Restart | ✅ Complete | Probe-based reattach in `tools/tmux/probe.rs`; reused on operation per `terminal/ws.rs:319-322` |
+| **REQ-TMUX-006:** Stale Socket Detection (System Reboot Recovery) | ✅ Complete | `tools/tmux/probe.rs:3` (DeadSocket path); silent unlink + respawn |
+| **REQ-TMUX-007:** Server Termination on Conversation Hard-Delete | ✅ Complete | `runtime.rs:511-515` exposes registry to bedrock cascade; wired alongside bash + projects per REQ-BED-032 |
+| **REQ-TMUX-008:** Conversation Soft-State Does Not Affect Server | ✅ Complete | Implicit (no soft-delete hook exists for tmux registry); soft-archive paths in `runtime.rs` do not touch `tmux_registry` |
+| **REQ-TMUX-009:** Tool Description Communicates Two-Tier Persistence Model | ✅ Complete | Tool description text at `tools.rs:326` (referenced by `tools/tmux.rs:3`) |
+| **REQ-TMUX-010:** Tool Cancellation and Output Limits | ✅ Complete | `tools/tmux/invoke.rs:6-18,53` — timeout default + max, middle-truncate at 128 KB |
+| **REQ-TMUX-011:** Tool Surface Hardening — Phoenix-Injected Flag Authority | ✅ Complete | `tools/tmux.rs:169` — `-S <conv-sock>` prepended; agent args not parsed/rewritten |
+| **REQ-TMUX-012:** Output Capture Format | ✅ Complete | Separate stdout/stderr in response; wire shape at `api/wire.rs:880` (`TmuxToolResponse`) + `tools/tmux/invoke.rs:3` |
+| **REQ-TMUX-013:** Stateless Tool with Per-Conversation Server Registry | ✅ Complete | `runtime/executor.rs:82` (registry in `ToolContext`); accessor shape mirrors `ctx.browser()` and `ctx.bash_handles()` |
 
-**Progress:** 0 of 13 implemented; greenfield spec.
+**Progress:** 13 of 13 complete.
 
 ## Behavioural Specification
 

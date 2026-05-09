@@ -42,13 +42,17 @@ use a mid-tier model balanced for cost and accuracy.
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-CHN-001:** Recall Past Work Without Re-Explaining Context | ❌ Not Started | Headline benefit; satisfied by REQ-CHN-004 (Q&A backend) atop REQ-CHN-002 (chain identity) |
-| **REQ-CHN-002:** Continuation Chains Surface as First-Class Entities | ❌ Not Started | Sidebar nesting + chain identity; derived from `continued_in_conv_id` |
-| **REQ-CHN-003:** Chain Page as a Navigable Place | ❌ Not Started | New route `/chains/:rootConvId`; deep-linkable |
-| **REQ-CHN-004:** Ask the Chain, Get a Streamed Answer | ❌ Not Started | Mid-tier model; reuses SSE token-stream infrastructure |
-| **REQ-CHN-005:** Q&A History Persists Per Chain | ❌ Not Started | New `chain_qa` table with `status` enum and integer snapshot counters |
-| **REQ-CHN-006:** Consistent Quality As Q&A Accumulates | ❌ Not Started | Stateless per-question invocation; no prior Q&A in context; visual independence on the Q&A panel |
-| **REQ-CHN-007:** Chain Has a User-Editable Name | ❌ Not Started | New nullable `conversations.chain_name`; defaults to root title |
+| **REQ-CHN-001:** Recall Past Work Without Re-Explaining Context | ✅ Complete | Headline benefit; system-prompt + bundling at `crates/phoenix-ide/src/chain_qa.rs:43,569`; backend at `api.rs:43` |
+| **REQ-CHN-002:** Continuation Chains Surface as First-Class Entities | ✅ Complete | `db.rs:2771-2837` (`chain_members_forward`, `chain_root_of`); chain identity derived from existing `continued_in_conv_id` graph |
+| **REQ-CHN-003:** Chain Page as a Navigable Place | ✅ Complete | `api/chains.rs:1,78,96`; route registered at `api/handlers.rs:137` |
+| **REQ-CHN-004:** Ask the Chain, Get a Streamed Answer | ✅ Complete | `chain_runtime.rs:1` (broadcaster), `chain_qa.rs:1`, wire at `api/wire.rs:449` |
+| **REQ-CHN-005:** Q&A History Persists Per Chain | ✅ Complete | `chain_qa` table CRUD at `db.rs:2909-3008`; status enum + snapshot counters at `chain_qa.rs:145,323,520`; startup sweep `db.rs:1014` |
+| **REQ-CHN-006:** Consistent Quality As Q&A Accumulates | ✅ Complete | Stateless per-question invocation `chain_qa.rs:29,38,384`; `chain_qa_id` demux `chain_runtime.rs:8`, `api/chains.rs:119`, `api/wire.rs:463` |
+| **REQ-CHN-007:** Chain Has a User-Editable Name | ✅ Complete | Nullable `chain_name` column (`db.rs:2737`, `db.rs:3041`); whitespace clears the name (`api/chains.rs:182`) |
+
+**Progress:** 7 of 7 complete. v1 shipped.
+
+The "out of scope" list below remains accurate — the deferred Allium spec for the Q&A lifecycle is recommended now that the actual transitions are observable in production.
 
 ## v1 (MVP) Scope
 
