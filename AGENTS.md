@@ -31,7 +31,7 @@ phoenix-client.py  # CLI client — interact with the app without a browser
 
 `phoenix-client.py` is a standalone CLI for the Phoenix API (spec: `specs/simple_client/`). LLM agents should prefer it over browser automation for testing conversations.
 
-**Allium specs** (`.allium` files in `specs/`) are formal behavioral specifications that complement spEARS prose. See [Behavioral Specifications](#behavioral-specifications-allium) below.
+**Specs** live under `specs/<name>/`: spEARS prose (`requirements.md`, `design.md`, `executive.md`) plus optional Allium behavioural specs (`.allium`). Both are normative. See [Specifications](#specifications) below.
 
 ---
 
@@ -200,28 +200,34 @@ See [`crates/phoenix-ide/src/tools/think.rs`](crates/phoenix-ide/src/tools/think
 
 ---
 
-## Behavioral Specifications (Allium)
+## Specifications
 
-spEARS specs (`requirements.md`, `design.md`, `executive.md`) capture *why* something should be built and track implementation status. Allium specs (`.allium` files) capture *what exactly* the system does — states, transitions, preconditions, postconditions, invariants — precisely enough to generate tests and catch ambiguities.
+This project uses two complementary specification formats. **Both are normative** — code that contradicts either is wrong.
 
-**spEARS without Allium:** rigorous about whether to build, vague about what exactly to build.
-**Allium without spEARS:** precise about behaviour, unmoored from user need and project reality.
-**Together:** user story → requirement ID → precise behavioral spec → testable implementation → status tracking, all traceable end-to-end.
+- **spEARS** specs (`requirements.md`, `design.md`, `executive.md`) capture the *what* and *why*, plus the high-level *how*. They establish user need, named requirements (REQ-* IDs), design rationale, and track implementation status.
+- **Allium** specs (`.allium` files) capture *how specifically* — states, transitions, preconditions, postconditions, invariants — precisely enough to generate tests and catch ambiguities.
 
-### When to use Allium
+The two formats complement each other. spEARS without Allium is vague about exact behaviour; Allium without spEARS is unmoored from user need. Together: user story → REQ-IDs → precise behavioural spec → testable implementation → status tracking, traceable end-to-end.
+
+### When to write an Allium spec alongside spEARS
+
+Allium is a heavier tool; not every spEARS spec needs an Allium counterpart. Write one when the system has:
 
 - **State machines** with multiple states and complex transitions (bedrock, projects)
 - **Lifecycle flows** with preconditions that must hold (task approval, complete, abandon)
 - **Multi-step operations** where ordering matters and partial failure is possible
 - **Cross-boundary contracts** where two specs interact (projects importing bedrock)
 
-Do NOT use for: CRUD endpoints, pure data transformations, UI components, tool implementations with no lifecycle.
+Do NOT add Allium for: CRUD endpoints, pure data transformations, UI components, tool implementations with no lifecycle. spEARS alone is sufficient there.
 
-### Discovering Allium specs
+### Discovering specs
 
-Allium specs live at `specs/<name>/<name>.allium` (one per directory). To enumerate them, list the disk: `ls specs/*/*.allium`. Cross-spec dependencies are declared explicitly in each file's header via `use "./other.allium" as other`. To validate, run `allium check specs/<name>/<name>.allium` (install via `cargo install allium-cli`).
+Both formats live under `specs/<name>/`:
 
-A previous version of this section listed each spec in a table; that rotted within months as specs were added. Avoid re-introducing a hand-maintained inventory — the disk is canonical.
+- spEARS: `requirements.md`, `design.md`, `executive.md`
+- Allium: `<name>.allium`
+
+Enumerate Allium specs with `ls specs/*/*.allium`. Cross-spec dependencies are declared in each file's header via `use "./other.allium" as other`. Validate with `allium check specs/<name>/<name>.allium` (install via `cargo install allium-cli`).
 
 ### Working with Allium specs
 
@@ -235,7 +241,7 @@ A previous version of this section listed each spec in a table; that rotted with
 
 **Resolving open questions is mandatory.** An open question in an Allium spec is not documentation — it's an unresolved ambiguity that may hide a bug. When distilling, present each open question to the user via `AskUserQuestion` with concrete options (not open-ended). The user decides; you implement the fix. Do not leave open questions as prose notes or "future work." Every ambiguity either becomes a code fix or an explicit design decision before the spec is merged.
 
-**The spec is authoritative for behavior.** If the code disagrees with the Allium spec, one of them is wrong. The transition graph, preconditions, and invariants in the `.allium` file define correct behavior. `@guidance` blocks describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right.
+**Both formats are authoritative.** If the code disagrees with either spEARS or Allium, one of them is wrong. spEARS requirements (REQ-* IDs) define what must be built; Allium's transition graph, preconditions, and invariants define exact behaviour. `@guidance` blocks in Allium describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right.
 
 ---
 
