@@ -54,7 +54,6 @@ ui/src/
 │   ├── DirectoryPicker.tsx       # Directory selection with validation
 │   ├── NewConversationSheet.tsx  # Mobile bottom sheet
 │   ├── ImageAttachments.tsx      # Image upload/preview
-│   ├── VoiceInput/               # Voice recording components
 │   ├── Toast.tsx                 # Toast notifications
 │   ├── ConfirmDialog.tsx         # Confirmation modal
 │   ├── RenameDialog.tsx          # Conversation rename
@@ -66,7 +65,7 @@ ui/src/
     └── uuid.ts                   # UUID generation
 ```
 
-## Responsive Layout Architecture (REQ-UI-010, REQ-UI-016)
+## Responsive Layout Architecture (REQ-CONV-010, REQ-CONV-016)
 
 The app uses viewport-based layout switching:
 
@@ -86,7 +85,7 @@ The app uses viewport-based layout switching:
 └──────────────────────────┴─────────────────────────────────┘
 ```
 
-### Desktop Layout (REQ-UI-016)
+### Desktop Layout (REQ-CONV-016)
 
 ```typescript
 function DesktopLayout({ children }: { children: React.ReactNode }) {
@@ -113,19 +112,11 @@ interface SidebarProps {
 }
 
 function Sidebar({ collapsed, onToggle }: SidebarProps) {
-  const location = useLocation();
-  const [newFormOpen, setNewFormOpen] = useState(false);
-  
-  const handleNewClick = () => {
-    if (location.pathname === '/') return; // No-op on root
-    setNewFormOpen(true); // Expand inline form
-  };
-  
+  const navigate = useNavigate();
   return (
     <aside className={`sidebar ${collapsed ? 'collapsed' : ''}`}>
       <PhoenixIcon onClick={() => navigate('/')} />
-      <button onClick={handleNewClick}>+ New</button>
-      {newFormOpen && <SidebarNewForm onClose={() => setNewFormOpen(false)} />}
+      <button onClick={() => navigate('/new')}>+ New</button>
       <ConversationList compact={collapsed} />
       <button onClick={onToggle}>{collapsed ? '▶' : '◀'}</button>
     </aside>
@@ -133,7 +124,15 @@ function Sidebar({ collapsed, onToggle }: SidebarProps) {
 }
 ```
 
-## New Conversation Flows (REQ-UI-015, REQ-UI-017, REQ-UI-018)
+The "inline new form" mode (REQ-CONV-018) was originally implemented as
+an `SidebarNewForm` component embedded in the sidebar; the current
+implementation routes to `/new` (a full `NewConversationPage`) regardless
+of the entry point, with mobile-specific layout switching inside that
+page. The functional outcome — a new-conversation entry point reachable
+from the sidebar without losing the active conversation — is satisfied
+by the route-based form.
+
+## New Conversation Flows (REQ-CONV-015, REQ-CONV-017, REQ-CONV-018)
 
 Three modes for creating conversations, all functionally equivalent:
 
@@ -143,30 +142,18 @@ Three modes for creating conversations, all functionally equivalent:
 | Desktop Full Page | Navigate to `/` | Main content area | Send, Send in Background |
 | Desktop Inline Sidebar | "+ New" from `/c/:slug` | Top of sidebar | Send, Send in Background |
 
-### Shared Form Component
+### New Conversation Form (current implementation)
 
-```typescript
-interface NewConversationFormProps {
-  layout: 'full' | 'sheet' | 'inline';
-  onSubmit: (data: NewConvData, background: boolean) => void;
-  onCancel?: () => void;
-}
-
-function NewConversationForm({ layout, onSubmit, onCancel }: NewConversationFormProps) {
-  return (
-    <form className={`new-conv-form new-conv-form--${layout}`}>
-      <DirectoryPicker ... />
-      <ModelSelector ... />
-      <MessageInput ... />
-      <div className="actions">
-        {onCancel && <button type="button" onClick={onCancel}>Cancel</button>}
-        <button type="button" onClick={() => onSubmit(data, true)}>Send in Background</button>
-        <button type="submit">Send</button>
-      </div>
-    </form>
-  );
-}
-```
+`NewConversationPage.tsx` is a single monolithic form that adapts its
+layout via responsive CSS rather than a `layout` prop. Earlier drafts
+of this design proposed a shared `NewConversationForm` component
+parameterised by `layout: 'full' | 'sheet' | 'inline'` plus a separate
+`ModelSelector`; that decomposition was never built. The form composes
+existing reusable components (`DirectoryPicker`, an inline model
+selector, the `InputArea` text composer) directly. Treat the
+single-page-with-CSS form as the contract; if the form grows complex
+enough to warrant the parameterised decomposition, that is a separate
+refactor.
 
 ### Send in Background Flow
 
@@ -179,7 +166,7 @@ async function sendInBackground(data: NewConvData) {
 }
 ```
 
-## Typed Conversation State (REQ-UI-007, REQ-UI-020)
+## Typed Conversation State (REQ-CONV-007, REQ-CONV-020)
 
 ### Discriminated Union for ConversationState
 
@@ -334,14 +321,14 @@ function conversationReducer(atom: ConversationAtom, action: SSEAction): Convers
 
 **Key invariants enforced by the reducer:**
 - Streaming buffer and finalized message cannot both exist — `sse_message` clears the
-  buffer atomically in one reducer call, producing one React render (REQ-UI-019).
+  buffer atomically in one reducer call, producing one React render (REQ-CONV-019).
 - `init` replaces breadcrumbs entirely. `state_change` appends with `sequenceId` dedup.
   No external `updateBreadcrumbsFromState()` mutation path.
 - Idempotency via `lastSequenceId >= event.sequenceId` — O(1) check, replaces
   unbounded `seenIdsRef: Set<number>`.
 - Malformed SSE events become typed `UIError` values, not unhandled exceptions.
 
-### Router-Level Context (REQ-UI-020)
+### Router-Level Context (REQ-CONV-020)
 
 The atom lives in a React context mounted at the router level, above individual page
 components. `lastSequenceId` survives navigation. On mount with the same
@@ -412,7 +399,7 @@ export function useAppMachine(): AppMachineHandle {
 After this: `appMachine.ts` is testable by importing `transition` and feeding events.
 No React, no DOM. One running implementation matching its spec.
 
-## Token Streaming Display (REQ-UI-019, REQ-BED-025)
+## Token Streaming Display (REQ-CONV-019, REQ-BED-025)
 
 ### StreamingState
 
@@ -437,10 +424,10 @@ On reconnect, missed token events are not replayed. The UI shows "thinking..." (
 - New token events arrive on the fresh connection (streaming resumes from current point)
 - The `sse_message` event arrives with the finalized message (streaming was completed)
 
-This is acceptable per REQ-UI-019: the requirement specifies no-flicker on completion,
+This is acceptable per REQ-CONV-019: the requirement specifies no-flicker on completion,
 not lossless token replay.
 
-## Conversation State Indicators (REQ-UI-012)
+## Conversation State Indicators (REQ-CONV-012)
 
 Each conversation displays its current state. The display state is derived from
 `ConversationState` via exhaustive switch — no catch-all:
@@ -501,35 +488,25 @@ function useConversationListPolling(intervalMs = 5000) {
 }
 ```
 
-## Scroll Position Memory (REQ-UI-013)
+## Scroll Position Memory (REQ-CONV-013)
 
-Per-conversation scroll position preserved across navigation:
+Per-conversation scroll position is preserved across navigation. The
+implementation lives inline in `MessageList.tsx` (see the save effect
+around `:261` and the restore effect around `:281`) rather than in a
+dedicated `useScrollMemory` hook — earlier drafts of this design
+proposed extracting one, but the inline approach handles
+visibility-change and unmount in the same effect tree as the message
+rendering it depends on. Storage key: `phoenix:scroll:{conversationId}`.
 
-```typescript
-const SCROLL_KEY = (id: string) => `phoenix:scroll:${id}`;
+The behavioural contract is unchanged from earlier drafts:
 
-function useScrollMemory(conversationId: string, containerRef: RefObject<HTMLElement>) {
-  // Restore on mount
-  useEffect(() => {
-    const saved = localStorage.getItem(SCROLL_KEY(conversationId));
-    if (saved && containerRef.current) {
-      containerRef.current.scrollTop = parseInt(saved, 10);
-    }
-  }, [conversationId]);
-  
-  // Save on unmount or navigation
-  useEffect(() => {
-    return () => {
-      if (containerRef.current) {
-        localStorage.setItem(
-          SCROLL_KEY(conversationId),
-          String(containerRef.current.scrollTop)
-        );
-      }
-    };
-  }, [conversationId]);
-}
-```
+- On mount of a conversation: read the saved scroll offset (if any)
+  and apply it after the first render that produces messages.
+- On unmount, route change, or `visibilitychange` to hidden: write the
+  current `scrollTop` to `phoenix:scroll:{conversationId}`.
+- A conversation's scroll memory is independent of every other
+  conversation's; switching back-and-forth always lands the user where
+  they left off.
 
 ### New Messages While Away
 
@@ -562,7 +539,7 @@ function MessageList({ conversationId, messages }) {
 }
 ```
 
-## Message Delivery State Machine (REQ-UI-004)
+## Message Delivery State Machine (REQ-CONV-004)
 
 ```
 [draft] --send--> [sending] --success--> [sent] ✓
@@ -579,7 +556,7 @@ function MessageList({ conversationId, messages }) {
 | sent | ✓ checkmark | server | Confirmed by API |
 | failed | ⚠️ tap to retry | localStorage (queue) | Retryable, persists across refresh |
 
-### localStorage Schema (REQ-UI-011)
+### localStorage Schema (REQ-CONV-011)
 
 ```typescript
 // Draft message (one per conversation)
@@ -601,7 +578,7 @@ localStorage.setItem(`phoenix:scroll:${convId}`, "1234");
 localStorage.setItem(`sidebar-collapsed`, "true");
 ```
 
-## Connection State Machine (REQ-UI-005, REQ-UI-006)
+## Connection State Machine (REQ-CONV-005, REQ-CONV-006)
 
 ```
 [disconnected] --connect--> [connecting] --open--> [connected]
@@ -705,7 +682,7 @@ The app machine coordinates:
 | sent | ✓ | normal message |
 | failed | ⚠️ | tap to retry |
 
-## Desktop Message Readability (REQ-UI-014)
+## Desktop Message Readability (REQ-CONV-014)
 
 ```css
 .message-content {
@@ -723,18 +700,17 @@ The app machine coordinates:
 
 | Component | Responsibility | Requirements |
 |-----------|---------------|-------------|
-| `ConversationProvider` | Router-level context, atom lifecycle | REQ-UI-020 |
-| `DesktopLayout` | Viewport detection, sidebar wrapper | REQ-UI-010, REQ-UI-016 |
-| `Sidebar` | Conversation list, new form, collapse | REQ-UI-016, REQ-UI-018 |
-| `ConversationList` | List display, state indicators, selection | REQ-UI-001, REQ-UI-012 |
-| `NewConversationSheet` | Mobile bottom sheet | REQ-UI-015 |
-| `NewConversationPage` | Full-page form | REQ-UI-017 |
-| `SidebarNewForm` | Inline sidebar form | REQ-UI-018 |
-| `MessageList` | Message display, scroll memory, streaming | REQ-UI-002, REQ-UI-013, REQ-UI-019 |
-| `StreamingMessage` | In-progress token display | REQ-UI-019 |
-| `InputArea` | Composition, drafts, queue | REQ-UI-003, REQ-UI-004 |
-| `StateBar` | Connection status, context info, state label | REQ-UI-005, REQ-UI-007 |
-| `BreadcrumbBar` | Completed + in-progress step trail | REQ-UI-007a |
+| `ConversationProvider` | Router-level context, atom lifecycle | REQ-CONV-020 |
+| `DesktopLayout` | Viewport detection, sidebar wrapper | REQ-CONV-010, REQ-CONV-016 |
+| `Sidebar` | Conversation list, new-conversation entry, collapse | REQ-CONV-016, REQ-CONV-018 |
+| `ConversationList` | List display, state indicators, selection | REQ-CONV-001, REQ-CONV-012 |
+| `NewConversationSheet` | Mobile bottom sheet | REQ-CONV-015 |
+| `NewConversationPage` | Full-page route serving all desktop entries (inline + root); satisfies REQ-CONV-017 + REQ-CONV-018 | REQ-CONV-017, REQ-CONV-018 |
+| `MessageList` | Message display, scroll memory, streaming | REQ-CONV-002, REQ-CONV-013, REQ-CONV-019 |
+| `StreamingMessage` | In-progress token display | REQ-CONV-019 |
+| `InputArea` | Composition, drafts, queue | REQ-CONV-003, REQ-CONV-004 |
+| `StateBar` | Connection status, context info, state label | REQ-CONV-005, REQ-CONV-007 |
+| `BreadcrumbBar` | Completed + in-progress step trail | REQ-CONV-007a |
 
 ---
 

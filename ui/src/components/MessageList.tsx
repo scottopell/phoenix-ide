@@ -258,7 +258,7 @@ export function MessageList({
     return () => observer.disconnect();
   }, []);
 
-  // Save scroll position on unmount / visibility change (REQ-UI-013)
+  // Save scroll position on unmount / visibility change (REQ-CONV-013)
   useEffect(() => {
     if (!conversationId) return;
     const saveScroll = () => {
@@ -278,7 +278,7 @@ export function MessageList({
     };
   }, [conversationId, messages.length]);
 
-  // Restore scroll position on mount after messages render (REQ-UI-013).
+  // Restore scroll position on mount after messages render (REQ-CONV-013).
   // useLayoutEffect runs synchronously after DOM commit and before the browser
   // fires ResizeObserver, so isPinnedToBottom is correctly set before the
   // observer decides whether to auto-scroll — no rAF, no flash to bottom first.
@@ -371,7 +371,7 @@ export function MessageList({
               onOpenFile={onOpenFile}
             />
           )}
-          {/* Streaming text — cleared atomically when sse_message arrives (REQ-UI-019).
+          {/* Streaming text — cleared atomically when sse_message arrives (REQ-CONV-019).
               Lives OUTSIDE <MessageListBody> so token updates only re-render this element,
               not the historical message list. */}
           <StreamingMessage buffer={streamingBuffer ?? null} />

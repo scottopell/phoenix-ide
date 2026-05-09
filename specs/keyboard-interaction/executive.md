@@ -40,6 +40,6 @@ keys and are never blocked by panel-level handlers.
 
 - `specs/ask-user-question/` -- QuestionPanel keyboard behavior must comply
   with REQ-KB-001 through REQ-KB-005
-- `specs/ui/` -- Sidebar navigation must respect REQ-KB-008
+- `specs/conversation-ui/` -- Sidebar navigation must respect REQ-KB-008
 - `specs/command-palette/` -- Must comply with REQ-KB-001, REQ-KB-002
 - `specs/inline-references/` -- Input area shortcuts reference REQ-KB-003

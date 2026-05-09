@@ -14,7 +14,7 @@ interface StreamingMessageProps {
 }
 
 /**
- * Displays in-progress streaming text below the message list (REQ-UI-019, REQ-BED-025).
+ * Displays in-progress streaming text below the message list (REQ-CONV-019, REQ-BED-025).
  *
  * Renders while the LLM is generating. When the final `sse_message` event arrives,
  * the reducer clears this buffer and appends the finalized message atomically — one

@@ -10,7 +10,7 @@ As a desktop user, I need a persistent file tree panel alongside my conversation
 
 WHEN viewport is desktop-sized (> 1024px)
 THE SYSTEM SHALL display a three-column layout:
-  - Left: Conversation sidebar (per REQ-UI-016)
+  - Left: Conversation sidebar (per REQ-CONV-016)
   - Center: File explorer panel (hosts FileTree component)
   - Right: Main content area (conversation or prose reader)
 

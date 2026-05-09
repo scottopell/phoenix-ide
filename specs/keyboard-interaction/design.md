@@ -158,7 +158,7 @@ via `navigator.platform` or `navigator.userAgent`.
 | Ctrl+Enter | Submit all answers | Submit all answers |
 | Escape | Confirm decline dialog | Confirm decline dialog |
 
-### Sidebar Navigation (cross-references specs/ui)
+### Sidebar Navigation (cross-references specs/conversation-ui)
 
 | Key | Action |
 |-----|--------|
