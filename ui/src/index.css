@@ -1146,16 +1146,29 @@ body {
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;
-  font-size: 14px;
   transition: all 0.15s;
   flex-shrink: 0;
 }
 
-.copy-btn:hover {
+.copy-btn svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.copy-btn:hover:not(:disabled) {
   background: var(--bg-tertiary);
   color: var(--text-primary);
 }
 
+.copy-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
 .copy-btn.copied {
   color: var(--accent-green);
 }
@@ -8678,16 +8691,6 @@ html * {
   cursor: pointer;
 }
 
-.viewer-shell-copy-btn svg {
-  width: 16px;
-  height: 16px;
-  fill: none;
-  stroke: currentColor;
-  stroke-width: 1.7;
-  stroke-linecap: round;
-  stroke-linejoin: round;
-}
-
 .viewer-shell-copy-btn:hover:not(:disabled) {
   color: var(--text-primary);
   border-color: var(--text-secondary);
@@ -8698,11 +8701,6 @@ html * {
   color: var(--accent-green, #22c55e);
   border-color: color-mix(in srgb, var(--accent-green, #22c55e) 55%, var(--border-color));
   background: color-mix(in srgb, var(--accent-green, #22c55e) 10%, transparent);
-}
-
-.viewer-shell-copy-btn:disabled {
-  opacity: 0.45;
-  cursor: default;
 }
 
 .viewer-shell-toggle {

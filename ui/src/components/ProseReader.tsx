@@ -19,7 +19,6 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { copyToClipboard } from '../utils/clipboard';
 import type { createElementProps } from '../utils/syntaxHighlighter';
 import { SyntaxHighlighter, createElement, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import { useRegisterFocusScope } from '../hooks/useFocusScope';
@@ -29,6 +28,7 @@ import { useReviewNotes } from '../contexts/ReviewNotesContext';
 import type { ReviewNote } from '../contexts/ReviewNotesContext';
 import { ViewerShell } from './viewer/ViewerShell';
 import { NotesPanel } from './viewer/NotesPanel';
+import { CopyButton } from './CopyButton';
 import { AnnotationDialog } from './viewer/AnnotationDialog';
 import { formatNotesForSend } from './viewer/formatNotes';
 import { Loader2, AlertCircle, MessageSquarePlus } from 'lucide-react';
@@ -46,24 +46,6 @@ export interface ProseReaderProps {
   patchContext?: PatchContext | undefined;
   /** Render inline (no overlay) for desktop split-pane mode (task 08654). */
   inline?: boolean;
-}
-
-function CopyFileIcon() {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-      <rect x="5" y="3" width="8" height="10" rx="1.5" />
-      <path d="M3 6.5V4.5A1.5 1.5 0 0 1 4.5 3H7" />
-      <path d="M3 6.5v5A1.5 1.5 0 0 0 4.5 13H7" />
-    </svg>
-  );
-}
-
-function CopiedFileIcon() {
-  return (
-    <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">
-      <path d="M3.5 8.5 6.5 11.5 12.5 4.5" />
-    </svg>
-  );
 }
 
 // Re-exported for backward compatibility with external callers that
@@ -190,11 +172,9 @@ export function ProseReader({
   const [annotating, setAnnotating] = useState<{ lineNumber: number; lineContent: string } | null>(null);
   const [showPanel, setShowPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
-  const [copied, setCopied] = useState(false);
   const [htmlViewMode, setHtmlViewMode] = useState<'preview' | 'source'>('source');
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
-  const copyResetTimeout = useRef<number | null>(null);
 
   const absolutePath = useMemo(() => {
     if (filePath.startsWith('/')) return filePath;
@@ -215,11 +195,6 @@ export function ProseReader({
   useEffect(() => {
     let cancelled = false;
     async function load() {
-      setCopied(false);
-      if (copyResetTimeout.current !== null) {
-        window.clearTimeout(copyResetTimeout.current);
-        copyResetTimeout.current = null;
-      }
       setLoading(true);
       setError(null);
       try {
@@ -255,14 +230,6 @@ export function ProseReader({
     }
     return undefined;
   }, [highlightedLine]);
-
-  useEffect(() => {
-    return () => {
-      if (copyResetTimeout.current !== null) {
-        window.clearTimeout(copyResetTimeout.current);
-      }
-    };
-  }, []);
 
   // Cmd/Ctrl+A: select all in viewer body. Guard against stealing the
   // shortcut from editable elements (annotation textarea, chat input,
@@ -339,20 +306,6 @@ export function ProseReader({
     }
     setShowPanel(false);
   }, [absolutePath]);
-
-  const handleCopyFile = useCallback(async () => {
-    if (content === null) return;
-    const ok = await copyToClipboard(content);
-    if (!ok) return;
-    setCopied(true);
-    if (copyResetTimeout.current !== null) {
-      window.clearTimeout(copyResetTimeout.current);
-    }
-    copyResetTimeout.current = window.setTimeout(() => {
-      setCopied(false);
-      copyResetTimeout.current = null;
-    }, 1500);
-  }, [content]);
 
   const handleSend = useCallback(() => {
     const formatted = formatNotesForSend(reviewNotes.notes);
@@ -456,16 +409,12 @@ export function ProseReader({
   const copyDisabled = content === null || loading || error !== null;
   const headerExtras = (
     <>
-      <button
-        type="button"
-        className={`viewer-shell-copy-btn ${copied ? 'copied' : ''}`}
-        onClick={handleCopyFile}
+      <CopyButton
+        text={content ?? ''}
+        className="viewer-shell-copy-btn"
+        title="Copy file contents"
         disabled={copyDisabled}
-        title={copied ? 'Copied file contents' : 'Copy file contents'}
-        aria-label={copied ? 'Copied file contents' : 'Copy file contents'}
-      >
-        {copied ? <CopiedFileIcon /> : <CopyFileIcon />}
-      </button>
+      />
       {fileType === 'html' && (
         <>
           <button
