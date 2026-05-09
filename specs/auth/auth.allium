@@ -173,14 +173,13 @@ invariant NoTokensWithoutAuth {
     not config.auth_enabled implies ShareTokens.count = 0
 }
 
--- Auth check: password comparison must be constant-time
--- to prevent timing attacks.
--- (This is an implementation constraint, not a state invariant.
--- Noted here for the implementer.)
-@invariant ConstantTimePasswordCheck
-    -- The server compares the request password against
-    -- config.password using constant-time comparison.
-    -- No early-exit on first differing byte.
+-- Implementation constraint: ConstantTimePasswordCheck
+-- The server compares the request password against config.password
+-- using constant-time comparison. No early-exit on first differing
+-- byte. Enforced at the call site, not as a structural invariant
+-- the model can verify -- the model has no notion of compare timing.
+-- Implementation: see crates/phoenix-ide/src/api/auth.rs:19
+-- (`constant_time_eq`).
 
 ------------------------------------------------------------
 -- Open Questions

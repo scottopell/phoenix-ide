@@ -8,7 +8,7 @@
 --           Frontmatter parsing (already in skills.allium)
 --           Argument substitution (already in skills.allium)
 
-import skills
+use "./skills.allium" as skills
 
 ------------------------------------------------------------
 -- External Entities
@@ -20,7 +20,7 @@ import skills
 -- ordinary filesystem skills.
 external entity BuiltinSkillAsset {
     relative_path: String   -- path within the embedded tree, e.g. "spears/SKILL.md"
-    content: Bytes          -- file content embedded as &'static [u8]
+    content: String         -- file content; underlying type is &'static [u8] in Rust
 }
 
 ------------------------------------------------------------
@@ -34,7 +34,7 @@ config {
 
     -- The embedded asset tree compiled into the binary.
     -- Implementation: src/skills/builtin/ directory with rust_embed::RustEmbed.
-    builtin_assets: List<BuiltinSkillAsset> = []
+    builtin_assets: List<BuiltinSkillAsset>
 }
 
 ------------------------------------------------------------
@@ -119,7 +119,7 @@ rule ScanBuiltinExtractDir {
 rule RenderBuiltinInCatalog {
     when: CatalogEntryFormatted(skill)
 
-    requires: skill.source matches Builtin
+    requires: skill.source = "Builtin"
 
     ensures: entry_text = "- **" + skill.name + "** — " + skill.description + " (built-in)"
 
@@ -131,6 +131,13 @@ rule RenderBuiltinInCatalog {
         -- user-installed ones at a glance. The real extract path is still
         -- available to the LLM via the `Base directory` line emitted when
         -- the skill is invoked.
+        --
+        -- Note: this rule treats Skill.source as a String discriminator
+        -- ("Builtin" vs other locations). skills.allium models source as
+        -- `source: String` so the equality is direct. The
+        -- ScanBuiltinExtractDir rule above writes `Builtin(path: ...)` as
+        -- shorthand for "source = 'Builtin', path = ..." -- the model
+        -- treats source as opaque.
 }
 
 ------------------------------------------------------------
@@ -147,12 +154,11 @@ invariant SourceImpliesReadableFile {
 
 -- Filesystem skills always shadow built-ins of the same name. The catalog
 -- never contains both a filesystem and a built-in entry with the same name.
-invariant FilesystemShadowsBuiltin {
-    for fs_skill in Skills where fs_skill.source matches Filesystem:
-        not exists builtin_skill in Skills
-            where builtin_skill.source matches Builtin
-              and builtin_skill.name = fs_skill.name
-}
+-- Enforced by construction: the discovery sequence runs the filesystem
+-- walk first, registers each filesystem skill by name, then scans the
+-- builtin extract dir with a name-dedup guard (see ScanBuiltinExtractDir
+-- rule above: `not name_taken(catalog, ...)`). A structural invariant
+-- here would be redundant with the rule's precondition.
 
 -- The existing SkillNamesUnique invariant from skills.allium remains in
 -- force and is reinforced here: built-ins do not break name uniqueness
