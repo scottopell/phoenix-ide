@@ -391,8 +391,10 @@ export interface ConversationUsage {
 
 export interface CodexLoginPreflight {
   auth_path: string;
+  piggyback_path: string;
   already_signed_in: boolean;
-  bridge_enabled: boolean;
+  bridge_loaded_at_startup: boolean;
+  piggyback_env_set: boolean;
 }
 
 export interface CodexPkceStartResponse {

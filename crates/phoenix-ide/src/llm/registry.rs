@@ -177,8 +177,12 @@ pub struct LlmConfig {
     /// How credential helper output should be sent in HTTP headers.
     /// Parsed from `LLM_AUTH_HEADER` env var at startup.
     pub auth_style: AuthStyle,
-    /// Explicit opt-in for routing `OpenAI` models through local Codex `ChatGPT`
-    /// credentials. Parsed from `OPENAI_USE_CODEX_AUTH=1`.
+    /// User has signalled intent to use the `ChatGPT` bridge. True when
+    /// Phoenix's own login file (`~/.phoenix-ide/codex-auth.json`) exists at
+    /// startup OR when `OPENAI_USE_CODEX_AUTH=1` is set (piggyback mode).
+    /// When true, `OpenAI` models route through the bridge; when true but
+    /// `codex_credential` is `None` (load failed), `OpenAI` models are
+    /// unavailable rather than silently falling back to `OPENAI_API_KEY`.
     pub use_codex_auth: bool,
     /// When populated, `OpenAI` models are routed through the
     /// `ChatGPT` backend (`https://chatgpt.com/backend-api/codex`) using
@@ -292,27 +296,38 @@ impl LlmConfig {
             .map(parse_request_tags)
             .unwrap_or_default();
 
-        let use_codex_auth = std::env::var("OPENAI_USE_CODEX_AUTH")
-            .ok()
-            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
-        let codex_credential = if use_codex_auth {
-            match CodexCredential::load(codex_credential::default_auth_path()) {
+        // Resolve which file (if any) holds ChatGPT credentials at startup.
+        // Phoenix's own ~/.phoenix-ide/codex-auth.json wins; OPENAI_USE_CODEX_AUTH=1
+        // opts into reading Codex CLI's ~/.codex/auth.json instead. See
+        // [`codex_credential::resolve_active_auth_path`].
+        let active_auth_path = codex_credential::resolve_active_auth_path();
+        let codex_credential = match active_auth_path.as_ref() {
+            Some(path) => match CodexCredential::load(path.clone()) {
                 Ok((cred, account_id)) => {
                     tracing::info!(
+                        path = %path.display(),
                         account_id = account_id.as_deref().unwrap_or("<none>"),
-                        "OPENAI_USE_CODEX_AUTH enabled — routing OpenAI models via ChatGPT backend"
+                        "ChatGPT bridge active — routing OpenAI models via ChatGPT backend"
                     );
                     Some(cred)
                 }
                 Err(e) => {
-                    tracing::warn!(error = %e,
-                        "OPENAI_USE_CODEX_AUTH set but codex credential load failed; OpenAI models unavailable");
+                    tracing::warn!(error = %e, path = %path.display(),
+                        "ChatGPT auth file present but failed to load; OpenAI models unavailable");
                     None
                 }
-            }
-        } else {
-            None
+            },
+            None => None,
         };
+        // `use_codex_auth` is the bridge-intent flag (see field docs). True
+        // whenever the user has done something that signals "I want OpenAI
+        // models routed through ChatGPT" — either logging in via Phoenix or
+        // setting the piggyback env-var. The credential's actual presence is
+        // checked separately at call sites.
+        let use_codex_auth = active_auth_path.is_some()
+            || std::env::var("OPENAI_USE_CODEX_AUTH")
+                .ok()
+                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
 
         Self {
             anthropic_api_key: std::env::var("ANTHROPIC_API_KEY").ok(),
@@ -604,9 +619,14 @@ impl ModelRegistry {
             return Some(Arc::new(LoggingService::new(service)));
         }
 
-        // Codex ChatGPT auth is an explicit OpenAI opt-in. If enabled but the
-        // credential failed to load, OpenAI models are unavailable rather than
-        // silently falling through to another auth path.
+        // ChatGPT bridge: when the user has signalled intent to use the
+        // bridge — either by logging in via Phoenix's `/codex/login` flow
+        // (which writes ~/.phoenix-ide/codex-auth.json) or by setting
+        // OPENAI_USE_CODEX_AUTH=1 to piggyback Codex CLI's file — OpenAI
+        // models route through the ChatGPT backend. If intent was signalled
+        // but the credential failed to load, OpenAI models are unavailable
+        // rather than silently falling through to OPENAI_API_KEY (which
+        // would bill the wrong account).
         if config.use_codex_auth && spec.provider == Provider::OpenAI {
             let cred = config.codex_credential.as_ref()?;
             let auth = LlmAuth::new(
@@ -1000,10 +1020,12 @@ mod tests {
         );
     }
 
-    /// With Codex auth disabled, codex_credential is ignored and standard
-    /// OpenAI auth remains available.
+    /// With Codex auth disabled (no bridge intent), codex_credential is
+    /// ignored and standard OpenAI auth via `OPENAI_API_KEY` remains
+    /// available. The bridge-intent flag — not mere credential presence —
+    /// is what diverts traffic to the ChatGPT backend.
     #[test]
-    fn test_codex_branch_is_gated_by_env_flag_not_just_cred_presence() {
+    fn test_codex_branch_is_gated_by_intent_flag_not_just_cred_presence() {
         let dir = tempfile::tempdir().unwrap();
         let config = LlmConfig {
             openai_api_key: Some("a-real-key".to_string()),
@@ -1014,7 +1036,7 @@ mod tests {
         let registry = ModelRegistry::new(&config);
         assert!(
             registry.get("gpt-5.5").is_some(),
-            "OpenAI should register via OPENAI_API_KEY when codex auth is disabled"
+            "OpenAI should register via OPENAI_API_KEY when bridge intent is off"
         );
     }
 

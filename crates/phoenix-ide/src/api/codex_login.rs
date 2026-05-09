@@ -13,13 +13,16 @@
 //!   requests a device code from `OpenAI` and returns the verification URL
 //!   plus the user-visible code. A background task polls and finalises.
 //!
-//! Both flows write `~/.codex/auth.json` on success. Status is read via
-//! `GET /api/codex/login/{kind}/{id}/status`. The Codex credential
-//! ([`crate::llm::codex_credential::CodexCredential`]) mtime-watches the file,
-//! so an active credential picks up the new tokens on next use without a
-//! restart. (However, if `OPENAI_USE_CODEX_AUTH` was unset at startup, the
-//! credential isn't constructed at all — the user must restart Phoenix with
-//! the env-var set after their first successful login.)
+//! Both flows write **Phoenix's own** `~/.phoenix-ide/codex-auth.json` on
+//! success — never Codex CLI's `~/.codex/auth.json`, even if the user happens
+//! to be in piggyback mode. Two distinct sources, two distinct lifecycles.
+//!
+//! Status is read via `GET /api/codex/login/{kind}/{id}/status`. The Codex
+//! credential ([`crate::llm::codex_credential::CodexCredential`]) mtime-watches
+//! its file, so an *already-loaded* credential picks up new tokens on next use.
+//! On a first-time login (no credential constructed at startup because the
+//! file didn't exist), Phoenix must be restarted before the bridge becomes
+//! active — the UI surfaces this in the success banner.
 
 use axum::{
     extract::{Path, State},
@@ -125,8 +128,11 @@ fn new_session_id() -> String {
     })
 }
 
-fn auth_path_override() -> PathBuf {
-    codex_credential::default_auth_path()
+/// Login flow always writes to Phoenix's own auth file. Piggybacking on Codex
+/// CLI's `~/.codex/auth.json` is read-only — that file belongs to the Codex
+/// CLI's lifecycle and we don't overwrite it from in-app login.
+fn login_target_path() -> PathBuf {
+    codex_credential::default_phoenix_auth_path()
 }
 
 // ---------------------------------------------------------------------------
@@ -255,7 +261,7 @@ async fn drive_pkce(
 
     let tokens =
         exchange_pkce_code(ISSUER_BASE, CLIENT_ID, &redirect_uri, &verifier, &code).await?;
-    finalize_login(&auth_path_override(), tokens)
+    finalize_login(&login_target_path(), tokens)
 }
 
 async fn settle_pkce(
@@ -409,7 +415,7 @@ pub async fn device_start(
 
 async fn drive_device_code(device: DeviceCode) -> Result<LoginResult, LoginError> {
     let tokens = poll_device_code(&device).await?;
-    finalize_login(&auth_path_override(), tokens)
+    finalize_login(&login_target_path(), tokens)
 }
 
 async fn settle_device(
@@ -466,26 +472,37 @@ pub async fn device_cancel(
 
 #[derive(Debug, Serialize)]
 pub struct LoginPreflight {
-    /// Path the login will write to.
+    /// Path the in-app login will write to (Phoenix's own auth file).
     pub auth_path: String,
-    /// Whether `~/.codex/auth.json` already exists with a valid `chatgpt`-mode
-    /// token. Lets the UI show "you're already signed in".
+    /// Path Phoenix will piggyback off when `OPENAI_USE_CODEX_AUTH=1` is set
+    /// and Phoenix's own file is absent. Surfaced for diagnostic clarity.
+    pub piggyback_path: String,
+    /// Whether Phoenix's own auth file exists and parses as a valid
+    /// chatgpt-mode token.
     pub already_signed_in: bool,
-    /// Whether `OPENAI_USE_CODEX_AUTH` was set when Phoenix started. When
-    /// false, the user must restart Phoenix with this env-var set after their
-    /// first login for the bridge to take effect.
-    pub bridge_enabled: bool,
+    /// Whether the active credential was constructed at startup. When `false`
+    /// after a successful login, Phoenix must be restarted before the bridge
+    /// activates.
+    pub bridge_loaded_at_startup: bool,
+    /// Whether `OPENAI_USE_CODEX_AUTH=1` is set in the current environment.
+    /// Informational; the env-var only governs piggyback mode, not whether
+    /// in-app login works.
+    pub piggyback_env_set: bool,
 }
 
 pub async fn login_preflight(State(_state): State<AppState>) -> Json<LoginPreflight> {
-    let auth_path = codex_credential::default_auth_path();
+    let auth_path = codex_credential::default_phoenix_auth_path();
+    let piggyback_path = codex_credential::default_auth_path();
     let already_signed_in = codex_credential::CodexCredential::load(auth_path.clone()).is_ok();
-    let bridge_enabled = std::env::var("OPENAI_USE_CODEX_AUTH")
+    let bridge_loaded_at_startup = codex_credential::resolve_active_auth_path().is_some();
+    let piggyback_env_set = std::env::var("OPENAI_USE_CODEX_AUTH")
         .ok()
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
     Json(LoginPreflight {
         auth_path: auth_path.display().to_string(),
+        piggyback_path: piggyback_path.display().to_string(),
         already_signed_in,
-        bridge_enabled,
+        bridge_loaded_at_startup,
+        piggyback_env_set,
     })
 }

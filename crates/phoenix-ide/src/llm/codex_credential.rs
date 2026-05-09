@@ -97,7 +97,9 @@ struct RefreshError {
     error: Option<String>,
 }
 
-/// Resolve the auth.json path: `$CODEX_HOME/auth.json` if set, else `~/.codex/auth.json`.
+/// Resolve the Codex CLI auth.json path: `$CODEX_HOME/auth.json` if set, else
+/// `~/.codex/auth.json`. This is Codex CLI's storage location — Phoenix only
+/// reads from it in piggyback mode (when `OPENAI_USE_CODEX_AUTH=1`).
 pub fn default_auth_path() -> PathBuf {
     if let Ok(home) = std::env::var("CODEX_HOME") {
         PathBuf::from(home).join("auth.json")
@@ -105,6 +107,45 @@ pub fn default_auth_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(home).join(".codex").join("auth.json")
     }
+}
+
+/// Resolve Phoenix's own ChatGPT auth file. Used by the in-app login flow
+/// (task 27104) so Phoenix has an independent session that doesn't depend on
+/// Codex CLI being installed.
+pub fn default_phoenix_auth_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home)
+        .join(".phoenix-ide")
+        .join("codex-auth.json")
+}
+
+/// Decide which file to load credentials from at startup.
+///
+/// Priority:
+/// 1. **Phoenix's own** `~/.phoenix-ide/codex-auth.json` — written by the
+///    in-app `/codex/login` flow. Independent session, "I logged into
+///    Phoenix" model.
+/// 2. **Codex CLI's** `~/.codex/auth.json` — only consulted when the user
+///    opts in via `OPENAI_USE_CODEX_AUTH=1`. Piggyback mode for users who
+///    already use the Codex CLI and want a single shared session.
+///
+/// Returns `None` when neither is available; the registry treats that as
+/// "no ChatGPT bridge today".
+pub fn resolve_active_auth_path() -> Option<PathBuf> {
+    let phoenix_path = default_phoenix_auth_path();
+    if phoenix_path.exists() {
+        return Some(phoenix_path);
+    }
+    let piggyback = std::env::var("OPENAI_USE_CODEX_AUTH")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
+    if piggyback {
+        let codex_path = default_auth_path();
+        if codex_path.exists() {
+            return Some(codex_path);
+        }
+    }
+    None
 }
 
 /// Read `auth.json` and validate it's a ChatGPT-mode file.
@@ -761,5 +802,69 @@ mod tests {
             },
         );
         assert!(auth.last_refresh.is_some());
+    }
+
+    /// resolve_active_auth_path: serial because it manipulates process env vars
+    /// and a $HOME override, both of which are global state. We do all four
+    /// scenarios in one test to keep that serialisation explicit and avoid
+    /// inter-test races.
+    #[test]
+    fn resolve_active_auth_path_priority_phoenix_then_piggyback() {
+        let dir = tempfile::tempdir().unwrap();
+        let prev_home = std::env::var_os("HOME");
+        let prev_codex_home = std::env::var_os("CODEX_HOME");
+        let prev_use = std::env::var_os("OPENAI_USE_CODEX_AUTH");
+
+        // SAFETY: tests in this module are not parallelised against each other
+        // (they share env), and we restore at the end.
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+            std::env::remove_var("CODEX_HOME");
+            std::env::remove_var("OPENAI_USE_CODEX_AUTH");
+        }
+
+        // (1) Nothing exists, no env-var → None.
+        assert!(resolve_active_auth_path().is_none());
+
+        // (2) Codex CLI file exists but env-var not set → still None
+        // (independent-mode is the default, piggyback is opt-in).
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(codex_dir.join("auth.json"), b"{}").unwrap();
+        assert!(resolve_active_auth_path().is_none());
+
+        // (3) Same plus env-var → Codex CLI file picked.
+        unsafe {
+            std::env::set_var("OPENAI_USE_CODEX_AUTH", "1");
+        }
+        assert_eq!(
+            resolve_active_auth_path().as_deref(),
+            Some(codex_dir.join("auth.json").as_path())
+        );
+
+        // (4) Phoenix's own file appears → it wins regardless of the env-var.
+        let phoenix_dir = dir.path().join(".phoenix-ide");
+        std::fs::create_dir_all(&phoenix_dir).unwrap();
+        std::fs::write(phoenix_dir.join("codex-auth.json"), b"{}").unwrap();
+        assert_eq!(
+            resolve_active_auth_path().as_deref(),
+            Some(phoenix_dir.join("codex-auth.json").as_path())
+        );
+
+        // Restore env.
+        unsafe {
+            match prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match prev_codex_home {
+                Some(v) => std::env::set_var("CODEX_HOME", v),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+            match prev_use {
+                Some(v) => std::env::set_var("OPENAI_USE_CODEX_AUTH", v),
+                None => std::env::remove_var("OPENAI_USE_CODEX_AUTH"),
+            }
+        }
     }
 }

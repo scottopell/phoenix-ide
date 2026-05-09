@@ -17,10 +17,13 @@
 //!   regular `/oauth/token` endpoint with `redirect_uri = {issuer}/deviceauth/callback`.
 //!   Wire format follows Codex CLI's `device_code_auth.rs` exactly.
 //!
-//! Both flows write to `~/.codex/auth.json` by default (configurable per call)
-//! using `codex_credential::write_auth_file_pub`, which is atomic and 0600 on
-//! Unix. After a successful write the next `CodexCredential::get()` call
-//! picks up the new tokens via its mtime check.
+//! These primitives are storage-agnostic — the caller passes the destination
+//! path. Phoenix's API layer (`api/codex_login.rs`) writes to its own
+//! `~/.phoenix-ide/codex-auth.json`; piggyback mode (`OPENAI_USE_CODEX_AUTH=1`)
+//! reads from Codex CLI's `~/.codex/auth.json` but does not write back to it.
+//! Writes are atomic and 0600 on Unix; the on-disk shape is identical to what
+//! Codex CLI produces, so a `CodexCredential` constructed against either path
+//! reads the same way.
 //!
 //! # Trade-offs
 //!

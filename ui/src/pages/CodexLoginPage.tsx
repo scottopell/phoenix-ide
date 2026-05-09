@@ -81,12 +81,10 @@ function SuccessBanner({ result, preflight }: { result: FlowResult; preflight: C
       <div className="codex-login-success-body">
         Tokens written to <code>{result.authPath}</code>
         {result.accountId && <> for account <code>{result.accountId}</code></>}.
-        {preflight && !preflight.bridge_enabled && (
+        {preflight && !preflight.bridge_loaded_at_startup && (
           <div className="codex-login-warning">
-            <strong>Restart required.</strong> Set
-            {' '}<code>OPENAI_USE_CODEX_AUTH=1</code>{' '}
-            in your environment and restart Phoenix to route OpenAI models through your
-            ChatGPT subscription.
+            <strong>Restart Phoenix</strong> to start using your ChatGPT subscription.
+            (The credential is loaded at startup; we can't pick it up mid-session yet.)
           </div>
         )}
       </div>
