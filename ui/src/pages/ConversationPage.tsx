@@ -178,7 +178,15 @@ function ConversationPageContent() {
     closeDiff();
     browserView.openPanel();
   }, [fileExplorer, closeDiff, browserView]);
-  const [isDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
+  const [isDesktop, setIsDesktop] = useState(
+    () => window.matchMedia('(min-width: 1025px)').matches,
+  );
+  useEffect(() => {
+    const mq = window.matchMedia('(min-width: 1025px)');
+    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
+    mq.addEventListener('change', handler);
+    return () => mq.removeEventListener('change', handler);
+  }, []);
   // Wider threshold (≥1280px) gates the split-pane prose reader (task 08654).
   // Below this we keep the existing full-screen overlay UX; above, the
   // reader sits beside the chat as a resizable sibling pane.
