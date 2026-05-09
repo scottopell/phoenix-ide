@@ -8664,6 +8664,47 @@ html * {
   gap: 8px;
 }
 
+.viewer-shell-copy-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 6px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.viewer-shell-copy-btn svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.viewer-shell-copy-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+  background: var(--bg-primary);
+}
+
+.viewer-shell-copy-btn.copied {
+  color: var(--accent-green, #22c55e);
+  border-color: color-mix(in srgb, var(--accent-green, #22c55e) 55%, var(--border-color));
+  background: color-mix(in srgb, var(--accent-green, #22c55e) 10%, transparent);
+}
+
+.viewer-shell-copy-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .viewer-shell-toggle {
   font-size: 12px;
   padding: 4px 10px;
