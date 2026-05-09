@@ -5349,13 +5349,8 @@ html * {
   }
 }
 
-/* Files button — opens FileBrowserOverlay on widths below the desktop
-   breakpoint (1025px). Rendered alongside the chevron in the StateBar.
-   Visible footprint matches the chevron (32x32) so the bar's 42px height
-   isn't blown out, but a ::before pseudo-element inflates the hit area
-   to 44x44 (WCAG 2.5.5 / Apple HIG). The desktop FileExplorerPanel covers
-   widths >= 1025px, so ConversationPage omits onOpenFiles there and this
-   button does not render. */
+/* ::before extends the 32x32 visible footprint to a 44x44 hit target
+   (WCAG 2.5.5 / Apple HIG) without blowing out the bar's 42px height. */
 .statebar-files-btn {
   position: relative;
   background: none;

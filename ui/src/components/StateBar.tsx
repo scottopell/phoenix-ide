@@ -492,21 +492,30 @@ export function StateBar({
               onTriggerContinuation={indicatorTrigger}
             />
           )}
+          {onOpenFiles && (
+            <button
+              type="button"
+              className="statebar-files-btn"
+              onClick={(e) => {
+                e.stopPropagation();
+                onOpenFiles();
+              }}
+              onKeyDown={(e) => {
+                // The collapsed StateBar (≤768px) has its own Enter/Space
+                // handler on `<header>` that calls preventDefault to expand
+                // the bar. Stop propagation so the button's default
+                // activation isn't suppressed and the bar doesn't toggle.
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.stopPropagation();
+                }
+              }}
+              aria-label="Browse project files"
+              title="Browse project files"
+            >
+              <FolderTree size={18} aria-hidden="true" />
+            </button>
+          )}
         </div>
-        {onOpenFiles && (
-          <button
-            type="button"
-            className="statebar-files-btn"
-            onClick={(e) => {
-              e.stopPropagation();
-              onOpenFiles();
-            }}
-            aria-label="Browse project files"
-            title="Browse project files"
-          >
-            <FolderTree size={18} aria-hidden="true" />
-          </button>
-        )}
         {isMobile && (
           <button
             type="button"
