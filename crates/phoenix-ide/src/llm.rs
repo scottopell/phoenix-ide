@@ -56,6 +56,7 @@
 
 mod anthropic;
 pub mod codex_credential;
+pub mod codex_login;
 pub mod credential_helper;
 mod discovery;
 mod error;

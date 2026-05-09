@@ -7679,6 +7679,151 @@ html * {
 }
 
 /* ============================================================
+   Codex/ChatGPT login page (task 27104)
+   ============================================================ */
+
+.codex-login-card {
+  max-width: 480px;
+}
+
+.codex-login-subtitle {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+  margin: 0;
+  line-height: 1.5;
+}
+
+.codex-login-choose,
+.codex-login-flow,
+.codex-login-paste {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.codex-login-flow {
+  margin-top: 8px;
+}
+
+.login-button-secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+}
+
+.codex-login-info,
+.codex-login-warning,
+.codex-login-success {
+  font-size: 13px;
+  line-height: 1.5;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
+.codex-login-info code,
+.codex-login-warning code,
+.codex-login-success code {
+  background: var(--bg-primary);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.codex-login-warning {
+  border-color: var(--accent-yellow, #c4a000);
+  color: var(--text-primary);
+}
+
+.codex-login-success {
+  border-color: var(--accent-green, #2e8b57);
+}
+
+.codex-login-success-title {
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 4px;
+}
+
+.codex-login-help {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.codex-login-help code {
+  font-size: 11px;
+}
+
+.codex-login-link {
+  margin-top: 6px;
+  word-break: break-all;
+}
+
+.codex-login-link a {
+  color: var(--accent-blue);
+  text-decoration: underline;
+}
+
+.codex-login-status {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+  font-style: italic;
+}
+
+.codex-login-paste-toggle {
+  font-size: 12px;
+}
+
+.codex-login-cancel {
+  margin-top: 8px;
+  padding: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  align-self: center;
+}
+
+.codex-login-cancel:hover {
+  color: var(--text-primary);
+}
+
+.codex-login-steps {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+
+.codex-login-steps li + li {
+  margin-top: 8px;
+}
+
+.codex-login-code {
+  margin-top: 6px;
+  padding: 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-align: center;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  user-select: all;
+}
+
+/* ============================================================
    Share Page (REQ-AUTH-005: Read-only shared view)
    ============================================================ */
 

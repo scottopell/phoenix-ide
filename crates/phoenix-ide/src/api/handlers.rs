@@ -59,6 +59,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/c/:slug", get(serve_spa))
         // New conversation page
         .route("/new", get(serve_spa))
+        // Codex/ChatGPT login page (SPA-rendered)
+        .route("/codex/login", get(serve_spa))
         // Service worker
         .route("/service-worker.js", get(serve_service_worker))
         // Favicon (referenced from index.html)
@@ -199,6 +201,40 @@ pub fn create_router(state: AppState) -> Router {
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
+        // Codex / ChatGPT OAuth login (task 27104). PKCE+loopback and OpenAI's
+        // custom device-code flow, both producing ~/.codex/auth.json.
+        .route(
+            "/api/codex/login/preflight",
+            get(super::codex_login::login_preflight),
+        )
+        .route(
+            "/api/codex/login/pkce/start",
+            post(super::codex_login::pkce_start),
+        )
+        .route(
+            "/api/codex/login/pkce/:id/manual",
+            post(super::codex_login::pkce_manual),
+        )
+        .route(
+            "/api/codex/login/pkce/:id/status",
+            get(super::codex_login::pkce_status),
+        )
+        .route(
+            "/api/codex/login/pkce/:id/cancel",
+            post(super::codex_login::pkce_cancel),
+        )
+        .route(
+            "/api/codex/login/device/start",
+            post(super::codex_login::device_start),
+        )
+        .route(
+            "/api/codex/login/device/:id/status",
+            get(super::codex_login::device_status),
+        )
+        .route(
+            "/api/codex/login/device/:id/cancel",
+            post(super::codex_login::device_cancel),
+        )
         // Share mode (REQ-AUTH-004 through REQ-AUTH-008)
         .route("/share/c/:slug", get(create_or_redirect_share))
         .route("/s/:token", get(serve_share_page))
@@ -3617,6 +3653,7 @@ mod hard_delete_cascade_tests {
             password: None,
             terminals,
             chain_qa,
+            codex_login: super::super::codex_login::CodexLoginManager::new(),
         }
     }
 

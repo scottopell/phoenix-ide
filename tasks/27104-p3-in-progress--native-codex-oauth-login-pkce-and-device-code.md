@@ -1,7 +1,7 @@
 ---
 created: 2026-05-04
 priority: p3
-status: ready
+status: in-progress
 artifact: src/llm/codex_credential.rs
 ---
 

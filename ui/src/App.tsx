@@ -28,6 +28,9 @@ const ChainPage = lazy(() =>
 const LoginPage = lazy(() =>
   import('./pages/LoginPage').then((m) => ({ default: m.LoginPage })),
 );
+const CodexLoginPage = lazy(() =>
+  import('./pages/CodexLoginPage').then((m) => ({ default: m.CodexLoginPage })),
+);
 const SharePage = lazy(() =>
   import('./pages/SharePage').then((m) => ({ default: m.SharePage })),
 );
@@ -76,6 +79,7 @@ function AppRoutes() {
                 <Route path="/new" element={<NewConversationPage />} />
                 <Route path="/c/:slug" element={<ConversationPage />} />
                 <Route path="/chains/:rootConvId" element={<ChainPage />} />
+                <Route path="/codex/login" element={<CodexLoginPage />} />
               </Routes>
             </DesktopLayout>
           } />
