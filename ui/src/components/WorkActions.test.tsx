@@ -9,6 +9,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { useEffect } from 'react';
 import type { ReactElement } from 'react';
+import { MemoryRouter } from 'react-router-dom';
 import { WorkActions } from './WorkActions';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import {
@@ -24,17 +25,21 @@ import { FileExplorerProvider } from './FileExplorer';
 // single-slot enforcement, ReviewNotesProvider for the diff viewer's
 // notes context, and the two viewer-state providers (Diff + Browser)
 // so the View-Diff and View-Browser controls can publish their state.
+// MemoryRouter is required because FileExplorerProvider reads the
+// open-file path from URL search params.
 const renderWithProviders = (ui: ReactElement) =>
   render(
-    <FileExplorerProvider>
-      <ReviewNotesProvider>
-        <DiffViewerStateProvider>
-          <BrowserViewStateProvider browserSessionActive={false}>
-            {ui}
-          </BrowserViewStateProvider>
-        </DiffViewerStateProvider>
-      </ReviewNotesProvider>
-    </FileExplorerProvider>,
+    <MemoryRouter>
+      <FileExplorerProvider>
+        <ReviewNotesProvider>
+          <DiffViewerStateProvider>
+            <BrowserViewStateProvider browserSessionActive={false}>
+              {ui}
+            </BrowserViewStateProvider>
+          </DiffViewerStateProvider>
+        </ReviewNotesProvider>
+      </FileExplorerProvider>
+    </MemoryRouter>,
   );
 
 /** Test helper: subscribes to DiffViewerStateContext and forwards every

@@ -15,7 +15,7 @@
  * sends or clears.
  */
 
-import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import type { Components } from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -175,11 +175,15 @@ export function ProseReader({
 
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
   const contentRef = useRef<HTMLDivElement>(null);
+  const scrollRestoredRef = useRef(false);
+  const lastScrollTopRef = useRef(0);
 
   const absolutePath = useMemo(() => {
     if (filePath.startsWith('/')) return filePath;
     return rootDir.endsWith('/') ? rootDir + filePath : rootDir + '/' + filePath;
   }, [filePath, rootDir]);
+
+  const scrollKey = useMemo(() => `phoenix:prose-scroll:${absolutePath}`, [absolutePath]);
 
   const fileType = useMemo(() => getFileType(filePath), [filePath]);
   const language = useMemo(() => getLanguage(filePath), [filePath]);
@@ -210,17 +214,84 @@ export function ProseReader({
     return () => { cancelled = true; };
   }, [absolutePath]);
 
-  // Auto-scroll to first modified line (REQ-PF-014)
+  // Reset scroll-restored flag when the file (or its scroll key) changes —
+  // a new file means a new restoration target.
+  useEffect(() => {
+    scrollRestoredRef.current = false;
+    lastScrollTopRef.current = 0;
+  }, [scrollKey]);
+
+  // Auto-scroll to first modified line (REQ-PF-014). Wins over saved scroll
+  // when a patchContext is provided — opening from a patch context means the
+  // user wants to see the changed lines, not where they last were.
   useEffect(() => {
     if (content && patchContext?.firstModifiedLine) {
       const timer = setTimeout(() => {
         const lineEl = lineRefs.current.get(patchContext.firstModifiedLine!);
         if (lineEl) lineEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        scrollRestoredRef.current = true;
       }, 100);
       return () => clearTimeout(timer);
     }
     return undefined;
   }, [content, patchContext?.firstModifiedLine]);
+
+  // Restore saved scroll position when the file loads without a
+  // patchContext to auto-scroll to. Runs in useLayoutEffect so it fires
+  // before paint — no flash at top before jumping to the saved offset.
+  useLayoutEffect(() => {
+    if (!content) return;
+    if (scrollRestoredRef.current) return;
+    if (patchContext?.firstModifiedLine) return; // auto-scroll path owns it
+    const saved = (() => {
+      try { return localStorage.getItem(scrollKey); } catch { return null; }
+    })();
+    if (saved === null) {
+      scrollRestoredRef.current = true;
+      return;
+    }
+    const pos = parseInt(saved, 10);
+    if (!Number.isNaN(pos)) {
+      const el = contentRef.current;
+      if (el) {
+        el.scrollTop = pos;
+        lastScrollTopRef.current = pos;
+      }
+    }
+    scrollRestoredRef.current = true;
+  }, [content, scrollKey, patchContext?.firstModifiedLine]);
+
+  // Track scrollTop on every scroll event so visibility-change / unmount
+  // saves see the latest value even if the DOM element has detached.
+  useEffect(() => {
+    const el = contentRef.current;
+    if (!el) return;
+    const onScroll = () => {
+      lastScrollTopRef.current = el.scrollTop;
+    };
+    el.addEventListener('scroll', onScroll, { passive: true });
+    return () => el.removeEventListener('scroll', onScroll);
+  }, [content]);
+
+  // Persist scroll on visibility-change (iOS PWA backgrounding) and on
+  // unmount (close / route change). Mirrors MessageList's pattern.
+  useEffect(() => {
+    const save = () => {
+      try {
+        localStorage.setItem(scrollKey, String(lastScrollTopRef.current));
+      } catch {
+        // storage full — degrade gracefully
+      }
+    };
+    const onVis = () => {
+      if (document.visibilityState === 'hidden') save();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      save();
+    };
+  }, [scrollKey]);
 
   // Clear highlight after animation
   useEffect(() => {

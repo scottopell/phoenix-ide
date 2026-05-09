@@ -201,16 +201,12 @@ function ConversationPageContent() {
     collapseThreshold: 280,
   });
 
-  // Mobile-only overlays
+  // Mobile-only file browser overlay. The prose reader itself reads its
+  // open-file state from `fileExplorer.proseReaderState` (URL-driven), so
+  // mobile and desktop share a single source of truth — opening or closing
+  // a file just rewrites `?file=...&root=...` on the current URL, which
+  // means an iOS PWA cold reload restores the exact view.
   const [showFileBrowser, setShowFileBrowser] = useState(false);
-  const [mobileProseFile, setMobileProseFile] = useState<{
-    path: string;
-    rootDir: string;
-    patchContext?: {
-      modifiedLines: Set<number>;
-      firstModifiedLine?: number;
-    };
-  } | null>(null);
 
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
@@ -265,7 +261,6 @@ function ConversationPageContent() {
     // useState resets — React batches these into the same render.
     setError(null);
     setShowFileBrowser(false);
-    setMobileProseFile(null);
     setImages([]);
     setShowTaskApproval(false);
     setShowFirstTaskWelcome(false);
@@ -754,22 +749,14 @@ function ConversationPageContent() {
   const handleFileSelect = useCallback(
     (filePath: string, rootDir: string) => {
       setShowFileBrowser(false);
-      if (isDesktop) {
-        fileExplorer.openFile(filePath, rootDir);
-      } else {
-        setMobileProseFile({ path: filePath, rootDir });
-      }
+      fileExplorer.openFile(filePath, rootDir);
     },
-    [isDesktop, fileExplorer]
+    [fileExplorer]
   );
 
   const handleCloseProseReader = useCallback(() => {
-    if (isDesktop) {
-      fileExplorer.closeFile();
-    } else {
-      setMobileProseFile(null);
-    }
-  }, [isDesktop, fileExplorer]);
+    fileExplorer.closeFile();
+  }, [fileExplorer]);
 
   const handleSendNotes = useCallback(
     (formattedNotes: string) => {
@@ -789,30 +776,18 @@ function ConversationPageContent() {
           console.warn('Failed to save notes to draft:', e);
         }
       }
-      if (isDesktop) {
-        fileExplorer.closeFile();
-      } else {
-        setMobileProseFile(null);
-      }
+      fileExplorer.closeFile();
     },
-    [isDesktop, fileExplorer, conversationId]
+    [fileExplorer, conversationId]
   );
 
   const handleOpenFileFromPatch = useCallback(
     (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => {
       const rootDir = conversation?.cwd || '/';
       const fullPath = filePath.startsWith('/') ? filePath : `${rootDir}/${filePath}`;
-      if (isDesktop) {
-        fileExplorer.openFile(fullPath, rootDir, { modifiedLines, firstModifiedLine });
-      } else {
-        setMobileProseFile({
-          path: fullPath,
-          rootDir,
-          patchContext: { modifiedLines, firstModifiedLine },
-        });
-      }
+      fileExplorer.openFile(fullPath, rootDir, { modifiedLines, firstModifiedLine });
     },
-    [conversation?.cwd, isDesktop, fileExplorer]
+    [conversation?.cwd, fileExplorer]
   );
 
   // REQ-SEED-003: click handler for the seed-parent breadcrumb link.
@@ -1321,15 +1296,17 @@ function ConversationPageContent() {
         onFileSelect={handleFileSelect}
       />
 
-      {/* Mobile prose reader overlay */}
-      {!isDesktop && mobileProseFile && (
+      {/* Mobile prose reader overlay — reads URL-driven state from
+          FileExplorerProvider so cold reload (e.g. iOS PWA return) restores
+          the exact file the user was viewing. */}
+      {!isDesktop && fileExplorer.proseReaderState && (
         <Suspense fallback={null}>
           <ProseReader
-            filePath={mobileProseFile.path}
-            rootDir={mobileProseFile.rootDir}
+            filePath={fileExplorer.proseReaderState.path}
+            rootDir={fileExplorer.proseReaderState.rootDir}
             onClose={handleCloseProseReader}
             onSendNotes={handleSendNotes}
-            patchContext={mobileProseFile.patchContext ?? undefined}
+            patchContext={fileExplorer.proseReaderState.patchContext ?? undefined}
           />
         </Suspense>
       )}

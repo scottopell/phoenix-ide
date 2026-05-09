@@ -28,6 +28,8 @@ import { useAppMachine } from '../hooks/useAppMachine';
 import { useToast } from '../hooks/useToast';
 import { CredentialHelperPanel } from '../components/CredentialHelperPanel';
 
+const SCROLL_KEY = 'phoenix:conversation-list-scroll';
+
 export function ConversationListPage() {
   const navigate = useNavigate();
   const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
@@ -114,10 +116,12 @@ export function ConversationListPage() {
   // This page calls `refresh()` after mutations that need an immediate
   // resync, but never holds its own conversation arrays.
 
-  // Restore scroll position after data loads
+  // Restore scroll position after data loads. Uses localStorage rather
+  // than sessionStorage so the position survives an iOS PWA cold kill
+  // (the OS clears sessionStorage when it terminates the JS context).
   useEffect(() => {
     if (!loading && !scrollRestoredRef.current && conversations.length > 0) {
-      const savedPosition = sessionStorage.getItem('conversationListScrollPosition');
+      const savedPosition = localStorage.getItem(SCROLL_KEY);
       if (savedPosition && mainRef.current) {
         const target = parseInt(savedPosition, 10);
         // Use rAF to ensure the list items are painted before scrolling
@@ -126,16 +130,44 @@ export function ConversationListPage() {
             mainRef.current.scrollTop = target;
           }
         });
-        sessionStorage.removeItem('conversationListScrollPosition');
       }
       scrollRestoredRef.current = true;
     }
   }, [loading, conversations]);
 
-  // Save scroll position before navigating away
+  // Save scroll position on backgrounding (iOS PWA suspend) and on every
+  // navigation away from the list. Saving on visibility-hidden catches
+  // the case where iOS kills the tab without firing pagehide.
+  useEffect(() => {
+    const save = () => {
+      if (mainRef.current) {
+        try {
+          localStorage.setItem(SCROLL_KEY, mainRef.current.scrollTop.toString());
+        } catch {
+          // storage full — degrade gracefully
+        }
+      }
+    };
+    const onVis = () => {
+      if (document.visibilityState === 'hidden') save();
+    };
+    document.addEventListener('visibilitychange', onVis);
+    return () => {
+      document.removeEventListener('visibilitychange', onVis);
+      save();
+    };
+  }, []);
+
+  // Save scroll position before navigating away (handles the in-app
+  // navigation case; the visibility-change listener above handles the
+  // iOS-kill case).
   const handleConversationClick = useCallback((conv: Conversation) => {
     if (mainRef.current) {
-      sessionStorage.setItem('conversationListScrollPosition', mainRef.current.scrollTop.toString());
+      try {
+        localStorage.setItem(SCROLL_KEY, mainRef.current.scrollTop.toString());
+      } catch {
+        // ignore
+      }
     }
     navigate(`/c/${conv.slug}`);
   }, [navigate]);

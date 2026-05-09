@@ -1,10 +1,14 @@
-// Tests for the per-scope reset behavior of FileExplorerProvider.
-// See task 02703 — file viewer state must not leak across conversation
-// (or any other scope) boundary.
+// Tests for FileExplorerProvider's URL-driven prose-reader state.
+//
+// path + rootDir live in the URL search params (?file=&root=) so an iOS PWA
+// cold reload restores the open file (the URL is the only state that
+// survives a JS context kill). patchContext (Set<number> highlights) lives
+// in scoped state and resets when the scopeKey changes.
 
 import { describe, it, expect } from 'vitest';
 import { render, act } from '@testing-library/react';
 import { useEffect } from 'react';
+import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { FileExplorerProvider } from './FileExplorerContext';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 
@@ -16,72 +20,108 @@ function Consumer({ onCtx }: { onCtx: (ctx: ReturnType<typeof useFileExplorer>) 
   return null;
 }
 
-describe('FileExplorerProvider scopeKey reset (task 02703)', () => {
-  it('clears proseReaderState when scopeKey changes', () => {
-    let latest: ReturnType<typeof useFileExplorer> | null = null;
-    const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
+// Captures the current location.search so tests can assert URL state.
+function LocationCapture({ onSearch }: { onSearch: (s: string) => void }) {
+  const location = useLocation();
+  useEffect(() => { onSearch(location.search); }, [location.search, onSearch]);
+  return null;
+}
 
-    const { rerender } = render(
-      <FileExplorerProvider scopeKey="conv-A">
-        <Consumer onCtx={onCtx} />
-      </FileExplorerProvider>,
+describe('FileExplorerProvider — URL-driven open file', () => {
+  it('openFile writes path + root to the URL; closeFile clears them', () => {
+    let latest: ReturnType<typeof useFileExplorer> | null = null;
+    let search = '';
+    const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
+    const onSearch = (s: string) => { search = s; };
+
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes>
+          <Route
+            path="/c/:slug"
+            element={
+              <FileExplorerProvider scopeKey="conv-A">
+                <Consumer onCtx={onCtx} />
+                <LocationCapture onSearch={onSearch} />
+              </FileExplorerProvider>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
     );
 
-    // Open a file in conv-A.
     act(() => { latest!.openFile('/repo/README.md', '/repo'); });
     expect(latest!.activeFile).toBe('/repo/README.md');
-    expect(latest!.proseReaderState).not.toBeNull();
+    expect(latest!.proseReaderState).toEqual({
+      path: '/repo/README.md',
+      rootDir: '/repo',
+    });
+    expect(search).toContain('file=%2Frepo%2FREADME.md');
+    expect(search).toContain('root=%2Frepo');
 
-    // Switch to a different scope (conv-B). The viewer must close — conv-B
-    // must NOT inherit conv-A's open file.
-    rerender(
-      <FileExplorerProvider scopeKey="conv-B">
-        <Consumer onCtx={onCtx} />
-      </FileExplorerProvider>,
-    );
+    act(() => { latest!.closeFile(); });
     expect(latest!.activeFile).toBeNull();
     expect(latest!.proseReaderState).toBeNull();
+    expect(search).not.toContain('file=');
+    expect(search).not.toContain('root=');
   });
 
-  it('preserves proseReaderState when scopeKey stays the same', () => {
+  it('hydrates proseReaderState from initial URL search params', () => {
+    let latest: ReturnType<typeof useFileExplorer> | null = null;
+    const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
+
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A?file=%2Frepo%2FREADME.md&root=%2Frepo']}>
+        <Routes>
+          <Route
+            path="/c/:slug"
+            element={
+              <FileExplorerProvider scopeKey="conv-A">
+                <Consumer onCtx={onCtx} />
+              </FileExplorerProvider>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
+    );
+
+    expect(latest!.activeFile).toBe('/repo/README.md');
+    expect(latest!.proseReaderState).toEqual({
+      path: '/repo/README.md',
+      rootDir: '/repo',
+    });
+  });
+
+  it('clears patchContext when scopeKey changes (URL-driven path stays)', () => {
     let latest: ReturnType<typeof useFileExplorer> | null = null;
     const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
 
     const { rerender } = render(
-      <FileExplorerProvider scopeKey="conv-A">
-        <Consumer onCtx={onCtx} />
-      </FileExplorerProvider>,
+      <MemoryRouter initialEntries={['/']}>
+        <FileExplorerProvider scopeKey="conv-A">
+          <Consumer onCtx={onCtx} />
+        </FileExplorerProvider>
+      </MemoryRouter>,
     );
-    act(() => { latest!.openFile('/repo/README.md', '/repo'); });
-    expect(latest!.activeFile).toBe('/repo/README.md');
 
-    // Re-render with the same scopeKey — unrelated parent re-renders should
-    // not nuke the viewer state.
-    rerender(
-      <FileExplorerProvider scopeKey="conv-A">
-        <Consumer onCtx={onCtx} />
-      </FileExplorerProvider>,
-    );
-    expect(latest!.activeFile).toBe('/repo/README.md');
-  });
-
-  it('starting with no scopeKey then assigning one resets', () => {
-    let latest: ReturnType<typeof useFileExplorer> | null = null;
-    const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
-
-    const { rerender } = render(
-      <FileExplorerProvider>
-        <Consumer onCtx={onCtx} />
-      </FileExplorerProvider>,
-    );
-    act(() => { latest!.openFile('/x', '/'); });
-    expect(latest!.activeFile).toBe('/x');
+    act(() => {
+      latest!.openFile('/repo/x.ts', '/repo', {
+        modifiedLines: new Set([3, 5]),
+        firstModifiedLine: 3,
+      });
+    });
+    expect(latest!.proseReaderState?.patchContext?.firstModifiedLine).toBe(3);
 
     rerender(
-      <FileExplorerProvider scopeKey="conv-A">
-        <Consumer onCtx={onCtx} />
-      </FileExplorerProvider>,
+      <MemoryRouter initialEntries={['/']}>
+        <FileExplorerProvider scopeKey="conv-B">
+          <Consumer onCtx={onCtx} />
+        </FileExplorerProvider>
+      </MemoryRouter>,
     );
-    expect(latest!.activeFile).toBeNull();
+    // patchContext is conversation-specific and resets on scopeKey change.
+    // The URL-driven path/rootDir would also be unset here because the
+    // MemoryRouter is a fresh instance per render.
+    expect(latest!.proseReaderState?.patchContext).toBeUndefined();
   });
 });
