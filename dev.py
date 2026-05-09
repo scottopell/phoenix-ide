@@ -1703,6 +1703,7 @@ def cmd_check():
         text = proc.stdout
         idx = 0
         failures = []
+        docs_parsed = 0
         decode_error = None
         while idx < len(text):
             while idx < len(text) and text[idx].isspace():
@@ -1715,20 +1716,47 @@ def cmd_check():
                 decode_error = str(e)
                 break
             idx = end
+            docs_parsed += 1
             errs = [d for d in doc.get("diagnostics", []) if d.get("severity") == "error"]
             if errs:
                 failures.append((doc.get("diagnostics", [{}])[0].get("location", {}).get("file") or "?", errs))
         elapsed = time.monotonic() - t0
-        if decode_error and not failures:
-            out = (f"could not parse allium check output: {decode_error}\n"
-                   f"first 500 chars of stdout:\n{text[:500]}\n"
-                   f"first 500 chars of stderr:\n{proc.stderr[:500]}")
-            with results_lock:
-                results.append(("allium specs", 1, elapsed, out))
-                print(f"  ✗ {'allium specs':<18s} ({elapsed:.1f}s)")
-            return
-        if failures:
+
+        # Hard-fail on any structural problem with the gate itself, even if
+        # earlier files already reported errors. A truncated/partial stream
+        # could otherwise hide diagnostics from later files; an empty
+        # stdout (allium changed output format, crashed, wrote only to
+        # stderr) would silently pass; a parsed-doc count below the file
+        # count means we lost some specs to a parse failure mid-stream.
+        # Each of these makes the gate unreliable, so report them
+        # explicitly rather than masking them behind whatever errors we
+        # did see.
+        gate_problems = []
+        if decode_error:
+            gate_problems.append(f"JSON-stream decode error after {docs_parsed} doc(s): {decode_error}")
+        if docs_parsed == 0:
+            gate_problems.append(
+                f"allium check produced no parseable diagnostic docs "
+                f"(passed {len(spec_files)} files; stdout {len(text)} bytes)"
+            )
+        elif docs_parsed != len(spec_files):
+            gate_problems.append(
+                f"allium check returned {docs_parsed} diagnostic doc(s) but "
+                f"{len(spec_files)} spec(s) were passed -- some specs were not validated"
+            )
+
+        if gate_problems or failures:
             lines = []
+            if gate_problems:
+                lines.append("allium check gate failure:")
+                for p in gate_problems:
+                    lines.append(f"  {p}")
+                if proc.stderr.strip():
+                    lines.append(f"stderr (first 500 chars):\n{proc.stderr[:500]}")
+                if text.strip() and not failures:
+                    lines.append(f"stdout (first 500 chars):\n{text[:500]}")
+                if failures:
+                    lines.append("")
             for path, errs in failures:
                 rel = path
                 try:
