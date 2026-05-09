@@ -125,36 +125,56 @@ rule DetectAgentFinished {
 -- check all conversations for states that need attention. Fire
 -- notifications for any that were missed while the tab was suspended.
 
-rule CatchUpOnReconnect {
-    when: SseReconnected
+-- Three sibling rules cover the three notify-worthy states the catch-up
+-- pass observes. v3 grammar does not allow `ensures: X if cond` so each
+-- conversation-state branch is its own rule with `requires:` filtering.
+-- Intentionally does NOT notify for idle conversations on reconnect:
+-- idle is only notification-worthy on live busy -> idle transition; on
+-- catch-up idle is ambiguous (may have been idle for hours).
 
-    for conversation in Conversations where not is_sub_agent:
-        let state = conversation.status
+rule CatchUpAwaitingTaskApproval {
+    when: SseReconnected(snapshot)
 
-        ensures: NotificationEvent(
-            type: task_approval_needed,
-            conversation: conversation,
-            title: "Task approval needed",
-            body: conversation.slug
-        ) if state = awaiting_task_approval
+    ensures:
+        for c in Conversations where not c.is_sub_agent:
+            CatchupCheckTaskApproval(c)
+}
 
-        ensures: NotificationEvent(
-            type: question_asked,
-            conversation: conversation,
-            title: "Question asked",
-            body: conversation.slug
-        ) if state = awaiting_user_response
+rule EmitTaskApprovalCatchupNotification {
+    when: CatchupCheckTaskApproval(conversation)
+    requires: conversation.status = awaiting_task_approval
 
-        ensures: NotificationEvent(
-            type: agent_error,
-            conversation: conversation,
-            title: "Agent error",
-            body: conversation.slug
-        ) if state in { error, context_exhausted }
+    ensures: NotificationEvent(
+        type: task_approval_needed,
+        conversation: conversation,
+        title: "Task approval needed",
+        body: conversation.slug
+    )
+}
 
-    -- Intentionally does NOT notify for idle conversations on reconnect.
-    -- Idle is only notification-worthy on live transition (busy -> idle).
-    -- On catch-up, idle is ambiguous (may have been idle for hours).
+rule EmitQuestionCatchupNotification {
+    when: CatchupCheckTaskApproval(conversation)
+    requires: conversation.status = awaiting_user_response
+
+    ensures: NotificationEvent(
+        type: question_asked,
+        conversation: conversation,
+        title: "Question asked",
+        body: conversation.slug
+    )
+}
+
+rule EmitErrorCatchupNotification {
+    when: CatchupCheckTaskApproval(conversation)
+    requires: conversation.status = error
+        or conversation.status = context_exhausted
+
+    ensures: NotificationEvent(
+        type: agent_error,
+        conversation: conversation,
+        title: "Agent error",
+        body: conversation.slug
+    )
 
     @guidance
         -- Implementation: in the SSE init handler (which fires on every
@@ -163,25 +183,27 @@ rule CatchUpOnReconnect {
         -- pipeline (checks settings, permission, tab focus).
         -- This runs AFTER the conversation list is loaded from the init
         -- event, so all data is available.
+        --
+        -- The intermediate event (CatchupCheckTaskApproval) lets the
+        -- three branches fire as separate rules without a top-level
+        -- conditional — Allium v3's preferred shape.
 }
 
 ------------------------------------------------------------
 -- Rules: Notification Delivery
 ------------------------------------------------------------
 
+-- Delivery is gated on the master toggle, the per-event toggle, browser
+-- permission, and tab-focus state. The per-event toggle is selected by
+-- the event type; v3 grammar has no `match` expression, so the lookup
+-- moves into a black-box predicate `event_type_enabled(type, settings)`
+-- that the implementation already maps via a small switch (see
+-- ui/src/notifications.ts).
 rule DeliverNotification {
     when: NotificationEvent(type, conversation, title, body)
 
-    let settings = NotificationSettings
-    let event_enabled = match type {
-        task_approval_needed: settings.notify_task_approval
-        question_asked: settings.notify_question
-        agent_error: settings.notify_error
-        agent_finished: settings.notify_idle
-    }
-
-    requires: settings.enabled
-    requires: event_enabled
+    requires: NotificationSettings.enabled
+    requires: event_type_enabled(type, NotificationSettings)
     requires: BrowserPermission = granted
     requires: not tab_is_focused
 
@@ -191,6 +213,11 @@ rule DeliverNotification {
         -- Implementation: new Notification(title, { body, tag: conversation.id })
         -- The tag prevents duplicate notifications for the same conversation.
         -- If the tab IS focused, the user is already looking -- no notification.
+        -- event_type_enabled maps:
+        --   task_approval_needed -> settings.notify_task_approval
+        --   question_asked       -> settings.notify_question
+        --   agent_error          -> settings.notify_error
+        --   agent_finished       -> settings.notify_idle
 }
 
 rule NotificationClicked {
@@ -225,7 +252,7 @@ rule UpdateNotificationSettings {
 }
 
 rule RequestBrowserPermission {
-    when: UserRequestsPermission
+    when: UserRequestsPermission(initiator)
 
     requires: BrowserPermission = default
 

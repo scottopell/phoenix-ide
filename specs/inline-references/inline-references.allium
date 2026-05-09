@@ -13,9 +13,12 @@ use "./specs/bedrock/bedrock.allium" as bedrock
 ------------------------------------------------------------
 
 value InlineReference {
-    sigil: "@" | "/" | "./"
+    sigil: String               -- "@" | "/" | "./"
     token: String               -- text after the sigil, until whitespace
-    span: Range                 -- byte range in original text
+    span_start: Integer         -- byte offset of sigil in original text
+    span_end: Integer           -- byte offset just past last token byte
+    intent: String?             -- set by ClassifyAtReference; one of ReferenceIntent values
+    expanded_content: String?   -- set by ExpandFileReference; null for pass-through tokens
 }
 
 enum ReferenceIntent {
@@ -83,30 +86,44 @@ rule TokenizeReferences {
 -- Classify each @ reference as intentional file reference or literal text.
 -- This is the key change: not every @ token is a file reference.
 
-rule ClassifyAtReference {
-    when: reference: InlineReference where sigil = "@"
+-- Classification: @ tokens that look path-like get file_expansion; the rest
+-- become not_a_reference. Allium v3 does not allow conditional `ensures: X
+-- if cond`; the equivalent pattern is to split the rule, each branch gated
+-- by `requires:`.
 
-    let token = reference.token
-    let looks_like_path =
-        token.contains("/")
-        or token.split(".").last in config.path_like_extensions
+rule ClassifyAtReferenceAsFile {
+    when: ReferenceClassified(reference)
+    requires: reference.sigil = "@"
+    requires: looks_like_path(reference.token)
 
-    ensures: reference.intent = file_expansion
-        if looks_like_path
-    ensures: reference.intent = not_a_reference
-        if not looks_like_path
+    ensures: ReferenceIntentAssigned(reference, "file_expansion")
 
     @guidance
-        -- Examples of classification:
+        -- looks_like_path: black-box predicate evaluated on the token —
+        -- true when the token contains "/" OR its trailing dot-suffix is
+        -- in config.path_like_extensions. Implementation: the same check
+        -- in expand() in message_expander.rs.
+        -- Examples:
         --   @src/main.rs       -> file_expansion (contains /)
         --   @AGENTS.md         -> file_expansion (.md is a known extension)
+}
+
+rule ClassifyAtReferenceAsLiteral {
+    when: ReferenceClassified(reference)
+    requires: reference.sigil = "@"
+    requires: not looks_like_path(reference.token)
+
+    ensures: ReferenceIntentAssigned(reference, "not_a_reference")
+
+    @guidance
+        -- Examples:
         --   @username          -> not_a_reference (bare word, no / or extension)
         --   @param             -> not_a_reference (bare word)
         --   user@email.com     -> not tokenized (@ not preceded by whitespace)
         --
         -- Implementation: in expand(), after tokenizing, check each @ ref.
         -- If intent = not_a_reference, skip it (leave as literal text).
-        -- If intent = file_expansion, resolve the file.
+        -- If intent = file_expansion, resolve the file (next rule).
 }
 
 ------------------------------------------------------------
@@ -115,26 +132,26 @@ rule ClassifyAtReference {
 
 -- File expansion: resolve @file references to file contents.
 rule ExpandFileReference {
-    when: reference: InlineReference where intent = file_expansion
+    when: ReferenceExpansionRequested(reference, working_dir)
+    requires: reference.intent = "file_expansion"
+    requires: file_exists_and_is_text(reference.token, working_dir)
 
-    let path = resolve_path(reference.token, working_dir)
-
-    requires: path.exists
-    requires: path.is_text_file
-
-    ensures: reference.expanded_content = read_file(path)
+    ensures: ReferenceContentExpanded(reference, read_file_resolved(reference.token, working_dir))
 
     @guidance
-        -- Replaces the @token span in llm_text with:
+        -- file_exists_and_is_text: black-box predicate over (token,
+        -- working_dir) that resolves the path and checks both
+        -- existence and text-file-ness. Replaces the @token span in
+        -- llm_text with:
         --   <file path="absolute/path">file contents</file>
         -- Display text retains the original @token.
 }
 
 -- File expansion failure: path looks like a file but doesn't exist.
 rule FileReferenceNotFound {
-    when: reference: InlineReference where intent = file_expansion
-
-    requires: not resolve_path(reference.token, working_dir).exists
+    when: ReferenceExpansionRequested(reference, working_dir)
+    requires: reference.intent = "file_expansion"
+    requires: not file_exists_and_is_text(reference.token, working_dir)
 
     ensures: ExpansionBlocked(reference)
     -- Message is NOT sent. User sees error identifying the missing file.
@@ -146,23 +163,21 @@ rule FileReferenceNotFound {
 
 -- Non-reference @ tokens: pass through as literal text.
 rule AtTokenPassThrough {
-    when: reference: InlineReference where intent = not_a_reference
+    when: ReferenceExpansionRequested(reference, working_dir)
+    requires: reference.intent = "not_a_reference"
 
-    ensures: reference.expanded_content = null
+    ensures: ReferenceContentExpanded(reference, null)
     -- Token is left as-is in both display_text and llm_text.
     -- No error, no expansion, no blocking.
 }
 
 -- Skill invocation: /skill-name at message start.
 rule ExpandSkillReference {
-    when: reference: InlineReference where sigil = "/"
+    when: ReferenceExpansionRequested(reference, working_dir)
+    requires: reference.sigil = "/"
+    requires: skill_matches_token(reference.token, working_dir)
 
-    let skills = discover_skills(working_dir)
-    let matched = skills where name = reference.token
-
-    requires: matched.count > 0
-
-    ensures: SkillInvoked(reference, matched.first)
+    ensures: SkillInvoked(reference, lookup_skill(reference.token, working_dir))
     -- Skill expansion replaces the entire message content.
     -- File @references in the original text are NOT expanded
     -- (skill output might contain @ that shouldn't trigger expansion).
@@ -170,16 +185,16 @@ rule ExpandSkillReference {
 
 -- Unmatched /skill: pass through silently (not an error).
 rule SkillTokenPassThrough {
-    when: reference: InlineReference where sigil = "/"
+    when: ReferenceExpansionRequested(reference, working_dir)
+    requires: reference.sigil = "/"
+    requires: not skill_matches_token(reference.token, working_dir)
 
-    let skills = discover_skills(working_dir)
-    let matched = skills where name = reference.token
-
-    requires: matched.count = 0
-
-    ensures: reference.expanded_content = null
+    ensures: ReferenceContentExpanded(reference, null)
     -- / followed by a non-skill word is treated as literal text.
     -- No error, no blocking. Common in normal prose ("use /tmp").
+    -- skill_matches_token: black-box predicate that walks the user's
+    -- discovered skill catalog (discover_skills in src/system_prompt.rs)
+    -- and returns true when name = token.
 }
 
 ------------------------------------------------------------
@@ -246,37 +261,56 @@ rule AutocompleteSelected {
 -- Rules: Message Delivery
 ------------------------------------------------------------
 
-rule MessageExpanded {
-    when: UserSendsMessage(conversation, text)
+-- Top-level message expansion. Three sibling rules cover the three
+-- branches; v3 does not support `ensures: X if cond` so each branch is
+-- a separate rule with its own `requires`. Helpers used:
+--   has_skill_match(text, working_dir): true iff text leads with /skill
+--     and skill resolves
+--   skill_body_for(text, working_dir): the resolved skill's body
+--   any_file_ref_fails(text, working_dir): true iff some @file ref looks
+--     path-like but doesn't resolve
 
-    let refs = extract_references(text)
-    let file_refs = refs where sigil = "@" and intent = file_expansion
-    let skill_ref = refs where sigil = "/" | first
+-- Skill invocation takes priority: replaces entire message.
+-- If a skill matches, @ refs in the original text are NOT expanded.
+rule MessageExpandedAsSkill {
+    when: UserSendsMessage(conversation, text, working_dir)
+    requires: has_skill_match(text, working_dir)
 
-    -- Skill invocation takes priority: replaces entire message.
-    -- If a skill matches, @ refs in the original text are NOT expanded.
     ensures: ExpansionResult.created(
         display_text: text,
-        llm_text: skill_body,
-        skill_invocation: skill
-    ) if skill_ref and skill_matched(skill_ref)
+        llm_text: skill_body_for(text, working_dir),
+        skill_invocation: lookup_skill_for(text, working_dir)
+    )
+}
 
-    -- No skill: expand @ file references.
+-- No skill: expand @ file references and deliver the expanded text.
+rule MessageExpandedAsFiles {
+    when: UserSendsMessage(conversation, text, working_dir)
+    requires: not has_skill_match(text, working_dir)
+    requires: not any_file_ref_fails(text, working_dir)
+
     ensures: ExpansionResult.created(
         display_text: text,
-        llm_text: expand_file_refs(text, file_refs),
+        llm_text: expand_file_refs(text, working_dir),
         skill_invocation: null
-    ) if not skill_matched(skill_ref)
+    )
+}
 
-    -- Blocked if any file_expansion ref fails to resolve.
-    ensures: ExpansionBlocked(failed_ref)
-        if any ref in file_refs: not ref.resolved
+-- Blocked if any file_expansion ref fails to resolve.
+rule MessageExpansionBlocked {
+    when: UserSendsMessage(conversation, text, working_dir)
+    requires: not has_skill_match(text, working_dir)
+    requires: any_file_ref_fails(text, working_dir)
+
+    ensures: ExpansionBlocked(text)
 
     @guidance
         -- Implementation: expand() in message_expander.rs
         -- Called by the chat handler before persisting the message.
         -- Returns Ok(ExpandedMessage) or Err(ExpansionError).
-        -- The handler stores display_text in DB and sends llm_text to the LLM.
+        -- The handler stores display_text in DB and sends llm_text to
+        -- the LLM. The error path returns the first failing reference's
+        -- path so the UI can render an inline error.
 }
 
 ------------------------------------------------------------
@@ -297,20 +331,21 @@ invariant SkillXorFileExpansion {
 
 -- @ tokens classified as not_a_reference never cause errors.
 invariant NonReferenceNeverBlocks {
-    for ref in InlineReferences where ref.intent = not_a_reference:
-        not ExpansionBlocked(ref)
+    for r in InlineReferences:
+        r.intent = "not_a_reference" implies not ExpansionBlocked(r)
 }
 
 -- Sigils that fall inside a markdown code region (fenced code block,
 -- indented code block, or inline backtick span) are never tokenized as
 -- references. A user pasting a stack trace or example code containing
--- `@src/main.rs` inside a fence sends the literal text to the LLM rather
--- than triggering file expansion (or a FileNotFound error if the path is
--- stale). Implementation: `masked_code_ranges` in `src/message_expander.rs`,
--- consumed by `tokenize_references`.
-invariant NoExpansionInsideCode {
-    for p in sigil_positions(text):
-        p in markdown_code_region(text)
-            implies not exists ref in tokenize_references(text):
-                ref.span.start = p
-}
+-- `@src/main.rs` inside a fence sends the literal text to the LLM
+-- rather than triggering file expansion (or a FileNotFound error if
+-- the path is stale).
+--
+-- Enforced by construction at the tokenizer: `tokenize_references` in
+-- `src/message_expander.rs` consumes `masked_code_ranges` and skips any
+-- sigil whose position falls inside one of those ranges. The invariant
+-- is therefore at the boundary of two black-box helpers
+-- (`masked_code_ranges` + `tokenize_references`); a structural
+-- restatement here would be redundant with the implementation
+-- contract. Tracked in spec prose rather than as a checkable invariant.

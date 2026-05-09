@@ -37,7 +37,7 @@ entity PatchPlanner {
 }
 
 entity PatchRequest {
-    operation: Replace | AppendEof | PrependBof | Overwrite
+    operation: replace | append_eof | prepend_bof | overwrite
     old_text: String?
     new_text: String?
     to_clipboard: String?       -- clipboard name to store old_text into
@@ -53,8 +53,8 @@ entity PatchPlan {
 }
 
 entity PatchEffect {
-    kind: WriteFile
-    path: Path
+    kind: String                -- always "WriteFile" in v1
+    path: String                -- absolute filesystem path
     content: String
 }
 
@@ -69,7 +69,7 @@ entity PatchEffect {
 entity MatchAttempt {
     content: String
     old_text: String
-    result: Matched | NotFound | NotUnique
+    result: matched | not_found | not_unique
 
     -- Derived (evaluated lazily in cascade order)
     exact_result: find_exact_unique(content, old_text)
@@ -82,7 +82,7 @@ entity MatchAttempt {
 rule ExactMatchSucceeds {
     when: attempt: MatchAttempt.created
     requires: attempt.exact_result != null
-    ensures: attempt.result = Matched
+    ensures: attempt.result = matched
     ensures: attempt.spec = attempt.exact_result
 }
 
@@ -90,7 +90,7 @@ rule DedentFallback {
     when: attempt: MatchAttempt.created
     requires: attempt.exact_result = null
     requires: attempt.dedent_result != null
-    ensures: attempt.result = Matched
+    ensures: attempt.result = matched
     ensures: attempt.spec = attempt.dedent_result
     @guidance
         -- Iterates over distinct indentation levels found in content.
@@ -104,7 +104,7 @@ rule TrimmedFallback {
     requires: attempt.exact_result = null
     requires: attempt.dedent_result = null
     requires: attempt.trimmed_result != null
-    ensures: attempt.result = Matched
+    ensures: attempt.result = matched
     ensures: attempt.spec = attempt.trimmed_result
     @guidance
         -- Requires old_text to have >2 lines.
@@ -119,7 +119,7 @@ rule SkeletonFallback {
     requires: attempt.dedent_result = null
     requires: attempt.trimmed_result = null
     requires: attempt.normalised_result != null
-    ensures: attempt.result = Matched
+    ensures: attempt.result = matched
     ensures: attempt.spec = attempt.normalised_result
     @guidance
         -- Uses Unicode TR39 confusable skeleton mapping (not NFKC).
@@ -141,7 +141,7 @@ rule MatchNotFound {
     requires: attempt.trimmed_result = null
     requires: attempt.normalised_result = null
     requires: attempt.raw_count = 0
-    ensures: attempt.result = NotFound
+    ensures: attempt.result = not_found
 }
 
 rule MatchNotUnique {
@@ -151,7 +151,7 @@ rule MatchNotUnique {
     requires: attempt.trimmed_result = null
     requires: attempt.normalised_result = null
     requires: attempt.raw_count > 1
-    ensures: attempt.result = NotUnique
+    ensures: attempt.result = not_unique
 }
 
 -- ============================================================================
@@ -162,7 +162,7 @@ rule PlanValidation {
     when: PlanRequested(planner, path, current_content, patches)
     requires: patches.count > 0
     requires:
-        for patch in patches where patch.operation = Replace:
+        for patch in patches where patch.operation = replace:
             current_content != null
     @guidance
         -- Empty patches -> NoPatches error.
@@ -174,56 +174,89 @@ rule PlanValidation {
 -- Edit building: per-patch -> Edit
 -- ============================================================================
 
-rule ResolveNewText {
+-- new_text resolution has two branches: from a stored clipboard, or from
+-- the patch's inline new_text field. v3 grammar does not allow `if/else`
+-- with separate `requires`/`ensures` per branch -- the equivalent shape is
+-- two sibling rules.
+
+rule ResolveNewTextFromClipboard {
     when: BuildEdit(planner, patch, original)
-    let effective_from_clipboard = patch.from_clipboard where patch.from_clipboard != ""
-    let effective_to_clipboard = patch.to_clipboard where patch.to_clipboard != ""
-    if effective_from_clipboard != null:
-        requires: effective_from_clipboard in planner.clipboard_names
-        ensures: new_text = planner.clipboards[effective_from_clipboard]
-    else:
-        ensures: new_text = patch.new_text ?? ""
+    requires: patch.from_clipboard != null
+    requires: patch.from_clipboard != ""
+    requires: patch.from_clipboard in planner.clipboard_names
+
+    ensures: NewTextResolved(patch, lookup_clipboard(planner, patch.from_clipboard))
+
     @guidance
         -- Empty string clipboard names ("") are treated as absent.
         -- LLMs sometimes pass "" instead of omitting the field.
 }
 
+rule ResolveNewTextInline {
+    when: BuildEdit(planner, patch, original)
+    requires: patch.from_clipboard = null or patch.from_clipboard = ""
+
+    ensures: NewTextResolved(patch, coalesce(patch.new_text, ""))
+}
+
 rule ApplyReindent {
     when: BuildEdit(planner, patch, original)
     requires: patch.reindent != null
-    let reindent = patch.reindent
-    ensures:
-        for line in new_text.split("\n") where line != "":
-            if reindent.strip != null:
-                requires: line.starts_with(reindent.strip)
-            if reindent.add != null:
-                line.starts_with(reindent.add)
+
+    ensures: ReindentApplied(patch, reindent_lines(new_text, patch.reindent))
+
     @guidance
         -- Strip runs first, then add. Empty lines pass through unchanged.
-        -- If strip prefix is absent on a non-empty line -> ReindentPrefixMismatch error.
+        -- If strip prefix is absent on a non-empty line ->
+        -- ReindentPrefixMismatch error. The per-line check (strip prefix
+        -- present, then strip + prepend add) lives in
+        -- `reindent_lines(new_text, reindent)` -- a black-box helper that
+        -- iterates non-empty lines and returns the reindented string. The
+        -- spec describes the contract; the per-line algorithm is
+        -- implementation. Splitting the loop into the rule body is not
+        -- expressible in v3 grammar (`if cond:` clauses inside an
+        -- `ensures: for ... in ...:` block are not allowed).
 }
 
-rule StoreToClipboard {
+-- Two sibling rules cover the two store-source branches: replace stores
+-- the actual matched text (handles fuzzy match divergence); other
+-- operations store the requested old_text. v3 grammar does not allow
+-- `if/else` with separate requires/ensures inside a single rule.
+
+rule StoreToClipboardFromMatch {
     when: BuildEdit(planner, patch, original)
-    let effective_to_clipboard = patch.to_clipboard where patch.to_clipboard != ""
-    requires: effective_to_clipboard != null
-    if patch.operation = Replace:
-        -- For Replace, store the *actual matched text* from content,
-        -- not the requested old_text. Handles fuzzy match divergence.
-        ensures: planner.clipboards[effective_to_clipboard] = matched_text_from_content
-    else:
-        requires: patch.old_text != null
-        ensures: planner.clipboards[effective_to_clipboard] = patch.old_text
+    requires: patch.to_clipboard != null
+    requires: patch.to_clipboard != ""
+    requires: patch.operation = replace
+
+    ensures: ClipboardWrite(planner, patch.to_clipboard, matched_text_from_content)
+
     @guidance
-        -- Clipboard write happens during edit building, before edit application.
-        -- The matched_text_from_content is original[spec.offset..spec.offset+spec.length]
-        -- where spec comes from find_unique_match. This is important when dedent or
-        -- trimmed matching finds a differently-indented version of old_text.
+        -- For replace, store the *actual matched text* from content
+        -- (not the requested old_text). matched_text_from_content =
+        -- original[spec.offset..spec.offset+spec.length] where spec
+        -- comes from find_unique_match. Important when dedent or
+        -- trimmed matching finds a differently-indented version of
+        -- old_text.
+}
+
+rule StoreToClipboardFromOldText {
+    when: BuildEdit(planner, patch, original)
+    requires: patch.to_clipboard != null
+    requires: patch.to_clipboard != ""
+    requires: patch.operation != replace
+    requires: patch.old_text != null
+
+    ensures: ClipboardWrite(planner, patch.to_clipboard, patch.old_text)
+
+    @guidance
+        -- Clipboard write happens during edit building, before edit
+        -- application.
 }
 
 rule BuildReplaceEdit {
     when: BuildEdit(planner, patch, original)
-    requires: patch.operation = Replace
+    requires: patch.operation = replace
     requires: patch.old_text != null
     let spec = find_unique_match(original, patch.old_text)
     ensures: edit = Edit(offset: spec.offset, length: spec.length, replacement: new_text)
@@ -231,19 +264,19 @@ rule BuildReplaceEdit {
 
 rule BuildPrependEdit {
     when: BuildEdit(planner, patch, original)
-    requires: patch.operation = PrependBof
+    requires: patch.operation = prepend_bof
     ensures: edit = Edit(offset: 0, length: 0, replacement: new_text)
 }
 
 rule BuildAppendEdit {
     when: BuildEdit(planner, patch, original)
-    requires: patch.operation = AppendEof
+    requires: patch.operation = append_eof
     ensures: edit = Edit(offset: original.length, length: 0, replacement: new_text)
 }
 
 rule BuildOverwriteEdit {
     when: BuildEdit(planner, patch, original)
-    requires: patch.operation = Overwrite
+    requires: patch.operation = overwrite
     ensures: edit = Edit(offset: 0, length: original.length, replacement: new_text)
 }
 
@@ -267,10 +300,15 @@ rule ApplyEditsReverseOrder {
 -- ============================================================================
 
 invariant ClipboardPersistence {
-    -- Clipboard entries persist across plan() calls on the same PatchPlanner.
-    -- A clipboard written in call N is readable in call N+1.
-    for name in planner.clipboard_names:
-        planner.clipboards[name] != null
+    -- Clipboard entries persist across plan() calls on the same
+    -- PatchPlanner. A clipboard written in call N is readable in call
+    -- N+1. Stated as: every name in clipboard_names resolves to a
+    -- non-null value via lookup_clipboard. The map indexing form
+    -- (planner.clipboards[name]) is not v3 grammar; lookup_clipboard
+    -- is the equivalent helper.
+    for p in PatchPlanner:
+        for name in p.clipboard_names:
+            lookup_clipboard(p, name) != null
 }
 
 invariant EmptyClipboardNameIgnored {

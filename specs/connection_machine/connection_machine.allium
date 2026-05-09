@@ -206,7 +206,7 @@ rule ClientMounted {
         epoch: 1
     )
 
-    @effect: emits OPEN_SSE{epoch: 1}
+    -- emits effect: OPEN_SSE{epoch: 1} (folded into @guidance below — see effects= list there)
 
     @guidance
         -- useConnection.ts:
@@ -432,7 +432,7 @@ rule RetryTimerFired {
     ensures: client.next_retry_ms = null
     ensures: client.epoch = client.epoch + 1
 
-    @effect: emits OPEN_SSE{epoch: client.epoch}
+    -- emits effect: OPEN_SSE{epoch: client.epoch} (folded into @guidance below — see effects= list there)
 
     @guidance
         -- connectionMachine.ts RETRY_TIMER_FIRED emits effects=[OPEN_SSE]
@@ -461,7 +461,7 @@ rule BrowserReportedOnline {
     ensures: client.epoch = client.epoch + 1
     ensures: not exists RetryTimer{client: client}
 
-    @effect: emits OPEN_SSE{epoch: client.epoch}
+    -- emits effect: OPEN_SSE{epoch: client.epoch} (folded into @guidance below — see effects= list there)
 
     @guidance
         -- Effects: [CANCEL_TIMERS, OPEN_SSE]. Triggered by the
@@ -496,7 +496,7 @@ rule UserTriggeredRetryNow {
     ensures: client.epoch = client.epoch + 1
     ensures: not exists RetryTimer{client: client}
 
-    @effect: emits OPEN_SSE{epoch: client.epoch}
+    -- emits effect: OPEN_SSE{epoch: client.epoch} (folded into @guidance below — see effects= list there)
 
     @guidance
         -- connectionMachine.ts RETRY_NOW case:
@@ -553,7 +553,7 @@ rule TabVisibilityRegained {
     ensures: client.epoch = client.epoch + 1
     ensures: not exists RetryTimer{client: client}
 
-    @effect: emits OPEN_SSE{epoch: client.epoch}
+    -- emits effect: OPEN_SSE{epoch: client.epoch} (folded into @guidance below — see effects= list there)
 
     @guidance
         -- useConnection.ts:
