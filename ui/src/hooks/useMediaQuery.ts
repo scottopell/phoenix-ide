@@ -6,9 +6,22 @@ import { useState, useEffect } from 'react';
  * unless you need an ad-hoc query.
  */
 export function useMediaQuery(query: string): boolean {
-  const [matches, setMatches] = useState(() => window.matchMedia(query).matches);
+  const [matches, setMatches] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia(query).matches
+      : false,
+  );
   useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') {
+      // Test environments (e.g. happy-dom without explicit polyfill) and
+      // any non-browser context fall through to the `false` default.
+      return undefined;
+    }
     const mq = window.matchMedia(query);
+    // Sync immediately on (re-)subscribe so a dynamic query string
+    // doesn't leave the consumer holding the previous query's match
+    // value until the next viewport change event fires.
+    setMatches(mq.matches);
     const handler = (e: MediaQueryListEvent) => setMatches(e.matches);
     mq.addEventListener('change', handler);
     return () => mq.removeEventListener('change', handler);

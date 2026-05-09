@@ -28,7 +28,7 @@ The browser viewer's `kind = browser` membership is independent of the live `bro
 | **REQ-VS-004:** User Closes Active Viewer | ✅ Complete | Per-viewer close handlers in ConversationPage; URL clears via `setSearchParams` |
 | **REQ-VS-005:** URL Hydrates Prose | ✅ Complete | `FileExplorerContext.tsx` reads `?file=` / `?root=` on mount |
 | **REQ-VS-006:** URL Hydrates Diff and Browser | ❌ Not Started | Diff and browser don't read or write the URL today; cold reload loses them |
-| **REQ-VS-007:** Single-Slot Mutex | 🚧 Partial | Enforced today by three `useEffect`s in ConversationPage:158-180. Spec wants the discriminated union to make this structural -- the effects deleted, the type system enforces |
+| **REQ-VS-007:** Single-Slot Mutex | 🚧 Partial | Enforced today by two coordinating `useEffect`s in `ConversationPage.tsx:158-162` (file open → close diff) and `:167-171` (anything else open → close browser), plus imperative clearing in the `handleOpenBrowserView` click handler at `:176-180`. Spec wants the discriminated union to make this structural — the effects deleted, the type system enforces |
 | **REQ-VS-008:** Browser Session Rising Edge Auto-Open | ✅ Complete | `ConversationPage.tsx:505-521` watches the prev-vs-current edge and calls `openPanel()` when slot is empty |
 | **REQ-VS-009:** Browser Session Falling Edge Auto-Close | ✅ Complete | Same effect: `wasActive && !browserSessionActive` → `closeBrowserView()` |
 | **REQ-VS-010:** Conversation Change Resets Slot | ✅ Complete | URL path change naturally drops `?viewer=` params (react-router doesn't preserve search across `navigate('/c/B')`); scoped state resets via `useScopedState` on `scopeKey` change |

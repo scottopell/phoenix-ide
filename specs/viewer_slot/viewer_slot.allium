@@ -47,7 +47,7 @@
 --
 -- Requirement traceability: REQ-VS-001 through REQ-VS-013
 
-use "./bedrock.allium" as bedrock
+use "../bedrock/bedrock.allium" as bedrock
 
 -- Note: the URL search params are the persistence medium for the
 -- slot; the spec governs which params correspond to which slot
