@@ -3,6 +3,7 @@ import { Link } from 'react-router-dom';
 import { FolderTree } from 'lucide-react';
 import type { Conversation, ConversationState, ModelInfo } from '../api';
 import type { ConnectionState } from '../hooks';
+import { useIsMobile } from '../hooks';
 import { getStateDescription } from '../utils';
 import { ContextIndicator } from './ContextIndicator';
 
@@ -111,8 +112,14 @@ export function StateBar({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
   // Mobile breakpoint mirrors the @media (max-width: 768px) block in index.css.
-  const [isMobile, setIsMobile] = useState(() => window.matchMedia('(max-width: 768px)').matches);
+  const isMobile = useIsMobile();
   const [mobileExpanded, setMobileExpanded] = useState(false);
+  // Collapse the mobile-expanded section when the viewport widens past
+  // mobile — otherwise a user who expanded on phone, rotated to landscape,
+  // would see a desktop bar with a stale "expanded" affordance.
+  useEffect(() => {
+    if (!isMobile) setMobileExpanded(false);
+  }, [isMobile]);
   const pickerRef = useRef<HTMLSpanElement>(null);
 
   // Live elapsed-time counter for tool_executing state.
@@ -130,15 +137,6 @@ export function StateBar({
     }, 1000);
     return () => window.clearInterval(interval);
   }, [convState.type, toolExecutingStartedAt]);
-  useEffect(() => {
-    const mq = window.matchMedia('(max-width: 768px)');
-    const handler = (e: MediaQueryListEvent) => {
-      setIsMobile(e.matches);
-      if (!e.matches) setMobileExpanded(false);
-    };
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
-  }, []);
 
   // Close model picker on outside click
   useEffect(() => {

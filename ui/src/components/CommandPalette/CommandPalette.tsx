@@ -12,6 +12,7 @@ import { createBuiltInActions } from './actions/builtInActions';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import { computeChainRoots } from '../../utils/chains';
 import { useFocusScope } from '../../hooks/useFocusScope';
+import { useIsDesktop } from '../../hooks/useMediaQuery';
 
 const SEARCH_DEBOUNCE_MS = 120;
 
@@ -21,7 +22,7 @@ interface CommandPaletteProps {
 
 export function CommandPalette({ conversations }: CommandPaletteProps) {
   const [state, setState] = useState<PaletteState>(initialState);
-  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
+  const isDesktop = useIsDesktop();
   const navigate = useNavigate();
   const location = useLocation();
   const overlayRef = useRef<HTMLDivElement>(null);
@@ -29,14 +30,6 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
   const searchAbortRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const { openFile } = useFileExplorer();
-
-  // Desktop detection
-  useEffect(() => {
-    const mq = window.matchMedia('(min-width: 1025px)');
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
-  }, []);
 
   // Extract current slug and active conversation
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);

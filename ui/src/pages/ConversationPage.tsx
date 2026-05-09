@@ -28,7 +28,7 @@ import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkActions } from '../components/WorkActions';
 import { useConversationAtom, useConversationSnapshot } from '../conversation';
-import { useResizablePane } from '../hooks';
+import { useResizablePane, useIsDesktop, useIsWideDesktop } from '../hooks';
 
 // Conditional overlays / heavy panels — code-split so the default render path
 // (chat view with no overlay open) doesn't pay their bundle cost.
@@ -178,27 +178,15 @@ function ConversationPageContent() {
     closeDiff();
     browserView.openPanel();
   }, [fileExplorer, closeDiff, browserView]);
-  const [isDesktop, setIsDesktop] = useState(
-    () => window.matchMedia('(min-width: 1025px)').matches,
-  );
-  useEffect(() => {
-    const mq = window.matchMedia('(min-width: 1025px)');
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
-  }, []);
+  // ConversationPage was previously snapshotting `isDesktop` at mount and
+  // never resubscribing — a window resize across 1025px wouldn't update
+  // the layout until the user navigated. The shared hooks now subscribe
+  // on every consumer.
+  const isDesktop = useIsDesktop();
   // Wider threshold (≥1280px) gates the split-pane prose reader (task 08654).
   // Below this we keep the existing full-screen overlay UX; above, the
   // reader sits beside the chat as a resizable sibling pane.
-  const [isWideDesktop, setIsWideDesktop] = useState(
-    () => window.matchMedia('(min-width: 1280px)').matches,
-  );
-  useEffect(() => {
-    const mq = window.matchMedia('(min-width: 1280px)');
-    const handler = (e: MediaQueryListEvent) => setIsWideDesktop(e.matches);
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
-  }, []);
+  const isWideDesktop = useIsWideDesktop();
   const VIEWER_PANE_MIN = 360;
   const VIEWER_PANE_MAX = 1200;
   const viewerPane = useResizablePane({

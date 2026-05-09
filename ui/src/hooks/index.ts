@@ -16,6 +16,7 @@ export { useModels } from './useModels';
 export { useAutoAuth } from './useAutoAuth';
 export { useTheme } from './useTheme';
 export { useScopedState } from './useScopedState';
+export { useMediaQuery, useIsDesktop, useIsWideDesktop, useIsMobile } from './useMediaQuery';
 
 // Export state machine for testing
 export {

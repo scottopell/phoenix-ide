@@ -1,11 +1,10 @@
-import { useState, useEffect } from 'react';
 import { useLocation } from 'react-router-dom';
 import {
   useConversationsList,
   useConversationsRefresh,
   useConversationSnapshot,
 } from '../conversation';
-import { useResizablePane } from '../hooks';
+import { useResizablePane, useIsDesktop } from '../hooks';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { CommandPalette } from './CommandPalette';
@@ -18,7 +17,7 @@ interface DesktopLayoutProps {
 }
 
 export function DesktopLayout({ children }: DesktopLayoutProps) {
-  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
+  const isDesktop = useIsDesktop();
   const sidebarPane = useResizablePane({
     key: 'sidebar-width',
     min: 160,
@@ -44,14 +43,6 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // `Conversation[]` state, no per-field bridge hooks.
   const { refresh: refreshConversations } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
-
-  // Media query listener
-  useEffect(() => {
-    const mq = window.matchMedia('(min-width: 1025px)');
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
-  }, []);
 
   // Extract active slug. `useConversationSnapshot` reads the row directly
   // from the store — polling and SSE both write through the same atom,

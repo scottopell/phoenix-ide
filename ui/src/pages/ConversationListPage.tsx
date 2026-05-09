@@ -3,7 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { api } from '../api';
 import { refreshModels } from '../modelsPoller';
 import type { ChainView, Conversation } from '../api';
-import { useModels, useAutoAuth } from '../hooks';
+import { useModels, useAutoAuth, useIsDesktop } from '../hooks';
 import {
   useConversationsList,
   useConversationsRefresh,
@@ -32,7 +32,7 @@ const SCROLL_KEY = 'phoenix:conversation-list-scroll';
 
 export function ConversationListPage() {
   const navigate = useNavigate();
-  const [isDesktop, setIsDesktop] = useState(() => window.matchMedia('(min-width: 1025px)').matches);
+  const isDesktop = useIsDesktop();
 
   // Task 08684: ConversationStore is the single source of truth. The
   // shared `useConversationsRefresh` (mounted in ConversationProvider)
@@ -354,13 +354,6 @@ export function ConversationListPage() {
     pullStartY.current = null;
   }, []);
 
-  // Desktop media query listener
-  useEffect(() => {
-    const mq = window.matchMedia('(min-width: 1025px)');
-    const handler = (e: MediaQueryListEvent) => setIsDesktop(e.matches);
-    mq.addEventListener('change', handler);
-    return () => mq.removeEventListener('change', handler);
-  }, []);
 
   // On desktop, the sidebar handles the conversation list.
   // Root route shows the new conversation form in main content.
