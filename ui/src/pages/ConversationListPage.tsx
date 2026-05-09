@@ -121,7 +121,12 @@ export function ConversationListPage() {
   // (the OS clears sessionStorage when it terminates the JS context).
   useEffect(() => {
     if (!loading && !scrollRestoredRef.current && conversations.length > 0) {
-      const savedPosition = localStorage.getItem(SCROLL_KEY);
+      let savedPosition: string | null = null;
+      try {
+        savedPosition = localStorage.getItem(SCROLL_KEY);
+      } catch {
+        // Safari private mode / storage disabled — treat as no saved position.
+      }
       if (savedPosition && mainRef.current) {
         const target = parseInt(savedPosition, 10);
         // Use rAF to ensure the list items are painted before scrolling

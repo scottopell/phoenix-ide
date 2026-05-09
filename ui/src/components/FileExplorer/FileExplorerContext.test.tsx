@@ -7,7 +7,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { render, act } from '@testing-library/react';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { FileExplorerProvider } from './FileExplorerContext';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
@@ -92,15 +92,28 @@ describe('FileExplorerProvider — URL-driven open file', () => {
     });
   });
 
-  it('clears patchContext when scopeKey changes (URL-driven path stays)', () => {
+  it('clears patchContext when scopeKey changes; URL-driven path/rootDir survive', () => {
     let latest: ReturnType<typeof useFileExplorer> | null = null;
+    let setKey: ((k: string) => void) | null = null;
     const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
 
-    const { rerender } = render(
-      <MemoryRouter initialEntries={['/']}>
-        <FileExplorerProvider scopeKey="conv-A">
+    // Stable parent that owns scopeKey state. The MemoryRouter and its
+    // location stay mounted across scopeKey changes, so we can test that
+    // the URL-driven path/rootDir persist while patchContext (scoped
+    // state) resets.
+    function ScopeHarness() {
+      const [scopeKey, setScopeKey] = useState('conv-A');
+      setKey = setScopeKey;
+      return (
+        <FileExplorerProvider scopeKey={scopeKey}>
           <Consumer onCtx={onCtx} />
         </FileExplorerProvider>
+      );
+    }
+
+    render(
+      <MemoryRouter initialEntries={['/']}>
+        <ScopeHarness />
       </MemoryRouter>,
     );
 
@@ -110,18 +123,17 @@ describe('FileExplorerProvider — URL-driven open file', () => {
         firstModifiedLine: 3,
       });
     });
+    expect(latest!.proseReaderState?.path).toBe('/repo/x.ts');
+    expect(latest!.proseReaderState?.rootDir).toBe('/repo');
     expect(latest!.proseReaderState?.patchContext?.firstModifiedLine).toBe(3);
 
-    rerender(
-      <MemoryRouter initialEntries={['/']}>
-        <FileExplorerProvider scopeKey="conv-B">
-          <Consumer onCtx={onCtx} />
-        </FileExplorerProvider>
-      </MemoryRouter>,
-    );
-    // patchContext is conversation-specific and resets on scopeKey change.
-    // The URL-driven path/rootDir would also be unset here because the
-    // MemoryRouter is a fresh instance per render.
+    // Switch scopeKey without remounting the Router.
+    act(() => { setKey!('conv-B'); });
+
+    // path + rootDir come from the URL — unchanged by scopeKey.
+    expect(latest!.proseReaderState?.path).toBe('/repo/x.ts');
+    expect(latest!.proseReaderState?.rootDir).toBe('/repo');
+    // patchContext is scoped — resets on scopeKey change.
     expect(latest!.proseReaderState?.patchContext).toBeUndefined();
   });
 });
