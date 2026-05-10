@@ -92,18 +92,18 @@ THE SYSTEM SHALL display a browser desktop notification: "Agent finished" + conv
 
 ### REQ-NOTIF-005: Don't Notify When I'm Already Looking
 
-WHEN the Phoenix tab is focused (`document.visibilityState === 'visible'` AND the document has focus)
-THE SYSTEM SHALL NOT fire browser desktop notifications for any event
+WHEN the Phoenix tab is focused (`document.visibilityState === 'visible'` AND the document has focus) AND the triggering conversation is the active route
+THE SYSTEM SHALL NOT fire a browser desktop notification for that event — I'm already looking at the thing it would point me to
 
-WHEN the conversation in question is the active route AND the tab is focused
-THE SYSTEM SHALL NOT fire a desktop notification for that conversation even when the underlying state machine would otherwise trigger one
+WHEN the tab is focused but the triggering conversation is NOT the active route
+THE SYSTEM SHALL fire a notification for the other conversation — being on Phoenix doesn't mean I'm watching every conversation
 
-WHEN the tab is focused but the user is on a different conversation
-THE SYSTEM SHALL still fire a notification for the other conversation (it's not what they're looking at)
+WHEN the tab is not focused
+THE SYSTEM SHALL fire notifications per the normal gating (REQ-NOTIF-006 toggles + permission state)
 
 THE SYSTEM SHALL continue to render in-app toasts (REQ-NOTIF-001/002) regardless of tab focus — toasts are the in-app channel and don't compete with desktop notifications
 
-**Rationale:** Desktop notifications exist to reach me when in-app indicators can't. Firing one while I'm already looking at the conversation is noise. Distinguishing "tab focused" from "this conversation focused" matters because a multi-conversation user wants to know when conversation B needs them, even while looking at conversation A.
+**Rationale:** Desktop notifications exist to reach me when in-app indicators can't. Firing one while I'm already on the specific conversation in question is noise. The "tab focused but different conversation" case matters: a multi-conversation user wants to know when conversation B needs them, even while looking at conversation A.
 
 ---
 
@@ -114,7 +114,7 @@ THE SYSTEM SHALL provide a settings panel reachable from the sidebar or StateBar
 - Enable or disable browser notifications globally (master toggle)
 - Toggle each event type independently (task approval, question, agent error, agent finished)
 - See current browser notification permission status (granted / denied / not yet asked)
-- Re-request browser permission if not yet granted
+- Request browser permission when status is `default` (not yet asked) — the OS-level permission cannot be re-prompted programmatically once denied; the UI shows guidance to change it in browser settings instead
 
 WHEN the master toggle is off
 THE SYSTEM SHALL NOT fire any browser notifications regardless of per-event toggles

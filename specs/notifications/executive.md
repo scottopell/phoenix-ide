@@ -32,8 +32,8 @@ Phased delivery: in-app toasts shipped first; browser desktop notifications are 
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-NOTIF-001:** Confirm My Action Quietly | ✅ Complete | `ui/src/components/Toast.tsx` (4 types, auto-dismiss, click-to-dismiss); `ui/src/hooks/useToast.tsx` (showSuccess / showInfo / showWarning / showError); 4s default duration |
-| **REQ-NOTIF-002:** Tell Me When a Background Action Failed | ✅ Complete | Same Toast component with `'error'` type; used at e.g. `McpStatusPanel.tsx:81,109` for MCP toggle/reload failures and `QuestionPanel.tsx:467` for per-question feedback |
+| **REQ-NOTIF-001:** Confirm My Action Quietly | ✅ Complete | `ui/src/components/Toast.tsx` (4 types, auto-dismiss, click-to-dismiss); `ui/src/hooks/useToast.tsx` (showSuccess / showInfo / showWarning / showError); 4s default duration. Confirmation call sites: `McpStatusPanel.tsx:77,107` (MCP reload + toggle outcomes), `QuestionPanel.tsx:242,273` ("Response sent" / "Declined to answer"), `ConversationListPage.tsx:98` (storage usage warning) |
+| **REQ-NOTIF-002:** Tell Me When a Background Action Failed | 🚧 Partial | Red `'error'` toast styling is used at `ConversationListPage.tsx:102,274,295,305,317` (storage quota exceeded, chain operation failures). Gap: `McpStatusPanel.tsx:81,109` shows error messages via the `showToast` prop, which `DesktopLayout.tsx:36,92` wires from `showSuccess` — so "MCP reload failed" / "Failed to enable/disable" render green even though their content describes a failure. Spec target: route those failures through `showError` so styling matches semantics |
 | **REQ-NOTIF-003:** Pull Me Back When the Agent Needs Me | ❌ Not Started | Spec target: browser desktop notification on transitions to `awaiting_task_approval`, `awaiting_user_response`, `error`, `context_exhausted` when the Phoenix tab is not focused |
 | **REQ-NOTIF-004:** Pull Me Back When a Long-Running Task Finishes | ❌ Not Started | Spec target: browser notification on `idle` after the conversation was busy long enough to be worth flagging (threshold TBD; the spec doesn't fix it) |
 | **REQ-NOTIF-005:** Don't Notify When I'm Already Looking | ❌ Not Started | Spec target: tab-focus gate. When `document.visibilityState === 'visible'` and the conversation is the active route, suppress browser notifications. Toasts always render (REQ-NOTIF-001/002) regardless of focus |
@@ -42,7 +42,7 @@ Phased delivery: in-app toasts shipped first; browser desktop notifications are 
 | **REQ-NOTIF-008:** Catch Me Up When I Reconnect After a Disconnect | ❌ Not Started | Spec target: on SSE reconnect, scan the conversation list for any non-sub-agent in a notification-worthy state and emit a notification per match. Captures notifications the user "missed" while disconnected |
 | **REQ-NOTIF-009:** Settings That Survive Browser Clears + Server Restarts | ❌ Not Started | Spec target: server-side notification_settings table; localStorage is too fragile for cross-device preferences |
 
-**Progress:** 2 of 9 complete. Phase 1 (in-app toasts) is shipped; Phase 2 (browser desktop notifications) is the next implementation block, with REQ-NOTIF-003 → 005 → 006 → 007 → 008 → 009 as the natural build order.
+**Progress:** 1 of 9 complete, 1 partial, 7 not started. Phase 1 (in-app toasts) is mostly shipped — the toast component, lifecycle, and confirmation paths are live; the remaining Phase 1 gap is routing McpStatusPanel's failure messages through `showError` rather than the green `showToast` prop so error styling matches content. Phase 2 (browser desktop notifications) is the next implementation block, with REQ-NOTIF-003 → 005 → 006 → 007 → 008 → 009 as the natural build order.
 
 ## Behavioural Specification
 

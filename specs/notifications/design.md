@@ -90,11 +90,14 @@ instance and passes `showToast` down to children that need it.
 
 Today's call sites (verified by grep `showInfo|showWarning|showError|showSuccess|showToast` in `ui/src/`):
 
-- `DesktopLayout.tsx:36,92` — "Send in Background" success
-- `McpStatusPanel.tsx:77,81,107,109` — MCP server reload + toggle outcomes
-- `QuestionPanel.tsx:242,273,467` — "Response sent" / "Declined to answer" / per-question feedback
-- `ConversationListPage.tsx:53` — list-page actions (warning/error)
-- `FileExplorerPanel.tsx` — passes through to McpStatusPanel
+- `McpStatusPanel.tsx:77,107` — MCP server reload + toggle outcomes (success-coloured)
+- `McpStatusPanel.tsx:81,109` — MCP failures (currently routed through the `showToast` prop, which is wired from `showSuccess` — see Phase 1 gap noted in REQ-NOTIF-002 status)
+- `QuestionPanel.tsx:242,273` — "Response sent" / "Declined to answer"
+- `QuestionPanel.tsx:467,533` — "Press Enter again to submit" (Enter-key hint)
+- `ConversationListPage.tsx:98` — `showWarning` for storage-usage threshold
+- `ConversationListPage.tsx:102,274,295,305,317` — `showError` for storage quota exceeded + chain operation failures (the only red-styled toasts in the UI today)
+- `DesktopLayout.tsx:36,92` — `useToast()` instance hosted at the layout level; passes `showSuccess` down as the `showToast` prop into `FileExplorerPanel` → `McpStatusPanel`
+- `FileExplorerPanel.tsx` — pass-through wiring only; doesn't trigger toasts itself
 
 The container is mounted once per page (`DesktopLayout.tsx:111` for
 the desktop layout; `ConversationListPage` mounts its own).
@@ -125,11 +128,22 @@ same handler:
    disabled, drop the trigger.
 3. **Tab-focus gate** (REQ-NOTIF-005). If the tab is focused AND the
    conversation is the active route, suppress.
-4. **Permission check.** If `Notification.permission !== 'granted'`,
-   drop. (The settings UI surfaces the permission state separately so
-   the user understands why nothing fires.)
-5. **Fire** `new Notification(title, { body, tag: conversationId,
-   onclick: () => focusAndNavigate(slug) })`.
+4. **Permission check.**
+   - If `Notification.permission === 'granted'`, fire (step 5).
+   - If `'default'` (not yet asked), call
+     `Notification.requestPermission()`. On `'granted'`, fall through
+     to step 5. On any other result, drop this trigger (REQ-NOTIF-003
+     covers prompting on first attempt).
+   - If `'denied'`, drop. The OS-level permission cannot be re-prompted
+     programmatically; the settings UI shows guidance to change it in
+     browser settings.
+5. **Fire** the notification:
+   ```ts
+   const n = new Notification(title, { body, tag: conversationId });
+   n.onclick = () => { window.focus(); navigate(`/c/${slug}`); };
+   ```
+   `onclick` is a property of the `Notification` instance, not a
+   `NotificationOptions` field — assign it after construction.
 
 The "previous state was busy" check on idle prevents spurious
 "finished" notifications on page load when conversations were already
