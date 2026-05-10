@@ -101,6 +101,7 @@ Recipes:
 Usage notes:
 - All inputs are interpreted literally (no automatic newline or whitespace handling)
 - For replace operations, oldText must appear EXACTLY ONCE in the file
+- All patches in a single call resolve against the original file content simultaneously, not sequentially. Repeating the same oldText across patches cannot disambiguate sites. For sequential edits where each step sees the prior result, use separate patch tool calls.
 
 IMPORTANT: Each patch call must be less than 60k tokens total. For large file
 changes, break them into multiple smaller patch operations rather than one
@@ -130,7 +131,7 @@ large overwrite. Prefer incremental replace operations over full file overwrites
                             },
                             "oldText": {
                                 "type": "string",
-                                "description": "Text to locate (must be unique in file, required for replace)"
+                                "description": "Text to locate. Required for replace. Must be unique in file; when the same text appears at multiple sites, widen with surrounding context."
                             },
                             "newText": {
                                 "type": "string",

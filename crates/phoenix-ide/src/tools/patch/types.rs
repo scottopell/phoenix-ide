@@ -90,7 +90,12 @@ pub enum PatchError {
     #[error("oldText not found in file")]
     OldTextNotFound,
 
-    #[error("oldText appears {0} times in file (must be unique)")]
+    #[error(
+        "oldText appears {0} times in file (must be unique). All patches in one call resolve \
+         against the original file content simultaneously, so each oldText must be unique on its \
+         own. Widen oldText with surrounding context to disambiguate sites, or split into \
+         separate patch tool calls (each call sees the file as updated by prior calls)."
+    )]
     OldTextNotUnique(usize),
 
     #[error("Edit extends beyond file content")]
