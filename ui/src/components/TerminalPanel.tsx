@@ -104,6 +104,10 @@ interface TerminalPanelProps {
    * TerminalPanel just builds the prompt and hands it off.
    */
   onAssistSetup?: (promptText: string, seedLabel: string, homeDir: string) => Promise<void> | void;
+  /** Failure-styled toast (red). Surfaces user-facing errors from the
+   *  assist-setup path so the user knows the click failed instead of
+   *  silently re-enabling the button. REQ-TPANEL-006 / REQ-NOTIF-002. */
+  showError?: (message: string, duration?: number) => void;
 }
 
 type ActivityState = 'idle' | 'running' | 'disconnected';
@@ -235,6 +239,7 @@ export function TerminalPanel({
   shell,
   homeDir,
   onAssistSetup,
+  showError,
 }: TerminalPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -775,9 +780,8 @@ export function TerminalPanel({
       // Parent navigates; this component unmounts. No need to close the
       // modal — it's disposed with the page.
     } catch (err) {
-      // Surface nothing fancy — the button re-enables so the user can retry.
-      // Console is the only place the error goes; REQ-TERM-020 is best-effort.
       console.error('Assist setup failed:', err);
+      showError?.('Could not start shell-integration assistant — try again', 4000);
       setAssistInFlight(false);
     }
   };

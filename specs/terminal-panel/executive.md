@@ -39,11 +39,11 @@ Status is per user-visible outcome. Code anchors point at the implementation tha
 | **REQ-TPANEL-003:** Live Command Status in the Header | ✅ Complete | `:789-873` (HUD render across 5 variants), `:399-444` (OSC 133 A/B/C/D parse driving running/idle), `:519-526` (500ms byte-activity decay for the absent-integration fallback) |
 | **REQ-TPANEL-004:** Current Working Directory in the Header | ✅ Complete | `:456` (OSC 7 parse), `:732` (fallback to conversation cwd at render time) |
 | **REQ-TPANEL-005:** Output Survives Collapse, with Unread Hint | ✅ Complete | `:299-301,930` (display:none preserves PTY/WS/scrollback), `:500-505,664-670,921-925` (unread counter) |
-| **REQ-TPANEL-006:** Shell Integration Setup CTA | 🚧 Partial | Detection + hint + snippet modal complete (`:123,365-387,472-478,904-913,933-999`); the "Let Phoenix set this up" hand-off works (`:184-225,768-783`) but failures surface only via `console.error` instead of a user-visible toast |
+| **REQ-TPANEL-006:** Shell Integration Setup CTA | ✅ Complete | Detection + hint + snippet modal (`:123,365-387,472-478,904-913,933-999`); the "Let Phoenix set this up" hand-off (`:184-225,768-783`) surfaces failures via `showError` (red toast) in addition to `console.error` — see REQ-NOTIF-002 |
 | **REQ-TPANEL-007:** Theme Matches the App | ✅ Complete | `:70-81` (read CSS vars), `:343` (apply on mount), `:628-633` (re-apply on theme toggle, no PTY teardown) |
 | **REQ-TPANEL-008:** Conflict Resolution When Already Open Elsewhere | ❌ Not Started | Backend rejects duplicate connections with 409 (REQ-TERM-001 / -003); frontend folds this into a generic "Connection error" today (`:539-547`) with no reclaim path. Spec target: distinguish the 409 close code and offer a "Reclaim this terminal" action |
 
-**Progress:** 6 of 8 complete, 1 partial, 1 not started. The two gaps are visible-error surfacing in REQ-TPANEL-006 (one mechanism away from done) and the unmodelled conflict UX in REQ-TPANEL-008 (needs a backend reclaim endpoint coordinated with `specs/terminal/`).
+**Progress:** 7 of 8 complete, 1 not started. Remaining gap is the unmodelled conflict UX in REQ-TPANEL-008 (needs a backend reclaim endpoint coordinated with `specs/terminal/`).
 
 ## Behavioural Specification
 

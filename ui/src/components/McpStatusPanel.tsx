@@ -4,10 +4,16 @@ import type { McpServerStatus } from '../api';
 import './McpStatusPanel.css';
 
 interface McpStatusPanelProps {
+  /** Success / info path. Renders with the success / info styling
+   *  (whatever the parent wires into this prop). */
   showToast: (message: string, duration?: number) => void;
+  /** Failure path — renders with red `error` styling so the user
+   *  can tell at a glance that something went wrong, vs the green
+   *  status path. REQ-NOTIF-002 (specs/notifications/). */
+  showError: (message: string, duration?: number) => void;
 }
 
-export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
+export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
   const [servers, setServers] = useState<McpServerStatus[]>([]);
   const [expanded, setExpanded] = useState(false);
   const [expandedServers, setExpandedServers] = useState<Set<string>>(new Set());
@@ -78,10 +84,10 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
       // Keep reloading=true until the next poll shows fresh OAuth content
       // (effect below) or the safety timeout fires.
     } catch {
-      showToast('MCP reload failed', 3000);
+      showError('MCP reload failed', 3000);
       setReloading(false);
     }
-  }, [reloading, fetchStatus, showToast]);
+  }, [reloading, fetchStatus, showToast, showError]);
 
   // Clear `reloading` once new content arrives, with a 5s safety timeout to
   // avoid a stuck spinner if the backend connection never emits anything.
@@ -106,7 +112,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
       await fetchStatus();
       showToast(`${serverName}: ${currentlyEnabled ? 'disabled' : 'enabled'}`, 2000);
     } catch {
-      showToast(`Failed to ${currentlyEnabled ? 'disable' : 'enable'} ${serverName}`, 3000);
+      showError(`Failed to ${currentlyEnabled ? 'disable' : 'enable'} ${serverName}`, 3000);
     } finally {
       setTogglingServers(prev => {
         const next = new Set(prev);
@@ -114,7 +120,7 @@ export function McpStatusPanel({ showToast }: McpStatusPanelProps) {
         return next;
       });
     }
-  }, [fetchStatus, showToast]);
+  }, [fetchStatus, showToast, showError]);
 
   const toggleServer = useCallback((name: string) => {
     setExpandedServers(prev => {

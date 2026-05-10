@@ -6,7 +6,7 @@ Phoenix has two notification channels:
 1. **In-app toasts** — short messages rendered in the conversation UI; useful only when the user is looking
 2. **Browser desktop notifications** — OS-level pings that reach the user even when the tab is not focused
 
-This spec covers both, plus the rules for picking which channel applies to a given trigger. The toast UI is shipped (REQ-NOTIF-001 ✅); the error-styled half of the toast story is partial (REQ-NOTIF-002 🚧 — red `showError` is wired in `ConversationListPage`, but `McpStatusPanel` failures still render green, see executive's status table). The desktop-notification half is spec'd here as the target (REQ-NOTIF-003 onwards). See `specs/notifications/executive.md` for the full boundary.
+This spec covers both, plus the rules for picking which channel applies to a given trigger. The toast UI is shipped (REQ-NOTIF-001 ✅) and the error-styled half is shipped too (REQ-NOTIF-002 ✅ — red `showError` is wired through `ConversationListPage`, `McpStatusPanel`, and `TerminalPanel` assist-setup; see executive's status table). The desktop-notification half is spec'd here as the target (REQ-NOTIF-003 onwards). See `specs/notifications/executive.md` for the full boundary.
 
 ## User Story
 
