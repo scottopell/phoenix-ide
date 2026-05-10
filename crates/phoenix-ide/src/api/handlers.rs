@@ -187,7 +187,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Per-conversation worktree diff and PR state
         .route("/api/conversations/:id/diff", get(get_conversation_diff))
-        .route("/api/conversations/:id/pr-status", get(get_conversation_pr_status))
+        .route(
+            "/api/conversations/:id/pr-status",
+            get(get_conversation_pr_status),
+        )
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
         // Environment info

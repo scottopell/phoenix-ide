@@ -3,8 +3,8 @@
 
 use super::handlers::AppError;
 use super::types::{
-    ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
-    PrCheckState, PrDisplayState, PrStatusResponse, PrUnavailableReason,
+    ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse, PrCheckState,
+    PrDisplayState, PrStatusResponse, PrUnavailableReason,
 };
 use super::AppState;
 use crate::db::ConvMode;
@@ -368,18 +368,13 @@ pub(crate) async fn get_conversation_pr_status(
 
     tokio::task::spawn_blocking(move || get_pr_status_for_branch(&cwd, &branch_name))
         .await
-        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))
         .map(Json)
 }
 
-fn get_pr_status_for_branch(
-    cwd: &std::path::Path,
-    branch_name: &str,
-) -> Result<PrStatusResponse, AppError> {
+fn get_pr_status_for_branch(cwd: &std::path::Path, branch_name: &str) -> PrStatusResponse {
     if run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_err() {
-        return Ok(PrStatusResponse::unavailable(
-            PrUnavailableReason::NotGitRepo,
-        ));
+        return PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo);
     }
 
     let list_output = match run_gh(
@@ -400,7 +395,7 @@ fn get_pr_status_for_branch(
         Ok(output) => output,
         Err(e) => {
             tracing::debug!(branch = %branch_name, error = %e.message, "gh pr list failed");
-            return Ok(PrStatusResponse::unavailable(e.reason));
+            return PrStatusResponse::unavailable(e.reason);
         }
     };
 
@@ -408,20 +403,18 @@ fn get_pr_status_for_branch(
         Ok(prs) => prs,
         Err(e) => {
             tracing::debug!(branch = %branch_name, output = %list_output, error = %e, "failed to parse gh pr list JSON");
-            return Ok(PrStatusResponse::unavailable(
-                PrUnavailableReason::CommandFailed,
-            ));
+            return PrStatusResponse::unavailable(PrUnavailableReason::CommandFailed);
         }
     };
 
     let Some(pr) = prs.pop() else {
-        return Ok(PrStatusResponse::not_found());
+        return PrStatusResponse::not_found();
     };
 
     let checks_state = fetch_pr_checks_state(cwd, pr.number);
     let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
 
-    Ok(PrStatusResponse {
+    PrStatusResponse {
         found: true,
         unavailable_reason: None,
         number: Some(pr.number),
@@ -433,7 +426,7 @@ fn get_pr_status_for_branch(
         head: Some(pr.head_ref_name),
         check_state: Some(checks_state),
         display_state: Some(display_state),
-    })
+    }
 }
 
 fn fetch_pr_checks_state(cwd: &std::path::Path, number: u64) -> PrCheckState {
@@ -441,7 +434,12 @@ fn fetch_pr_checks_state(cwd: &std::path::Path, number: u64) -> PrCheckState {
     let output = match run_gh(
         cwd,
         &[
-            "pr", "checks", &number, "--json", "name,state,bucket", "--watch=false",
+            "pr",
+            "checks",
+            &number,
+            "--json",
+            "name,state,bucket",
+            "--watch=false",
         ],
     ) {
         Ok(output) => output,
@@ -568,10 +566,20 @@ fn normalize_checks(checks: &[GhPrCheck]) -> PrCheckState {
 
     let mut has_pending = false;
     for check in checks {
-        let state = check.state.as_deref().unwrap_or_default().to_ascii_uppercase();
-        let bucket = check.bucket.as_deref().unwrap_or_default().to_ascii_uppercase();
-        if matches!(state.as_str(), "FAILURE" | "ERROR" | "CANCELLED" | "ACTION_REQUIRED")
-            || matches!(bucket.as_str(), "FAIL" | "CANCEL" | "ACTION_REQUIRED")
+        let state = check
+            .state
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        let bucket = check
+            .bucket
+            .as_deref()
+            .unwrap_or_default()
+            .to_ascii_uppercase();
+        if matches!(
+            state.as_str(),
+            "FAILURE" | "ERROR" | "CANCELLED" | "ACTION_REQUIRED"
+        ) || matches!(bucket.as_str(), "FAIL" | "CANCEL" | "ACTION_REQUIRED")
         {
             return PrCheckState::Failing;
         }
