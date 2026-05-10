@@ -1,7 +1,7 @@
 export { ConversationProvider } from './ConversationProvider';
 export { ConversationStore } from './ConversationStore';
 export { useConversationsRefresh } from './useConversationsRefresh';
-export { useCreateConversationWithStore } from './useCreateAndOpenConversation';
+export { useCreateConversationWithStore } from './useCreateConversationWithStore';
 export {
   useConversationAtom,
   useConversationSnapshot,
