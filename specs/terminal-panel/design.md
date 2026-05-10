@@ -86,13 +86,22 @@ known mirroring (see Open Questions).
 
 ### CommandTracker
 
-`idle → running → completed → idle (next C marker)`
+`idle → running → completed`, with the next C marker either re-entering
+`running` (if the user runs another command) or sitting in `completed`
+indefinitely while the prompt waits.
 
-- `running` records `commandText`, `startedAt`.
-- `completed` records `exitCode` (nullable), `finishedAt`.
-- A new `running` transition on the next C marker moves the previous
-  completed command into `lastCompletedCommand` (the HUD's "what just
-  happened" slot).
+- OSC 133;C: `idle | completed → running`. Records `commandText`,
+  `startedAt`. Clears `lastCompletedCommand` so the HUD doesn't show
+  the previous command's ✓/✗ glyph during this fresh running window.
+- OSC 133;D: `running → completed`. Records `exitCode` (nullable) +
+  `finishedAt` into `lastCompletedCommand` (the HUD's "what just
+  happened" slot). `currentCommand` becomes null.
+
+So the lifecycle of `lastCompletedCommand` is: set on D (when a
+command finishes), persists through the prompt-idle window, cleared
+on the next C (when a new command starts). The ✓/✗ glyph therefore
+has a useful visible lifetime — from D until the user runs the next
+thing.
 
 This machine drives the HUD's running and idle variants
 (REQ-TPANEL-003). It only runs when integration is detected; without

@@ -19,7 +19,7 @@ Note: agent-spawned commands have a separate path via the `tmux` tool (`specs/tm
 - A specific recovery path when the same terminal is open in another tab — not a silent take-over
 
 **Owned by other specs:**
-- `specs/terminal/` — the backend PTY session, WebSocket protocol, OSC marker semantics on the server side, the `read_terminal` agent tool, single-attach 409 enforcement
+- `specs/terminal/` — the backend PTY session, WebSocket protocol, OSC marker semantics on the server side, the `terminal_last_command` / `terminal_command_history` agent tools (replacements for the original `read_terminal` tool, split at commit 99c5df1), single-attach 409 enforcement
 - `specs/seeded-conversations/` — the route + draft-prefill mechanism the assist-setup CTA uses
 - `specs/conversation-ui/` — the parent layout that hosts the panel
 - `specs/keyboard-interaction/` — global keyboard shortcuts (panel doesn't define its own)

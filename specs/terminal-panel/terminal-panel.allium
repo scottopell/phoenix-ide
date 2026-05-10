@@ -102,9 +102,12 @@ entity TerminalPanelInstance {
     integration_status: IntegrationStatus
 
     -- Live command tracker: at most one running command at a time.
-    -- The "completed" status is transient — on the next OSC 133;C
-    -- marker, the completed command moves to last_completed_command
-    -- and the tracker re-enters running with the new command.
+    -- last_completed_command is set on OSC 133;D (when a command
+    -- finishes), persists through the prompt-idle window so the
+    -- HUD's ✓/✗ glyph stays visible, and is cleared on the next
+    -- OSC 133;C (when a new command starts running) so the new
+    -- running window doesn't show stale outcome data. See the
+    -- CommandStartedOnC and CommandCompletedOnD rules below.
     command_status: CommandStatus
     current_command: CommandExecution? when command_status = running
     last_completed_command: CommandExecution?
@@ -190,6 +193,9 @@ rule WsConnectingOnMount {
     ensures: panel.activity = disconnected
     ensures: panel.integration_status = unknown
     ensures: panel.command_status = idle
+    ensures: panel.current_command = null
+    ensures: panel.last_completed_command = null
+    ensures: panel.reported_cwd = null
 
     @guidance
         -- TerminalPanel.tsx:481 allocates the WebSocket synchronously
@@ -333,17 +339,41 @@ rule CommandCompletedOnD {
 -- by the HUD because the C payload already carries the command text.
 -- Modelled as no-op rules below so the spec covers all four sub-markers.
 
+-- A/B markers can arrive while integration_status is still unknown
+-- (e.g. powerlevel10k emits them at startup before the user runs
+-- anything). They are accepted as no-ops in any state — explicit
+-- no-op rules cover all three integration_status values so the
+-- model doesn't reject events the runtime would otherwise see.
+
 rule Osc133AIsNoop {
     when: Osc133MarkerA(panel, payload)
-    requires: panel.integration_status = detected
 
     ensures: panel.command_status = panel.command_status
-    -- Explicit no-op: the marker is consumed but no field changes.
 }
 
 rule Osc133BIsNoop {
     when: Osc133MarkerB(panel, payload)
-    requires: panel.integration_status = detected
+
+    ensures: panel.command_status = panel.command_status
+}
+
+-- Once integration_status has timed out to absent, late-arriving C/D
+-- markers are explicitly ignored by the implementation
+-- (TerminalPanel.tsx early-returns when integrationStatusRef ===
+-- 'absent'). They can occur at runtime if the shell finally emits
+-- markers after the 5s detection window — modelling them as
+-- no-op rules captures the behaviour.
+
+rule Osc133CIgnoredAfterAbsent {
+    when: Osc133MarkerC(panel, command_text)
+    requires: panel.integration_status = absent
+
+    ensures: panel.command_status = panel.command_status
+}
+
+rule Osc133DIgnoredAfterAbsent {
+    when: Osc133MarkerD(panel, exit_code)
+    requires: panel.integration_status = absent
 
     ensures: panel.command_status = panel.command_status
 }
