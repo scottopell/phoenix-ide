@@ -101,7 +101,11 @@ value PatchContext {
 -- per-conversation last-viewer storage (REQ-VS-014). Encoded as a
 -- string so the storage helper does not need to mirror the URL grammar
 -- -- a future `?viewer=diff` shape will round-trip without spec
--- changes here. Empty string represents "slot was none."
+-- changes here. "Slot was none" is represented by ABSENCE: the
+-- implementation removes the localStorage key on close rather than
+-- writing an empty string. Both forms (absent key OR empty string,
+-- should one ever be written) are equivalent at the read site, which
+-- treats them identically as "no restore."
 --
 -- Example today: "file=%2FUsers%2Fme%2Fproj%2Fsrc%2Ffoo.ts&root=%2FUsers%2Fme%2Fproj"
 -- Both `file` and `root` are absolute paths today (current openFile
@@ -506,10 +510,12 @@ rule UrlHydratesBrowserWritesStorage {
 -- a file then leaving the conversation and returning would silently
 -- re-open the file -- undoing the user's close intent. Co-fires with
 -- UserClosesActiveViewer (slot.kind transitions to none); listed
--- separately for clarity.
+-- separately for clarity. The cleared key is the conversation's
+-- slug -- storage is slug-keyed throughout (see ConversationHardDeleted
+-- event for the parallel cascade path).
 rule UserClosesClearsStorage {
     when: UserClosesViewer(slot)
-    ensures: ViewerSnapshotCleared(slot.conversation)
+    ensures: ViewerSnapshotCleared(slot.conversation.slug)
 }
 
 -- The restore rule. Fires only on in-app entry to a conversation
@@ -544,8 +550,8 @@ rule InAppNavigationRestoresFromStorage {
 -- orphan entry would silently restore a file under the wrong
 -- conversation.
 rule HardDeleteClearsStorage {
-    when: ConversationHardDeleted(conversation)
-    ensures: ViewerSnapshotCleared(conversation)
+    when: ConversationHardDeleted(slug)
+    ensures: ViewerSnapshotCleared(slug)
 }
 
 -- ===========================================================

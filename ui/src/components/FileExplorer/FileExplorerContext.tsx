@@ -85,18 +85,15 @@ export function FileExplorerProvider({ children, scopeKey }: FileExplorerProvide
   // REQ-VS-014: persist the current viewer URL params for this conversation
   // whenever the slot is non-empty. Snapshotting searchParams.toString() keeps
   // future ?viewer=diff / ?viewer=browser additions round-trippable without
-  // touching this effect. Depending on (file, root, scopeKey) -- not on the
-  // searchParams object reference, which changes every render -- avoids
-  // re-writing storage on unrelated re-renders.
+  // touching this effect. We depend on the SERIALIZED string (a primitive)
+  // rather than the searchParams object reference (which changes every
+  // render), so the effect re-fires exactly when the URL actually changes.
+  const searchString = searchParams.toString();
   useEffect(() => {
     if (!scopeKey) return;
     if (!file || !root) return;
-    setLastViewer(scopeKey, searchParams.toString());
-    // searchParams is intentionally read but excluded from deps; (file, root)
-    // capture the only fields the snapshot cares about today, and including
-    // the searchParams reference would re-fire on every render.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [scopeKey, file, root]);
+    setLastViewer(scopeKey, searchString);
+  }, [scopeKey, file, root, searchString]);
 
   // REQ-VS-014: restore the last viewer on in-app entry to a conversation.
   // react-router v6/v7 documented behavior: location.key === 'default' on the
