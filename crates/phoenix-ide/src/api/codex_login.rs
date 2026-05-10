@@ -102,12 +102,20 @@ struct LoginStatus {
 // ---------------------------------------------------------------------------
 
 struct PkceSessionInner {
-    /// Sender used to feed a manually-pasted auth code to the background task
-    /// when the loopback callback can't fire (e.g. user on SSH, browser on a
-    /// different host). Consumed at most once; mutually exclusive with the
+    /// Sender used to feed a manually-pasted auth code + state to the
+    /// background task when the loopback callback can't fire (e.g. user on
+    /// SSH, browser on a different host). Both fields are required so the
+    /// driver can run the same `validate_state` CSRF check it runs on the
+    /// loopback path. Consumed at most once; mutually exclusive with the
     /// loopback callback firing.
-    manual_tx: Option<oneshot::Sender<String>>,
+    manual_tx: Option<oneshot::Sender<ManualCallback>>,
     status: LoginStatus,
+}
+
+#[derive(Debug, Clone)]
+struct ManualCallback {
+    code: String,
+    state: String,
 }
 
 struct PkceSession {
@@ -184,7 +192,7 @@ pub async fn pkce_start(
     let session = build_pkce_session();
     let session_id = new_session_id();
 
-    let (manual_tx, manual_rx) = oneshot::channel::<String>();
+    let (manual_tx, manual_rx) = oneshot::channel::<ManualCallback>();
     let cancel = CancellationToken::new();
 
     let pkce_session = Arc::new(PkceSession {
@@ -253,7 +261,7 @@ pub async fn pkce_start(
 async fn drive_pkce(
     cancel: CancellationToken,
     loopback: Option<LoopbackServer>,
-    manual_rx: oneshot::Receiver<String>,
+    manual_rx: oneshot::Receiver<ManualCallback>,
     expected_state: String,
     verifier: String,
     redirect_uri: String,
@@ -283,15 +291,19 @@ async fn drive_pkce(
                         }
                     }
                 }
-                code = manual_rx => {
-                    // Manual paste pre-empts the browser callback. We
-                    // intentionally do NOT validate state here: the manual
-                    // path doesn't carry a state value, the user pasted only
-                    // the code. The CSRF concern that motivates state is
-                    // about a malicious page sending a callback to our
-                    // loopback; a hand-pasted code from the user's own
-                    // browser bar isn't subject to that attack.
-                    code.map_err(|_| LoginError::Loopback("manual code channel closed".into()))?
+                manual = manual_rx => {
+                    // Manual paste must validate state too. Without this
+                    // check, an attacker who tricked the user into pasting
+                    // an authorization code minted for the attacker's own
+                    // session would have Phoenix store tokens for the wrong
+                    // ChatGPT account. The UI now collects the full
+                    // post-redirect URL (or both code+state) so this branch
+                    // has the same CSRF guarantee as the loopback path.
+                    let m = manual.map_err(|_| {
+                        LoginError::Loopback("manual code channel closed".into())
+                    })?;
+                    validate_state(&expected_state, &m.state)?;
+                    m.code
                 }
             }
         }
@@ -299,9 +311,13 @@ async fn drive_pkce(
             biased;
             () = cancel.cancelled() => return Err(LoginError::Cancelled),
             () = tokio::time::sleep(PKCE_TIMEOUT) => return Err(LoginError::Cancelled),
-            code = manual_rx => code.map_err(|_| {
-                LoginError::Loopback("manual code channel closed (no loopback)".into())
-            })?,
+            manual = manual_rx => {
+                let m = manual.map_err(|_| {
+                    LoginError::Loopback("manual code channel closed (no loopback)".into())
+                })?;
+                validate_state(&expected_state, &m.state)?;
+                m.code
+            }
         },
     };
 
@@ -354,9 +370,87 @@ fn schedule_pkce_sweep(mgr: Arc<CodexLoginManager>, session_id: String) {
     });
 }
 
+/// Manual-paste fallback request. Either:
+/// - `redirect_url`: full post-callback URL with `code=…&state=…` (preferred),
+/// - or `code` + `state` extracted by the UI.
+///
+/// `state` is mandatory because the backend validates it before exchanging
+/// the code; without that check, an attacker who tricked the user into
+/// pasting a code minted for the attacker's session would have Phoenix
+/// store tokens for the wrong ChatGPT account.
 #[derive(Deserialize)]
 pub struct ManualCodeRequest {
-    pub code: String,
+    #[serde(default)]
+    pub redirect_url: Option<String>,
+    #[serde(default)]
+    pub code: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+}
+
+/// Pull `code` and `state` out of either a full redirect URL or the raw
+/// fields. Tolerates both `http://localhost:1455/auth/callback?code=…&state=…`
+/// and bare `?code=…&state=…` (just the query string) — anything we can find
+/// a `?` in.
+fn extract_manual_callback(req: &ManualCodeRequest) -> Option<ManualCallback> {
+    if let Some(url) = req.redirect_url.as_deref().map(str::trim) {
+        // The user may have pasted just the query (`?code=…&state=…`) or the
+        // full URL. Find the first `?` to anchor the query string.
+        let qs = url.split_once('?').map_or(url, |(_, q)| q);
+        let mut code = None;
+        let mut state = None;
+        for pair in qs.split('&') {
+            let (k, v) = pair.split_once('=')?;
+            let v = url_decode(v);
+            match k {
+                "code" => code = Some(v),
+                "state" => state = Some(v),
+                _ => {}
+            }
+        }
+        if let (Some(code), Some(state)) = (code, state) {
+            return Some(ManualCallback { code, state });
+        }
+    }
+    if let (Some(code), Some(state)) = (req.code.as_ref(), req.state.as_ref()) {
+        return Some(ManualCallback {
+            code: code.clone(),
+            state: state.clone(),
+        });
+    }
+    None
+}
+
+/// Decode the small subset of URL-encoded characters that show up in OAuth
+/// query strings. Avoids pulling in the `url` crate just for this.
+fn url_decode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut bytes = s.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let hi = bytes.next();
+            let lo = bytes.next();
+            match (hi, lo) {
+                (Some(h), Some(l)) => {
+                    if let (Some(h), Some(l)) =
+                        (char::from(h).to_digit(16), char::from(l).to_digit(16))
+                    {
+                        out.push(char::from(((h << 4) | l) as u8));
+                    } else {
+                        out.push('%');
+                        out.push(char::from(h));
+                        out.push(char::from(l));
+                    }
+                }
+                _ => out.push('%'),
+            }
+        } else if b == b'+' {
+            out.push(' ');
+        } else {
+            out.push(char::from(b));
+        }
+    }
+    out
 }
 
 pub async fn pkce_manual(
@@ -365,6 +459,18 @@ pub async fn pkce_manual(
     Json(body): Json<ManualCodeRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let mgr = state.codex_login.clone();
+    let Some(callback) = extract_manual_callback(&body) else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "missing_code_or_state",
+                "message": "Provide either redirect_url or both code and state. \
+                            State is required so the backend can verify the redirect \
+                            wasn't crafted for a different login session."
+            })),
+        ));
+    };
+
     let session = {
         let sessions = mgr.pkce.lock().await;
         sessions.get(&session_id).cloned()
@@ -388,7 +494,7 @@ pub async fn pkce_manual(
         ));
     };
 
-    if tx.send(body.code).is_err() {
+    if tx.send(callback).is_err() {
         // Background task already exited; this can happen if the loopback
         // callback fired first or the flow was cancelled.
         return Err((
@@ -618,10 +724,23 @@ pub struct LoginPreflight {
     /// Whether Phoenix's own auth file exists and parses as a valid
     /// chatgpt-mode token.
     pub already_signed_in: bool,
-    /// Whether the active credential was constructed at startup. When `false`
-    /// after a successful login, Phoenix must be restarted before the bridge
-    /// activates.
+    /// Whether a Codex credential was constructed at startup (any path).
+    /// Informational only — the UI should drive restart messaging from
+    /// `restart_required_after_login` instead, since piggyback-loaded
+    /// credentials still require restart when the user signs in via Phoenix.
     pub bridge_loaded_at_startup: bool,
+    /// Whether the user must restart Phoenix before an in-app login takes
+    /// effect. True when:
+    ///  - no credential was loaded at startup (registry has nothing to
+    ///    refresh), OR
+    ///  - a credential was loaded but from a different path than the in-app
+    ///    login writes to (e.g. piggyback mode loaded `~/.codex/auth.json`,
+    ///    but the new login writes `~/.phoenix-ide/codex-auth.json` — the
+    ///    in-memory credential keeps watching the old path).
+    /// False only when the loaded credential's path matches the destination
+    /// of the in-app login, i.e. its `mtime` watch will pick up new tokens
+    /// without a restart.
+    pub restart_required_after_login: bool,
     /// Whether `OPENAI_USE_CODEX_AUTH=1` is set in the current environment.
     /// Informational; the env-var only governs piggyback mode, not whether
     /// in-app login works.
@@ -632,12 +751,15 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
     let auth_path = codex_credential::default_phoenix_auth_path();
     let piggyback_path = codex_credential::default_auth_path();
     let already_signed_in = codex_credential::CodexCredential::load(auth_path.clone()).is_ok();
-    // Read the registry's frozen "loaded at startup" flag rather than
-    // re-checking the filesystem. A user who ran `codex login` in another
-    // terminal mid-session will see auth.json appear on disk but the
-    // in-memory registry hasn't picked it up — the UI must still show
-    // restart-required until task 13005 lands.
     let bridge_loaded_at_startup = state.llm_registry.codex_bridge_loaded_at_startup;
+    // Restart is required UNLESS the registry's loaded credential is pinned
+    // to the same path the in-app login writes to. This catches the
+    // piggyback-then-Phoenix-login footgun: bridge_loaded_at_startup is true
+    // (Codex CLI's auth.json was loaded), but a Phoenix login writes
+    // ~/.phoenix-ide/codex-auth.json, which the running registry doesn't
+    // watch. (Codex P2 review feedback on PR #57.)
+    let restart_required_after_login =
+        state.llm_registry.codex_loaded_path.as_deref() != Some(auth_path.as_path());
     let piggyback_env_set = std::env::var("OPENAI_USE_CODEX_AUTH")
         .ok()
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
@@ -646,6 +768,7 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
         piggyback_path: piggyback_path.display().to_string(),
         already_signed_in,
         bridge_loaded_at_startup,
+        restart_required_after_login,
         piggyback_env_set,
     })
 }
@@ -655,6 +778,73 @@ mod tests {
     use super::*;
     use crate::llm::codex_login::{finalize_login, DeviceCode, LoginError, TokenResponse};
     use std::time::Instant;
+
+    #[test]
+    fn extract_manual_callback_parses_full_redirect_url() {
+        let req = ManualCodeRequest {
+            redirect_url: Some("http://localhost:1455/auth/callback?code=abc&state=xyz".into()),
+            code: None,
+            state: None,
+        };
+        let m = extract_manual_callback(&req).unwrap();
+        assert_eq!(m.code, "abc");
+        assert_eq!(m.state, "xyz");
+    }
+
+    #[test]
+    fn extract_manual_callback_decodes_url_encoded_values() {
+        let req = ManualCodeRequest {
+            redirect_url: Some("?code=a%2Bb%2Fc%3D&state=hello%20world".into()),
+            code: None,
+            state: None,
+        };
+        let m = extract_manual_callback(&req).unwrap();
+        assert_eq!(m.code, "a+b/c=");
+        assert_eq!(m.state, "hello world");
+    }
+
+    #[test]
+    fn extract_manual_callback_falls_back_to_explicit_fields() {
+        let req = ManualCodeRequest {
+            redirect_url: None,
+            code: Some("c".into()),
+            state: Some("s".into()),
+        };
+        let m = extract_manual_callback(&req).unwrap();
+        assert_eq!(m.code, "c");
+        assert_eq!(m.state, "s");
+    }
+
+    /// A manual paste that's missing the state parameter must NOT be
+    /// extractable. The handler refuses with 400 BAD_REQUEST so the
+    /// background driver never sees a state-less code (which would skip
+    /// the CSRF check). PR #57 review feedback.
+    #[test]
+    fn extract_manual_callback_rejects_missing_state() {
+        // URL with code but no state.
+        let req = ManualCodeRequest {
+            redirect_url: Some("http://localhost:1455/auth/callback?code=abc".into()),
+            code: None,
+            state: None,
+        };
+        assert!(extract_manual_callback(&req).is_none());
+
+        // Explicit code without explicit state.
+        let req = ManualCodeRequest {
+            redirect_url: None,
+            code: Some("c".into()),
+            state: None,
+        };
+        assert!(extract_manual_callback(&req).is_none());
+
+        // Empty body.
+        let req = ManualCodeRequest {
+            redirect_url: None,
+            code: None,
+            state: None,
+        };
+        assert!(extract_manual_callback(&req).is_none());
+    }
 
     /// Cancellation racing into `drive_device_code` MUST short-circuit the
     /// whole flow before `finalize_login` runs. The bug Codex review caught:

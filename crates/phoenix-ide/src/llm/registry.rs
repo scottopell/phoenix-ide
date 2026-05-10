@@ -189,6 +189,14 @@ pub struct LlmConfig {
     /// `OAuth` tokens borrowed from the local `Codex` CLI's `~/.codex/auth.json`.
     /// `Anthropic` and `Mock` providers are unaffected.
     pub codex_credential: Option<Arc<CodexCredential>>,
+    /// Filesystem path the loaded `codex_credential` was constructed from
+    /// (Phoenix's own auth file or Codex CLI's, depending on which won the
+    /// startup-time priority dance — see `codex_credential::resolve_active_auth_path`).
+    /// `None` whenever `codex_credential` is `None`. Surfaced so the login
+    /// preflight can answer "do you need to restart after signing in?": if
+    /// the loaded path equals the path the in-app login writes to, the mtime
+    /// watch picks up new tokens; otherwise a restart is required.
+    pub codex_credential_path: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for LlmConfig {
@@ -231,6 +239,7 @@ impl Clone for LlmConfig {
             auth_style: self.auth_style,
             use_codex_auth: self.use_codex_auth,
             codex_credential: self.codex_credential.as_ref().map(Arc::clone),
+            codex_credential_path: self.codex_credential_path.clone(),
         }
     }
 }
@@ -250,6 +259,7 @@ impl Default for LlmConfig {
             auth_style: AuthStyle::ApiKey,
             use_codex_auth: false,
             codex_credential: None,
+            codex_credential_path: None,
         }
     }
 }
@@ -301,7 +311,7 @@ impl LlmConfig {
         // opts into reading Codex CLI's ~/.codex/auth.json instead. See
         // [`codex_credential::resolve_active_auth_path`].
         let active_auth_path = codex_credential::resolve_active_auth_path();
-        let codex_credential = match active_auth_path.as_ref() {
+        let (codex_credential, codex_credential_path) = match active_auth_path.as_ref() {
             Some(path) => match CodexCredential::load(path.clone()) {
                 Ok((cred, account_id)) => {
                     tracing::info!(
@@ -309,15 +319,15 @@ impl LlmConfig {
                         account_id = account_id.as_deref().unwrap_or("<none>"),
                         "ChatGPT bridge active — routing OpenAI models via ChatGPT backend"
                     );
-                    Some(cred)
+                    (Some(cred), Some(path.clone()))
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, path = %path.display(),
                         "ChatGPT auth file present but failed to load; OpenAI models unavailable");
-                    None
+                    (None, None)
                 }
             },
-            None => None,
+            None => (None, None),
         };
         // `use_codex_auth` is the bridge-intent flag (see field docs). True
         // whenever the user has done something that signals "I want OpenAI
@@ -349,6 +359,7 @@ impl LlmConfig {
             },
             use_codex_auth,
             codex_credential,
+            codex_credential_path,
         }
     }
 }
@@ -399,6 +410,14 @@ pub struct ModelRegistry {
     /// after signing in?". The registry can't pick up a credential that
     /// appeared after startup until task 13005 lands.
     pub codex_bridge_loaded_at_startup: bool,
+    /// Filesystem path the loaded credential was constructed from (Phoenix's
+    /// own auth file or Codex CLI's piggyback path). `None` when no credential
+    /// was loaded. The preflight uses this to detect the
+    /// piggyback-then-Phoenix-login case: cred loaded at startup from
+    /// `~/.codex/auth.json`, then user signs in via Phoenix and writes
+    /// `~/.phoenix-ide/codex-auth.json` — restart still required because
+    /// the in-memory credential remains pinned to the old path.
+    pub codex_loaded_path: Option<std::path::PathBuf>,
 }
 
 impl ModelRegistry {
@@ -410,6 +429,7 @@ impl ModelRegistry {
             default_model: "test-model".to_string(),
             gateway_status: GatewayStatus::NotConfigured,
             codex_bridge_loaded_at_startup: false,
+            codex_loaded_path: None,
         }
     }
 
@@ -433,6 +453,7 @@ impl ModelRegistry {
             default_model,
             gateway_status: GatewayStatus::NotConfigured,
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
+            codex_loaded_path: config.codex_credential_path.clone(),
         }
     }
 
@@ -571,6 +592,7 @@ impl ModelRegistry {
             default_model,
             gateway_status: GatewayStatus::Healthy,
             codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
+            codex_loaded_path: config.codex_credential_path.clone(),
         }
     }
 
@@ -771,6 +793,7 @@ impl ModelRegistry {
             default_model: "claude-sonnet-4-6".to_string(),
             gateway_status: GatewayStatus::NotConfigured,
             codex_bridge_loaded_at_startup: false,
+            codex_loaded_path: None,
         }
     }
 

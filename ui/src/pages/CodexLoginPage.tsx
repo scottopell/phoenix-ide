@@ -18,12 +18,6 @@ export function CodexLoginPage() {
   const [mode, setMode] = useState<Mode>('choose');
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<FlowResult | null>(null);
-  // PKCE-specific: a tab pre-opened from the user's click on "Sign in with
-  // browser". Browsers require window.open() to fire inside a synchronous
-  // user-gesture handler, so we open `about:blank` immediately and rewrite
-  // its location once the authorize URL arrives from the API. Held in a ref
-  // (not state) because changing it shouldn't trigger a re-render.
-  const pkcePreopenedRef = useRef<Window | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -55,44 +49,16 @@ export function CodexLoginPage() {
         {mode === 'choose' && (
           <ChooseFlow
             preflight={preflight}
-            onPickPkce={() => {
-              setError(null);
-              // Open the destination tab in the user-gesture window. We only
-              // know the URL after the /pkce/start round-trip completes, so
-              // navigate this blank tab from the API success handler below.
-              //
-              // No `noopener` — when honored it makes window.open return
-              // `null`, which would leave us with a blank tab we can't
-              // navigate. We need the handle here, and the destination is
-              // our own intent (auth.openai.com), not arbitrary content.
-              pkcePreopenedRef.current = window.open('about:blank', '_blank');
-              setMode('pkce');
-            }}
+            onPickPkce={() => { setError(null); setMode('pkce'); }}
             onPickDevice={() => { setError(null); setMode('device'); }}
           />
         )}
 
         {mode === 'pkce' && (
           <PkceFlow
-            preopenedWindow={pkcePreopenedRef.current}
-            onCancel={() => {
-              if (pkcePreopenedRef.current) {
-                pkcePreopenedRef.current.close();
-                pkcePreopenedRef.current = null;
-              }
-              setMode('choose');
-            }}
+            onCancel={() => setMode('choose')}
             onSuccess={handleSuccess}
-            onError={(msg) => {
-              // Close the popup on the error path too — otherwise a /pkce/start
-              // failure or polling error leaves a blank tab open.
-              if (pkcePreopenedRef.current) {
-                pkcePreopenedRef.current.close();
-                pkcePreopenedRef.current = null;
-              }
-              setError(msg);
-              setMode('choose');
-            }}
+            onError={(msg) => { setError(msg); setMode('choose'); }}
           />
         )}
 
@@ -115,10 +81,13 @@ function SuccessBanner({ result, preflight }: { result: FlowResult; preflight: C
       <div className="codex-login-success-body">
         Tokens written to <code>{result.authPath}</code>
         {result.accountId && <> for account <code>{result.accountId}</code></>}.
-        {preflight && !preflight.bridge_loaded_at_startup && (
+        {preflight?.restart_required_after_login && (
           <div className="codex-login-warning">
             <strong>Restart Phoenix</strong> to start using your ChatGPT subscription.
-            (The credential is loaded at startup; we can't pick it up mid-session yet.)
+            {preflight.bridge_loaded_at_startup
+              ? ' (Phoenix is currently using a different credential file ' +
+                'that was loaded at startup; restart to switch to the new login.)'
+              : ' (The credential is loaded at startup; we can’t pick it up mid-session yet.)'}
           </div>
         )}
       </div>
@@ -151,25 +120,23 @@ function ChooseFlow({
       </button>
       <p className="codex-login-help">
         The browser flow opens auth.openai.com and redirects to a local port (1455).
-        Use the code flow on SSH/headless hosts where that won't work.
+        Use the code flow on SSH/headless hosts where that won&rsquo;t work.
       </p>
     </div>
   );
 }
 
 function PkceFlow({
-  preopenedWindow,
   onCancel,
   onSuccess,
   onError,
 }: {
-  preopenedWindow: Window | null;
   onCancel: () => void;
   onSuccess: (r: FlowResult) => void;
   onError: (msg: string) => void;
 }) {
   const [start, setStart] = useState<CodexPkceStartResponse | null>(null);
-  const [pasteCode, setPasteCode] = useState('');
+  const [pasteUrl, setPasteUrl] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [showPaste, setShowPaste] = useState(false);
   const startedRef = useRef(false);
@@ -186,16 +153,10 @@ function PkceFlow({
         // If loopback bind failed we MUST surface the manual paste path
         // immediately — the browser callback will go nowhere.
         if (!s.loopback_bound) setShowPaste(true);
-        // Navigate the tab the user opened on click into the authorize URL.
-        // If the popup was blocked or the user closed it, fall back to a
-        // user-clickable link rendered below.
-        if (preopenedWindow && !preopenedWindow.closed) {
-          preopenedWindow.location.href = s.authorize_url;
-        }
       })
       .catch((e) => { if (!cancelled) onError(e instanceof Error ? e.message : String(e)); });
     return () => { cancelled = true; };
-  }, [onError, preopenedWindow]);
+  }, [onError]);
 
   // Poll status while we have a session id.
   useEffect(() => {
@@ -237,67 +198,82 @@ function PkceFlow({
     if (!start) return;
     setSubmitting(true);
     try {
-      await api.codexPkceManual(start.session_id, pasteCode.trim());
+      // Send the full URL the user pasted; the backend extracts code+state
+      // from it and validates state. The UI deliberately doesn't try to
+      // parse here so the validation lives in one place server-side.
+      await api.codexPkceManual(start.session_id, { redirect_url: pasteUrl.trim() });
     } catch (e) {
       onError(e instanceof Error ? e.message : String(e));
     } finally {
       setSubmitting(false);
     }
-  }, [start, pasteCode, onError]);
+  }, [start, pasteUrl, onError]);
 
   if (!start) {
-    return <div className="codex-login-info">Starting…</div>;
+    return <div className="codex-login-info">Starting&hellip;</div>;
   }
 
   return (
     <div className="codex-login-flow">
       <div className="codex-login-info">
-        A browser tab should have opened. Sign in to continue.
         <div className="codex-login-link">
-          <a href={start.authorize_url} target="_blank" rel="noopener noreferrer">
-            Open sign-in page
+          <a
+            href={start.authorize_url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="login-button codex-login-open-link"
+          >
+            Open sign-in page &rarr;
           </a>
         </div>
+        <p className="codex-login-help">
+          Click the link above to open ChatGPT&rsquo;s sign-in page in a new tab.
+          After signing in your browser will be redirected back to Phoenix
+          {!start.loopback_bound && ' (but the loopback isn’t reachable on this host — use the manual paste below)'}.
+        </p>
         {!start.loopback_bound && (
           <div className="codex-login-warning">
-            Couldn't bind localhost:{start.callback_port}; browser callback won't reach Phoenix.
+            Couldn&rsquo;t bind localhost:{start.callback_port}; browser callback won&rsquo;t reach Phoenix.
             Use the manual paste below.
           </div>
         )}
       </div>
 
-      <div className="codex-login-status">Waiting for sign-in…</div>
+      <div className="codex-login-status">Waiting for sign-in&hellip;</div>
 
       <button
         type="button"
         className="login-button login-button-secondary codex-login-paste-toggle"
         onClick={() => setShowPaste((v) => !v)}
       >
-        {showPaste ? 'Hide manual paste' : 'Browser callback didn’t fire? Paste code'}
+        {showPaste ? 'Hide manual paste' : 'Browser callback didn’t fire? Paste URL'}
       </button>
 
       {showPaste && (
         <div className="codex-login-paste">
           <p className="codex-login-help">
-            After signing in, your browser is redirected to{' '}
-            <code>{start.redirect_uri}?code=…&amp;state=…</code>. Copy the value of the{' '}
-            <code>code</code> query parameter and paste it here.
+            After signing in, your browser is redirected to a URL that starts
+            with <code>{start.redirect_uri}?code=&hellip;&amp;state=&hellip;</code>.
+            Copy the entire URL out of your address bar and paste it here.
+            (Both <code>code</code> and <code>state</code> are required;
+            Phoenix verifies <code>state</code> to prevent a malicious site from
+            tricking you into pasting someone else&rsquo;s code.)
           </p>
           <input
             type="text"
             className="login-input"
-            placeholder="Paste auth code"
-            value={pasteCode}
-            onChange={(e) => setPasteCode(e.target.value)}
+            placeholder="Paste full redirect URL"
+            value={pasteUrl}
+            onChange={(e) => setPasteUrl(e.target.value)}
             disabled={submitting}
           />
           <button
             type="button"
             className="login-button"
             onClick={handlePaste}
-            disabled={submitting || pasteCode.trim().length === 0}
+            disabled={submitting || pasteUrl.trim().length === 0}
           >
-            {submitting ? 'Submitting…' : 'Submit code'}
+            {submitting ? 'Submitting…' : 'Submit'}
           </button>
         </div>
       )}
@@ -368,7 +344,7 @@ function DeviceFlow({
   }, [start, onCancel]);
 
   if (!start) {
-    return <div className="codex-login-info">Requesting device code…</div>;
+    return <div className="codex-login-info">Requesting device code&hellip;</div>;
   }
 
   return (
@@ -391,7 +367,7 @@ function DeviceFlow({
         </li>
       </ol>
       <div className="codex-login-status">
-        Waiting (expires in {Math.floor(start.timeout_secs / 60)} minutes)…
+        Waiting (expires in {Math.floor(start.timeout_secs / 60)} minutes)&hellip;
       </div>
       <button type="button" className="codex-login-cancel" onClick={handleCancel}>
         Cancel

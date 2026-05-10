@@ -394,7 +394,19 @@ export interface CodexLoginPreflight {
   piggyback_path: string;
   already_signed_in: boolean;
   bridge_loaded_at_startup: boolean;
+  /// True when an in-app login won't take effect until Phoenix restarts —
+  /// either because no credential was loaded at startup or because the
+  /// loaded credential is pinned to a different file (the piggyback case).
+  restart_required_after_login: boolean;
   piggyback_env_set: boolean;
+}
+
+export interface CodexManualCodeRequest {
+  /// Either the full post-callback URL (preferred — backend extracts code+state),
+  /// or both `code` and `state` if the UI parsed them itself.
+  redirect_url?: string;
+  code?: string;
+  state?: string;
 }
 
 export interface CodexPkceStartResponse {
@@ -451,15 +463,15 @@ export const api = {
     return resp.json();
   },
 
-  async codexPkceManual(sessionId: string, code: string): Promise<void> {
+  async codexPkceManual(sessionId: string, body: CodexManualCodeRequest): Promise<void> {
     const resp = await fetch(`/api/codex/login/pkce/${encodeURIComponent(sessionId)}/manual`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code }),
+      body: JSON.stringify(body),
     });
     if (!resp.ok) {
-      const err = await resp.json().catch(() => ({})) as { error?: string };
-      throw new Error(err.error ?? 'Manual code submission failed');
+      const err = await resp.json().catch(() => ({})) as { error?: string; message?: string };
+      throw new Error(err.message ?? err.error ?? 'Manual code submission failed');
     }
   },
 
