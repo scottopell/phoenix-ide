@@ -159,7 +159,14 @@ export const ConversationRow = memo(function ConversationRow({
         </div>
       </div>
       <div ref={menuRef} className="conv-item-menu-container">
-        <button className="conv-item-menu-btn" onClick={(e) => onToggleMenu(e, conv.id)} title="Actions">
+        <button
+          className="conv-item-menu-btn"
+          onClick={(e) => onToggleMenu(e, conv.id)}
+          title="Actions"
+          aria-label="Conversation actions"
+          aria-haspopup="menu"
+          aria-expanded={isMenuOpen}
+        >
           ⋮
         </button>
         {isMenuOpen && (
