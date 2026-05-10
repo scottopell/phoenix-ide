@@ -1,9 +1,14 @@
-import { useCallback, useMemo } from 'react';
+import { useCallback, useEffect, useMemo } from 'react';
 import type { ReactNode } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { useLocation, useSearchParams } from 'react-router-dom';
 import { useScopedState } from '../../hooks/useScopedState';
 import { FileExplorerContext } from './fileExplorerTypes';
 import type { PatchContext, ProseReaderState } from './fileExplorerTypes';
+import {
+  clearLastViewer,
+  getLastViewer,
+  setLastViewer,
+} from './lastViewerStorage';
 
 interface FileExplorerProviderProps {
   children: ReactNode;
@@ -13,6 +18,10 @@ interface FileExplorerProviderProps {
    * conversation don't bleed into another. The path + rootDir live in URL
    * search params (?file=...&root=...) and are naturally scoped by the
    * `/c/:slug` segment, so they don't need a scopeKey reset.
+   *
+   * Also keys per-conversation last-viewer storage (REQ-VS-014): in-app
+   * navigation back to this slug restores its previously open viewer from
+   * localStorage.
    */
   scopeKey?: string | undefined;
 }
@@ -22,6 +31,7 @@ const ROOT_PARAM = 'root';
 
 export function FileExplorerProvider({ children, scopeKey }: FileExplorerProviderProps) {
   const [searchParams, setSearchParams] = useSearchParams();
+  const location = useLocation();
 
   // patchContext (modified-line highlights) is conversation-specific and not
   // URL-encodable (Set<number>). It lives in scoped state so a slug change
@@ -69,7 +79,44 @@ export function FileExplorerProvider({ children, scopeKey }: FileExplorerProvide
       },
       { replace: true },
     );
-  }, [setPatchContext, setSearchParams]);
+    if (scopeKey) clearLastViewer(scopeKey);
+  }, [setPatchContext, setSearchParams, scopeKey]);
+
+  // REQ-VS-014: persist the current viewer URL params for this conversation
+  // whenever the slot is non-empty. Snapshotting searchParams.toString() keeps
+  // future ?viewer=diff / ?viewer=browser additions round-trippable without
+  // touching this effect. Depending on (file, root, scopeKey) -- not on the
+  // searchParams object reference, which changes every render -- avoids
+  // re-writing storage on unrelated re-renders.
+  useEffect(() => {
+    if (!scopeKey) return;
+    if (!file || !root) return;
+    setLastViewer(scopeKey, searchParams.toString());
+    // searchParams is intentionally read but excluded from deps; (file, root)
+    // capture the only fields the snapshot cares about today, and including
+    // the searchParams reference would re-fire on every render.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeKey, file, root]);
+
+  // REQ-VS-014: restore the last viewer on in-app entry to a conversation.
+  // react-router v6/v7 documented behavior: location.key === 'default' on the
+  // initial SPA mount (cold reload, browser refresh, iOS PWA cold start);
+  // every subsequent navigate() mints a fresh key. Cold reload is excluded
+  // by design (D1) -- the URL is authoritative there. The "URL has no ?file"
+  // precondition prevents double-firing on browser back/forward, where the
+  // URL already carries the prior params.
+  useEffect(() => {
+    if (!scopeKey) return;
+    if (location.key === 'default') return;
+    if (file || root) return;
+    const stored = getLastViewer(scopeKey);
+    if (!stored) return;
+    setSearchParams(new URLSearchParams(stored), { replace: true });
+    // file / root included so the effect re-evaluates when a separate code
+    // path (e.g. closeFile) clears the URL; we explicitly want NOT to fire
+    // in that case because the user just closed it. The guard above handles
+    // that: closeFile clears storage, so getLastViewer returns null.
+  }, [scopeKey, location.key, file, root, setSearchParams]);
 
   const activeFile = proseReaderState?.path ?? null;
 

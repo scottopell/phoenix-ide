@@ -37,9 +37,9 @@ The browser viewer's `kind = browser` membership is independent of the live `bro
 | **REQ-VS-011:** Patch Context for Prose | ✅ Complete | `FileExplorerContext.tsx` carries `patchContext` in `useScopedState` alongside the URL-driven file path |
 | **REQ-VS-012:** Malformed URL Normalization | ❌ Not Started | Today, `?viewer=prose` without `?file=` is undefined behaviour. Spec mandates normalization to `?viewer=` (none) and a corrective `setSearchParams` |
 | **REQ-VS-013:** Browser Slot Independent of Live Session | ✅ Complete | `BrowserViewPanel` renders an "ended" state when `browser_session_active = false`; the slot doesn't auto-close until the falling-edge rule fires |
-| **REQ-VS-014:** Per-Conversation Viewer Persistence on In-App Nav | ❌ Not Started | New: localStorage-backed last-viewer map (slug → URL params snapshot). Written on every viewer-open transition; cleared on explicit close + on conversation hard-delete; consulted only on in-app entry (`location.key !== 'default'`), never on cold reload. Implementation lives in `FileExplorerProvider` until REQ-VS-002 unification, then moves to the unified `ViewerSlotProvider` |
+| **REQ-VS-014:** Per-Conversation Viewer Persistence on In-App Nav | ✅ Complete (prose-only) | localStorage-backed last-viewer map (`phoenix:lastviewer:<slug>` → URL params snapshot) in `ui/src/components/FileExplorer/lastViewerStorage.ts`. `FileExplorerProvider` writes on every prose open, clears on explicit close, and restores on in-app entry (`useLocation().key !== 'default'`) when the URL is bare. Cold reload deliberately does not restore (D1). Hard-delete cascade clears the entry via `useConversationsRefresh.ts`. Diff/browser viewers join when REQ-VS-006 lands |
 
-**Progress:** 7 of 14 complete, 4 partial, 3 not started
+**Progress:** 8 of 14 complete, 4 partial, 2 not started
 
 The path to ✅ across the board is one focused task: collapse the three providers (`FileExplorerProvider`, `DiffViewerStateProvider`, `BrowserViewStateProvider`) into a single `ViewerSlotProvider` that derives its state from the URL, deletes the three coordinating effects in `ConversationPage.tsx`, and lets the type system enforce the mutex. The diff payload moves to a viewer-mounted fetch keyed on the URL comparator. PR #47's prose work is the prototype; this spec is the contract the unification needs to satisfy.
 

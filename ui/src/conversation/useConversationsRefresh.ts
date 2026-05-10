@@ -3,6 +3,7 @@ import { ConversationContext } from './ConversationContext';
 import type { ConversationStore } from './ConversationStore';
 import { api } from '../api';
 import { cacheDB } from '../cache';
+import { clearLastViewer } from '../components/FileExplorer/lastViewerStorage';
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -127,7 +128,12 @@ export function useConversationsRefreshDriver(): void {
       const detail = (e as CustomEvent<{ conversationId?: string }>).detail;
       if (!detail?.conversationId) return;
       const slug = store.slugForId(detail.conversationId);
-      if (slug) store.remove(slug);
+      if (slug) {
+        store.remove(slug);
+        // REQ-VS-014: drop the per-conversation last-viewer entry so a
+        // future conversation that reuses this slug doesn't inherit it.
+        clearLastViewer(slug);
+      }
       // Always re-poll — the deleted row may have been part of a chain
       // whose other members' counts are now stale.
       void refreshRef.current();
