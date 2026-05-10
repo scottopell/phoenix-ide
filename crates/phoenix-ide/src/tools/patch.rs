@@ -103,9 +103,7 @@ Usage notes:
 - For replace operations, oldText must appear EXACTLY ONCE in the file
 - All patches in a single call resolve against the original file content simultaneously, not sequentially. Repeating the same oldText across patches cannot disambiguate sites. For sequential edits where each step sees the prior result, use separate patch tool calls.
 
-IMPORTANT: Each patch call must be less than 60k tokens total. For large file
-changes, break them into multiple smaller patch operations rather than one
-large overwrite. Prefer incremental replace operations over full file overwrites.".to_string()
+Size limit: each patch call must be less than 60 KB of input.".to_string()
     }
 
     fn input_schema(&self) -> Value {

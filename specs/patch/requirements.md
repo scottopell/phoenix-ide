@@ -132,11 +132,11 @@ THE SYSTEM SHALL notify LLM of the modification
 
 ### REQ-PATCH-008: Size Limits
 
-WHEN patch input exceeds 60k tokens
+WHEN patch input exceeds 60 KB
 THE SYSTEM SHALL reject the operation
 AND suggest breaking into smaller patches
 
-**Rationale:** Large patches risk context window issues and are harder to review. Incremental edits are preferred.
+**Rationale:** Bounding tool-call input size keeps the round-trip cheap and predictable. The unit is bytes of serialized JSON input, matching `MAX_INPUT_SIZE` in the implementation.
 
 ---
 
