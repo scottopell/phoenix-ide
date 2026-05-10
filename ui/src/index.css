@@ -5528,8 +5528,7 @@ html * {
   .statebar-chevron {
     background: none;
     border: 0;
- .work-actions-abandon {
-  color: var(--text-muted);
+    color: var(--text-muted);
     font-size: 12px;
     width: 32px;
     height: 32px;
