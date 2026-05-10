@@ -2941,9 +2941,9 @@ dependencies = [
 
 [[package]]
 name = "taskmd-core"
-version = "1.0.0-rc2"
+version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d03090e8a7535dd05833d74746a85784425efd1ef320d79e37a18b09ce46a409"
+checksum = "0f2415b7cb9a7bb7297a8a5d8dc23459bf5d4e219c1f54dd3f0c915a7e278a98"
 dependencies = [
  "gethostname",
  "regex",
