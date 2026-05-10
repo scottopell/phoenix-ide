@@ -566,11 +566,6 @@ impl TryFrom<Event> for SubAgentEvent {
             Event::UserTriggerContinuation => {
                 Ok(SubAgentEvent::Core(CoreEvent::UserTriggerContinuation))
             }
-            Event::SteerDrainedUserMessages { entries } => {
-                Ok(SubAgentEvent::Core(CoreEvent::SteerDrainedUserMessages {
-                    entries,
-                }))
-            }
             // Sub-agent-only events
             Event::GraceTurnExhausted { result } => Ok(SubAgentEvent::SubAgent(
                 SubAgentOnlyEvent::GraceTurnExhausted { result },
@@ -578,6 +573,9 @@ impl TryFrom<Event> for SubAgentEvent {
             // Parent-only events are invalid for sub-agent;
             // SteerMessage, CancelSteerMessage, and Shutdown are intercepted by
             // the executor before reaching the state-machine conversion.
+            // SteerDrainedUserMessages is parent-only: steering is a parent-
+            // conversation feature, and the executor's drain detector guards
+            // against firing for sub-agents.
             Event::TaskApprovalResponse { .. }
             | Event::UserQuestionResponse { .. }
             | Event::CredentialBecameAvailable
@@ -585,6 +583,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::TaskResolved { .. }
             | Event::SteerMessage { .. }
             | Event::CancelSteerMessage { .. }
+            | Event::SteerDrainedUserMessages { .. }
             | Event::Shutdown => Err(EventConversionError {
                 event_variant: event.variant_name(),
                 target_type: "SubAgentEvent",

@@ -723,15 +723,23 @@ where
 
     /// If the current state transition is a steering-queue drain hook point and
     /// the queue is non-empty, drain all entries into a single
-    /// `SteerDrainedUserMessages` event and persist the (now empty) queue.
+    /// `SteerDrainedUserMessages` event. The DB queue is NOT touched here; it
+    /// is cleared later by `Effect::ClearSteeringQueue` once the emitted event
+    /// is processed and all `PersistMessage` effects succeed.
     ///
-    /// Hook points:
+    /// Sub-agents do not have steering queues; this returns `None` for them.
+    ///
+    /// Hook points (parent conversations only):
     /// - Entering `Idle` from any other state (turn complete; deliver steers
     ///   into the next LLM call).
     /// - Entering `LlmRequesting` from `ToolExecuting`/`AwaitingSubAgents` (mid-
     ///   turn; the prior transition already dispatched `RequestLlm`, so steers
     ///   land in the NEXT LLM call, not the in-flight one).
     fn maybe_drain_steering_queue(&mut self, old_state: &ConvState) -> Option<Event> {
+        if self.context.is_sub_agent {
+            return None;
+        }
+
         let entering_idle =
             !matches!(old_state, ConvState::Idle) && matches!(self.state, ConvState::Idle);
         let entering_llm_requesting_from_tool_round =
@@ -1130,11 +1138,13 @@ where
                 display_data,
                 usage_data,
                 message_id,
+                idempotent,
             } => {
-                // Idempotent: skip if already persisted. Prevents double-insert
-                // (and seq gap) when a SteerDrainedUserMessages re-fires after
-                // crash recovery before ClearSteeringQueue ran.
-                if self.storage.message_exists(&message_id).await? {
+                // Idempotent path: skip if already persisted. Prevents double-
+                // insert (and seq gap) when a SteerDrainedUserMessages re-fires
+                // after crash recovery before ClearSteeringQueue ran. Gated to
+                // idempotent=true so non-replayable persists pay no extra query.
+                if idempotent && self.storage.message_exists(&message_id).await? {
                     tracing::debug!(
                         message_id = %message_id,
                         "Skipping PersistMessage; message already exists"
@@ -3759,7 +3769,9 @@ mod steer_drain_detector_tests {
 
     /// Drain-all on entering `Idle`: from `LlmRequesting` → `Idle` with 3 queued
     /// entries, the executor must emit one `SteerDrainedUserMessages` carrying
-    /// all 3 entries, clear `self.steering_queue`, and persist the empty queue.
+    /// all 3 entries and clear in-memory `self.steering_queue`. DB queue clear
+    /// is the `Effect::ClearSteeringQueue` arm's job, covered by
+    /// `clear_steering_queue_effect_empties_storage`.
     #[tokio::test]
     async fn drain_all_on_entering_idle() {
         let queue = vec![
@@ -3767,7 +3779,7 @@ mod steer_drain_detector_tests {
             mk_entry("s2", "second"),
             mk_entry("s3", "third"),
         ];
-        let (mut rt, storage) = build_runtime_with_state_and_queue(
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
             "conv-drain-idle",
             ConvState::LlmRequesting { attempt: 1 },
             queue,
@@ -3796,19 +3808,15 @@ mod steer_drain_detector_tests {
             rt.steering_queue.is_empty(),
             "in-memory queue must be empty"
         );
-        assert!(
-            storage.get_steering_queue("conv-drain-idle").is_empty(),
-            "persisted queue must be empty after drain"
-        );
     }
 
     /// Mid-turn drain from `ToolExecuting` → `LlmRequesting`: all queued entries
-    /// are emitted in a single `SteerDrainedUserMessages` event; queue cleared
-    /// and persisted empty.
+    /// are emitted in a single `SteerDrainedUserMessages` event; in-memory queue
+    /// cleared. DB queue clear is covered by `clear_steering_queue_effect_empties_storage`.
     #[tokio::test]
     async fn drain_all_mid_turn_from_tool_executing() {
         let queue = vec![mk_entry("s1", "one"), mk_entry("s2", "two")];
-        let (mut rt, storage) =
+        let (mut rt, _storage) =
             build_runtime_with_state_and_queue("conv-drain-tool", mk_tool_executing(), queue);
 
         let result = TransitionResult::new(ConvState::LlmRequesting { attempt: 1 });
@@ -3823,14 +3831,13 @@ mod steer_drain_detector_tests {
         assert_eq!(drained[0][0].message_id, "s1");
         assert_eq!(drained[0][1].message_id, "s2");
         assert!(rt.steering_queue.is_empty());
-        assert!(storage.get_steering_queue("conv-drain-tool").is_empty());
     }
 
     /// Mid-turn drain from `AwaitingSubAgents` → `LlmRequesting`.
     #[tokio::test]
     async fn drain_all_mid_turn_from_awaiting_subagents() {
         let queue = vec![mk_entry("s1", "alpha")];
-        let (mut rt, storage) =
+        let (mut rt, _storage) =
             build_runtime_with_state_and_queue("conv-drain-sub", mk_awaiting_sub_agents(), queue);
 
         let result = TransitionResult::new(ConvState::LlmRequesting { attempt: 1 });
@@ -3844,7 +3851,6 @@ mod steer_drain_detector_tests {
         assert_eq!(drained[0].len(), 1);
         assert_eq!(drained[0][0].message_id, "s1");
         assert!(rt.steering_queue.is_empty());
-        assert!(storage.get_steering_queue("conv-drain-sub").is_empty());
     }
 
     /// Entering `Idle` with an empty queue produces no drain event.
@@ -3977,12 +3983,13 @@ mod steer_drain_detector_tests {
         let initial_count = storage.get_all_messages("conv-idem").len();
         assert_eq!(initial_count, 1);
 
-        // Run PersistMessage with the same message_id — must be a no-op.
+        // Run idempotent PersistMessage with the same message_id — must be a no-op.
         rt.execute_effect(Effect::PersistMessage {
             content: MessageContent::User(UserContent::new("duplicate-attempt")),
             display_data: None,
             usage_data: None,
             message_id: dup_id.clone(),
+            idempotent: true,
         })
         .await
         .expect("PersistMessage on duplicate must succeed");
@@ -3994,5 +4001,81 @@ mod steer_drain_detector_tests {
             "no duplicate row should be inserted for an existing message_id"
         );
         assert_eq!(after[0].message_id, dup_id);
+    }
+
+    /// Sub-agent runtimes never drain a steering queue. Steering is a parent-
+    /// only feature; even if a sub-agent's in-memory queue is non-empty (e.g.,
+    /// corrupted state on resume), the drain detector must skip it.
+    #[tokio::test]
+    async fn no_drain_on_sub_agent_runtime() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::sub_agent(
+            "conv-sub-drain",
+            PathBuf::from("/tmp"),
+            "test-model",
+            200_000,
+            "parent-conv",
+        );
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let broadcaster = SseBroadcaster::new(128, 0);
+        let mut rt = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            broadcaster,
+        )
+        .with_steering_queue(vec![mk_entry("ignored", "should not drain")]);
+
+        let result = TransitionResult::new(ConvState::Idle);
+        let generated = rt
+            .apply_transition_result(result)
+            .await
+            .expect("apply_transition_result must succeed");
+
+        assert!(
+            extract_steer_drain_entries(&generated).is_empty(),
+            "sub-agent runtimes must NOT drain queued steers"
+        );
+        assert_eq!(
+            rt.steering_queue.len(),
+            1,
+            "sub-agent queue must remain untouched"
+        );
+    }
+
+    /// Non-idempotent `PersistMessage` does NOT do a `message_exists` precheck.
+    /// This is the hot-path guarantee: agent/tool/checkpoint persistence pays
+    /// no extra DB query.
+    #[tokio::test]
+    async fn persist_message_non_idempotent_skips_existence_check() {
+        use crate::db::{MessageContent, UserContent};
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-non-idem",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+
+        // Fresh message_id; non-idempotent path should persist normally.
+        rt.execute_effect(Effect::PersistMessage {
+            content: MessageContent::User(UserContent::new("fresh-message")),
+            display_data: None,
+            usage_data: None,
+            message_id: "new-1".to_string(),
+            idempotent: false,
+        })
+        .await
+        .expect("non-idempotent PersistMessage must succeed");
+
+        assert_eq!(storage.get_all_messages("conv-non-idem").len(), 1);
     }
 }

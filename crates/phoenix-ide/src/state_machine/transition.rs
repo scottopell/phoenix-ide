@@ -342,6 +342,7 @@ pub fn transition_core(
                     message_id.clone(),
                     user_agent.clone(),
                     skill_invocation.clone(),
+                    false,
                 ))
                 .with_effect(Effect::PersistState)
                 .with_effect(notify_llm_requesting(1))
@@ -468,8 +469,8 @@ pub fn transition_core(
 }
 
 /// Build a `PersistMessage` effect from a queued steering entry.
-/// Mirrors the field layout used by the `UserMessage` arm above so a drained
-/// entry persists identically to a freshly-received user message.
+/// `idempotent: true` because steering-queue re-drain after crash recovery
+/// may re-emit this effect with the same `message_id`.
 fn steer_entry_to_persist_effect(entry: &crate::state_machine::event::SteerEntry) -> Effect {
     Effect::persist_user_message(
         entry.text.clone(),
@@ -478,6 +479,7 @@ fn steer_entry_to_persist_effect(entry: &crate::state_machine::event::SteerEntry
         entry.message_id.clone(),
         entry.user_agent.clone(),
         entry.skill_invocation.clone(),
+        true,
     )
 }
 
@@ -1259,12 +1261,14 @@ pub fn transition_parent(
                     display_data: None,
                     usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
+                    idempotent: false,
                 })
                 .with_effect(Effect::PersistMessage {
                     content: crate::db::MessageContent::user(annotations),
                     display_data: None,
                     usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
+                    idempotent: false,
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(notify_llm_requesting(1))
@@ -1284,6 +1288,7 @@ pub fn transition_parent(
                     display_data: None,
                     usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
+                    idempotent: false,
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_agent_done()),
@@ -1344,6 +1349,7 @@ pub fn transition_parent(
                     display_data: None,
                     usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
+                    idempotent: false,
                 })
                 .with_effect(Effect::PersistState)
                 .with_effect(notify_llm_requesting(1))
@@ -1366,6 +1372,7 @@ pub fn transition_parent(
                 display_data: None,
                 usage_data: None,
                 message_id: uuid::Uuid::new_v4().to_string(),
+                idempotent: false,
             })
             .with_effect(Effect::PersistState)
             .with_effect(notify_llm_requesting(1))
@@ -3403,6 +3410,30 @@ mod tests {
             notify_count, 1,
             "Idle path must emit exactly one state-change notification"
         );
+
+        // Crash-safety ordering: ClearSteeringQueue must come AFTER PersistState
+        // (so DB queue is only cleared once messages + state are durable).
+        let last_persist_msg_idx = result
+            .effects
+            .iter()
+            .rposition(|e| matches!(e, Effect::PersistMessage { .. }))
+            .expect("PersistMessage must be present");
+        let persist_state_idx = result
+            .effects
+            .iter()
+            .position(|e| matches!(e, Effect::PersistState))
+            .expect("PersistState must be present");
+        let clear_idx = result
+            .effects
+            .iter()
+            .position(|e| matches!(e, Effect::ClearSteeringQueue))
+            .expect("ClearSteeringQueue must be present");
+        assert!(
+            last_persist_msg_idx < persist_state_idx
+                && persist_state_idx < clear_idx,
+            "ordering must be: all PersistMessage < PersistState < ClearSteeringQueue, \
+             got persist_msg={last_persist_msg_idx} persist_state={persist_state_idx} clear={clear_idx}"
+        );
     }
 
     #[test]
@@ -3454,6 +3485,29 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::NotifyClient { .. })),
             "mid-turn drain must NOT emit state-change notification — state unchanged"
+        );
+
+        // Crash-safety ordering: ClearSteeringQueue must come AFTER PersistState.
+        let last_persist_msg_idx = result
+            .effects
+            .iter()
+            .rposition(|e| matches!(e, Effect::PersistMessage { .. }))
+            .expect("PersistMessage must be present");
+        let persist_state_idx = result
+            .effects
+            .iter()
+            .position(|e| matches!(e, Effect::PersistState))
+            .expect("PersistState must be present");
+        let clear_idx = result
+            .effects
+            .iter()
+            .position(|e| matches!(e, Effect::ClearSteeringQueue))
+            .expect("ClearSteeringQueue must be present");
+        assert!(
+            last_persist_msg_idx < persist_state_idx
+                && persist_state_idx < clear_idx,
+            "mid-turn ordering must be: all PersistMessage < PersistState < ClearSteeringQueue, \
+             got persist_msg={last_persist_msg_idx} persist_state={persist_state_idx} clear={clear_idx}"
         );
     }
 
