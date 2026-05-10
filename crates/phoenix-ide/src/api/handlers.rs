@@ -476,7 +476,10 @@ async fn serve_spa() -> impl IntoResponse {
         Some(content) => Html(content).into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            Html("<h1>404 - UI not found. Build with: cd ui && npm run build</h1>".to_string()),
+            Html(
+                "<h1>404 - UI not found. Build with: corepack pnpm --dir ui run build</h1>"
+                    .to_string(),
+            ),
         )
             .into_response(),
     }
@@ -3449,7 +3452,10 @@ async fn serve_share_page(
         Some(content) => Ok(Html(content).into_response()),
         None => Ok((
             StatusCode::NOT_FOUND,
-            Html("<h1>404 - UI not found. Build with: cd ui && npm run build</h1>".to_string()),
+            Html(
+                "<h1>404 - UI not found. Build with: corepack pnpm --dir ui run build</h1>"
+                    .to_string(),
+            ),
         )
             .into_response()),
     }
