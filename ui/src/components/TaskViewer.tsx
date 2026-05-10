@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { api } from '../api';
 import type { TaskEntry, Conversation } from '../api';
+import { useCreateConversationWithStore } from '../conversation';
 import './TaskViewer.css';
 
 interface TaskViewerProps {
@@ -27,6 +27,7 @@ const TERMINAL_STATUSES = new Set(['done', 'wont-do']);
 
 export function TaskViewer({ task, tasksDir, parentConversation, onBack }: TaskViewerProps) {
   const navigate = useNavigate();
+  const createConversationWithStore = useCreateConversationWithStore();
   const [content, setContent] = useState<string | null>(null);
   const [rawContent, setRawContent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -86,7 +87,7 @@ export function TaskViewer({ task, tasksDir, parentConversation, onBack }: TaskV
       const messageId =
         crypto.randomUUID?.() ??
         `seed-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-      const newConv = await api.createConversation(
+      const newConv = await createConversationWithStore(
         parentConversation.cwd,
         '', // empty — server accepts empty text when seed_parent_id is set
         messageId,

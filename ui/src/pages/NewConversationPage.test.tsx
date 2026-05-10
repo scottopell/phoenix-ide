@@ -14,6 +14,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { NewConversationPage } from './NewConversationPage';
+import { ConversationProvider } from '../conversation';
 
 // Mock the API -- validateCwd is async, so it won't resolve during initial render
 vi.mock('../api', () => ({
@@ -22,6 +23,16 @@ vi.mock('../api', () => ({
     getEnv: vi.fn().mockResolvedValue({ home_dir: '/home/user' }),
     validateCwd: vi.fn().mockResolvedValue({ valid: true }),
     listDirectory: vi.fn().mockResolvedValue({ entries: [] }),
+    listConversations: vi.fn().mockResolvedValue([]),
+    listArchivedConversations: vi.fn().mockResolvedValue([]),
+  },
+}));
+
+vi.mock('../cache', () => ({
+  cacheDB: {
+    getAllConversations: vi.fn().mockResolvedValue([]),
+    syncConversations: vi.fn().mockResolvedValue(undefined),
+    putConversation: vi.fn().mockResolvedValue(undefined),
   },
 }));
 
@@ -36,7 +47,9 @@ describe('FTUX-01: Dir status flash on page load', () => {
   it('should NOT show "checking" status indicator on initial render when cwd is saved', () => {
     const { container } = render(
       <MemoryRouter>
-        <NewConversationPage />
+        <ConversationProvider>
+          <NewConversationPage />
+        </ConversationProvider>
       </MemoryRouter>
     );
 

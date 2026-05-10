@@ -6,6 +6,7 @@ import type { DirStatus } from '../components/SettingsFields';
 import { processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
 import { generateUUID } from '../utils/uuid';
+import { useCreateConversationWithStore } from '../conversation';
 
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
@@ -25,6 +26,7 @@ function addRecentDir(dir: string) {
 }
 
 export function useCreateConversation(navigate: (path: string) => void) {
+  const createConversationWithStore = useCreateConversationWithStore();
   const [homeDir, setHomeDir] = useState<string>('');
   const [cwd, setCwd] = useState(() => localStorage.getItem(LAST_CWD_KEY) || '');
   const [dirStatus, setDirStatus] = useState<DirStatus>(() =>
@@ -219,7 +221,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setCreating(false);
         return;
       }
-      const conv = await api.createConversation(
+      const conv = await createConversationWithStore(
         trimmedCwd, trimmed, messageId, selectedModel || undefined, images, mode,
         effectiveBranch,
       );

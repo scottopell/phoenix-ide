@@ -27,7 +27,7 @@ import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkActions } from '../components/WorkActions';
-import { useConversationAtom, useConversationSnapshot } from '../conversation';
+import { useConversationAtom, useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
 import { useResizablePane, useIsDesktop, useIsWideDesktop } from '../hooks';
 
 // Conditional overlays / heavy panels — code-split so the default render path
@@ -126,6 +126,7 @@ function BrowserViewWrapper({
 function ConversationPageContent() {
   const { slug } = useParams<{ slug: string }>();
   const navigate = useNavigate();
+  const createConversationWithStore = useCreateConversationWithStore();
 
   // Atom-backed conversation state (survives navigation via ConversationProvider)
   const [atom, dispatch] = useConversationAtom(slug!);
@@ -686,7 +687,7 @@ function ConversationPageContent() {
       // Stash the seed draft BEFORE navigation so it's visible to the new
       // page on first render (useDraft reads localStorage synchronously in
       // its initializer).
-      const newConvPromise = api.createConversation(
+      const newConv = await createConversationWithStore(
         homeDir,
         '', // empty — server accepts empty text when seed_parent_id is set
         messageId,
@@ -697,7 +698,6 @@ function ConversationPageContent() {
         conversation.id,
         seedLabel,
       );
-      const newConv = await newConvPromise;
       try {
         localStorage.setItem(`seed-draft:${newConv.id}`, promptText);
       } catch {
@@ -707,7 +707,7 @@ function ConversationPageContent() {
         navigate(`/c/${newConv.slug}`);
       }
     },
-    [conversation, navigate],
+    [conversation, navigate, createConversationWithStore],
   );
 
   const handleApproveTask = async () => {
