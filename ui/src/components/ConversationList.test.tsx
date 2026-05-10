@@ -532,8 +532,8 @@ describe('ConversationList — row memoization on keyboard navigation', () => {
     // c3 and c4 are untouched — same DOM nodes.
     const c3After = container.querySelector('[data-id="c3"] .conv-item-main')!;
     const c4After = container.querySelector('[data-id="c4"] .conv-item-main')!;
-    expect(c3After).toBe(before.c3);
-    expect(c4After).toBe(before.c4);
+    expect(c3After).toBe(before['c3']);
+    expect(c4After).toBe(before['c4']);
 
     // Sanity: c2 is now keyboard-selected, c1 is not.
     expect(

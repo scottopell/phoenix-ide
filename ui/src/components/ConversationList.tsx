@@ -55,7 +55,7 @@ interface ConversationRowProps {
   onCloseMenu: () => void;
   /** Forwarded only when this row's menu is open; lets the parent install a
    *  click-outside listener scoped to the actual DOM node. */
-  menuRef?: React.RefObject<HTMLDivElement>;
+  menuRef?: React.RefObject<HTMLDivElement> | undefined;
 }
 
 const ConversationRow = memo(function ConversationRow({
@@ -223,15 +223,15 @@ interface ChainBlockProps {
   collapsed: boolean;
   isMenuOpen: boolean;
   expandedRowId: string | null;
-  keyboardSelectedId: string | null;
+  keyboardSelectedId: string | null | undefined;
   activeSlug: string | null | undefined;
   showArchived: boolean;
   onToggleCollapsed: (rootId: string) => void;
   onToggleChainMenu: (e: React.MouseEvent, rootId: string) => void;
   onCloseChainMenu: () => void;
-  onArchiveChain?: (rootId: string) => void;
-  onUnarchiveChain?: (rootId: string) => void;
-  onDeleteChain?: (rootId: string) => void;
+  onArchiveChain?: ((rootId: string) => void) | undefined;
+  onUnarchiveChain?: ((rootId: string) => void) | undefined;
+  onDeleteChain?: ((rootId: string) => void) | undefined;
   onRowClick: (conv: Conversation) => void;
   onRowToggleMenu: (e: React.MouseEvent, convId: string) => void;
   onArchive: (conv: Conversation) => void;
@@ -239,8 +239,8 @@ interface ChainBlockProps {
   onDelete: (conv: Conversation) => void;
   onRename: (conv: Conversation) => void;
   onCloseRowMenu: () => void;
-  rowMenuRef?: React.RefObject<HTMLDivElement>;
-  chainMenuRef?: React.RefObject<HTMLDivElement>;
+  rowMenuRef?: React.RefObject<HTMLDivElement> | undefined;
+  chainMenuRef?: React.RefObject<HTMLDivElement> | undefined;
 }
 
 const ChainBlock = memo(function ChainBlock({
