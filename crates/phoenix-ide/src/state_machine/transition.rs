@@ -62,7 +62,7 @@ fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, St
     let rel_path = Path::new(task_file);
     if rel_path.is_absolute() {
         return Err(format!(
-            "task_file must be relative to the repo root (got '{task_file}')"
+            "task_file must be a relative path (got '{task_file}')"
         ));
     }
     let first_component = rel_path

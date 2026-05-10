@@ -26,10 +26,11 @@ impl Tool for ProposeTaskTool {
          gateway from Explore mode (read-only) to Work mode (write access). \
          Pass the path to a task file under `tasks/` — either an existing \
          task file you want to begin working on, or a new task file you \
-         created with `patch` in this conversation. The file's frontmatter \
-         supplies priority and status; the body is the plan shown to the \
-         user. Status must be one of: ready, in-progress, brainstorming. \
-         This must be the only tool call in the response."
+         created with `patch` in this conversation. Priority and status \
+         come from the filename (taskmd 1.0); the body is free-form \
+         markdown and is shown to the user as the plan. Status must be \
+         one of: ready, in-progress, brainstorming. This must be the only \
+         tool call in the response."
             .to_string()
     }
 
@@ -40,7 +41,7 @@ impl Tool for ProposeTaskTool {
             "properties": {
                 "task_file": {
                     "type": "string",
-                    "description": "Path (relative to the repo root) to an existing task file under tasks/. The file must follow the taskmd naming convention (e.g. tasks/01234-p2-ready--my-slug.md) and have valid frontmatter."
+                    "description": "Path (relative to your working directory) to an existing task file under tasks/. The filename must follow the taskmd naming convention (e.g. tasks/01234-p2-ready--my-slug.md) — taskmd 1.0 derives id, priority, status, and slug from the filename, with no frontmatter."
                 }
             }
         })
