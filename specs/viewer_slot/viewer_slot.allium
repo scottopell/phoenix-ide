@@ -45,7 +45,7 @@
 --   conversation-scoped state, not in the URL -- it is patch-
 --   provenance, not view identity. Loss on cold reload is acceptable.
 --
--- Requirement traceability: REQ-VS-001 through REQ-VS-013
+-- Requirement traceability: REQ-VS-001 through REQ-VS-014
 
 use "../bedrock/bedrock.allium" as bedrock
 
@@ -96,6 +96,26 @@ value PatchContext {
     first_modified_line: Integer?     -- target for auto-scroll
 }
 
+-- Snapshot of the URL search params describing a viewer slot, in the
+-- form they would appear in `?...`. Used as the persistence shape for
+-- per-conversation last-viewer storage (REQ-VS-014). Encoded as a
+-- string so the storage helper does not need to mirror the URL grammar
+-- -- a future `?viewer=diff` shape will round-trip without spec
+-- changes here. Empty string represents "slot was none."
+--
+-- Example today: "file=%2FUsers%2Fme%2Fproj%2Fsrc%2Ffoo.ts&root=%2FUsers%2Fme%2Fproj"
+-- Both `file` and `root` are absolute paths today (current openFile
+-- signature). `root` is the conversation's worktree root and is used
+-- server-side as a containment gate (the resolved file must live
+-- within it) and client-side to render the relative display path.
+-- The `?viewer=` prefix is not present in today's URL -- only `file`
+-- and `root` -- because the prose-only URL contract pre-dates the
+-- unified slot work in REQ-VS-002. Compaction (e.g. encoding `file`
+-- as relative-to-root) is in scope for that unification, not here.
+value ViewerUrlSnapshot {
+    params: String
+}
+
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
@@ -103,6 +123,18 @@ value PatchContext {
 -- The four kinds of slot state. Encoded in URL as ?viewer=<kind>.
 -- `none` corresponds to "no ?viewer= param present."
 enum ViewerKind { none | prose | diff | browser }
+
+-- Note: ConversationEntered carries an entry-source discriminator
+-- (`cold_reload` vs `in_app`) modelled inline at the event call site
+-- below rather than as a top-level enum. `cold_reload` = the SPA just
+-- mounted (browser refresh, iOS PWA cold start, shared link click);
+-- the URL is authoritative. `in_app` = the user navigated within the
+-- SPA (sidebar click, command palette, programmatic navigate); the
+-- destination URL is bare unless we restore it from per-conversation
+-- storage. The implementation distinguishes these via
+-- `useLocation().key` -- documented react-router v6/v7 behavior: the
+-- initial location key is `'default'`, every subsequent navigate
+-- mints a fresh key.
 
 ------------------------------------------------------------
 -- Entities
@@ -156,6 +188,21 @@ entity ViewerSlot {
     }
 }
 
+-- Per-conversation last-viewer storage is modelled via the events
+-- below (`ViewerSnapshotPersisted`, `ViewerSnapshotCleared`,
+-- `UrlRestorationRequested`) rather than as a typed entity, because
+-- Allium does not yet support indexed assignment in `ensures:` clauses.
+-- The implementation backs these events with `localStorage` keyed by
+-- conversation slug:
+--
+--   localStorage["phoenix:lastviewer:<slug>"] = ViewerUrlSnapshot.params
+--
+-- Survives page reload, cleared by explicit close (REQ-VS-004), and
+-- cleared when the conversation is hard-deleted (REQ-BED-032 cascade).
+-- Keyed by slug rather than conversation id so the read on entry can
+-- fire from `useParams<{slug}>` without an extra slug→id lookup.
+-- Slugs are stable identifiers.
+
 ------------------------------------------------------------
 -- Events (referenced inline by rules; not declared separately)
 ------------------------------------------------------------
@@ -188,6 +235,18 @@ entity ViewerSlot {
 -- naturally don't survive a different /c/:slug path. Captured as
 -- an explicit event for clarity.
 --   ConversationChanged(slot)
+--
+-- Conversation entry: the user lands on /c/:slug, either via SPA
+-- mount (cold_reload) or in-app navigation (in_app). Distinct from
+-- ConversationChanged because it covers the cold-reload entry (no
+-- prior conversation to change FROM) and because it carries the
+-- entry-source discriminator the restore rule depends on.
+--   ConversationEntered(slot, source: ConversationEntrySource)
+--
+-- Hard-delete cascade: bedrock removed the conversation row server-
+-- side. Storage entries for that slug must be cleared so a future
+-- conversation that happens to reuse the slug doesn't inherit them.
+--   ConversationHardDeleted(slug)
 
 ------------------------------------------------------------
 -- Rules
@@ -363,6 +422,130 @@ rule BrowserSessionFellAutoClosesSlot {
 rule ConversationChangeResetsSlot {
     when: ConversationChanged(slot)
     ensures: slot.kind = none
+}
+
+-- ===========================================================
+-- VS 5b. PER-CONVERSATION VIEWER PERSISTENCE (REQ-VS-014)
+-- ===========================================================
+
+-- @guidance
+--   REQ-VS-010 still holds: navigating from /c/A to /c/B never
+--   carries A's viewer state INTO B. This section is the symmetric
+--   case: when the user navigates back TO a conversation they
+--   previously had a viewer open in, restore that viewer.
+--
+--   Two design decisions are baked in:
+--
+--   (D1) Cold reload does NOT restore. A user who reloaded the tab
+--        with a bare URL gets a bare URL back. Only in-app navigation
+--        triggers restore. This keeps the URL the unambiguous source
+--        of truth on cold reload (REQ-VS-005, REQ-VS-006) and avoids
+--        surprising a user who deliberately shared `/c/A` (no viewer
+--        params) with their team only to have it auto-open a file
+--        the recipient cannot see.
+--
+--   (D2) Storage is localStorage (matches the per-file scroll-restore
+--        tier in ProseReader). Survives reload but is per-tab-group;
+--        cross-tab races are best-effort last-writer-wins. Acceptable
+--        for v1 -- same semantics as the scroll restore.
+--
+--   The persistence layer sits BELOW the URL but ABOVE the slot:
+--   in-app navigation reads storage and decorates the URL before
+--   commit; the slot rules then hydrate from the URL exactly as
+--   they would for a cold reload that happened to have params. No
+--   slot rule changes; only entry-time URL synthesis.
+
+-- Storage write: every event that lands the slot in a non-none kind
+-- (user-driven open OR URL-driven hydration) persists the current URL
+-- params for this conversation's slug. Modelled as one rule per
+-- triggering event because Allium triggers fire on events, not on
+-- entity-field transitions. Subsumes both "user just opened prose"
+-- and "URL hydrated prose on cold reload" -- both leave a storage
+-- entry so a subsequent in-app navigation away and back restores
+-- the same viewer.
+--
+-- @guidance: the implementation can collapse these into a single
+-- effect that watches `(slot.kind, current URL params)` and writes
+-- on any transition where `slot.kind != none`. The per-event
+-- decomposition here is for spec analysability; it is not a
+-- prescription on how to factor the React effects.
+
+rule UserOpensProseWritesStorage {
+    when: UserOpensProse(slot, file, patch?)
+    ensures: ViewerSnapshotPersisted(slot)
+}
+
+rule UserOpensDiffWritesStorage {
+    when: UserOpensDiff(slot, key)
+    ensures: ViewerSnapshotPersisted(slot)
+}
+
+rule UserOpensBrowserWritesStorage {
+    when: UserOpensBrowser(slot)
+    ensures: ViewerSnapshotPersisted(slot)
+}
+
+rule UrlHydratesProseWritesStorage {
+    when: UrlSlotChanged(slot, prose, file, _)
+    requires: file != null
+    ensures: ViewerSnapshotPersisted(slot)
+}
+
+rule UrlHydratesDiffWritesStorage {
+    when: UrlSlotChanged(slot, diff, _, key)
+    requires: key != null
+    ensures: ViewerSnapshotPersisted(slot)
+}
+
+rule UrlHydratesBrowserWritesStorage {
+    when: UrlSlotChanged(slot, browser, _, _)
+    ensures: ViewerSnapshotPersisted(slot)
+}
+
+-- Storage clear on explicit close. Without this, clicking X to close
+-- a file then leaving the conversation and returning would silently
+-- re-open the file -- undoing the user's close intent. Co-fires with
+-- UserClosesActiveViewer (slot.kind transitions to none); listed
+-- separately for clarity.
+rule UserClosesClearsStorage {
+    when: UserClosesViewer(slot)
+    ensures: ViewerSnapshotCleared(slot.conversation)
+}
+
+-- The restore rule. Fires only on in-app entry to a conversation
+-- whose URL has no viewer params. Implementation reads
+-- localStorage["phoenix:lastviewer:<slug>"] when handling the
+-- emitted UrlRestorationRequested event; if absent or empty, the
+-- effect is a no-op and the slot stays none. Modelling the
+-- localStorage read as a `requires:` would tie the spec to
+-- implementation; emitting the event unconditionally and letting the
+-- handler short-circuit on empty storage keeps the slot rules pure.
+rule InAppNavigationRestoresFromStorage {
+    when: ConversationEntered(slot, in_app)
+    requires: slot.kind = none
+    ensures: UrlRestorationRequested(slot)
+    -- Effect: handler reads storage, calls setSearchParams(stored,
+    -- { replace: true }) if any. On the next render the existing
+    -- UrlHydratesProse / UrlHydratesDiff / UrlHydratesBrowser rules
+    -- fire and the slot reaches the restored kind. Two render
+    -- cycles: this rule emits the request, URL update fires the
+    -- hydration rule, slot updates.
+}
+
+-- @guidance: cold-reload entry is intentionally NOT covered by a
+-- restore rule. The URL is authoritative -- if it has params, the
+-- existing UrlHydrates* rules apply; if bare, the slot stays none.
+-- Storage is consulted only on in-app entry. This is decision D1.
+
+-- Storage cleanup on hard-delete. Without this, slug entries
+-- accumulate forever for conversations the user has explicitly
+-- removed. The slug-keyed storage assumes slugs are stable
+-- identifiers; if a future server change recycles slugs, an
+-- orphan entry would silently restore a file under the wrong
+-- conversation.
+rule HardDeleteClearsStorage {
+    when: ConversationHardDeleted(conversation)
+    ensures: ViewerSnapshotCleared(conversation)
 }
 
 -- ===========================================================

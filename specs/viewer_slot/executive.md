@@ -4,6 +4,8 @@
 
 Inside a conversation, the user can open one of three viewers next to (or instead of) the chat: the prose reader for files, the diff viewer for git changes, or the live browser view. Only one viewer is active at a time -- opening one closes any other. Closing the viewer returns the user to the chat. After a cold reload (iOS PWA kill, browser refresh, shared link), the user comes back to exactly the viewer they had open, with the same data, because the URL is the source of truth. Switching to a different conversation always closes the viewer; viewer state never leaks between conversations.
 
+When the user navigates *back* in-app to a conversation they had a viewer open in (e.g. sidebar click on conversation A → conversation B → back to A), the previous viewer is restored from per-conversation localStorage. Cold reload deliberately does NOT restore -- a bare URL on reload reflects user intent ("I shared this link with no viewer params") and must not be silently overridden.
+
 The browser viewer auto-opens on a server-side rising edge (a tool just spawned a browser session for this conversation, slot was empty), and auto-closes on a falling edge (session ended). Manual entry via the launcher chip is the recovery path when auto-open is suppressed.
 
 ## Technical Summary
@@ -35,8 +37,9 @@ The browser viewer's `kind = browser` membership is independent of the live `bro
 | **REQ-VS-011:** Patch Context for Prose | ✅ Complete | `FileExplorerContext.tsx` carries `patchContext` in `useScopedState` alongside the URL-driven file path |
 | **REQ-VS-012:** Malformed URL Normalization | ❌ Not Started | Today, `?viewer=prose` without `?file=` is undefined behaviour. Spec mandates normalization to `?viewer=` (none) and a corrective `setSearchParams` |
 | **REQ-VS-013:** Browser Slot Independent of Live Session | ✅ Complete | `BrowserViewPanel` renders an "ended" state when `browser_session_active = false`; the slot doesn't auto-close until the falling-edge rule fires |
+| **REQ-VS-014:** Per-Conversation Viewer Persistence on In-App Nav | ❌ Not Started | New: localStorage-backed last-viewer map (slug → URL params snapshot). Written on every viewer-open transition; cleared on explicit close + on conversation hard-delete; consulted only on in-app entry (`location.key !== 'default'`), never on cold reload. Implementation lives in `FileExplorerProvider` until REQ-VS-002 unification, then moves to the unified `ViewerSlotProvider` |
 
-**Progress:** 7 of 13 complete, 4 partial, 2 not started
+**Progress:** 7 of 14 complete, 4 partial, 3 not started
 
 The path to ✅ across the board is one focused task: collapse the three providers (`FileExplorerProvider`, `DiffViewerStateProvider`, `BrowserViewStateProvider`) into a single `ViewerSlotProvider` that derives its state from the URL, deletes the three coordinating effects in `ConversationPage.tsx`, and lets the type system enforce the mutex. The diff payload moves to a viewer-mounted fetch keyed on the URL comparator. PR #47's prose work is the prototype; this spec is the contract the unification needs to satisfy.
 
