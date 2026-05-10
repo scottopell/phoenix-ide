@@ -43,11 +43,18 @@ use tokio_util::sync::CancellationToken;
 /// rather than living forever.
 const PKCE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
+/// After a flow settles (success / error / cancelled), the session record
+/// stays in the manager long enough for the polling UI to read the terminal
+/// state, then is swept. `pkce_status` / `device_status` already drop
+/// sessions on first terminal read; this sweeper is the safety net for
+/// clients that crash, navigate away, or never poll back.
+const SETTLED_SESSION_RETENTION: Duration = Duration::from_secs(60);
+
 use crate::llm::codex_credential;
 use crate::llm::codex_login::{
     self, build_pkce_session, exchange_pkce_code, finalize_login, poll_device_code,
-    request_device_code, CallbackPayload, DeviceCode, LoginError, LoginResult, LoopbackServer,
-    CALLBACK_PORT, CLIENT_ID, ISSUER_BASE,
+    request_device_code, validate_state, CallbackPayload, DeviceCode, LoginError, LoginResult,
+    LoopbackServer, CALLBACK_PORT, CLIENT_ID, ISSUER_BASE,
 };
 
 use super::AppState;
@@ -265,14 +272,14 @@ async fn drive_pkce(
                 cb = &mut server.callback_rx => {
                     match cb.map_err(|_| LoginError::Loopback("callback channel closed".into()))? {
                         CallbackPayload::Success { code, state: returned_state } => {
-                            if returned_state != expected_state {
-                                return Err(LoginError::StateMismatch);
-                            }
+                            validate_state(&expected_state, &returned_state)?;
                             code
                         }
                         CallbackPayload::Error { error, description } => {
-                            let detail = description.unwrap_or_default();
-                            return Err(LoginError::OAuth(format!("{error}: {detail}")));
+                            return Err(LoginError::OAuth(match description {
+                                Some(d) if !d.is_empty() => format!("{error}: {d}"),
+                                _ => error,
+                            }));
                         }
                     }
                 }
@@ -319,7 +326,7 @@ async fn drive_pkce(
 }
 
 async fn settle_pkce(
-    mgr: &CodexLoginManager,
+    mgr: &Arc<CodexLoginManager>,
     session_id: &str,
     outcome: Result<LoginResult, LoginError>,
 ) {
@@ -328,8 +335,23 @@ async fn settle_pkce(
         sessions.get(session_id).cloned()
     };
     let Some(session) = session else { return };
-    let mut inner = session.inner.lock().await;
-    inner.status.outcome = Some(outcome);
+    {
+        let mut inner = session.inner.lock().await;
+        inner.status.outcome = Some(outcome);
+    }
+    schedule_pkce_sweep(mgr.clone(), session_id.to_string());
+}
+
+/// Remove a settled PKCE session after [`SETTLED_SESSION_RETENTION`] elapses.
+/// Bounds memory growth when a client crashes or navigates away without
+/// reading `/status` (in which case `pkce_status` would have removed it
+/// eagerly). Idempotent: if the entry has already been swept, this is a no-op.
+fn schedule_pkce_sweep(mgr: Arc<CodexLoginManager>, session_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(SETTLED_SESSION_RETENTION).await;
+        let mut sessions = mgr.pkce.lock().await;
+        sessions.remove(&session_id);
+    });
 }
 
 #[derive(Deserialize)]
@@ -510,7 +532,7 @@ async fn drive_device_code(
 }
 
 async fn settle_device(
-    mgr: &CodexLoginManager,
+    mgr: &Arc<CodexLoginManager>,
     session_id: &str,
     outcome: Result<LoginResult, LoginError>,
 ) {
@@ -525,8 +547,20 @@ async fn settle_device(
             "codex_login: device code flow ended in error"
         );
     }
-    let mut status = session.status.lock().await;
-    status.outcome = Some(outcome);
+    {
+        let mut status = session.status.lock().await;
+        status.outcome = Some(outcome);
+    }
+    schedule_device_sweep(mgr.clone(), session_id.to_string());
+}
+
+/// See [`schedule_pkce_sweep`].
+fn schedule_device_sweep(mgr: Arc<CodexLoginManager>, session_id: String) {
+    tokio::spawn(async move {
+        tokio::time::sleep(SETTLED_SESSION_RETENTION).await;
+        let mut sessions = mgr.device.lock().await;
+        sessions.remove(&session_id);
+    });
 }
 
 pub async fn device_status(
@@ -625,17 +659,19 @@ mod tests {
     /// whole flow before `finalize_login` runs. The bug Codex review caught:
     /// previously, `device_cancel` only removed the session record from the
     /// map; the spawned poll keeps running and writes auth.json on success.
+    ///
+    /// We exercise the pre-poll cancel path: a token already cancelled when
+    /// drive_device_code starts must error out with `Cancelled` from the
+    /// `tokio::select!`, never reaching `poll_device_code` (which would hit
+    /// the network) or `finalize_login` (which would write to
+    /// `login_target_path()`). Asserting on the error type is what tells us
+    /// the fix is in place — a regression that drops the cancel branch would
+    /// surface as `LoginError::Network` or a hang on the unreachable issuer.
     #[tokio::test]
-    async fn drive_device_code_cancelled_before_poll_does_not_write_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let auth_path = dir.path().join("codex-auth.json");
-
+    async fn drive_device_code_cancelled_before_poll_short_circuits() {
         let cancel = CancellationToken::new();
         cancel.cancel();
 
-        // Unreachable issuer: if cancellation didn't pre-empt, the poll
-        // would error on the network call. We assert specifically Cancelled,
-        // not Network — that's the bug fix.
         let device = DeviceCode {
             verification_url: "https://example/codex/device".into(),
             user_code: "ABCD-1234".into(),
@@ -650,10 +686,6 @@ mod tests {
         assert!(
             matches!(err, LoginError::Cancelled),
             "expected Cancelled, got {err:?}"
-        );
-        assert!(
-            !auth_path.exists(),
-            "auth file must not be written when login was cancelled"
         );
     }
 

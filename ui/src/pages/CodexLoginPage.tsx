@@ -82,7 +82,16 @@ export function CodexLoginPage() {
               setMode('choose');
             }}
             onSuccess={handleSuccess}
-            onError={(msg) => { setError(msg); setMode('choose'); }}
+            onError={(msg) => {
+              // Close the popup on the error path too — otherwise a /pkce/start
+              // failure or polling error leaves a blank tab open.
+              if (pkcePreopenedRef.current) {
+                pkcePreopenedRef.current.close();
+                pkcePreopenedRef.current = null;
+              }
+              setError(msg);
+              setMode('choose');
+            }}
           />
         )}
 

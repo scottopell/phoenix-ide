@@ -129,6 +129,18 @@ pub fn generate_state() -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Compare the `state` value returned in the OAuth callback against the one we
+/// sent in the authorize URL. A mismatch is treated as a CSRF signal; the
+/// caller must NOT proceed to exchange the code. Extracted as a helper so the
+/// guarantee can be unit-tested without standing up a real loopback server.
+pub fn validate_state(expected: &str, returned: &str) -> Result<(), LoginError> {
+    if expected == returned {
+        Ok(())
+    } else {
+        Err(LoginError::StateMismatch)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Authorize URL construction
 // ---------------------------------------------------------------------------
@@ -882,15 +894,34 @@ mod tests {
 
     /// PKCE state validation: when the redirect callback's `state` doesn't
     /// match the value we generated, we treat it as a CSRF attempt and abort
-    /// before exchanging the code. This test exercises the comparator the
-    /// API layer uses; the actual loopback handler is exercised in
-    /// integration paths.
+    /// before exchanging the code. Exercises [`validate_state`], the function
+    /// `drive_pkce` actually calls — so removing or weakening the comparison
+    /// in production code would fail this test.
     #[test]
-    fn state_mismatch_is_caught_before_token_exchange() {
+    fn validate_state_rejects_mismatch_and_accepts_match() {
         let session = build_pkce_session();
-        let received_state = "attacker-supplied-state";
-        // The check the API layer must perform.
-        assert_ne!(session.state, received_state);
+
+        assert!(validate_state(&session.state, &session.state).is_ok());
+
+        // Substring of the real state still mismatches — guards against a
+        // future regression to a permissive `starts_with` / prefix check.
+        let prefix = &session.state[..session.state.len() - 1];
+        assert!(matches!(
+            validate_state(&session.state, prefix),
+            Err(LoginError::StateMismatch)
+        ));
+
+        // Empty returned state.
+        assert!(matches!(
+            validate_state(&session.state, ""),
+            Err(LoginError::StateMismatch)
+        ));
+
+        // Attacker-controlled value bearing no relation to ours.
+        assert!(matches!(
+            validate_state(&session.state, "attacker-supplied-state"),
+            Err(LoginError::StateMismatch)
+        ));
     }
 
     /// Device code timeout: when `expires_at` is in the past, `poll_device_code`
