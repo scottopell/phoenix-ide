@@ -75,6 +75,7 @@ fn is_exempt_path(path: &str) -> bool {
     // Static assets: SPA routes, JS/CSS bundles, images, service worker, favicon
     if path == "/"
         || path == "/new"
+        || path == "/codex/login"
         || path.starts_with("/c/")
         || path.starts_with("/assets/")
         || path == "/service-worker.js"
@@ -219,6 +220,7 @@ mod tests {
     fn exempt_paths_are_correct() {
         assert!(is_exempt_path("/"));
         assert!(is_exempt_path("/new"));
+        assert!(is_exempt_path("/codex/login"));
         assert!(is_exempt_path("/c/some-slug"));
         assert!(is_exempt_path("/assets/index-abc.js"));
         assert!(is_exempt_path("/service-worker.js"));

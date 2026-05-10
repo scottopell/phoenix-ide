@@ -392,6 +392,13 @@ pub struct ModelRegistry {
     default_model: String,
     /// Reachability status of the configured gateway, determined at startup
     pub gateway_status: GatewayStatus,
+    /// Whether the Codex/ChatGPT credential was loaded into the registry at
+    /// process startup. Frozen at construction time — does NOT track later
+    /// filesystem changes. Read by the `/api/codex/login/preflight` handler
+    /// to give the UI an honest answer to "do you need to restart Phoenix
+    /// after signing in?". The registry can't pick up a credential that
+    /// appeared after startup until task 13005 lands.
+    pub codex_bridge_loaded_at_startup: bool,
 }
 
 impl ModelRegistry {
@@ -402,6 +409,7 @@ impl ModelRegistry {
             specs: HashMap::new(),
             default_model: "test-model".to_string(),
             gateway_status: GatewayStatus::NotConfigured,
+            codex_bridge_loaded_at_startup: false,
         }
     }
 
@@ -424,6 +432,7 @@ impl ModelRegistry {
             specs,
             default_model,
             gateway_status: GatewayStatus::NotConfigured,
+            codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
         }
     }
 
@@ -561,6 +570,7 @@ impl ModelRegistry {
             specs,
             default_model,
             gateway_status: GatewayStatus::Healthy,
+            codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
         }
     }
 
@@ -760,6 +770,7 @@ impl ModelRegistry {
             specs: HashMap::new(),
             default_model: "claude-sonnet-4-6".to_string(),
             gateway_status: GatewayStatus::NotConfigured,
+            codex_bridge_loaded_at_startup: false,
         }
     }
 

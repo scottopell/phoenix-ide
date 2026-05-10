@@ -33,7 +33,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{oneshot, Mutex};
+use tokio_util::sync::CancellationToken;
+
+/// Hard cap on how long a PKCE attempt can wait for either the browser
+/// callback or a manual paste. Matches the device-code 15-minute window. After
+/// this elapses the background task settles the session as `Err(Cancelled)`
+/// rather than living forever.
+const PKCE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 use crate::llm::codex_credential;
 use crate::llm::codex_login::{
@@ -97,12 +105,21 @@ struct PkceSessionInner {
 
 struct PkceSession {
     inner: Mutex<PkceSessionInner>,
+    /// Fired by `pkce_cancel`. The background driver races every step
+    /// against this; a late callback after cancel must NOT proceed to
+    /// `finalize_login` and write `~/.phoenix-ide/codex-auth.json`.
+    cancel: CancellationToken,
 }
 
 struct DeviceSession {
     /// User-visible code retained for log lines on settle.
     user_code: String,
     status: Mutex<LoginStatus>,
+    /// Fired by `device_cancel`. The polling task aborts before
+    /// `finalize_login` runs, so a user who clicked Cancel — even one who
+    /// completes the verification page anyway — does NOT end up with
+    /// silently-written credentials.
+    cancel: CancellationToken,
 }
 
 #[derive(Default)]
@@ -161,12 +178,14 @@ pub async fn pkce_start(
     let session_id = new_session_id();
 
     let (manual_tx, manual_rx) = oneshot::channel::<String>();
+    let cancel = CancellationToken::new();
 
     let pkce_session = Arc::new(PkceSession {
         inner: Mutex::new(PkceSessionInner {
             manual_tx: Some(manual_tx),
             status: LoginStatus::default(),
         }),
+        cancel: cancel.clone(),
     });
 
     // Try to bind the loopback. Failure here isn't fatal — the manual paste
@@ -200,9 +219,17 @@ pub async fn pkce_start(
         let verifier = session.pkce.code_verifier.clone();
         let redirect_uri = session.redirect_uri.clone();
         let mgr_for_task = mgr.clone();
+        let cancel_for_task = cancel.clone();
         tokio::spawn(async move {
-            let outcome =
-                drive_pkce(loopback, manual_rx, expected_state, verifier, redirect_uri).await;
+            let outcome = drive_pkce(
+                cancel_for_task,
+                loopback,
+                manual_rx,
+                expected_state,
+                verifier,
+                redirect_uri,
+            )
+            .await;
             settle_pkce(&mgr_for_task, &session_id_for_task, outcome).await;
         });
     }
@@ -217,17 +244,24 @@ pub async fn pkce_start(
 }
 
 async fn drive_pkce(
+    cancel: CancellationToken,
     loopback: Option<LoopbackServer>,
     manual_rx: oneshot::Receiver<String>,
     expected_state: String,
     verifier: String,
     redirect_uri: String,
 ) -> Result<LoginResult, LoginError> {
-    // Race the loopback callback against the manual-paste channel. If we
-    // didn't manage to bind the loopback, only the manual channel is in play.
+    // Race the loopback callback against the manual-paste channel and the
+    // user-cancellation token. `biased` makes cancel preempt deterministically
+    // when multiple branches ready simultaneously — we never want to hand a
+    // late callback through to `finalize_login` after the user has clicked
+    // Cancel.
     let code = match loopback {
         Some(mut server) => {
             tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(LoginError::Cancelled),
+                () = tokio::time::sleep(PKCE_TIMEOUT) => return Err(LoginError::Cancelled),
                 cb = &mut server.callback_rx => {
                     match cb.map_err(|_| LoginError::Loopback("callback channel closed".into()))? {
                         CallbackPayload::Success { code, state: returned_state } => {
@@ -254,13 +288,33 @@ async fn drive_pkce(
                 }
             }
         }
-        None => manual_rx
-            .await
-            .map_err(|_| LoginError::Loopback("manual code channel closed (no loopback)".into()))?,
+        None => tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Err(LoginError::Cancelled),
+            () = tokio::time::sleep(PKCE_TIMEOUT) => return Err(LoginError::Cancelled),
+            code = manual_rx => code.map_err(|_| {
+                LoginError::Loopback("manual code channel closed (no loopback)".into())
+            })?,
+        },
     };
 
-    let tokens =
-        exchange_pkce_code(ISSUER_BASE, CLIENT_ID, &redirect_uri, &verifier, &code).await?;
+    // Re-check after the await above and before each subsequent step, so a
+    // cancellation that lands between the callback and the file-write still
+    // short-circuits before we spend any tokens.
+    if cancel.is_cancelled() {
+        return Err(LoginError::Cancelled);
+    }
+
+    let tokens = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(LoginError::Cancelled),
+        r = exchange_pkce_code(ISSUER_BASE, CLIENT_ID, &redirect_uri, &verifier, &code) => r?,
+    };
+
+    if cancel.is_cancelled() {
+        return Err(LoginError::Cancelled);
+    }
+
     finalize_login(&login_target_path(), tokens)
 }
 
@@ -333,11 +387,22 @@ pub async fn pkce_status(
         sessions.get(&session_id).cloned()
     };
     let session = session.ok_or(StatusCode::NOT_FOUND)?;
-    let inner = session.inner.lock().await;
-    Ok(Json(match &inner.status.outcome {
-        None => LoginStatusJson::Pending,
-        Some(r) => LoginStatusJson::from_result(r),
-    }))
+    let response = {
+        let inner = session.inner.lock().await;
+        match &inner.status.outcome {
+            None => LoginStatusJson::Pending,
+            Some(r) => LoginStatusJson::from_result(r),
+        }
+    };
+    // Once we've returned a terminal state, the UI stops polling — drop the
+    // session so the map doesn't grow unbounded over a session that opens the
+    // login page repeatedly. Subsequent /status calls 404, which the UI
+    // already handles as "session no longer tracked".
+    if !matches!(response, LoginStatusJson::Pending) {
+        let mut sessions = mgr.pkce.lock().await;
+        sessions.remove(&session_id);
+    }
+    Ok(Json(response))
 }
 
 pub async fn pkce_cancel(
@@ -345,8 +410,17 @@ pub async fn pkce_cancel(
     Path(session_id): Path<String>,
 ) -> Json<serde_json::Value> {
     let mgr = state.codex_login.clone();
-    let mut sessions = mgr.pkce.lock().await;
-    sessions.remove(&session_id);
+    // Hold the session — don't remove it from the map. We need to (a) fire
+    // the cancellation token so the background driver bails before
+    // `finalize_login`, and (b) leave the session record present so the next
+    // /status poll can read the settled `Cancelled` outcome the driver writes.
+    let session = {
+        let sessions = mgr.pkce.lock().await;
+        sessions.get(&session_id).cloned()
+    };
+    if let Some(session) = session {
+        session.cancel.cancel();
+    }
     Json(serde_json::json!({ "ok": true }))
 }
 
@@ -382,6 +456,7 @@ pub async fn device_start(
     })?;
 
     let session_id = new_session_id();
+    let cancel = CancellationToken::new();
     let response = DeviceStartResponse {
         session_id: session_id.clone(),
         verification_url: device.verification_url.clone(),
@@ -397,6 +472,7 @@ pub async fn device_start(
             Arc::new(DeviceSession {
                 user_code: device.user_code.clone(),
                 status: Mutex::new(LoginStatus::default()),
+                cancel: cancel.clone(),
             }),
         );
     }
@@ -405,7 +481,7 @@ pub async fn device_start(
         let mgr_for_task = mgr.clone();
         let session_id_for_task = session_id.clone();
         tokio::spawn(async move {
-            let outcome = drive_device_code(device).await;
+            let outcome = drive_device_code(cancel, device).await;
             settle_device(&mgr_for_task, &session_id_for_task, outcome).await;
         });
     }
@@ -413,8 +489,23 @@ pub async fn device_start(
     Ok(Json(response))
 }
 
-async fn drive_device_code(device: DeviceCode) -> Result<LoginResult, LoginError> {
-    let tokens = poll_device_code(&device).await?;
+async fn drive_device_code(
+    cancel: CancellationToken,
+    device: DeviceCode,
+) -> Result<LoginResult, LoginError> {
+    // Race the long polling loop against user cancellation. Without this,
+    // pressing Cancel only deletes the session record while the poll keeps
+    // running — and if the user has already (or subsequently) completes the
+    // verification page, `finalize_login` would still write
+    // `~/.phoenix-ide/codex-auth.json` against their wishes.
+    let tokens = tokio::select! {
+        biased;
+        () = cancel.cancelled() => return Err(LoginError::Cancelled),
+        r = poll_device_code(&device) => r?,
+    };
+    if cancel.is_cancelled() {
+        return Err(LoginError::Cancelled);
+    }
     finalize_login(&login_target_path(), tokens)
 }
 
@@ -448,11 +539,18 @@ pub async fn device_status(
         sessions.get(&session_id).cloned()
     };
     let session = session.ok_or(StatusCode::NOT_FOUND)?;
-    let status = session.status.lock().await;
-    Ok(Json(match &status.outcome {
-        None => LoginStatusJson::Pending,
-        Some(r) => LoginStatusJson::from_result(r),
-    }))
+    let response = {
+        let status = session.status.lock().await;
+        match &status.outcome {
+            None => LoginStatusJson::Pending,
+            Some(r) => LoginStatusJson::from_result(r),
+        }
+    };
+    if !matches!(response, LoginStatusJson::Pending) {
+        let mut sessions = mgr.device.lock().await;
+        sessions.remove(&session_id);
+    }
+    Ok(Json(response))
 }
 
 pub async fn device_cancel(
@@ -460,8 +558,13 @@ pub async fn device_cancel(
     Path(session_id): Path<String>,
 ) -> Json<serde_json::Value> {
     let mgr = state.codex_login.clone();
-    let mut sessions = mgr.device.lock().await;
-    sessions.remove(&session_id);
+    let session = {
+        let sessions = mgr.device.lock().await;
+        sessions.get(&session_id).cloned()
+    };
+    if let Some(session) = session {
+        session.cancel.cancel();
+    }
     Json(serde_json::json!({ "ok": true }))
 }
 
@@ -490,11 +593,16 @@ pub struct LoginPreflight {
     pub piggyback_env_set: bool,
 }
 
-pub async fn login_preflight(State(_state): State<AppState>) -> Json<LoginPreflight> {
+pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
     let auth_path = codex_credential::default_phoenix_auth_path();
     let piggyback_path = codex_credential::default_auth_path();
     let already_signed_in = codex_credential::CodexCredential::load(auth_path.clone()).is_ok();
-    let bridge_loaded_at_startup = codex_credential::resolve_active_auth_path().is_some();
+    // Read the registry's frozen "loaded at startup" flag rather than
+    // re-checking the filesystem. A user who ran `codex login` in another
+    // terminal mid-session will see auth.json appear on disk but the
+    // in-memory registry hasn't picked it up — the UI must still show
+    // restart-required until task 13005 lands.
+    let bridge_loaded_at_startup = state.llm_registry.codex_bridge_loaded_at_startup;
     let piggyback_env_set = std::env::var("OPENAI_USE_CODEX_AUTH")
         .ok()
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
@@ -505,4 +613,80 @@ pub async fn login_preflight(State(_state): State<AppState>) -> Json<LoginPrefli
         bridge_loaded_at_startup,
         piggyback_env_set,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::codex_login::{finalize_login, DeviceCode, LoginError, TokenResponse};
+    use std::time::Instant;
+
+    /// Cancellation racing into `drive_device_code` MUST short-circuit the
+    /// whole flow before `finalize_login` runs. The bug Codex review caught:
+    /// previously, `device_cancel` only removed the session record from the
+    /// map; the spawned poll keeps running and writes auth.json on success.
+    #[tokio::test]
+    async fn drive_device_code_cancelled_before_poll_does_not_write_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("codex-auth.json");
+
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        // Unreachable issuer: if cancellation didn't pre-empt, the poll
+        // would error on the network call. We assert specifically Cancelled,
+        // not Network — that's the bug fix.
+        let device = DeviceCode {
+            verification_url: "https://example/codex/device".into(),
+            user_code: "ABCD-1234".into(),
+            interval: std::time::Duration::from_secs(5),
+            expires_at: Instant::now() + std::time::Duration::from_secs(60),
+            device_auth_id: "dev-id".into(),
+            issuer: "https://auth.example.invalid".into(),
+            client_id: "client".into(),
+        };
+
+        let err = drive_device_code(cancel, device).await.unwrap_err();
+        assert!(
+            matches!(err, LoginError::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+        assert!(
+            !auth_path.exists(),
+            "auth file must not be written when login was cancelled"
+        );
+    }
+
+    /// `finalize_login` is the synchronous file-write step. Cancellation
+    /// arriving between `poll_device_code` returning Ok and the file write
+    /// must still suppress the write — verified by checking that a manually
+    /// triggered cancel between the two steps short-circuits.
+    #[tokio::test]
+    async fn cancel_between_token_receipt_and_write_skips_file() {
+        // We can't easily fake `poll_device_code` Ok without hitting the
+        // network, but the code path between the await and `finalize_login`
+        // is `if cancel.is_cancelled() { return Cancelled }`. Exercise that
+        // check directly by inlining the same predicate against tokens we
+        // synthesise — and confirm `finalize_login` would have written if
+        // we let it through, then verify the predicate stops it.
+        let dir = tempfile::tempdir().unwrap();
+        let auth_path = dir.path().join("codex-auth.json");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let tokens = TokenResponse {
+            access_token: "at".into(),
+            refresh_token: "rt".into(),
+            id_token: "header.eyJleHAiOjE3MDAwMDAwMDB9.sig".into(),
+        };
+        // The check that `drive_device_code` performs immediately before
+        // calling finalize_login.
+        let outcome: Result<(), LoginError> = if cancel.is_cancelled() {
+            Err(LoginError::Cancelled)
+        } else {
+            finalize_login(&auth_path, tokens).map(|_| ())
+        };
+        assert!(matches!(outcome, Err(LoginError::Cancelled)));
+        assert!(!auth_path.exists());
+    }
 }

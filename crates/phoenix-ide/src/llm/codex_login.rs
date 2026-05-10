@@ -87,6 +87,8 @@ pub enum LoginError {
     Loopback(String),
     #[error("auth file write error: {0}")]
     Write(String),
+    #[error("login was cancelled")]
+    Cancelled,
 }
 
 // ---------------------------------------------------------------------------

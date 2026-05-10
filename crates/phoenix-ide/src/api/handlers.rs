@@ -202,7 +202,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
         // Codex / ChatGPT OAuth login (task 27104). PKCE+loopback and OpenAI's
-        // custom device-code flow, both producing ~/.codex/auth.json.
+        // custom device-code flow, both writing Phoenix's own
+        // ~/.phoenix-ide/codex-auth.json (NOT Codex CLI's ~/.codex/auth.json —
+        // see api/codex_login.rs module docs).
         .route(
             "/api/codex/login/preflight",
             get(super::codex_login::login_preflight),

@@ -804,19 +804,62 @@ mod tests {
         assert!(auth.last_refresh.is_some());
     }
 
-    /// resolve_active_auth_path: serial because it manipulates process env vars
-    /// and a $HOME override, both of which are global state. We do all four
-    /// scenarios in one test to keep that serialisation explicit and avoid
-    /// inter-test races.
+    /// Process-wide mutex for tests that mutate env vars. `set_var` /
+    /// `remove_var` are unsafe because concurrent env access is UB; cargo's
+    /// per-binary thread pool runs tests in parallel by default. Any test in
+    /// this binary that touches env vars must take this lock.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII restore of three env vars on drop. Holding `_lock` blocks other
+    /// env-mutating tests; restoring on drop survives a panic mid-test.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        home: Option<std::ffi::OsString>,
+        codex_home: Option<std::ffi::OsString>,
+        use_codex: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            // If a previous test panicked while holding the lock, the mutex is
+            // poisoned but the env state is restorable; recover and continue.
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            Self {
+                _lock: lock,
+                home: std::env::var_os("HOME"),
+                codex_home: std::env::var_os("CODEX_HOME"),
+                use_codex: std::env::var_os("OPENAI_USE_CODEX_AUTH"),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: we hold ENV_MUTEX, so no other test in this binary is
+            // touching these vars right now.
+            unsafe {
+                match self.home.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match self.codex_home.take() {
+                    Some(v) => std::env::set_var("CODEX_HOME", v),
+                    None => std::env::remove_var("CODEX_HOME"),
+                }
+                match self.use_codex.take() {
+                    Some(v) => std::env::set_var("OPENAI_USE_CODEX_AUTH", v),
+                    None => std::env::remove_var("OPENAI_USE_CODEX_AUTH"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn resolve_active_auth_path_priority_phoenix_then_piggyback() {
+        let _guard = EnvGuard::capture();
         let dir = tempfile::tempdir().unwrap();
-        let prev_home = std::env::var_os("HOME");
-        let prev_codex_home = std::env::var_os("CODEX_HOME");
-        let prev_use = std::env::var_os("OPENAI_USE_CODEX_AUTH");
 
-        // SAFETY: tests in this module are not parallelised against each other
-        // (they share env), and we restore at the end.
+        // SAFETY: ENV_MUTEX is held by `_guard` for this test's lifetime.
         unsafe {
             std::env::set_var("HOME", dir.path());
             std::env::remove_var("CODEX_HOME");
@@ -850,21 +893,6 @@ mod tests {
             resolve_active_auth_path().as_deref(),
             Some(phoenix_dir.join("codex-auth.json").as_path())
         );
-
-        // Restore env.
-        unsafe {
-            match prev_home {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-            match prev_codex_home {
-                Some(v) => std::env::set_var("CODEX_HOME", v),
-                None => std::env::remove_var("CODEX_HOME"),
-            }
-            match prev_use {
-                Some(v) => std::env::set_var("OPENAI_USE_CODEX_AUTH", v),
-                None => std::env::remove_var("OPENAI_USE_CODEX_AUTH"),
-            }
-        }
+        // _guard's Drop restores HOME/CODEX_HOME/OPENAI_USE_CODEX_AUTH.
     }
 }

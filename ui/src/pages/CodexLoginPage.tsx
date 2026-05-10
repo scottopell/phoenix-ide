@@ -18,6 +18,12 @@ export function CodexLoginPage() {
   const [mode, setMode] = useState<Mode>('choose');
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<FlowResult | null>(null);
+  // PKCE-specific: a tab pre-opened from the user's click on "Sign in with
+  // browser". Browsers require window.open() to fire inside a synchronous
+  // user-gesture handler, so we open `about:blank` immediately and rewrite
+  // its location once the authorize URL arrives from the API. Held in a ref
+  // (not state) because changing it shouldn't trigger a re-render.
+  const pkcePreopenedRef = useRef<Window | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -49,14 +55,32 @@ export function CodexLoginPage() {
         {mode === 'choose' && (
           <ChooseFlow
             preflight={preflight}
-            onPickPkce={() => { setError(null); setMode('pkce'); }}
+            onPickPkce={() => {
+              setError(null);
+              // Open the destination tab in the user-gesture window. We only
+              // know the URL after the /pkce/start round-trip completes, so
+              // navigate this blank tab from the API success handler below.
+              pkcePreopenedRef.current = window.open(
+                'about:blank',
+                '_blank',
+                'noopener,noreferrer',
+              );
+              setMode('pkce');
+            }}
             onPickDevice={() => { setError(null); setMode('device'); }}
           />
         )}
 
         {mode === 'pkce' && (
           <PkceFlow
-            onCancel={() => setMode('choose')}
+            preopenedWindow={pkcePreopenedRef.current}
+            onCancel={() => {
+              if (pkcePreopenedRef.current) {
+                pkcePreopenedRef.current.close();
+                pkcePreopenedRef.current = null;
+              }
+              setMode('choose');
+            }}
             onSuccess={handleSuccess}
             onError={(msg) => { setError(msg); setMode('choose'); }}
           />
@@ -124,10 +148,12 @@ function ChooseFlow({
 }
 
 function PkceFlow({
+  preopenedWindow,
   onCancel,
   onSuccess,
   onError,
 }: {
+  preopenedWindow: Window | null;
   onCancel: () => void;
   onSuccess: (r: FlowResult) => void;
   onError: (msg: string) => void;
@@ -150,14 +176,16 @@ function PkceFlow({
         // If loopback bind failed we MUST surface the manual paste path
         // immediately — the browser callback will go nowhere.
         if (!s.loopback_bound) setShowPaste(true);
-        // Open the authorize URL in a new tab. Browsers may block this if
-        // not in a user-gesture context; we always also display the URL as
-        // a clickable link.
-        window.open(s.authorize_url, '_blank', 'noopener,noreferrer');
+        // Navigate the tab the user opened on click into the authorize URL.
+        // If the popup was blocked or the user closed it, fall back to a
+        // user-clickable link rendered below.
+        if (preopenedWindow && !preopenedWindow.closed) {
+          preopenedWindow.location.href = s.authorize_url;
+        }
       })
       .catch((e) => { if (!cancelled) onError(e instanceof Error ? e.message : String(e)); });
     return () => { cancelled = true; };
-  }, [onError]);
+  }, [onError, preopenedWindow]);
 
   // Poll status while we have a session id.
   useEffect(() => {
