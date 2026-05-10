@@ -55,7 +55,7 @@ function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
     commits_ahead: 1,
     commits_behind: 0,
     conv_mode_label: 'Work',
-    project_name: 'phoenix-ide',
+    browser_session_active: false,
     ...overrides,
   };
 }

@@ -515,9 +515,11 @@ rule TaskApprovalExecuted {
 -- Push to remote is not modelled here. `git push` is a bash command the
 -- agent may run from inside a worktree; Phoenix imposes no policy
 -- beyond the bash-tool ban on `--force` (REQ-PROJ-019). Push has no
--- lifecycle side effects and no Phoenix-side observable state — the
--- terminal actions below (Mark-as-merged, Abandon) are the only
--- user-initiated lifecycle events on a Work/Branch conversation.
+-- lifecycle side effects. PR state is advisory UI/API state. Phoenix may query GitHub via `gh` and
+-- use the result to label or gate the cleanup affordance, but that observation
+-- does not create a lifecycle transition by itself: cleanup still occurs only
+-- when the user initiates the MarkAsMerged terminal action below. Task 02664
+-- tracks any future fully automatic merge-detection/cleanup behavior.
 
 -- REQ-PROJ-026/027: User marks conversation as merged
 rule MarkAsMerged {
