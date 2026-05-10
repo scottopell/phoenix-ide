@@ -40,7 +40,7 @@ and Task viewer, implementing `specs/tasks-ui/requirements.md`.
 
 The panel reads three endpoints:
 
-- `api.listConversationTasks(conversationId)` — returns `{ tasks: TaskEntry[] }` where `TaskEntry` carries `{ id, priority, status, slug, path?, conversation_slug? }`. The backend resolves `path` server-side from `id-priority-status--slug.md` so the viewer can fetch by absolute path without reconstructing it.
+- `api.listConversationTasks(conversationId)` — returns `{ tasks: TaskEntry[] }` where `TaskEntry` carries `{ id, priority, status, slug, path, conversation_slug? }`. `path` is the absolute path to the task file on disk (always present in current responses; the TaskViewer's `task.path || <reconstructed>` fallback at `TaskViewer.tsx:41` is a defensive hedge against legacy responses that may have predated the field).
 - `GET /api/files/read?path=<absolute>` — generic read endpoint used by `TaskViewer` for the body. Same endpoint the prose reader uses.
 - `api.createConversation(...)` — used by the "Start working" path. Owned by `specs/seeded-conversations/`.
 

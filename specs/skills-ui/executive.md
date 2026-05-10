@@ -30,10 +30,10 @@ Slash-command skills are powerful but non-obvious — without a UI surface, user
 | **REQ-SKILLS-UI-001:** See What Skills Are Available Here | ✅ Complete | `ui/src/components/SkillsPanel.tsx:79-105` (fetch on conversation change), `:131-141` (collapsible header with count) |
 | **REQ-SKILLS-UI-002:** Tell Built-in vs Project vs User at a Glance | ✅ Complete | `:13-39` (groupLabel: built-in pulled to top, then per-project, then User), `:42-68` (groupSkills + insertion-order Map for stable rendering) |
 | **REQ-SKILLS-UI-003:** Read a Skill's Prompt Before Using It | ✅ Complete | `SkillViewer.tsx:50-80` (fetch SKILL.md), `:91-145` (description + details + prompt body with frontmatter stripped) |
-| **REQ-SKILLS-UI-004:** Insert a Skill Invocation Into My Message | ✅ Complete | `SkillViewer.tsx:82-89` (dispatch `phoenix:insert-draft` event), `:147-151` (insert button); InputArea consumes the event |
-| **REQ-SKILLS-UI-005:** Hide When There's Nothing To Show | ✅ Complete | `:109-111` (panel returns null when no skills + collapsed) |
+| **REQ-SKILLS-UI-004:** Drop a Skill Invocation Into My Draft | ✅ Complete | `SkillViewer.tsx:82-89` (dispatch `phoenix:insert-draft` event), `:147-151` (insert button); `InputArea.tsx:90-101` consumes the event via `setDraft(text)` (replace, not insert-at-cursor) |
+| **REQ-SKILLS-UI-005:** Don't Mislead Me When the Catalog Changes | ✅ Complete | `SkillsPanel.tsx:79-105` (re-fetch on `conversationId` change), `:109-111` (hide entire panel when no skills + collapsed). Brief stale-count window during the new fetch is acceptable per the REQ |
 
-**Progress:** 5 of 5 complete. Read-mostly UI; one mutation path (insert into draft) goes through a CustomEvent rather than a callback prop, decoupling the panel from the input.
+**Progress:** 5 of 5 complete. Read-mostly UI; one mutation path (replace draft with `/<name> `) goes through a CustomEvent rather than a callback prop, decoupling the panel from the input.
 
 ## Behavioural Specification
 

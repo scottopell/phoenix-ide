@@ -41,7 +41,7 @@ panel and Skill viewer, implementing `specs/skills-ui/requirements.md`.
 
 ## API Surface
 
-- `api.listConversationSkills(conversationId)` — returns `{ skills: SkillEntry[] }` where each entry carries `{ name, description, source, path, argument_hint? }`. The backend runs the discovery walk rooted at the conversation's `cwd` and returns the same catalog the LLM sees in its system prompt (per `specs/skills/`).
+- `api.listConversationSkills(conversationId)` — returns `{ skills: SkillEntry[] }` where each entry carries `{ name, description, source, path, argument_hint? }`. `source` is either the literal `"builtin"` (for skills bundled with the Phoenix binary and extracted at startup) or the discovery directory marker that the walk hit — typically `".claude/skills"` or `".agents/skills"`. It is NOT a kind enum like `"builtin"` / `"filesystem"`; the SkillViewer renders the raw value in the Source field so the user can tell exactly where a skill came from. The backend runs the discovery walk rooted at the conversation's `cwd` and returns the same catalog the LLM sees in its system prompt (per `specs/skills/`).
 - `GET /api/files/read?path=<absolute>` — generic read endpoint used by `SkillViewer` for the SKILL.md body. Built-ins are extracted to disk at server startup (per `specs/builtin-skills/`), so they share the same read path as filesystem skills.
 
 ## State (`SkillsPanel`)

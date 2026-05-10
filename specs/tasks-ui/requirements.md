@@ -30,15 +30,14 @@ Each numbered question maps to one or more requirements below.
 
 WHEN I'm inside a conversation
 THE SYSTEM SHALL show a collapsed "Tasks" panel header in the conversation's chrome
-AND SHALL include a count summary in that header (e.g. "Tasks · 3 active · 7 closed") so I can tell at a glance whether anything is waiting for me
 
 WHEN I click the header
-THE SYSTEM SHALL expand the panel and load the task list
+THE SYSTEM SHALL expand the panel and load the task list, and SHALL display a count summary alongside the header (e.g. "Tasks · 3 active · 7 closed") for the rest of the panel's lifetime
 
 WHEN the load fails or `tasks/` doesn't exist
 THE SYSTEM SHALL show a brief, non-alarming "No tasks/ directory found" message rather than an error
 
-**Rationale:** The task list is reference data, not a control surface I'm always interacting with. Headline-with-count is the right disclosure pattern: it's silent until I look, and the count tells me whether looking is worth it. A missing `tasks/` directory is a normal state (not every repo uses the workflow); treating it as an error would be noise.
+**Rationale:** The task list is reference data, not a control surface I'm always interacting with. The current behaviour delivers the count after first expansion (the load is gated on expansion to avoid paying the round-trip cost on every conversation mount — see REQ-TASKS-UI-007). A future improvement could add a lightweight `count` endpoint that lets the collapsed header carry the summary on first paint without fetching the full list; the present REQ does not require it. A missing `tasks/` directory is a normal state (not every repo uses the workflow); treating it as an error would be noise.
 
 ---
 
@@ -132,6 +131,6 @@ WHEN I expand the panel for the first time
 THE SYSTEM SHALL fetch the list, with a brief "Loading..." indicator while the request is in flight
 
 WHEN I navigate to a different conversation
-THE SYSTEM SHALL discard the previous conversation's task list and re-fetch from scratch when next expanded — the panel's view is always for the current conversation's repo
+THE SYSTEM SHALL clear any previously-displayed task list (so the count summary doesn't lie about which conversation it represents) and re-fetch the new conversation's list when next expanded
 
-**Rationale:** Task lists can grow to hundreds of files; eagerly fetching on every conversation mount would waste round-trips and give the user nothing they asked to see. Defer-until-expanded is the right cost model here. Re-fetching per conversation is the correct trade because tasks are per-repo: a stale list from another repo would mislead worse than a brief loading flash.
+**Rationale:** Task lists can grow to hundreds of files; eagerly fetching on every conversation mount would waste round-trips and give the user nothing they asked to see. Defer-until-expanded is the right cost model. The "clear on conversation change" rule is the partner: if the user navigates from conversation A (with 5 active tasks) to conversation B with the panel collapsed, the lingering "5 active" count from A would be misleading. Today the implementation does not yet clear on conversation change while collapsed (`TasksPanel.tsx` early-returns from the load effect when `!expanded`); this REQ is therefore a 🚧 partial — the defer-until-expanded half is complete, the clear-on-conversation-change half is the spec target.
