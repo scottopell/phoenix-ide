@@ -3045,8 +3045,8 @@ async fn list_conversation_tasks(
             let conversation_slug = task_to_slug.get(&t.id).cloned();
             TaskEntry {
                 id: t.id,
-                priority: t.priority,
-                status: t.status,
+                priority: t.priority.to_string(),
+                status: t.status.to_string(),
                 slug: t.slug,
                 path: t.path.to_string_lossy().into_owned(),
                 conversation_slug,

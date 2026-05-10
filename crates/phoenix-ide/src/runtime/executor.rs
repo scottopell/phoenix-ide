@@ -2831,7 +2831,15 @@ fn execute_approve_task_blocking(
     }
 
     // 5. Write task file (taskmd format: DDNNN-pX-status--slug.md)
-    let filename = taskmd_core::filename::format_filename(&task_id, priority, "in-progress", &slug);
+    use std::str::FromStr;
+    let priority_enum = taskmd_core::constants::Priority::from_str(priority)
+        .map_err(|e| format!("Invalid priority '{priority}': {e}"))?;
+    let filename = taskmd_core::filename::format_filename(
+        &task_id,
+        priority_enum,
+        taskmd_core::constants::Status::InProgress,
+        &slug,
+    );
     let filepath = tasks_dir.join(&filename);
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();
     let branch_name = format!("task-{task_id}-{slug}");

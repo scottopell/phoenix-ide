@@ -26,7 +26,11 @@ use std::time::Duration;
 use thiserror::Error;
 
 /// Statuses a task file may be in for `propose_task` to accept it.
-const ACCEPTABLE_PROPOSE_STATUSES: &[&str] = &["ready", "in-progress", "brainstorming"];
+const ACCEPTABLE_PROPOSE_STATUSES: &[taskmd_core::constants::Status] = &[
+    taskmd_core::constants::Status::Ready,
+    taskmd_core::constants::Status::InProgress,
+    taskmd_core::constants::Status::Brainstorming,
+];
 
 /// Validated snapshot of a task file at the moment `propose_task` was called.
 ///
@@ -75,19 +79,23 @@ fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, St
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
-    let (_id, fn_priority, fn_status, fn_slug) = taskmd_core::filename::parse_filename(filename)
-        .ok_or_else(|| {
-            format!(
-                "task_file '{filename}' does not match the taskmd filename pattern \
-                 (NNNNN-pX-status--slug.md)"
-            )
-        })?;
+    let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
+        format!(
+            "task_file '{filename}' does not match the taskmd filename pattern \
+             (NNNNN-pX-status--slug.md)"
+        )
+    })?;
 
-    if !ACCEPTABLE_PROPOSE_STATUSES.contains(&fn_status.as_str()) {
+    if !ACCEPTABLE_PROPOSE_STATUSES.contains(&parsed.status) {
+        let allowed: Vec<&str> = ACCEPTABLE_PROPOSE_STATUSES
+            .iter()
+            .map(|s| s.as_str())
+            .collect();
         return Err(format!(
-            "task file status '{fn_status}' cannot be proposed for approval. \
+            "task file status '{}' cannot be proposed for approval. \
              Acceptable statuses: {}.",
-            ACCEPTABLE_PROPOSE_STATUSES.join(", ")
+            parsed.status,
+            allowed.join(", ")
         ));
     }
 
@@ -100,13 +108,13 @@ fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, St
         )
     })?;
 
-    let title = extract_title(&body).unwrap_or_else(|| slug_to_title(&fn_slug));
+    let title = extract_title(&body).unwrap_or_else(|| slug_to_title(&parsed.slug));
     let plan = body.trim().to_string();
 
     Ok(TaskFileSnapshot {
         task_file: task_file.replace('\\', "/"),
         title,
-        priority: fn_priority,
+        priority: parsed.priority.to_string(),
         plan,
     })
 }
