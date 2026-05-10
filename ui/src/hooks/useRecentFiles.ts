@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback } from 'react';
 
 export interface RecentFile {
   path: string;
@@ -27,12 +27,20 @@ function saveRecent(conversationId: string, files: RecentFile[]) {
 }
 
 export function useRecentFiles(conversationId: string | undefined) {
+  // In-render reset on conversationId change. The previous `useEffect`-based
+  // reload committed the prior conversation's recent-files for one frame on
+  // returning navigation (visit A → visit B → return to A) before the effect
+  // ran. Re-reading storage during render keeps the list in lockstep with the
+  // current conversation prop without a commit gap.
   const [files, setFiles] = useState<RecentFile[]>(() => loadRecent(conversationId));
+  const [trackedConversationId, setTrackedConversationId] = useState<string | undefined>(conversationId);
 
-  // Reload when conversation changes
-  useEffect(() => {
-    setFiles(loadRecent(conversationId));
-  }, [conversationId]);
+  let currentFiles = files;
+  if (trackedConversationId !== conversationId) {
+    setTrackedConversationId(conversationId);
+    currentFiles = loadRecent(conversationId);
+    setFiles(currentFiles);
+  }
 
   const addRecentFile = useCallback((path: string) => {
     if (!conversationId) return;
@@ -45,5 +53,5 @@ export function useRecentFiles(conversationId: string | undefined) {
     });
   }, [conversationId]);
 
-  return { recentFiles: files, addRecentFile };
+  return { recentFiles: currentFiles, addRecentFile };
 }

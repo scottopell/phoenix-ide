@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect } from 'react';
+import { useState, useCallback } from 'react';
 import { generateUUID } from '../utils/uuid';
 import type { ImageData } from '../api';
 
@@ -66,6 +66,28 @@ interface UseMessageQueueReturn {
   dismiss: (localId: string) => void;
 }
 
+function loadQueueFromStorage(storageKey: string | null): QueuedMessage[] {
+  if (!storageKey) return [];
+  try {
+    const stored = localStorage.getItem(storageKey);
+    if (!stored) return [];
+    const parsed = JSON.parse(stored) as QueuedMessage[];
+    // Coerce the legacy `'sending'` status to `'pending'` (renamed in task
+    // 02676) so rehydrated entries survive the schema change without an
+    // explicit migration path.
+    return parsed.map((m) => {
+      const rawStatus = (m as unknown as { status?: string }).status;
+      if (rawStatus === 'sending') {
+        return { ...m, status: 'pending' as const };
+      }
+      return m;
+    });
+  } catch (error) {
+    console.warn('Error reading message queue from localStorage:', error);
+    return [];
+  }
+}
+
 /**
  * Hook for managing a queue of messages the client has sent but the server
  * has not yet echoed. Messages persist to localStorage and survive page
@@ -81,37 +103,22 @@ interface UseMessageQueueReturn {
 export function useMessageQueue(conversationId: string | undefined): UseMessageQueueReturn {
   const storageKey = conversationId ? `phoenix:queue:${conversationId}` : null;
 
-  // Load initial value from localStorage. Coerce the legacy `'sending'` status
-  // to `'pending'` (renamed in task 02676) so rehydrated entries survive the
-  // schema change without an explicit migration path.
-  const loadFromStorage = useCallback((): QueuedMessage[] => {
-    if (!storageKey) return [];
-    try {
-      const stored = localStorage.getItem(storageKey);
-      if (!stored) return [];
-      const parsed = JSON.parse(stored) as QueuedMessage[];
-      return parsed.map((m) => {
-        const rawStatus = (m as unknown as { status?: string }).status;
-        if (rawStatus === 'sending') {
-          return { ...m, status: 'pending' as const };
-        }
-        return m;
-      });
-    } catch (error) {
-      console.warn('Error reading message queue from localStorage:', error);
-      return [];
-    }
-  }, [storageKey]);
+  // In-render reset on conversationId change. The previous `useEffect`-based
+  // reload committed the prior conversation's queue for one frame on
+  // *returning* navigation (visit A → visit B → return to A): the render under
+  // the new `conversationId` ran before the effect, so derived pending bubbles
+  // from A briefly appeared in B's view. Reading storage during render — and
+  // bumping a tracked-scope sentinel before returning — keeps state and props
+  // in lockstep without a commit gap.
+  const [messages, setMessages] = useState<QueuedMessage[]>(() => loadQueueFromStorage(storageKey));
+  const [trackedConversationId, setTrackedConversationId] = useState<string | undefined>(conversationId);
 
-  const [messages, setMessages] = useState<QueuedMessage[]>(() => loadFromStorage());
-
-  // Reload (or clear) the queue whenever the conversation identity changes.
-  // The previous `initializedRef` guard skipped reloads on truthy→truthy
-  // transitions, which leaked queue items across navigations when the
-  // ConversationPage instance was reused (no `key={slug}` on the Route).
-  useEffect(() => {
-    setMessages(conversationId ? loadFromStorage() : []);
-  }, [conversationId, loadFromStorage]);
+  let currentMessages = messages;
+  if (trackedConversationId !== conversationId) {
+    setTrackedConversationId(conversationId);
+    currentMessages = loadQueueFromStorage(storageKey);
+    setMessages(currentMessages);
+  }
 
   // Save to localStorage
   const saveToStorage = useCallback((msgs: QueuedMessage[]) => {
@@ -182,7 +189,7 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
   }, [updateMessages]);
 
   return {
-    queuedMessages: messages,
+    queuedMessages: currentMessages,
     enqueue,
     markFailed,
     markSteeringQueued,

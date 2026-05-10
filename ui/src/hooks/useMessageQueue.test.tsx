@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { renderHook, act } from '@testing-library/react';
+import { renderHook, act, render } from '@testing-library/react';
+import { useState } from 'react';
 import {
   useMessageQueue,
   derivePendingMessages,
@@ -229,5 +230,112 @@ describe('useMessageQueue', () => {
     const { result } = renderHook(() => useMessageQueue('conv-legacy'));
     expect(result.current.queuedMessages).toHaveLength(1);
     expect(result.current.queuedMessages[0]!.status).toBe('pending');
+  });
+});
+
+// Regression: visit A → visit B → return to A. Under the prior `useEffect`-
+// based reset the *render* under conv-A's id (after returning) briefly saw
+// conv-B's queue, then committed conv-A's. The bug was visually invisible on
+// first visits because there was nothing to flash from. Asserting on the
+// rendered DOM after each switch — without an intervening commit cycle that
+// would mask a re-derivation bug — exercises the in-render reset.
+describe('useMessageQueue — returning navigation does not flash stale queue', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  function Probe({ id }: { id: string | undefined }) {
+    const { queuedMessages } = useMessageQueue(id);
+    return (
+      <ul data-testid="queue">
+        {queuedMessages.map((m) => (
+          <li key={m.localId} data-localid={m.localId}>{m.text}</li>
+        ))}
+      </ul>
+    );
+  }
+
+  function Harness({ initial }: { initial: string | undefined }) {
+    const [id, setId] = useState<string | undefined>(initial);
+    return (
+      <>
+        <button data-testid="to-a" onClick={() => setId('conv-a')}>A</button>
+        <button data-testid="to-b" onClick={() => setId('conv-b')}>B</button>
+        <Probe id={id} />
+      </>
+    );
+  }
+
+  it('renders B-only items immediately after A→B switch (no A flash)', () => {
+    localStorage.setItem(
+      'phoenix:queue:conv-a',
+      JSON.stringify([queued('a-1', { text: 'from A' })]),
+    );
+    localStorage.setItem(
+      'phoenix:queue:conv-b',
+      JSON.stringify([queued('b-1', { text: 'from B' })]),
+    );
+
+    const { getByTestId, queryByText } = render(<Harness initial="conv-a" />);
+    expect(queryByText('from A')).not.toBeNull();
+
+    act(() => {
+      getByTestId('to-b').click();
+    });
+
+    const items = getByTestId('queue').querySelectorAll('li');
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toBe('from B');
+    expect(queryByText('from A')).toBeNull();
+  });
+
+  it('renders A-only items immediately on returning A→B→A (no B flash)', () => {
+    localStorage.setItem(
+      'phoenix:queue:conv-a',
+      JSON.stringify([queued('a-1', { text: 'from A' })]),
+    );
+    localStorage.setItem(
+      'phoenix:queue:conv-b',
+      JSON.stringify([queued('b-1', { text: 'from B' })]),
+    );
+
+    const { getByTestId, queryByText } = render(<Harness initial="conv-a" />);
+    act(() => {
+      getByTestId('to-b').click();
+    });
+    act(() => {
+      getByTestId('to-a').click();
+    });
+
+    const items = getByTestId('queue').querySelectorAll('li');
+    expect(items).toHaveLength(1);
+    expect(items[0]!.textContent).toBe('from A');
+    expect(queryByText('from B')).toBeNull();
+  });
+
+  it('renders empty list immediately when conversationId becomes undefined', () => {
+    localStorage.setItem(
+      'phoenix:queue:conv-a',
+      JSON.stringify([queued('a-1', { text: 'from A' })]),
+    );
+
+    function ClearHarness() {
+      const [id, setId] = useState<string | undefined>('conv-a');
+      return (
+        <>
+          <button data-testid="clear" onClick={() => setId(undefined)}>clear</button>
+          <Probe id={id} />
+        </>
+      );
+    }
+
+    const { getByTestId, queryByText } = render(<ClearHarness />);
+    expect(queryByText('from A')).not.toBeNull();
+
+    act(() => {
+      getByTestId('clear').click();
+    });
+
+    expect(getByTestId('queue').querySelectorAll('li')).toHaveLength(0);
   });
 });
