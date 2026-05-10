@@ -305,6 +305,7 @@ pub struct InMemoryStorage {
     states: Mutex<HashMap<String, ConvState>>,
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     next_msg_id: Mutex<u64>,
+    steering_queues: Mutex<HashMap<String, Vec<crate::state_machine::event::SteerEntry>>>,
 }
 
 #[allow(dead_code)]
@@ -315,7 +316,21 @@ impl InMemoryStorage {
             states: Mutex::new(HashMap::new()),
             modes: Mutex::new(HashMap::new()),
             next_msg_id: Mutex::new(1),
+            steering_queues: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Read back the persisted steering queue for a conversation (test-only).
+    pub fn get_steering_queue(
+        &self,
+        conv_id: &str,
+    ) -> Vec<crate::state_machine::event::SteerEntry> {
+        self.steering_queues
+            .lock()
+            .unwrap()
+            .get(conv_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Seed the `conv_mode` for a conversation (used by tests that need to
@@ -434,6 +449,13 @@ impl MessageStore for InMemoryStorage {
         Ok(self.get_all_messages(conv_id))
     }
 
+    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
+        let messages = self.messages.lock().unwrap();
+        Ok(messages
+            .values()
+            .any(|msgs| msgs.iter().any(|m| m.message_id == message_id)))
+    }
+
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {
         let messages = self.messages.lock().unwrap();
         for msgs in messages.values() {
@@ -543,10 +565,13 @@ impl StateStore for InMemoryStorage {
 
     async fn update_steering_queue(
         &self,
-        _conv_id: &str,
-        _queue: &[crate::state_machine::event::SteerEntry],
+        conv_id: &str,
+        queue: &[crate::state_machine::event::SteerEntry],
     ) -> Result<(), String> {
-        // In-memory storage doesn't persist the steering queue
+        self.steering_queues
+            .lock()
+            .unwrap()
+            .insert(conv_id.to_string(), queue.to_vec());
         Ok(())
     }
 }

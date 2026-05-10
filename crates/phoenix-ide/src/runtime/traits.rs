@@ -57,6 +57,11 @@ pub trait MessageStore: Send + Sync {
     /// Get a single message by ID
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String>;
 
+    /// Returns true if a message with the given `message_id` already exists.
+    /// Used by `PersistMessage` to make persistence idempotent across crash
+    /// recovery (re-drain after partial steering-queue drain).
+    async fn message_exists(&self, message_id: &str) -> Result<bool, String>;
+
     /// Update `display_data` for an existing message
     async fn update_message_display_data(
         &self,
@@ -205,6 +210,10 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {
         (**self).get_message_by_id(message_id).await
+    }
+
+    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
+        (**self).message_exists(message_id).await
     }
 
     async fn update_message_display_data(
@@ -379,6 +388,13 @@ impl MessageStore for DatabaseStorage {
     async fn get_message_by_id(&self, message_id: &str) -> Result<Message, String> {
         self.db
             .get_message_by_id(message_id)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn message_exists(&self, message_id: &str) -> Result<bool, String> {
+        self.db
+            .message_exists(message_id)
             .await
             .map_err(|e| e.to_string())
     }

@@ -159,6 +159,12 @@ pub enum Effect {
         system_message: String,
         repo_root: String,
     },
+
+    /// Persist an empty steering queue. Emitted by `SteerDrainedUserMessages`
+    /// transition arms AFTER all `PersistMessage` + `PersistState` effects so
+    /// that a crash before this effect runs leaves the queue intact for
+    /// re-drain on restart (idempotent persist guards against double-delivery).
+    ClearSteeringQueue,
 }
 
 impl Effect {

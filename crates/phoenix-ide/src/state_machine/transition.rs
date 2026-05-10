@@ -315,6 +315,7 @@ impl CoreTransitionResult {
 /// Does NOT handle: `propose_task` interception (parent-only), terminal tools
 /// (sub-agent-only), `LlmError` -> `Error` vs `Failed` (diverges by type),
 /// `UserCancel` from `LlmRequesting` (parent -> `Idle`, sub-agent -> `Failed`).
+#[allow(clippy::too_many_lines)]
 pub fn transition_core(
     state: &CoreState,
     context: &ConvContext,
@@ -352,11 +353,15 @@ pub fn transition_core(
             | CoreState::ToolExecuting { .. }
             | CoreState::AwaitingSubAgents { .. },
             CoreEvent::UserMessage { .. },
+        )
+        | (
+            CoreState::ToolExecuting { .. } | CoreState::AwaitingSubAgents { .. },
+            CoreEvent::SteerDrainedUserMessages { .. },
         ) => Err(TransitionError::AgentBusy),
 
         (
             CoreState::CancellingTool { .. } | CoreState::CancellingSubAgents { .. },
-            CoreEvent::UserMessage { .. },
+            CoreEvent::UserMessage { .. } | CoreEvent::SteerDrainedUserMessages { .. },
         ) => Err(TransitionError::CancellationInProgress),
 
         // LLM Response Processing (REQ-BED-003)
@@ -418,12 +423,62 @@ pub fn transition_core(
             Ok(CoreTransitionResult::new(state.clone()))
         }
 
+        // Steering queue drain (REQ-SM-*): persist all entries, then ask LLM.
+        // ClearSteeringQueue runs AFTER persist+state so a crash mid-drain
+        // leaves the queue intact for re-drain on restart.
+        (CoreState::Idle, CoreEvent::SteerDrainedUserMessages { entries }) => {
+            if entries.is_empty() {
+                return Ok(CoreTransitionResult::new(CoreState::Idle));
+            }
+            let mut result = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
+            for entry in entries {
+                result = result.with_effect(steer_entry_to_persist_effect(entry));
+            }
+            Ok(result
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::ClearSteeringQueue)
+                .with_effect(notify_llm_requesting(1))
+                .with_effect(Effect::RequestLlm))
+        }
+
+        // Mid-turn drain: an LLM request is already in flight (just transitioned
+        // from ToolExecuting), so persist entries but do NOT issue a new RequestLlm.
+        (CoreState::LlmRequesting { attempt }, CoreEvent::SteerDrainedUserMessages { entries }) => {
+            let attempt = *attempt;
+            if entries.is_empty() {
+                return Ok(CoreTransitionResult::new(CoreState::LlmRequesting {
+                    attempt,
+                }));
+            }
+            let mut result = CoreTransitionResult::new(CoreState::LlmRequesting { attempt });
+            for entry in entries {
+                result = result.with_effect(steer_entry_to_persist_effect(entry));
+            }
+            Ok(result
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::ClearSteeringQueue))
+        }
+
         // Invalid Transitions
         (state, event) => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
             event: event.variant_name(),
         }),
     }
+}
+
+/// Build a `PersistMessage` effect from a queued steering entry.
+/// Mirrors the field layout used by the `UserMessage` arm above so a drained
+/// entry persists identically to a freshly-received user message.
+fn steer_entry_to_persist_effect(entry: &crate::state_machine::event::SteerEntry) -> Effect {
+    Effect::persist_user_message(
+        entry.text.clone(),
+        entry.llm_text.clone(),
+        entry.images.clone(),
+        entry.message_id.clone(),
+        entry.user_agent.clone(),
+        entry.skill_invocation.clone(),
+    )
 }
 
 // ============================================================================
@@ -3269,6 +3324,238 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::RequestContinuation { .. })),
             "Idle path must fire RequestContinuation effect"
+        );
+    }
+
+    // ============================================================================
+    // SteerDrainedUserMessages transition tests
+    // ============================================================================
+
+    fn mk_steer_entry(id: &str, text: &str) -> crate::state_machine::event::SteerEntry {
+        crate::state_machine::event::SteerEntry {
+            text: text.to_string(),
+            llm_text: None,
+            images: vec![],
+            message_id: id.to_string(),
+            user_agent: None,
+            skill_invocation: None,
+        }
+    }
+
+    #[test]
+    fn steer_drained_from_idle_persists_all_and_transitions() {
+        let entries = vec![
+            mk_steer_entry("m1", "first"),
+            mk_steer_entry("m2", "second"),
+            mk_steer_entry("m3", "third"),
+        ];
+
+        let result = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::SteerDrainedUserMessages { entries },
+        )
+        .expect("Idle + SteerDrainedUserMessages must succeed");
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
+            "must enter LlmRequesting attempt=1, got {:?}",
+            result.new_state
+        );
+
+        let persist_ids: Vec<&str> = result
+            .effects
+            .iter()
+            .filter_map(|e| match e {
+                Effect::PersistMessage { message_id, .. } => Some(message_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            persist_ids,
+            vec!["m1", "m2", "m3"],
+            "must emit PersistMessage effects in input order"
+        );
+
+        let persist_state_count = result
+            .effects
+            .iter()
+            .filter(|e| matches!(e, Effect::PersistState))
+            .count();
+        assert_eq!(persist_state_count, 1, "must emit exactly one PersistState");
+
+        let request_llm_count = result
+            .effects
+            .iter()
+            .filter(|e| matches!(e, Effect::RequestLlm))
+            .count();
+        assert_eq!(
+            request_llm_count, 1,
+            "Idle path must issue exactly one RequestLlm"
+        );
+
+        let notify_count = result
+            .effects
+            .iter()
+            .filter(|e| matches!(e, Effect::NotifyClient { .. }))
+            .count();
+        assert_eq!(
+            notify_count, 1,
+            "Idle path must emit exactly one state-change notification"
+        );
+    }
+
+    #[test]
+    fn steer_drained_from_llm_requesting_persists_no_request_llm() {
+        let entries = vec![
+            mk_steer_entry("m1", "first"),
+            mk_steer_entry("m2", "second"),
+        ];
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 2 },
+            &test_context(),
+            Event::SteerDrainedUserMessages { entries },
+        )
+        .expect("LlmRequesting + SteerDrainedUserMessages must succeed");
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { attempt: 2 }),
+            "attempt count must be preserved, got {:?}",
+            result.new_state
+        );
+
+        let persist_count = result
+            .effects
+            .iter()
+            .filter(|e| matches!(e, Effect::PersistMessage { .. }))
+            .count();
+        assert_eq!(persist_count, 2, "must persist all entries");
+
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistState)),
+            "must emit PersistState"
+        );
+
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "mid-turn drain must NOT issue RequestLlm — request already in flight"
+        );
+
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyClient { .. })),
+            "mid-turn drain must NOT emit state-change notification — state unchanged"
+        );
+    }
+
+    #[test]
+    fn steer_drained_from_tool_executing_rejected() {
+        use crate::state_machine::state::{
+            AssistantMessage, BashInput, BashMode, ToolCall, ToolInput,
+        };
+
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new(
+                "tool-1",
+                ToolInput::Bash(BashInput {
+                    command: "echo".to_string(),
+                    mode: BashMode::Default,
+                }),
+            ),
+            remaining_tools: vec![],
+            completed_results: vec![],
+            pending_sub_agents: vec![],
+            assistant_message: AssistantMessage::default(),
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::SteerDrainedUserMessages {
+                entries: vec![mk_steer_entry("m1", "x")],
+            },
+        );
+
+        assert!(
+            matches!(result, Err(TransitionError::AgentBusy)),
+            "ToolExecuting must reject SteerDrainedUserMessages with AgentBusy, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn steer_drained_from_terminal_rejected_or_absorbed() {
+        // Terminal state has a catch-all absorbing arm in transition_parent
+        // (matches the existing behavior for other events). Confirm it does NOT
+        // mutate state and produces no effects.
+        let result = transition(
+            &ConvState::Terminal,
+            &test_context(),
+            Event::SteerDrainedUserMessages {
+                entries: vec![mk_steer_entry("m1", "x")],
+            },
+        )
+        .expect("Terminal absorbs unknown events as no-op");
+
+        assert!(
+            matches!(result.new_state, ConvState::Terminal),
+            "Terminal must remain Terminal, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result.effects.is_empty(),
+            "Terminal absorb must produce no effects, got {} effects",
+            result.effects.len()
+        );
+    }
+
+    #[test]
+    fn steer_drained_empty_entries_noop_from_idle() {
+        let result = transition(
+            &ConvState::Idle,
+            &test_context(),
+            Event::SteerDrainedUserMessages { entries: vec![] },
+        )
+        .expect("empty drain must succeed");
+
+        assert!(
+            matches!(result.new_state, ConvState::Idle),
+            "empty drain from Idle must remain Idle, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result.effects.is_empty(),
+            "empty drain must produce no effects, got {} effects",
+            result.effects.len()
+        );
+    }
+
+    #[test]
+    fn steer_drained_empty_entries_noop_from_llm_requesting() {
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 3 },
+            &test_context(),
+            Event::SteerDrainedUserMessages { entries: vec![] },
+        )
+        .expect("empty drain must succeed");
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { attempt: 3 }),
+            "empty drain from LlmRequesting must preserve attempt, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result.effects.is_empty(),
+            "empty drain must produce no effects, got {} effects",
+            result.effects.len()
         );
     }
 }
