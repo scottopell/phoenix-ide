@@ -779,3 +779,11 @@ existing branch" (Branch). The branch picker is reused across Managed and
 Branch modes with different labeling to communicate the different semantics:
 "base branch" (starting point) vs "branch" (destination).
 
+
+---
+
+## Audit Trail
+
+| Date | Pass | Notes |
+|---|---|---|
+| 2026-05-10 | Automated review (Copilot/codex) | Drift surface scan over the legacy spec since the doc-rot audit. Findings addressed inline on this PR. |

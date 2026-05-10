@@ -93,3 +93,11 @@ REQ-PROJ-008 (Work Sub-Agents) is the only incomplete pre-024 requirement. Neede
 - `specs/bash/` -- REQ-BASH-008, REQ-BASH-009 (Explore mode read-only enforcement)
 - `specs/patch/` -- REQ-PATCH-009 (patch disabled in Explore mode)
 - `specs/prose-feedback/` -- REQ-PF-015, REQ-PF-016 (programmatic task approval trigger)
+
+---
+
+## Audit Trail
+
+| Date | Pass | Notes |
+|---|---|---|
+| 2026-05-10 | Automated review (Copilot/codex) | Drift surface scan over the legacy spec since the doc-rot audit. Findings addressed inline on this PR. |

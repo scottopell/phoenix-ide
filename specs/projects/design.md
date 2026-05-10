@@ -492,3 +492,11 @@ No rebase automation. No agent notification. The agent has bash access to run
 
 `.gitignore` management: the system checks for `.phoenix/worktrees/` in `.gitignore`
 at project creation and appends it if missing.
+
+---
+
+## Audit Trail
+
+| Date | Pass | Notes |
+|---|---|---|
+| 2026-05-10 | Automated review (Copilot/codex) | Drift surface scan over the legacy spec since the doc-rot audit. Findings addressed inline on this PR. |
