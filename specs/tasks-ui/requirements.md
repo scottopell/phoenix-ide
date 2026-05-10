@@ -34,10 +34,12 @@ THE SYSTEM SHALL show a collapsed "Tasks" panel header in the conversation's chr
 WHEN I click the header
 THE SYSTEM SHALL expand the panel and load the task list, and SHALL display a count summary alongside the header (e.g. "Tasks · 3 active · 7 closed") for the rest of the panel's lifetime
 
-WHEN the load fails or `tasks/` doesn't exist
-THE SYSTEM SHALL show a brief, non-alarming "No tasks/ directory found" message rather than an error
+WHEN the response is empty (no tasks found, OR `tasks/` doesn't exist, OR the request errored)
+THE SYSTEM SHALL show a brief, non-alarming empty-state message rather than a loud error banner
 
-**Rationale:** The task list is reference data, not a control surface I'm always interacting with. The current behaviour delivers the count after first expansion (the load is gated on expansion to avoid paying the round-trip cost on every conversation mount — see REQ-TASKS-UI-007). A future improvement could add a lightweight `count` endpoint that lets the collapsed header carry the summary on first paint without fetching the full list; the present REQ does not require it. A missing `tasks/` directory is a normal state (not every repo uses the workflow); treating it as an error would be noise.
+**Rationale:** The task list is reference data, not a control surface I'm always interacting with. The current behaviour delivers the count after first expansion (the load is gated on expansion to avoid paying the round-trip cost on every conversation mount — see REQ-TASKS-UI-007). A future improvement could add a lightweight `count` endpoint that lets the collapsed header carry the summary on first paint without fetching the full list; the present REQ does not require it.
+
+The empty-state condition is deliberately broad. Today's UI shows the same "No tasks/ directory found" copy whenever the response is empty (`TasksPanel.tsx:111-113`) — which conflates three distinct situations: (a) the directory doesn't exist, (b) it exists and is empty, (c) the request failed and the error was logged to console without surfacing. The current copy is misleading for (b) and (c). The REQ accepts that ambiguity: empty-state-as-non-error is the right baseline, and a future tightening could differentiate the three only if the API starts distinguishing them. A small UI follow-up — reword the visible copy to "No tasks found," neutral across all three causes — is worth tracking.
 
 ---
 

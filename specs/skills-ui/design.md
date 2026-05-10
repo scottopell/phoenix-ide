@@ -95,9 +95,12 @@ onBack();
 ```
 
 The `InputArea` (owned by `specs/conversation-ui/`) listens for this
-event and inserts the text. The decoupling avoids prop-drilling a
-callback through SkillsPanel + SkillViewer; both can sit anywhere in
-the tree without needing to know what hosts them.
+event at `InputArea.tsx:90-101` and **replaces** the entire draft via
+`setDraft(text)`, then focuses the textarea. It does not insert at
+the cursor or preserve any existing draft text. The decoupling
+avoids prop-drilling a callback through SkillsPanel + SkillViewer;
+both can sit anywhere in the tree without needing to know what
+hosts them.
 
 The event is fire-and-forget. There's no acknowledgement: if the
 InputArea is unmounted (e.g. user is on a page that doesn't have one),
