@@ -109,6 +109,14 @@ export function ConversationSettings({
   // (already sorted by recency from backend for local, or relevance for search).
   const displayBranches = branches ?? [];
 
+  // When no LLM is configured, the only useful action is signing in. Hide
+  // every downstream field (model picker, directory, mode, branches) so the
+  // user isn't presented with a half-functional form full of empty selects
+  // and disabled controls. The banner itself owns the sign-in CTA.
+  if (models && !models.llm_configured) {
+    return <LlmStatusBanner models={models} />;
+  }
+
   return (
     <>
       <LlmStatusBanner models={models} />

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../api';
-import { getModels } from '../modelsPoller';
+import { subscribeModels } from '../modelsPoller';
 import type { GitBranchEntry, ImageData, ModelsResponse } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
 import { processImageFiles } from '../utils/images';
@@ -52,25 +52,32 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [interimText, setInterimText] = useState('');
   const draftBeforeVoiceRef = useRef<string>('');
 
-  // Load models (via shared cache — dedupes with other callers that may be
-  // mounted concurrently) and environment info once on mount.
+  // Subscribe to the shared models poller so credential transitions
+  // (Codex sign-in/sign-out, gateway flips) reach this page without a
+  // manual refresh.
   useEffect(() => {
-    getModels().then(modelsData => {
+    const unsub = subscribeModels(modelsData => {
       setModels(modelsData);
       // Honor saved preference only if it's still a registered model. Without
       // this, a stale localStorage entry (e.g. a model that was the only
       // option at a previous deploy and has since been superseded) silently
-      // sticks and the user submits against an unintended model.
-      setSelectedModel(prev =>
-        prev && modelsData.models.some(m => m.id === prev) ? prev : modelsData.default,
-      );
-    }).catch(console.error);
+      // sticks and the user submits against an unintended model. After a
+      // sign-out the registered set may drop to empty — null out the
+      // selection so the UI doesn't pin a now-invalid id.
+      setSelectedModel(prev => {
+        if (modelsData.models.length === 0) return null;
+        return prev && modelsData.models.some(m => m.id === prev)
+          ? prev
+          : modelsData.default;
+      });
+    });
     api.getEnv().then(env => {
       setHomeDir(env.home_dir);
       if (!localStorage.getItem(LAST_CWD_KEY)) {
         setCwd(env.home_dir);
       }
     }).catch(console.error);
+    return () => { unsub(); };
   }, []);
 
   // Save preferences

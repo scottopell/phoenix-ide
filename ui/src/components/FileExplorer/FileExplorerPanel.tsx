@@ -19,6 +19,10 @@ interface Props {
   rootPath: string;
   conversationId: string | undefined;
   showToast: (message: string, duration?: number) => void;
+  /** Error-styled toast (red). Used by `McpStatusPanel` for failure
+   *  paths so they don't render with the same green styling as
+   *  success messages (REQ-NOTIF-002). */
+  showError: (message: string, duration?: number) => void;
   /** Branch name of the current conversation (for extracting task ID in Work mode) */
   branchName?: string | null | undefined;
   /** Active conversation, used by TaskViewer to seed a "start working on this task"
@@ -35,7 +39,7 @@ function extractTaskId(branchName: string | null | undefined): string | undefine
   return match ? match[1] : undefined;
 }
 
-export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, branchName, parentConversation, width }: Props) {
+export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, parentConversation, width }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const [refreshKey, setRefreshKey] = useState(0);
   const handleRefresh = useCallback(() => setRefreshKey(k => k + 1), []);
@@ -106,7 +110,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
               refreshKey={refreshKey}
             />
           </div>
-          <McpStatusPanel showToast={showToast} />
+          <McpStatusPanel showToast={showToast} showError={showError} />
           <SkillsPanel
             conversationId={conversationId}
             onSkillClick={setSelectedSkill}

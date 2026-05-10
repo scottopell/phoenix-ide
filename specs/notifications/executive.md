@@ -9,7 +9,7 @@ This spec governs **how Phoenix tells the user something happened** — through 
 
 **In scope here (user-facing experiences):**
 - Quiet confirmations after user actions (toasts) — implemented today
-- Visible failure messages from background operations (toasts) — partially implemented today (red error styling lives in ConversationListPage; McpStatusPanel failures still render green; see REQ-NOTIF-002 status)
+- Visible failure messages from background operations (toasts) — implemented today (red error styling in `ConversationListPage`, `McpStatusPanel`, `TerminalPanel` assist-setup; see REQ-NOTIF-002 status)
 - Pull-me-back notifications when the agent needs me (browser notifications) — spec target
 - Catch-up notifications after a missed event (browser notifications via SSE reconnect) — spec target
 - Per-event configurability + global toggle — spec target
@@ -33,7 +33,7 @@ Phased delivery: in-app toasts shipped first; browser desktop notifications are 
 | Requirement | Status | Notes |
 |---|---|---|
 | **REQ-NOTIF-001:** Confirm My Action Quietly | ✅ Complete | `ui/src/components/Toast.tsx` (4 types, auto-dismiss, click-to-dismiss); `ui/src/hooks/useToast.tsx` (showSuccess / showInfo / showWarning / showError); 4s default duration. Confirmation call sites: `McpStatusPanel.tsx:77,107` (MCP reload + toggle outcomes), `QuestionPanel.tsx:242,273` ("Response sent" / "Declined to answer"), `ConversationListPage.tsx:98` (storage usage warning) |
-| **REQ-NOTIF-002:** Tell Me When a Background Action Failed | 🚧 Partial | Red `'error'` toast styling is used at `ConversationListPage.tsx:102,274,295,305,317` (storage quota exceeded, chain operation failures). Gap: `McpStatusPanel.tsx:81,109` shows error messages via the `showToast` prop, which `DesktopLayout.tsx:36,92` wires from `showSuccess` — so "MCP reload failed" / "Failed to enable/disable" render green even though their content describes a failure. Spec target: route those failures through `showError` so styling matches semantics |
+| **REQ-NOTIF-002:** Tell Me When a Background Action Failed | ✅ Complete | Red `'error'` toast styling at `ConversationListPage.tsx:102,274,295,305,317` (storage quota exceeded, chain operation failures); `McpStatusPanel.tsx` now routes "MCP reload failed" / "Failed to enable/disable" via the dedicated `showError` prop wired from `DesktopLayout.tsx` → `FileExplorerPanel.tsx`; `TerminalPanel.tsx` assist-setup failures also route via `showError` (closes REQ-TPANEL-006 partial) |
 | **REQ-NOTIF-003:** Pull Me Back When the Agent Needs Me | ❌ Not Started | Spec target: browser desktop notification on transitions to `awaiting_task_approval`, `awaiting_user_response`, `error`, `context_exhausted` when the Phoenix tab is not focused |
 | **REQ-NOTIF-004:** Pull Me Back When a Long-Running Task Finishes | ❌ Not Started | Spec target: browser notification on `idle` after the conversation was busy long enough to be worth flagging (threshold TBD; the spec doesn't fix it) |
 | **REQ-NOTIF-005:** Don't Notify When I'm Already Looking | ❌ Not Started | Spec target: tab-focus gate. "Tab focused" means `document.visibilityState === 'visible'` AND `document.hasFocus()` (matches the requirements.md definition). When focused AND the triggering conversation is the active route, suppress browser notifications; otherwise fire. Toasts always render (REQ-NOTIF-001/002) regardless of focus |
@@ -53,4 +53,4 @@ Phased delivery: in-app toasts shipped first; browser desktop notifications are 
 - `specs/sse_wire/`: every browser-notification trigger reads from the same `state_change` events the conversation atom consumes. No new SSE event types are needed.
 - `specs/bedrock/`: the phase transitions that map to notification events (`awaiting_task_approval`, `awaiting_user_response`, `error`, `context_exhausted`, busy → idle) are owned there.
 - `specs/conversation-ui/`: the toast container is mounted in the desktop layout (`DesktopLayout.tsx:111`) and on the conversation list page; the settings panel for notifications would live in the same chrome.
-- `specs/terminal-panel/` (REQ-TPANEL-009): documents an open assist-setup error path that surfaces via `console.error` today; once REQ-NOTIF-002 is the canonical visible-error mechanism, terminal-panel's gap closes by routing through `useToast.showError`.
+- `specs/terminal-panel/` (REQ-TPANEL-006): the partial note for "Let Phoenix set this up" called out that assist-setup failures only hit `console.error`. Closed by routing through `useToast.showError` (`TerminalPanel.tsx`); REQ-NOTIF-002 is the canonical visible-error mechanism.

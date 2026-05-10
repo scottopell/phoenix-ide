@@ -33,7 +33,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
     collapseThreshold: 120,
   });
   const location = useLocation();
-  const { toasts, dismissToast, showSuccess } = useToast();
+  const { toasts, dismissToast, showSuccess, showError } = useToast();
 
   // Task 08684: ConversationStore is the single source of truth.
   // The store-owned `useConversationsRefresh` (mounted in
@@ -90,6 +90,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             rootPath={effectiveCwd}
             conversationId={activeConversation?.id}
             showToast={showSuccess}
+            showError={showError}
             branchName={activeConversation?.branch_name}
             parentConversation={activeConversation}
             width={fileExplorerPane.collapsed ? undefined : fileExplorerPane.size}

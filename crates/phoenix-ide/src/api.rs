@@ -6,6 +6,7 @@ mod assets;
 pub mod auth;
 mod browser_view;
 mod chains;
+pub mod codex_login;
 mod git_handlers;
 mod handlers;
 mod lifecycle_handlers;
@@ -44,6 +45,8 @@ pub struct AppState {
     /// [`crate::chain_runtime::ChainRuntimeRegistry`] that the chains API
     /// handlers subscribe to and publish onto.
     pub chain_qa: ChainQa,
+    /// In-flight Codex/ChatGPT login flows. See [`codex_login`].
+    pub codex_login: Arc<codex_login::CodexLoginManager>,
 }
 
 impl AppState {
@@ -72,6 +75,7 @@ impl AppState {
         // it via `state.chain_qa.runtime_registry()` so subscribers and
         // publishers go through one registry.
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
+        let codex_login = codex_login::CodexLoginManager::new();
         Self {
             runtime,
             llm_registry,
@@ -82,6 +86,7 @@ impl AppState {
             password,
             terminals,
             chain_qa,
+            codex_login,
         }
     }
 }

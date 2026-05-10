@@ -97,7 +97,9 @@ struct RefreshError {
     error: Option<String>,
 }
 
-/// Resolve the auth.json path: `$CODEX_HOME/auth.json` if set, else `~/.codex/auth.json`.
+/// Resolve the Codex CLI auth.json path: `$CODEX_HOME/auth.json` if set, else
+/// `~/.codex/auth.json`. This is Codex CLI's storage location — Phoenix only
+/// reads from it in piggyback mode (when `OPENAI_USE_CODEX_AUTH=1`).
 pub fn default_auth_path() -> PathBuf {
     if let Ok(home) = std::env::var("CODEX_HOME") {
         PathBuf::from(home).join("auth.json")
@@ -105,6 +107,59 @@ pub fn default_auth_path() -> PathBuf {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
         PathBuf::from(home).join(".codex").join("auth.json")
     }
+}
+
+/// Resolve Phoenix's own `ChatGPT` auth file. Used by the in-app login flow
+/// (task 27104) so Phoenix has an independent session that doesn't depend on
+/// Codex CLI being installed.
+///
+/// When `$HOME` is unset (containers, oddly-spawned daemons), we fall back to
+/// the system temp dir and emit a warning. We deliberately avoid relative-CWD
+/// fallback because the file holds bearer tokens and writing it where `pwd`
+/// happens to point is unsafe.
+pub fn default_phoenix_auth_path() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".phoenix-ide")
+            .join("codex-auth.json");
+    }
+    let fallback = std::env::temp_dir()
+        .join("phoenix-ide")
+        .join("codex-auth.json");
+    tracing::warn!(
+        path = %fallback.display(),
+        "HOME is unset; storing ChatGPT credentials under $TMPDIR. Set HOME to a stable location for persistent sign-in."
+    );
+    fallback
+}
+
+/// Decide which file to load credentials from at startup.
+///
+/// Priority:
+/// 1. **Phoenix's own** `~/.phoenix-ide/codex-auth.json` — written by the
+///    in-app `/codex/login` flow. Independent session, "I logged into
+///    Phoenix" model.
+/// 2. **Codex CLI's** `~/.codex/auth.json` — only consulted when the user
+///    opts in via `OPENAI_USE_CODEX_AUTH=1`. Piggyback mode for users who
+///    already use the Codex CLI and want a single shared session.
+///
+/// Returns `None` when neither is available; the registry treats that as
+/// "no `ChatGPT` bridge today".
+pub fn resolve_active_auth_path() -> Option<PathBuf> {
+    let phoenix_path = default_phoenix_auth_path();
+    if phoenix_path.exists() {
+        return Some(phoenix_path);
+    }
+    let piggyback = std::env::var("OPENAI_USE_CODEX_AUTH")
+        .ok()
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
+    if piggyback {
+        let codex_path = default_auth_path();
+        if codex_path.exists() {
+            return Some(codex_path);
+        }
+    }
+    None
 }
 
 /// Read `auth.json` and validate it's a ChatGPT-mode file.
@@ -363,6 +418,15 @@ impl CodexCredential {
     /// Snapshot the current `account_id` without forcing a file read.
     pub fn account_id(&self) -> Option<String> {
         self.account_id.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Read the on-disk `id_token` without instantiating a credential. Used by
+    /// the login preflight to extract human-friendly identity claims (email,
+    /// name) for the sidebar account chip without exposing the JWT itself
+    /// or coupling the API layer to the on-disk schema.
+    pub fn read_id_token(auth_path: &PathBuf) -> Option<String> {
+        let auth = read_auth_file(auth_path).ok()?;
+        auth.tokens.and_then(|t| t.id_token)
     }
 
     /// Acquire a valid access token, refreshing if needed. The mutex is held
@@ -761,5 +825,97 @@ mod tests {
             },
         );
         assert!(auth.last_refresh.is_some());
+    }
+
+    /// Process-wide mutex for tests that mutate env vars. `set_var` /
+    /// `remove_var` are unsafe because concurrent env access is UB; cargo's
+    /// per-binary thread pool runs tests in parallel by default. Any test in
+    /// this binary that touches env vars must take this lock.
+    static ENV_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// RAII restore of three env vars on drop. Holding `_lock` blocks other
+    /// env-mutating tests; restoring on drop survives a panic mid-test.
+    struct EnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        home: Option<std::ffi::OsString>,
+        codex_home: Option<std::ffi::OsString>,
+        use_codex: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn capture() -> Self {
+            // If a previous test panicked while holding the lock, the mutex is
+            // poisoned but the env state is restorable; recover and continue.
+            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            Self {
+                _lock: lock,
+                home: std::env::var_os("HOME"),
+                codex_home: std::env::var_os("CODEX_HOME"),
+                use_codex: std::env::var_os("OPENAI_USE_CODEX_AUTH"),
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: we hold ENV_MUTEX, so no other test in this binary is
+            // touching these vars right now.
+            unsafe {
+                match self.home.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match self.codex_home.take() {
+                    Some(v) => std::env::set_var("CODEX_HOME", v),
+                    None => std::env::remove_var("CODEX_HOME"),
+                }
+                match self.use_codex.take() {
+                    Some(v) => std::env::set_var("OPENAI_USE_CODEX_AUTH", v),
+                    None => std::env::remove_var("OPENAI_USE_CODEX_AUTH"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_active_auth_path_priority_phoenix_then_piggyback() {
+        let _guard = EnvGuard::capture();
+        let dir = tempfile::tempdir().unwrap();
+
+        // SAFETY: ENV_MUTEX is held by `_guard` for this test's lifetime.
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+            std::env::remove_var("CODEX_HOME");
+            std::env::remove_var("OPENAI_USE_CODEX_AUTH");
+        }
+
+        // (1) Nothing exists, no env-var → None.
+        assert!(resolve_active_auth_path().is_none());
+
+        // (2) Codex CLI file exists but env-var not set → still None
+        // (independent-mode is the default, piggyback is opt-in).
+        let codex_dir = dir.path().join(".codex");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(codex_dir.join("auth.json"), b"{}").unwrap();
+        assert!(resolve_active_auth_path().is_none());
+
+        // (3) Same plus env-var → Codex CLI file picked.
+        unsafe {
+            std::env::set_var("OPENAI_USE_CODEX_AUTH", "1");
+        }
+        assert_eq!(
+            resolve_active_auth_path().as_deref(),
+            Some(codex_dir.join("auth.json").as_path())
+        );
+
+        // (4) Phoenix's own file appears → it wins regardless of the env-var.
+        let phoenix_dir = dir.path().join(".phoenix-ide");
+        std::fs::create_dir_all(&phoenix_dir).unwrap();
+        std::fs::write(phoenix_dir.join("codex-auth.json"), b"{}").unwrap();
+        assert_eq!(
+            resolve_active_auth_path().as_deref(),
+            Some(phoenix_dir.join("codex-auth.json").as_path())
+        );
+        // _guard's Drop restores HOME/CODEX_HOME/OPENAI_USE_CODEX_AUTH.
     }
 }

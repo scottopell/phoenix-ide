@@ -28,15 +28,15 @@ The agent and I both work against the `tasks/` directory: the agent creates and 
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-TASKS-UI-001:** See My Tasks Without Leaving the Conversation | 🚧 Partial | `ui/src/components/TasksPanel.tsx:34-106` (collapsible header + list); `:50-64` (defer load until expanded). Count summary appears alongside the header after first expansion — paired with REQ-TASKS-UI-007's defer-load contract. A future count-only endpoint could let the collapsed header carry the summary on first paint, but the present spec doesn't require it |
+| **REQ-TASKS-UI-001:** See My Tasks Without Leaving the Conversation | ✅ Complete | `ui/src/components/TasksPanel.tsx:34-110` (collapsible header + list); count summary on the header after first expansion satisfies the spec text (the future count-only endpoint is explicitly out of scope per requirements.md rationale); empty-state copy is now the neutral `"No tasks found"` (`:117`) covering directory-missing / empty / errored alike |
 | **REQ-TASKS-UI-002:** Tasks Grouped by Status with Active/Closed Distinction | ✅ Complete | `:15-22` (status order), `:32` (terminal-status set), `:67-77` (group + sort), `:114-172` (per-group render with terminal-collapsed-by-default) |
 | **REQ-TASKS-UI-003:** Recognize My Current Task at a Glance | ✅ Complete | `:135` (currentTaskId match), `:142,152` (highlight + "current" badge) |
 | **REQ-TASKS-UI-004:** Open a Task's Full Details | ✅ Complete | `:145` (onTaskClick) wires into `TaskViewer.tsx:114-190` (status + priority + slug + filename + raw content with frontmatter stripped) |
 | **REQ-TASKS-UI-005:** Start Working on a Task as a Seeded Sub-Conversation | ✅ Complete | `TaskViewer.tsx:79-112` (seeded-conversation creation), `:202-215` (prompt builder); cross-references `specs/seeded-conversations/` REQ-SEED-001..004 |
 | **REQ-TASKS-UI-006:** Navigate Between a Task and Its Conversation | ✅ Complete | `TasksPanel.tsx:153-164` (→ button on task row when `conversation_slug` is present), `TaskViewer.tsx:162-172` ("Go to conversation" link) |
-| **REQ-TASKS-UI-007:** Pay the Load Cost Only When I Look | 🚧 Partial | `TasksPanel.tsx:50-64` — defer-until-expanded half is complete (`useEffect` is gated on `expanded`). The clear-on-conversation-change half is the spec target: today the impl keeps `tasks` state across `conversationId` changes when the panel is collapsed, so the count summary can show stale data after navigation |
+| **REQ-TASKS-UI-007:** Pay the Load Cost Only When I Look | ✅ Complete | `TasksPanel.tsx:53-58` clears `tasks` immediately on `conversationId` change so a stale count from the prior conversation never bleeds across navigation; `:60-72` keeps the load itself gated on `expanded` so the round-trip is paid only when the user looks |
 
-**Progress:** 5 of 7 complete, 2 partial. Both partials are render correctness on the count summary: REQ-001 wants count visible while collapsed (today shows after first expansion); REQ-007 wants stale data cleared on conversation change (today persists when collapsed). Both are small frontend follow-ups; no backend work needed.
+**Progress:** 7 of 7 complete.
 
 ## Behavioural Specification
 

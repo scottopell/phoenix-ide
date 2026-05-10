@@ -387,6 +387,51 @@ export interface ConversationUsage {
   total: UsageTotals;
 }
 
+// ---- Codex / ChatGPT OAuth login (task 27104) ----
+
+export interface CodexLoginPreflight {
+  auth_path: string;
+  piggyback_path: string;
+  already_signed_in: boolean;
+  bridge_loaded_at_startup: boolean;
+  /// True when an in-app login won't take effect until Phoenix restarts —
+  /// either because no credential was loaded at startup or because the
+  /// loaded credential is pinned to a different file (the piggyback case).
+  restart_required_after_login: boolean;
+  piggyback_env_set: boolean;
+  account_id: string | null;
+  account_email: string | null;
+}
+
+export interface CodexManualCodeRequest {
+  /// Either the full post-callback URL (preferred — backend extracts code+state),
+  /// or both `code` and `state` if the UI parsed them itself.
+  redirect_url?: string;
+  code?: string;
+  state?: string;
+}
+
+export interface CodexPkceStartResponse {
+  session_id: string;
+  authorize_url: string;
+  redirect_uri: string;
+  loopback_bound: boolean;
+  callback_port: number;
+}
+
+export interface CodexDeviceStartResponse {
+  session_id: string;
+  verification_url: string;
+  user_code: string;
+  interval_secs: number;
+  timeout_secs: number;
+}
+
+export type CodexLoginStatus =
+  | { kind: 'pending' }
+  | { kind: 'success'; account_id: string | null; auth_path: string }
+  | { kind: 'error'; message: string };
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -404,6 +449,71 @@ export const api = {
       const err = await resp.json() as { error?: string };
       throw new Error(err.error ?? 'Login failed');
     }
+  },
+
+  // ---- Codex / ChatGPT OAuth login (task 27104) ----
+
+  async codexLoginPreflight(): Promise<CodexLoginPreflight> {
+    const resp = await fetch('/api/codex/login/preflight');
+    if (!resp.ok) throw new Error('Failed to check codex login preflight');
+    return resp.json();
+  },
+
+  async codexPkceStart(): Promise<CodexPkceStartResponse> {
+    const resp = await fetch('/api/codex/login/pkce/start', { method: 'POST' });
+    if (!resp.ok) throw new Error('Failed to start PKCE login');
+    return resp.json();
+  },
+
+  async codexPkceManual(sessionId: string, body: CodexManualCodeRequest): Promise<void> {
+    const resp = await fetch(`/api/codex/login/pkce/${encodeURIComponent(sessionId)}/manual`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; message?: string };
+      throw new Error(err.message ?? err.error ?? 'Manual code submission failed');
+    }
+  },
+
+  async codexPkceStatus(sessionId: string): Promise<CodexLoginStatus> {
+    const resp = await fetch(`/api/codex/login/pkce/${encodeURIComponent(sessionId)}/status`);
+    if (!resp.ok) throw new Error('Failed to read login status');
+    return resp.json();
+  },
+
+  async codexPkceCancel(sessionId: string): Promise<void> {
+    await fetch(`/api/codex/login/pkce/${encodeURIComponent(sessionId)}/cancel`, { method: 'POST' });
+  },
+
+  async codexDeviceStart(): Promise<CodexDeviceStartResponse> {
+    const resp = await fetch('/api/codex/login/device/start', { method: 'POST' });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string; message?: string };
+      throw new Error(err.message ?? err.error ?? 'Failed to start device code login');
+    }
+    return resp.json();
+  },
+
+  async codexDeviceStatus(sessionId: string): Promise<CodexLoginStatus> {
+    const resp = await fetch(`/api/codex/login/device/${encodeURIComponent(sessionId)}/status`);
+    if (!resp.ok) throw new Error('Failed to read login status');
+    return resp.json();
+  },
+
+  async codexDeviceCancel(sessionId: string): Promise<void> {
+    await fetch(`/api/codex/login/device/${encodeURIComponent(sessionId)}/cancel`, { method: 'POST' });
+  },
+
+  async codexSignout(): Promise<void> {
+    const resp = await fetch('/api/codex/login/signout', { method: 'POST' });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({})) as { error?: string };
+      throw new Error(err.error ?? 'Sign-out failed');
+    }
+    const body = await resp.json().catch(() => ({})) as { ok?: boolean; error?: string };
+    if (body.ok === false) throw new Error(body.error ?? 'Sign-out failed');
   },
 
   async getProjects(): Promise<Project[]> {

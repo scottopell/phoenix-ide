@@ -7,7 +7,10 @@ import { ConfirmDialog } from './ConfirmDialog';
 import { ChainDeleteConfirm } from './ChainDeleteConfirm';
 import { RenameDialog } from './RenameDialog';
 import { ThemeToggle } from './ThemeToggle';
+import { AccountChip } from './AccountChip';
 import { useTheme } from '../hooks';
+import type { CodexLoginPreflight } from '../api';
+import { subscribeModels } from '../modelsPoller';
 
 const PROJECT_FILTER_KEY = 'phoenix:sidebar-project-filter';
 
@@ -45,6 +48,28 @@ export function Sidebar({
   const navigate = useNavigate();
   const location = useLocation();
   const { theme, toggleTheme } = useTheme();
+  const [codexPreflight, setCodexPreflight] = useState<CodexLoginPreflight | null>(null);
+  const refetchCodexPreflight = useCallback(() => {
+    api.codexLoginPreflight()
+      .then((p) => setCodexPreflight(p))
+      .catch(() => { /* chip just hides — non-fatal */ });
+  }, []);
+  // Fetch once at mount, and refetch whenever the credential health flips.
+  // The shared models poller fires on credential transitions (login completes,
+  // token expires, sign-out wipes), so subscribing keeps the chip in sync
+  // without a second polling loop.
+  useEffect(() => {
+    refetchCodexPreflight();
+    let lastConfigured: boolean | null = null;
+    const unsub = subscribeModels((m) => {
+      if (lastConfigured !== null && lastConfigured !== m.llm_configured) {
+        refetchCodexPreflight();
+      }
+      lastConfigured = m.llm_configured;
+    });
+    return () => { unsub(); };
+  }, [refetchCodexPreflight]);
+
   const [showArchived, setShowArchived] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
   const [deleteChainTarget, setDeleteChainTarget] = useState<ChainView | null>(null);
@@ -230,6 +255,11 @@ export function Sidebar({
           +
         </button>
         <ThemeToggle theme={theme} onToggle={toggleTheme} />
+        <AccountChip
+          preflight={codexPreflight}
+          onPreflightInvalidated={refetchCodexPreflight}
+          compact
+        />
         <div className="sidebar-collapsed-dots">
           {conversations.map(conv => {
             const displayState = getConvDisplayState(conv);
@@ -270,6 +300,7 @@ export function Sidebar({
           + New
         </button>
         <ThemeToggle theme={theme} onToggle={toggleTheme} />
+        <AccountChip preflight={codexPreflight} onPreflightInvalidated={refetchCodexPreflight} />
       </div>
       {projects.length > 0 && (
         <div className="project-tabs">

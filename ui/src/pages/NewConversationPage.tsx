@@ -58,6 +58,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   };
 
   const buttonText = conv.creating ? (conv.dirStatus === 'will-create' ? 'Creating folder...' : 'Creating...') : 'Send';
+  // Until an LLM is configured, the only meaningful action is the sign-in
+  // CTA inside ConversationSettings. Hide the message composer + actions so
+  // the user isn't tempted to type into a draft that can't be sent.
+  const llmReady = conv.models === null || conv.models.llm_configured;
 
   return (
     <div className="new-conv-page">
@@ -105,28 +109,32 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             branchSearchLoading={conv.branchSearchLoading}
           />
 
-          {/* Main input */}
-          <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
-          <textarea
-            ref={textareaRef}
-            className="new-conv-textarea"
-            placeholder="What would you like to work on?"
-            rows={3}
-            value={conv.textareaValue}
-            onChange={(e) => conv.updateDraft(e.target.value)}
-            onKeyDown={handleKeyDown}
-            onPaste={handlePaste}
-            disabled={conv.creating}
-          />
+          {/* Main input — hidden until an LLM is configured */}
+          {llmReady && (
+            <>
+              <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
+              <textarea
+                ref={textareaRef}
+                className="new-conv-textarea"
+                placeholder="What would you like to work on?"
+                rows={3}
+                value={conv.textareaValue}
+                onChange={(e) => conv.updateDraft(e.target.value)}
+                onKeyDown={handleKeyDown}
+                onPaste={handlePaste}
+                disabled={conv.creating}
+              />
 
-          {/* Actions row: send group */}
-          <div className="new-conv-actions">
-            <div className="new-conv-send-group">
-              <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
-              {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
-              <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
-            </div>
-          </div>
+              {/* Actions row: send group */}
+              <div className="new-conv-actions">
+                <div className="new-conv-send-group">
+                  <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
+                  {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
+                  <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
+                </div>
+              </div>
+            </>
+          )}
         </div>
 
         {/* Mobile: keep existing layout */}
@@ -158,27 +166,29 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
         </div>
       </main>
 
-      {/* Mobile: bottom-anchored input */}
-      <div className="new-conv-bottom-input mobile-only">
-        <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
-        <textarea
-          className="new-conv-textarea-mobile"
-          placeholder="What would you like to work on?"
-          rows={2}
-          value={conv.textareaValue}
-          onChange={(e) => conv.updateDraft(e.target.value)}
-          onKeyDown={handleKeyDown}
-          onPaste={handlePaste}
-          disabled={conv.creating}
-        />
-        <div className="new-conv-input-row">
-          <div className="new-conv-input-left">
-            <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
-            {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
+      {/* Mobile: bottom-anchored input — hidden until an LLM is configured */}
+      {llmReady && (
+        <div className="new-conv-bottom-input mobile-only">
+          <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
+          <textarea
+            className="new-conv-textarea-mobile"
+            placeholder="What would you like to work on?"
+            rows={2}
+            value={conv.textareaValue}
+            onChange={(e) => conv.updateDraft(e.target.value)}
+            onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
+            disabled={conv.creating}
+          />
+          <div className="new-conv-input-row">
+            <div className="new-conv-input-left">
+              <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
+              {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
+            </div>
+            <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
           </div>
-          <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
         </div>
-      </div>
+      )}
     </div>
   );
 }

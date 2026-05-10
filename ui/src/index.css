@@ -3092,6 +3092,125 @@ pre:hover .copy-btn {
   color: var(--text-primary);
 }
 
+/* Account chip — sidebar header sign-out menu (paired with ThemeToggle) */
+.account-chip-wrap {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.account-chip {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  cursor: pointer;
+  padding: 2px 8px;
+  height: 24px;
+  border-radius: 6px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  white-space: nowrap;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+/* Compact variant for the 48px-wide collapsed sidebar — single-letter
+ * label, tighter box. Paired with `compact` prop on AccountChip. */
+.account-chip--compact {
+  padding: 2px 0;
+  width: 24px;
+  letter-spacing: 0;
+  font-weight: 700;
+}
+
+.account-chip:hover,
+.account-chip[aria-expanded='true'] {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+.account-chip-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  min-width: 200px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 8px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.25);
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* On the collapsed icon-strip sidebar, the chip sits flush left; flip the
+   menu's anchor so it doesn't run off-screen. */
+.sidebar-collapsed .account-chip-menu {
+  right: auto;
+  left: 0;
+}
+
+.account-chip-menu-header {
+  padding: 4px 8px 6px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.account-chip-menu-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.account-chip-menu-id {
+  font-size: 13px;
+  color: var(--text-primary);
+  margin-top: 2px;
+  word-break: break-all;
+}
+
+.account-chip-menu-id code {
+  background: var(--bg-tertiary);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--text-primary);
+}
+
+.account-chip-menu-error {
+  font-size: 12px;
+  color: var(--accent-red, #c44);
+  padding: 0 8px;
+}
+
+.account-chip-menu-item {
+  background: transparent;
+  border: none;
+  text-align: left;
+  padding: 6px 8px;
+  font-size: 13px;
+  color: var(--text-primary);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: background 0.1s;
+}
+
+.account-chip-menu-item:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+}
+
+.account-chip-menu-item:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
 /* Smooth theme transition */
 html {
   transition: background-color 0.2s ease, color 0.2s ease;
@@ -4920,6 +5039,34 @@ html * {
   border-radius: 3px;
 }
 
+.llm-status-banner__action {
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  color: var(--accent-color, #7c9ef8);
+  font-size: inherit;
+  font-family: inherit;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.llm-status-banner__action:hover {
+  color: var(--accent-color-hover, #a0b8ff);
+}
+
+.llm-status-banner--expanded {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 8px;
+  padding: 12px 16px;
+}
+
+.llm-status-banner__panel-header {
+  font-size: 13px;
+  color: var(--text-primary);
+}
+
 /* Legacy input-box kept for mobile fallback only */
 .new-conv-input-box {
   width: 100%;
@@ -5700,6 +5847,12 @@ html * {
   padding: 4px;
   border-radius: 6px;
   color: var(--text-primary);
+  /* Allow brand to absorb width pressure first — the logo stays, the
+   * "Phoenix" label truncates so the right-edge controls (theme, account
+   * chip) keep their full size at narrow sidebar widths. */
+  min-width: 0;
+  flex: 0 1 auto;
+  overflow: hidden;
 }
 
 .sidebar-brand:hover {
@@ -5714,6 +5867,10 @@ html * {
 .sidebar-brand-text {
   font-size: 15px;
   font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
 }
 
 .sidebar-header .sidebar-new-btn {
@@ -7677,6 +7834,205 @@ html * {
   font-size: 13px;
   color: var(--accent-red);
   text-align: center;
+}
+
+/* ============================================================
+   Codex/ChatGPT login page (task 27104)
+   ============================================================ */
+
+.codex-login-card {
+  max-width: 480px;
+}
+
+.codex-login-subtitle {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+  margin: 0;
+  line-height: 1.5;
+}
+
+.codex-login-choose,
+.codex-login-flow,
+.codex-login-paste {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.codex-login-flow {
+  margin-top: 8px;
+}
+
+.login-button-secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border-color);
+}
+
+.codex-login-info,
+.codex-login-warning,
+.codex-login-success {
+  font-size: 13px;
+  line-height: 1.5;
+  border-radius: 6px;
+  padding: 10px 12px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+}
+
+.codex-login-info code,
+.codex-login-warning code,
+.codex-login-success code {
+  background: var(--bg-primary);
+  padding: 1px 4px;
+  border-radius: 3px;
+  font-size: 12px;
+}
+
+.codex-login-warning {
+  border-color: var(--accent-yellow, #c4a000);
+  color: var(--text-primary);
+}
+
+.codex-login-success {
+  border-color: var(--accent-green, #2e8b57);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 12px;
+  padding: 20px 16px;
+  text-align: center;
+}
+
+.codex-login-success-title {
+  font-weight: 600;
+  font-size: 16px;
+  color: var(--text-primary);
+}
+
+.codex-login-success-body {
+  color: var(--text-secondary);
+}
+
+.codex-login-success-cta {
+  width: auto;
+  align-self: center;
+  margin-top: 4px;
+}
+
+.codex-login-help {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.5;
+  margin: 0;
+}
+
+.codex-login-help code {
+  font-size: 11px;
+}
+
+.codex-login-link {
+  margin-top: 6px;
+  word-break: break-all;
+}
+
+.codex-login-link a:not(.login-button),
+.codex-login-help a:not(.login-button) {
+  color: var(--accent-blue);
+  text-decoration: underline;
+}
+
+.codex-login-link a:not(.login-button):visited,
+.codex-login-help a:not(.login-button):visited {
+  color: var(--accent-blue);
+}
+
+/* PKCE browser flow CTA block */
+.pkce-action {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 20px 16px 16px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  text-align: center;
+}
+
+.pkce-open-btn {
+  display: inline-flex;
+  align-items: center;
+  width: auto;
+  align-self: center;
+}
+
+.codex-login-status {
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-align: center;
+  font-style: italic;
+}
+
+.codex-login-paste-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12px;
+  color: var(--text-muted);
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+  align-self: center;
+}
+
+.codex-login-paste-toggle:hover {
+  color: var(--text-primary);
+}
+
+.codex-login-cancel {
+  margin-top: 8px;
+  padding: 6px;
+  font-size: 12px;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  text-decoration: underline;
+  align-self: center;
+}
+
+.codex-login-cancel:hover {
+  color: var(--text-primary);
+}
+
+.codex-login-steps {
+  margin: 0;
+  padding-left: 20px;
+  font-size: 13px;
+  color: var(--text-primary);
+  line-height: 1.6;
+}
+
+.codex-login-steps li + li {
+  margin-top: 8px;
+}
+
+.codex-login-code {
+  margin-top: 6px;
+  padding: 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 28px;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-align: center;
+  background: var(--bg-primary);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  color: var(--text-primary);
+  user-select: all;
 }
 
 /* ============================================================

@@ -47,6 +47,13 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
     'wont-do': false,
   });
 
+  // REQ-TASKS-UI-007: drop the prior conversation's tasks immediately on
+  // navigation so the collapsed-header count summary can't outlive the
+  // conversation it described.
+  useEffect(() => {
+    setTasks([]);
+  }, [conversationId]);
+
   useEffect(() => {
     if (!conversationId || !expanded) return;
 
@@ -109,7 +116,7 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
         <div className="tasks-panel-body">
           {loading && <div className="tasks-loading">Loading...</div>}
           {!loading && tasks.length === 0 && (
-            <div className="tasks-empty">No tasks/ directory found</div>
+            <div className="tasks-empty">No tasks found</div>
           )}
           {!loading &&
             sortedGroups.map(([status, groupTasks]) => {

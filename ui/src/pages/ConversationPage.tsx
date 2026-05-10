@@ -211,7 +211,7 @@ function ConversationPageContent() {
   const { isOnline, queueOperation } = useAppMachine();
 
   // Toast for question panel feedback
-  const { toasts, dismissToast, showInfo } = useToast();
+  const { toasts, dismissToast, showInfo, showError } = useToast();
 
   // Image attachments (not conversation state — cleared on page refresh)
   const [images, setImages] = useState<ImageData[]>([]);
@@ -1252,6 +1252,7 @@ function ConversationPageContent() {
               shell={conversation.shell ?? undefined}
               homeDir={conversation.home_dir ?? undefined}
               onAssistSetup={handleAssistShellSetup}
+              showError={showError}
             />
           </Suspense>
         </>
