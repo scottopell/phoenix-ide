@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "taskmd",
+#   "taskmd>=1.0",
 # ]
 # ///
 """Development tasks for phoenix-ide."""
@@ -1927,38 +1927,25 @@ def cmd_check():
 # Task Validation
 # =============================================================================
 #
-# Implementation report (taskmd integration):
+# Backed by taskmd >= 1.0. In 1.0 the filename is the sole source of truth
+# for task metadata (id, priority, status, slug); bodies are free-form
+# markdown with no frontmatter. validate() therefore checks filename
+# pattern and duplicate IDs only, and fix() handles legacy-ID migration,
+# duplicate-ID renumbering, and (under explicit opt-in) stripping pre-1.0
+# YAML frontmatter.
 #
 # API surface used:
 #   - taskmd.validate(tasks_dir) -> ValidationResult  (.ok, .errors, .file_count)
-#   - taskmd.fix(tasks_dir) -> FixResult  (.ok, .errors, .patched, .renamed)
+#   - taskmd.fix(tasks_dir, migrate=False) -> FixResult  (renames, renumbered,
+#     migrated, frontmatter_pending, errors, summary())
 #   - taskmd.VALID_STATUSES, taskmd.VALID_PRIORITIES  (frozensets)
 #
-# API gaps:
-#   - No way to pass a custom filename regex to validate/fix. Phoenix migrated
-#     from 3-digit single-dash to 4-digit double-dash format to match taskmd's
-#     built-in pattern exactly, so no gap remains post-migration.
-#
-# API friction:
-#   - taskmd.validate() prints nothing and returns structured data; dev.py's
-#     cmd_tasks_validate() has a quiet=True codepath used by cmd_check that
-#     suppresses output. The mapping is clean: always call taskmd.validate(),
-#     then conditionally print based on quiet.
-#   - cmd_tasks_fix() previously printed per-file rename lines inline. taskmd's
-#     FixResult only gives aggregate counts (patched, renamed), not per-file
-#     detail. The old behavior printed "  old.md -> new.md" for each rename;
-#     that granularity is lost. The aggregate summary is sufficient.
-#   - taskmd.VALID_STATUSES excludes "pending" (Phoenix used it). Migration
-#     converted all "pending" files to "ready" in both filename and frontmatter.
-#
-# Suggestions for taskmd:
-#   - Add FixResult.renames: list[tuple[str, str]] so callers can display
-#     per-file rename detail without re-implementing scan logic.
-#   - Consider exposing ValidationResult.file_count as the count of files
-#     examined (currently it is, but document it clearly — it counts all task
-#     files seen, not just those with errors).
-#   - A FixResult.summary() -> str convenience method returning the canonical
-#     "patched N file(s), renamed M file(s)" string would reduce boilerplate.
+# fix() takes migrate={None,True,False}. We pass migrate=False here because
+# the repo migrated off frontmatter in commit b90a846; if frontmatter
+# reappears we want fix to treat the file's ID/dup state, not silently
+# rewrite the body. To strip newly reintroduced frontmatter, run
+# `taskmd fix --migrate` from the CLI directly (it's destructive — commit
+# first).
 
 
 def cmd_codegen() -> bool:
@@ -1998,7 +1985,8 @@ def cmd_codegen() -> bool:
 def cmd_tasks_validate(quiet: bool = False) -> bool:
     """Validate all task files using taskmd.
 
-    Returns True if all tasks pass, False otherwise.
+    Checks filename pattern conformance and duplicate IDs. Returns True if
+    all tasks pass, False otherwise.
     """
     import taskmd
     tasks_dir = ROOT / "tasks"
@@ -2009,7 +1997,7 @@ def cmd_tasks_validate(quiet: bool = False) -> bool:
             print(f"✗ {len(result.errors)} task validation error(s):")
             for err in result.errors:
                 print(f"  - {err}")
-            print("\nRun './dev.py tasks fix' to auto-fix (injects missing 'created', renames files).")
+            print("\nRun './dev.py tasks fix' to auto-fix (legacy IDs, duplicate IDs).")
         return False
 
     if not quiet:
@@ -2219,13 +2207,18 @@ def cmd_audit_specs(verbose: bool = False) -> bool:
 
 
 def cmd_tasks_fix() -> bool:
-    """Auto-fix task files using taskmd: inject missing 'created' and rename to match frontmatter.
+    """Auto-fix task files using taskmd: migrate legacy IDs and renumber duplicates.
+
+    Frontmatter stripping is intentionally NOT performed by this command —
+    the repo migrated off frontmatter once already. To strip frontmatter
+    that has been reintroduced, run `taskmd fix --migrate` from the CLI
+    directly after committing.
 
     Returns True if all files are now correct, False on errors.
     """
     import taskmd
     tasks_dir = ROOT / "tasks"
-    result = taskmd.fix(tasks_dir)
+    result = taskmd.fix(tasks_dir, migrate=False)
 
     if not result.ok:
         print(f"\n✗ {len(result.errors)} error(s):")
@@ -2233,15 +2226,13 @@ def cmd_tasks_fix() -> bool:
             print(f"  - {err}")
         return False
 
-    if result.patched or result.renamed:
-        parts = []
-        if result.patched:
-            parts.append(f"patched {result.patched} file(s)")
-        if result.renamed:
-            parts.append(f"renamed {result.renamed} file(s)")
-        print(f"\n✓ {', '.join(parts).capitalize()}")
-    else:
-        print("✓ All files already correctly named")
+    for old, new in result.renames:
+        print(f"  {old} -> {new}")
+    for old_id, new_id, old_name, new_name in result.renumbered:
+        print(f"  renumbered {old_id} -> {new_id}: {old_name} -> {new_name}")
+
+    summary = result.summary()
+    print(f"✓ {summary}")
     return True
 
 
@@ -3743,8 +3734,8 @@ def main():
     # tasks
     tasks_parser = sub.add_parser("tasks", help="Task management")
     tasks_sub = tasks_parser.add_subparsers(dest="tasks_command", required=True)
-    tasks_sub.add_parser("validate", help="Validate task file naming and frontmatter")
-    tasks_sub.add_parser("fix", help="Auto-rename task files to match frontmatter")
+    tasks_sub.add_parser("validate", help="Validate task filenames and check for duplicate IDs")
+    tasks_sub.add_parser("fix", help="Migrate legacy IDs and renumber duplicate task IDs")
 
     args = parser.parse_args()
 

@@ -88,7 +88,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 # Browser automation
 chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime", "_fetcher-rustls-tokio"] }
 brush-parser = "0.3.0"
-taskmd-core = "=1.0.0-rc1"
+taskmd-core = "1"
 listenfd = "1.0.2"
 nucleo-matcher = "0.3.1"
 

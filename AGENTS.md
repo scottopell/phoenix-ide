@@ -41,18 +41,15 @@ phoenix-client.py  # CLI client — interact with the app without a browser
 
 ```bash
 echo 'What the task does, in a few sentences.' \
-  | taskmd new --slug fix-login --artifact crates/phoenix-ide/src/api/auth.rs --priority p1
+  | taskmd new --slug fix-login --priority p1
 ```
 
-`taskmd new` allocates the next ID, synthesizes the frontmatter, and writes
-the file atomically. Direct file writes (and `taskmd next` + write-your-own)
-are discouraged because:
+`taskmd new` allocates the next ID, formats the filename, and atomically
+writes the file with the body from stdin. Direct file writes (and
+`taskmd next` + write-your-own) are discouraged because two callers
+using `next` can race and receive the same ID.
 
-- ID allocation races: two callers using `next` can get the same ID.
-- Frontmatter drifts from what `taskmd` produces (e.g. missing `artifact`
-  field), and `./dev.py check` will then fail.
-
-Required flags: `--slug`, `--artifact`, and a non-empty body on stdin.
+Required flag: `--slug`. Required input: a non-empty task body on stdin.
 Optional: `--priority` (default `p2`), `--status` (default `ready`).
 
 **Filename format** (produced by `taskmd new`, don't hand-craft):
@@ -60,14 +57,16 @@ Optional: `--priority` (default `p2`), `--status` (default `ready`).
 
 - `pX`: `p0` (critical) … `p4` (nice-to-have)
 - `status`: `ready`, `in-progress`, `blocked`, `brainstorming`, `done`, `wont-do`
-- Frontmatter must include `created`, `priority`, `status`, `artifact`; filename
-  must match frontmatter. Both invariants are enforced by `./dev.py check`.
+- The filename is the **sole source of truth** for task metadata. Bodies
+  are free-form markdown — no frontmatter. `./dev.py tasks validate`
+  enforces filename pattern conformance and absence of duplicate IDs.
 
 ```bash
 ls tasks/*-ready--*.md             # List ready tasks
-taskmd status <id> in-progress     # Transition a task's status
-./dev.py tasks fix                 # Sync filenames to frontmatter / repair legacy IDs
-./dev.py tasks validate            # Check consistency (also runs in ./dev.py check)
+taskmd list --status ready         # Same, structured
+taskmd status <id> in-progress     # Transition a task by renaming the file
+./dev.py tasks fix                 # Migrate legacy IDs / renumber duplicates
+./dev.py tasks validate            # Check filenames + IDs (also runs in ./dev.py check)
 ```
 
 ---
