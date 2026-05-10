@@ -103,4 +103,59 @@ describe('refreshOnce coalescing (REQ-SIDEBAR-CREATE-TRAILING)', () => {
     // No second call — the pending flag was never set.
     expect(listConversations).toHaveBeenCalledTimes(1);
   });
+
+  it('await refresh() waits for the trailing re-fire that observed the poke', async () => {
+    // Regression for PR #68 review (Copilot bot): callers awaiting a
+    // poked refresh must not see their await resolve before the
+    // reconcile that included their poke has actually run. Without
+    // this, `await refreshConversations(); /* read store */` could
+    // observe pre-mutation state.
+    const store = new ConversationStore();
+
+    const first = __testing.refreshOnce(store);
+    await flushMicrotasks();
+    expect(listConversations).toHaveBeenCalledTimes(1);
+
+    // Poke during in-flight. Await the returned promise.
+    let pokeResolved = false;
+    const pokeAwait = __testing.refreshOnce(store).then(() => {
+      pokeResolved = true;
+    });
+
+    // Resolve the in-flight call. The trailing re-fire kicks off but
+    // its listConversations promise is itself pending — the poke's
+    // await must NOT resolve yet.
+    activePromises[0]!.resolve([]);
+    await first;
+    await flushMicrotasks();
+    expect(listConversations).toHaveBeenCalledTimes(2);
+    expect(pokeResolved).toBe(false);
+
+    // Resolve the trailing call. Now the poke's await resolves.
+    activePromises[1]!.resolve([]);
+    await pokeAwait;
+    expect(pokeResolved).toBe(true);
+  });
+
+  it('all concurrent pokes share one trailing re-fire promise', async () => {
+    const store = new ConversationStore();
+
+    const first = __testing.refreshOnce(store);
+    await flushMicrotasks();
+    expect(listConversations).toHaveBeenCalledTimes(1);
+
+    const pokeA = __testing.refreshOnce(store);
+    const pokeB = __testing.refreshOnce(store);
+    const pokeC = __testing.refreshOnce(store);
+
+    activePromises[0]!.resolve([]);
+    await first;
+    await flushMicrotasks();
+    expect(listConversations).toHaveBeenCalledTimes(2);
+
+    // All three pokes resolve when the single trailing re-fire ends.
+    activePromises[1]!.resolve([]);
+    await Promise.all([pokeA, pokeB, pokeC]);
+    expect(listConversations).toHaveBeenCalledTimes(2);
+  });
 });

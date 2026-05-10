@@ -26,6 +26,15 @@ const POLL_INTERVAL_MS = 5000;
  * delete) that lands while the 5s driver tick is mid-flight would be
  * silently dropped and the sidebar would reflect pre-mutation state
  * until the next tick.
+ *
+ * Await semantics: callers who `await refresh()` get a promise that
+ * resolves only after a refresh attempt that observed their poke has
+ * settled. A poke during in-flight does not resolve when the in-flight
+ * call ends — it resolves when the trailing re-fire ends. Without this,
+ * `await refreshConversations()` followed by reading the store could
+ * see pre-poke state because the awaited promise resolved before the
+ * trailing fire ran. (Today no caller awaits, but the contract should
+ * hold by default.)
  */
 async function refreshOnce(store: ConversationStore): Promise<void> {
   // Flags live on the store so they're shared across every consumer
@@ -35,10 +44,18 @@ async function refreshOnce(store: ConversationStore): Promise<void> {
   const f = store as ConversationStore & {
     __refreshInFlight?: boolean;
     __refreshPending?: boolean;
+    __refreshPendingPromise?: Promise<void>;
+    __refreshPendingResolve?: () => void;
   };
   if (f.__refreshInFlight) {
-    f.__refreshPending = true;
-    return;
+    if (!f.__refreshPending) {
+      f.__refreshPending = true;
+      f.__refreshPendingPromise = new Promise<void>((resolve) => {
+        f.__refreshPendingResolve = resolve;
+      });
+    }
+    // Every concurrent poke awaits the same trailing-fire promise.
+    return f.__refreshPendingPromise!;
   }
   f.__refreshInFlight = true;
   try {
@@ -71,7 +88,14 @@ async function refreshOnce(store: ConversationStore): Promise<void> {
     f.__refreshInFlight = false;
     if (f.__refreshPending) {
       f.__refreshPending = false;
-      void refreshOnce(store);
+      const pendingResolve = f.__refreshPendingResolve;
+      f.__refreshPendingResolve = undefined;
+      f.__refreshPendingPromise = undefined;
+      // Settle the pending awaiters when the trailing fire completes —
+      // not when it starts. A failed trailing fire still resolves (the
+      // outer try/catch swallows network errors), so awaiters never
+      // hang on a transient outage.
+      void refreshOnce(store).then(() => pendingResolve?.());
     }
   }
 }
