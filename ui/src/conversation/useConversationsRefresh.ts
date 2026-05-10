@@ -90,8 +90,11 @@ async function refreshOnce(store: ConversationStore): Promise<void> {
     if (f.__refreshPending) {
       f.__refreshPending = false;
       const pendingResolve = f.__refreshPendingResolve;
-      f.__refreshPendingResolve = undefined;
-      f.__refreshPendingPromise = undefined;
+      // `delete` rather than `= undefined` satisfies
+      // `exactOptionalPropertyTypes: true` — the field's type is `T | absent`,
+      // not `T | undefined`.
+      delete f.__refreshPendingResolve;
+      delete f.__refreshPendingPromise;
       // Settle the pending awaiters when the trailing fire completes —
       // not when it starts. A failed trailing fire still resolves (the
       // outer try/catch swallows network errors), so awaiters never
