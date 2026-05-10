@@ -6,7 +6,7 @@ Phoenix has two notification channels:
 1. **In-app toasts** — short messages rendered in the conversation UI; useful only when the user is looking
 2. **Browser desktop notifications** — OS-level pings that reach the user even when the tab is not focused
 
-This spec covers both, plus the rules for picking which channel applies to a given trigger. The toast UI is implemented (REQ-NOTIF-001, REQ-NOTIF-002 ✅); the desktop-notification half is spec'd here as the target (REQ-NOTIF-003 onwards). See `specs/notifications/executive.md` for the full boundary.
+This spec covers both, plus the rules for picking which channel applies to a given trigger. The toast UI is shipped (REQ-NOTIF-001 ✅); the error-styled half of the toast story is partial (REQ-NOTIF-002 🚧 — red `showError` is wired in `ConversationListPage`, but `McpStatusPanel` failures still render green, see executive's status table). The desktop-notification half is spec'd here as the target (REQ-NOTIF-003 onwards). See `specs/notifications/executive.md` for the full boundary.
 
 ## User Story
 
@@ -71,10 +71,14 @@ AND notifications for that event type are enabled (REQ-NOTIF-006)
 AND I have granted browser notification permission
 THE SYSTEM SHALL display a browser desktop notification with a title naming the event ("Question asked", "Task approval needed", "Agent error") and a body identifying the conversation slug
 
-WHEN browser notification permission has not been granted
-THE SYSTEM SHALL prompt for it on first attempt rather than silently dropping the notification
+WHEN browser notification permission has not yet been granted
+THE SYSTEM SHALL silently drop SSE-driven triggers — `Notification.requestPermission()` requires a user-gesture context that an SSE handler does not have, and a blocked / ignored prompt would be a worse experience than no prompt at all
+AND SHALL surface an in-app cue (toast or banner) the next time I focus Phoenix, telling me how to enable desktop notifications via the settings panel
 
-**Rationale:** When Phoenix is in another tab and the agent is blocked on me, that's the canonical "interrupt me" moment. Without a desktop notification, I'd come back hours later to find work parked the whole time. The permission prompt is one-time, but skipping it would mean the feature silently does nothing for users who never realised they had to opt in.
+WHEN I click the settings-panel "Enable desktop notifications" button (a user gesture)
+THE SYSTEM SHALL call `Notification.requestPermission()` and reflect the resulting `granted` / `denied` state immediately in the panel
+
+**Rationale:** When Phoenix is in another tab and the agent is blocked on me, that's the canonical "interrupt me" moment. Without a desktop notification I'd come back hours later to find work parked. But: browsers gate `requestPermission()` to user-gesture contexts. Calling it from inside an SSE handler is unreliable — most browsers either block the prompt or quietly ignore the call. Routing all permission requests through an explicit settings-panel click makes the prompt land where the browser will allow it, and the in-app cue on next focus is the discoverability nudge for users who haven't visited the settings panel yet.
 
 ---
 

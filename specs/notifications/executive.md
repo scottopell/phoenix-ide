@@ -9,7 +9,7 @@ This spec governs **how Phoenix tells the user something happened** — through 
 
 **In scope here (user-facing experiences):**
 - Quiet confirmations after user actions (toasts) — implemented today
-- Visible failure messages from background operations (toasts) — implemented today
+- Visible failure messages from background operations (toasts) — partially implemented today (red error styling lives in ConversationListPage; McpStatusPanel failures still render green; see REQ-NOTIF-002 status)
 - Pull-me-back notifications when the agent needs me (browser notifications) — spec target
 - Catch-up notifications after a missed event (browser notifications via SSE reconnect) — spec target
 - Per-event configurability + global toggle — spec target
@@ -36,7 +36,7 @@ Phased delivery: in-app toasts shipped first; browser desktop notifications are 
 | **REQ-NOTIF-002:** Tell Me When a Background Action Failed | 🚧 Partial | Red `'error'` toast styling is used at `ConversationListPage.tsx:102,274,295,305,317` (storage quota exceeded, chain operation failures). Gap: `McpStatusPanel.tsx:81,109` shows error messages via the `showToast` prop, which `DesktopLayout.tsx:36,92` wires from `showSuccess` — so "MCP reload failed" / "Failed to enable/disable" render green even though their content describes a failure. Spec target: route those failures through `showError` so styling matches semantics |
 | **REQ-NOTIF-003:** Pull Me Back When the Agent Needs Me | ❌ Not Started | Spec target: browser desktop notification on transitions to `awaiting_task_approval`, `awaiting_user_response`, `error`, `context_exhausted` when the Phoenix tab is not focused |
 | **REQ-NOTIF-004:** Pull Me Back When a Long-Running Task Finishes | ❌ Not Started | Spec target: browser notification on `idle` after the conversation was busy long enough to be worth flagging (threshold TBD; the spec doesn't fix it) |
-| **REQ-NOTIF-005:** Don't Notify When I'm Already Looking | ❌ Not Started | Spec target: tab-focus gate. When `document.visibilityState === 'visible'` and the conversation is the active route, suppress browser notifications. Toasts always render (REQ-NOTIF-001/002) regardless of focus |
+| **REQ-NOTIF-005:** Don't Notify When I'm Already Looking | ❌ Not Started | Spec target: tab-focus gate. "Tab focused" means `document.visibilityState === 'visible'` AND `document.hasFocus()` (matches the requirements.md definition). When focused AND the triggering conversation is the active route, suppress browser notifications; otherwise fire. Toasts always render (REQ-NOTIF-001/002) regardless of focus |
 | **REQ-NOTIF-006:** Let Me Tune Which Events Notify Me | ❌ Not Started | Spec target: per-event toggles + master toggle; surfaced in a settings panel reachable from sidebar/StateBar |
 | **REQ-NOTIF-007:** One Click Back to the Right Conversation | ❌ Not Started | Spec target: clicking a desktop notification focuses the Phoenix tab and navigates to the triggering conversation |
 | **REQ-NOTIF-008:** Catch Me Up When I Reconnect After a Disconnect | ❌ Not Started | Spec target: on SSE reconnect, scan the conversation list for any non-sub-agent in a notification-worthy state and emit a notification per match. Captures notifications the user "missed" while disconnected |

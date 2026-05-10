@@ -130,13 +130,18 @@ same handler:
    conversation is the active route, suppress.
 4. **Permission check.**
    - If `Notification.permission === 'granted'`, fire (step 5).
-   - If `'default'` (not yet asked), call
-     `Notification.requestPermission()`. On `'granted'`, fall through
-     to step 5. On any other result, drop this trigger (REQ-NOTIF-003
-     covers prompting on first attempt).
-   - If `'denied'`, drop. The OS-level permission cannot be re-prompted
-     programmatically; the settings UI shows guidance to change it in
-     browser settings.
+   - If `'default'` (not yet asked), drop this trigger and queue an
+     in-app cue ("Enable desktop notifications in Settings to be
+     pulled in for events like this one") to show on next focus.
+     Do NOT call `Notification.requestPermission()` from this code
+     path — `requestPermission()` is gated to user-gesture contexts
+     (button clicks etc.) and an SSE handler is not one. A blocked
+     / ignored prompt would be worse than no prompt. The settings
+     panel's "Enable desktop notifications" button (REQ-NOTIF-003)
+     is the only place that calls `requestPermission()`.
+   - If `'denied'`, drop. The OS-level permission cannot be
+     re-prompted programmatically; the settings UI shows guidance
+     to change it in browser settings.
 5. **Fire** the notification:
    ```ts
    const n = new Notification(title, { body, tag: conversationId });
