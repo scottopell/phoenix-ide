@@ -99,7 +99,12 @@ THE SYSTEM SHALL show one of two consistent states:
 - An accurate in-progress state with activity indication, if generation is still running
 AND SHALL NOT show partial or duplicate content from the interrupted stream
 
-**Rationale:** Users expect real-time feedback during agent execution. Token streaming provides immediate evidence that the system is working. The `after` parameter enables seamless reconnection without a separate fetch request, eliminating race conditions. Reconnection correctness ensures dropped connections during long generations never leave users with stale or broken views.
+WHEN client reconnects during a tool round before its checkpoint persists
+THE SYSTEM SHALL include the in-flight assistant message (containing the LLM's text and any pending tool_use blocks) in the init payload
+AND SHALL surface the current tool execution state via the breadcrumb / state_change event delivered in init's pending_events
+SO THAT the user sees the active tool render in the main message list rather than a blank gap until the tool round completes
+
+**Rationale:** Users expect real-time feedback during agent execution. Token streaming provides immediate evidence that the system is working. The `after` parameter enables seamless reconnection without a separate fetch request, eliminating race conditions. Reconnection correctness ensures dropped connections during long generations never leave users with stale or broken views. The in-flight-assistant-message coverage on reconnect closes the symmetric gap during tool execution: without it, a reconnect between "LLM finished, tool started" and "tool finished, checkpoint persisted" would blank out the assistant's message and the tool card.
 
 ---
 
@@ -191,3 +196,42 @@ THE SYSTEM SHALL serve embedded frontend assets
 AND apply appropriate cache headers
 
 **Rationale:** Single binary deployment includes frontend; no separate static file server needed.
+
+---
+
+### REQ-API-012: Reconnect Replay Buffer
+
+WHEN the server emits a non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, conversation_became_terminal, error, browser_session_state, steer_message_queued)
+THE SYSTEM SHALL retain the event in a per-conversation in-memory ring buffer until the next persisted Message broadcast replaces it (anchor reset)
+
+WHEN the server emits an eager (non-persisted) assistant Message via the runtime's BroadcastAssistantMessage effect
+THE SYSTEM SHALL append the Message event to the ring buffer without resetting the anchor
+SO THAT a subscriber connecting before the corresponding persist_checkpoint completes still receives the in-flight assistant message
+
+WHEN the ring buffer reaches its capacity (default 512 entries)
+THE SYSTEM SHALL discard all entries (clear the ring)
+AND set a `pending_truncated` flag on the conversation's ring
+AND no-op all subsequent appends until the next anchor reset
+WHICH is surfaced in init snapshots as `pending_events: []` and `pending_truncated: true`
+SO THAT clients reconnecting in this window perform a clean DB-only resync rather than rendering a partial in-flight view that could mislead the user
+
+WHEN the ring's aggregate serialised byte size grows
+THE SYSTEM SHALL emit a debug-level tracing counter and gauge metric per conversation
+WHERE bytes are observability-only (the cap is enforced by entry count, not bytes)
+SO THAT pathological large-event-dominated rings can be detected before they become a memory issue
+
+WHEN a client subscribes to a conversation's SSE stream
+THE SYSTEM SHALL include in the init payload:
+- `pending_anchor_sequence_id`: the sequence_id of the last persisted Message (the ring's anchor)
+- `pending_events`: the ordered ring entries with sequence_ids strictly greater than the anchor
+- `pending_truncated`: whether the ring overflowed since the anchor
+
+WHEN the server process restarts
+THE SYSTEM SHALL discard the ring buffer
+WHERE clients reconnecting after a restart receive DB-only state in the init payload (empty pending_events), which is correct because no events were in flight across the restart
+
+**Rationale:** Persisted-only state on the SSE wire is sufficient for crash recovery but produces a visible "blank UI" symptom during transient network outages mid-turn. Tokens, state_change events, and the eager in-flight assistant message all live between two persisted Message broadcasts; without a replay buffer, a reconnect in that window resyncs the UI to a state strictly behind what the user saw before disconnect. The ring is bounded, in-memory, and cheap (events are small structured payloads). The 512-entry cap covers ~10 seconds of LLM streaming — comfortable for typical mid-turn outages.
+
+Overflow behaviour is clear-and-truncate rather than evict-oldest because partial replay was deemed misleading: a user reconnecting to a long-running turn would see only the tail of the in-flight stream filling in, with no indication that earlier content was lost. A clean force-resync is honest about the gap and the next persisted message restores authoritative state.
+
+Bytes-based capping is deferred to observability-only: a debug-level metric exposes aggregate ring byte size so pathological large-event-dominated rings can be detected, but the enforcement cap remains entry-count-based for simplicity.

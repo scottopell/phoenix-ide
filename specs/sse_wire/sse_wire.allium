@@ -10,7 +10,14 @@
 -- Includes: All nine SSE event types (init, message, message_updated,
 --           state_change, token, agent_done, conversation_became_terminal,
 --           conversation_update, error); ordering constraints between them;
---           the persist-before-broadcast invariant; broadcast-lag semantics.
+--           the persist-before-broadcast invariant; broadcast-lag semantics;
+--           the per-conversation ReplayRing that buffers ephemeral events
+--           between persisted Message anchors so reconnecting clients can
+--           resume mid-stream views (in-flight assistant message + state
+--           changes + streaming tokens). The distinction between persisted
+--           and ephemeral Message broadcasts (send_persisted_message vs
+--           send_ephemeral_message) lives at the broadcaster API only —
+--           the wire variant is shared.
 --
 -- Excludes: Client-side reducer behaviour (see conversation_atom.allium).
 --           Client reconnect lifecycle (see connection_machine.allium, task 02681).
@@ -43,11 +50,56 @@
 -- Data carried in the init event. The reducer (conversation_atom.allium)
 -- governs how each field is applied. This spec stores last_sequence_id
 -- on the stream to anchor the sequence ordering guarantee.
+--
+-- `pending_events` are the contents of the per-conversation ReplayRing
+-- at subscribe time: every event broadcast since the last persisted
+-- Message that has not yet been absorbed into a durable DB row. The
+-- reducer replays them through its normal per-event rules after the
+-- DB snapshot lands so a reconnect during an in-flight turn (mid-LLM
+-- stream, mid-tool-execution) does not blank out the UI's in-progress
+-- state.
+--
+-- `pending_anchor_sequence_id` is the sequence_id of the last persisted
+-- Message at subscribe time — i.e., the seq corresponding to the most
+-- recent durable fact already in `messages`. Every entry in
+-- `pending_events` has sequence_id > pending_anchor_sequence_id; the
+-- client uses this as the floor for `applyIfNewer` when replaying.
+--
+-- `pending_truncated` is true iff the ring overflowed (capacity reached
+-- and oldest entries evicted) between the anchor and the current tip.
+-- A truncated replay produces a partial in-flight view; the client can
+-- surface this to the user analogously to the broadcast-lag close path.
 value InitSnapshot {
     last_sequence_id: Integer
+    pending_anchor_sequence_id: Integer
+    pending_events: List<PendingEventEntry>
+    pending_truncated: Boolean
     -- conversation, messages, breadcrumbs, agent_working, display_state,
     -- context_window_size, model_context_window, commits_behind,
     -- commits_ahead, project_name: opaque at this level.
+}
+
+-- One entry in the per-conversation replay ring. Each carries the
+-- original sequence_id assigned by SseBroadcaster.next_seq when the
+-- event was first emitted — that is, the entry's seq is the one the
+-- client's reducer rules will see if/when the entry replays via init.
+--
+-- `event_type` matches the SseWireEvent's `type` discriminator
+-- ("token", "state_change", "message", "message_updated",
+-- "agent_done", "conversation_update", "conversation_became_terminal",
+-- "error", "browser_session_state", "steer_message_queued"). Init
+-- itself is never in the ring (init is per-subscriber, never
+-- broadcast). ConversationHardDeleted is excluded by construction (a
+-- deleted conversation cannot subsequently receive a subscribe).
+--
+-- `payload` is opaque at this level — it is whatever the wire-format
+-- carries for that event_type. The replay path serialises the entry
+-- back through SseWireEvent so the client cannot tell a replayed
+-- event from a live one.
+value PendingEventEntry {
+    event_type: String
+    sequence_id: Integer
+    -- payload: opaque
 }
 
 -- A user-facing error broadcast as an error event. Carries a flat
@@ -89,6 +141,39 @@ entity StreamMessage {
     stream: SseStream
     message_id: String
     sequence_id: Integer
+}
+
+-- Per-conversation ring buffer of broadcast events between persisted
+-- Messages. Anchored at the sequence_id of the most recent persisted
+-- Message; entries are events with strictly greater seqs that have not
+-- yet been collapsed into a durable DB row.
+--
+-- Created lazily on the conversation's first broadcast (or on the
+-- first persisted Message, whichever comes first). One ring per
+-- conversation; cleared on every persisted Message broadcast
+-- (PersistedMessageClearsReplayRing rule) so the buffer never grows
+-- without bound across multi-turn histories. Bounded by
+-- `replay_ring_capacity`; oldest-first eviction on overflow sets
+-- `truncated` until the next anchor reset.
+--
+-- The ring is NOT a substitute for the DB: durable state lives in
+-- SQLite. The ring is a recovery aid for the narrow window between
+-- one PersistedMessage and the next, where the UI's in-flight view
+-- (streaming tokens, current_tool phase, eager assistant message
+-- before its tool round completes) would otherwise vanish on reconnect.
+entity ReplayRing {
+    conversation_id: String
+    -- The sequence_id of the persisted Message that last reset this
+    -- ring. All entries have sequence_id strictly greater than this.
+    -- Starts at 0 for a freshly-created conversation.
+    anchor_sequence_id: Integer
+    -- Whether the ring overflowed since the last anchor reset. Surfaced
+    -- in InitSnapshot.pending_truncated; cleared on every anchor reset
+    -- (every PersistedMessage broadcast).
+    truncated: Boolean
+    -- The retained entries, in broadcast order. length(entries) is
+    -- bounded by config.replay_ring_capacity.
+    entries: List<PendingEventEntry>
 }
 
 -- An active or closed SSE connection for one conversation.
@@ -138,6 +223,13 @@ config {
     -- Sized for ~80 seconds at 50 tokens/second. Exceeding this
     -- triggers LagCloseStream.
     broadcast_capacity: Integer = 4096
+
+    -- Capacity of the per-conversation ReplayRing. Bounds how many
+    -- ephemeral events between two persisted Messages can be replayed
+    -- on reconnect. At 50 tokens/sec, 512 entries covers ~10 seconds
+    -- of LLM streaming — a typical mid-turn outage window. Overflow
+    -- evicts oldest-first and sets the ring's truncated flag.
+    replay_ring_capacity: Integer = 512
 }
 
 ------------------------------------------------------------
@@ -148,8 +240,19 @@ config {
 -- delivered as the very first event. init_sent is set true at
 -- creation; no other rule may deliver events to a stream with
 -- init_sent = false.
+--
+-- The init snapshot captures both the DB-durable state (messages,
+-- conversation metadata, etc.) AND the current ReplayRing contents
+-- so that a reconnect during an in-flight turn can resume the UI's
+-- mid-stream view rather than blanking out until the next checkpoint.
 rule StreamOpened {
     when: ClientSubscribes(conversation_id, snapshot)
+
+    requires: snapshot.pending_anchor_sequence_id <= snapshot.last_sequence_id
+    requires:
+        for entry in snapshot.pending_events:
+            entry.sequence_id > snapshot.pending_anchor_sequence_id
+            and entry.sequence_id <= snapshot.last_sequence_id
 
     ensures: SseStream.created(
         conversation_id: conversation_id,
@@ -162,11 +265,20 @@ rule StreamOpened {
     @guidance
         -- The init payload is a consistent DB snapshot taken at
         -- subscribe time. It includes all persisted messages with
-        -- sequence_id <= snapshot.last_sequence_id. Because
+        -- sequence_id <= snapshot.pending_anchor_sequence_id. Because
         -- PersistBeforeBroadcast holds, any message that was already
         -- broadcast before this subscribe has sequence_id <=
-        -- last_sequence_id and appears in the snapshot — the client
-        -- receives no gaps.
+        -- pending_anchor_sequence_id and appears in the snapshot — the
+        -- client receives no gaps for durable state.
+        --
+        -- snapshot.pending_events captures the ReplayRing contents at
+        -- subscribe time. Each entry's sequence_id is in
+        -- (pending_anchor_sequence_id, last_sequence_id]. The client
+        -- reducer replays them after applying the DB snapshot,
+        -- re-anchoring streaming buffers / phase / in-flight assistant
+        -- messages that would otherwise be lost. See
+        -- conversation_atom.allium SseInitFreshConnect /
+        -- SseInitReconnectMerge for the replay semantics.
         --
         -- init_sent is set true atomically with last_delivered_seq
         -- at creation, enforcing InitAlwaysFirst by construction:
@@ -220,6 +332,12 @@ rule MessageCommittedToDb {
 -- After a message is persisted, a message event is broadcast to every
 -- open, initialized stream for this conversation. A StreamMessage join
 -- entity is created for each delivery, anchoring PersistBeforeBroadcast.
+--
+-- Persisted message broadcast also anchors the conversation's
+-- ReplayRing: a Message with a backing PersistedMessage is durable
+-- (the next reconnect's init reads it from the DB), so any prior
+-- ephemeral events between the previous anchor and this message are
+-- no longer needed for replay. See PersistedMessageClearsReplayRing.
 rule MessageBroadcast {
     when: msg: PersistedMessage.created
 
@@ -233,14 +351,24 @@ rule MessageBroadcast {
             stream.last_delivered_seq = msg.sequence_id
 
     @guidance
-        -- Implementation: SseBroadcaster.send_message(message) is called
-        -- after db.save_message() returns Ok (src/runtime.rs). The chain
-        -- PersistedMessage.created → MessageBroadcast mirrors this:
-        -- the DB commit is the enabling condition; the broadcast follows.
+        -- Implementation: SseBroadcaster.send_persisted_message(message)
+        -- is called after db.save_message() returns Ok (src/runtime.rs).
+        -- The chain PersistedMessage.created → MessageBroadcast mirrors
+        -- this: the DB commit is the enabling condition; the broadcast
+        -- follows.
         --
         -- The message event's envelope sequence_id equals the message's
         -- own sequence_id: SseWireEvent::Message { sequence_id, message }
         -- where sequence_id = message.sequence_id (see src/api/wire.rs).
+        --
+        -- send_persisted_message is the dual of send_ephemeral_message
+        -- (Q1 in open questions): the former resets the ReplayRing
+        -- anchor; the latter appends to the ring without clearing it.
+        -- Both emit SseWireEvent::Message; the distinction lives only
+        -- in the broadcaster's ring lifecycle. The client cannot
+        -- distinguish them on the wire (SseMessageDedupReplay handles
+        -- the case where the same message_id is later re-broadcast as
+        -- a persisted Message after its checkpoint completes).
 }
 
 -- A message's mutable fields (display_data, content) changed.
@@ -260,6 +388,153 @@ rule MessageUpdatedBroadcast {
         -- snapshot). A client that receives message_updated before
         -- message treats it as a silent no-op
         -- (SseMessageUpdatedUnknownTarget in conversation_atom.allium).
+}
+
+------------------------------------------------------------
+-- Rules — ReplayRing lifecycle
+------------------------------------------------------------
+
+-- Every persisted Message broadcast resets the conversation's
+-- ReplayRing: the anchor advances to the new message's seq, the
+-- entries list clears, the truncated flag clears.
+--
+-- The narrow guarantee this captures: every event the client could
+-- ever need to replay sits in (anchor, current_tip]. Anything at or
+-- below anchor is durable in the DB and reads back via init's
+-- messages.
+rule PersistedMessageClearsReplayRing {
+    when: msg: PersistedMessage.created
+
+    let ring = ReplayRing{conversation_id: msg.conversation_id}
+
+    ensures: ring.anchor_sequence_id = msg.sequence_id
+    ensures: ring.entries = empty_list
+    ensures: ring.truncated = false
+
+    @guidance
+        -- Implementation: SseBroadcaster.send_persisted_message clears
+        -- the ring before publishing. Order matters: clearing first
+        -- ensures that any concurrent subscribe seeing the ring will
+        -- either see the prior state (entries above the old anchor) or
+        -- the cleared state (entries above the new anchor) — never a
+        -- spurious mix in which the new Message's seq is also in
+        -- `entries` (which would double-deliver it through the
+        -- client's pending replay path).
+}
+
+-- Every non-Message broadcast appends to the ring. Includes:
+-- token, state_change, message_updated, agent_done, conversation_update,
+-- conversation_became_terminal, error, browser_session_state,
+-- steer_message_queued. Excludes Init (per-stream, never broadcast)
+-- and ConversationHardDeleted (terminal action; no subsequent init
+-- can fire for this conversation, so replay is moot).
+--
+-- Append happens atomically with broadcast: the entry's seq IS the
+-- envelope seq the live subscribers receive.
+rule EphemeralEventAppendedToReplayRing {
+    when: EphemeralEventBroadcast(conv_id, entry)
+
+    requires: entry.event_type in {
+        "token", "state_change", "message_updated", "agent_done",
+        "conversation_update", "conversation_became_terminal", "error",
+        "browser_session_state", "steer_message_queued"
+    }
+
+    let ring = ReplayRing{conversation_id: conv_id}
+
+    requires: entry.sequence_id > ring.anchor_sequence_id
+
+    -- Append until the cap; on overflow, drop the ring entirely and
+    -- enter "truncated" mode. The next subscribe will see
+    -- pending_events = empty list and pending_truncated = true,
+    -- which forces a full resync on the client side (Q3 resolution).
+    ensures: ring.entries = append_or_clear(ring.entries, entry,
+                                            config.replay_ring_capacity,
+                                            ring.truncated)
+    ensures: ring.truncated = ring.truncated or
+                length(ring.entries) >= config.replay_ring_capacity
+
+    @guidance
+        -- append_or_clear(list, entry, cap, already_truncated):
+        --   if already_truncated:               return list  (no-op)
+        --   if length(list) + 1 < cap:          return list ++ [entry]
+        --   if length(list) + 1 == cap:         return list ++ [entry]
+        --                                       (this entry fills the
+        --                                       ring; subsequent
+        --                                       appends will trip the
+        --                                       overflow branch)
+        --   if length(list) + 1 > cap:          return empty_list
+        --                                       (truncate-and-clear;
+        --                                       ring is now dead until
+        --                                       PersistedMessageClearsReplayRing
+        --                                       resets it)
+        --
+        -- Note that truncate-and-clear is irreversible within a
+        -- single anchor window: once ring.truncated = true, no more
+        -- appends accumulate. The flag clears only via
+        -- PersistedMessageClearsReplayRing.
+        --
+        -- Implementation should also emit a tracing::warn! on the
+        -- truncation transition (one-shot per anchor window) so ops
+        -- can detect pathological cases.
+        --
+        -- Per Q2 resolution: track aggregate serialised bytes of
+        -- ring entries as a metric (debug-level tracing counter on
+        -- every append, gauge for current ring byte size). Bytes
+        -- are observability-only — the cap is enforced by entry
+        -- count, not bytes.
+}
+
+-- Eager (non-persisted) Message broadcast appends to the ring without
+-- resetting the anchor. The accompanying PersistedMessage with the
+-- same message_id (emitted later via the persist_checkpoint path)
+-- will fire PersistedMessageClearsReplayRing and discard this entry.
+--
+-- The narrow purpose: the runtime's Effect::BroadcastAssistantMessage
+-- needs the in-flight assistant content (text + tool_use blocks) to
+-- reach reconnecting clients during a tool round — not just live
+-- subscribers. Without ring residency, the bridge between
+-- "LLM responded" and "tool round checkpoint" is invisible to a client
+-- that disconnects in that window.
+rule EagerAssistantMessageAppendedToReplayRing {
+    when: EagerAssistantMessageBroadcast(conv_id, entry)
+
+    requires: entry.event_type = "message"
+    requires: not exists PersistedMessage{message_id: entry.payload.message_id, conversation_id: conv_id}
+
+    let ring = ReplayRing{conversation_id: conv_id}
+
+    requires: entry.sequence_id > ring.anchor_sequence_id
+
+    -- Same overflow semantics as EphemeralEventAppendedToReplayRing:
+    -- if the append would exceed the cap, clear the ring and set
+    -- truncated; if already truncated, the append is a no-op.
+    ensures: ring.entries = append_or_clear(ring.entries, entry,
+                                            config.replay_ring_capacity,
+                                            ring.truncated)
+    ensures: ring.truncated = ring.truncated or
+                length(ring.entries) >= config.replay_ring_capacity
+
+    @guidance
+        -- Implementation: SseBroadcaster.send_ephemeral_message,
+        -- called from Effect::BroadcastAssistantMessage in
+        -- src/runtime/executor.rs after the LLM response lands but
+        -- before tool execution begins. The DB write is deferred to
+        -- Effect::PersistCheckpoint (atomic with the round's
+        -- tool_results), which goes through send_persisted_message.
+        --
+        -- The client's SseMessageDedupReplay rule
+        -- (conversation_atom.allium) is what handles the eventual
+        -- duplicate: the eager Message and the persisted Message
+        -- carry the same message_id, so the second arrival is a no-op
+        -- on `messages` (still advances lastSequenceId).
+
+    -- Open Q1 in the questions section: an alternative shape would
+    -- give the wire two variants (message_ephemeral, message). Today
+    -- we share SseWireEvent::Message and distinguish only at the
+    -- broadcaster API. If a future feature needs a client-visible
+    -- distinction (e.g. "do not show this as a permanent message in
+    -- the share view"), promote to two variants.
 }
 
 ------------------------------------------------------------
@@ -414,3 +689,127 @@ invariant SequencesNonNegative {
     for stream in SseStreams:
         stream.last_delivered_seq >= 0
 }
+
+-- ReplayRing size is bounded by the configured capacity. Append paths
+-- evict oldest-first when length would exceed the cap, so this invariant
+-- is enforced structurally by append_bounded (see
+-- EphemeralEventAppendedToReplayRing / EagerAssistantMessageAppendedToReplayRing).
+invariant ReplayRingBounded {
+    for ring in ReplayRings:
+        length(ring.entries) <= config.replay_ring_capacity
+}
+
+-- Every entry in a ring has a sequence_id strictly greater than the
+-- ring's anchor. PersistedMessageClearsReplayRing resets the anchor
+-- and empties entries simultaneously; append paths require the new
+-- entry's seq > anchor by precondition. A violation would mean an
+-- entry survived a checkpoint that should have evicted it — a replay
+-- of pending events on init could then re-deliver a Message the
+-- client already has in `messages` from the DB read.
+invariant ReplayRingEntriesAboveAnchor {
+    for ring in ReplayRings:
+        for entry in ring.entries:
+            entry.sequence_id > ring.anchor_sequence_id
+}
+
+-- The init snapshot's pending_anchor matches the conversation's ring
+-- anchor at the moment the snapshot was taken. Pending entries are
+-- mirrored as well, but list-content equivalence is not expressible
+-- in this dialect — it is guarded structurally by the snapshot
+-- constructor reading ring.entries directly (see StreamOpened's
+-- `requires:` clauses for the per-entry sequence_id bounds).
+invariant InitSnapshotMirrorsRing {
+    for stream in SseStreams:
+        for ring in ReplayRings:
+            ring.conversation_id = stream.conversation_id
+                implies stream.init_snapshot.pending_anchor_sequence_id = ring.anchor_sequence_id
+}
+
+-- Ring entries are in strictly increasing sequence_id order. Not
+-- expressible as a structural invariant in this dialect (no list
+-- indexing primitive). Guarded by construction:
+--   - SseBroadcaster.next_seq allocates via fetch_add(1), so
+--     successive entries have strictly increasing seqs.
+--   - append_bounded appends at the tail; eviction (oldest-first)
+--     drops only the head.
+--   - PersistedMessageClearsReplayRing resets `entries = empty_list`
+--     atomically with the anchor advance, so no out-of-order entry
+--     can survive an anchor reset.
+-- A future change that violates any of those three would need a
+-- corresponding behavioural test (see test_replay_ring_order in
+-- src/runtime.rs once the implementation lands).
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+-- Kept as prose rather than `open question` declarations so the file
+-- remains parseable. These are design-intent clarifications discovered
+-- during the ReplayRing extension; each either needs explicit
+-- confirmation before the implementation lands or is a deferred
+-- follow-up the next reader should be aware of.
+--
+-- Q1. Wire shape: shared `message` event vs split
+--     `message_ephemeral` / `message`. Today the eager assistant
+--     broadcast and the persisted Message both emit
+--     SseWireEvent::Message. The distinction lives only in the
+--     broadcaster's ring lifecycle (send_ephemeral_message appends,
+--     send_persisted_message anchors + appends through MessageBroadcast).
+--     Pro shared: smaller wire surface; client cannot accidentally
+--       branch on "is this real?" — the persisted vs ephemeral
+--       distinction is a server-side hygiene concern.
+--     Pro split: lets future UI features render eager Messages
+--       distinctly (e.g., a faint "in-flight" treatment, or omitting
+--       them from a Share view). Today no consumer needs this.
+--     Decision: stay with shared. Promote to split only if a
+--     concrete consumer needs it.
+--
+-- Q2. ReplayRing capacity unit: event count vs bytes. Today: count
+--     (512 entries). Tokens dominate the entry count during LLM
+--     streaming; each is small (~tens of bytes serialised). A pure
+--     count cap exposes us to pathological cases where a tool result
+--     with a large payload counts the same as one token. If that
+--     ever becomes a real failure mode, switch to a hybrid
+--     (max_entries OR max_bytes, whichever hits first). Today: count.
+--
+--     RESOLVED 2026-05-10: cap by count; ALSO track aggregate
+--     serialised bytes as an observability metric so we can detect
+--     the pathological case (large-event-dominated rings) before it
+--     causes a memory issue. Surface via the existing tracing
+--     subscriber as a debug counter on every append, and as a gauge
+--     readable by an ops-side dashboard if one is later added. No
+--     enforcement on bytes today; metric-only.
+--
+-- Q3. RESOLVED 2026-05-10: on ring overflow, force a full resync —
+--     do not deliver partial pending_events. Once the ring exceeds
+--     `replay_ring_capacity` between two persisted Message anchors,
+--     the ring transitions to a "truncated" state where:
+--       (a) further appends are no-ops (ring entries do not grow),
+--       (b) ring.entries is cleared,
+--       (c) ring.truncated is set true.
+--     The init snapshot then carries pending_events = empty list and
+--     pending_truncated = true. The client renders the DB snapshot
+--     and waits for the next persisted Message (or state_change /
+--     other live events) to repopulate the UI.
+--
+--     Rationale: partial replay was deemed misleading — the user
+--     would see an incomplete in-progress view that "fills in" later
+--     in a way that's hard to distinguish from a bug. Full resync is
+--     a clean, consistent fallback: the only thing the user
+--     temporarily loses is the in-flight streaming preview, and the
+--     next Message broadcast restores authoritative state.
+--
+-- Q4. Per-event vs per-byte cap. See Q2. Bytes would also handle
+--     pathological event sizes; punted to a follow-up.
+--
+-- Q5. RESOLVED 2026-05-10: accept as-is. The ring is in-process
+--     memory only; a server restart loses it. On restart the next
+--     subscribe gets an empty pending_events and the client falls
+--     back to DB-only reconstruction. This is correct by
+--     construction: the underlying LLM stream itself did not survive
+--     the restart (the in-flight call is lost), so a recovered ring
+--     would replay events for a turn that is restarting from
+--     scratch anyway. The state machine's existing recovery path
+--     (ConvState persisted, retry LlmRequesting) handles the rest.
+--     A future "graceful restart" feature that preserves in-flight
+--     LLM turns across restarts would need to revisit this — flagged
+--     for that hypothetical work.

@@ -13,6 +13,10 @@
 --           (append + clear buffer + advance seq); streaming buffer
 --           phase coupling; wire vs local dispatch distinction;
 --           init merge-by-id semantics for reconnect resync;
+--           init pending-events replay (server's ReplayRing contents
+--           applied through the reducer rules after the snapshot lands,
+--           so reconnect during an in-flight turn resumes streaming /
+--           in-flight tool state rather than blanking out);
 --           connection-epoch monotonic guard (wire-side cross-conv
 --           contamination); expectedConversationId guard on
 --           client-originated actions (post-navigation stale-dispatch
@@ -168,36 +172,100 @@ rule WireActionStaleEpochDropped {
         -- expectedConversationId instead).
 }
 
--- `init` on fresh connect: full state snapshot replaces atom.
+-- `init` on fresh connect: full state snapshot replaces atom, then
+-- pending events from the server's ReplayRing are applied through
+-- their normal per-event reducer rules in seq order. After the
+-- pending replay completes, lastSequenceId is finalised to the max
+-- of whatever the replay reached and payload.last_sequence_id.
+--
+-- The two-phase structure (snapshot then replay) is what lets a
+-- reconnect mid-LLM-turn or mid-tool-execution resume the in-flight
+-- view: snapshot supplies durable state (DB-backed messages, phase
+-- as of last persisted Message), pending replay supplies the
+-- transit-only deltas (streaming tokens, current_tool state_change,
+-- eager assistant Message).
 rule SseInitFreshConnect {
     when: SseInitDispatched(atom, payload)
 
     requires: atom.lastSequenceId = 0
 
+    -- Phase 1: snapshot. Note lastSequenceId is set to
+    -- payload.pending_anchor_sequence_id (NOT payload.last_sequence_id)
+    -- so the per-event rules below can apply each pending entry via
+    -- their normal applyIfNewer guard.
     ensures: atom.messages = payload.messages
     ensures: atom.phase = payload.phase
     ensures: atom.breadcrumbs = payload.breadcrumbs
-    ensures: atom.lastSequenceId = payload.last_sequence_id
+    ensures: atom.lastSequenceId = payload.pending_anchor_sequence_id
     ensures: atom.streamingBuffer = null
     ensures: atom.uiError = null
+
+    -- Phase 2: apply pending events. For each entry in
+    -- payload.pending_events (in seq order), dispatch through the
+    -- corresponding per-event rule below. The applyIfNewer guard
+    -- naturally advances atom.lastSequenceId entry-by-entry.
+    ensures: atom = apply_pending_in_order(atom, payload.pending_events)
+
+    -- Phase 3: safety belt. If the replay didn't cover everything
+    -- the server believes happened (e.g., ring truncated, or pending
+    -- list empty because server has no ring contents to replay),
+    -- advance lastSequenceId to the server's witnessed tip so future
+    -- live events with lower seqs are correctly dropped.
+    ensures: atom.lastSequenceId = max_int(atom.lastSequenceId, payload.last_sequence_id)
+
+    @guidance
+        -- apply_pending_in_order: fold over payload.pending_events,
+        -- dispatching each through the reducer:
+        --   for entry in payload.pending_events:
+        --     dispatch({ type: entry.event_type, ...entry.payload,
+        --                sequenceId: entry.sequence_id })
+        -- Each dispatch routes through this spec's per-event rule
+        -- (SseTokenAccumulated, SseStateChangeApplied,
+        -- SseMessageAppended / SseMessageDedupReplay, etc.) which
+        -- already gates on applyIfNewer. Replayed entries with seq
+        -- <= atom.lastSequenceId are dropped as replays (the floor
+        -- starts at pending_anchor_sequence_id and rises as each
+        -- accepted entry advances it).
+        --
+        -- The phase 1 lastSequenceId = pending_anchor_sequence_id
+        -- is the key change from the prior version of this rule:
+        -- previously it was payload.last_sequence_id, which would
+        -- cause every pending entry to be dropped as a replay.
 }
 
--- `init` on reconnect: merge by message_id. Replace existing messages
--- with incoming (captures mutations that happened while disconnected);
--- append genuinely new messages. `lastSequenceId` advances to the
--- max of its current value and the payload's — never regresses, even
--- if the payload was produced before a live event that raced ahead.
+-- `init` on reconnect: merge by message_id, then apply pending
+-- events the same way SseInitFreshConnect does. The merge captures
+-- mutations that happened while disconnected; pending replay restores
+-- the in-flight UI state for the active turn (if any).
+--
+-- Unlike fresh-connect, the atom's pre-existing lastSequenceId may
+-- already be above the snapshot's pending_anchor. In that case the
+-- per-event rules' applyIfNewer guard drops any pending entry whose
+-- seq is below the current floor — exactly correct, because the atom
+-- has already observed those events live.
 rule SseInitReconnectMerge {
     when: SseInitDispatched(atom, payload)
 
     requires: atom.lastSequenceId > 0
 
+    -- Phase 1: snapshot merge. Note we do NOT reset lastSequenceId
+    -- yet — keep the atom's current floor so pending entries the
+    -- atom has already seen live are dropped as replays.
     ensures: atom.messages = merge_by_id(atom.messages, payload.messages)
     ensures: atom.phase = payload.phase
     ensures: atom.breadcrumbs = payload.breadcrumbs
-    ensures: atom.lastSequenceId = max_int(atom.lastSequenceId, payload.last_sequence_id)
     ensures: atom.streamingBuffer = null
     ensures: atom.uiError = null
+
+    -- Phase 2: apply pending events. Per-event applyIfNewer naturally
+    -- filters entries with seq <= atom.lastSequenceId. Each accepted
+    -- entry advances the floor.
+    ensures: atom = apply_pending_in_order(atom, payload.pending_events)
+
+    -- Phase 3: safety belt — never regress lastSequenceId, but also
+    -- never let it stay below the server's witnessed tip if the
+    -- replay couldn't bring it there.
+    ensures: atom.lastSequenceId = max_int(atom.lastSequenceId, payload.last_sequence_id)
 
     @guidance
         -- merge_by_id (ui/src/conversation/atom.ts:sse_init case):
@@ -209,6 +277,20 @@ rule SseInitReconnectMerge {
         --   4. Concatenate (replaced ++ appended).
         -- The merge is what lets a reconnect after a broadcast-lag close
         -- resurrect messages that were lost to the silent-drop window.
+        --
+        -- payload.pending_events: the ReplayRing contents at subscribe
+        -- time. Carries events the server emitted since the last
+        -- persisted Message. Replaying them through the reducer
+        -- restores streaming buffers, in-flight phase, and any eager
+        -- (non-persisted) assistant Message — the mid-turn UI state
+        -- that would otherwise vanish until the next checkpoint.
+        --
+        -- payload.pending_truncated indicates the server-side ring
+        -- overflowed since the last anchor. The reducer treats this
+        -- as a soft hint: the snapshot + remaining pending events
+        -- still produce a valid (if partial) view. Surfacing the
+        -- truncation to the user via the UI is a conversation-ui
+        -- decision, not a reducer concern.
 }
 
 -- `message` — a newly-persisted message appended to the conversation.
@@ -678,3 +760,25 @@ invariant ConnectionEpochNonNegative {
 --     what happened; the envelope last_sequence_id is the server's
 --     witness. Today this is fine; flag if the dedup behavior ever
 --     changes.
+--
+-- Q3. apply_pending_in_order is described as a fold over per-event
+--     reducer dispatches. The semantics depend on whether dispatch
+--     observes atom mutations in real time (it does in the real
+--     reducer — each dispatch produces the next atom state, which
+--     the next dispatch sees). The spec rule's `ensures: atom =
+--     apply_pending_in_order(...)` is meant to denote that
+--     sequential-fold behaviour. If a future implementation tried to
+--     batch pending dispatches into a single atomic mutation (e.g.,
+--     to avoid React re-renders per token), the per-event preconditions
+--     (applyIfNewer comparing to atom.lastSequenceId) would still need
+--     to see entry-by-entry floor advancement. Worth re-checking the
+--     implementation matches this denotation.
+--
+-- Q4. Token replay and streamingBuffer reconstruction. After a
+--     reconnect, snapshot phase 1 sets streamingBuffer = null, then
+--     phase 2's pending replay re-accumulates tokens. If the client
+--     had already seen tokens 1..N before disconnect, replay re-emits
+--     them, producing exactly the same buffer text. Idempotent in
+--     terms of final state, but the user briefly sees the buffer
+--     re-build from empty. Acceptable today; revisit if the visible
+--     reset becomes confusing in practice.
