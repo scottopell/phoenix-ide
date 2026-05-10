@@ -479,6 +479,13 @@ fn handle_core_llm_response(
     let remaining_count = rest.len();
     let display_data = compute_bash_display_data(&content, &context.working_dir);
     let assistant_message = AssistantMessage::new(content, Some(usage_data), display_data);
+    // Broadcast (not persist) the assistant message now so the UI's main
+    // message list renders the in-flight `tool_use` blocks during execution.
+    // Atomic DB persistence still happens later via `PersistCheckpoint`; the
+    // UI dedups the duplicate `sse_message` by `message_id`.
+    let broadcast_effect = Effect::BroadcastAssistantMessage {
+        message: assistant_message.clone(),
+    };
 
     Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
         current_tool: first.clone(),
@@ -488,6 +495,7 @@ fn handle_core_llm_response(
         assistant_message,
     })
     .with_effect(Effect::PersistState)
+    .with_effect(broadcast_effect)
     .with_effect(notify_tool_executing(
         first.name(),
         &first.id,

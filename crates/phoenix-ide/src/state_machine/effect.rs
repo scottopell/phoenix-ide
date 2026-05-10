@@ -99,6 +99,15 @@ pub enum Effect {
     /// Execute a tool (spawns as background task)
     ExecuteTool { tool: ToolCall },
 
+    /// Eagerly broadcast the assistant message to SSE clients before tools run,
+    /// so the UI can render the in-flight `tool_use` blocks during execution.
+    /// Pairs with the later `PersistCheckpoint` that performs the DB write —
+    /// the UI dedups the duplicate `sse_message` by `message_id`.
+    /// Broadcast-only on purpose: persisting eagerly would create half-written
+    /// history (`tool_use` without `tool_result`) that the LLM history builder
+    /// and crash recovery do not expect.
+    BroadcastAssistantMessage { message: AssistantMessage },
+
     /// Abort the currently running tool
     AbortTool { tool_use_id: String },
 

@@ -1191,6 +1191,34 @@ where
 
             Effect::PersistCheckpoint { data } => self.persist_checkpoint(data).await,
 
+            Effect::BroadcastAssistantMessage { message } => {
+                // Broadcast-only: no DB write here. The atomic
+                // `PersistCheckpoint` at the end of the tool round performs
+                // the durable write (and emits a duplicate `sse_message`
+                // that the UI dedups by `message_id`).
+                //
+                // Reconnect mid-tool-exec falls back to the
+                // pre-eager-broadcast behaviour (the message is missing
+                // from the init payload until the checkpoint fires) —
+                // acceptable because the breadcrumb + `tool_executing`
+                // state still signal that work is in flight. The
+                // forthcoming SSE ReplayRing closes that reconnect gap.
+                let seq = self.broadcast_tx.next_seq();
+                let agent_content = MessageContent::agent(message.content);
+                let db_msg = crate::db::Message {
+                    message_id: message.message_id,
+                    conversation_id: self.context.conversation_id.clone(),
+                    sequence_id: seq,
+                    message_type: agent_content.message_type(),
+                    content: agent_content,
+                    display_data: message.display_data,
+                    usage_data: message.usage,
+                    created_at: chrono::Utc::now(),
+                };
+                let _ = self.broadcast_tx.send_message(db_msg);
+                Ok(None)
+            }
+
             Effect::PersistToolResults { results } => {
                 for result in results {
                     let content = MessageContent::tool(
