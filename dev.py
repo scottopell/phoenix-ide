@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -1962,6 +1963,132 @@ def cmd_tasks_validate(quiet: bool = False) -> bool:
     return True
 
 
+# REQ-* anchor regex. Matches `REQ-{PREFIX}-{NUM}` where PREFIX is one
+# or more uppercase-letter/digit/hyphen segments (e.g. REQ-BED-001,
+# REQ-TASKS-UI-007, REQ-CONV-018). Word-boundary on each side so
+# substring matches in URLs / filenames don't trigger.
+_REQ_ANCHOR_RE = re.compile(r'\bREQ-[A-Z][A-Z0-9-]*-\d+\b')
+
+# Code file extensions to scan for REQ-* anchors. The walk explicitly
+# skips node_modules / target / generated / build artefact directories
+# so the report stays signal-rich.
+_CODE_EXTENSIONS = {".rs", ".tsx", ".ts", ".css", ".html", ".js", ".py"}
+_CODE_SKIP_DIRS = {
+    "node_modules", "target", ".git", "dist", "build", ".vite",
+    "generated", "ui/src/generated",
+}
+
+
+def _scan_for_req_anchors(root: Path, *, extensions: set[str], skip_dirs: set[str]):
+    """Walk `root` and return a dict { req_id: [(path, line, snippet), ...] }."""
+    from collections import defaultdict
+    found: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
+    for path in root.rglob("*"):
+        # Cheap skip check on any path component matching skip_dirs.
+        if any(part in skip_dirs for part in path.parts):
+            continue
+        if not path.is_file():
+            continue
+        if path.suffix not in extensions:
+            continue
+        try:
+            text = path.read_text()
+        except (UnicodeDecodeError, PermissionError):
+            continue
+        for line_num, line in enumerate(text.splitlines(), 1):
+            for m in _REQ_ANCHOR_RE.finditer(line):
+                rel = str(path.relative_to(ROOT))
+                snippet = line.strip()
+                if len(snippet) > 100:
+                    snippet = snippet[:97] + "..."
+                found[m.group()].append((rel, line_num, snippet))
+    return found
+
+
+def cmd_audit_specs(verbose: bool = False) -> bool:
+    """Cross-validate REQ-* anchors between specs/ and source code.
+
+    Reports:
+      - Orphan code anchors: REQ-* IDs referenced in source but not
+        declared in any specs/ file. These are typos, renames, or
+        deletions where the code anchor wasn't updated. ALWAYS a bug.
+      - Optional (verbose): unanchored REQ-IDs declared in specs/ that
+        have no source-code reference. High-noise signal — many specs
+        legitimately have REQs without explicit anchors — but useful
+        for spotting "✅ Complete" claims without code coverage.
+
+    Returns True if no orphan anchors found.
+    """
+    print("Scanning specs/ and code for REQ-* references...")
+
+    spec_decls = _scan_for_req_anchors(
+        ROOT / "specs",
+        extensions={".md", ".allium"},
+        skip_dirs=_CODE_SKIP_DIRS,
+    )
+    code_anchors = {}
+    for code_root_rel in ("crates", "ui/src"):
+        code_root = ROOT / code_root_rel
+        if not code_root.is_dir():
+            continue
+        chunk = _scan_for_req_anchors(
+            code_root,
+            extensions=_CODE_EXTENSIONS,
+            skip_dirs=_CODE_SKIP_DIRS,
+        )
+        # Merge into code_anchors
+        for req, locs in chunk.items():
+            code_anchors.setdefault(req, []).extend(locs)
+
+    declared = set(spec_decls.keys())
+    anchored = set(code_anchors.keys())
+
+    print()
+    print(f"  declared in specs/: {len(declared)} unique REQ-IDs")
+    print(f"  referenced in code: {len(anchored)} unique REQ-IDs")
+    print()
+
+    orphan_anchors = sorted(anchored - declared)
+    unanchored_reqs = sorted(declared - anchored)
+
+    ok = True
+
+    if orphan_anchors:
+        ok = False
+        print(f"✗ Orphan code anchors ({len(orphan_anchors)} REQ-IDs referenced in code "
+              f"but not declared in any spec):")
+        print()
+        for req in orphan_anchors:
+            locs = code_anchors[req]
+            print(f"  {req}  ({len(locs)} occurrence{'s' if len(locs) != 1 else ''})")
+            for path, line, snippet in locs[:3]:
+                print(f"    {path}:{line}  {snippet}")
+            if len(locs) > 3:
+                print(f"    ... and {len(locs) - 3} more")
+        print()
+    else:
+        print("✓ All code REQ-* anchors resolve to a spec declaration")
+        print()
+
+    if verbose:
+        if unanchored_reqs:
+            print(f"ℹ Unanchored REQ-IDs ({len(unanchored_reqs)} declared in specs/ "
+                  f"with no source-code reference):")
+            print()
+            print("  (Note: many REQs legitimately have no source-code anchor — design "
+                  "intent, behavioural invariants, future targets. Filter for ✅-status "
+                  "REQs to find real drift.)")
+            print()
+            for req in unanchored_reqs:
+                locs = spec_decls[req]
+                primary = locs[0]
+                print(f"  {req}  →  {primary[0]}:{primary[1]}")
+            print()
+
+    return ok
+
+
+
 def cmd_tasks_fix() -> bool:
     """Auto-fix task files using taskmd: inject missing 'created' and rename to match frontmatter.
 
@@ -3428,6 +3555,16 @@ def main():
     # check
     sub.add_parser("check", help="Run lint, fmt check, and tests")
 
+    # audit-specs
+    audit_parser = sub.add_parser(
+        "audit-specs",
+        help="Cross-validate REQ-* anchors between specs/ and source code (prototype)",
+    )
+    audit_parser.add_argument(
+        "--verbose", "-v", action="store_true", default=False,
+        help="Also list REQ-IDs declared in specs/ without a source-code anchor",
+    )
+
     # codegen
     sub.add_parser("codegen", help="Regenerate ui/src/generated/ from Rust types (task 02677)")
 
@@ -3541,6 +3678,9 @@ def main():
         elif args.tasks_command == "fix":
             if not cmd_tasks_fix():
                 sys.exit(1)
+    elif args.command == "audit-specs":
+        if not cmd_audit_specs(verbose=args.verbose):
+            sys.exit(1)
 
 
 if __name__ == "__main__":
