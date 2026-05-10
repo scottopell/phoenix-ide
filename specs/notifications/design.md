@@ -1,91 +1,226 @@
-# Notifications -- Design
+# Notifications — Design
 
-## Design Goals
+This document describes the technical architecture for both
+notification channels, implementing
+`specs/notifications/requirements.md`.
 
-Notifications are a frontend-heavy feature. The SSE stream already
-delivers all state transitions; the notification system listens to
-that stream and decides when to fire a browser notification. The only
-backend component is settings persistence.
+## Two Channels, One Routing Rule
 
-### Event Detection (REQ-NOTIF-001, REQ-NOTIF-007)
+```
+                                    ┌─ user-initiated action ─┐
+                                    │  ("Send in Background", │
+                                    │  MCP toggle, "Response  │
+                                    │  sent", etc.)           │
+                                    └────────────┬────────────┘
+                                                 │
+                                                 ▼
+                                       ┌─────────────────┐
+                                       │  useToast hook  │
+                                       │  show*() calls  │
+                                       └────────┬────────┘
+                                                │
+                                                ▼ always renders
+                                       ┌─────────────────┐
+                                       │  <Toast />      │  in-app
+                                       │  container      │  channel ✅
+                                       └─────────────────┘
 
-The frontend SSE handler already processes `state_change` events.
-The notification system hooks into this same handler and checks:
-1. Is the new state a notification-worthy event?
-2. Is that event type enabled in settings?
-3. Is the tab currently focused? (if focused, skip)
-4. Fire `new Notification(...)` with title, body, and click handler.
+  ┌─ SSE state_change events ─┐
+  │  awaiting_task_approval   │
+  │  awaiting_user_response   │
+  │  error / context_exhausted│
+  │  busy → idle              │       (REQ-NOTIF-005 gate)
+  └─────────────┬─────────────┘            tab focused
+                │                              and on this convo?
+                ▼                                  │
+      ┌──────────────────┐                  ┌─────┴─────┐
+      │ event classifier │                  │  YES → suppress
+      │  + per-event     │─────routing──→   │  NO  → fire
+      │  toggle check    │                  └─────┬─────┘
+      └──────────────────┘                        │
+                                                  ▼
+                                         ┌─────────────────┐
+                                         │ new Notification│  desktop
+                                         │ (title, body,   │  channel ❌
+                                         │  click handler) │  (spec target)
+                                         └─────────────────┘
+```
 
-State-to-event mapping:
-- `awaiting_task_approval` -> "Task approval needed"
-- `awaiting_user_response` -> "Question asked"
-- `error` | `context_exhausted` -> "Agent error"
-- `idle` (when previous state was busy) -> "Agent finished"
+The two channels are deliberately disjoint by trigger source — toasts
+for user-initiated actions, desktop notifications for state-machine
+events that need attention. The routing rule is "what triggered this?"
+not "what does the user prefer?" — a user with desktop notifications
+disabled still gets toast confirmations on their own actions.
 
-The "previous state was busy" check prevents spurious "finished"
-notifications on page load when conversations are already idle.
+## Channel 1: In-App Toasts (REQ-NOTIF-001, REQ-NOTIF-002)
 
-### Settings Storage (REQ-NOTIF-003, REQ-NOTIF-004)
+### Components
 
-Server-side settings table:
+- `ui/src/components/Toast.tsx` — render layer. `Toast` (container,
+  maps `messages` to `ToastItem`s) + `ToastItem` (single toast with
+  auto-dismiss, click-to-dismiss, leave animation).
+- `ui/src/hooks/useToast.tsx` — hook providing `toasts`,
+  `showToast(type, message, duration?)`, `showInfo` / `showWarning` /
+  `showError` / `showSuccess` convenience wrappers, and `dismissToast`.
+
+### Toast lifecycle
+
+```
+showToast(type, message, duration=4000)
+  → adds {id, type, message, duration} to setToasts
+  → ToastItem effects schedule setTimeout(duration)
+  → on timeout: setIsLeaving(true), setTimeout(200) → onDismiss(id)
+  → onDismiss removes the entry from the toast array
+
+(or)
+  → user clicks toast
+  → handleDismiss(): setIsLeaving(true), setTimeout(200) → onDismiss(id)
+```
+
+`duration: 0` (rather than the default 4000ms) keeps the toast
+indefinite until clicked — useful for errors that the user must
+acknowledge. The hook accepts an optional `duration` parameter on
+every `show*` method.
+
+### Where toasts originate
+
+The hook is consumed at multiple layers; each conversation page or
+panel that triggers a user-visible action holds a `useToast()`
+instance and passes `showToast` down to children that need it.
+
+Today's call sites (verified by grep `showInfo|showWarning|showError|showSuccess|showToast` in `ui/src/`):
+
+- `DesktopLayout.tsx:36,92` — "Send in Background" success
+- `McpStatusPanel.tsx:77,81,107,109` — MCP server reload + toggle outcomes
+- `QuestionPanel.tsx:242,273,467` — "Response sent" / "Declined to answer" / per-question feedback
+- `ConversationListPage.tsx:53` — list-page actions (warning/error)
+- `FileExplorerPanel.tsx` — passes through to McpStatusPanel
+
+The container is mounted once per page (`DesktopLayout.tsx:111` for
+the desktop layout; `ConversationListPage` mounts its own).
+
+### What toasts do NOT do
+
+- They do not survive across page reloads (in-memory React state).
+- They do not show for events the user didn't trigger themselves
+  (those are the desktop-notification channel's job).
+- They do not stack indefinitely — a flood of error toasts is its
+  own UX problem, but the spec doesn't cap them. The implementation
+  could add a max-visible cap as a future hardening.
+
+## Channel 2: Browser Desktop Notifications (REQ-NOTIF-003 → 009, all ❌)
+
+### Trigger flow
+
+The frontend SSE handler already processes `state_change` events for
+conversation atom updates. The notification system would hook the
+same handler:
+
+1. **Classify the new state.** State-to-event mapping:
+   - `awaiting_task_approval` → "Task approval needed"
+   - `awaiting_user_response` → "Question asked"
+   - `error | context_exhausted` → "Agent error"
+   - `idle` (when previous state was busy long enough) → "Agent finished"
+2. **Per-event toggle check** (REQ-NOTIF-006). If the event type is
+   disabled, drop the trigger.
+3. **Tab-focus gate** (REQ-NOTIF-005). If the tab is focused AND the
+   conversation is the active route, suppress.
+4. **Permission check.** If `Notification.permission !== 'granted'`,
+   drop. (The settings UI surfaces the permission state separately so
+   the user understands why nothing fires.)
+5. **Fire** `new Notification(title, { body, tag: conversationId,
+   onclick: () => focusAndNavigate(slug) })`.
+
+The "previous state was busy" check on idle prevents spurious
+"finished" notifications on page load when conversations were already
+idle.
+
+### Settings storage (REQ-NOTIF-006, REQ-NOTIF-009)
+
+Server-side `notification_settings` table (single-row or kv):
+
 ```
 notification_settings (
-  key TEXT PRIMARY KEY,
+  key   TEXT PRIMARY KEY,
   value TEXT NOT NULL
 )
 ```
 
-Simple key-value pairs:
-- `notifications_enabled`: "true" | "false"
-- `notify_task_approval`: "true" | "false"
-- `notify_question`: "true" | "false"
-- `notify_error`: "true" | "false"
-- `notify_idle`: "true" | "false"
+Keys: `notifications_enabled`, `notify_task_approval`,
+`notify_question`, `notify_error`, `notify_idle`. Boolean values
+serialised as `"true"` / `"false"`.
 
-API: `GET /api/settings/notifications`, `PUT /api/settings/notifications`
+API: `GET /api/settings/notifications` returns the current map; `PUT
+/api/settings/notifications` replaces it. The frontend caches the
+response in the conversation atom (or app-level state) and refreshes
+on settings-page mount.
 
-### Tab Lifecycle and Catch-Up (REQ-NOTIF-001, REQ-NOTIF-007)
+### Tab lifecycle and catch-up (REQ-NOTIF-008)
 
-Browser tabs in the background degrade over time:
-- **First ~5 minutes:** SSE connection alive, JS timers throttled to
-  ~1/sec. Notifications fire normally.
-- **After ~5 minutes:** Chrome may suspend the tab. JS stops executing.
-  The SSE connection may survive as a TCP keep-alive but events are
-  not processed.
-- **Extended background / memory pressure:** Browser may discard the
-  tab entirely. SSE connection dies.
+Background tabs degrade over time:
 
-The notification system handles this gracefully:
+- **First ~5 minutes:** SSE alive, JS timers throttled to ~1/sec. Notifications fire normally.
+- **After ~5 minutes:** Chrome may suspend the tab. The SSE TCP keep-alive may survive but JS does not process events.
+- **Extended background:** the tab may be discarded; SSE dies.
 
-1. **SSE reconnection already exists.** When the tab wakes up or the
-   user returns, the SSE reconnects and receives the current state.
-2. **Catch-up on reconnect:** When SSE reconnects (init event), the
-   frontend checks each conversation's current state against the
-   notification-worthy states. If any conversation is in a state that
-   needs attention (awaiting_task_approval, awaiting_user_response,
-   error, context_exhausted), fire a notification immediately --
-   even though the state_change event was missed.
-3. **No spurious "agent finished" on catch-up.** The idle state is
-   only notification-worthy on live transition (from busy to idle).
-   On reconnect, idle conversations are not notification-worthy
-   because the user may have already seen them.
+The notification system handles this via the catch-up rule
+(REQ-NOTIF-008): on SSE reconnect, scan the conversation list for any
+non-sub-agent in a notification-worthy state and emit notifications
+per the same gating rules. If the agent asked a question while the tab
+was suspended, the question's notification fires when the tab wakes up
+and the SSE reconnects. Not as instant as a service-worker push, but
+functionally correct.
 
-This means: if an agent asks a question while you're away for 30
-minutes, the notification fires when you return to the browser (tab
-wakes up, SSE reconnects, catch-up detects awaiting_user_response).
-Not as instant as a service worker push, but functionally correct.
+A service-worker push channel could be added later if instant
+notifications during long-background sessions become a requirement.
+The spec leaves it as a non-goal for v1.
 
-A service worker implementation can be added later if instant push
-for long-background sessions becomes a requirement.
+### Click-to-navigate (REQ-NOTIF-007)
 
-### Browser Permission (REQ-NOTIF-002)
+The `Notification` constructor's `onclick` handler:
 
-The `Notification.permission` API has three states: "default" (not asked),
-"granted", "denied". The settings UI shows the current state and offers
-a button to request permission when "default". When "denied", it shows
-guidance to change it in browser settings (cannot re-prompt programmatically).
+```ts
+notification.onclick = () => {
+  window.focus();
+  navigate(`/c/${slug}`);
+};
+```
 
-### Behavioral Specification
+`window.focus()` requests focus from the OS; modern browsers honor it
+when the click came from a notification (user-gesture proxy). The
+React Router `navigate` runs inside the still-alive React tree because
+the tab was active when the notification was created.
 
-The complete behavioral contract is defined in
-`specs/notifications/notifications.allium`.
+### Browser permission (REQ-NOTIF-003)
+
+`Notification.permission` is `'default'`, `'granted'`, or `'denied'`.
+The settings UI surfaces the current state and a "Request permission"
+button when `'default'`. When `'denied'`, no programmatic re-prompt is
+possible — the UI shows guidance to change it in browser settings.
+
+The first attempt to fire a notification when the permission is still
+`'default'` should call `Notification.requestPermission()` rather than
+silently dropping. The user has notifications enabled in Phoenix
+settings; the browser-level prompt is the next gate.
+
+## Why Two Channels, Not One
+
+A naïve design might use only one mechanism (e.g. always show in-app
+toasts, never desktop notifications). That would miss the canonical
+"Phoenix is in another tab and the agent is blocked" case the
+desktop-notification channel exists to serve.
+
+The opposite naïve design (always desktop notifications, never
+toasts) would interrupt the user with an OS-level popup every time
+they clicked a button. The desktop notification permission would
+quickly burn out and they'd disable it.
+
+Two channels by trigger source is the right shape: each channel has
+a clear "what fires me" rule that doesn't overlap with the other.
+
+## Cross-Spec Dependencies
+
+- `specs/sse_wire/`: every desktop-notification trigger reads from `state_change` events. The notification system is a parallel consumer of the same stream the conversation atom drives off. No new SSE event types needed.
+- `specs/bedrock/`: phase transitions (`awaiting_task_approval`, `awaiting_user_response`, `error`, `context_exhausted`, busy → idle) define notification-worthiness. Same source of truth as the conversation atom and the StateBar.
+- `specs/conversation-ui/`: the `<Toast />` container is mounted in `DesktopLayout.tsx:111`. The eventual notification settings panel would live in the same chrome.
+- `specs/terminal-panel/` REQ-TPANEL-009: the assist-setup error path currently uses `console.error` and is documented as a gap. Once REQ-NOTIF-002 is the canonical visible-error mechanism, that gap closes by routing through `useToast.showError`.

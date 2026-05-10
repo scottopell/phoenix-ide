@@ -1,129 +1,161 @@
-# Notifications -- Requirements
+# Notifications
 
-## User Stories
+## Scope
 
-### Story 1: Don't Miss Agent Requests
+Phoenix has two notification channels:
+1. **In-app toasts** — short messages rendered in the conversation UI; useful only when the user is looking
+2. **Browser desktop notifications** — OS-level pings that reach the user even when the tab is not focused
 
-As a developer who starts an agent task and switches to another window
-or tab, I need to be pulled back to Phoenix when the agent needs my
-input (task approval, question, error) so I don't leave the agent
-blocked for minutes while I'm unaware.
+This spec covers both, plus the rules for picking which channel applies to a given trigger. The toast UI is implemented (REQ-NOTIF-001, REQ-NOTIF-002 ✅); the desktop-notification half is spec'd here as the target (REQ-NOTIF-003 onwards). See `specs/notifications/executive.md` for the full boundary.
 
-### Story 2: Know When Work Completes
+## User Story
 
-As a developer who kicked off a long-running agent task, I want to
-know when it finishes so I can review the results and continue working
-without polling the tab.
+As a Phoenix user, I delegate work to the agent and rarely watch it actively. I need Phoenix to:
 
-### Story 3: Tune Notification Noise
+- Confirm my own actions worked (or failed), so I know whether to retry
+- Tell me when the agent finishes a long task or hits something it needs me for
+- Reach me even when I've context-switched away (other tab, other window, other app)
+- Stay quiet when I'm already looking — no tab badges or popups that just say "you're here, FYI"
+- Let me dial down the noise on the events I don't care about
 
-As a developer who uses Phoenix throughout the day, I need control
-over which events trigger notifications so I can dial down the noise
-without turning off notifications entirely.
+## Transparency Contract
+
+The notifications system must let me confidently answer:
+
+1. Did my last action succeed or fail?
+2. Did Phoenix run a background operation while I was looking? What was its result?
+3. Is the agent currently waiting on me to do something?
+4. Did I miss a notification while I was disconnected from Phoenix?
+5. Why does (or doesn't) Phoenix interrupt me for event X? Can I change it?
+6. If a notification fires for a different conversation, can I get there in one click?
+
+Each numbered question maps to one or more requirements below.
 
 ---
 
-### REQ-NOTIF-001: Browser Desktop Notifications
+## Requirements
 
-WHEN a notification-worthy event occurs on any conversation
-AND the user has granted browser notification permission
+### REQ-NOTIF-001: Confirm My Action Quietly
+
+WHEN I take an action whose result is not immediately obvious from the page (e.g., "Send in Background", MCP server toggle, "Response sent" on a question)
+THE SYSTEM SHALL display an in-app toast confirming the outcome
+
+WHEN the toast is shown
+THE SYSTEM SHALL auto-dismiss it after a brief interval (default ~4 seconds)
+AND SHALL accept a click as an explicit dismiss
+
+WHEN I take multiple actions in quick succession
+THE SYSTEM SHALL stack toasts vertically rather than replacing them, so I can see what I confirmed
+
+**Rationale:** In-app actions need closure but rarely deserve a modal interruption. The toast is the right disclosure shape: visible enough to register, transient enough to ignore. Stacking matters because the user often performs sequences ("toggle five MCP servers") and would otherwise see only the last result.
+
+---
+
+### REQ-NOTIF-002: Tell Me When a Background Action Failed
+
+WHEN a user-initiated action fails (network error, server-side rejection, validation issue)
+THE SYSTEM SHALL display an in-app toast with the failure reason, styled distinctly from success toasts (`error` type, red accent)
+
+WHEN the failure happens because of an external service Phoenix doesn't control (e.g., MCP server not responding)
+THE SYSTEM SHALL include enough context in the toast for the user to know which thing failed (server name, operation name)
+
+**Rationale:** A silently-failing button is the worst outcome — the user doesn't know whether to wait, retry, or work around. The error toast is the floor: it doesn't have to explain how to fix the problem, just confirm that one happened. The `console.error`-only path that PR #56 documented (REQ-TPANEL-009) is the anti-pattern: invisible to the user, only visible to people inspecting devtools.
+
+---
+
+### REQ-NOTIF-003: Pull Me Back When the Agent Needs Me
+
+WHEN a conversation transitions into a state that blocks the agent on me (`awaiting_task_approval`, `awaiting_user_response`, `error`, `context_exhausted`)
+AND the Phoenix tab is not focused (REQ-NOTIF-005)
+AND notifications for that event type are enabled (REQ-NOTIF-006)
+AND I have granted browser notification permission
+THE SYSTEM SHALL display a browser desktop notification with a title naming the event ("Question asked", "Task approval needed", "Agent error") and a body identifying the conversation slug
+
+WHEN browser notification permission has not been granted
+THE SYSTEM SHALL prompt for it on first attempt rather than silently dropping the notification
+
+**Rationale:** When Phoenix is in another tab and the agent is blocked on me, that's the canonical "interrupt me" moment. Without a desktop notification, I'd come back hours later to find work parked the whole time. The permission prompt is one-time, but skipping it would mean the feature silently does nothing for users who never realised they had to opt in.
+
+---
+
+### REQ-NOTIF-004: Pull Me Back When a Long-Running Task Finishes
+
+WHEN a conversation transitions from busy to `idle` (the agent finished a turn cleanly)
+AND the conversation was busy long enough to be worth flagging
 AND the Phoenix tab is not focused
-THE SYSTEM SHALL display a browser desktop notification with a title
-identifying the event type and a body identifying the conversation
+AND the "agent finished" event type is enabled
+THE SYSTEM SHALL display a browser desktop notification: "Agent finished" + conversation slug
 
-WHEN the Phoenix tab is focused
-THE SYSTEM SHALL NOT display a desktop notification (the user is already looking)
-
-**Rationale:** Desktop notifications are the only mechanism that reaches
-the user when Phoenix is backgrounded. In-app indicators are invisible
-when the tab is not active.
+**Rationale:** Long agent runs are the second canonical "interrupt me" moment — the agent isn't blocked but I asked for the work and want to know it's done. The "long enough" threshold is deliberately not pinned in this spec; the implementation picks a value (e.g., 30 seconds) that filters out routine quick turns. Lowering the threshold over time is reversible; users complaining about noise can disable the event type via REQ-NOTIF-006.
 
 ---
 
-### REQ-NOTIF-002: Notification Permission Request
+### REQ-NOTIF-005: Don't Notify When I'm Already Looking
 
-WHEN notifications are enabled in settings but browser permission has
-not been granted
-THE SYSTEM SHALL prompt the user to grant notification permission
+WHEN the Phoenix tab is focused (`document.visibilityState === 'visible'` AND the document has focus)
+THE SYSTEM SHALL NOT fire browser desktop notifications for any event
 
-WHEN the user denies permission
-THE SYSTEM SHALL display a message explaining that notifications
-require browser permission and offer a link to browser settings
+WHEN the conversation in question is the active route AND the tab is focused
+THE SYSTEM SHALL NOT fire a desktop notification for that conversation even when the underlying state machine would otherwise trigger one
 
-**Rationale:** Browser notification permission is a one-time grant. The
-system cannot send notifications without it, so the request must be
-surfaced clearly.
+WHEN the tab is focused but the user is on a different conversation
+THE SYSTEM SHALL still fire a notification for the other conversation (it's not what they're looking at)
 
----
+THE SYSTEM SHALL continue to render in-app toasts (REQ-NOTIF-001/002) regardless of tab focus — toasts are the in-app channel and don't compete with desktop notifications
 
-### REQ-NOTIF-003: Configurable Event Types
-
-THE SYSTEM SHALL support enabling or disabling notifications for each
-of these event types independently:
-
-1. **Task approval needed** -- conversation entered `awaiting_task_approval`
-2. **Question asked** -- conversation entered `awaiting_user_response`
-3. **Agent error** -- conversation entered `error` or `context_exhausted`
-4. **Agent finished** -- conversation returned to `idle` after being busy
-
-THE SYSTEM SHALL store these preferences server-side so they survive
-browser clears and server restarts
-
-**Rationale:** Different events have different urgency. Task approval and
-questions block the agent; errors need investigation; idle is informational.
-Users should control the noise level.
+**Rationale:** Desktop notifications exist to reach me when in-app indicators can't. Firing one while I'm already looking at the conversation is noise. Distinguishing "tab focused" from "this conversation focused" matters because a multi-conversation user wants to know when conversation B needs them, even while looking at conversation A.
 
 ---
 
-### REQ-NOTIF-004: Global Scope with Per-Event Toggles
+### REQ-NOTIF-006: Let Me Tune Which Events Notify Me
 
-THE SYSTEM SHALL apply notification preferences globally across all
-conversations
+THE SYSTEM SHALL provide a settings panel reachable from the sidebar or StateBar where I can:
 
-THE SYSTEM SHALL NOT support per-conversation notification overrides
-in the initial implementation
+- Enable or disable browser notifications globally (master toggle)
+- Toggle each event type independently (task approval, question, agent error, agent finished)
+- See current browser notification permission status (granted / denied / not yet asked)
+- Re-request browser permission if not yet granted
 
-**Rationale:** A single set of global toggles covers the primary use case
-without adding per-conversation UI complexity. Per-conversation overrides
-can be added later if needed.
+WHEN the master toggle is off
+THE SYSTEM SHALL NOT fire any browser notifications regardless of per-event toggles
 
----
+WHEN browser permission is denied
+THE SYSTEM SHALL display guidance for re-enabling in browser settings, since the OS-level permission cannot be re-prompted programmatically
 
-### REQ-NOTIF-005: Click-to-Navigate
-
-WHEN the user clicks a desktop notification
-THE SYSTEM SHALL focus the Phoenix browser tab or window
-AND navigate to the conversation that triggered the notification
-
-**Rationale:** The notification exists to pull the user back to a specific
-conversation. One click should get them there.
+**Rationale:** Different event types have different urgency to different people. A user who wants to be pulled in for questions but not for completions needs that switch. The master toggle is the "leave me alone for now" panic button. Showing permission status separately from the toggles prevents the confusion of "I enabled it, why no notifications?" — the permission is upstream of the toggles.
 
 ---
 
-### REQ-NOTIF-006: Notification Settings UI
+### REQ-NOTIF-007: One Click Back to the Right Conversation
 
-THE SYSTEM SHALL provide a settings panel accessible from the sidebar
-or StateBar where the user can:
-- Enable or disable notifications globally (master toggle)
-- Toggle each event type independently
-- See current browser permission status
-- Request browser permission if not yet granted
+WHEN I click a desktop notification
+THE SYSTEM SHALL focus the Phoenix browser tab/window
+AND SHALL navigate to the conversation that triggered the notification (`/c/<slug>`)
 
-**Rationale:** Settings should be discoverable and editable without
-leaving the app. The permission status display prevents confusion
-when notifications don't appear despite being "enabled."
+**Rationale:** The notification exists to interrupt me _into_ a specific conversation. If the click landed me on the conversation list and I had to find the right one, the value drops in half. This is one-click recovery, not "Phoenix is open in some tab somewhere."
 
 ---
 
-### REQ-NOTIF-007: SSE-Driven Notification Triggers
+### REQ-NOTIF-008: Catch Me Up When I Reconnect After a Disconnect
 
-THE SYSTEM SHALL detect notification-worthy events from the existing
-SSE stream (state_change events) rather than polling or adding new
-API endpoints
+WHEN the SSE connection re-establishes after a disconnect (network blip, laptop wake, server restart)
+THE SYSTEM SHALL scan the conversation list for any non-sub-agent conversation in a notification-worthy state (`awaiting_task_approval`, `awaiting_user_response`, `error`, `context_exhausted`)
+AND for each match SHALL emit a desktop notification per the same gating rules (REQ-NOTIF-005, REQ-NOTIF-006)
 
-WHEN a state_change SSE event arrives matching an enabled event type
-THE SYSTEM SHALL trigger the notification pipeline
+THE SYSTEM SHALL NOT emit catch-up notifications for `idle` (which is ambiguous — may have been idle for hours) or for sub-agent conversations (which the user doesn't manage directly)
 
-**Rationale:** The SSE stream already carries all state transitions in
-real-time. Notifications are a frontend concern driven by data already
-available. No backend changes needed for the trigger mechanism.
+**Rationale:** Live SSE events drive the normal notification flow. Without a catch-up pass, anything that transitioned during the disconnect window is invisible: I close my laptop, agent asks a question, I reopen and the question is silently waiting. The catch-up pass is conservative on idle because "agent went idle three hours ago while you were at lunch" is not actionable; only currently-blocking states warrant the interrupt.
+
+---
+
+### REQ-NOTIF-009: Settings That Survive Browser Clears + Server Restarts
+
+THE SYSTEM SHALL persist notification preferences server-side (not in localStorage)
+
+WHEN a user signs in from a new browser or clears local data
+THE SYSTEM SHALL restore the same preferences
+
+WHEN the Phoenix server restarts
+THE SYSTEM SHALL restore preferences from durable storage on startup
+
+**Rationale:** Notification preferences are a tuning decision the user makes once and expects to persist. Storing them in localStorage means the user re-tunes after every browser clear and the preferences don't follow them across devices. Server-side storage is the correct durability tier for "I configured this; remember it."
