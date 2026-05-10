@@ -43,6 +43,11 @@ struct TaskFileSnapshot {
 
 /// Read and validate a task file referenced by `propose_task`.
 ///
+/// In taskmd 1.0 the filename is the sole source of metadata — id,
+/// priority, status, and slug all come from the filename. The body is
+/// free-form markdown; we use it only to pull out the H1 for a UI title
+/// and to surface the plan in the approval reader.
+///
 /// The state machine treats this read as a deterministic data-load — like
 /// reading the conversation cwd off disk — not as an external side effect.
 /// All I/O is local to the worktree, synchronous, and bounded.
@@ -66,15 +71,6 @@ fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, St
         ));
     }
 
-    let abs_path = cwd.join(rel_path);
-    let content = std::fs::read_to_string(&abs_path).map_err(|e| {
-        format!(
-            "Failed to read task file '{task_file}': {e}. \
-             Create the file under tasks/ (with valid frontmatter and the \
-             taskmd filename format) before calling propose_task."
-        )
-    })?;
-
     let filename = rel_path
         .file_name()
         .and_then(|n| n.to_str())
@@ -87,58 +83,32 @@ fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, St
             )
         })?;
 
-    let frontmatter = taskmd_core::frontmatter::parse_frontmatter_str(&content);
-    let priority = frontmatter
-        .get("priority")
-        .cloned()
-        .unwrap_or_else(|| fn_priority.clone());
-    let status = frontmatter
-        .get("status")
-        .cloned()
-        .unwrap_or_else(|| fn_status.clone());
-
-    if priority != fn_priority {
+    if !ACCEPTABLE_PROPOSE_STATUSES.contains(&fn_status.as_str()) {
         return Err(format!(
-            "task file frontmatter priority '{priority}' does not match filename priority '{fn_priority}' \
-             — fix the file before calling propose_task"
-        ));
-    }
-    if status != fn_status {
-        return Err(format!(
-            "task file frontmatter status '{status}' does not match filename status '{fn_status}' \
-             — fix the file before calling propose_task"
-        ));
-    }
-    if !ACCEPTABLE_PROPOSE_STATUSES.contains(&status.as_str()) {
-        return Err(format!(
-            "task file status '{status}' cannot be proposed for approval. \
+            "task file status '{fn_status}' cannot be proposed for approval. \
              Acceptable statuses: {}.",
             ACCEPTABLE_PROPOSE_STATUSES.join(", ")
         ));
     }
 
-    let body_after_frontmatter = strip_frontmatter(&content);
-    let title = extract_title(body_after_frontmatter).unwrap_or_else(|| slug_to_title(&fn_slug));
-    let plan = body_after_frontmatter.trim().to_string();
+    let abs_path = cwd.join(rel_path);
+    let body = std::fs::read_to_string(&abs_path).map_err(|e| {
+        format!(
+            "Failed to read task file '{task_file}': {e}. \
+             Create the file under tasks/ (taskmd filename format \
+             NNNNN-pX-status--slug.md) before calling propose_task."
+        )
+    })?;
+
+    let title = extract_title(&body).unwrap_or_else(|| slug_to_title(&fn_slug));
+    let plan = body.trim().to_string();
 
     Ok(TaskFileSnapshot {
         task_file: task_file.replace('\\', "/"),
         title,
-        priority,
+        priority: fn_priority,
         plan,
     })
-}
-
-fn strip_frontmatter(content: &str) -> &str {
-    if !content.starts_with("---\n") {
-        return content;
-    }
-    let after_open = &content[4..];
-    if let Some(close) = after_open.find("\n---\n") {
-        &after_open[close + 5..]
-    } else {
-        content
-    }
 }
 
 fn extract_title(body: &str) -> Option<String> {

@@ -2152,10 +2152,15 @@ where
     #[allow(clippy::too_many_lines)] // NonEmptyString construction adds wrapping lines
     async fn execute_approve_task(
         &mut self,
+        task_file: String,
         title: String,
         priority: String,
         plan: String,
     ) -> Result<(), String> {
+        // TODO(taskmd-1.0): full rewrite — derive id/slug from `task_file`
+        // (no new ID allocation, no new content write). For now `task_file`
+        // is threaded through but unused until the executor refactor lands.
+        let _ = task_file;
         let cwd = self.context.working_dir.clone();
         // The spec invariant WorktreePathDerivedFromConversation requires
         // the worktree path to be rooted at the repo root, not at cwd.
@@ -2297,6 +2302,7 @@ where
                 // The DB still has AwaitingTaskApproval (PersistState hasn't run for the
                 // new Idle state yet), so this keeps memory and DB consistent.
                 self.state = ConvState::AwaitingTaskApproval {
+                    task_file: String::new(), // TODO(taskmd-1.0): thread real task_file
                     title: title_backup,
                     priority: priority_backup,
                     plan: plan_backup,
