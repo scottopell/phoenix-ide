@@ -45,8 +45,8 @@ async function refreshOnce(store: ConversationStore): Promise<void> {
   const f = store as ConversationStore & {
     __refreshInFlight?: boolean;
     __refreshPending?: boolean;
-    __refreshPendingPromise?: Promise<void>;
-    __refreshPendingResolve?: () => void;
+    __refreshPendingPromise?: Promise<void> | undefined;
+    __refreshPendingResolve?: (() => void) | undefined;
   };
   if (f.__refreshInFlight) {
     if (!f.__refreshPending) {
