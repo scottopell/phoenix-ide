@@ -30,6 +30,15 @@ export function CodexLoginPage() {
   const handleSuccess = useCallback((r: FlowResult) => {
     setResult(r);
     setMode('choose');
+    // Re-fetch preflight after a successful login so the success banner
+    // reflects the post-reload state of the registry. Server-side, the
+    // settle_* handler swaps the bridge BEFORE marking the session
+    // success, so by the time we get here the registry has already
+    // updated; preflight will report restart_required_after_login=false
+    // in the common case (login wrote the path the registry now reads).
+    api.codexLoginPreflight()
+      .then((p) => setPreflight(p))
+      .catch(() => {});
   }, []);
 
   return (
@@ -81,13 +90,12 @@ function SuccessBanner({ result, preflight }: { result: FlowResult; preflight: C
       <div className="codex-login-success-body">
         Tokens written to <code>{result.authPath}</code>
         {result.accountId && <> for account <code>{result.accountId}</code></>}.
+        {' '}The ChatGPT bridge is now active &mdash; your next message will use
+        your subscription.
         {preflight?.restart_required_after_login && (
           <div className="codex-login-warning">
-            <strong>Restart Phoenix</strong> to start using your ChatGPT subscription.
-            {preflight.bridge_loaded_at_startup
-              ? ' (Phoenix is currently using a different credential file ' +
-                'that was loaded at startup; restart to switch to the new login.)'
-              : ' (The credential is loaded at startup; we can’t pick it up mid-session yet.)'}
+            Phoenix couldn&rsquo;t hot-reload the credential. Restart Phoenix
+            and the bridge will pick up your new login on the next boot.
           </div>
         )}
       </div>

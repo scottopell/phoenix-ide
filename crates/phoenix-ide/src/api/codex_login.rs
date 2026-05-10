@@ -20,9 +20,13 @@
 //! Status is read via `GET /api/codex/login/{kind}/{id}/status`. The Codex
 //! credential ([`crate::llm::codex_credential::CodexCredential`]) mtime-watches
 //! its file, so an *already-loaded* credential picks up new tokens on next use.
-//! On a first-time login (no credential constructed at startup because the
-//! file didn't exist), Phoenix must be restarted before the bridge becomes
-//! active — the UI surfaces this in the success banner.
+//! On a first-time login (no credential constructed at startup), or when
+//! switching accounts from a piggyback-loaded credential to a Phoenix-own
+//! one, the `settle_*` handlers call
+//! [`crate::llm::ModelRegistry::reload_codex_credential`] *before* publishing
+//! the success status. That hot-reload swaps the OpenAI bridge services in
+//! atomically, so the next OpenAI request after login uses the new credential
+//! without a Phoenix restart (task 13005).
 
 use axum::{
     extract::{Path, State},
@@ -234,6 +238,7 @@ pub async fn pkce_start(
         let verifier = session.pkce.code_verifier.clone();
         let redirect_uri = session.redirect_uri.clone();
         let mgr_for_task = mgr.clone();
+        let registry_for_task = state.llm_registry.clone();
         let cancel_for_task = cancel.clone();
         tokio::spawn(async move {
             let outcome = drive_pkce(
@@ -245,7 +250,13 @@ pub async fn pkce_start(
                 redirect_uri,
             )
             .await;
-            settle_pkce(&mgr_for_task, &session_id_for_task, outcome).await;
+            settle_pkce(
+                &mgr_for_task,
+                &registry_for_task,
+                &session_id_for_task,
+                outcome,
+            )
+            .await;
         });
     }
 
@@ -343,6 +354,7 @@ async fn drive_pkce(
 
 async fn settle_pkce(
     mgr: &Arc<CodexLoginManager>,
+    llm_registry: &Arc<crate::llm::ModelRegistry>,
     session_id: &str,
     outcome: Result<LoginResult, LoginError>,
 ) {
@@ -351,6 +363,17 @@ async fn settle_pkce(
         sessions.get(session_id).cloned()
     };
     let Some(session) = session else { return };
+    // Hot-reload the registry's ChatGPT bridge BEFORE publishing the success
+    // status (task 13005). Sequence matters: the UI's status poller treats
+    // `kind: success` as "the bridge is live now" and may immediately fire
+    // an OpenAI request — that request must hit the new credential, not the
+    // pre-login state.
+    if outcome.is_ok() {
+        let registry = llm_registry.clone();
+        tokio::task::spawn_blocking(move || registry.reload_codex_credential())
+            .await
+            .ok();
+    }
     {
         let mut inner = session.inner.lock().await;
         inner.status.outcome = Some(outcome);
@@ -607,10 +630,17 @@ pub async fn device_start(
 
     {
         let mgr_for_task = mgr.clone();
+        let registry_for_task = state.llm_registry.clone();
         let session_id_for_task = session_id.clone();
         tokio::spawn(async move {
             let outcome = drive_device_code(cancel, device).await;
-            settle_device(&mgr_for_task, &session_id_for_task, outcome).await;
+            settle_device(
+                &mgr_for_task,
+                &registry_for_task,
+                &session_id_for_task,
+                outcome,
+            )
+            .await;
         });
     }
 
@@ -639,6 +669,7 @@ async fn drive_device_code(
 
 async fn settle_device(
     mgr: &Arc<CodexLoginManager>,
+    llm_registry: &Arc<crate::llm::ModelRegistry>,
     session_id: &str,
     outcome: Result<LoginResult, LoginError>,
 ) {
@@ -653,6 +684,13 @@ async fn settle_device(
             error = %err,
             "codex_login: device code flow ended in error"
         );
+    }
+    // Reload before publishing status — see settle_pkce for the rationale.
+    if outcome.is_ok() {
+        let registry = llm_registry.clone();
+        tokio::task::spawn_blocking(move || registry.reload_codex_credential())
+            .await
+            .ok();
     }
     {
         let mut status = session.status.lock().await;
@@ -752,14 +790,13 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
     let piggyback_path = codex_credential::default_auth_path();
     let already_signed_in = codex_credential::CodexCredential::load(auth_path.clone()).is_ok();
     let bridge_loaded_at_startup = state.llm_registry.codex_bridge_loaded_at_startup;
-    // Restart is required UNLESS the registry's loaded credential is pinned
-    // to the same path the in-app login writes to. This catches the
-    // piggyback-then-Phoenix-login footgun: bridge_loaded_at_startup is true
-    // (Codex CLI's auth.json was loaded), but a Phoenix login writes
-    // ~/.phoenix-ide/codex-auth.json, which the running registry doesn't
-    // watch. (Codex P2 review feedback on PR #57.)
+    // Read the *current* (post-reload-aware) loaded path. Task 13005's
+    // hot-reload makes restart-required false in the common case: the
+    // login completion handler swaps the registry's bridge to the new
+    // Phoenix-own auth file, so by the time the UI calls preflight again
+    // after a successful sign-in, current_codex_loaded_path == auth_path.
     let restart_required_after_login =
-        state.llm_registry.codex_loaded_path.as_deref() != Some(auth_path.as_path());
+        state.llm_registry.current_codex_loaded_path().as_deref() != Some(auth_path.as_path());
     let piggyback_env_set = std::env::var("OPENAI_USE_CODEX_AUTH")
         .ok()
         .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"));
