@@ -2515,29 +2515,6 @@ pre:hover .copy-btn {
   max-width: 320px;
 }
 
-/* Git delta badges */
-.git-badge {
-  display: inline-block;
-  font-size: 10px;
-  font-family: var(--font-mono);
-  padding: 0 4px;
-  border-radius: 4px;
-  white-space: nowrap;
-  font-weight: 500;
-  line-height: 1.5;
-  flex-shrink: 0;
-}
-
-.git-badge--ahead {
-  color: var(--accent-green);
-  background: color-mix(in srgb, var(--accent-green) 12%, transparent);
-}
-
-.git-badge--behind {
-  color: var(--accent-yellow);
-  background: color-mix(in srgb, var(--accent-yellow) 12%, transparent);
-}
-
 .pr-badge {
   display: inline-flex;
   align-items: center;
@@ -7168,7 +7145,6 @@ html * {
   text-decoration: underline;
 }
 
-/* (conv-behind-badge replaced by .git-badge--behind in state bar layout section) */
 
 /* --- Work Actions (inline bar above input area) --- */
 

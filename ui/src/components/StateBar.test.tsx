@@ -52,8 +52,6 @@ function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
     base_branch: 'main',
     worktree_path: '/repo/.phoenix/worktrees/conv-1',
     task_title: 'Track PR status',
-    commits_ahead: 1,
-    commits_behind: 0,
     conv_mode_label: 'Work',
     browser_session_active: false,
     ...overrides,

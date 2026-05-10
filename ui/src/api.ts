@@ -57,8 +57,6 @@ export interface Conversation {
   worktree_path?: string | null;
   base_branch?: string | null;
   task_title?: string | null;
-  commits_behind?: number;
-  commits_ahead?: number;
   archived?: boolean;
   project_id?: string | null;
   conv_mode_label?: string;

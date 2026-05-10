@@ -24,8 +24,7 @@ use super::types::{
 use super::AppState;
 use crate::db::{ConvMode, ConversationUsage, ImageData, Message, MessageContent, MessageType};
 use crate::git_ops::{
-    check_branch_conflict, create_worktree, effective_base_ref, materialize_branch, run_git,
-    BranchConflict, GitOpError,
+    check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict, GitOpError,
 };
 use crate::llm::{ContentBlock, GatewayStatus};
 use crate::runtime::SseEvent;
@@ -280,62 +279,6 @@ pub(crate) fn enrich_message_for_api(msg: &Message) -> Value {
     serde_json::to_value(&enriched).unwrap_or(Value::Null)
 }
 
-/// Count how many commits `base_branch` is ahead of `task_branch` in `repo_root`.
-///
-/// Compares against `origin/<base>` when the remote-tracking ref exists
-/// (kept fresh by the periodic fetch loop in `stream_conversation`),
-/// falling back to bare `<base>` for local-only repos. See task 13001.
-///
-/// Shells out to `git rev-list --count`. Returns 0 on any error (missing branch,
-/// git not available, parse failure). This is a best-effort indicator.
-///
-/// **Blocking** -- must be called from `spawn_blocking` or an already-blocking context.
-fn commits_behind(repo_root: &std::path::Path, base_branch: &str, task_branch: &str) -> u32 {
-    let comparator = effective_base_ref(repo_root, base_branch);
-    let range = format!("{task_branch}..{comparator}");
-    match run_git(repo_root, &["rev-list", "--count", &range]) {
-        Ok(output) => output.trim().parse::<u32>().unwrap_or(0),
-        Err(e) => {
-            tracing::debug!(
-                repo = %repo_root.display(),
-                base_branch,
-                task_branch,
-                error = %e,
-                "commits_behind check failed, returning 0"
-            );
-            0
-        }
-    }
-}
-
-/// How many commits the task branch is ahead of the base branch.
-///
-/// Same `origin/<base>` preference as `commits_behind`; see task 13001.
-///
-/// Shells out to `git rev-list --count`. Returns 0 on any error.
-///
-/// **Blocking** -- must be called from `spawn_blocking` or an already-blocking context.
-fn commits_ahead(repo_root: &std::path::Path, base_branch: &str, task_branch: &str) -> u32 {
-    let comparator = effective_base_ref(repo_root, base_branch);
-    let range = format!("{comparator}..{task_branch}");
-    match run_git(repo_root, &["rev-list", "--count", &range]) {
-        Ok(output) => output.trim().parse::<u32>().unwrap_or(0),
-        Err(e) => {
-            tracing::debug!(
-                repo = %repo_root.display(),
-                base_branch,
-                task_branch,
-                error = %e,
-                "commits_ahead check failed, returning 0"
-            );
-            0
-        }
-    }
-}
-
-/// Merge pre-computed `display_data` into content blocks.
-///
-/// `display_data` format: `{ "bash": [{ "tool_use_id": "...", "display": "..." }] }`
 /// Build an `EnrichedConversation` with derived display fields.
 ///
 /// Note: `seed_parent_slug` is left as `None` here. Call sites that need to
@@ -1403,54 +1346,6 @@ async fn stream_conversation(
     );
     let broadcast_rx = handle.broadcast_tx.subscribe();
 
-    // Compute initial commits_behind for Work conversations.
-    // Extract the git info we need for both the init value and the polling task.
-    let work_git_info = match &conversation.conv_mode {
-        ConvMode::Work {
-            branch_name,
-            base_branch,
-            ..
-        }
-        | ConvMode::Branch {
-            branch_name,
-            base_branch,
-            ..
-        } if !base_branch.as_str().starts_with("__LEGACY")
-            && !branch_name.as_str().starts_with("__LEGACY") =>
-        {
-            // Resolve repo root from project
-            let repo_root = if let Some(ref project_id) = conversation.project_id {
-                state
-                    .db
-                    .get_project(project_id)
-                    .await
-                    .ok()
-                    .map(|p| PathBuf::from(p.canonical_path))
-            } else {
-                None
-            };
-            repo_root.map(|root| (root, base_branch.to_string(), branch_name.to_string()))
-        }
-        _ => None,
-    };
-
-    let (initial_commits_behind, initial_commits_ahead) =
-        if let Some((ref repo_root, ref base, ref task)) = work_git_info {
-            let root1 = repo_root.clone();
-            let base1 = base.clone();
-            let task1 = task.clone();
-            let root2 = repo_root.clone();
-            let base2 = base.clone();
-            let task2 = task.clone();
-            let (behind, ahead) = tokio::join!(
-                tokio::task::spawn_blocking(move || commits_behind(&root1, &base1, &task1)),
-                tokio::task::spawn_blocking(move || commits_ahead(&root2, &base2, &task2)),
-            );
-            (behind.unwrap_or(0), ahead.unwrap_or(0))
-        } else {
-            (0, 0)
-        };
-
     // Derive project_name from the project's canonical_path (repo root dirname).
     let project_name = if let Some(ref project_id) = conversation.project_id {
         state.db.get_project(project_id).await.ok().and_then(|p| {
@@ -1490,74 +1385,11 @@ async fn stream_conversation(
         last_sequence_id: init_seq,
         context_window_size,
         breadcrumbs,
-        commits_behind: initial_commits_behind,
-        commits_ahead: initial_commits_ahead,
         project_name,
         pending_anchor_sequence_id,
         pending_events,
         pending_truncated,
     };
-
-    // Spawn periodic git delta polling for Work conversations (REQ-PROJ-011)
-    if let Some((repo_root, base_branch, task_branch)) = work_git_info {
-        let broadcast_tx = handle.broadcast_tx.clone();
-        tokio::spawn(async move {
-            let mut last_behind = initial_commits_behind;
-            let mut last_ahead = initial_commits_ahead;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_mins(1)).await;
-
-                // REQ-PROJ-023: single-branch fetch for the base branch only.
-                let fetch_root = repo_root.clone();
-                let fetch_branch = base_branch.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let refspec = format!(
-                        "refs/heads/{fetch_branch}:refs/remotes/origin/{fetch_branch}"
-                    );
-                    if let Err(e) = run_git(&fetch_root, &["fetch", "origin", &refspec]) {
-                        tracing::debug!(error = %e, "periodic single-branch fetch failed (non-fatal)");
-                    }
-                })
-                .await;
-
-                let root1 = repo_root.clone();
-                let base1 = base_branch.clone();
-                let task1 = task_branch.clone();
-                let root2 = repo_root.clone();
-                let base2 = base_branch.clone();
-                let task2 = task_branch.clone();
-                let (new_behind, new_ahead) = tokio::join!(
-                    tokio::task::spawn_blocking(move || commits_behind(&root1, &base1, &task1)),
-                    tokio::task::spawn_blocking(move || commits_ahead(&root2, &base2, &task2)),
-                );
-                let new_behind = new_behind.unwrap_or(last_behind);
-                let new_ahead = new_ahead.unwrap_or(last_ahead);
-
-                if new_behind != last_behind || new_ahead != last_ahead {
-                    last_behind = new_behind;
-                    last_ahead = new_ahead;
-                    let result = broadcast_tx.send_seq(|seq| SseEvent::ConversationUpdate {
-                        sequence_id: seq,
-                        update: crate::runtime::ConversationMetadataUpdate {
-                            cwd: None,
-                            branch_name: None,
-                            worktree_path: None,
-                            conv_mode_label: None,
-                            base_branch: None,
-                            commits_behind: Some(new_behind),
-                            commits_ahead: Some(new_ahead),
-                            task_title: None,
-                        },
-                    });
-                    // No receivers left -- client disconnected, exit polling loop
-                    if result.is_err() {
-                        break;
-                    }
-                }
-            }
-            tracing::debug!("git delta polling task exited");
-        });
-    }
 
     Ok(sse_stream(id, init_event, broadcast_rx))
 }
@@ -3584,8 +3416,6 @@ async fn shared_sse_stream(
         last_sequence_id: init_seq,
         context_window_size,
         breadcrumbs,
-        commits_behind: 0,
-        commits_ahead: 0,
         project_name,
         pending_anchor_sequence_id,
         pending_events,

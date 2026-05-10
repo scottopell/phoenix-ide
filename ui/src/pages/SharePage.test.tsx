@@ -153,8 +153,6 @@ describe('SharePage SSE schema validation', () => {
         presentation_mode: 'idle',
         context_window_size: 0,
         breadcrumbs: [],
-        commits_behind: 0,
-        commits_ahead: 0,
         project_name: null,
         pending_anchor_sequence_id: 0,
         pending_events: [],

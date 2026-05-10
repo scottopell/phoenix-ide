@@ -555,10 +555,6 @@ pub struct ConversationMetadataUpdate {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_branch: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub commits_behind: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commits_ahead: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub task_title: Option<String>,
 }
 
@@ -648,11 +644,6 @@ pub enum SseEvent {
         /// Current context window usage in tokens
         context_window_size: u64,
         breadcrumbs: Vec<SseBreadcrumb>,
-        /// How many commits the base branch is ahead of this conversation's task branch.
-        /// Only populated for Work-mode conversations. 0 means up-to-date or not applicable.
-        commits_behind: u32,
-        /// How many commits the task branch is ahead of the base branch.
-        commits_ahead: u32,
         /// Human-readable project name derived from the repo root directory name.
         project_name: Option<String>,
         /// `sequence_id` of the most recent persisted Message at subscribe

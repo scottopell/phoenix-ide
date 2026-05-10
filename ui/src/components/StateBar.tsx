@@ -356,9 +356,6 @@ export function StateBar({
     onUpgradeModel(modelId);
   };
 
-  // Git delta badges
-  const ahead = conversation?.commits_ahead;
-  const behind = conversation?.commits_behind;
   const baseBranch = conversation?.base_branch;
   const branchName = conversation?.branch_name;
   const taskTitle = conversation?.task_title;
@@ -557,22 +554,6 @@ export function StateBar({
                           {prHint}
                         </span>
                       )}
-                    </span>
-                  )}
-                  {ahead != null && ahead > 0 && (
-                    <span
-                      className="git-badge git-badge--ahead"
-                      title={`${ahead} commit(s) ahead of ${baseBranch || 'base'}`}
-                    >
-                      +{ahead}
-                    </span>
-                  )}
-                  {behind != null && behind > 0 && (
-                    <span
-                      className="git-badge git-badge--behind"
-                      title={`${behind} commit(s) behind ${baseBranch || 'base'} -- may need rebase`}
-                    >
-                      -{behind}
                     </span>
                   )}
                   {projectName && (
