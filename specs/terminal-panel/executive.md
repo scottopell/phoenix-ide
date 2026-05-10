@@ -4,7 +4,9 @@
 
 This spec governs the **frontend `TerminalPanel.tsx` component** — the React surface that mounts xterm.js, manages the WebSocket connection to the backend PTY, parses OSC escape sequences in the browser, renders the HUD overlay, and offers the shell-integration setup affordance.
 
-The companion backend spec — `specs/terminal/` — owns the PTY spawn, the WebSocket protocol, the server-side vt100 parser, the `read_terminal` agent tool, and the conversation-teardown cascade. That spec explicitly defers "UI panel placement" to the implementation; this document fills that gap.
+The companion backend spec — `specs/terminal/` — owns the PTY spawn, the WebSocket protocol, the server-side vt100 parser, the `terminal_last_command` / `terminal_command_history` agent tools (replacements for the original `read_terminal` tool, split at commit `99c5df1`), and the conversation-teardown cascade. That spec explicitly defers "UI panel placement" to the implementation; this document fills that gap.
+
+Note: agent-spawned commands have a separate path via the `tmux` tool (`specs/tmux-integration/`). The `terminal_*_command` tools are user-mediated — they let the agent observe what the user just ran in the panel — and remain useful even with tmux, because tmux gives the agent its own persistent session rather than visibility into the user's interactive one.
 
 **In scope here (user-facing experiences):**
 - The terminal experience: connecting, typing into a real shell, seeing output as if I'd opened a local terminal

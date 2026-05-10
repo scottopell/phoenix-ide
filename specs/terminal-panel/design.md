@@ -35,9 +35,12 @@ This document describes the technical architecture for the
 ```
 
 The frontend OWNS xterm.js and the WebSocket client. The backend OWNS
-the PTY, the vt100 parser (server-side, for `read_terminal`), and the
-session lifecycle. They share only the binary frame protocol
-(REQ-TERM-004) and the OSC 133/OSC 7 marker format (REQ-TERM-015..018).
+the PTY, the server-side vt100 parser (now used by the command tracker
+to parse OSC 133 markers for the `terminal_last_command` and
+`terminal_command_history` agent tools — the older `read_terminal`
+tool was split into those two at commit `99c5df1`), and the session
+lifecycle. They share only the binary frame protocol (REQ-TERM-004)
+and the OSC 133/OSC 7 marker format (REQ-TERM-015..018).
 
 ## State Machines
 
@@ -191,20 +194,29 @@ out-of-order.
 ```
 isDisconnected ? Disconnected
   : integrationStatus === 'unknown' ? Unknown
-  : integrationStatus === 'absent' ?
-      currentCommand ? Running
-      : lastCompletedCommand ? Idle
-      : Absent (static cwd, fallback)
-  : (integrationStatus === 'detected')
-      currentCommand ? Running
-      : lastCompletedCommand ? Idle
-      : Absent (static cwd; integration is detected but no command yet)
+  : integrationStatus === 'absent'  ? Absent (static cwd + activity dot)
+  : integrationStatus === 'detected'
+      ? currentCommand        ? Running
+      : lastCompletedCommand  ? Idle
+      : (no command yet)      → Absent (same static cwd render —
+                                  reached when integration was just
+                                  detected and the user hasn't run a
+                                  command yet)
 ```
 
+`currentCommand` and `lastCompletedCommand` are populated only by the
+CommandTracker, which only runs when integration is detected. In the
+absent branch they stay null by construction, so the HUD renders the
+static cwd path.
+
 The activity dot colour is computed independently from the same inputs
-plus the byte-activity sampler — but only when integration is absent,
-per the rationale in REQ-TPANEL-003 (the system never makes up
-command outcomes the shell didn't report).
+plus the byte-activity sampler. When integration is detected, the dot
+mirrors CommandTracker (running glyph during a command, ✓/✗ during
+idle); when integration is absent or unknown, the dot mirrors the
+sampler's idle/running pulse instead. The sampler updates on every
+data frame regardless of integration_status (per the
+ActivityRunningOnData rule in `terminal-panel.allium`); the
+detected-vs-absent distinction is render-side, not state-side.
 
 ## Shell Integration Setup CTA
 

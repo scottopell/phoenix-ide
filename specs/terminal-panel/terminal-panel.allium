@@ -187,7 +187,7 @@ rule WsConnectingOnMount {
     when: PanelMounted(panel)
 
     ensures: panel.ws_status = connecting
-    ensures: panel.activity = idle
+    ensures: panel.activity = disconnected
     ensures: panel.integration_status = unknown
     ensures: panel.command_status = idle
 
@@ -197,6 +197,15 @@ rule WsConnectingOnMount {
         -- status text "Connecting…" is set at :484. The deferred
         -- timer at :319-331 dodges React 18 StrictMode double-mount;
         -- the spec treats the deferred allocation as part of mount.
+        --
+        -- activity starts at `disconnected` rather than `idle`: the
+        -- panel hasn't yet seen a live signal from the shell. The
+        -- HUD's "Disconnected" rendering path is gated on
+        -- ws_status (not activity alone), so showing "Shell exited"
+        -- before the connection completes would be wrong — the
+        -- panel renders "Connecting…" via the status banner during
+        -- this phase. WsConnected promotes activity to idle on
+        -- ws.onopen.
 }
 
 rule WsConnected {
@@ -274,12 +283,20 @@ rule IntegrationAbsentOnTimeout {
 }
 
 ------------------------------------------------------------
--- Rules — command tracking (only fires when integration detected)
+-- Rules — command tracking
 ------------------------------------------------------------
 
+-- Both this rule and IntegrationDetectedOnFirstC fire on the same
+-- OSC 133;C event. The implementation (TerminalPanel.tsx:380-411)
+-- promotes integration_status to detected AND starts the command
+-- inside one handler call — so the precondition here covers BOTH
+-- "first C marker, integration still unknown" and "subsequent C
+-- markers, integration already detected." A precondition of just
+-- `integration_status = detected` would skip the first command of
+-- every session.
 rule CommandStartedOnC {
     when: Osc133MarkerC(panel, command_text)
-    requires: panel.integration_status = detected
+    requires: panel.integration_status in { unknown, detected }
     requires: panel.command_status in { idle, completed }
 
     ensures: panel.command_status = running
@@ -289,20 +306,11 @@ rule CommandStartedOnC {
         finished_at: null,
         exit_code: null
     )
-    -- The previous completed command (if any) moves into
-    -- last_completed_command — captured by the rule below.
-}
-
-rule LastCompletedClearedOnNewCommand {
-    when: Osc133MarkerC(panel, command_text)
-    requires: panel.command_status = completed
-    requires: panel.last_completed_command != null
-
-    ensures: panel.last_completed_command = panel.last_completed_command
-    -- No change; the completed command is preserved as
-    -- last_completed_command for the HUD's "what just happened" slot.
-    -- The CommandStartedOnC rule fires alongside this one and moves
-    -- command_status to running.
+    ensures: panel.last_completed_command = null
+    -- HUD contract (TerminalPanel.tsx:403): a new command starts
+    -- with a clean "what just happened" slot. Otherwise the
+    -- previous command's ✓/✗ glyph would keep showing while the
+    -- new command runs, conflating the two timelines.
 }
 
 rule CommandCompletedOnD {
@@ -347,18 +355,26 @@ rule Osc133BIsNoop {
 rule ActivityRunningOnData {
     when: WsMessageReceived(panel, bytes)
     requires: panel.ws_status = connected
-    requires: panel.integration_status != detected
     requires: panel.activity != disconnected
 
     ensures: panel.activity = running
     ensures: ActivityDecayTimerArmed(panel, config.activity_decay_ms)
 
     @guidance
-        -- Sampler fires only when integration is NOT detected — the
-        -- HUD uses the command tracker as the authoritative source
-        -- otherwise (see ActivityIsAuthoritativeWhenDetected). Once
-        -- ws closes (activity = disconnected), the sampler is locked
-        -- until the next nonce-bumped reconnect.
+        -- The sampler always updates on data arrival, regardless of
+        -- integration_status. The render-side gate
+        -- (specs/terminal-panel/design.md "HUD Rendering Decision
+        -- Tree") decides which source to display: when integration =
+        -- detected, the HUD uses CommandTracker and ignores activity;
+        -- when integration = absent, the HUD uses activity as the
+        -- coarse "shell is producing output / quiet" indicator.
+        -- Modelling the sampler as state-gated (only firing when
+        -- integration != detected) would be cheaper but doesn't match
+        -- the implementation, which uses a single hot path through
+        -- ws.onmessage (TerminalPanel.tsx:493-527).
+        --
+        -- Once ws closes (activity = disconnected), the sampler is
+        -- locked until the next nonce-bumped reconnect.
 }
 
 rule ActivityIdleOnDecay {
@@ -405,10 +421,22 @@ invariant DetectionMonotonic {
 -- (post-reconnect) can leave it — there is no in-place transition
 -- back to idle/running. Captured structurally: the transitions block
 -- has no edge from disconnected to anything.
+--
+-- activity = disconnected is reachable from two sources:
+--   1. WsConnectingOnMount (initial state, before ws.onopen fires).
+--      During this phase ws_status = connecting, and the HUD shows
+--      "Connecting…" via the status banner — not the "Shell exited"
+--      Disconnected path, which gates on ws_status, not activity.
+--   2. WsErroredTransitionsToDisconnected /
+--      WsClosedTransitionsToDisconnected (post-connect failure).
+--      Here ws_status = disconnected.
+-- The invariant therefore allows ws_status in any of {connecting,
+-- disconnected}; reaching activity = disconnected via a `connected`
+-- ws_status is a bug.
 invariant ActivityDisconnectedSticky {
     for p in TerminalPanelInstance:
         p.activity = disconnected
-            implies p.ws_status = disconnected
+            implies p.ws_status in { connecting, disconnected }
 }
 
 -- @invariant CurrentCommandPresenceMatchesStatus
