@@ -112,11 +112,25 @@ pub fn default_auth_path() -> PathBuf {
 /// Resolve Phoenix's own ChatGPT auth file. Used by the in-app login flow
 /// (task 27104) so Phoenix has an independent session that doesn't depend on
 /// Codex CLI being installed.
+///
+/// When `$HOME` is unset (containers, oddly-spawned daemons), we fall back to
+/// the system temp dir and emit a warning. We deliberately avoid relative-CWD
+/// fallback because the file holds bearer tokens and writing it where `pwd`
+/// happens to point is unsafe.
 pub fn default_phoenix_auth_path() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home)
-        .join(".phoenix-ide")
-        .join("codex-auth.json")
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home)
+            .join(".phoenix-ide")
+            .join("codex-auth.json");
+    }
+    let fallback = std::env::temp_dir()
+        .join("phoenix-ide")
+        .join("codex-auth.json");
+    tracing::warn!(
+        path = %fallback.display(),
+        "HOME is unset; storing ChatGPT credentials under $TMPDIR. Set HOME to a stable location for persistent sign-in."
+    );
+    fallback
 }
 
 /// Decide which file to load credentials from at startup.

@@ -60,11 +60,12 @@ export function CodexLoginPage() {
               // Open the destination tab in the user-gesture window. We only
               // know the URL after the /pkce/start round-trip completes, so
               // navigate this blank tab from the API success handler below.
-              pkcePreopenedRef.current = window.open(
-                'about:blank',
-                '_blank',
-                'noopener,noreferrer',
-              );
+              //
+              // No `noopener` — when honored it makes window.open return
+              // `null`, which would leave us with a blank tab we can't
+              // navigate. We need the handle here, and the destination is
+              // our own intent (auth.openai.com), not arbitrary content.
+              pkcePreopenedRef.current = window.open('about:blank', '_blank');
               setMode('pkce');
             }}
             onPickDevice={() => { setError(null); setMode('device'); }}

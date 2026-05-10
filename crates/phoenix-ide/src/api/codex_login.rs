@@ -197,7 +197,7 @@ pub async fn pkce_start(
 
     // Try to bind the loopback. Failure here isn't fatal — the manual paste
     // fallback can still complete the flow.
-    let loopback = match LoopbackServer::start().await {
+    let loopback = match LoopbackServer::start(session.state.clone()).await {
         Ok(srv) => Some(srv),
         Err(LoginError::PortInUse(_)) => {
             tracing::info!(
@@ -541,9 +541,10 @@ async fn settle_device(
         sessions.get(session_id).cloned()
     };
     let Some(session) = session else { return };
-    if outcome.is_err() {
+    if let Err(err) = &outcome {
         tracing::warn!(
             user_code = %session.user_code,
+            error = %err,
             "codex_login: device code flow ended in error"
         );
     }

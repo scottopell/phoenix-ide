@@ -593,6 +593,12 @@ use tokio::sync::Mutex as TokioMutex;
 #[derive(Clone)]
 struct CallbackState {
     sender: Arc<TokioMutex<Option<oneshot::Sender<CallbackPayload>>>>,
+    /// State we generated and embedded in the authorize URL. The handler
+    /// validates this **before** consuming the sender, so a malicious local
+    /// process that hits `/auth/callback` with garbage cannot DoS the login
+    /// session by burning the one-shot before the real browser callback
+    /// arrives.
+    expected_state: Arc<String>,
 }
 
 /// Either a successful auth code or an error reported by the OAuth provider.
@@ -611,56 +617,105 @@ pub enum CallbackPayload {
 pub struct LoopbackServer {
     /// Receiver for the single callback. May be consumed at most once.
     pub callback_rx: oneshot::Receiver<CallbackPayload>,
-    shutdown_tx: Option<oneshot::Sender<()>>,
-    handle: tokio::task::JoinHandle<()>,
+    /// One sender per bound listener (typically two: 127.0.0.1 + ::1).
+    /// Dropping all of them initiates graceful shutdown.
+    shutdown_txs: Vec<oneshot::Sender<()>>,
+    handles: Vec<tokio::task::JoinHandle<()>>,
 }
 
 impl LoopbackServer {
     /// Bind to the loopback callback port and start serving.
-    pub async fn start() -> Result<Self, LoginError> {
-        Self::start_on_port(CALLBACK_PORT).await
+    ///
+    /// Tries both `127.0.0.1:port` and `[::1]:port`. The redirect URI is
+    /// registered as `localhost`, which on dual-stack systems can resolve to
+    /// either family depending on the browser; binding both makes the
+    /// callback robust regardless of resolution order.
+    ///
+    /// Bind to at least one address is required. If the requested port is in
+    /// use on either loopback (typical: a previous Codex CLI login left
+    /// something listening), returns `PortInUse`. If only one family is
+    /// unavailable on the host (e.g. no IPv6 stack), the other is enough.
+    pub async fn start(expected_state: String) -> Result<Self, LoginError> {
+        Self::start_on_port(CALLBACK_PORT, expected_state).await
     }
 
-    pub async fn start_on_port(port: u16) -> Result<Self, LoginError> {
-        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-        let listener = match tokio::net::TcpListener::bind(addr).await {
-            Ok(l) => l,
+    pub async fn start_on_port(port: u16, expected_state: String) -> Result<Self, LoginError> {
+        let v4_addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let v6_addr = std::net::SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], port));
+
+        let v4 = match tokio::net::TcpListener::bind(v4_addr).await {
+            Ok(l) => Some(l),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
                 return Err(LoginError::PortInUse(port));
             }
-            Err(e) => return Err(LoginError::Loopback(format!("bind {addr}: {e}"))),
+            Err(e) => {
+                tracing::debug!(addr = %v4_addr, error = %e,
+                    "codex_login: IPv4 loopback bind failed");
+                None
+            }
         };
+        let v6 = match tokio::net::TcpListener::bind(v6_addr).await {
+            Ok(l) => Some(l),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                if v4.is_none() {
+                    return Err(LoginError::PortInUse(port));
+                }
+                tracing::debug!(addr = %v6_addr, error = %e,
+                    "codex_login: IPv6 loopback in use, continuing with IPv4 only");
+                None
+            }
+            Err(e) => {
+                tracing::debug!(addr = %v6_addr, error = %e,
+                    "codex_login: IPv6 loopback bind failed (no v6 stack?)");
+                None
+            }
+        };
+
+        if v4.is_none() && v6.is_none() {
+            return Err(LoginError::Loopback(format!(
+                "neither 127.0.0.1:{port} nor [::1]:{port} could be bound"
+            )));
+        }
 
         let (callback_tx, callback_rx) = oneshot::channel();
         let state = CallbackState {
             sender: Arc::new(TokioMutex::new(Some(callback_tx))),
+            expected_state: Arc::new(expected_state),
         };
 
-        let app = Router::new()
-            .route("/auth/callback", get(callback_handler))
-            .with_state(state);
-
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
-        let handle = tokio::spawn(async move {
-            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-                let _ = shutdown_rx.await;
+        let mut shutdown_txs = Vec::new();
+        let mut handles = Vec::new();
+        for (listener, label) in [(v4, "127.0.0.1"), (v6, "::1")]
+            .into_iter()
+            .filter_map(|(l, label)| l.map(|l| (l, label)))
+        {
+            let app = Router::new()
+                .route("/auth/callback", get(callback_handler))
+                .with_state(state.clone());
+            let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+            let handle = tokio::spawn(async move {
+                let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+                    let _ = shutdown_rx.await;
+                });
+                if let Err(e) = server.await {
+                    tracing::warn!(addr = %label, error = %e,
+                        "codex_login: loopback server exited with error");
+                }
             });
-            if let Err(e) = server.await {
-                tracing::warn!(error = %e, "codex_login: loopback server exited with error");
-            }
-        });
+            shutdown_txs.push(shutdown_tx);
+            handles.push(handle);
+        }
 
         Ok(Self {
             callback_rx,
-            shutdown_tx: Some(shutdown_tx),
-            handle,
+            shutdown_txs,
+            handles,
         })
     }
 
-    /// Initiate graceful shutdown. Idempotent.
+    /// Initiate graceful shutdown of every bound listener. Idempotent.
     pub fn shutdown(&mut self) {
-        if let Some(tx) = self.shutdown_tx.take() {
+        for tx in self.shutdown_txs.drain(..) {
             let _ = tx.send(());
         }
     }
@@ -669,7 +724,9 @@ impl LoopbackServer {
 impl Drop for LoopbackServer {
     fn drop(&mut self) {
         self.shutdown();
-        self.handle.abort();
+        for h in self.handles.drain(..) {
+            h.abort();
+        }
     }
 }
 
@@ -677,24 +734,37 @@ async fn callback_handler(
     State(state): State<CallbackState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Html<String> {
-    // Decide what to send back to the browser before consuming the channel,
-    // so a race between two callbacks doesn't strand one with no response.
+    // RFC 6749 §4.1.2.1: the OAuth provider includes `state` in both the
+    // success and error redirect. Validate it BEFORE consuming the one-shot.
+    // Any caller — including a malicious local process trying to DoS the
+    // login by burning the channel with garbage — that doesn't supply our
+    // exact state value sees an error page but does NOT settle the session.
+    // The real browser callback can still arrive afterwards.
+    let returned_state = params.get("state").map(String::as_str);
+    if returned_state != Some(state.expected_state.as_str()) {
+        tracing::debug!(
+            "codex_login: rejecting callback with missing/mismatched state — \
+             not consuming session sender"
+        );
+        return Html(ERROR_HTML.to_string());
+    }
+
     let payload = if let Some(error) = params.get("error") {
         CallbackPayload::Error {
             error: error.clone(),
             description: params.get("error_description").cloned(),
         }
-    } else {
-        match (params.get("code"), params.get("state")) {
-            (Some(code), Some(st)) => CallbackPayload::Success {
-                code: code.clone(),
-                state: st.clone(),
-            },
-            _ => CallbackPayload::Error {
-                error: "invalid_callback".to_string(),
-                description: Some("missing code or state parameter".to_string()),
-            },
+    } else if let Some(code) = params.get("code") {
+        CallbackPayload::Success {
+            code: code.clone(),
+            // We've already validated state above, but pass it through for
+            // the defense-in-depth check in `drive_pkce`.
+            state: state.expected_state.as_ref().clone(),
         }
+    } else {
+        // State validated but neither error nor code present. Treat as
+        // garbage; do NOT consume the sender.
+        return Html(ERROR_HTML.to_string());
     };
 
     let mut guard = state.sender.lock().await;
@@ -922,6 +992,70 @@ mod tests {
             validate_state(&session.state, "attacker-supplied-state"),
             Err(LoginError::StateMismatch)
         ));
+    }
+
+    /// Loopback callback DoS protection (PR #57 review): a request without
+    /// a matching `state` parameter must NOT consume the one-shot sender.
+    /// This guards against a local malicious process firing one bogus GET
+    /// to `:1455/auth/callback` and stranding the real browser callback.
+    /// Exercises `callback_handler` directly with a hand-built
+    /// `CallbackState`, since spinning up a real listener on a fixed port
+    /// risks conflict with an actual login flow.
+    #[tokio::test]
+    async fn callback_handler_rejects_wrong_state_without_consuming_sender() {
+        let (tx, rx) = oneshot::channel::<CallbackPayload>();
+        let state = CallbackState {
+            sender: Arc::new(TokioMutex::new(Some(tx))),
+            expected_state: Arc::new("real-state".into()),
+        };
+
+        // (1) Mismatched state — handler rejects, sender preserved.
+        let mut bad_params = HashMap::new();
+        bad_params.insert("state".to_string(), "attacker-supplied".to_string());
+        bad_params.insert("code".to_string(), "some-code".to_string());
+        let _ = callback_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(bad_params),
+        )
+        .await;
+        assert!(
+            state.sender.lock().await.is_some(),
+            "wrong-state callback must not consume the one-shot sender"
+        );
+
+        // (2) Missing state parameter entirely — same protection.
+        let mut missing_params = HashMap::new();
+        missing_params.insert("code".to_string(), "some-code".to_string());
+        let _ = callback_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(missing_params),
+        )
+        .await;
+        assert!(
+            state.sender.lock().await.is_some(),
+            "callback without state must not consume the one-shot sender"
+        );
+
+        // (3) Real callback now arrives with matching state — settles.
+        let mut good_params = HashMap::new();
+        good_params.insert("state".to_string(), "real-state".to_string());
+        good_params.insert("code".to_string(), "real-code".to_string());
+        let _ = callback_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(good_params),
+        )
+        .await;
+        let payload = rx.await.expect("real callback must settle the session");
+        match payload {
+            CallbackPayload::Success {
+                code,
+                state: returned_state,
+            } => {
+                assert_eq!(code, "real-code");
+                assert_eq!(returned_state, "real-state");
+            }
+            other => panic!("expected Success, got {other:?}"),
+        }
     }
 
     /// Device code timeout: when `expires_at` is in the past, `poll_device_code`
