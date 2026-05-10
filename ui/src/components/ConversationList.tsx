@@ -58,7 +58,7 @@ interface ConversationRowProps {
   menuRef?: React.RefObject<HTMLDivElement> | undefined;
 }
 
-const ConversationRow = memo(function ConversationRow({
+export const ConversationRow = memo(function ConversationRow({
   conv,
   isMenuOpen,
   isKeyboardSelected,
@@ -243,7 +243,7 @@ interface ChainBlockProps {
   chainMenuRef?: React.RefObject<HTMLDivElement> | undefined;
 }
 
-const ChainBlock = memo(function ChainBlock({
+export const ChainBlock = memo(function ChainBlock({
   item,
   collapsed,
   isMenuOpen,
