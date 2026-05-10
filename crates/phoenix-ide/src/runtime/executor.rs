@@ -1300,11 +1300,13 @@ where
             }
 
             Effect::ApproveTask {
+                task_file,
                 title,
                 priority,
                 plan,
             } => {
-                self.execute_approve_task(title, priority, plan).await?;
+                self.execute_approve_task(task_file, title, priority, plan)
+                    .await?;
                 Ok(None)
             }
 

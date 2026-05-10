@@ -146,9 +146,14 @@ pub enum Effect {
     NotifyContextExhausted { summary: String },
 
     /// Execute git operations for task approval (REQ-BED-028).
-    /// The executor handles: assign task ID, write task file, commit to main,
-    /// create branch, checkout branch. Placeholder — executor implementation in later batch.
+    ///
+    /// `task_file` (relative to the conversation cwd) is the canonical
+    /// source: the executor reads it from disk to derive task id, slug,
+    /// priority, and status, then sets up the branch and worktree. The
+    /// remaining fields are the snapshot the user approved and are used for
+    /// the user-facing branch announcement message.
     ApproveTask {
+        task_file: String,
         title: String,
         priority: String,
         plan: String,

@@ -21,8 +21,149 @@ use super::state::{
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use serde_json::json;
+use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
+
+/// Statuses a task file may be in for `propose_task` to accept it.
+const ACCEPTABLE_PROPOSE_STATUSES: &[&str] = &["ready", "in-progress", "brainstorming"];
+
+/// Validated snapshot of a task file at the moment `propose_task` was called.
+///
+/// `task_file` is normalised to a forward-slash path relative to the
+/// conversation cwd; `title` is the first H1 heading or, lacking that, a
+/// title-cased version of the slug from the filename.
+#[derive(Debug)]
+struct TaskFileSnapshot {
+    task_file: String,
+    title: String,
+    priority: String,
+    plan: String,
+}
+
+/// Read and validate a task file referenced by `propose_task`.
+///
+/// The state machine treats this read as a deterministic data-load — like
+/// reading the conversation cwd off disk — not as an external side effect.
+/// All I/O is local to the worktree, synchronous, and bounded.
+fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, String> {
+    if task_file.is_empty() {
+        return Err("task_file is required".to_string());
+    }
+    let rel_path = Path::new(task_file);
+    if rel_path.is_absolute() {
+        return Err(format!(
+            "task_file must be relative to the repo root (got '{task_file}')"
+        ));
+    }
+    let first_component = rel_path
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str());
+    if first_component != Some("tasks") {
+        return Err(format!(
+            "task_file must be under tasks/ (got '{task_file}')"
+        ));
+    }
+
+    let abs_path = cwd.join(rel_path);
+    let content = std::fs::read_to_string(&abs_path).map_err(|e| {
+        format!(
+            "Failed to read task file '{task_file}': {e}. \
+             Create the file under tasks/ (with valid frontmatter and the \
+             taskmd filename format) before calling propose_task."
+        )
+    })?;
+
+    let filename = rel_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+    let (_id, fn_priority, fn_status, fn_slug) = taskmd_core::filename::parse_filename(filename)
+        .ok_or_else(|| {
+            format!(
+                "task_file '{filename}' does not match the taskmd filename pattern \
+                 (NNNNN-pX-status--slug.md)"
+            )
+        })?;
+
+    let frontmatter = taskmd_core::frontmatter::parse_frontmatter_str(&content);
+    let priority = frontmatter
+        .get("priority")
+        .cloned()
+        .unwrap_or_else(|| fn_priority.clone());
+    let status = frontmatter
+        .get("status")
+        .cloned()
+        .unwrap_or_else(|| fn_status.clone());
+
+    if priority != fn_priority {
+        return Err(format!(
+            "task file frontmatter priority '{priority}' does not match filename priority '{fn_priority}' \
+             — fix the file before calling propose_task"
+        ));
+    }
+    if status != fn_status {
+        return Err(format!(
+            "task file frontmatter status '{status}' does not match filename status '{fn_status}' \
+             — fix the file before calling propose_task"
+        ));
+    }
+    if !ACCEPTABLE_PROPOSE_STATUSES.contains(&status.as_str()) {
+        return Err(format!(
+            "task file status '{status}' cannot be proposed for approval. \
+             Acceptable statuses: {}.",
+            ACCEPTABLE_PROPOSE_STATUSES.join(", ")
+        ));
+    }
+
+    let body_after_frontmatter = strip_frontmatter(&content);
+    let title = extract_title(body_after_frontmatter).unwrap_or_else(|| slug_to_title(&fn_slug));
+    let plan = body_after_frontmatter.trim().to_string();
+
+    Ok(TaskFileSnapshot {
+        task_file: task_file.replace('\\', "/"),
+        title,
+        priority,
+        plan,
+    })
+}
+
+fn strip_frontmatter(content: &str) -> &str {
+    if !content.starts_with("---\n") {
+        return content;
+    }
+    let after_open = &content[4..];
+    if let Some(close) = after_open.find("\n---\n") {
+        &after_open[close + 5..]
+    } else {
+        content
+    }
+}
+
+fn extract_title(body: &str) -> Option<String> {
+    body.lines().find_map(|line| {
+        let trimmed = line.trim_start();
+        trimmed
+            .strip_prefix("# ")
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    })
+}
+
+fn slug_to_title(slug: &str) -> String {
+    slug.split('-')
+        .filter(|s| !s.is_empty())
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 
@@ -1169,6 +1310,7 @@ pub fn transition_parent(
 
         (
             ParentState::AwaitingTaskApproval {
+                task_file,
                 title,
                 priority,
                 plan,
@@ -1179,6 +1321,7 @@ pub fn transition_parent(
         ) => Ok(
             ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting { attempt: 1 }))
                 .with_effect(Effect::ApproveTask {
+                    task_file: task_file.clone(),
                     title: title.clone(),
                     priority: priority.clone(),
                     plan: plan.clone(),
@@ -1447,6 +1590,32 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
                 if let ToolInput::ProposeTask(ref input) = tool.input {
+                    let snapshot = match resolve_task_file(&context.working_dir, &input.task_file) {
+                        Ok(s) => s,
+                        Err(err_msg) => {
+                            // Validation failed: surface the error as a tool_result and
+                            // re-request the LLM so it can fix the file (or pick another)
+                            // and retry.
+                            let display_data =
+                                compute_bash_display_data(&content, &context.working_dir);
+                            let assistant_message =
+                                AssistantMessage::new(content, Some(usage_data), display_data);
+                            let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                            let checkpoint = CheckpointData::tool_round(
+                                assistant_message,
+                                vec![tool_result],
+                            )
+                            .expect("propose_task produces exactly one tool_use and one result");
+                            return Ok(ParentTransitionResult::new(ParentState::Core(
+                                CoreState::LlmRequesting { attempt: 1 },
+                            ))
+                            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                            .with_effect(Effect::PersistState)
+                            .with_effect(notify_llm_requesting(1))
+                            .with_effect(Effect::RequestLlm));
+                        }
+                    };
+
                     let tool_result = ToolResult::success(
                         tool.id.clone(),
                         "Plan submitted for review".to_string(),
@@ -1460,18 +1629,20 @@ pub fn transition_parent(
 
                     return Ok(
                         ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
-                            title: input.title.clone(),
-                            priority: input.priority.clone(),
-                            plan: input.plan.clone(),
+                            task_file: snapshot.task_file.clone(),
+                            title: snapshot.title.clone(),
+                            priority: snapshot.priority.clone(),
+                            plan: snapshot.plan.clone(),
                         })
                         .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::notify_state_change(
                             "awaiting_task_approval",
                             json!({
-                                "title": input.title,
-                                "priority": input.priority,
-                                "plan": input.plan
+                                "task_file": snapshot.task_file,
+                                "title": snapshot.title,
+                                "priority": snapshot.priority,
+                                "plan": snapshot.plan,
                             }),
                         )),
                     );

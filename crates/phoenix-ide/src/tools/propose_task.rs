@@ -3,14 +3,16 @@
 //! This tool is intercepted at the state machine level (`LlmResponse` handler)
 //! before it ever reaches `ToolExecuting`. The `run()` method exists only as a
 //! fallback and should never be called in practice.
+//!
+//! The tool now references an existing task file on disk under `tasks/`. The
+//! agent (in Explore mode) writes/edits the task file via `patch` — task file
+//! content lives on disk, not in the tool call. This keeps revisions as file
+//! edits instead of round-tripping the full plan through tool args.
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-/// Tool definition for `propose_task`. Registered in Explore mode so the LLM
-/// sees it in its tool list. Intercepted before execution -- the state machine
-/// transitions to `AwaitingTaskApproval` instead.
 pub struct ProposeTaskTool;
 
 #[async_trait]
@@ -22,37 +24,29 @@ impl Tool for ProposeTaskTool {
     fn description(&self) -> String {
         "Propose a task for the user to review and approve. This is the \
          gateway from Explore mode (read-only) to Work mode (write access). \
-         The task will be shown to the user for review — they can approve it, \
-         request changes, or discard it. This must be the only tool call in \
-         the response (do not combine with other tool calls)."
+         Pass the path to a task file under `tasks/` — either an existing \
+         task file you want to begin working on, or a new task file you \
+         created with `patch` in this conversation. The file's frontmatter \
+         supplies priority and status; the body is the plan shown to the \
+         user. Status must be one of: ready, in-progress, brainstorming. \
+         This must be the only tool call in the response."
             .to_string()
     }
 
     fn input_schema(&self) -> Value {
         json!({
             "type": "object",
-            "required": ["title", "priority", "plan"],
+            "required": ["task_file"],
             "properties": {
-                "title": {
+                "task_file": {
                     "type": "string",
-                    "description": "Short title for the task (used in filenames and branch names)"
-                },
-                "priority": {
-                    "type": "string",
-                    "enum": ["p0", "p1", "p2", "p3"],
-                    "description": "Priority level: p0 (critical), p1 (high), p2 (medium), p3 (low)"
-                },
-                "plan": {
-                    "type": "string",
-                    "description": "The full task plan in markdown. Include: summary, context, what to do, and acceptance criteria."
+                    "description": "Path (relative to the repo root) to an existing task file under tasks/. The file must follow the taskmd naming convention (e.g. tasks/01234-p2-ready--my-slug.md) and have valid frontmatter."
                 }
             }
         })
     }
 
     async fn run(&self, _input: Value, _ctx: ToolContext) -> ToolOutput {
-        // This should never be called — propose_task is intercepted at the
-        // state machine level before entering ToolExecuting.
         ToolOutput::error(
             "propose_task was not intercepted by the state machine. \
              This is a bug — please report it.",

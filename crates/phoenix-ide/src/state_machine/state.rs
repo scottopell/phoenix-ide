@@ -81,12 +81,14 @@ pub struct SubmitErrorInput {
     pub error: String,
 }
 
-/// Input for the `propose_task` tool (task approval workflow)
+/// Input for the `propose_task` tool (task approval workflow).
+///
+/// The agent passes a path (relative to the repo root) to an existing task
+/// file under `tasks/`. Title, priority, status, and plan body are all read
+/// from disk by the state-machine interception layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposeTaskInput {
-    pub title: String,
-    pub priority: String,
-    pub plan: String,
+    pub task_file: String,
 }
 
 /// A single question presented to the user (REQ-AUQ-001)
@@ -451,8 +453,15 @@ pub enum ConvState {
         attempt: u32,
     },
 
-    /// Awaiting user approval of a proposed task plan (REQ-BED-028)
+    /// Awaiting user approval of a proposed task plan (REQ-BED-028).
+    ///
+    /// `task_file` is the canonical source — the path (relative to the
+    /// conversation cwd) to a file under `tasks/`. The other fields are a
+    /// snapshot derived from that file at the moment `propose_task` was
+    /// called and exist for UI display only; the executor re-reads
+    /// `task_file` on approval.
     AwaitingTaskApproval {
+        task_file: String,
         title: String,
         priority: String,
         plan: String,
@@ -549,6 +558,7 @@ pub enum ParentState {
         recovery_kind: RecoveryKind,
     },
     AwaitingTaskApproval {
+        task_file: String,
         title: String,
         priority: String,
         plan: String,
@@ -596,10 +606,12 @@ impl From<ParentState> for ConvState {
                 recovery_kind,
             },
             ParentState::AwaitingTaskApproval {
+                task_file,
                 title,
                 priority,
                 plan,
             } => ConvState::AwaitingTaskApproval {
+                task_file,
                 title,
                 priority,
                 plan,
@@ -788,10 +800,12 @@ impl TryFrom<ConvState> for ParentState {
                 recovery_kind,
             }),
             ConvState::AwaitingTaskApproval {
+                task_file,
                 title,
                 priority,
                 plan,
             } => Ok(ParentState::AwaitingTaskApproval {
+                task_file,
                 title,
                 priority,
                 plan,
