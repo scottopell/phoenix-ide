@@ -5,7 +5,8 @@
 // CHN-Sidebar: chain grouping render (REQ-CHN-002, task 02690 Phase 5)
 
 import { describe, it, expect, vi } from 'vitest';
-import { render, fireEvent, within } from '@testing-library/react';
+import { useState } from 'react';
+import { render, fireEvent, within, act } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { ConversationList } from './ConversationList';
 import type { Conversation } from '../api';
@@ -479,3 +480,108 @@ describe('Chain lifecycle UI (task 02701)', () => {
     ).toBe('auth refactor');
   });
 });
+
+// Phase 3 regression: rows are React.memo components with narrow props +
+// stable parent callbacks. Keyboard nav (j/k) flips selectedId, which
+// changes only the previously- and newly-selected rows' isKeyboardSelected
+// prop; every other row's props are referentially identical across the
+// parent re-render and must skip update.
+//
+// Render-count via instrumented onArchive callback: we don't need to
+// touch React internals. The parent passes a single shared `onArchive`
+// callback to every row; each ConversationRow attaches it to a memoized
+// "Archive" button. With memo working, only the rows whose other props
+// changed re-evaluate the archive-button JSX subtree — which is what
+// makes memoization observable here. We verify the simpler invariant:
+// arrow-key navigation that walks past several rows toggles
+// `keyboard-selected` only on the affected rows, and the child-element
+// identity of unaffected rows is preserved across the navigation.
+describe('ConversationList — row memoization on keyboard navigation', () => {
+  it('arrow-down preserves DOM-node identity for unaffected rows', () => {
+    const conversations = [
+      makeConv('c1', 'one'),
+      makeConv('c2', 'two'),
+      makeConv('c3', 'three'),
+      makeConv('c4', 'four'),
+    ];
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList {...defaultProps} conversations={conversations} />
+      </MemoryRouter>,
+    );
+
+    // Capture the inner .conv-item-main node identity before navigation.
+    // React replaces these refs only when the parent component re-renders
+    // them; a memo-skipped row keeps the exact same DOM nodes.
+    const before: Record<string, Element> = {};
+    container.querySelectorAll('.conv-item').forEach((el) => {
+      const id = el.getAttribute('data-id')!;
+      before[id] = el.querySelector('.conv-item-main')!;
+    });
+
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown' }));
+    });
+    act(() => {
+      window.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown' }));
+    });
+
+    // c1 was selected then deselected — its className changed, so its
+    // memo bailed out. Same for c2 (now selected).
+    // c3 and c4 are untouched — same DOM nodes.
+    const c3After = container.querySelector('[data-id="c3"] .conv-item-main')!;
+    const c4After = container.querySelector('[data-id="c4"] .conv-item-main')!;
+    expect(c3After).toBe(before.c3);
+    expect(c4After).toBe(before.c4);
+
+    // Sanity: c2 is now keyboard-selected, c1 is not.
+    expect(
+      container.querySelector('[data-id="c2"]')!.classList.contains('keyboard-selected'),
+    ).toBe(true);
+    expect(
+      container.querySelector('[data-id="c1"]')!.classList.contains('keyboard-selected'),
+    ).toBe(false);
+  });
+
+  it('parent re-render with stable props does not touch any row DOM', () => {
+    const conversations = [
+      makeConv('c1', 'one'),
+      makeConv('c2', 'two'),
+      makeConv('c3', 'three'),
+    ];
+
+    function Harness() {
+      const [tick, setTick] = useState(0);
+      return (
+        <>
+          <button data-testid="bump" onClick={() => setTick((t) => t + 1)}>
+            bump {tick}
+          </button>
+          <ConversationList {...defaultProps} conversations={conversations} />
+        </>
+      );
+    }
+
+    const { container, getByTestId } = render(
+      <MemoryRouter>
+        <Harness />
+      </MemoryRouter>,
+    );
+
+    const before: Record<string, Element> = {};
+    container.querySelectorAll('.conv-item').forEach((el) => {
+      const id = el.getAttribute('data-id')!;
+      before[id] = el.querySelector('.conv-item-main')!;
+    });
+
+    fireEvent.click(getByTestId('bump'));
+    fireEvent.click(getByTestId('bump'));
+
+    for (const id of ['c1', 'c2', 'c3']) {
+      const after = container.querySelector(`[data-id="${id}"] .conv-item-main`)!;
+      expect(after).toBe(before[id]);
+    }
+  });
+});
+

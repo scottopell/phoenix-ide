@@ -236,6 +236,10 @@ export function Sidebar({
     setRenameTarget(conv);
   }, []);
 
+  const handleToggleArchived = useCallback(() => {
+    setShowArchived((prev) => !prev);
+  }, []);
+
   const isOnNewPage = location.pathname === '/' || location.pathname === '/new';
 
   if (collapsed) {
@@ -327,7 +331,7 @@ export function Sidebar({
           conversations={filteredConversations}
           archivedConversations={filteredArchivedConversations}
           showArchived={showArchived}
-          onToggleArchived={() => setShowArchived(!showArchived)}
+          onToggleArchived={handleToggleArchived}
           onNewConversation={handleNewClick}
           onArchive={handleArchive}
           onUnarchive={handleUnarchive}

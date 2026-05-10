@@ -354,6 +354,19 @@ export function ConversationListPage() {
     pullStartY.current = null;
   }, []);
 
+  const handleToggleArchived = useCallback(() => {
+    setShowArchived((prev) => !prev);
+  }, []);
+
+  const handleSetDeleteTarget = useCallback((conv: Conversation) => {
+    setDeleteTarget(conv);
+  }, []);
+
+  const handleSetRenameTarget = useCallback((conv: Conversation) => {
+    setRenameError(undefined);
+    setRenameTarget(conv);
+  }, []);
+
 
   // On desktop, the sidebar handles the conversation list.
   // Root route shows the new conversation form in main content.
@@ -431,15 +444,12 @@ export function ConversationListPage() {
               conversations={conversations}
               archivedConversations={archivedConversations}
               showArchived={showArchived}
-              onToggleArchived={() => setShowArchived(!showArchived)}
+              onToggleArchived={handleToggleArchived}
               onNewConversation={handleNewConversation}
               onArchive={handleArchive}
               onUnarchive={handleUnarchive}
-              onDelete={(conv) => setDeleteTarget(conv)}
-              onRename={(conv) => {
-                setRenameError(undefined);
-                setRenameTarget(conv);
-              }}
+              onDelete={handleSetDeleteTarget}
+              onRename={handleSetRenameTarget}
               onArchiveChain={handleArchiveChain}
               onUnarchiveChain={handleUnarchiveChain}
               onDeleteChain={requestDeleteChain}
