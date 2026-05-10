@@ -935,9 +935,27 @@ impl ModelRegistry {
             Some(path) => match CodexCredential::load(path.clone()) {
                 Ok((cred, account_id)) => Some((cred, account_id)),
                 Err(e) => {
+                    // Load failed for a specified path. Do NOT swap services
+                    // or update `current_codex_loaded_path`: pretending we
+                    // loaded the file would suppress the UI's
+                    // restart-required warning even though the bridge isn't
+                    // actually live. Preserve the prior state — if the user
+                    // had a working credential before, requests keep going
+                    // through it; if not, OpenAI stays unavailable and the
+                    // preflight honestly still asks for a restart.
                     tracing::warn!(error = %e, path = %path.display(),
-                        "codex_login: reload failed to load credential");
-                    None
+                        "codex_login: reload failed to load credential — preserving prior bridge state");
+                    let prior_path = self
+                        .current_codex_loaded_path
+                        .read()
+                        .ok()
+                        .and_then(|g| g.clone());
+                    return CodexReloadOutcome {
+                        previous_path: prior_path.clone(),
+                        current_path: prior_path,
+                        credential_loaded: false,
+                        account_id: None,
+                    };
                 }
             },
             None => None,
@@ -1357,6 +1375,49 @@ mod tests {
         assert!(
             registry.get("gpt-5.5").is_none(),
             "OpenAI bridge must be removed when reload resolves to None"
+        );
+    }
+
+    /// Load failure must NOT swap state. The prior bridge is preserved
+    /// (so requests keep working) and `current_codex_loaded_path` keeps
+    /// reflecting the actually-loaded path — so the preflight's
+    /// `restart_required_after_login` predicate stays honest.
+    #[test]
+    fn reload_load_failure_preserves_prior_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let initial_path = dir.path().join("auth.json");
+        let config = LlmConfig {
+            use_codex_auth: true,
+            codex_credential: Some(fake_codex_credential(&dir)),
+            codex_credential_path: Some(initial_path.clone()),
+            ..Default::default()
+        };
+        let registry = ModelRegistry::new(&config);
+        assert!(registry.get("gpt-5.5").is_some());
+        assert_eq!(
+            registry.current_codex_loaded_path().as_deref(),
+            Some(initial_path.as_path())
+        );
+
+        // Point reload at a path with a malformed auth file. Load must fail.
+        let bad_dir = tempfile::tempdir().unwrap();
+        let bad_path = bad_dir.path().join("malformed.json");
+        std::fs::write(&bad_path, b"{ not even json").unwrap();
+        let outcome = registry.reload_codex_credential_with(Some(bad_path));
+        assert!(!outcome.credential_loaded);
+
+        // Prior bridge still works; current path still points at the
+        // originally-loaded file. A preflight read here would correctly
+        // report restart_required iff initial_path doesn't equal the
+        // login-write path — independent of this failed attempt.
+        assert!(
+            registry.get("gpt-5.5").is_some(),
+            "load failure must not deregister the working bridge"
+        );
+        assert_eq!(
+            registry.current_codex_loaded_path().as_deref(),
+            Some(initial_path.as_path()),
+            "load failure must not advance current_codex_loaded_path"
         );
     }
 
