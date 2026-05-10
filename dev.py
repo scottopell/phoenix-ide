@@ -1782,6 +1782,59 @@ def cmd_check():
                 results.append(("allium specs", 0, elapsed, ""))
                 print(f"  ✓ {'allium specs':<18s} ({elapsed:.1f}s)")
 
+    def check_spec_anchors():
+        """REQ-* anchor cross-validator. Fails on orphan code anchors —
+        REQ-IDs referenced in source code but not canonically declared
+        in any executive.md status row or requirements.md heading.
+        Same logic as `./dev.py audit-specs`; the verbose /
+        unanchored-half is on the standalone subcommand only (too
+        noisy as a build gate)."""
+        t0 = time.monotonic()
+        try:
+            spec_decls = _scan_for_canonical_req_decls(ROOT / "specs")
+            code_anchors = {}
+            for code_root_rel in ("crates", "ui/src"):
+                code_root = ROOT / code_root_rel
+                if not code_root.is_dir():
+                    continue
+                chunk = _scan_for_req_anchors(
+                    code_root,
+                    extensions=_CODE_EXTENSIONS,
+                    skip_dirs=_CODE_SKIP_DIRS,
+                )
+                for req, locs in chunk.items():
+                    code_anchors.setdefault(req, []).extend(locs)
+        except Exception as e:
+            elapsed = time.monotonic() - t0
+            with results_lock:
+                results.append(("spec anchors", 1, elapsed, f"scan failed: {e}"))
+                print(f"  ✗ {'spec anchors':<18s} ({elapsed:.1f}s)")
+            return
+
+        elapsed = time.monotonic() - t0
+        orphans = sorted(set(code_anchors.keys()) - set(spec_decls.keys()))
+        if orphans:
+            lines = [
+                f"{len(orphans)} REQ-ID(s) referenced in code but not declared in any spec.",
+                "These are typos, renames, or deletions where the code anchor wasn't updated.",
+                "",
+            ]
+            for req in orphans:
+                locs = code_anchors[req]
+                lines.append(f"{req}  ({len(locs)} occurrence{'s' if len(locs) != 1 else ''})")
+                for path, line, snippet in locs[:3]:
+                    lines.append(f"  {path}:{line}  {snippet}")
+                if len(locs) > 3:
+                    lines.append(f"  ... and {len(locs) - 3} more")
+            out = "\n".join(lines)
+            with results_lock:
+                results.append(("spec anchors", 1, elapsed, out))
+                print(f"  ✗ {'spec anchors':<18s} ({elapsed:.1f}s)")
+        else:
+            with results_lock:
+                results.append(("spec anchors", 0, elapsed, ""))
+                print(f"  ✓ {'spec anchors':<18s} ({elapsed:.1f}s)")
+
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     ensure_ui_deps()
 
@@ -1843,6 +1896,7 @@ def cmd_check():
         threading.Thread(target=lane_fast),
         threading.Thread(target=check_ast_grep),
         threading.Thread(target=check_allium),
+        threading.Thread(target=check_spec_anchors),
         threading.Thread(target=check_package_lock_clean),
     ]
     for t in threads:
@@ -1965,43 +2019,117 @@ def cmd_tasks_validate(quiet: bool = False) -> bool:
 
 # REQ-* anchor regex. Matches `REQ-{PREFIX}-{NUM}` where PREFIX is one
 # or more uppercase-letter/digit/hyphen segments (e.g. REQ-BED-001,
-# REQ-TASKS-UI-007, REQ-CONV-018). Word-boundary on each side so
-# substring matches in URLs / filenames don't trigger.
+# REQ-TASKS-UI-007, REQ-CONV-018). Word boundaries match between
+# alphanumeric and non-alphanumeric chars (`-`, `.`, `/`), so
+# `REQ-FOO-001-style`, `REQ-FOO-001.md`, and `…/REQ-FOO-001` all
+# yield the trailing-digit-bounded match `REQ-FOO-001` — which is
+# the right behaviour: those still mention the REQ.
 _REQ_ANCHOR_RE = re.compile(r'\bREQ-[A-Z][A-Z0-9-]*-\d+\b')
 
-# Code file extensions to scan for REQ-* anchors. The walk explicitly
-# skips node_modules / target / generated / build artefact directories
-# so the report stays signal-rich.
+# Canonical REQ-declaration patterns. The audit's gate has two halves:
+#   - SOURCE CODE (extensions below) is scanned with the broad
+#     _REQ_ANCHOR_RE — every comment mention counts as an anchor.
+#   - SPECIFICATIONS are scanned with these tighter patterns so cross-
+#     references in design.md / .allium prose don't count as
+#     declarations. Only the canonical declaration sites — executive
+#     status table rows and requirements.md `### REQ-...` headings —
+#     register a REQ-ID as "owned by" some spec. Without this
+#     tightening, a code anchor pointing at a non-existent REQ would
+#     pass the orphan check whenever any spec happens to mention that
+#     ID in prose. (Catch from Copilot review on PR #63.)
+_REQ_DECL_TABLE_RE = re.compile(r'^\|\s*\*\*(REQ-[A-Z][A-Z0-9-]*-\d+)[:.]')
+_REQ_DECL_HEADING_RE = re.compile(r'^###\s+(REQ-[A-Z][A-Z0-9-]*-\d+)(?::|\s|$)')
+
+# Code file extensions to scan for REQ-* anchors.
 _CODE_EXTENSIONS = {".rs", ".tsx", ".ts", ".css", ".html", ".js", ".py"}
+
+# Directory names to prune during the walk. These are matched against
+# individual `os.walk` dirnames (single path components), not full
+# paths — multi-component entries like `ui/src/generated` would never
+# match. We rely on `generated` alone catching `ui/src/generated/`,
+# `target/.../generated/`, etc.
 _CODE_SKIP_DIRS = {
     "node_modules", "target", ".git", "dist", "build", ".vite",
-    "generated", "ui/src/generated",
+    "generated",
 }
 
 
 def _scan_for_req_anchors(root: Path, *, extensions: set[str], skip_dirs: set[str]):
-    """Walk `root` and return a dict { req_id: [(path, line, snippet), ...] }."""
+    """Walk `root` for any REQ-* mention. Used for source-code anchor
+    scanning, where every comment mention is a valid anchor.
+
+    Returns: { req_id: [(rel_path, line_number, snippet), ...] }.
+
+    Uses os.walk so we can prune skipped directories before traversing
+    into them — `Path.rglob` would still descend into node_modules /
+    target before our filter runs, which on a typical dev machine
+    makes this lane visibly slow.
+    """
     from collections import defaultdict
     found: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
-    for path in root.rglob("*"):
-        # Cheap skip check on any path component matching skip_dirs.
-        if any(part in skip_dirs for part in path.parts):
-            continue
-        if not path.is_file():
-            continue
-        if path.suffix not in extensions:
-            continue
-        try:
-            text = path.read_text()
-        except (UnicodeDecodeError, PermissionError):
-            continue
-        for line_num, line in enumerate(text.splitlines(), 1):
-            for m in _REQ_ANCHOR_RE.finditer(line):
-                rel = str(path.relative_to(ROOT))
-                snippet = line.strip()
-                if len(snippet) > 100:
-                    snippet = snippet[:97] + "..."
-                found[m.group()].append((rel, line_num, snippet))
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Prune in-place so os.walk skips matching subtrees entirely.
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs and not d.startswith(".")]
+        for name in filenames:
+            path = Path(dirpath) / name
+            if path.suffix not in extensions:
+                continue
+            try:
+                text = path.read_text()
+            except (UnicodeDecodeError, PermissionError, OSError):
+                # Best-effort scanner — transient FS issues, weird
+                # encodings, missing-after-listing races, all fall
+                # through silently.
+                continue
+            for line_num, line in enumerate(text.splitlines(), 1):
+                for m in _REQ_ANCHOR_RE.finditer(line):
+                    rel = str(path.relative_to(ROOT))
+                    snippet = line.strip()
+                    if len(snippet) > 100:
+                        snippet = snippet[:97] + "..."
+                    found[m.group()].append((rel, line_num, snippet))
+    return found
+
+
+def _scan_for_canonical_req_decls(specs_root: Path):
+    """Walk `specs_root` and return canonically-declared REQ-IDs.
+
+    Canonical declaration sites:
+      - Executive status table rows: `| **REQ-FOO-NNN:** ... |`
+      - Requirements headings:        `### REQ-FOO-NNN: ...`
+
+    Cross-references in design.md prose, .allium @guidance blocks,
+    and parenthetical mentions are NOT declarations — they're
+    references, and a REQ that only appears as a reference is not
+    really declared anywhere. This is the canonical-only set the
+    orphan check uses to validate code anchors against.
+
+    Returns: { req_id: [(rel_path, line_number), ...] } where each
+    entry is a canonical declaration site.
+    """
+    from collections import defaultdict
+    found: dict[str, list[tuple[str, int]]] = defaultdict(list)
+    for dirpath, dirnames, filenames in os.walk(specs_root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in filenames:
+            # Only executive.md and requirements.md carry canonical
+            # declarations. design.md and .allium files are
+            # cross-reference-only.
+            if name not in ("executive.md", "requirements.md"):
+                continue
+            path = Path(dirpath) / name
+            try:
+                text = path.read_text()
+            except (UnicodeDecodeError, PermissionError, OSError):
+                continue
+            patterns = (_REQ_DECL_TABLE_RE, _REQ_DECL_HEADING_RE)
+            for line_num, line in enumerate(text.splitlines(), 1):
+                for pat in patterns:
+                    m = pat.match(line)
+                    if m:
+                        rel = str(path.relative_to(ROOT))
+                        found[m.group(1)].append((rel, line_num))
+                        break
     return found
 
 
@@ -2009,23 +2137,25 @@ def cmd_audit_specs(verbose: bool = False) -> bool:
     """Cross-validate REQ-* anchors between specs/ and source code.
 
     Reports:
-      - Orphan code anchors: REQ-* IDs referenced in source but not
-        declared in any specs/ file. These are typos, renames, or
-        deletions where the code anchor wasn't updated. ALWAYS a bug.
-      - Optional (verbose): unanchored REQ-IDs declared in specs/ that
-        have no source-code reference. High-noise signal — many specs
-        legitimately have REQs without explicit anchors — but useful
-        for spotting "✅ Complete" claims without code coverage.
+      - Orphan code anchors: REQ-* IDs referenced in source code that
+        are not canonically declared in any executive.md status row or
+        requirements.md `### REQ-...` heading. Cross-references in
+        prose don't count as declarations — see
+        `_scan_for_canonical_req_decls` for the rule. These are
+        typos, renames, or deletions where the code anchor wasn't
+        updated. ALWAYS a bug.
+      - Optional (verbose): unanchored REQ-IDs canonically declared
+        in specs/ that have no source-code reference. High-noise
+        signal — many REQs legitimately have no explicit anchors
+        (design intent, behavioural invariants, future targets) —
+        but useful for spotting "✅ Complete" claims without code
+        coverage.
 
     Returns True if no orphan anchors found.
     """
     print("Scanning specs/ and code for REQ-* references...")
 
-    spec_decls = _scan_for_req_anchors(
-        ROOT / "specs",
-        extensions={".md", ".allium"},
-        skip_dirs=_CODE_SKIP_DIRS,
-    )
+    spec_decls = _scan_for_canonical_req_decls(ROOT / "specs")
     code_anchors = {}
     for code_root_rel in ("crates", "ui/src"):
         code_root = ROOT / code_root_rel
@@ -2036,7 +2166,6 @@ def cmd_audit_specs(verbose: bool = False) -> bool:
             extensions=_CODE_EXTENSIONS,
             skip_dirs=_CODE_SKIP_DIRS,
         )
-        # Merge into code_anchors
         for req, locs in chunk.items():
             code_anchors.setdefault(req, []).extend(locs)
 
@@ -2044,8 +2173,8 @@ def cmd_audit_specs(verbose: bool = False) -> bool:
     anchored = set(code_anchors.keys())
 
     print()
-    print(f"  declared in specs/: {len(declared)} unique REQ-IDs")
-    print(f"  referenced in code: {len(anchored)} unique REQ-IDs")
+    print(f"  canonically declared in specs/: {len(declared)} unique REQ-IDs")
+    print(f"  referenced in code:             {len(anchored)} unique REQ-IDs")
     print()
 
     orphan_anchors = sorted(anchored - declared)
@@ -2056,7 +2185,7 @@ def cmd_audit_specs(verbose: bool = False) -> bool:
     if orphan_anchors:
         ok = False
         print(f"✗ Orphan code anchors ({len(orphan_anchors)} REQ-IDs referenced in code "
-              f"but not declared in any spec):")
+              f"but not canonically declared in any spec):")
         print()
         for req in orphan_anchors:
             locs = code_anchors[req]
@@ -2067,13 +2196,13 @@ def cmd_audit_specs(verbose: bool = False) -> bool:
                 print(f"    ... and {len(locs) - 3} more")
         print()
     else:
-        print("✓ All code REQ-* anchors resolve to a spec declaration")
+        print("✓ All code REQ-* anchors resolve to a canonical spec declaration")
         print()
 
     if verbose:
         if unanchored_reqs:
-            print(f"ℹ Unanchored REQ-IDs ({len(unanchored_reqs)} declared in specs/ "
-                  f"with no source-code reference):")
+            print(f"ℹ Unanchored REQ-IDs ({len(unanchored_reqs)} canonically declared "
+                  f"in specs/ with no source-code reference):")
             print()
             print("  (Note: many REQs legitimately have no source-code anchor — design "
                   "intent, behavioural invariants, future targets. Filter for ✅-status "
@@ -3555,10 +3684,11 @@ def main():
     # check
     sub.add_parser("check", help="Run lint, fmt check, and tests")
 
-    # audit-specs
+    # audit-specs (manual / verbose run; the orphan-anchor half also
+    # runs as a `spec anchors` lane inside `./dev.py check`)
     audit_parser = sub.add_parser(
         "audit-specs",
-        help="Cross-validate REQ-* anchors between specs/ and source code (prototype)",
+        help="Cross-validate REQ-* anchors between specs/ and source code",
     )
     audit_parser.add_argument(
         "--verbose", "-v", action="store_true", default=False,

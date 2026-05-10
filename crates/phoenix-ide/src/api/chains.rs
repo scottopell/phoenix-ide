@@ -93,7 +93,8 @@ pub struct ChainMemberSummary {
     pub has_worktree: bool,
 }
 
-/// Where a member sits in its chain (REQ-CHN-003 / REQ-CHN-009-style emphasis).
+/// Where a member sits in its chain — drives the chain-page emphasis
+/// on the most-recent / leaf member (REQ-CHN-003).
 ///
 /// `Latest` is whichever member has the most-recent `updated_at`; the root
 /// keeps `Root` even if it is also the most-recent (small chains where the
