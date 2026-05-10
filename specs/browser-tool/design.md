@@ -594,3 +594,11 @@ chromiumoxide handles all CDP protocol complexity internally:
 - `image` - Screenshot resizing (already used by `read_image`)
 - `futures` - For `StreamExt` on the CDP handler
 - Chrome/Chromium installation (headless-shell in containers)
+
+---
+
+## Audit Trail
+
+| Date | Pass | Notes |
+|---|---|---|
+| 2026-05-10 | Automated review (Copilot/codex) | Drift surface scan over the legacy spec since the doc-rot audit. Findings addressed inline on this PR. |

@@ -541,3 +541,11 @@ The auto-mount trigger is the server-authoritative `browser_session_state` lifec
 | REQ-BT-022: Offline Mode Simulation | US-3 | ❌ |
 | REQ-BT-023: Multi-Context Console | US-3 | ❌ |
 | REQ-BT-024: Capture Network Requests | US-1, US-2 | ❌ |
+
+---
+
+## Audit Trail
+
+| Date | Pass | Notes |
+|---|---|---|
+| 2026-05-10 | Automated review (Copilot/codex) | Drift surface scan over the legacy spec since the doc-rot audit. Findings addressed inline on this PR. |

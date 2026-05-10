@@ -51,3 +51,11 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 
 **Core Progress:** 18 of 18 complete
 **Total Progress:** 18 of 23 complete
+
+---
+
+## Audit Trail
+
+| Date | Pass | Notes |
+|---|---|---|
+| 2026-05-10 | Automated review (Copilot/codex) | Drift surface scan over the legacy spec since the doc-rot audit. Findings addressed inline on this PR. |
