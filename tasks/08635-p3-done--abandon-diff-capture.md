@@ -1,10 +1,3 @@
----
-created: 2026-04-07
-priority: p3
-status: done
-artifact: src/api/handlers.rs
----
-
 # Capture git diff as message before abandon destroys worktree
 
 ## Summary

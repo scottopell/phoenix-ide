@@ -1,10 +1,3 @@
----
-created: 2026-01-31
-priority: p3
-status: done
-artifact: completed
----
-
 # Conversation Management UI
 
 ## Summary

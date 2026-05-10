@@ -1,10 +1,3 @@
----
-created: 2026-04-07
-priority: p3
-status: ready
-artifact: src/tools/mcp.rs
----
-
 # Native MCP OAuth instead of shelling out to npx
 
 ## Problem

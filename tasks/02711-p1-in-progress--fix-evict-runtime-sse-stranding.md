@@ -1,10 +1,3 @@
----
-created: 2026-05-07
-priority: p1
-status: in-progress
-artifact: pending
----
-
 # fix-evict-runtime-sse-stranding
 
 ## Plan

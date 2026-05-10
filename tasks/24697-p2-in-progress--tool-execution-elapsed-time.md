@@ -1,10 +1,3 @@
----
-created: 2026-04-27
-priority: p2
-status: in-progress
-artifact: pending
----
-
 # tool-execution-elapsed-time
 
 ## Plan

@@ -1,10 +1,3 @@
----
-created: 2026-02-08
-priority: p0
-status: done
-artifact: completed
----
-
 # Graceful Context Exhaustion UI
 
 ## Summary

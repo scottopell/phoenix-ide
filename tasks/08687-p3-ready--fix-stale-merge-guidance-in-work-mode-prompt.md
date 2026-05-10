@@ -1,10 +1,3 @@
----
-created: 2026-05-08
-priority: p3
-status: ready
-artifact: src/system_prompt.rs
----
-
 # fix-stale-merge-guidance-in-work-mode-prompt
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-05-05
-priority: p2
-status: done
-artifact: ui/src/components/ConversationList.tsx
----
-
 # Chain-atomic lifecycle: UI
 
 ## Context

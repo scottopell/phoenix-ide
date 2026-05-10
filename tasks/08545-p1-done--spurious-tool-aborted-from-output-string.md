@@ -1,10 +1,3 @@
----
-created: 2026-02-15
-priority: p1
-status: done
-artifact: completed
----
-
 # Spurious ToolAborted Events From Output String Matching
 
 ## Summary

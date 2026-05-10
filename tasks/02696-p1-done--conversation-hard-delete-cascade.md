@@ -1,10 +1,3 @@
----
-created: 2026-05-01
-priority: p1
-status: done
-artifact: src/api/handlers.rs
----
-
 Replace the one-line `delete_conversation` handler with the cascade orchestrator from REQ-BED-032: cancel-or-reject if busy, run cleanup functions in order, delete row, broadcast SSE event. Wires together the bash, tmux, and projects cleanup paths into a single user-facing hard-delete flow.
 
 ## In scope

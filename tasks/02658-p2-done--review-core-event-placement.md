@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p2
-status: done
-artifact: src/state_machine/event.rs
----
-
 # Review SpawnAgentsComplete and SubAgentResult placement in CoreEvent
 
 ## Summary

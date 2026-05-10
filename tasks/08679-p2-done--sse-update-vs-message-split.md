@@ -1,10 +1,3 @@
----
-created: 2026-04-22
-priority: p2
-status: done
-artifact: src/api/sse.rs
----
-
 Split `SseEvent::Message` into `Message` (new) + `MessageUpdated` (mutate) AND close the reconnect-window gap where update-in-place broadcasts are lost when the client is disconnected at broadcast time. Both fixes must land together — the type split alone doesn't replay missed updates.
 
 ## Two bugs, one task

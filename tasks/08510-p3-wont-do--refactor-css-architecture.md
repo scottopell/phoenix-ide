@@ -1,10 +1,3 @@
----
-status: wont-do
-priority: p3
-created: 2025-02-08
-artifact: completed
----
-
 # Refactor CSS Architecture
 
 ## Problem

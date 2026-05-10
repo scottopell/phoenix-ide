@@ -1,10 +1,3 @@
----
-status: done
-priority: p2
-created: 2026-02-16
-artifact: completed
----
-
 ## Problem
 
 When a conversation is in `context_exhausted` state and the server restarts, the state resets to `idle`. The continuation summary message IS persisted (message type `continuation`), but the recovery logic doesn't recognize it.

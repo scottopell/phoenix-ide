@@ -1,10 +1,3 @@
----
-created: 2026-03-13
-priority: p2
-status: done
-artifact: pending
----
-
 # Show task title in StateBar for Work conversations
 
 ## Problem

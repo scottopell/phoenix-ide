@@ -1,10 +1,3 @@
----
-created: 2026-03-05
-priority: p1
-status: done
-artifact: completed
----
-
 # Projects M1: Project Entity + Explore Mode
 
 ## Summary

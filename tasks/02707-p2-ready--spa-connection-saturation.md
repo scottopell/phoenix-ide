@@ -1,10 +1,3 @@
----
-created: 2026-05-06
-priority: p2
-status: ready
-artifact: ui/src/
----
-
 # spa-connection-saturation
 
 > **Status update (2026-05-08).** HTTP/2 (task 02705) is live in prod

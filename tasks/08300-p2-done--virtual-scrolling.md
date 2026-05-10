@@ -1,10 +1,3 @@
----
-created: 2026-02-04
-priority: p2
-status: done
-artifact: completed
----
-
 # Implement Virtual Scrolling for Large Conversations
 
 ## Summary

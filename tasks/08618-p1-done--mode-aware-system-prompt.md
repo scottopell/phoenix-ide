@@ -1,10 +1,3 @@
----
-created: 2026-04-03
-priority: p1
-status: done
-artifact: src/system_prompt.rs
----
-
 # Mode-aware system prompt
 
 ## Summary

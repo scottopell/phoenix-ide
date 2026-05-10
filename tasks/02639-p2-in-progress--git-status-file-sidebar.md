@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p2
-status: in-progress
-artifact: pending
----
-
 # git-status-file-sidebar
 
 ## Plan

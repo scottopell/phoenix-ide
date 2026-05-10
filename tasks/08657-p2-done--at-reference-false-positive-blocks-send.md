@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p2
-status: done
-artifact: src/message_expander.rs
----
-
 # @ references that don't resolve to files should not block message send
 
 ## Problem

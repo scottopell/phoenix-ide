@@ -1,10 +1,3 @@
----
-created: 2026-01-30
-priority: p3
-status: done
-artifact: completed
----
-
 # API route naming consistency
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-04-23
-priority: p2
-status: in-progress
-artifact: ui/src/hooks/useConnection.ts
----
-
 # SSE wire-format validation at the parse boundary
 
 ## Problem

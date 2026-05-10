@@ -1,10 +1,3 @@
----
-created: 2026-01-29
-priority: p2
-status: done
-artifact: completed
----
-
 # Add cancellation test coverage (REQ-BED-005)
 
 ## Summary

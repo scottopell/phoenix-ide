@@ -1,10 +1,3 @@
----
-created: 2026-02-04
-priority: p3
-status: done
-artifact: completed
----
-
 # Implement Preload on Hover
 
 ## Summary

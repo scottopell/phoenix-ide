@@ -1,10 +1,3 @@
----
-created: 2026-04-21
-priority: p3
-status: done
-artifact: ui/src/index.css
----
-
 ## Resolution
 
 Resolved in the same session it was filed. The mobile-only

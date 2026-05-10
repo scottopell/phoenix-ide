@@ -1,10 +1,3 @@
----
-created: 2026-04-03
-priority: p2
-status: done
-artifact: src/tools/propose_plan.rs
----
-
 # Rename propose_plan to propose_task
 
 ## Summary

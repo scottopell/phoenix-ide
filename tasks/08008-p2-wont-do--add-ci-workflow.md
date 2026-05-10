@@ -1,10 +1,3 @@
----
-created: 2026-01-29
-priority: p2
-status: wont-do
-artifact: completed
----
-
 # Add CI Workflow for Automated Testing
 
 ## Summary

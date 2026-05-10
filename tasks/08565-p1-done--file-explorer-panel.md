@@ -1,20 +1,3 @@
----
-priority: p1
-status: done
-created: 2025-02-22
-  - REQ-FE-001
-  - REQ-FE-002
-  - REQ-FE-003
-  - REQ-FE-004
-  - REQ-FE-005
-  - REQ-FE-006
-  - REQ-FE-007
-  - REQ-FE-008
-  - REQ-FE-009
-  - REQ-FE-010
-artifact: completed
----
-
 # File Explorer Panel Implementation
 
 Implement the File Explorer Panel feature for desktop, and refactor file browsing to use a single FileTree component across desktop and mobile.

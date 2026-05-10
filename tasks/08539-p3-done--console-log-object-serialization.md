@@ -1,10 +1,3 @@
----
-created: 2026-02-09
-priority: p3
-status: done
-artifact: completed
----
-
 # Improve Console Log Object Serialization
 
 ## Summary

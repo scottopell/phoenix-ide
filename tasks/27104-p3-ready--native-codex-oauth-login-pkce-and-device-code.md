@@ -1,10 +1,3 @@
----
-created: 2026-05-04
-priority: p3
-status: ready
-artifact: src/llm/codex_credential.rs
----
-
 <!--
 ID 27104 chosen above 27102 (27103 reserved for the cross-process flock
 follow-up flagged in the same conversation). Created without `taskmd new`

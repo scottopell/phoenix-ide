@@ -1,10 +1,3 @@
----
-created: 2026-02-05
-priority: p4
-status: done
-artifact: completed
----
-
 # Add Skeleton for Tool Execution Output
 
 ## Summary

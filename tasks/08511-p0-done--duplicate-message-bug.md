@@ -1,10 +1,3 @@
----
-created: 2026-02-05
-priority: p0
-status: done
-artifact: completed
----
-
 # P0: Critical - Messages Sent Twice When Retrying Failed Send
 
 ## Status: FIXED ✅

@@ -1,10 +1,3 @@
----
-created: 2026-04-15
-priority: p2
-status: done
-artifact: src/api/handlers.rs
----
-
 # Branch search exact match not appearing in results
 
 ## Summary

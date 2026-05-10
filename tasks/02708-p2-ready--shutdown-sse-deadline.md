@@ -1,10 +1,3 @@
----
-created: 2026-05-05
-priority: p2
-status: ready
-artifact: src/main.rs
----
-
 Add a hard shutdown deadline so SSE streams cannot pin the binary alive
 forever after a deploy.
 

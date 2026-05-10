@@ -1,10 +1,3 @@
----
-created: 2026-05-03
-priority: p2
-status: ready
-artifact: src/system_prompt.rs
----
-
 <!--
 ID 27102 chosen above 27101. Created without `taskmd new` since the binary
 isn't installed; run `./dev.py tasks fix` if reallocation needed.

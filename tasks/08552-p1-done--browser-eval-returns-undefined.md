@@ -1,10 +1,3 @@
----
-status: done
-priority: p1
-created: 2026-02-16
-artifact: completed
----
-
 ## Problem
 
 The `browser_eval` tool returns `undefined` for JavaScript expressions that should return values. This makes the browser tools unreliable for QA and automation.

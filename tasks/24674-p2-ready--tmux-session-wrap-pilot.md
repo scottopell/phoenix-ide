@@ -1,10 +1,3 @@
----
-created: 2026-04-12
-priority: p2
-status: ready
-artifact: pending
----
-
 # tmux-session-wrap-pilot
 
 ## Problem

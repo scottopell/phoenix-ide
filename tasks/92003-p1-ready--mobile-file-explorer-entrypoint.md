@@ -1,9 +1,3 @@
----
-created: 2026-05-05
-priority: p1
-status: ready
-artifact: ui/src/pages/ConversationPage.tsx
----
 # Define and add mobile file access
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2025-02-07
-priority: p3
-status: done
-artifact: completed
----
-
 # Investigate: Context Continuation at 95% Threshold
 
 ## ⚠️ INVESTIGATION ONLY

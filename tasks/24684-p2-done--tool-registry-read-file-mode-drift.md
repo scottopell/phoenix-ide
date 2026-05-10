@@ -1,10 +1,3 @@
----
-created: 2026-04-14
-priority: p2
-status: done
-artifact: src/tools.rs
----
-
 # `read_file` missing from Direct / Work tool registry
 
 > **Renumbered from 24679 → 24684 during rebase.** This task was

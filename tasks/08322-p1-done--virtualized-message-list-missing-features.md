@@ -1,10 +1,3 @@
----
-created: 2026-02-05
-priority: p1
-status: done
-artifact: completed
----
-
 # BUG: VirtualizedMessageList Missing Recent UI Improvements
 
 ## Resolution

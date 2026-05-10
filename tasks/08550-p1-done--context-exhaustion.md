@@ -1,10 +1,3 @@
----
-status: done
-priority: p1
-created: 2025-02-15
-artifact: completed
----
-
 # Implement Context Exhaustion Handling (REQ-BED-019 through REQ-BED-024)
 
 ## Overview

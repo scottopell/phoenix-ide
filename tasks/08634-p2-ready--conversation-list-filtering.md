@@ -1,10 +1,3 @@
----
-created: 2026-04-06
-priority: p2
-status: ready
-artifact: ui/src/components/ConversationList.tsx
----
-
 # Conversation list filtering and auto-archive (REQ-PROJ-019)
 
 ## Summary

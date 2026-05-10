@@ -1,10 +1,3 @@
----
-created: 2025-02-10
-priority: p2
-status: done
-artifact: completed
----
-
 # Inline Patch Diff Preview
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p2
-status: done
-artifact: src/api/handlers.rs
----
-
 # Split handlers.rs into domain-specific handler modules
 
 ## Summary

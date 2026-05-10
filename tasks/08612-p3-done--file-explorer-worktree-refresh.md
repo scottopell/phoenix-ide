@@ -1,10 +1,3 @@
----
-created: 2026-03-13
-priority: p3
-status: done
-artifact: pending
----
-
 # File explorer should refresh when CWD changes
 
 ## Problem

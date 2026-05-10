@@ -1,10 +1,3 @@
----
-created: 2026-02-08
-priority: p3
-status: done
-artifact: completed
----
-
 # Richer LLM Breadcrumb Preview
 
 ## Summary

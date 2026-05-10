@@ -1,10 +1,3 @@
----
-created: 2026-04-03
-priority: p1
-status: done
-artifact: ui/src/components/StateBar.tsx
----
-
 # Mode indicator in StateBar
 
 ## Summary

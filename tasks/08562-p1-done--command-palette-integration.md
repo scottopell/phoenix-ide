@@ -1,18 +1,3 @@
----
-priority: p1
-status: done
-created: 2025-02-22
-  - REQ-CP-001
-  - REQ-CP-002
-  - REQ-CP-003
-  - REQ-CP-004
-  - REQ-CP-005
-  - REQ-CP-006
-  - REQ-CP-007
-  - REQ-CP-008
-artifact: completed
----
-
 # Command Palette Integration
 
 Integration task for Command Palette after core implementation is complete (task 564).

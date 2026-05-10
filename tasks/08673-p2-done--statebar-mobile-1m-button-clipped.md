@@ -1,10 +1,3 @@
----
-created: 2026-04-21
-priority: p2
-status: done
-artifact: ui/src/components/StateBar.tsx
----
-
 # StateBar 1M button clipped in mobile portrait
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-04-21
-priority: p3
-status: done
-artifact: ui/src/pages/NewConversationPage.tsx
----
-
 # /new page shows directory + model twice (top form + bottom chips)
 
 ## Summary

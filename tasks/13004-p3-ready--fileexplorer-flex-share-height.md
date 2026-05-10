@@ -1,10 +1,3 @@
----
-created: 2026-05-02
-priority: p3
-status: ready
-artifact: ui/src/components/FileExplorer.tsx
----
-
 FileExplorer middle-column sub-panels (Skills, MCP, Tasks) currently
 each cap their expanded body height at `max-height: 300px` with internal
 overflow (task 13002). That fixes the single-section-expanded case but

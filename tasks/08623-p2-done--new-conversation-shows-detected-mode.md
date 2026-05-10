@@ -1,10 +1,3 @@
----
-created: 2026-04-03
-priority: p2
-status: done
-artifact: ui/src/pages/NewConversationPage.tsx
----
-
 # New conversation form shows detected mode
 
 ## Summary

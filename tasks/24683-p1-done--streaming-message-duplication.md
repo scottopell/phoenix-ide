@@ -1,10 +1,3 @@
----
-created: 2026-04-14
-priority: p1
-status: done
-artifact: src/runtime/executor.rs, ui/src/conversation/atom.ts
----
-
 # Streaming message appears to "repeatedly deliver itself" (real-provider)
 
 ## Resolution

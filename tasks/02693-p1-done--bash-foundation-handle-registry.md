@@ -1,10 +1,3 @@
----
-created: 2026-05-01
-priority: p1
-status: done
-artifact: src/tools/bash/registry.rs
----
-
 Lay the foundation for the bash-tool handle model: types, registry, ring buffer, ToolContext extension, reaper, and the lock-ordering helper that all subsequent bash work depends on.
 
 ## In scope

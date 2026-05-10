@@ -1,10 +1,3 @@
----
-created: 2026-04-23
-priority: p1
-status: done
-artifact: src/api/sse.rs
----
-
 # Streaming response finalizes then visually disappears
 
 ## Symptom

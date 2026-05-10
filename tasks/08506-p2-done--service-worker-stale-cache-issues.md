@@ -1,10 +1,3 @@
----
-created: 2026-02-07
-priority: p2
-status: done
-artifact: completed
----
-
 # Service Worker Cache Staleness and Edge Cases
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p1
-status: done
-artifact: src/db/schema.rs
----
-
 # Remove serde(default) shims from ConvMode fields
 
 ## Summary

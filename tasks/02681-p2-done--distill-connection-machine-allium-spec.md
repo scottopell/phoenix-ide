@@ -1,10 +1,3 @@
----
-created: 2026-04-23
-priority: p2
-status: done
-artifact: specs/connection_machine/connection_machine.allium
----
-
 # Distill connection_machine.allium — SSE connection lifecycle
 
 ## Scope

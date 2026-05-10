@@ -1,10 +1,3 @@
----
-created: 2026-02-04
-priority: p3
-status: wont-do
-artifact: completed
----
-
 # Add Performance Regression Tests
 
 ## Summary

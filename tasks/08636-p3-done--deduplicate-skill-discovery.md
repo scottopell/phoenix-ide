@@ -1,10 +1,3 @@
----
-created: 2026-04-07
-priority: p3
-status: done
-artifact: src/message_expander.rs
----
-
 # Deduplicate skill discovery filesystem traversals
 
 ## Problem

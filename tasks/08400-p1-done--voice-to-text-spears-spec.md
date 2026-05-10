@@ -1,10 +1,3 @@
----
-created: 2026-02-06
-priority: p1
-status: done
-artifact: completed
----
-
 # Create SPEARS Spec for Voice-to-Text Integration
 
 ## Summary

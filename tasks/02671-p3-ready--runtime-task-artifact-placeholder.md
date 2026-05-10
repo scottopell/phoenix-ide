@@ -1,10 +1,3 @@
----
-created: 2026-04-22
-priority: p3
-status: ready
-artifact: src/runtime/executor.rs
----
-
 # Runtime writes `artifact: pending` for auto-created task files on plan approval
 
 ## Summary

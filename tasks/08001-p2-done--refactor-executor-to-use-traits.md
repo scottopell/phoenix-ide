@@ -1,10 +1,3 @@
----
-created: 2026-01-29
-priority: p2
-status: done
-artifact: completed
----
-
 # Refactor Executor to Use Trait Abstractions
 
 ## Summary

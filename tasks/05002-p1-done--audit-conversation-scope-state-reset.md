@@ -1,10 +1,3 @@
----
-created: 2026-05-07
-priority: p1
-status: done
-artifact: ui/src
----
-
 Triage pass: every piece of UI state that lives across conversation
 switches must either reset cleanly or persist intentionally. We keep
 catching individual bugs (most recently the browser-view panel staying

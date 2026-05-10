@@ -1,10 +1,3 @@
----
-created: 2026-02-04
-priority: p3
-status: brainstorming
-artifact: pending
----
-
 # Optimize Bundle Size
 
 ## Summary

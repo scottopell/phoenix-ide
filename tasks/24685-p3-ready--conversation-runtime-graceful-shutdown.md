@@ -1,10 +1,3 @@
----
-created: 2026-04-14
-priority: p3
-status: ready
-artifact: src/runtime/executor.rs, src/runtime/testing.rs
----
-
 # `ConversationRuntime` has no graceful-shutdown path
 
 ## Summary

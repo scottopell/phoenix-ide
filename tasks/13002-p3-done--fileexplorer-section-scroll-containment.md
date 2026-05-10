@@ -1,10 +1,3 @@
----
-created: 2026-05-02
-priority: p3
-status: done
-artifact: ui/src/components/FileExplorer/FileExplorerPanel.tsx
----
-
 When the user expands the Skills and/or Tasks panels inside
 FileExplorerPanel.tsx, those panels render their list at natural
 height with no max-height or internal scroll. The file tree above

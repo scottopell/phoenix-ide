@@ -1,10 +1,3 @@
----
-created: 2026-05-05
-priority: p1
-status: done
-artifact: ui/src/conversation/ConversationStore.ts
----
-
 # unify-conversation-source-of-truth
 
 ## Summary

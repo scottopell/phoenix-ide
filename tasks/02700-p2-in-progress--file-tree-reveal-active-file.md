@@ -1,10 +1,3 @@
----
-created: 2026-05-05
-priority: p2
-status: in-progress
-artifact: ui/src/components/FileExplorer/FileTree.tsx
----
-
 # file-tree-reveal-active-file
 
 ## Plan

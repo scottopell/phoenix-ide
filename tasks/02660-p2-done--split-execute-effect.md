@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p2
-status: done
-artifact: src/runtime/executor.rs
----
-
 # Extract dispatch_llm_request and dispatch_tool_execution from execute_effect
 
 ## Summary

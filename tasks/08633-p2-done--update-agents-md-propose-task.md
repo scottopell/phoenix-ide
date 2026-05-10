@@ -1,10 +1,3 @@
----
-created: 2026-04-06
-priority: p2
-status: done
-artifact: AGENTS.md
----
-
 # Update AGENTS.md to reference propose_task (not propose_plan)
 
 ## Summary

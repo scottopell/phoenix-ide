@@ -1,10 +1,3 @@
----
-created: 2026-04-10
-priority: p1
-status: done
-artifact: pending
----
-
 # terminal-implementation
 
 ## Plan

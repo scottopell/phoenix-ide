@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p2
-status: wont-do
-artifact: ui/src/components/Sidebar.tsx
----
-
 # Sidebar: add collapsible Files section + fix expand/scroll behavior
 
 ## Two issues

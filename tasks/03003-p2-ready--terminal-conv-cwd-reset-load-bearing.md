@@ -1,10 +1,3 @@
----
-created: 2026-05-06
-priority: p2
-status: ready
-artifact: src/runtime/executor.rs
----
-
 ## Phase 3 follow-up to task 03001/09001 ConvMode::Explore refactor
 
 The cwd-fallback removal in Phase 2 (commit 624c2516) didn't reach

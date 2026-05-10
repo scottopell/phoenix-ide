@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p2
-status: done
-artifact: ui/src/components/TaskApprovalReader.tsx
----
-
 # Noticeable lag after clicking approve on task proposal
 
 ## Problem

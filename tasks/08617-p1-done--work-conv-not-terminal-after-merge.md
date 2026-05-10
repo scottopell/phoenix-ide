@@ -1,10 +1,3 @@
----
-created: 2026-04-03
-priority: p1
-status: done
-artifact: src/api/handlers.rs
----
-
 # Work conversation not terminal after merge
 
 ## Summary

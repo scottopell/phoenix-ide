@@ -1,10 +1,3 @@
----
-created: 2026-01-31
-priority: p4
-status: ready
-artifact: pending
----
-
 # Search and Filter Conversations
 
 ## Summary

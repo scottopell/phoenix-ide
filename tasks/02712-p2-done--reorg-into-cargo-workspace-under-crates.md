@@ -1,10 +1,3 @@
----
-created: 2026-05-08
-priority: p2
-status: done
-artifact: pending
----
-
 # reorg-into-cargo-workspace-under-crates
 
 ## Plan

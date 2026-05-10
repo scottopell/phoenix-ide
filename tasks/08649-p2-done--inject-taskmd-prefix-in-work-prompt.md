@@ -1,10 +1,3 @@
----
-created: 2026-04-07
-priority: p2
-status: done
-artifact: src/system_prompt.rs
----
-
 # Include taskmd prefix in Work mode system prompt
 
 ## Problem

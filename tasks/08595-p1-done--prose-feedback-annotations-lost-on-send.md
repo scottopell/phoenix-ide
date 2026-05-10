@@ -1,10 +1,3 @@
----
-created: 2026-03-02
-priority: p1
-status: done
-artifact: completed
----
-
 # Prose Feedback: Annotations Lost on Send
 
 ## Description

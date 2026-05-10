@@ -1,10 +1,3 @@
----
-created: 2025-05-30
-priority: p1
-status: done
-artifact: completed
----
-
 # VirtualizedMessageList height cutoff bug
 
 ## Summary

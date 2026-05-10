@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p0
-status: done
-artifact: pending
----
-
 # Duplicate git commit block in task approval causes approval to always fail
 
 ## Summary

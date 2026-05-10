@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p3
-status: ready
-artifact: proptest-regressions/state_machine/proptests.txt
----
-
 # Investigate GraceTurnExhausted + ContextExhausted proptest regression
 
 ## Summary

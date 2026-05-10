@@ -1,10 +1,3 @@
----
-created: 2026-04-23
-priority: p2
-status: done
-artifact: specs/sse_wire/sse_wire.allium
----
-
 # Distill sse_wire.allium — SSE protocol contract between server and client
 
 ## Scope

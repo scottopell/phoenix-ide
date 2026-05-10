@@ -1,10 +1,3 @@
----
-created: 2026-02-17
-priority: p1
-status: done
-artifact: completed
----
-
 # Remove AI Gateway mode entirely
 
 ## Summary

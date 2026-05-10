@@ -1,10 +1,3 @@
----
-created: 2026-03-30
-priority: p3
-status: ready
-artifact: pending
----
-
 # MCP: Project/conversation-scoped enable/disable preferences
 
 ## Summary

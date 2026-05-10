@@ -1,10 +1,3 @@
----
-created: 2026-02-09
-priority: p1
-status: done
-artifact: completed
----
-
 # Audit OpenAI Provider for Completeness
 
 ## Summary

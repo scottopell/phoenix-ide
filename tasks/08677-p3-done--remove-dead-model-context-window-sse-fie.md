@@ -1,10 +1,3 @@
----
-created: 2026-04-21
-priority: p3
-status: done
-artifact: src/runtime.rs
----
-
 # Remove dead model_context_window from SSE init payload
 
 ## Summary

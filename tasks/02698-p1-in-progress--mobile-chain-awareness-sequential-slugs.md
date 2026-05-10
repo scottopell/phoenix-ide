@@ -1,10 +1,3 @@
----
-created: 2026-05-01
-priority: p1
-status: in-progress
-artifact: pending
----
-
 # mobile-chain-awareness-sequential-slugs
 
 ## Plan

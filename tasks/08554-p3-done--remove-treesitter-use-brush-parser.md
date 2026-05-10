@@ -1,10 +1,3 @@
----
-created: 2025-03-28
-priority: p3
-status: done
-artifact: completed
----
-
 # Remove tree-sitter, use brush-parser exclusively
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-04-13
-priority: p2
-status: wont-do
-artifact: pending
----
-
 # evaluate-wezterm-term-migration
 
 > **Wont-do: duplicate of task 24673** (same evaluation, also done). The

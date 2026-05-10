@@ -1,10 +1,3 @@
----
-created: 2026-05-06
-priority: p2
-status: in-progress
-artifact: pending
----
-
 # fix-context-exhausted-dot-color
 
 ## Plan

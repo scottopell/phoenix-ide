@@ -1,10 +1,3 @@
----
-created: 2026-05-05
-priority: p1
-status: ready
-artifact: ui/src/hooks/useMessageQueue.ts
----
-
 # sweep-sync-derivation-providers-rows
 
 ## Summary

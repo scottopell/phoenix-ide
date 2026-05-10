@@ -1,10 +1,3 @@
----
-status: done
-priority: p2
-created: 2025-02-08
-artifact: completed
----
-
 # HTML Entity Encoding Bug in Message Display
 
 ## Problem

@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p4
-status: ready
-artifact: src/runtime/executor.rs
----
-
 # Merge consecutive user-role messages for Bedrock compatibility
 
 ## Problem

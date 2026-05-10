@@ -1,10 +1,3 @@
----
-created: 2026-04-24
-priority: p1
-status: done
-artifact: ui/src/pages/ConversationPage.tsx
----
-
 ## Resolved (2026-04-24)
 
 Fixed root-cause on branch `task-24696-continuation-worktree-transfer`

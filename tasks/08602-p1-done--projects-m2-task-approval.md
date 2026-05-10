@@ -1,10 +1,3 @@
----
-created: 2026-03-05
-priority: p1
-status: done
-artifact: pending
----
-
 # Projects M2: Task Creation and Approval
 
 ## Summary

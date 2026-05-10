@@ -1,10 +1,3 @@
----
-created: 2026-01-31
-priority: p2
-status: done
-artifact: completed
----
-
 # Offline and Reconnection Handling
 
 ## Summary

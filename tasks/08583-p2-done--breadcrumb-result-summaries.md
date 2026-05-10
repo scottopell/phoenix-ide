@@ -1,10 +1,3 @@
----
-created: 2026-02-28
-priority: p2
-status: done
-artifact: completed
----
-
 # Breadcrumb Result Summaries
 
 ## Problem

@@ -1,10 +1,3 @@
----
-created: 2026-02-19
-priority: p1
-status: done
-artifact: completed
----
-
 # Silent model fallback: wrong model used without any indication
 
 ## Summary

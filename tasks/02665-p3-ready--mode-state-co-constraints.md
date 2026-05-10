@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p3
-status: ready
-artifact: src/state_machine/transition.rs
----
-
 # Full ConvMode/ConvState co-constraint enforcement
 
 ## Summary

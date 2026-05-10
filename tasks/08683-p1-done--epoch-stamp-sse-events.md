@@ -1,10 +1,3 @@
----
-created: 2026-05-05
-priority: p1
-status: done
-artifact: ui/src/hooks/useConnection.ts
----
-
 # epoch-stamp-sse-events
 
 ## Summary

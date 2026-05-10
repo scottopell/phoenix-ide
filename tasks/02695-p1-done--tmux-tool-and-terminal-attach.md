@@ -1,10 +1,3 @@
----
-created: 2026-05-01
-priority: p1
-status: done
-artifact: src/tools/tmux.rs
----
-
 Implement the `tmux` pass-through agent tool, its per-conversation server registry, and modify the in-app terminal spawn so it attaches to the conversation's tmux session when the binary is available.
 
 ## In scope

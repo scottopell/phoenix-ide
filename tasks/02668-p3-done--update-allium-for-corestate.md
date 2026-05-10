@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p3
-status: done
-artifact: specs/bedrock/bedrock.allium
----
-
 # Update bedrock.allium for CoreState wrapper pattern
 
 ## Summary

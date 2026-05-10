@@ -1,10 +1,3 @@
----
-created: 2026-03-13
-priority: p2
-status: done
-artifact: pending
----
-
 # Clear visual treatment for Terminal conversations
 
 ## Problem

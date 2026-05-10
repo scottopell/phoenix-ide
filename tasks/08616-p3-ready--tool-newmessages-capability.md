@@ -1,10 +1,3 @@
----
-artifact: src/tools.rs ToolOutput newMessages field + Skill tool convergence
-created: 2026-04-03
-priority: p3
-status: ready
----
-
 # Tool system: support newMessages alongside tool results
 
 ## Summary

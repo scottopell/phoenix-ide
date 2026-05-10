@@ -1,10 +1,3 @@
----
-created: 2026-05-05
-priority: p3
-status: in-progress
-artifact: src/main.rs
----
-
 Add HTTP/2 + TLS to phoenix's HTTP server so a single browser-to-phoenix
 TCP connection can multiplex an unbounded number of concurrent streams,
 eliminating the 6-connections-per-origin saturation class of bugs

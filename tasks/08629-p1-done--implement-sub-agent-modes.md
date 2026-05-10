@@ -1,10 +1,3 @@
----
-created: 2026-04-06
-priority: p1
-status: done
-artifact: src/tools/subagent.rs
----
-
 # Implement sub-agent modes (REQ-PROJ-008)
 
 ## Summary

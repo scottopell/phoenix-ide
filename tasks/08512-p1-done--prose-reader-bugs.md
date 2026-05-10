@@ -1,10 +1,3 @@
----
-created: 2026-02-11
-priority: p1
-status: done
-artifact: completed
----
-
 # P0: Prose Reader Spec - Critical UX Bugs
 
 ## Summary

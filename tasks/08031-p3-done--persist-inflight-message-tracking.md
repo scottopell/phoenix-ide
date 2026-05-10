@@ -1,10 +1,3 @@
----
-created: 2026-02-02
-priority: p3
-status: done
-artifact: completed
----
-
 # Persist In-Flight Message Tracking
 
 ## Summary

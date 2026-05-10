@@ -1,10 +1,3 @@
----
-created: 2026-02-04
-priority: p2
-status: wont-do
-artifact: completed
----
-
 # Add Conflict Resolution UI
 
 ## Summary

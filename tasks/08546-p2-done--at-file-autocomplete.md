@@ -1,10 +1,3 @@
----
-created: 2026-02-15
-priority: p2
-status: done
-artifact: completed
----
-
 # Implement `@file` file content inclusion (REQ-IR-001, REQ-IR-004, REQ-IR-006, REQ-IR-007)
 
 ## Summary

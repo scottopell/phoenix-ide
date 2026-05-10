@@ -1,10 +1,3 @@
----
-created: 2026-04-29
-priority: p3
-status: ready
-artifact: ui/src/components/McpStatusPanel.tsx
----
-
 Surface MCP server connection failures in the UI instead of silently hiding the panel.
 
 Currently when an MCP server background connect fails (mcp-remote spawn error, OAuth timeout, transport error, etc.), the backend logs a `Skipping MCP server: {e}` warn and the server name vanishes from /api/mcp/status. The UI panel disappears entirely if there are no other servers, leaving the user with no signal that something went wrong — only the toast from the reload click, which expires in 3s.

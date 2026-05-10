@@ -1,10 +1,3 @@
----
-created: 2026-02-08
-priority: p0
-status: done
-artifact: completed
----
-
 # Simplify Caching Architecture: Remove Service Worker, Eliminate Race Conditions
 
 ## Summary

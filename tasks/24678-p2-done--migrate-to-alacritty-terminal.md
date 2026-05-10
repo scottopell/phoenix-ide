@@ -1,10 +1,3 @@
----
-created: 2026-04-13
-priority: p2
-status: done
-artifact: src/terminal/
----
-
 # migrate-to-alacritty-terminal
 
 ## Problem

@@ -1,10 +1,3 @@
----
-created: 2026-05-01
-priority: p1
-status: done
-artifact: ui/src/sseSchemas.ts
----
-
 Migrate all the surfaces around the bash + tmux + cascade work: SSE wire types, ts_rs codegen, valibot schemas, UI rendering, mock fixtures, and the subagent schema passthrough. Lands after the backend tasks and ties them to the user-visible frontend.
 
 ## In scope

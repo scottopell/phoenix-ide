@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p3
-status: ready
-artifact: src/db/migrations.rs
----
-
 # Drop dead state_data column from conversations table
 
 ## Summary

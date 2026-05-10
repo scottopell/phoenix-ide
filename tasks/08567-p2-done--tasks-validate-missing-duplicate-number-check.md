@@ -1,10 +1,3 @@
----
-created: 2025-01-28
-priority: p2
-status: done
-artifact: completed
----
-
 # tasks validate: missing duplicate task number check
 
 ## Summary

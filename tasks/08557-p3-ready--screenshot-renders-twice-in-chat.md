@@ -1,10 +1,3 @@
----
-created: 2026-02-19
-priority: p3
-status: ready
-artifact: pending
----
-
 # Screenshot renders twice in chat UI
 
 ## Summary

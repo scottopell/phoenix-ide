@@ -1,10 +1,3 @@
----
-created: 2026-04-07
-priority: p2
-status: done
-artifact: src/api/handlers.rs
----
-
 # Basic single-user password authentication
 
 ## Problem

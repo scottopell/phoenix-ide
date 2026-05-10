@@ -1,10 +1,3 @@
----
-created: 2026-02-19
-priority: p3
-status: done
-artifact: completed
----
-
 # Dynamic model discovery from LLM gateway
 
 ## Summary

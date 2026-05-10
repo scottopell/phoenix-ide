@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p1
-status: done
-artifact: specs/projects/executive.md
----
-
 # Update executive.md prose summaries
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-05-02
-priority: p3
-status: brainstorming
-artifact: pending
----
-
 Currently the middle file-explorer panel (FileExplorerPanel.tsx)
 has an asymmetric layout:
 

@@ -1,10 +1,3 @@
----
-status: done
-priority: p3
-created: 2025-02-15
-artifact: completed
----
-
 # Fix Flaky Clipboard Proptest
 
 ## Problem

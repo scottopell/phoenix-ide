@@ -1,10 +1,3 @@
----
-created: 2026-05-03
-priority: p2
-status: ready
-artifact: src/tools/tool_search.rs
----
-
 <!--
 This task file was created without `taskmd new` because the binary was not
 available in the working environment. ID 27100 chosen above the existing

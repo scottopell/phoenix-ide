@@ -1,10 +1,3 @@
----
-created: 2026-05-07
-priority: p1
-status: in-progress
-artifact: pending
----
-
 # simplify-scoped-sse-connection-ownership
 
 ## Plan

@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p2
-status: done
-artifact: src/runtime/executor.rs
----
-
 # Thread message ID through state instead of format! convention
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-04-07
-priority: p1
-status: done
-artifact: src/runtime/executor.rs
----
-
 # Give sub-agents a final turn to submit results on turn limit
 
 ## Problem

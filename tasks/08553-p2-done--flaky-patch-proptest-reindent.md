@@ -1,10 +1,3 @@
----
-status: done
-priority: p2
-created: 2025-02-16
-artifact: completed
----
-
 # Flaky Proptest: prop_reindent_roundtrip Too Many Global Rejects
 
 ## Summary

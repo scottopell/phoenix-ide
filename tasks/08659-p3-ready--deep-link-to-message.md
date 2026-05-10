@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p3
-status: ready
-artifact: ui/src/components/MessageList.tsx
----
-
 # Deep link to specific message via URL hash fragment
 
 ## Problem

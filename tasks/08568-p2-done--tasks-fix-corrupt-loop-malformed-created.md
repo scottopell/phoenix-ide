@@ -1,10 +1,3 @@
----
-created: 2025-01-28
-priority: p2
-status: done
-artifact: completed
----
-
 # tasks fix: corrupt-loop on malformed `created` field
 
 ## Summary

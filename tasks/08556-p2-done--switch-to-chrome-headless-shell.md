@@ -1,10 +1,3 @@
----
-created: 2026-02-18
-priority: p2
-status: done
-artifact: completed
----
-
 # Switch to ChromeHeadlessShell for smaller download
 
 ## Problem

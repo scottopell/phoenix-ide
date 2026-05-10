@@ -1,10 +1,3 @@
----
-created: 2026-04-10
-priority: p3
-status: ready
-artifact: .agents/skills/allium/references/patterns.md
----
-
 # Allium Skill: Add Cross-Spec Coordination Pattern
 
 ## Summary

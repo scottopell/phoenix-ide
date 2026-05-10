@@ -1,10 +1,3 @@
----
-created: 2026-03-01
-priority: p2
-status: done
-artifact: completed
----
-
 # Streaming Markdown Rendering
 
 ## Problem

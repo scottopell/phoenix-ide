@@ -1,10 +1,3 @@
----
-created: 2025-02-09
-priority: p2
-status: done
-artifact: completed
----
-
 # Preserve scroll position when navigating back to conversation list
 
 ## Summary

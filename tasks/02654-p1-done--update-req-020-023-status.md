@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p1
-status: done
-artifact: specs/projects/executive.md
----
-
 # Mark REQ-PROJ-020-023 as Complete in executive.md
 
 ## Summary

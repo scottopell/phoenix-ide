@@ -1,10 +1,3 @@
----
-created: 2025-07-05
-priority: p2
-status: done
-artifact: src/api/assets.rs
----
-
 # RustEmbed fails in worktrees without frontend build
 
 ## Summary

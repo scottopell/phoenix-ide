@@ -1,10 +1,3 @@
----
-created: 2026-02-28
-priority: p3
-status: done
-artifact: completed
----
-
 # Breadcrumb Tooltip Spacing
 
 ## Problem

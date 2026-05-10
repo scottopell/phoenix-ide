@@ -1,10 +1,3 @@
----
-created: 2026-03-02
-priority: p2
-status: blocked
-artifact: pending
----
-
 # SSE stream corruption from exe.dev LLM gateway
 
 ## Summary

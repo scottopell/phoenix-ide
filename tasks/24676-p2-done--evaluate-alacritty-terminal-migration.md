@@ -1,10 +1,3 @@
----
-created: 2026-04-13
-priority: p2
-status: done
-artifact: specs/terminal/alacritty-evaluation.md
----
-
 # evaluate-alacritty-terminal-migration
 
 ## Problem

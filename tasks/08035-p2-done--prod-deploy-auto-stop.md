@@ -1,10 +1,3 @@
----
-created: 2025-02-02
-priority: p2
-status: done
-artifact: completed
----
-
 # Auto-stop service during prod deploy
 
 ## Summary

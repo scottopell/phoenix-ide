@@ -1,10 +1,3 @@
----
-created: 2026-04-13
-priority: p3
-status: ready
-artifact: pending
----
-
 # vte-upstream-prompt-mark-handler
 
 ## Problem

@@ -1,10 +1,3 @@
----
-created: 2025-07-13
-priority: p3
-status: done
-artifact: completed
----
-
 # Breadcrumb bar z-index bleed-through on mobile
 
 ## Summary

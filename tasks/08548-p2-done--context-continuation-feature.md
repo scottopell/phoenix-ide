@@ -1,10 +1,3 @@
----
-created: 2026-02-15
-priority: p2
-status: done
-artifact: completed
----
-
 # Context Continuation Feature
 
 ## Summary

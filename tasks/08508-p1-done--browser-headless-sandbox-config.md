@@ -1,10 +1,3 @@
----
-created: 2026-02-07
-priority: p1
-status: done
-artifact: completed
----
-
 # Browser Tools Need Headless/Sandbox Configuration
 
 ## Summary

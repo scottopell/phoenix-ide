@@ -1,10 +1,3 @@
----
-created: 2026-04-07
-priority: p2
-status: done
-artifact: ui/src/components/WorkActions.tsx
----
-
 # Git diff viewer in Work mode actions
 
 ## Summary

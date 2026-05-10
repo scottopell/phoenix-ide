@@ -1,10 +1,3 @@
----
-created: 2026-03-13
-priority: p2
-status: done
-artifact: pending
----
-
 # Auto-scroll message list to bottom on new messages
 
 ## Problem

@@ -1,10 +1,3 @@
----
-created: 2026-04-06
-priority: p2
-status: done
-artifact: src/api/handlers.rs
----
-
 # Wrap confirm_complete DB writes in a transaction
 
 ## Summary

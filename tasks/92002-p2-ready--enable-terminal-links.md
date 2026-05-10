@@ -1,10 +1,3 @@
----
-created: 2026-05-04
-priority: p2
-status: ready
-artifact: ui/src/components/TerminalPanel.tsx
----
-
 # enable-terminal-links
 
 ## Summary

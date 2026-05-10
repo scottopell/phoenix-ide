@@ -1,10 +1,3 @@
----
-created: 2025-01-28
-priority: p2
-status: done
-artifact: completed
----
-
 # Implement skill slash-command invocation (REQ-IR-002, REQ-IR-003, REQ-IR-005)
 
 ## Summary

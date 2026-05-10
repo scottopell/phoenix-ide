@@ -1,10 +1,3 @@
----
-created: 2026-04-10
-priority: p2
-status: done
-artifact: ui/src/components/DesktopLayout.tsx
----
-
 # ConversationPage local state lost on desktop/mobile breakpoint crossing
 
 `DesktopLayout` toggles between two distinct React subtrees when the viewport crosses the 1025 px breakpoint (live media query listener). This unmounts and remounts `ConversationPage`, resetting all its local state (e.g. `terminalOpen`, task approval overlays, image attachments).

@@ -1,10 +1,3 @@
----
-created: 2026-04-23
-priority: p3
-status: ready
-artifact: specs/user_message_queue/user_message_queue.allium
----
-
 # Distill user_message_queue.allium — queued-to-rendered derivation
 
 ## Scope

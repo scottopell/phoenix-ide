@@ -1,10 +1,3 @@
----
-created: 2026-01-29
-priority: p3
-status: done
-artifact: completed
----
-
 # Fix Flaky prop_multiple_patches_independent Test
 
 ## Summary

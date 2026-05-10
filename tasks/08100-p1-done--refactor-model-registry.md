@@ -1,10 +1,3 @@
----
-created: 2026-02-02
-priority: p1
-status: done
-artifact: completed
----
-
 # Refactor Model Registry for Centralized Model Definition
 
 ## Summary

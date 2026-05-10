@@ -1,10 +1,3 @@
----
-created: 2026-04-23
-priority: p2
-status: done
-artifact: src/message_expander.rs
----
-
 # Problem
 
 `looks_like_file_path` and the `@` tokenizer are markdown-blind. Inline

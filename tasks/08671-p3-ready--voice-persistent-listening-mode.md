@@ -1,10 +1,3 @@
----
-created: 2026-04-19
-priority: p3
-status: ready
-artifact: pending
----
-
 # voice-persistent-listening-mode
 
 ## Summary

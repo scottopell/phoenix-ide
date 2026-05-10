@@ -1,10 +1,3 @@
----
-created: 2026-03-29
-priority: p2
-status: done
-artifact: src/tools/patch.rs
----
-
 # patch tool: `oldText not found` when text contains multi-byte UTF-8 characters
 
 ## Summary

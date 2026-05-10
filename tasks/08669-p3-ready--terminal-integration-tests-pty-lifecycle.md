@@ -1,10 +1,3 @@
----
-created: 2026-04-11
-priority: p3
-status: ready
-artifact: src/terminal/
----
-
 # Terminal integration tests: PTY I/O paths and lifecycle teardown
 
 The terminal unit tests (src/terminal/proptests.rs) cover the registry invariants,

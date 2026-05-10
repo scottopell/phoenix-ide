@@ -1,10 +1,3 @@
----
-created: 2025-02-07
-priority: p3
-status: done
-artifact: completed
----
-
 # Investigate: Cancellation as First-Class State Transitions
 
 ## ⚠️ INVESTIGATION ONLY

@@ -1,10 +1,3 @@
----
-created: 2026-04-11
-priority: p2
-status: done
-artifact: dev.py
----
-
 # Retire build-taskmd-wheel.sh once taskmd is on PyPI
 
 The `scripts/build-taskmd-wheel.sh` script and `.taskmd-wheel/` local cache exist

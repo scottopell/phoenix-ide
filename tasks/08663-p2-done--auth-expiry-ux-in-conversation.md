@@ -1,10 +1,3 @@
----
-created: 2026-04-10
-priority: p2
-status: done
-artifact: ui/src/pages/ConversationPage.tsx
----
-
 # Surface credential expiry inside an active conversation
 
 ## Problem

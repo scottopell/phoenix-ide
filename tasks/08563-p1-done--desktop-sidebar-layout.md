@@ -1,13 +1,3 @@
----
-priority: p1
-status: done
-created: 2025-02-22
-  - REQ-UI-016
-  - REQ-UI-017
-  - REQ-UI-018
-artifact: completed
----
-
 # Desktop Sidebar Layout
 
 Implement persistent sidebar layout for desktop viewports (> 1024px). 

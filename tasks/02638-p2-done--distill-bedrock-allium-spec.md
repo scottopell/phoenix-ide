@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p2
-status: done
-artifact: pending
----
-
 # distill-bedrock-allium-spec
 
 ## Plan

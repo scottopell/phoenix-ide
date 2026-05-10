@@ -1,10 +1,3 @@
----
-created: 2026-02-11
-priority: p2
-status: done
-artifact: completed
----
-
 # Prose Reader - Trigger Requirements Analysis
 
 ## Summary

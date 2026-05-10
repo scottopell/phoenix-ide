@@ -1,10 +1,3 @@
----
-created: 2025-07-13
-priority: p3
-status: done
-artifact: completed
----
-
 # UI messages missing after server restart, phase indicators disconnected from visible content
 
 ## Summary

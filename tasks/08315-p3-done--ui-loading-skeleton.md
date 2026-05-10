@@ -1,10 +1,3 @@
----
-created: 2026-02-05
-priority: p3
-status: done
-artifact: completed
----
-
 # Add Loading Skeletons Instead of Spinners
 
 ## Summary

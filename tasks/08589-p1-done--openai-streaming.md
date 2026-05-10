@@ -1,10 +1,3 @@
----
-created: 2026-03-01
-priority: p1
-status: done
-artifact: completed
----
-
 # OpenAI Token Streaming
 
 ## Context

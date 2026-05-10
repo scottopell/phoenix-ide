@@ -1,10 +1,3 @@
----
-created: 2026-05-07
-priority: p1
-status: done
-artifact: dev.py
----
-
 Migrate `ui/` from npm to pnpm and harden `./dev.py` so the wrong package
 manager (or wrong pnpm version) cannot be used by accident. Goal: end the
 recurring lockfile-drift commits (e.g. 6c66c7a, 146452f) caused by multiple

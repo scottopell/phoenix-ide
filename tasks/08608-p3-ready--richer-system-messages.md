@@ -1,10 +1,3 @@
----
-created: 2026-03-13
-priority: p3
-status: ready
-artifact: pending
----
-
 # Richer system messages with task context and file links
 
 ## Problem

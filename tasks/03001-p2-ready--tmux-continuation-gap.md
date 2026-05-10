@@ -1,10 +1,3 @@
----
-created: 2025-05-02
-priority: p2
-status: ready
-artifact: src/tools/tmux/registry.rs
----
-
 ## tmux session not transferred on conversation continuation
 
 When a conversation is continued (context exhaustion → `awaiting_continuation` → child conversation), the worktree transfers cleanly because `worktree_path`, `branch_name`, etc. are explicitly copied to the child. The tmux session does **not** transfer.

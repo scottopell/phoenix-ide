@@ -1,10 +1,3 @@
----
-created: 2026-05-03
-priority: p3
-status: ready
-artifact: src/message_expander.rs
----
-
 <!--
 ID 27101 chosen above 27100. Created without `taskmd new` since the binary
 isn't installed; run `./dev.py tasks fix` if reallocation needed.

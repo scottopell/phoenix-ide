@@ -1,9 +1,3 @@
----
-created: 2025-07-14
-priority: p3
-status: ready
-artifact: improved phoenix-integration snippet + revised installation prompt
----
 # Fix bugs and gaps in Phoenix OSC 133 shell integration
 
 ## Summary

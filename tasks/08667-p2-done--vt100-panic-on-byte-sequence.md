@@ -1,10 +1,3 @@
----
-created: 2026-04-10
-priority: p2
-status: done
-artifact: vendor/vt100/src/grid.rs
----
-
 # vt100 0.15.2 panics on certain byte sequences — fixed via vendor patch
 
 Found by proptest (`prop_parser_accepts_arbitrary_bytes`) during allium:propagate

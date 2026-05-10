@@ -1,10 +1,3 @@
----
-created: 2026-04-11
-priority: p1
-status: done
-artifact: pending
----
-
 # fix-react-perf-antipatterns-conversation-view
 
 ## Plan

@@ -1,10 +1,3 @@
----
-created: 2026-02-23
-priority: p2
-status: done
-artifact: completed
----
-
 ## Problem
 
 Phoenix currently silently falls back to hardcoded models in all failure modes,

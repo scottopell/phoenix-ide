@@ -1,10 +1,3 @@
----
-created: 2026-04-16
-priority: p1
-status: done
-artifact: ui/src/components/CredentialHelperPanel.tsx
----
-
 # Seamless auth: auto-retry on helper failure and clear stale output
 
 ## Summary

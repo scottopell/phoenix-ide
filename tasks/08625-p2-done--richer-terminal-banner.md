@@ -1,10 +1,3 @@
----
-created: 2026-04-03
-priority: p2
-status: done
-artifact: ui/src/pages/ConversationPage.tsx
----
-
 # Richer terminal banner
 
 ## Summary

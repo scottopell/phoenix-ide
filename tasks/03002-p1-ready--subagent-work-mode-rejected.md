@@ -1,10 +1,3 @@
----
-created: 2025-05-02
-priority: p1
-status: ready
-artifact: src/tools.rs
----
-
 ## Work-mode sub-agents rejected by `spawn_agents` tool even when parent is in Work mode
 
 When an agent invokes `spawn_agents` with `mode: "work"` from within a Work-mode conversation, the tool rejects the request with:

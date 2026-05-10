@@ -1,10 +1,3 @@
----
-created: 2026-05-06
-priority: p2
-status: in-progress
-artifact: pending
----
-
 # browser-live-view-panel
 
 ## Plan

@@ -1,10 +1,3 @@
----
-created: 2026-03-02
-priority: p3
-status: done
-artifact: completed
----
-
 # browser_eval: Arrow function expressions return {} instead of error or result
 
 ## Problem

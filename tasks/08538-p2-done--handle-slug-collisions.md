@@ -1,10 +1,3 @@
----
-created: 2026-02-09
-priority: p2
-status: done
-artifact: completed
----
-
 # Handle Slug Collisions Gracefully
 
 ## Summary

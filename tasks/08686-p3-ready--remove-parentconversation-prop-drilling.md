@@ -1,10 +1,3 @@
----
-created: 2026-05-08
-priority: p3
-status: ready
-artifact: ui/src/components/TaskViewer.tsx
----
-
 # remove-parentconversation-prop-drilling
 
 ## Summary

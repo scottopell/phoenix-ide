@@ -1,10 +1,3 @@
----
-created: 2026-02-04
-priority: p2
-status: done
-artifact: completed
----
-
 # Add Service Worker for Network-Level Caching
 
 ## Summary

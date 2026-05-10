@@ -1,10 +1,3 @@
----
-created: 2026-01-30
-priority: p2
-status: done
-artifact: completed
----
-
 # Kill Bash Subprocesses on Cancellation
 
 ## Summary

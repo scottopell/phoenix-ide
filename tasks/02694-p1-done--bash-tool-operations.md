@@ -1,10 +1,3 @@
----
-created: 2026-05-01
-priority: p1
-status: done
-artifact: src/tools/bash.rs
----
-
 Implement the `BashTool` dispatch and the four agent-facing operations (`spawn`, `peek`, `wait`, `kill`) on top of the foundation from task 02693.
 
 ## In scope

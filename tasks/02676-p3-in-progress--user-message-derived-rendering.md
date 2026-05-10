@@ -1,10 +1,3 @@
----
-created: 2026-04-23
-priority: p3
-status: in-progress
-artifact: ui/src/pages/ConversationPage.tsx
----
-
 # User-message rendering: derive, don't patch
 
 ## Problem

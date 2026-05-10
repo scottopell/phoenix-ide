@@ -1,10 +1,3 @@
----
-created: 2026-05-01
-priority: p2
-status: done
-artifact: src/git_ops.rs
----
-
 Several diff-comparator code paths use bare local <base_branch> refs
 (e.g. main...HEAD, task..base_branch) when computing what a worktree
 has done relative to its base. The local <base> ref is only fast-

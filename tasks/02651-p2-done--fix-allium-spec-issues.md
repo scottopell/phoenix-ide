@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p2
-status: done
-artifact: pending
----
-
 # fix-allium-spec-issues
 
 ## Plan

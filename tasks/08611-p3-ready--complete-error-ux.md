@@ -1,10 +1,3 @@
----
-created: 2026-03-13
-priority: p3
-status: ready
-artifact: pending
----
-
 # Differentiated error messages for Complete pre-check failures
 
 ## Problem

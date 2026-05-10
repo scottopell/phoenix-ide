@@ -1,10 +1,3 @@
----
-created: 2026-05-05
-priority: p1
-status: done
-artifact: pending
----
-
 # smooth-conversation-sidebar
 
 ## Plan

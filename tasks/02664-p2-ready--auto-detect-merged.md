@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p2
-status: ready
-artifact: src/api/handlers.rs
----
-
 # Auto-detect PR merge for conversation lifecycle
 
 ## Summary

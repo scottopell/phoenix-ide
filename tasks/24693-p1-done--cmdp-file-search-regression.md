@@ -1,10 +1,3 @@
----
-created: 2026-04-22
-priority: p1
-status: done
-artifact: ui/src/components/CommandPalette/sources/FileSource.ts
----
-
 # Cmd+P file search not returning results in current conversation's cwd
 
 ## Symptom

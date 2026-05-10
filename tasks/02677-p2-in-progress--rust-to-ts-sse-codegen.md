@@ -1,10 +1,3 @@
----
-created: 2026-04-23
-priority: p2
-status: in-progress
-artifact: src/api/sse.rs
----
-
 # Rust → TS codegen for SSE event types
 
 ## Problem

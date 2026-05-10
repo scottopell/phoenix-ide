@@ -1,10 +1,3 @@
----
-created: 2026-05-07
-priority: p1
-status: done
-artifact: ui/src
----
-
 Audit every SSE / streaming / subscription path for conversation-scope ownership bugs.
 
 We have observed intermittent issues when switching between conversations that are both concurrently sending SSE updates. The failures are timing/network dependent: late events, reconnects, init messages, or timers from conversation A can appear to affect conversation B after navigation. This task is the SSE-focused sibling of task 05002's UI-state scope audit.

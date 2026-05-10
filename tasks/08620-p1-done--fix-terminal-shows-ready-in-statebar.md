@@ -1,10 +1,3 @@
----
-created: 2026-04-03
-priority: p1
-status: done
-artifact: ui/src/components/StateBar.tsx
----
-
 # Fix terminal state showing "ready" in StateBar
 
 ## Summary

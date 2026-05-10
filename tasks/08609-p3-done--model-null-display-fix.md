@@ -1,10 +1,3 @@
----
-created: 2026-03-13
-priority: p3
-status: done
-artifact: pending
----
-
 # StateBar shows "Model: null" when no model explicitly set
 
 ## Problem

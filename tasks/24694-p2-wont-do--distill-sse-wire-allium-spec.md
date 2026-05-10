@@ -1,10 +1,3 @@
----
-created: 2026-04-23
-priority: p2
-status: wont-do
-artifact: pending
----
-
 # distill-sse-wire-allium-spec
 
 ## Plan

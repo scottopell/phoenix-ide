@@ -1,10 +1,3 @@
----
-created: 2025-01-30
-priority: p2
-status: done
-artifact: completed
----
-
 # MVP UI Implementation
 
 ## Summary

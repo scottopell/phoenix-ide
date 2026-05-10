@@ -1,10 +1,3 @@
----
-created: 2026-02-28
-priority: p1
-status: done
-artifact: completed
----
-
 # Empty LLM Response False Error
 
 ## Problem

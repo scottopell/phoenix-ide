@@ -1,10 +1,3 @@
----
-created: 2026-02-08
-priority: p2
-status: done
-artifact: completed
----
-
 # Breadcrumb Tooltip Position Relative to Item
 
 ## Summary

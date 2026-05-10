@@ -1,10 +1,3 @@
----
-created: 2026-04-03
-priority: p3
-status: done
-artifact: ui/src/components/ConversationList.tsx
----
-
 # Rename Standalone to Direct in UI
 
 ## Summary

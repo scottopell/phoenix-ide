@@ -1,10 +1,3 @@
----
-created: 2025-01-29
-priority: p2
-status: done
-artifact: completed
----
-
 # Implement sub-agent spawning (REQ-BED-008, REQ-BED-009)
 
 ## Summary

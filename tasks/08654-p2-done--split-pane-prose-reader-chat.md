@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p2
-status: done
-artifact: ui/src/components/DesktopLayout.tsx
----
-
 # Split pane layout: prose reader alongside chat
 
 ## Problem

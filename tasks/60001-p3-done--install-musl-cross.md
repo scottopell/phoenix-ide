@@ -1,10 +1,3 @@
----
-created: 2026-05-03
-priority: p3
-status: done
-artifact: dev.py
----
-
 Restore the macOS musl smoke check (`cargo check --target x86_64-unknown-linux-musl`)
 that `./dev.py check` runs at dev.py:928-940 by providing an `x86_64-linux-musl-gcc`
 on PATH.

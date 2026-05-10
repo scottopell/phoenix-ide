@@ -1,10 +1,3 @@
----
-created: 2026-04-07
-priority: p3
-status: done
-artifact: ui/src/components/MessageList.tsx
----
-
 # Duplicate "Task completed" message after Work mode merge
 
 ## Problem

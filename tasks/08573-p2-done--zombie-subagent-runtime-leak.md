@@ -1,10 +1,3 @@
----
-created: 2026-02-27
-priority: p2
-status: done
-artifact: completed
----
-
 # Zombie Sub-Agent Runtime Leak
 
 ## Problem

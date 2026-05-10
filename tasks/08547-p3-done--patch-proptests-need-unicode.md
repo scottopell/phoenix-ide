@@ -1,10 +1,3 @@
----
-created: 2026-02-15
-priority: p3
-status: done
-artifact: completed
----
-
 # Patch Proptests Need Unicode Content Generation
 
 ## Summary

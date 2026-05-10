@@ -1,10 +1,3 @@
----
-created: 2025-01-28
-priority: p2
-status: done
-artifact: completed
----
-
 # Implement `./path` file path autocomplete (REQ-IR-004, REQ-IR-008)
 
 ## Summary

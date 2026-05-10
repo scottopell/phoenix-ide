@@ -1,10 +1,3 @@
----
-created: 2026-04-30
-priority: p3
-status: brainstorming
-artifact: specs/chains/requirements.md
----
-
 A user-curated, per-project text blob that Phoenix would inject into the system prompt of every conversation in that project. Sister concept to chains: chains recall PAST work, steering doc primes FUTURE work.
 
 Originally pitched at the start of the chains design conversation as the "project summary" idea. Branch was originally named project-summary before being repurposed for chains. The chains spec lists this in the explicit non-requirements ("Project-level summary or steering doc. A separate concept, explicitly deferred.").

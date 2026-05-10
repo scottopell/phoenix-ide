@@ -1,10 +1,3 @@
----
-created: 2026-03-30
-priority: p3
-status: done
-artifact: pending
----
-
 # Dynamic MCP Tool Resolution
 
 ## Summary

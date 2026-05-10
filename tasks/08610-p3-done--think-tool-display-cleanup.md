@@ -1,10 +1,3 @@
----
-created: 2026-03-13
-priority: p3
-status: done
-artifact: pending
----
-
 # Collapse or hide think tool results in message display
 
 ## Problem

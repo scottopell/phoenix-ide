@@ -1,10 +1,3 @@
----
-created: 2026-04-24
-priority: p3
-status: ready
-artifact: specs/sse_wire/sse_wire.allium
----
-
 # Allium language feedback: temporal ordering invariants
 
 Observed while distilling `sse_wire.allium` (task 02680). Collecting

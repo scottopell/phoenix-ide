@@ -1,10 +1,3 @@
----
-created: 2026-04-22
-priority: p1
-status: ready
-artifact: ui/src/components/TerminalPanel.tsx
----
-
 # Terminal: keyboard shortcut to send selected text as LLM context
 
 ## Summary

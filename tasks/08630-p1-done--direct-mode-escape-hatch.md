@@ -1,10 +1,3 @@
----
-created: 2026-04-06
-priority: p1
-status: done
-artifact: src/api/handlers.rs
----
-
 # Direct mode escape hatch for git repos (REQ-PROJ-018)
 
 ## Summary

@@ -1,10 +1,3 @@
----
-artifact: worktree-cleanup-on-context-exhausted
-created: 2026-04-22
-priority: p1
-status: done
----
-
 # Fix: Work/Branch worktree not cleaned up on ContextExhausted
 
 ## Background

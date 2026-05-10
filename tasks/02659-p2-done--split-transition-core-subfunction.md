@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p2
-status: done
-artifact: src/state_machine/transition.rs
----
-
 # Extract handle_llm_response, handle_tool_complete from transition_core
 
 ## Summary

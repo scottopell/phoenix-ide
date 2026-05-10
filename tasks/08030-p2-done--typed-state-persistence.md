@@ -1,10 +1,3 @@
----
-created: 2026-02-01
-priority: p2
-status: done
-artifact: completed
----
-
 # Typed State Persistence
 
 ## Summary

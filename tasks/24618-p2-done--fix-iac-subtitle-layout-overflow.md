@@ -1,10 +1,3 @@
----
-created: 2026-04-04
-priority: p2
-status: done
-artifact: done
----
-
 # fix-iac-subtitle-layout-overflow
 
 ## Plan

@@ -1,10 +1,3 @@
----
-created: 2026-04-12
-priority: p1
-status: wont-do
-artifact: pending
----
-
 # auto-mark-task-done-on-squash-merge
 
 ## Wont-do (2026-04-24)

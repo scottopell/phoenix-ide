@@ -1,10 +1,3 @@
----
-created: 2026-04-22
-priority: p2
-status: wont-do
-artifact: src/runtime/executor.rs
----
-
 # Auto-stash uncommitted worktree changes on ContextExhausted cleanup
 
 ## Wont-do (2026-04-24)

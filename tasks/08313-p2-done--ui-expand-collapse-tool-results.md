@@ -1,10 +1,3 @@
----
-created: 2026-02-05
-priority: p2
-status: done
-artifact: completed
----
-
 # Redesign Tool Block Display: Inline Calls, Collapsed Output
 
 ## Summary

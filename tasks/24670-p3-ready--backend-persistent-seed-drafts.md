@@ -1,10 +1,3 @@
----
-created: 2026-04-12
-priority: p3
-status: ready
-artifact: pending
----
-
 # backend-persistent-seed-drafts
 
 ## Problem

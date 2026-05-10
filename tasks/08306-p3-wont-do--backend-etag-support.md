@@ -1,10 +1,3 @@
----
-created: 2026-02-04
-priority: p3
-status: wont-do
-artifact: completed
----
-
 # Add ETag Support to Backend API
 
 ## Summary

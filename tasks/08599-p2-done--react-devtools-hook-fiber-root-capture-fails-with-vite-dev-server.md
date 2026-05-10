@@ -1,10 +1,3 @@
----
-created: 2026-03-02
-priority: p2
-status: done
-artifact: completed
----
-
 # browser_inject_react_devtools: onCommitFiberRoot never fires with Vite dev server
 
 ## Problem

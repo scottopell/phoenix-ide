@@ -1,10 +1,3 @@
----
-created: 2025-02-07
-priority: p1
-status: wont-do
-artifact: completed
----
-
 # Add CSRF Protection Headers
 
 ## Summary

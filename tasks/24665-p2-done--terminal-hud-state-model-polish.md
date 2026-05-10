@@ -1,10 +1,3 @@
----
-created: 2026-04-12
-priority: p2
-status: done
-artifact: pending
----
-
 # terminal-hud-state-model-polish
 
 ## Problem

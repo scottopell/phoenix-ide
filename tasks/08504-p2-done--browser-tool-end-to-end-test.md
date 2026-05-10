@@ -1,10 +1,3 @@
----
-created: 2026-02-07
-priority: p2
-status: done
-artifact: completed
----
-
 # Add Browser Tools End-to-End Tests
 
 ## Summary

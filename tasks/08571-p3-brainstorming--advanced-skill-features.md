@@ -1,10 +1,3 @@
----
-created: 2025-01-28
-priority: p3
-status: brainstorming
-artifact: pending
----
-
 # Advanced skill features: subagent execution, invocation control, dynamic context
 
 ## Summary

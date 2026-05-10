@@ -1,10 +1,3 @@
----
-created: 2026-02-09
-priority: p3
-status: brainstorming
-artifact: pending
----
-
 # Browser Tool Enhancements
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-02-08
-priority: p3
-status: ready
-artifact: pending
----
-
 # Mobile Tooltip Support for Breadcrumbs
 
 ## Summary

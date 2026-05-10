@@ -1,10 +1,3 @@
----
-created: 2026-04-14
-priority: p3
-status: done
-artifact: ui/src/index.css
----
-
 # Terminal panel hardcodes dark colors, ignores `data-theme="light"`
 
 ## Resolution

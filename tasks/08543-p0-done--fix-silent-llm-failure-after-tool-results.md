@@ -1,10 +1,3 @@
----
-created: 2026-02-11
-priority: p0
-status: done
-artifact: completed
----
-
 # Task 543: Fix Silent LLM Failure After Tool Results
 
 ## Summary

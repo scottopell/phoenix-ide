@@ -1,10 +1,3 @@
----
-created: 2026-03-30
-priority: p2
-status: ready
-artifact: pending
----
-
 # MCP: Discover project-local .mcp.json from conversation working directory
 
 ## Summary

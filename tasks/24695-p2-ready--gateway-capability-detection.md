@@ -1,10 +1,3 @@
----
-created: 2026-04-24
-priority: p2
-status: ready
-artifact: src/llm/models.rs
----
-
 ## Problem
 
 The exe.dev LLM gateway (`http://169.254.169.254/gateway/llm`) does not support

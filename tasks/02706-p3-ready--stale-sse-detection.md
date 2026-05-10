@@ -1,10 +1,3 @@
----
-created: 2026-05-06
-priority: p3
-status: ready
-artifact: src/api/sse.rs
----
-
 Surface stale SSE clients so silent connection leaks get caught early
 instead of being discovered when a user hits saturation symptoms days
 or weeks later.

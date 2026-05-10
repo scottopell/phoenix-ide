@@ -1,10 +1,3 @@
----
-created: 2026-01-29
-priority: p3
-status: blocked
-artifact: pending
----
-
 # Implement static asset serving (REQ-API-010)
 
 ## Summary

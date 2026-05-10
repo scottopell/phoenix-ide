@@ -1,10 +1,3 @@
----
-created: 2026-04-23
-priority: p3
-status: in-progress
-artifact: ui/src/pages/SharePage.tsx
----
-
 # Apply SSE schema validation to SharePage
 
 ## Problem

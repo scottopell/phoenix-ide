@@ -1,10 +1,3 @@
----
-created: 2026-03-28
-priority: p2
-status: done
-artifact: src/runtime/
----
-
 # Sub-agent timeout wastes tokens on network I/O
 
 **Resolution:** Absorbed into task 08629 (sub-agent modes, REQ-PROJ-008).

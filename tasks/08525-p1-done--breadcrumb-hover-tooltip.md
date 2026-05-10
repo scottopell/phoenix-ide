@@ -1,10 +1,3 @@
----
-created: 2026-02-08
-priority: p1
-status: done
-artifact: completed
----
-
 # Breadcrumb Hover Tooltip
 
 ## Summary

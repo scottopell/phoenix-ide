@@ -1,10 +1,3 @@
----
-created: 2026-02-03
-priority: p2
-status: done
-artifact: completed
----
-
 # Implement Additional LLM Providers
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-02-07
-priority: p3
-status: done
-artifact: completed
----
-
 # Fix [object Object] rendering in review feedback notes
 
 ## Summary

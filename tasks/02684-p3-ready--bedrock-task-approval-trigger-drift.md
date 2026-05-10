@@ -1,10 +1,3 @@
----
-created: 2026-04-24
-priority: p3
-status: ready
-artifact: specs/bedrock/bedrock.allium
----
-
 Three rules in `specs/bedrock/bedrock.allium` (~lines 616, 627, 636) subscribe to a trigger named `TaskApprovalDecided` (or `UserApprovesTask` / `UserProvidesFeedback` / `UserRejectsTask` — check the actual spelling), but the runtime emits `TaskApprovalResponse` on the corresponding endpoint. The trigger names in the spec do not match what fires.
 
 Found by the projects.allium audit on 2026-04-24 (sub-agent investigation under task 24696). Out of scope for that PR; filed separately.

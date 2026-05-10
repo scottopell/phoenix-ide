@@ -1,10 +1,3 @@
----
-created: 2026-04-03
-priority: p1
-status: done
-artifact: src/runtime/executor.rs
----
-
 # Fix non-atomic task approval (commit before worktree)
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2026-04-07
-priority: p2
-status: done
-artifact: ui/src/components/StateBar.tsx
----
-
 # Frontend UI for model upgrade flow
 
 ## Summary

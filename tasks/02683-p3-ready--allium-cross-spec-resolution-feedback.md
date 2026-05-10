@@ -1,10 +1,3 @@
----
-created: 2026-04-24
-priority: p3
-status: ready
-artifact: specs/auth/auth.allium
----
-
 # Allium language feedback: cross-spec references aren't resolved
 
 Observed while reviewing task 24696's multi-spec changes on

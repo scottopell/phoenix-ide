@@ -1,10 +1,3 @@
----
-created: 2026-04-22
-priority: p1
-status: in-progress
-artifact: src/terminal/ws.rs, src/terminal/relay.rs, src/terminal/session.rs
----
-
 # Terminal WS reclaim — recover sessions when WS connections hang
 
 ## Summary

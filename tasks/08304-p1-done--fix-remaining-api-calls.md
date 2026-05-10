@@ -1,10 +1,3 @@
----
-created: 2026-02-04
-priority: p1
-status: done
-artifact: completed
----
-
 # Fix Remaining API Calls to Use Enhanced API
 
 ## Summary

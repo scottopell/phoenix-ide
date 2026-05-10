@@ -1,10 +1,3 @@
----
-created: 2025-02-07
-priority: p1
-status: done
-artifact: completed
----
-
 # Migrate from rusqlite to sqlx
 
 ## Summary

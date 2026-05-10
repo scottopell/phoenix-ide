@@ -1,10 +1,3 @@
----
-created: 2026-04-20
-priority: p2
-status: ready
-artifact: ui/src/components/StateBar.tsx
----
-
 # PR tracking integration in StateBar
 
 ## Summary

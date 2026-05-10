@@ -1,10 +1,3 @@
----
-created: 2026-04-08
-priority: p3
-status: wont-do
-artifact: pending
----
-
 # Create BRANCH_TEST.md with hello world
 
 ## Plan

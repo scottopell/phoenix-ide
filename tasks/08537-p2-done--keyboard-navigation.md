@@ -1,10 +1,3 @@
----
-created: 2025-05-30
-priority: p2
-status: done
-artifact: completed
----
-
 # Keyboard navigation for Phoenix UI
 
 ## Summary

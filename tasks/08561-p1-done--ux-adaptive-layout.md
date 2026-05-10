@@ -1,14 +1,3 @@
----
-priority: p1
-status: done
-created: 2025-02-22
-  - REQ-UI-012
-  - REQ-UI-013
-  - REQ-UI-014
-  - REQ-UI-015
-artifact: completed
----
-
 # UX Adaptive Layout Improvements
 
 Implement UX improvements identified in the adaptive layout audit (`docs/ux-audit-adaptive-layout.md`). Requirements are defined in `specs/ui/requirements.md`.

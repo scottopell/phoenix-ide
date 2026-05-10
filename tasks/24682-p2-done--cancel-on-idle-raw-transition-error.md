@@ -1,10 +1,3 @@
----
-created: 2026-04-14
-priority: p2
-status: done
-artifact: src/api/handlers.rs
----
-
 # `POST /cancel` on an idle conversation surfaces raw Rust Debug error
 
 ## Resolution

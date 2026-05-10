@@ -1,10 +1,3 @@
----
-created: 2026-05-07
-priority: p2
-status: ready
-artifact: ui/src/pages/ConversationPage.tsx
----
-
 Audit non-SSE async send callbacks for conversation-scope ownership after route switches.
 
 During task 01002, SSE subscription ownership was simplified and guarded. One adjacent non-SSE path remains worth checking separately: `sendMessage` can outlive a route switch, and its catch path calls `dismissRef.current(localId)` / `markFailedRef.current(localId)`. Those refs intentionally point at the current hook instance, so a send started under conversation A may be able to mark/dismiss the current conversation B queue if it fails after navigation.

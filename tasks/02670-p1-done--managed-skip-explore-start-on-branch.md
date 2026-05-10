@@ -1,10 +1,3 @@
----
-created: 2026-04-15
-priority: p1
-status: done
-artifact: src/runtime/executor.rs
----
-
 # Managed mode: option to skip Explore and start directly on a branch
 
 ## Summary

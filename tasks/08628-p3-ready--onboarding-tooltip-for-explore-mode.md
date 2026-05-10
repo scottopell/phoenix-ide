@@ -1,10 +1,3 @@
----
-created: 2026-04-03
-priority: p3
-status: ready
-artifact: ui/src/pages/ConversationPage.tsx
----
-
 # Onboarding tooltip for first Explore conversation
 
 ## Summary

@@ -1,10 +1,3 @@
----
-created: 2025-01-28
-priority: p0
-status: done
-artifact: completed
----
-
 # Update recommended model list for claude-opus-4-6, claude-sonnet-4-6, gpt-5.2-codex
 
 ## Summary

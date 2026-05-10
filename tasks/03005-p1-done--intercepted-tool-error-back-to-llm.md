@@ -1,10 +1,3 @@
----
-created: 2026-05-07
-priority: p1
-status: done
-artifact: pending
----
-
 # intercepted-tool-error-back-to-llm
 
 ## Plan

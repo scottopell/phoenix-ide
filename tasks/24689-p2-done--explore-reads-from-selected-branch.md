@@ -1,10 +1,3 @@
----
-created: 2026-04-15
-priority: p2
-status: done
-artifact: src/runtime/executor.rs
----
-
 # Explore mode should read from the selected branch, not main checkout
 
 ## Summary

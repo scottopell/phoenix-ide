@@ -1,10 +1,3 @@
----
-created: 2026-05-06
-priority: p1
-status: ready
-artifact: src/state_machine/projects.rs
----
-
 ## Worktrees can be created nested inside other worktrees
 
 Observed from `git worktree list` in the main checkout:

@@ -1,10 +1,3 @@
----
-created: 2026-04-10
-priority: p2
-status: done
-artifact: src/state_machine/state.rs
----
-
 # Fix `is_terminal()` Missing `ContextExhausted`
 
 ## Summary

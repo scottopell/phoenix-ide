@@ -1,10 +1,3 @@
----
-created: 2026-05-05
-priority: p2
-status: wont-do
-artifact: src/api/sse.rs
----
-
 Force-close every SSE stream after a bounded lifetime so HTTP/1.1
 connection exhaustion is self-healing without protocol changes.
 
