@@ -743,3 +743,11 @@ postcondition before cascade fires.
 **Dependencies:** REQ-BASH-006 (`specs/bash/`), REQ-TMUX-007
 (`specs/tmux-integration/`), REQ-PROJ-`<new subscriber>`
 (`specs/projects/`).
+
+---
+
+## Audit Trail
+
+| Date | Pass | Notes |
+|---|---|---|
+| 2026-05-10 | Automated review (Copilot/codex) | First pass over the legacy spec since the doc-rot audit. Goal: surface drift between spec language, status claims, and current code. Findings are addressed inline on this PR. |

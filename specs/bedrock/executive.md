@@ -46,3 +46,9 @@ Implements Elm Architecture with a typed-effect executor boundary. The SM has tw
 | **REQ-BED-032:** Conversation Hard-Delete Cascade | ✅ Complete | `ConversationHardDeleted` lifecycle event emitted from `runtime.rs:426,1198`; bash + tmux subscribers wired; `RejectHardDeleteWhileBusy` enforced (see `bedrock.allium:899-958`) |
 
 **Progress:** 29 of 32 complete (3 deprecated, not counted)
+
+## Audit Trail
+
+| Date | Pass | Notes |
+|---|---|---|
+| 2026-05-10 | Automated review (Copilot/codex) | First pass over the legacy spec since the doc-rot audit. Goal: surface drift between spec language, status claims, and current code. Findings are addressed inline on this PR. |

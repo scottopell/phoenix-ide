@@ -1646,3 +1646,11 @@ Decision: Effect typing. The event log is the most powerful for crash recovery a
 debugging but is the largest migration. Typed effects get 90% of the correctness wins
 without touching persistence architecture. If the event log is wanted later, typed
 effects make it easier to retrofit — each effect dispatch becomes a log append.
+
+---
+
+## Audit Trail
+
+| Date | Pass | Notes |
+|---|---|---|
+| 2026-05-10 | Automated review (Copilot/codex) | First pass over the legacy spec since the doc-rot audit. Goal: surface drift between spec language, status claims, and current code. Findings are addressed inline on this PR. |
