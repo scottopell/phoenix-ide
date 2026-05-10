@@ -1197,12 +1197,14 @@ where
                 // the durable write (and emits a duplicate `sse_message`
                 // that the UI dedups by `message_id`).
                 //
-                // Reconnect mid-tool-exec falls back to the
-                // pre-eager-broadcast behaviour (the message is missing
-                // from the init payload until the checkpoint fires) —
-                // acceptable because the breadcrumb + `tool_executing`
-                // state still signal that work is in flight. The
-                // forthcoming SSE ReplayRing closes that reconnect gap.
+                // The eager message is appended to the per-conversation
+                // ReplayRing via `send_ephemeral_message` so reconnecting
+                // clients during the tool round still see the in-flight
+                // assistant content. The eventual persisted Message with
+                // the same `message_id` will fire `send_persisted_message`
+                // when the checkpoint completes, resetting the ring anchor
+                // and discarding this entry; the client dedups by
+                // `message_id` via `SseMessageDedupReplay`.
                 let seq = self.broadcast_tx.next_seq();
                 let agent_content = MessageContent::agent(message.content);
                 let db_msg = crate::db::Message {
@@ -1215,7 +1217,7 @@ where
                     usage_data: message.usage,
                     created_at: chrono::Utc::now(),
                 };
-                let _ = self.broadcast_tx.send_message(db_msg);
+                let _ = self.broadcast_tx.send_ephemeral_message(db_msg);
                 Ok(None)
             }
 
