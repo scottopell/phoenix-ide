@@ -612,7 +612,7 @@ describe('conversationReducer', () => {
         sequenceId: 5,
         phase: {
           type: 'tool_executing',
-          current_tool: { id: 'tool-1', input: { _tool: 'bash' } },
+          current_tool: { id: 'tool-1', name: 'bash', input: { _tool: 'bash' } },
           remaining_tools: [],
         },
       });
@@ -854,7 +854,7 @@ describe('conversationReducer', () => {
         ...createInitialAtom(),
         phase: {
           type: 'tool_executing',
-          current_tool: { id: 'tool-1', input: { _tool: 'bash' } },
+          current_tool: { id: 'tool-1', name: 'bash', input: { _tool: 'bash' } },
           remaining_tools: [],
         },
       };
@@ -1312,8 +1312,11 @@ describe('breadcrumbFromPhase', () => {
     const crumb = breadcrumbFromPhase(
       {
         type: 'tool_executing',
-        current_tool: { id: 't1', input: { _tool: 'bash' } },
-        remaining_tools: [{ id: 't2', input: {} }, { id: 't3', input: {} }],
+        current_tool: { id: 't1', name: 'bash', input: { _tool: 'bash' } },
+        remaining_tools: [
+          { id: 't2', name: 'bash', input: {} },
+          { id: 't3', name: 'bash', input: {} },
+        ],
       },
       5
     );
@@ -1321,6 +1324,26 @@ describe('breadcrumbFromPhase', () => {
     expect(crumb?.type).toBe('tool');
     expect(crumb?.label).toBe('bash (+2)');
     expect(crumb?.toolId).toBe('t1');
+  });
+
+  it('uses top-level name for tools that serialize as ToolInput::Unknown', () => {
+    // Rust ToolInput::Unknown serializes as { _tool: "unknown", ... } inside
+    // `input` — the authoritative name lives at ToolCall.name (set by the
+    // custom Serialize impl on the Rust side).
+    const crumb = breadcrumbFromPhase(
+      {
+        type: 'tool_executing',
+        current_tool: {
+          id: 't1',
+          name: 'subagent',
+          input: { _tool: 'unknown', name: 'subagent', input: { slug: 'explore' } },
+        },
+        remaining_tools: [],
+      },
+      5
+    );
+
+    expect(crumb?.label).toBe('subagent');
   });
 
   it('returns LLM breadcrumb with retry number', () => {

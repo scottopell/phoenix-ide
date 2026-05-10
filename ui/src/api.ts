@@ -187,6 +187,9 @@ export function getConvDisplayState(conv: Conversation | undefined): 'idle' | 'w
 
 export interface ToolCall {
   id: string;
+  /** Authoritative tool name. Emitted by ToolCall's custom Serialize impl on
+   *  the Rust side; also supplied by the NotifyClient state_change summary. */
+  name: string;
   input: { _tool?: string; [key: string]: unknown };
 }
 

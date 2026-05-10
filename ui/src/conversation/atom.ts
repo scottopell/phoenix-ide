@@ -169,15 +169,13 @@ export function breadcrumbFromPhase(
 ): Breadcrumb | null {
   switch (phase.type) {
     case 'tool_executing': {
-      // current_tool.name comes from the NotifyClient summary path;
-      // current_tool.input._tool comes from the PersistState full-serialize path.
-      const toolName =
-        phase.current_tool?.input?._tool ||
-        (phase.current_tool as { name?: string } | undefined)?.name ||
-        'tool';
+      // `current_tool.name` is authoritative on both wire paths (NotifyClient
+      // summary and the PersistState full-serialize) — see ToolCall's custom
+      // Serialize in state_machine/state.rs.
+      const toolName = phase.current_tool?.name || 'tool';
       const remaining = phase.remaining_tools?.length ?? 0;
       const label =
-        remaining > 0 ? `${String(toolName)} (+${remaining})` : String(toolName);
+        remaining > 0 ? `${toolName} (+${remaining})` : toolName;
       return { type: 'tool', label, toolId: phase.current_tool?.id, sequenceId };
     }
     case 'llm_requesting': {

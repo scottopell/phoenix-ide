@@ -279,11 +279,34 @@ impl ToolInput {
 // Tool Call - A tool invocation with ID and typed input
 // ============================================================================
 
-/// A tool call from the LLM with typed input
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// A tool call from the LLM with typed input.
+///
+/// On the wire we expose `name` at the top level (not buried inside the
+/// `_tool` serde-tag of `ToolInput`). The `_tool` tag is an internal
+/// encoding for the typed enum — for `ToolInput::Unknown` it serializes
+/// as the literal string `"unknown"`, which is useless to consumers. The
+/// authoritative tool name lives at `ToolCall.name` and is emitted by the
+/// custom `Serialize` impl below. Derived `Deserialize` ignores the extra
+/// `name` field on read-back (we reconstruct it from the inner variant via
+/// `input.tool_name()` whenever it is needed).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub input: ToolInput,
+}
+
+impl Serialize for ToolCall {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("id", &self.id)?;
+        map.serialize_entry("name", self.input.tool_name())?;
+        map.serialize_entry("input", &self.input)?;
+        map.end()
+    }
 }
 
 impl ToolCall {
