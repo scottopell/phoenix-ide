@@ -18,20 +18,29 @@ const POLL_INTERVAL_MS = 5000;
  *      successful fetches back to the cache.
  *
  * In-flight coalescing: a `__refreshInFlight` flag on the store
- * prevents concurrent refreshes from stacking up. The flag is shared
- * across all callers of `useConversationsRefresh` so a manual poke
- * (e.g. after `archiveConversation`) coalesces with the driver's
- * 5s tick if they overlap.
+ * prevents concurrent refreshes from stacking up. Pokes that arrive
+ * while a refresh is already running set `__refreshPending`, which
+ * triggers exactly one trailing re-fire after the in-flight call
+ * settles. Any number of pokes during one in-flight collapse to that
+ * single re-fire — without this, a sidebar mutation (rename / archive /
+ * delete) that lands while the 5s driver tick is mid-flight would be
+ * silently dropped and the sidebar would reflect pre-mutation state
+ * until the next tick.
  */
 async function refreshOnce(store: ConversationStore): Promise<void> {
-  // The flag lives on the store so it's shared across every consumer
+  // Flags live on the store so they're shared across every consumer
   // that might trigger a refresh (the driver, post-mutation pokes from
   // ConversationListPage handlers, the onConversationCreated callback
-  // in DesktopLayout). Without this, two callers in the same tick
-  // would both fire `listConversations` etc.
-  const flagged = store as ConversationStore & { __refreshInFlight?: boolean };
-  if (flagged.__refreshInFlight) return;
-  flagged.__refreshInFlight = true;
+  // in DesktopLayout).
+  const f = store as ConversationStore & {
+    __refreshInFlight?: boolean;
+    __refreshPending?: boolean;
+  };
+  if (f.__refreshInFlight) {
+    f.__refreshPending = true;
+    return;
+  }
+  f.__refreshInFlight = true;
   try {
     try {
       const cached = await cacheDB.getAllConversations();
@@ -59,9 +68,17 @@ async function refreshOnce(store: ConversationStore): Promise<void> {
     // Network failure leaves the store untouched. Live atoms still
     // reflect SSE state; the next successful poll reconciles.
   } finally {
-    flagged.__refreshInFlight = false;
+    f.__refreshInFlight = false;
+    if (f.__refreshPending) {
+      f.__refreshPending = false;
+      void refreshOnce(store);
+    }
   }
 }
+
+/** Test-only handle on the private refresh implementation. Not part of
+ *  the public surface — consumers should use `useConversationsRefresh`. */
+export const __testing = { refreshOnce };
 
 function useStoreFromContext(label: string): ConversationStore {
   const store = useContext(ConversationContext);
@@ -77,8 +94,8 @@ function useStoreFromContext(label: string): ConversationStore {
  * Mount the driver exactly once per app — see
  * {@link useConversationsRefreshDriver}, which `ConversationProvider`
  * already calls. Multiple consumers calling this accessor share the
- * same in-flight guard via `__refreshInFlight` on the store, so two
- * pokes in the same tick coalesce.
+ * same in-flight + pending flags on the store, so concurrent pokes
+ * collapse to a single trailing re-fire (see {@link refreshOnce}).
  */
 export function useConversationsRefresh(): {
   refresh: () => Promise<void>;
