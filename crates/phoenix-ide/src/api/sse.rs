@@ -404,8 +404,20 @@ mod tests {
     /// Init with a populated `ReplayRing` snapshot. Exercises the recursive
     /// SseWireEvent serialisation inside `pending_events` and the parity
     /// of `pending_anchor_sequence_id` / `pending_truncated`.
+    ///
+    /// Every entry's `sequence_id` exceeds the anchor — matches what a real
+    /// `ReplayRing` snapshot can ever produce (sse_wire.allium invariant
+    /// `ReplayRingEntriesAboveAnchor`). A test fixture that violates the
+    /// invariant would mask ordering regressions, since the eager-Message
+    /// envelope `sequence_id` equals `message.sequence_id` on the wire.
     #[test]
     fn parity_init_with_pending_events() {
+        let anchor: i64 = 42;
+        // Eager assistant Message reused from another fixture but reseq'd
+        // above the anchor — the wire envelope seq is `message.sequence_id`,
+        // so the local mutation flows through to the parity comparison.
+        let mut eager = fixture_agent_message_with_bash();
+        eager.sequence_id = 45;
         let pending = vec![
             SseEvent::Token {
                 sequence_id: 43,
@@ -417,30 +429,29 @@ mod tests {
                 state: ConvState::LlmRequesting { attempt: 1 },
                 presentation_mode: "working".to_string(),
             },
-            SseEvent::Message {
-                message: fixture_agent_message_with_bash(),
-            },
+            SseEvent::Message { message: eager },
         ];
         let event = SseEvent::Init {
-            sequence_id: 44,
+            sequence_id: 45,
             conversation: Box::new(fixture_enriched_conversation()),
             messages: vec![fixture_user_message()],
             agent_working: true,
             presentation_mode: "working".to_string(),
-            last_sequence_id: 44,
+            last_sequence_id: 45,
             context_window_size: 2048,
             breadcrumbs: fixture_breadcrumbs(),
             commits_behind: 0,
             commits_ahead: 0,
             project_name: Some("phoenix".to_string()),
-            pending_anchor_sequence_id: 42,
+            pending_anchor_sequence_id: anchor,
             pending_events: pending,
             pending_truncated: false,
         };
         assert_parity(&event);
 
         // Belt + braces: assert the typed wire output carries the pending
-        // entries with their original `type` discriminators and seqs.
+        // entries with their original `type` discriminators and seqs, and
+        // that every entry's seq strictly exceeds the anchor.
         let typed = typed_sse_event_to_value(&event);
         let pending_arr = typed["pending_events"]
             .as_array()
@@ -449,9 +460,18 @@ mod tests {
         assert_eq!(pending_arr[0]["type"], "token");
         assert_eq!(pending_arr[0]["sequence_id"], 43);
         assert_eq!(pending_arr[1]["type"], "state_change");
+        assert_eq!(pending_arr[1]["sequence_id"], 44);
         assert_eq!(pending_arr[2]["type"], "message");
-        assert_eq!(typed["pending_anchor_sequence_id"], 42);
+        assert_eq!(pending_arr[2]["sequence_id"], 45);
+        assert_eq!(typed["pending_anchor_sequence_id"], anchor);
         assert_eq!(typed["pending_truncated"], false);
+        for entry in pending_arr {
+            assert!(
+                entry["sequence_id"].as_i64().unwrap() > anchor,
+                "every pending entry's seq must exceed the anchor \
+                 (sse_wire.allium ReplayRingEntriesAboveAnchor)"
+            );
+        }
     }
 
     /// Init with `pending_truncated = true`: per Q3, `pending_events` is
