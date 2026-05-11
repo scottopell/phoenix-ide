@@ -576,16 +576,21 @@ export function conversationReducer(
       const phase1Floor = isFreshConnect ? p.pendingAnchorSequenceId : atom.lastSequenceId;
       // streamingBuffer policy: fresh-connect always clears (atom had no
       // buffer to preserve). Reconnect preserves the existing buffer when
-      // the snapshot phase is still llm_requesting — pending tokens with
-      // seq > floor extend it via the sse_token reducer, tokens at or below
-      // are dropped as replays. Clearing on reconnect unconditionally would
-      // create a blank-UI window the pending replay cannot rebuild because
-      // applyIfNewer drops the very tokens we'd need. When the snapshot
-      // phase is anything else, the turn ended while disconnected and we
-      // clear. See SseInitReconnectMerge in
+      // the snapshot phase is still llm_requesting AND the ring did not
+      // overflow — pending tokens with seq > floor extend it via the
+      // sse_token reducer, tokens at or below are dropped as replays.
+      // Clearing on reconnect unconditionally would create a blank-UI
+      // window the pending replay cannot rebuild because applyIfNewer
+      // drops the very tokens we'd need. When pendingTruncated is true
+      // we MUST clear — the missing middle of the stream is unreplayable
+      // and the safety belt advances lastSequenceId past it, so any
+      // preserved buffer would be a stale prefix that future live tokens
+      // append onto (producing a gapped, corrupted message). When the
+      // snapshot phase is anything else, the turn ended while
+      // disconnected and we clear. See SseInitReconnectMerge in
       // specs/conversation_atom/conversation_atom.allium.
       const phase1StreamingBuffer =
-        !isFreshConnect && p.phase.type === 'llm_requesting'
+        !isFreshConnect && p.phase.type === 'llm_requesting' && !p.pendingTruncated
           ? atom.streamingBuffer
           : null;
       let next: ConversationAtom = {

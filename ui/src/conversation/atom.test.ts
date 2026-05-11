@@ -508,6 +508,34 @@ describe('conversationReducer', () => {
       expect(next.lastSequenceId).toBe(9);
     });
 
+    // Codex P2 from PR #79: when pendingTruncated=true the ring
+    // overflowed, so the server is intentionally NOT sending the tokens
+    // between anchor and tip. The safety belt advances lastSequenceId
+    // past the gap. Preserving the buffer would leave a stale prefix
+    // that future live tokens append onto, producing a gapped/corrupted
+    // message. Truncated must force a clear regardless of phase.
+    it('reconnect clears streamingBuffer when pendingTruncated even if phase is llm_requesting', () => {
+      const atom: ConversationAtom = {
+        ...createInitialAtom(),
+        lastSequenceId: 7,
+        phase: { type: 'llm_requesting', attempt: 1 },
+        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000 },
+        conversationId: 'conv-1',
+      };
+      const payload = makeInitPayload({
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastSequenceId: 50,
+        pendingAnchorSequenceId: 7,
+        pendingEvents: [],
+        pendingTruncated: true,
+      });
+
+      const next = dispatch(atom, { type: 'sse_init', payload });
+
+      expect(next.streamingBuffer).toBeNull();
+      expect(next.lastSequenceId).toBe(50);
+    });
+
     // Turn ended while disconnected: snapshot phase is no longer
     // llm_requesting, so the buffer must clear (the next response will
     // start fresh; preserving stale text would confuse the UI).

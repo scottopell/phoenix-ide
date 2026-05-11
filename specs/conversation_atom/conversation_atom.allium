@@ -263,7 +263,7 @@ rule SseInitReconnectMerge {
     ensures: atom.messages = merge_by_id(atom.messages, payload.messages)
     ensures: atom.phase = payload.phase
     ensures: atom.breadcrumbs = payload.breadcrumbs
-    ensures: atom.streamingBuffer = preserve_buffer_when_streaming(atom.streamingBuffer, payload.phase)
+    ensures: atom.streamingBuffer = preserve_buffer_when_streaming(atom.streamingBuffer, payload.phase, payload.pending_truncated)
     ensures: atom.uiError = null
 
     -- Phase 2: apply pending events. Per-event applyIfNewer naturally
@@ -277,8 +277,9 @@ rule SseInitReconnectMerge {
     ensures: atom.lastSequenceId = max_int(atom.lastSequenceId, payload.last_sequence_id)
 
     @guidance
-        -- preserve_buffer_when_streaming(buf, phase):
-        --   if phase.type = llm_requesting then buf else null
+        -- preserve_buffer_when_streaming(buf, phase, pendingTruncated):
+        --   if phase.type = llm_requesting and not pendingTruncated
+        --     then buf else null
         -- Rationale: on reconnect the atom may already hold a live
         -- streamingBuffer from tokens this connection has accepted.
         -- Clearing it unconditionally creates a blank-UI window because
@@ -289,6 +290,14 @@ rule SseInitReconnectMerge {
         -- disconnected." Pending agent_done in phase 2 still clears the
         -- buffer through its own per-event rule, so the final state is
         -- correct even when the snapshot phase is stale.
+        --
+        -- pendingTruncated MUST force a clear regardless of phase: the
+        -- ring overflowed, so the server is intentionally NOT sending
+        -- the tokens between the anchor and the tip. The safety belt
+        -- in phase 3 advances lastSequenceId past that gap; preserving
+        -- the buffer would leave a stale prefix that future live tokens
+        -- (at seqs above the new tip) append onto, producing a gapped
+        -- and corrupted message. Truncated → fall back to DB-only.
         --
         -- merge_by_id (ui/src/conversation/atom.ts:sse_init case):
         --   1. Build a Map<message_id, Message> from payload.messages.
