@@ -618,9 +618,14 @@ pub fn build_system_prompt_with_options(
                      Your task ID prefix is {task_prefix}. Task files in this worktree \
                      use IDs starting with {task_prefix} (e.g., {task_prefix}001).\n\
                      Use bash and the patch tool to make changes.\n\n\
-                     When the work is complete, let the user know. They will initiate \
-                     the merge to {base_branch} when ready. Task-file status renames \
-                     are handled automatically during merge."
+                     When the task is complete, update its task file's status to \
+                     `done` yourself: rename the file from `...-{{status}}--{{slug}}.md` \
+                     to `...-done--{{slug}}.md` (the filename is the sole source of \
+                     truth for task status -- nothing renames it for you) and commit \
+                     that rename on this branch alongside your work. Then let the user \
+                     know it's ready; they review and merge the branch into \
+                     {base_branch} via a pull request -- Phoenix does not perform the \
+                     merge and does not touch the task file."
                 );
             }
             ModeContext::Direct => {
@@ -1181,7 +1186,9 @@ mod tests {
         assert!(prompt.contains("task-42-fix-bug"));
         assert!(prompt.contains("/home/user/project/worktrees/abc123"));
         assert!(prompt.contains("MUST stay inside this worktree"));
-        assert!(prompt.contains("Task-file status renames"));
+        // The agent owns the task-status rename; nothing does it automatically.
+        assert!(prompt.contains("update its task file's status to"));
+        assert!(prompt.contains("Phoenix does not perform the merge"));
         assert!(prompt.contains("Your task ID prefix is"));
     }
 
