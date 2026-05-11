@@ -646,8 +646,9 @@ mod tests {
         }
 
         // Explore (no sandbox): read-only + propose_task + scoped patch
-        // (limited to tasks/ at runtime). No bash, no tmux, no terminal —
-        // the agent only sees what's in the repo here.
+        // (limited to the configured tasks dir at runtime; `"tasks"` here
+        // is the fixture name). No bash, no tmux, no terminal — the agent
+        // only sees what's in the repo here.
         let explore = names(&ToolRegistry::explore_no_sandbox("tasks"));
         assert!(explore.contains("propose_task"));
         assert!(explore.contains("ask_user_question"));
