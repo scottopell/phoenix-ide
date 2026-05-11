@@ -1,8 +1,14 @@
 //! `OpenAI` and `OpenAI`-compatible provider implementation
 
 use super::models::ModelSpec;
+use super::rate_limit::{
+    parse_active_limit, parse_credits_snapshot, parse_promo_message, parse_rate_limit_for_limit,
+    QuotaDetails,
+};
 use super::types::{ContentBlock, LlmRequest, LlmResponse, MessageRole, Usage, LLM_SOURCE_HEADER};
 use super::LlmError;
+use chrono::{DateTime, Utc};
+use reqwest::header::HeaderMap;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -88,12 +94,18 @@ pub async fn complete(
     })?;
 
     let status = response.status();
+    let headers = response.headers().clone();
     let body = response
         .text()
         .await
         .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
 
     if !status.is_success() {
+        if use_codex_backend {
+            if let Some(err) = parse_codex_error(status.as_u16(), &headers, &body) {
+                return Err(err);
+            }
+        }
         if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
             let message = error_resp.error.message;
             return Err(match status.as_u16() {
@@ -287,10 +299,16 @@ pub async fn complete_streaming(
 
     let status = response.status();
     if !status.is_success() {
+        let headers = response.headers().clone();
         let body = response
             .text()
             .await
             .map_err(|e| LlmError::network(format!("Failed to read error response: {e}")))?;
+        if use_codex_backend {
+            if let Some(err) = parse_codex_error(status.as_u16(), &headers, &body) {
+                return Err(err);
+            }
+        }
         return Err(LlmError::from_http_status(status.as_u16(), &body));
     }
 
@@ -582,6 +600,90 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
 }
 
 // ===========================================================================
+// Codex backend error parsing (REQ-LLM-006a)
+// ===========================================================================
+//
+// Mirrors the codex CLI's `map_api_error` decision tree
+// (`codex-rs/codex-api/src/api_bridge.rs:42-121`) for the responses Phoenix
+// can encounter when routed through `chatgpt.com/backend-api/codex`. Returns
+// `None` when the response doesn't match any codex-specific shape so the
+// caller can fall through to the generic `OpenAIErrorResponse` path.
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageErrorEnvelope {
+    error: CodexUsageError,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexUsageError {
+    #[serde(rename = "type")]
+    error_type: Option<String>,
+    plan_type: Option<String>,
+    resets_at: Option<i64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexCodedErrorEnvelope {
+    error: CodexCodedError,
+}
+
+#[derive(Debug, Deserialize)]
+struct CodexCodedError {
+    code: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)] // Available for future surfacing if needed
+    message: Option<String>,
+}
+
+fn parse_codex_error(status: u16, headers: &HeaderMap, body: &str) -> Option<LlmError> {
+    match status {
+        429 => {
+            let envelope = serde_json::from_str::<CodexUsageErrorEnvelope>(body).ok()?;
+            match envelope.error.error_type.as_deref() {
+                Some("usage_limit_reached") => {
+                    let limit_id = parse_active_limit(headers);
+                    let (primary, secondary, limit_name) =
+                        parse_rate_limit_for_limit(headers, limit_id.as_deref());
+                    let credits = parse_credits_snapshot(headers);
+                    let promo_message = parse_promo_message(headers);
+                    let resets_at = envelope
+                        .error
+                        .resets_at
+                        .and_then(|seconds| DateTime::<Utc>::from_timestamp(seconds, 0));
+                    Some(LlmError::usage_limit_reached(QuotaDetails {
+                        plan_type: envelope.error.plan_type,
+                        resets_at,
+                        limit_id,
+                        limit_name,
+                        primary,
+                        secondary,
+                        credits,
+                        promo_message,
+                    }))
+                }
+                Some("usage_not_included") => Some(LlmError::auth(
+                    "Upgrade required: this plan does not include Codex usage. \
+                     Visit https://chatgpt.com/codex/settings/usage to upgrade.",
+                )),
+                // Recognised envelope shape but the codex backend didn't flag
+                // it as a quota exhaustion — treat as a transient throttle.
+                _ => None,
+            }
+        }
+        503 => {
+            let envelope = serde_json::from_str::<CodexCodedErrorEnvelope>(body).ok()?;
+            match envelope.error.code.as_deref() {
+                Some("server_is_overloaded" | "slow_down") => Some(LlmError::server_overloaded(
+                    "Selected model is at capacity. Try a different model.",
+                )),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+// ===========================================================================
 // OpenAI API types
 // ===========================================================================
 
@@ -766,6 +868,172 @@ mod tests {
             json.get("tags").is_none(),
             "tags must be omitted from the wire when not set; got {json}"
         );
+    }
+
+    // Codex backend 429/503 parsing — fixtures mirror
+    // codex-rs/codex-api/src/api_bridge_tests.rs.
+    mod codex_errors {
+        use super::super::parse_codex_error;
+        use crate::llm::LlmErrorKind;
+        use reqwest::header::{HeaderMap, HeaderValue};
+
+        #[test]
+        fn usage_limit_reached_plus_plan_renders_plus_wording() {
+            let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"plus","resets_at":1709568000}}"#;
+            let err = parse_codex_error(429, &HeaderMap::new(), body).expect("parsed");
+            assert_eq!(err.kind, LlmErrorKind::UsageLimitReached);
+            assert!(err.quota.is_some(), "quota payload threaded through");
+            assert!(
+                err.message.contains("Upgrade to Pro"),
+                "got: {}",
+                err.message
+            );
+        }
+
+        #[test]
+        fn usage_limit_reached_pro_plan_renders_credits_path() {
+            let body =
+                r#"{"error":{"type":"usage_limit_reached","plan_type":"pro","resets_at":null}}"#;
+            let err = parse_codex_error(429, &HeaderMap::new(), body).expect("parsed");
+            assert_eq!(err.kind, LlmErrorKind::UsageLimitReached);
+            assert!(
+                err.message.contains("purchase more credits"),
+                "got: {}",
+                err.message
+            );
+        }
+
+        #[test]
+        fn usage_limit_reached_team_plan_renders_admin_path() {
+            let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"team"}}"#;
+            let err = parse_codex_error(429, &HeaderMap::new(), body).expect("parsed");
+            assert!(err.message.contains("send a request to your admin"));
+        }
+
+        #[test]
+        fn usage_limit_reached_free_plan_renders_plus_upgrade() {
+            let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"free"}}"#;
+            let err = parse_codex_error(429, &HeaderMap::new(), body).expect("parsed");
+            assert!(err.message.contains("Upgrade to Plus"));
+        }
+
+        #[test]
+        fn usage_limit_reached_unknown_plan_falls_back_to_generic() {
+            let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"mystery"}}"#;
+            let err = parse_codex_error(429, &HeaderMap::new(), body).expect("parsed");
+            assert_eq!(err.message, "You've hit your usage limit. Try again later.");
+        }
+
+        #[test]
+        fn usage_limit_reached_threads_promo_message_from_headers() {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-codex-promo-message",
+                HeaderValue::from_static("Upgrade to Pro at chatgpt.com/explore/pro"),
+            );
+            let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"plus"}}"#;
+            let err = parse_codex_error(429, &headers, body).expect("parsed");
+            assert!(err
+                .message
+                .contains("Upgrade to Pro at chatgpt.com/explore/pro"));
+            assert_eq!(
+                err.quota.as_ref().unwrap().promo_message.as_deref(),
+                Some("Upgrade to Pro at chatgpt.com/explore/pro")
+            );
+        }
+
+        #[test]
+        fn usage_limit_reached_extracts_limit_name_from_active_family() {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-codex-active-limit",
+                HeaderValue::from_static("codex_other"),
+            );
+            headers.insert(
+                "x-codex-other-limit-name",
+                HeaderValue::from_static("gpt-5.2-codex-sonic"),
+            );
+            let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"pro"}}"#;
+            let err = parse_codex_error(429, &headers, body).expect("parsed");
+            let quota = err.quota.as_ref().expect("quota");
+            assert_eq!(quota.limit_id.as_deref(), Some("codex_other"));
+            assert_eq!(quota.limit_name.as_deref(), Some("gpt-5.2-codex-sonic"));
+            // The non-codex limit_name branch wins over the plan wording.
+            assert!(
+                err.message
+                    .starts_with("You've hit your usage limit for gpt-5.2-codex-sonic."),
+                "got: {}",
+                err.message
+            );
+        }
+
+        #[test]
+        fn usage_limit_reached_extracts_secondary_window() {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "x-codex-secondary-used-percent",
+                HeaderValue::from_static("80"),
+            );
+            headers.insert(
+                "x-codex-secondary-window-minutes",
+                HeaderValue::from_static("10080"),
+            );
+            let body = r#"{"error":{"type":"usage_limit_reached","plan_type":"plus"}}"#;
+            let err = parse_codex_error(429, &headers, body).expect("parsed");
+            let quota = err.quota.as_ref().expect("quota");
+            let secondary = quota.secondary.as_ref().expect("secondary");
+            assert_eq!(secondary.used_percent, 80.0);
+            assert_eq!(secondary.window_minutes, Some(10080));
+        }
+
+        #[test]
+        fn usage_not_included_returns_auth_terminal() {
+            let body = r#"{"error":{"type":"usage_not_included"}}"#;
+            let err = parse_codex_error(429, &HeaderMap::new(), body).expect("parsed");
+            assert_eq!(err.kind, LlmErrorKind::Auth);
+            assert!(err.message.contains("Upgrade required"));
+        }
+
+        #[test]
+        fn plain_429_without_recognized_type_falls_through_to_caller() {
+            // A 429 from the codex backend with a body the codex CLI would
+            // classify as a transient throttle (RetryLimit) — Phoenix lets the
+            // generic OpenAIErrorResponse path handle it as RateLimit.
+            let body = r#"{"error":{"message":"slow down","type":"rate_limit_exceeded"}}"#;
+            assert!(parse_codex_error(429, &HeaderMap::new(), body).is_none());
+        }
+
+        #[test]
+        fn malformed_429_body_falls_through() {
+            assert!(parse_codex_error(429, &HeaderMap::new(), "not json").is_none());
+        }
+
+        #[test]
+        fn server_overloaded_503_returns_server_overloaded_terminal() {
+            let body = r#"{"error":{"code":"server_is_overloaded"}}"#;
+            let err = parse_codex_error(503, &HeaderMap::new(), body).expect("parsed");
+            assert_eq!(err.kind, LlmErrorKind::ServerOverloaded);
+            assert!(err.message.contains("Try a different model"));
+        }
+
+        #[test]
+        fn slow_down_503_returns_server_overloaded_terminal() {
+            let body = r#"{"error":{"code":"slow_down"}}"#;
+            let err = parse_codex_error(503, &HeaderMap::new(), body).expect("parsed");
+            assert_eq!(err.kind, LlmErrorKind::ServerOverloaded);
+        }
+
+        #[test]
+        fn unrelated_503_code_falls_through() {
+            let body = r#"{"error":{"code":"something_else"}}"#;
+            assert!(parse_codex_error(503, &HeaderMap::new(), body).is_none());
+        }
+
+        #[test]
+        fn other_status_codes_return_none() {
+            assert!(parse_codex_error(500, &HeaderMap::new(), "").is_none());
+            assert!(parse_codex_error(400, &HeaderMap::new(), "").is_none());
+        }
     }
 
     #[test]
