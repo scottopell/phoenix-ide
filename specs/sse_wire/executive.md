@@ -6,7 +6,7 @@ The SSE wire protocol is the server's contract for streaming conversation state 
 
 Nine event types are in scope: `init` (the snapshot delivered on subscribe), `message` (a newly persisted message), `message_updated` (a mutation to an existing message's fields), `state_change` (a phase transition), `token` (an LLM streaming chunk), `agent_done` (turn completion), `conversation_became_terminal` (terminal state reached), `conversation_update` (partial metadata change), and `error` (a user-facing error). Two ordering invariants are load-bearing: every delivered message event has a backing committed-to-DB row (PersistBeforeBroadcast), and `init` is always the first event on a stream (InitAlwaysFirst). Both invariants exist because we shipped a class of bugs (task 02679: "streaming finalizes then disappears") that the structural ordering catches.
 
-A per-conversation `ReplayRing` buffers ephemeral events (tokens, state_changes, message_updates, and eager-broadcast in-flight assistant messages) between persisted-Message anchors. The ring contents are delivered in every `init` snapshot's `pending_events` field so a client that reconnects mid-turn can resume the in-flight view (streaming text, current tool, eager assistant card) instead of blanking out until the next checkpoint. The ring is bounded by `replay_ring_capacity` (512 entries); overflow evicts oldest and surfaces `pending_truncated: true` in `init`. A restarted server loses the ring (in-memory only); the client falls back to DB-only reconstruction, which is correct because no events are in flight if the process restarted.
+A per-conversation `ReplayRing` buffers ephemeral events (tokens, state_changes, message_updates, and eager-broadcast in-flight assistant messages) between persisted-Message anchors. **Implementation is staged across phases**: Phase 1 (current) lands the broadcaster-side ring storage and append/anchor lifecycle. Phase 2 wires the ring contents into the `init` snapshot's `pending_events` field. Phase 3 teaches the client reducer to replay them through its existing per-event rules. End-user impact (a client reconnecting mid-turn resumes the in-flight view — streaming text, current tool, eager assistant card — instead of blanking out until the next checkpoint) lands when all three phases ship. The ring is bounded by `replay_ring_capacity` (512 entries); overflow clears the ring and sets `truncated`, forcing the next subscribe to do a full DB-only resync. A restarted server loses the ring (in-memory only); the client falls back to DB-only reconstruction, which is correct because no events are in flight if the process restarted.
 
 ## Technical Summary
 
@@ -41,15 +41,20 @@ The `.allium` spec was distilled from a working, deployed implementation, so all
 | **PersistBeforeBroadcast** (invariant) | ✅ Enforced by construction | `SseBroadcaster::send_message` (`runtime.rs:228`) takes an already-persisted message; the call site is the enabling condition |
 | **InitAlwaysFirst** (invariant) | ✅ Enforced by construction | `init_event` is hard-coded as the first stream item in `sse_stream` (`api/sse.rs:46-47`) — no path delivers events before init |
 | **SequencesNonNegative** (invariant) | ✅ Enforced by construction | `SseBroadcaster::next_seq` starts at the DB watermark (always ≥ 0) and only increments via `fetch_add(1)` |
-| **PersistedMessageClearsReplayRing** | 🚧 Pending | `SseBroadcaster::send_persisted_message` (planned) — anchor reset on persisted Message broadcast |
-| **EphemeralEventAppendedToReplayRing** | 🚧 Pending | `SseBroadcaster::send_seq` (planned) — append-on-broadcast with FIFO eviction |
-| **EagerAssistantMessageAppendedToReplayRing** | 🚧 Pending | `SseBroadcaster::send_ephemeral_message` (planned) — eager Message appends without anchor reset; called from `Effect::BroadcastAssistantMessage` |
-| **ReplayRingBounded** (invariant) | 🚧 Pending | `append_bounded` constructor (planned); evicts oldest at `replay_ring_capacity` |
-| **ReplayRingEntriesAboveAnchor** (invariant) | 🚧 Pending | Append paths gated by `entry.sequence_id > ring.anchor_sequence_id` (planned) |
-| **ReplayRingEntriesOrdered** (invariant) | 🚧 Pending | FIFO append + head-only eviction preserves seq order (planned) |
-| **InitSnapshotMirrorsRing** (invariant) | 🚧 Pending | Init constructor reads ring atomically with messages (planned) |
+| **PersistedMessageClearsReplayRing** | ✅ Complete (Phase 1) | `SseBroadcaster::send_persisted_message` (`runtime.rs`) — anchor reset on persisted Message broadcast |
+| **EphemeralEventAppendedToReplayRing** | ✅ Complete (Phase 1) | `SseBroadcaster::send_seq` (`runtime.rs`) — appends on broadcast; overflow clears + truncates per Q3 |
+| **EagerAssistantMessageAppendedToReplayRing** | ✅ Complete (Phase 1) | `SseBroadcaster::send_ephemeral_message` (`runtime.rs`); called from `Effect::BroadcastAssistantMessage` |
+| **ReplayRingBounded** (invariant) | ✅ Enforced by construction | `ReplayRing::append` (`runtime.rs`) clears + sets truncated when `entries.len() >= REPLAY_RING_CAPACITY` |
+| **ReplayRingEntriesAboveAnchor** (invariant) | ✅ Enforced by construction | Anchor reset clears entries simultaneously; `next_seq` strictly exceeds the most recent observed seq |
+| **ReplayRingEntriesOrdered** (invariant) | ✅ Enforced by construction | `VecDeque::push_back` + head-only eviction preserves seq order (and `next_seq` is monotonic) |
+| **InitSnapshotMirrorsRing** (invariant) | 🚧 Pending — Phase 2 | Init constructor not yet calling `broadcast_tx.snapshot_pending()`; tracked in `tasks/62001-p2-ready--sse-replay-phase2-init-wire.md` |
 
-**Progress:** Original spec (event types + ordering invariants) is fully implemented. The ReplayRing extension is pending implementation; it adds five rules and four invariants. The spec was distilled in response to task 02679 (streaming-finalize-disappear bug); the `PersistBeforeBroadcast` invariant is the formal statement of the leading fix hypothesis and now serves as a guardrail against regressions. The ReplayRing extension targets a different recovery shape: the user-visible "blank UI mid-LLM-turn / mid-tool-execution on reconnect" symptom, which is structurally distinct from 02679 (durability holds; the gap is purely in transit-only ephemeral state).
+**Progress:** Original spec (event types + ordering invariants) is fully implemented. The ReplayRing extension is rolling out in three phases:
+- **Phase 1 (landed)** — server-side ring storage, anchor lifecycle, append rules, bounded invariants. Six of the seven new rules/invariants are now ✅; only `InitSnapshotMirrorsRing` remains because the init payload doesn't yet carry `pending_events`.
+- **Phase 2 (planned, `tasks/62001`)** — wire `pending_events` / `pending_anchor_sequence_id` / `pending_truncated` into `SseEvent::Init` + codegen.
+- **Phase 3 (planned, `tasks/62002`)** — client reducer applies pending events through existing per-event rules on init.
+
+The spec was distilled in response to task 02679 (streaming-finalize-disappear bug); the `PersistBeforeBroadcast` invariant is the formal statement of the leading fix hypothesis and now serves as a guardrail against regressions. The ReplayRing extension targets a different recovery shape: the user-visible "blank UI mid-LLM-turn / mid-tool-execution on reconnect" symptom, which is structurally distinct from 02679 (durability holds; the gap is purely in transit-only ephemeral state).
 
 ## Cross-Spec Relationships
 

@@ -159,10 +159,11 @@ pub struct ReplayRingEntry {
 ///   - Once `truncated = true`, no further appends accumulate until the
 ///     next anchor reset.
 ///
-/// `bytes` is observability-only: aggregate serialised JSON length of the
-/// retained entries. Tracked so ops can detect pathological large-event
-/// rings before they become a memory issue. NOT used to enforce the cap
-/// (the cap is by entry count per Q2 resolution).
+/// Byte-size observability is lazy: see [`ReplayRing::total_bytes`].
+/// Tokens are the dominant append path during LLM streaming and we
+/// refuse to pay a `serde_json::to_vec` on every one of them just to
+/// keep a running counter. Bytes are computed on demand at the
+/// truncation log line and through the `replay_ring_bytes()` accessor.
 #[derive(Debug)]
 struct ReplayRing {
     entries: VecDeque<ReplayRingEntry>,
@@ -172,9 +173,6 @@ struct ReplayRing {
     /// True iff the ring has overflowed since the last anchor reset.
     /// Once true, subsequent appends are no-ops. Cleared by `reset`.
     truncated: bool,
-    /// Aggregate estimated serialised byte size of `entries`. Updated on
-    /// every append; reset to 0 on every anchor advance / truncation.
-    bytes: usize,
 }
 
 impl ReplayRing {
@@ -183,17 +181,15 @@ impl ReplayRing {
             entries: VecDeque::new(),
             anchor_seq: 0,
             truncated: false,
-            bytes: 0,
         }
     }
 
     /// Anchor reset on persisted Message broadcast. Clears entries,
-    /// advances anchor, clears truncation and byte counters.
+    /// advances anchor, clears truncation flag.
     fn reset(&mut self, new_anchor: i64) {
         self.entries.clear();
         self.anchor_seq = new_anchor;
         self.truncated = false;
-        self.bytes = 0;
     }
 
     /// Append an entry. If accepting it would exceed `REPLAY_RING_CAPACITY`,
@@ -205,25 +201,26 @@ impl ReplayRing {
             return;
         }
         if self.entries.len() >= REPLAY_RING_CAPACITY {
+            // One-shot bytes computation at the truncation transition.
+            // This is the only place we pay the serialisation cost during
+            // an anchor window — ops gets a useful "what was in the ring
+            // when it overflowed?" data point without making every token
+            // append a hot-path serde call.
+            let bytes = self.total_bytes();
             tracing::warn!(
                 target: "phoenix_ide::replay_ring",
                 cap = REPLAY_RING_CAPACITY,
                 anchor = self.anchor_seq,
-                bytes = self.bytes,
+                bytes,
                 "ReplayRing capacity reached; clearing and entering truncated mode (next subscribe will force-resync)"
             );
             self.entries.clear();
             self.truncated = true;
-            self.bytes = 0;
             return;
         }
-        let entry_bytes = estimated_event_bytes(&entry.event);
-        self.bytes += entry_bytes;
         tracing::trace!(
             target: "phoenix_ide::replay_ring",
             seq = entry.sequence_id,
-            entry_bytes,
-            total_bytes = self.bytes,
             entries = self.entries.len() + 1,
             "ReplayRing append"
         );
@@ -241,15 +238,21 @@ impl ReplayRing {
         };
         (self.anchor_seq, self.truncated, events)
     }
-}
 
-/// Estimate the serialised JSON byte length of an `SseEvent`. Observability
-/// metric only — not used to enforce ring capacity. Uses the same
-/// `SseWireEvent` conversion the production wire path takes, so the
-/// estimate matches what actually goes on the wire.
-fn estimated_event_bytes(event: &SseEvent) -> usize {
-    let wire: crate::api::wire::SseWireEvent = event.clone().into();
-    serde_json::to_vec(&wire).map(|v| v.len()).unwrap_or(0)
+    /// Aggregate serialised JSON byte length across current ring entries.
+    /// Lazy / on-demand — iterates and serialises each entry via the
+    /// `SseWireEvent` conversion (matching the production wire path).
+    /// NOT a hot-path metric: call from the truncation log line or the
+    /// `replay_ring_bytes()` ops accessor, not from per-event append.
+    fn total_bytes(&self) -> usize {
+        self.entries
+            .iter()
+            .map(|e| {
+                let wire: crate::api::wire::SseWireEvent = e.event.clone().into();
+                serde_json::to_vec(&wire).map(|v| v.len()).unwrap_or(0)
+            })
+            .sum()
+    }
 }
 
 /// What to do with the per-conversation `ReplayRing` when broadcasting an
@@ -465,11 +468,15 @@ impl SseBroadcaster {
         self.ring.lock().expect("ReplayRing mutex").snapshot()
     }
 
-    /// Aggregate estimated serialised byte size of `ReplayRing` entries.
-    /// Observability-only; exposed for callers that want to surface the
-    /// metric (e.g. a future ops dashboard / Prometheus gauge).
+    /// Aggregate serialised byte size of `ReplayRing` entries, computed
+    /// on demand. Observability-only; exposed for callers that want to
+    /// surface the metric (e.g. a future ops dashboard / Prometheus gauge).
+    ///
+    /// Cost: O(entries) serialisations. Do not call on the hot path —
+    /// scrape periodically from a gauge collector or read at truncation
+    /// time only.
     pub fn replay_ring_bytes(&self) -> usize {
-        self.ring.lock().expect("ReplayRing mutex").bytes
+        self.ring.lock().expect("ReplayRing mutex").total_bytes()
     }
 }
 
