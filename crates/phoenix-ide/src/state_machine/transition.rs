@@ -65,6 +65,17 @@ fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, St
             "task_file must be a relative path (got '{task_file}')"
         ));
     }
+    // Reject `..` components: a path like `tasks/../other/foo.md` has
+    // `tasks` as its first component but escapes the tree once joined to
+    // cwd. PatchTool enforces the same rule.
+    if rel_path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "task_file must not contain '..' components (got '{task_file}')"
+        ));
+    }
     let first_component = rel_path
         .components()
         .next()

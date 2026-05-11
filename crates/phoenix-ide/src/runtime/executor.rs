@@ -2828,6 +2828,16 @@ fn execute_approve_task_blocking(
 
     // 1. Parse the on-disk task filename. Filename is the sole source of
     //    id/priority/status/slug in taskmd 1.0 — no ID allocation here.
+    if task_file.is_empty() {
+        // Backward-compat shim: AwaitingTaskApproval rows persisted before
+        // task_file existed deserialise with an empty string. The legacy
+        // (title/priority/plan) approval path is gone, so the only way
+        // forward is for the user to reject and re-propose with a file.
+        return Err("This approval predates the file-based propose_task flow. \
+             Reject the plan and ask the agent to propose again — it will \
+             draft a task file under tasks/ this time."
+            .to_string());
+    }
     let rel_path = std::path::Path::new(task_file);
     let original_filename = rel_path
         .file_name()

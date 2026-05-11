@@ -460,7 +460,14 @@ pub enum ConvState {
     /// snapshot derived from that file at the moment `propose_task` was
     /// called and exist for UI display only; the executor re-reads
     /// `task_file` on approval.
+    ///
+    /// `serde(default)` on `task_file` is a rollout shim for pre-1.0
+    /// conversations persisted before this field existed. Such rows
+    /// deserialise with an empty `task_file`, which the executor surfaces
+    /// as a clear "reject and re-propose" error rather than silently
+    /// resetting the conversation to `Idle`.
     AwaitingTaskApproval {
+        #[serde(default)]
         task_file: String,
         title: String,
         priority: String,
