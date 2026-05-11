@@ -55,7 +55,11 @@ struct TaskFileSnapshot {
 /// The state machine treats this read as a deterministic data-load — like
 /// reading the conversation cwd off disk — not as an external side effect.
 /// All I/O is local to the worktree, synchronous, and bounded.
-fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, String> {
+fn resolve_task_file(
+    cwd: &Path,
+    tasks_dir_name: &str,
+    task_file: &str,
+) -> Result<TaskFileSnapshot, String> {
     if task_file.is_empty() {
         return Err("task_file is required".to_string());
     }
@@ -80,9 +84,9 @@ fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, St
         .components()
         .next()
         .and_then(|c| c.as_os_str().to_str());
-    if first_component != Some("tasks") {
+    if first_component != Some(tasks_dir_name) {
         return Err(format!(
-            "task_file must be under tasks/ (got '{task_file}')"
+            "task_file must be under {tasks_dir_name}/ (got '{task_file}')"
         ));
     }
 
@@ -114,7 +118,7 @@ fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, St
     let body = std::fs::read_to_string(&abs_path).map_err(|e| {
         format!(
             "Failed to read task file '{task_file}': {e}. \
-             Create the file under tasks/ (taskmd filename format \
+             Create the file under {tasks_dir_name}/ (taskmd filename format \
              NNNNN-pX-status--slug.md) before calling propose_task."
         )
     })?;
@@ -1656,7 +1660,11 @@ pub fn transition_parent(
                     .with_effect(Effect::RequestLlm));
                 }
                 if let ToolInput::ProposeTask(ref input) = tool.input {
-                    let snapshot = match resolve_task_file(&context.working_dir, &input.task_file) {
+                    let snapshot = match resolve_task_file(
+                        &context.working_dir,
+                        &context.tasks_dir_name,
+                        &input.task_file,
+                    ) {
                         Ok(s) => s,
                         Err(err_msg) => {
                             // Validation failed: surface the error as a tool_result and
@@ -2719,6 +2727,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
+            tasks_dir_name: crate::tasks_dir::DEFAULT_TASKS_DIR_NAME.to_string(),
         };
 
         let result = handle_context_exhaustion(
@@ -2835,6 +2844,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
+            tasks_dir_name: crate::tasks_dir::DEFAULT_TASKS_DIR_NAME.to_string(),
         };
 
         let result = transition(
@@ -2936,6 +2946,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
+            tasks_dir_name: crate::tasks_dir::DEFAULT_TASKS_DIR_NAME.to_string(),
         };
 
         // attempt == MAX_RETRY_ATTEMPTS (3), retryable error → retries exhausted
@@ -2984,6 +2995,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
+            tasks_dir_name: crate::tasks_dir::DEFAULT_TASKS_DIR_NAME.to_string(),
         };
 
         // Non-retryable error at attempt 1 → immediate failure

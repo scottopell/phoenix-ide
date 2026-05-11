@@ -1116,7 +1116,9 @@ async fn get_system_prompt(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
-    let system_prompt = crate::system_prompt::build_system_prompt(&cwd, false, None);
+    let tasks_dir_name = crate::tasks_dir::discover_tasks_dir_name(&cwd);
+    let system_prompt =
+        crate::system_prompt::build_system_prompt(&cwd, &tasks_dir_name, false, None);
 
     Ok(Json(SystemPromptResponse { system_prompt }))
 }
@@ -3076,7 +3078,8 @@ async fn list_conversation_tasks(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
-    let tasks_dir = cwd.join("tasks");
+    let tasks_dir_name = crate::tasks_dir::discover_tasks_dir_name(&cwd);
+    let tasks_dir = cwd.join(&tasks_dir_name);
 
     // Build task_id -> conversation_slug map from active Work conversations
     let all_convs = state

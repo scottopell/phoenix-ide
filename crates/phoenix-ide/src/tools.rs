@@ -387,13 +387,13 @@ impl ToolRegistry {
     ///
     /// REQ-PROJ-002, REQ-PROJ-013: Restricted tool set — no bash, no
     /// general patch. A scoped `patch` is included so the agent can draft
-    /// task files under `tasks/` before calling `propose_task`; writes
-    /// outside `tasks/` are rejected at runtime.
-    pub fn explore_no_sandbox() -> Self {
+    /// task files under the project's tasks dir before calling
+    /// `propose_task`; writes outside that dir are rejected at runtime.
+    pub fn explore_no_sandbox(tasks_dir_name: &str) -> Self {
         let mut tools = read_only_tools();
         tools.extend(browser_tools());
         tools.extend(parent_coordination_tools());
-        tools.push(Arc::new(PatchTool::restricted_to("tasks")));
+        tools.push(Arc::new(PatchTool::restricted_to(tasks_dir_name)));
         tools.push(Arc::new(ProposeTaskTool));
         Self { tools }
     }
@@ -402,11 +402,12 @@ impl ToolRegistry {
     /// REQ-PROJ-013: Full tool suite, bash sandboxed read-only at runtime.
     /// Adds `propose_task` (Explore-only gateway to Work mode). Replaces
     /// the unrestricted `patch` from the standard set with one scoped to
-    /// `tasks/` so Explore mode can only mutate task files.
-    pub fn explore_with_sandbox() -> Self {
+    /// the project's tasks directory so Explore mode can only mutate task
+    /// files.
+    pub fn explore_with_sandbox(tasks_dir_name: &str) -> Self {
         let mut registry = Self::new_with_options(false);
         if let Some(idx) = registry.tools.iter().position(|t| t.name() == "patch") {
-            registry.tools[idx] = Arc::new(PatchTool::restricted_to("tasks"));
+            registry.tools[idx] = Arc::new(PatchTool::restricted_to(tasks_dir_name));
         }
         registry.tools.push(Arc::new(ProposeTaskTool));
         registry
@@ -582,8 +583,14 @@ mod tests {
 
         let registries: Vec<(&str, ToolRegistry)> = vec![
             ("direct", ToolRegistry::direct()),
-            ("explore_no_sandbox", ToolRegistry::explore_no_sandbox()),
-            ("explore_with_sandbox", ToolRegistry::explore_with_sandbox()),
+            (
+                "explore_no_sandbox",
+                ToolRegistry::explore_no_sandbox("tasks"),
+            ),
+            (
+                "explore_with_sandbox",
+                ToolRegistry::explore_with_sandbox("tasks"),
+            ),
             ("subagent_explore", ToolRegistry::for_subagent_explore()),
             ("subagent_work", ToolRegistry::for_subagent_work()),
         ];
@@ -629,7 +636,7 @@ mod tests {
         assert!(!direct.contains("submit_error"));
 
         // Explore (sandbox): full suite + propose_task.
-        let work = names(&ToolRegistry::explore_with_sandbox());
+        let work = names(&ToolRegistry::explore_with_sandbox("tasks"));
         assert!(work.contains("bash"));
         assert!(work.contains("patch"));
         assert!(work.contains("tmux"));
@@ -641,7 +648,7 @@ mod tests {
         // Explore (no sandbox): read-only + propose_task + scoped patch
         // (limited to tasks/ at runtime). No bash, no tmux, no terminal —
         // the agent only sees what's in the repo here.
-        let explore = names(&ToolRegistry::explore_no_sandbox());
+        let explore = names(&ToolRegistry::explore_no_sandbox("tasks"));
         assert!(explore.contains("propose_task"));
         assert!(explore.contains("ask_user_question"));
         assert!(explore.contains("patch"));

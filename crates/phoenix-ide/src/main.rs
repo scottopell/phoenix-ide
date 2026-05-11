@@ -15,6 +15,7 @@ mod runtime;
 pub mod skills;
 mod state_machine;
 mod system_prompt;
+mod tasks_dir;
 mod terminal;
 mod title_generator;
 mod tls;

@@ -1541,6 +1541,7 @@ where
         let root_conv_id = self.context.root_conversation_id.clone();
         let model_id = self.context.model_id.clone();
         let working_dir = self.context.working_dir.clone();
+        let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
 
@@ -1611,8 +1612,12 @@ where
             };
 
             // Build system prompt with AGENTS.md content + mode context
-            let system_prompt =
-                build_system_prompt(&working_dir, is_sub_agent, mode_context.as_ref());
+            let system_prompt = build_system_prompt(
+                &working_dir,
+                &tasks_dir_name,
+                is_sub_agent,
+                mode_context.as_ref(),
+            );
 
             // Build request — normalize messages against current tool set
             // to remove tool_use/tool_result blocks for tools no longer
@@ -2310,6 +2315,7 @@ where
             crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
         let conv_id = self.context.conversation_id.clone();
         let desired_base_branch = self.context.desired_base_branch.clone();
+        let tasks_dir_name = self.context.tasks_dir_name.clone();
         let storage = self.storage.clone();
 
         // Clone for state revert on failure (originals moved into spawn_blocking)
@@ -2324,6 +2330,7 @@ where
                 &cwd,
                 &repo_root,
                 &conv_id,
+                &tasks_dir_name,
                 &task_file,
                 &title,
                 desired_base_branch.as_deref(),
@@ -2945,6 +2952,7 @@ fn execute_approve_task_blocking(
     cwd: &std::path::Path,
     repo_root: &std::path::Path,
     conv_id: &str,
+    tasks_dir_name: &str,
     task_file: &str,
     title: &str,
     desired_base_branch: Option<&str>,
@@ -2987,10 +2995,11 @@ fn execute_approve_task_blocking(
         // task_file existed deserialise with an empty string. The legacy
         // (title/priority/plan) approval path is gone, so the only way
         // forward is for the user to reject and re-propose with a file.
-        return Err("This approval predates the file-based propose_task flow. \
+        return Err(format!(
+            "This approval predates the file-based propose_task flow. \
              Reject the plan and ask the agent to propose again — it will \
-             draft a task file under tasks/ this time."
-            .to_string());
+             draft a task file under {tasks_dir_name}/ this time."
+        ));
     }
     let rel_path = std::path::Path::new(task_file);
     let original_filename = rel_path
@@ -3057,7 +3066,7 @@ fn execute_approve_task_blocking(
         })?;
 
         let final_filename = promote_task_status_to_in_progress(
-            &worktree_path.join("tasks"),
+            &worktree_path.join(tasks_dir_name),
             &task_id,
             parsed.status,
             &original_filename,
@@ -3071,10 +3080,14 @@ fn execute_approve_task_blocking(
         if final_filename != original_filename {
             let _ = run_git(
                 &worktree_path,
-                &["add", "--", &format!("tasks/{original_filename}")],
+                &[
+                    "add",
+                    "--",
+                    &format!("{tasks_dir_name}/{original_filename}"),
+                ],
             );
         }
-        let relative_path = format!("tasks/{final_filename}");
+        let relative_path = format!("{tasks_dir_name}/{final_filename}");
         run_git(&worktree_path, &["add", &relative_path])?;
         let commit_msg = format!("task {task_id}: {title}");
         if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
@@ -3102,7 +3115,7 @@ fn execute_approve_task_blocking(
         if on_base_branch {
             // On base branch: rename status in cwd, commit, then create branch + worktree.
             let final_filename = promote_task_status_to_in_progress(
-                &cwd.join("tasks"),
+                &cwd.join(tasks_dir_name),
                 &task_id,
                 parsed.status,
                 &original_filename,
@@ -3112,9 +3125,16 @@ fn execute_approve_task_blocking(
             // Stage the rename's deletion as well (see early-worktree path
             // above). Harmless no-op when the old name was untracked.
             if final_filename != original_filename {
-                let _ = run_git(cwd, &["add", "--", &format!("tasks/{original_filename}")]);
+                let _ = run_git(
+                    cwd,
+                    &[
+                        "add",
+                        "--",
+                        &format!("{tasks_dir_name}/{original_filename}"),
+                    ],
+                );
             }
-            let relative_path = format!("tasks/{final_filename}");
+            let relative_path = format!("{tasks_dir_name}/{final_filename}");
             run_git(cwd, &["add", &relative_path])?;
 
             let commit_msg = format!("task {task_id}: {title}");
@@ -3170,15 +3190,15 @@ fn execute_approve_task_blocking(
                 ));
             }
 
-            let wt_tasks_dir = worktree_path.join("tasks");
+            let wt_tasks_dir = worktree_path.join(tasks_dir_name);
             std::fs::create_dir_all(&wt_tasks_dir)
-                .map_err(|e| format!("Failed to create tasks/ in worktree: {e}"))?;
+                .map_err(|e| format!("Failed to create {tasks_dir_name}/ in worktree: {e}"))?;
             let wt_filepath = wt_tasks_dir.join(&final_filename);
             std::fs::write(&wt_filepath, &body)
                 .map_err(|e| format!("Failed to write task file in worktree: {e}"))?;
 
             ensure_gitignore_has_phoenix(&worktree_path)?;
-            let relative_path = format!("tasks/{final_filename}");
+            let relative_path = format!("{tasks_dir_name}/{final_filename}");
             run_git(&worktree_path, &["add", &relative_path])?;
             let commit_msg = format!("task {task_id}: {title}");
             if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
@@ -3779,6 +3799,7 @@ mod cwd_immutability_tests {
             &explore_wt,
             &repo_root,
             conv_id,
+            "tasks",
             &format!("tasks/{task_filename}"),
             "Fix the login bug",
             Some(base_branch),

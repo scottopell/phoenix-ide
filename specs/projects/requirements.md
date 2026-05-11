@@ -109,7 +109,8 @@ AND the agent MAY revise the plan and call `propose_plan` again
 
 WHEN user approves the task
 THE SYSTEM SHALL assign the next sequential task ID for the project
-AND write a task file to `tasks/` in taskmd format
+AND write a task file to the project's tasks directory (typically `tasks/`,
+  discovered per-project via `_TEMPLATE.md`; see task 13008) in taskmd format
 AND commit the task file on the task branch in the existing worktree (REQ-PROJ-028)
 AND transition the conversation from Explore to Work mode within the same worktree
   (storing base_branch, worktree_path, branch, task_id)
@@ -151,7 +152,8 @@ because their code changes never share a directory.
 WHEN the user approves a task (REQ-PROJ-004)
 THE SYSTEM SHALL allocate a task ID via `taskmd_core::ids::next_id` (a
   5-digit `DDNNN` value — per-directory prefix + monotonic counter)
-AND write a task file to `tasks/` with filename
+AND write a task file to the project's tasks directory (typically `tasks/`,
+  discovered per-project via `_TEMPLATE.md`; see task 13008) with filename
   `{ID}-{priority}-{status}--{slug}.md`
 AND include frontmatter with `created`, `priority`, `status`, and `artifact`
   fields (matching what `taskmd new` synthesizes, so the file round-trips

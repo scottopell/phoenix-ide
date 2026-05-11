@@ -102,7 +102,11 @@ present. Worktrees are ephemeral; they are never committed or pushed.
 
 ### REQ-PROJ-006 — Task File Format
 
-Task files live at `{repo_root}/tasks/` and are committed to main.
+Task files live at `{repo_root}/{tasks_dir}/` and are committed to main.
+`{tasks_dir}` is the project's tasks directory, discovered at conversation
+startup as the first immediate child of the repo root containing
+`_TEMPLATE.md`. It falls back to the literal `tasks/` when no marker is
+found, so existing repos behave as before (task 13008).
 
 Filename convention: `{ID}-{priority}-{status}--{slug}.md`
 - `ID`: 5-digit numeric (`DDNNN`) allocated by `taskmd_core::ids::next_id`
@@ -289,7 +293,7 @@ the git operation and feeds back `WorktreeCreated`, `WorktreeMerged`,
 | Tool | Explore mode | Work mode |
 |------|-------------|----------|
 | `bash` | Allowed (read-only enforced per REQ-BASH-008) | Allowed (write enabled in worktree) |
-| `patch` | Disabled (per REQ-PATCH-009) | Enabled (scoped to worktree) |
+| `patch` | Scoped to project's tasks dir (typically `tasks/`, discovered per project — task 13008) so the agent can draft a task file before `propose_task`; writes elsewhere rejected | Enabled (scoped to worktree) |
 | `think` | Allowed | Allowed |
 | `keyword_search` | Allowed | Allowed |
 | `read_image` | Allowed | Allowed |

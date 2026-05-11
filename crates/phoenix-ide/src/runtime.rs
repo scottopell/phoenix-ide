@@ -1034,6 +1034,10 @@ impl RuntimeManager {
             ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
+        // Sub-agent inherits parent's worktree cwd; discover the project's
+        // tasks directory the same way the parent did.
+        conv_context.tasks_dir_name =
+            crate::tasks_dir::discover_tasks_dir_name(&conv_context.working_dir);
 
         // 4. Create channels for the sub-agent runtime. The broadcaster
         // seeds its counter from the message we just inserted (sequence_id=1)
@@ -1234,6 +1238,11 @@ impl RuntimeManager {
             ConvMode::Explore { .. } | ConvMode::Work { .. } => ModeKind::Managed,
             ConvMode::Branch { .. } => ModeKind::Branch,
         };
+        // Discover the project's tasks directory once at conversation
+        // startup; cached for the lifetime of this runtime so state machine,
+        // executor, patch tool registration, and system prompt all agree on
+        // the same name without re-walking the worktree.
+        context.tasks_dir_name = crate::tasks_dir::discover_tasks_dir_name(&context.working_dir);
 
         let (event_tx, event_rx) = mpsc::channel(32);
         // Inherit the broadcaster from an eviction if available (e.g. model
@@ -1279,9 +1288,9 @@ impl RuntimeManager {
             let registry = match conv.conv_mode {
                 ConvMode::Explore { .. } => {
                     if self.platform.has_sandbox() {
-                        ToolRegistry::explore_with_sandbox()
+                        ToolRegistry::explore_with_sandbox(&context.tasks_dir_name)
                     } else {
-                        ToolRegistry::explore_no_sandbox()
+                        ToolRegistry::explore_no_sandbox(&context.tasks_dir_name)
                     }
                 }
                 ConvMode::Direct => {

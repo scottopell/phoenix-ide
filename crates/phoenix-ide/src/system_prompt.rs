@@ -493,12 +493,14 @@ pub fn discover_guidance_files(working_dir: &Path) -> Vec<GuidanceFile> {
 /// Build the complete system prompt for a conversation.
 pub fn build_system_prompt(
     working_dir: &Path,
+    tasks_dir_name: &str,
     is_sub_agent: bool,
     mode: Option<&ModeContext>,
 ) -> String {
     let builtin_dir = crate::skills::builtin::default_extract_dir();
     build_system_prompt_with_options(
         working_dir,
+        tasks_dir_name,
         is_sub_agent,
         mode,
         None,
@@ -513,6 +515,7 @@ pub fn build_system_prompt(
 #[allow(clippy::too_many_lines)] // One match arm per ModeContext variant; splitting hurts readability
 pub fn build_system_prompt_with_options(
     working_dir: &Path,
+    tasks_dir_name: &str,
     is_sub_agent: bool,
     mode: Option<&ModeContext>,
     home_override: Option<&Path>,
@@ -571,29 +574,30 @@ pub fn build_system_prompt_with_options(
     if let Some(mode) = mode {
         match mode {
             ModeContext::Explore => {
-                prompt.push_str(
+                let _ = write!(
+                    prompt,
                     "\n\nYou are in Explore mode. This conversation is read-only \
                      for source files -- you can read files, search, analyze, and \
                      discuss the codebase, but you cannot modify code.\n\n\
                      Workflow for proposing work:\n\
-                     1. Find or draft a task file under `tasks/`.\n   \
+                     1. Find or draft a task file under `{tasks_dir_name}/`.\n   \
                         - To reuse an existing task, locate it with `keyword_search` \
-                        or by browsing `tasks/` with `read_file`.\n   \
+                        or by browsing `{tasks_dir_name}/` with `read_file`.\n   \
                         - To draft a new task, use `patch` with operation \
-                        `overwrite` to create a file under `tasks/`. The filename \
-                        must follow the taskmd 1.0 convention: \
+                        `overwrite` to create a file under `{tasks_dir_name}/`. The \
+                        filename must follow the taskmd 1.0 convention: \
                         `NNNNN-pX-status--slug.md` where status is one of \
                         `ready`, `in-progress`, or `brainstorming`. The body is \
                         free-form markdown -- start with an `# H1` title, then the \
                         plan.\n\
                      2. Call `propose_task` with `task_file` set to the path \
-                        (e.g. `tasks/12345-p2-ready--my-slug.md`). The user will \
-                        review and can approve, request revisions, or reject. \
-                        On approval, an isolated worktree is created and you \
-                        gain full write access.\n\n\
-                     The `patch` tool is restricted to `tasks/` in this mode. \
-                     `bash` is unavailable. If the user asks you to change code \
-                     directly, explain that you must propose a task first.",
+                        (e.g. `{tasks_dir_name}/12345-p2-ready--my-slug.md`). The \
+                        user will review and can approve, request revisions, or \
+                        reject. On approval, an isolated worktree is created and \
+                        you gain full write access.\n\n\
+                     The `patch` tool is restricted to `{tasks_dir_name}/` in this \
+                     mode. `bash` is unavailable. If the user asks you to change \
+                     code directly, explain that you must propose a task first."
                 );
             }
             ModeContext::Work {
@@ -602,7 +606,7 @@ pub fn build_system_prompt_with_options(
                 worktree_path,
             } => {
                 let task_prefix = taskmd_core::ids::prefix_for(
-                    &std::path::PathBuf::from(&worktree_path).join("tasks"),
+                    &std::path::PathBuf::from(&worktree_path).join(tasks_dir_name),
                 );
                 let _ = write!(
                     prompt,
@@ -711,8 +715,14 @@ mod tests {
     fn test_build_system_prompt_no_guidance() {
         let temp = TempDir::new().unwrap();
         // Use temp as home override to avoid $HOME skill contamination
-        let prompt =
-            build_system_prompt_with_options(temp.path(), false, None, Some(temp.path()), None);
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            None,
+            Some(temp.path()),
+            None,
+        );
 
         assert!(prompt.contains("helpful AI assistant"));
         assert!(!prompt.contains("<project_guidance>"));
@@ -724,8 +734,14 @@ mod tests {
         let temp = TempDir::new().unwrap();
         fs::write(temp.path().join("AGENTS.md"), "# Project Rules\nBe nice.").unwrap();
 
-        let prompt =
-            build_system_prompt_with_options(temp.path(), false, None, Some(temp.path()), None);
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            None,
+            Some(temp.path()),
+            None,
+        );
 
         assert!(prompt.contains("<project_guidance>"));
         assert!(prompt.contains("# Project Rules"));
@@ -736,8 +752,14 @@ mod tests {
     #[test]
     fn test_build_system_prompt_sub_agent() {
         let temp = TempDir::new().unwrap();
-        let prompt =
-            build_system_prompt_with_options(temp.path(), true, None, Some(temp.path()), None);
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            true,
+            None,
+            Some(temp.path()),
+            None,
+        );
 
         assert!(prompt.contains("sub-agent"));
         assert!(prompt.contains("submit_result"));
@@ -1006,8 +1028,14 @@ mod tests {
             "Deploy the app. Use when deploying.",
         );
 
-        let prompt =
-            build_system_prompt_with_options(temp.path(), false, None, Some(temp.path()), None);
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            None,
+            Some(temp.path()),
+            None,
+        );
 
         assert!(prompt.contains("<available_skills>"));
         assert!(prompt.contains("</available_skills>"));
@@ -1019,8 +1047,14 @@ mod tests {
     #[test]
     fn test_build_system_prompt_no_skills() {
         let temp = TempDir::new().unwrap();
-        let prompt =
-            build_system_prompt_with_options(temp.path(), false, None, Some(temp.path()), None);
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            None,
+            Some(temp.path()),
+            None,
+        );
 
         assert!(!prompt.contains("<available_skills>"));
     }
@@ -1136,6 +1170,7 @@ mod tests {
         };
         let prompt = build_system_prompt_with_options(
             temp.path(),
+            "tasks",
             false,
             Some(&mode),
             Some(temp.path()),
@@ -1250,6 +1285,7 @@ mod tests {
         let extract_dir = write_fake_builtin(temp.path(), "spears", "Built-in spears");
         let prompt = build_system_prompt_with_options(
             temp.path(),
+            "tasks",
             false,
             None,
             Some(temp.path()),

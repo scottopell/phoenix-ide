@@ -46,19 +46,20 @@ pub struct PatchTool {
     planner: Mutex<PatchPlanner>,
     /// When set, edits are rejected unless the resolved path is inside this
     /// directory (relative to the conversation cwd). Used by Explore mode
-    /// to permit drafting task files under `tasks/` without unlocking the
-    /// rest of the worktree.
-    allowed_path_prefix: Option<&'static str>,
+    /// to permit drafting task files under the project's tasks directory
+    /// (typically `tasks/` but discovered per project — task 13008) without
+    /// unlocking the rest of the worktree.
+    allowed_path_prefix: Option<String>,
 }
 
 impl PatchTool {
     /// Construct a `PatchTool` that only accepts paths inside the named
     /// relative directory (e.g. `"tasks"`). Paths outside that directory
     /// are rejected at runtime.
-    pub fn restricted_to(prefix: &'static str) -> Self {
+    pub fn restricted_to(prefix: impl Into<String>) -> Self {
         Self {
             planner: Mutex::new(PatchPlanner::new()),
-            allowed_path_prefix: Some(prefix),
+            allowed_path_prefix: Some(prefix.into()),
         }
     }
 
@@ -85,7 +86,7 @@ impl PatchTool {
         raw_path: &str,
         resolved: &std::path::Path,
     ) -> Option<String> {
-        let prefix = self.allowed_path_prefix?;
+        let prefix = self.allowed_path_prefix.as_deref()?;
 
         if std::path::Path::new(raw_path)
             .components()
