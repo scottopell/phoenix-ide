@@ -2900,6 +2900,16 @@ fn execute_approve_task_blocking(
         )?;
 
         ensure_gitignore_has_phoenix(&worktree_path)?;
+        // When `update_task` renamed the file, the old name is now an
+        // on-disk deletion. Stage it explicitly so the commit captures the
+        // rename rather than introducing a duplicate task ID. `git add` on
+        // an untracked-and-missing path errors harmlessly (new-file flow).
+        if final_filename != original_filename {
+            let _ = run_git(
+                &worktree_path,
+                &["add", "--", &format!("tasks/{original_filename}")],
+            );
+        }
         let relative_path = format!("tasks/{final_filename}");
         run_git(&worktree_path, &["add", &relative_path])?;
         let commit_msg = format!("task {task_id}: {title}");
@@ -2935,6 +2945,11 @@ fn execute_approve_task_blocking(
             )?;
             ensure_gitignore_has_phoenix(cwd)?;
 
+            // Stage the rename's deletion as well (see early-worktree path
+            // above). Harmless no-op when the old name was untracked.
+            if final_filename != original_filename {
+                let _ = run_git(cwd, &["add", "--", &format!("tasks/{original_filename}")]);
+            }
             let relative_path = format!("tasks/{final_filename}");
             run_git(cwd, &["add", &relative_path])?;
 
@@ -2957,11 +2972,12 @@ fn execute_approve_task_blocking(
         } else {
             // Off base branch: the task file lives on the current branch in
             // cwd, but the new worktree is created from base_branch (which
-            // doesn't have it). Read the body, rename to in-progress, and
-            // write into the new worktree.
+            // doesn't have it). Read the body, transplant it to the
+            // worktree, and only remove the cwd copy once the worktree
+            // commit has landed — otherwise a worktree-create failure
+            // would lose the user's draft.
             let body = std::fs::read_to_string(&cwd_filepath)
                 .map_err(|e| format!("Failed to read task file '{task_file}': {e}"))?;
-            let _ = std::fs::remove_file(&cwd_filepath);
 
             let final_filename = if parsed.status == taskmd_core::constants::Status::InProgress {
                 original_filename.clone()
@@ -3007,6 +3023,10 @@ fn execute_approve_task_blocking(
                 return Err(format!("Failed to commit task file in worktree: {e}"));
             }
             tracing::info!(commit_msg = %commit_msg, "Task file committed in worktree");
+
+            // Worktree commit succeeded — safe to drop the cwd copy now
+            // that the file lives on the task branch.
+            let _ = std::fs::remove_file(&cwd_filepath);
         }
 
         tracing::info!(

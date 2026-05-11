@@ -73,8 +73,30 @@ impl PatchTool {
 
     /// Reject paths that fall outside the configured allowlist. Returns
     /// `None` if no restriction is configured.
-    fn enforce_allowlist(&self, ctx: &ToolContext, resolved: &std::path::Path) -> Option<String> {
+    ///
+    /// `raw_path` is the unresolved path string from the LLM. We reject `..`
+    /// components on it directly: when the patch target does not yet exist,
+    /// `canonicalize(resolved)` returns `Err` and the function falls back to
+    /// the lexical path — which would let `tasks/../src/foo.rs` pass the
+    /// prefix check on a brand-new file.
+    fn enforce_allowlist(
+        &self,
+        ctx: &ToolContext,
+        raw_path: &str,
+        resolved: &std::path::Path,
+    ) -> Option<String> {
         let prefix = self.allowed_path_prefix?;
+
+        if std::path::Path::new(raw_path)
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Some(format!(
+                "patch is restricted to '{prefix}/' in this mode; \
+                 '..' components are not allowed (got '{raw_path}')."
+            ));
+        }
+
         let allowed_root = ctx.working_dir.join(prefix);
         let canon_allowed = std::fs::canonicalize(&allowed_root).unwrap_or(allowed_root);
         let canon_resolved =
@@ -224,7 +246,7 @@ large overwrite. Prefer incremental replace operations over full file overwrites
         // Resolve path
         let path = Self::resolve_path(&ctx, &patch_input.path);
 
-        if let Some(msg) = self.enforce_allowlist(&ctx, &path) {
+        if let Some(msg) = self.enforce_allowlist(&ctx, &patch_input.path, &path) {
             return ToolOutput::error(msg);
         }
 
@@ -355,6 +377,32 @@ mod tests {
             fs::read_to_string(dir.path().join("source.rs")).unwrap(),
             "fn main() {}\n",
             "source must be untouched"
+        );
+
+        // `..` traversal to a *new* file outside the prefix is rejected
+        // (canonicalize() returns Err for missing targets and would
+        // otherwise fall back to the lexical path that starts_with "tasks").
+        let ctx = test_context(dir.path().to_path_buf());
+        let traversal = tool
+            .run(
+                json!({
+                    "path": "tasks/../escape.rs",
+                    "patches": [{
+                        "operation": "overwrite",
+                        "newText": "fn pwned() {}\n"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+        assert!(
+            !traversal.success,
+            "expected rejection of '..' traversal, got: {}",
+            traversal.output
+        );
+        assert!(
+            !dir.path().join("escape.rs").exists(),
+            "escape file must not have been created"
         );
 
         // Write inside the allowed prefix succeeds.
