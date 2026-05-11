@@ -153,13 +153,8 @@ function transformBreadcrumb(b: SseBreadcrumb): Breadcrumb {
 }
 
 function transformInitData(raw: SseInitData): InitPayload {
-  // Merge top-level git delta + project info into conversation (backend sends at SSE init level)
-  const overrides: Partial<typeof raw.conversation> = {};
-  if (raw.commits_behind != null) overrides.commits_behind = raw.commits_behind;
-  if (raw.commits_ahead != null) overrides.commits_ahead = raw.commits_ahead;
-  if (raw.project_name != null) overrides.project_name = raw.project_name;
-  const conversation = Object.keys(overrides).length > 0
-    ? { ...raw.conversation, ...overrides }
+  const conversation = raw.project_name != null
+    ? { ...raw.conversation, project_name: raw.project_name }
     : raw.conversation;
   const messages = raw.messages || [];
   const phase = parseConversationState(conversation?.state);

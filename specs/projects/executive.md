@@ -14,8 +14,10 @@ mode lets users work directly on an existing branch with no Explore phase and no
 file. A branch picker with local listing (sorted by recency, with staleness counts) and
 on-demand remote search (cached `git ls-remote`) supports both Managed and Branch mode
 branch selection. When work is complete, the agent pushes the branch to origin and the
-user merges via PR on their hosting platform. The user then marks the conversation as
-merged (terminal) or abandons it. In Managed mode, abandon deletes the worktree and
+user merges via PR on their hosting platform. Phoenix observes PR state through
+GitHub CLI when available: merged PRs get a first-class cleanup affordance,
+unmerged PRs are discouraged from cleanup, and manual "Mark as merged" remains a
+fallback when PR state is unavailable. In Managed mode, abandon deletes the worktree and
 branch; in Branch mode, abandon deletes only the worktree, keeping the user's branch.
 
 ## Technical Summary
@@ -31,11 +33,12 @@ phase and no task file. Worktree paths are derived from conversation IDs -- coll
 structurally impossible. One tool: `propose_plan` (Explore mode only, pure data carrier
 intercepted like submit_result). Tool registry is configured by mode: write tools
 disabled in Explore, enabled in Work and Branch. Push is a regular bash command with no
-lifecycle side effects. Terminal actions are Mark as Merged and Abandon, both
-user-initiated. Managed mode deletes the branch on terminal; Branch mode keeps it. A
-remote-aware commits-behind poller does single-branch fetches on a 60-second interval
-and emits SSE updates. Branch discovery uses local `git for-each-ref` for instant
-listing and cached `git ls-remote` for on-demand remote search (5-minute TTL).
+lifecycle side effects. Phoenix can observe PR state through `gh` to guide the
+user-visible cleanup affordance, but does not push, merge, or run unattended
+cleanup. Terminal actions remain user-initiated: verified merged PR cleanup / manual
+Mark as Merged and Abandon. Managed mode deletes the branch on terminal; Branch mode keeps it.
+Branch discovery uses local `git for-each-ref` for instant listing and cached `git ls-remote`
+for on-demand remote search (5-minute TTL).
 
 ## Status Summary
 
@@ -51,7 +54,7 @@ listing and cached `git ls-remote` for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | 🔄 Partial | Sub-agents work but missing: mode parameter (explore/work), model override, one-writer constraint, MCP access |
 | **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted. Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
 | **REQ-PROJ-010:** Abandon a Conversation | 🔄 Needs Update | Branch mode keeps branch on abandon; Managed deletes it |
-| **REQ-PROJ-011:** Passive Commits-Behind Indicator | ✅ Complete | Task 08604 (M4). StateBar badge |
+| **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | ✅ Complete | PR badge replaces ahead/behind StateBar noise |
 | **REQ-PROJ-012:** Provide propose_plan Tool to Agents | ✅ Complete | Same as REQ-PROJ-003 |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
@@ -63,11 +66,11 @@ listing and cached `git ls-remote` for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-020:** Branch Discovery (Local, No Network) | ✅ Complete | Branch picker with search, staleness counts, recency sort |
 | **REQ-PROJ-021:** Remote Branch Search (On-Demand) | ✅ Complete | Cached `git ls-remote` with 5-min TTL, substring filter |
 | **REQ-PROJ-022:** Branch Materialization (Single-Branch Fetch) | ✅ Complete | Best-effort single-branch fetch at worktree creation |
-| **REQ-PROJ-023:** Remote-Aware Commits-Behind Polling | ✅ Complete | 60s poller with single-branch fetch, SSE delta updates |
+| **REQ-PROJ-023:** Reserved | Removed | Commits-behind polling removed; PR status is the branch health signal |
 | **REQ-PROJ-024:** Work Directly on an Existing Branch (Branch Mode) | ✅ Complete | Worktree on existing branch, no task file, no Explore phase |
 | **REQ-PROJ-025:** One Active Work Conversation Per Branch | ✅ Complete | Conflict detection with redirect/delete/fresh-start options |
-| **REQ-PROJ-026:** Branch Mode Lifecycle (Push, Mark Merged, Abandon) | ✅ Complete | Push via bash; Mark as Merged and Abandon as terminal actions |
-| **REQ-PROJ-027:** Simplified Managed Completion (Push Branch) | ✅ Complete | Push branch, user merges via PR; task file on branch, not main |
+| **REQ-PROJ-026:** Branch Mode Lifecycle (Push, Mark Merged, Abandon) | ✅ Complete | Push via bash; PR-aware cleanup guidance via gh; Abandon as terminal action |
+| **REQ-PROJ-027:** Simplified Managed Completion (Push Branch) | ✅ Complete | Push branch, user merges via PR; gh observes merge state for cleanup; task file on branch, not main |
 | **REQ-PROJ-028:** Managed Mode Worktree from First Message | ✅ Complete | Worktree created on first message with temp branch |
 | **REQ-PROJ-029:** Branch Mode in the Mode Picker | ✅ Complete | Mode picker offers Direct, Managed, and Branch |
 

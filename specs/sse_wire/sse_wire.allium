@@ -75,8 +75,7 @@ value InitSnapshot {
     pending_events: List<PendingEventEntry>
     pending_truncated: Boolean
     -- conversation, messages, breadcrumbs, agent_working, display_state,
-    -- context_window_size, model_context_window, commits_behind,
-    -- commits_ahead, project_name: opaque at this level.
+    -- context_window_size, model_context_window, project_name: opaque at this level.
 }
 
 -- One entry in the per-conversation replay ring. Each carries the
@@ -116,7 +115,7 @@ value UserFacingError {
 value ConversationMetadataUpdate {
     cwd: String?
     -- branch_name, worktree_path, conv_mode_label, base_branch,
-    -- commits_behind, commits_ahead, task_title: opaque
+    -- task_title: opaque
 }
 
 ------------------------------------------------------------

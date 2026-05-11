@@ -108,10 +108,10 @@ describe('parseEvent', () => {
   describe('init schema', () => {
     // Task 02677 tightened the init schema so that fields the Rust side
     // always sets (presentation_mode, context_window_size, breadcrumbs,
-    // commits_behind, commits_ahead, project_name) are required here
-    // too. The generated TS type in `./generated/sse` is the source of
-    // truth; the schema `satisfies v.GenericSchema<unknown, WireInitData>`
-    // would fail to compile if these were still marked optional.
+    // project_name) are required here too. The generated TS type in
+    // `./generated/sse` is the source of truth; the schema
+    // `satisfies v.GenericSchema<unknown, WireInitData>` would fail to
+    // compile if these were still marked optional.
     const validInit = {
       sequence_id: 0,
       conversation: { id: 'conv-1' },
@@ -121,8 +121,6 @@ describe('parseEvent', () => {
       presentation_mode: 'idle',
       context_window_size: 0,
       breadcrumbs: [],
-      commits_behind: 0,
-      commits_ahead: 0,
       project_name: null,
       pending_anchor_sequence_id: 0,
       pending_events: [],
@@ -485,7 +483,7 @@ describe('parseEvent', () => {
       const { dispatch } = mockDispatch();
       const res = parseEvent(
         SseConversationUpdateDataSchema,
-        makeEvent({ sequence_id: 9, conversation: { commits_behind: 2 } }),
+        makeEvent({ sequence_id: 9, conversation: { branch_name: 'task-123' } }),
         'conversation_update',
         dispatch,
       );

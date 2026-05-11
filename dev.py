@@ -1893,6 +1893,7 @@ def cmd_check():
         # under `-b`; bare `pnpm exec tsc --noEmit` silently misses them.
         threading.Thread(target=run_step, args=("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR)),
         threading.Thread(target=run_step, args=("eslint", ["pnpm", "run", "lint"], UI_DIR)),
+        threading.Thread(target=run_step, args=("vite build", ["pnpm", "exec", "vite", "build"], UI_DIR)),
         threading.Thread(target=run_step, args=("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
         threading.Thread(target=lane_fast),
         threading.Thread(target=check_ast_grep),

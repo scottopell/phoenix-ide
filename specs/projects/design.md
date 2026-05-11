@@ -477,22 +477,15 @@ On startup, the executor scans conversations with `conv_mode = Work`:
 - If worktree directory is missing: transition to Terminal state, mark task `wont-do`
   on base_branch, log warning
 
-## Commits-Behind Indicator
+## Branch Health Indicator
 
-### REQ-PROJ-011 — Passive polling for base branch advancement
+### REQ-PROJ-011 — PR status, not local commit divergence
 
-No filesystem watcher. The system polls on two triggers:
-
-1. **SSE connect:** When a client connects to a Work conversation, compute
-   `git rev-list HEAD..base_branch --count` and include in the initial state payload.
-2. **Periodic poll:** Every ~60 seconds while clients are connected, re-run the count
-   and emit `SSE::CommitsBehind { count: N }` if the value changed.
-
-The UI shows an "N behind" badge in the StateBar next to the branch name when count > 0.
-No badge when count is 0.
-
-No rebase automation. No agent notification. The agent has bash access to run
-`git rebase` when the user asks.
+The StateBar uses PR status as the branch health signal for Work and Branch
+conversations. It shows the PR number plus merge/check state when `gh` can resolve
+a pull request for the branch. It does not render local commits-ahead or
+commits-behind badges; those counts are easy to inspect with git commands when
+needed, but they are not the primary decision point for PR cleanup.
 
 `.gitignore` management: the system checks for `.phoenix/worktrees/` in `.gitignore`
 at project creation and appends it if missing.

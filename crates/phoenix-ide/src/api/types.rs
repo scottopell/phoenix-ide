@@ -482,6 +482,83 @@ pub struct ConversationDiffResponse {
     pub uncommitted_saturated: bool,
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrUnavailableReason {
+    GhMissing,
+    NotAuthenticated,
+    NotGitRepo,
+    CommandFailed,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrCheckState {
+    Passing,
+    Pending,
+    Failing,
+    Unknown,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrDisplayState {
+    Open,
+    Draft,
+    Merged,
+    Closed,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PrStatusResponse {
+    pub found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<PrUnavailableReason>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub draft: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub check_state: Option<PrCheckState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub display_state: Option<PrDisplayState>,
+}
+
+impl PrStatusResponse {
+    pub fn not_found() -> Self {
+        Self {
+            found: false,
+            unavailable_reason: None,
+            number: None,
+            title: None,
+            url: None,
+            state: None,
+            draft: None,
+            base: None,
+            head: None,
+            check_state: None,
+            display_state: None,
+        }
+    }
+
+    pub fn unavailable(reason: PrUnavailableReason) -> Self {
+        Self {
+            unavailable_reason: Some(reason),
+            ..Self::not_found()
+        }
+    }
+}
+
 /// Error response
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {

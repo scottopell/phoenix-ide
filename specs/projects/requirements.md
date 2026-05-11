@@ -252,31 +252,17 @@ Phoenix. The confirmation dialog prevents accidental worktree deletion.
 
 ---
 
-### REQ-PROJ-011: Passive Commits-Behind Indicator
+### REQ-PROJ-011: PR Status Is the Branch Health Indicator
 
-WHEN a client connects to a Work conversation via SSE
-THE SYSTEM SHALL check how many commits base_branch is ahead of the worktree's branch point
-AND emit the count as part of the initial state payload
+WHEN a Work or Branch conversation has an associated pull request
+THE SYSTEM SHALL display the PR status in the StateBar
 
-WHILE a Work conversation has connected clients
-THE SYSTEM SHALL poll for base_branch advancement approximately every 60 seconds
-AND emit updated counts via SSE when the value changes
+THE SYSTEM SHALL NOT display local commits-ahead or commits-behind badges in the StateBar
 
-WHEN the commits-behind count is greater than zero
-THE SYSTEM SHALL display an "N behind" badge in the StateBar next to the branch name
-
-WHEN the commits-behind count is zero
-THE SYSTEM SHALL NOT display any badge
-
-THE SYSTEM SHALL NOT automatically rebase, notify the agent, or take any action
-  based on the commits-behind count
-
-**Rationale:** The commits-behind indicator gives the user ambient awareness that their
-base branch has advanced, which may affect the merge at completion time. It is passive
-and informational only -- no filesystem watcher, no rebase automation. The agent already
-has bash access to run `git rebase` when the user asks. Polling on SSE connect plus a
-periodic interval is simple and sufficient; real-time filesystem watching adds complexity
-without meaningful benefit for a metric that changes infrequently.
+**Rationale:** PR state is the actionable signal in the normal review workflow. Local
+commit divergence badges draw attention without telling the user whether the PR is
+ready, merged, blocked, or stale. Users and agents can still inspect git history via
+normal git commands when they need that detail.
 
 ---
 
@@ -599,20 +585,10 @@ commit point where it has the highest value.
 
 ---
 
-### REQ-PROJ-023: Remote-Aware Commits-Behind Polling
+### REQ-PROJ-023: Reserved
 
-WHEN the commits-behind poller fires for a Work conversation (REQ-PROJ-011)
-THE SYSTEM SHALL run `git fetch origin <base_branch>` (single-branch) before
-  comparing commit counts
-AND this fetch SHALL be best-effort (failures are non-fatal, logged at debug)
-
-THE SYSTEM SHALL compare the task branch against the local base branch ref
-  (which is now updated by the single-branch fetch)
-
-**Rationale:** The poller already runs every 60 seconds. Adding a single-branch
-fetch before comparison ensures the behind/ahead counts reflect remote state,
-not just the local snapshot from the last full fetch. The cost is one lightweight
-network call per minute for one branch, not a full repo fetch.
+Remote-aware commits-behind polling was removed when PR status became the StateBar's
+branch health indicator.
 
 ---
 
@@ -688,6 +664,10 @@ AND transition the conversation to terminal state
 THE SYSTEM SHALL NOT offer "Complete (squash-merge)" for Branch mode conversations
 THE SYSTEM SHALL NOT push to origin on the user's behalf (push is the agent's
 responsibility, run through the bash tool when the user requests it)
+THE SYSTEM SHALL use the GitHub CLI, when available, to observe PR state for the
+branch and guide the cleanup action
+THE SYSTEM SHALL treat a user-asserted manual "Mark as merged" action as a
+fallback when PR state is unavailable, not as the preferred happy path
 
 **Rationale:** Branch mode conversations track the PR lifecycle, not the task
 lifecycle. The agent commits and pushes from bash on the user's instruction;
@@ -721,7 +701,10 @@ works with protected branches, and aligns with how teams actually ship code.
 The task file lives on the task branch alongside the code changes, keeping the
 task branch self-contained. Phoenix never pushes on the user's behalf — the
 agent runs `git push` from bash if and when instructed; Phoenix observes no
-push event and gates no lifecycle on it. On "Mark as merged," Phoenix cleans
+push event and gates no lifecycle on it. When `gh` can observe a PR for the
+branch, Phoenix uses that state to make merged PR cleanup the happy path and to
+discourage local cleanup while the PR is still open, draft, failing, pending, or
+closed-unmerged. On "Mark as merged" / merged-PR cleanup, Phoenix cleans
 up both the worktree and the task branch (since Phoenix created it). On
 abandon, same cleanup -- the task branch was a Phoenix artifact that the user
 is discarding.

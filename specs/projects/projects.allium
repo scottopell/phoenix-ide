@@ -152,12 +152,6 @@ entity Worktree {
     base_branch: String            -- recorded at creation time
     task_file: TaskFile?           -- present only for managed (work mode) worktrees
 
-    -- REQ-PROJ-023: commits ahead/behind remote tracking ref.
-    -- Updated by CommitsBehindPoll. Absent before the first poll fires
-    -- (or when the conversation has no connected clients).
-    commits_behind: Integer?
-    commits_ahead: Integer?
-
     -- Derived
     is_clean: git_status_clean(path)
 }
@@ -515,9 +509,11 @@ rule TaskApprovalExecuted {
 -- Push to remote is not modelled here. `git push` is a bash command the
 -- agent may run from inside a worktree; Phoenix imposes no policy
 -- beyond the bash-tool ban on `--force` (REQ-PROJ-019). Push has no
--- lifecycle side effects and no Phoenix-side observable state — the
--- terminal actions below (Mark-as-merged, Abandon) are the only
--- user-initiated lifecycle events on a Work/Branch conversation.
+-- lifecycle side effects. PR state is advisory UI/API state. Phoenix may query GitHub via `gh` and
+-- use the result to label or gate the cleanup affordance, but that observation
+-- does not create a lifecycle transition by itself: cleanup still occurs only
+-- when the user initiates the MarkAsMerged terminal action below. Task 02664
+-- tracks any future fully automatic merge-detection/cleanup behavior.
 
 -- REQ-PROJ-026/027: User marks conversation as merged
 rule MarkAsMerged {
@@ -846,45 +842,7 @@ rule DirectContinuationInheritsCwd {
 }
 
 -- ===========================================================
--- 6. COMMITS-BEHIND POLLING (REQ-PROJ-011, REQ-PROJ-023)
--- ===========================================================
-
--- REQ-PROJ-023: Remote-aware commits-behind polling
-rule CommitsBehindPoll {
-    when: PollerFires(conversation, interval: 60 seconds)
-
-    -- Skip for Branch mode: base_branch == branch_name, comparison is always 0.
-    requires: conversation.mode = work
-    requires: conversation.has_connected_clients
-
-    let worktree = Worktree{conversation: conversation}
-
-    -- Single-branch fetch before comparison (best-effort)
-    ensures: BestEffortFetch(worktree.project.repo, worktree.base_branch)
-
-    ensures: worktree.commits_behind =
-        commits_between(worktree.branch_name, worktree.base_branch)
-    ensures: worktree.commits_ahead =
-        commits_between(worktree.base_branch, worktree.branch_name)
-
-    -- Emit SSE only when values change. SSE is conversation-scoped
-    -- (frontend subscribers attach to a conversation) but the values
-    -- belong to the worktree.
-    ensures:
-        if values_changed:
-            SseEmit(conversation, worktree.commits_behind, worktree.commits_ahead)
-
-    @guidance
-        -- `git fetch origin <base_branch>` before rev-list comparison.
-        -- Single-branch fetch: sub-second, even on large repos.
-        -- Failure is non-fatal; comparison proceeds against local refs.
-        --
-        -- Poller exits when broadcast channel has no receivers
-        -- (client disconnected).
-}
-
--- ===========================================================
--- 7. WRITE SCOPING (REQ-PROJ-007)
+-- 6. WRITE SCOPING (REQ-PROJ-007)
 -- ===========================================================
 
 -- REQ-PROJ-007: Writes scoped to worktree

@@ -162,11 +162,10 @@ export type SseBreadcrumb = v.InferOutput<typeof SseBreadcrumbSchema>;
 /** `init`: full state snapshot at connect / reconnect.
  *
  *  `conversation`, `messages`, `breadcrumbs` are the structured fields the
- *  reducer reads. `commits_behind`/`commits_ahead`/`project_name` are
- *  top-level mirrors that `transformInitData` in useConnection.ts merges
- *  back into the conversation object — they live at the top level on the
- *  wire because the Rust `SseEvent::Init` struct carries them as flat
- *  fields.
+ *  reducer reads. `project_name` is a top-level mirror that
+ *  `transformInitData` in useConnection.ts merges back into the conversation
+ *  object — it lives at the top level on the wire because the Rust
+ *  `SseEvent::Init` struct carries it as a flat field.
  *
  *  `sequence_id` and `last_sequence_id` are the same number by construction
  *  (the snapshot's own place in the total order equals the highest-ever-
@@ -184,8 +183,6 @@ export const SseInitDataSchema = v.looseObject({
   presentation_mode: v.string(),
   context_window_size: v.number(),
   breadcrumbs: v.array(SseBreadcrumbSchema),
-  commits_behind: v.number(),
-  commits_ahead: v.number(),
   project_name: v.nullable(v.string()),
   // ReplayRing snapshot (Phase 2: server-side wiring). The reducer does
   // not yet consume these — see `specs/sse_wire/sse_wire.allium`

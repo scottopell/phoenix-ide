@@ -30,7 +30,7 @@ conversation: unknown,
  * valibot schema validates each element against `MessageSchema`
  * and transforms to `Message` at that boundary.
  */
-messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, breadcrumbs: Array<SseBreadcrumb>, commits_behind: number, commits_ahead: number, project_name: string | null, 
+messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, breadcrumbs: Array<SseBreadcrumb>, project_name: string | null, 
 /**
  * `ReplayRing` anchor: the seq of the last persisted Message at
  * subscribe time. Every entry in `pending_events` has
