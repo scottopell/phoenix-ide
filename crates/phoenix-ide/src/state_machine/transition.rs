@@ -2207,11 +2207,32 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 recovery_in_progress: false,
             }
         }
+        LlmOutcome::UsageLimitReached {
+            details: _,
+            message,
+        } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::UsageLimitReached,
+                attempt,
+                recovery_in_progress: false,
+            }
+        }
         LlmOutcome::ServerError { status, body } => {
             let attempt = current_attempt(state);
             Event::LlmError {
                 message: format!("Server error {status}: {body}"),
                 error_kind: ErrorKind::ServerError,
+                attempt,
+                recovery_in_progress: false,
+            }
+        }
+        LlmOutcome::ServerOverloaded { message } => {
+            let attempt = current_attempt(state);
+            Event::LlmError {
+                message,
+                error_kind: ErrorKind::ServerOverloaded,
                 attempt,
                 recovery_in_progress: false,
             }
@@ -2444,9 +2465,11 @@ pub fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> ErrorKind {
     match kind {
         crate::llm::LlmErrorKind::Auth => ErrorKind::Auth,
         crate::llm::LlmErrorKind::RateLimit => ErrorKind::RateLimit,
+        crate::llm::LlmErrorKind::UsageLimitReached => ErrorKind::UsageLimitReached,
         crate::llm::LlmErrorKind::Network => ErrorKind::Network,
         crate::llm::LlmErrorKind::InvalidRequest => ErrorKind::InvalidRequest,
         crate::llm::LlmErrorKind::ServerError => ErrorKind::ServerError,
+        crate::llm::LlmErrorKind::ServerOverloaded => ErrorKind::ServerOverloaded,
         crate::llm::LlmErrorKind::ContentFilter => ErrorKind::ContentFilter,
         crate::llm::LlmErrorKind::ContextWindowExceeded => ErrorKind::ContextExhausted,
     }

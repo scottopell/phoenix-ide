@@ -3232,9 +3232,11 @@ fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind
     match kind {
         crate::llm::LlmErrorKind::Auth => crate::db::ErrorKind::Auth,
         crate::llm::LlmErrorKind::RateLimit => crate::db::ErrorKind::RateLimit,
+        crate::llm::LlmErrorKind::UsageLimitReached => crate::db::ErrorKind::UsageLimitReached,
         crate::llm::LlmErrorKind::Network => crate::db::ErrorKind::Network,
         crate::llm::LlmErrorKind::InvalidRequest => crate::db::ErrorKind::InvalidRequest,
         crate::llm::LlmErrorKind::ServerError => crate::db::ErrorKind::ServerError,
+        crate::llm::LlmErrorKind::ServerOverloaded => crate::db::ErrorKind::ServerOverloaded,
         crate::llm::LlmErrorKind::ContentFilter => crate::db::ErrorKind::ContentFilter,
         crate::llm::LlmErrorKind::ContextWindowExceeded => crate::db::ErrorKind::ContextExhausted,
     }
@@ -3246,9 +3248,34 @@ fn llm_error_to_outcome(error: crate::llm::LlmError) -> LlmOutcome {
     use crate::llm::LlmErrorKind;
     match error.kind {
         LlmErrorKind::RateLimit => LlmOutcome::RateLimited { retry_after: None },
+        LlmErrorKind::UsageLimitReached => {
+            // The codex parser always attaches a QuotaDetails to UsageLimitReached
+            // errors; fall back to an empty payload only as a defensive measure
+            // in case a future caller forgets to populate it.
+            let details = error.quota.map_or(
+                crate::llm::QuotaDetails {
+                    plan_type: None,
+                    resets_at: None,
+                    limit_id: None,
+                    limit_name: None,
+                    primary: None,
+                    secondary: None,
+                    credits: None,
+                    promo_message: None,
+                },
+                |boxed| *boxed,
+            );
+            LlmOutcome::UsageLimitReached {
+                details,
+                message: error.message,
+            }
+        }
         LlmErrorKind::ServerError => LlmOutcome::ServerError {
             status: 500,
             body: error.message,
+        },
+        LlmErrorKind::ServerOverloaded => LlmOutcome::ServerOverloaded {
+            message: error.message,
         },
         LlmErrorKind::Network => LlmOutcome::NetworkError {
             message: error.message,
@@ -3300,6 +3327,28 @@ mod error_mapping_tests {
         assert_eq!(
             llm_error_to_db_error(LlmErrorKind::ContextWindowExceeded),
             crate::db::ErrorKind::ContextExhausted
+        );
+        assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::UsageLimitReached),
+            crate::db::ErrorKind::UsageLimitReached
+        );
+        assert_eq!(
+            llm_error_to_db_error(LlmErrorKind::ServerOverloaded),
+            crate::db::ErrorKind::ServerOverloaded
+        );
+    }
+
+    #[test]
+    fn test_usage_limit_reached_is_terminal_after_mapping() {
+        let db_kind = llm_error_to_db_error(LlmErrorKind::UsageLimitReached);
+        assert!(
+            !db_kind.is_retryable(),
+            "UsageLimitReached must NOT be retryable after mapping"
+        );
+        let db_kind = llm_error_to_db_error(LlmErrorKind::ServerOverloaded);
+        assert!(
+            !db_kind.is_retryable(),
+            "ServerOverloaded must NOT be retryable after mapping"
         );
     }
 

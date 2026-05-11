@@ -8,7 +8,7 @@
 //! `EffectOutcome` before passing to `handle_outcome()`.
 
 use crate::db::ToolResult;
-use crate::llm::{ContentBlock, Usage};
+use crate::llm::{ContentBlock, QuotaDetails, Usage};
 use crate::state_machine::state::{SubAgentOutcome, ToolCall};
 use std::time::Duration;
 
@@ -26,13 +26,24 @@ pub enum LlmOutcome {
         end_turn: bool,
         usage: Usage,
     },
-    /// Rate limited (429) — retryable
+    /// Transient rate-limit throttle (429) — retryable
     RateLimited {
         #[allow(dead_code)] // Populated when provider sends Retry-After header
         retry_after: Option<Duration>,
     },
+    /// Quota window exhausted (codex backend 429 with `usage_limit_reached`) — terminal.
+    /// `details` carries plan + reset + windows; `message` is the pre-rendered
+    /// plan-aware string ready for display.
+    UsageLimitReached {
+        #[allow(dead_code)] // Persisted to message JSON in a follow-up task
+        details: QuotaDetails,
+        message: String,
+    },
     /// Server error (5xx) — retryable
     ServerError { status: u16, body: String },
+    /// Selected model is at capacity (`server_is_overloaded` / `slow_down`) — terminal,
+    /// suggest a different model.
+    ServerOverloaded { message: String },
     /// Network/connection error — retryable
     NetworkError { message: String },
     /// Token budget exceeded

@@ -470,14 +470,18 @@ impl Conversation {
 pub enum ErrorKind {
     /// Authentication failed (401, 403) - not retryable
     Auth,
-    /// Rate limited (429) - retryable with backoff
+    /// Transient rate-limit throttle (429) - retryable with backoff
     RateLimit,
+    /// Quota window exhausted (plan-level cap, depleted credits, etc.) - not retryable
+    UsageLimitReached,
     /// Network issues, connection failures - retryable
     Network,
     /// Bad request (400) - not retryable
     InvalidRequest,
     /// Server error (5xx) - retryable
     ServerError,
+    /// Selected model is at capacity (`server_is_overloaded` / `slow_down`) - not retryable
+    ServerOverloaded,
     /// Request timed out - retryable
     TimedOut,
     /// Operation was cancelled - not retryable
@@ -496,6 +500,8 @@ impl ErrorKind {
         match self {
             Self::Network | Self::RateLimit | Self::ServerError | Self::TimedOut => true,
             Self::Auth
+            | Self::UsageLimitReached
+            | Self::ServerOverloaded
             | Self::InvalidRequest
             | Self::Cancelled
             | Self::SubAgentError
