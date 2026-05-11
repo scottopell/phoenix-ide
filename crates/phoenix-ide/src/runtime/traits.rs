@@ -72,6 +72,17 @@ pub trait MessageStore: Send + Sync {
         message_id: &str,
         content: &str,
     ) -> Result<(), String>;
+
+    /// Override an existing message's `created_at`. Used by `persist_checkpoint`
+    /// to align the durable DB row's timestamp with the one already broadcast
+    /// to clients via `Effect::BroadcastAssistantMessage`, so a reconnect's
+    /// init payload doesn't surface a shifted timestamp on the same
+    /// `message_id` the UI is already showing.
+    async fn update_message_created_at(
+        &self,
+        message_id: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String>;
 }
 
 /// Storage for conversation state
@@ -224,6 +235,16 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     ) -> Result<(), String> {
         (**self)
             .update_tool_message_content(message_id, content)
+            .await
+    }
+
+    async fn update_message_created_at(
+        &self,
+        message_id: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .update_message_created_at(message_id, created_at)
             .await
     }
 }
@@ -401,6 +422,17 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .update_tool_message_content(message_id, content)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn update_message_created_at(
+        &self,
+        message_id: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        self.db
+            .update_message_created_at(message_id, created_at)
             .await
             .map_err(|e| e.to_string())
     }

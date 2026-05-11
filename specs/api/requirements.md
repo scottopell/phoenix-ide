@@ -215,10 +215,15 @@ AND no-op all subsequent appends until the next anchor reset
 WHICH is surfaced in init snapshots as `pending_events: []` and `pending_truncated: true`
 SO THAT clients reconnecting in this window perform a clean DB-only resync rather than rendering a partial in-flight view that could mislead the user
 
-WHEN the ring's aggregate serialised byte size grows
-THE SYSTEM SHALL emit a debug-level tracing counter and gauge metric per conversation
-WHERE bytes are observability-only (the cap is enforced by entry count, not bytes)
-SO THAT pathological large-event-dominated rings can be detected before they become a memory issue
+WHEN the ring transitions to truncated (overflow detected on append)
+THE SYSTEM SHALL emit a warn-level tracing event including the aggregate serialised byte size of the entries discarded at that transition
+SO THAT operators get a useful "what was in the ring when it overflowed?" data point without paying a per-event serialisation cost on the hot path
+
+WHEN an operator queries the per-conversation aggregate serialised byte size
+THE SYSTEM SHALL compute it on demand by iterating the ring entries
+WHERE the metric is observability-only (the cap is enforced by entry count, not bytes)
+AND the accessor (`replay_ring_bytes()`) is intended for periodic scraping (gauge collector / dashboard), NOT per-event tracking
+SO THAT pathological large-event-dominated rings can be detected before they become a memory issue, without making token streaming pay a `serde_json::to_vec` on every append
 
 WHEN a client subscribes to a conversation's SSE stream
 THE SYSTEM SHALL include in the init payload:

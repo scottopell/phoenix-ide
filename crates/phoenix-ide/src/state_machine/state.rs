@@ -330,12 +330,35 @@ impl ToolCall {
 /// An LLM assistant message held in state until persistence.
 /// Bundles content, display metadata, usage stats, and message ID so they
 /// cannot be partially threaded or forgotten.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+///
+/// `created_at` is captured once at construction and threaded through BOTH
+/// the eager SSE broadcast (`Effect::BroadcastAssistantMessage`) and the
+/// eventual DB persist at `persist_checkpoint`. Keeping them in lockstep
+/// prevents a user-visible timestamp jump: without this, the eager copy
+/// carries one `Utc::now()` and the persisted DB row carries a later one,
+/// so reconnecting clients would see the message timestamp shift when init
+/// merges the DB row in. `#[serde(default = "chrono::Utc::now")]` lets old
+/// `ConvState` JSON rows without the field deserialise cleanly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AssistantMessage {
     pub message_id: String,
     pub content: Vec<ContentBlock>,
     pub usage: Option<UsageData>,
     pub display_data: Option<Value>,
+    #[serde(default = "chrono::Utc::now")]
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl Default for AssistantMessage {
+    fn default() -> Self {
+        Self {
+            message_id: String::new(),
+            content: Vec::new(),
+            usage: None,
+            display_data: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
 }
 
 impl AssistantMessage {
@@ -349,6 +372,7 @@ impl AssistantMessage {
             content,
             usage,
             display_data,
+            created_at: chrono::Utc::now(),
         }
     }
 

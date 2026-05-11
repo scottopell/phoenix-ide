@@ -282,15 +282,18 @@ rule SseStreamOpenedByServer {
         -- sibling rules below (SseStreamOpenedFromConnecting,
         -- SseStreamOpenedFromReconnect) if the parser insists.
         --
-        -- The init payload now carries the server's ReplayRing
-        -- contents in `pending_events` (see sse_wire.allium's
-        -- ReplayRing entity and conversation_atom.allium's
-        -- SseInitFreshConnect / SseInitReconnectMerge). The connection
-        -- machine itself is unaffected by this — pending events flow
-        -- through the conversation atom dispatcher after SSE_OPEN
-        -- lands. Connection-state coupling (live, reconnected_display)
-        -- depends only on the EventSource being open, not on whether
-        -- the init carried pending events.
+        -- Once the SSE ReplayRing rollout completes (Phase 2 wires the
+        -- ring into the init payload; see tasks/62001 and
+        -- specs/sse_wire/sse_wire.allium's ReplayRing entity), the init
+        -- payload will carry the server's pending_events field for
+        -- mid-turn replay. The connection machine itself is unaffected by
+        -- that wire change — pending events flow through the conversation
+        -- atom dispatcher after SSE_OPEN lands (see
+        -- conversation_atom.allium's SseInitFreshConnect /
+        -- SseInitReconnectMerge for the replay path). Connection-state
+        -- coupling (live, reconnected_display) depends only on the
+        -- EventSource being open, not on whether the init carries
+        -- pending events.
 }
 
 rule SseStreamOpenedFromConnecting {

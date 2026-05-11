@@ -1413,6 +1413,24 @@ impl Database {
         })
     }
 
+    /// Override an existing message's `created_at`. Used by the
+    /// `persist_checkpoint` path to align the durable DB row's timestamp
+    /// with the one already broadcast for that `message_id` via
+    /// `Effect::BroadcastAssistantMessage`, so a reconnect's init payload
+    /// doesn't surface a shifted timestamp on the same message.
+    pub async fn update_message_created_at(
+        &self,
+        message_id: &str,
+        created_at: DateTime<Utc>,
+    ) -> DbResult<()> {
+        sqlx::query("UPDATE messages SET created_at = ?1 WHERE message_id = ?2")
+            .bind(created_at.to_rfc3339())
+            .bind(message_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     /// Get messages for a conversation
     pub async fn get_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
         let rows = sqlx::query(

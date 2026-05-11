@@ -1205,6 +1205,14 @@ where
                 // when the checkpoint completes, resetting the ring anchor
                 // and discarding this entry; the client dedups by
                 // `message_id` via `SseMessageDedupReplay`.
+                //
+                // `created_at` comes from `AssistantMessage` (captured at
+                // LLM-response time) — NOT a fresh `Utc::now()`. The same
+                // timestamp is later written to the DB row by
+                // `persist_checkpoint`, so a reconnecting client's init
+                // payload reads back the same timestamp the UI is already
+                // displaying. Without that alignment, the displayed
+                // timestamp would jump when init merges the DB row in.
                 let seq = self.broadcast_tx.next_seq();
                 let agent_content = MessageContent::agent(message.content);
                 let db_msg = crate::db::Message {
@@ -1215,7 +1223,7 @@ where
                     content: agent_content,
                     display_data: message.display_data,
                     usage_data: message.usage,
-                    created_at: chrono::Utc::now(),
+                    created_at: message.created_at,
                 };
                 let _ = self.broadcast_tx.send_ephemeral_message(db_msg);
                 Ok(None)
@@ -1755,10 +1763,20 @@ where
                 assistant_message,
                 tool_results,
             } => {
-                // Persist assistant message
+                // Persist assistant message.
+                //
+                // The eager broadcast at `Effect::BroadcastAssistantMessage`
+                // already used `assistant_message.created_at`. Align the
+                // durable DB row to the same timestamp so a reconnect's
+                // init payload doesn't surface a shifted timestamp on the
+                // message_id the UI is already displaying. The in-memory
+                // `agent_msg.created_at` is also overridden so the
+                // (deduped-by-UI) persisted broadcast still carries the
+                // stable timestamp for consistency on the wire.
+                let assistant_created_at = assistant_message.created_at;
                 let agent_content = MessageContent::agent(assistant_message.content);
                 let agent_seq = self.broadcast_tx.next_seq();
-                let agent_msg = self
+                let mut agent_msg = self
                     .storage
                     .add_message_with_seq(
                         &assistant_message.message_id,
@@ -1769,6 +1787,10 @@ where
                         assistant_message.usage.as_ref(),
                     )
                     .await?;
+                self.storage
+                    .update_message_created_at(&agent_msg.message_id, assistant_created_at)
+                    .await?;
+                agent_msg.created_at = assistant_created_at;
                 let _ = self.broadcast_tx.send_message(agent_msg);
 
                 // Persist all tool results

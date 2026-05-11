@@ -482,6 +482,23 @@ impl MessageStore for InMemoryStorage {
         }
         Err(format!("Message not found: {message_id}"))
     }
+
+    async fn update_message_created_at(
+        &self,
+        message_id: &str,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        let mut messages = self.messages.lock().unwrap();
+        for msgs in messages.values_mut() {
+            for msg in msgs.iter_mut() {
+                if msg.message_id == message_id {
+                    msg.created_at = created_at;
+                    return Ok(());
+                }
+            }
+        }
+        Err(format!("Message not found: {message_id}"))
+    }
 }
 
 #[async_trait]
