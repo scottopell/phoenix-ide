@@ -425,19 +425,23 @@ pub fn transition_core(
         }
 
         // Steering queue drain (REQ-SM-*): persist all entries, then ask LLM.
-        // ClearSteeringQueue runs AFTER persist+state so a crash mid-drain
-        // leaves the queue intact for re-drain on restart.
+        // ClearSteeringQueueEntries runs AFTER persist+state so a crash mid-
+        // drain leaves the queue intact for re-drain on restart, and removes
+        // only the drained ids so a concurrent enqueue is preserved.
         (CoreState::Idle, CoreEvent::SteerDrainedUserMessages { entries }) => {
             if entries.is_empty() {
                 return Ok(CoreTransitionResult::new(CoreState::Idle));
             }
+            let drained_ids: Vec<String> = entries.iter().map(|e| e.message_id.clone()).collect();
             let mut result = CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 });
             for entry in entries {
                 result = result.with_effect(steer_entry_to_persist_effect(entry));
             }
             Ok(result
                 .with_effect(Effect::PersistState)
-                .with_effect(Effect::ClearSteeringQueue)
+                .with_effect(Effect::ClearSteeringQueueEntries {
+                    message_ids: drained_ids,
+                })
                 .with_effect(notify_llm_requesting(1))
                 .with_effect(Effect::RequestLlm))
         }
@@ -451,13 +455,16 @@ pub fn transition_core(
                     attempt,
                 }));
             }
+            let drained_ids: Vec<String> = entries.iter().map(|e| e.message_id.clone()).collect();
             let mut result = CoreTransitionResult::new(CoreState::LlmRequesting { attempt });
             for entry in entries {
                 result = result.with_effect(steer_entry_to_persist_effect(entry));
             }
-            Ok(result
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::ClearSteeringQueue))
+            Ok(result.with_effect(Effect::PersistState).with_effect(
+                Effect::ClearSteeringQueueEntries {
+                    message_ids: drained_ids,
+                },
+            ))
         }
 
         // Invalid Transitions
@@ -3426,8 +3433,8 @@ mod tests {
         let clear_idx = result
             .effects
             .iter()
-            .position(|e| matches!(e, Effect::ClearSteeringQueue))
-            .expect("ClearSteeringQueue must be present");
+            .position(|e| matches!(e, Effect::ClearSteeringQueueEntries { .. }))
+            .expect("ClearSteeringQueueEntries must be present");
         assert!(
             last_persist_msg_idx < persist_state_idx
                 && persist_state_idx < clear_idx,
@@ -3501,8 +3508,8 @@ mod tests {
         let clear_idx = result
             .effects
             .iter()
-            .position(|e| matches!(e, Effect::ClearSteeringQueue))
-            .expect("ClearSteeringQueue must be present");
+            .position(|e| matches!(e, Effect::ClearSteeringQueueEntries { .. }))
+            .expect("ClearSteeringQueueEntries must be present");
         assert!(
             last_persist_msg_idx < persist_state_idx
                 && persist_state_idx < clear_idx,

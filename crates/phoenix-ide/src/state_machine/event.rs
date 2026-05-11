@@ -169,8 +169,9 @@ pub enum Event {
     },
 
     /// Drained steering entries delivered to bedrock for persistence as
-    /// `UserMessage`s. Fired by the executor at mid-turn hook points
-    /// (entering `Idle`, or entering `LlmRequesting` from a tool round).
+    /// `UserMessage`s. Fired by the executor at steering-drain hook points:
+    /// turn-end (entering `Idle`) or mid-turn (entering `LlmRequesting` from
+    /// a tool round). Parent conversations only.
     SteerDrainedUserMessages {
         entries: Vec<SteerEntry>,
     },

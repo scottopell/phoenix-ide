@@ -574,6 +574,23 @@ impl StateStore for InMemoryStorage {
             .insert(conv_id.to_string(), queue.to_vec());
         Ok(())
     }
+
+    async fn remove_steering_entries(
+        &self,
+        conv_id: &str,
+        message_ids: &[String],
+    ) -> Result<(), String> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let mut guard = self.steering_queues.lock().unwrap();
+        if let Some(queue) = guard.get_mut(conv_id) {
+            let to_remove: std::collections::HashSet<&str> =
+                message_ids.iter().map(String::as_str).collect();
+            queue.retain(|e| !to_remove.contains(e.message_id.as_str()));
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================

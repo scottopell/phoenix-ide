@@ -166,11 +166,14 @@ pub enum Effect {
         repo_root: String,
     },
 
-    /// Persist an empty steering queue. Emitted by `SteerDrainedUserMessages`
-    /// transition arms AFTER all `PersistMessage` + `PersistState` effects so
-    /// that a crash before this effect runs leaves the queue intact for
-    /// re-drain on restart (idempotent persist guards against double-delivery).
-    ClearSteeringQueue,
+    /// Remove the specified drained entries from the persisted steering queue.
+    /// Emitted by `SteerDrainedUserMessages` transition arms AFTER all
+    /// `PersistMessage` + `PersistState` effects so that a crash before this
+    /// effect runs leaves the queue intact for re-drain on restart (idempotent
+    /// persist guards against double-delivery). Removing only the drained ids
+    /// (rather than overwriting with empty) preserves concurrently-enqueued
+    /// steers that arrived during the drain window.
+    ClearSteeringQueueEntries { message_ids: Vec<String> },
 }
 
 impl Effect {

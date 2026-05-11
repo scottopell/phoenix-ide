@@ -594,6 +594,41 @@ impl Database {
         Ok(())
     }
 
+    /// Remove the specified `message_ids` from `conversations.steering_queue`.
+    /// Read-filter-write inside a transaction so a concurrent
+    /// `enqueue_steer_message` cannot lose a steer that arrived during the
+    /// drain window.
+    pub async fn remove_steering_entries(&self, id: &str, message_ids: &[String]) -> DbResult<()> {
+        if message_ids.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let mut tx = self.pool.begin().await?;
+        let row = sqlx::query("SELECT steering_queue FROM conversations WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let Some(row) = row else {
+            return Err(DbError::ConversationNotFound(id.to_string()));
+        };
+        let queue_str: Option<String> = row.try_get("steering_queue")?;
+        let queue_str = queue_str.unwrap_or_else(|| "[]".to_string());
+        let mut queue: Vec<crate::state_machine::event::SteerEntry> =
+            serde_json::from_str(&queue_str).unwrap_or_default();
+        let to_remove: std::collections::HashSet<&str> =
+            message_ids.iter().map(String::as_str).collect();
+        queue.retain(|entry| !to_remove.contains(entry.message_id.as_str()));
+        let new_json = serde_json::to_string(&queue).unwrap_or_else(|_| "[]".to_string());
+        sqlx::query("UPDATE conversations SET steering_queue = ?1, updated_at = ?2 WHERE id = ?3")
+            .bind(&new_json)
+            .bind(now.to_rfc3339())
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Update conversation mode (e.g., Explore -> Work on task approval)
     pub async fn update_conversation_mode(&self, id: &str, mode: &ConvMode) -> DbResult<()> {
         let now = Utc::now();

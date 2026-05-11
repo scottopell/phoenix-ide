@@ -705,27 +705,76 @@ where
             self.sub_agent_deadline = None;
         }
 
-        // Mid-turn drain hook: steers drained when entering LlmRequesting from a
-        // tool round land in the NEXT LLM call, not the one already dispatched.
-        if let Some(event) = self.maybe_drain_steering_queue(&old_state) {
-            generated_events.push(event);
-        }
-
-        // Execute effects and collect generated events
-        for effect in result.effects {
-            if let Some(gen_event) = self.execute_effect(effect).await? {
-                generated_events.push(gen_event);
+        // Steering-queue drain: process synchronously so persist effects land
+        // BEFORE any RequestLlm in the current effect list. This eliminates a
+        // race where a mid-turn drain would persist steers concurrently with
+        // (or after) the LLM task reading the DB; if the in-flight LLM then
+        // returned a no-tool response, the conversation would settle to Idle
+        // with the steers persisted but unanswered.
+        if let Some(drain_event) = self.maybe_drain_steering_queue(&old_state) {
+            self.run_effects_with_inline_drain(result.effects, drain_event, &mut generated_events)
+                .await?;
+        } else {
+            for effect in result.effects {
+                if let Some(gen_event) = self.execute_effect(effect).await? {
+                    generated_events.push(gen_event);
+                }
             }
         }
 
         Ok(generated_events)
     }
 
+    /// Defer any `RequestLlm` in `original_effects`, run the rest, then process
+    /// the drain event's persist effects inline, then run the deferred
+    /// `RequestLlm`. Guarantees the spawned LLM task reads a DB that already
+    /// contains the steered messages.
+    async fn run_effects_with_inline_drain(
+        &mut self,
+        original_effects: Vec<Effect>,
+        drain_event: Event,
+        generated_events: &mut Vec<Event>,
+    ) -> Result<(), String> {
+        let mut deferred_request_llm: Option<Effect> = None;
+        for effect in original_effects {
+            if matches!(effect, Effect::RequestLlm) {
+                deferred_request_llm = Some(effect);
+                continue;
+            }
+            if let Some(gen_event) = self.execute_effect(effect).await? {
+                generated_events.push(gen_event);
+            }
+        }
+
+        let Event::SteerDrainedUserMessages { entries } = drain_event else {
+            unreachable!("maybe_drain_steering_queue returns only SteerDrainedUserMessages")
+        };
+        let drain_result = transition(
+            &self.state,
+            &self.context,
+            Event::SteerDrainedUserMessages { entries },
+        )
+        .map_err(|e| format!("steering drain transition failed: {e:?}"))?;
+        self.state = drain_result.new_state;
+        for effect in drain_result.effects {
+            if let Some(gen_event) = self.execute_effect(effect).await? {
+                generated_events.push(gen_event);
+            }
+        }
+
+        if let Some(effect) = deferred_request_llm {
+            if let Some(gen_event) = self.execute_effect(effect).await? {
+                generated_events.push(gen_event);
+            }
+        }
+        Ok(())
+    }
+
     /// If the current state transition is a steering-queue drain hook point and
     /// the queue is non-empty, drain all entries into a single
     /// `SteerDrainedUserMessages` event. The DB queue is NOT touched here; it
-    /// is cleared later by `Effect::ClearSteeringQueue` once the emitted event
-    /// is processed and all `PersistMessage` effects succeed.
+    /// is updated later by `Effect::ClearSteeringQueueEntries` once the emitted
+    /// event is processed and all `PersistMessage` effects succeed.
     ///
     /// Sub-agents do not have steering queues; this returns `None` for them.
     ///
@@ -761,9 +810,9 @@ where
             mid_turn = entering_llm_requesting_from_tool_round,
             "Draining all queued steering messages"
         );
-        // DB queue is cleared by `Effect::ClearSteeringQueue` AFTER persist
-        // effects run, so a crash mid-drain leaves the queue intact for
-        // idempotent re-drain on restart.
+        // DB queue is updated by `Effect::ClearSteeringQueueEntries` AFTER
+        // persist effects run, so a crash mid-drain leaves the queue intact
+        // for idempotent re-drain on restart.
         Some(Event::SteerDrainedUserMessages { entries })
     }
 
@@ -1142,8 +1191,9 @@ where
             } => {
                 // Idempotent path: skip if already persisted. Prevents double-
                 // insert (and seq gap) when a SteerDrainedUserMessages re-fires
-                // after crash recovery before ClearSteeringQueue ran. Gated to
-                // idempotent=true so non-replayable persists pay no extra query.
+                // after crash recovery before ClearSteeringQueueEntries ran.
+                // Gated to idempotent=true so non-replayable persists pay no
+                // extra query.
                 if idempotent && self.storage.message_exists(&message_id).await? {
                     tracing::debug!(
                         message_id = %message_id,
@@ -1350,13 +1400,13 @@ where
                 Ok(None)
             }
 
-            Effect::ClearSteeringQueue => {
+            Effect::ClearSteeringQueueEntries { message_ids } => {
                 if let Err(e) = self
                     .storage
-                    .update_steering_queue(&self.context.conversation_id, &[])
+                    .remove_steering_entries(&self.context.conversation_id, &message_ids)
                     .await
                 {
-                    tracing::warn!(error = %e, "Failed to clear steering queue");
+                    tracing::warn!(error = %e, "Failed to remove drained steering entries");
                 }
                 Ok(None)
             }
@@ -3770,8 +3820,11 @@ mod steer_drain_detector_tests {
     /// Drain-all on entering `Idle`: from `LlmRequesting` → `Idle` with 3 queued
     /// entries, the executor must emit one `SteerDrainedUserMessages` carrying
     /// all 3 entries and clear in-memory `self.steering_queue`. DB queue clear
-    /// is the `Effect::ClearSteeringQueue` arm's job, covered by
-    /// `clear_steering_queue_effect_empties_storage`.
+    /// is the `Effect::ClearSteeringQueueEntries` arm's job, covered by
+    /// `clear_steering_queue_entries_preserves_concurrent_enqueue`.
+    /// Drain-all on entering Idle is processed INLINE: persists land before
+    /// `apply_transition_result` returns. Assertion is via storage rather than
+    /// generated_events because the drain event no longer surfaces externally.
     #[tokio::test]
     async fn drain_all_on_entering_idle() {
         let queue = vec![
@@ -3779,77 +3832,106 @@ mod steer_drain_detector_tests {
             mk_entry("s2", "second"),
             mk_entry("s3", "third"),
         ];
-        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-drain-idle",
             ConvState::LlmRequesting { attempt: 1 },
             queue,
         );
 
-        // Synthetic transition: LlmRequesting → Idle (no effects).
         let result = TransitionResult::new(ConvState::Idle);
-        let generated = rt
-            .apply_transition_result(result)
+        rt.apply_transition_result(result)
             .await
             .expect("apply_transition_result must succeed");
 
-        let drained = extract_steer_drain_entries(&generated);
-        assert_eq!(
-            drained.len(),
-            1,
-            "exactly one drain event must be emitted, got {generated:?}"
-        );
-        let entries = &drained[0];
-        assert_eq!(entries.len(), 3, "all 3 entries must be drained at once");
-        assert_eq!(entries[0].message_id, "s1");
-        assert_eq!(entries[1].message_id, "s2");
-        assert_eq!(entries[2].message_id, "s3");
+        // Persists ran inline → messages now in storage in FIFO order.
+        let msgs = storage.get_all_messages("conv-drain-idle");
+        let persisted_ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(persisted_ids, vec!["s1", "s2", "s3"]);
 
         assert!(
             rt.steering_queue.is_empty(),
             "in-memory queue must be empty"
         );
+        // Drain transition lands in LlmRequesting (Idle → LlmRequesting via the
+        // SteerDrainedUserMessages arm).
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
     }
 
-    /// Mid-turn drain from `ToolExecuting` → `LlmRequesting`: all queued entries
-    /// are emitted in a single `SteerDrainedUserMessages` event; in-memory queue
-    /// cleared. DB queue clear is covered by `clear_steering_queue_effect_empties_storage`.
+    /// Mid-turn drain from `ToolExecuting` → `LlmRequesting`: persists run
+    /// inline before the (deferred) RequestLlm, so the spawned LLM task reads
+    /// a DB that already has the steered messages.
     #[tokio::test]
     async fn drain_all_mid_turn_from_tool_executing() {
         let queue = vec![mk_entry("s1", "one"), mk_entry("s2", "two")];
-        let (mut rt, _storage) =
+        let (mut rt, storage) =
             build_runtime_with_state_and_queue("conv-drain-tool", mk_tool_executing(), queue);
 
         let result = TransitionResult::new(ConvState::LlmRequesting { attempt: 1 });
-        let generated = rt
-            .apply_transition_result(result)
+        rt.apply_transition_result(result)
             .await
             .expect("apply_transition_result must succeed");
 
-        let drained = extract_steer_drain_entries(&generated);
-        assert_eq!(drained.len(), 1, "exactly one drain event");
-        assert_eq!(drained[0].len(), 2);
-        assert_eq!(drained[0][0].message_id, "s1");
-        assert_eq!(drained[0][1].message_id, "s2");
+        let msgs = storage.get_all_messages("conv-drain-tool");
+        let persisted_ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(persisted_ids, vec!["s1", "s2"]);
         assert!(rt.steering_queue.is_empty());
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    /// Mid-turn drain with RequestLlm in the original effects list: the
+    /// executor must defer RequestLlm so persists land before the LLM task
+    /// reads the DB. This is a smoke test that the deferred-RequestLlm path
+    /// runs without panic, persists land, and final state is LlmRequesting.
+    /// Stronger ordering is enforced by `apply_transition_result`'s sequential
+    /// awaits (persists before deferred RequestLlm spawn).
+    #[tokio::test]
+    async fn mid_turn_drain_defers_request_llm_until_after_persists() {
+        let queue = vec![mk_entry("s1", "first"), mk_entry("s2", "second")];
+        let (mut rt, storage) =
+            build_runtime_with_state_and_queue("conv-defer-req", mk_tool_executing(), queue);
+
+        // Queue an LLM response so dispatch_llm_request can complete cleanly.
+        // We don't assert on the response — just that the pipeline doesn't panic
+        // and the persists landed before RequestLlm was dispatched.
+        rt.llm_client.queue_response(crate::llm::LlmResponse {
+            content: vec![],
+            end_turn: true,
+            usage: crate::llm::Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                cache_creation_tokens: 0,
+                cache_read_tokens: 0,
+            },
+        });
+
+        let result = TransitionResult::new(ConvState::LlmRequesting { attempt: 1 })
+            .with_effect(Effect::RequestLlm);
+        rt.apply_transition_result(result)
+            .await
+            .expect("apply_transition_result with deferred RequestLlm must succeed");
+
+        // Persists landed before the LLM task spawn (sequential await ordering).
+        let msgs = storage.get_all_messages("conv-defer-req");
+        let persisted_ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+        assert_eq!(persisted_ids, vec!["s1", "s2"]);
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
     }
 
     /// Mid-turn drain from `AwaitingSubAgents` → `LlmRequesting`.
     #[tokio::test]
     async fn drain_all_mid_turn_from_awaiting_subagents() {
         let queue = vec![mk_entry("s1", "alpha")];
-        let (mut rt, _storage) =
+        let (mut rt, storage) =
             build_runtime_with_state_and_queue("conv-drain-sub", mk_awaiting_sub_agents(), queue);
 
         let result = TransitionResult::new(ConvState::LlmRequesting { attempt: 1 });
-        let generated = rt
-            .apply_transition_result(result)
+        rt.apply_transition_result(result)
             .await
             .expect("apply_transition_result must succeed");
 
-        let drained = extract_steer_drain_entries(&generated);
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].len(), 1);
-        assert_eq!(drained[0][0].message_id, "s1");
+        let msgs = storage.get_all_messages("conv-drain-sub");
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].message_id, "s1");
         assert!(rt.steering_queue.is_empty());
     }
 
@@ -3927,31 +4009,41 @@ mod steer_drain_detector_tests {
         let _ = storage; // touch to silence unused warning
     }
 
-    /// `Effect::ClearSteeringQueue` writes an empty queue to storage.
-    /// Pre-seed storage with entries, run the effect, assert storage is empty.
+    /// `Effect::ClearSteeringQueueEntries` removes ONLY the matching message_ids
+    /// from storage; concurrently-enqueued entries are preserved. Models the
+    /// enqueue-during-drain race.
     #[tokio::test]
-    async fn clear_steering_queue_effect_empties_storage() {
+    async fn clear_steering_queue_entries_preserves_concurrent_enqueue() {
         use crate::runtime::traits::StateStore;
         let (mut rt, storage) = build_runtime_with_state_and_queue(
             "conv-clear-effect",
             ConvState::LlmRequesting { attempt: 1 },
             vec![],
         );
-        // Pre-seed storage with non-empty queue (simulates pre-drain state).
+        // Pre-seed storage as if drain took [p1, p2] from in-memory, then a
+        // concurrent enqueue persisted [p1, p2, c1] (c1 added by enqueue).
         storage
-            .update_steering_queue("conv-clear-effect", &[mk_entry("p1", "pending")])
+            .update_steering_queue(
+                "conv-clear-effect",
+                &[
+                    mk_entry("p1", "pending-1"),
+                    mk_entry("p2", "pending-2"),
+                    mk_entry("c1", "concurrent"),
+                ],
+            )
             .await
             .expect("seed steering queue");
-        assert_eq!(storage.get_steering_queue("conv-clear-effect").len(), 1);
 
-        rt.execute_effect(Effect::ClearSteeringQueue)
-            .await
-            .expect("ClearSteeringQueue effect must succeed");
+        // Drain only removes p1 and p2.
+        rt.execute_effect(Effect::ClearSteeringQueueEntries {
+            message_ids: vec!["p1".to_string(), "p2".to_string()],
+        })
+        .await
+        .expect("ClearSteeringQueueEntries effect must succeed");
 
-        assert!(
-            storage.get_steering_queue("conv-clear-effect").is_empty(),
-            "storage queue must be empty after ClearSteeringQueue effect"
-        );
+        let remaining = storage.get_steering_queue("conv-clear-effect");
+        assert_eq!(remaining.len(), 1, "concurrent enqueue must survive drain");
+        assert_eq!(remaining[0].message_id, "c1");
     }
 
     /// `PersistMessage` is idempotent on duplicate `message_id`. Models the

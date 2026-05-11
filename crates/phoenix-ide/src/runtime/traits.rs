@@ -117,6 +117,16 @@ pub trait StateStore: Send + Sync {
         conv_id: &str,
         queue: &[crate::state_machine::event::SteerEntry],
     ) -> Result<(), String>;
+
+    /// Remove specific drained entries from the persisted steering queue,
+    /// preserving any concurrently-enqueued entries. Implementations must be
+    /// atomic re: `enqueue_steer_message`'s read-modify-write to avoid losing
+    /// a steer queued during the drain window.
+    async fn remove_steering_entries(
+        &self,
+        conv_id: &str,
+        message_ids: &[String],
+    ) -> Result<(), String>;
 }
 
 /// Client for making LLM requests
@@ -277,6 +287,14 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         queue: &[crate::state_machine::event::SteerEntry],
     ) -> Result<(), String> {
         (**self).update_steering_queue(conv_id, queue).await
+    }
+
+    async fn remove_steering_entries(
+        &self,
+        conv_id: &str,
+        message_ids: &[String],
+    ) -> Result<(), String> {
+        (**self).remove_steering_entries(conv_id, message_ids).await
     }
 }
 
@@ -483,6 +501,17 @@ impl StateStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .update_steering_queue(conv_id, queue)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn remove_steering_entries(
+        &self,
+        conv_id: &str,
+        message_ids: &[String],
+    ) -> Result<(), String> {
+        self.db
+            .remove_steering_entries(conv_id, message_ids)
             .await
             .map_err(|e| e.to_string())
     }
