@@ -44,9 +44,24 @@ const MAX_INPUT_SIZE: usize = 60 * 1024; // 60KB limit
 /// REQ-BASH-010: Stateless - uses `ToolContext` for `working_dir`
 pub struct PatchTool {
     planner: Mutex<PatchPlanner>,
+    /// When set, edits are rejected unless the resolved path is inside this
+    /// directory (relative to the conversation cwd). Used by Explore mode
+    /// to permit drafting task files under `tasks/` without unlocking the
+    /// rest of the worktree.
+    allowed_path_prefix: Option<&'static str>,
 }
 
 impl PatchTool {
+    /// Construct a `PatchTool` that only accepts paths inside the named
+    /// relative directory (e.g. `"tasks"`). Paths outside that directory
+    /// are rejected at runtime.
+    pub fn restricted_to(prefix: &'static str) -> Self {
+        Self {
+            planner: Mutex::new(PatchPlanner::new()),
+            allowed_path_prefix: Some(prefix),
+        }
+    }
+
     fn resolve_path(ctx: &ToolContext, path: &str) -> PathBuf {
         let p = PathBuf::from(path);
         if p.is_absolute() {
@@ -55,12 +70,32 @@ impl PatchTool {
             ctx.working_dir.join(p)
         }
     }
+
+    /// Reject paths that fall outside the configured allowlist. Returns
+    /// `None` if no restriction is configured.
+    fn enforce_allowlist(&self, ctx: &ToolContext, resolved: &std::path::Path) -> Option<String> {
+        let prefix = self.allowed_path_prefix?;
+        let allowed_root = ctx.working_dir.join(prefix);
+        let canon_allowed = std::fs::canonicalize(&allowed_root).unwrap_or(allowed_root);
+        let canon_resolved =
+            std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
+        if canon_resolved.starts_with(&canon_allowed) {
+            None
+        } else {
+            Some(format!(
+                "patch is restricted to '{prefix}/' in this mode; \
+                 '{}' is outside the allowed directory.",
+                resolved.display()
+            ))
+        }
+    }
 }
 
 impl Default for PatchTool {
     fn default() -> Self {
         Self {
             planner: Mutex::new(PatchPlanner::new()),
+            allowed_path_prefix: None,
         }
     }
 }
@@ -189,6 +224,10 @@ large overwrite. Prefer incremental replace operations over full file overwrites
         // Resolve path
         let path = Self::resolve_path(&ctx, &patch_input.path);
 
+        if let Some(msg) = self.enforce_allowlist(&ctx, &path) {
+            return ToolOutput::error(msg);
+        }
+
         // Read current content
         let current_content = match read_file_content(&path) {
             Ok(content) => content,
@@ -276,6 +315,67 @@ mod tests {
 
         assert!(result.success, "Error: {}", result.output);
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "Hello Rust");
+    }
+
+    #[tokio::test]
+    async fn restricted_patch_rejects_paths_outside_allowlist() {
+        let dir = tempdir().unwrap();
+        let tool = PatchTool::restricted_to("tasks");
+
+        // Pre-create both the allowed and disallowed targets.
+        fs::create_dir_all(dir.path().join("tasks")).unwrap();
+        fs::write(dir.path().join("tasks/note.md"), "old\n").unwrap();
+        fs::write(dir.path().join("source.rs"), "fn main() {}\n").unwrap();
+
+        // Write outside the allowed prefix is rejected.
+        let ctx = test_context(dir.path().to_path_buf());
+        let blocked = tool
+            .run(
+                json!({
+                    "path": "source.rs",
+                    "patches": [{
+                        "operation": "overwrite",
+                        "newText": "fn pwned() {}\n"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+        assert!(
+            !blocked.success,
+            "expected rejection, got: {}",
+            blocked.output
+        );
+        assert!(
+            blocked.output.contains("restricted to 'tasks/'"),
+            "missing allowlist hint: {}",
+            blocked.output
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("source.rs")).unwrap(),
+            "fn main() {}\n",
+            "source must be untouched"
+        );
+
+        // Write inside the allowed prefix succeeds.
+        let ctx = test_context(dir.path().to_path_buf());
+        let allowed = tool
+            .run(
+                json!({
+                    "path": "tasks/note.md",
+                    "patches": [{
+                        "operation": "overwrite",
+                        "newText": "new\n"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+        assert!(allowed.success, "expected success, got: {}", allowed.output);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("tasks/note.md")).unwrap(),
+            "new\n"
+        );
     }
 
     #[tokio::test]

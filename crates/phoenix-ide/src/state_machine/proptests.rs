@@ -196,11 +196,17 @@ fn arb_awaiting_task_approval_state() -> impl Strategy<Value = ConvState> {
             Just("p2".to_string())
         ],
         "[a-zA-Z0-9 .,\n]{1,100}",
+        "[0-9]{5}",
+        "[a-z][a-z0-9-]{0,20}",
     )
-        .prop_map(|(title, priority, plan)| ConvState::AwaitingTaskApproval {
-            title,
-            priority,
-            plan,
+        .prop_map(|(title, priority, plan, id, slug)| {
+            let status = "ready";
+            ConvState::AwaitingTaskApproval {
+                task_file: format!("tasks/{id}-{priority}-{status}--{slug}.md"),
+                title,
+                priority,
+                plan,
+            }
         })
 }
 

@@ -3091,9 +3091,7 @@ mod tests {
         let propose_tool = ToolCall::new(
             "tool-propose-1",
             ToolInput::ProposeTask(ProposeTaskInput {
-                title: "Fix the bug".to_string(),
-                priority: "p1".to_string(),
-                plan: "Step 1: Do the thing".to_string(),
+                task_file: "tasks/12345-p1-ready--fix-the-bug.md".to_string(),
             }),
         );
         let bash_tool = ToolCall::new(

@@ -384,20 +384,30 @@ fn parent_terminal_tools() -> Vec<Arc<dyn Tool>> {
 
 impl ToolRegistry {
     /// Create tool registry for Explore mode WITHOUT sandbox.
-    /// REQ-PROJ-002, REQ-PROJ-013: Restricted tool set — no bash, no patch.
+    ///
+    /// REQ-PROJ-002, REQ-PROJ-013: Restricted tool set — no bash, no
+    /// general patch. A scoped `patch` is included so the agent can draft
+    /// task files under `tasks/` before calling `propose_task`; writes
+    /// outside `tasks/` are rejected at runtime.
     pub fn explore_no_sandbox() -> Self {
         let mut tools = read_only_tools();
         tools.extend(browser_tools());
         tools.extend(parent_coordination_tools());
+        tools.push(Arc::new(PatchTool::restricted_to("tasks")));
         tools.push(Arc::new(ProposeTaskTool));
         Self { tools }
     }
 
     /// Create tool registry for Explore mode WITH sandbox.
     /// REQ-PROJ-013: Full tool suite, bash sandboxed read-only at runtime.
-    /// Adds `propose_task` (Explore-only gateway to Work mode).
+    /// Adds `propose_task` (Explore-only gateway to Work mode). Replaces
+    /// the unrestricted `patch` from the standard set with one scoped to
+    /// `tasks/` so Explore mode can only mutate task files.
     pub fn explore_with_sandbox() -> Self {
         let mut registry = Self::new_with_options(false);
+        if let Some(idx) = registry.tools.iter().position(|t| t.name() == "patch") {
+            registry.tools[idx] = Arc::new(PatchTool::restricted_to("tasks"));
+        }
         registry.tools.push(Arc::new(ProposeTaskTool));
         registry
     }
@@ -628,13 +638,14 @@ mod tests {
             assert!(work.contains(*tool), "Work missing {tool}");
         }
 
-        // Explore (no sandbox): read-only + propose_task, no bash/patch/tmux,
-        // no terminal (the agent only sees what's in the repo here).
+        // Explore (no sandbox): read-only + propose_task + scoped patch
+        // (limited to tasks/ at runtime). No bash, no tmux, no terminal —
+        // the agent only sees what's in the repo here.
         let explore = names(&ToolRegistry::explore_no_sandbox());
         assert!(explore.contains("propose_task"));
         assert!(explore.contains("ask_user_question"));
+        assert!(explore.contains("patch"));
         assert!(!explore.contains("bash"));
-        assert!(!explore.contains("patch"));
         assert!(!explore.contains("tmux"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(

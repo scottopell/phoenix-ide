@@ -573,15 +573,27 @@ pub fn build_system_prompt_with_options(
             ModeContext::Explore => {
                 prompt.push_str(
                     "\n\nYou are in Explore mode. This conversation is read-only \
-                     -- you can read files, search, analyze, and discuss the codebase, \
-                     but you cannot modify files.\n\n\
-                     When the user wants to make changes, use the propose_task tool to \
-                     propose a plan. The user will review the plan and can approve, \
-                     request revisions, or reject. On approval, an isolated workspace \
-                     is created and you gain write access.\n\n\
-                     Do not attempt to use bash for writes or the patch tool -- they \
-                     are not available in this mode. If the user asks you to make a \
-                     change directly, explain that you need to propose a task first.",
+                     for source files -- you can read files, search, analyze, and \
+                     discuss the codebase, but you cannot modify code.\n\n\
+                     Workflow for proposing work:\n\
+                     1. Find or draft a task file under `tasks/`.\n   \
+                        - To reuse an existing task, locate it with `keyword_search` \
+                        or by browsing `tasks/` with `read_file`.\n   \
+                        - To draft a new task, use `patch` with operation \
+                        `overwrite` to create a file under `tasks/`. The filename \
+                        must follow the taskmd 1.0 convention: \
+                        `NNNNN-pX-status--slug.md` where status is one of \
+                        `ready`, `in-progress`, or `brainstorming`. The body is \
+                        free-form markdown -- start with an `# H1` title, then the \
+                        plan.\n\
+                     2. Call `propose_task` with `task_file` set to the path \
+                        (e.g. `tasks/12345-p2-ready--my-slug.md`). The user will \
+                        review and can approve, request revisions, or reject. \
+                        On approval, an isolated worktree is created and you \
+                        gain full write access.\n\n\
+                     The `patch` tool is restricted to `tasks/` in this mode. \
+                     `bash` is unavailable. If the user asks you to change code \
+                     directly, explain that you must propose a task first.",
                 );
             }
             ModeContext::Work {

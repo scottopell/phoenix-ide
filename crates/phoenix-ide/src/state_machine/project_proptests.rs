@@ -958,9 +958,7 @@ mod random_walk {
                     let tc = ToolCall::new(
                         tool_id.clone(),
                         ToolInput::ProposeTask(ProposeTaskInput {
-                            title: random_string(&mut rng, 10),
-                            priority: "p1".to_string(),
-                            plan: random_string(&mut rng, 20),
+                            task_file: "tasks/12345-p1-ready--proposed-task.md".to_string(),
                         }),
                     );
                     Event::LlmResponse {
