@@ -65,6 +65,7 @@ mod models;
 mod openai;
 #[cfg(test)]
 mod proptests;
+pub mod rate_limit;
 mod registry;
 mod service;
 pub(crate) mod sse;
@@ -74,7 +75,12 @@ pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
 pub use error::{LlmError, LlmErrorKind};
+// Re-exported types: QuotaDetails is consumed by `LlmOutcome::UsageLimitReached`
+// and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
+// accessed via the `rate_limit` submodule.
 pub use models::{all_models, ModelSpec, Provider};
+#[allow(unused_imports)]
+pub use rate_limit::{CreditsSnapshot, QuotaDetails, RateLimitWindow};
 #[allow(unused_imports)]
 // CredentialSource + ResolvedAuth + AuthStyle: public API for downstream consumers
 pub use registry::{
