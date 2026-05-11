@@ -1413,22 +1413,63 @@ impl Database {
         })
     }
 
-    /// Override an existing message's `created_at`. Used by the
-    /// `persist_checkpoint` path to align the durable DB row's timestamp
-    /// with the one already broadcast for that `message_id` via
-    /// `Effect::BroadcastAssistantMessage`, so a reconnect's init payload
-    /// doesn't surface a shifted timestamp on the same message.
-    pub async fn update_message_created_at(
+    /// Like `add_message_with_seq`, but persists a caller-supplied
+    /// `created_at` instead of `Utc::now()`. Used by `persist_checkpoint`
+    /// to align the durable row's timestamp with the eager-broadcast
+    /// timestamp atomically — a single INSERT, no transient
+    /// `Utc::now()` value visible to a concurrent reconnect.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn add_message_with_seq_at(
         &self,
         message_id: &str,
+        conversation_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&serde_json::Value>,
+        usage_data: Option<&UsageData>,
         created_at: DateTime<Utc>,
-    ) -> DbResult<()> {
-        sqlx::query("UPDATE messages SET created_at = ?1 WHERE message_id = ?2")
-            .bind(created_at.to_rfc3339())
-            .bind(message_id)
+    ) -> DbResult<Message> {
+        let msg_type = content.message_type();
+        let content_str = serde_json::to_string(&content.to_json()).unwrap();
+        let display_str = display_data.map(|v| serde_json::to_string(v).unwrap());
+        let usage_str = usage_data.map(|u| serde_json::to_string(u).unwrap());
+
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(message_id)
+        .bind(conversation_id)
+        .bind(sequence_id)
+        .bind(msg_type.to_string())
+        .bind(&content_str)
+        .bind(&display_str)
+        .bind(&usage_str)
+        .bind(created_at.to_rfc3339())
+        .execute(&self.pool)
+        .await?;
+
+        // Mirror the `add_message_with_seq` side-effect: bump the
+        // conversation's `updated_at` so list-ordering stays current.
+        // Use Utc::now() here (not the message's created_at) — the
+        // conversation's "last activity" is wall-clock, not the message
+        // timestamp the UI displays.
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(Utc::now().to_rfc3339())
+            .bind(conversation_id)
             .execute(&self.pool)
             .await?;
-        Ok(())
+
+        Ok(Message {
+            message_id: message_id.to_string(),
+            conversation_id: conversation_id.to_string(),
+            sequence_id,
+            message_type: msg_type,
+            content: content.clone(),
+            display_data: display_data.cloned(),
+            usage_data: usage_data.cloned(),
+            created_at,
+        })
     }
 
     /// Get messages for a conversation

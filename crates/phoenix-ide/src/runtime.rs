@@ -196,8 +196,36 @@ impl ReplayRing {
     /// transition to truncated state: clear the ring and set
     /// `truncated = true`. Subsequent appends within this anchor window
     /// are no-ops. The next `reset` clears the truncated flag.
+    ///
+    /// Concurrent-allocation safety: `SseBroadcaster::send_seq` allocates
+    /// `next_seq()` outside this ring mutex, then builds the event, then
+    /// re-acquires the mutex to append. Two concurrent senders can
+    /// therefore interleave such that a higher seq locks the ring first
+    /// and a lower seq locks second. Two guards keep the ring consistent:
+    ///
+    /// 1. Entries with `seq <= anchor_seq` are dropped on append. Covers
+    ///    the case where a persisted-Message broadcast slips in between
+    ///    a sender's `next_seq` and its ring-append: the anchor advances
+    ///    past the late sender's seq, and the late entry is for a
+    ///    superseded message anyway.
+    /// 2. `snapshot()` sorts entries by `sequence_id`. Out-of-order
+    ///    insertion at append time is then corrected at read time, so
+    ///    replay delivers events in the order the client's
+    ///    `applyIfNewer` expects.
     fn append(&mut self, entry: ReplayRingEntry) {
         if self.truncated {
+            return;
+        }
+        // Concurrent-allocation guard #1: drop seqs that no longer beat
+        // the current anchor. A persisted Message broadcast may have
+        // raced ahead of this sender, advancing the anchor past its seq.
+        if entry.sequence_id <= self.anchor_seq {
+            tracing::trace!(
+                target: "phoenix_ide::replay_ring",
+                seq = entry.sequence_id,
+                anchor = self.anchor_seq,
+                "ReplayRing append dropped: seq below anchor (concurrent reset raced ahead)"
+            );
             return;
         }
         if self.entries.len() >= REPLAY_RING_CAPACITY {
@@ -230,11 +258,22 @@ impl ReplayRing {
     /// Snapshot for delivery in `SseEvent::Init`: returns the anchor, the
     /// truncated flag, and a clone of the entries (empty if truncated, per
     /// Q3 resolution: force full resync rather than partial replay).
+    ///
+    /// Concurrent-allocation guard #2: entries are sorted by
+    /// `sequence_id` here. The append path can receive entries out of seq
+    /// order when two senders race between `next_seq()` and the ring
+    /// mutex (see [`ReplayRing::append`] for details). The client's
+    /// `applyIfNewer` reducer relies on strictly increasing seqs to apply
+    /// per-event rules, so the read path establishes the ordering rather
+    /// than the write path (which would require holding seq allocation
+    /// inside the ring mutex and serialising every broadcast).
     fn snapshot(&self) -> (i64, bool, Vec<SseEvent>) {
         let events = if self.truncated {
             Vec::new()
         } else {
-            self.entries.iter().map(|e| e.event.clone()).collect()
+            let mut entries: Vec<&ReplayRingEntry> = self.entries.iter().collect();
+            entries.sort_by_key(|e| e.sequence_id);
+            entries.into_iter().map(|e| e.event.clone()).collect()
         };
         (self.anchor_seq, self.truncated, events)
     }
@@ -1873,6 +1912,74 @@ mod broadcaster_tests {
                 "entries must be in strictly increasing seq order"
             );
         }
+    }
+
+    /// Snapshot returns entries sorted by `sequence_id` even when
+    /// appends arrive out of seq order. Models the
+    /// `next_seq` → build → ring-mutex race where two tasks allocate
+    /// in one order and lock the ring in the opposite order.
+    #[test]
+    fn replay_ring_snapshot_sorts_out_of_order_appends() {
+        let mut ring = ReplayRing::new();
+        // Two tasks: A allocated seq 5 first, B allocated 6 second.
+        // B raced ahead and appended first.
+        ring.append(ReplayRingEntry {
+            event: token_event(6, "b"),
+            sequence_id: 6,
+        });
+        ring.append(ReplayRingEntry {
+            event: token_event(5, "a"),
+            sequence_id: 5,
+        });
+
+        let (_, _, events) = ring.snapshot();
+        assert_eq!(events.len(), 2);
+        let seqs: Vec<i64> = events
+            .iter()
+            .map(|e| {
+                let SseEvent::Token { sequence_id, .. } = e else {
+                    unreachable!()
+                };
+                *sequence_id
+            })
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![5, 6],
+            "snapshot must sort entries by sequence_id"
+        );
+    }
+
+    /// An append with `sequence_id <= anchor_seq` is dropped. Models the
+    /// race where a persisted-Message broadcast advances the anchor
+    /// between a sender's `next_seq` and the sender's ring-mutex acquire.
+    #[test]
+    fn replay_ring_append_below_anchor_dropped() {
+        let mut ring = ReplayRing::new();
+        ring.anchor_seq = 10;
+
+        // Late append with seq <= anchor: dropped.
+        ring.append(ReplayRingEntry {
+            event: token_event(8, "stale"),
+            sequence_id: 8,
+        });
+        ring.append(ReplayRingEntry {
+            event: token_event(10, "boundary"),
+            sequence_id: 10,
+        });
+        // Above anchor: accepted.
+        ring.append(ReplayRingEntry {
+            event: token_event(11, "fresh"),
+            sequence_id: 11,
+        });
+
+        let (anchor, _, events) = ring.snapshot();
+        assert_eq!(anchor, 10);
+        assert_eq!(events.len(), 1, "only seq=11 should remain");
+        let SseEvent::Token { sequence_id, .. } = &events[0] else {
+            unreachable!()
+        };
+        assert_eq!(*sequence_id, 11);
     }
 
     /// Every ring entry has seq strictly greater than the ring's anchor.

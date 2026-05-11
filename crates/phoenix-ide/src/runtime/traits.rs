@@ -51,6 +51,24 @@ pub trait MessageStore: Send + Sync {
         usage_data: Option<&UsageData>,
     ) -> Result<Message, String>;
 
+    /// Like `add_message_with_seq`, but writes a caller-supplied
+    /// `created_at` instead of `Utc::now()`. Used by `persist_checkpoint`
+    /// to align the durable DB row's timestamp with the eager-broadcast
+    /// `AssistantMessage` timestamp atomically (single INSERT), so there
+    /// is no window where a concurrent reconnect's init read could see
+    /// a transient `Utc::now()` value before the alignment write lands.
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_at(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Message, String>;
+
     /// Get all messages for a conversation
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String>;
 
@@ -71,17 +89,6 @@ pub trait MessageStore: Send + Sync {
         &self,
         message_id: &str,
         content: &str,
-    ) -> Result<(), String>;
-
-    /// Override an existing message's `created_at`. Used by `persist_checkpoint`
-    /// to align the durable DB row's timestamp with the one already broadcast
-    /// to clients via `Effect::BroadcastAssistantMessage`, so a reconnect's
-    /// init payload doesn't surface a shifted timestamp on the same
-    /// `message_id` the UI is already showing.
-    async fn update_message_created_at(
-        &self,
-        message_id: &str,
-        created_at: chrono::DateTime<chrono::Utc>,
     ) -> Result<(), String>;
 }
 
@@ -210,6 +217,30 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
             .await
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_at(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Message, String> {
+        (**self)
+            .add_message_with_seq_at(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                created_at,
+            )
+            .await
+    }
+
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
         (**self).get_messages(conv_id).await
     }
@@ -235,16 +266,6 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     ) -> Result<(), String> {
         (**self)
             .update_tool_message_content(message_id, content)
-            .await
-    }
-
-    async fn update_message_created_at(
-        &self,
-        message_id: &str,
-        created_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        (**self)
-            .update_message_created_at(message_id, created_at)
             .await
     }
 }
@@ -390,6 +411,31 @@ impl MessageStore for DatabaseStorage {
             .map_err(|e| e.to_string())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_at(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Message, String> {
+        self.db
+            .add_message_with_seq_at(
+                message_id,
+                conv_id,
+                sequence_id,
+                content,
+                display_data,
+                usage_data,
+                created_at,
+            )
+            .await
+            .map_err(|e| e.to_string())
+    }
+
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
         self.db
             .get_messages(conv_id)
@@ -422,17 +468,6 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .update_tool_message_content(message_id, content)
-            .await
-            .map_err(|e| e.to_string())
-    }
-
-    async fn update_message_created_at(
-        &self,
-        message_id: &str,
-        created_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        self.db
-            .update_message_created_at(message_id, created_at)
             .await
             .map_err(|e| e.to_string())
     }

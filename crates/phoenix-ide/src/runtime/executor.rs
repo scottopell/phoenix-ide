@@ -1765,32 +1765,29 @@ where
             } => {
                 // Persist assistant message.
                 //
-                // The eager broadcast at `Effect::BroadcastAssistantMessage`
-                // already used `assistant_message.created_at`. Align the
-                // durable DB row to the same timestamp so a reconnect's
-                // init payload doesn't surface a shifted timestamp on the
-                // message_id the UI is already displaying. The in-memory
-                // `agent_msg.created_at` is also overridden so the
-                // (deduped-by-UI) persisted broadcast still carries the
-                // stable timestamp for consistency on the wire.
-                let assistant_created_at = assistant_message.created_at;
+                // Uses `add_message_with_seq_at` so the DB row carries the
+                // exact `assistant_message.created_at` value the eager
+                // broadcast (`Effect::BroadcastAssistantMessage`) already
+                // delivered for this `message_id`. Single INSERT, no
+                // transient `Utc::now()` value visible to a concurrent
+                // reconnect's init read. Without this, a reconnect that
+                // landed between the INSERT and a follow-up UPDATE would
+                // see a shifted timestamp on the same message_id the UI
+                // is already displaying.
                 let agent_content = MessageContent::agent(assistant_message.content);
                 let agent_seq = self.broadcast_tx.next_seq();
-                let mut agent_msg = self
+                let agent_msg = self
                     .storage
-                    .add_message_with_seq(
+                    .add_message_with_seq_at(
                         &assistant_message.message_id,
                         &self.context.conversation_id,
                         agent_seq,
                         &agent_content,
                         assistant_message.display_data.as_ref(),
                         assistant_message.usage.as_ref(),
+                        assistant_message.created_at,
                     )
                     .await?;
-                self.storage
-                    .update_message_created_at(&agent_msg.message_id, assistant_created_at)
-                    .await?;
-                agent_msg.created_at = assistant_created_at;
                 let _ = self.broadcast_tx.send_message(agent_msg);
 
                 // Persist all tool results

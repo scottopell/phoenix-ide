@@ -430,6 +430,48 @@ impl MessageStore for InMemoryStorage {
         Ok(msg)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn add_message_with_seq_at(
+        &self,
+        message_id: &str,
+        conv_id: &str,
+        sequence_id: i64,
+        content: &MessageContent,
+        display_data: Option<&Value>,
+        usage_data: Option<&UsageData>,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Message, String> {
+        // Mirror add_message_with_seq's seq-floor bump.
+        {
+            let mut id_guard = self.next_msg_id.lock().unwrap();
+            #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+            let floor = (sequence_id as u64).saturating_add(1);
+            if *id_guard < floor {
+                *id_guard = floor;
+            }
+        }
+
+        let msg = Message {
+            message_id: message_id.to_string(),
+            conversation_id: conv_id.to_string(),
+            sequence_id,
+            message_type: content.message_type(),
+            content: content.clone(),
+            display_data: display_data.cloned(),
+            usage_data: usage_data.cloned(),
+            created_at,
+        };
+
+        self.messages
+            .lock()
+            .unwrap()
+            .entry(conv_id.to_string())
+            .or_default()
+            .push(msg.clone());
+
+        Ok(msg)
+    }
+
     async fn get_messages(&self, conv_id: &str) -> Result<Vec<Message>, String> {
         Ok(self.get_all_messages(conv_id))
     }
@@ -477,23 +519,6 @@ impl MessageStore for InMemoryStorage {
                         return Ok(());
                     }
                     return Err(format!("Message {message_id} is not a tool message"));
-                }
-            }
-        }
-        Err(format!("Message not found: {message_id}"))
-    }
-
-    async fn update_message_created_at(
-        &self,
-        message_id: &str,
-        created_at: chrono::DateTime<chrono::Utc>,
-    ) -> Result<(), String> {
-        let mut messages = self.messages.lock().unwrap();
-        for msgs in messages.values_mut() {
-            for msg in msgs.iter_mut() {
-                if msg.message_id == message_id {
-                    msg.created_at = created_at;
-                    return Ok(());
                 }
             }
         }
