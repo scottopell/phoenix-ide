@@ -256,8 +256,23 @@ impl ReplayRing {
     }
 
     /// Snapshot for delivery in `SseEvent::Init`: returns the anchor, the
-    /// truncated flag, and a clone of the entries (empty if truncated, per
-    /// Q3 resolution: force full resync rather than partial replay).
+    /// truncated flag, the highest `sequence_id` covered by the snapshot,
+    /// and a clone of the entries (empty if truncated, per Q3 resolution:
+    /// force full resync rather than partial replay).
+    ///
+    /// `highest_seq` is the upper bound the caller uses to set the init
+    /// payload's `last_sequence_id`. With non-empty entries it is the seq
+    /// of the last entry (after sorting); with empty entries (including
+    /// the truncated case) it is the anchor. The caller computes
+    /// `init.last_sequence_id = max(db_last_seq, highest_seq)` so the
+    /// spec invariant `entry.sequence_id <= snapshot.last_sequence_id`
+    /// (`sse_wire.allium` `StreamOpened`) holds even if a sender broadcast
+    /// raced the handler between the DB read and the ring snapshot. Using
+    /// `highest_seq` (not the broadcaster's current counter) as the floor
+    /// also lets any in-flight broadcast — one that allocated a seq via
+    /// `next_seq()` but had not yet appended to the ring at snapshot time
+    /// — pass the client's `applyIfNewer` guard on its live delivery,
+    /// because its seq strictly exceeds `highest_seq`.
     ///
     /// Concurrent-allocation guard #2: entries are sorted by
     /// `sequence_id` here. The append path can receive entries out of seq
@@ -267,15 +282,17 @@ impl ReplayRing {
     /// per-event rules, so the read path establishes the ordering rather
     /// than the write path (which would require holding seq allocation
     /// inside the ring mutex and serialising every broadcast).
-    fn snapshot(&self) -> (i64, bool, Vec<SseEvent>) {
-        let events = if self.truncated {
-            Vec::new()
+    fn snapshot(&self) -> (i64, bool, i64, Vec<SseEvent>) {
+        let (highest_seq, events) = if self.truncated {
+            (self.anchor_seq, Vec::new())
         } else {
             let mut entries: Vec<&ReplayRingEntry> = self.entries.iter().collect();
             entries.sort_by_key(|e| e.sequence_id);
-            entries.into_iter().map(|e| e.event.clone()).collect()
+            let highest = entries.last().map_or(self.anchor_seq, |e| e.sequence_id);
+            let events = entries.into_iter().map(|e| e.event.clone()).collect();
+            (highest, events)
         };
-        (self.anchor_seq, self.truncated, events)
+        (self.anchor_seq, self.truncated, highest_seq, events)
     }
 
     /// Aggregate serialised JSON byte length across current ring entries.
@@ -499,11 +516,15 @@ impl SseBroadcaster {
     }
 
     /// Atomic snapshot of the `ReplayRing` for delivery in `SseEvent::Init`.
+    ///
+    /// Returns `(anchor, truncated, highest_seq, events)`. See
+    /// [`ReplayRing::snapshot`] for `highest_seq` semantics — it is the
+    /// floor the caller uses to set `Init.last_sequence_id`.
     /// Returns `(pending_anchor_sequence_id, pending_truncated,
     /// pending_events)`. When truncated, `pending_events` is empty — forcing
     /// a full DB-only resync on the client side per the Q3 resolution in
     /// `sse_wire.allium`.
-    pub fn snapshot_pending(&self) -> (i64, bool, Vec<SseEvent>) {
+    pub fn snapshot_pending(&self) -> (i64, bool, i64, Vec<SseEvent>) {
         self.ring.lock().expect("ReplayRing mutex").snapshot()
     }
 
@@ -1755,9 +1776,13 @@ mod broadcaster_tests {
     #[test]
     fn replay_ring_starts_empty_and_anchored_at_initial_seq() {
         let b = SseBroadcaster::new(16, 5);
-        let (anchor, truncated, events) = b.snapshot_pending();
+        let (anchor, truncated, highest, events) = b.snapshot_pending();
         assert_eq!(anchor, 5, "anchor should match initial_last_seq");
         assert!(!truncated);
+        assert_eq!(
+            highest, 5,
+            "empty ring reports highest_seq equal to the anchor"
+        );
         assert!(events.is_empty());
         assert_eq!(b.replay_ring_bytes(), 0);
     }
@@ -1775,9 +1800,13 @@ mod broadcaster_tests {
         let _ = b.send_seq(|seq| token_event(seq, "hello"));
         let _ = b.send_seq(|seq| token_event(seq, "world"));
 
-        let (anchor, truncated, events) = b.snapshot_pending();
+        let (anchor, truncated, highest, events) = b.snapshot_pending();
         assert_eq!(anchor, 0, "no persisted Message yet; anchor stays at 0");
         assert!(!truncated);
+        assert_eq!(
+            highest, 2,
+            "highest_seq tracks the last entry's seq when the ring is populated"
+        );
         assert_eq!(events.len(), 2);
         assert!(b.replay_ring_bytes() > 0);
 
@@ -1812,9 +1841,13 @@ mod broadcaster_tests {
         let msg = test_message(3, "msg-1");
         let _ = b.send_persisted_message(msg);
 
-        let (anchor, truncated, events) = b.snapshot_pending();
+        let (anchor, truncated, highest, events) = b.snapshot_pending();
         assert_eq!(anchor, 3, "anchor advances to the persisted message's seq");
         assert!(!truncated);
+        assert_eq!(
+            highest, 3,
+            "empty post-reset ring reports highest_seq = anchor"
+        );
         assert!(events.is_empty(), "ring entries cleared on anchor reset");
         assert_eq!(b.replay_ring_bytes(), 0);
     }
@@ -1837,9 +1870,10 @@ mod broadcaster_tests {
         // Then the eager assistant message.
         let _ = b.send_ephemeral_message(test_message(3, "eager"));
 
-        let (anchor, truncated, events) = b.snapshot_pending();
+        let (anchor, truncated, highest, events) = b.snapshot_pending();
         assert_eq!(anchor, 1, "eager message does not advance the anchor");
         assert!(!truncated);
+        assert_eq!(highest, 3, "highest_seq covers the eager message at seq 3");
         assert_eq!(events.len(), 2, "token + eager message both in ring");
         match &events[1] {
             SseEvent::Message { message } => assert_eq!(message.message_id, "eager"),
@@ -1860,16 +1894,20 @@ mod broadcaster_tests {
             let _ = b.send_seq(|seq| token_event(seq, &format!("t{i}")));
         }
         {
-            let (_, truncated, events) = b.snapshot_pending();
+            let (_, truncated, _, events) = b.snapshot_pending();
             assert!(!truncated, "exactly-at-capacity is not yet truncated");
             assert_eq!(events.len(), REPLAY_RING_CAPACITY);
         }
 
         // One more pushes past the cap — clear and truncate.
         let _ = b.send_seq(|seq| token_event(seq, "overflow"));
-        let (anchor, truncated, events) = b.snapshot_pending();
+        let (anchor, truncated, highest, events) = b.snapshot_pending();
         assert_eq!(anchor, 0, "anchor unchanged across overflow");
         assert!(truncated, "ring should be marked truncated");
+        assert_eq!(
+            highest, 0,
+            "truncated ring falls back to anchor for highest_seq"
+        );
         assert!(
             events.is_empty(),
             "snapshot returns empty events on truncation"
@@ -1878,7 +1916,7 @@ mod broadcaster_tests {
 
         // Further appends are no-ops within this anchor window.
         let _ = b.send_seq(|seq| token_event(seq, "after-truncate"));
-        let (_, truncated2, events2) = b.snapshot_pending();
+        let (_, truncated2, _, events2) = b.snapshot_pending();
         assert!(truncated2);
         assert!(events2.is_empty());
     }
@@ -1899,14 +1937,14 @@ mod broadcaster_tests {
         let next_seq = b.next_seq();
         let _ = b.send_persisted_message(test_message(next_seq, "msg"));
 
-        let (anchor, truncated, events) = b.snapshot_pending();
+        let (anchor, truncated, _, events) = b.snapshot_pending();
         assert_eq!(anchor, next_seq);
         assert!(!truncated, "anchor reset clears truncated flag");
         assert!(events.is_empty());
 
         // Future appends accumulate normally.
         let _ = b.send_seq(|seq| token_event(seq, "post-reset"));
-        let (_, _, events) = b.snapshot_pending();
+        let (_, _, _, events) = b.snapshot_pending();
         assert_eq!(events.len(), 1);
     }
 
@@ -1919,7 +1957,7 @@ mod broadcaster_tests {
         for i in 0..20 {
             let _ = b.send_seq(|seq| token_event(seq, &format!("t{i}")));
         }
-        let (_, _, events) = b.snapshot_pending();
+        let (_, _, _, events) = b.snapshot_pending();
         let seqs: Vec<i64> = events
             .iter()
             .map(|e| match e {
@@ -1953,7 +1991,7 @@ mod broadcaster_tests {
             sequence_id: 5,
         });
 
-        let (_, _, events) = ring.snapshot();
+        let (_, _, _, events) = ring.snapshot();
         assert_eq!(events.len(), 2);
         let seqs: Vec<i64> = events
             .iter()
@@ -1994,7 +2032,7 @@ mod broadcaster_tests {
             sequence_id: 11,
         });
 
-        let (anchor, _, events) = ring.snapshot();
+        let (anchor, _, _, events) = ring.snapshot();
         assert_eq!(anchor, 10);
         assert_eq!(events.len(), 1, "only seq=11 should remain");
         let SseEvent::Token { sequence_id, .. } = &events[0] else {
@@ -2014,7 +2052,7 @@ mod broadcaster_tests {
             let _ = b.send_seq(|seq| token_event(seq, &format!("t{i}")));
         }
 
-        let (anchor, _, events) = b.snapshot_pending();
+        let (anchor, _, _, events) = b.snapshot_pending();
         assert_eq!(anchor, 5);
         for e in events {
             let SseEvent::Token {
@@ -2025,5 +2063,37 @@ mod broadcaster_tests {
             };
             assert!(seq > anchor, "every entry's seq must exceed anchor");
         }
+    }
+
+    /// `snapshot_pending` reports a `highest_seq` that bounds every entry
+    /// in the snapshot. Regression test for the race PR #76 review caught:
+    /// reading `current_seq` separately would let a sender's mid-flight
+    /// allocation produce a `last_sequence_id` that exceeds what the
+    /// snapshot actually covers (or, conversely, leave a snapshot entry
+    /// with seq above `last_sequence_id`, violating
+    /// `sse_wire.allium` StreamOpened).
+    #[test]
+    fn snapshot_pending_highest_seq_bounds_entries() {
+        let b = SseBroadcaster::new(64, 10);
+        let _rx = b.subscribe();
+        for i in 0..7 {
+            let _ = b.send_seq(|seq| token_event(seq, &format!("t{i}")));
+        }
+        let (anchor, _, highest, events) = b.snapshot_pending();
+        for e in &events {
+            let SseEvent::Token {
+                sequence_id: seq, ..
+            } = e
+            else {
+                unreachable!()
+            };
+            assert!(*seq <= highest, "entry seq must not exceed highest_seq");
+            assert!(*seq > anchor, "entry seq must exceed anchor");
+        }
+        assert_eq!(
+            highest,
+            anchor + events.len() as i64,
+            "with seq 11..17 in the ring, highest is 17"
+        );
     }
 }

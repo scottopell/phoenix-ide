@@ -761,7 +761,7 @@ mod tests {
             request_id: "req-init".to_string(),
         });
 
-        let (pending_anchor_sequence_id, pending_truncated, pending_events) =
+        let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
             broadcaster.snapshot_pending();
 
         // Acceptance: anchor equals initial_last_seq (no persisted Message
@@ -769,8 +769,14 @@ mod tests {
         assert_eq!(pending_anchor_sequence_id, initial_last_seq);
         assert!(!pending_truncated);
         assert_eq!(pending_events.len(), 3);
+        // highest_pending_seq tracks the last entry's seq.
+        assert_eq!(highest_pending_seq, initial_last_seq + 3);
 
-        let init_seq = broadcaster.current_seq();
+        // Matches the production handler: init_seq is bounded by the
+        // snapshot's highest seq, not the live broadcaster counter, so
+        // any post-snapshot broadcast still passes the client's
+        // `applyIfNewer` guard on its live delivery.
+        let init_seq = std::cmp::max(initial_last_seq, highest_pending_seq);
         let init = SseEvent::Init {
             sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
@@ -863,18 +869,20 @@ mod tests {
         };
         let _ = broadcaster.send_persisted_message(msg);
 
-        let (anchor, truncated, events) = broadcaster.snapshot_pending();
+        let (anchor, truncated, highest, events) = broadcaster.snapshot_pending();
         assert_eq!(anchor, 5);
         assert!(!truncated);
+        assert_eq!(highest, 5, "empty post-reset ring reports highest = anchor");
         assert!(events.is_empty());
 
+        let init_seq = std::cmp::max(0_i64, highest);
         let init = SseEvent::Init {
-            sequence_id: broadcaster.current_seq(),
+            sequence_id: init_seq,
             conversation: Box::new(fixture_enriched_conversation()),
             messages: Vec::new(),
             agent_working: false,
             presentation_mode: "idle".to_string(),
-            last_sequence_id: broadcaster.current_seq(),
+            last_sequence_id: init_seq,
             context_window_size: 0,
             breadcrumbs: Vec::new(),
             commits_behind: 0,

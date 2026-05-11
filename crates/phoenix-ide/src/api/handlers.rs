@@ -1455,20 +1455,23 @@ async fn stream_conversation(
         None
     };
 
-    // Ensure the broadcaster's counter has at least absorbed the highest
-    // persisted message id, then take the current tip as the Init's own
-    // sequence_id. Init's `sequence_id` and `last_sequence_id` are the same
-    // number by construction: the snapshot IS the highest fact the client has
-    // seen so far, and it sets the floor for subsequent `applyIfNewer` checks.
-    handle.broadcast_tx.observe_seq(last_sequence_id);
-    let init_seq = handle.broadcast_tx.current_seq();
-
     // Snapshot the ReplayRing alongside the DB read so reconnecting clients
     // can resume mid-turn views (in-flight assistant message, streaming
     // tokens, current tool phase) instead of blanking out until the next
     // checkpoint. See `sse_wire.allium` StreamOpened + InitSnapshotMirrorsRing.
-    let (pending_anchor_sequence_id, pending_truncated, pending_events) =
+    //
+    // `init_seq` derives from the snapshot's `highest_seq`, not the live
+    // broadcaster counter: a sender that allocated a seq via `next_seq()`
+    // but had not yet appended to the ring at snapshot time would otherwise
+    // have its live event (delivered later via `broadcast_rx`) dropped by
+    // the client's `applyIfNewer` guard. By bounding `last_sequence_id` to
+    // what the snapshot actually covers, that in-flight broadcast's seq
+    // strictly exceeds the floor and passes the guard. This also enforces
+    // the StreamOpened invariant `entry.sequence_id <= last_sequence_id`.
+    let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
         handle.broadcast_tx.snapshot_pending();
+    let init_seq = std::cmp::max(last_sequence_id, highest_pending_seq);
+    handle.broadcast_tx.observe_seq(init_seq);
 
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
@@ -3553,13 +3556,14 @@ async fn shared_sse_stream(
         None
     };
 
-    handle.broadcast_tx.observe_seq(last_sequence_id);
-    let init_seq = handle.broadcast_tx.current_seq();
-
     // Mirror the ReplayRing into the init payload (sse_wire.allium
-    // InitSnapshotMirrorsRing). Same shape as the primary handler above.
-    let (pending_anchor_sequence_id, pending_truncated, pending_events) =
+    // InitSnapshotMirrorsRing). Same shape as the primary handler above —
+    // see that site for the rationale on deriving `init_seq` from the
+    // snapshot's `highest_seq` rather than the live counter.
+    let (pending_anchor_sequence_id, pending_truncated, highest_pending_seq, pending_events) =
         handle.broadcast_tx.snapshot_pending();
+    let init_seq = std::cmp::max(last_sequence_id, highest_pending_seq);
+    handle.broadcast_tx.observe_seq(init_seq);
 
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
