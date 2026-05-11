@@ -94,18 +94,16 @@ pub async fn complete(
     })?;
 
     let status = response.status();
-    let headers = response.headers().clone();
     let body = response
         .text()
         .await
         .map_err(|e| LlmError::network(format!("Failed to read response: {e}")))?;
 
+    // Codex backend errors are handled in `complete_streaming()` — callers with
+    // `use_codex_backend == true` short-circuit there above. Reaching this point
+    // means we're on the platform Responses API path, which doesn't emit the
+    // codex `x-codex-*` headers or `usage_limit_reached` envelopes.
     if !status.is_success() {
-        if use_codex_backend {
-            if let Some(err) = parse_codex_error(status.as_u16(), &headers, &body) {
-                return Err(err);
-            }
-        }
         if let Ok(error_resp) = serde_json::from_str::<OpenAIErrorResponse>(&body) {
             let message = error_resp.error.message;
             return Err(match status.as_u16() {
