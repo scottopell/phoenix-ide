@@ -100,7 +100,7 @@ fn resolve_task_file(cwd: &Path, task_file: &str) -> Result<TaskFileSnapshot, St
     if !ACCEPTABLE_PROPOSE_STATUSES.contains(&parsed.status) {
         let allowed: Vec<&str> = ACCEPTABLE_PROPOSE_STATUSES
             .iter()
-            .map(|s| s.as_str())
+            .map(taskmd_core::constants::Status::as_str)
             .collect();
         return Err(format!(
             "task file status '{}' cannot be proposed for approval. \
