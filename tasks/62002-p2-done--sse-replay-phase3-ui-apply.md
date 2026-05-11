@@ -1,7 +1,7 @@
 ---
 created: 2026-05-10
 priority: p2
-status: ready
+status: done
 artifact: ui/src/conversation/atom.ts
 ---
 

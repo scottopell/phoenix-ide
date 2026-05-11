@@ -49,10 +49,10 @@ The `.allium` spec was distilled from a working, deployed implementation, so all
 | **ReplayRingEntriesOrdered** (invariant) | ✅ Enforced by construction | `VecDeque::push_back` + head-only eviction preserves seq order (and `next_seq` is monotonic) |
 | **InitSnapshotMirrorsRing** (invariant) | ✅ Complete (Phase 2) | `crates/phoenix-ide/src/api/handlers.rs` — both `init_event` constructors call `broadcast_tx.snapshot_pending()` and thread `pending_anchor_sequence_id` / `pending_events` / `pending_truncated` into `SseEvent::Init` |
 
-**Progress:** Original spec (event types + ordering invariants) is fully implemented. The ReplayRing extension is rolling out in three phases:
+**Progress:** Original spec (event types + ordering invariants) is fully implemented. The ReplayRing rollout is complete:
 - **Phase 1 (landed)** — server-side ring storage, anchor lifecycle, append rules, bounded invariants. Six of the seven new rules/invariants landed; `InitSnapshotMirrorsRing` was the lone holdout.
 - **Phase 2 (landed, `tasks/62001`)** — wired `pending_events` / `pending_anchor_sequence_id` / `pending_truncated` into `SseEvent::Init` + `SseWireEvent::Init` + ts-rs codegen + valibot schema. All seven new ReplayRing rules/invariants are now ✅.
-- **Phase 3 (planned, `tasks/62002`)** — client reducer applies pending events through existing per-event rules on init.
+- **Phase 3 (landed, `tasks/62002`)** — client reducer (`ui/src/conversation/atom.ts` `sse_init` case + `applyPendingEvent` helper) applies pending events through existing per-event rules on init. Fresh-connect seeds `lastSequenceId` from `pending_anchor_sequence_id` so per-event `applyIfNewer` accepts pending entries; reconnect preserves the live floor so already-observed entries drop as replays; safety-belt `max(current, payload.last_sequence_id)` covers the truncated case where the ring overflowed.
 
 The spec was distilled in response to task 02679 (streaming-finalize-disappear bug); the `PersistBeforeBroadcast` invariant is the formal statement of the leading fix hypothesis and now serves as a guardrail against regressions. The ReplayRing extension targets a different recovery shape: the user-visible "blank UI mid-LLM-turn / mid-tool-execution on reconnect" symptom, which is structurally distinct from 02679 (durability holds; the gap is purely in transit-only ephemeral state).
 
