@@ -634,6 +634,27 @@ pub enum SseEvent {
         commits_ahead: u32,
         /// Human-readable project name derived from the repo root directory name.
         project_name: Option<String>,
+        /// `sequence_id` of the most recent persisted Message at subscribe
+        /// time. Every entry in `pending_events` has `sequence_id` strictly
+        /// greater than this. Equals `initial_last_seq` for a fresh
+        /// conversation with no broadcasts since the last persisted Message
+        /// (or no persisted Messages yet). See `sse_wire.allium`
+        /// `InitSnapshot.pending_anchor_sequence_id`.
+        pending_anchor_sequence_id: i64,
+        /// `ReplayRing` contents at subscribe time: ephemeral SSE events
+        /// broadcast since the last persisted Message anchor that have not
+        /// yet been folded into a durable DB row. The client reducer replays
+        /// these through its per-event rules after applying the DB snapshot
+        /// so a reconnect mid-turn resumes the in-flight view (streaming
+        /// tokens, current tool phase, eager assistant message before its
+        /// tool round completes). Empty when `pending_truncated = true`
+        /// (force full resync; see `sse_wire.allium` Q3 resolution).
+        pending_events: Vec<SseEvent>,
+        /// True iff the `ReplayRing` overflowed since the last anchor and
+        /// `pending_events` is therefore empty by construction. The client
+        /// renders the DB snapshot and waits for the next live event to
+        /// repopulate the in-flight UI.
+        pending_truncated: bool,
     },
     /// A newly-persisted message joins the conversation. Uses `message.sequence_id`
     /// as its envelope `sequence_id` — no separate field needed because

@@ -119,9 +119,20 @@ mod tests {
                 commits_behind,
                 commits_ahead,
                 project_name,
+                pending_anchor_sequence_id,
+                pending_events,
+                pending_truncated,
             } => {
                 let enriched_msgs: Vec<Value> =
                     messages.iter().map(enrich_message_for_api).collect();
+                // Mirror the typed-path conversion: each pending entry is
+                // recursively rendered via the legacy JSON producer so this
+                // function remains the gold-standard reference for the
+                // production wire bytes.
+                let pending_json: Vec<Value> = pending_events
+                    .iter()
+                    .map(legacy_sse_event_to_json)
+                    .collect();
                 json!({
                     "type": "init",
                     "sequence_id": sequence_id,
@@ -135,6 +146,9 @@ mod tests {
                     "commits_behind": commits_behind,
                     "commits_ahead": commits_ahead,
                     "project_name": project_name,
+                    "pending_anchor_sequence_id": pending_anchor_sequence_id,
+                    "pending_events": pending_json,
+                    "pending_truncated": pending_truncated,
                 })
             }
             SseEvent::Message { message } => {
@@ -380,8 +394,90 @@ mod tests {
             commits_behind: 0,
             commits_ahead: 3,
             project_name: Some("phoenix".to_string()),
+            pending_anchor_sequence_id: 0,
+            pending_events: Vec::new(),
+            pending_truncated: false,
         };
         assert_parity(&event);
+    }
+
+    /// Init with a populated `ReplayRing` snapshot. Exercises the recursive
+    /// SseWireEvent serialisation inside `pending_events` and the parity
+    /// of `pending_anchor_sequence_id` / `pending_truncated`.
+    #[test]
+    fn parity_init_with_pending_events() {
+        let pending = vec![
+            SseEvent::Token {
+                sequence_id: 43,
+                text: "Hel".to_string(),
+                request_id: "req-1".to_string(),
+            },
+            SseEvent::StateChange {
+                sequence_id: 44,
+                state: ConvState::LlmRequesting { attempt: 1 },
+                presentation_mode: "working".to_string(),
+            },
+            SseEvent::Message {
+                message: fixture_agent_message_with_bash(),
+            },
+        ];
+        let event = SseEvent::Init {
+            sequence_id: 44,
+            conversation: Box::new(fixture_enriched_conversation()),
+            messages: vec![fixture_user_message()],
+            agent_working: true,
+            presentation_mode: "working".to_string(),
+            last_sequence_id: 44,
+            context_window_size: 2048,
+            breadcrumbs: fixture_breadcrumbs(),
+            commits_behind: 0,
+            commits_ahead: 0,
+            project_name: Some("phoenix".to_string()),
+            pending_anchor_sequence_id: 42,
+            pending_events: pending,
+            pending_truncated: false,
+        };
+        assert_parity(&event);
+
+        // Belt + braces: assert the typed wire output carries the pending
+        // entries with their original `type` discriminators and seqs.
+        let typed = typed_sse_event_to_value(&event);
+        let pending_arr = typed["pending_events"]
+            .as_array()
+            .expect("pending_events must be an array");
+        assert_eq!(pending_arr.len(), 3);
+        assert_eq!(pending_arr[0]["type"], "token");
+        assert_eq!(pending_arr[0]["sequence_id"], 43);
+        assert_eq!(pending_arr[1]["type"], "state_change");
+        assert_eq!(pending_arr[2]["type"], "message");
+        assert_eq!(typed["pending_anchor_sequence_id"], 42);
+        assert_eq!(typed["pending_truncated"], false);
+    }
+
+    /// Init with `pending_truncated = true`: per Q3, `pending_events` is
+    /// empty by construction (force full resync).
+    #[test]
+    fn parity_init_truncated() {
+        let event = SseEvent::Init {
+            sequence_id: 99,
+            conversation: Box::new(fixture_enriched_conversation()),
+            messages: vec![fixture_user_message()],
+            agent_working: false,
+            presentation_mode: "idle".to_string(),
+            last_sequence_id: 99,
+            context_window_size: 0,
+            breadcrumbs: Vec::new(),
+            commits_behind: 0,
+            commits_ahead: 0,
+            project_name: None,
+            pending_anchor_sequence_id: 50,
+            pending_events: Vec::new(),
+            pending_truncated: true,
+        };
+        assert_parity(&event);
+        let typed = typed_sse_event_to_value(&event);
+        assert_eq!(typed["pending_truncated"], true);
+        assert!(typed["pending_events"].as_array().unwrap().is_empty());
     }
 
     #[test]
@@ -606,6 +702,173 @@ mod tests {
     // Backwards-compat sanity: the axum Event is still constructed with
     // the correct `event:` label for every variant.
     // ------------------------------------------------------------------
+
+    // ------------------------------------------------------------------
+    // Phase 2 end-to-end: SseBroadcaster.snapshot_pending() → SseEvent::Init
+    // → SseWireEvent → JSON. Verifies init carries the in-flight ring
+    // contents in seq order with the right anchor — the core promise of
+    // `sse_wire.allium` StreamOpened + InitSnapshotMirrorsRing.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn init_carries_pending_events_from_broadcaster_ring() {
+        use crate::runtime::SseBroadcaster;
+
+        // Fresh broadcaster, no persisted Messages yet — anchor stays at the
+        // initial_last_seq we seeded.
+        let initial_last_seq: i64 = 7;
+        let broadcaster = SseBroadcaster::new(64, initial_last_seq);
+        // A live subscriber so the channel send paths in send_seq don't
+        // short-circuit (the ring append happens first either way, but
+        // matching real handler shape avoids spurious Err returns).
+        let _rx = broadcaster.subscribe();
+
+        // Three ephemeral broadcasts — no PersistedMessage between them, so
+        // they accumulate in the ring.
+        let _ = broadcaster.send_seq(|seq| SseEvent::Token {
+            sequence_id: seq,
+            text: "Hel".to_string(),
+            request_id: "req-init".to_string(),
+        });
+        let _ = broadcaster.send_seq(|seq| SseEvent::StateChange {
+            sequence_id: seq,
+            state: ConvState::LlmRequesting { attempt: 1 },
+            presentation_mode: "working".to_string(),
+        });
+        let _ = broadcaster.send_seq(|seq| SseEvent::Token {
+            sequence_id: seq,
+            text: "lo".to_string(),
+            request_id: "req-init".to_string(),
+        });
+
+        let (pending_anchor_sequence_id, pending_truncated, pending_events) =
+            broadcaster.snapshot_pending();
+
+        // Acceptance: anchor equals initial_last_seq (no persisted Message
+        // has bumped it).
+        assert_eq!(pending_anchor_sequence_id, initial_last_seq);
+        assert!(!pending_truncated);
+        assert_eq!(pending_events.len(), 3);
+
+        let init_seq = broadcaster.current_seq();
+        let init = SseEvent::Init {
+            sequence_id: init_seq,
+            conversation: Box::new(fixture_enriched_conversation()),
+            messages: Vec::new(),
+            agent_working: true,
+            presentation_mode: "working".to_string(),
+            last_sequence_id: init_seq,
+            context_window_size: 0,
+            breadcrumbs: Vec::new(),
+            commits_behind: 0,
+            commits_ahead: 0,
+            project_name: None,
+            pending_anchor_sequence_id,
+            pending_events,
+            pending_truncated,
+        };
+
+        // Parity holds end-to-end (legacy json! and typed path agree).
+        assert_parity(&init);
+
+        let typed = typed_sse_event_to_value(&init);
+        assert_eq!(typed["type"], "init");
+        assert_eq!(typed["pending_anchor_sequence_id"], initial_last_seq);
+        assert_eq!(typed["pending_truncated"], false);
+
+        let arr = typed["pending_events"]
+            .as_array()
+            .expect("pending_events is an array");
+        assert_eq!(arr.len(), 3);
+
+        // Entries appear in strictly increasing sequence_id order — every
+        // entry above the anchor.
+        let seqs: Vec<i64> = arr
+            .iter()
+            .map(|e| e["sequence_id"].as_i64().expect("seq present"))
+            .collect();
+        assert_eq!(
+            seqs,
+            vec![
+                initial_last_seq + 1,
+                initial_last_seq + 2,
+                initial_last_seq + 3
+            ]
+        );
+        for s in &seqs {
+            assert!(
+                *s > pending_anchor_sequence_id,
+                "every pending seq must exceed the anchor"
+            );
+        }
+
+        // Event-type discriminators survive the round-trip.
+        assert_eq!(arr[0]["type"], "token");
+        assert_eq!(arr[0]["text"], "Hel");
+        assert_eq!(arr[1]["type"], "state_change");
+        assert_eq!(arr[2]["type"], "token");
+        assert_eq!(arr[2]["text"], "lo");
+    }
+
+    /// After a persisted Message broadcast, the ring resets and a fresh
+    /// init carries empty pending_events with the anchor advanced.
+    #[test]
+    fn init_pending_is_empty_after_persisted_message() {
+        use crate::runtime::SseBroadcaster;
+
+        let broadcaster = SseBroadcaster::new(64, 0);
+        let _rx = broadcaster.subscribe();
+
+        // Some ephemeral activity.
+        let _ = broadcaster.send_seq(|seq| SseEvent::Token {
+            sequence_id: seq,
+            text: "x".to_string(),
+            request_id: "r".to_string(),
+        });
+        // A persisted Message reaches the broadcaster — anchor advances,
+        // ring clears.
+        let msg = {
+            use crate::db::{Message, MessageContent, MessageType};
+            use chrono::Utc;
+            Message {
+                message_id: "m1".to_string(),
+                conversation_id: "c".to_string(),
+                sequence_id: 5,
+                message_type: MessageType::Agent,
+                content: MessageContent::agent(vec![crate::llm::ContentBlock::text("hi")]),
+                display_data: None,
+                usage_data: None,
+                created_at: Utc::now(),
+            }
+        };
+        let _ = broadcaster.send_persisted_message(msg);
+
+        let (anchor, truncated, events) = broadcaster.snapshot_pending();
+        assert_eq!(anchor, 5);
+        assert!(!truncated);
+        assert!(events.is_empty());
+
+        let init = SseEvent::Init {
+            sequence_id: broadcaster.current_seq(),
+            conversation: Box::new(fixture_enriched_conversation()),
+            messages: Vec::new(),
+            agent_working: false,
+            presentation_mode: "idle".to_string(),
+            last_sequence_id: broadcaster.current_seq(),
+            context_window_size: 0,
+            breadcrumbs: Vec::new(),
+            commits_behind: 0,
+            commits_ahead: 0,
+            project_name: None,
+            pending_anchor_sequence_id: anchor,
+            pending_events: events,
+            pending_truncated: truncated,
+        };
+        let typed = typed_sse_event_to_value(&init);
+        assert_eq!(typed["pending_anchor_sequence_id"], 5);
+        assert_eq!(typed["pending_truncated"], false);
+        assert!(typed["pending_events"].as_array().unwrap().is_empty());
+    }
 
     #[test]
     fn axum_event_label_for_message_updated() {

@@ -215,6 +215,30 @@ pub enum SseWireEvent {
         commits_behind: u32,
         commits_ahead: u32,
         project_name: Option<String>,
+        /// `ReplayRing` anchor: the seq of the last persisted Message at
+        /// subscribe time. Every entry in `pending_events` has
+        /// `sequence_id > pending_anchor_sequence_id`. See
+        /// `sse_wire.allium` `InitSnapshot`.
+        pending_anchor_sequence_id: i64,
+        /// `ReplayRing` contents at subscribe time. Each entry is a full
+        /// `SseWireEvent` (already converted from the runtime `SseEvent`),
+        /// so the client can route through its normal per-event listeners
+        /// after the DB snapshot lands. Empty when `pending_truncated`.
+        /// `Init` is structurally excluded from this list by construction —
+        /// the ring never accepts `Init` entries (it is per-stream, never
+        /// broadcast) — but the type does not enforce this exclusion.
+        ///
+        /// Exported as `Array<unknown>` on the TS side (same pattern as
+        /// `messages`) so the valibot schema can validate per-entry shape
+        /// via the existing per-event schemas without needing a recursive
+        /// `SseWireEvent` schema. Phase 3 (`tasks/62002`) wires that
+        /// validation into the reducer's init path.
+        #[ts(type = "Array<unknown>")]
+        pending_events: Vec<SseWireEvent>,
+        /// True iff the ring overflowed since the last anchor; clients
+        /// should fall back to DB-only state and wait for the next live
+        /// event. Q3 resolution in `sse_wire.allium`.
+        pending_truncated: bool,
     },
     /// A newly-persisted message joins the conversation. The envelope
     /// `sequence_id` equals `message.sequence_id` by construction.
@@ -341,6 +365,9 @@ impl From<SseEvent> for SseWireEvent {
                 commits_behind,
                 commits_ahead,
                 project_name,
+                pending_anchor_sequence_id,
+                pending_events,
+                pending_truncated,
             } => SseWireEvent::Init {
                 sequence_id,
                 conversation,
@@ -353,6 +380,9 @@ impl From<SseEvent> for SseWireEvent {
                 commits_behind,
                 commits_ahead,
                 project_name,
+                pending_anchor_sequence_id,
+                pending_events: pending_events.into_iter().map(SseWireEvent::from).collect(),
+                pending_truncated,
             },
             SseEvent::Message { message } => {
                 // The envelope `sequence_id` equals `message.sequence_id` —

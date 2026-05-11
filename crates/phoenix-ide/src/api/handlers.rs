@@ -1463,6 +1463,13 @@ async fn stream_conversation(
     handle.broadcast_tx.observe_seq(last_sequence_id);
     let init_seq = handle.broadcast_tx.current_seq();
 
+    // Snapshot the ReplayRing alongside the DB read so reconnecting clients
+    // can resume mid-turn views (in-flight assistant message, streaming
+    // tokens, current tool phase) instead of blanking out until the next
+    // checkpoint. See `sse_wire.allium` StreamOpened + InitSnapshotMirrorsRing.
+    let (pending_anchor_sequence_id, pending_truncated, pending_events) =
+        handle.broadcast_tx.snapshot_pending();
+
     // Create init event with typed data -- serialization deferred to SSE layer
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
@@ -1476,6 +1483,9 @@ async fn stream_conversation(
         commits_behind: initial_commits_behind,
         commits_ahead: initial_commits_ahead,
         project_name,
+        pending_anchor_sequence_id,
+        pending_events,
+        pending_truncated,
     };
 
     // Spawn periodic git delta polling for Work conversations (REQ-PROJ-011)
@@ -3546,6 +3556,11 @@ async fn shared_sse_stream(
     handle.broadcast_tx.observe_seq(last_sequence_id);
     let init_seq = handle.broadcast_tx.current_seq();
 
+    // Mirror the ReplayRing into the init payload (sse_wire.allium
+    // InitSnapshotMirrorsRing). Same shape as the primary handler above.
+    let (pending_anchor_sequence_id, pending_truncated, pending_events) =
+        handle.broadcast_tx.snapshot_pending();
+
     let init_event = SseEvent::Init {
         sequence_id: init_seq,
         conversation: Box::new(enrich_conversation_with_seed(&state, &conversation).await),
@@ -3558,6 +3573,9 @@ async fn shared_sse_stream(
         commits_behind: 0,
         commits_ahead: 0,
         project_name,
+        pending_anchor_sequence_id,
+        pending_events,
+        pending_truncated,
     };
 
     Ok(sse_stream(conversation_id, init_event, broadcast_rx))
