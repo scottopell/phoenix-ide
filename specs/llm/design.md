@@ -45,26 +45,40 @@ pub struct Usage {
 }
 ```
 
-## Error Types (REQ-LLM-006)
+## Error Types (REQ-LLM-006, REQ-LLM-006a)
 
 No `Unknown` variant. No `#[non_exhaustive]`. No `_ =>` in match arms. Adding a new
 HTTP status class requires adding a variant and handling it in every consumer — the
 compiler forces it.
+
+`RateLimit` and `UsageLimitReached` are split deliberately. A 429 can mean either a
+transient per-window throttle (retry in seconds) or a quota window having reset-on-a-
+calendar-boundary (retry next Sunday). Treating both as `RateLimit` either wastes work
+or misclassifies recovery, depending on which way the default lands. The split keeps
+`is_retryable()` honest.
 
 ```rust
 pub struct LlmError {
     pub kind: LlmErrorKind,
     pub message: String,
     pub retry_after: Option<Duration>,
+    /// Present iff `kind == UsageLimitReached`. Structured payload extracted
+    /// from the codex backend's 429 response (body + headers). Used to render
+    /// plan-aware messages and (later) drive a quota status indicator.
+    pub quota: Option<QuotaDetails>,
 }
 
 pub enum LlmErrorKind {
     /// Network issues, timeouts - retryable
     Network,
-    /// Rate limited (429) - retryable with backoff
+    /// Transient rate-limit throttle (per-minute, per-second windows) - retryable with backoff
     RateLimit,
+    /// Quota window exhausted (plan-level cap hit, credits depleted, etc.) - NOT retryable
+    UsageLimitReached,
     /// Server error (5xx) - retryable
     ServerError,
+    /// Selected model is at capacity (`server_is_overloaded` / `slow_down`) - NOT retryable
+    ServerOverloaded,
     /// Authentication failed (401, 403) - not retryable
     Auth,
     /// Bad request (400) - not retryable
@@ -79,9 +93,65 @@ pub enum LlmErrorKind {
 impl LlmErrorKind {
     pub fn is_retryable(&self) -> bool {
         matches!(self, Self::Network | Self::RateLimit | Self::ServerError)
+        // UsageLimitReached and ServerOverloaded are intentionally terminal.
     }
 }
+
+/// Structured quota state extracted from the codex backend on 429.
+///
+/// All fields are optional: the codex backend populates a subset depending on
+/// which limit was hit (per-model vs global), the user's plan, and whether
+/// credits are tracked. Consumers must handle every field being None.
+pub struct QuotaDetails {
+    pub plan_type: Option<String>,         // raw "plus" / "pro" / "team" / ...
+    pub resets_at: Option<DateTime<Utc>>,  // when the active window resets
+    pub limit_id: Option<String>,          // active limit family, e.g. "codex"
+    pub limit_name: Option<String>,        // human label, e.g. "gpt-5.2-codex-sonic"
+    pub primary: Option<RateLimitWindow>,
+    pub secondary: Option<RateLimitWindow>,
+    pub credits: Option<CreditsSnapshot>,
+    pub promo_message: Option<String>,
+}
+
+pub struct RateLimitWindow {
+    pub used_percent: f64,
+    pub window_minutes: Option<i64>,
+    pub resets_at: Option<i64>,            // unix seconds
+}
+
+pub struct CreditsSnapshot {
+    pub has_credits: bool,
+    pub unlimited: bool,
+    pub balance: Option<String>,
+}
 ```
+
+### Codex backend 429 parsing (REQ-LLM-006a)
+
+When `use_codex_backend == true` and a request returns HTTP 429, both the
+non-streaming and streaming paths run an additional parsing step before
+falling through to the generic `LlmError::rate_limit` path:
+
+1. Attempt to deserialize the body as `{ error: { type, plan_type, resets_at } }`.
+2. On `type == "usage_limit_reached"`:
+   - Read response headers via the `x-codex-*` family
+     (`primary-used-percent`, `primary-window-minutes`, `primary-reset-at`,
+     secondary variants, `credits-*`, `active-limit`, `limit-name`,
+     `promo-message`) to populate `QuotaDetails`.
+   - Render the message using plan-aware wording (recovery action per plan,
+     absolute reset time in user's local timezone).
+   - Return `LlmError { kind: UsageLimitReached, ... }`.
+3. On `type == "usage_not_included"`: return `LlmError { kind: Auth, ... }`
+   with an upgrade-required message.
+4. Otherwise (no recognized `type` field): return
+   `LlmError { kind: RateLimit, ... }` — transient throttle, retryable.
+
+HTTP 503 with body `error.code in {server_is_overloaded, slow_down}` returns
+`LlmError { kind: ServerOverloaded, ... }`. Platform Responses API requests
+(`use_codex_backend == false`) skip this entire path — they're unchanged.
+
+This mirrors the canonical client behavior of the codex CLI (against the
+same backend), so user-facing wording aligns with adjacent tools.
 
 ## Streaming Interface (REQ-LLM-009)
 
@@ -140,8 +210,13 @@ This is the typed boundary between provider I/O and the pure state machine:
 ```rust
 pub enum LlmOutcome {
     Response(AssistantMessage, TokenUsage),
+    /// Transient rate-limit throttle - retryable
     RateLimited { retry_after: Option<Duration> },
+    /// Quota window exhausted - terminal. `details` carries plan + reset + windows.
+    UsageLimitReached { details: QuotaDetails, message: String },
     ServerError { status: u16, body: String },
+    /// Selected model at capacity - terminal, suggest different model
+    ServerOverloaded { message: String },
     NetworkError { message: String },
     TokenBudgetExceeded { partial: Option<AssistantMessage> },
     Cancelled,

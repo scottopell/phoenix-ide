@@ -110,13 +110,47 @@ WHEN LLM request fails
 THE SYSTEM SHALL classify error into an explicit, named category
 AND SHALL NOT use a catch-all or unknown classification
 
-WHEN error is retryable (network timeout, rate limit, server error)
+WHEN error is retryable (network timeout, transient rate-limit throttle, server error)
 THE SYSTEM SHALL include retry-after hint when available
+
+WHEN error is a quota/usage-limit exhaustion (distinct from a transient throttle)
+THE SYSTEM SHALL classify it as a terminal, non-retryable error category
+AND SHALL NOT collapse it into the transient rate-limit category
+
+WHEN error indicates the selected model is at capacity (e.g. provider returns `server_is_overloaded` or `slow_down`)
+THE SYSTEM SHALL classify it as a terminal, non-retryable error category distinct from generic server errors
+AND SHALL surface a message suggesting the user try a different model
 
 WHEN a new error condition is encountered
 THE SYSTEM SHALL require an explicit classification decision before it can be handled
 
-**Rationale:** Error classification enables the state machine to implement appropriate retry logic. Exhaustive classification prevents accidental behavioral contracts where unknown errors silently become non-retryable, causing transient failures to be treated as permanent.
+**Rationale:** Error classification enables the state machine to implement appropriate retry logic. Exhaustive classification prevents accidental behavioral contracts where unknown errors silently become non-retryable, causing transient failures to be treated as permanent. Quota exhaustion and overloaded-model errors are distinct from transient throttles — retrying them is wasted work and the user-facing recovery differs (wait for window reset / upgrade plan / pick another model).
+
+---
+
+### REQ-LLM-006a: Plan-Aware Quota Messages (Codex Backend)
+
+WHEN a request through the codex backend (`chatgpt.com/backend-api/codex`) fails with HTTP 429 and a body indicating quota exhaustion
+THE SYSTEM SHALL parse the structured error payload to extract:
+- the user's plan type (e.g. plus, pro, team, business, enterprise, free)
+- the quota reset timestamp when present
+- the primary and secondary rate-limit window snapshots from response headers (used percent, window minutes, reset-at)
+- the credits snapshot (has-credits, unlimited, balance) when present
+- the active limit identifier and limit name when present
+- the optional promotional message from the response headers
+
+WHEN rendering a quota-exhaustion error to the user
+THE SYSTEM SHALL produce a plan-aware message that names the recovery action appropriate to the user's plan (upgrade path for consumer plans, admin-contact for workspace plans, credit purchase for paid plans with depleted credits)
+AND SHALL include the absolute reset time formatted in the user's local timezone when known
+
+WHEN a 429 response from the codex backend does NOT indicate quota exhaustion (i.e. it is a transient per-window throttle)
+THE SYSTEM SHALL classify it as the retryable transient rate-limit category, not as quota exhaustion
+
+WHEN a request through any backend that is NOT the codex backend returns 429
+THE SYSTEM SHALL apply the provider's existing generic error path
+AND SHALL NOT attempt to parse codex-specific structured fields
+
+**Rationale:** Phoenix's codex bridge routes ChatGPT-plan-backed traffic to a backend that returns structured quota state in both the response body (plan type, reset timestamp) and headers (window snapshots, credits, promo messages). Surfacing this structure as opaque text strands the user — they cannot tell whether to wait, upgrade, or contact an admin. The codex CLI (the canonical client for the same backend) already renders these strings; adopting the same wording avoids divergence with what users see in adjacent tools.
 
 ---
 

@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-The LLM provider abstracts communication with multiple LLM APIs behind a common interface. Users select their preferred model while the system handles provider-specific translation internally. When exe.dev gateway is configured, Phoenix queries provider model listing endpoints (`/anthropic/v1/models`, `/openai/v1/models`, `/fireworks/inference/v1/models`) at startup to discover available models dynamically, merging gateway data with hardcoded metadata for context windows and descriptions. If gateway doesn't support model listing, Phoenix falls back to hardcoded models. In direct API mode, only models with configured API keys are registered. Requests use a common format (system prompt, messages, tools) that gets translated per-provider. Responses are normalized to text blocks, tool use requests, end-of-turn indicators, and usage statistics. Errors are classified as retryable (network, rate limit) or non-retryable (auth) to enable appropriate state machine handling.
+The LLM provider abstracts communication with multiple LLM APIs behind a common interface. Users select their preferred model while the system handles provider-specific translation internally. When exe.dev gateway is configured, Phoenix queries provider model listing endpoints (`/anthropic/v1/models`, `/openai/v1/models`, `/fireworks/inference/v1/models`) at startup to discover available models dynamically, merging gateway data with hardcoded metadata for context windows and descriptions. If gateway doesn't support model listing, Phoenix falls back to hardcoded models. In direct API mode, only models with configured API keys are registered. Requests use a common format (system prompt, messages, tools) that gets translated per-provider. Responses are normalized to text blocks, tool use requests, end-of-turn indicators, and usage statistics. Errors are classified as retryable (network, transient rate-limit throttle, server error) or terminal (auth, quota exhaustion, model at capacity, content filter, context exhausted) to enable appropriate state machine handling. When traffic routes through the codex backend, 429 responses carrying structured quota state (plan type, reset time, window snapshots, credits, promo message) are parsed into a plan-aware terminal error rather than an opaque retryable message.
 
 ## Technical Summary
 
@@ -18,9 +18,10 @@ Implements `LlmService` trait with `complete()` method returning `LlmResponse`. 
 | **REQ-LLM-003a:** Model Discovery | ✅ Complete | Queries gateway endpoints, falls back to hardcoded |
 | **REQ-LLM-004:** Request Format | ✅ Complete | LlmRequest with system, messages, tools |
 | **REQ-LLM-005:** Response Handling | ✅ Complete | Normalized to ContentBlock variants |
-| **REQ-LLM-006:** Error Classification | ✅ Complete | LlmErrorKind with is_retryable() |
+| **REQ-LLM-006:** Error Classification | 🚧 Extension pending | Base classification complete; split of transient throttle vs quota exhaustion vs model-overloaded tracked in task 67002 |
+| **REQ-LLM-006a:** Plan-Aware Quota Messages (Codex Backend) | 📋 Planned | Task 67002 — parse codex 429 body + `x-codex-*` headers into structured `QuotaDetails`, render plan-aware messages matching codex CLI wording. Phases 2/3 (mid-stream SSE event, UI surface) tracked as 67003/67004. |
 | **REQ-LLM-007:** Usage Tracking | ✅ Complete | Usage struct with token counts |
 | **REQ-LLM-008:** Request Logging | ✅ Complete | LoggingService wrapper with tracing |
 | **REQ-LLM-009:** Streaming Responses | ✅ Complete | Task 582. `complete_streaming()` on `LlmClient` trait, Anthropic implemented, OpenAI falls back |
 
-**Progress:** 10 of 10 complete
+**Progress:** 9 of 10 complete; REQ-LLM-006 extension + REQ-LLM-006a in flight (task 67002)
