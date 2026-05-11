@@ -58,3 +58,8 @@ When `get_or_create()` is called after eviction, pass the old broadcaster (if we
 
 ## Progress
 
+- Implemented (Option A). `Event::Shutdown` added; `RuntimeManager::evict_runtime` sends it
+  before removing the HashMap entry; the executor `select!` loop returns immediately on it
+  (`runtime/executor.rs`). The evicted broadcaster is also deposited so late events still reach
+  the new runtime. Status had been left `in-progress` — flipped to `done`.
+

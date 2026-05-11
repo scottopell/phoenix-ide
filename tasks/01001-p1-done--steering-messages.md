@@ -136,3 +136,8 @@ SseWireEvent::SteerMessageQueued {
 
 ## Progress
 
+- Implemented. Steering queue (DB column + migration, `SteerEntry`, `Event::SteerMessage`,
+  `SteerMessageQueued` SSE, `enqueue_steer_message`, executor drain in `apply_transition_result`)
+  shipped in PR #37; drain-all + mid-turn drain + crash-safe persist in PR #73. Status had been
+  left `in-progress` — flipped to `done`.
+

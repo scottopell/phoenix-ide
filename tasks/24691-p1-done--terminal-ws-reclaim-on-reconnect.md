@@ -196,6 +196,15 @@ to `send(StopReason::TearDown)` so the relay exits via the full-teardown arm.
 - `ui/src/components/TerminalPanel.tsx` — no change required; reclaim is
   server-side.
 
+## Progress
+
+- Implemented. `StopReason { Running, Detach, TearDown }` added to `terminal/session.rs`;
+  `terminal/ws.rs` reclaims an already-active `conv_id` via a single `attach_permit` + `stop_tx`
+  watch channel instead of returning 409; exit cleanup branches on `RelayExit` so `PtyEof` /
+  `TearDown` fully tear down while `Detach` / `WsClosed` keep the shell alive. Tests live in
+  `terminal/relay.rs`, `terminal/ws.rs`, and `terminal/proptests.rs`. Status had been left
+  `in-progress` — flipped to `done`.
+
 ## Implementation Hints
 
 - The resize callback in `ws.rs:184-187` captures `master_fd_raw`. Each

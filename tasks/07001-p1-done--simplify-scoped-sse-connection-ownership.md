@@ -79,3 +79,9 @@ Add or update tests for:
 
 ## Progress
 
+- Implemented in PR #39 ("Simplify scoped SSE connection ownership"). The `conversationIdForSSE`
+  page-level debounce was removed; `useConnection` resets by `conversationId`; queue drain is
+  scoped to the active connection. The `atom.connectionState` mirror was deliberately kept — it
+  has a live consumer via `connectionInfo.state` → `StateBar` — which the task allowed ("if
+  dead"). Status had been left `in-progress` — flipped to `done`.
+

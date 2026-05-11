@@ -164,3 +164,9 @@ Add rules for chain elements when NOT in sidebar mode. In full-page mode, chain 
 
 ## Progress
 
+- Implemented. Backend: `continue_conversation` derives `{root_slug}-{N}` via `chain_root_of` +
+  `chain_members_forward` with a UNIQUE-violation retry loop and a UUID-suffix safety valve
+  (`db.rs`). UI: `groupedItems` in `ConversationList.tsx` is no longer gated on `sidebarMode`;
+  chain member rows render `#{idx+1}` instead of raw slugs. Existing-slug migration remains out
+  of scope per the task body. Status had been left `in-progress` — flipped to `done`.
+
