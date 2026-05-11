@@ -33,6 +33,7 @@ function makeMessage(sequenceId: number, messageType: 'user' | 'agent' = 'agent'
 }
 
 function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
+  const lastSequenceId = overrides.lastSequenceId ?? 5;
   return {
     conversation: testConversation,
     messages: [],
@@ -40,7 +41,12 @@ function makeInitPayload(overrides: Partial<InitPayload> = {}): InitPayload {
     breadcrumbs: [],
     breadcrumbSequenceIds: new Set(),
     contextWindow: { used: 1000 },
-    lastSequenceId: 5,
+    lastSequenceId,
+    // Default to "no pending replay": anchor matches the tip and the ring
+    // is empty. Tests exercising ReplayRing behaviour override these.
+    pendingAnchorSequenceId: lastSequenceId,
+    pendingEvents: [],
+    pendingTruncated: false,
     ...overrides,
   };
 }

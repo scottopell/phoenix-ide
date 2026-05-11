@@ -181,6 +181,9 @@ function transformInitData(raw: SseInitData): InitPayload {
       used: raw.context_window_size ?? 0,
     },
     lastSequenceId: raw.last_sequence_id ?? 0,
+    pendingAnchorSequenceId: raw.pending_anchor_sequence_id,
+    pendingEvents: raw.pending_events,
+    pendingTruncated: raw.pending_truncated,
   };
 }
 

@@ -55,6 +55,21 @@ export interface InitPayload {
   breadcrumbSequenceIds: ReadonlySet<number>;
   contextWindow: { used: number };
   lastSequenceId: number;
+  /** ReplayRing anchor: seq of the last persisted Message at subscribe time.
+   *  Every entry in `pendingEvents` has `sequence_id > pendingAnchorSequenceId`.
+   *  On fresh-connect the init reducer seeds `lastSequenceId` from this value
+   *  so the per-event applyIfNewer guards accept pending entries instead of
+   *  dropping them as replays against `payload.lastSequenceId`. */
+  pendingAnchorSequenceId: number;
+  /** ReplayRing contents at subscribe time. Each entry is a wire-format
+   *  `SseWireEvent` (snake_case fields, `type` discriminator). Validated
+   *  per-entry at apply time via the existing per-event valibot schemas;
+   *  malformed entries are skipped without crashing the whole init. */
+  pendingEvents: unknown[];
+  /** True iff the server-side ring overflowed since the last anchor. Treated
+   *  as a soft hint: the DB snapshot is still authoritative and the safety
+   *  belt advances `lastSequenceId` to the server's witnessed tip. */
+  pendingTruncated: boolean;
 }
 
 // Task 02675: every wire-originated SSE action carries a `sequenceId` from
