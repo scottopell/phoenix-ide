@@ -187,6 +187,21 @@ export const SseInitDataSchema = v.looseObject({
   commits_behind: v.number(),
   commits_ahead: v.number(),
   project_name: v.nullable(v.string()),
+  // ReplayRing snapshot (Phase 2: server-side wiring). The reducer does
+  // not yet consume these — see `specs/sse_wire/sse_wire.allium`
+  // StreamOpened and `tasks/62002` for Phase 3 client wiring. Validate
+  // the load-bearing top-level shape now so a future reducer addition
+  // can rely on the fields being present and well-typed.
+  //
+  // `pending_events` is intentionally `unknown[]`: Phase 3 will apply
+  // the per-event schemas (SseTokenDataSchema etc.) at replay time so
+  // each entry is validated through the same path as its live
+  // counterpart. Validating it here as a strongly-typed discriminated
+  // union would require a recursive SseWireEvent schema that drifts
+  // independently from the per-event validators below.
+  pending_anchor_sequence_id: v.number(),
+  pending_events: v.array(v.unknown()),
+  pending_truncated: v.boolean(),
 }) satisfies v.GenericSchema<unknown, WireInitData>;
 
 /** `message`: a newly-created message joins the conversation.

@@ -30,7 +30,36 @@ conversation: unknown,
  * valibot schema validates each element against `MessageSchema`
  * and transforms to `Message` at that boundary.
  */
-messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, breadcrumbs: Array<SseBreadcrumb>, commits_behind: number, commits_ahead: number, project_name: string | null, } | { "type": "message", sequence_id: number, 
+messages: Array<unknown>, agent_working: boolean, presentation_mode: string, last_sequence_id: number, context_window_size: number, breadcrumbs: Array<SseBreadcrumb>, commits_behind: number, commits_ahead: number, project_name: string | null, 
+/**
+ * `ReplayRing` anchor: the seq of the last persisted Message at
+ * subscribe time. Every entry in `pending_events` has
+ * `sequence_id > pending_anchor_sequence_id`. See
+ * `sse_wire.allium` `InitSnapshot`.
+ */
+pending_anchor_sequence_id: number, 
+/**
+ * `ReplayRing` contents at subscribe time. Each entry is a full
+ * `SseWireEvent` (already converted from the runtime `SseEvent`),
+ * so the client can route through its normal per-event listeners
+ * after the DB snapshot lands. Empty when `pending_truncated`.
+ * `Init` is structurally excluded from this list by construction —
+ * the ring never accepts `Init` entries (it is per-stream, never
+ * broadcast) — but the type does not enforce this exclusion.
+ *
+ * Exported as `Array<unknown>` on the TS side (same pattern as
+ * `messages`) so the valibot schema can validate per-entry shape
+ * via the existing per-event schemas without needing a recursive
+ * `SseWireEvent` schema. Phase 3 (`tasks/62002`) wires that
+ * validation into the reducer's init path.
+ */
+pending_events: Array<unknown>, 
+/**
+ * True iff the ring overflowed since the last anchor; clients
+ * should fall back to DB-only state and wait for the next live
+ * event. Q3 resolution in `sse_wire.allium`.
+ */
+pending_truncated: boolean, } | { "type": "message", sequence_id: number, 
 /**
  * See the note on `Init.messages` — the message payload is
  * validated against `MessageSchema` and transformed to the UI's

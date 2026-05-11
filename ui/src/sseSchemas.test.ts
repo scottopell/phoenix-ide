@@ -124,6 +124,9 @@ describe('parseEvent', () => {
       commits_behind: 0,
       commits_ahead: 0,
       project_name: null,
+      pending_anchor_sequence_id: 0,
+      pending_events: [],
+      pending_truncated: false,
     };
 
     it('accepts a minimal valid init payload', () => {

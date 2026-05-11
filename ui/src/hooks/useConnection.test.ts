@@ -106,6 +106,9 @@ function makeInitPayload(convId: string, slug: string) {
     commits_behind: 0,
     commits_ahead: 0,
     project_name: null,
+    pending_anchor_sequence_id: 0,
+    pending_events: [],
+    pending_truncated: false,
   };
 }
 
