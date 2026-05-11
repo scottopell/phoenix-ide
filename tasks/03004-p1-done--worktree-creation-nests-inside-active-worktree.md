@@ -1,3 +1,33 @@
+## Resolution
+
+Fixed by commit `c504ad0` ("fix: REQ-PROJ-028 branch rename unreachable;
+extract canonical repo_root helper (#23)"):
+
+- `execute_approve_task_blocking` now takes an explicit `repo_root: &Path`
+  alongside `cwd`. The caller derives it via the new
+  `git_ops::repo_root_from_phoenix_worktree` helper, so `phoenix_dir` is
+  anchored at the repo root rather than at the active worktree's cwd.
+- The helper replaced four ad-hoc ancestor-walk implementations across
+  `cleanup_worktree_if_present`, `execute_approve_task`,
+  `reconcile_worktrees`, and `system_prompt`. Strict predicate
+  (`Option<PathBuf>`); callers opt into the input-as-fallback behaviour
+  via `.unwrap_or_else(|| cwd.clone())` at each call site so the contract
+  is explicit.
+- Regression test:
+  `cwd_immutability_tests::approve_task_returns_same_path_as_explore_worktree`
+  exercises Explore→Work promotion and asserts no nested worktree and no
+  nested `.phoenix/` is created.
+
+The remaining `handlers.rs` worktree-creation site (initial Explore
+worktree) is only reached from a fresh conversation whose cwd the user
+explicitly chose; a user pointing it inside an existing worktree is a
+manual-misuse case and not the mainline-continuation nesting this task
+was filed for. Tracking that as a separate p3 if it materialises.
+
+The three nested worktrees observed when this task was filed should be
+relocated or pruned manually — no auto-relocation, since the inner
+worktrees may carry uncommitted work.
+
 ## Worktrees can be created nested inside other worktrees
 
 Observed from `git worktree list` in the main checkout:
