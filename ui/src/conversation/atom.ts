@@ -474,8 +474,12 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
     }
     case 'steer_message_queued': {
       // Validated for forward-compat parity with the live handler in
-      // useConnection.ts; no reducer action needed (no-op).
-      v.safeParse(SseSteerMessageQueuedDataSchema, entry);
+      // useConnection.ts; no reducer action needed (no-op). Schema drift
+      // still warns in DEV so a Rust-side wire change surfaces here.
+      const res = v.safeParse(SseSteerMessageQueuedDataSchema, entry);
+      if (!res.success && import.meta.env.DEV) {
+        console.warn('[sse] dropping malformed pending steer_message_queued entry', { issues: res.issues });
+      }
       return atom;
     }
     case 'error': {
@@ -492,9 +496,18 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         error: { type: 'BackendError', message: res.output.message },
       });
     }
-    // `init`, `conversation_became_terminal`, `conversation_hard_deleted`
-    // are not expected in the ring (init is per-stream; terminal/delete
-    // events post-date any in-flight turn). Drop quietly.
+    // Known event types that don't belong in the ring by construction:
+    // init is per-stream (never broadcast); terminal/delete events post-
+    // date any in-flight turn (the broadcaster anchor resets on each
+    // persisted Message, and these types arrive after the final message).
+    // Drop silently — surfacing them as warnings would be noise during
+    // forward-compatible server changes, not signal.
+    case 'init':
+    case 'conversation_became_terminal':
+    case 'conversation_hard_deleted':
+      return atom;
+    // Truly unknown discriminator (new Rust-side variant the client
+    // hasn't been updated for). Warn in DEV so the drift is observable.
     default:
       if (import.meta.env.DEV) {
         console.warn('[sse] dropping unrecognized pending entry type', { type, entry });
@@ -561,6 +574,20 @@ export function conversationReducer(
       }
 
       const phase1Floor = isFreshConnect ? p.pendingAnchorSequenceId : atom.lastSequenceId;
+      // streamingBuffer policy: fresh-connect always clears (atom had no
+      // buffer to preserve). Reconnect preserves the existing buffer when
+      // the snapshot phase is still llm_requesting — pending tokens with
+      // seq > floor extend it via the sse_token reducer, tokens at or below
+      // are dropped as replays. Clearing on reconnect unconditionally would
+      // create a blank-UI window the pending replay cannot rebuild because
+      // applyIfNewer drops the very tokens we'd need. When the snapshot
+      // phase is anything else, the turn ended while disconnected and we
+      // clear. See SseInitReconnectMerge in
+      // specs/conversation_atom/conversation_atom.allium.
+      const phase1StreamingBuffer =
+        !isFreshConnect && p.phase.type === 'llm_requesting'
+          ? atom.streamingBuffer
+          : null;
       let next: ConversationAtom = {
         ...atom,
         conversationId: p.conversation.id,
@@ -571,7 +598,7 @@ export function conversationReducer(
         breadcrumbSequenceIds: snapshotBreadcrumbSeqIds,
         contextWindow: p.contextWindow,
         lastSequenceId: phase1Floor,
-        streamingBuffer: null,
+        streamingBuffer: phase1StreamingBuffer,
         uiError: null,
         toolExecutingStartedAt: p.phase.type === 'tool_executing' ? Date.now() : null,
       };

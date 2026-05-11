@@ -251,10 +251,19 @@ rule SseInitReconnectMerge {
     -- Phase 1: snapshot merge. Note we do NOT reset lastSequenceId
     -- yet — keep the atom's current floor so pending entries the
     -- atom has already seen live are dropped as replays.
+    --
+    -- streamingBuffer is preserved when payload.phase is
+    -- llm_requesting (the turn is still in flight; pending tokens
+    -- with seq > floor will extend the existing buffer, and tokens
+    -- at or below the floor are correctly dropped as replays — the
+    -- alternative of clearing the buffer creates a blank window
+    -- because the cleared buffer cannot be rebuilt from already-
+    -- observed tokens). Cleared when payload.phase is anything
+    -- else, because the turn ended while disconnected.
     ensures: atom.messages = merge_by_id(atom.messages, payload.messages)
     ensures: atom.phase = payload.phase
     ensures: atom.breadcrumbs = payload.breadcrumbs
-    ensures: atom.streamingBuffer = null
+    ensures: atom.streamingBuffer = preserve_buffer_when_streaming(atom.streamingBuffer, payload.phase)
     ensures: atom.uiError = null
 
     -- Phase 2: apply pending events. Per-event applyIfNewer naturally
@@ -268,6 +277,19 @@ rule SseInitReconnectMerge {
     ensures: atom.lastSequenceId = max_int(atom.lastSequenceId, payload.last_sequence_id)
 
     @guidance
+        -- preserve_buffer_when_streaming(buf, phase):
+        --   if phase.type = llm_requesting then buf else null
+        -- Rationale: on reconnect the atom may already hold a live
+        -- streamingBuffer from tokens this connection has accepted.
+        -- Clearing it unconditionally creates a blank-UI window because
+        -- the pending tokens that would otherwise rebuild it have seq
+        -- at-or-below the existing floor and are dropped by applyIfNewer
+        -- as replays. Preserving when phase=llm_requesting closes that
+        -- window; clearing for other phases reflects "turn ended while
+        -- disconnected." Pending agent_done in phase 2 still clears the
+        -- buffer through its own per-event rule, so the final state is
+        -- correct even when the snapshot phase is stale.
+        --
         -- merge_by_id (ui/src/conversation/atom.ts:sse_init case):
         --   1. Build a Map<message_id, Message> from payload.messages.
         --   2. For each existing m in atom.messages: replace with the
