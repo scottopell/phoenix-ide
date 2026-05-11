@@ -182,20 +182,28 @@ rule DrainOnIdleEntry {
         -- the entire Vec<SteerEntry> out atomically. The bedrock arm for
         -- (Idle, SteerDrainedUserMessages) emits one Effect::persist_user_message
         -- per entry in iteration order, then Effect::PersistState, then
-        -- Effect::ClearSteeringQueue, then NotifyLlmRequesting, and finally
-        -- Effect::RequestLlm. The effect loop runs persist effects serially, each
-        -- allocating a sequential sequence_id, so transcript order is FIFO and
-        -- matches enqueue order.
+        -- Effect::ClearSteeringQueueEntries { message_ids }, then
+        -- NotifyLlmRequesting, and finally Effect::RequestLlm. The effect loop
+        -- runs persist effects serially, each allocating a sequential
+        -- sequence_id, so transcript order is FIFO and matches enqueue order.
         --
         -- Single RequestLlm: only one is emitted regardless of how many entries
         -- were drained. The next LLM call sees all N messages as freshly-persisted
         -- transcript context.
         --
-        -- Crash recovery: ClearSteeringQueue runs AFTER persist effects, so a
-        -- crash mid-drain leaves the DB queue populated. On restart the queue
-        -- reloads; the next drain hook re-fires SteerDrainedUserMessages with
-        -- the same entries; Effect::PersistMessage skips already-persisted entries
-        -- via a storage.message_exists() precheck. At-least-once delivery without
+        -- Inline processing: the drain event is processed inside the same
+        -- apply_transition_result call that triggered the hook, not via the
+        -- outer event loop. This is what makes ordering deterministic.
+        --
+        -- Crash recovery: ClearSteeringQueueEntries removes ONLY the drained
+        -- message_ids (not the whole queue), so a concurrent enqueue during
+        -- the drain window is preserved. It runs AFTER persist effects, so a
+        -- crash mid-drain leaves the drained entries in the DB queue. On
+        -- restart the queue reloads; the next drain hook re-fires
+        -- SteerDrainedUserMessages with the same entries; Effect::PersistMessage
+        -- skips already-persisted entries via a storage.message_exists()
+        -- precheck gated by an idempotent: bool flag (so non-replayable
+        -- persists pay no extra DB query). At-least-once delivery without
         -- double-insertion.
         --
         -- FIFO is preserved: entries are stored in a Vec with append-at-tail
@@ -206,10 +214,9 @@ rule DrainOnIdleEntry {
 -- REQ-STEER-005
 -- When a conversation transitions into llm_requesting from a tool round
 -- (executing_tools or awaiting_sub_agents) and the queue is non-empty,
--- ALL queued entries are drained and persisted as UserMessages in FIFO order.
--- No new RequestLlm is issued — the prior transition's RequestLlm is already
--- in flight and does not see these messages; they land in the LLM call that
--- follows the upcoming tool round (i.e., the NEXT round-trip).
+-- ALL queued entries are drained and persisted as UserMessages in FIFO order
+-- BEFORE the prior transition's RequestLlm spawns the LLM task. The
+-- in-flight LLM call sees the steered messages deterministically.
 rule DrainOnEnteringLlmRoundFromToolRound {
     when: conversation: bedrock.Conversation.core_status
         transitions_to llm_requesting
@@ -217,53 +224,45 @@ rule DrainOnEnteringLlmRoundFromToolRound {
         executing_tools, awaiting_sub_agents
     }
     for q in SteeringQueue where q.conversation = conversation and q.depth > 0:
-        ensures: q.depth = 0
-        -- Every drained entry becomes a UserMessage; FIFO order is preserved
-        -- by the implementation (Vec iteration order = enqueue order).
+        -- Drained ids removed from queue; concurrently-enqueued ids preserved.
         ensures: q.entries.all(e =>
                      bedrock.UserSendsMessage(conversation,
                          e.text, e.llm_text, e.images,
                          e.message_id, e.user_agent, e.skill_invocation))
-        -- No new RequestLlm — the in-flight one from the prior transition
-        -- continues, but it cannot observe the newly-persisted messages.
-        ensures: not bedrock.RequestLlmIssued(conversation)
+        -- The bedrock arm itself does NOT emit a new RequestLlm. The executor's
+        -- deferred-RequestLlm machinery (see @guidance) runs the original
+        -- transition's RequestLlm AFTER drain persists, so the in-flight call
+        -- sees the steered messages.
+        ensures: not bedrock.NewRequestLlmIssuedByDrainArm(conversation)
 
     @guidance
         -- The bedrock state-machine transition that goes
         --   executing_tools -> llm_requesting  (or)
         --   awaiting_sub_agents -> llm_requesting
-        -- already dispatches RequestLlm as part of its effects (the conversation
-        -- is going to ask the LLM to interpret the tool results). The executor's
-        -- mid-turn drain detector fires AFTER that prior transition's
-        -- RequestLlm has been queued onto the effect list, so the in-flight
-        -- LLM call's request body has already been (or is about to be)
-        -- assembled from a transcript snapshot that does not include the
-        -- drained entries.
+        -- emits Effect::RequestLlm as part of its effects (the conversation
+        -- is going to ask the LLM to interpret the tool results).
         --
-        -- Allium ensures clauses are concurrent assertions about the post-state,
-        -- not a temporal sequence. The "in-flight LLM call cannot see new
-        -- messages" property is therefore enforced by construction in the
-        -- bedrock arm: (LlmRequesting, SteerDrainedUserMessages) emits N
-        -- Effect::persist_user_message + Effect::PersistState, but NOT
-        -- Effect::RequestLlm. Bedrock has no second LLM call to issue, so by
-        -- "not bedrock.RequestLlmIssued" we mean "this rule does not cause
-        -- one to be issued"; the prior transition's RequestLlm still flows
-        -- through the system.
+        -- The executor's `run_effects_with_inline_drain` handles this:
+        --   1. Defers any Effect::RequestLlm from the original effects.
+        --   2. Runs the remaining original effects.
+        --   3. Synchronously transitions (LlmRequesting, SteerDrainedUserMessages)
+        --      and runs its effects (N Effect::persist_user_message,
+        --      Effect::PersistState, Effect::ClearSteeringQueueEntries).
+        --   4. Runs the deferred RequestLlm. The spawned LLM task's
+        --      build_llm_messages_static reads a DB that already contains the
+        --      steered messages — deterministic, no race.
         --
-        -- Consequently, the freshly-persisted messages are first visible to
-        -- the LLM in the round-trip AFTER the current tool round: the LLM
-        -- responds to the tool results (in-flight call), the response is
-        -- processed (next tool round or text-only end-of-turn), and the
-        -- LLM call after THAT will see the steered messages in the
-        -- transcript. This matches the user-intended semantics of
-        -- "interject between tool-call LLM API calls".
+        -- This eliminates the race that would otherwise occur if RequestLlm
+        -- spawned the LLM task before the drain's persist effects ran. It also
+        -- closes the failure mode where a no-tool LLM response would settle
+        -- the conversation to Idle with steers persisted but unanswered.
         --
-        -- Same drain-all and FIFO properties as DrainOnIdleEntry: std::mem::take,
-        -- serial persist effects with sequential sequence_ids. The bedrock arm
-        -- also emits Effect::PersistState then Effect::ClearSteeringQueue at the
-        -- end. Crash recovery: queue cleared AFTER persist effects, so a crash
-        -- mid-drain reloads the queue on restart; idempotent PersistMessage via
-        -- storage.message_exists() prevents double-insertion on re-drain.
+        -- ClearSteeringQueueEntries removes only the drained ids (not the whole
+        -- queue), so a concurrent enqueue during the drain window is preserved.
+        -- Crash recovery: queue updated AFTER persist effects, so a crash
+        -- mid-drain reloads the drained entries on restart; idempotent
+        -- PersistMessage (gated by idempotent: bool, via storage.message_exists)
+        -- prevents double-insertion on re-drain.
 }
 
 -- REQ-STEER-003
@@ -378,8 +377,16 @@ surface SteeringQueueApi {
         -- of two points: turn-end (entering idle) or mid-turn (entering
         -- llm_requesting from executing_tools or awaiting_sub_agents) —
         -- whichever comes first. At each hook ALL queued entries drain together
-        -- as a batch; the queue is never partially drained. Mid-turn drained
-        -- steers are persisted into the transcript but are visible only to the
-        -- LLM call AFTER the in-flight one (which has already been dispatched
-        -- with a snapshot that does not include them).
+        -- as a batch; the queue is never partially drained. The drained
+        -- entries are persisted to the transcript BEFORE the LLM task is
+        -- spawned (inline drain + deferred RequestLlm in the executor), so the
+        -- in-flight LLM call deterministically observes the steered messages.
+
+    @guarantee EnqueueDuringDrainPreserved
+        -- A steering message enqueued while a drain is in progress is not lost.
+        -- Effect::ClearSteeringQueueEntries removes only the specific drained
+        -- message_ids (not the whole queue); the DB method
+        -- Database::remove_steering_entries does read-filter-write under a
+        -- transaction so a concurrent enqueue's read-append-write cannot be
+        -- clobbered.
 }
