@@ -147,13 +147,13 @@
   transition: opacity 150ms ease, background 150ms ease;
 }
 
-.task-viewer-start-work:hover:not(:disabled) {
-  opacity: 0.85;
-}
-
 .task-viewer-start-work:disabled {
   opacity: 0.4;
   cursor: not-allowed;
+}
+
+.task-viewer-start-work:hover:not(:disabled) {
+  opacity: 0.85;
 }
 
 .task-viewer-seed-error {

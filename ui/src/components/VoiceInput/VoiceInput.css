@@ -25,15 +25,6 @@
   flex-shrink: 0;
 }
 
-.voice-btn:hover:not(:disabled) {
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-}
-
-.voice-btn:active:not(:disabled) {
-  transform: scale(0.95);
-}
-
 .voice-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
@@ -42,6 +33,15 @@
 .voice-btn:focus-visible {
   outline: 2px solid var(--accent-blue);
   outline-offset: 2px;
+}
+
+.voice-btn:hover:not(:disabled) {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.voice-btn:active:not(:disabled) {
+  transform: scale(0.95);
 }
 
 /* Listening state - red pulsing */
