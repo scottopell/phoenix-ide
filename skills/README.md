@@ -79,7 +79,7 @@ We're starting conservatively to learn how agents consume skills:
 | Skill | Description |
 |-------|-------------|
 | [phoenix-development](phoenix-development/SKILL.md) | Dev workflow: `./dev.py up/down/restart/check`, testing, code conventions |
-| [phoenix-deployment](phoenix-deployment/SKILL.md) | Production deployment across Lima VM, native systemd, and daemon modes |
+| [phoenix-deployment](phoenix-deployment/SKILL.md) | Production deployment across native launchd (macOS), native systemd, and daemon modes |
 | [phoenix-task-tracking](phoenix-task-tracking/SKILL.md) | Task file format, CLI commands, issue discovery protocol |
 
 ---

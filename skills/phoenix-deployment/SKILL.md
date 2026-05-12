@@ -11,8 +11,7 @@ Run `./dev.py prod status` to see which mode is active. Do NOT choose or configu
 
 ```
 macOS
-└── Lima VM installed?  → YES → Lima mode
-                        → NO  → Error (install Lima first)
+└── Native launchd mode (always)
 
 Linux
 └── systemd available?  → YES → Native systemd mode
@@ -33,14 +32,13 @@ Linux
 ## ⚠️ Do NOT
 
 - **Do not** run `cargo run` or start the binary directly — use `./dev.py prod deploy`
-- **Do not** run `systemctl stop/start phoenix-ide` manually — `./dev.py prod deploy` handles this
-- **Do not** deploy in Lima mode without pushing first — the VM has its own git clone and cannot see unpushed commits; the deploy will fail
+- **Do not** run `systemctl stop/start phoenix-ide` or `launchctl load/unload` manually — `./dev.py prod deploy` handles this
 
 ## Mode-specific details
 
 For full details on each mode (ports, paths, log locations, LLM config), read the relevant file:
 
-- **Lima VM (macOS):** read `skills/phoenix-deployment/LIMA.md`
+- **Native launchd (macOS):** read `skills/phoenix-deployment/LAUNCHD.md`
 - **Native systemd (Linux):** read `skills/phoenix-deployment/SYSTEMD.md`
 - **Daemon (Linux, no systemd):** read `skills/phoenix-deployment/DAEMON.md`
 

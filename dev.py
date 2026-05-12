@@ -178,10 +178,6 @@ PROD_DB_PATH = Path.home() / ".phoenix-ide" / "prod.db"
 PROD_ENV_FILE = Path("/etc/phoenix-ide/phoenix.env")
 PROD_PORT = 8031
 
-# Lima VM configuration (dev environment only — create/shell/destroy)
-LIMA_VM_NAME = "phoenix-ide"
-LIMA_YAML = ROOT / "lima" / "phoenix-ide.yaml"
-
 # launchd (native macOS) configuration
 LAUNCHD_LABEL = "com.phoenix-ide.server"
 LAUNCHD_PLIST_PATH = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHD_LABEL}.plist"
@@ -2890,7 +2886,7 @@ def prod_daemon_deploy():
     prod_dir = Path.home() / ".phoenix-ide"
     prod_dir.mkdir(parents=True, exist_ok=True)
 
-    prod_db_path = prod_dir / "prod.db"  # Consistent with native/lima
+    prod_db_path = prod_dir / "prod.db"
     prod_log_path = prod_dir / "prod.log"
     prod_pid_path = prod_dir / "prod.pid"
 
@@ -3596,128 +3592,6 @@ def cmd_prod_override_unset(name: str):
 
 
 # =============================================================================
-# Lima VM Commands
-# =============================================================================
-
-def lima_shell_quiet(cmd: str, check=True) -> subprocess.CompletedProcess:
-    """Run a command inside the Lima VM, capturing output."""
-    return subprocess.run(
-        ["limactl", "shell", "--workdir", "/", LIMA_VM_NAME, "--", "bash", "-lc", cmd],
-        check=check, capture_output=True, text=True,
-    )
-
-
-def lima_is_running() -> bool:
-    """Check if the Lima VM is running."""
-    result = subprocess.run(
-        ["limactl", "list", "--json"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return False
-    for line in result.stdout.strip().splitlines():
-        try:
-            vm = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if vm.get("name") == LIMA_VM_NAME and vm.get("status") == "Running":
-            return True
-    return False
-
-
-def lima_vm_exists() -> bool:
-    """Check if the Lima VM exists (any status)."""
-    result = subprocess.run(
-        ["limactl", "list", "--json"],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return False
-    for line in result.stdout.strip().splitlines():
-        try:
-            vm = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if vm.get("name") == LIMA_VM_NAME:
-            return True
-    return False
-
-
-def lima_ensure_running():
-    """Start VM if stopped, error if not created."""
-    if lima_is_running():
-        return
-    if not lima_vm_exists():
-        print("Lima VM does not exist. Run './dev.py lima create' first.", file=sys.stderr)
-        sys.exit(1)
-    print("Starting Lima VM...")
-    subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
-
-
-def cmd_lima_create():
-    """Create and provision the Lima VM."""
-    # Check limactl exists
-    result = subprocess.run(["limactl", "--version"], capture_output=True)
-    if result.returncode != 0:
-        print("limactl not found. Install Lima: brew install lima", file=sys.stderr)
-        sys.exit(1)
-
-    if lima_vm_exists():
-        print(f"VM '{LIMA_VM_NAME}' already exists.")
-        if not lima_is_running():
-            print("Starting VM...")
-            subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
-        print("VM is running.")
-        return
-
-    print(f"Creating Lima VM '{LIMA_VM_NAME}' from {LIMA_YAML}...")
-    subprocess.run(
-        ["limactl", "create", f"--name={LIMA_VM_NAME}", str(LIMA_YAML)],
-        check=True,
-    )
-
-    print("Starting VM...")
-    subprocess.run(["limactl", "start", LIMA_VM_NAME], check=True)
-
-    # Verify provisioning
-    print("\nVerifying provisioning...")
-    result = lima_shell_quiet("rustc --version", check=False)
-    if result.returncode == 0:
-        print(f"  Rust: {result.stdout.strip()}")
-    else:
-        print("  WARNING: Rust not found. Provisioning may have failed.", file=sys.stderr)
-
-    result = lima_shell_quiet("uname -r", check=False)
-    if result.returncode == 0:
-        print(f"  Kernel: {result.stdout.strip()}")
-
-    result = lima_shell_quiet("node --version", check=False)
-    if result.returncode == 0:
-        print(f"  Node: {result.stdout.strip()}")
-
-    print(f"\nVM '{LIMA_VM_NAME}' is ready.")
-
-
-def cmd_lima_shell():
-    """Open an interactive shell in the Lima VM."""
-    lima_ensure_running()
-    os.execvp("limactl", [
-        "limactl", "shell", "--workdir", "/", LIMA_VM_NAME,
-    ])
-
-
-def cmd_lima_destroy():
-    """Delete the Lima VM."""
-    if not lima_vm_exists():
-        print(f"VM '{LIMA_VM_NAME}' does not exist.")
-        return
-
-    print(f"Deleting VM '{LIMA_VM_NAME}'...")
-    subprocess.run(["limactl", "delete", LIMA_VM_NAME, "--force"], check=True)
-    print("VM deleted.")
-
-
-# =============================================================================
 # Main
 # =============================================================================
 
@@ -3805,13 +3679,6 @@ def main():
     override_unset_parser = prod_sub.add_parser("unset", help="Remove environment override")
     override_unset_parser.add_argument("name", help="Environment variable name to remove")
 
-    # lima
-    lima_parser = sub.add_parser("lima", help="Lima VM management")
-    lima_sub = lima_parser.add_subparsers(dest="lima_command", required=True)
-    lima_sub.add_parser("create", help="Create and provision Lima VM")
-    lima_sub.add_parser("shell", help="Open shell in Lima VM")
-    lima_sub.add_parser("destroy", help="Delete Lima VM")
-
     # tasks
     tasks_parser = sub.add_parser("tasks", help="Task management")
     tasks_sub = tasks_parser.add_subparsers(dest="tasks_command", required=True)
@@ -3874,13 +3741,6 @@ def main():
             cmd_prod_override_set(args.name, args.value)
         elif args.prod_command == "unset":
             cmd_prod_override_unset(args.name)
-    elif args.command == "lima":
-        if args.lima_command == "create":
-            cmd_lima_create()
-        elif args.lima_command == "shell":
-            cmd_lima_shell()
-        elif args.lima_command == "destroy":
-            cmd_lima_destroy()
     elif args.command == "tasks":
         if args.tasks_command == "validate":
             if not cmd_tasks_validate():

@@ -68,14 +68,9 @@ Multi-provider LLM support routes through either the Anthropic API or an exe.dev
 ## Production Deployment
 
 ```bash
-./dev.py prod deploy   # build release + deploy (auto-detects Linux native vs macOS+Lima)
+./dev.py prod deploy   # build release + deploy (launchd on macOS, systemd on Linux)
 ./dev.py prod status   # check running production instance
 ./dev.py prod stop     # stop production instance
-
-# Lima VM lifecycle (macOS only)
-./dev.py lima create   # provision VM
-./dev.py lima shell    # SSH into VM
-./dev.py lima destroy  # tear down VM
 ```
 
 ### Optional HTTPS Quick Start
