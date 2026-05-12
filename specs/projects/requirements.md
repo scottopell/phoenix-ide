@@ -78,11 +78,12 @@ from plan review and worktree isolation, but should be opt-in rather than mandat
 WHILE a conversation is in Explore mode
 THE SYSTEM SHALL allow the agent to draft a markdown task file using the `patch`
 tool (whose Explore-mode allowlist is scoped to the project's tasks directory).
-A filename following the taskmd 1.0 convention (`NNNNN-pX-status--slug.md`, status
-one of `ready` / `in-progress` / `brainstorming`) is one accepted form — taskmd-named
-files additionally yield id/priority/status/slug and a `ready` → `in-progress` rename
-on approval (REQ-PROJ-006) — but any other `.md` file is also accepted as a plain task
-brief (task 13009)
+The recommended form is the taskmd 1.0 convention (`NNNNN-pX-status--slug.md`, status
+one of `ready` / `in-progress` / `brainstorming`) — taskmd-named files additionally
+yield id/priority/status/slug and a `ready` → `in-progress` rename on approval
+(REQ-PROJ-006) and **must live under the project's tasks directory**. Any other `.md`
+file is also accepted as a plain task brief (task 13009) — no structured metadata, no
+status rename — and may live anywhere in the worktree
 
 WHEN agent calls the `propose_task` tool with a `task_file` path to a markdown file
 inside the worktree
@@ -92,6 +93,11 @@ AND NOT execute any side effects (no git operations)
 AND read the file and persist the assistant message and a synthetic tool result atomically
 AND transition the conversation to AwaitingTaskApproval state
 AND pause agent execution until the user responds
+
+WHEN the `task_file` name parses as a taskmd filename but the path is **not** under the
+project's tasks directory
+THE SYSTEM SHALL reject the call (taskmd-named files must live under the tasks dir; a
+brief that wants to live elsewhere must not use the taskmd naming)
 
 WHEN the task file's name parses as taskmd but its status is not `ready` /
 `in-progress` / `brainstorming` (e.g. `done`)
@@ -229,10 +235,10 @@ THE SYSTEM SHALL treat it as a plain task brief: the display title is the body's
   `# H1` (falling back to a title-cased file stem), the display priority defaults to `p2`,
   there is no structured id/status/slug, no on-approve status rename, and the task branch
   is named `task-{sanitized-stem}-{conversation-id-prefix}`
-AND the file is committed at its own path on the task branch (so plain-markdown briefs
-  conventionally live *outside* the tasks directory — a recommendation surfaced in the
-  Explore-mode prompt, not a structural rule — keeping `taskmd validate` clean for projects
-  that do use taskmd)
+AND the file is committed at its own path on the task branch (a plain `.md` file may live
+  anywhere in the worktree — only a *new* file drafted via `patch` is forced under the
+  tasks directory by the Explore-mode `patch` scope; the Explore prompt steers the agent
+  toward taskmd naming so a project that uses `taskmd validate` stays clean)
 
 **Rationale:** Task files live on the task branch alongside the code changes, keeping
 the branch self-contained — no commits to main (which may be protected), no two-path
@@ -340,10 +346,10 @@ WHEN agent is in Explore mode
 THE SYSTEM SHALL provide the `propose_task` tool
 WHICH accepts: `task_file` (required string) — a path, relative to the agent's working
   directory, to an existing markdown (`.md`) file inside the worktree. A taskmd 1.0
-  filename (`NNNNN-pX-status--slug.md`, conventionally under the project's tasks
-  directory, status one of `ready` / `in-progress` / `brainstorming`) additionally
+  filename (`NNNNN-pX-status--slug.md`, status one of `ready` / `in-progress` /
+  `brainstorming`, **required to be under the project's tasks directory**) additionally
   derives id/priority/status/slug from the name; any other `.md` file is accepted as a
-  plain task brief (REQ-PROJ-006, task 13009)
+  plain task brief (REQ-PROJ-006, task 13009) and may live anywhere in the worktree
 
 WHEN `propose_task` is called outside Explore mode
 THE SYSTEM SHALL reject the call ("propose_task is only available in Explore mode")

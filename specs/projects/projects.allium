@@ -117,10 +117,11 @@ entity Project {
 -- A task file, committed on the task branch.
 --
 -- This entity models the *taskmd* form (the default): a filename
--- `{task_id}-{priority}-{status}--{slug}.md`, conventionally under the
--- project's tasks dir, where the filename is the sole source of metadata —
--- no frontmatter (taskmd 1.0). Phoenix allocates no ID; it parses
--- id/priority/status/slug back out of the filename.
+-- `{task_id}-{priority}-{status}--{slug}.md`, *required* to be under the
+-- project's tasks dir (a taskmd-pattern name elsewhere is rejected), where
+-- the filename is the sole source of metadata — no frontmatter (taskmd 1.0).
+-- Phoenix allocates no ID; it parses id/priority/status/slug back out of the
+-- filename.
 --
 -- task 13009: `propose_task` may also point at a *plain-markdown* file (any
 -- other `.md` file inside the worktree — e.g. `docs/plan.md`, `README.md`).
@@ -515,7 +516,8 @@ rule TaskApprovalExecuted {
         --   6. Transition Explore -> Work (permission upgrade).
         --
         -- Sequence (plain-markdown brief — `crate::task_source::TaskSource`
-        -- routes here when the filename doesn't parse as taskmd):
+        -- routes here when the filename doesn't parse as taskmd; this path
+        -- handles only the early-worktree case):
         --   1. Sanitize the file stem; branch = `task-<stem>-<conv-id[..8]>`.
         --   2. Single-branch fetch of base_branch, best-effort.
         --   3. Rename branch in place to that branch name.
@@ -524,14 +526,19 @@ rule TaskApprovalExecuted {
         --   6. Transition Explore -> Work. Recorded task_id = the stem.
         --
         -- The worktree and base_branch were set by
-        -- ManagedWorktreeOnFirstMessage. No new worktree is created here.
-        -- (A conversation that referenced an existing task file from the main
-        --  checkout instead of a pre-created worktree falls back to creating
-        --  the worktree off base_branch and transplanting the file there.)
+        -- ManagedWorktreeOnFirstMessage; this rule never creates a new
+        -- worktree. The taskmd path additionally carries a legacy fallback
+        -- for a conversation that referenced an existing task file from the
+        -- repo-root checkout (no pre-created worktree) — it creates the
+        -- worktree off base_branch and transplants the file there. The
+        -- plain-markdown path has no such fallback (plain briefs are new in
+        -- task 13009, so there are no legacy plain-markdown conversations):
+        -- if the early worktree is missing the approval fails with a clear
+        -- "reject and re-propose" message.
         --
-        -- Rollback: worktree-commit failure removes the worktree/branch and
-        -- leaves the cwd copy of the file in place; branch-rename failure
-        -- keeps the temp name and logs a warning.
+        -- Rollback: worktree-commit failure (taskmd fallback) removes the
+        -- worktree/branch and leaves the cwd copy of the file in place;
+        -- branch-rename failure keeps the temp name and logs a warning.
 }
 
 -- REQ-PROJ-004 propose/feedback/reject loop: no git operations. Until

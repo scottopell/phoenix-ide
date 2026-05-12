@@ -48,11 +48,11 @@ struct TaskFileSnapshot {
 
 /// Read and validate a task file referenced by `propose_task`.
 ///
-/// The task file may be either a taskmd 1.0 filename (`NNNNN-pX-status--slug.md`,
-/// conventionally under the project's tasks dir — id/priority/status/slug come
-/// from the filename) or any other markdown file inside the worktree (a plain
-/// task brief — title from the body's `# H1`, priority defaults to `p2`). See
-/// [`crate::task_source::TaskSource`].
+/// The task file may be either a taskmd 1.0 filename (`NNNNN-pX-status--slug.md`
+/// — id/priority/status/slug come from the filename; this form is *required* to
+/// live under the project's tasks dir) or any other markdown file anywhere in
+/// the worktree (a plain task brief — title from the body's `# H1`, priority
+/// defaults to `p2`). See [`crate::task_source::TaskSource`].
 ///
 /// The state machine treats this read as a deterministic data-load — like
 /// reading the conversation cwd off disk — not as an external side effect.
@@ -99,12 +99,14 @@ fn resolve_task_file(
 
     match &source {
         TaskSource::Taskmd { status, .. } => {
-            // Taskmd files conventionally live under the project's tasks dir,
-            // and `taskmd validate` expects every file there to follow the
-            // convention — so a taskmd-named file is only accepted there.
+            // A taskmd-named file is required to live under the project's tasks
+            // dir — that's where `taskmd validate` (and the project's task
+            // tooling generally) expects taskmd files. A plain `.md` brief that
+            // wants to live elsewhere just must not use the taskmd naming.
             if first_component != Some(tasks_dir_name) {
                 return Err(format!(
-                    "taskmd-named task files must be under {tasks_dir_name}/ (got '{task_file}')"
+                    "taskmd-named task files must be under {tasks_dir_name}/ (got '{task_file}'). \
+                     Use a non-taskmd `.md` filename if you want it elsewhere."
                 ));
             }
             if !ACCEPTABLE_PROPOSE_STATUSES.contains(status) {

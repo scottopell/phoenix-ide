@@ -132,9 +132,10 @@ There are two "task source" kinds, behind the `TaskSource` seam
 (`crate::task_source::TaskSource`); taskmd is the default but not a hard dependency
 (task 13009):
 
-1. **taskmd** — a filename matching `{ID}-{priority}-{status}--{slug}.md`,
-   conventionally under `{tasks_dir}/`. taskmd 1.0: the filename is the sole source of
-   task metadata; there is no frontmatter. Described below.
+1. **taskmd** — a filename matching `{ID}-{priority}-{status}--{slug}.md`, *required*
+   to be under `{tasks_dir}/` (`resolve_task_file` rejects a taskmd-pattern name
+   elsewhere). taskmd 1.0: the filename is the sole source of task metadata; there is no
+   frontmatter. Described below.
 2. **plain-markdown** — any other `.md` file inside the worktree (e.g. `docs/plan.md`,
    or even `README.md`). No structured metadata: the display title is the body's first
    `# H1` (falling back to a title-cased file stem), the display priority defaults to
@@ -261,10 +262,10 @@ enters `ToolExecuting`. Only available in Explore mode, rejected from sub-agents
 
 Input: `{ task_file: string }` — a path (relative to the agent's cwd) to an existing
 markdown (`.md`) file inside the worktree. A taskmd 1.0 filename
-(`NNNNN-pX-status--slug.md`, conventionally under `{tasks_dir}/`, status one of
-`ready`/`in-progress`/`brainstorming`) additionally derives id/priority/status/slug
+(`NNNNN-pX-status--slug.md`, status one of `ready`/`in-progress`/`brainstorming`,
+*required* to be under `{tasks_dir}/`) additionally derives id/priority/status/slug
 from the name; any other `.md` file is accepted as a plain task brief (`TaskSource`,
-task 13009). The agent either points at an existing file or drafts one first with
+task 13009) and may live anywhere in the worktree. The agent either points at an existing file or drafts one first with
 `patch` (the Explore-mode `patch` allowlist is scoped to `{tasks_dir}/`, so a freshly
 drafted brief lands there even when it isn't taskmd-named). The body is free-form
 markdown shown to the user as the plan.

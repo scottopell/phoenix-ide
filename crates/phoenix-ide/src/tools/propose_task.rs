@@ -30,12 +30,14 @@ impl Tool for ProposeTaskTool {
          Pass the path to a markdown file in your working directory — either \
          an existing file you want to begin working on, or one you created \
          with `patch` in this conversation. The body is free-form markdown, \
-         shown to the user as the plan; start it with an `# H1` title. If \
-         the filename follows the taskmd 1.0 convention \
-         (`NNNNN-pX-status--slug.md`, conventionally under `tasks/`) it also \
-         carries id/priority/status/slug — in that case status must be one \
-         of: ready, in-progress, brainstorming. This must be the only tool \
-         call in the response."
+         shown to the user as the plan; start it with an `# H1` title. \
+         Prefer the taskmd 1.0 convention: name the file \
+         `NNNNN-pX-status--slug.md` (status one of: ready, in-progress, \
+         brainstorming) under your project's tasks directory — that gives the \
+         task a stable id/priority/status/slug. (taskmd files MUST live under \
+         the tasks directory; a non-taskmd `.md` file works too as a plain \
+         brief with no metadata, and can live anywhere in the worktree.) This \
+         must be the only tool call in the response."
             .to_string()
     }
 
@@ -46,7 +48,7 @@ impl Tool for ProposeTaskTool {
             "properties": {
                 "task_file": {
                     "type": "string",
-                    "description": "Path (relative to your working directory) to an existing markdown (.md) file. A taskmd 1.0 filename (e.g. tasks/01234-p2-ready--my-slug.md) additionally derives id/priority/status/slug from the name; any other .md file (e.g. docs/plan.md) is treated as a plain task brief with the title taken from its first `# H1`."
+                    "description": "Path (relative to your working directory) to an existing markdown (.md) file. Prefer a taskmd 1.0 filename (NNNNN-pX-status--slug.md) under your project's tasks directory — it derives id/priority/status/slug from the name. A taskmd-pattern filename is ONLY accepted under the tasks directory; any other .md file (e.g. docs/plan.md) is treated as a plain task brief (title from its first `# H1`, no metadata) and may live anywhere in the worktree."
                 }
             }
         })
