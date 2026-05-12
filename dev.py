@@ -2811,6 +2811,22 @@ def _env_provides_llm_config(env: dict[str, str]) -> bool:
     )
 
 
+def _llm_mode_summary(env: dict[str, str], auto_gateway: str | None) -> str:
+    """Human-readable description of how the deployed server will reach an LLM,
+    for the post-deploy summary line. `auto_gateway` is the gateway the deploy
+    auto-detected (None when `env` already provided LLM config)."""
+    if env.get("LLM_API_KEY_HELPER"):
+        return "api_key_helper (from .phoenix-ide.env)"
+    if env.get("LLM_GATEWAY"):
+        return f"gateway ({env['LLM_GATEWAY']}, from .phoenix-ide.env)"
+    keys = [k for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY") if env.get(k)]
+    if keys:
+        return f"{' + '.join(keys)} (from .phoenix-ide.env)"
+    if auto_gateway:
+        return f"gateway ({auto_gateway}, auto-detected)"
+    return "none detected — server has no LLM configured"
+
+
 def _configure_llm_env(env: dict[str, str]) -> str:
     """Configure LLM environment variables. Returns a human-readable mode string.
 
@@ -3372,12 +3388,7 @@ def launchd_prod_deploy(version: str | None = None):
             print("WARNING: Server started but health check failed after 10s", file=sys.stderr)
 
     write_deployed_sha()
-    if env_overrides.get("LLM_API_KEY_HELPER"):
-        llm_mode = "api_key_helper (from .phoenix-ide.env)"
-    elif gateway:
-        llm_mode = f"gateway ({gateway})"
-    else:
-        llm_mode = "no gateway detected"
+    llm_mode = _llm_mode_summary(env_overrides, gateway)
     print(f"\n✓ Deployed {version} to production (launchd)")
     if health_version:
         print(f"  Version: {health_version}")

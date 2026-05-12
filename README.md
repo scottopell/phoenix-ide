@@ -185,8 +185,9 @@ you (dev mode auto-detects an LLM gateway; prod reads `.phoenix-ide.env` from th
 | `CODEX_HOME` | Where the Codex CLI keeps `auth.json` (read when the ChatGPT bridge is active) | `$HOME/.codex` |
 | `PHOENIX_ENABLE_MOCK_MODEL` | `1` → register the deterministic mock provider (testing only) | off |
 
-If none of `ANTHROPIC_API_KEY`, `LLM_GATEWAY`, or `LLM_API_KEY_HELPER` (or a
-ChatGPT/Codex credential) is present, the server starts with no models and logs a warning.
+If none of `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `LLM_GATEWAY`, or
+`LLM_API_KEY_HELPER` (and no ChatGPT/Codex credential) is present, the server
+starts with no models and logs a warning.
 
 ### TLS
 
