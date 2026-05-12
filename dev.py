@@ -1538,7 +1538,13 @@ def cmd_check():
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
-        """Rust lane: clippy → musl smoke check → test compile → test run → codegen staleness check.
+        """Rust lane: vite build → clippy → musl smoke check → test compile → test run → codegen staleness check.
+
+        vite build is sequenced here (rather than as its own parallel thread)
+        because `#[derive(Embed)]` in crates/phoenix-ide/src/api/assets.rs reads
+        ui/dist/ during proc-macro expansion. Running vite build in parallel
+        with cargo races: clippy can expand the macro before (or during) vite's
+        output write and panic with "File should be readable: NotFound".
 
         Test compile and run are split into two steps so each gets its own
         CHECK_TIMEOUT budget. Cold test-binary compiles on this codebase can
@@ -1551,6 +1557,7 @@ def cmd_check():
         overwrite the generated .ts files; if those differ from what's
         committed to git, the developer forgot to regenerate.
         """
+        run_step("vite build", ["pnpm", "exec", "vite", "build"], UI_DIR)
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
         if sys.platform == "darwin":
             # macOS prod deploy uses native target (launchd_prod_deploy → prod_build target=None),
@@ -1889,7 +1896,6 @@ def cmd_check():
         # under `-b`; bare `pnpm exec tsc --noEmit` silently misses them.
         threading.Thread(target=run_step, args=("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR)),
         threading.Thread(target=run_step, args=("eslint", ["pnpm", "run", "lint"], UI_DIR)),
-        threading.Thread(target=run_step, args=("vite build", ["pnpm", "exec", "vite", "build"], UI_DIR)),
         threading.Thread(target=run_step, args=("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
         threading.Thread(target=lane_fast),
         threading.Thread(target=check_ast_grep),
