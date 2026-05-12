@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p3
-status: ready
-artifact: ui/src/components
----
-
 Phase 3 of codex quota awareness (depends on 67002 + 67003).
 
 Once 67002 lands structured `UsageLimitReached` errors with `QuotaDetails`, and 67003 surfaces continuous `RateLimitSnapshot` chunks, the UI can grow:

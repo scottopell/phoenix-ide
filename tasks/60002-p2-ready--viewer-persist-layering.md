@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p2
-status: ready
-artifact: ui/src/components/FileExplorer/lastViewerStorage.ts
----
-
 lastViewerStorage.ts lives under ui/src/components/FileExplorer/ but is now imported by ui/src/conversation/useConversationsRefresh.ts (REQ-VS-014 hard-delete cascade clears the entry). conversation/ is structurally more foundational than components/, so this is backwards layering.
 
 Two clean options:

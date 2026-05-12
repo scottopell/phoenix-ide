@@ -1,10 +1,3 @@
----
-created: 2026-05-11
-priority: p2
-status: ready
-artifact: ui/src/cache.ts
----
-
 When IndexedDB is blocked by another tab holding the DB open at a different version, `cacheDB.init()` hangs forever silently — no `onblocked` handler, no timeout. This deadlocks both `useAppMachine.init()` (blocks `isReady`) AND `useConversationsRefresh.refreshOnce()` (blocks cache hydration before the network fetch fires). User-visible symptom: empty sidebar, "No conversations yet", no `/api/conversations` request ever fires. Incognito works because it has no other tabs/state.
 
 Repro: open Phoenix in two tabs, force a schema version bump in one (or leave one hung after a crash), open another → silent hang.

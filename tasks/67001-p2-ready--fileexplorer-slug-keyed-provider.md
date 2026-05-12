@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p2
-status: ready
-artifact: ui/src/components/FileExplorer/FileExplorerContext.tsx
----
-
 Follow-up to task 08685 Phase 2. The synchronous-derivation sweep + ConversationList row componentization shipped; this task carries the Phase 2 structural change forward as a focused PR.
 
 ## Scope

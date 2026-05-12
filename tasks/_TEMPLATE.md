@@ -1,17 +1,12 @@
----
-created: YYYY-MM-DD
-priority: p2
-status: ready
-artifact: path/or/concrete/output
----
-
 <!--
-Reference template only. Prefer `taskmd new` to create tasks — it synthesizes
-this frontmatter atomically with ID allocation:
+Reference template only. Prefer `taskmd new` to create a task — it allocates the
+next ID and formats the filename atomically:
 
-    echo 'Task body...' | taskmd new --slug short-slug --artifact src/foo.rs --priority p1
+    echo 'Task body...' | taskmd new --slug short-slug --priority p1
 
-See AGENTS.md §Task Tracking and skills/phoenix-task-tracking/SKILL.md.
+The filename (`NNNNN-pX-status--slug.md`) is the sole source of task metadata;
+the body is free-form markdown — no frontmatter. See AGENTS.md §Task Tracking
+and skills/phoenix-task-tracking/SKILL.md.
 -->
 
 # Task Title

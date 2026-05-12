@@ -1,10 +1,3 @@
----
-created: 2026-05-11
-priority: p2
-status: ready
-artifact: crates/phoenix-ide/src/state_machine/transition.rs
----
-
 When the LLM itself rejects with a `context_length_exceeded`-class error (terminal), the state machine routes the event through the generic non-retryable LlmError path in `transition.rs:1224-1250` and lands the conv in `ConvState::Error { error_kind: ContextExhausted }`. The `/api/conversations/:id/continue` precondition in `db.rs:724` requires `ConvState::ContextExhausted { summary }` specifically — different variant — so the only way users can recover from a backend-rejected context overflow is to manually edit the DB.
 
 Two paths trigger context exhaustion today:

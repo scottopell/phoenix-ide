@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p2
-status: ready
-artifact: crates/phoenix-ide/src/llm/openai.rs
----
-
 # Codex/ChatGPT quota awareness — parse structured 429 payload, plan-aware messages
 
 ## Problem

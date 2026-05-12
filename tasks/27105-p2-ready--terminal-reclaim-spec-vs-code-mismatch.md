@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p2
-status: ready
-artifact: crates/phoenix-ide/src/terminal/ws.rs
----
-
 <!--
 ID 27105 chosen as the next free slot above 27104.
 Created without `taskmd new` since the binary isn't installed in this

@@ -1,10 +1,3 @@
----
-created: 2026-05-11
-priority: p2
-status: ready
-artifact: crates/phoenix-ide/src/llm/models.rs
----
-
 Codex backend supports a 1M-token max for gpt-5.4 and codex-auto-review via opt-in (`max_context_window: 1000000` in `~/.codex/models_cache.json`). Phoenix declares 272K default for all codex-backed models — matches the default cap, but leaves the higher ceiling on the table for users who could use it.
 
 Investigation needed:

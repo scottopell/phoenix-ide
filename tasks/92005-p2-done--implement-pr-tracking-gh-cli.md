@@ -1,10 +1,3 @@
----
-created: 2026-05-09
-priority: p2
-status: done
-artifact: pending
----
-
 # implement-pr-tracking-gh-cli
 
 ## Plan

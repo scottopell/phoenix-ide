@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p2
-status: done
-artifact: crates/phoenix-ide/src/api/handlers.rs
----
-
 Wire the server-side SSE ReplayRing into the `Init` event payload so reconnecting clients receive the pending-events list and can resume mid-turn views.
 
 Phase 2 of the SSE ReplayRing rollout. Builds on commit c5d91af (SseBroadcaster ring buffer landed in #74).

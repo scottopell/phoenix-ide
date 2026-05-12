@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p3
-status: ready
-artifact: crates/phoenix-ide/src/llm/openai.rs
----
-
 Phase 2 of codex quota awareness (depends on 67002).
 
 Codex backend emits a structured `type: "codex.rate_limits"` SSE event mid-stream on every turn carrying `used_percent`, `window_minutes`, `reset_at` for primary + secondary windows, plus credits + plan_type. Phoenix currently drops this event in `ResponsesStreamAccumulator::process_event` (openai.rs:143-222).

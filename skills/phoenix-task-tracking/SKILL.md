@@ -8,21 +8,19 @@ description: Task tracking conventions for Phoenix IDE. Use when creating a task
 ## Happy path: `taskmd new`
 
 Always create tasks with `taskmd new`. It atomically allocates the next ID,
-synthesizes the frontmatter, and writes the file. **Do not** write task files
-directly, and **do not** use `taskmd next` + manual file writes — both risk ID
-collisions and frontmatter drift.
+formats the filename, and writes the file with the body from stdin. **Do not**
+write task files directly, and **do not** use `taskmd next` + manual file writes
+— both risk ID collisions.
 
 ```bash
 echo 'Brief description of what needs doing and why.' \
-  | taskmd new --slug fix-login --artifact src/auth.py --priority p1
+  | taskmd new --slug fix-login --priority p1
 ```
 
 Required:
 - `--slug` — URL-safe slug (dirty input is normalized). E.g. `fix-login`.
-- `--artifact` — the concrete output this task produces (file path, config
-  change, commit). If you can't name one, the task probably shouldn't exist.
-- stdin — the task body, non-empty. No frontmatter in the body; `taskmd`
-  synthesizes it.
+- stdin — the task body, non-empty. Free-form markdown — **no frontmatter**;
+  the filename is the sole source of task metadata.
 
 Optional:
 - `--priority` — `p0` (critical) … `p4` (nice-to-have). Default `p2`.
@@ -32,7 +30,7 @@ Optional:
 Piping multi-line bodies:
 
 ```bash
-cat <<'EOF' | taskmd new --slug ws-keepalive --artifact src/terminal/relay.rs --priority p1
+cat <<'EOF' | taskmd new --slug ws-keepalive --priority p1
 # Title
 
 ## Summary
@@ -58,18 +56,10 @@ Example: `tasks/24691-p1-ready--terminal-ws-keepalive-reap-stale-sessions.md`
 | `status` | `ready`, `in-progress`, `blocked`, `brainstorming`, `done`, `wont-do` |
 | `slug` | Short hyphenated description |
 
-### Required frontmatter
-
-```yaml
----
-created: YYYY-MM-DD
-priority: p2
-status: ready
-artifact: src/auth.py
----
-```
-
-Filename must match frontmatter. `./dev.py check` enforces this.
+The **filename is the sole source of task metadata** — there is no frontmatter.
+The body is free-form markdown. `./dev.py check` (the `task validation` lane,
+also `./dev.py tasks validate`) enforces the filename pattern and the absence of
+duplicate IDs.
 
 ## Updating a task
 
@@ -80,20 +70,21 @@ taskmd status 24691 in-progress
 taskmd status 24691 done
 ```
 
-The file is renamed and frontmatter updated in one step.
+This renames the file — the `status` segment of the filename changes — and that's
+the whole operation; there is nothing else to keep in sync.
 
 ## Maintenance
 
 ```bash
 ls tasks/*-ready--*.md       # List tasks ready to work on
-./dev.py tasks validate      # Check all files for format errors
-./dev.py tasks fix           # Auto-repair: inject missing 'created', rename to
-                             # match frontmatter, migrate legacy ID formats,
-                             # resolve duplicate IDs
+./dev.py tasks validate      # Check all files for filename-format errors
+./dev.py tasks fix           # Auto-repair: migrate legacy ID formats,
+                             # rename files to match the pattern, resolve
+                             # duplicate IDs
 ```
 
-`fix` cannot handle (requires human): missing `status`, missing `priority`,
-missing `artifact`, invalid field values.
+`fix` cannot handle (requires human): a filename that doesn't parse at all, or
+genuinely ambiguous duplicates.
 
 ## Issue Discovery Protocol
 

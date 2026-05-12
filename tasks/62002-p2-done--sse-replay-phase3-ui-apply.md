@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p2
-status: done
-artifact: ui/src/conversation/atom.ts
----
-
 Apply server-delivered pending events through the reducer on every init so the UI resumes mid-turn views on reconnect.
 
 Phase 3 of the SSE ReplayRing rollout. Depends on task 62001 (Phase 2 wire format).

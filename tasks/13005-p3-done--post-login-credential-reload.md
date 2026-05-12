@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p3
-status: done
-artifact: crates/phoenix-ide/src/llm/registry.rs
----
-
 # Skip the restart after Codex login
 
 ## Problem

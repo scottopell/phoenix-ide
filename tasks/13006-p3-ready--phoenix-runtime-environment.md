@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p3
-status: ready
-artifact: crates/phoenix-ide/src/runtime_env.rs
----
-
 # Centralize filesystem-environment access in `PhoenixRuntimeEnvironment`
 
 ## Problem

@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p3
-status: ready
-artifact: dev.py
----
-
 `./dev.py check` runs `cargo clippy -- -D warnings` which only checks the default targets (main bin + lib). Test code is not gated. With `cargo clippy --all-targets -- -D warnings`, ~82 lint errors surface in tests: doc_markdown (missing backticks around identifiers), too_many_lines, unnested or-patterns, redundant continue, etc.
 
 Fix in two stages:

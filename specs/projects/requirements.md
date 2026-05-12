@@ -175,11 +175,17 @@ THE SYSTEM SHALL place it in the project's tasks directory (typically `tasks/`,
   discovered per-project as the first immediate child of the repo root containing
   `_TEMPLATE.md`, falling back to literal `tasks/`; see task 13008)
 AND the filename SHALL follow the taskmd 1.0 convention `{ID}-{priority}-{status}--{slug}.md`
-  where `ID` is a 5-digit `DDNNN` value (per-directory prefix + monotonic counter), the
-  agent picks the whole filename, and the filename is the sole source of the task's
-  metadata — there is NO frontmatter
+  where `ID` is a 5-digit `DDNNN` value (per-directory prefix + monotonic counter) and the
+  agent picks the whole filename — the **filename is the sole authoritative source of the
+  task's metadata** (id, priority, status, slug); Phoenix neither writes nor reads any
+  body frontmatter
 AND the body SHALL be free-form markdown (conventionally an `# H1` title, a `## Plan`
   section, and a `## Progress` section the agent updates as work proceeds)
+
+Note on frontmatter: taskmd's validator only checks the filename pattern, so a task file
+whose body happens to carry a YAML `created/priority/status/...` block is not *rejected* —
+but that block is decorative, never consulted, and may diverge from the filename, so it is
+not written. The filename always wins.
 
 WHEN the user approves the task (REQ-PROJ-004)
 THE SYSTEM SHALL parse the task ID, priority, status, and slug from the filename
@@ -197,9 +203,9 @@ Branch mode conversations (REQ-PROJ-024) do not have task files.
 
 **Rationale:** Task files live on the task branch alongside the code changes, keeping
 the branch self-contained — no commits to main (which may be protected), no two-path
-commit logic. taskmd 1.0's filename-is-truth model means there is no frontmatter to keep
-in sync and no ID allocation step on the Phoenix side; the agent owns the filename
-(including the `done` rename) the same way it owns the code.
+commit logic. taskmd 1.0's filename-is-truth model means there's nothing for Phoenix to
+keep in sync — no authoritative frontmatter, no ID allocation step on the Phoenix side;
+the agent owns the filename (including the `done` rename) the same way it owns the code.
 
 ---
 

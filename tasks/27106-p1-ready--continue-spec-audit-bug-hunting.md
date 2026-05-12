@@ -1,10 +1,3 @@
----
-created: 2026-05-10
-priority: p1
-status: ready
-artifact: specs/
----
-
 <!--
 ID 27106 chosen as the next free slot above 27105.
 Created without `taskmd new` since the binary isn't installed in this
