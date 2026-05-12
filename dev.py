@@ -1653,7 +1653,7 @@ def cmd_check():
 
     def check_ast_grep():
         """Run structural lint rules via ast-grep (one result entry per rule file)."""
-        import shutil
+        import shutil, re
         if not shutil.which("ast-grep"):
             with results_lock:
                 results.append(("ast-grep", 0, 0.0, ""))
@@ -1665,6 +1665,10 @@ def cmd_check():
         rule_files = sorted(rules_dir.glob("*.yml"))
         if not rule_files:
             return
+        # Match `language: rust` as a top-level YAML scalar (allowing optional
+        # quotes / inline comments), case-insensitively. Avoids matching the
+        # word "rust" in comments, array items, etc.
+        rust_lang_re = re.compile(r"""(?im)^\s*language\s*:\s*['"]?rust['"]?\s*(#.*)?$""")
         for rule_file in rule_files:
             # A rule file declares its target language; Rust rules scan
             # `crates/`, everything else scans `ui/src/`.
@@ -1672,7 +1676,7 @@ def cmd_check():
                 rule_text = rule_file.read_text()
             except OSError:
                 rule_text = ""
-            scan_target = "crates/" if "language: rust" in rule_text else "ui/src/"
+            scan_target = "crates/" if rust_lang_re.search(rule_text) else "ui/src/"
             run_step(f"ast-grep:{rule_file.stem[:14]}", [
                 "ast-grep", "scan", "--rule", str(rule_file), scan_target,
             ])

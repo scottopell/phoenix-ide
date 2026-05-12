@@ -151,17 +151,18 @@ pub struct ToolContext {
 
     /// Resolved filesystem-environment. Tools that need on-disk locations
     /// (terminal output dir, Chromium cache, `~` expansion) read it via
-    /// [`Self::runtime_env`]. Production threads the process-wide
-    /// `Arc<PhoenixRuntimeEnvironment>`; tests that don't set one get a
-    /// throwaway `detect()`ed instance on first access.
-    runtime_env: Option<Arc<crate::runtime_env::PhoenixRuntimeEnvironment>>,
+    /// [`Self::runtime_env`]. Resolved exactly once per context: production
+    /// replaces the default with the process-wide `Arc<PhoenixRuntimeEnvironment>`
+    /// via [`Self::with_runtime_env`] right after [`Self::new`]; test
+    /// contexts keep the `detect()`ed default created in `new`.
+    runtime_env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
 }
 
 impl ToolContext {
-    /// Create a new tool context. The runtime environment defaults to
-    /// "unset" — production code calls [`Self::with_runtime_env`]
-    /// immediately after; tests that don't care let [`Self::runtime_env`]
-    /// fall back to a `detect()`ed instance.
+    /// Create a new tool context. The runtime environment is `detect()`ed
+    /// once here; production code immediately overrides it with the shared
+    /// instance via [`Self::with_runtime_env`], test contexts keep the
+    /// detected default.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cancel: CancellationToken,
@@ -184,7 +185,7 @@ impl ToolContext {
             terminals,
             tmux_registry,
             worktree_path,
-            runtime_env: None,
+            runtime_env: Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::detect()),
         }
     }
 
@@ -195,17 +196,14 @@ impl ToolContext {
         mut self,
         env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
     ) -> Self {
-        self.runtime_env = Some(env);
+        self.runtime_env = env;
         self
     }
 
-    /// Resolved filesystem-environment for this tool invocation. If none
-    /// was attached (test contexts), a freshly `detect()`ed instance is
-    /// returned — never the process env read directly.
+    /// Resolved filesystem-environment for this tool invocation — never the
+    /// process env read directly.
     pub fn runtime_env(&self) -> Arc<crate::runtime_env::PhoenixRuntimeEnvironment> {
-        self.runtime_env
-            .clone()
-            .unwrap_or_else(|| Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::detect()))
+        self.runtime_env.clone()
     }
 
     /// Get or create the browser session for this conversation.

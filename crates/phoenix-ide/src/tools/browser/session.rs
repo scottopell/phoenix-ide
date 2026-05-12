@@ -474,11 +474,12 @@ pub struct BrowserSessionManager {
     /// streams. Stays `None` for tool-level tests.
     lifecycle_sink: Option<BrowserSessionLifecycleSink>,
     /// Resolved filesystem-environment, used to locate the Chrome download
-    /// cache (`<home>/.cache/phoenix-ide/chromium`). Production wires the
-    /// process-wide `Arc<PhoenixRuntimeEnvironment>` via
-    /// [`Self::with_runtime_env`]; tests that don't get a `detect()`ed one
-    /// on first session creation — never a direct env read.
-    runtime_env: Option<Arc<crate::runtime_env::PhoenixRuntimeEnvironment>>,
+    /// cache (`<home>/.cache/phoenix-ide/chromium`). Resolved once at
+    /// construction: production passes the process-wide
+    /// `Arc<PhoenixRuntimeEnvironment>` to [`Self::with_lifecycle_sink`];
+    /// when none is given (tests, [`Self::new`]) a `detect()`ed default is
+    /// used — never a direct env read.
+    runtime_env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
 }
 
 impl BrowserSessionManager {
@@ -489,9 +490,10 @@ impl BrowserSessionManager {
 
     /// Construct a manager that publishes session-create / session-destroy
     /// edges into `sink`, locating the Chrome download cache via
-    /// `runtime_env`. The runtime wires `sink` to a bridge task that
-    /// resolves `conversation_id` to the matching `SseBroadcaster` and
-    /// emits `SseEvent::BrowserSessionState`; tests pass `None` for both.
+    /// `runtime_env` (a `detect()`ed default when `None`). The runtime wires
+    /// `sink` to a bridge task that resolves `conversation_id` to the matching
+    /// `SseBroadcaster` and emits `SseEvent::BrowserSessionState`; tests pass
+    /// `None` for both.
     pub fn with_lifecycle_sink(
         sink: Option<BrowserSessionLifecycleSink>,
         runtime_env: Option<Arc<crate::runtime_env::PhoenixRuntimeEnvironment>>,
@@ -500,7 +502,9 @@ impl BrowserSessionManager {
             sessions: RwLock::new(HashMap::new()),
             cleanup_task: None,
             lifecycle_sink: sink,
-            runtime_env,
+            runtime_env: runtime_env.unwrap_or_else(|| {
+                Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::detect())
+            }),
         });
 
         // Start background cleanup task with weak reference to avoid reference cycle
@@ -549,13 +553,10 @@ impl BrowserSessionManager {
         }
     }
 
-    /// Resolved filesystem-environment for this manager. Returns the wired
-    /// `Arc<PhoenixRuntimeEnvironment>` if one was supplied, else a
-    /// freshly `detect()`ed instance — never a direct env read.
+    /// Resolved filesystem-environment for this manager — never a direct
+    /// env read.
     fn resolved_env(&self) -> Arc<crate::runtime_env::PhoenixRuntimeEnvironment> {
-        self.runtime_env
-            .clone()
-            .unwrap_or_else(|| Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::detect()))
+        self.runtime_env.clone()
     }
 
     /// Get or create a browser session for a conversation
@@ -739,7 +740,7 @@ impl Default for BrowserSessionManager {
             sessions: RwLock::new(HashMap::new()),
             cleanup_task: None,
             lifecycle_sink: None,
-            runtime_env: None,
+            runtime_env: Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::detect()),
         }
     }
 }

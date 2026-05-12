@@ -2434,6 +2434,25 @@ async fn list_directory(
     Ok(Json(ListDirectoryResponse { entries: result }))
 }
 
+/// Resolve `.`/`..` components purely lexically (no filesystem access — the
+/// path may not exist yet). Used to validate the `mkdir` target so a string
+/// like `/home/user/../etc` can't sneak past a containment check that only
+/// looked at the literal prefix.
+fn lexically_normalize(p: &std::path::Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
 /// Create a directory (with parents if needed)
 async fn mkdir(
     State(state): State<AppState>,
@@ -2452,15 +2471,17 @@ async fn mkdir(
         });
     }
 
-    // Don't allow creating directories outside of user's home or /tmp
-    let home = state.runtime_env.home().to_string_lossy().into_owned();
-    let path_str = path.to_string_lossy();
-    if (home.is_empty() || !path_str.starts_with(&home)) && !path_str.starts_with("/tmp/") {
+    // Resolve `..`/`.` so containment is checked on the real target, then
+    // require it to live under $HOME or /tmp. `Path::starts_with` matches on
+    // component boundaries, so `/home/al` does not satisfy `/home/alice`.
+    let path = lexically_normalize(&path);
+    let home = state.runtime_env.home();
+    if !path.starts_with(home) && !path.starts_with("/tmp") {
         return Json(MkdirResponse {
             created: false,
             error: Some(format!(
                 "Can only create directories under {} or /tmp",
-                if home.is_empty() { "$HOME" } else { &home }
+                home.display()
             )),
         });
     }

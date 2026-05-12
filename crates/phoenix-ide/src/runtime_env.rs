@@ -209,11 +209,32 @@ impl PhoenixRuntimeEnvironment {
     /// instead of `std::env::temp_dir().join(...)` so Phoenix scratch files
     /// never collide with other apps' tmpfiles and the namespace is
     /// auditable.
+    ///
+    /// `namespace` must be a single relative path component (no separators,
+    /// no `..`, not absolute) so the result cannot escape `tmp_root`;
+    /// anything else is an [`io::ErrorKind::InvalidInput`] error.
+    ///
+    /// [`io::ErrorKind::InvalidInput`]: std::io::ErrorKind::InvalidInput
     pub fn tmp_subdir(&self, namespace: &str) -> std::io::Result<PathBuf> {
+        if !is_single_path_component(namespace) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("tmp_subdir namespace must be a single relative path component, got {namespace:?}"),
+            ));
+        }
         let dir = self.tmp_root.join(namespace);
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
     }
+}
+
+/// True iff `s` is exactly one normal path component — no `/` or `\`, not
+/// `.`/`..`, not absolute, not empty. Used to keep [`PhoenixRuntimeEnvironment::tmp_subdir`]
+/// from escaping its temp root.
+fn is_single_path_component(s: &str) -> bool {
+    use std::path::Component;
+    let mut components = Path::new(s).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 #[cfg(test)]
@@ -265,6 +286,21 @@ mod tests {
         let sub2 = env.tmp_subdir("git-index").unwrap();
         assert_eq!(sub, sub2);
         assert!(sub2.is_dir());
+    }
+
+    #[test]
+    fn tmp_subdir_rejects_escaping_namespaces() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = PhoenixRuntimeEnvironment::with_root(tmp.path());
+        for bad in ["..", ".", "", "a/b", "/etc", "../sibling", "a/../b"] {
+            let err = env.tmp_subdir(bad).unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "namespace {bad:?}"
+            );
+        }
+        assert!(env.tmp_subdir("ok").unwrap().is_dir());
     }
 
     #[test]

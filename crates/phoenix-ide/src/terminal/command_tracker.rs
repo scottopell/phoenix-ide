@@ -198,7 +198,7 @@ impl CommandTracker {
         let disk_path = self.disk_path_for_seq();
 
         // Write full output to disk.
-        if let Some(parent) = std::path::Path::new(&disk_path).parent() {
+        if let Some(parent) = disk_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
         let _ = std::fs::write(&disk_path, self.output_buffer.as_bytes());
@@ -215,15 +215,16 @@ impl CommandTracker {
         // SAFETY: safe_end is guaranteed to be a valid char boundary by the check above.
         #[allow(clippy::string_slice)]
         let preview = &raw[..safe_end];
-        format!("{preview}\n[output truncated; full output at: {disk_path}]")
+        format!(
+            "{preview}\n[output truncated; full output at: {}]",
+            disk_path.display()
+        )
     }
 
-    fn disk_path_for_seq(&self) -> String {
+    fn disk_path_for_seq(&self) -> std::path::PathBuf {
         self.terminal_output_dir
             .join(&self.session_id)
             .join(format!("{}.txt", self.seq))
-            .to_string_lossy()
-            .into_owned()
     }
 }
 

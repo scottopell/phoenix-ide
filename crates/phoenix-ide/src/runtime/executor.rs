@@ -137,8 +137,9 @@ where
     /// When the state is `AwaitingRecovery`, the select loop awaits `settled.notified()`.
     credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
     /// Resolved filesystem-environment, threaded into each `ToolContext`
-    /// and into `build_system_prompt`. `None` in test constructors.
-    runtime_env: Option<Arc<crate::runtime_env::PhoenixRuntimeEnvironment>>,
+    /// and into `build_system_prompt`. Resolved once per runtime: `new`
+    /// `detect()`s a default; production replaces it via [`Self::with_runtime_env`].
+    runtime_env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -199,26 +200,25 @@ where
             outcome_tx,
             outcome_rx,
             credential_helper: None,
-            runtime_env: None,
+            runtime_env: Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::detect()),
         }
     }
 
-    /// Attach the resolved filesystem-environment (builder-style).
+    /// Attach the resolved filesystem-environment (builder-style), replacing
+    /// the `detect()`ed default from [`Self::new`].
     #[must_use]
     pub fn with_runtime_env(
         mut self,
         env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
     ) -> Self {
-        self.runtime_env = Some(env);
+        self.runtime_env = env;
         self
     }
 
-    /// Resolved filesystem-environment, or a freshly `detect()`ed instance
-    /// when none was attached (test runtimes).
+    /// Resolved filesystem-environment for this runtime — never the process
+    /// env read directly.
     fn runtime_env(&self) -> Arc<crate::runtime_env::PhoenixRuntimeEnvironment> {
-        self.runtime_env
-            .clone()
-            .unwrap_or_else(|| Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::detect()))
+        self.runtime_env.clone()
     }
 
     /// Set the credential helper for recovery settlement (REQ-BED-030).
