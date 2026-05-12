@@ -3291,21 +3291,28 @@ fn execute_approve_plain_markdown_blocking(
 
     // base_branch is recorded on the resulting Work-mode conversation; for the
     // early-worktree case it is otherwise unused here (the worktree was already
-    // created from it). REQ-PROJ-022: ensure it exists locally (best-effort).
+    // created from it). Normally the conversation recorded it at creation
+    // (`desired_base_branch`); if not (e.g. an older `mode=auto` Managed
+    // conversation whose inferred base wasn't persisted), fall back to the
+    // main checkout's HEAD — *not* `cwd`'s HEAD, which is the early worktree's
+    // temp branch (`task-pending-…`) and would be recorded wrongly.
     let base_branch = if let Some(b) = desired_base_branch {
         b.to_string()
     } else {
-        let b = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?
+        let b = run_git(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
             .trim()
             .to_string();
         if b.is_empty() || b == "HEAD" {
             return Err(
-                "Cannot determine current branch (detached HEAD?). Check out a branch before approving."
+                "Cannot determine the base branch for this approval (the conversation didn't \
+                 record one and the repository is on a detached HEAD). Re-create the \
+                 conversation with an explicit base branch."
                     .to_string(),
             );
         }
         b
     };
+    // REQ-PROJ-022: ensure the base branch exists locally (best-effort).
     crate::git_ops::materialize_branch(cwd, &base_branch).map_err(|e| e.to_string())?;
 
     let cwd_filepath = cwd.join(task_file);
@@ -3352,14 +3359,20 @@ fn execute_approve_plain_markdown_blocking(
     .map_err(|e| format!("Failed to rename branch '{temp_branch}' to '{branch_name}': {e}"))?;
     ensure_gitignore_has_phoenix(&worktree_path)?;
     run_git(&worktree_path, &["add", "--", task_file])?;
-    if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
-        return Err(format!("Failed to commit task file in worktree: {e}"));
+    // If the agent pointed at an existing file that was already on the branch
+    // (inherited from base_branch) and didn't modify it — common when
+    // `propose_task` targets something like `docs/plan.md` that Explore mode
+    // can't edit — there is nothing staged. The file is already on the branch;
+    // skip the commit rather than failing with "nothing to commit". `git diff
+    // --cached --quiet` exits 0 when the index matches HEAD.
+    if run_git(&worktree_path, &["diff", "--cached", "--quiet"]).is_err() {
+        if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
+            return Err(format!("Failed to commit task file in worktree: {e}"));
+        }
+        tracing::info!(branch = %branch_name, worktree = %worktree_path_str, "Plain-markdown task approved — temp branch renamed, task file committed");
+    } else {
+        tracing::info!(branch = %branch_name, worktree = %worktree_path_str, "Plain-markdown task approved — temp branch renamed; task file already on the branch unchanged, no commit needed");
     }
-    tracing::info!(
-        branch = %branch_name,
-        worktree = %worktree_path_str,
-        "Plain-markdown task approved — temp branch renamed, task file committed"
-    );
 
     Ok(TaskApprovalResult {
         task_id,
@@ -4110,6 +4123,75 @@ mod plain_markdown_approval_tests {
         }
         assert!(branch_exists(&repo_root, "task-feature-aaaaaaaa"));
         assert!(branch_exists(&repo_root, "task-feature-bbbbbbbb"));
+    }
+
+    /// `propose_task` may point at a file that already exists on the base branch
+    /// and that the agent didn't (couldn't) modify — approval still succeeds, it
+    /// just doesn't create an empty commit; the task branch == the base branch.
+    #[test]
+    fn approve_plain_markdown_unchanged_existing_file_skips_commit() {
+        let (_tmp, repo_root) = init_repo();
+        // Put docs/plan.md (and a .gitignore that already lists .phoenix/, so
+        // ensure_gitignore_has_phoenix is a no-op in the worktree) on `main`.
+        std::fs::create_dir_all(repo_root.join("docs")).unwrap();
+        std::fs::write(repo_root.join("docs/plan.md"), "# Existing plan\n").unwrap();
+        std::fs::write(repo_root.join(".gitignore"), ".phoenix/\n").unwrap();
+        for args in [
+            &["add", "docs/plan.md", ".gitignore"][..],
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "add plan",
+                "-q",
+            ][..],
+        ] {
+            let s = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo_root)
+                .status()
+                .unwrap();
+            assert!(s.success(), "git {args:?} failed");
+        }
+        let conv_id = "existconv-12345678";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        assert!(explore_wt.join("docs/plan.md").exists());
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            "docs/plan.md",
+            "Existing plan",
+            Some("main"),
+        )
+        .expect("approve should succeed even with nothing to commit");
+
+        let conv_prefix: String = conv_id.chars().take(8).collect();
+        assert_eq!(result.branch_name, format!("task-plan-{conv_prefix}"));
+        let rev = |r: &str| {
+            String::from_utf8_lossy(
+                &std::process::Command::new("git")
+                    .args(["rev-parse", r])
+                    .current_dir(&repo_root)
+                    .output()
+                    .unwrap()
+                    .stdout,
+            )
+            .trim()
+            .to_string()
+        };
+        assert_eq!(
+            rev(&result.branch_name),
+            rev("main"),
+            "no empty commit should have been created"
+        );
     }
 }
 

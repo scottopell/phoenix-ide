@@ -616,6 +616,13 @@ async fn create_conversation(
         None => "direct",
     };
 
+    // For Managed mode, the *resolved* base branch (explicit `req.base_branch`
+    // or, for `mode=auto`, the branch inferred from the repo HEAD) is recorded
+    // on the conversation as `desired_base_branch` so task approval has a
+    // reliable base — the early Explore worktree sits on a `task-pending-…`
+    // temp branch, so HEAD there is not the base.
+    let mut managed_base_branch: Option<String> = None;
+
     // Branch mode: create worktree on existing branch (REQ-PROJ-024)
     let (conv_mode, effective_cwd) = if resolved_mode == "branch" {
         let branch_name = req.base_branch.as_deref().ok_or_else(|| {
@@ -718,6 +725,7 @@ async fn create_conversation(
                         .to_string(),
                 )
             })?;
+        managed_base_branch = Some(base_branch.to_string());
 
         let conv_id = id.clone();
         let branch = base_branch.to_string();
@@ -747,11 +755,7 @@ async fn create_conversation(
         (crate::db::ConvMode::Direct, req.cwd.clone())
     };
 
-    let desired_base_branch = if resolved_mode == "managed" {
-        req.base_branch.as_deref()
-    } else {
-        None
-    };
+    let desired_base_branch = managed_base_branch.as_deref();
     // Resolve the model NOW so the conversation record reflects what is
     // actually being used (instead of leaving NULL and forcing every
     // consumer to reach for a default).
