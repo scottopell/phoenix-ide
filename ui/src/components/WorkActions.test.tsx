@@ -110,8 +110,13 @@ describe('WorkActions — continuation gate (REQ-BED-031)', () => {
     const abandon = screen.getByTestId('abandon-button') as HTMLButtonElement;
     const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
 
-    expect(abandon.disabled).toBe(false);
-    expect(mark.disabled).toBe(false);
+    // Mark-as-Merged is disabled until the PR-status fetch resolves (so a
+    // fast click can't cleanup a still-open PR). The mocked getPrStatus
+    // resolves to { found: false } → no PR → cleanup is allowed.
+    await waitFor(() => {
+      expect(abandon.disabled).toBe(false);
+      expect(mark.disabled).toBe(false);
+    });
 
     // Mark-as-merged is safe to click (no confirm dialog); assert it
     // actually wires through. Abandon triggers window.confirm which
