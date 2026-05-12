@@ -129,13 +129,27 @@ fn resolve_task_file(
         }
     }
 
-    let abs_path = cwd.join(rel_path);
-    let body = std::fs::read_to_string(&abs_path).map_err(|e| {
+    // The lexical `..` check above doesn't catch a symlink that points outside
+    // the worktree. Canonicalize and verify the resolved path stays under
+    // `cwd` — otherwise the approval UI could show a plan from outside the
+    // worktree (and `git add` of a path through a symlink fails anyway).
+    let abs_canon = cwd.join(rel_path).canonicalize().map_err(|e| {
         format!(
             "Failed to read task file '{task_file}': {e}. \
              Create the file in your working directory before calling propose_task."
         )
     })?;
+    let cwd_canon = cwd
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve the working directory: {e}"))?;
+    if !abs_canon.starts_with(&cwd_canon) {
+        return Err(format!(
+            "task_file '{task_file}' resolves outside your working directory (a symlink?). \
+             The task file must be a real file inside the worktree."
+        ));
+    }
+    let body = std::fs::read_to_string(&abs_canon)
+        .map_err(|e| format!("Failed to read task file '{task_file}': {e}"))?;
 
     let title = source.title(&body);
     let priority = source.priority().to_string();
@@ -3896,5 +3910,17 @@ mod resolve_task_file_tests {
         let tmp = TempDir::new().unwrap();
         let err = resolve_task_file(tmp.path(), "tasks", "../escape.md").unwrap_err();
         assert!(err.contains("'..'"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn symlink_escaping_the_worktree_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("secret.md"), "# Secret\n").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("secret.md"), tmp.path().join("link.md"))
+            .unwrap();
+        let err = resolve_task_file(tmp.path(), "tasks", "link.md").unwrap_err();
+        assert!(err.contains("outside your working directory"), "got: {err}");
     }
 }

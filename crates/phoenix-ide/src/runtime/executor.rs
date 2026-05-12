@@ -2933,16 +2933,90 @@ fn promote_task_status_to_in_progress(
 /// Task approval is rare; a single mutex is sufficient.
 static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Blocking implementation of approve task git operations.
+/// Resolve the base branch to record on the Work-mode conversation a task
+/// approval produces, and single-branch-fetch it (REQ-PROJ-022, best-effort).
+///
+/// Normally the conversation recorded the base at creation time
+/// (`desired_base_branch`). If not (e.g. an older `mode=auto` Managed
+/// conversation), fall back to the *main checkout's* HEAD via `repo_root` —
+/// **not** `cwd`'s HEAD, which is the early Explore worktree's `task-pending-…`
+/// temp branch.
+fn resolve_approval_base_branch(
+    cwd: &std::path::Path,
+    repo_root: &std::path::Path,
+    desired_base_branch: Option<&str>,
+) -> Result<String, String> {
+    let base_branch = if let Some(b) = desired_base_branch {
+        b.to_string()
+    } else {
+        let b = run_git(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string();
+        if b.is_empty() || b == "HEAD" {
+            return Err(
+                "Cannot determine the base branch for this approval (the conversation didn't \
+                 record one and the repository is on a detached HEAD). Re-create the \
+                 conversation with an explicit base branch."
+                    .to_string(),
+            );
+        }
+        b
+    };
+    crate::git_ops::materialize_branch(cwd, &base_branch).map_err(|e| e.to_string())?;
+    Ok(base_branch)
+}
+
+/// Locate the early Explore worktree at `{repo_root}/.phoenix/worktrees/{conv_id}`
+/// and rename its `task-pending-…` temp branch to `task_branch` in place
+/// (REQ-PROJ-028). Returns the worktree path.
+///
+/// `propose_task` is Managed-only and a Managed conversation gets this worktree
+/// on its first message, so it always exists by approval time; if it somehow
+/// doesn't, this errors with a clear "reject and re-propose" message rather than
+/// nesting a new worktree.
+fn open_early_worktree_and_rename_branch(
+    repo_root: &std::path::Path,
+    conv_id: &str,
+    task_branch: &str,
+) -> Result<std::path::PathBuf, String> {
+    let worktree_path = repo_root.join(".phoenix/worktrees").join(conv_id);
+    let exists = worktree_path.is_dir()
+        && run_git(&worktree_path, &["rev-parse", "--is-inside-work-tree"]).is_ok();
+    if !exists {
+        return Err(format!(
+            "No Explore worktree found at {} for this conversation. \
+             Reject the plan and ask the agent to propose again.",
+            worktree_path.display()
+        ));
+    }
+    let temp_branch = run_git(&worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .map_err(|e| format!("Failed to determine current branch in worktree: {e}"))?
+        .trim()
+        .to_string();
+    tracing::info!(temp_branch = %temp_branch, task_branch, "REQ-PROJ-028: renaming temp branch");
+    run_git(&worktree_path, &["branch", "-m", &temp_branch, task_branch])
+        .map_err(|e| format!("Failed to rename branch '{temp_branch}' to '{task_branch}': {e}"))?;
+    Ok(worktree_path)
+}
+
+/// Blocking implementation of taskmd task approval (REQ-PROJ-028).
 /// Runs on a blocking thread via `spawn_blocking`.
 ///
-/// `cwd` is where git commands run (the Explore worktree for Managed
-/// conversations, or the repo root for Direct/legacy paths).
-/// `repo_root` is the git repository root, used for the canonical worktree
-/// path formula: `{repo_root}/.phoenix/worktrees/{conv_id}`.
-/// These are distinct parameters because for Managed conversations `cwd`
-/// IS the Explore worktree, not the repo root.
-#[allow(clippy::too_many_lines)] // Sequential git flow; splitting hurts readability
+/// `propose_task` is a Managed-only tool and a Managed conversation gets its
+/// Explore worktree on its first message, so by the time approval runs `cwd`
+/// IS that worktree, sitting on a `task-pending-…` temp branch with the task
+/// file already written under `{tasks_dir}/`. Approval renames the temp branch
+/// to `task-{id}-{slug}`, promotes the file's status segment to `in-progress`
+/// if needed, and commits it on the task branch. There is no "task file lives
+/// in the repo-root checkout" fallback — the early worktree always exists; if
+/// it somehow doesn't, approval fails with a clear retry message rather than
+/// nesting a new worktree.
+///
+/// A plain-markdown task file (a `.md` name that isn't a taskmd filename) is
+/// handled by [`execute_approve_plain_markdown_blocking`] — dispatched below.
+///
+/// `cwd` is the Explore worktree; `repo_root` is the git repository root, used
+/// for the canonical worktree path `{repo_root}/.phoenix/worktrees/{conv_id}`.
 fn execute_approve_task_blocking(
     cwd: &std::path::Path,
     repo_root: &std::path::Path,
@@ -2978,49 +3052,25 @@ fn execute_approve_task_blocking(
     }
 
     // Serialize approvals so concurrent attempts can't race on the same
-    // branch/worktree name. Originally needed for unique ID allocation;
-    // retained because the same branch-collision logic still benefits.
+    // branch/worktree name.
     let _guard = TASK_APPROVAL_MUTEX
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-    // 0. Determine the base branch: use desired if set, otherwise current HEAD.
-    //    REQ-PROJ-022: always single-branch fetch before worktree creation.
-    let base_branch = if let Some(desired) = desired_base_branch {
-        desired.to_string()
-    } else {
-        let branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
-        let branch = branch.trim().to_string();
-        if branch.is_empty() || branch == "HEAD" {
-            return Err(
-                "Cannot determine current branch (detached HEAD?). Check out a branch before approving."
-                    .to_string(),
-            );
-        }
-        branch
-    };
-
-    crate::git_ops::materialize_branch(cwd, &base_branch).map_err(|e| e.to_string())?;
-
-    let current_head = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let on_base_branch = base_branch == current_head;
-
-    // 1. Parse the on-disk task filename. Filename is the sole source of
-    //    id/priority/status/slug in taskmd 1.0 — no ID allocation here.
     if task_file.is_empty() {
         // Backward-compat shim: AwaitingTaskApproval rows persisted before
-        // task_file existed deserialise with an empty string. The legacy
-        // (title/priority/plan) approval path is gone, so the only way
-        // forward is for the user to reject and re-propose with a file.
+        // task_file existed deserialise with an empty string.
         return Err(format!(
             "This approval predates the file-based propose_task flow. \
              Reject the plan and ask the agent to propose again — it will \
              draft a task file under {tasks_dir_name}/ this time."
         ));
     }
+
+    let base_branch = resolve_approval_base_branch(cwd, repo_root, desired_base_branch)?;
+
+    // Parse the on-disk task filename — in taskmd 1.0 the filename is the sole
+    // source of id/priority/status/slug; Phoenix allocates no ID.
     let rel_path = std::path::Path::new(task_file);
     let original_filename = rel_path
         .file_name()
@@ -3046,206 +3096,55 @@ fn execute_approve_task_blocking(
         ));
     }
 
-    // `first_task` is a tracing-only hint; in the file-based flow the task
-    // file (and therefore tasks/) already exists.
-    let first_task = false;
-
-    // 2. Set up the canonical worktree location.
-    let phoenix_dir = repo_root.join(".phoenix").join("worktrees");
-    std::fs::create_dir_all(&phoenix_dir)
-        .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
-    let worktree_path = phoenix_dir.join(conv_id);
+    // REQ-PROJ-028: `cwd` IS the early Explore worktree, on a `task-pending-…`
+    // temp branch, with the task file already under `{tasks_dir}/`. Rename the
+    // temp branch, promote the file's status to `in-progress` if needed, then
+    // commit it on the task branch.
+    let worktree_path = open_early_worktree_and_rename_branch(repo_root, conv_id, &branch_name)?;
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
-    // REQ-PROJ-028: Detect the early Explore worktree created at conversation
-    // start. When present, cwd IS that worktree — promote it in place rather
-    // than nesting a new one.
-    let early_worktree_exists = worktree_path.exists()
-        && worktree_path.is_dir()
-        && run_git(&worktree_path, &["rev-parse", "--is-inside-work-tree"]).is_ok();
+    let final_filename = promote_task_status_to_in_progress(
+        &worktree_path.join(tasks_dir_name),
+        &task_id,
+        parsed.status,
+        &original_filename,
+    )?;
 
-    if early_worktree_exists {
-        // REQ-PROJ-028: cwd == worktree. The task file is already in place
-        // under tasks/. Rename the temp branch, promote status to in-progress
-        // if needed, then commit.
-        let temp_branch_name = run_git(&worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
-            .map_err(|e| format!("Failed to determine current branch in early worktree: {e}"))?;
-        let temp_branch_name = temp_branch_name.trim().to_string();
-
-        tracing::info!(
-            temp_branch = %temp_branch_name,
-            final_branch = %branch_name,
-            "REQ-PROJ-028: early worktree detected, renaming temp branch"
-        );
-        run_git(
+    ensure_gitignore_has_phoenix(&worktree_path)?;
+    // If `update_task` renamed the file, the old name is now a deletion — stage
+    // it so the commit captures the rename rather than a duplicate task ID.
+    // `git add` on an untracked-and-missing path errors harmlessly.
+    if final_filename != original_filename {
+        let _ = run_git(
             &worktree_path,
-            &["branch", "-m", &temp_branch_name, &branch_name],
-        )
-        .map_err(|e| {
-            format!("Failed to rename branch '{temp_branch_name}' to '{branch_name}': {e}")
-        })?;
-
-        let final_filename = promote_task_status_to_in_progress(
-            &worktree_path.join(tasks_dir_name),
-            &task_id,
-            parsed.status,
-            &original_filename,
-        )?;
-
-        ensure_gitignore_has_phoenix(&worktree_path)?;
-        // When `update_task` renamed the file, the old name is now an
-        // on-disk deletion. Stage it explicitly so the commit captures the
-        // rename rather than introducing a duplicate task ID. `git add` on
-        // an untracked-and-missing path errors harmlessly (new-file flow).
-        if final_filename != original_filename {
-            let _ = run_git(
-                &worktree_path,
-                &[
-                    "add",
-                    "--",
-                    &format!("{tasks_dir_name}/{original_filename}"),
-                ],
-            );
-        }
-        let relative_path = format!("{tasks_dir_name}/{final_filename}");
-        run_git(&worktree_path, &["add", &relative_path])?;
-        let commit_msg = format!("task {task_id}: {title}");
-        if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
-            return Err(format!("Failed to commit task file in early worktree: {e}"));
-        }
-        tracing::info!(commit_msg = %commit_msg, "Task file committed in early worktree (REQ-PROJ-028)");
-    } else {
-        // Legacy path: no early worktree. cwd is the repo root checkout; the
-        // task file lives there and must be transplanted to (or shared with)
-        // the new worktree.
-        let branch_exists = run_git(cwd, &["rev-parse", "--verify", &branch_name]).is_ok();
-        if branch_exists {
-            let merge_base = run_git(cwd, &["merge-base", "--is-ancestor", &branch_name, "HEAD"]);
-            if merge_base.is_ok() {
-                run_git(cwd, &["branch", "-d", &branch_name])?;
-                tracing::info!(branch = %branch_name, "Deleted stale fully-merged branch");
-            } else {
-                return Err(format!(
-                    "Branch '{branch_name}' already exists and is not fully merged. \
-                     Please resolve this manually before approving."
-                ));
-            }
-        }
-
-        if on_base_branch {
-            // On base branch: rename status in cwd, commit, then create branch + worktree.
-            let final_filename = promote_task_status_to_in_progress(
-                &cwd.join(tasks_dir_name),
-                &task_id,
-                parsed.status,
-                &original_filename,
-            )?;
-            ensure_gitignore_has_phoenix(cwd)?;
-
-            // Stage the rename's deletion as well (see early-worktree path
-            // above). Harmless no-op when the old name was untracked.
-            if final_filename != original_filename {
-                let _ = run_git(
-                    cwd,
-                    &[
-                        "add",
-                        "--",
-                        &format!("{tasks_dir_name}/{original_filename}"),
-                    ],
-                );
-            }
-            let relative_path = format!("{tasks_dir_name}/{final_filename}");
-            run_git(cwd, &["add", &relative_path])?;
-
-            let commit_msg = format!("task {task_id}: {title}");
-            if let Err(e) = run_git(cwd, &["commit", "-m", &commit_msg]) {
-                let _ = run_git(cwd, &["reset", "HEAD"]);
-                return Err(format!("Failed to commit task file: {e}"));
-            }
-            tracing::info!(commit_msg = %commit_msg, "Task file committed on base branch");
-
-            if let Err(e) = run_git(cwd, &["branch", &branch_name]) {
-                let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
-                return Err(format!("Failed to create branch '{branch_name}': {e}"));
-            }
-            if let Err(e) = run_git(cwd, &["worktree", "add", &worktree_path_str, &branch_name]) {
-                let _ = run_git(cwd, &["branch", "-D", &branch_name]);
-                let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
-                return Err(format!("Failed to create worktree: {e}"));
-            }
-        } else {
-            // Off base branch: the task file lives on the current branch in
-            // cwd, but the new worktree is created from base_branch (which
-            // doesn't have it). Read the body, transplant it to the
-            // worktree, and only remove the cwd copy once the worktree
-            // commit has landed — otherwise a worktree-create failure
-            // would lose the user's draft.
-            let body = std::fs::read_to_string(&cwd_filepath)
-                .map_err(|e| format!("Failed to read task file '{task_file}': {e}"))?;
-
-            let final_filename = if parsed.status == taskmd_core::constants::Status::InProgress {
-                original_filename.clone()
-            } else {
-                taskmd_core::filename::format_filename(
-                    &task_id,
-                    parsed.priority,
-                    taskmd_core::constants::Status::InProgress,
-                    &slug,
-                )
-            };
-
-            if let Err(e) = run_git(
-                cwd,
-                &[
-                    "worktree",
-                    "add",
-                    "-b",
-                    &branch_name,
-                    &worktree_path_str,
-                    &base_branch,
-                ],
-            ) {
-                return Err(format!(
-                    "Failed to create worktree from base '{base_branch}': {e}"
-                ));
-            }
-
-            let wt_tasks_dir = worktree_path.join(tasks_dir_name);
-            std::fs::create_dir_all(&wt_tasks_dir)
-                .map_err(|e| format!("Failed to create {tasks_dir_name}/ in worktree: {e}"))?;
-            let wt_filepath = wt_tasks_dir.join(&final_filename);
-            std::fs::write(&wt_filepath, &body)
-                .map_err(|e| format!("Failed to write task file in worktree: {e}"))?;
-
-            ensure_gitignore_has_phoenix(&worktree_path)?;
-            let relative_path = format!("{tasks_dir_name}/{final_filename}");
-            run_git(&worktree_path, &["add", &relative_path])?;
-            let commit_msg = format!("task {task_id}: {title}");
-            if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
-                let _ = run_git(cwd, &["worktree", "remove", &worktree_path_str, "--force"]);
-                let _ = run_git(cwd, &["branch", "-D", &branch_name]);
-                return Err(format!("Failed to commit task file in worktree: {e}"));
-            }
-            tracing::info!(commit_msg = %commit_msg, "Task file committed in worktree");
-
-            // Worktree commit succeeded — safe to drop the cwd copy now
-            // that the file lives on the task branch.
-            let _ = std::fs::remove_file(&cwd_filepath);
-        }
-
-        tracing::info!(
-            branch = %branch_name,
-            worktree = %worktree_path_str,
-            on_base_branch,
-            "Created git worktree"
+            &[
+                "add",
+                "--",
+                &format!("{tasks_dir_name}/{original_filename}"),
+            ],
         );
+    }
+    run_git(
+        &worktree_path,
+        &["add", "--", &format!("{tasks_dir_name}/{final_filename}")],
+    )?;
+    let commit_msg = format!("task {task_id}: {title}");
+    // Nothing staged — e.g. reusing an existing already-`in-progress` task file
+    // that wasn't modified: it's already on the branch, skip the commit.
+    if run_git(&worktree_path, &["diff", "--cached", "--quiet"]).is_err() {
+        if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
+            return Err(format!("Failed to commit task file in worktree: {e}"));
+        }
+        tracing::info!(branch = %branch_name, commit_msg = %commit_msg, "Task file committed on task branch");
+    } else {
+        tracing::info!(branch = %branch_name, "Task file already on the branch unchanged — no commit needed");
     }
 
     Ok(TaskApprovalResult {
         task_id,
         task_title: title.to_string(),
         branch_name,
-        first_task,
+        first_task: false,
         worktree_path: worktree_path_str,
         base_branch,
     })
@@ -3291,29 +3190,8 @@ fn execute_approve_plain_markdown_blocking(
 
     // base_branch is recorded on the resulting Work-mode conversation; for the
     // early-worktree case it is otherwise unused here (the worktree was already
-    // created from it). Normally the conversation recorded it at creation
-    // (`desired_base_branch`); if not (e.g. an older `mode=auto` Managed
-    // conversation whose inferred base wasn't persisted), fall back to the
-    // main checkout's HEAD — *not* `cwd`'s HEAD, which is the early worktree's
-    // temp branch (`task-pending-…`) and would be recorded wrongly.
-    let base_branch = if let Some(b) = desired_base_branch {
-        b.to_string()
-    } else {
-        let b = run_git(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?
-            .trim()
-            .to_string();
-        if b.is_empty() || b == "HEAD" {
-            return Err(
-                "Cannot determine the base branch for this approval (the conversation didn't \
-                 record one and the repository is on a detached HEAD). Re-create the \
-                 conversation with an explicit base branch."
-                    .to_string(),
-            );
-        }
-        b
-    };
-    // REQ-PROJ-022: ensure the base branch exists locally (best-effort).
-    crate::git_ops::materialize_branch(cwd, &base_branch).map_err(|e| e.to_string())?;
+    // created from it).
+    let base_branch = resolve_approval_base_branch(cwd, repo_root, desired_base_branch)?;
 
     let cwd_filepath = cwd.join(task_file);
     if !cwd_filepath.exists() {
@@ -3330,33 +3208,11 @@ fn execute_approve_plain_markdown_blocking(
     .branch_and_id(conv_id);
     let commit_msg = format!("task {task_id}: {title}");
 
-    let phoenix_dir = repo_root.join(".phoenix").join("worktrees");
-    std::fs::create_dir_all(&phoenix_dir)
-        .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
-    let worktree_path = phoenix_dir.join(conv_id);
+    // REQ-PROJ-028: `cwd` IS the early Explore worktree, on a temp branch, with
+    // the task file already in place. Rename the temp branch, then commit the
+    // file at its own path on it.
+    let worktree_path = open_early_worktree_and_rename_branch(repo_root, conv_id, &branch_name)?;
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
-
-    let worktree_exists = worktree_path.is_dir()
-        && run_git(&worktree_path, &["rev-parse", "--is-inside-work-tree"]).is_ok();
-    if !worktree_exists {
-        return Err(format!(
-            "No Explore worktree found at {worktree_path_str} for this conversation. \
-             Reject the plan and ask the agent to propose again."
-        ));
-    }
-
-    // REQ-PROJ-028: `cwd` IS that worktree, on a temp branch, with the task
-    // file already in place. Rename the temp branch to the task branch, then
-    // commit the file on it.
-    let temp_branch = run_git(&worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
-        .map_err(|e| format!("Failed to determine current branch in worktree: {e}"))?
-        .trim()
-        .to_string();
-    run_git(
-        &worktree_path,
-        &["branch", "-m", &temp_branch, &branch_name],
-    )
-    .map_err(|e| format!("Failed to rename branch '{temp_branch}' to '{branch_name}': {e}"))?;
     ensure_gitignore_has_phoenix(&worktree_path)?;
     run_git(&worktree_path, &["add", "--", task_file])?;
     // If the agent pointed at an existing file that was already on the branch
