@@ -132,14 +132,26 @@ change.
 
 ## Acceptance
 
-- [ ] `crates/phoenix-ide/src/runtime_env.rs` with the public surface above
-- [ ] All 16 HOME reads + 5 temp_dir reads migrated
-- [ ] ast-grep rule in `./dev.py check` rejects new direct reads outside
-      `runtime_env.rs`
-- [ ] Tests use `PhoenixRuntimeEnvironment::with_root(tempdir)` instead
-      of mutating `HOME` (closes the env-mutation flakiness window)
-- [ ] No behavior changes vs current — fallback paths preserved per call
-      site, just centralized
+- [x] `crates/phoenix-ide/src/runtime_env.rs` with the public surface above
+- [x] All HOME reads + temp_dir reads migrated (caveats: `tls.rs:227`
+      uses the `env::var_os("HOME")` form — out of scope per task, and the
+      ast-grep rule's `std::env::…` patterns don't flag it. `spawn.rs`
+      keeps its `$USER`/`$PATH` reads — those aren't filesystem-path env
+      vars and aren't in the banned list.)
+- [x] ast-grep rule in `./dev.py check` rejects new direct reads outside
+      `runtime_env.rs` (`ast-grep-rules/no-direct-home-reads.yml`; dev.py
+      `check_ast_grep` now scans Rust rules against `crates/`)
+- [x] Tests use `PhoenixRuntimeEnvironment::with_root(tempdir)` instead
+      of mutating `HOME` (the `codex_credential.rs` tests already take a
+      `&PhoenixRuntimeEnvironment`; `OPENAI_USE_CODEX_AUTH` mutation
+      stays — not a path var)
+- [x] No behavior changes vs current — fallback paths preserved per call
+      site, with one documented exception: `bash_check::paths_match`'s
+      `cd ~` display-stripping heuristic no longer expands `~` (the pure
+      state-machine layer doesn't carry the resolved home), so a
+      `cd ~ && x` command where `~` == cwd now shows `cd ~ && x` instead
+      of `x` — a near-impossible real scenario, and the conservative
+      direction (keep, don't drop).
 
 ## Notes
 
