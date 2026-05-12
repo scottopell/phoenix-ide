@@ -126,10 +126,29 @@ found, so existing repos behave as before (task 13008).
 The task file is authored by the agent in Explore mode with the `patch` tool (whose
 allowlist in Explore mode is scoped to `{tasks_dir}/`) and referenced by path in the
 `propose_task` call. On approval it is committed on the task branch — never on `main`
-or the base branch (REQ-PROJ-027). taskmd 1.0: the filename is the sole source of task
-metadata; there is no frontmatter.
+or the base branch (REQ-PROJ-027).
 
-Filename convention: `{ID}-{priority}-{status}--{slug}.md`
+There are two "task source" kinds, behind the `TaskSource` seam
+(`crate::task_source::TaskSource`); taskmd is the default but not a hard dependency
+(task 13009):
+
+1. **taskmd** — a filename matching `{ID}-{priority}-{status}--{slug}.md`,
+   conventionally under `{tasks_dir}/`. taskmd 1.0: the filename is the sole source of
+   task metadata; there is no frontmatter. Described below.
+2. **plain-markdown** — any other `.md` file inside the worktree (e.g. `docs/plan.md`,
+   or even `README.md`). No structured metadata: the display title is the body's first
+   `# H1` (falling back to a title-cased file stem), the display priority defaults to
+   `p2`, there is no status segment and therefore no on-approve status rename, and the
+   task branch is named `task-{sanitized-stem}-{conversation-id-prefix}` (the conv-id
+   prefix uniquifies — the approval mutex serializes but does not uniquify, so two
+   conversations proposing files with the same stem must not collide). The file is
+   committed at its own path. A project that hasn't adopted taskmd uses this; the
+   Explore-mode prompt recommends keeping plain briefs *outside* `{tasks_dir}/` so
+   `taskmd validate` stays clean, but that is a convention, not a structural rule. A
+   future explicit "task source" backend (beads, …) would slot in behind the same seam;
+   that is out of scope for v1.
+
+taskmd filename convention: `{ID}-{priority}-{status}--{slug}.md`
 - `ID`: 5-digit (`DDNNN`) value — a per-directory prefix (hostname + tasks-dir path)
   plus a monotonic counter. The agent chooses the filename when it drafts the file;
   Phoenix does not allocate the ID, it parses it back out of the filename at approval
@@ -160,9 +179,9 @@ along on the task branch.
 
 ```
 AwaitingTaskApproval {
-  task_file: String,    // path under {tasks_dir}/ to the file the agent wrote
-  title: String,        // display copy (parsed from the file's H1 / filename)
-  priority: String,     // display copy ("p0".."p4", from the filename)
+  task_file: String,    // path (relative to cwd) to the markdown file the agent wrote
+  title: String,        // display copy (the file's H1, falling back to filename/stem)
+  priority: String,     // display copy ("p0".."p4" from a taskmd filename; "p2" for a plain brief)
   plan: String,         // display copy of the file body
 }
 ```
@@ -240,11 +259,14 @@ never pushes or merges — `git push` is the agent's job via the bash tool.
 intercepted at the `LlmResponse` handler (same pattern as `submit_result`) and never
 enters `ToolExecuting`. Only available in Explore mode, rejected from sub-agents.
 
-Input: `{ task_file: string }` — a path (relative to the agent's cwd) to a file under
-`{tasks_dir}/` whose filename follows the taskmd 1.0 convention
-(`NNNNN-pX-status--slug.md`, status one of `ready`/`in-progress`/`brainstorming`). The
-agent either points at an existing task file or drafts one first with `patch` (the
-Explore-mode `patch` allowlist is scoped to `{tasks_dir}/`). The body is free-form
+Input: `{ task_file: string }` — a path (relative to the agent's cwd) to an existing
+markdown (`.md`) file inside the worktree. A taskmd 1.0 filename
+(`NNNNN-pX-status--slug.md`, conventionally under `{tasks_dir}/`, status one of
+`ready`/`in-progress`/`brainstorming`) additionally derives id/priority/status/slug
+from the name; any other `.md` file is accepted as a plain task brief (`TaskSource`,
+task 13009). The agent either points at an existing file or drafts one first with
+`patch` (the Explore-mode `patch` allowlist is scoped to `{tasks_dir}/`, so a freshly
+drafted brief lands there even when it isn't taskmd-named). The body is free-form
 markdown shown to the user as the plan.
 
 **Interception flow (in the `LlmResponse` transition arm):**
@@ -262,17 +284,22 @@ process-global approval mutex):**
 1. Resolve `base_branch` (the conversation's `desired_base_branch` if set, else the
    current `HEAD` of the conversation's cwd) and `git fetch origin {base_branch}`
    single-branch, best-effort (REQ-PROJ-022).
-2. Parse the on-disk task filename → `task_id`, `priority`, `status`, `slug`. No ID
-   allocation here — taskmd 1.0 puts the metadata in the filename. The task branch name
-   is `task-{task_id}-{slug}`.
+2. Classify via `TaskSource`. **taskmd filename:** parse → `task_id`, `priority`,
+   `status`, `slug` (no ID allocation — the metadata is in the filename); task branch =
+   `task-{task_id}-{slug}`. **plain-markdown:** task branch =
+   `task-{sanitized-stem}-{conv-id[..8]}` (the conv-id suffix uniquifies — the approval
+   mutex serializes but does not uniquify); the recorded `task_id` is the sanitized
+   stem; there is no status segment, so no rename happens (step 3).
 3. Locate `.phoenix/worktrees/{conv-id}/`. **Early-worktree path (REQ-PROJ-028, the
    normal Managed flow):** the conversation's cwd already *is* that worktree on a temp
-   branch. Rename the temp branch in place to `task-{task_id}-{slug}`, rename the task
-   file to `...-in-progress--{slug}.md` if it isn't already in-progress, `git add` +
-   `git commit -m "task {task_id}: {title}"` on the task branch. **Fallback path** (no
-   pre-created worktree, e.g. a conversation that referenced an existing task file from
-   the main checkout): transplant the file into a freshly created worktree on the new
-   branch off `base_branch` and commit it there; only then remove the cwd copy.
+   branch. Rename the temp branch in place to the task branch, rename a taskmd file to
+   `...-in-progress--{slug}.md` if it isn't already in-progress (plain-markdown: no
+   rename), `git add` + `git commit -m "task {task_id}: {title}"` on the task branch (a
+   taskmd file is staged at `{tasks_dir}/...`, a plain brief at its own path).
+   **Fallback path** (no pre-created worktree, e.g. a conversation that referenced an
+   existing file from the main checkout): transplant the file into a freshly created
+   worktree on the new branch off `base_branch` and commit it there; only then remove
+   the cwd copy.
 4. Ensure `.phoenix/worktrees/` is in the worktree's `.gitignore`.
 5. Update `conv_mode` to `Work { worktree_path, branch_name, base_branch, task_id,
    task_title }`.

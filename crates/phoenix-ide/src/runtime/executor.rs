@@ -2952,6 +2952,27 @@ fn execute_approve_task_blocking(
     title: &str,
     desired_base_branch: Option<&str>,
 ) -> Result<TaskApprovalResult, String> {
+    // task 13009: a plain-markdown task file (anything whose name doesn't match
+    // the taskmd pattern) takes a separate, simpler approval path — no taskmd
+    // id/status/slug, no status-rename, branch uniquified by conversation id.
+    // The empty-string legacy shim and all taskmd handling fall through to the
+    // code below.
+    if let Some(filename) = std::path::Path::new(task_file)
+        .file_name()
+        .and_then(|f| f.to_str())
+    {
+        if taskmd_core::filename::parse_filename(filename).is_none() {
+            return execute_approve_plain_markdown_blocking(
+                cwd,
+                repo_root,
+                conv_id,
+                task_file,
+                title,
+                desired_base_branch,
+            );
+        }
+    }
+
     // Serialize approvals so concurrent attempts can't race on the same
     // branch/worktree name. Originally needed for unique ID allocation;
     // retained because the same branch-collision logic still benefits.
@@ -3226,6 +3247,204 @@ fn execute_approve_task_blocking(
     })
 }
 
+/// Blocking git operations for approving a *plain-markdown* task file (task
+/// 13009) — a sibling of [`execute_approve_task_blocking`] for the case where
+/// the task file's name is not a taskmd 1.0 filename.
+///
+/// Differences from the taskmd path:
+/// - branch name is `task-{sanitized-stem}-{conv-id-prefix}` — the conv-id
+///   prefix is the uniquifier so two conversations proposing files with the
+///   same stem don't collide (the approval mutex only serializes);
+/// - no `...-ready--` → `...-in-progress--` rename, no `format_filename` call —
+///   plain markdown has no status segment;
+/// - the file is committed at its own path (e.g. `docs/plan.md`), not under the
+///   project's tasks dir.
+///
+/// `cwd` / `repo_root` have the same meaning as in [`execute_approve_task_blocking`].
+#[allow(clippy::too_many_lines)] // Mirrors the three-way git flow of the taskmd path.
+fn execute_approve_plain_markdown_blocking(
+    cwd: &std::path::Path,
+    repo_root: &std::path::Path,
+    conv_id: &str,
+    task_file: &str,
+    title: &str,
+    desired_base_branch: Option<&str>,
+) -> Result<TaskApprovalResult, String> {
+    use crate::task_source::TaskSource;
+
+    let _guard = TASK_APPROVAL_MUTEX
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let rel_path = std::path::Path::new(task_file);
+    let original_filename = rel_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
+    let TaskSource::PlainMarkdown { stem } = TaskSource::detect(original_filename)
+        .ok_or_else(|| format!("task_file '{original_filename}' is not a markdown file"))?
+    else {
+        // Unreachable: the caller only routes here when the filename doesn't
+        // parse as taskmd.
+        return Err(format!(
+            "task_file '{original_filename}' parsed as a taskmd filename but was \
+             routed to the plain-markdown approval path — this is a bug"
+        ));
+    };
+
+    // Determine the base branch (same as the taskmd path).
+    let base_branch = if let Some(desired) = desired_base_branch {
+        desired.to_string()
+    } else {
+        let branch = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?
+            .trim()
+            .to_string();
+        if branch.is_empty() || branch == "HEAD" {
+            return Err(
+                "Cannot determine current branch (detached HEAD?). Check out a branch before approving."
+                    .to_string(),
+            );
+        }
+        branch
+    };
+    crate::git_ops::materialize_branch(cwd, &base_branch).map_err(|e| e.to_string())?;
+    let current_head = run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let on_base_branch = base_branch == current_head;
+
+    let cwd_filepath = cwd.join(rel_path);
+    if !cwd_filepath.exists() {
+        return Err(format!(
+            "Task file '{task_file}' does not exist under {}. \
+             The file must be on disk before approval.",
+            cwd.display()
+        ));
+    }
+
+    let (branch_name, task_id) = TaskSource::PlainMarkdown { stem }.branch_and_id(conv_id);
+    let commit_msg = format!("task {task_id}: {title}");
+
+    let phoenix_dir = repo_root.join(".phoenix").join("worktrees");
+    std::fs::create_dir_all(&phoenix_dir)
+        .map_err(|e| format!("Failed to create .phoenix/worktrees/: {e}"))?;
+    let worktree_path = phoenix_dir.join(conv_id);
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+
+    let early_worktree_exists = worktree_path.exists()
+        && worktree_path.is_dir()
+        && run_git(&worktree_path, &["rev-parse", "--is-inside-work-tree"]).is_ok();
+
+    if early_worktree_exists {
+        // REQ-PROJ-028: cwd == the early Explore worktree. The task file is
+        // already in place; rename the temp branch and commit.
+        let temp_branch_name = run_git(&worktree_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .map_err(|e| format!("Failed to determine current branch in early worktree: {e}"))?
+            .trim()
+            .to_string();
+        run_git(
+            &worktree_path,
+            &["branch", "-m", &temp_branch_name, &branch_name],
+        )
+        .map_err(|e| {
+            format!("Failed to rename branch '{temp_branch_name}' to '{branch_name}': {e}")
+        })?;
+        ensure_gitignore_has_phoenix(&worktree_path)?;
+        run_git(&worktree_path, &["add", "--", task_file])?;
+        if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
+            return Err(format!("Failed to commit task file in early worktree: {e}"));
+        }
+        tracing::info!(commit_msg = %commit_msg, "Plain-markdown task file committed in early worktree");
+    } else {
+        let branch_exists = run_git(cwd, &["rev-parse", "--verify", &branch_name]).is_ok();
+        if branch_exists {
+            let merged = run_git(cwd, &["merge-base", "--is-ancestor", &branch_name, "HEAD"]);
+            if merged.is_ok() {
+                run_git(cwd, &["branch", "-d", &branch_name])?;
+                tracing::info!(branch = %branch_name, "Deleted stale fully-merged branch");
+            } else {
+                return Err(format!(
+                    "Branch '{branch_name}' already exists and is not fully merged. \
+                     Please resolve this manually before approving."
+                ));
+            }
+        }
+
+        if on_base_branch {
+            ensure_gitignore_has_phoenix(cwd)?;
+            run_git(cwd, &["add", "--", task_file])?;
+            if let Err(e) = run_git(cwd, &["commit", "-m", &commit_msg]) {
+                let _ = run_git(cwd, &["reset", "HEAD"]);
+                return Err(format!("Failed to commit task file: {e}"));
+            }
+            if let Err(e) = run_git(cwd, &["branch", &branch_name]) {
+                let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
+                return Err(format!("Failed to create branch '{branch_name}': {e}"));
+            }
+            if let Err(e) = run_git(cwd, &["worktree", "add", &worktree_path_str, &branch_name]) {
+                let _ = run_git(cwd, &["branch", "-D", &branch_name]);
+                let _ = run_git(cwd, &["reset", "--hard", "HEAD~1"]);
+                return Err(format!("Failed to create worktree: {e}"));
+            }
+        } else {
+            // Off base branch: transplant the file body to a worktree created
+            // from base_branch, then drop the cwd copy only once the worktree
+            // commit has landed.
+            let body = std::fs::read_to_string(&cwd_filepath)
+                .map_err(|e| format!("Failed to read task file '{task_file}': {e}"))?;
+            if let Err(e) = run_git(
+                cwd,
+                &[
+                    "worktree",
+                    "add",
+                    "-b",
+                    &branch_name,
+                    &worktree_path_str,
+                    &base_branch,
+                ],
+            ) {
+                return Err(format!(
+                    "Failed to create worktree from base '{base_branch}': {e}"
+                ));
+            }
+            if let Some(parent) = rel_path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(worktree_path.join(parent)).map_err(|e| {
+                        format!("Failed to create parent directory in worktree: {e}")
+                    })?;
+                }
+            }
+            std::fs::write(worktree_path.join(rel_path), &body)
+                .map_err(|e| format!("Failed to write task file in worktree: {e}"))?;
+            ensure_gitignore_has_phoenix(&worktree_path)?;
+            run_git(&worktree_path, &["add", "--", task_file])?;
+            if let Err(e) = run_git(&worktree_path, &["commit", "-m", &commit_msg]) {
+                let _ = run_git(cwd, &["worktree", "remove", &worktree_path_str, "--force"]);
+                let _ = run_git(cwd, &["branch", "-D", &branch_name]);
+                return Err(format!("Failed to commit task file in worktree: {e}"));
+            }
+            let _ = std::fs::remove_file(&cwd_filepath);
+        }
+
+        tracing::info!(
+            branch = %branch_name,
+            worktree = %worktree_path_str,
+            on_base_branch,
+            "Created git worktree (plain-markdown task)"
+        );
+    }
+
+    Ok(TaskApprovalResult {
+        task_id,
+        task_title: title.to_string(),
+        branch_name,
+        first_task: false,
+        worktree_path: worktree_path_str,
+        base_branch,
+    })
+}
+
 /// Build the continuation prompt (REQ-BED-020)
 fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
     let mut prompt = String::from(
@@ -3409,6 +3628,9 @@ mod test_git_helpers {
                 "user.email=t@example.com",
                 "-c",
                 "user.name=t",
+                // Don't depend on the host's commit-signing setup in tests.
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",
@@ -3839,6 +4061,129 @@ mod cwd_immutability_tests {
             ".phoenix must not exist inside the worktree; \
              its presence means a nested worktree was created"
         );
+    }
+}
+
+// ============================================================
+// Plain-markdown task files (task 13009)
+// ============================================================
+
+#[cfg(test)]
+mod plain_markdown_approval_tests {
+    use super::test_git_helpers::{add_explore_worktree, branch_exists, init_repo};
+    use super::*;
+
+    fn git_show_head(cwd: &std::path::Path) -> String {
+        String::from_utf8_lossy(
+            &std::process::Command::new("git")
+                .args(["log", "-1", "--name-only", "--pretty=%s"])
+                .current_dir(cwd)
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .to_string()
+    }
+
+    /// A Managed conversation can approve a plain-markdown task file (one whose
+    /// name is not a taskmd filename). The temp branch is renamed to
+    /// `task-{stem}-{conv-id-prefix}`, the file is committed at its own path,
+    /// and no `...-ready--` -> `...-in-progress--` rename happens.
+    #[test]
+    fn approve_plain_markdown_task_file_in_early_worktree() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "plainconv-abcdef";
+        let base_branch = "main";
+
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, base_branch);
+        // The Explore-mode patch tool is restricted to `tasks/`, so a plain
+        // task brief lands there too.
+        let tasks_dir = explore_wt.join("tasks");
+        std::fs::create_dir_all(&tasks_dir).unwrap();
+        std::fs::write(tasks_dir.join("my-plan.md"), "# My plan\n\nDo the thing.\n").unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            "tasks/my-plan.md",
+            "My plan",
+            Some(base_branch),
+        )
+        .expect("approve_task_blocking failed for plain markdown");
+
+        let conv_prefix: String = conv_id.chars().take(8).collect();
+        assert_eq!(result.branch_name, format!("task-my-plan-{conv_prefix}"));
+        assert_eq!(result.task_id, "my-plan");
+        assert_eq!(result.task_title, "My plan");
+        assert_eq!(result.worktree_path, explore_wt.to_string_lossy());
+        assert!(branch_exists(&repo_root, &result.branch_name));
+        assert!(
+            !branch_exists(&repo_root, &format!("task-pending-{conv_prefix}")),
+            "temp branch should have been renamed"
+        );
+        // No status-rename: the file keeps its original name.
+        assert!(explore_wt.join("tasks/my-plan.md").exists());
+        let head = git_show_head(&explore_wt);
+        assert!(
+            head.contains("task my-plan: My plan"),
+            "commit subject: {head}"
+        );
+        assert!(head.contains("tasks/my-plan.md"), "committed files: {head}");
+    }
+
+    /// `propose_task` may point at any markdown file, including one outside the
+    /// tasks dir — it is committed at its own path.
+    #[test]
+    fn approve_plain_markdown_outside_tasks_dir() {
+        let (_tmp, repo_root) = init_repo();
+        let conv_id = "docsconv-99887766";
+        let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+        std::fs::create_dir_all(explore_wt.join("docs")).unwrap();
+        std::fs::write(explore_wt.join("docs/plan.md"), "# Doc plan\n").unwrap();
+
+        let result = execute_approve_task_blocking(
+            &explore_wt,
+            &repo_root,
+            conv_id,
+            "tasks",
+            "docs/plan.md",
+            "Doc plan",
+            Some("main"),
+        )
+        .expect("approve failed for docs/plan.md");
+
+        let conv_prefix: String = conv_id.chars().take(8).collect();
+        assert_eq!(result.branch_name, format!("task-plan-{conv_prefix}"));
+        let head = git_show_head(&explore_wt);
+        assert!(head.contains("docs/plan.md"), "committed files: {head}");
+    }
+
+    /// Two conversations proposing files with the same stem must get distinct
+    /// branch names — the conversation-id suffix is the uniquifier.
+    #[test]
+    fn plain_markdown_branches_distinct_across_conversations() {
+        let (_tmp, repo_root) = init_repo();
+        for conv_id in ["aaaaaaaa-conv-1", "bbbbbbbb-conv-2"] {
+            let explore_wt = add_explore_worktree(&repo_root, conv_id, "main");
+            std::fs::create_dir_all(explore_wt.join("tasks")).unwrap();
+            std::fs::write(explore_wt.join("tasks/feature.md"), "# Feature\n").unwrap();
+            let r = execute_approve_task_blocking(
+                &explore_wt,
+                &repo_root,
+                conv_id,
+                "tasks",
+                "tasks/feature.md",
+                "Feature",
+                Some("main"),
+            )
+            .expect("approve failed");
+            let prefix: String = conv_id.chars().take(8).collect();
+            assert_eq!(r.branch_name, format!("task-feature-{prefix}"));
+        }
+        assert!(branch_exists(&repo_root, "task-feature-aaaaaaaa"));
+        assert!(branch_exists(&repo_root, "task-feature-bbbbbbbb"));
     }
 }
 

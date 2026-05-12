@@ -15,6 +15,7 @@ mod runtime;
 pub mod skills;
 mod state_machine;
 mod system_prompt;
+mod task_source;
 mod tasks_dir;
 mod terminal;
 mod title_generator;

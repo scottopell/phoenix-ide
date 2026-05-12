@@ -76,13 +76,16 @@ from plan review and worktree isolation, but should be opt-in rather than mandat
 ### REQ-PROJ-003: Propose a Task to Initiate Work Mode
 
 WHILE a conversation is in Explore mode
-THE SYSTEM SHALL allow the agent to draft a task file under the project's tasks
-directory using the `patch` tool (whose Explore-mode allowlist is scoped to that
-directory), with a filename following the taskmd 1.0 convention
-(`NNNNN-pX-status--slug.md`, status one of `ready` / `in-progress` / `brainstorming`)
+THE SYSTEM SHALL allow the agent to draft a markdown task file using the `patch`
+tool (whose Explore-mode allowlist is scoped to the project's tasks directory).
+A filename following the taskmd 1.0 convention (`NNNNN-pX-status--slug.md`, status
+one of `ready` / `in-progress` / `brainstorming`) is one accepted form — taskmd-named
+files additionally yield id/priority/status/slug and a `ready` → `in-progress` rename
+on approval (REQ-PROJ-006) — but any other `.md` file is also accepted as a plain task
+brief (task 13009)
 
-WHEN agent calls the `propose_task` tool with a `task_file` path under the tasks
-directory
+WHEN agent calls the `propose_task` tool with a `task_file` path to a markdown file
+inside the worktree
 THE SYSTEM SHALL intercept it at the LlmResponse handler (like submit_result)
 AND require it to be the only tool call in the response
 AND NOT execute any side effects (no git operations)
@@ -90,10 +93,15 @@ AND read the file and persist the assistant message and a synthetic tool result 
 AND transition the conversation to AwaitingTaskApproval state
 AND pause agent execution until the user responds
 
+WHEN the task file's name parses as taskmd but its status is not `ready` /
+`in-progress` / `brainstorming` (e.g. `done`)
+THE SYSTEM SHALL reject the call (a closed task cannot be proposed for approval).
+For a non-taskmd-named `.md` file there is no status segment, so this check does not apply.
+
 THE AwaitingTaskApproval state SHALL carry the `task_file` path plus a display copy of
-the title, priority, and body (so the prose reader and SSE state payload need not
-re-read the file); on approval the executor SHALL re-read the file from disk as the
-source of truth
+the title, priority (taken from a taskmd filename; `p2` for a plain-markdown file), and
+body (so the prose reader and SSE state payload need not re-read the file); on approval
+the executor SHALL re-read the file from disk as the source of truth
 
 WHEN `propose_task` is called while the conversation is not in Explore mode
 THE SYSTEM SHALL reject the call with an error explaining that tasks must be proposed
@@ -103,10 +111,13 @@ WHEN `propose_task` is called by a sub-agent
 THE SYSTEM SHALL reject the call (task management is the parent conversation's job)
 
 **Rationale:** The task file is a real file the agent edits with `patch`, so revisions
-are file edits rather than full plans round-tripped through tool arguments. taskmd 1.0
-makes the filename the sole source of task metadata — there is no frontmatter and
-Phoenix allocates no ID. `propose_task` itself is a pure data carrier (its `run()` is
-an unreachable fallback): no git work happens until the user approves.
+are file edits rather than full plans round-tripped through tool arguments. taskmd is
+the *default* (the filename carries id/priority/status/slug; Phoenix allocates no ID and
+reads no frontmatter), but it is not a hard dependency: a project that hasn't adopted
+taskmd can point `propose_task` at any markdown file and the Explore → Work cycle still
+works (see `crate::task_source::TaskSource` for the seam). `propose_task` itself is a
+pure data carrier (its `run()` is an unreachable fallback): no git work happens until
+the user approves.
 
 ---
 
@@ -123,7 +134,7 @@ AND transition the conversation to Explore mode (Idle)
 AND the agent MAY revise the plan and call `propose_task` again
   (which re-enters AwaitingTaskApproval and reopens the prose reader)
 
-WHEN user approves the task
+WHEN user approves the task AND the file's name parses as a taskmd filename
 THE SYSTEM SHALL parse the task ID, priority, status, and slug from the on-disk task
   file's name (it allocates no ID; see REQ-PROJ-006)
 AND rename the worktree's temp branch in place to `task-{ID}-{slug}` (REQ-PROJ-028)
@@ -132,6 +143,17 @@ AND commit the task file on that task branch in the existing worktree
 AND transition the conversation from Explore to Work mode within the same worktree
   (storing worktree_path, branch_name, base_branch, task_id, task_title)
 AND resume agent execution with "Task approved. You are on branch task-{ID}-{slug}."
+
+WHEN user approves the task AND the file is a plain-markdown brief (not a taskmd filename)
+THE SYSTEM SHALL rename the worktree's temp branch in place to
+  `task-{sanitized-file-stem}-{conversation-id-prefix}` (the conversation-id prefix is the
+  uniquifier — two conversations proposing files with the same stem must not collide on the
+  branch name; the approval mutex only serializes, it does not uniquify)
+AND NOT rename the file (a plain brief has no status segment) and NOT call `format_filename`
+AND commit the file at its own path on the task branch
+AND transition the conversation to Work mode (the `task_id` recorded is the sanitized stem,
+  kept non-empty for the conversation record; there is no `task_title` parse so the display
+  title — the body's `# H1`, falling back to the stem — is used)
 
 WHEN user discards the task
 THE SYSTEM SHALL return the conversation to Explore mode
@@ -201,11 +223,26 @@ AND the agent SHALL rename the file to `...-done--{slug}.md` (or `...-wont-do--{
 
 Branch mode conversations (REQ-PROJ-024) do not have task files.
 
+WHEN the task file the agent points `propose_task` at is **not** a taskmd-named file
+(any other `.md` file inside the worktree — e.g. `docs/plan.md`, or even `README.md`)
+THE SYSTEM SHALL treat it as a plain task brief: the display title is the body's first
+  `# H1` (falling back to a title-cased file stem), the display priority defaults to `p2`,
+  there is no structured id/status/slug, no on-approve status rename, and the task branch
+  is named `task-{sanitized-stem}-{conversation-id-prefix}`
+AND the file is committed at its own path on the task branch (so plain-markdown briefs
+  conventionally live *outside* the tasks directory — a recommendation surfaced in the
+  Explore-mode prompt, not a structural rule — keeping `taskmd validate` clean for projects
+  that do use taskmd)
+
 **Rationale:** Task files live on the task branch alongside the code changes, keeping
 the branch self-contained — no commits to main (which may be protected), no two-path
 commit logic. taskmd 1.0's filename-is-truth model means there's nothing for Phoenix to
 keep in sync — no authoritative frontmatter, no ID allocation step on the Phoenix side;
 the agent owns the filename (including the `done` rename) the same way it owns the code.
+taskmd is the default but not a hard dependency (task 13009): pointing `propose_task` at
+a plain `.md` file works too — the `TaskSource` seam (`crate::task_source`) picks taskmd
+when the filename parses, plain-markdown otherwise. A future explicit "task source"
+backend (beads, etc.) would slot in behind the same seam; that is out of scope for v1.
 
 ---
 
@@ -302,9 +339,11 @@ normal git commands when they need that detail.
 WHEN agent is in Explore mode
 THE SYSTEM SHALL provide the `propose_task` tool
 WHICH accepts: `task_file` (required string) — a path, relative to the agent's working
-  directory, to a file under the project's tasks directory whose filename follows the
-  taskmd 1.0 convention (`NNNNN-pX-status--slug.md`, status one of `ready` /
-  `in-progress` / `brainstorming`)
+  directory, to an existing markdown (`.md`) file inside the worktree. A taskmd 1.0
+  filename (`NNNNN-pX-status--slug.md`, conventionally under the project's tasks
+  directory, status one of `ready` / `in-progress` / `brainstorming`) additionally
+  derives id/priority/status/slug from the name; any other `.md` file is accepted as a
+  plain task brief (REQ-PROJ-006, task 13009)
 
 WHEN `propose_task` is called outside Explore mode
 THE SYSTEM SHALL reject the call ("propose_task is only available in Explore mode")

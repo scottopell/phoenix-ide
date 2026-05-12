@@ -114,8 +114,25 @@ entity Project {
     work_conversations: conversations where mode in { work, branch }
 }
 
--- A task file in the tasks/ directory, committed on the task branch.
--- taskmd 1.0: the filename is the sole source of metadata — no frontmatter.
+-- A task file, committed on the task branch.
+--
+-- This entity models the *taskmd* form (the default): a filename
+-- `{task_id}-{priority}-{status}--{slug}.md`, conventionally under the
+-- project's tasks dir, where the filename is the sole source of metadata —
+-- no frontmatter (taskmd 1.0). Phoenix allocates no ID; it parses
+-- id/priority/status/slug back out of the filename.
+--
+-- task 13009: `propose_task` may also point at a *plain-markdown* file (any
+-- other `.md` file inside the worktree — e.g. `docs/plan.md`, `README.md`).
+-- A plain brief carries no structured metadata: the display title is the
+-- body's `# H1` (falling back to the file stem), priority defaults to `p2`,
+-- there is no status segment and therefore no on-approve status rename, and
+-- the task branch is `task-{sanitized-stem}-{conversation-id-prefix}`. The
+-- `TaskSource` seam (`crate::task_source`) picks taskmd when the filename
+-- parses, plain-markdown otherwise; a future explicit backend (beads, …)
+-- would slot in behind the same seam. (Plain briefs are not modelled as a
+-- distinct entity here — they have no lifecycle of their own; see
+-- TaskApprovalExecuted's guidance for the approval behaviour.)
 entity TaskFile {
     project: Project
     task_id: String                -- DDNNN: per-directory prefix + monotonic counter;
@@ -446,6 +463,14 @@ rule MaterializeBranch {
 -- REQ-PROJ-004/006/028: User approves task — permission upgrade + commit
 -- the (already-written) task file on the task branch.
 -- Subscribes to bedrock's UserApprovesTask event (see bedrock.allium).
+--
+-- This rule models the taskmd-filename case (the default). For a
+-- plain-markdown brief (task 13009) the shape is the same except: the branch
+-- is `task-{sanitized-stem}-{conversation-id-prefix}` (the conv-id prefix is
+-- the uniquifier — the approval mutex serializes but does not uniquify),
+-- there is no `...-ready--` -> `...-in-progress--` rename, the file is
+-- committed at its own path (not under the tasks dir), and the recorded
+-- `task_id` is the sanitized stem. See the guidance below.
 rule TaskApprovalExecuted {
     when: UserApprovesTask(conversation, decision)
 
@@ -456,10 +481,10 @@ rule TaskApprovalExecuted {
 
     let worktree = Worktree{conversation: conversation}
     -- The proposal carries the path to a task file the agent already wrote
-    -- under tasks/ in Explore mode (bedrock's AwaitingTaskApproval data
+    -- with `patch` in Explore mode (bedrock's AwaitingTaskApproval data
     -- holds `task_file` plus display copies of title/priority/body).
-    -- Phoenix allocates no ID — taskmd 1.0 puts the metadata in the filename;
-    -- the executor parses id/priority/status/slug back out of it.
+    -- For a taskmd filename, Phoenix allocates no ID — the metadata lives in
+    -- the filename and the executor parses id/priority/status/slug back out.
     let task_id = parse_task_id(conversation.proposal.task_file)
     let slug = parse_slug(conversation.proposal.task_file)
     let branch_name = "task-" + task_id + "-" + slug
@@ -481,13 +506,22 @@ rule TaskApprovalExecuted {
         -- All operations run under a process-global approval mutex so two
         -- concurrent approvals can't race on the same branch/worktree name.
         --
-        -- Sequence:
+        -- Sequence (taskmd filename):
         --   1. Parse id/priority/status/slug from the on-disk filename.
         --   2. Single-branch fetch of base_branch, best-effort (REQ-PROJ-022).
         --   3. Rename branch in place: `git branch -m <temp-name> <task-branch>`.
         --   4. Rename the task file to ...-in-progress--<slug>.md if needed.
         --   5. `git add` + `git commit` the task file on the task branch.
         --   6. Transition Explore -> Work (permission upgrade).
+        --
+        -- Sequence (plain-markdown brief — `crate::task_source::TaskSource`
+        -- routes here when the filename doesn't parse as taskmd):
+        --   1. Sanitize the file stem; branch = `task-<stem>-<conv-id[..8]>`.
+        --   2. Single-branch fetch of base_branch, best-effort.
+        --   3. Rename branch in place to that branch name.
+        --   4. (no status rename — a plain brief has no status segment)
+        --   5. `git add <task_file>` + `git commit` at the file's own path.
+        --   6. Transition Explore -> Work. Recorded task_id = the stem.
         --
         -- The worktree and base_branch were set by
         -- ManagedWorktreeOnFirstMessage. No new worktree is created here.

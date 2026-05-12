@@ -35,8 +35,9 @@ const ACCEPTABLE_PROPOSE_STATUSES: &[taskmd_core::constants::Status] = &[
 /// Validated snapshot of a task file at the moment `propose_task` was called.
 ///
 /// `task_file` is normalised to a forward-slash path relative to the
-/// conversation cwd; `title` is the first H1 heading or, lacking that, a
-/// title-cased version of the slug from the filename.
+/// conversation cwd; `title`/`priority` come from the [`TaskSource`] (taskmd
+/// filenames carry both; plain-markdown files take the body's `# H1` and a
+/// `p2` default).
 #[derive(Debug)]
 struct TaskFileSnapshot {
     task_file: String,
@@ -47,10 +48,11 @@ struct TaskFileSnapshot {
 
 /// Read and validate a task file referenced by `propose_task`.
 ///
-/// In taskmd 1.0 the filename is the sole source of metadata — id,
-/// priority, status, and slug all come from the filename. The body is
-/// free-form markdown; we use it only to pull out the H1 for a UI title
-/// and to surface the plan in the approval reader.
+/// The task file may be either a taskmd 1.0 filename (`NNNNN-pX-status--slug.md`,
+/// conventionally under the project's tasks dir — id/priority/status/slug come
+/// from the filename) or any other markdown file inside the worktree (a plain
+/// task brief — title from the body's `# H1`, priority defaults to `p2`). See
+/// [`crate::task_source::TaskSource`].
 ///
 /// The state machine treats this read as a deterministic data-load — like
 /// reading the conversation cwd off disk — not as an external side effect.
@@ -60,6 +62,8 @@ fn resolve_task_file(
     tasks_dir_name: &str,
     task_file: &str,
 ) -> Result<TaskFileSnapshot, String> {
+    use crate::task_source::TaskSource;
+
     if task_file.is_empty() {
         return Err("task_file is required".to_string());
     }
@@ -80,82 +84,67 @@ fn resolve_task_file(
             "task_file must not contain '..' components (got '{task_file}')"
         ));
     }
-    let first_component = rel_path
-        .components()
-        .next()
-        .and_then(|c| c.as_os_str().to_str());
-    if first_component != Some(tasks_dir_name) {
-        return Err(format!(
-            "task_file must be under {tasks_dir_name}/ (got '{task_file}')"
-        ));
-    }
 
     let filename = rel_path
         .file_name()
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("task_file has no filename component: '{task_file}'"))?;
-    let parsed = taskmd_core::filename::parse_filename(filename).ok_or_else(|| {
-        format!(
-            "task_file '{filename}' does not match the taskmd filename pattern \
-             (NNNNN-pX-status--slug.md)"
-        )
-    })?;
+    let source = TaskSource::detect(filename)
+        .ok_or_else(|| format!("task_file must be a markdown file (.md) (got '{task_file}')"))?;
 
-    if !ACCEPTABLE_PROPOSE_STATUSES.contains(&parsed.status) {
-        let allowed: Vec<&str> = ACCEPTABLE_PROPOSE_STATUSES
-            .iter()
-            .map(taskmd_core::constants::Status::as_str)
-            .collect();
-        return Err(format!(
-            "task file status '{}' cannot be proposed for approval. \
-             Acceptable statuses: {}.",
-            parsed.status,
-            allowed.join(", ")
-        ));
+    let first_component = rel_path
+        .components()
+        .next()
+        .and_then(|c| c.as_os_str().to_str());
+
+    match &source {
+        TaskSource::Taskmd { status, .. } => {
+            // Taskmd files conventionally live under the project's tasks dir,
+            // and `taskmd validate` expects every file there to follow the
+            // convention — so a taskmd-named file is only accepted there.
+            if first_component != Some(tasks_dir_name) {
+                return Err(format!(
+                    "taskmd-named task files must be under {tasks_dir_name}/ (got '{task_file}')"
+                ));
+            }
+            if !ACCEPTABLE_PROPOSE_STATUSES.contains(status) {
+                let allowed: Vec<&str> = ACCEPTABLE_PROPOSE_STATUSES
+                    .iter()
+                    .map(taskmd_core::constants::Status::as_str)
+                    .collect();
+                return Err(format!(
+                    "task file status '{status}' cannot be proposed for approval. \
+                     Acceptable statuses: {}.",
+                    allowed.join(", ")
+                ));
+            }
+        }
+        TaskSource::PlainMarkdown { .. } => {
+            // Any markdown file inside the worktree is acceptable as a plain
+            // task brief. (Keeping plain-markdown task files *outside* the
+            // tasks dir is a convention the agent prompt recommends, not a
+            // hard rule — there is nothing structurally wrong with one there.)
+        }
     }
 
     let abs_path = cwd.join(rel_path);
     let body = std::fs::read_to_string(&abs_path).map_err(|e| {
         format!(
             "Failed to read task file '{task_file}': {e}. \
-             Create the file under {tasks_dir_name}/ (taskmd filename format \
-             NNNNN-pX-status--slug.md) before calling propose_task."
+             Create the file in your working directory before calling propose_task."
         )
     })?;
 
-    let title = extract_title(&body).unwrap_or_else(|| slug_to_title(&parsed.slug));
+    let title = source.title(&body);
+    let priority = source.priority().to_string();
     let plan = body.trim().to_string();
 
     Ok(TaskFileSnapshot {
         task_file: task_file.replace('\\', "/"),
         title,
-        priority: parsed.priority.to_string(),
+        priority,
         plan,
     })
-}
-
-fn extract_title(body: &str) -> Option<String> {
-    body.lines().find_map(|line| {
-        let trimmed = line.trim_start();
-        trimmed
-            .strip_prefix("# ")
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-    })
-}
-
-fn slug_to_title(slug: &str) -> String {
-    slug.split('-')
-        .filter(|s| !s.is_empty())
-        .map(|word| {
-            let mut chars = word.chars();
-            match chars.next() {
-                Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 const MAX_RETRY_ATTEMPTS: u32 = 3;
@@ -3819,5 +3808,91 @@ mod tests {
             "empty drain must produce no effects, got {} effects",
             result.effects.len()
         );
+    }
+}
+
+#[cfg(test)]
+mod resolve_task_file_tests {
+    use super::resolve_task_file;
+    use tempfile::TempDir;
+
+    #[test]
+    fn taskmd_file_under_tasks_dir_is_accepted() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("tasks")).unwrap();
+        std::fs::write(
+            tmp.path().join("tasks/12345-p1-ready--fix-login.md"),
+            "# Repair login\n\nplan body\n",
+        )
+        .unwrap();
+        let snap = resolve_task_file(tmp.path(), "tasks", "tasks/12345-p1-ready--fix-login.md")
+            .expect("taskmd file should resolve");
+        assert_eq!(snap.title, "Repair login");
+        assert_eq!(snap.priority, "p1");
+        assert!(snap.plan.contains("plan body"));
+    }
+
+    #[test]
+    fn taskmd_file_outside_tasks_dir_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("elsewhere")).unwrap();
+        std::fs::write(
+            tmp.path().join("elsewhere/12345-p1-ready--fix-login.md"),
+            "# x\n",
+        )
+        .unwrap();
+        let err = resolve_task_file(
+            tmp.path(),
+            "tasks",
+            "elsewhere/12345-p1-ready--fix-login.md",
+        )
+        .unwrap_err();
+        assert!(err.contains("must be under tasks/"), "got: {err}");
+    }
+
+    #[test]
+    fn taskmd_file_with_done_status_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("tasks")).unwrap();
+        std::fs::write(tmp.path().join("tasks/12345-p1-done--x.md"), "# x\n").unwrap();
+        let err = resolve_task_file(tmp.path(), "tasks", "tasks/12345-p1-done--x.md").unwrap_err();
+        assert!(err.contains("cannot be proposed"), "got: {err}");
+    }
+
+    #[test]
+    fn plain_markdown_anywhere_is_accepted_with_h1_title_and_p2() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("docs")).unwrap();
+        std::fs::write(
+            tmp.path().join("docs/plan.md"),
+            "# Migrate the database\n\nstep one\n",
+        )
+        .unwrap();
+        let snap = resolve_task_file(tmp.path(), "tasks", "docs/plan.md")
+            .expect("plain markdown should resolve");
+        assert_eq!(snap.title, "Migrate the database");
+        assert_eq!(snap.priority, "p2");
+        assert_eq!(snap.task_file, "docs/plan.md");
+        assert!(snap.plan.contains("step one"));
+
+        // README.md works too.
+        std::fs::write(tmp.path().join("README.md"), "# The readme\n").unwrap();
+        let snap = resolve_task_file(tmp.path(), "tasks", "README.md").unwrap();
+        assert_eq!(snap.title, "The readme");
+    }
+
+    #[test]
+    fn non_markdown_file_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("notes.txt"), "# x\n").unwrap();
+        let err = resolve_task_file(tmp.path(), "tasks", "notes.txt").unwrap_err();
+        assert!(err.contains("must be a markdown file"), "got: {err}");
+    }
+
+    #[test]
+    fn parent_dir_components_are_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let err = resolve_task_file(tmp.path(), "tasks", "../escape.md").unwrap_err();
+        assert!(err.contains("'..'"), "got: {err}");
     }
 }

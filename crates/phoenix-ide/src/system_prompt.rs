@@ -590,21 +590,25 @@ pub fn build_system_prompt_with_options(
                      for source files -- you can read files, search, analyze, and \
                      discuss the codebase, but you cannot modify code.\n\n\
                      Workflow for proposing work:\n\
-                     1. Find or draft a task file under `{tasks_dir_name}/`.\n   \
+                     1. Find or draft a markdown task file. The body is free-form \
+                        markdown -- start with an `# H1` title, then the plan.\n   \
                         - To reuse an existing task, locate it with `keyword_search` \
-                        or by browsing `{tasks_dir_name}/` with `read_file`.\n   \
-                        - To draft a new task, use `patch` with operation \
-                        `overwrite` to create a file under `{tasks_dir_name}/`. The \
-                        filename must follow the taskmd 1.0 convention: \
-                        `NNNNN-pX-status--slug.md` where status is one of \
-                        `ready`, `in-progress`, or `brainstorming`. The body is \
-                        free-form markdown -- start with an `# H1` title, then the \
-                        plan.\n\
+                        or by browsing with `read_file`.\n   \
+                        - To draft a new one, use `patch` with operation `overwrite`. \
+                        The conventional place is `{tasks_dir_name}/` using the \
+                        taskmd 1.0 naming `NNNNN-pX-status--slug.md` (status one of \
+                        `ready`, `in-progress`, or `brainstorming`) -- files named \
+                        that way additionally carry id/priority/status/slug and get \
+                        an automatic `ready` -> `in-progress` rename on approval. \
+                        Any other `.md` file (e.g. `{tasks_dir_name}/my-plan.md`) \
+                        also works as a plain task brief; just write a clear `# H1` \
+                        title.\n\
                      2. Call `propose_task` with `task_file` set to the path \
-                        (e.g. `{tasks_dir_name}/12345-p2-ready--my-slug.md`). The \
-                        user will review and can approve, request revisions, or \
-                        reject. On approval, an isolated worktree is created and \
-                        you gain full write access.\n\n\
+                        (e.g. `{tasks_dir_name}/12345-p2-ready--my-slug.md` or \
+                        `{tasks_dir_name}/my-plan.md`). The user will review and can \
+                        approve, request revisions, or reject. On approval, an \
+                        isolated worktree is created and you gain full write \
+                        access.\n\n\
                      The `patch` tool is restricted to `{tasks_dir_name}/` in this \
                      mode. `bash` is unavailable. If the user asks you to change \
                      code directly, explain that you must propose a task first."
@@ -615,9 +619,6 @@ pub fn build_system_prompt_with_options(
                 base_branch,
                 worktree_path,
             } => {
-                let task_prefix = taskmd_core::ids::prefix_for(
-                    &std::path::PathBuf::from(&worktree_path).join(tasks_dir_name),
-                );
                 let _ = write!(
                     prompt,
                     "\n\nYou are in Work mode on branch {branch_name}, targeting \
@@ -625,17 +626,16 @@ pub fn build_system_prompt_with_options(
                      Your working directory is {worktree_path}. All file edits and \
                      bash commands MUST stay inside this worktree. Do NOT modify \
                      files in the main checkout or repo root.\n\
-                     Your task ID prefix is {task_prefix}. Task files in this worktree \
-                     use IDs starting with {task_prefix} (e.g., {task_prefix}001).\n\
                      Use bash and the patch tool to make changes.\n\n\
-                     When the task is complete, update its task file's status to \
-                     `done` yourself: rename the file from `...-{{status}}--{{slug}}.md` \
-                     to `...-done--{{slug}}.md` (the filename is the sole source of \
-                     truth for task status -- nothing renames it for you) and commit \
-                     that rename on this branch alongside your work. Then let the user \
-                     know it's ready; they review and merge the branch into \
-                     {base_branch} via a pull request -- Phoenix does not perform the \
-                     merge and does not touch the task file."
+                     When the task is complete, let the user know it's ready; they \
+                     review and merge the branch into {base_branch} via a pull \
+                     request -- Phoenix does not perform the merge. If your task \
+                     file follows the taskmd convention (`NNNNN-pX-status--slug.md`), \
+                     also mark it done yourself before handing off: rename the file \
+                     from `...-{{status}}--{{slug}}.md` to `...-done--{{slug}}.md` \
+                     (the filename is the sole source of truth for task status -- \
+                     nothing renames it for you) and commit that rename on this \
+                     branch alongside your work."
                 );
             }
             ModeContext::Direct => {
@@ -1196,10 +1196,13 @@ mod tests {
         assert!(prompt.contains("task-42-fix-bug"));
         assert!(prompt.contains("/home/user/project/worktrees/abc123"));
         assert!(prompt.contains("MUST stay inside this worktree"));
-        // The agent owns the task-status rename; nothing does it automatically.
-        assert!(prompt.contains("update its task file's status to"));
+        // The agent owns the task-status rename (taskmd files only); nothing
+        // does it automatically.
+        assert!(prompt.contains("mark it done yourself"));
         assert!(prompt.contains("Phoenix does not perform the merge"));
-        assert!(prompt.contains("Your task ID prefix is"));
+        // The Work block no longer hands out a taskmd ID prefix — task files
+        // need not be taskmd files at all (task 13009).
+        assert!(!prompt.contains("task ID prefix"));
     }
 
     // -------------------------------------------------------------------------
