@@ -2082,8 +2082,8 @@ pre:hover .copy-btn {
 
 .offline-banner-retry {
   background: none;
-  border: 1px solid rgb(255 255 255 / 60%);
-  color: white;
+  border: 1px solid rgb(0 0 0 / 40%);
+  color: #000;
   padding: 2px 10px;
   border-radius: 4px;
   font-size: 13px;
@@ -2092,8 +2092,8 @@ pre:hover .copy-btn {
 }
 
 .offline-banner-retry:hover {
-  background: rgb(255 255 255 / 15%);
-  border-color: white;
+  background: rgb(0 0 0 / 10%);
+  border-color: #000;
 }
 
 /* Message Status Indicators */
@@ -5985,6 +5985,8 @@ html * {
   overflow-x: auto;
   flex-shrink: 0;
   scrollbar-width: none;
+  /* stylelint-disable-next-line property-no-vendor-prefix -- Safari < 17.2 needs the prefixed property for CSS masks */
+  -webkit-mask-image: linear-gradient(to right, black 85%, transparent 100%);
   mask-image: linear-gradient(to right, black 85%, transparent 100%);
 }
 
