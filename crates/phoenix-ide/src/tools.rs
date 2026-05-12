@@ -148,10 +148,20 @@ pub struct ToolContext {
     /// key the socket to the worktree rather than the conversation ID so
     /// the session survives context-exhaustion continuations (task 03001).
     pub worktree_path: Option<PathBuf>,
+
+    /// Resolved filesystem-environment. Tools that need on-disk locations
+    /// (terminal output dir, Chromium cache, `~` expansion) read it via
+    /// [`Self::runtime_env`]. Production threads the process-wide
+    /// `Arc<PhoenixRuntimeEnvironment>`; tests that don't set one get a
+    /// throwaway `detect()`ed instance on first access.
+    runtime_env: Option<Arc<crate::runtime_env::PhoenixRuntimeEnvironment>>,
 }
 
 impl ToolContext {
-    /// Create a new tool context
+    /// Create a new tool context. The runtime environment defaults to
+    /// "unset" — production code calls [`Self::with_runtime_env`]
+    /// immediately after; tests that don't care let [`Self::runtime_env`]
+    /// fall back to a `detect()`ed instance.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         cancel: CancellationToken,
@@ -174,7 +184,28 @@ impl ToolContext {
             terminals,
             tmux_registry,
             worktree_path,
+            runtime_env: None,
         }
+    }
+
+    /// Attach the resolved filesystem-environment. Builder-style so the
+    /// long positional [`Self::new`] signature doesn't grow.
+    #[must_use]
+    pub fn with_runtime_env(
+        mut self,
+        env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
+    ) -> Self {
+        self.runtime_env = Some(env);
+        self
+    }
+
+    /// Resolved filesystem-environment for this tool invocation. If none
+    /// was attached (test contexts), a freshly `detect()`ed instance is
+    /// returned — never the process env read directly.
+    pub fn runtime_env(&self) -> Arc<crate::runtime_env::PhoenixRuntimeEnvironment> {
+        self.runtime_env
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::detect()))
     }
 
     /// Get or create the browser session for this conversation.

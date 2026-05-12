@@ -65,7 +65,7 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
     let ctx = ToolContext::new(
         CancellationToken::new(),
         conversation_id.to_string(),
-        std::env::temp_dir(),
+        std::path::PathBuf::from("/tmp"),
         manager.clone(),
         Arc::new(crate::tools::BashHandleRegistry::new()),
         Arc::new(crate::llm::ModelRegistry::new_empty()),

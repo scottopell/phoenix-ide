@@ -268,8 +268,9 @@ async fn acquire_handle(
     let plan = resolve_exec_plan(conversation_id, worktree_path, cwd, runtime).await;
 
     let cwd_owned = cwd.to_path_buf();
+    let runtime_env = runtime.runtime_env().clone();
     let handle = match tokio::task::spawn_blocking(move || {
-        spawn_pty(&cwd_owned, initial_dims, plan)
+        spawn_pty(&cwd_owned, runtime_env.as_ref(), initial_dims, plan)
     })
     .await
     {
@@ -511,7 +512,10 @@ mod reclaim_tests {
         Arc::new(TerminalHandle {
             master_fd: owned_fd,
             child_pid: nix::unistd::Pid::from_raw(1),
-            tracker: Arc::new(Mutex::new(CommandTracker::new("reclaim-test".to_string()))),
+            tracker: Arc::new(Mutex::new(CommandTracker::new(
+                "reclaim-test".to_string(),
+                std::path::PathBuf::from("/tmp/phoenix-test-terminal-output"),
+            ))),
             shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
             stop_tx,
             attach_permit: Arc::new(Semaphore::new(1)),

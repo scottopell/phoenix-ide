@@ -92,6 +92,9 @@ pub struct RuntimeManager {
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
     /// Credential helper for recovery settlement (REQ-BED-030).
     credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+    /// Resolved filesystem-environment, threaded into each conversation's
+    /// `ToolContext` and used to construct the per-process `TmuxRegistry`.
+    runtime_env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
     /// Receiver for browser session lifecycle edges. Taken once by
     /// [`RuntimeManager::start_browser_lifecycle_bridge`] which spawns a
     /// task that resolves `conversation_id` to its `SseBroadcaster` and
@@ -767,6 +770,7 @@ impl RuntimeManager {
         platform: PlatformCapability,
         mcp_manager: Arc<crate::tools::mcp::McpClientManager>,
         credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+        runtime_env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
     ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
@@ -779,11 +783,12 @@ impl RuntimeManager {
             db,
             llm_registry,
             platform,
-            browser_sessions: BrowserSessionManager::with_lifecycle_sink(Some(
-                browser_lifecycle_tx,
-            )),
+            browser_sessions: BrowserSessionManager::with_lifecycle_sink(
+                Some(browser_lifecycle_tx),
+                Some(runtime_env.clone()),
+            ),
             bash_handles: Arc::new(BashHandleRegistry::new()),
-            tmux_registry: Arc::new(TmuxRegistry::new()),
+            tmux_registry: Arc::new(TmuxRegistry::for_env(&runtime_env)),
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
@@ -793,8 +798,14 @@ impl RuntimeManager {
             cancel_tx,
             cancel_rx: RwLock::new(Some(cancel_rx)),
             credential_helper,
+            runtime_env,
             browser_lifecycle_rx: RwLock::new(Some(browser_lifecycle_rx)),
         }
+    }
+
+    /// Resolved filesystem-environment for this process.
+    pub fn runtime_env(&self) -> &Arc<crate::runtime_env::PhoenixRuntimeEnvironment> {
+        &self.runtime_env
     }
 
     /// Get the detected platform capability
@@ -1065,7 +1076,8 @@ impl RuntimeManager {
         )
         .with_parent(parent_event_tx.clone())
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
-        .with_credential_helper(self.credential_helper.clone());
+        .with_credential_helper(self.credential_helper.clone())
+        .with_runtime_env(self.runtime_env.clone());
 
         // 7. Store handle
         let sub_agent_identity = Arc::new(());
@@ -1320,7 +1332,8 @@ impl RuntimeManager {
         )
         .with_steering_queue(conv.steering_queue)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
-        .with_credential_helper(self.credential_helper.clone());
+        .with_credential_helper(self.credential_helper.clone())
+        .with_runtime_env(self.runtime_env.clone());
 
         // If auto-continuing, inject a system message so the LLM knows a restart
         // happened. This also serves as the restart loop counter — recovery.rs

@@ -1,0 +1,16 @@
+id: no-direct-home-reads
+language: rust
+files:
+  - "crates/**/*.rs"
+ignores:
+  - "crates/phoenix-ide/src/runtime_env.rs"
+  - "crates/phoenix-ide/src/bin/monitor.rs"
+rule:
+  any:
+    - pattern: std::env::var("HOME")
+    - pattern: std::env::var_os("HOME")
+    - pattern: std::env::var("CODEX_HOME")
+    - pattern: std::env::var_os("CODEX_HOME")
+    - pattern: std::env::temp_dir()
+severity: error
+message: Read filesystem paths via PhoenixRuntimeEnvironment, not the environment directly. See crates/phoenix-ide/src/runtime_env.rs.

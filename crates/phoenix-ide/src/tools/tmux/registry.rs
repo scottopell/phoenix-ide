@@ -170,11 +170,19 @@ pub struct TmuxRegistry {
 }
 
 impl TmuxRegistry {
-    /// Construct a registry with the default socket directory rooted at
-    /// `~/.phoenix-ide/tmux-sockets/` (or `$PHOENIX_DATA_DIR` if set).
+    /// Construct a registry with the socket directory taken from the
+    /// resolved [`crate::runtime_env::PhoenixRuntimeEnvironment`]
+    /// (`data_dir/tmux-sockets`). This is the production constructor.
     /// `which::which("tmux")` is called once here and cached for the
     /// process lifetime (REQ-TMUX-003 design / "Binary Availability
     /// Detection").
+    pub fn for_env(env: &crate::runtime_env::PhoenixRuntimeEnvironment) -> Self {
+        Self::with_socket_dir(env.tmux_socket_dir())
+    }
+
+    /// Construct a registry with the legacy default socket directory
+    /// (`/tmp/phoenix-ide/tmux-sockets/`). Tests use this; production goes
+    /// through [`Self::for_env`].
     pub fn new() -> Self {
         Self::with_socket_dir(default_socket_dir())
     }
@@ -604,18 +612,11 @@ pub async fn spawn_session(
     Ok(())
 }
 
-/// Default socket directory: `$PHOENIX_DATA_DIR/tmux-sockets/` if set,
-/// else `$HOME/.phoenix-ide/tmux-sockets/`, else
-/// `/tmp/phoenix-ide/tmux-sockets/` as a last resort.
+/// Legacy default socket directory (`/tmp/phoenix-ide/tmux-sockets/`),
+/// used by the test-only [`TmuxRegistry::new`]. Production resolves the
+/// directory from [`crate::runtime_env::PhoenixRuntimeEnvironment`] via
+/// [`TmuxRegistry::for_env`].
 fn default_socket_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("PHOENIX_DATA_DIR") {
-        return PathBuf::from(dir).join(DEFAULT_SOCKET_SUBDIR);
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home)
-            .join(".phoenix-ide")
-            .join(DEFAULT_SOCKET_SUBDIR);
-    }
     PathBuf::from("/tmp/phoenix-ide").join(DEFAULT_SOCKET_SUBDIR)
 }
 

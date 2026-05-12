@@ -387,6 +387,7 @@ pub(crate) fn capture_branch_diff(
     worktree: &Path,
     base_branch: &str,
     max_section_bytes: usize,
+    tmp_dir: &Path,
 ) -> CapturedDiff {
     let comparator = effective_base_ref(worktree, base_branch);
     // Hard limit on bytes streamed before we kill the child process. 8x
@@ -421,7 +422,7 @@ pub(crate) fn capture_branch_diff(
         saturated: false,
     });
 
-    let uncommitted = capture_uncommitted_diff(worktree, max_section_bytes, hard_limit);
+    let uncommitted = capture_uncommitted_diff(worktree, max_section_bytes, hard_limit, tmp_dir);
 
     CapturedDiff {
         comparator,
@@ -435,7 +436,12 @@ pub(crate) fn capture_branch_diff(
     }
 }
 
-fn capture_uncommitted_diff(worktree: &Path, max_bytes: usize, hard_limit: u64) -> CappedStdout {
+fn capture_uncommitted_diff(
+    worktree: &Path,
+    max_bytes: usize,
+    hard_limit: u64,
+    tmp_dir: &Path,
+) -> CappedStdout {
     let empty = || CappedStdout {
         stdout: String::new(),
         total_bytes: 0,
@@ -444,7 +450,7 @@ fn capture_uncommitted_diff(worktree: &Path, max_bytes: usize, hard_limit: u64) 
 
     // Try to set up an isolated index. If anything fails, fall back to a
     // tracked-only diff — never mutate the real index.
-    let Some(temp) = prepare_temp_index(worktree) else {
+    let Some(temp) = prepare_temp_index(worktree, tmp_dir) else {
         tracing::debug!(
             worktree = %worktree.display(),
             "could not isolate git index — falling back to tracked-only uncommitted diff"
@@ -463,10 +469,10 @@ fn capture_uncommitted_diff(worktree: &Path, max_bytes: usize, hard_limit: u64) 
         .unwrap_or_else(|_| empty())
 }
 
-/// Find the worktree's git index, copy it to a unique temp path, and
-/// return a guard that cleans up the copy on drop. Returns `None` if any
-/// step fails.
-fn prepare_temp_index(worktree: &Path) -> Option<TempPath> {
+/// Find the worktree's git index, copy it to a unique temp path under
+/// `tmp_dir`, and return a guard that cleans up the copy on drop. Returns
+/// `None` if any step fails.
+fn prepare_temp_index(worktree: &Path, tmp_dir: &Path) -> Option<TempPath> {
     let git_dir = run_git(worktree, &["rev-parse", "--git-dir"]).ok()?;
     // `git rev-parse --git-dir` returns a path that may be relative to
     // `worktree`. Resolve it.
@@ -479,7 +485,7 @@ fn prepare_temp_index(worktree: &Path) -> Option<TempPath> {
         }
     };
     let real_index = git_dir.join("index");
-    let temp = std::env::temp_dir().join(format!("phoenix-git-index-{}", uuid::Uuid::new_v4()));
+    let temp = tmp_dir.join(format!("phoenix-git-index-{}", uuid::Uuid::new_v4()));
     if real_index.exists() {
         std::fs::copy(&real_index, &temp).ok()?;
     } else {
@@ -920,7 +926,7 @@ mod tests {
             None
         };
 
-        let captured = capture_branch_diff(tmp.path(), "main", 100 * 1024);
+        let captured = capture_branch_diff(tmp.path(), "main", 100 * 1024, tmp.path());
         // Sanity: the untracked file showed up in the diff (so add -N
         // actually ran against the temp index).
         assert!(

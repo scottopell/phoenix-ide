@@ -253,6 +253,10 @@ pub(crate) async fn abandon_task(
     // reads — git stdout never fully materialises in memory.
     let worktree_path_clone = worktree_path.clone();
     let base_branch_clone = base_branch.clone();
+    let git_tmp = state
+        .runtime_env
+        .tmp_subdir("git-index")
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
     let diff_snapshot: Option<String> = tokio::task::spawn_blocking(move || {
         const MAX_DIFF_BYTES: usize = 100 * 1024; // 100KiB
 
@@ -262,7 +266,7 @@ pub(crate) async fn abandon_task(
             return None;
         }
 
-        let captured = capture_branch_diff(&wt, &base_branch_clone, MAX_DIFF_BYTES);
+        let captured = capture_branch_diff(&wt, &base_branch_clone, MAX_DIFF_BYTES, &git_tmp);
 
         if captured.committed_diff.is_empty() && captured.uncommitted_diff.is_empty() {
             return None;

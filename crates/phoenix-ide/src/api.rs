@@ -23,6 +23,7 @@ use crate::db::Database;
 use crate::llm::ModelRegistry;
 use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
+use crate::runtime_env::PhoenixRuntimeEnvironment;
 use crate::terminal::ActiveTerminals;
 use crate::tools::mcp::McpClientManager;
 use std::sync::Arc;
@@ -47,6 +48,11 @@ pub struct AppState {
     pub chain_qa: ChainQa,
     /// In-flight Codex/ChatGPT login flows. See [`codex_login`].
     pub codex_login: Arc<codex_login::CodexLoginManager>,
+    /// Resolved filesystem-environment for this process. Handlers that need
+    /// on-disk locations ($HOME-derived paths, codex auth paths, etc.) read
+    /// it via `state.runtime_env` rather than the process environment.
+    /// Resolved once at startup by [`PhoenixRuntimeEnvironment::detect`].
+    pub runtime_env: Arc<PhoenixRuntimeEnvironment>,
 }
 
 impl AppState {
@@ -58,6 +64,7 @@ impl AppState {
         mcp_manager: Arc<McpClientManager>,
         credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
         password: Option<String>,
+        runtime_env: Arc<PhoenixRuntimeEnvironment>,
     ) -> Self {
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
@@ -65,6 +72,7 @@ impl AppState {
             platform,
             mcp_manager.clone(),
             credential_helper.clone(),
+            runtime_env.clone(),
         ));
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
@@ -87,6 +95,7 @@ impl AppState {
             terminals,
             chain_qa,
             codex_login,
+            runtime_env,
         }
     }
 }

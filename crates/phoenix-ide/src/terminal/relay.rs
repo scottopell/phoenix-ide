@@ -417,7 +417,10 @@ mod tests {
     use tokio::sync::watch;
 
     fn make_tracker() -> Arc<Mutex<CommandTracker>> {
-        Arc::new(Mutex::new(CommandTracker::new("test-session".to_string())))
+        Arc::new(Mutex::new(CommandTracker::new(
+            "test-session".to_string(),
+            std::path::PathBuf::from("/tmp/phoenix-test-terminal-output"),
+        )))
     }
 
     fn default_stop() -> tokio::sync::watch::Receiver<StopReason> {

@@ -167,8 +167,8 @@ fn new_session_id() -> String {
 /// Login flow always writes to Phoenix's own auth file. Piggybacking on Codex
 /// CLI's `~/.codex/auth.json` is read-only — that file belongs to the Codex
 /// CLI's lifecycle and we don't overwrite it from in-app login.
-fn login_target_path() -> PathBuf {
-    codex_credential::default_phoenix_auth_path()
+fn login_target_path(env: &crate::runtime_env::PhoenixRuntimeEnvironment) -> PathBuf {
+    codex_credential::default_phoenix_auth_path(env)
 }
 
 // ---------------------------------------------------------------------------
@@ -302,6 +302,7 @@ pub async fn pkce_start(
         let redirect_uri = session.redirect_uri.clone();
         let mgr_for_task = mgr.clone();
         let registry_for_task = state.llm_registry.clone();
+        let env_for_task = state.runtime_env.clone();
         let cancel_for_task = cancel.clone();
         tokio::spawn(async move {
             let outcome = drive_pkce(
@@ -311,11 +312,13 @@ pub async fn pkce_start(
                 expected_state,
                 verifier,
                 redirect_uri,
+                env_for_task.clone(),
             )
             .await;
             settle_pkce(
                 &mgr_for_task,
                 &registry_for_task,
+                &env_for_task,
                 &session_id_for_task,
                 outcome,
             )
@@ -339,6 +342,7 @@ async fn drive_pkce(
     expected_state: String,
     verifier: String,
     redirect_uri: String,
+    env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
 ) -> Result<LoginResult, LoginError> {
     // Race the loopback callback against the manual-paste channel and the
     // user-cancellation token. `biased` makes cancel preempt deterministically
@@ -411,12 +415,13 @@ async fn drive_pkce(
         return Err(LoginError::Cancelled);
     }
 
-    finalize_login(&login_target_path(), tokens)
+    finalize_login(&login_target_path(&env), tokens)
 }
 
 async fn settle_pkce(
     mgr: &Arc<CodexLoginManager>,
     llm_registry: &Arc<crate::llm::ModelRegistry>,
+    env: &Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
     session_id: &str,
     outcome: Result<LoginResult, LoginError>,
 ) {
@@ -432,7 +437,8 @@ async fn settle_pkce(
     // pre-login state.
     if outcome.is_ok() {
         let registry = llm_registry.clone();
-        tokio::task::spawn_blocking(move || registry.reload_codex_credential())
+        let env = env.clone();
+        tokio::task::spawn_blocking(move || registry.reload_codex_credential(&env))
             .await
             .ok();
     }
@@ -695,12 +701,14 @@ pub async fn device_start(
     {
         let mgr_for_task = mgr.clone();
         let registry_for_task = state.llm_registry.clone();
+        let env_for_task = state.runtime_env.clone();
         let session_id_for_task = session_id.clone();
         tokio::spawn(async move {
-            let outcome = drive_device_code(cancel, device).await;
+            let outcome = drive_device_code(cancel, device, env_for_task.clone()).await;
             settle_device(
                 &mgr_for_task,
                 &registry_for_task,
+                &env_for_task,
                 &session_id_for_task,
                 outcome,
             )
@@ -714,6 +722,7 @@ pub async fn device_start(
 async fn drive_device_code(
     cancel: CancellationToken,
     device: DeviceCode,
+    env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
 ) -> Result<LoginResult, LoginError> {
     // Race the long polling loop against user cancellation. Without this,
     // pressing Cancel only deletes the session record while the poll keeps
@@ -728,12 +737,13 @@ async fn drive_device_code(
     if cancel.is_cancelled() {
         return Err(LoginError::Cancelled);
     }
-    finalize_login(&login_target_path(), tokens)
+    finalize_login(&login_target_path(&env), tokens)
 }
 
 async fn settle_device(
     mgr: &Arc<CodexLoginManager>,
     llm_registry: &Arc<crate::llm::ModelRegistry>,
+    env: &Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
     session_id: &str,
     outcome: Result<LoginResult, LoginError>,
 ) {
@@ -752,7 +762,8 @@ async fn settle_device(
     // Reload before publishing status — see settle_pkce for the rationale.
     if outcome.is_ok() {
         let registry = llm_registry.clone();
-        tokio::task::spawn_blocking(move || registry.reload_codex_credential())
+        let env = env.clone();
+        tokio::task::spawn_blocking(move || registry.reload_codex_credential(&env))
             .await
             .ok();
     }
@@ -862,8 +873,8 @@ pub struct LoginPreflight {
 }
 
 pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflight> {
-    let auth_path = codex_credential::default_phoenix_auth_path();
-    let piggyback_path = codex_credential::default_auth_path();
+    let auth_path = codex_credential::default_phoenix_auth_path(&state.runtime_env);
+    let piggyback_path = codex_credential::default_auth_path(&state.runtime_env);
     let (already_signed_in, account_id) =
         match codex_credential::CodexCredential::load(auth_path.clone()) {
             Ok((_cred, account_id)) => (true, account_id),
@@ -906,7 +917,7 @@ pub async fn login_preflight(State(state): State<AppState>) -> Json<LoginPreflig
 /// `~/.codex/auth.json` via `OPENAI_USE_CODEX_AUTH=1`) is left alone: this
 /// endpoint only manages Phoenix's own auth file.
 pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let auth_path = codex_credential::default_phoenix_auth_path();
+    let auth_path = codex_credential::default_phoenix_auth_path(&state.runtime_env);
     let removed = match std::fs::remove_file(&auth_path) {
         Ok(()) => true,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
@@ -924,7 +935,8 @@ pub async fn signout(State(state): State<AppState>) -> Json<serde_json::Value> {
     // just asked us to delete.
     let drained = drain_active_pkce(&state.codex_login).await;
     let registry = state.llm_registry.clone();
-    let outcome = tokio::task::spawn_blocking(move || registry.reload_codex_credential())
+    let env = state.runtime_env.clone();
+    let outcome = tokio::task::spawn_blocking(move || registry.reload_codex_credential(&env))
         .await
         .ok();
     tracing::info!(
@@ -1036,7 +1048,11 @@ mod tests {
             client_id: "client".into(),
         };
 
-        let err = drive_device_code(cancel, device).await.unwrap_err();
+        let tmp = tempfile::TempDir::new().unwrap();
+        let env = Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::with_root(
+            tmp.path(),
+        ));
+        let err = drive_device_code(cancel, device, env).await.unwrap_err();
         assert!(
             matches!(err, LoginError::Cancelled),
             "expected Cancelled, got {err:?}"

@@ -266,7 +266,7 @@ impl Default for LlmConfig {
 }
 
 impl LlmConfig {
-    pub fn from_env() -> Self {
+    pub fn from_env(env: &crate::runtime_env::PhoenixRuntimeEnvironment) -> Self {
         let credential_helper = std::env::var("LLM_API_KEY_HELPER")
             .ok()
             .filter(|s| !s.is_empty())
@@ -311,7 +311,7 @@ impl LlmConfig {
         // Phoenix's own ~/.phoenix-ide/codex-auth.json wins; OPENAI_USE_CODEX_AUTH=1
         // opts into reading Codex CLI's ~/.codex/auth.json instead. See
         // [`codex_credential::resolve_active_auth_path`].
-        let active_auth_path = codex_credential::resolve_active_auth_path();
+        let active_auth_path = codex_credential::resolve_active_auth_path(env);
         let (codex_credential, codex_credential_path) = match active_auth_path.as_ref() {
             Some(path) => match CodexCredential::load(path.clone()) {
                 Ok((cred, account_id)) => {
@@ -927,8 +927,11 @@ impl ModelRegistry {
     /// `current_codex_loaded_path` for the duration. Concurrent `get()` /
     /// `available_models()` callers either see the prior state or the new
     /// state — never a torn map.
-    pub fn reload_codex_credential(&self) -> CodexReloadOutcome {
-        self.reload_codex_credential_with(codex_credential::resolve_active_auth_path())
+    pub fn reload_codex_credential(
+        &self,
+        env: &crate::runtime_env::PhoenixRuntimeEnvironment,
+    ) -> CodexReloadOutcome {
+        self.reload_codex_credential_with(codex_credential::resolve_active_auth_path(env))
     }
 
     /// Same as [`Self::reload_codex_credential`] but accepts an explicit

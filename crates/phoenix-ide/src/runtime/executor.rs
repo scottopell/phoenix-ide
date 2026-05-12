@@ -136,6 +136,9 @@ where
     /// Credential helper for recovery settlement (REQ-BED-030).
     /// When the state is `AwaitingRecovery`, the select loop awaits `settled.notified()`.
     credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+    /// Resolved filesystem-environment, threaded into each `ToolContext`
+    /// and into `build_system_prompt`. `None` in test constructors.
+    runtime_env: Option<Arc<crate::runtime_env::PhoenixRuntimeEnvironment>>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -196,7 +199,26 @@ where
             outcome_tx,
             outcome_rx,
             credential_helper: None,
+            runtime_env: None,
         }
+    }
+
+    /// Attach the resolved filesystem-environment (builder-style).
+    #[must_use]
+    pub fn with_runtime_env(
+        mut self,
+        env: Arc<crate::runtime_env::PhoenixRuntimeEnvironment>,
+    ) -> Self {
+        self.runtime_env = Some(env);
+        self
+    }
+
+    /// Resolved filesystem-environment, or a freshly `detect()`ed instance
+    /// when none was attached (test runtimes).
+    fn runtime_env(&self) -> Arc<crate::runtime_env::PhoenixRuntimeEnvironment> {
+        self.runtime_env
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::detect()))
     }
 
     /// Set the credential helper for recovery settlement (REQ-BED-030).
@@ -1544,6 +1566,7 @@ where
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
+        let runtime_env = self.runtime_env();
 
         // Token streaming channel (REQ-BED-025).
         //
@@ -1617,6 +1640,7 @@ where
                 &tasks_dir_name,
                 is_sub_agent,
                 mode_context.as_ref(),
+                &runtime_env,
             );
 
             // Build request — normalize messages against current tool set
@@ -1756,7 +1780,8 @@ where
             self.terminals.clone(),
             self.tmux_registry.clone(),
             tmux_worktree,
-        );
+        )
+        .with_runtime_env(self.runtime_env());
 
         let conv_id = self.context.conversation_id.clone();
         let tool_executor = self.tool_executor.clone();

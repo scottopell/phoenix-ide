@@ -389,7 +389,7 @@ mod tests {
         ToolContext::new(
             CancellationToken::new(),
             conv.to_string(),
-            std::env::temp_dir(),
+            std::path::PathBuf::from("/tmp"),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(BashHandleRegistry::new()),
             Arc::new(crate::llm::ModelRegistry::new_empty()),
@@ -655,7 +655,7 @@ mod tests {
         let ctx = ToolContext::new(
             cancel.clone(),
             "conv-cancel".to_string(),
-            std::env::temp_dir(),
+            std::path::PathBuf::from("/tmp"),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(BashHandleRegistry::new()),
             Arc::new(crate::llm::ModelRegistry::new_empty()),

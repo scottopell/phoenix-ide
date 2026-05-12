@@ -59,7 +59,7 @@ impl Tool for SkillTool {
             return ToolOutput::error("skill_name is required");
         }
 
-        let skills = crate::system_prompt::discover_skills(&ctx.working_dir);
+        let skills = crate::system_prompt::discover_skills(&ctx.working_dir, &ctx.runtime_env());
         match crate::skills::invoke_skill(skill_name, args, &skills) {
             Ok(invocation) => ToolOutput::success(invocation.body),
             Err(e) => ToolOutput::error(e),

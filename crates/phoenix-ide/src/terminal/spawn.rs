@@ -53,6 +53,7 @@ pub enum PtyExecPlan {
 #[allow(clippy::too_many_lines)] // inherently dense fork+exec sequence
 pub fn spawn_pty(
     cwd: &Path,
+    env: &crate::runtime_env::PhoenixRuntimeEnvironment,
     initial_dims: Dims,
     plan: PtyExecPlan,
 ) -> Result<TerminalHandle, String> {
@@ -116,8 +117,8 @@ pub fn spawn_pty(
             // tmux's nesting refusal ("sessions should be nested with
             // care"). The shell branch keeps the v1 env unchanged.
             let env_pairs = match &plan {
-                PtyExecPlan::Tmux { .. } => build_env_for_tmux(&shell_path),
-                PtyExecPlan::Shell => build_env(&shell_path),
+                PtyExecPlan::Tmux { .. } => build_env_for_tmux(&shell_path, env.home()),
+                PtyExecPlan::Shell => build_env(&shell_path, env.home()),
             };
             let env_cstrings: Vec<CString> = env_pairs
                 .iter()
@@ -213,7 +214,10 @@ pub fn spawn_pty(
             Ok(TerminalHandle {
                 master_fd,
                 child_pid: child,
-                tracker: Arc::new(Mutex::new(CommandTracker::new(session_id))),
+                tracker: Arc::new(Mutex::new(CommandTracker::new(
+                    session_id,
+                    env.terminal_output_dir(),
+                ))),
                 shell_integration_status: Arc::new(Mutex::new(ShellIntegrationStatus::Unknown)),
                 stop_tx,
                 // 1 permit: the attached relay holds it for its lifetime; a
@@ -248,8 +252,11 @@ pub fn set_winsize_raw(fd: RawFd, dims: Dims) -> Result<(), String> {
 /// Construct an explicit minimal environment for the shell (REQ-TERM-002).
 ///
 /// Never inherits the API server's environment — prevents secret leakage.
-pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_owned());
+/// `home` is the resolved Phoenix home (from
+/// [`crate::runtime_env::PhoenixRuntimeEnvironment`]), used as the spawned
+/// shell's `$HOME`; we deliberately do not re-read the process `$HOME` here.
+pub(crate) fn build_env(shell_path: &str, home: &Path) -> Vec<(String, String)> {
+    let home = home.to_string_lossy().into_owned();
     let user = std::env::var("USER")
         .or_else(|_| std::env::var("LOGNAME"))
         .unwrap_or_else(|_| "user".to_owned());
@@ -282,12 +289,12 @@ pub(crate) fn build_env(shell_path: &str) -> Vec<(String, String)> {
 /// env var causes the inner tmux to refuse to nest by default
 /// ("sessions should be nested with care"). REQ-TMUX-004 / spec
 /// design.md §"TMUX env handling".
-pub(crate) fn build_env_for_tmux(shell_path: &str) -> Vec<(String, String)> {
+pub(crate) fn build_env_for_tmux(shell_path: &str, home: &Path) -> Vec<(String, String)> {
     // build_env() never includes TMUX in the first place — its caller
     // populates the env from a fixed list. We re-use it verbatim and
     // belt-and-braces drop any TMUX-prefixed key just in case the list
     // grows in the future.
-    build_env(shell_path)
+    build_env(shell_path, home)
         .into_iter()
         .filter(|(k, _)| k != "TMUX" && k != "TMUX_PANE")
         .collect()
@@ -332,7 +339,7 @@ mod tests {
 
     #[test]
     fn build_env_for_tmux_omits_tmux_keys() {
-        let env = build_env_for_tmux("/bin/bash");
+        let env = build_env_for_tmux("/bin/bash", std::path::Path::new("/home/test"));
         for (k, _) in &env {
             assert_ne!(k, "TMUX", "TMUX env var must be stripped on tmux path");
             assert_ne!(k, "TMUX_PANE", "TMUX_PANE env var must be stripped");

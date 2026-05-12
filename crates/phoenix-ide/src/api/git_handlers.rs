@@ -694,6 +694,10 @@ pub(crate) async fn get_conversation_diff(
         }
     };
 
+    let git_tmp = state
+        .runtime_env
+        .tmp_subdir("git-index")
+        .unwrap_or_else(|_| PathBuf::from("/tmp"));
     tokio::task::spawn_blocking(move || {
         let wt = PathBuf::from(&worktree_path);
         if !wt.exists() {
@@ -702,7 +706,7 @@ pub(crate) async fn get_conversation_diff(
             )));
         }
 
-        let captured = capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES);
+        let captured = capture_branch_diff(&wt, &base_branch, MAX_DIFF_BYTES, &git_tmp);
 
         Ok(ConversationDiffResponse {
             comparator: captured.comparator,

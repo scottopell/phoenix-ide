@@ -7,7 +7,7 @@ use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
@@ -557,16 +557,22 @@ pub struct McpClientManager {
     /// Servers currently blocked on an OAuth flow: name → auth URL.
     /// Written by the stderr drain; cleared when the server connects or fails.
     pending_oauth_urls: Arc<RwLock<HashMap<String, String>>>,
+    /// Home directory used to locate user-level MCP config files
+    /// (`~/.claude.json`, `~/.cursor/mcp.json`, `~/.config/mcp/mcp.json`).
+    /// Resolved once from [`crate::runtime_env::PhoenixRuntimeEnvironment`].
+    home: PathBuf,
 }
 
 impl McpClientManager {
     /// Create an empty manager. Servers are connected asynchronously via
-    /// `start_background_discovery`.
-    pub fn new() -> Self {
+    /// `start_background_discovery`. `home` is the directory used to look up
+    /// user-level MCP config files.
+    pub fn new(home: PathBuf) -> Self {
         Self {
             servers: Arc::new(RwLock::new(HashMap::new())),
             disabled_servers: RwLock::new(std::collections::HashSet::new()),
             pending_oauth_urls: Arc::new(RwLock::new(HashMap::new())),
+            home,
         }
     }
 
@@ -597,7 +603,7 @@ impl McpClientManager {
     pub fn start_background_discovery(self: &Arc<Self>) {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
-            let configs = Self::read_all_configs();
+            let configs = Self::read_all_configs(&manager.home);
             if configs.is_empty() {
                 tracing::debug!("No MCP server configs found");
                 return;
@@ -862,10 +868,10 @@ impl McpClientManager {
     }
 
     /// Read all MCP config files in priority order, merging by server name
-    /// (first-seen wins).
-    fn read_all_configs() -> Vec<(String, McpServerConfig)> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let home = PathBuf::from(home);
+    /// (first-seen wins). `home` locates the user-level configs; the
+    /// per-project `cwd/.mcp.json` is read relative to the current working
+    /// directory (not an environment read).
+    fn read_all_configs(home: &Path) -> Vec<(String, McpServerConfig)> {
         let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
 
         let config_paths = [
@@ -977,7 +983,7 @@ impl McpClientManager {
     ///
     /// Returns a summary of what changed.
     pub async fn reload(&self) -> McpReloadResult {
-        let configs = Self::read_all_configs();
+        let configs = Self::read_all_configs(&self.home);
         let config_names: std::collections::HashSet<String> =
             configs.iter().map(|(n, _)| n.clone()).collect();
 
@@ -1172,7 +1178,7 @@ mod tests {
 
     #[test]
     fn test_tool_naming() {
-        let manager = Arc::new(McpClientManager::new());
+        let manager = Arc::new(McpClientManager::new(std::path::PathBuf::from("/tmp")));
 
         let tool = McpTool {
             server_name: "slack".to_string(),
@@ -1189,7 +1195,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_create_mcp_tool_by_name_empty() {
-        let manager = Arc::new(McpClientManager::new());
+        let manager = Arc::new(McpClientManager::new(std::path::PathBuf::from("/tmp")));
         let tool = create_mcp_tool_by_name(&manager, "slack__send_message").await;
         assert!(tool.is_none());
     }
@@ -1198,7 +1204,7 @@ mod tests {
     fn test_config_parsing_skips_http() {
         // Verify that read_all_configs works with no config files present
         // (it should return empty, not error).
-        let configs = McpClientManager::read_all_configs();
+        let configs = McpClientManager::read_all_configs(std::path::Path::new("/tmp"));
         // We can't assert anything about count since the dev machine may have configs,
         // but the call should not panic.
         let _ = configs;

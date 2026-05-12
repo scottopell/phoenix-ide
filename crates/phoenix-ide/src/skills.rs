@@ -246,7 +246,10 @@ mod tests {
             "Run cargo build.",
         );
 
-        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let skills = crate::system_prompt::discover_skills(
+            tmp.path(),
+            &crate::runtime_env::PhoenixRuntimeEnvironment::with_root(tmp.path()),
+        );
         let result = invoke_skill("build", "", &skills).unwrap();
         assert_eq!(result.name, "build");
         assert!(result.body.contains("Base directory for this skill:"));
@@ -266,7 +269,10 @@ mod tests {
             "Deploy to $ARGUMENTS environment.",
         );
 
-        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let skills = crate::system_prompt::discover_skills(
+            tmp.path(),
+            &crate::runtime_env::PhoenixRuntimeEnvironment::with_root(tmp.path()),
+        );
         let result = invoke_skill("deploy", "staging", &skills).unwrap();
         assert!(result.body.contains("Deploy to staging environment."));
     }
@@ -274,7 +280,10 @@ mod tests {
     #[test]
     fn test_invoke_skill_not_found() {
         let tmp = TempDir::new().unwrap();
-        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let skills = crate::system_prompt::discover_skills(
+            tmp.path(),
+            &crate::runtime_env::PhoenixRuntimeEnvironment::with_root(tmp.path()),
+        );
         let err = invoke_skill("nonexistent", "", &skills).unwrap_err();
         assert!(err.contains("not found"));
         assert!(err.contains("nonexistent"));
@@ -286,7 +295,10 @@ mod tests {
         write_skill(tmp.path(), "build", "build", "Build it", "body");
         write_skill(tmp.path(), "lint", "lint", "Lint it", "body");
 
-        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let skills = crate::system_prompt::discover_skills(
+            tmp.path(),
+            &crate::runtime_env::PhoenixRuntimeEnvironment::with_root(tmp.path()),
+        );
         let err = invoke_skill("deploy", "", &skills).unwrap_err();
         assert!(err.contains("deploy"));
         assert!(err.contains("build"));
@@ -353,7 +365,10 @@ mod tests {
             "Do the thing.",
         );
 
-        let skills = crate::system_prompt::discover_skills(tmp.path());
+        let skills = crate::system_prompt::discover_skills(
+            tmp.path(),
+            &crate::runtime_env::PhoenixRuntimeEnvironment::with_root(tmp.path()),
+        );
         let result = invoke_skill("simple", "extra args", &skills).unwrap();
         assert!(result.body.contains("ARGUMENTS: extra args"));
     }

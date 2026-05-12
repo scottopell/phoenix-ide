@@ -559,11 +559,8 @@ fn test_overwrite_then_replace_with_filesystem() {
     use super::executor::{execute_effects, read_file_content};
     use std::fs;
 
-    let test_dir = std::env::temp_dir();
-    let test_file = test_dir.join("test_patch_demo.txt");
-
-    // Clean up any existing file
-    let _ = fs::remove_file(&test_file);
+    let test_dir = tempfile::TempDir::new().expect("create tempdir");
+    let test_file = test_dir.path().join("test_patch_demo.txt");
 
     // Create a fresh planner
     let mut planner = PatchPlanner::new();
@@ -619,9 +616,6 @@ fn test_overwrite_then_replace_with_filesystem() {
     // Verify step 2
     let content_after_2 = fs::read_to_string(&test_file).expect("file should exist after replace");
     assert_eq!(content_after_2, "Hello Phoenix IDE");
-
-    // Clean up
-    let _ = fs::remove_file(&test_file);
 }
 
 // ============================================================================

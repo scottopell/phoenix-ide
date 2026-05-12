@@ -50,6 +50,7 @@ fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
         child_pid: nix::unistd::Pid::from_raw(1), // init — never reaped in tests
         tracker: std::sync::Arc::new(std::sync::Mutex::new(CommandTracker::new(
             "test-session".to_string(),
+            std::path::PathBuf::from("/tmp/phoenix-test-terminal-output"),
         ))),
         shell_integration_status: std::sync::Arc::new(std::sync::Mutex::new(
             ShellIntegrationStatus::Unknown,
@@ -339,7 +340,7 @@ proptest! {
 fn build_env_contains_required_variables() {
     use super::spawn::build_env;
 
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", std::path::Path::new("/home/test"));
     let keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
 
     for required in &["TERM", "COLORTERM", "HOME", "USER", "SHELL", "PATH", "LANG"] {
@@ -353,7 +354,7 @@ fn build_env_contains_required_variables() {
 #[test]
 fn build_env_term_is_xterm_256color() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", std::path::Path::new("/home/test"));
     let term = env
         .iter()
         .find(|(k, _)| k == "TERM")
@@ -368,7 +369,7 @@ fn build_env_term_is_xterm_256color() {
 #[test]
 fn build_env_colorterm_is_truecolor() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", std::path::Path::new("/home/test"));
     let ct = env
         .iter()
         .find(|(k, _)| k == "COLORTERM")
@@ -379,7 +380,7 @@ fn build_env_colorterm_is_truecolor() {
 #[test]
 fn build_env_shell_matches_argument() {
     use super::spawn::build_env;
-    let env = build_env("/usr/bin/zsh");
+    let env = build_env("/usr/bin/zsh", std::path::Path::new("/home/test"));
     let shell = env
         .iter()
         .find(|(k, _)| k == "SHELL")
@@ -394,7 +395,7 @@ fn build_env_shell_matches_argument() {
 #[test]
 fn build_env_lang_is_utf8() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", std::path::Path::new("/home/test"));
     let lang = env
         .iter()
         .find(|(k, _)| k == "LANG")
@@ -405,7 +406,7 @@ fn build_env_lang_is_utf8() {
 #[test]
 fn build_env_no_duplicate_keys() {
     use super::spawn::build_env;
-    let env = build_env("/bin/bash");
+    let env = build_env("/bin/bash", std::path::Path::new("/home/test"));
     let mut keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
     let original_len = keys.len();
     keys.dedup();
@@ -436,7 +437,7 @@ mod command_tracker_proptest {
         fn prop_command_tracker_arbitrary_bytes_no_panic(
             bytes in proptest::collection::vec(any::<u8>(), 0..1024),
         ) {
-            let mut tracker = CommandTracker::new("prop-test".to_string());
+            let mut tracker = CommandTracker::new("prop-test".to_string(), std::path::PathBuf::from("/tmp/phoenix-test-terminal-output"));
             tracker.ingest(&bytes);
             prop_assert!(
                 tracker.record_count() <= 5,
@@ -480,7 +481,7 @@ mod command_tracker_proptest {
             splits.dedup();
 
             // Deliver in chunks.
-            let mut tracker = CommandTracker::new("prop-split".to_string());
+            let mut tracker = CommandTracker::new("prop-split".to_string(), std::path::PathBuf::from("/tmp/phoenix-test-terminal-output"));
             let mut last = 0usize;
             for &split in &splits {
                 if split > last {
@@ -646,7 +647,7 @@ mod command_tracker_op_proptest {
         fn prop_state_machine_invariants_hold_after_every_op(
             ops in proptest::collection::vec(arb_op(), 1..=20usize),
         ) {
-            let mut tracker = CommandTracker::new("op-prop".to_string());
+            let mut tracker = CommandTracker::new("op-prop".to_string(), std::path::PathBuf::from("/tmp/phoenix-test-terminal-output"));
             for (step, op) in ops.iter().enumerate() {
                 apply_op(&mut tracker, op);
                 check_invariants(&tracker, op, step)?;

@@ -12,6 +12,7 @@ mod llm;
 mod message_expander;
 mod platform;
 mod runtime;
+mod runtime_env;
 pub mod skills;
 mod state_machine;
 mod system_prompt;
@@ -61,12 +62,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rather than init. Must run before any tool spawns a child.
     crate::tools::bash::install_reaper();
 
+    // Resolve the filesystem environment once. Every subsystem that needs a
+    // path (db, auth, terminal output, tmux sockets, …) consults this.
+    let runtime_env = Arc::new(runtime_env::PhoenixRuntimeEnvironment::detect());
+
     // Log startup context: binary path, version, and whether this looks like a deploy
     let exe_path =
         std::env::current_exe().map_or_else(|_| "unknown".to_string(), |p| p.display().to_string());
-    let is_prod = std::env::var("PHOENIX_DB_PATH")
-        .ok()
-        .is_some_and(|p| p.contains("prod"));
+    let is_prod = runtime_env.is_production();
     tracing::info!(
         exe = %exe_path,
         pid = std::process::id(),
@@ -75,10 +78,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // Configuration
-    let db_path = std::env::var("PHOENIX_DB_PATH").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        format!("{home}/.phoenix-ide/phoenix.db")
-    });
+    let db_path = runtime_env.db_path().display().to_string();
 
     let port: u16 = std::env::var("PHOENIX_PORT")
         .ok()
@@ -95,7 +95,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // discovery (filesystem-shadows-builtin override, companion-file reads,
     // etc.). Failure is non-fatal — built-ins simply won't appear in the
     // catalog and the user can still install filesystem skills.
-    if let Some(target) = skills::builtin::default_extract_dir() {
+    {
+        let target = runtime_env.builtin_skills_dir();
         match skills::builtin::extract_to(&target) {
             Ok(()) => tracing::info!(path = %target.display(), "extracted built-in skills"),
             Err(e) => tracing::warn!(
@@ -132,7 +133,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Initialize LLM registry with model discovery
-    let llm_config = LlmConfig::from_env();
+    let llm_config = LlmConfig::from_env(&runtime_env);
     let credential_helper = llm_config.credential_helper.clone();
     let llm_registry = Arc::new(ModelRegistry::new_with_discovery(&llm_config).await);
 
@@ -192,7 +193,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Create MCP manager and start background server discovery (non-blocking).
     // Servers connect in parallel; tools become available as each finishes.
-    let mcp_manager = Arc::new(crate::tools::mcp::McpClientManager::new());
+    let mcp_manager = Arc::new(crate::tools::mcp::McpClientManager::new(
+        runtime_env.home().to_path_buf(),
+    ));
 
     // Load persisted disabled-server set before discovery starts.
     let disabled = db.get_disabled_mcp_servers().await.unwrap_or_default();
@@ -219,6 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mcp_manager,
         credential_helper,
         password,
+        runtime_env,
     )
     .await;
 

@@ -326,9 +326,15 @@ fn collect_builtin_skills_from_dir(
 /// (useful for testing without mutating process-global env vars).
 ///
 /// Returns skills sorted by name for deterministic output.
-pub fn discover_skills(working_dir: &Path) -> Vec<SkillMetadata> {
-    let builtin_dir = crate::skills::builtin::default_extract_dir();
-    discover_skills_with_options(working_dir, None, builtin_dir.as_deref())
+pub fn discover_skills(
+    working_dir: &Path,
+    env: &crate::runtime_env::PhoenixRuntimeEnvironment,
+) -> Vec<SkillMetadata> {
+    discover_skills_with_options(
+        working_dir,
+        Some(env.home()),
+        Some(&env.builtin_skills_dir()),
+    )
 }
 
 /// Discovery with explicit overrides for both `$HOME` and the built-in
@@ -402,14 +408,11 @@ pub fn discover_skills_with_options(
         }
     }
 
-    // Explicitly check $HOME/.claude/skills/ and $HOME/.agents/skills/
-    // in case $HOME is not an ancestor of working_dir (e.g., different mount).
-    // Skip if the walk-up already passed through $HOME.
-    let resolved_home = match home_override {
-        Some(h) => Some(h.to_path_buf()),
-        None => std::env::var("HOME").ok().map(PathBuf::from),
-    };
-    if let Some(home) = resolved_home {
+    // Explicitly check <home>/.claude/skills/ and <home>/.agents/skills/
+    // in case the home directory is not an ancestor of working_dir (e.g.,
+    // different mount). Skip if the walk-up already passed through it, or if
+    // no home was supplied (test contexts that pass `None`).
+    if let Some(home) = home_override {
         for skill_subdir in SKILL_DIRS {
             let skills_dir = home.join(skill_subdir);
             if !skills_dir.is_dir() {
@@ -496,15 +499,15 @@ pub fn build_system_prompt(
     tasks_dir_name: &str,
     is_sub_agent: bool,
     mode: Option<&ModeContext>,
+    env: &crate::runtime_env::PhoenixRuntimeEnvironment,
 ) -> String {
-    let builtin_dir = crate::skills::builtin::default_extract_dir();
     build_system_prompt_with_options(
         working_dir,
         tasks_dir_name,
         is_sub_agent,
         mode,
-        None,
-        builtin_dir.as_deref(),
+        Some(env.home()),
+        Some(&env.builtin_skills_dir()),
     )
 }
 

@@ -249,24 +249,16 @@ fn is_cd_to_cwd_simple_command(command: &SimpleCommand, cwd: &str) -> bool {
 fn paths_match(target: &str, cwd: &str) -> bool {
     use std::path::Path;
 
-    // Handle ~ expansion (common in cd commands)
-    let target = if target.starts_with('~') {
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = home.to_string_lossy();
-            if target == "~" {
-                home.to_string()
-            } else if let Some(rest) = target.strip_prefix("~/") {
-                format!("{home}/{rest}")
-            } else {
-                // ~user syntax - don't try to expand
-                return false;
-            }
-        } else {
-            return false;
-        }
-    } else {
-        target.to_string()
-    };
+    // `cd ~` / `cd ~/foo` / `cd ~user`: this display heuristic runs in the
+    // pure state-machine layer, which does not carry the resolved home
+    // directory (`PhoenixRuntimeEnvironment` is not threaded into
+    // `ConvContext`). Conservatively treat any tilde target as "not provably
+    // the cwd" so the `cd` prefix is *kept* in the displayed command rather
+    // than stripped — never silently dropped.
+    if target.starts_with('~') {
+        return false;
+    }
+    let target = target.to_string();
 
     let target_path = Path::new(&target);
     let cwd_path = Path::new(cwd);

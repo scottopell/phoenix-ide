@@ -284,7 +284,10 @@ pub(crate) fn enrich_message_for_api(msg: &Message) -> Value {
 /// Note: `seed_parent_slug` is left as `None` here. Call sites that need to
 /// render the seed breadcrumb (single-conversation fetch, SSE init) should
 /// use [`enrich_conversation_with_seed`] instead to resolve the parent slug.
-fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::EnrichedConversation {
+fn enrich_conversation(
+    conv: &crate::db::Conversation,
+    home_dir: Option<&str>,
+) -> crate::runtime::EnrichedConversation {
     crate::runtime::EnrichedConversation {
         conv_mode_label: conv.conv_mode.label().to_string(),
         branch_name: conv.conv_mode.branch_name().map(String::from),
@@ -304,10 +307,9 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         // spawn path reads `$SHELL` from the same env, so this matches what
         // the user's shell will actually be.
         shell: std::env::var("SHELL").ok(),
-        // REQ-SEED-*: surface $HOME so the UI can spawn a seeded conversation
-        // scoped to the user's home directory (e.g. for shell integration
-        // setup).
-        home_dir: std::env::var("HOME").ok(),
+        // REQ-SEED-*: surface the resolved home dir so the UI can spawn a
+        // seeded conversation scoped to it (e.g. for shell integration setup).
+        home_dir: home_dir.map(str::to_owned),
         seed_parent_slug: None,
         // Default to `false`; callers that have access to `AppState` set
         // this from the manager's `HashMap` via
@@ -327,7 +329,7 @@ async fn enrich_conversation_with_seed(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> crate::runtime::EnrichedConversation {
-    let mut enriched = enrich_conversation(conv);
+    let mut enriched = enrich_conversation(conv, Some(&state.runtime_env.home().to_string_lossy()));
     if let Some(parent_id) = conv.seed_parent_id.as_deref() {
         if let Ok(parent) = state.runtime.db().get_conversation(parent_id).await {
             enriched.seed_parent_slug = parent.slug;
@@ -364,8 +366,8 @@ fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
 /// Used by endpoints that return `serde_json::Value` (conversation list, etc.).
 /// `presentation_mode` is injected here (not on `EnrichedConversation`) so REST
 /// clients still receive it while the typed struct stays clean.
-fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
-    let mut val = serde_json::to_value(enrich_conversation(conv)).unwrap_or(Value::Null);
+fn conversation_to_json(conv: &crate::db::Conversation, home_dir: Option<&str>) -> Value {
+    let mut val = serde_json::to_value(enrich_conversation(conv, home_dir)).unwrap_or(Value::Null);
     if let Value::Object(ref mut map) = val {
         map.insert(
             "presentation_mode".to_string(),
@@ -442,7 +444,11 @@ async fn list_conversations(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_convs: Vec<Value> = conversations.iter().map(conversation_to_json).collect();
+    let home = state.runtime_env.home().to_string_lossy().into_owned();
+    let json_convs: Vec<Value> = conversations
+        .iter()
+        .map(|c| conversation_to_json(c, Some(&home)))
+        .collect();
 
     Ok(Json(ConversationListResponse {
         conversations: json_convs,
@@ -459,7 +465,11 @@ async fn list_archived_conversations(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_convs: Vec<Value> = conversations.iter().map(conversation_to_json).collect();
+    let home = state.runtime_env.home().to_string_lossy().into_owned();
+    let json_convs: Vec<Value> = conversations
+        .iter()
+        .map(|c| conversation_to_json(c, Some(&home)))
+        .collect();
 
     Ok(Json(ConversationListResponse {
         conversations: json_convs,
@@ -806,14 +816,15 @@ async fn create_conversation(
     if !(is_seeded && req.text.trim().is_empty()) {
         // Expand `@file` inline references before sending (REQ-IR-001, REQ-IR-007)
         let working_dir_for_expand = std::path::PathBuf::from(&effective_cwd);
-        let expanded_initial = crate::message_expander::expand(&req.text, &working_dir_for_expand)
-            .map_err(|e| {
-                AppError::UnprocessableEntity(ExpansionErrorResponse {
-                    error: e.to_string(),
-                    error_type: e.error_type().to_string(),
-                    reference: e.reference(),
-                })
-            })?;
+        let expanded_initial =
+            crate::message_expander::expand(&req.text, &working_dir_for_expand, &state.runtime_env)
+                .map_err(|e| {
+                    AppError::UnprocessableEntity(ExpansionErrorResponse {
+                        error: e.to_string(),
+                        error_type: e.error_type().to_string(),
+                        reference: e.reference(),
+                    })
+                })?;
 
         // Convert images
         let images: Vec<ImageData> = req
@@ -1067,8 +1078,13 @@ async fn get_system_prompt(
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
     let tasks_dir_name = crate::tasks_dir::discover_tasks_dir_name(&cwd);
-    let system_prompt =
-        crate::system_prompt::build_system_prompt(&cwd, &tasks_dir_name, false, None);
+    let system_prompt = crate::system_prompt::build_system_prompt(
+        &cwd,
+        &tasks_dir_name,
+        false,
+        None,
+        &state.runtime_env,
+    );
 
     Ok(Json(SystemPromptResponse { system_prompt }))
 }
@@ -1474,13 +1490,14 @@ async fn send_chat(
 
             let working_dir = std::path::PathBuf::from(&conversation.cwd);
             let expanded =
-                crate::message_expander::expand(&req.text, &working_dir).map_err(|e| {
-                    AppError::UnprocessableEntity(ExpansionErrorResponse {
-                        error: e.to_string(),
-                        error_type: e.error_type().to_string(),
-                        reference: e.reference(),
-                    })
-                })?;
+                crate::message_expander::expand(&req.text, &working_dir, &state.runtime_env)
+                    .map_err(|e| {
+                        AppError::UnprocessableEntity(ExpansionErrorResponse {
+                            error: e.to_string(),
+                            error_type: e.error_type().to_string(),
+                            reference: e.reference(),
+                        })
+                    })?;
             let images: Vec<ImageData> = req
                 .images
                 .into_iter()
@@ -1537,13 +1554,14 @@ async fn send_chat(
     }
 
     let working_dir = std::path::PathBuf::from(&conversation.cwd);
-    let expanded = crate::message_expander::expand(&req.text, &working_dir).map_err(|e| {
-        AppError::UnprocessableEntity(ExpansionErrorResponse {
-            error: e.to_string(),
-            error_type: e.error_type().to_string(),
-            reference: e.reference(),
-        })
-    })?;
+    let expanded = crate::message_expander::expand(&req.text, &working_dir, &state.runtime_env)
+        .map_err(|e| {
+            AppError::UnprocessableEntity(ExpansionErrorResponse {
+                error: e.to_string(),
+                error_type: e.error_type().to_string(),
+                reference: e.reference(),
+            })
+        })?;
 
     // Convert images
     let images: Vec<ImageData> = req
@@ -2417,7 +2435,10 @@ async fn list_directory(
 }
 
 /// Create a directory (with parents if needed)
-async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
+async fn mkdir(
+    State(state): State<AppState>,
+    Json(payload): Json<PathQuery>,
+) -> Json<MkdirResponse> {
     // Normalize path: remove trailing slashes (except for root)
     let path_str = payload.path.trim_end_matches('/');
     let path_str = if path_str.is_empty() { "/" } else { path_str };
@@ -2432,9 +2453,7 @@ async fn mkdir(Json(payload): Json<PathQuery>) -> Json<MkdirResponse> {
     }
 
     // Don't allow creating directories outside of user's home or /tmp
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
+    let home = state.runtime_env.home().to_string_lossy().into_owned();
     let path_str = path.to_string_lossy();
     if (home.is_empty() || !path_str.starts_with(&home)) && !path_str.starts_with("/tmp/") {
         return Json(MkdirResponse {
@@ -2872,7 +2891,7 @@ async fn list_conversation_skills(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
-    let skills = crate::system_prompt::discover_skills(&cwd);
+    let skills = crate::system_prompt::discover_skills(&cwd, &state.runtime_env);
 
     let skill_entries: Vec<SkillEntry> = skills
         .into_iter()
@@ -3074,10 +3093,8 @@ async fn invalidate_credential(State(state): State<AppState>) -> impl IntoRespon
 // Environment Info
 // ============================================================
 
-async fn get_env() -> Json<serde_json::Value> {
-    let home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .unwrap_or_default();
+async fn get_env(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let home = state.runtime_env.home().to_string_lossy().into_owned();
     Json(serde_json::json!({ "home_dir": home }))
 }
 
@@ -3504,13 +3521,17 @@ mod hard_delete_cascade_tests {
         let db = Database::open_in_memory().await.expect("open db");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
         let platform = PlatformCapability::None;
-        let mcp_manager = Arc::new(McpClientManager::new());
+        let runtime_env = Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::with_root(
+            std::path::Path::new("/tmp"),
+        ));
+        let mcp_manager = Arc::new(McpClientManager::new(runtime_env.home().to_path_buf()));
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
             platform,
             mcp_manager.clone(),
             None,
+            runtime_env.clone(),
         ));
         let terminals = runtime.terminals.clone();
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
@@ -3525,6 +3546,7 @@ mod hard_delete_cascade_tests {
             terminals,
             chain_qa,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
+            runtime_env,
         }
     }
 

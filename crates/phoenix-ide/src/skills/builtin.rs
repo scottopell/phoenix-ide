@@ -30,25 +30,16 @@
 //! first-seen entry.
 
 use std::collections::BTreeSet;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 #[derive(rust_embed::RustEmbed)]
 #[folder = "src/skills/builtin/"]
 struct BuiltinAssets;
 
 /// Subdirectory under the phoenix data dir where built-ins are extracted.
+/// The absolute path is resolved by
+/// [`crate::runtime_env::PhoenixRuntimeEnvironment::builtin_skills_dir`].
 pub const EXTRACT_SUBDIR: &str = "builtin-skills";
-
-/// Default extraction target: `<HOME>/.phoenix-ide/builtin-skills/`.
-/// Returns `None` if `$HOME` is unset.
-#[must_use]
-pub fn default_extract_dir() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(|home| {
-        PathBuf::from(home)
-            .join(".phoenix-ide")
-            .join(EXTRACT_SUBDIR)
-    })
-}
 
 /// Names of built-in skills (top-level directories that contain `SKILL.md`).
 /// Sorted, deterministic.

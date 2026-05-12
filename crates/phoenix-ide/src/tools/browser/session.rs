@@ -177,9 +177,12 @@ pub(crate) fn truncate_unicode_safe(s: String, max_bytes: usize) -> String {
 
 impl BrowserSession {
     /// Directory where the fetcher caches downloaded Chrome binaries
-    pub(crate) fn fetcher_cache_dir() -> PathBuf {
-        let base = std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from);
-        base.join(".cache/phoenix-ide/chromium")
+    /// (`<home>/.cache/phoenix-ide/chromium`, resolved via
+    /// [`crate::runtime_env::PhoenixRuntimeEnvironment`]).
+    pub(crate) fn fetcher_cache_dir(
+        env: &crate::runtime_env::PhoenixRuntimeEnvironment,
+    ) -> PathBuf {
+        env.chromium_cache_dir()
     }
 
     /// Build a `BrowserConfig` with optional explicit Chrome executable path
@@ -275,7 +278,10 @@ impl BrowserSession {
     ///   2. System Chrome via chromiumoxide's lookup (PATH + standard
     ///      install paths).
     ///   3. `BrowserFetcher` downloads a compatible Chromium and caches it.
-    async fn new(conversation_id: &str) -> Result<Self, BrowserError> {
+    async fn new(
+        conversation_id: &str,
+        env: &crate::runtime_env::PhoenixRuntimeEnvironment,
+    ) -> Result<Self, BrowserError> {
         // 1. Explicit env-var override — used by the test harness in
         //    sandboxes where Chrome lives at a non-standard path that
         //    chromiumoxide's lookup doesn't probe.
@@ -311,7 +317,7 @@ impl BrowserSession {
         }
 
         // 2. Download / use cached Chrome via fetcher
-        let cache_dir = Self::fetcher_cache_dir();
+        let cache_dir = Self::fetcher_cache_dir(env);
         tracing::info!("Downloading Chrome to {cache_dir:?} (first run only)...");
 
         std::fs::create_dir_all(&cache_dir).map_err(|e| {
@@ -467,23 +473,34 @@ pub struct BrowserSessionManager {
     /// so session create/destroy edges flow into per-conversation SSE
     /// streams. Stays `None` for tool-level tests.
     lifecycle_sink: Option<BrowserSessionLifecycleSink>,
+    /// Resolved filesystem-environment, used to locate the Chrome download
+    /// cache (`<home>/.cache/phoenix-ide/chromium`). Production wires the
+    /// process-wide `Arc<PhoenixRuntimeEnvironment>` via
+    /// [`Self::with_runtime_env`]; tests that don't get a `detect()`ed one
+    /// on first session creation — never a direct env read.
+    runtime_env: Option<Arc<crate::runtime_env::PhoenixRuntimeEnvironment>>,
 }
 
 impl BrowserSessionManager {
     /// Create a new session manager and start cleanup task
     pub fn new() -> Arc<Self> {
-        Self::with_lifecycle_sink(None)
+        Self::with_lifecycle_sink(None, None)
     }
 
     /// Construct a manager that publishes session-create / session-destroy
-    /// edges into `sink`. The runtime wires this to a bridge task that
+    /// edges into `sink`, locating the Chrome download cache via
+    /// `runtime_env`. The runtime wires `sink` to a bridge task that
     /// resolves `conversation_id` to the matching `SseBroadcaster` and
-    /// emits `SseEvent::BrowserSessionState`.
-    pub fn with_lifecycle_sink(sink: Option<BrowserSessionLifecycleSink>) -> Arc<Self> {
+    /// emits `SseEvent::BrowserSessionState`; tests pass `None` for both.
+    pub fn with_lifecycle_sink(
+        sink: Option<BrowserSessionLifecycleSink>,
+        runtime_env: Option<Arc<crate::runtime_env::PhoenixRuntimeEnvironment>>,
+    ) -> Arc<Self> {
         let manager = Arc::new(Self {
             sessions: RwLock::new(HashMap::new()),
             cleanup_task: None,
             lifecycle_sink: sink,
+            runtime_env,
         });
 
         // Start background cleanup task with weak reference to avoid reference cycle
@@ -532,6 +549,15 @@ impl BrowserSessionManager {
         }
     }
 
+    /// Resolved filesystem-environment for this manager. Returns the wired
+    /// `Arc<PhoenixRuntimeEnvironment>` if one was supplied, else a
+    /// freshly `detect()`ed instance — never a direct env read.
+    fn resolved_env(&self) -> Arc<crate::runtime_env::PhoenixRuntimeEnvironment> {
+        self.runtime_env
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::runtime_env::PhoenixRuntimeEnvironment::detect()))
+    }
+
     /// Get or create a browser session for a conversation
     pub async fn get_or_create(
         &self,
@@ -552,7 +578,7 @@ impl BrowserSessionManager {
 
         if !sessions.contains_key(conversation_id) {
             tracing::info!(conversation_id, "Creating new browser session");
-            let session = BrowserSession::new(conversation_id).await?;
+            let session = BrowserSession::new(conversation_id, &self.resolved_env()).await?;
             sessions.insert(conversation_id.to_string(), Arc::new(RwLock::new(session)));
         }
 
@@ -595,7 +621,7 @@ impl BrowserSessionManager {
         }
 
         tracing::info!(conversation_id, "Creating new browser session");
-        let session = BrowserSession::new(conversation_id).await?;
+        let session = BrowserSession::new(conversation_id, &self.resolved_env()).await?;
         let session_arc = Arc::new(RwLock::new(session));
 
         // Set up console log listener
@@ -713,6 +739,7 @@ impl Default for BrowserSessionManager {
             sessions: RwLock::new(HashMap::new()),
             cleanup_task: None,
             lifecycle_sink: None,
+            runtime_env: None,
         }
     }
 }
@@ -751,7 +778,10 @@ mod lifecycle_hook_tests {
             BrowserSessionLifecycleSink,
             tokio::sync::mpsc::UnboundedReceiver<BrowserSessionLifecycleEvent>,
         ) = tokio::sync::mpsc::unbounded_channel();
-        (BrowserSessionManager::with_lifecycle_sink(Some(tx)), rx)
+        (
+            BrowserSessionManager::with_lifecycle_sink(Some(tx), None),
+            rx,
+        )
     }
 
     /// `kill_session` on a manager that never had a session for `conv_id`

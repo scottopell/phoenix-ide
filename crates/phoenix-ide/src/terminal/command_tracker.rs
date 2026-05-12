@@ -65,6 +65,10 @@ pub struct CommandTracker {
     current_capture: Option<CaptureState>,
     output_buffer: String,
     session_id: String,
+    /// Root directory for truncated-output files
+    /// (`<phoenix_home>/terminal-output`), resolved via
+    /// [`crate::runtime_env::PhoenixRuntimeEnvironment::terminal_output_dir`].
+    terminal_output_dir: std::path::PathBuf,
     seq: u64,
     parser: vte::Parser,
 }
@@ -72,14 +76,15 @@ pub struct CommandTracker {
 impl CommandTracker {
     /// Create a new tracker for the given terminal session.
     ///
-    /// `session_id` is used to construct the disk path for truncated outputs
-    /// (`~/.phoenix-ide/terminal-output/<session_id>/<seq>.txt`).
-    pub fn new(session_id: String) -> Self {
+    /// `session_id` and `terminal_output_dir` together name the disk path for
+    /// truncated outputs (`<terminal_output_dir>/<session_id>/<seq>.txt`).
+    pub fn new(session_id: String, terminal_output_dir: std::path::PathBuf) -> Self {
         Self {
             records: VecDeque::with_capacity(RING_CAPACITY),
             current_capture: None,
             output_buffer: String::new(),
             session_id,
+            terminal_output_dir,
             seq: 0,
             // vte::Parser::new() uses a Vec-backed OSC buffer (unbounded) when the
             // `std` feature is active (the default). Do NOT add `default-features = false`
@@ -214,11 +219,11 @@ impl CommandTracker {
     }
 
     fn disk_path_for_seq(&self) -> String {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-        format!(
-            "{}/.phoenix-ide/terminal-output/{}/{}.txt",
-            home, self.session_id, self.seq
-        )
+        self.terminal_output_dir
+            .join(&self.session_id)
+            .join(format!("{}.txt", self.seq))
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -317,7 +322,10 @@ mod tests {
     use crate::terminal::test_helpers::{full_command, TerminalStream};
 
     fn tracker() -> CommandTracker {
-        CommandTracker::new("test-session".to_string())
+        CommandTracker::new(
+            "test-session".to_string(),
+            std::path::PathBuf::from("/tmp/phoenix-test-terminal-output"),
+        )
     }
 
     #[test]
@@ -545,7 +553,10 @@ mod tests {
     fn utf8_boundary_safe_in_truncation() {
         // Build output that puts a multi-byte char (€ = 3 bytes) straddling the 4KB preview
         // cutoff point to verify finalize_output walks back to a valid char boundary.
-        let mut t = CommandTracker::new("utf8-test".to_string());
+        let mut t = CommandTracker::new(
+            "utf8-test".to_string(),
+            std::path::PathBuf::from("/tmp/phoenix-test-terminal-output"),
+        );
 
         // Seed capture.
         t.ingest(&TerminalStream::new().osc133_c("cat").build());
