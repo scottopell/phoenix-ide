@@ -59,11 +59,19 @@ Multi-provider LLM support routes through either the Anthropic API or an exe.dev
 |------|-------------|------|
 | bash | Shell command execution with timeout, truncation, background mode | [spec](specs/bash/executive.md) |
 | patch | Structured file editing — create, modify, delete with fuzzy matching | [spec](specs/patch/executive.md) |
+| read_file | Read a file (or a line range) from the working directory | — |
+| search | grep + glob over the working directory (ripgrep-style) | — |
 | keyword_search | Semantic code search using LLM-filtered results | [spec](specs/keyword_search/executive.md) |
 | think | Reasoning scratchpad with zero side effects | [spec](specs/think/executive.md) |
-| browser | Headless browser — navigate, eval JS, screenshot, console logs | [spec](specs/browser-tool/executive.md) |
+| browser (`browser_*`) | Headless browser — navigate, eval JS, screenshot, click/type/keypress, resize, console logs | [spec](specs/browser-tool/executive.md) |
 | read_image | Read and encode image files for vision models | — |
-| subagent | Parallel task delegation to child agents | — |
+| tmux | Drive a persistent tmux session for long-lived / interactive processes | [spec](specs/tmux-integration/executive.md) |
+| terminal_last_command / terminal_command_history | Inspect the in-app terminal's last command and history | [spec](specs/terminal/executive.md) |
+| spawn_agents | Parallel task delegation to child agents | [spec](specs/subagents/executive.md) |
+| ask_user_question | Ask the user a structured multiple-choice question mid-run | [spec](specs/ask-user-question/executive.md) |
+| skill | Invoke a user-defined skill (SKILL.md instruction set) | [spec](specs/skills/executive.md) |
+| propose_task | Propose a task file (task-authoring conversations only) | — |
+| MCP tools | Tools exposed by configured MCP servers, registered dynamically at startup | — |
 
 ## Production Deployment
 
