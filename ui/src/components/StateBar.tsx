@@ -110,10 +110,11 @@ function prBadgeLabel(pr: PrStatusResponse): string {
 }
 
 function prTooltip(pr: PrStatusResponse): string {
+  const label = pr.number ? `PR #${pr.number}` : 'PR';
   const title = pr.title ? ` — ${pr.title}` : '';
   const state = pr.display_state ?? 'unknown';
   const checks = pr.check_state ?? 'unknown';
-  return `PR #${pr.number}${title}\nState: ${state}\nChecks: ${checks}`;
+  return `${label}${title}\nState: ${state}\nChecks: ${checks}`;
 }
 
 function unavailablePrHint(reason: PrStatusResponse['unavailable_reason']): string | null {

@@ -353,9 +353,11 @@ pub(crate) async fn get_conversation_pr_status(
             ..
         } => (branch_name.to_string(), worktree_path.to_string()),
         _ => {
-            return Ok(Json(PrStatusResponse::unavailable(
-                PrUnavailableReason::NotGitRepo,
-            )));
+            // Not applicable: no branch/worktree to query. Distinct from the
+            // `gh`-can't-tell-us cases below, which return 200 + unavailable_reason.
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work or Branch mode (no associated branch)".to_string(),
+            ));
         }
     };
 
@@ -465,6 +467,7 @@ struct GhError {
 }
 
 fn run_gh(cwd: &std::path::Path, args: &[&str]) -> Result<String, GhError> {
+    use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
@@ -483,34 +486,51 @@ fn run_gh(cwd: &std::path::Path, args: &[&str]) -> Result<String, GhError> {
             message: format!("Failed to run gh {}: {e}", args.join(" ")),
         })?;
 
+    // Drain stdout/stderr in background threads so a large `gh` response (e.g.
+    // a PR with many checks) can't fill the OS pipe buffer and wedge the child
+    // while we poll for exit. The threads finish on EOF — which arrives when
+    // the child exits or is killed — so they always join cleanly.
+    let mut stdout_pipe = child.stdout.take().expect("gh stdout is piped");
+    let mut stderr_pipe = child.stderr.take().expect("gh stderr is piped");
+    let stdout_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buf);
+        buf
+    });
+    let stderr_h = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buf);
+        buf
+    });
+
     let started = Instant::now();
-    loop {
-        if let Some(_status) = child.try_wait().map_err(|e| GhError {
+    let status = loop {
+        if let Some(status) = child.try_wait().map_err(|e| GhError {
             reason: PrUnavailableReason::CommandFailed,
             message: format!("gh {} wait failed: {e}", args.join(" ")),
         })? {
-            break;
+            break status;
         }
         if started.elapsed() > Duration::from_secs(8) {
             let _ = child.kill();
             let _ = child.wait();
+            let _ = stdout_h.join();
+            let _ = stderr_h.join();
             return Err(GhError {
                 reason: PrUnavailableReason::CommandFailed,
                 message: format!("gh {} timed out", args.join(" ")),
             });
         }
         std::thread::sleep(Duration::from_millis(50));
-    }
+    };
 
-    let output = child.wait_with_output().map_err(|e| GhError {
-        reason: PrUnavailableReason::CommandFailed,
-        message: format!("gh {} output read failed: {e}", args.join(" ")),
-    })?;
+    let stdout = stdout_h.join().unwrap_or_default();
+    let stderr = stderr_h.join().unwrap_or_default();
 
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    if status.success() {
+        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
     } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
         let lower = stderr.to_lowercase();
         let reason = if lower.contains("not logged")
             || lower.contains("not authenticated")
