@@ -374,16 +374,22 @@ export function StateBar({
 
     let cancelled = false;
     let timeout: number | null = null;
+    // Per-effect-run sequence: fetchStatus fires from the initial call, the
+    // 60s poll, and visibilitychange; only the most recent response may apply
+    // so an out-of-order resolution can't clobber fresher data.
+    let latestSeq = 0;
 
     const fetchStatus = async () => {
+      const seq = ++latestSeq;
+      const fresh = () => !cancelled && seq === latestSeq;
       setPrLoading(true);
       try {
         const status = await api.getPrStatus(conversation.id);
-        if (!cancelled) setPrStatus(status);
+        if (fresh()) setPrStatus(status);
       } catch {
-        if (!cancelled) setPrStatus({ found: false, unavailable_reason: 'command_failed' });
+        if (fresh()) setPrStatus({ found: false, unavailable_reason: 'command_failed' });
       } finally {
-        if (!cancelled) setPrLoading(false);
+        if (fresh()) setPrLoading(false);
       }
     };
 

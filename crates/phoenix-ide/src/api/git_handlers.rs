@@ -413,8 +413,15 @@ fn get_pr_status_for_branch(cwd: &std::path::Path, branch_name: &str) -> PrStatu
         return PrStatusResponse::not_found();
     };
 
-    let checks_state = fetch_pr_checks_state(cwd, pr.number);
     let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
+    // Only an open, non-draft PR has CI state worth a second `gh` call; for
+    // merged/closed/draft the badge is coloured by display_state, so skip the
+    // (potentially slow) `gh pr checks` invocation.
+    let check_state = if matches!(display_state, PrDisplayState::Open) {
+        Some(fetch_pr_checks_state(cwd, pr.number))
+    } else {
+        None
+    };
 
     PrStatusResponse {
         found: true,
@@ -426,7 +433,7 @@ fn get_pr_status_for_branch(cwd: &std::path::Path, branch_name: &str) -> PrStatu
         draft: Some(pr.is_draft),
         base: Some(pr.base_ref_name),
         head: Some(pr.head_ref_name),
-        check_state: Some(checks_state),
+        check_state,
         display_state: Some(display_state),
     }
 }

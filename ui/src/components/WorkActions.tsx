@@ -61,15 +61,21 @@ export function WorkActions({
       return;
     }
     let cancelled = false;
+    // Per-effect-run sequence: fetchStatus can fire from the initial call and
+    // again on visibilitychange, so only the most recent response may apply
+    // (out-of-order resolutions must not clobber fresher data).
+    let latestSeq = 0;
     const fetchStatus = () => {
+      const seq = ++latestSeq;
+      const fresh = () => !cancelled && seq === latestSeq;
       api.getPrStatus(conversationId)
         .then(status => {
-          if (cancelled) return;
+          if (!fresh()) return;
           setPrStatus(status);
           // gh became available again → drop any stale manual-fallback opt-in.
           if (!status.unavailable_reason) setManualFallback(false);
         })
-        .catch(() => { if (!cancelled) setPrStatus({ found: false, unavailable_reason: 'command_failed' }); });
+        .catch(() => { if (fresh()) setPrStatus({ found: false, unavailable_reason: 'command_failed' }); });
     };
     fetchStatus();
     // Re-fetch when the tab regains focus so a merge done elsewhere unsticks
