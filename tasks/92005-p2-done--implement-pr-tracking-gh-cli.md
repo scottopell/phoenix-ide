@@ -1,7 +1,7 @@
 ---
 created: 2026-05-09
 priority: p2
-status: in-progress
+status: done
 artifact: pending
 ---
 
@@ -80,4 +80,15 @@ Implement first-class PR tracking for Work/Branch/Managed conversations using th
 - Existing task `02664` remains the follow-up for any future fully automatic merge detection/cleanup behavior.
 
 ## Progress
+
+- Implemented on branch `task-92005-implement-pr-tracking-gh-cli-cli` and merged into the
+  review branch. Backend: `GET /api/conversations/:id/pr-status` → `get_pr_status_for_branch`
+  shells out to `gh pr list`/`gh pr checks` from the worktree, normalised to
+  `display_state`/`check_state` + `unavailable_reason` (`api/git_handlers.rs`, `api/types.rs`).
+  Frontend: PR badge in `StateBar`, PR-aware completion affordance in `WorkActions`
+  (`api.ts`, `StateBar.tsx`, `WorkActions.tsx`, `index.css`), plus the branch-divergence
+  badge removed. Specs: REQ-PROJ-011 reframed (PR status, not commit divergence),
+  REQ-PROJ-023 retired; `02663` marked done. `./dev.py check` green. Task 02664 remains the
+  follow-up for automatic merge detection/cleanup.
+
 
