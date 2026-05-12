@@ -271,7 +271,7 @@ WHEN user does not respond within reasonable time
 THE SYSTEM SHALL remain paused (no automatic timeout to Unrestricted)
 
 **Deprecation Reason:** The `request_mode_upgrade` tool and `AwaitingModeApproval`
-state are replaced by the `propose_plan` tool and `AwaitingTaskApproval` state. The
+state are replaced by the `propose_task` tool and `AwaitingTaskApproval` state. The
 new flow is richer: the agent proposes a full task plan rather than just a reason
 string, and the user reviews via the prose reader with line-level annotation support.
 The mode transition is now inseparable from task creation.
@@ -307,13 +307,13 @@ THE SYSTEM SHALL NOT modify tool descriptions based on mode
 
 WHEN a tool is unavailable due to mode restrictions
 THE SYSTEM SHALL return a clear, actionable error message
-AND for write tools blocked in Explore mode, SHALL suggest using `propose_plan` to
+AND for write tools blocked in Explore mode, SHALL suggest using `propose_task` to
 propose work that requires write access
 
 **Rationale:** Tool descriptions must remain static throughout a conversation to avoid
 confusing the LLM. Mode awareness comes through synthetic messages on transitions and
 clear error responses when tools are blocked. Updated from REQ-BED-014/015 framing to
-reflect Explore/Work mode names and `propose_plan` as the path to write access.
+reflect Explore/Work mode names and `propose_task` as the path to write access.
 
 ---
 
@@ -333,7 +333,7 @@ AND configure its working directory as the parent's worktree path
 AND enforce that only one Work sub-agent exists per parent at a time
 
 WHEN sub-agent is running
-THE SYSTEM SHALL NOT provide `propose_plan` tool to sub-agents
+THE SYSTEM SHALL NOT provide `propose_task` tool to sub-agents
 AND sub-agents SHALL NOT be able to change their own mode
 
 **Rationale:** Sub-agents operate under the parent's direction with a constrained
@@ -491,7 +491,7 @@ AND record the worktree path and associated task ID in the mode field
 
 WHILE a conversation is in Direct mode
 THE SYSTEM SHALL configure the tool registry with full write access (equivalent to Work)
-AND SHALL NOT provide `propose_plan` tool
+AND SHALL NOT provide `propose_task` tool
 AND the mode SHALL NOT change for the lifetime of the conversation
 
 WHEN conversation mode changes (Explore to Work on task approval)
@@ -512,45 +512,55 @@ without the managed (Explore/Work) ceremony — see REQ-PROJ-018 for the histori
 
 ### REQ-BED-028: Task Approval State
 
-WHEN the LLM response contains a `propose_plan` tool call
+WHEN the LLM response contains a `propose_task` tool call (which must be the only tool
+  call in the response, and references a task file the agent already wrote under the
+  project's tasks directory)
 THE SYSTEM SHALL intercept it at the LlmResponse handler (same pattern as submit_result)
 AND NOT route it through the tool executor
-AND persist the assistant message and a synthetic tool result as a CheckpointData::ToolRound
+AND read the referenced file and persist the assistant message and a synthetic tool
+  result as a CheckpointData::ToolRound
 AND transition the conversation to AwaitingTaskApproval state
-AND emit a `task_approval_requested` SSE event with the plan content
 
-THE AwaitingTaskApproval state SHALL carry: title, priority, and plan text
-  (all serializable data — no file paths, no oneshot channels, no git references)
+THE AwaitingTaskApproval state SHALL carry: `task_file` (the path), plus a display copy
+  of the title, priority, and body — all serializable; on approval the executor re-reads
+  `task_file` from disk as the source of truth. (`task_file` carries `#[serde(default)]`
+  as a rollout shim; a row with an empty `task_file` is surfaced as a "reject and
+  re-propose" error rather than silently resetting to Idle.)
 
 WHEN the user approves the task while in AwaitingTaskApproval
-THE SYSTEM SHALL write a task file to `tasks/` and commit to main
-AND create branch `task-{NNNN}-{slug}` from main HEAD and checkout it
-AND transition the conversation to Idle in Work mode
+THE SYSTEM SHALL rename the worktree's temp branch in place to `task-{NNNN}-{slug}`
+  (the worktree already exists — REQ-PROJ-028), promote the task file's status to
+  `in-progress` if needed, commit it on that branch (never on main), and transition the
+  conversation to Idle in Work mode
 
 WHEN the user provides annotation feedback while in AwaitingTaskApproval
 THE SYSTEM SHALL close the prose reader
 AND deliver the annotations to the agent as a user message
 AND transition the conversation to Idle in Explore mode
-  (the agent may revise and call `propose_plan` again, re-entering AwaitingTaskApproval)
+  (the agent may revise the task file and call `propose_task` again, re-entering AwaitingTaskApproval)
 
 WHEN the user discards the task while in AwaitingTaskApproval
 THE SYSTEM SHALL transition the conversation to Idle in Explore mode
-AND NOT perform any git operations (nothing was written to disk)
+AND NOT perform any git operations (the task file stays on disk where the agent left it)
 
 **Persistence and restart:**
 
 WHEN the server persists AwaitingTaskApproval to the database
-THE SYSTEM SHALL store the title, priority, and plan text as part of the serialized ConvState
+THE SYSTEM SHALL store `task_file` and the display copy of title/priority/body as part
+  of the serialized ConvState
 
 WHEN the server restarts and loads a conversation in AwaitingTaskApproval
-THE SYSTEM SHALL reconstruct the state from the serialized data (all data is in the DB)
-AND re-emit the `task_approval_requested` SSE event when the UI reconnects
+THE SYSTEM SHALL reconstruct the state from the serialized data
+AND the UI SHALL re-open the task-approval reader on reconnect from the conversation
+  state payload
 
 **Rationale:** AwaitingTaskApproval is a first-class state because it has a distinct
 set of valid incoming events (approve, discard, feedback) and a distinct UI
-representation (prose reader with plan content). `propose_plan` follows the
-submit_result interception pattern — pure data carrier, no side effects, no tool
-execution. All git operations are deferred to the approval moment.
+representation (the task-approval reader). `propose_task` follows the submit_result
+interception pattern — pure data carrier (its `run()` is an unreachable fallback), no
+side effects, no tool execution. The plan is a real file the agent edits with `patch`,
+so revisions are file edits; all git operations are deferred to the approval moment and
+happen on the task branch.
 
 **Dependencies:** REQ-PROJ-003, REQ-PROJ-004
 
@@ -558,26 +568,28 @@ execution. All git operations are deferred to the approval moment.
 
 ### REQ-BED-029: Conversation Terminal State on Task Resolution
 
-WHEN a Work conversation's task is completed (squash merged to base_branch)
+WHEN a Work or Branch conversation is marked as merged (REQ-PROJ-026/027 — worktree
+  removed; the task branch deleted for Managed mode, kept for Branch mode)
 THE SYSTEM SHALL transition the conversation to Terminal state
 AND the conversation SHALL NOT accept new user messages
 
-WHEN a Work conversation's task is abandoned
+WHEN a Work or Branch conversation is abandoned (REQ-PROJ-010)
 THE SYSTEM SHALL transition the conversation to Terminal state
 AND the conversation SHALL NOT accept new user messages
 
 WHEN a conversation enters Terminal state after task resolution
 THE SYSTEM SHALL inject a synthetic system message indicating the outcome
-  (completed with commit hash, or abandoned)
+  ("Marked as merged…" / "Abandoned…", plus the captured diff snapshot on abandon)
 AND the conversation SHALL remain visible in the sidebar for reference
-AND the user SHALL be able to start a new Explore conversation on the same project
+AND the user SHALL be able to start a new conversation on the same project
 
-**Rationale:** Work conversations are single-purpose: one task, one worktree, one
-lifecycle. When the task concludes (successfully or not), the conversation is done.
-Returning to Explore mode would create confusion about what the conversation's
-context represents (the old worktree is gone, the pinned commit is arbitrary).
-Terminal state is clean and explicit. The user creates a new Explore conversation
-to continue working on the project.
+**Rationale:** Work and Branch conversations are single-purpose: one task or one branch,
+one worktree, one lifecycle. When the task concludes (merged or abandoned), the
+conversation is done — there is no in-Phoenix merge step, just a cleanup of the
+worktree (and, for Managed mode, the task branch). Returning to Explore mode would
+create confusion about what the conversation's context represents (the worktree is
+gone). Terminal state is clean and explicit; the user creates a new conversation to keep
+working on the project.
 
 ---
 

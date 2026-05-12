@@ -7,7 +7,7 @@ three conversation modes. Direct mode is the default for all conversations: full
 access, no worktrees, no ceremony. Managed mode is opt-in for git repositories and
 provides a two-phase lifecycle: conversations start in Explore (read-only worktree
 created on first message), then upgrade to Work when the user approves a task proposed
-via `propose_plan`. The plan is presented for human review; users can annotate, request
+via `propose_task`. The plan is presented for human review; users can annotate, request
 revisions, or approve. On approval, the temporary branch is renamed to the final task
 branch, a task file is committed on that branch, and write tools are enabled. Branch
 mode lets users work directly on an existing branch with no Explore phase and no task
@@ -22,15 +22,19 @@ branch; in Branch mode, abandon deletes only the worktree, keeping the user's br
 
 ## Technical Summary
 
-`ConvMode` has three variants: Direct, Explore, Work -- plus a distinct Branch mode
-stored as a separate conversation-level field in SQLite. Direct carries no git metadata.
-Managed conversations start in Explore: a worktree is created on first message using a
-temporary branch (`task-pending-{id}`), with a best-effort single-branch fetch of the
-base branch. On task approval, the temp branch is renamed to `task-{NNNN}-{slug}`, a
-task file is committed on the task branch (not main), and the mode upgrades to Work.
+`ConvMode` is a four-variant enum stored as a JSON column on the conversation: Direct
+(default, no git metadata), Explore (`worktree_path: Option`), Work (`worktree_path`,
+`branch_name`, `base_branch`, `task_id`, `task_title`), and Branch (`worktree_path`,
+`branch_name`, `base_branch`; no `task_id`). Managed conversations start in Explore: a
+worktree is created on first message using a temporary branch (`task-pending-{id}`),
+with a best-effort single-branch fetch of the base branch. The agent drafts a task file
+under the project's tasks directory with `patch`; on `propose_task` + approval the temp
+branch is renamed to `task-{NNNN}-{slug}`, the task file's status is promoted to
+`in-progress` and it is committed on that branch (never main), and the mode upgrades to
+Work.
 Branch mode creates a worktree on the user's chosen branch immediately, with no Explore
 phase and no task file. Worktree paths are derived from conversation IDs -- collision is
-structurally impossible. One tool: `propose_plan` (Explore mode only, pure data carrier
+structurally impossible. One tool: `propose_task` (Explore mode only, pure data carrier
 intercepted like submit_result). Tool registry is configured by mode: write tools
 disabled in Explore, enabled in Work and Branch. Push is a regular bash command with no
 lifecycle side effects. Phoenix can observe PR state through `gh` to guide the
@@ -46,16 +50,16 @@ for on-demand remote search (5-minute TTL).
 |-------------|--------|-----------|
 | **REQ-PROJ-001:** Open a Git Repository as a Project | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-002:** Start Every Conversation in Explore Mode | ✅ Complete | Task 08601 (M1) |
-| **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete | Task 08602 (M2). propose_plan tool |
-| **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | 🔄 Needs Update | Approval becomes permission upgrade in existing worktree (REQ-PROJ-028) |
+| **REQ-PROJ-003:** Propose a Task to Initiate Work Mode | ✅ Complete | Task 08602 (M2). propose_task tool |
+| **REQ-PROJ-004:** Review and Iterate on Task Plan Before Starting Work | ✅ Complete | Approval is a permission upgrade in the existing worktree (REQ-PROJ-028): rename temp branch, promote+commit the agent's task file on it |
 | **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Task 08603 (M3). Derived from conversation UUID |
-| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | 🔄 Needs Update | Task file committed on branch, not main (REQ-PROJ-027) |
+| **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | taskmd 1.0 (filename is metadata, no frontmatter); agent drafts the file via `patch` in Explore; committed on the task branch, not main (REQ-PROJ-027) |
 | **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete | Task 08603 (M3). upgrade_to_work_mode() |
 | **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | 🔄 Partial | Sub-agents work but missing: mode parameter (explore/work), model override, one-writer constraint, MCP access |
 | **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted. Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
-| **REQ-PROJ-010:** Abandon a Conversation | 🔄 Needs Update | Branch mode keeps branch on abandon; Managed deletes it |
+| **REQ-PROJ-010:** Abandon a Conversation | ✅ Complete | Worktree removed; Managed deletes the task branch, Branch keeps it; diff snapshot captured as a system message first; no task-file edit |
 | **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | ✅ Complete | PR badge replaces ahead/behind StateBar noise |
-| **REQ-PROJ-012:** Provide propose_plan Tool to Agents | ✅ Complete | Same as REQ-PROJ-003 |
+| **REQ-PROJ-012:** Provide propose_task Tool to Agents | ✅ Complete | Same as REQ-PROJ-003 |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
 | **REQ-PROJ-015:** Project Worktree Registry | Descoped | ConvMode::Work serves as de facto registry |
@@ -74,7 +78,9 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-028:** Managed Mode Worktree from First Message | ✅ Complete | Worktree created on first message with temp branch |
 | **REQ-PROJ-029:** Branch Mode in the Mode Picker | ✅ Complete | Mode picker offers Direct, Managed, and Branch |
 
-**Progress:** 23 of 27 complete (2 descoped, 1 partial, 3 needs update)
+**Progress:** of the 25 active requirements, 24 complete and 1 partial (REQ-PROJ-008,
+Work sub-agents). REQ-PROJ-009 and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016
+superseded by REQ-PROJ-018.
 
 ## Remaining Work
 

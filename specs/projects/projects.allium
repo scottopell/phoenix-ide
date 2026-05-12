@@ -115,14 +115,15 @@ entity Project {
 }
 
 -- A task file in the tasks/ directory, committed on the task branch.
+-- taskmd 1.0: the filename is the sole source of metadata — no frontmatter.
 entity TaskFile {
     project: Project
-    task_id: String                -- NNNN format (date-based sequential)
-    title: String
-    priority: String               -- p0, p1, p2, p3
-    slug: String
+    task_id: String                -- DDNNN: per-directory prefix + monotonic counter;
+                                   -- the agent picks the whole filename, Phoenix parses it
+    title: String                  -- from the body's # H1
+    priority: String               -- p0..p4, from the filename
+    slug: String                   -- from the filename
     status: TaskFileStatus
-    created_at: Timestamp
 
     -- Filename: {task_id}-{priority}-{status}--{slug}.md
     filename: derive_filename(task_id, priority, status, slug)
@@ -134,7 +135,7 @@ entity TaskFile {
     }
 
     -- Entity-level invariants
-    invariant FilenameMatchesFrontmatter {
+    invariant FilenameEncodesMetadata {
         filename = derive_filename(task_id, priority, status, slug)
     }
 }
@@ -314,7 +315,7 @@ rule ManagedWorktreeOnFirstMessage {
 }
 
 -- REQ-PROJ-016/018: Non-git or Direct mode has no project features
--- (No propose_plan tool, no worktrees, no task files)
+-- (No propose_task tool, no worktrees, no task files)
 -- Enforced by tool registry configuration, not by rules.
 
 -- ===========================================================
@@ -435,11 +436,15 @@ rule MaterializeBranch {
 -- 3. TASK APPROVAL -- GIT OPERATIONS (REQ-PROJ-003, 004, 006, 012)
 -- ===========================================================
 
--- REQ-PROJ-003/012: propose_plan tool intercepted by bedrock.
--- No git operations during propose/feedback loop. Plan exists only in memory.
--- Tool availability (Explore only, no sub-agents) enforced by bedrock.
+-- REQ-PROJ-003/012: propose_task tool intercepted by bedrock. The agent
+-- has already written the task file under tasks/ with `patch`; the tool
+-- call carries only the file path. No git operations during the
+-- propose/feedback loop — the file just sits on the temp branch,
+-- uncommitted. Tool availability (Explore only, no sub-agents) enforced
+-- by bedrock.
 
--- REQ-PROJ-004/006/028: User approves task — permission upgrade + task file
+-- REQ-PROJ-004/006/028: User approves task — permission upgrade + commit
+-- the (already-written) task file on the task branch.
 -- Subscribes to bedrock's UserApprovesTask event (see bedrock.allium).
 rule TaskApprovalExecuted {
     when: UserApprovesTask(conversation, decision)
@@ -450,26 +455,22 @@ rule TaskApprovalExecuted {
     -- Approval is a permission upgrade (Explore -> Work), not worktree creation.
 
     let worktree = Worktree{conversation: conversation}
-    let project = conversation.project
-    let proposal = conversation.proposal
-    let task_id = next_task_id(project)
-    let slug = derive_slug(proposal.title)
+    -- The proposal carries the path to a task file the agent already wrote
+    -- under tasks/ in Explore mode (bedrock's AwaitingTaskApproval data
+    -- holds `task_file` plus display copies of title/priority/body).
+    -- Phoenix allocates no ID — taskmd 1.0 puts the metadata in the filename;
+    -- the executor parses id/priority/status/slug back out of it.
+    let task_id = parse_task_id(conversation.proposal.task_file)
+    let slug = parse_slug(conversation.proposal.task_file)
     let branch_name = "task-" + task_id + "-" + slug
 
-    -- Rename the temporary branch to the final task branch name
+    -- Rename the temporary branch to the final task branch name (in place).
     ensures: worktree.branch_name = branch_name
 
-    -- Create and commit task file on the task branch (not main)
-    ensures: TaskFile.created(
-        project: project,
-        task_id: task_id,
-        title: proposal.title,
-        priority: proposal.priority,
-        slug: slug,
-        status: in_progress,
-        created_at: now
-    )
+    -- The worktree now has a task file; its status is in-progress and it is
+    -- committed on the task branch (never on main / base_branch).
     ensures: worktree.task_file = TaskFile{task_id: task_id}
+    ensures: worktree.task_file.status = in_progress
     ensures: TaskFileCommittedOnBranch(worktree, task_id)
 
     -- Mode transition to Work
@@ -477,30 +478,33 @@ rule TaskApprovalExecuted {
     ensures: conversation.task_id = task_id
 
     @guidance
-        -- All operations run under a global mutex to prevent concurrent
-        -- approvals from getting the same task number.
+        -- All operations run under a process-global approval mutex so two
+        -- concurrent approvals can't race on the same branch/worktree name.
         --
         -- Sequence:
-        --   1. Assign task ID (date-based sequential via taskmd-core)
-        --   2. Rename branch: `git branch -m <temp-name> <task-branch>`
-        --   3. Write task file to tasks/ in the worktree
-        --   4. Stage and commit on the task branch (not main)
-        --   5. Transition Explore -> Work (permission upgrade)
+        --   1. Parse id/priority/status/slug from the on-disk filename.
+        --   2. Single-branch fetch of base_branch, best-effort (REQ-PROJ-022).
+        --   3. Rename branch in place: `git branch -m <temp-name> <task-branch>`.
+        --   4. Rename the task file to ...-in-progress--<slug>.md if needed.
+        --   5. `git add` + `git commit` the task file on the task branch.
+        --   6. Transition Explore -> Work (permission upgrade).
         --
         -- The worktree and base_branch were set by
         -- ManagedWorktreeOnFirstMessage. No new worktree is created here.
+        -- (A conversation that referenced an existing task file from the main
+        --  checkout instead of a pre-created worktree falls back to creating
+        --  the worktree off base_branch and transplanting the file there.)
         --
-        -- Rollback:
-        --   Task file write failure: remove file, reset
-        --   Branch rename failure: keep temp name, log warning
+        -- Rollback: worktree-commit failure removes the worktree/branch and
+        -- leaves the cwd copy of the file in place; branch-rename failure
+        -- keeps the temp name and logs a warning.
 }
 
--- REQ-PROJ-004 propose/feedback/reject loop: no git operations. The plan
--- exists only in memory until UserApprovesTask fires; until then the
--- agent can revise (UserProvidesFeedback) or the user can reject. This
--- spec emits no rule for those events because there is nothing to
--- specify — the bedrock state machine handles the transitions; this
--- file only describes git side-effects, and there are none.
+-- REQ-PROJ-004 propose/feedback/reject loop: no git operations. Until
+-- UserApprovesTask fires, the task file sits uncommitted on the temp
+-- branch and the agent can revise it (UserProvidesFeedback) or the user
+-- can reject. This spec emits no rule for those events — bedrock handles
+-- the state transitions and there are no git side-effects.
 
 -- ===========================================================
 -- 4. TERMINAL ACTIONS (REQ-PROJ-026, REQ-PROJ-027)

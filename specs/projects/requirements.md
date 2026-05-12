@@ -55,11 +55,13 @@ AND provide full tool access (bash, patch, all tools)
 
 WHEN a conversation is created for a git repository AND the user selects "Managed" mode
 THE SYSTEM SHALL initialize the conversation in Explore mode
-AND record the HEAD commit of the main branch as the conversation's pinned snapshot
 AND configure all tools in read-only mode
+AND (on the user's first message) create a worktree on a temp branch off the chosen base
+  branch and run the conversation in that worktree (REQ-PROJ-028)
 
 WHILE a conversation is in Explore mode (Managed workflow)
 THE SYSTEM SHALL prevent file writes to the project via any tool
+  (except drafting a task file under the project's tasks directory — REQ-PROJ-003)
 AND SHALL allow unrestricted file reading, directory listing, and read-only command execution
 
 WHEN the user selects "Managed" mode for a non-git directory
@@ -73,24 +75,38 @@ from plan review and worktree isolation, but should be opt-in rather than mandat
 
 ### REQ-PROJ-003: Propose a Task to Initiate Work Mode
 
-WHEN agent calls the `propose_plan` tool with title, priority, and a written plan
+WHILE a conversation is in Explore mode
+THE SYSTEM SHALL allow the agent to draft a task file under the project's tasks
+directory using the `patch` tool (whose Explore-mode allowlist is scoped to that
+directory), with a filename following the taskmd 1.0 convention
+(`NNNNN-pX-status--slug.md`, status one of `ready` / `in-progress` / `brainstorming`)
+
+WHEN agent calls the `propose_task` tool with a `task_file` path under the tasks
+directory
 THE SYSTEM SHALL intercept it at the LlmResponse handler (like submit_result)
-AND NOT execute any side effects (no file writes, no git operations)
-AND persist the assistant message and a synthetic tool result atomically
+AND require it to be the only tool call in the response
+AND NOT execute any side effects (no git operations)
+AND read the file and persist the assistant message and a synthetic tool result atomically
 AND transition the conversation to AwaitingTaskApproval state
 AND pause agent execution until the user responds
 
-THE AwaitingTaskApproval state SHALL carry the plan content (title, priority, plan text)
-as serializable data, NOT as a file path or git reference
+THE AwaitingTaskApproval state SHALL carry the `task_file` path plus a display copy of
+the title, priority, and body (so the prose reader and SSE state payload need not
+re-read the file); on approval the executor SHALL re-read the file from disk as the
+source of truth
 
-WHEN `propose_plan` is called while the conversation is not in Explore mode
-THE SYSTEM SHALL reject the call with an error explaining that plans must be proposed
+WHEN `propose_task` is called while the conversation is not in Explore mode
+THE SYSTEM SHALL reject the call with an error explaining that tasks must be proposed
 from Explore mode
 
-**Rationale:** `propose_plan` is a pure data carrier with no side effects. The plan
-exists only in the state machine and prose reader until the user approves. This keeps
-the feedback loop cheap (no git operations, no files to clean up on reject) and defers
-all git work to the approval moment when the user has committed to the approach.
+WHEN `propose_task` is called by a sub-agent
+THE SYSTEM SHALL reject the call (task management is the parent conversation's job)
+
+**Rationale:** The task file is a real file the agent edits with `patch`, so revisions
+are file edits rather than full plans round-tripped through tool arguments. taskmd 1.0
+makes the filename the sole source of task metadata — there is no frontmatter and
+Phoenix allocates no ID. `propose_task` itself is a pure data carrier (its `run()` is
+an unreachable fallback): no git work happens until the user approves.
 
 ---
 
@@ -104,28 +120,33 @@ WHEN user sends annotation feedback
 THE SYSTEM SHALL close the prose reader
 AND deliver the annotations to the agent as a user message
 AND transition the conversation to Explore mode (Idle)
-AND the agent MAY revise the plan and call `propose_plan` again
+AND the agent MAY revise the plan and call `propose_task` again
   (which re-enters AwaitingTaskApproval and reopens the prose reader)
 
 WHEN user approves the task
-THE SYSTEM SHALL assign the next sequential task ID for the project
-AND write a task file to the project's tasks directory (typically `tasks/`,
-  discovered per-project via `_TEMPLATE.md`; see task 13008) in taskmd format
-AND commit the task file on the task branch in the existing worktree (REQ-PROJ-028)
+THE SYSTEM SHALL parse the task ID, priority, status, and slug from the on-disk task
+  file's name (it allocates no ID; see REQ-PROJ-006)
+AND rename the worktree's temp branch in place to `task-{ID}-{slug}` (REQ-PROJ-028)
+AND rename the task file to `...-in-progress--{slug}.md` if it isn't already
+AND commit the task file on that task branch in the existing worktree
 AND transition the conversation from Explore to Work mode within the same worktree
-  (storing base_branch, worktree_path, branch, task_id)
-AND resume agent execution with "Task approved. You are on branch task-{NNNN}-{slug}."
+  (storing worktree_path, branch_name, base_branch, task_id, task_title)
+AND resume agent execution with "Task approved. You are on branch task-{ID}-{slug}."
 
 WHEN user discards the task
 THE SYSTEM SHALL return the conversation to Explore mode
 AND return a rejection result to the agent
-AND NOT perform any git operations (no file was written, nothing to clean up)
+AND NOT perform any git operations (the task file stays on disk where the agent
+left it under the tasks directory — nothing to commit, nothing to clean up)
 
 **Rationale:** The Explore -> Work transition is a permission upgrade within an
-existing worktree (REQ-PROJ-028). The task file is committed on the task branch
-(never main -- REQ-PROJ-027) at approval time. Discarding a task is cheap: the
-worktree and branch already exist but no task file was written. The prose reader
-renders from the plan content carried in the state, not from a file on disk.
+existing worktree (REQ-PROJ-028). The task file already exists on disk (the agent
+wrote it with `patch` in Explore mode); approval renames the temp branch, promotes the
+file's status to `in-progress` if needed, and commits it on the task branch (never
+main -- REQ-PROJ-027). Discarding is cheap: the worktree and temp branch already
+exist, and an uncommitted task file on the temp branch is harmless. The prose reader
+renders the file's body — surfaced via the display copy in the state, re-read from disk
+on approval.
 
 ---
 
@@ -149,32 +170,36 @@ because their code changes never share a directory.
 
 ### REQ-PROJ-006: Task Files as Versioned Living Contracts
 
-WHEN the user approves a task (REQ-PROJ-004)
-THE SYSTEM SHALL allocate a task ID via `taskmd_core::ids::next_id` (a
-  5-digit `DDNNN` value — per-directory prefix + monotonic counter)
-AND write a task file to the project's tasks directory (typically `tasks/`,
-  discovered per-project via `_TEMPLATE.md`; see task 13008) with filename
-  `{ID}-{priority}-{status}--{slug}.md`
-AND include frontmatter with `created`, `priority`, `status`, and `artifact`
-  fields (matching what `taskmd new` synthesizes, so the file round-trips
-  through `taskmd validate`/`fix`)
-AND include a Plan section containing the agent's proposed approach as approved
-AND include a Progress section (initially empty, updated by the agent via patch tool)
+WHEN the agent drafts a task file in Explore mode (REQ-PROJ-003)
+THE SYSTEM SHALL place it in the project's tasks directory (typically `tasks/`,
+  discovered per-project as the first immediate child of the repo root containing
+  `_TEMPLATE.md`, falling back to literal `tasks/`; see task 13008)
+AND the filename SHALL follow the taskmd 1.0 convention `{ID}-{priority}-{status}--{slug}.md`
+  where `ID` is a 5-digit `DDNNN` value (per-directory prefix + monotonic counter), the
+  agent picks the whole filename, and the filename is the sole source of the task's
+  metadata — there is NO frontmatter
+AND the body SHALL be free-form markdown (conventionally an `# H1` title, a `## Plan`
+  section, and a `## Progress` section the agent updates as work proceeds)
+
+WHEN the user approves the task (REQ-PROJ-004)
+THE SYSTEM SHALL parse the task ID, priority, status, and slug from the filename
+  (`taskmd_core::filename::parse_filename`) — it allocates no ID
+AND rename the file to `...-in-progress--{slug}.md` if its status is not already `in-progress`
 AND commit the file on the task branch (never on main or the base branch)
 
-Task files are only created on approval. During the propose/feedback loop, the plan
-exists only in the AwaitingTaskApproval state -- no file on disk, no git commit.
-Branch mode conversations (REQ-PROJ-024) do not create task files.
+WHEN the agent updates the task file during Work mode (via the patch tool)
+THE SYSTEM SHALL allow edits to it on the task branch like any other file; those commits
+  reach main only when the PR is merged through the user's normal workflow
+AND the agent SHALL rename the file to `...-done--{slug}.md` (or `...-wont-do--{slug}.md`)
+  itself when the work closes — Phoenix does not rename it
 
-WHEN the agent updates a task file during Work mode (via patch tool)
-THE SYSTEM SHALL allow edits to the task file on the task branch like any other file
-(if and when the agent pushes via bash, the task-file commits ride along with
-the rest of the branch)
+Branch mode conversations (REQ-PROJ-024) do not have task files.
 
 **Rationale:** Task files live on the task branch alongside the code changes, keeping
-the branch self-contained. This avoids committing to main (which may be protected)
-and eliminates the two-path commit logic. The task file merges to main when the PR
-is merged through the user's normal workflow.
+the branch self-contained — no commits to main (which may be protected), no two-path
+commit logic. taskmd 1.0's filename-is-truth model means there is no frontmatter to keep
+in sync and no ID allocation step on the Phoenix side; the agent owns the filename
+(including the `done` rename) the same way it owns the code.
 
 ---
 
@@ -266,31 +291,39 @@ normal git commands when they need that detail.
 
 ---
 
-### REQ-PROJ-012: Provide propose_plan Tool to Agents
+### REQ-PROJ-012: Provide propose_task Tool to Agents
 
 WHEN agent is in Explore mode
-THE SYSTEM SHALL provide the `propose_plan` tool
-WHICH accepts: title (required string), priority (required: p0-p3),
-  and plan (required string describing the proposed approach)
+THE SYSTEM SHALL provide the `propose_task` tool
+WHICH accepts: `task_file` (required string) — a path, relative to the agent's working
+  directory, to a file under the project's tasks directory whose filename follows the
+  taskmd 1.0 convention (`NNNNN-pX-status--slug.md`, status one of `ready` /
+  `in-progress` / `brainstorming`)
 
-WHEN `propose_plan` is called outside Explore mode
-THE SYSTEM SHALL reject the call with "propose_plan is only available in Explore mode"
+WHEN `propose_task` is called outside Explore mode
+THE SYSTEM SHALL reject the call ("propose_task is only available in Explore mode")
 
-WHEN `propose_plan` is called by a sub-agent
+WHEN `propose_task` is called by a sub-agent
 THE SYSTEM SHALL reject the call
 AND explain that task management is the parent conversation's responsibility
 
-`propose_plan` is a pure data carrier — it has no side effects. It is intercepted
-at the LlmResponse handler (like submit_result for sub-agents) and never enters the
-tool executor. The plan data flows into the AwaitingTaskApproval state.
+WHEN `propose_task` is not the only tool call in the response
+THE SYSTEM SHALL reject it
 
-During Work mode, the agent updates task files directly using the patch tool like
+`propose_task` is a pure data carrier — its `run()` is an unreachable fallback. It is
+intercepted at the LlmResponse handler (like submit_result for sub-agents) and never
+enters the tool executor; the file path and a display copy of its contents flow into
+the AwaitingTaskApproval state. The agent drafts the referenced file with the patch
+tool beforehand (or points at an existing task file).
+
+During Work mode, the agent updates the task file directly using the patch tool like
 any other file. No dedicated `update_task` tool is needed.
 
-**Rationale:** `propose_plan` is the agent's way of saying "I have a plan, please
-review it." The name signals human review is required. Keeping it as a pure data
-carrier with no side effects means the feedback loop is free (no git work to undo)
-and the implementation follows the established submit_result interception pattern.
+**Rationale:** `propose_task` is the agent's way of saying "here's a task file, please
+review it." The name signals human review is required. Referencing a file (rather than
+passing the plan inline) means revisions are ordinary file edits and the task's metadata
+lives where taskmd 1.0 keeps it — in the filename. The interception follows the
+established submit_result pattern, so no git work happens until approval.
 
 ---
 
@@ -387,7 +420,7 @@ AND provide the full tool suite (bash, patch, and all other tools)
 AND NOT associate it with any project
 
 WHILE a conversation is in Standalone mode
-THE SYSTEM SHALL NOT provide the `propose_plan` tool
+THE SYSTEM SHALL NOT provide the `propose_task` tool
 AND SHALL NOT allow transition to Explore or Work modes
 
 WHEN displaying a Standalone conversation
@@ -415,15 +448,22 @@ non-project behaviors.
 WHEN a conversation transitions to Work or Branch mode
 THE SYSTEM SHALL record the base branch in the conversation's mode data
 
-THE shared worktree fields (present in Explore, Work, and Branch modes) SHALL be:
-- `worktree_path: PathBuf` -- path to the conversation's worktree
-- `branch_name: String` -- the task branch (Work) or existing branch (Branch)
-- `base_branch: String` -- the branch the worktree was created from
+THE Work and Branch modes SHALL each carry:
+- `worktree_path` -- path to the conversation's worktree
+- `branch_name` -- the task branch (Work) or the existing branch (Branch)
+- `base_branch` -- the branch the worktree was created from (== `branch_name` for Branch)
 
-THE Work mode SHALL additionally contain:
-- `task_id: String` -- always present, the structural discriminator vs Branch mode
+THE Work mode SHALL additionally carry:
+- `task_id` -- always present, the structural discriminator vs Branch mode
+- `task_title` -- human-readable title, for UI
 
-THE Branch mode SHALL NOT contain `task_id`
+THE Branch mode SHALL NOT carry `task_id` or `task_title`
+
+THE Explore mode SHALL carry only `worktree_path` (an `Option` — `Some` for a top-level
+Managed Explore conversation, which runs in its own worktree on a temp branch before
+approval; `None` for an Explore sub-agent, which shares the parent's working directory)
+
+THE Direct mode SHALL carry no git metadata
 
 WHEN the "Mark as merged" action runs (REQ-PROJ-026/027)
 THE SYSTEM SHALL delete the worktree (and delete the branch for Managed mode)
@@ -446,7 +486,7 @@ Direct mode is the default for all new conversations, git-backed and non-git ali
 split non-git directory conversations into a separate `Standalone` mode
 (see superseded REQ-PROJ-016 and the rationale in REQ-BED-027). In
 practice the two modes had identical runtime semantics (full tool suite,
-no `propose_plan`, no worktree, no task file, no branch, no project
+no `propose_task`, no worktree, no task file, no branch, no project
 association beyond `cwd`), so the split produced no behavioral difference
 — only type-level ceremony. `Standalone` was folded into `Direct` via DB
 migration 001 (`UPDATE conversations SET conv_mode = REPLACE(conv_mode,
@@ -718,7 +758,7 @@ THE SYSTEM SHALL create the worktree and task branch immediately
 AND initialize the conversation in Explore mode within the worktree
 AND the agent SHALL read from the worktree (not the main checkout)
 
-WHEN the agent calls `propose_plan` in a Managed conversation with a worktree
+WHEN the agent calls `propose_task` in a Managed conversation with a worktree
 THE SYSTEM SHALL intercept the call (same as REQ-PROJ-003)
 AND on approval, transition the conversation from Explore to Work mode
 AND the agent SHALL begin writing in the same worktree (no second worktree created)

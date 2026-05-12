@@ -73,21 +73,37 @@ Project {
 }
 
 ConvMode {
-  Explore {                    // read-only, pinned to a commit
-    pinned_commit: String,     // SHA of main HEAD at conversation creation
+  Direct                       // default — full tools, no worktree, no git ceremony
+  Explore {                    // Managed phase 1 — read-only
+    worktree_path: Option<NonEmptyString>,  // Some for a top-level managed Explore
+                               // conversation (REQ-PROJ-028); None for an Explore
+                               // sub-agent that shares the parent's cwd
   }
-  Work {                       // read-write in an isolated worktree
-    worktree_path: PathBuf,    // .phoenix/worktrees/{conv-id}/
-    branch: String,            // task-{NNNN}-{slug}
-    task_id: String,
-    base_branch: String,       // branch checked out at approval time (e.g. "main")
+  Work {                       // Managed phase 2 — read-write in the same worktree
+    worktree_path: NonEmptyString,
+    branch_name:   NonEmptyString,   // task-{NNNN}-{slug} (renamed from the temp branch)
+    base_branch:   NonEmptyString,   // branch the worktree was created from
+    task_id:       NonEmptyString,   // structural discriminator vs Branch mode
+    task_title:    NonEmptyString,   // human-readable title, for UI
+  }
+  Branch {                     // work directly on an existing branch (REQ-PROJ-024)
+    worktree_path: NonEmptyString,
+    branch_name:   NonEmptyString,   // the user-chosen existing branch
+    base_branch:   NonEmptyString,   // == branch_name for Branch mode
   }
 }
 ```
 
-`ConvMode` is stored as a field on the conversation record in SQLite alongside the
-existing `state` column. It is NOT embedded inside every `ConvState` variant — mode
-is conversation-level identity, not per-state ephemeral data.
+The presence/absence of `task_id` is the structural Work-vs-Branch discriminator
+(REQ-PROJ-017). A top-level managed Explore conversation carries its temp branch
+(`task-pending-{conv-id}`) only as the worktree's checked-out branch on disk — it is
+not stored in the `Explore` variant; on approval the temp branch is renamed in place
+to `task-{NNNN}-{slug}` and the mode becomes `Work`.
+
+`ConvMode` is stored as a JSON field on the conversation record in SQLite alongside
+the existing `state` column. It is NOT embedded inside every `ConvState` variant —
+mode is conversation-level identity, not per-state ephemeral data. There is no
+`Standalone` variant — non-git directories use `Direct` (REQ-PROJ-016/018).
 
 ### REQ-PROJ-005 — Worktree Path
 
@@ -102,189 +118,196 @@ present. Worktrees are ephemeral; they are never committed or pushed.
 
 ### REQ-PROJ-006 — Task File Format
 
-Task files live at `{repo_root}/{tasks_dir}/` and are committed to main.
-`{tasks_dir}` is the project's tasks directory, discovered at conversation
-startup as the first immediate child of the repo root containing
-`_TEMPLATE.md`. It falls back to the literal `tasks/` when no marker is
+Task files live at `{repo_root}/{tasks_dir}/`. `{tasks_dir}` is the project's tasks
+directory, discovered at conversation startup as the first immediate child of the repo
+root containing `_TEMPLATE.md`. It falls back to the literal `tasks/` when no marker is
 found, so existing repos behave as before (task 13008).
 
+The task file is authored by the agent in Explore mode with the `patch` tool (whose
+allowlist in Explore mode is scoped to `{tasks_dir}/`) and referenced by path in the
+`propose_task` call. On approval it is committed on the task branch — never on `main`
+or the base branch (REQ-PROJ-027). taskmd 1.0: the filename is the sole source of task
+metadata; there is no frontmatter.
+
 Filename convention: `{ID}-{priority}-{status}--{slug}.md`
-- `ID`: 5-digit numeric (`DDNNN`) allocated by `taskmd_core::ids::next_id`
-  — a per-directory prefix (derived from hostname + tasks-dir path) plus a
-  monotonic counter. Not a simple sequence.
+- `ID`: 5-digit (`DDNNN`) value — a per-directory prefix (hostname + tasks-dir path)
+  plus a monotonic counter. The agent chooses the filename when it drafts the file;
+  Phoenix does not allocate the ID, it parses it back out of the filename at approval
+  time (`taskmd_core::filename::parse_filename`).
 - `priority`: p0 (critical) through p4 (nice-to-have)
-- `status`: ready | in-progress | blocked | brainstorming | done | wont-do
-  (the status set accepted by `taskmd`)
-- `slug`: kebab-case title derived by Phoenix at creation time via
-  `taskmd_core::filename::derive_slug`
+- `status`: ready | in-progress | brainstorming at proposal time (`propose_task`
+  rejects any other status); the executor promotes it to `in-progress` on approval if
+  it isn't already. The agent moves it to `done` (or `wont-do`) itself via `patch`
+  before the work closes — nothing renames it automatically.
+- `slug`: kebab-case, part of the filename the agent chose.
 
-Frontmatter (synthesized by Phoenix at creation; matches what `taskmd new`
-produces so the files round-trip through `taskmd validate/fix`):
-```
-created: YYYY-MM-DD
-priority: p1
-status: in-progress
-artifact: pending
-```
+Body: free-form markdown. Conventionally an `# H1` title, a `## Plan` section (the
+approach the user reviewed), and a `## Progress` section the agent updates as work
+proceeds. The whole body is what the prose reader shows the user at approval time.
 
-`artifact` is a required field — `pending` is an explicit placeholder for
-tasks Phoenix itself creates on plan approval, where the concrete artifact
-is "whatever this branch ships". Human/agent-authored tasks created via
-`taskmd new` must name a real artifact.
-
-Body sections:
-- `## Plan` — the agent's proposed approach as reviewed and approved by the user
-- `## Progress` — checklist the agent updates as work proceeds (optional)
-
-Task files are written to `tasks/` and committed to main at the moment the user
-approves a plan. During the propose/feedback loop, the plan exists only in memory
-(AwaitingTaskApproval state). During Work mode, agents update task files directly
-via the patch tool like any other file.
+During the propose/feedback loop the task file already exists on disk under
+`{tasks_dir}/` (the agent wrote it); `AwaitingTaskApproval` carries the file path plus
+a display copy of the title/priority/body. During Work mode, agents update the task
+file directly via `patch` like any other file in the worktree; those commits ride
+along on the task branch.
 
 ## State Machine Integration
 
 ### REQ-PROJ-003, REQ-PROJ-004 — AwaitingTaskApproval State
 
-A new state is added to the bedrock state machine (see `specs/bedrock/`
-REQ-BED-028):
+`AwaitingTaskApproval` is a parent-conversation state in the bedrock state machine
+(see `specs/bedrock/` REQ-BED-028):
 
 ```
 AwaitingTaskApproval {
-  title: String,
-  priority: Priority,   // p0-p3
-  plan: String,          // the full plan text
+  task_file: String,    // path under {tasks_dir}/ to the file the agent wrote
+  title: String,        // display copy (parsed from the file's H1 / filename)
+  priority: String,     // display copy ("p0".."p4", from the filename)
+  plan: String,         // display copy of the file body
 }
 ```
 
-`propose_plan` is intercepted at the LlmResponse handler (same pattern as
-`submit_result`). It never enters `ToolExecuting`. The assistant message and a
-synthetic tool result are persisted as a `CheckpointData::ToolRound` before the
-state transitions. No oneshot channels — all data is serializable.
+The display fields are populated once at interception time so the prose reader and
+SSE state payload don't have to re-read the file; on approval the executor re-reads
+`task_file` from disk (it is the source of truth). `task_file` carries
+`#[serde(default)]` as a rollout shim — rows persisted before the file-based flow
+deserialise with an empty `task_file`, which the executor surfaces as a clear
+"reject and re-propose" error rather than silently resetting to `Idle`.
 
-The prose reader opens with the plan content from the state (not from a file on
-disk). SSE event: `task_approval_requested` with the plan data.
+`propose_task` is intercepted at the `LlmResponse` handler (same pattern as
+`submit_result`). It never enters `ToolExecuting`. It must be the only tool call in
+the response. The assistant message and a synthetic tool result are persisted as a
+`CheckpointData::ToolRound` before the state transitions. No oneshot channels — all
+data is serializable. The conversation entering `AwaitingTaskApproval` is what drives
+the UI to open the prose reader on the task file's body (see `specs/prose-feedback/`).
 
-- **Approved:** Write task file to main, create branch, checkout, transition to
-  Work mode. All git operations happen here and only here.
-- **FeedbackProvided:** Close prose reader, deliver annotations as user message,
-  return to Explore/Idle. Agent may revise and call `propose_plan` again.
-- **Rejected:** Return to Explore/Idle. No git operations, nothing to clean up.
+- **Approved:** the executor runs the git sequence below (`Effect::ApproveTask`),
+  then resumes the agent in Work mode in the same worktree.
+- **FeedbackProvided:** close prose reader, deliver annotations as a user message,
+  return to Explore/Idle. The agent may edit the task file (via `patch`) and call
+  `propose_task` again, re-entering `AwaitingTaskApproval`.
+- **Rejected:** return to Explore/Idle. No git operations — the task file stays on
+  disk where the agent left it; nothing to clean up.
 
-On server restart: reconstruct from DB (title, priority, plan are all serialized
-in the ConvState column). Re-emit SSE event on UI reconnect.
+On server restart: reconstruct from DB (`task_file` + display fields are serialized in
+the `ConvState` column). The UI re-opens the prose reader on reconnect.
 
-### REQ-PROJ-009, REQ-PROJ-010 — Task Completion and Abandon
+### REQ-PROJ-010, REQ-PROJ-026, REQ-PROJ-027 — Terminal Actions (Mark as Merged, Abandon)
 
-There is no `AwaitingMergeApproval` state. Completion and abandonment are user-initiated
-actions on idle Work conversations, handled entirely by the executor as effect sequences.
-The conversation transitions to Terminal (an existing state) after cleanup completes.
+There is no `AwaitingMergeApproval` state and no in-Phoenix squash-merge (REQ-PROJ-009
+was removed — see `requirements.md`). The two terminal actions are user-initiated HTTP
+calls (`POST /api/conversations/:id/mark-merged`, `POST /api/conversations/:id/abandon-task`)
+on a Work or Branch conversation that is `Idle` or `ContextExhausted`. Both reject with
+409 if the conversation has been continued (`continued_in_conv_id` set — REQ-BED-031);
+the live conversation is the continuation, so terminal actions belong there. The handler
+performs the git cleanup in a `spawn_blocking` task, then routes through the state
+machine via `Effect::ResolveTask`/`TaskResolved`, which moves the conversation to
+`Terminal`.
 
-**Complete flow (REQ-PROJ-009):**
+**Mark as merged:**
 
-1. User clicks Complete on an idle Work conversation
-2. Executor runs pre-checks:
-   - `git -C {worktree} status --porcelain` — must be empty (no dirty files)
-   - `git -C {worktree} merge-tree $(git merge-base base_branch HEAD) base_branch HEAD` — check for conflicts
-3. If pre-checks fail: return actionable error, conversation stays in Work/Idle
-4. If task file status is not `done`: emit non-blocking nudge to UI
-5. Executor sends `git diff base_branch...HEAD` to LLM for commit message generation
-6. UI shows editable commit message in confirmation dialog
-7. On confirm: executor runs squash merge sequence:
-   - `git checkout base_branch`
-   - `git merge --squash {branch}`
-   - `git commit -m "{user-confirmed message}"`
-   - `git worktree remove {path} --force`
-   - `git branch -D {branch}`
-8. Conversation transitions to Terminal
+1. Validate mode (Work or Branch), state (`Idle`/`ContextExhausted`), not continued,
+   project-scoped.
+2. `git worktree remove {worktree_path} --force` (filesystem-rm + `worktree prune`
+   fallback on failure).
+3. Work (Managed) mode: `git branch -D {branch_name}` — the task branch is a Phoenix
+   artifact. Branch mode: keep the branch — it is the user's PR branch.
+4. Emit a system message ("Marked as merged. Worktree removed[, task branch deleted].")
+   and transition to `Terminal`.
 
-**Abandon flow (REQ-PROJ-010):**
+The UI (`WorkActions`) makes this action PR-aware via `GET /api/conversations/:id/pr-status`
+(REQ-PROJ-011/026/027): a `gh`-confirmed merged PR gets the "Clean up merged PR" happy
+path; an open/draft/failing/closed-unmerged PR disables the button with an explanatory
+note; when `gh` is unavailable the user can opt into an explicit manual fallback. Phoenix
+never pushes or merges — `git push` is the agent's job via the bash tool.
 
-1. User clicks Abandon on an idle Work conversation
-2. UI shows confirmation dialog (destructive action warning)
-3. On confirm: executor runs cleanup:
-   - `git worktree remove {path} --force`
-   - `git branch -D {branch}`
-   - `git checkout base_branch`
-   - Update task file status to `wont-do`: rename file, `git add tasks/`, `git commit`
-4. Conversation transitions to Terminal
+**Abandon:**
+
+1. Same validation as mark-merged.
+2. Capture a best-effort diff snapshot (committed + uncommitted, capped at 100 KiB) from
+   the worktree *before* deleting it, and persist it as a system message so the work
+   isn't silently lost.
+3. `git worktree remove {worktree_path} --force` (same fallback as above).
+4. Work mode: `git branch -D {branch_name}`. Branch mode: keep the branch.
+5. No task-file edit — for Work mode the branch (and the task file on it) is deleted;
+   for Branch mode there is no task file. Transition to `Terminal`.
 
 ## Tool Implementation
 
-### REQ-PROJ-012 — propose_plan Tool
+### REQ-PROJ-012 — propose_task Tool
 
-`propose_plan` is a pure data carrier, intercepted at the LlmResponse handler
-(same pattern as `submit_result`). It never enters `ToolExecuting` or the tool
-executor. Only available in Explore mode, rejected from sub-agents.
+`propose_task` is a pure data carrier — its `run()` is an unreachable fallback. It is
+intercepted at the `LlmResponse` handler (same pattern as `submit_result`) and never
+enters `ToolExecuting`. Only available in Explore mode, rejected from sub-agents.
 
-**Interception flow (in the LlmResponse transition arm):**
+Input: `{ task_file: string }` — a path (relative to the agent's cwd) to a file under
+`{tasks_dir}/` whose filename follows the taskmd 1.0 convention
+(`NNNNN-pX-status--slug.md`, status one of `ready`/`in-progress`/`brainstorming`). The
+agent either points at an existing task file or drafts one first with `patch` (the
+Explore-mode `patch` allowlist is scoped to `{tasks_dir}/`). The body is free-form
+markdown shown to the user as the plan.
 
-1. Detect `propose_plan` tool_use in the LLM response
-2. Validate: must be the only tool in the response (error otherwise)
-3. Extract title, priority, plan from the tool input
-4. Build synthetic `ToolResult::success` with "Plan submitted for review"
-5. Persist `CheckpointData::ToolRound(assistant_message, [tool_result])`
-6. Transition to `AwaitingTaskApproval { title, priority, plan }`
+**Interception flow (in the `LlmResponse` transition arm):**
 
-**On Approved (executor handles git):**
+1. Detect a `propose_task` tool_use in the response.
+2. Validate: it must be the only tool call (error otherwise).
+3. Read the file, parse its filename, build the display fields (title/priority/body).
+4. Build a synthetic `ToolResult::success` ("Task submitted for review").
+5. Persist `CheckpointData::ToolRound(assistant_message, [tool_result])`.
+6. Transition to `AwaitingTaskApproval { task_file, title, priority, plan }`.
 
-1. Allocate next task ID via `taskmd_core::ids::next_id(tasks_dir)` (handles
-   per-directory prefix + monotonic counter atomically; do not scan by hand)
-2. Derive filename slug from title via `taskmd_core::filename::derive_slug`
-3. Record current checked-out branch as `base_branch`
-4. Write task file to `{repo_root}/tasks/{ID}-{priority}-in-progress--{slug}.md`
-   using `taskmd_core::filename::format_filename`
-5. `git add tasks/{file} && git commit --only tasks/{file} -m "task {NNNN}: {title}"`
-6. `git worktree add .phoenix/worktrees/{conv-id} -b task-{NNNN}-{slug}`
-7. Update `conv_mode` to `Work { worktree_path, branch, task_id, base_branch }`
-8. Resume agent with "Task approved. You are on branch task-{NNNN}-{slug}."
+**On Approved — `Effect::ApproveTask` (executor, in `spawn_blocking`, serialized by a
+process-global approval mutex):**
 
-**On Rejected:**
+1. Resolve `base_branch` (the conversation's `desired_base_branch` if set, else the
+   current `HEAD` of the conversation's cwd) and `git fetch origin {base_branch}`
+   single-branch, best-effort (REQ-PROJ-022).
+2. Parse the on-disk task filename → `task_id`, `priority`, `status`, `slug`. No ID
+   allocation here — taskmd 1.0 puts the metadata in the filename. The task branch name
+   is `task-{task_id}-{slug}`.
+3. Locate `.phoenix/worktrees/{conv-id}/`. **Early-worktree path (REQ-PROJ-028, the
+   normal Managed flow):** the conversation's cwd already *is* that worktree on a temp
+   branch. Rename the temp branch in place to `task-{task_id}-{slug}`, rename the task
+   file to `...-in-progress--{slug}.md` if it isn't already in-progress, `git add` +
+   `git commit -m "task {task_id}: {title}"` on the task branch. **Fallback path** (no
+   pre-created worktree, e.g. a conversation that referenced an existing task file from
+   the main checkout): transplant the file into a freshly created worktree on the new
+   branch off `base_branch` and commit it there; only then remove the cwd copy.
+4. Ensure `.phoenix/worktrees/` is in the worktree's `.gitignore`.
+5. Update `conv_mode` to `Work { worktree_path, branch_name, base_branch, task_id,
+   task_title }`.
+6. Resume the agent with "Task approved. You are on branch task-{task_id}-{slug}."
 
-1. Transition to Explore/Idle
-2. No git operations needed
+The task file is committed on the task branch — never on `main`/the base branch
+(REQ-PROJ-027). `Effect::ResolveTask`/`TaskResolved` is the symmetric terminal effect
+used by mark-merged and abandon (see above).
 
-**On FeedbackProvided:**
-
-1. Close prose reader
-2. Deliver annotations as user message
-3. Transition to Explore/Idle
-4. Agent may call `propose_plan` again (re-enters AwaitingTaskApproval)
+**On Rejected / FeedbackProvided:** no git operations. The task file stays on disk; the
+conversation returns to Explore/Idle (FeedbackProvided also delivers the annotations and
+lets the agent re-propose).
 
 ### Task File Updates During Work Mode
 
-During Work mode, the agent updates task files directly using the `patch` tool,
-just like any other file in the worktree. No dedicated tool is needed — task files
-are regular markdown files. Updates to the task file live on the task branch and
-merge to main with the rest of the code changes (M4).
-
-## Main Checkout Mutex
-
-The Complete and Abandon flows require git operations on the main checkout
-(base_branch). Since other Explore conversations may be using the main checkout,
-the executor must acquire a mutex lock before operating on it. Use a per-project
-mutex (keyed by project root path) to serialize Complete/Abandon operations. The
-lock is held only for the duration of the git sequence (checkout + merge +
-commit), not during the LLM commit message generation.
-
-If the main checkout has uncommitted changes when the lock is acquired, the
-operation fails with an actionable error (same pattern as the dirty-worktree
-pre-check).
+During Work mode the agent updates the task file with `patch`, like any other file in
+the worktree — no dedicated tool. Those commits live on the task branch and reach `main`
+when the user merges the PR (REQ-PROJ-027). The agent renames the file to `...-done--...`
+(or `...-wont-do--...`) itself when the work closes; Phoenix does not.
 
 ## Executor-Layer Git Operations
 
-All git operations are side effects dispatched by the executor, not SM transitions:
+The git choreography is not modelled as fine-grained typed effects — the state machine
+emits one of two coarse effects (`Effect::ApproveTask`, `Effect::ResolveTask`) and the
+corresponding handler runs the `git` sequence directly in a `spawn_blocking` task,
+feeding back a single completion (or a `GitOperationFailed`-style error message). A
+process-global `TASK_APPROVAL_MUTEX` serialises concurrent approvals so two of them
+can't race on the same branch/worktree name; there is no per-project main-checkout
+mutex because no terminal action touches the main checkout — mark-merged and abandon
+operate only on the conversation's own worktree (and, for Managed mode, delete its task
+branch). The concrete `git` commands are listed inline in the flows above.
 
-| Effect | Git operation |
-|--------|---------------|
-| `CreateWorktree` | `git worktree add {path} -b {branch}` |
-| `DeleteWorktree` | `git worktree remove {path} --force` + `git branch -D {branch}` |
-| `SquashMergeWorktree` | `git checkout {base_branch} && git merge --squash {branch} && git commit -m {msg}` |
-| `CommitTaskFile` | `git add tasks/{file} && git commit --only tasks/{file} -m {msg}` |
-| `CommitTaskStatusOnBase` | `git checkout {base_branch}`, then transition the task's status via `taskmd_core` (renames the file + rewrites frontmatter), then `git add tasks/ && git commit -m {msg}` |
-
-These effects are typed -- the state machine emits the intent; the executor performs
-the git operation and feeds back `WorktreeCreated`, `WorktreeMerged`,
-`WorktreeDeleted`, or `GitOperationFailed`.
+`git worktree remove --force` is used unconditionally on cleanup (the worktree may have
+uncommitted files), with a `std::fs::remove_dir_all` + `git worktree prune` fallback if
+the porcelain command fails.
 
 ## Tool Registry Configuration by Mode
 
@@ -298,7 +321,7 @@ the git operation and feeds back `WorktreeCreated`, `WorktreeMerged`,
 | `keyword_search` | Allowed | Allowed |
 | `read_image` | Allowed | Allowed |
 | `browser_*` | Allowed | Allowed |
-| `propose_plan` | Allowed (intercepted, not executed) | Disabled |
+| `propose_task` | Allowed (intercepted, not executed) | Disabled |
 | `spawn_agents` | Allowed | Allowed |
 | `submit_result` | Sub-agents only | Sub-agents only |
 
@@ -350,7 +373,7 @@ Each sub-agent mode gets a distinct tool registry:
 | `spawn_agents` | No | No |
 | `ask_user_question` | No | No |
 | `skill` | No | No |
-| `propose_plan` | No | No |
+| `propose_task` | No | No |
 | `submit_result` | Yes | Yes |
 | `submit_error` | Yes | Yes |
 | MCP tools | Yes (deferred, search-oriented) | Yes (full set, deferred) |
@@ -361,7 +384,7 @@ implement changes.
 
 Neither mode gets `spawn_agents` (no recursive spawning), `ask_user_question`
 (sub-agents cannot interact with the end user), `skill` (parent handles skill
-invocation), or `propose_plan` (parent handles task proposals).
+invocation), or `propose_task` (parent handles task proposals).
 
 #### Model Selection
 
@@ -445,37 +468,29 @@ validated: Work sub-agents cannot write outside the parent's worktree even if
 
 ## Persistence
 
-### New database columns
+### Conversation columns
 
-The `conversations` table gains:
+`ConvMode` is stored as a JSON `conv_mode` column on `conversations` (added by the
+projects migration; `Direct` is the default for new rows). Examples:
+`"Direct"`, `{"Explore":{"worktree_path":"/repo/.phoenix/worktrees/<id>"}}`,
+`{"Work":{"worktree_path":"...","branch_name":"task-YF042-fix-bug","base_branch":"main","task_id":"YF042","task_title":"Fix bug"}}`,
+`{"Branch":{"worktree_path":"...","branch_name":"my-pr","base_branch":"my-pr"}}`.
+`desired_base_branch` is a separate nullable column used between Managed-mode worktree
+creation and approval. There is **no `tasks` table** — querying conversations whose
+`conv_mode` is `Work` (or `Branch`) is the de-facto worktree registry (REQ-PROJ-015);
+task metadata lives in the task file's name on the task branch.
 
-```sql
-ALTER TABLE conversations ADD COLUMN conv_mode TEXT NOT NULL DEFAULT 'explore';
--- Stored as JSON: {"Explore":{"pinned_commit":"abc123"}} or
--- {"Work":{"worktree_path":"/...","branch":"phoenix/001-...","task_id":"001"}}
-```
+### Crash recovery (worktree reconciliation)
 
-The `tasks` table (new):
-
-```sql
-CREATE TABLE tasks (
-  id TEXT PRIMARY KEY,               -- "001"
-  project_path TEXT NOT NULL,
-  conversation_id TEXT NOT NULL,
-  status TEXT NOT NULL,
-  file_path TEXT NOT NULL,           -- tasks/001-p1-in-progress-....md
-  branch TEXT NOT NULL,
-  created_at TEXT NOT NULL,
-  FOREIGN KEY (conversation_id) REFERENCES conversations(id)
-);
-```
-
-### Crash recovery
-
-On startup, the executor scans conversations with `conv_mode = Work`:
-- If worktree directory exists: restore normally, resume from `Idle` in Work mode
-- If worktree directory is missing: transition to Terminal state, mark task `wont-do`
-  on base_branch, log warning
+On startup `reconcile_worktrees` scans conversations whose `conv_mode` is `Work`,
+`Branch`, or `Explore`-with-a-worktree:
+- Worktree directory present on disk → leave the conversation as-is.
+- Worktree directory missing → the conversation is a genuine orphan; mark it `Terminal`
+  and log a warning. (No task-file edit — the task file went away with the worktree.)
+- **Exception (REQ-BED-031 / REQ-PROJ-015):** a conversation in `ContextExhausted`, or
+  one with `continued_in_conv_id` set, is *not* treated as orphaned even if its worktree
+  is gone — the worktree is held intentionally pending explicit user action; its mode is
+  not demoted.
 
 ## Branch Health Indicator
 
@@ -486,6 +501,14 @@ conversations. It shows the PR number plus merge/check state when `gh` can resol
 a pull request for the branch. It does not render local commits-ahead or
 commits-behind badges; those counts are easy to inspect with git commands when
 needed, but they are not the primary decision point for PR cleanup.
+
+`GET /api/conversations/:id/pr-status` is the data source. It runs `gh pr list --head
+{branch} --state all --json ...` (and `gh pr checks` where needed) from the
+conversation's worktree, in a `spawn_blocking` task, and normalises the result to
+`{ found, display_state: open|draft|merged|closed, check_state: passing|pending|failing|unknown,
+number/title/url/... }` or `{ found: false, unavailable_reason: gh_missing|not_authenticated|not_git_repo|command_failed }`.
+`gh` failures are logged at `debug` and surfaced to the UI as a compact non-blocking
+hint, never as a hard error — the conversation page stays usable without `gh`.
 
 `.gitignore` management: the system checks for `.phoenix/worktrees/` in `.gitignore`
 at project creation and appends it if missing.

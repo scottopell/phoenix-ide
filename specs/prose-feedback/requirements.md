@@ -366,12 +366,12 @@ AND NOT perform any git operations (no file was written, nothing to clean up)
 WHEN user annotates lines and taps Send Feedback
 THE SYSTEM SHALL format the annotations as a structured message (per REQ-PF-009 format)
 AND deliver the formatted feedback to the agent as a user message (NOT a tool result —
-  the propose_plan tool result was already persisted when entering AwaitingTaskApproval)
+  the propose_task tool result was already persisted when entering AwaitingTaskApproval)
 AND close the prose reader
 AND transition the conversation to Explore/Idle
 AND clear annotations after sending
 
-The agent may revise the plan and call `propose_plan` again, which re-enters
+The agent may revise the plan and call `propose_task` again, which re-enters
 AwaitingTaskApproval and opens a fresh prose reader with the updated plan content.
 No content reload or keep-open behavior is needed — each feedback cycle is a clean
 mount/unmount of the prose reader.

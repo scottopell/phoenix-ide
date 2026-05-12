@@ -438,67 +438,70 @@ requiring every state variant to carry mode.
 |------|---------|------|
 | `patch` | Disabled | Enabled (worktree only) |
 | `bash` | Allowed (read-only enforced) | Allowed (write in worktree) |
-| `propose_plan` | Allowed (intercepted, not executed) | Disabled |
+| `propose_task` | Allowed (intercepted, not executed) | Disabled |
 | `think`, `keyword_search`, `read_image`, `browser_*` | Allowed | Allowed |
 
 ## Task Approval State (REQ-BED-028, REQ-PROJ-003, REQ-PROJ-004)
 
-A new state handles the human review loop for task plans:
+A `ConvState` variant handles the human review loop for task proposals. All fields are
+serializable — no oneshot channels:
 
 ```rust
 AwaitingTaskApproval {
-    task_id: String,
-    task_path: PathBuf,
-    reply: oneshot::Sender<TaskApprovalOutcome>,
+    #[serde(default)]      // rollout shim: legacy rows deserialise with an empty
+    task_file: String,     // path; the executor surfaces that as "reject and re-propose"
+    title: String,         // display copy (from the body's H1 / filename)
+    priority: String,      // display copy ("p0".."p4", from the filename)
+    plan: String,          // display copy of the file body
 }
 
-enum TaskApprovalOutcome {
-    Approved,
-    Rejected,
-    FeedbackProvided { annotations: String },
-}
+enum TaskApprovalOutcome { Approved, Rejected, FeedbackProvided { annotations: String } }
 ```
 
 Transitions:
 
 ```
-LlmRequesting + LlmResponse(propose_plan) → AwaitingTaskApproval
+LlmRequesting + LlmResponse(propose_task) → AwaitingTaskApproval
     Effects: PersistCheckpoint(ToolRound), BroadcastState
-    Note: intercepted at LlmResponse like submit_result, never enters ToolExecuting
+    Note: intercepted at LlmResponse like submit_result; must be the only tool call;
+          never enters ToolExecuting. The file referenced by `task_file` already exists
+          on disk (the agent wrote it with `patch` in Explore mode).
 
 AwaitingTaskApproval + Approved → Idle (mode becomes Work)
-    Effects: CommitTaskFile, CreateBranch, CheckoutBranch, PersistMode
+    Effects: ApproveTask  -- rename the worktree's temp branch in place to
+             task-{NNNN}-{slug}, promote the task file's status to in-progress if
+             needed, commit it on that branch (never on main), update conv_mode to Work
 
 AwaitingTaskApproval + FeedbackProvided → Idle (mode stays Explore)
-    Effects: (annotations delivered as user message; agent may call propose_plan again)
+    Effects: (annotations delivered as user message; agent may revise the file and call
+             propose_task again)
 
 AwaitingTaskApproval + Rejected → Idle (mode stays Explore)
-    Effects: (no git operations — nothing was written to disk)
+    Effects: (no git operations — the task file stays on disk where the agent left it)
 ```
 
-On server restart with conversation in `AwaitingTaskApproval`: restore state from DB,
-re-emit `SSE::TaskApprovalRequested` to reconnecting clients.
+On server restart with a conversation in `AwaitingTaskApproval`: restore state from the
+serialized `ConvState` column; the UI re-opens the task-approval reader on reconnect
+from the conversation state payload (there is no dedicated SSE event).
 
-## Task Completion and Abandon (REQ-BED-029, REQ-PROJ-009, REQ-PROJ-010)
+## Task Resolution: Mark as Merged and Abandon (REQ-BED-029, REQ-PROJ-010/026/027)
 
-There is no `AwaitingMergeApproval` state. Task completion and abandonment are
-user-initiated actions dispatched to the executor, not state machine transitions.
+There is no `AwaitingMergeApproval` state and no in-Phoenix squash-merge. Mark-as-merged
+and abandon are user-initiated HTTP actions on a Work or Branch conversation that is
+`Idle` or `ContextExhausted` (rejected with 409 if the conversation has been continued —
+REQ-BED-031). The handler does the git cleanup in a `spawn_blocking` task, then routes
+through the state machine via `Effect::ResolveTask`/`TaskResolved`, which feeds back the
+transition to `Terminal` through `handle_outcome()`.
 
-The conversation must be in `Idle` state (Work mode) for these actions to be available.
-If the agent is working, the user must cancel first.
+**Mark as merged:** remove the worktree; for Managed mode delete the task branch (it's a
+Phoenix artifact), for Branch mode keep it (it's the user's PR branch). The UI makes the
+action PR-aware via `gh` (REQ-PROJ-011/026/027) but Phoenix never pushes or merges.
 
-**Complete action:** The executor runs pre-checks, generates a commit message via LLM,
-shows a confirmation dialog, and on confirm executes the squash merge sequence
-(see `specs/projects/design.md` REQ-PROJ-009 section for full flow). On success,
-the conversation transitions to `Terminal`.
+**Abandon:** capture a best-effort diff snapshot from the worktree first (persisted as a
+system message so work isn't silently lost), then remove the worktree and — for Managed
+mode — delete the task branch. No task-file edit (the file went away with the branch).
 
-**Abandon action:** The executor shows a confirmation dialog, and on confirm deletes
-the worktree and branch, updates the task file to `wont-do` on base_branch, and
-transitions the conversation to `Terminal`.
-
-Both actions use the existing `Terminal` state -- no new `ConvState` variant is needed.
-The executor dispatches the cleanup effects and feeds back the terminal transition
-through `handle_outcome()`.
+Both use the existing `Terminal` state — no new `ConvState` variant.
 
 ---
 
