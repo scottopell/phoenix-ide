@@ -592,22 +592,25 @@ pub fn build_system_prompt_with_options(
                      Workflow for proposing work:\n\
                      1. Find or draft a markdown task file. The body is free-form \
                         markdown -- start with an `# H1` title, then the plan.\n   \
-                        - To reuse an existing task, locate it with `keyword_search` \
-                        or by browsing with `read_file`.\n   \
-                        - To draft a new one, use `patch` with operation `overwrite`. \
-                        The conventional place is `{tasks_dir_name}/` using the \
-                        taskmd 1.0 naming `NNNNN-pX-status--slug.md` (status one of \
-                        `ready`, `in-progress`, or `brainstorming`) -- files named \
-                        that way additionally carry id/priority/status/slug and get \
-                        an automatic `ready` -> `in-progress` rename on approval. \
-                        Any other `.md` file (e.g. `{tasks_dir_name}/my-plan.md`) \
-                        also works as a plain task brief; just write a clear `# H1` \
-                        title.\n\
+                        - To reuse an existing markdown file as the task (e.g. \
+                        `docs/plan.md`), locate it with `keyword_search` or \
+                        `read_file` -- any `.md` file in the worktree works.\n   \
+                        - To draft a new one, use `patch` with operation \
+                        `overwrite`; the Explore-mode `patch` allowlist is scoped \
+                        to `{tasks_dir_name}/`, so a new file lands there. Prefer \
+                        the taskmd 1.0 naming `NNNNN-pX-status--slug.md` (status \
+                        one of `ready`, `in-progress`, or `brainstorming`) -- \
+                        files named that way additionally carry \
+                        id/priority/status/slug and get an automatic `ready` -> \
+                        `in-progress` rename on approval, and keep `taskmd \
+                        validate` happy. A non-taskmd name there also works (a \
+                        plain brief, no metadata) -- fine for a project that \
+                        doesn't use taskmd.\n\
                      2. Call `propose_task` with `task_file` set to the path \
-                        (e.g. `{tasks_dir_name}/12345-p2-ready--my-slug.md` or \
-                        `{tasks_dir_name}/my-plan.md`). The user will review and can \
-                        approve, request revisions, or reject. On approval, an \
-                        isolated worktree is created and you gain full write \
+                        (e.g. `{tasks_dir_name}/12345-p2-ready--my-slug.md`, or \
+                        `docs/plan.md` for an existing brief). The user will review \
+                        and can approve, request revisions, or reject. On approval, \
+                        an isolated worktree is created and you gain full write \
                         access.\n\n\
                      The `patch` tool is restricted to `{tasks_dir_name}/` in this \
                      mode. `bash` is unavailable. If the user asks you to change \

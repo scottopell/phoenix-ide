@@ -36,19 +36,18 @@ pub enum TaskSource {
     },
     /// Any other markdown file — a plain task brief.
     PlainMarkdown {
-        /// Filename with the `.md`/`.markdown` extension stripped.
+        /// Filename with the `.md` extension stripped.
         stem: String,
     },
 }
 
 impl TaskSource {
     /// Classify a task-file *filename* (not a path). Returns `None` if the name
-    /// is not a markdown file at all (no `.md`/`.markdown` extension, or an
-    /// empty stem).
+    /// is not a markdown file at all (no `.md` extension, or an empty stem).
     ///
     /// taskmd is tried first: if the name matches the taskmd pattern it is a
     /// [`TaskSource::Taskmd`] regardless of extension casing, otherwise any
-    /// markdown file is a [`TaskSource::PlainMarkdown`].
+    /// `.md` file is a [`TaskSource::PlainMarkdown`].
     pub fn detect(filename: &str) -> Option<Self> {
         if let Some(parsed) = taskmd_core::filename::parse_filename(filename) {
             return Some(Self::Taskmd {
@@ -62,7 +61,7 @@ impl TaskSource {
         let is_markdown = path
             .extension()
             .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"));
+            .is_some_and(|e| e.eq_ignore_ascii_case("md"));
         if !is_markdown {
             return None;
         }
@@ -210,13 +209,6 @@ mod tests {
                 stem: "README".to_string()
             })
         );
-        // .markdown extension is also accepted.
-        assert_eq!(
-            TaskSource::detect("Design.markdown"),
-            Some(TaskSource::PlainMarkdown {
-                stem: "Design".to_string()
-            })
-        );
     }
 
     #[test]
@@ -225,6 +217,8 @@ mod tests {
         assert_eq!(TaskSource::detect("Makefile"), None);
         assert_eq!(TaskSource::detect(".md"), None);
         assert_eq!(TaskSource::detect(""), None);
+        // Only `.md` — `.markdown` and other variants are not accepted.
+        assert_eq!(TaskSource::detect("Design.markdown"), None);
     }
 
     #[test]
