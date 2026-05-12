@@ -49,6 +49,10 @@ writes the file with the body from stdin. Direct file writes (and
 `taskmd next` + write-your-own) are discouraged because two callers
 using `next` can race and receive the same ID.
 
+If `taskmd` isn't on your PATH, `./dev.py taskmd …` runs the copy bundled
+in dev.py's env — e.g. `… | ./dev.py taskmd new --slug fix-login --priority p1`.
+Args are forwarded verbatim.
+
 Required flag: `--slug`. Required input: a non-empty task body on stdin.
 Optional: `--priority` (default `p2`), `--status` (default `ready`).
 

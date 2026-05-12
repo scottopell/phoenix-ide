@@ -2238,6 +2238,28 @@ def cmd_tasks_fix() -> bool:
     return True
 
 
+def cmd_taskmd(taskmd_args: list[str]) -> None:
+    """Passthrough to the `taskmd` CLI.
+
+    `taskmd` ships as a dependency of this script's uv env (see the inline
+    metadata up top), so the console script is on PATH whenever dev.py runs —
+    even though it isn't installed globally. This subcommand exposes it so the
+    AGENTS.md happy path (`taskmd new --slug … --priority …`, body on stdin)
+    works from any checkout without a separate install step. Args are forwarded
+    verbatim; stdin/stdout/stderr are inherited; run from the repo root so
+    taskmd auto-detects `tasks/` via its `_TEMPLATE.md` marker.
+    """
+    exe = shutil.which("taskmd")
+    if exe is None:
+        print(
+            "ERROR: `taskmd` is not on PATH. It's a dependency of dev.py's uv env, "
+            "so this shouldn't happen — try `uv sync` (or report it).",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    result = subprocess.run([exe, *taskmd_args], cwd=ROOT)
+    sys.exit(result.returncode)
+
 
 # =============================================================================
 # Production Commands
@@ -3700,6 +3722,14 @@ def cmd_lima_destroy():
 # =============================================================================
 
 def main():
+    # `taskmd` is a verbatim passthrough to the bundled taskmd CLI — intercept
+    # it before argparse so flags like `--version` / `--help` reach taskmd
+    # rather than dev.py's own parser (argparse.REMAINDER doesn't handle a
+    # leading optional cleanly).
+    if len(sys.argv) >= 2 and sys.argv[1] == "taskmd":
+        cmd_taskmd(sys.argv[2:])
+        return
+
     parser = argparse.ArgumentParser(prog="dev.py", description="Phoenix development tasks")
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -3787,6 +3817,14 @@ def main():
     tasks_sub = tasks_parser.add_subparsers(dest="tasks_command", required=True)
     tasks_sub.add_parser("validate", help="Validate task filenames and check for duplicate IDs")
     tasks_sub.add_parser("fix", help="Migrate legacy IDs and renumber duplicate task IDs")
+
+    # taskmd — passthrough to the bundled taskmd CLI (intercepted above before
+    # argparse runs; this entry exists only so it shows up in `./dev.py --help`)
+    sub.add_parser(
+        "taskmd",
+        help="Run the bundled taskmd CLI; all args forwarded (e.g. ./dev.py taskmd new --slug fix-x --priority p1)",
+        add_help=False,
+    )
 
     args = parser.parse_args()
 
