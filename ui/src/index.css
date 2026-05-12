@@ -2142,7 +2142,7 @@ pre:hover .copy-btn {
 
 .cancel-steering-btn:hover {
   color: var(--accent-red);
-  background: rgb(var(--accent-red-rgb, 220, 50, 47), 0.12);
+  background: rgb(220 50 47 / 12%);
 }
 
 /* Steering-queued message bubble: muted appearance */
@@ -2809,7 +2809,7 @@ pre:hover .copy-btn {
   gap: 8px;
   width: 100%;
   padding: 10px 14px;
-  background: rgb(var(--accent-yellow-rgb, 234, 179, 8), 0.1);
+  background: rgb(234 179 8 / 10%);
   border: none;
   color: inherit;
   font: inherit;
@@ -2818,7 +2818,7 @@ pre:hover .copy-btn {
 }
 
 .context-exhausted-header:hover {
-  background: rgb(var(--accent-yellow-rgb, 234, 179, 8), 0.15);
+  background: rgb(234 179 8 / 15%);
 }
 
 .context-exhausted-banner--expanded .context-exhausted-header {
