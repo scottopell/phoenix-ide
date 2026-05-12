@@ -282,8 +282,9 @@ markdown shown to the user as the plan.
 **On Approved — `Effect::ApproveTask` (executor, in `spawn_blocking`, serialized by a
 process-global approval mutex):**
 
-1. Resolve `base_branch` (the conversation's `desired_base_branch` if set, else the
-   current `HEAD` of the conversation's cwd) and `git fetch origin {base_branch}`
+1. Resolve `base_branch` — the conversation's `desired_base_branch` if recorded, else
+   the main checkout's `HEAD` via `repo_root` (*not* `cwd`'s HEAD: `cwd` is the early
+   worktree on a `task-pending-…` temp branch) — and `git fetch origin {base_branch}`
    single-branch, best-effort (REQ-PROJ-022).
 2. Classify via `TaskSource`. **taskmd filename:** parse → `task_id`, `priority`,
    `status`, `slug` (no ID allocation — the metadata is in the filename); task branch =
@@ -291,16 +292,16 @@ process-global approval mutex):**
    `task-{sanitized-stem}-{conv-id[..8]}` (the conv-id suffix uniquifies — the approval
    mutex serializes but does not uniquify); the recorded `task_id` is the sanitized
    stem; there is no status segment, so no rename happens (step 3).
-3. Locate `.phoenix/worktrees/{conv-id}/`. **Early-worktree path (REQ-PROJ-028, the
-   normal Managed flow):** the conversation's cwd already *is* that worktree on a temp
-   branch. Rename the temp branch in place to the task branch, rename a taskmd file to
-   `...-in-progress--{slug}.md` if it isn't already in-progress (plain-markdown: no
-   rename), `git add` + `git commit -m "task {task_id}: {title}"` on the task branch (a
-   taskmd file is staged at `{tasks_dir}/...`, a plain brief at its own path).
-   **Fallback path** (no pre-created worktree, e.g. a conversation that referenced an
-   existing file from the main checkout): transplant the file into a freshly created
-   worktree on the new branch off `base_branch` and commit it there; only then remove
-   the cwd copy.
+3. Open the early Explore worktree at `.phoenix/worktrees/{conv-id}/` (REQ-PROJ-028 —
+   it was created by `ManagedWorktreeOnFirstMessage`, so it always exists by approval
+   time; if it's somehow missing, approval fails with a "reject and re-propose" error
+   rather than nesting a new worktree). `cwd` *is* that worktree, on a temp branch with
+   the task file already in place. Rename the temp branch in place to the task branch,
+   rename a taskmd file to `...-in-progress--{slug}.md` if it isn't already in-progress
+   (plain-markdown: no rename), `git add` + `git commit -m "task {task_id}: {title}"` on
+   the task branch — a taskmd file staged at `{tasks_dir}/...`, a plain brief at its own
+   path; the commit is skipped if nothing was staged (the file was already on the branch
+   inherited from base and not modified).
 4. Ensure `.phoenix/worktrees/` is in the worktree's `.gitignore`.
 5. Update `conv_mode` to `Work { worktree_path, branch_name, base_branch, task_id,
    task_title }`.

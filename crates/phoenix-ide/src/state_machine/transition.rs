@@ -129,26 +129,39 @@ fn resolve_task_file(
         }
     }
 
-    // The lexical `..` check above doesn't catch a symlink that points outside
-    // the worktree. Canonicalize and verify the resolved path stays under
-    // `cwd` — otherwise the approval UI could show a plan from outside the
-    // worktree (and `git add` of a path through a symlink fails anyway).
-    let abs_canon = cwd.join(rel_path).canonicalize().map_err(|e| {
+    let abs_path = cwd.join(rel_path);
+    let meta = abs_path.symlink_metadata().map_err(|e| {
         format!(
             "Failed to read task file '{task_file}': {e}. \
              Create the file in your working directory before calling propose_task."
         )
     })?;
+    // The task file must be a plain regular file: a symlink would show the
+    // target's contents in the approval reader but `git add <task_file>` would
+    // stage the *link*, so the committed plan wouldn't match what was reviewed
+    // (and a symlink could also point outside the worktree).
+    if !meta.file_type().is_file() {
+        return Err(format!(
+            "task_file '{task_file}' must be a regular file — not a symlink, directory, \
+             or special file."
+        ));
+    }
+    // Belt-and-suspenders against an intermediate symlink in the path that
+    // escapes the worktree (the lexical `..` check doesn't catch those):
+    // resolve everything and confirm it stays under `cwd`.
+    let abs_canon = abs_path
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve task file '{task_file}': {e}"))?;
     let cwd_canon = cwd
         .canonicalize()
         .map_err(|e| format!("Failed to resolve the working directory: {e}"))?;
     if !abs_canon.starts_with(&cwd_canon) {
         return Err(format!(
-            "task_file '{task_file}' resolves outside your working directory (a symlink?). \
+            "task_file '{task_file}' resolves outside your working directory. \
              The task file must be a real file inside the worktree."
         ));
     }
-    let body = std::fs::read_to_string(&abs_canon)
+    let body = std::fs::read_to_string(&abs_path)
         .map_err(|e| format!("Failed to read task file '{task_file}': {e}"))?;
 
     let title = source.title(&body);
@@ -3914,13 +3927,32 @@ mod resolve_task_file_tests {
 
     #[test]
     #[cfg(unix)]
-    fn symlink_escaping_the_worktree_is_rejected() {
+    fn symlink_task_file_is_rejected() {
         let tmp = TempDir::new().unwrap();
         let outside = TempDir::new().unwrap();
         std::fs::write(outside.path().join("secret.md"), "# Secret\n").unwrap();
         std::os::unix::fs::symlink(outside.path().join("secret.md"), tmp.path().join("link.md"))
             .unwrap();
         let err = resolve_task_file(tmp.path(), "tasks", "link.md").unwrap_err();
-        assert!(err.contains("outside your working directory"), "got: {err}");
+        assert!(err.contains("must be a regular file"), "got: {err}");
+        // Also a symlink to a file *inside* the worktree (committed plan would
+        // be the link, not the target the reader showed).
+        std::fs::write(tmp.path().join("real.md"), "# Real\n").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("real.md"), tmp.path().join("inner-link.md"))
+            .unwrap();
+        let err = resolve_task_file(tmp.path(), "tasks", "inner-link.md").unwrap_err();
+        assert!(err.contains("must be a regular file"), "got: {err}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn intermediate_symlink_escaping_the_worktree_is_rejected() {
+        let tmp = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        std::fs::write(outside.path().join("plan.md"), "# Outside plan\n").unwrap();
+        // `escape/` inside the worktree is a symlink to the outside dir.
+        std::os::unix::fs::symlink(outside.path(), tmp.path().join("escape")).unwrap();
+        let err = resolve_task_file(tmp.path(), "tasks", "escape/plan.md").unwrap_err();
+        assert!(err.contains("resolves outside"), "got: {err}");
     }
 }

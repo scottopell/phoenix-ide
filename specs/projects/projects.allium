@@ -511,34 +511,33 @@ rule TaskApprovalExecuted {
         --   1. Parse id/priority/status/slug from the on-disk filename.
         --   2. Single-branch fetch of base_branch, best-effort (REQ-PROJ-022).
         --   3. Rename branch in place: `git branch -m <temp-name> <task-branch>`.
-        --   4. Rename the task file to ...-in-progress--<slug>.md if needed.
-        --   5. `git add` + `git commit` the task file on the task branch.
+        --   4. Rename the task file to ...-in-progress--<slug>.md if needed
+        --      (staging the old name's deletion too, so the commit is a rename).
+        --   5. `git add` + `git commit` on the task branch (skipped if nothing
+        --      is staged — e.g. reusing an existing already-in-progress file
+        --      that wasn't modified).
         --   6. Transition Explore -> Work (permission upgrade).
         --
         -- Sequence (plain-markdown brief — `crate::task_source::TaskSource`
-        -- routes here when the filename doesn't parse as taskmd; this path
-        -- handles only the early-worktree case):
+        -- routes here when the filename doesn't parse as taskmd):
         --   1. Sanitize the file stem; branch = `task-<stem>-<conv-id[..8]>`.
         --   2. Single-branch fetch of base_branch, best-effort.
         --   3. Rename branch in place to that branch name.
         --   4. (no status rename — a plain brief has no status segment)
-        --   5. `git add <task_file>` + `git commit` at the file's own path.
+        --   5. `git add <task_file>` + `git commit` at the file's own path
+        --      (skipped if nothing is staged — e.g. the file was already on
+        --      the branch, inherited from base, and not modified).
         --   6. Transition Explore -> Work. Recorded task_id = the stem.
         --
-        -- The worktree and base_branch were set by
-        -- ManagedWorktreeOnFirstMessage; this rule never creates a new
-        -- worktree. The taskmd path additionally carries a legacy fallback
-        -- for a conversation that referenced an existing task file from the
-        -- repo-root checkout (no pre-created worktree) — it creates the
-        -- worktree off base_branch and transplants the file there. The
-        -- plain-markdown path has no such fallback (plain briefs are new in
-        -- task 13009, so there are no legacy plain-markdown conversations):
-        -- if the early worktree is missing the approval fails with a clear
-        -- "reject and re-propose" message.
+        -- Both paths handle only the early-worktree case: the worktree (and
+        -- base_branch) were set by ManagedWorktreeOnFirstMessage, so by the
+        -- time approval runs the worktree always exists; this rule never
+        -- creates a new worktree. If it is somehow missing, approval fails
+        -- with a clear "reject and re-propose" message rather than nesting a
+        -- new worktree.
         --
-        -- Rollback: worktree-commit failure (taskmd fallback) removes the
-        -- worktree/branch and leaves the cwd copy of the file in place;
-        -- branch-rename failure keeps the temp name and logs a warning.
+        -- Rollback: branch-rename failure keeps the temp name and logs a
+        -- warning; a failed commit leaves the index/worktree as-is.
 }
 
 -- REQ-PROJ-004 propose/feedback/reject loop: no git operations. Until
