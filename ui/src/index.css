@@ -105,6 +105,7 @@
 
 html {
   height: 100%;
+  transition: background-color 0.2s ease, color 0.2s ease;
 }
 
 body {
@@ -424,6 +425,9 @@ body {
   margin-bottom: 8px;
   cursor: pointer;
   transition: background 0.15s;
+  position: relative;
+  display: flex;
+  flex-direction: column;
 }
 
 .conv-item:hover {
@@ -638,16 +642,13 @@ body {
   transition: box-shadow 0.3s ease;
 }
 
-.message.breadcrumb-highlight {
-  box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgb(88 166 255 / 30%);
-}
-
 @keyframes breadcrumb-pulse {
   0%, 100% { box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgb(88 166 255 / 30%); }
   50% { box-shadow: 0 0 0 3px var(--accent-blue), 0 0 24px rgb(88 166 255 / 50%); }
 }
 
 .message.breadcrumb-highlight {
+  box-shadow: 0 0 0 2px var(--accent-blue), 0 0 16px rgb(88 166 255 / 30%);
   animation: breadcrumb-pulse 0.75s ease-in-out 2;
 }
 
@@ -681,10 +682,6 @@ body {
   letter-spacing: normal;
   color: var(--text-muted);
   opacity: 0.7;
-}
-
-.message-status {
-  margin-left: auto;
 }
 
 .message-content {
@@ -916,6 +913,7 @@ body {
   background: var(--bg-tertiary);
   border-bottom: 1px solid var(--border-color);
   font-size: 12px;
+  position: relative;
 }
 
 .tool-block-name {
@@ -957,6 +955,7 @@ body {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   line-height: 1.35;
+  position: relative;
 }
 
 .tool-block-input.multiline {
@@ -1075,6 +1074,7 @@ body {
   max-height: 300px;
   overflow-y: auto;
   line-height: 1.35;
+  position: relative;
 }
 
 /* Short output (no collapse header) */
@@ -1192,17 +1192,9 @@ body {
 }
 
 /* Copy button positioning in tool blocks */
-.tool-block-header {
-  position: relative;
-}
-
 .tool-block-header .copy-btn {
   margin-left: auto;
   margin-right: 4px;
-}
-
-.tool-block-input {
-  position: relative;
 }
 
 .tool-block-input .copy-btn {
@@ -1219,10 +1211,6 @@ body {
 
 .tool-block-output-header .copy-btn {
   margin-left: auto;
-}
-
-.tool-block-output-content {
-  position: relative;
 }
 
 .tool-block-output-content .copy-btn {
@@ -1671,7 +1659,7 @@ pre:hover .copy-btn {
 
 .modal-actions {
   display: flex;
-  gap: 8px;
+  gap: 12px;
   justify-content: flex-end;
   margin-top: 16px;
 }
@@ -1785,6 +1773,8 @@ pre:hover .copy-btn {
 
 .subagent-item.completed {
   background: rgb(63 185 80 / 10%);
+  flex-direction: column;
+  align-items: stretch;
 }
 
 .subagent-item.completed.error {
@@ -1838,11 +1828,6 @@ pre:hover .copy-btn {
 }
 
 /* Completed sub-agent with expandable result */
-.subagent-item.completed {
-  flex-direction: column;
-  align-items: stretch;
-}
-
 .subagent-item-header {
   display: flex;
   align-items: center;
@@ -2035,16 +2020,18 @@ pre:hover .copy-btn {
   100% { transform: scale(1); }
 }
 
-/* Offline Banner */
+/* Offline banner - minimal top bar */
 .offline-banner {
   flex: 0 0 auto;
-  background: var(--accent-red);
-  color: white;
-  padding: 8px 16px;
+  background: var(--accent-yellow);
+  color: #000;
+  padding: 6px 16px;
   display: flex;
   align-items: center;
   gap: 8px;
-  font-size: 14px;
+  font-size: 12px;
+  font-weight: 500;
+  text-align: center;
   animation: slide-down 0.2s ease-out;
 }
 
@@ -2086,6 +2073,7 @@ pre:hover .copy-btn {
 
 /* Message Status Indicators */
 .message-status {
+  margin-left: auto;
   font-size: 14px;
   text-transform: none;
   letter-spacing: normal;
@@ -3252,10 +3240,6 @@ pre:hover .copy-btn {
 }
 
 /* Smooth theme transition */
-html {
-  transition: background-color 0.2s ease, color 0.2s ease;
-}
-
 html * {
   transition: background-color 0.2s ease, border-color 0.2s ease;
 }
@@ -3333,12 +3317,6 @@ html * {
 }
 
 /* Conversation Item Actions */
-.conv-item {
-  position: relative;
-  display: flex;
-  flex-direction: column;
-}
-
 .conv-item-main {
   display: flex;
   flex-direction: column;
@@ -3455,12 +3433,14 @@ html * {
   border: none;
   color: var(--accent-blue);
   cursor: pointer;
-  font-size: 13px;
   padding: 0;
+  font-size: inherit;
+  font-family: inherit;
+  text-decoration: underline;
 }
 
 .btn-link:hover {
-  text-decoration: underline;
+  text-decoration: none;
 }
 
 /* Confirm Dialog */
@@ -3498,12 +3478,6 @@ html * {
 .chain-delete-final {
   font-weight: 500;
   color: var(--text-primary);
-}
-
-.modal-actions {
-  display: flex;
-  gap: 12px;
-  justify-content: flex-end;
 }
 
 .btn-danger {
@@ -3563,16 +3537,6 @@ html * {
 }
 
 /* Status header styles */
-
-/* Offline banner - minimal top bar */
-.offline-banner {
-  padding: 6px 16px;
-  text-align: center;
-  font-size: 12px;
-  font-weight: 500;
-  background: var(--accent-yellow);
-  color: #000;
-}
 
 /* Pull-to-refresh indicator */
 .pull-refresh-indicator {
@@ -9171,21 +9135,6 @@ html * {
 .chain-qa-failure-label {
   color: var(--accent-red);
   font-weight: 600;
-}
-
-.btn-link {
-  background: none;
-  border: none;
-  color: var(--accent-blue);
-  cursor: pointer;
-  padding: 0;
-  font-size: inherit;
-  font-family: inherit;
-  text-decoration: underline;
-}
-
-.btn-link:hover {
-  text-decoration: none;
 }
 
 .chain-qa-meta {
