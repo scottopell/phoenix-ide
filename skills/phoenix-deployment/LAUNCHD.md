@@ -12,13 +12,13 @@ Applies when: macOS. This is the only macOS production mode — `./dev.py prod d
 | Logs | `~/.phoenix-ide/prod.log` (stdout + stderr) |
 | launchd label | `com.phoenix-ide.server` |
 | plist | `~/Library/LaunchAgents/com.phoenix-ide.server.plist` |
-| Log rotation | `/etc/newsyslog.d/com.phoenix-ide.server.conf` (copy-truncate, 14 MB) |
+| Log rotation | `/etc/newsyslog.d/com.phoenix-ide.server.conf` — daily at 00:00, 14 generations, bzip2, copy-truncate (no size threshold) |
 
 The binary is ad-hoc codesigned (`codesign --sign -`) on each deploy so the OS will run it.
 
 ## LLM config
 
-Place an env file at `~/.phoenix-ide/.phoenix-ide.env`. If it provides LLM config (e.g. `ANTHROPIC_API_KEY` / `api_key_helper`), that wins. Otherwise the deploy auto-detects a local LLM gateway, mirroring dev mode.
+`./dev.py prod deploy` reads `.phoenix-ide.env` from the **repo root** of the checkout you deploy from (via `_load_env_file`) and bakes those vars into the launchd plist. If it provides LLM config (`LLM_API_KEY_HELPER`, `LLM_GATEWAY`, or `ANTHROPIC_API_KEY`), that wins. Otherwise the deploy auto-detects a local LLM gateway, mirroring dev mode.
 
 ## Environment overrides
 

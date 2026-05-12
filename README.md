@@ -1,6 +1,60 @@
 # Phoenix IDE
 
-LLM-powered coding agent. Rust backend, React frontend, self-hosted.
+Web based, self-hosted LLM-powered coding agent.
+
+Forking encouraged, make your own personal IDE that matches _your_ workflow.
+
+Self hosted means you can poke it when it breaks.
+All data is stored in a single local sqlite db.
+
+Server/client architecture from day 1 means you can run the API half on a remote
+coding VM and access from anywhere!
+
+## Quick Start - LLM Access
+
+Supported Options:
+- API Keys -> `ANTHROPIC_API_KEY`
+- Paid ChatGPT / Codex -> in-app login!
+    - "We want people to be able to use Codex, and their ChatGPT subscription,
+      wherever they like!" - [from OpenAI themselves](https://x.com/romainhuet/status/2038699202834841962)
+    - Browser and device code supported.
+- LLM API GATEWAY -> `ANTHROPIC/OPENAI_BASE_URL`
+
+See the env var section for more details (or point your preferred coding agent
+at the repo)
+
+## Quick Start - Run it
+
+
+```bash
+# Start everything (backend build + frontend dev server)
+./dev.py up
+
+# Other lifecycle commands
+./dev.py down        # stop services
+./dev.py restart     # restart services
+./dev.py status      # show running state
+./dev.py check       # pre-commit checks (fmt, clippy, tests)
+
+# Optional: run the dev backend over HTTPS with h2 ALPN enabled
+./dev.py up --https
+```
+
+
+### Single-shot CLI
+
+```bash
+# Runs via uv — no manual dependency install needed
+./phoenix-client.py -d /tmp "Create hello.txt with 'Hello World'"
+./phoenix-client.py -c <conversation-slug> "Now modify it"
+```
+
+## Architecture
+
+Rust backend serves the API and, in production, embeds the React frontend via `rust-embed`.
+SQLite persists conversations and messages. A bedrock state machine drives the conversation
+lifecycle (Idle → Processing → ToolExecuting → …). Tools are modular and LLM-invokable.
+Multi-provider LLM support routes through either the Anthropic API or an exe.dev gateway.
 
 ## Philosophy
 
@@ -21,37 +75,6 @@ tab close. The server restarts to a known-good state.
 clearly without wasting visual elements. Status is shown inline with
 symbols and color, not buried in separate screens or modals. Progressive
 disclosure: essentials visible by default, details on demand.
-
-## Quick Start
-
-```bash
-# Start everything (backend build + frontend dev server)
-./dev.py up
-
-# Other lifecycle commands
-./dev.py down        # stop services
-./dev.py restart     # restart services
-./dev.py status      # show running state
-./dev.py check       # pre-commit checks (fmt, clippy, tests)
-
-# Optional: run the dev backend over HTTPS with h2 ALPN enabled
-./dev.py up --https
-```
-
-### Single-shot CLI
-
-```bash
-# Runs via uv — no manual dependency install needed
-./phoenix-client.py -d /tmp "Create hello.txt with 'Hello World'"
-./phoenix-client.py -c <conversation-slug> "Now modify it"
-```
-
-## Architecture
-
-Rust backend serves the API and, in production, embeds the React frontend via `rust-embed`.
-SQLite persists conversations and messages. A bedrock state machine drives the conversation
-lifecycle (Idle → Processing → ToolExecuting → …). Tools are modular and LLM-invokable.
-Multi-provider LLM support routes through either the Anthropic API or an exe.dev gateway.
 
 ## Tools
 
@@ -75,8 +98,10 @@ Multi-provider LLM support routes through either the Anthropic API or an exe.dev
 
 ## Production Deployment
 
+Designed to be run as a background service, it exposes an HTTP api and
+
 ```bash
-./dev.py prod deploy   # build release + deploy (launchd on macOS, systemd on Linux)
+./dev.py prod deploy   # build release + deploy (launchd on macOS; systemd, or daemon mode if no systemd, on Linux)
 ./dev.py prod status   # check running production instance
 ./dev.py prod stop     # stop production instance
 ```
@@ -129,7 +154,7 @@ https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-x
 
 Everything Phoenix reads. The server reads its config from the environment at
 startup; `./dev.py` and the production deploy paths populate most of these for
-you (dev mode auto-detects an LLM gateway; prod reads `~/.phoenix-ide/.phoenix-ide.env`).
+you (dev mode auto-detects an LLM gateway; prod reads `.phoenix-ide.env` from the repo root of the checkout you deploy from).
 
 ### Core server
 
