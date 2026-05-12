@@ -2627,11 +2627,8 @@ def native_prod_deploy(version: str | None = None):
     if env_file_loaded:
         print(f"  Loaded env from {env_file_loaded}")
 
-    # Auto-detect gateway only if env file didn't provide LLM config (mirrors launchd).
-    if env_overrides.get("LLM_API_KEY_HELPER") or env_overrides.get("LLM_GATEWAY"):
-        gateway = None
-    else:
-        gateway = get_llm_gateway()
+    # Auto-detect gateway only if the env file didn't already provide LLM config (mirrors launchd).
+    gateway = None if _env_provides_llm_config(env_overrides) else get_llm_gateway()
 
     env_file_path = _install_prod_env_file(env_overrides, service_user)
     if env_file_path:
@@ -2802,6 +2799,16 @@ def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> s
             if key and sep:
                 env[key.strip()] = value.strip().replace("\\n", "\n")
     return str(env_file)
+
+
+def _env_provides_llm_config(env: dict[str, str]) -> bool:
+    """True if `env` already specifies how to reach an LLM, so the deploy paths
+    should not auto-detect and inject a local gateway. Counts a credential
+    helper, an explicit gateway, or a direct provider API key."""
+    return any(
+        env.get(k)
+        for k in ("LLM_API_KEY_HELPER", "LLM_GATEWAY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY")
+    )
 
 
 def _configure_llm_env(env: dict[str, str]) -> str:
@@ -3333,10 +3340,8 @@ def launchd_prod_deploy(version: str | None = None):
     if env_file:
         print(f"  Loaded env from {env_file}")
 
-    # Auto-detect gateway only if env file didn't provide LLM config
-    gateway = None
-    if not env_overrides.get("LLM_API_KEY_HELPER") and not env_overrides.get("LLM_GATEWAY"):
-        gateway = get_llm_gateway()
+    # Auto-detect gateway only if the env file didn't already provide LLM config
+    gateway = None if _env_provides_llm_config(env_overrides) else get_llm_gateway()
 
     # Generate and write plist
     plist_content = generate_launchd_plist(version, gateway, env_overrides)

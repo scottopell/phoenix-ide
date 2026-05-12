@@ -13,12 +13,12 @@ coding VM and access from anywhere!
 ## Quick Start - LLM Access
 
 Supported Options:
-- API Keys -> `ANTHROPIC_API_KEY`
+- API keys -> `ANTHROPIC_API_KEY` and/or `OPENAI_API_KEY`
 - Paid ChatGPT / Codex -> in-app login!
     - "We want people to be able to use Codex, and their ChatGPT subscription,
       wherever they like!" - [from OpenAI themselves](https://x.com/romainhuet/status/2038699202834841962)
     - Browser and device code supported.
-- LLM API GATEWAY -> `ANTHROPIC/OPENAI_BASE_URL`
+- LLM gateway / custom endpoint -> `LLM_GATEWAY`, or `ANTHROPIC_BASE_URL` / `OPENAI_BASE_URL`
 
 See the env var section for more details (or point your preferred coding agent
 at the repo)
@@ -54,7 +54,7 @@ at the repo)
 Rust backend serves the API and, in production, embeds the React frontend via `rust-embed`.
 SQLite persists conversations and messages. A bedrock state machine drives the conversation
 lifecycle (Idle → Processing → ToolExecuting → …). Tools are modular and LLM-invokable.
-Multi-provider LLM support routes through either the Anthropic API or an exe.dev gateway.
+Multi-provider LLM support: the Anthropic and OpenAI APIs, a ChatGPT/Codex bridge, or an LLM gateway.
 
 ## Philosophy
 
@@ -82,8 +82,8 @@ disclosure: essentials visible by default, details on demand.
 |------|-------------|------|
 | bash | Shell command execution with timeout, truncation, background mode | [spec](specs/bash/executive.md) |
 | patch | Structured file editing — create, modify, delete with fuzzy matching | [spec](specs/patch/executive.md) |
-| read_file | Read a file (or a line range) from the working directory | — |
-| search | grep + glob over the working directory (ripgrep-style) | — |
+| read_file | Read a file, or a line range of one (any path the server process can access) | — |
+| search | grep + glob over a directory tree, ripgrep-style (any path the server process can access) | — |
 | keyword_search | Semantic code search using LLM-filtered results | [spec](specs/keyword_search/executive.md) |
 | think | Reasoning scratchpad with zero side effects | [spec](specs/think/executive.md) |
 | browser (`browser_*`) | Headless browser — navigate, eval JS, screenshot, click/type/keypress, resize, console logs | [spec](specs/browser-tool/executive.md) |
@@ -98,7 +98,7 @@ disclosure: essentials visible by default, details on demand.
 
 ## Production Deployment
 
-Designed to be run as a background service, it exposes an HTTP api and
+Designed to run as a background service: a single static binary that serves the HTTP API with the React UI embedded.
 
 ```bash
 ./dev.py prod deploy   # build release + deploy (launchd on macOS; systemd, or daemon mode if no systemd, on Linux)
