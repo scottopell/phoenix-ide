@@ -1623,6 +1623,16 @@ def cmd_check():
             'fi'
         )])
 
+    def lane_ui_lint():
+        """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
+
+        Both run on the same source tree and need no build artifact, so
+        bundling them into one thread avoids spending a parallel slot on
+        a sub-second stylelint pass. Each emits its own result entry.
+        """
+        run_step("eslint", ["pnpm", "run", "lint"], UI_DIR)
+        run_step("stylelint", ["pnpm", "run", "lint:css"], UI_DIR)
+
     def lane_fast():
         """Fast lane: cargo fmt then task validation."""
         run_step("cargo fmt", ["cargo", "fmt", "--check"])
@@ -1895,7 +1905,7 @@ def cmd_check():
         # uses. Project references + exactOptionalPropertyTypes only fire
         # under `-b`; bare `pnpm exec tsc --noEmit` silently misses them.
         threading.Thread(target=run_step, args=("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR)),
-        threading.Thread(target=run_step, args=("eslint", ["pnpm", "run", "lint"], UI_DIR)),
+        threading.Thread(target=lane_ui_lint),
         threading.Thread(target=run_step, args=("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
         threading.Thread(target=lane_fast),
         threading.Thread(target=check_ast_grep),
