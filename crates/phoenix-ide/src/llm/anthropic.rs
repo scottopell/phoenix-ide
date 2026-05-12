@@ -95,6 +95,7 @@ impl StreamAccumulator {
                     .and_then(serde_json::Value::as_u64)
                     .unwrap_or(self.output_tokens);
             }
+            "error" => return Err(parse_anthropic_sse_error(&v)),
             "message_stop" => self.done = true,
             _ => {} // "ping" and unknown events ignored
         }
@@ -294,6 +295,28 @@ impl StreamAccumulator {
             },
             diagnostics,
         )
+    }
+}
+
+fn parse_anthropic_sse_error(v: &serde_json::Value) -> LlmError {
+    let error_type = v
+        .pointer("/error/type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("error");
+    let message = v
+        .pointer("/error/message")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Anthropic stream error");
+    let detail = format!("Anthropic {error_type}: {message}");
+
+    match error_type {
+        "overloaded_error" => LlmError::server_overloaded(
+            "Anthropic is overloaded for this model. Try a different model or retry later.",
+        ),
+        "rate_limit_error" => LlmError::rate_limit(detail),
+        "authentication_error" | "permission_error" => LlmError::auth(detail),
+        "invalid_request_error" => LlmError::invalid_request(detail),
+        _ => LlmError::server_error(detail),
     }
 }
 
@@ -1176,6 +1199,26 @@ mod tests {
                 .any(|t| t.get("type").and_then(|v| v.as_str()) == Some(TOOL_SEARCH_VARIANT)),
             "tool_search entry should not be present when supports_tool_search is false"
         );
+    }
+
+    #[test]
+    fn test_streaming_error_event_overloaded_maps_to_server_overloaded() {
+        let mut acc = StreamAccumulator::new();
+        let (chunk_tx, _chunk_rx) = tokio::sync::broadcast::channel(1);
+        let err = acc
+            .process_event(
+                "error",
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"},"request_id":"req_test"}"#,
+                &chunk_tx,
+            )
+            .unwrap_err();
+
+        assert_eq!(err.kind, crate::llm::LlmErrorKind::ServerOverloaded);
+        assert!(
+            !err.kind.is_retryable(),
+            "overloaded Anthropic SSE errors should not be retried as empty responses"
+        );
+        assert!(err.message.contains("overloaded"));
     }
 
     #[test]
