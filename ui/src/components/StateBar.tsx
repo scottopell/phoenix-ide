@@ -121,6 +121,7 @@ function unavailablePrHint(reason: PrStatusResponse['unavailable_reason']): stri
   switch (reason) {
     case 'gh_missing': return 'gh missing';
     case 'not_authenticated': return 'gh auth';
+    case 'not_git_repo': return 'no worktree';
     case 'command_failed': return 'PR status unavailable';
     default: return null;
   }
@@ -363,8 +364,10 @@ export function StateBar({
   const prHint = prStatus && !prStatus.found ? unavailablePrHint(prStatus.unavailable_reason) : null;
 
   useEffect(() => {
+    // Drop the previous conversation's PR status immediately so the badge/hint
+    // never shows stale data while the new fetch is in flight.
+    setPrStatus(null);
     if (!conversation?.id || !branchName) {
-      setPrStatus(null);
       setPrLoading(false);
       return;
     }

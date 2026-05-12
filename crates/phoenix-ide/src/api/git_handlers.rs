@@ -433,7 +433,7 @@ fn get_pr_status_for_branch(cwd: &std::path::Path, branch_name: &str) -> PrStatu
 
 fn fetch_pr_checks_state(cwd: &std::path::Path, number: u64) -> PrCheckState {
     let number = number.to_string();
-    let output = match run_gh(
+    let out = match run_gh_raw(
         cwd,
         &[
             "pr",
@@ -444,17 +444,25 @@ fn fetch_pr_checks_state(cwd: &std::path::Path, number: u64) -> PrCheckState {
             "--watch=false",
         ],
     ) {
-        Ok(output) => output,
+        Ok(out) => out,
         Err(e) => {
-            tracing::debug!(pr = %number, error = %e.message, "gh pr checks failed");
+            tracing::debug!(pr = %number, error = %e.message, "gh pr checks could not run");
             return PrCheckState::Unknown;
         }
     };
 
-    match serde_json::from_str::<Vec<GhPrCheck>>(&output) {
+    // `gh pr checks` exits non-zero when checks are failing (1) or pending (8) but still
+    // emits the JSON we need to classify them — so we key off the parsed output, not the
+    // exit code. Only a usage/auth error (empty or non-JSON stdout) yields `Unknown`.
+    let stdout = out.stdout.trim();
+    if stdout.is_empty() {
+        tracing::debug!(pr = %number, stderr = %out.stderr.trim(), "gh pr checks produced no output");
+        return PrCheckState::Unknown;
+    }
+    match serde_json::from_str::<Vec<GhPrCheck>>(stdout) {
         Ok(checks) => normalize_checks(&checks),
         Err(e) => {
-            tracing::debug!(pr = %number, output = %output, error = %e, "failed to parse gh pr checks JSON");
+            tracing::debug!(pr = %number, output = %stdout, error = %e, "failed to parse gh pr checks JSON");
             PrCheckState::Unknown
         }
     }
@@ -466,7 +474,16 @@ struct GhError {
     message: String,
 }
 
-fn run_gh(cwd: &std::path::Path, args: &[&str]) -> Result<String, GhError> {
+struct GhOutput {
+    status: std::process::ExitStatus,
+    stdout: String,
+    stderr: String,
+}
+
+/// Run `gh` with an 8s timeout, returning the exit status and captured output.
+/// `Err` only on spawn failure or timeout — a non-zero exit is still `Ok` so the
+/// caller can decide (some `gh` subcommands exit non-zero but still emit useful JSON).
+fn run_gh_raw(cwd: &std::path::Path, args: &[&str]) -> Result<GhOutput, GhError> {
     use std::io::Read;
     use std::process::{Command, Stdio};
     use std::time::Instant;
@@ -524,14 +541,25 @@ fn run_gh(cwd: &std::path::Path, args: &[&str]) -> Result<String, GhError> {
         std::thread::sleep(Duration::from_millis(50));
     };
 
-    let stdout = stdout_h.join().unwrap_or_default();
-    let stderr = stderr_h.join().unwrap_or_default();
+    Ok(GhOutput {
+        status,
+        stdout: String::from_utf8_lossy(&stdout_h.join().unwrap_or_default())
+            .trim()
+            .to_string(),
+        stderr: String::from_utf8_lossy(&stderr_h.join().unwrap_or_default())
+            .trim()
+            .to_string(),
+    })
+}
 
-    if status.success() {
-        Ok(String::from_utf8_lossy(&stdout).trim().to_string())
+/// Run `gh` expecting success; maps a non-zero exit to a typed `GhError`
+/// (auth vs generic failure) and returns trimmed stdout on success.
+fn run_gh(cwd: &std::path::Path, args: &[&str]) -> Result<String, GhError> {
+    let out = run_gh_raw(cwd, args)?;
+    if out.status.success() {
+        Ok(out.stdout)
     } else {
-        let stderr = String::from_utf8_lossy(&stderr).trim().to_string();
-        let lower = stderr.to_lowercase();
+        let lower = out.stderr.to_lowercase();
         let reason = if lower.contains("not logged")
             || lower.contains("not authenticated")
             || lower.contains("authentication")
@@ -543,7 +571,7 @@ fn run_gh(cwd: &std::path::Path, args: &[&str]) -> Result<String, GhError> {
         };
         Err(GhError {
             reason,
-            message: format!("gh {} failed: {stderr}", args.join(" ")),
+            message: format!("gh {} failed: {}", args.join(" "), out.stderr),
         })
     }
 }

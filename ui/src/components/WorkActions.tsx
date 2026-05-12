@@ -52,23 +52,34 @@ export function WorkActions({
   }, [phaseType]);
 
   useEffect(() => {
-    // New conversation/branch → require a fresh explicit opt-in for the
-    // gh-unavailable manual fallback; it must not leak across conversations.
+    // New conversation/branch → drop the previous one's PR status so the
+    // cleanup affordance never reflects a stale PR, and require a fresh
+    // explicit opt-in for the gh-unavailable manual fallback.
+    setPrStatus(null);
     setManualFallback(false);
     if (!branchName || (convModeLabel !== 'Work' && convModeLabel !== 'Branch')) {
-      setPrStatus(null);
       return;
     }
     let cancelled = false;
-    api.getPrStatus(conversationId)
-      .then(status => {
-        if (cancelled) return;
-        setPrStatus(status);
-        // gh became available again → drop any stale manual-fallback opt-in.
-        if (!status.unavailable_reason) setManualFallback(false);
-      })
-      .catch(() => { if (!cancelled) setPrStatus({ found: false, unavailable_reason: 'command_failed' }); });
-    return () => { cancelled = true; };
+    const fetchStatus = () => {
+      api.getPrStatus(conversationId)
+        .then(status => {
+          if (cancelled) return;
+          setPrStatus(status);
+          // gh became available again → drop any stale manual-fallback opt-in.
+          if (!status.unavailable_reason) setManualFallback(false);
+        })
+        .catch(() => { if (!cancelled) setPrStatus({ found: false, unavailable_reason: 'command_failed' }); });
+    };
+    fetchStatus();
+    // Re-fetch when the tab regains focus so a merge done elsewhere unsticks
+    // the cleanup button without a page reload.
+    const onVisible = () => { if (document.visibilityState === 'visible') fetchStatus(); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      cancelled = true;
+      document.removeEventListener('visibilitychange', onVisible);
+    };
   }, [conversationId, branchName, convModeLabel]);
 
   const isBranch = convModeLabel === 'Branch';

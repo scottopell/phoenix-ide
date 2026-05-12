@@ -142,10 +142,18 @@ AND suggest breaking into smaller patches
 
 ### REQ-PATCH-009: Mode-Based Availability
 
-WHEN conversation is in Explore mode
-THE SYSTEM SHALL disable the patch tool entirely
-AND return error: "Patch tool is unavailable in Explore mode. Use `propose_task` to
-propose work that requires file edits."
+WHEN conversation is in Explore mode (Managed workflow)
+THE SYSTEM SHALL provide the patch tool restricted to the project's tasks directory
+  (typically `tasks/`, discovered per-project — see task 13008) so the agent can draft a
+  task file before calling `propose_task`
+AND reject a patch operation targeting any path outside that directory
+AND return a descriptive error identifying the out-of-scope path and pointing at
+  `propose_task` for work that requires editing source files
+
+WHEN conversation is in Direct mode, or in a sub-agent's Explore context (which has no
+  worktree of its own)
+THE SYSTEM SHALL NOT register the patch tool's task-dir-restricted variant — Direct mode
+  gets the full unscoped patch tool, and Explore sub-agents get no patch tool at all
 
 WHEN conversation is in Work mode
 THE SYSTEM SHALL enable full patch tool functionality
@@ -155,7 +163,9 @@ WHEN a patch operation targets a path outside the worktree directory
 THE SYSTEM SHALL reject the operation
 AND return a descriptive error identifying the out-of-scope path
 
-**Rationale:** The patch tool writes files and must be disabled in Explore mode where
-conversations are read-only. When enabled in Work mode, writes are scoped to the
-conversation's isolated worktree — a conversation cannot use patch to modify the main
-branch directly or another conversation's worktree.
+**Rationale:** Explore mode is read-only for *source* files, but the agent still needs to
+write the task file it proposes — so the patch tool is present in Explore, allowlisted to
+the tasks directory only (REQ-PROJ-003). Out-of-scope writes are rejected with a clear
+error. In Work mode the allowlist widens to the conversation's isolated worktree — a
+conversation cannot use patch to modify the main checkout or another conversation's
+worktree.
