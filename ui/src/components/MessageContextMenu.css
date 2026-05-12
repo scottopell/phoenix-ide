@@ -6,7 +6,7 @@
   border: 1px solid var(--border-color);
   border-radius: 6px;
   padding: 4px 0;
-  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 4px 16px rgb(0 0 0 / 30%);
   font-size: 12px;
 }
 

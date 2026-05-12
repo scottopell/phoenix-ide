@@ -20,6 +20,7 @@
   cursor: pointer;
   user-select: none;
   transition: background 150ms ease;
+
   /* Keep header visible during browser auto-scroll on sibling expand.
    * Task 13002. */
   scroll-margin-top: 8px;
@@ -213,7 +214,7 @@
   align-items: center;
   gap: 6px;
   padding: 6px 12px;
-  background: var(--color-warning-bg, rgba(255, 193, 7, 0.12));
+  background: var(--color-warning-bg, rgb(255 193 7 / 12%));
   border-bottom: 1px solid var(--border-color);
   font-size: 12px;
 }

@@ -20,6 +20,7 @@
   cursor: pointer;
   user-select: none;
   transition: background 150ms ease;
+
   /* If a sibling expand pushes this header during browser auto-scroll,
    * leave a small margin so the click target stays in view. Task 13002. */
   scroll-margin-top: 8px;
