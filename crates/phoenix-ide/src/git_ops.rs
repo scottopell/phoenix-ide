@@ -305,14 +305,12 @@ pub(crate) fn materialize_branch(cwd: &Path, branch_name: &str) -> Result<(), Gi
 /// Returns `"origin/<base>"` when the remote-tracking ref exists, falling
 /// back to bare `"<base>"` for local-only repos with no remote.
 ///
-/// Diff comparisons in this codebase (abandon snapshot, commits-ahead/behind,
-/// the conversation diff endpoint) historically used bare `<base>`. The local
-/// ref is only fast-forwarded at lifecycle events via `materialize_branch`;
-/// the periodic 1-minute fetch loop in `stream_conversation` keeps
-/// `origin/<base>` fresh but does NOT re-materialize the local ref. So bare
+/// Diff comparisons in this codebase (abandon snapshot, the conversation
+/// diff endpoint) historically used bare `<base>`. The local ref is only
+/// fast-forwarded at lifecycle events via `materialize_branch`, so bare
 /// `<base>` drifts stale for any task that lives across upstream advances.
 /// Routing all diff-comparison call sites through this helper makes them
-/// prefer the already-fresh remote-tracking ref.
+/// prefer the remote-tracking ref when one exists.
 pub(crate) fn effective_base_ref(cwd: &Path, base_branch: &str) -> String {
     let remote = format!("origin/{base_branch}");
     if run_git(cwd, &["rev-parse", "--verify", &remote]).is_ok() {

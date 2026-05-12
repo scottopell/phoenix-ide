@@ -225,7 +225,8 @@ pub enum ConvMode {
         /// Absolute path to the git worktree for this conversation.
         worktree_path: NonEmptyString,
         /// The branch that was checked out when the task was approved (e.g., `main`).
-        /// Used as the merge target for Complete and the restore target for Abandon.
+        /// Used as the diff comparator (View diff, abandon snapshot) and the
+        /// PR base the agent is told to target.
         base_branch: NonEmptyString,
         /// The task ID assigned at approval time (e.g., "YF042").
         /// Used to locate and update the task file in `tasks/`.
@@ -302,7 +303,6 @@ impl ConvMode {
     }
 
     /// The task ID if in Work mode, None otherwise. Branch mode has no task.
-    #[allow(dead_code)] // Used by M4 Complete/Abandon flows (task 0604)
     pub fn task_id(&self) -> Option<&str> {
         match self {
             Self::Work { task_id, .. } => Some(task_id.as_str()),
