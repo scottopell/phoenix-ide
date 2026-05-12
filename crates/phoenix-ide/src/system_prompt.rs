@@ -560,14 +560,24 @@ pub fn build_system_prompt_with_options(
         prompt.push_str("</available_skills>");
     }
 
-    // Add worktree grounding when working_dir is inside a .phoenix/worktrees/ path
-    if let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(working_dir) {
-        let _ = write!(
-            prompt,
-            "\n\nYou are working in a git worktree. Your working directory is the worktree, \
-             not the main checkout at {}. Stay grounded here for file operations.",
-            repo_root.display()
-        );
+    // Worktree grounding when cwd is inside .phoenix/worktrees/. The Work and
+    // Branch mode blocks below already state the worktree boundary (with the
+    // concrete path), so only emit the generic note when no such block will —
+    // i.e. for Explore (REQ-PROJ-028 gives Explore conversations a worktree
+    // too) and the no-mode case.
+    let mode_states_worktree_boundary = matches!(
+        mode,
+        Some(ModeContext::Work { .. } | ModeContext::Branch { .. })
+    );
+    if !mode_states_worktree_boundary {
+        if let Some(repo_root) = crate::git_ops::repo_root_from_phoenix_worktree(working_dir) {
+            let _ = write!(
+                prompt,
+                "\n\nYou are working in a git worktree. Your working directory is the worktree, \
+                 not the main checkout at {}. Stay grounded here for file operations.",
+                repo_root.display()
+            );
+        }
     }
 
     // Add mode context so the agent understands its capabilities
