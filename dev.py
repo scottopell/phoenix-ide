@@ -1666,8 +1666,15 @@ def cmd_check():
         if not rule_files:
             return
         for rule_file in rule_files:
+            # A rule file declares its target language; Rust rules scan
+            # `crates/`, everything else scans `ui/src/`.
+            try:
+                rule_text = rule_file.read_text()
+            except OSError:
+                rule_text = ""
+            scan_target = "crates/" if "language: rust" in rule_text else "ui/src/"
             run_step(f"ast-grep:{rule_file.stem[:14]}", [
-                "ast-grep", "scan", "--rule", str(rule_file), "ui/src/",
+                "ast-grep", "scan", "--rule", str(rule_file), scan_target,
             ])
 
     def check_allium():
