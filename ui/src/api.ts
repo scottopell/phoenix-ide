@@ -174,14 +174,14 @@ export type ConversationState =
 
 /** Derive the coarse display category from a conversation's raw state type string.
  *  Internal fallback — prefer `getConvDisplayState` which reads `presentation_mode`. */
-function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval' {
+function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting-approval' {
   switch (stateType) {
     case 'idle': return 'idle';
     case 'terminal': return 'terminal';
     case 'error': return 'error';
     case 'context_exhausted': return 'idle';
-    case 'awaiting_task_approval': return 'awaiting_approval';
-    case 'awaiting_user_response': return 'awaiting_approval';
+    case 'awaiting_task_approval': return 'awaiting-approval';
+    case 'awaiting_user_response': return 'awaiting-approval';
     default: return stateType ? 'working' : 'idle';
   }
 }
@@ -189,11 +189,11 @@ function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'e
 /** Derive the coarse display category for a conversation.
  *  Reads `presentation_mode` from the server when available; falls back to
  *  `state.type` for SSE-only views that may not have received a REST snapshot. */
-export function getConvDisplayState(conv: Conversation | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting_approval' {
+export function getConvDisplayState(conv: Conversation | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting-approval' {
   switch (conv?.presentation_mode) {
     case 'idle': return 'idle';
     case 'working': return 'working';
-    case 'needs_action': return 'awaiting_approval';
+    case 'needs_action': return 'awaiting-approval';
     case 'error': return 'error';
     case 'done': return 'terminal';
     default: return getDisplayState(conv?.state?.type);

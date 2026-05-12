@@ -96,7 +96,7 @@ export const ConversationRow = memo(function ConversationRow({
       case 'working': return 'Working';
       case 'error': return 'Error';
       case 'terminal': return 'Completed';
-      case 'awaiting_approval': return 'Awaiting approval';
+      case 'awaiting-approval': return 'Awaiting approval';
     }
   })();
 

@@ -756,7 +756,7 @@ function TmuxResponseView({ response }: { response: Record<string, unknown> }) {
   return (
     <div className="tmux-response">
       <div className="tmux-response-header">
-        <span className={`tmux-status tmux-status-${status}`}>{status}</span>
+        <span className={`tmux-status tmux-status-${status.replace(/_/g, '-')}`}>{status}</span>
         {exitCode !== undefined && exitCode !== null && (
           <span className="tmux-exit-code">exit code {String(exitCode)}</span>
         )}

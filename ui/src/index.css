@@ -208,9 +208,17 @@ body {
 
 .dot.idle { background: var(--accent-green); }
 .dot.terminal { background: var(--text-muted); }
-.dot.working { background: var(--accent-yellow); animation: pulse 1.5s infinite; }
+
+.dot.working {
+  background: var(--accent-yellow);
+  animation: pulse 1.5s infinite;
+}
 .dot.error { background: var(--accent-red); }
-.dot.connecting { background: var(--text-muted); animation: pulse 1s infinite; }
+
+.dot.connecting {
+  background: var(--text-muted);
+  animation: pulse 1s infinite;
+}
 
 @keyframes pulse {
   0%, 100% { opacity: 1; }
@@ -265,6 +273,7 @@ body {
   border-radius: 4px;
   cursor: pointer;
   flex-shrink: 0;
+  position: relative;
 }
 
 .breadcrumb-item:hover {
@@ -291,10 +300,6 @@ body {
 }
 
 /* Breadcrumb tooltip */
-.breadcrumb-item {
-  position: relative;
-}
-
 .breadcrumb-tooltip {
   position: fixed;
   bottom: calc(var(--breadcrumb-height) + 24px);
@@ -357,7 +362,7 @@ body {
   color: var(--text-secondary);
   overflow: hidden;
   text-overflow: ellipsis;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   line-height: 1.4;
 }
 
@@ -471,7 +476,7 @@ body {
   background: var(--text-muted, #6b7280);
 }
 
-.conv-state-dot.awaiting_approval {
+.conv-state-dot.awaiting-approval {
   background: var(--accent-purple, #7c3aed);
 }
 
@@ -544,8 +549,15 @@ body {
 }
 
 @keyframes jump-btn-fade-in {
-  from { opacity: 0; transform: translateX(-50%) translateY(8px); }
-  to { opacity: 1; transform: translateX(-50%) translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
 }
 
 #messages {
@@ -612,7 +624,7 @@ body {
   color: var(--text-primary);
   background: var(--bg-secondary);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   max-height: 60vh;
   overflow-y: auto;
   border-top: 1px solid var(--border-color);
@@ -943,7 +955,7 @@ body {
   font-size: 13px;
   color: var(--text-primary);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   line-height: 1.35;
 }
 
@@ -1058,7 +1070,7 @@ body {
   font-family: var(--font-mono);
   font-size: 13px;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   color: var(--text-secondary);
   max-height: 300px;
   overflow-y: auto;
@@ -1132,7 +1144,7 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   font-size: 13px;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   line-height: 1.5;
   color: var(--text-secondary);
   border-left: 2px solid var(--border-color);
@@ -1397,14 +1409,9 @@ pre:hover .copy-btn {
   gap: 16px;
 }
 
-/* Fade in animation for content after skeleton */
-@keyframes fadeIn {
-  from { opacity: 0; }
-  to { opacity: 1; }
-}
-
+/* Fade in animation for content after skeleton — shares @keyframes fade-in defined below */
 .skeleton-loaded {
-  animation: fadeIn 0.2s ease-out;
+  animation: fade-in 0.2s ease-out;
 }
 
 /* Input Area */
@@ -1860,7 +1867,7 @@ pre:hover .copy-btn {
   padding-left: 30px;
   line-height: 1.4;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .subagent-result.expanded {
@@ -4148,7 +4155,11 @@ html * {
   transition: opacity 0.15s, color 0.15s, background-color 0.15s;
   z-index: 1;
 }
-.annotatable:hover > .annotatable__btn { opacity: 1; pointer-events: auto; }
+
+.annotatable:hover > .annotatable__btn {
+  opacity: 1;
+  pointer-events: auto;
+}
 
 .annotatable__btn:hover {
   color: var(--accent-blue);
@@ -4159,7 +4170,10 @@ html * {
 @media (hover: none) { .annotatable__btn { display: none; } }
 
 /* === View-specific layout (compose with .annotatable) === */
-.prose-line { display: flex; min-height: 24px; }
+.prose-line {
+  display: flex;
+  min-height: 24px;
+}
 
 .prose-line__number {
   width: 48px;
@@ -5661,7 +5675,7 @@ html * {
   font-size: 13px;
   color: var(--text-error-details, #d4a5a5);
   line-height: 1.4;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 /* Action bar — mirrors #input-area bottom bar */
@@ -6413,8 +6427,15 @@ html * {
 }
 
 @keyframes iac-in {
-  from { opacity: 0; transform: translateY(4px); }
-  to   { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* Header row: trigger prefix + hint */
@@ -7646,8 +7667,15 @@ html * {
 }
 
 @keyframes commit-modal-slide-in {
-  from { transform: translateY(8px); opacity: 0; }
-  to { transform: translateY(0); opacity: 1; }
+  from {
+    transform: translateY(8px);
+    opacity: 0;
+  }
+
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
 }
 
 .commit-modal-title {
@@ -8439,8 +8467,15 @@ html * {
 }
 
 @keyframes terminal-hint-tooltip-fade {
-  from { opacity: 0; transform: translateY(2px); }
-  to   { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
 
 /* Rich HUD (OSC 133 detected) — inline spans inside .terminal-panel-prompt */
@@ -8971,7 +9006,7 @@ html * {
 
 .chain-qa-pair-question {
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   line-height: 1.55;
 }
 
@@ -8991,7 +9026,7 @@ html * {
   color: var(--text-primary);
   line-height: 1.55;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 /* When the answer is rendered through ReactMarkdown the children are real
@@ -9005,7 +9040,10 @@ html * {
 .chain-qa-markdown p:last-child { margin-bottom: 0; }
 
 .chain-qa-markdown ul,
-.chain-qa-markdown ol { margin: 0 0 0.6em; padding-left: 1.4em; }
+.chain-qa-markdown ol {
+  margin: 0 0 0.6em;
+  padding-left: 1.4em;
+}
 .chain-qa-markdown li { margin: 0.15em 0; }
 
 .chain-qa-markdown h1,
@@ -9042,7 +9080,12 @@ html * {
   font-size: 12px;
   line-height: 1.45;
 }
-.chain-qa-markdown pre code { background: transparent; padding: 0; font-size: inherit; }
+
+.chain-qa-markdown pre code {
+  background: transparent;
+  padding: 0;
+  font-size: inherit;
+}
 
 .chain-qa-markdown blockquote {
   margin: 0.4em 0;
@@ -9115,7 +9158,7 @@ html * {
   color: var(--text-muted);
   font-size: 13px;
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .chain-qa-failure {
@@ -9479,7 +9522,7 @@ html * {
   font-size: 13px;
   color: var(--text-primary);
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
 }
 
 .notes-panel-actions {
@@ -9728,7 +9771,7 @@ html * {
 
 /* Pending kill / timed-out: amber (attention). */
 .bash-status-kill-pending-kernel,
-.tmux-status-timed_out {
+.tmux-status-timed-out {
   background: color-mix(in srgb, var(--accent-yellow, #d69e2e) 22%, var(--bg-secondary));
   color: var(--accent-yellow, #d69e2e);
 }
@@ -9804,7 +9847,7 @@ html * {
 .bash-lines,
 .tmux-stream-content {
   white-space: pre-wrap;
-  word-break: break-word;
+  overflow-wrap: anywhere;
   margin: 4px 0;
   padding: 6px 8px;
   background: var(--code-bg);

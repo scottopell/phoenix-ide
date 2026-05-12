@@ -92,12 +92,12 @@
 /* Single question content area */
 .question-wizard-content {
   padding: 8px 16px 12px;
-  animation: wizardFadeIn 150ms ease-out;
+  animation: wizard-fade-in 150ms ease-out;
   overflow-y: auto;
   min-height: 0;
 }
 
-@keyframes wizardFadeIn {
+@keyframes wizard-fade-in {
   from {
     opacity: 0;
     transform: translateX(8px);
@@ -510,14 +510,14 @@
 .question-feedback {
   font-size: 13px;
   color: var(--accent-green);
-  animation: questionFeedbackIn 0.2s ease-out;
+  animation: question-feedback-in 0.2s ease-out;
 }
 
 .question-feedback--error {
   color: var(--accent-red);
 }
 
-@keyframes questionFeedbackIn {
+@keyframes question-feedback-in {
   from {
     opacity: 0;
     transform: translateY(4px);

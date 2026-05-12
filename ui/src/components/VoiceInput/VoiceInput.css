@@ -305,7 +305,7 @@
 }
 
 /* High contrast mode support */
-@media (prefers-contrast: high) {
+@media (prefers-contrast: more) {
   .voice-btn--listening {
     background: var(--accent-red);
     color: white;
