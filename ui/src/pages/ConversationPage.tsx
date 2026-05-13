@@ -775,7 +775,22 @@ function ConversationPageContent() {
       const sourceLabel = conversation?.terminal_uses_tmux
         ? 'From tmux pane `main:0.0`'
         : 'From terminal';
-      const fenced = `${sourceLabel}${cwdHint}:\n\`\`\`\n${trimmed}\n\`\`\``;
+      // Fence length must exceed the longest backtick run in the selection
+      // (CommonMark §4.5) so output containing literal triple-backticks —
+      // markdown snippets, AI tool transcripts — doesn't close the fence
+      // early.
+      let longestRun = 0;
+      let run = 0;
+      for (let i = 0; i < trimmed.length; i++) {
+        if (trimmed.charCodeAt(i) === 0x60 /* ` */) {
+          run += 1;
+          if (run > longestRun) longestRun = run;
+        } else {
+          run = 0;
+        }
+      }
+      const fence = '`'.repeat(Math.max(3, longestRun + 1));
+      const fenced = `${sourceLabel}${cwdHint}:\n${fence}\n${trimmed}\n${fence}`;
       if (inputRef.current) {
         inputRef.current.appendToDraft(fenced);
         inputRef.current.focus();
@@ -790,7 +805,7 @@ function ConversationPageContent() {
         }
       }
     },
-    [conversationId, conversation?.cwd]
+    [conversationId, conversation?.cwd, conversation?.terminal_uses_tmux]
   );
 
   const handleSendNotes = useCallback(
