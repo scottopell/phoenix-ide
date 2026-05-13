@@ -1264,16 +1264,26 @@ impl RuntimeManager {
         let storage = DatabaseStorage::new(self.db.clone());
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
 
-        // Use appropriate tool registry based on sub-agent status and conversation mode.
-        // Sub-agents get a restricted tool set (no MCP, no spawn_agents) -- they only
-        // have SubmitResult/SubmitError for completion signaling.
+        // Tool registry selection -- sub-agents get a restricted tool set
+        // (no spawn_agents, no ask_user_question, no skill); parent
+        // conversations get the mode-appropriate registry. Both layers wrap
+        // their registry with `with_mcp` so MCP tool defs resolve live from
+        // the manager on every `definitions()` call.
         let tool_executor = if is_sub_agent {
-            // Resumed sub-agents default to Explore registry (mode not persisted).
-            // This is a rare path -- sub-agents don't normally survive restarts.
-            ToolRegistryExecutor::with_mcp(
-                ToolRegistry::for_subagent_explore(),
-                self.mcp_manager.clone(),
-            )
+            // Resumed sub-agents inherit their persisted `conv_mode` so a
+            // Work sub-agent does not lose write capability across a runtime
+            // re-creation (e.g. model-upgrade eviction). Sub-agents don't
+            // normally survive server restart; the alignment matters for
+            // in-process re-creation. See subagents.allium
+            // `SubAgentRegistryOnResume`.
+            use crate::db::ConvMode;
+            let registry = match conv.conv_mode {
+                ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                    ToolRegistry::for_subagent_work()
+                }
+                ConvMode::Explore { .. } | ConvMode::Direct => ToolRegistry::for_subagent_explore(),
+            };
+            ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone())
         } else {
             use crate::db::ConvMode;
             let registry = match conv.conv_mode {
@@ -1293,8 +1303,6 @@ impl RuntimeManager {
                     ToolRegistry::direct()
                 }
             };
-            // MCP tools resolved live from the manager on every definitions()
-            // call -- enable/disable and reload take effect immediately.
             ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone())
         };
 
