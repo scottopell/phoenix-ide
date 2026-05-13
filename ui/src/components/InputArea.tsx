@@ -30,6 +30,7 @@ import { fuzzyMatch } from './CommandPalette/fuzzyMatch';
 export interface InputAreaHandle {
   appendToDraft: (text: string) => void;
   setDraft: (text: string) => void;
+  focus: () => void;
 }
 
 interface InputAreaProps {
@@ -83,6 +84,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     },
     setDraft: (text: string) => {
       setDraft(text);
+    },
+    focus: () => {
+      textareaRef.current?.focus();
     },
   }), [draft, setDraft]);
 

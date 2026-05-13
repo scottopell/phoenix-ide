@@ -77,6 +77,13 @@ function readXtermTheme(): ITheme {
     background: get('--terminal-bg', '#1a1a1a'),
     foreground: get('--terminal-fg', '#d4d4d4'),
     cursor: get('--terminal-cursor', '#d4d4d4'),
+    // Without these, xterm.js falls back to a translucent white that's
+    // invisible against the light-mode terminal background (#f6f8fa).
+    selectionBackground: get('--terminal-selection-bg', '#3a3d41'),
+    selectionInactiveBackground: get(
+      '--terminal-selection-inactive-bg',
+      '#2a2d31',
+    ),
   };
 }
 
@@ -108,6 +115,13 @@ interface TerminalPanelProps {
    *  assist-setup path so the user knows the click failed instead of
    *  silently re-enabling the button. REQ-TPANEL-006 / REQ-NOTIF-002. */
   showError?: (message: string, duration?: number) => void;
+  /**
+   * Fired on Cmd/Ctrl+Shift+L when the terminal has focus AND a non-empty
+   * selection exists. The raw selected text is passed up — the caller is
+   * responsible for fencing it and inserting it into the message composer
+   * (task 02672). Empty-selection presses are silently no-op'd here.
+   */
+  onSendSelectionToDraft?: (selection: string) => void;
 }
 
 type ActivityState = 'idle' | 'running' | 'disconnected';
@@ -240,6 +254,7 @@ export function TerminalPanel({
   homeDir,
   onAssistSetup,
   showError,
+  onSendSelectionToDraft,
 }: TerminalPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -248,6 +263,11 @@ export function TerminalPanel({
   const statusRef = useRef<HTMLDivElement>(null);
   const collapsedRef = useRef(collapsed);
   collapsedRef.current = collapsed;
+
+  // Mirror the selection-callback prop so the mount-time key handler always
+  // sees the latest closure without re-registering on every parent re-render.
+  const onSendSelectionToDraftRef = useRef(onSendSelectionToDraft);
+  onSendSelectionToDraftRef.current = onSendSelectionToDraft;
 
   // Fallback (sampler) HUD state
   const [activity, setActivity] = useState<ActivityState>('disconnected');
@@ -362,6 +382,31 @@ export function TerminalPanel({
     }
     termRef.current = term;
     fitAddonRef.current = fitAddon;
+
+    // Cmd/Ctrl+Shift+L: send the current terminal selection up to the
+    // message composer (task 02672). Empty selection → silent no-op.
+    // Returning `false` from the custom handler tells xterm.js to skip
+    // its own processing of the event; preventDefault stops the browser
+    // default (some browsers focus the URL bar on Cmd+L). The shortcut
+    // works regardless of OSC 133 status or whether a command is running,
+    // and works identically whether the PTY child is a direct shell or
+    // `tmux attach` — xterm.js owns the DOM selection in both cases.
+    term.attachCustomKeyEventHandler((e) => {
+      if (e.type !== 'keydown') return true;
+      const isSendSelection =
+        e.shiftKey &&
+        (e.metaKey || e.ctrlKey) &&
+        !e.altKey &&
+        (e.key === 'L' || e.key === 'l');
+      if (!isSendSelection) return true;
+      e.preventDefault();
+      const cb = onSendSelectionToDraftRef.current;
+      if (cb && term.hasSelection()) {
+        const sel = term.getSelection();
+        if (sel.length > 0) cb(sel);
+      }
+      return false;
+    });
 
     // --- OSC 133 / OSC 7 handlers (REQ-TERM-015/016/018) ---
     // Register before WS opens so even bytes arriving in the very first

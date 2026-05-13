@@ -754,6 +754,37 @@ function ConversationPageContent() {
     fileExplorer.closeFile();
   }, [fileExplorer]);
 
+  // Task 02672: terminal selection → composer draft.
+  // TerminalPanel fires this when the user presses Cmd/Ctrl+Shift+L with
+  // text selected. We fence the selection so it stays distinguishable from
+  // the user's in-flight prose, prefix it with a `From terminal` label that
+  // hints at the source (cwd if known), append to the existing draft (never
+  // replace), and focus the composer so the user can immediately type a
+  // follow-up question.
+  const handleSendTerminalSelection = useCallback(
+    (selection: string) => {
+      if (!selection) return;
+      const trimmed = selection.replace(/\s+$/u, '');
+      if (!trimmed) return;
+      const cwdHint = conversation?.cwd ? ` (cwd: \`${conversation.cwd}\`)` : '';
+      const fenced = `From terminal${cwdHint}:\n\`\`\`\n${trimmed}\n\`\`\``;
+      if (inputRef.current) {
+        inputRef.current.appendToDraft(fenced);
+        inputRef.current.focus();
+      } else if (conversationId) {
+        const key = `phoenix:draft:${conversationId}`;
+        try {
+          const existing = localStorage.getItem(key) ?? '';
+          const next = existing.trim() ? existing + '\n\n' + fenced : fenced;
+          localStorage.setItem(key, next);
+        } catch (e) {
+          console.warn('Failed to save terminal selection to draft:', e);
+        }
+      }
+    },
+    [conversationId, conversation?.cwd]
+  );
+
   const handleSendNotes = useCallback(
     (formattedNotes: string) => {
       if (inputRef.current) {
@@ -1253,6 +1284,7 @@ function ConversationPageContent() {
               homeDir={conversation.home_dir ?? undefined}
               onAssistSetup={handleAssistShellSetup}
               showError={showError}
+              onSendSelectionToDraft={handleSendTerminalSelection}
             />
           </Suspense>
         </>

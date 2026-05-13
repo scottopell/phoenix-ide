@@ -75,6 +75,8 @@
   --terminal-border: #333;
   --terminal-fg: #e6edf3;
   --terminal-cursor: #e6edf3;
+  --terminal-selection-bg: #3a3d41;
+  --terminal-selection-inactive-bg: #2a2d31;
 }
 
 /* Light theme */
@@ -101,6 +103,8 @@
   --terminal-border: #d0d7de;
   --terminal-fg: #1f2328;
   --terminal-cursor: #1f2328;
+  --terminal-selection-bg: #add6ff;
+  --terminal-selection-inactive-bg: #d8e6f3;
 }
 
 html {
