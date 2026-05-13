@@ -2,8 +2,9 @@ import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen } from '@testing-library/react';
 import { useRef } from 'react';
 import { InputArea } from './InputArea';
+import { AgentMessage } from './MessageComponents';
 import type { InputAreaHandle } from './InputArea';
-import type { ConversationState, SkillEntry } from '../api';
+import type { ConversationState, Message, SkillEntry } from '../api';
 import { api } from '../api';
 
 const idleState: ConversationState = { type: 'idle' };
@@ -216,5 +217,80 @@ describe('InputArea focusToken contract', () => {
 
     fireEvent.click(screen.getByText('do-focus'));
     expect(document.activeElement).toBe(textarea);
+  });
+});
+
+function renderBashTool(input: Record<string, unknown>) {
+  const agentMessage: Message = {
+    message_id: `agent-${JSON.stringify(input)}`,
+    sequence_id: 1,
+    conversation_id: 'conv-bash',
+    message_type: 'agent',
+    content: [
+      {
+        type: 'tool_use',
+        id: 'tool-1',
+        name: 'bash',
+        input,
+      },
+    ],
+    created_at: '2026-01-01T00:00:00Z',
+  };
+
+  render(<AgentMessage message={agentMessage} toolResults={new Map()} />);
+}
+
+describe('bash tool rendering', () => {
+  it('renders modern bash handle operations from op and handle', () => {
+    renderBashTool({ op: 'peek', handle: 'b-13', lines: 20 });
+    expect(screen.getByText('peek b-13 · last 20 lines')).toBeInTheDocument();
+
+    renderBashTool({ op: 'wait', handle: 'b-13', wait_seconds: 60, since: 42 });
+    expect(screen.getByText('wait b-13 (up to 60s) · since 42')).toBeInTheDocument();
+
+    renderBashTool({ op: 'kill', handle: 'b-13', signal: 'KILL' });
+    expect(screen.getByText('kill b-13 (KILL)')).toBeInTheDocument();
+  });
+
+  it('renders malformed bash input as explicit JSON instead of placeholder text', () => {
+    renderBashTool({ bogus: true });
+
+    expect(screen.getByText('bash {"bogus":true}')).toBeInTheDocument();
+    expect(screen.queryByText('$ <bash>')).not.toBeInTheDocument();
+  });
+
+  it('does not render a peek draft mutation action for running output', () => {
+    const agentMessage: Message = {
+      message_id: 'agent-1',
+      sequence_id: 1,
+      conversation_id: 'conv-bash',
+      message_type: 'agent',
+      content: [
+        {
+          type: 'tool_use',
+          id: 'tool-1',
+          name: 'bash',
+          input: { op: 'run', cmd: 'sleep 100' },
+        },
+      ],
+      created_at: '2026-01-01T00:00:00Z',
+    };
+    const resultMessage: Message = {
+      message_id: 'tool-result-1',
+      sequence_id: 2,
+      conversation_id: 'conv-bash',
+      message_type: 'tool',
+      content: {
+        tool_use_id: 'tool-1',
+        content: JSON.stringify({ status: 'running', handle: 'b-1', lines: [] }),
+      },
+      created_at: '2026-01-01T00:00:01Z',
+    };
+
+    render(<AgentMessage message={agentMessage} toolResults={new Map([['tool-1', resultMessage]])} />);
+
+    expect(screen.getByText('running')).toBeInTheDocument();
+    expect(screen.getByText('b-1')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /peek/i })).not.toBeInTheDocument();
   });
 });

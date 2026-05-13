@@ -337,8 +337,12 @@ pub fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<
     for block in blocks {
         if let ContentBlock::ToolUse { id, name, input } = block {
             if name == "bash" {
-                if let Some(command) = input.get("command").and_then(|c| c.as_str()) {
-                    let display = display_command(command, &cwd_str);
+                let Ok(input) =
+                    serde_json::from_value::<crate::tools::BashToolInput>(input.clone())
+                else {
+                    continue;
+                };
+                if let Some(display) = bash_input_display(&input, &cwd_str) {
                     bash_displays.push(serde_json::json!({
                         "tool_use_id": id,
                         "display": display
@@ -352,5 +356,26 @@ pub fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<
         None
     } else {
         Some(serde_json::json!({ "bash": bash_displays }))
+    }
+}
+
+fn bash_input_display(input: &crate::tools::BashToolInput, cwd: &str) -> Option<String> {
+    match input.op {
+        crate::tools::BashOp::Run => input.cmd.as_deref().map(|cmd| display_command(cmd, cwd)),
+        crate::tools::BashOp::Peek => input
+            .handle
+            .as_deref()
+            .map(|handle| format!("peek {handle}")),
+        crate::tools::BashOp::Wait => input.handle.as_deref().map(|handle| {
+            let suffix = input
+                .wait_seconds
+                .map(|seconds| format!(" (up to {seconds}s)"))
+                .unwrap_or_default();
+            format!("wait {handle}{suffix}")
+        }),
+        crate::tools::BashOp::Kill => input.handle.as_deref().map(|handle| {
+            let signal = input.signal.as_deref().unwrap_or("TERM");
+            format!("kill {handle} ({signal})")
+        }),
     }
 }

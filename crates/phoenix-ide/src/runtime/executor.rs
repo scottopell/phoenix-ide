@@ -4252,7 +4252,7 @@ mod steer_drain_detector_tests {
     use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
     use crate::state_machine::event::SteerEntry;
     use crate::state_machine::state::{
-        AssistantMessage, BashInput, BashMode, PendingSubAgent, SubAgentMode, ToolCall, ToolInput,
+        AssistantMessage, PendingSubAgent, SubAgentMode, ToolCall, ToolInput,
     };
     use crate::state_machine::transition::TransitionResult;
     use crate::state_machine::ConvContext;
@@ -4276,10 +4276,7 @@ mod steer_drain_detector_tests {
         ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(BashInput {
-                    command: "echo hi".to_string(),
-                    mode: BashMode::Default,
-                }),
+                ToolInput::Bash(crate::tools::BashToolInput::run("echo hi")),
             ),
             remaining_tools: vec![],
             completed_results: vec![],

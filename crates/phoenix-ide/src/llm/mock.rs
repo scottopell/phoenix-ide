@@ -170,7 +170,8 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
                         id: tool_use_id(),
                         name: "bash".to_string(),
                         input: serde_json::json!({
-                            "command": "git status --short"
+                            "op": "run",
+                            "cmd": "git status --short"
                         }),
                     },
                 ],
@@ -234,14 +235,16 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
                         id: tool_use_id(),
                         name: "bash".to_string(),
                         input: serde_json::json!({
-                            "command": "ls -la src/"
+                            "op": "run",
+                            "cmd": "ls -la src/"
                         }),
                     },
                     ContentBlock::ToolUse {
                         id: tool_use_id(),
                         name: "bash".to_string(),
                         input: serde_json::json!({
-                            "command": "git log --oneline -5"
+                            "op": "run",
+                            "cmd": "git log --oneline -5"
                         }),
                     },
                 ],

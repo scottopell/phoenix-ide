@@ -2581,16 +2581,26 @@ mod tests {
     #[test]
     fn test_cancellation_produces_synthetic_results() {
         use crate::llm::ContentBlock;
-        use crate::state_machine::state::{
-            AssistantMessage, BashInput, BashMode, ToolCall, ToolInput,
-        };
+        use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
 
         // Build an AssistantMessage with 3 tool_use blocks matching the 3 tools
         let assistant_message = AssistantMessage::new(
             vec![
-                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({"command": "echo 1"})),
-                ContentBlock::tool_use("tool-2", "bash", serde_json::json!({"command": "echo 2"})),
-                ContentBlock::tool_use("tool-3", "bash", serde_json::json!({"command": "echo 3"})),
+                ContentBlock::tool_use(
+                    "tool-1",
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "echo 1"}),
+                ),
+                ContentBlock::tool_use(
+                    "tool-2",
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "echo 2"}),
+                ),
+                ContentBlock::tool_use(
+                    "tool-3",
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "echo 3"}),
+                ),
             ],
             None,
             None,
@@ -2600,25 +2610,16 @@ mod tests {
             &ConvState::ToolExecuting {
                 current_tool: ToolCall::new(
                     "tool-1",
-                    ToolInput::Bash(BashInput {
-                        command: "echo 1".to_string(),
-                        mode: BashMode::Default,
-                    }),
+                    ToolInput::Bash(crate::tools::BashToolInput::run("echo 1")),
                 ),
                 remaining_tools: vec![
                     ToolCall::new(
                         "tool-2",
-                        ToolInput::Bash(BashInput {
-                            command: "echo 2".to_string(),
-                            mode: BashMode::Default,
-                        }),
+                        ToolInput::Bash(crate::tools::BashToolInput::run("echo 2")),
                     ),
                     ToolCall::new(
                         "tool-3",
-                        ToolInput::Bash(BashInput {
-                            command: "echo 3".to_string(),
-                            mode: BashMode::Default,
-                        }),
+                        ToolInput::Bash(crate::tools::BashToolInput::run("echo 3")),
                     ),
                 ],
                 completed_results: vec![],
@@ -2795,16 +2796,13 @@ mod tests {
     #[test]
     fn test_parent_context_exhaustion_triggers_continuation() {
         use crate::llm::ContentBlock;
-        use crate::state_machine::state::{BashInput, BashMode, ToolCall, ToolInput};
+        use crate::state_machine::state::{ToolCall, ToolInput};
 
         let parent_ctx = test_context(); // Uses ThresholdBasedContinuation
 
         let tool_calls = vec![ToolCall::new(
             "tool-1",
-            ToolInput::Bash(BashInput {
-                command: "echo test".to_string(),
-                mode: BashMode::Default,
-            }),
+            ToolInput::Bash(crate::tools::BashToolInput::run("echo test")),
         )];
 
         let result = handle_context_exhaustion(
@@ -3164,16 +3162,13 @@ mod tests {
     #[test]
     fn test_ask_user_question_must_be_only_tool() {
         use crate::llm::{ContentBlock, Usage};
-        use crate::state_machine::state::{BashInput, BashMode, ToolInput};
+        use crate::state_machine::state::ToolInput;
 
         let ctx = test_context();
         let auq_tool = make_ask_user_question_tool_call("tool-auq-1");
         let bash_tool = ToolCall::new(
             "tool-bash-1",
-            ToolInput::Bash(BashInput {
-                command: "echo test".to_string(),
-                mode: BashMode::Default,
-            }),
+            ToolInput::Bash(crate::tools::BashToolInput::run("echo test")),
         );
 
         let result = transition(
@@ -3189,7 +3184,7 @@ mod tests {
                     ContentBlock::ToolUse {
                         id: "tool-bash-1".to_string(),
                         name: "bash".to_string(),
-                        input: serde_json::json!({"command": "echo test"}),
+                        input: serde_json::json!({"op": "run", "cmd": "echo test"}),
                     },
                 ],
                 tool_calls: vec![auq_tool, bash_tool],
@@ -3226,7 +3221,7 @@ mod tests {
     #[test]
     fn test_propose_task_must_be_only_tool() {
         use crate::llm::{ContentBlock, Usage};
-        use crate::state_machine::state::{BashInput, BashMode, ProposeTaskInput, ToolInput};
+        use crate::state_machine::state::{ProposeTaskInput, ToolInput};
 
         let ctx = test_context();
         let propose_tool = ToolCall::new(
@@ -3237,10 +3232,7 @@ mod tests {
         );
         let bash_tool = ToolCall::new(
             "tool-bash-1",
-            ToolInput::Bash(BashInput {
-                command: "echo test".to_string(),
-                mode: BashMode::Default,
-            }),
+            ToolInput::Bash(crate::tools::BashToolInput::run("echo test")),
         );
 
         let result = transition(
@@ -3260,7 +3252,7 @@ mod tests {
                     ContentBlock::ToolUse {
                         id: "tool-bash-1".to_string(),
                         name: "bash".to_string(),
-                        input: serde_json::json!({"command": "echo test"}),
+                        input: serde_json::json!({"op": "run", "cmd": "echo test"}),
                     },
                 ],
                 tool_calls: vec![propose_tool, bash_tool],
@@ -3461,17 +3453,12 @@ mod tests {
 
     #[test]
     fn user_trigger_continuation_in_tool_executing_is_absorbed() {
-        use crate::state_machine::state::{
-            AssistantMessage, BashInput, BashMode, ToolCall, ToolInput,
-        };
+        use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
 
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(BashInput {
-                    command: "echo".to_string(),
-                    mode: BashMode::Default,
-                }),
+                ToolInput::Bash(crate::tools::BashToolInput::run("echo")),
             ),
             remaining_tools: vec![],
             completed_results: vec![],
@@ -3739,17 +3726,12 @@ mod tests {
 
     #[test]
     fn steer_drained_from_tool_executing_rejected() {
-        use crate::state_machine::state::{
-            AssistantMessage, BashInput, BashMode, ToolCall, ToolInput,
-        };
+        use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
 
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(BashInput {
-                    command: "echo".to_string(),
-                    mode: BashMode::Default,
-                }),
+                ToolInput::Bash(crate::tools::BashToolInput::run("echo")),
             ),
             remaining_tools: vec![],
             completed_results: vec![],

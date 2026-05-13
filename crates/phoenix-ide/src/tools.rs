@@ -22,7 +22,8 @@ pub mod tmux;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
-    BashHandleError, BashHandleRegistry, BashTool, ConversationHandles as BashConversationHandles,
+    BashHandleError, BashHandleRegistry, BashOp, BashTool, BashToolInput,
+    ConversationHandles as BashConversationHandles,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,

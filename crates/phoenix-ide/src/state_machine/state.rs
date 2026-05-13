@@ -3,6 +3,7 @@
 use crate::db::{ErrorKind, ToolResult, UsageData};
 use crate::llm::ContentBlock;
 use crate::tools::patch::types::PatchInput;
+use crate::tools::BashToolInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -11,24 +12,6 @@ use std::time::Duration;
 // ============================================================================
 // Tool Input Types - Strongly typed inputs for each tool
 // ============================================================================
-
-/// Execution mode for bash commands
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum BashMode {
-    #[default]
-    Default,
-    Slow,
-    Background,
-}
-
-/// Input for the bash tool
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct BashInput {
-    pub command: String,
-    #[serde(default)]
-    pub mode: BashMode,
-}
 
 /// Input for the think tool
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,7 +124,7 @@ pub struct QuestionMetadata {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "_tool", rename_all = "snake_case")]
 pub enum ToolInput {
-    Bash(BashInput),
+    Bash(BashToolInput),
     Think(ThinkInput),
     Patch(PatchInput),
     KeywordSearch(KeywordSearchInput),

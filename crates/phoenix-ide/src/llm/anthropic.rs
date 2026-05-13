@@ -1290,7 +1290,7 @@ mod tests {
                 AnthropicContentBlock::ToolUse {
                     id: "toolu_xyz789".to_string(),
                     name: "bash".to_string(),
-                    input: serde_json::json!({"command": "ls"}),
+                    input: serde_json::json!({"op": "run", "cmd": "ls"}),
                 },
             ],
             stop_reason: Some("tool_use".to_string()),

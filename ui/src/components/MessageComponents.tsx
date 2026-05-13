@@ -19,6 +19,7 @@ import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import { api } from '../api';
 import type { Message, ContentBlock, ToolResultContent, ConversationState, PendingSubAgent, SubAgentResult } from '../api';
+import type { BashToolInput } from '../generated/sse';
 import { cacheDB } from '../cache';
 import type { QueuedMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
@@ -112,34 +113,72 @@ function cleanThoughts(raw: string): string {
   return text.trim();
 }
 
+function isBashToolInput(input: Record<string, unknown>): input is BashToolInput {
+  const op = input['op'];
+  if (op !== 'run' && op !== 'peek' && op !== 'wait' && op !== 'kill') return false;
+  if (input['cmd'] !== undefined && typeof input['cmd'] !== 'string') return false;
+  if (input['handle'] !== undefined && typeof input['handle'] !== 'string') return false;
+  if (input['label'] !== undefined && typeof input['label'] !== 'string') return false;
+  if (input['wait_seconds'] !== undefined && typeof input['wait_seconds'] !== 'number') return false;
+  if (input['signal'] !== undefined && typeof input['signal'] !== 'string') return false;
+  if (input['lines'] !== undefined && typeof input['lines'] !== 'number') return false;
+  if (input['since'] !== undefined && typeof input['since'] !== 'number') return false;
+  return true;
+}
+
+function readWindowSuffix(input: Pick<BashToolInput, 'lines' | 'since'>): string {
+  if (typeof input.lines === 'number') return ` · last ${input.lines} lines`;
+  if (typeof input.since === 'number') return ` · since ${input.since}`;
+  return '';
+}
+
+function formatModernBashInput(input: BashToolInput, displayOverride?: string): { display: string; isMultiline: boolean } {
+  switch (input.op) {
+    case 'run': {
+      const cmd = input.cmd || '';
+      if (!cmd) return { display: 'bash run <missing cmd>', isMultiline: false };
+      const displayCmd = displayOverride || cmd;
+      const waitSuffix = typeof input.wait_seconds === 'number' ? ` · wait ${input.wait_seconds}s` : '';
+      return { display: `$ ${displayCmd}${waitSuffix}${readWindowSuffix(input)}`, isMultiline: cmd.includes('\n') };
+    }
+    case 'peek': {
+      const handle = input.handle || '<missing handle>';
+      return { display: `peek ${handle}${readWindowSuffix(input)}`, isMultiline: false };
+    }
+    case 'wait': {
+      const handle = input.handle || '<missing handle>';
+      const waitSuffix = typeof input.wait_seconds === 'number' ? ` (up to ${input.wait_seconds}s)` : '';
+      return { display: `wait ${handle}${waitSuffix}${readWindowSuffix(input)}`, isMultiline: false };
+    }
+    case 'kill': {
+      const handle = input.handle || '<missing handle>';
+      const signal = input.signal || 'TERM';
+      return { display: `kill ${handle} (${signal})`, isMultiline: false };
+    }
+  }
+}
+
+function bashInputCopyText(input: Record<string, unknown>): string {
+  if (isBashToolInput(input)) {
+    if (input.op === 'run') return input.cmd || JSON.stringify(input);
+    return JSON.stringify(input);
+  }
+  return String(input['command'] || input['peek'] || input['wait'] || input['kill'] || JSON.stringify(input, null, 2));
+}
+
 function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): { display: string; isMultiline: boolean } {
   switch (name) {
     case 'bash': {
-      // Spawn: `cmd` is the new field; older messages used `command` (the
-      // bash tool still accepts both — task 02694's `RawBashInput::command`
-      // alias). Handle operations (peek/wait/kill) synthesize a label per
-      // REQ-BASH-015 so the user sees something meaningful instead of "$".
-      const cmd = String(input['cmd'] || input['command'] || '');
-      if (cmd) {
-        const displayCmd = displayOverride || cmd;
-        return { display: `$ ${displayCmd}`, isMultiline: cmd.includes('\n') };
+      if (isBashToolInput(input)) {
+        return formatModernBashInput(input, displayOverride);
       }
-      const peek = input['peek'];
-      if (typeof peek === 'string') {
-        return { display: `peek ${peek}`, isMultiline: false };
+      const legacyCommand = String(input['command'] || '');
+      if (legacyCommand) {
+        const displayCmd = displayOverride || legacyCommand;
+        return { display: `$ ${displayCmd}`, isMultiline: legacyCommand.includes('\n') };
       }
-      const wait = input['wait'];
-      if (typeof wait === 'string') {
-        const waitSeconds = input['wait_seconds'];
-        const suffix = typeof waitSeconds === 'number' ? ` (up to ${waitSeconds}s)` : '';
-        return { display: `wait ${wait}${suffix}`, isMultiline: false };
-      }
-      const kill = input['kill'];
-      if (typeof kill === 'string') {
-        const signal = typeof input['signal'] === 'string' ? String(input['signal']) : 'TERM';
-        return { display: `kill ${kill} (${signal})`, isMultiline: false };
-      }
-      return { display: '$ <bash>', isMultiline: false };
+      const legacyJson = JSON.stringify(input);
+      return { display: `bash ${legacyJson}`, isMultiline: false };
     }
     case 'tmux': {
       const args = (input['args'] as unknown[] | undefined) ?? [];
@@ -856,7 +895,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
   const isSubAgentResult = !!(result?.display_data && isSubAgentSummaryData(result.display_data));
 
   // Get the raw input for copying (not the formatted display)
-  const rawInput = name === 'bash' ? String(input['cmd'] || input['command'] || input['peek'] || input['wait'] || input['kill'] || '') :
+  const rawInput = name === 'bash' ? bashInputCopyText(input as Record<string, unknown>) :
                    name === 'think' ? String(input['thoughts'] || '') :
                    name === 'read_file' ? String(input['path'] || '') :
                    name === 'ask_user_question' ? String(((input['questions'] as Array<{ question?: string }> | undefined)?.[0]?.question) || '') :
@@ -867,6 +906,10 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
                    name === 'browser_wait_for_selector' ? String(input['selector'] || '') :
                    name === 'browser_type' ? String(input['text'] || '') :
                    JSON.stringify(input, null, 2);
+
+  const bashCopyTitle = name === 'bash' && isBashToolInput(input as Record<string, unknown>) && (input as BashToolInput).op !== 'run'
+    ? 'Copy operation'
+    : 'Copy command';
 
   return (
     <div className="tool-block" data-tool-id={toolId}>
@@ -886,7 +929,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
       {/* Tool input - always visible */}
       <div className={`tool-block-input ${inputIsMultiline ? 'multiline' : ''}`}>
         {inputDisplay}
-        <CopyButton text={rawInput} title="Copy command" />
+        <CopyButton text={rawInput} title={bashCopyTitle} />
       </div>
 
       {/* Tool output - collapsible for long outputs; suppressed when structured summary is shown */}

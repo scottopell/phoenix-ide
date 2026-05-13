@@ -18,7 +18,9 @@ export type { UsageData } from './UsageData';
 export type { UserFacingError } from './UserFacingError';
 export type { UserFacingErrorKind } from './UserFacingErrorKind';
 
-// Bash and tmux tool response wire types (task 02697).
+// Bash tool input and bash/tmux tool response wire types.
+export type { BashOp } from './BashOp';
+export type { BashToolInput } from './BashToolInput';
 export type { BashResponse } from './BashResponse';
 export type { BashRunningPayload } from './BashRunningPayload';
 export type { BashStillRunningPayload } from './BashStillRunningPayload';

@@ -2,13 +2,13 @@
 //!
 //! The tool exposes four operations (REQ-BASH-001/002/003/010):
 //!
-//! - **spawn** (`cmd=...`): start a new shell command. Block up to
+//! - **run** (`op="run", cmd=...`): start a new shell command. Block up to
 //!   `wait_seconds` for it to finish; if it does not, return a handle.
-//! - **peek** (`peek=<handle>`): snapshot the live ring or tombstone.
-//! - **wait** (`wait=<handle>`): block up to `wait_seconds` for the handle's
+//! - **peek** (`op="peek", handle=<handle>`): snapshot the live ring or tombstone.
+//! - **wait** (`op="wait", handle=<handle>`): block up to `wait_seconds` for the handle's
 //!   process to exit. Returns the SAME handle id on re-timeout
 //!   (REQ-BASH-003).
-//! - **kill** (`kill=<handle>`): send `TERM` (default) or `KILL` to the
+//! - **kill** (`op="kill", handle=<handle>`): send `TERM` (default) or `KILL` to the
 //!   handle's process group EXACTLY ONCE (no auto-escalation). On
 //!   `KILL_RESPONSE_TIMEOUT_SECONDS` of no exit, return
 //!   `kill_pending_kernel`; the waiter task survives so a late exit can
@@ -23,9 +23,11 @@ mod operations;
 pub mod reaper;
 pub mod registry;
 pub mod ring;
+pub mod types;
 
 pub use reaper::{install_reaper, shutdown_kill_tree};
 pub use registry::{BashHandleError, BashHandleRegistry, ConversationHandles};
+pub use types::{BashOp, BashToolInput};
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;

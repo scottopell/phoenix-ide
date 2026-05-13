@@ -40,16 +40,8 @@ pub(crate) fn assistant_message_for_tools(tool_ids: &[&str]) -> AssistantMessage
 // Arbitrary Generators
 // ============================================================================
 
-fn arb_bash_mode() -> impl Strategy<Value = BashMode> {
-    prop_oneof![
-        Just(BashMode::Default),
-        Just(BashMode::Slow),
-        Just(BashMode::Background),
-    ]
-}
-
-fn arb_bash_input() -> impl Strategy<Value = BashInput> {
-    ("[a-z ]{1,20}", arb_bash_mode()).prop_map(|(command, mode)| BashInput { command, mode })
+fn arb_bash_input() -> impl Strategy<Value = crate::tools::BashToolInput> {
+    "[a-z ]{1,20}".prop_map(crate::tools::BashToolInput::run)
 }
 
 fn arb_think_input() -> impl Strategy<Value = ThinkInput> {
@@ -1052,10 +1044,7 @@ fn test_complete_tool_cycle() {
     // Step 2: LLM responds with tool call
     let tool = ToolCall::new(
         "tool-123",
-        ToolInput::Bash(BashInput {
-            command: "ls".to_string(),
-            mode: BashMode::Default,
-        }),
+        ToolInput::Bash(crate::tools::BashToolInput::run("ls")),
     );
     let result = transition(
         &state,
@@ -1066,7 +1055,7 @@ fn test_complete_tool_cycle() {
                 ContentBlock::ToolUse {
                     id: "tool-123".to_string(),
                     name: "bash".to_string(),
-                    input: serde_json::json!({"command": "ls"}),
+                    input: serde_json::json!({"op": "run", "cmd": "ls"}),
                 },
             ],
             tool_calls: vec![tool.clone()],
@@ -1172,24 +1161,15 @@ fn test_multi_tool_chain() {
 
     let tool1 = ToolCall::new(
         "t1",
-        ToolInput::Bash(BashInput {
-            command: "echo 1".to_string(),
-            mode: BashMode::Default,
-        }),
+        ToolInput::Bash(crate::tools::BashToolInput::run("echo 1")),
     );
     let tool2 = ToolCall::new(
         "t2",
-        ToolInput::Bash(BashInput {
-            command: "echo 2".to_string(),
-            mode: BashMode::Default,
-        }),
+        ToolInput::Bash(crate::tools::BashToolInput::run("echo 2")),
     );
     let tool3 = ToolCall::new(
         "t3",
-        ToolInput::Bash(BashInput {
-            command: "echo 3".to_string(),
-            mode: BashMode::Default,
-        }),
+        ToolInput::Bash(crate::tools::BashToolInput::run("echo 3")),
     );
 
     // LLM responds with 3 tools
@@ -1348,25 +1328,16 @@ fn test_cancel_mid_tool_chain() {
     let state = ConvState::ToolExecuting {
         current_tool: ToolCall::new(
             "t2",
-            ToolInput::Bash(BashInput {
-                command: "sleep 10".to_string(),
-                mode: BashMode::Default,
-            }),
+            ToolInput::Bash(crate::tools::BashToolInput::run("sleep 10")),
         ),
         remaining_tools: vec![
             ToolCall::new(
                 "t3",
-                ToolInput::Bash(BashInput {
-                    command: "echo 3".to_string(),
-                    mode: BashMode::Default,
-                }),
+                ToolInput::Bash(crate::tools::BashToolInput::run("echo 3")),
             ),
             ToolCall::new(
                 "t4",
-                ToolInput::Bash(BashInput {
-                    command: "echo 4".to_string(),
-                    mode: BashMode::Default,
-                }),
+                ToolInput::Bash(crate::tools::BashToolInput::run("echo 4")),
             ),
         ],
         completed_results: vec![t1_result],
@@ -1438,17 +1409,11 @@ fn test_cancel_mid_tool_chain() {
 fn test_tool_completion_advances_to_next_tool() {
     let tool1 = ToolCall::new(
         "t1",
-        ToolInput::Bash(BashInput {
-            command: "echo 1".to_string(),
-            mode: BashMode::Default,
-        }),
+        ToolInput::Bash(crate::tools::BashToolInput::run("echo 1")),
     );
     let tool2 = ToolCall::new(
         "t2",
-        ToolInput::Bash(BashInput {
-            command: "echo 2".to_string(),
-            mode: BashMode::Default,
-        }),
+        ToolInput::Bash(crate::tools::BashToolInput::run("echo 2")),
     );
 
     let state = ConvState::ToolExecuting {
@@ -1494,10 +1459,7 @@ fn test_tool_completion_advances_to_next_tool() {
 fn test_last_tool_completion_goes_to_llm_requesting() {
     let tool1 = ToolCall::new(
         "t1",
-        ToolInput::Bash(BashInput {
-            command: "echo 1".to_string(),
-            mode: BashMode::Default,
-        }),
+        ToolInput::Bash(crate::tools::BashToolInput::run("echo 1")),
     );
 
     let state = ConvState::ToolExecuting {
@@ -1769,10 +1731,7 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
     let state = ConvState::ToolExecuting {
         current_tool: ToolCall::new(
             "t1",
-            ToolInput::Bash(BashInput {
-                command: "echo".to_string(),
-                mode: BashMode::Default,
-            }),
+            ToolInput::Bash(crate::tools::BashToolInput::run("echo")),
         ),
         remaining_tools: vec![],
         completed_results: vec![],
@@ -1821,10 +1780,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
         ),
         remaining_tools: vec![ToolCall::new(
             "t2",
-            ToolInput::Bash(BashInput {
-                command: "echo".to_string(),
-                mode: BashMode::Default,
-            }),
+            ToolInput::Bash(crate::tools::BashToolInput::run("echo")),
         )],
         completed_results: vec![],
         pending_sub_agents: vec![PendingSubAgent {

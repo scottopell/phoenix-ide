@@ -2115,7 +2115,11 @@ mod tests {
             "conv-1",
             &MessageContent::agent(vec![
                 ContentBlock::text("Let me run that for you."),
-                ContentBlock::tool_use("tool-123", "bash", serde_json::json!({"command": "ls"})),
+                ContentBlock::tool_use(
+                    "tool-123",
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "ls"}),
+                ),
             ]),
             None,
             None,
@@ -2180,7 +2184,7 @@ mod tests {
             &MessageContent::agent(vec![ContentBlock::tool_use(
                 "tool-123",
                 "bash",
-                serde_json::json!({"command": "ls"}),
+                serde_json::json!({"op": "run", "cmd": "ls"}),
             )]),
             None,
             None,
@@ -2225,9 +2229,21 @@ mod tests {
             "msg-1",
             "conv-1",
             &MessageContent::agent(vec![
-                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({"command": "ls"})),
-                ContentBlock::tool_use("tool-2", "bash", serde_json::json!({"command": "pwd"})),
-                ContentBlock::tool_use("tool-3", "bash", serde_json::json!({"command": "date"})),
+                ContentBlock::tool_use(
+                    "tool-1",
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "ls"}),
+                ),
+                ContentBlock::tool_use(
+                    "tool-2",
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "pwd"}),
+                ),
+                ContentBlock::tool_use(
+                    "tool-3",
+                    "bash",
+                    serde_json::json!({"op": "run", "cmd": "date"}),
+                ),
             ]),
             None,
             None,
@@ -2303,7 +2319,7 @@ mod tests {
                 &MessageContent::agent(vec![ContentBlock::tool_use(
                     format!("{id}-tool"),
                     "bash",
-                    serde_json::json!({"command": "ls"}),
+                    serde_json::json!({"op": "run", "cmd": "ls"}),
                 )]),
                 None,
                 None,

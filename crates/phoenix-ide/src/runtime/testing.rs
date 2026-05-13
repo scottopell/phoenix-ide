@@ -811,6 +811,7 @@ impl<L: LlmClient + 'static, T: ToolExecutor + 'static> TestRuntime<L, T> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::llm::{ContentBlock, Usage};
     use std::path::PathBuf;
@@ -932,7 +933,7 @@ mod tests {
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
-                serde_json::json!({"command": "ls"}),
+                serde_json::json!({"op": "run", "cmd": "ls"}),
             )],
             end_turn: false,
             usage: Usage::default(),
@@ -1098,7 +1099,7 @@ mod tests {
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
-                serde_json::json!({"command": "echo hi"}),
+                serde_json::json!({"op": "run", "cmd": "echo hi"}),
             )],
             end_turn: false,
             usage: Usage::default(),
@@ -1205,7 +1206,7 @@ mod tests {
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
-                serde_json::json!({"command": "sleep 100"}),
+                serde_json::json!({"op": "run", "cmd": "sleep 100"}),
             )],
             end_turn: false,
             usage: Usage::default(),
@@ -1297,9 +1298,7 @@ mod tests {
     #[tokio::test]
     async fn test_state_machine_cancel_produces_synthetic_results() {
         use crate::llm::ContentBlock;
-        use crate::state_machine::state::{
-            AssistantMessage, BashInput, BashMode, ToolCall, ToolInput,
-        };
+        use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
         use crate::state_machine::{transition, CheckpointData, Effect};
         use std::path::PathBuf;
 
@@ -1332,25 +1331,16 @@ mod tests {
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "t1",
-                ToolInput::Bash(BashInput {
-                    command: "cmd1".to_string(),
-                    mode: BashMode::Default,
-                }),
+                ToolInput::Bash(crate::tools::BashToolInput::run("cmd1")),
             ),
             remaining_tools: vec![
                 ToolCall::new(
                     "t2",
-                    ToolInput::Bash(BashInput {
-                        command: "cmd2".to_string(),
-                        mode: BashMode::Default,
-                    }),
+                    ToolInput::Bash(crate::tools::BashToolInput::run("cmd2")),
                 ),
                 ToolCall::new(
                     "t3",
-                    ToolInput::Bash(BashInput {
-                        command: "cmd3".to_string(),
-                        mode: BashMode::Default,
-                    }),
+                    ToolInput::Bash(crate::tools::BashToolInput::run("cmd3")),
                 ),
             ],
             completed_results: vec![],
@@ -1559,9 +1549,7 @@ mod tests {
     /// Test terminal tool validation: must be sole tool in response
     #[tokio::test]
     async fn test_subagent_terminal_tool_must_be_alone() {
-        use crate::state_machine::state::{
-            BashInput, BashMode, SubmitResultInput, ToolCall, ToolInput,
-        };
+        use crate::state_machine::state::{SubmitResultInput, ToolCall, ToolInput};
         use crate::state_machine::{transition, ConvContext, Event};
         use std::path::PathBuf;
 
@@ -1578,10 +1566,7 @@ mod tests {
         // Two tools, one of which is terminal
         let bash_call = ToolCall::new(
             "tool-1",
-            ToolInput::Bash(BashInput {
-                command: "ls".to_string(),
-                mode: BashMode::Default,
-            }),
+            ToolInput::Bash(crate::tools::BashToolInput::run("ls")),
         );
         let submit_call = ToolCall::new(
             "tool-2",
@@ -1592,7 +1577,11 @@ mod tests {
 
         let event = Event::LlmResponse {
             content: vec![
-                ContentBlock::tool_use("tool-1", "bash", serde_json::json!({ "command": "ls" })),
+                ContentBlock::tool_use(
+                    "tool-1",
+                    "bash",
+                    serde_json::json!({ "op": "run", "cmd": "ls" }),
+                ),
                 ContentBlock::tool_use(
                     "tool-2",
                     "submit_result",
@@ -1752,7 +1741,7 @@ mod tests {
             content: vec![ContentBlock::tool_use(
                 "tool-1",
                 "bash",
-                serde_json::json!({"command": "echo test"}),
+                serde_json::json!({"op": "run", "cmd": "echo test"}),
             )],
             end_turn: false,
             usage: Usage::default(),
@@ -1865,7 +1854,7 @@ mod tests {
                 content: vec![ContentBlock::tool_use(
                     "tool-x",
                     "bash",
-                    serde_json::json!({ "command": "echo loop" }),
+                    serde_json::json!({ "op": "run", "cmd": "echo loop" }),
                 )],
                 end_turn: false,
                 usage: Usage::default(),

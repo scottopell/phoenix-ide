@@ -16,7 +16,6 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Deserialize;
 use serde_json::Value;
 use tokio::process::Command;
 use tokio::sync::RwLock;
@@ -30,6 +29,7 @@ use super::handle::{
 };
 use super::registry::{BashHandleError, ConversationHandles, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
+use super::types::{BashOp, BashToolInput};
 use crate::api::wire::{
     BashErrorResponse, BashKillPendingKernelPayload, BashLiveHandleSummary, BashResponse,
     BashRingLine, BashRingWindow, BashRunTombstonePayload, BashRunningPayload,
@@ -73,54 +73,6 @@ const HANDLE_NOT_FOUND_HINT: &str =
 // ---------------------------------------------------------------------------
 // Request shape
 // ---------------------------------------------------------------------------
-
-/// Raw deserialised input. `op` is the required discriminator; `cmd` /
-/// `handle` / `wait_seconds` / `signal` / `lines` / `since` / `label` are
-/// the per-op fields advertised in the schema. `deny_unknown_fields`
-/// turns the retired affordances (`mode`, `command` alias for `cmd`, the
-/// legacy `peek` / `wait` / `kill` operation keys) into structured parse
-/// errors rather than silent acceptance — see REQ-BASH-010 rationale.
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RawBashInput {
-    #[serde(default)]
-    op: Option<String>,
-    #[serde(default)]
-    cmd: Option<String>,
-    #[serde(default)]
-    handle: Option<String>,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    wait_seconds: Option<i64>,
-    #[serde(default)]
-    signal: Option<String>,
-    #[serde(default)]
-    lines: Option<i64>,
-    #[serde(default)]
-    since: Option<i64>,
-}
-
-/// Operation discriminator. Mirrors `OperationKind` in
-/// `specs/bash/bash.allium`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op {
-    Run,
-    Peek,
-    Wait,
-    Kill,
-}
-
-impl Op {
-    fn as_field_name(self) -> &'static str {
-        match self {
-            Op::Run => "run",
-            Op::Peek => "peek",
-            Op::Wait => "wait",
-            Op::Kill => "kill",
-        }
-    }
-}
 
 /// Parsed read-window arguments (REQ-BASH-004). `lines` xor `since`.
 #[derive(Debug, Default, Clone)]
@@ -288,7 +240,7 @@ impl BashError {
 /// - `op` is required. The retired affordances (legacy four-sibling
 ///   `peek`/`wait`/`kill` keys, `mode` shim, `command` alias for `cmd`,
 ///   bare `cmd` with no `op`) are no longer accepted; `deny_unknown_fields`
-///   on `RawBashInput` turns them into structured parse errors.
+///   on `BashToolInput` turns them into structured parse errors.
 /// - `since=0` is treated as absent (default-fill from models that emit
 ///   the schema minimum despite `minimum: 1`). A `tracing::debug!` line
 ///   names the dropped value.
@@ -296,7 +248,7 @@ impl BashError {
 ///   is silently dropped (default-fill collision on optional integers).
 ///   A `tracing::debug!` line records the drop.
 pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
-    let raw: RawBashInput = serde_json::from_value(input).map_err(|e| {
+    let raw: BashToolInput = serde_json::from_value(input).map_err(|e| {
         // Schema-level rejection — the agent passed a malformed shape, or
         // an unknown field (notably any of the retired affordances).
         BashError::MutuallyExclusiveModes {
@@ -308,11 +260,10 @@ pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
         }
     })?;
 
-    let op = resolve_op(&raw)?;
     let read_args = parse_read_args(raw.lines, raw.since)?;
 
-    match op {
-        Op::Run => {
+    match raw.op {
+        BashOp::Run => {
             let cmd = raw.cmd.filter(|s| !s.is_empty()).ok_or_else(|| {
                 BashError::MutuallyExclusiveModes {
                     message: "op=run requires a non-empty 'cmd'".into(),
@@ -330,15 +281,15 @@ pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
                 read_args,
             })
         }
-        Op::Peek => {
-            let handle_id = resolve_handle(&raw, Op::Peek)?;
+        BashOp::Peek => {
+            let handle_id = resolve_handle(&raw, BashOp::Peek)?;
             Ok(BashRequest::Peek {
                 handle_id,
                 read_args,
             })
         }
-        Op::Wait => {
-            let handle_id = resolve_handle(&raw, Op::Wait)?;
+        BashOp::Wait => {
+            let handle_id = resolve_handle(&raw, BashOp::Wait)?;
             let wait_seconds = resolve_wait_seconds(raw.wait_seconds)?;
             Ok(BashRequest::Wait {
                 handle_id,
@@ -346,8 +297,8 @@ pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
                 read_args,
             })
         }
-        Op::Kill => {
-            let handle_id = resolve_handle(&raw, Op::Kill)?;
+        BashOp::Kill => {
+            let handle_id = resolve_handle(&raw, BashOp::Kill)?;
             let signal = match raw.signal.as_deref() {
                 None | Some("TERM") => KillSignal::Term,
                 Some("KILL") => KillSignal::Kill,
@@ -367,36 +318,11 @@ pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
     }
 }
 
-/// Determine the operation. `op` is required; absent or invalid values
-/// surface as `mutually_exclusive_modes`.
-fn resolve_op(raw: &RawBashInput) -> Result<Op, BashError> {
-    let s = raw.op.as_deref().filter(|s| !s.is_empty()).ok_or_else(|| {
-        BashError::MutuallyExclusiveModes {
-            message: "op is required and must be one of: run, peek, wait, kill".into(),
-            conflicting_args: vec![],
-            recommended_action: "set op to one of: run, peek, wait, kill".into(),
-            extra: None,
-        }
-    })?;
-    match s {
-        "run" => Ok(Op::Run),
-        "peek" => Ok(Op::Peek),
-        "wait" => Ok(Op::Wait),
-        "kill" => Ok(Op::Kill),
-        other => Err(BashError::MutuallyExclusiveModes {
-            message: format!("op='{other}' is not recognized; valid values are run|peek|wait|kill"),
-            conflicting_args: vec!["op"],
-            recommended_action: "set op to one of: run, peek, wait, kill".into(),
-            extra: None,
-        }),
-    }
-}
-
 /// Resolve the handle id for peek/wait/kill from the canonical `handle`
 /// field. The legacy operation-key fallback (`raw.peek` / `raw.wait` /
 /// `raw.kill`) was retired alongside the four-sibling shape (REQ-BASH-010,
 /// revision 3).
-fn resolve_handle(raw: &RawBashInput, op: Op) -> Result<String, BashError> {
+fn resolve_handle(raw: &BashToolInput, op: BashOp) -> Result<String, BashError> {
     raw.handle
         .as_deref()
         .filter(|s| !s.is_empty())
