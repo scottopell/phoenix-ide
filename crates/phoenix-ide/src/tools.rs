@@ -393,7 +393,9 @@ impl ToolRegistry {
         let mut tools = read_only_tools();
         tools.extend(browser_tools());
         tools.extend(parent_coordination_tools());
-        tools.push(Arc::new(PatchTool::restricted_to(tasks_dir_name)));
+        tools.push(Arc::new(PatchTool::for_task_proposal_drafts(
+            tasks_dir_name,
+        )));
         tools.push(Arc::new(ProposeTaskTool));
         Self { tools }
     }
@@ -407,7 +409,7 @@ impl ToolRegistry {
     pub fn explore_with_sandbox(tasks_dir_name: &str) -> Self {
         let mut registry = Self::new_with_options(false);
         if let Some(idx) = registry.tools.iter().position(|t| t.name() == "patch") {
-            registry.tools[idx] = Arc::new(PatchTool::restricted_to(tasks_dir_name));
+            registry.tools[idx] = Arc::new(PatchTool::for_task_proposal_drafts(tasks_dir_name));
         }
         registry.tools.push(Arc::new(ProposeTaskTool));
         registry

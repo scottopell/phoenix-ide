@@ -36,6 +36,12 @@ use std::sync::Mutex;
 
 const MAX_INPUT_SIZE: usize = 60 * 1024; // 60KB limit
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PatchScope {
+    Unrestricted,
+    TaskProposalDraft { tasks_dir_name: String },
+}
+
 /// Patch tool for file editing
 ///
 /// This is the Tool implementation that wraps the pure `PatchPlanner`
@@ -44,22 +50,26 @@ const MAX_INPUT_SIZE: usize = 60 * 1024; // 60KB limit
 /// REQ-BASH-010: Stateless - uses `ToolContext` for `working_dir`
 pub struct PatchTool {
     planner: Mutex<PatchPlanner>,
-    /// When set, edits are rejected unless the resolved path is inside this
-    /// directory (relative to the conversation cwd). Used by Explore mode
-    /// to permit drafting task files under the project's tasks directory
-    /// (typically `tasks/` but discovered per project — task 13008) without
-    /// unlocking the rest of the worktree.
-    allowed_path_prefix: Option<String>,
+    scope: PatchScope,
 }
 
 impl PatchTool {
-    /// Construct a `PatchTool` that only accepts paths inside the named
-    /// relative directory (e.g. `"tasks"`). Paths outside that directory
-    /// are rejected at runtime.
-    pub fn restricted_to(prefix: impl Into<String>) -> Self {
+    pub fn unrestricted() -> Self {
         Self {
             planner: Mutex::new(PatchPlanner::new()),
-            allowed_path_prefix: Some(prefix.into()),
+            scope: PatchScope::Unrestricted,
+        }
+    }
+
+    /// Construct the Explore-mode patch tool for drafting task proposal files.
+    /// This scope both enforces the task-directory write boundary and emits the
+    /// post-success `propose_task` next-step reminder.
+    pub fn for_task_proposal_drafts(tasks_dir_name: impl Into<String>) -> Self {
+        Self {
+            planner: Mutex::new(PatchPlanner::new()),
+            scope: PatchScope::TaskProposalDraft {
+                tasks_dir_name: tasks_dir_name.into(),
+            },
         }
     }
 
@@ -72,33 +82,37 @@ impl PatchTool {
         }
     }
 
-    /// Reject paths that fall outside the configured allowlist. Returns
-    /// `None` if no restriction is configured.
-    ///
-    /// `raw_path` is the unresolved path string from the LLM. We reject `..`
-    /// components on it directly: when the patch target does not yet exist,
-    /// `canonicalize(resolved)` returns `Err` and the function falls back to
-    /// the lexical path — which would let `tasks/../src/foo.rs` pass the
-    /// prefix check on a brand-new file.
-    fn enforce_allowlist(
+    fn enforce_scope(
         &self,
         ctx: &ToolContext,
         raw_path: &str,
         resolved: &std::path::Path,
     ) -> Option<String> {
-        let prefix = self.allowed_path_prefix.as_deref()?;
+        let PatchScope::TaskProposalDraft { tasks_dir_name } = &self.scope else {
+            return None;
+        };
 
         if std::path::Path::new(raw_path)
             .components()
             .any(|c| matches!(c, std::path::Component::ParentDir))
         {
             return Some(format!(
-                "patch is restricted to '{prefix}/' in this mode; \
+                "patch is restricted to '{tasks_dir_name}/' task proposal drafts in this mode; \
                  '..' components are not allowed (got '{raw_path}')."
             ));
         }
 
-        let allowed_root = ctx.working_dir.join(prefix);
+        let filename = std::path::Path::new(raw_path)
+            .file_name()
+            .and_then(|name| name.to_str());
+        if filename.is_none_or(|name| crate::task_source::TaskSource::detect(name).is_none()) {
+            return Some(format!(
+                "patch is restricted to markdown task proposal drafts under '{tasks_dir_name}/' \
+                 in this mode (got '{raw_path}')."
+            ));
+        }
+
+        let allowed_root = ctx.working_dir.join(tasks_dir_name);
         let canon_allowed = std::fs::canonicalize(&allowed_root).unwrap_or(allowed_root);
         let canon_resolved =
             std::fs::canonicalize(resolved).unwrap_or_else(|_| resolved.to_path_buf());
@@ -106,20 +120,35 @@ impl PatchTool {
             None
         } else {
             Some(format!(
-                "patch is restricted to '{prefix}/' in this mode; \
+                "patch is restricted to '{tasks_dir_name}/' task proposal drafts in this mode; \
                  '{}' is outside the allowed directory.",
                 resolved.display()
             ))
         }
     }
+
+    fn proposal_next_step(&self, raw_path: &str) -> Option<String> {
+        match &self.scope {
+            PatchScope::Unrestricted => None,
+            PatchScope::TaskProposalDraft { .. } => Some(format!(
+                "\n<next_step>Call propose_task with task_file=\"{}\" if this is the task you want the user to approve.</next_step>",
+                escape_xml_attribute(raw_path)
+            )),
+        }
+    }
+}
+
+fn escape_xml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 impl Default for PatchTool {
     fn default() -> Self {
-        Self {
-            planner: Mutex::new(PatchPlanner::new()),
-            allowed_path_prefix: None,
-        }
+        Self::unrestricted()
     }
 }
 
@@ -246,7 +275,7 @@ Size limit: each patch call must be less than 60 KB of input.".to_string()
         // Resolve path
         let path = Self::resolve_path(&ctx, &patch_input.path);
 
-        if let Some(msg) = self.enforce_allowlist(&ctx, &patch_input.path, &path) {
+        if let Some(msg) = self.enforce_scope(&ctx, &patch_input.path, &path) {
             return ToolOutput::error(msg);
         }
 
@@ -276,6 +305,10 @@ Size limit: each patch call must be less than 60 KB of input.".to_string()
             output.push_str(
                 "\n<warning>This file appears to be auto-generated. Edits may be overwritten.</warning>",
             );
+        }
+
+        if let Some(next_step) = self.proposal_next_step(&patch_input.path) {
+            output.push_str(&next_step);
         }
 
         let display_data = json!({
@@ -340,21 +373,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restricted_patch_rejects_paths_outside_allowlist() {
+    async fn task_proposal_patch_rejects_paths_outside_task_dir() {
         let dir = tempdir().unwrap();
-        let tool = PatchTool::restricted_to("tasks");
+        let tool = PatchTool::for_task_proposal_drafts("tasks");
 
         // Pre-create both the allowed and disallowed targets.
         fs::create_dir_all(dir.path().join("tasks")).unwrap();
         fs::write(dir.path().join("tasks/note.md"), "old\n").unwrap();
-        fs::write(dir.path().join("source.rs"), "fn main() {}\n").unwrap();
+        fs::write(dir.path().join("source.md"), "# Source\n").unwrap();
 
         // Write outside the allowed prefix is rejected.
         let ctx = test_context(dir.path().to_path_buf());
         let blocked = tool
             .run(
                 json!({
-                    "path": "source.rs",
+                    "path": "source.md",
                     "patches": [{
                         "operation": "overwrite",
                         "newText": "fn pwned() {}\n"
@@ -369,13 +402,15 @@ mod tests {
             blocked.output
         );
         assert!(
-            blocked.output.contains("restricted to 'tasks/'"),
-            "missing allowlist hint: {}",
+            blocked
+                .output
+                .contains("restricted to 'tasks/' task proposal drafts"),
+            "missing task proposal scope hint: {}",
             blocked.output
         );
         assert_eq!(
-            fs::read_to_string(dir.path().join("source.rs")).unwrap(),
-            "fn main() {}\n",
+            fs::read_to_string(dir.path().join("source.md")).unwrap(),
+            "# Source\n",
             "source must be untouched"
         );
 
@@ -420,10 +455,82 @@ mod tests {
             )
             .await;
         assert!(allowed.success, "expected success, got: {}", allowed.output);
+        assert!(
+            allowed
+                .output
+                .contains("<next_step>Call propose_task with task_file=\"tasks/note.md\""),
+            "missing proposal next-step reminder: {}",
+            allowed.output
+        );
         assert_eq!(
             fs::read_to_string(dir.path().join("tasks/note.md")).unwrap(),
             "new\n"
         );
+    }
+    #[tokio::test]
+    async fn task_proposal_patch_rejects_non_markdown_files() {
+        let dir = tempdir().unwrap();
+        let tool = PatchTool::for_task_proposal_drafts("tasks");
+        fs::create_dir_all(dir.path().join("tasks")).unwrap();
+
+        let ctx = test_context(dir.path().to_path_buf());
+        let result = tool
+            .run(
+                json!({
+                    "path": "tasks/note.txt",
+                    "patches": [{
+                        "operation": "overwrite",
+                        "newText": "not markdown\n"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+
+        assert!(
+            !result.success,
+            "expected rejection, got: {}",
+            result.output
+        );
+        assert!(
+            result
+                .output
+                .contains("restricted to markdown task proposal drafts"),
+            "missing markdown-task-source hint: {}",
+            result.output
+        );
+        assert!(
+            !dir.path().join("tasks/note.txt").exists(),
+            "non-markdown task proposal draft must not be created"
+        );
+        assert!(
+            !result.output.contains("propose_task"),
+            "failed patches must not include the success next-step reminder: {}",
+            result.output
+        );
+    }
+
+    #[tokio::test]
+    async fn unrestricted_patch_success_does_not_include_proposal_reminder() {
+        let dir = tempdir().unwrap();
+        let tool = PatchTool::default();
+        let ctx = test_context(dir.path().to_path_buf());
+
+        let result = tool
+            .run(
+                json!({
+                    "path": "notes.md",
+                    "patches": [{
+                        "operation": "overwrite",
+                        "newText": "# Notes\n"
+                    }]
+                }),
+                ctx,
+            )
+            .await;
+
+        assert!(result.success, "expected success, got: {}", result.output);
+        assert_eq!(result.output, "<patches_applied>all</patches_applied>");
     }
 
     #[tokio::test]
