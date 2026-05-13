@@ -10,10 +10,13 @@ work for write access) and optionally a model and turn budget per
 sub-agent. Mode enforcement: Explore parents can only spawn Explore
 sub-agents; Work, Branch, and Direct parents can spawn either, with at
 most one Work sub-agent active at a time per parent (and per
-`spawn_agents` call). A Work sub-agent's effective cwd — including any
-`task.cwd` override — must stay inside the parent's worktree. Results are
-submitted via dedicated tools (`submit_result` / `submit_error`). Maximum
-10 sub-agents per spawn call.
+`spawn_agents` call). When the parent owns a worktree (Work or Branch
+mode), a Work sub-agent's effective cwd — including any `task.cwd`
+override — must stay inside that worktree; a Work sub-agent spawned
+from a Direct parent has no worktree to scope against, matching
+Direct's unscoped write semantics. Results are submitted via dedicated
+tools (`submit_result` / `submit_error`). Maximum 10 sub-agents per
+spawn call.
 
 ## Technical Summary
 

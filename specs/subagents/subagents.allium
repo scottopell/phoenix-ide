@@ -130,13 +130,15 @@ rule WorkSubAgentRequiresWriteableParent {
     requires: any_task_mode_is_work(tasks)
     requires: parent.mode not in { work, branch, direct }
     ensures: SpawnAgentsRejected(parent,
-        reason: "Work sub-agents require the parent to be in Work mode")
+        reason: "Work sub-agents require the parent to be in a \
+                 write-capable mode (Work, Branch, or Direct)")
 
     @guidance
-        -- Parent mode is read from `ConvContext.mode_context` at the call
-        -- site. The only other parent mode is `explore`; `parent.mode =
-        -- explore` => reject. The error string also instructs the LLM to
-        -- use `mode: "explore"` or omit `mode` for read-only sub-agents.
+        -- Parent mode is read from `ConvContext.mode_context` at the
+        -- call site. The only writeable-disqualifying mode is `explore`;
+        -- `parent.mode = explore` => reject. The error string also
+        -- instructs the LLM to use `mode: "explore"` or omit `mode` for
+        -- read-only sub-agents.
 }
 
 -- One-writer-per-batch: a single `spawn_agents` call carries at most one
@@ -312,11 +314,19 @@ rule SubAgentSpecsResolved {
 -- ===========================================================
 
 -- Fresh spawn: the registry is determined by the sub-agent's mode.
--- Explore => `subagent_explore` (read-only tools + bash + browser +
--- submit_result/submit_error). Work => `subagent_work` (Explore set +
--- patch). Both modes get the parent's MCP tool set; an
+-- Explore => `subagent_explore` (read-only information tools + bash +
+-- browser + submit_result/submit_error). Work => `subagent_work`
+-- (Explore set + patch). Both modes get the parent's MCP tool set; an
 -- Explore-search-restricted MCP subset is a documented deferred
 -- refinement (see executive.md status).
+--
+-- Bash in the Explore registry is currently the full `BashTool`, NOT a
+-- read-only sandbox; the spec calls it "read-only" by intent and
+-- registry composition (no `patch`, no write tools), but read-only
+-- bash enforcement is a deferred capability tracked under REQ-BASH-008
+-- (see `crates/phoenix-ide/src/tools.rs::for_subagent_explore`). Until
+-- that lands, an Explore sub-agent can still mutate state through
+-- bash; this is an acknowledged gap rather than a spec contradiction.
 rule SubAgentRegistryOnFreshSpawn {
     when: SubAgentSpawnSucceeded(parent, sub_agent, mode, cwd_override)
     ensures:
@@ -373,12 +383,19 @@ invariant OneWorkSubAgentPerParent {
         active_work_subagents(p) <= 1
 }
 
--- A Work sub-agent's effective cwd is always inside its parent's
--- worktree. Combined with projects.allium's WriteBlockedOutsideWorktree,
--- this guarantees that sub-agent writes cannot escape the parent's
+-- When the parent owns a worktree (Work or Branch mode), the effective
+-- cwd of any Work sub-agent it spawns is inside that worktree.
+-- Combined with projects.allium's WriteBlockedOutsideWorktree, this
+-- guarantees that sub-agent writes cannot escape the parent's
 -- isolation boundary.
+--
+-- Work sub-agents spawned from a Direct parent are out of scope here:
+-- Direct mode has no worktree to scope against, and Direct's writes are
+-- unscoped by design (see WriteBlockedOutsideWorktree's
+-- `parent.mode in { work, branch }` precondition). Explore sub-agents
+-- are read-only, so escape-via-cwd is not a write-safety concern.
 invariant WorkSubAgentCwdInsideWorktree {
-    for sa in SubAgents where mode in { work, branch }:
+    for sa in SubAgents where sa.mode != explore and sa.parent.mode in { work, branch }:
         is_within(sa.working_dir, sa.parent.worktree_path)
 }
 

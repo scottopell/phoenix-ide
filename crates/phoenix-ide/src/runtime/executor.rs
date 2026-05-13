@@ -37,23 +37,26 @@ const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 
 /// Decide whether `path` is inside the worktree rooted at `root`.
 ///
-/// The guard rejects up front any path that is not absolute or that
-/// contains a `..` component. Without that sanitisation, `Path::starts_with`
-/// matches components lexically and `/worktree/../escape` satisfies
-/// `starts_with("/worktree")` -- the canonicalise-or-lexical fallback
-/// could then be bypassed by passing a `..`-traversing override that does
-/// not exist on disk yet (canonicalize fails, falls into the lexical
-/// branch, which then accepts the escape).
-///
-/// After that sanitisation, the comparison is: canonicalise both sides
-/// to follow symlinks and resolve `.`, then `starts_with`. If
-/// canonicalisation fails on either side (e.g. override `cwd` not yet
-/// created on disk) the lexical comparison is sound because the path
-/// has no `..` to escape with.
+/// Three stages, each closing a class of bypass:
+///   1. Reject non-absolute paths and any `..` component up front.
+///      Without this, `Path::new("/worktree/../escape")` would
+///      lexically `starts_with("/worktree")` -- the first component
+///      matches.
+///   2. Canonicalise `root`. The worktree must exist; if it doesn't,
+///      the comparison is meaningless and we reject (fail closed).
+///   3. Canonicalise the deepest existing ancestor of `path` and check
+///      that ancestor lies inside the canonical root. This closes the
+///      "intermediate symlink, leaf doesn't exist yet" escape: if
+///      `/worktree/escape` is a symlink to `/outside` and the override
+///      is `/worktree/escape/newdir`, the deepest existing ancestor is
+///      `/worktree/escape`, canonical form `/outside`, which does not
+///      start with the canonical worktree -- rejected. Step 1 already
+///      guarantees the tail beyond the ancestor has no `..` to escape
+///      with, so an inside-ancestor satisfies the invariant once
+///      created.
 fn path_is_within(path: &str, root: &str) -> bool {
-    use std::path::{Component, Path};
+    use std::path::{Component, Path, PathBuf};
     let raw_path = Path::new(path);
-    let raw_root = Path::new(root);
     if !raw_path.is_absolute() {
         return false;
     }
@@ -63,12 +66,17 @@ fn path_is_within(path: &str, root: &str) -> bool {
     {
         return false;
     }
-    match (
-        std::fs::canonicalize(raw_path).ok(),
-        std::fs::canonicalize(raw_root).ok(),
-    ) {
-        (Some(p), Some(r)) => p == r || p.starts_with(&r),
-        _ => raw_path == raw_root || raw_path.starts_with(raw_root),
+    let Ok(canon_root) = std::fs::canonicalize(Path::new(root)) else {
+        return false;
+    };
+    let mut anchor = PathBuf::from(raw_path);
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&anchor) {
+            return canon == canon_root || canon.starts_with(&canon_root);
+        }
+        if !anchor.pop() {
+            return false;
+        }
     }
 }
 
@@ -1068,8 +1076,9 @@ where
                 if !parent_allows_work {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
-                        "Work sub-agents require the parent to be in Work mode. \
-                         Use mode: \"explore\" or omit mode for read-only sub-agents."
+                        "Work sub-agents require the parent to be in a write-capable mode \
+                         (Work, Branch, or Direct). Use mode: \"explore\" or omit mode \
+                         for read-only sub-agents."
                             .to_string(),
                     );
                     return Ok(Some(Event::ToolComplete {
@@ -4887,37 +4896,65 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[test]
-    fn path_is_within_lexical_fallback() {
-        // Both paths nonexistent: canonicalisation fails on both sides,
-        // so the fallback is a strict lexical Path::starts_with.
-        assert!(path_is_within("/nonexistent/root/sub", "/nonexistent/root"));
-        assert!(!path_is_within("/nonexistent/other", "/nonexistent/root"));
-        assert!(path_is_within("/nonexistent/root", "/nonexistent/root"));
+    fn path_is_within_requires_root_to_exist() {
+        // Worktree root that doesn't canonicalise -> fail closed. A
+        // non-existent root would make the comparison meaningless.
+        assert!(!path_is_within(
+            "/nonexistent/root/sub",
+            "/nonexistent/root"
+        ));
+    }
+
+    #[test]
+    fn path_is_within_accepts_nonexistent_leaf_under_real_root() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let path_in = worktree.path().join("not/yet/created");
+        // Deepest existing ancestor of `path_in` is the worktree itself,
+        // which canonicalises and starts_with itself.
+        assert!(path_is_within(
+            path_in.to_str().unwrap(),
+            worktree.path().to_str().unwrap()
+        ));
     }
 
     #[test]
     fn path_is_within_rejects_parent_dir_traversal() {
-        // Without the up-front `..` rejection, the lexical fallback would
-        // accept `/worktree/../escape`: Path::starts_with matches component
-        // by component, and the first component IS `/worktree`. Reject
-        // any `..` outright so the fallback is sound.
-        assert!(!path_is_within(
-            "/nonexistent/root/../escape",
-            "/nonexistent/root"
-        ));
-        assert!(!path_is_within(
-            "/nonexistent/root/sub/../../escape",
-            "/nonexistent/root"
-        ));
+        // `..` rejected up front, so `/worktree/../escape` never reaches
+        // the prefix check.
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let bad = format!("{}/../escape", worktree.path().display());
+        assert!(!path_is_within(&bad, worktree.path().to_str().unwrap()));
     }
 
     #[test]
     fn path_is_within_rejects_relative_paths() {
-        // Relative paths are non-portable for an override -- reject them
-        // up front rather than guessing at what they should resolve
-        // against.
-        assert!(!path_is_within("sub/dir", "/worktree"));
-        assert!(!path_is_within("./sub", "/worktree"));
+        let worktree = TempDir::new().expect("worktree tempdir");
+        assert!(!path_is_within(
+            "sub/dir",
+            worktree.path().to_str().unwrap()
+        ));
+        assert!(!path_is_within("./sub", worktree.path().to_str().unwrap()));
+    }
+
+    /// The intermediate-symlink escape: `/worktree/escape` is a symlink
+    /// to `/outside`, override cwd is `/worktree/escape/newdir` (does
+    /// not exist yet). Without the deepest-existing-ancestor canonical
+    /// resolution, the leaf's canonicalisation fails and a lexical
+    /// `starts_with` would accept the path. Resolving the deepest
+    /// existing ancestor (the symlink itself, which canonicalises to
+    /// `/outside`) rejects it.
+    #[cfg(unix)]
+    #[test]
+    fn path_is_within_rejects_intermediate_symlink_escape() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let outside = TempDir::new().expect("outside tempdir");
+        let escape = worktree.path().join("escape");
+        std::os::unix::fs::symlink(outside.path(), &escape).expect("create symlink");
+        let bypass = escape.join("newdir");
+        assert!(!path_is_within(
+            bypass.to_str().unwrap(),
+            worktree.path().to_str().unwrap()
+        ));
     }
 
     #[cfg(unix)]

@@ -491,12 +491,17 @@ invoke multiple tools.
 | Work | Work | Parent's worktree path (writes to worktree) |
 | Branch | Explore / Work | Parent's worktree path |
 | Direct | Explore | Parent's cwd |
+| Direct | Work | Parent's cwd (no worktree to scope against; writes are unscoped, matching Direct's own write semantics) |
 
 The `cwd` field on `SubAgentTaskSpec` overrides this default. The override is
 validated by the spawn handler: when the parent owns a worktree (Work or
 Branch), a Work sub-agent's effective cwd must canonicalise to a path inside
-that worktree, otherwise the spawn is rejected with a tool error. The full
-mode/cwd/model/turn validation lives in `specs/subagents/subagents.allium`.
+that worktree, otherwise the spawn is rejected with a tool error. Work
+sub-agents from a Direct parent are not subject to the cwd-scoping guard —
+Direct mode has no worktree to scope against, consistent with
+`projects.allium`'s `WriteBlockedOutsideWorktree` (which only applies in
+Work/Branch). The full mode/cwd/model/turn validation lives in
+`specs/subagents/subagents.allium`.
 
 ## Persistence
 
