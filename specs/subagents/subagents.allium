@@ -1,0 +1,388 @@
+-- allium: 3
+-- subagents.allium
+--
+-- Phoenix Sub-Agents: Behavioural Specification
+--
+-- Scope: Spawn-time validation, per-mode configuration resolution, the
+--        cross-domain seam between bedrock's sub-agent state space and
+--        projects' worktree ownership.
+-- Includes:
+--   - SubAgentMode (explore/work) and parent-mode rules
+--   - One-writer invariant (per-call AND across calls per parent)
+--   - cwd-scoping invariant for Work sub-agents (incl. task.cwd overrides)
+--   - Explore-sub-agent working_dir derivation
+--   - Per-mode tool-registry selection (fresh spawn + resume path)
+--   - Model and max-turns defaulting & validation (config in @guidance)
+--   - Sub-agent timeout (REQ-SA-006) at the spawn layer
+-- Excludes:
+--   - Core conversation state machine (see bedrock.allium):
+--       awaiting_sub_agents, cancelling_sub_agents, completed, failed,
+--       fan-in, cancellation propagation, the OneWorkSubAgent
+--       Conversation-level invariant, sub-agent terminal-tool semantics
+--       (submit_result/submit_error must be sole tool in response),
+--       SpawnLimit, NoRecursiveSubAgents.
+--   - Worktree creation / branch lifecycle (see projects.allium).
+--   - Tool implementations (bash, patch, etc.).
+--
+-- Requirement traceability: REQ-SA-001 .. REQ-SA-008, REQ-PROJ-008.
+-- (REQ-SA-007 is superseded by REQ-PROJ-008; REQ-SA-008 read_first
+--  injection is not implemented in the spawn handler — tracked in
+--  requirements.md status.)
+
+use "./bedrock.allium" as bedrock
+use "./projects.allium" as projects
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Per-task input from the `spawn_agents` tool. All fields except `task`
+-- are optional in the JSON wire form; this record captures the
+-- LLM-supplied shape *before* defaulting.
+value SubAgentTask {
+    task: String                  -- task description, required, non-empty
+    cwd: String?                  -- working-directory override
+    mode: SubAgentMode?           -- absent => explore (default)
+    model: String?                -- explicit model id (must exist in registry)
+    max_turns: Integer?           -- override per-mode default
+}
+
+-- The resolved spec the runtime spawns the sub-agent from.
+-- Every field is concrete: defaults applied, model validated, cwd
+-- resolved.
+value SubAgentSpec {
+    agent_id: String              -- fresh UUID generated at spawn time
+    task: String
+    cwd: String                   -- absolute path on disk
+    timeout: Duration             -- mandatory (REQ-SA-006)
+    mode: SubAgentMode
+    model_id: String              -- exists in LLM registry
+    max_turns: Integer            -- > 0
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum SubAgentMode { explore | work }
+
+-- Tool registries selectable for a sub-agent. The registry shape itself
+-- lives in code (crates/phoenix-ide/src/tools.rs); the spec only names
+-- the two variants and which mode picks which.
+enum SubAgentToolRegistry { subagent_explore | subagent_work }
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- REQ-SA-006: per-spawn time limit (`DEFAULT_SUBAGENT_TIMEOUT`).
+    default_subagent_timeout: Duration = 20.minutes
+
+    -- REQ-PROJ-008: per-mode max-turns defaults applied when the
+    -- per-task `max_turns` is absent.
+    default_max_turns_explore: Integer = 20
+    default_max_turns_work: Integer = 50
+
+    -- Hard cap on a single `spawn_agents` call. Matches
+    -- bedrock.allium config.max_sub_agents_per_spawn; the
+    -- JSON-schema `maxItems` is the wire-level enforcement.
+    max_sub_agents_per_spawn: Integer = 10
+}
+
+------------------------------------------------------------
+-- Rules: Spawn-time validation
+------------------------------------------------------------
+
+-- ===========================================================
+-- 1. CALL-LEVEL VALIDATION (REQ-SA-001)
+-- ===========================================================
+
+rule SpawnRejectedEmptyTasks {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: tasks.count = 0
+    ensures: SpawnAgentsRejected(parent,
+        reason: "At least one task is required")
+}
+
+rule SpawnRejectedTooManyTasks {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: tasks.count > config.max_sub_agents_per_spawn
+    ensures: SpawnAgentsRejected(parent,
+        reason: "Too many tasks in a single spawn_agents call")
+
+    @guidance
+        -- The wire-level cap is the JSON schema `maxItems: 10` on the
+        -- tool input; this rule is the spec-level statement of the same
+        -- bound.
+}
+
+-- ===========================================================
+-- 2. MODE VALIDATION (REQ-PROJ-008, REQ-BED-018)
+-- ===========================================================
+
+-- A Work sub-agent requires the parent to be writeable. "Writeable" here
+-- means the parent's mode grants write access to a worktree (Work or
+-- Branch) or to the user's cwd (Direct). An Explore parent has no place
+-- to put a Work sub-agent's writes.
+rule WorkSubAgentRequiresWriteableParent {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: any_task_mode_is_work(tasks)
+    requires: parent.mode not in { work, branch, direct }
+    ensures: SpawnAgentsRejected(parent,
+        reason: "Work sub-agents require the parent to be in Work mode")
+
+    @guidance
+        -- Parent mode is read from `ConvContext.mode_context` at the call
+        -- site. The only other parent mode is `explore`; `parent.mode =
+        -- explore` => reject. The error string also instructs the LLM to
+        -- use `mode: "explore"` or omit `mode` for read-only sub-agents.
+}
+
+-- One-writer-per-batch: a single `spawn_agents` call carries at most one
+-- task with `mode = work`. Mixed batches with several Explore + one Work
+-- are allowed.
+rule SpawnRejectedMultipleWorkInBatch {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: work_task_count(tasks) > 1
+    ensures: SpawnAgentsRejected(parent,
+        reason: "Only one Work sub-agent can be spawned per call")
+}
+
+-- One-writer-across-batches: the parent may have at most one Work
+-- sub-agent running at any time. The executor tracks this in
+-- `active_work_subagents`; a fresh batch that would push it above one is
+-- rejected.
+rule SpawnRejectedWorkSubAgentAlreadyActive {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: work_task_count(tasks) > 0
+    requires: active_work_subagents(parent) > 0
+    ensures: SpawnAgentsRejected(parent,
+        reason: "A Work sub-agent is already active for this parent")
+
+    @guidance
+        -- The active counter is incremented at the end of a successful
+        -- batch by `work_count_in_batch` and decremented when each
+        -- spawned Work sub-agent's terminal SubAgentResult drains in
+        -- `apply_transition_result`. Crash/restart does not persist the
+        -- counter: sub-agents do not survive server restart, so a fresh
+        -- runtime starts with active = 0 by construction.
+}
+
+-- ===========================================================
+-- 3. MODEL VALIDATION (REQ-PROJ-008, REQ-SA-007)
+-- ===========================================================
+
+-- An explicit `model` field on a task must exist in the LLM registry.
+-- Defaulting (Explore -> cheapest per provider; Work -> parent's model)
+-- never produces an unknown model, so this only checks overrides.
+rule SpawnRejectedUnknownModel {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: any_task_has_unknown_model(tasks)
+    ensures: SpawnAgentsRejected(parent,
+        reason: "Unknown model in task spec")
+
+    @guidance
+        -- Error message includes the offending model id and the list of
+        -- available model ids from the registry.
+        --
+        -- Defaulting (resolved before this check) is config:
+        --   t.mode = explore, t.model absent =>
+        --       LlmRegistry.cheap_model_for_provider(parent.model_id)
+        --   t.mode = work,    t.model absent => parent.model_id
+        --   t.model present  => t.model (after this check)
+}
+
+-- ===========================================================
+-- 4. CWD SCOPING (REQ-PROJ-008)
+-- ===========================================================
+
+-- The Work sub-agent's *effective* cwd — including any per-task `cwd`
+-- override — must be inside the parent's worktree. Without this guard a
+-- Work sub-agent could write outside the worktree (defeating
+-- projects.allium's WriteBlockedOutsideWorktree because the sub-agent
+-- runtime would see a different working_dir).
+rule SpawnRejectedWorkCwdOutsideWorktree {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: parent.mode in { work, branch }
+    requires: any_work_task_has_cwd_outside_worktree(tasks, parent.worktree_path)
+    ensures: SpawnAgentsRejected(parent,
+        reason: "Work sub-agent cwd must be inside the parent's worktree")
+
+    @guidance
+        -- `is_within(path, root)`: path is `root` itself or a descendant
+        -- of root, after canonicalisation. The implementation in
+        -- `handle_spawn_agents_tool` compares canonicalised paths so a
+        -- symlink that escapes the worktree is rejected.
+        --
+        -- When the task omits `cwd`, the effective cwd is the parent's
+        -- working_dir, which for parent.mode in { work, branch } equals
+        -- worktree_path by the projects.allium worktree contract — that
+        -- case satisfies the invariant trivially.
+}
+
+-- A successful spawn assigns the resolved cwd to the sub-agent.
+-- For Work sub-agents this is co-located with the parent's worktree;
+-- for Explore sub-agents the cwd is the parent's working_dir (which is
+-- the worktree path when the parent has one, else the parent's cwd).
+rule SpawnedSubAgentCwdAssignment {
+    when: SubAgentSpawnSucceeded(parent, sub_agent, mode, cwd_override)
+    ensures:
+        if cwd_override != absent:
+            sub_agent.working_dir = cwd_override
+        else:
+            sub_agent.working_dir = parent.working_dir
+
+    @guidance
+        -- The Explore-sub-agent ConvMode is `Explore { worktree_path:
+        -- None }` — Explore sub-agents do not own a worktree of their
+        -- own; they read from the parent's worktree (when present) or
+        -- the parent's cwd. See projects.allium ExploreSubAgentDirectory
+        -- for the cross-spec restatement.
+        --
+        -- For Work sub-agents the resolved cwd has already been verified
+        -- by SpawnRejectedWorkCwdOutsideWorktree to lie inside the
+        -- parent's worktree.
+}
+
+------------------------------------------------------------
+-- Rules: Successful spawn -> SubAgentSpec
+------------------------------------------------------------
+
+-- All per-task validations passed: build a SubAgentSpec for each task
+-- (defaults applied, model validated, cwd resolved) and hand it to
+-- `RuntimeManager::handle_spawn_request`. The bedrock-level
+-- `SpawnAgentsCompletes*` rule then drives the parent state transition.
+rule SubAgentSpecsResolved {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: tasks.count >= 1
+    requires: tasks.count <= config.max_sub_agents_per_spawn
+    requires: parent.mode in { work, branch, direct }
+        or not any_task_mode_is_work(tasks)
+    requires: work_task_count(tasks) <= 1
+    requires: work_task_count(tasks) = 0
+        or active_work_subagents(parent) = 0
+    requires: not any_task_has_unknown_model(tasks)
+    requires: parent.mode not in { work, branch }
+        or not any_work_task_has_cwd_outside_worktree(
+            tasks, parent.worktree_path)
+    ensures: SubAgentSpecsCreated(parent, tasks)
+    ensures: SpawnAgentsCompletes(parent,
+        spawned_agents: pending_sub_agents_from(tasks))
+    ensures: active_work_subagents(parent)
+        = previous(active_work_subagents(parent)) + work_task_count(tasks)
+
+    @guidance
+        -- Per-task resolution (referenced as `resolve_*` helpers):
+        --
+        --   resolve_mode(t):
+        --     t.mode.present => t.mode
+        --     else            => explore   (REQ-PROJ-008 default)
+        --
+        --   resolve_model_id(t, parent):
+        --     t.model.present  => t.model
+        --     resolve_mode(t)=explore =>
+        --         LlmRegistry.cheap_model_for_provider(parent.model_id)
+        --     resolve_mode(t)=work    => parent.model_id
+        --
+        --   resolve_max_turns(t):
+        --     t.max_turns.present => t.max_turns
+        --     resolve_mode(t)=explore =>
+        --         config.default_max_turns_explore (20)
+        --     resolve_mode(t)=work    =>
+        --         config.default_max_turns_work (50)
+        --
+        --   resolve_cwd(t, parent):
+        --     t.cwd.present => t.cwd
+        --     else          => parent.working_dir
+        --
+        -- After this rule fires, bedrock's `SpawnAgentsCompletesAsLastTool`
+        -- (or `SpawnAgentsCompletesWithMoreTools`) drives the parent into
+        -- `awaiting_sub_agents` and the projects-level worktree contract
+        -- (WorkSubAgentInheritsWorktree, ExploreSubAgentDirectory) covers
+        -- the worktree-side seam.
+}
+
+------------------------------------------------------------
+-- Rules: Tool registry selection
+------------------------------------------------------------
+
+-- ===========================================================
+-- 5. PER-MODE TOOL REGISTRIES (REQ-PROJ-008)
+-- ===========================================================
+
+-- Fresh spawn: the registry is determined by the sub-agent's mode.
+-- Explore => `subagent_explore` (read-only tools + bash + browser +
+-- submit_result/submit_error). Work => `subagent_work` (Explore set +
+-- patch). Both modes get the parent's MCP tool set; an
+-- Explore-search-restricted MCP subset is a documented deferred
+-- refinement (see executive.md status).
+rule SubAgentRegistryOnFreshSpawn {
+    when: SubAgentSpawnSucceeded(parent, sub_agent, mode, cwd_override)
+    ensures:
+        if mode = work:
+            sub_agent.tool_registry = subagent_work
+        else:
+            sub_agent.tool_registry = subagent_explore
+    ensures: sub_agent.mcp_enabled = true
+}
+
+-- Resume path (`RuntimeManager::get_or_create` for a sub-agent
+-- conversation): the registry is recovered from the persisted `conv_mode`
+-- so the sub-agent does not lose its write capability across a restart or
+-- model-upgrade eviction. Sub-agents do not normally survive server
+-- restart, so this path is exercised only for in-process re-creation
+-- (e.g. model upgrade).
+rule SubAgentRegistryOnResume {
+    when: SubAgentRuntimeResumed(sub_agent)
+    ensures:
+        if sub_agent.mode in { work, branch }:
+            sub_agent.tool_registry = subagent_work
+        else:
+            sub_agent.tool_registry = subagent_explore
+    ensures: sub_agent.mcp_enabled = true
+
+    @guidance
+        -- `conv_mode` is the persisted source of truth (DB column
+        -- `conv_mode`). The runtime maps Work/Branch -> subagent_work,
+        -- Explore -> subagent_explore, Direct -> subagent_explore (a
+        -- sub-agent in Direct mode has no worktree of its own and is
+        -- treated as read-only).
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Restatement at the spawn layer of bedrock's `OneWorkSubAgent`
+-- Conversation-level invariant. Bedrock states it as a structural
+-- post-condition (`work_sub_agents.count <= 1`); subagents.allium
+-- states it as the spawn-time *check* that maintains it.
+--
+-- "Running" = not yet terminal (completed / failed). The counter
+-- `active_work_subagents(parent)` is the runtime realisation.
+invariant OneWorkSubAgentPerParent {
+    for p in Conversations:
+        active_work_subagents(p) <= 1
+}
+
+-- A Work sub-agent's effective cwd is always inside its parent's
+-- worktree. Combined with projects.allium's WriteBlockedOutsideWorktree,
+-- this guarantees that sub-agent writes cannot escape the parent's
+-- isolation boundary.
+invariant WorkSubAgentCwdInsideWorktree {
+    for sa in SubAgents where mode in { work, branch }:
+        is_within(sa.working_dir, sa.parent.worktree_path)
+}
+
+-- Explore sub-agents always carry the explore tool registry; Work
+-- sub-agents always carry the work tool registry. Restated against the
+-- persisted `conv_mode` so it survives runtime re-creation.
+invariant ToolRegistryMatchesMode {
+    for sa in SubAgents:
+        (sa.mode in { work, branch }
+            implies sa.tool_registry = subagent_work)
+        and
+        (sa.mode not in { work, branch }
+            implies sa.tool_registry = subagent_explore)
+}

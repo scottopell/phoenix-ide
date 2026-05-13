@@ -2,23 +2,70 @@
 
 ## Requirements Summary
 
-Sub-agents enable parallel task execution by spawning independent child conversations that run concurrently and report results back to a parent conversation. Each sub-agent runs in isolation and cannot spawn its own sub-agents. The parent specifies mode (explore for read-only, work for write access) and tier (fast for cheap research, capable for implementation) per sub-agent. Mode enforcement follows REQ-BED-018: Explore parents can only spawn Explore sub-agents; Work parents can spawn either, with Work sub-agents limited to one at a time on the shared worktree. Sub-agents can receive focused file context via `read_first` paths injected into their system prompt. Results are submitted via dedicated tools (`submit_result`, `submit_error`). Max 10 sub-agents per spawn call.
+Sub-agents enable parallel task execution by spawning independent child
+conversations that run concurrently and report results back to a parent
+conversation. Each sub-agent runs in isolation and cannot spawn its own
+sub-agents. The parent specifies mode (explore for read-only research,
+work for write access) and optionally a model and turn budget per
+sub-agent. Mode enforcement: Explore parents can only spawn Explore
+sub-agents; Work, Branch, and Direct parents can spawn either, with at
+most one Work sub-agent active at a time per parent (and per
+`spawn_agents` call). A Work sub-agent's effective cwd — including any
+`task.cwd` override — must stay inside the parent's worktree. Results are
+submitted via dedicated tools (`submit_result` / `submit_error`). Maximum
+10 sub-agents per spawn call.
 
 ## Technical Summary
 
-Parent state machine accumulates `pending_sub_agents` during `ToolExecuting`, transitions to `AwaitingSubAgents` when all tools complete. Fan-in uses bounded buffer (capacity = sub-agent count) for results that arrive before parent is ready. Sub-agents use typed `SubAgentOutcome` via oneshot channels: `Success`, `Failure`, or `TimedOut`. Terminal tools (`submit_result`/`submit_error`) must be the sole tool in an LLM response — the transition function enforces this structurally. Cancellation during `AwaitingSubAgents` transitions to `CancellingSubAgents`, propagating `UserCancel` to all pending sub-agents and waiting for acknowledgment before returning to idle. Timeout implemented via `deadline: Instant` in `AwaitingSubAgentsState` with executor `select!` racing result arrival against `sleep_until(deadline)`.
+The detailed state-machine and spawn-layer behaviour is normative in
+[`subagents.allium`](./subagents.allium) +
+[`bedrock.allium`](../bedrock/bedrock.allium); this section summarises
+only the architectural seams.
+
+- **State machine** lives in bedrock: `executing_tools` accumulates
+  `pending_sub_agents`; the parent transitions to `awaiting_sub_agents`
+  when all tools complete; fan-in uses a bounded buffer (capacity = the
+  spawn batch size) for results that arrive before the parent enters the
+  await state. Cancellation flows through `cancelling_sub_agents` and
+  back to idle.
+- **Sub-agent terminal states** are `completed { result }` and
+  `failed { error, error_kind }`. The `submit_result` / `submit_error`
+  tools must be the sole tool in their LLM response; the transition
+  function enforces this structurally.
+- **Spawn-layer** (`tools/subagent.rs` + `runtime/executor.rs::
+  handle_spawn_agents_tool`) validates the call, applies defaults
+  (mode, model, max_turns, cwd, timeout), enforces the one-writer +
+  cwd-scoping invariants, then hands each task to
+  `RuntimeManager::handle_spawn_request`. `runtime.rs` derives the
+  sub-agent's `ConvMode` from the parent's mode and selects the
+  per-mode tool registry (`for_subagent_explore` /
+  `for_subagent_work`); on runtime re-creation the registry is
+  recovered from the persisted `conv_mode`.
+- **Timeout** is a 20-minute wall-clock safety-net set when the parent
+  enters `awaiting_sub_agents`; `max_turns` (per-mode default 20/50) is
+  the primary budget.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-SA-001:** Parallel Task Execution | ✅ Complete | State machine support implemented |
-| **REQ-SA-002:** Sub-Agent Isolation | ✅ Complete | Tool set restriction, no nesting |
-| **REQ-SA-003:** Result Submission | ✅ Complete | `submit_result`/`submit_error` tools |
-| **REQ-SA-004:** Parent Fan-In | ✅ Complete | Bounded buffer, conservation invariant tested |
-| **REQ-SA-005:** Cancellation Propagation | ✅ Complete | `CancellingSubAgents` state |
-| **REQ-SA-006:** Timeout Enforcement | ✅ Complete | Task 578. `DEFAULT_SUBAGENT_TIMEOUT = 5min`, deadline in executor `select!` |
-| **REQ-SA-007:** Model Tier Selection | ❌ Not Started | `fast`/`capable` tiers mapped per model family |
-| **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | Exact paths injected into sub-agent system prompt |
+| **REQ-SA-001:** Parallel Task Execution | ✅ Complete | Mode/model/max-turns wired; max 10 tasks per call |
+| **REQ-SA-002:** Sub-Agent Isolation | ✅ Complete | Tool registries exclude `spawn_agents`, `ask_user_question`, `skill`, `propose_task`; sub-agents tagged `user_initiated = false` |
+| **REQ-SA-003:** Result Submission | ✅ Complete | `submit_result` / `submit_error`; terminal-tool-must-be-sole enforced structurally |
+| **REQ-SA-004:** Parent Fan-In | ✅ Complete | Bounded buffer; conservation invariant tested in proptests |
+| **REQ-SA-005:** Cancellation Propagation | ✅ Complete | `cancelling_sub_agents` state, propagates `UserCancel`; missing-runtime synthesises failure |
+| **REQ-SA-006:** Timeout Enforcement | ✅ Complete | `DEFAULT_SUBAGENT_TIMEOUT = 20 min`; deadline races in executor `select!` |
+| **REQ-SA-007:** Model Tier Selection | ✅ Superseded | Replaced by REQ-PROJ-008 mode defaults + explicit `model` override |
+| **REQ-SA-008:** Context Injection via Read-First | ❌ Not Started | `read_first` field not yet on `SubAgentTask`; deferred |
 
-**Progress:** 6 of 8 complete
+**Progress:** 7 of 8 implemented (one explicitly superseded; one deferred).
+
+## Deferred refinements
+
+- **Explore-MCP subset:** Explore sub-agents currently receive the
+  parent's full MCP tool set. A search-restricted subset (Atlassian
+  search, Google Workspace search, ...) is a documented deferred
+  refinement — kept deferred per task 13010. The spec records the
+  current behaviour; a future task can promote it.
+- **REQ-SA-008 `read_first`:** Not yet on the wire-level
+  `SubAgentTask`. Tracked in this status table.

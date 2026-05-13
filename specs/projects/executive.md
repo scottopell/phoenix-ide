@@ -55,7 +55,7 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-005:** Worktree Paths Are Unique by Construction | ✅ Complete | Task 08603 (M3). Derived from conversation UUID |
 | **REQ-PROJ-006:** Task Files as Versioned Living Contracts | ✅ Complete | taskmd 1.0 (filename is metadata, no frontmatter) is the default; agent drafts the file via `patch` in Explore; committed on the task branch, not main (REQ-PROJ-027). Task 13009 — a plain `.md` file (no taskmd metadata, no on-approve status rename, branch `task-{stem}-{conv-id8}`) works too, behind the `TaskSource` seam |
 | **REQ-PROJ-007:** Work Mode Enables Writes Within the Worktree | ✅ Complete | Task 08603 (M3). upgrade_to_work_mode() |
-| **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | 🔄 Partial | Sub-agents work but missing: mode parameter (explore/work), model override, one-writer constraint, MCP access |
+| **REQ-PROJ-008:** Work Sub-Agents Inherit the Worktree | ✅ Complete | Mode parameter, model override, max_turns, one-writer constraint, MCP access, cwd-scoping guard all implemented; spec normative in `specs/subagents/subagents.allium`. Explore-search-restricted MCP subset stays deferred (see subagents executive.md). |
 | **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted. Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
 | **REQ-PROJ-010:** Abandon a Conversation | ✅ Complete | Worktree removed; Managed deletes the task branch, Branch keeps it; diff snapshot captured as a system message first; no task-file edit |
 | **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | ✅ Complete | PR badge replaces ahead/behind StateBar noise |
@@ -78,23 +78,9 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-028:** Managed Mode Worktree from First Message | ✅ Complete | Worktree created on first message with temp branch |
 | **REQ-PROJ-029:** Branch Mode in the Mode Picker | ✅ Complete | Mode picker offers Direct, Managed, and Branch |
 
-**Progress:** of the 25 active requirements, 24 complete and 1 partial (REQ-PROJ-008,
-Work sub-agents). REQ-PROJ-009 and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016
-superseded by REQ-PROJ-018.
-
-## Remaining Work
-
-REQ-PROJ-008 (Work Sub-Agents) is the only incomplete pre-024 requirement. Needed:
-
-1. **Agent mode parameter** on spawn_agents: `mode: "explore" | "work"`. Explore gets
-   read-only tools + cheaper model. Work gets full tools + parent model.
-2. **One-writer constraint**: Only one Work sub-agent per parent at a time. Multiple
-   Explore sub-agents allowed in parallel.
-3. **MCP access**: Explore sub-agents get search-oriented MCP tools (deferred). Work
-   sub-agents get the full MCP set.
-4. **Model selection**: Explore defaults to haiku. Work inherits parent. Optional
-   override per task.
-5. **Max turns limit**: Per-agent turn cap (replaces or supplements 5-minute timeout).
+**Progress:** of the 25 active requirements, all 25 complete. REQ-PROJ-009
+and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by
+REQ-PROJ-018.
 
 ## Dependencies
 

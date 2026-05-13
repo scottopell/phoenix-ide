@@ -486,14 +486,17 @@ invoke multiple tools.
 
 | Parent mode | Sub-agent mode | Sub-agent cwd |
 |-------------|---------------|---------------|
-| Explore | Explore | Parent's cwd (main checkout) |
+| Explore (Managed, post-REQ-PROJ-028) | Explore | Parent's Explore worktree path |
 | Work | Explore | Parent's worktree path (reads current work state) |
 | Work | Work | Parent's worktree path (writes to worktree) |
+| Branch | Explore / Work | Parent's worktree path |
 | Direct | Explore | Parent's cwd |
 
 The `cwd` field on `SubAgentTaskSpec` overrides this default. The override is
-validated: Work sub-agents cannot write outside the parent's worktree even if
-`cwd` is overridden to a different directory.
+validated by the spawn handler: when the parent owns a worktree (Work or
+Branch), a Work sub-agent's effective cwd must canonicalise to a path inside
+that worktree, otherwise the spawn is rejected with a tool error. The full
+mode/cwd/model/turn validation lives in `specs/subagents/subagents.allium`.
 
 ## Persistence
 

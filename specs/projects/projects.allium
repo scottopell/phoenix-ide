@@ -903,6 +903,15 @@ rule WriteBlockedOutsideWorktree {
 -- ===========================================================
 -- 8. SUB-AGENT WORKTREE INHERITANCE (REQ-PROJ-008)
 -- ===========================================================
+--
+-- Sub-agent spawn rules (mode validation, one-writer, cwd-scoping,
+-- model/turn defaulting, tool-registry selection) live in
+-- subagents.allium. The two thin rules below model only the worktree
+-- side of the seam: which directory a freshly spawned sub-agent inherits
+-- from its parent. The cwd-scoping invariant
+-- (WorkSubAgentCwdInsideWorktree in subagents.allium) keeps Work
+-- sub-agent writes inside the bounds modelled by
+-- WriteBlockedOutsideWorktree above.
 
 -- REQ-PROJ-008: Work sub-agent inherits parent worktree
 rule WorkSubAgentInheritsWorktree {
@@ -915,8 +924,11 @@ rule WorkSubAgentInheritsWorktree {
     ensures: sub_agent.working_dir = parent.worktree_path
 
     @guidance
-        -- One Work sub-agent per parent (enforced by bedrock invariant).
-        -- Sub-agent has write access to parent's worktree.
+        -- One Work sub-agent per parent is the
+        -- OneWorkSubAgentPerParent invariant in subagents.allium,
+        -- restating bedrock's OneWorkSubAgent.
+        -- Sub-agent has write access to parent's worktree, scoped by
+        -- WriteBlockedOutsideWorktree above.
 }
 
 -- REQ-PROJ-008: Explore sub-agent reads from worktree or main
@@ -926,7 +938,7 @@ rule ExploreSubAgentDirectory {
     requires: mode = explore
 
     ensures:
-        if parent.mode in { work, branch }:
+        if parent.mode in { work, branch, explore }:
             sub_agent.working_dir = parent.worktree_path
         else:
             sub_agent.working_dir = parent.working_dir
@@ -934,6 +946,13 @@ rule ExploreSubAgentDirectory {
     @guidance
         -- Explore sub-agents are read-only regardless of parent mode.
         -- Multiple Explore sub-agents allowed in parallel.
+        --
+        -- An Explore parent that has been promoted from Managed -> Work
+        -- via task approval (REQ-PROJ-028) already owns a worktree; even
+        -- before that promotion an Explore parent in Managed mode has
+        -- a worktree, so `parent.mode = explore` resolves to the
+        -- worktree path here. Only Direct parents fall through to
+        -- `parent.working_dir`.
 }
 
 -- ===========================================================

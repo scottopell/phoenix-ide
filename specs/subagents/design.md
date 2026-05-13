@@ -2,9 +2,19 @@
 
 ## Overview
 
-Sub-agents enable parallel task execution by spawning independent child conversations that run concurrently and report results back to a parent conversation.
+Sub-agents enable parallel task execution by spawning independent child
+conversations that run concurrently and report results back to a parent
+conversation.
 
-**Requirements**: REQ-BED-008 (Sub-Agent Spawning), REQ-BED-009 (Sub-Agent Isolation)
+**Requirements:** REQ-BED-008 (Sub-Agent Spawning), REQ-BED-009 (Sub-Agent
+Isolation), REQ-PROJ-008 (Sub-Agent Mode + Resource Controls).
+
+> Detailed behaviour — states, transitions, invariants, mode rules,
+> one-writer constraint, cwd-scoping, model/turn defaulting — is normative
+> in [`subagents.allium`](./subagents.allium) (spawn layer) and
+> [`bedrock.allium`](../bedrock/bedrock.allium) (state-machine layer).
+> This file keeps only the architectural overview, the rationale, and
+> example use cases.
 
 ## Architecture
 
@@ -12,16 +22,16 @@ Sub-agents enable parallel task execution by spawning independent child conversa
 ┌─────────────────────────────────────────────────────────────────┐
 │                      PARENT CONVERSATION                         │
 │                                                                  │
-│  ToolExecuting ───[spawn_agents]───▶ AwaitingSubAgents          │
+│  ToolExecuting ───[spawn_agents]───▶ AwaitingSubAgents           │
 │                                             │                    │
 │       ┌─────────────────────────────────────┤ (SpawnSubAgent     │
 │       │               │               │       effects)           │
 │       ▼               ▼               ▼                          │
-│  ┌─────────┐    ┌─────────┐    ┌─────────┐                      │
-│  │SubAgent1│    │SubAgent2│    │SubAgent3│  (independent)       │
-│  │  ...    │    │  ...    │    │  ...    │                      │
-│  │Completed│    │ Failed  │    │Completed│  (terminal states)   │
-│  └────┬────┘    └────┬────┘    └────┬────┘                      │
+│  ┌─────────┐    ┌─────────┐    ┌─────────┐                       │
+│  │SubAgent1│    │SubAgent2│    │SubAgent3│  (independent)        │
+│  │  ...    │    │  ...    │    │  ...    │                       │
+│  │Completed│    │ Failed  │    │Completed│  (terminal states)    │
+│  └────┬────┘    └────┬────┘    └────┬────┘                       │
 │       │              │              │                            │
 │       │    SubAgentResult events    │                            │
 │       └──────────────┼──────────────┘                            │
@@ -31,745 +41,66 @@ Sub-agents enable parallel task execution by spawning independent child conversa
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## State Machine Changes
-
-### New/Modified States
-
-```rust
-enum ConvState {
-    // ... existing states ...
-
-    // Modified: tracks spawned sub-agents during tool execution
-    ToolExecuting {
-        current_tool: ToolCall,
-        remaining_tools: Vec<ToolCall>,
-        completed_results: Vec<ToolResult>,
-        pending_sub_agents: Vec<String>,  // NEW: accumulated from spawn_agents
-    },
-
-    // Existing but now reachable (REQ-SA-004, REQ-SA-006)
-    AwaitingSubAgents {
-        pending_ids: Vec<String>,
-        completed_results: Vec<SubAgentResult>,
-        deadline: Instant,  // mandatory timeout for all pending sub-agents
-    },
-
-    // NEW: waiting for sub-agents to acknowledge cancellation
-    CancellingSubAgents {
-        pending_ids: Vec<String>,
-        completed_results: Vec<SubAgentResult>,
-    },
-
-    // NEW: sub-agent terminal states
-    Completed { result: String },
-    Failed { error: String, error_kind: ErrorKind },
-}
-```
-
-### New Events
-
-```rust
-enum Event {
-    // ... existing events ...
-
-    // NEW: spawn_agents tool completion (distinct from ToolComplete)
-    SpawnAgentsComplete {
-        tool_use_id: String,
-        result: ToolResult,           // Normal result for LLM context
-        agent_ids: Vec<String>,       // Spawned sub-agent conversation IDs
-    },
-
-    // Existing but now used
-    SubAgentResult {
-        agent_id: String,
-        outcome: SubAgentOutcome,
-    },
-}
-
-// Typed outcome - pit of success, no invalid states
-enum SubAgentOutcome {
-    Success { result: String },
-    Failure { error: String, error_kind: ErrorKind },
-}
-```
-
-### New Effects (Typed-Effect Architecture)
-
-Effects carry oneshot channels for their outcome type. See bedrock design.md for the
-full typed-effect architecture.
-
-```rust
-enum Effect {
-    // ... existing effects ...
-
-    // NEW: spawn a sub-agent conversation (REQ-SA-001, REQ-SA-006)
-    SpawnSubAgent {
-        config: SubAgentConfig,
-        reply: oneshot::Sender<SubAgentOutcome>,
-    },
-
-    // NEW: cancel all pending sub-agents (REQ-SA-005)
-    CancelSubAgents { ids: Vec<String> },
-
-    // NEW: notify parent of sub-agent completion (sub-agent only)
-    NotifyParent { outcome: SubAgentOutcome },
-}
-
-struct SubAgentConfig {
-    agent_id: String,
-    task: String,
-    cwd: String,
-    timeout: Duration,          // mandatory (REQ-SA-006)
-    mode: SubAgentMode,         // mandatory (REQ-SA-001, REQ-BED-018)
-    tier: ModelTier,            // mandatory (REQ-SA-007)
-    read_first: Vec<PathBuf>,   // optional (REQ-SA-008)
-}
-
-/// Conversation mode for the sub-agent (REQ-BED-018)
-enum SubAgentMode {
-    Explore,  // read-only tools, safe in parallel
-    Work,     // write access to parent's worktree, one at a time
-}
-
-/// Model capability tier — resolved to a concrete model ID at spawn time (REQ-SA-007)
-enum ModelTier {
-    Fast,     // cheapest model in the parent's family (e.g., haiku, gpt-4o-mini)
-    Capable,  // most capable in the family (e.g., sonnet, gpt-4o)
-}
-
-enum SubAgentOutcome {
-    Success { result: String },
-    Failure { error: String, error_kind: ErrorKind },
-    TimedOut,
-}
-```
-
-## Edge Cases and Clarifications
-
-### Early SubAgentResult (Race Condition)
-
-**Problem:** Sub-agent completes while parent still in `ToolExecuting`.
-
-**Solution:** Bounded buffer with capacity equal to sub-agent count. Results that arrive
-before `AwaitingSubAgents` fill buffer slots. Parent drains on entry. Deadlock-free
-because sub-agents send exactly once and buffer capacity equals sub-agent count.
-
-```rust
-// In executor/runtime — bounded channel, not unbounded Vec
-let (result_tx, result_rx) = mpsc::channel::<SubAgentResult>(pending_count);
-// Capacity = exact number of sub-agents. No more, no less.
-
-// When SubAgentResult arrives and parent not in AwaitingSubAgents:
-//   result_tx.send(result) — fills a buffer slot, blocks if full (shouldn't happen)
-// When parent transitions to AwaitingSubAgents:
-//   while let Ok(result) = result_rx.try_recv() { process(result) }
-```
-
-### Terminal Tool Handling (submit_result / submit_error)
-
-**Rule:** `submit_result` and `submit_error` MUST be the sole tool in the response.
-
-**Note:** This restriction applies ONLY to sub-agent terminal tools. `spawn_agents` can appear alongside other tools (e.g., `[bash, spawn_agents, patch]`) - that's the whole point of `pending_sub_agents` accumulation in `ToolExecuting`.
-
-**Detection:** Transition function inspects tool_calls BEFORE entering ToolExecuting:
-
-```rust
-// In transition, when is_sub_agent:
-(LlmRequesting, LlmResponse { tool_calls, .. }) => {
-    let terminal_tool = tool_calls.iter().find(|t| 
-        t.name() == "submit_result" || t.name() == "submit_error"
-    );
-    
-    if let Some(tool) = terminal_tool {
-        if tool_calls.len() > 1 {
-            // Error: terminal tool must be alone
-            return Err(TransitionError::InvalidToolCombination(
-                "submit_result/submit_error must be the only tool in response"
-            ));
-        }
-        // Transition directly to terminal state
-        match tool.name() {
-            "submit_result" => Completed { result: tool.input.result },
-            "submit_error" => Failed { error: tool.input.error, error_kind: SubAgentError },
-        }
-    } else {
-        // Normal tool execution
-        ToolExecuting { ... }
-    }
-}
-```
-
-### Cancellation During ToolExecuting with Pending Sub-Agents
-
-**Problem:** Parent cancelled while sub-agents already spawned but more tools remain.
-
-**Solution:** Transition to CancellingTool (existing) AND emit CancelSubAgents:
-
-```
-ToolExecuting { pending_sub_agents: [ids...] } + UserCancel
-    → CancellingTool { ... }
-    + Effect::AbortTool { current_tool }
-    + Effect::CancelSubAgents { ids }  // NEW: also cancel spawned sub-agents
-```
-
-The CancellingTool flow continues normally. Buffered SubAgentResults are discarded since parent won't reach AwaitingSubAgents.
-
-### agent_id Generation
-
-**Responsibility:** Tool executor generates UUIDs when processing spawn_agents tool.
-
-```rust
-// In spawn_agents tool executor
-fn execute_spawn_agents(input: SpawnAgentsInput, ctx: &ConvContext) -> SpawnAgentsResult {
-    let agent_ids: Vec<String> = input.tasks.iter()
-        .map(|_| Uuid::new_v4().to_string())
-        .collect();
-    
-    // Return immediately with IDs; effects will spawn the actual agents
-    SpawnAgentsResult {
-        agent_ids: agent_ids.clone(),
-        output: format!("Spawning {} sub-agents: {:?}", agent_ids.len(), agent_ids),
-    }
-}
-
-// Executor then sends SpawnAgentsComplete event with these IDs
-// AND emits SpawnSubAgent effects with the same IDs
-```
-
-### Partial Spawn Failure
-
-**Policy:** All-or-nothing. If any spawn fails:
-1. Cancel already-spawned agents
-2. Return error to parent LLM
-3. Parent remains in ToolExecuting (or transitions to next tool)
-
-```rust
-// SpawnAgentsComplete indicates success
-// On failure, send ToolComplete with error result instead
-Event::ToolComplete {
-    tool_use_id,
-    result: ToolResult {
-        output: "Failed to spawn sub-agents: DB error",
-        is_error: true,
-    }
-}
-```
-
-### Missing Runtime During Cancel
-
-**Problem:** Sub-agent runtime crashed; CancelSubAgents can't reach it.
-
-**Solution:** Synthesize failure result immediately:
-
-```rust
-async fn handle_cancel_sub_agents(ids: Vec<String>, runtime_manager: &RuntimeManager, parent_tx: &EventSender) {
-    for id in ids {
-        if let Some(runtime) = runtime_manager.get(&id) {
-            runtime.send_event(Event::UserCancel).await;
-        } else {
-            // Runtime gone - synthesize result
-            parent_tx.send(Event::SubAgentResult {
-                agent_id: id,
-                outcome: SubAgentOutcome::Failure {
-                    error: "Sub-agent runtime not found".into(),
-                    error_kind: ErrorKind::Cancelled,
-                },
-            }).await;
-        }
-    }
-}
-```
-
-### Timeout Behavior (REQ-SA-006, REQ-BED-026)
-
-**Mandatory:** `timeout: Duration` is required on `SubAgentConfig` — not `Option`.
-The caller must make a conscious decision about how long this sub-agent should run.
-
-Sub-agent terminates when any of these occur first:
-- It calls submit_result/submit_error
-- Parent is cancelled (propagates to sub-agents)
-- Sub-agent hits unrecoverable error
-- **Timeout fires** — executor sends `UserCancel` to sub-agent, producing
-  `SubAgentOutcome::TimedOut`
-
-The deadline is stamped when the SM emits the `SpawnSubAgent` effect. The executor's
-`select!` loop races result arrival against `sleep_until(deadline)`:
-
-### Mode Enforcement at Spawn Time (REQ-BED-018, REQ-SA-001)
-
-The executor validates mode at spawn time based on the parent's current mode:
-
-```rust
-fn validate_sub_agent_mode(
-    parent_mode: &ConvMode,
-    requested: SubAgentMode,
-) -> Result<SubAgentMode, SpawnError> {
-    match (parent_mode, requested) {
-        // Explore parent: only Explore sub-agents allowed.
-        // Requesting Work from Explore is an error — forces the LLM to
-        // understand it's in a read-only context.
-        (ConvMode::Explore { .. }, SubAgentMode::Explore) => Ok(SubAgentMode::Explore),
-        (ConvMode::Explore { .. }, SubAgentMode::Work) => Err(SpawnError::ModeNotAllowed {
-            message: "Cannot spawn Work sub-agent from Explore mode. \
-                      Use propose_task to propose work that requires write access.",
-        }),
-
-        // Work parent: both modes allowed.
-        // Work sub-agents share the parent's worktree (one at a time).
-        (ConvMode::Work { .. }, SubAgentMode::Explore) => Ok(SubAgentMode::Explore),
-        (ConvMode::Work { .. }, SubAgentMode::Work) => Ok(SubAgentMode::Work),
-    }
-}
-```
-
-Work sub-agent count enforcement: the executor tracks active Work sub-agents per
-parent. If a Work sub-agent is already running and another Work spawn is requested,
-the spawn fails with an error. Explore sub-agents have no such limit (up to the
-hard cap of 10 per call).
-
-### Model Tier Resolution (REQ-SA-007)
-
-Each model family defines its tier mapping in the model registry:
-
-```rust
-struct ModelFamily {
-    name: String,           // "claude", "gpt"
-    fast: String,           // "claude-haiku-4-5", "gpt-4o-mini"
-    capable: String,        // "claude-sonnet-4-6", "gpt-4o"
-}
-```
-
-At spawn time: look up the parent's model in the registry, find its family, resolve
-the requested tier to a concrete model ID. If the tier's model is not available
-(e.g., API key missing), fail the spawn — don't silently fall back.
-
-### Context Injection via read_first (REQ-SA-008)
-
-At spawn time, before creating the sub-agent conversation:
-
-1. Read each file in `read_first` from disk
-2. Wrap contents: `<file path="/absolute/path">...contents...</file>`
-3. Inject as a system prompt section before the sub-agent's standard system prompt
-4. If any file doesn't exist or can't be read, fail the entire spawn call
-
-The system prompt order for a sub-agent:
-```
-[read_first file contents]
-[standard sub-agent system prompt]
-[user message: task description]
-```
-
-Files are read once at spawn time — the sub-agent sees a snapshot. If the parent
-modifies files while the sub-agent runs, the sub-agent won't see the changes (this
-is intentional — sub-agents work on a consistent snapshot).
-
-### Terminal State Exclusion from Wildcard Cancel
-
-**Clarification:** The wildcard `* + UserCancel → Failed` explicitly excludes terminal states:
-
-```rust
-// This does NOT apply to Completed or Failed states
-(state, Event::UserCancel) if ctx.is_sub_agent && !state.is_terminal() => {
-    Failed { error: "Cancelled", error_kind: Cancelled }
-}
-
-impl ConvState {
-    fn is_terminal(&self) -> bool {
-        matches!(self, ConvState::Completed { .. } | ConvState::Failed { .. })
-    }
-}
-```
-
-### NotifyParent Failure Handling
-
-**If parent_event_tx is None:** Programming error - sub-agent created without parent link. Log error, sub-agent still transitions to terminal state.
-
-**If send() fails:** Parent terminated. Sub-agent transitions to terminal state anyway; result is lost but that's acceptable (parent is gone).
-
-## State Transitions
-
-### Parent: Tool Execution with Sub-Agent Spawning
-
-```
-// spawn_agents completes (more tools remaining)
-ToolExecuting { current, remaining: [next, ...], pending_sub_agents }
-    + SpawnAgentsComplete { agent_ids }
-    → ToolExecuting { 
-        current: next, 
-        remaining: [...],
-        pending_sub_agents: pending_sub_agents ++ agent_ids 
-      }
-    + Effect::ExecuteTool { next }
-    + Effect::SpawnSubAgent × len(agent_ids)
-
-// Last tool completes, sub-agents pending
-ToolExecuting { remaining: [], pending_sub_agents: [..] }
-    + ToolComplete | SpawnAgentsComplete
-    → AwaitingSubAgents { pending_ids: pending_sub_agents, completed_results: [] }
-
-// Last tool completes, no sub-agents
-ToolExecuting { remaining: [], pending_sub_agents: [] }
-    + ToolComplete
-    → LlmRequesting { attempt: 1 }
-    + Effect::RequestLlm
-```
-
-### Parent: Awaiting Sub-Agent Results (Fan-In)
-
-```
-// Sub-agent completes (more pending)
-AwaitingSubAgents { pending_ids: [id, ...rest], completed_results }
-    + SubAgentResult { agent_id: id, outcome }
-    → AwaitingSubAgents { 
-        pending_ids: rest, 
-        completed_results: completed_results ++ [result] 
-      }
-
-// Last sub-agent completes
-AwaitingSubAgents { pending_ids: [id], completed_results }
-    + SubAgentResult { agent_id: id, outcome }
-    → LlmRequesting { attempt: 1 }
-    + Effect::PersistMessage { aggregated results }
-    + Effect::RequestLlm
-
-// Unknown agent_id - reject
-AwaitingSubAgents { pending_ids }
-    + SubAgentResult { agent_id } where agent_id ∉ pending_ids
-    → Error: InvalidTransition
-```
-
-### Parent: Cancellation While Awaiting Sub-Agents
-
-```
-// User cancels while waiting
-AwaitingSubAgents { pending_ids, completed_results }
-    + UserCancel
-    → CancellingSubAgents { pending_ids, completed_results }
-    + Effect::CancelSubAgents { ids: pending_ids }
-
-// Sub-agent acknowledges cancellation (or completes naturally)
-CancellingSubAgents { pending_ids: [id, ...rest], completed_results }
-    + SubAgentResult { agent_id: id, outcome }
-    → CancellingSubAgents { pending_ids: rest, completed_results ++ [result] }
-
-// Last sub-agent done during cancellation
-CancellingSubAgents { pending_ids: [id], completed_results }
-    + SubAgentResult { agent_id: id, outcome }
-    → Idle
-    + Effect::NotifyAgentDone
-```
-
-### Sub-Agent: Terminal State Transitions
-
-```
-// LLM calls submit_result - transition to Completed (not tool execution)
-LlmRequesting + LlmResponse { tool_calls: [submit_result { result }] }
-    where context.is_sub_agent
-    → Completed { result }
-    + Effect::NotifyParent { outcome: Success { result } }
-
-// LLM calls submit_error - transition to Failed
-LlmRequesting + LlmResponse { tool_calls: [submit_error { error }] }
-    where context.is_sub_agent
-    → Failed { error, error_kind: SubAgentError }
-    + Effect::NotifyParent { outcome: Failure { error, error_kind } }
-
-// Sub-agent hits unrecoverable error - also terminal
-Error { message, error_kind } where context.is_sub_agent
-    → Failed { error: message, error_kind }
-    + Effect::NotifyParent { outcome: Failure { ... } }
-
-// Sub-agent receives cancellation (from parent or timeout)
-* + UserCancel where context.is_sub_agent
-    → Failed { error: "Cancelled", error_kind: Cancelled }
-    + Effect::NotifyParent { outcome: Failure { ... } }
-```
-
-## Property Invariants
-
-### Fan-In Conservation
-
-```rust
-// pending_ids.len() + completed_results.len() == N (constant)
-#[proptest]
-fn prop_subagent_count_conserved(initial_ids: Vec<String>, completions: Vec<SubAgentResult>) {
-    let n = initial_ids.len();
-    let mut state = AwaitingSubAgents { pending_ids: initial_ids, completed_results: vec![] };
-    
-    for result in completions {
-        state = transition(&state, &ctx, SubAgentResult(result)).new_state;
-        match &state {
-            AwaitingSubAgents { pending_ids, completed_results } |
-            CancellingSubAgents { pending_ids, completed_results } => {
-                assert_eq!(pending_ids.len() + completed_results.len(), n);
-            }
-            _ => {}
-        }
-    }
-}
-```
-
-### Monotonicity
-
-```rust
-// pending_ids only decreases
-#[proptest]
-fn prop_pending_decreases_monotonically(...) { ... }
-
-// completed_results only increases
-#[proptest]
-fn prop_completed_increases_monotonically(...) { ... }
-```
-
-### Terminal State Properties
-
-```rust
-// Completed and Failed are terminal - no transitions out
-#[proptest]
-fn prop_terminal_states_are_terminal(event: Event) {
-    let completed = ConvState::Completed { result: "done".into() };
-    let failed = ConvState::Failed { error: "err".into(), error_kind: ... };
-    
-    assert!(transition(&completed, &sub_agent_ctx, event.clone()).is_err());
-    assert!(transition(&failed, &sub_agent_ctx, event).is_err());
-}
-```
-
-### Rejection Properties
-
-```rust
-// Unknown agent_id rejected
-#[proptest]
-fn prop_unknown_agent_rejected(pending_ids: Vec<String>, unknown: String) {
-    prop_assume!(!pending_ids.contains(&unknown));
-    let state = AwaitingSubAgents { pending_ids, completed_results: vec![] };
-    let event = SubAgentResult { agent_id: unknown, ... };
-    assert!(transition(&state, &ctx, event).is_err());
-}
-
-// Duplicate completion rejected
-#[proptest]
-fn prop_duplicate_rejected(agent_id: String) {
-    let state = AwaitingSubAgents { 
-        pending_ids: vec![], 
-        completed_results: vec![SubAgentResult { agent_id: agent_id.clone(), ... }]
-    };
-    let event = SubAgentResult { agent_id, ... };
-    assert!(transition(&state, &ctx, event).is_err());
-}
-```
-
-### No Nested Sub-Agents
-
-```rust
-// spawn_agents not available to sub-agents (enforced at tool filtering)
-#[test]
-fn test_subagent_tools_exclude_spawn_agents() {
-    let tools = tools_for_context(&sub_agent_context);
-    assert!(!tools.iter().any(|t| t.name() == "spawn_agents"));
-}
-```
-
-## Tool Definitions
-
-### spawn_agents (Parent Only)
-
-```json
-{
-  "name": "spawn_agents",
-  "description": "Spawn sub-agents to execute tasks in parallel. Each sub-agent runs independently and returns a result. Use for: multiple perspectives on code review, exploring unfamiliar parts of a codebase, parallel research or analysis tasks, or divide-and-conquer problem solving. You MUST specify mode and tier for each task.",
-  "input_schema": {
-    "type": "object",
-    "required": ["tasks"],
-    "properties": {
-      "tasks": {
-        "type": "array",
-        "items": {
-          "type": "object",
-          "required": ["task", "mode", "tier"],
-          "properties": {
-            "task": {
-              "type": "string",
-              "description": "Task description for the sub-agent"
-            },
-            "mode": {
-              "type": "string",
-              "enum": ["explore", "work"],
-              "description": "explore = read-only (safe in parallel), work = write access to worktree (one at a time). Explore parents can only spawn explore sub-agents."
-            },
-            "tier": {
-              "type": "string",
-              "enum": ["fast", "capable"],
-              "description": "fast = cheapest model in the family (research, search). capable = most capable (implementation, review)."
-            },
-            "read_first": {
-              "type": "array",
-              "items": { "type": "string" },
-              "description": "Exact file paths to inject into the sub-agent's system prompt as context before it starts. No glob patterns."
-            },
-            "cwd": {
-              "type": "string",
-              "description": "Working directory (defaults to parent's cwd)"
-            }
-          }
-        },
-        "minItems": 1,
-        "maxItems": 10,
-        "description": "List of tasks to execute in parallel (max 10)"
-      }
-    }
-  }
-}
-```
-
-### submit_result (Sub-Agent Only)
-
-```json
-{
-  "name": "submit_result",
-  "description": "Submit your final result to the parent conversation. Call this when you have completed your assigned task. After calling this, your conversation ends.",
-  "input_schema": {
-    "type": "object",
-    "required": ["result"],
-    "properties": {
-      "result": {
-        "type": "string",
-        "description": "Your final result, summary, or output"
-      }
-    }
-  }
-}
-```
-
-### submit_error (Sub-Agent Only)
-
-```json
-{
-  "name": "submit_error",
-  "description": "Report that you cannot complete the assigned task. Call this if you encounter an unrecoverable error or determine the task is impossible. After calling this, your conversation ends.",
-  "input_schema": {
-    "type": "object",
-    "required": ["error"],
-    "properties": {
-      "error": {
-        "type": "string",
-        "description": "Description of why the task could not be completed"
-      }
-    }
-  }
-}
-```
-
-## Tool Availability
-
-```rust
-fn tools_for_context(ctx: &ConvContext) -> Vec<Tool> {
-    let mut tools = vec![
-        bash_tool(),
-        patch_tool(),
-        think_tool(),
-        keyword_search_tool(),
-        read_image_tool(),
-        // ... other standard tools
-    ];
-
-    if ctx.is_sub_agent {
-        // Sub-agents get completion tools, no spawning
-        tools.push(submit_result_tool());
-        tools.push(submit_error_tool());
-    } else {
-        // Main conversations can spawn sub-agents
-        tools.push(spawn_agents_tool());
-    }
-
-    tools
-}
-```
-
-## Runtime / Executor Responsibilities
-
-### Sub-Agent Spawning (Effect Handler)
-
-```rust
-async fn handle_spawn_sub_agent(effect: SpawnSubAgent, parent_ctx: &ConvContext) {
-    // 1. Create conversation in DB
-    let conv = db.create_conversation(CreateConversation {
-        cwd: effect.cwd,
-        parent_conversation_id: Some(parent_ctx.conversation_id.clone()),
-        user_initiated: false,
-    });
-
-    // 2. Insert initial task as synthetic user message
-    db.add_message(conv.id, MessageContent::User { 
-        text: effect.task,
-        images: vec![],
-    });
-
-    // 3. Create sub-agent context
-    let sub_ctx = ConvContext {
-        conversation_id: conv.id,
-        working_dir: effect.cwd.into(),
-        model_id: parent_ctx.model_id.clone(),
-        is_sub_agent: true,
-        parent_event_tx: Some(parent_event_tx.clone()),
-    };
-
-    // 4. Start runtime with optional timeout
-    let runtime = ConversationRuntime::new(sub_ctx);
-    if let Some(timeout) = effect.timeout {
-        runtime.set_timeout(timeout);
-    }
-    
-    // 5. Spawn runtime task
-    tokio::spawn(runtime.run());
-}
-```
-
-### Parent Notification (Effect Handler)
-
-```rust
-async fn handle_notify_parent(outcome: SubAgentOutcome, ctx: &ConvContext) {
-    if let Some(parent_tx) = &ctx.parent_event_tx {
-        parent_tx.send(Event::SubAgentResult {
-            agent_id: ctx.conversation_id.clone(),
-            outcome,
-        }).await;
-    }
-}
-```
-
-### Cancel Propagation (Effect Handler)
-
-```rust
-async fn handle_cancel_sub_agents(ids: Vec<String>, runtime_manager: &RuntimeManager) {
-    for id in ids {
-        if let Some(runtime) = runtime_manager.get(&id) {
-            runtime.send_event(Event::UserCancel).await;
-        }
-    }
-}
-```
-
-### Timeout (Executor Concern)
-
-```rust
-impl ConversationRuntime {
-    fn set_timeout(&mut self, duration: Duration) {
-        let event_tx = self.event_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(duration).await;
-            // Timeout triggers cancellation
-            let _ = event_tx.send(Event::UserCancel).await;
-        });
-    }
-}
-```
+Two layers cooperate:
+
+1. **Spawn layer** — `crates/phoenix-ide/src/tools/subagent.rs` (the
+   `spawn_agents` / `submit_result` / `submit_error` tools) and
+   `crates/phoenix-ide/src/runtime/executor.rs::handle_spawn_agents_tool`
+   (validation, defaulting, one-writer + cwd-scoping guards). Normative
+   in `subagents.allium`.
+
+2. **State-machine layer** — `crates/phoenix-ide/src/state_machine/`
+   (the `executing_tools` / `awaiting_sub_agents` / `cancelling_sub_agents`
+   / `completed` / `failed` transitions, the `SubAgentResult` fan-in,
+   cancellation propagation). Normative in `bedrock.allium`.
+
+3. **Cross-spec seam** — projects.allium owns the worktree contract
+   (`WorkSubAgentInheritsWorktree`, `ExploreSubAgentDirectory`). The
+   cwd-scoping invariant in `subagents.allium` keeps Work sub-agent
+   writes inside that boundary.
+
+## Mode rules (summary)
+
+- **Explore parent** → can spawn Explore sub-agents only. A Work spawn
+  request from an Explore parent is rejected at spawn time.
+- **Work / Branch / Direct parent** → can spawn either mode; at most one
+  Work sub-agent active at a time per parent (one-writer invariant), and
+  per single `spawn_agents` call. Multiple Explore sub-agents in parallel
+  are unconstrained beyond the hard cap of 10 tasks per call.
+
+The mode-validation, one-writer, and cwd-scoping rules are normative in
+`subagents.allium` §§1–4.
+
+## Defaulting (config)
+
+| Sub-agent mode | Default model | Default `max_turns` |
+|----------------|--------------|---------------------|
+| Explore | Cheapest model in the parent's provider family (e.g. haiku for Anthropic) | 20 |
+| Work | Parent's model (inherited) | 50 |
+
+`DEFAULT_SUBAGENT_TIMEOUT = 20 minutes` is the wall-clock safety-net;
+`max_turns` is the primary budget. An explicit `model` field on the task
+is validated against the LLM registry and rejected if unknown. See
+`subagents.allium`'s `SubAgentSpecsResolved` rule for the full resolution
+sequence.
+
+## Tool availability
+
+The two sub-agent tool registries live in
+`crates/phoenix-ide/src/tools.rs` (`ToolRegistry::for_subagent_explore` /
+`for_subagent_work`). Both include `submit_result` / `submit_error`;
+neither includes `spawn_agents`, `ask_user_question`, `skill`, or
+`propose_task` (REQ-SA-002 + REQ-AUQ-006). The Work variant adds `patch`
+on top of the Explore set.
+
+MCP tools are wrapped at runtime via `ToolRegistryExecutor::with_mcp` —
+sub-agents share the parent's MCP manager. An
+Explore-search-restricted MCP subset is a documented deferred refinement
+(see `executive.md`).
 
 ## Database
 
-### Schema (No Changes Required)
-
-Existing fields support sub-agents:
+No schema changes for sub-agents. Existing fields suffice:
 
 ```sql
 CREATE TABLE conversations (
@@ -777,50 +108,22 @@ CREATE TABLE conversations (
     parent_conversation_id TEXT,    -- Set for sub-agents
     user_initiated BOOLEAN NOT NULL, -- FALSE for sub-agents
     ...
-    FOREIGN KEY (parent_conversation_id) 
+    FOREIGN KEY (parent_conversation_id)
         REFERENCES conversations(id) ON DELETE CASCADE
 );
 ```
 
-### Queries
+`active_work_subagents` (the one-writer counter) is held on the
+runtime executor and intentionally *not* persisted — sub-agents do
+not survive server restart, so the counter resets to 0 on restart
+by construction.
 
-```sql
--- List user conversations (excludes sub-agents) - ALREADY EXISTS
-SELECT * FROM conversations 
-WHERE user_initiated = 1 AND archived = 0;
+## Aggregated results format
 
--- Get sub-agents for a parent
-SELECT * FROM conversations 
-WHERE parent_conversation_id = ?;
-```
-
-## Sub-Agent Initial Message
-
-Sub-agents receive their task as a synthetic `UserMessage`:
-
-```rust
-// When spawning sub-agent
-db.add_message(conv.id, Message {
-    message_type: MessageType::User,
-    content: MessageContent::User { 
-        text: task,  // From spawn_agents input
-        images: vec![],
-    },
-    ...
-});
-```
-
-This triggers the normal flow: `Idle → LlmRequesting → ...`
-
-The sub-agent's LLM sees:
-```
-[User]: Review the error handling in src/api/ and identify potential issues
-[Assistant]: I'll examine the error handling patterns...
-```
-
-## Aggregated Results Format
-
-When all sub-agents complete, parent's LLM receives:
+When all sub-agents complete, the parent's LLM receives a structured
+summary message persisted in place of the `spawn_agents` placeholder.
+See `runtime/executor.rs::persist_sub_agent_results` for the exact
+JSON shape; conceptually:
 
 ```json
 {
@@ -828,138 +131,15 @@ When all sub-agents complete, parent's LLM receives:
     {
       "agent_id": "uuid-1",
       "task": "Review error handling from a security perspective",
-      "outcome": {
-        "success": {
-          "result": "Found 3 issues: 1) Auth errors leak internal details in src/api/handlers.rs:45, 2) ..."
-        }
-      }
+      "outcome": { "success": { "result": "Found 3 issues: ..." } }
     },
     {
-      "agent_id": "uuid-2", 
+      "agent_id": "uuid-2",
       "task": "Review error handling from a performance perspective",
-      "outcome": {
-        "failure": {
-          "error": "Codebase too large to analyze within time limit",
-          "error_kind": "sub_agent_error"
-        }
-      }
+      "outcome": { "failure": { "error": "...", "error_kind": "sub_agent_error" } }
     }
   ]
 }
-```
-
-## Complete Lifecycle Trace
-
-This section traces a complete sub-agent flow from spawn to completion.
-
-### Happy Path: Two Sub-Agents Complete Successfully
-
-```
-1. Parent in LlmRequesting, LLM returns spawn_agents tool
-   State: LlmRequesting { attempt: 1 }
-   Event: LlmResponse { tool_calls: [spawn_agents { tasks: [A, B] }] }
-   
-2. Transition to ToolExecuting
-   State: ToolExecuting { current: spawn_agents, remaining: [], pending_sub_agents: [] }
-   Effect: ExecuteTool { spawn_agents }
-
-3. Executor runs spawn_agents tool, generates IDs ["sa-1", "sa-2"]
-   Executor sends: SpawnAgentsComplete { agent_ids: ["sa-1", "sa-2"], result: "Spawned 2 agents" }
-   Executor emits: SpawnSubAgent { agent_id: "sa-1", task: A }
-   Executor emits: SpawnSubAgent { agent_id: "sa-2", task: B }
-
-4. Transition to AwaitingSubAgents (last tool, has pending)
-   State: AwaitingSubAgents { pending_ids: ["sa-1", "sa-2"], completed_results: [] }
-   Effect: PersistMessage { "Spawned 2 agents" }
-
-5. SpawnSubAgent effects execute:
-   - Create conversation sa-1 (user_initiated=false, parent_id=parent)
-   - Insert synthetic UserMessage with task A
-   - Start sa-1 runtime
-   - (same for sa-2)
-
-6. Sub-agent sa-1 runs its own state machine:
-   Idle → LlmRequesting → ToolExecuting → ... → LlmRequesting
-   LLM returns: submit_result { result: "Completed task A" }
-   Transition: Completed { result: "Completed task A" }
-   Effect: NotifyParent { Success { result: "Completed task A" } }
-
-7. NotifyParent effect sends to parent:
-   Event: SubAgentResult { agent_id: "sa-1", outcome: Success { "Completed task A" } }
-
-8. Parent receives first result:
-   State: AwaitingSubAgents { pending: ["sa-1", "sa-2"], completed: [] }
-   Event: SubAgentResult { agent_id: "sa-1", ... }
-   State: AwaitingSubAgents { pending: ["sa-2"], completed: [sa-1-result] }
-
-9. Sub-agent sa-2 completes similarly, parent receives:
-   State: AwaitingSubAgents { pending: ["sa-2"], completed: [sa-1-result] }
-   Event: SubAgentResult { agent_id: "sa-2", ... }
-   State: LlmRequesting { attempt: 1 }  // Last result triggers exit
-   Effect: PersistMessage { aggregated results }
-   Effect: RequestLlm
-
-10. Parent LLM receives aggregated results, continues conversation.
-```
-
-### Cancellation Path: User Cancels During AwaitingSubAgents
-
-```
-1. Parent in AwaitingSubAgents { pending: ["sa-1", "sa-2"], completed: [] }
-   Event: UserCancel
-
-2. Transition to CancellingSubAgents
-   State: CancellingSubAgents { pending: ["sa-1", "sa-2"], completed: [] }
-   Effect: CancelSubAgents { ids: ["sa-1", "sa-2"] }
-
-3. Executor sends UserCancel to each sub-agent runtime
-
-4. Sub-agent sa-1 receives cancel:
-   State: (whatever it was)
-   Event: UserCancel
-   State: Failed { error: "Cancelled", error_kind: Cancelled }
-   Effect: NotifyParent { Failure { error: "Cancelled", error_kind: Cancelled } }
-
-5. Parent receives cancellation acknowledgment:
-   State: CancellingSubAgents { pending: ["sa-1", "sa-2"], completed: [] }
-   Event: SubAgentResult { agent_id: "sa-1", outcome: Failure { Cancelled } }
-   State: CancellingSubAgents { pending: ["sa-2"], completed: [sa-1-result] }
-
-6. Sub-agent sa-2 similarly cancelled and reports
-
-7. Last cancellation result:
-   State: CancellingSubAgents { pending: ["sa-2"], completed: [sa-1-result] }
-   Event: SubAgentResult { agent_id: "sa-2", ... }
-   State: Idle
-   Effect: NotifyAgentDone
-```
-
-### Early Completion Race: Sub-Agent Finishes During Parent ToolExecuting
-
-```
-1. Parent calls [spawn_agents, bash]
-   State: ToolExecuting { current: spawn_agents, remaining: [bash], pending_sub_agents: [] }
-
-2. spawn_agents completes:
-   Event: SpawnAgentsComplete { agent_ids: ["sa-1"] }
-   State: ToolExecuting { current: bash, remaining: [], pending_sub_agents: ["sa-1"] }
-   Effect: ExecuteTool { bash }
-   Effect: SpawnSubAgent { "sa-1" }
-
-3. Sub-agent sa-1 spawned and runs FAST, completes before bash:
-   sa-1: Completed { result }
-   sa-1: Effect::NotifyParent
-   
-4. Executor receives SubAgentResult but parent still in ToolExecuting:
-   Executor: buffer.push(SubAgentResult { "sa-1" })
-
-5. bash completes:
-   Event: ToolComplete { bash result }
-   State: AwaitingSubAgents { pending: ["sa-1"], completed: [] }  // has pending_sub_agents
-   
-6. Executor sees transition to AwaitingSubAgents, drains buffer:
-   Event: SubAgentResult { "sa-1" } (from buffer)
-   State: LlmRequesting  // immediate transition, sa-1 already done
 ```
 
 ## Example Use Cases
@@ -978,8 +158,8 @@ Agent calls spawn_agents with:
   ]
 }
 
-Three sub-agents analyze the same code with different lenses,
-parent aggregates findings into comprehensive review.
+Three sub-agents analyze the same code with different lenses; parent
+aggregates findings into comprehensive review.
 ```
 
 ### Codebase Exploration
@@ -996,8 +176,8 @@ Agent calls spawn_agents with:
   ]
 }
 
-Sub-agents explore different areas in parallel,
-parent synthesizes into architectural overview.
+Sub-agents explore different areas in parallel; parent synthesizes into
+architectural overview.
 ```
 
 ### Focused Deep-Dive (Single Sub-Agent)
@@ -1012,8 +192,8 @@ Agent calls spawn_agents with:
   ]
 }
 
-Single sub-agent does focused research without polluting
-parent's context with exploration details.
+Single sub-agent does focused research without polluting parent's context
+with exploration details.
 ```
 
 ### Comparative Analysis
@@ -1029,8 +209,8 @@ Agent calls spawn_agents with:
   ]
 }
 
-Sub-agents research independently without biasing each other,
-parent makes informed recommendation based on both analyses.
+Sub-agents research independently without biasing each other; parent
+makes informed recommendation based on both analyses.
 ```
 
 ### Persona-Based Review
@@ -1049,29 +229,3 @@ Agent calls spawn_agents with:
 
 Different perspectives surface different issues.
 ```
-
-## Implementation Order
-
-1. **State machine changes**
-   - Add `pending_sub_agents` to `ToolExecuting`
-   - Add `CancellingSubAgents` state
-   - Add `Completed` / `Failed` terminal states
-   - Add `SpawnAgentsComplete` event
-   - Implement new transitions
-   - Add property tests
-
-2. **Tools**
-   - Implement `spawn_agents` tool
-   - Implement `submit_result` tool
-   - Implement `submit_error` tool
-   - Tool filtering by context
-
-3. **Runtime support**
-   - Effect handlers for `SpawnSubAgent`, `CancelSubAgents`, `NotifyParent`
-   - Timeout support
-   - Event routing between parent/child
-
-4. **Integration**
-   - End-to-end tests
-   - Error handling edge cases
-   - Documentation
