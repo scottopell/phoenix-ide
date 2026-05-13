@@ -11,6 +11,8 @@ export interface UseResizablePaneOptions {
   defaultSize: number;
   /** Drag below this px → snap to collapsed */
   collapseThreshold?: number;
+  /** Initial collapsed state when nothing is persisted (default: false) */
+  defaultCollapsed?: boolean;
 }
 
 export interface UseResizablePaneResult {
@@ -68,7 +70,7 @@ function writeBool(key: string, value: boolean): void {
 }
 
 export function useResizablePane(options: UseResizablePaneOptions): UseResizablePaneResult {
-  const { key, min, max, defaultSize, collapseThreshold } = options;
+  const { key, min, max, defaultSize, collapseThreshold, defaultCollapsed = false } = options;
   const collapsedKey = `${key}-collapsed`;
 
   const resolveMax = useCallback(() => (typeof max === 'function' ? max() : max), [max]);
@@ -79,14 +81,23 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
   );
 
   const [size, setSize] = useState<number>(() => clamp(readNumber(key, defaultSize)));
-  const [collapsed, setCollapsedState] = useState<boolean>(() => readBool(collapsedKey, false));
+  const [collapsed, setCollapsedState] = useState<boolean>(() =>
+    readBool(collapsedKey, defaultCollapsed),
+  );
 
-  // Persist
+  // Persistence is gated on real user interaction. Writing on mount makes the
+  // initial default "sticky" — flipping the default in code never reaches
+  // anyone whose first page-load already wrote the old default to storage.
+  // The *Interacted refs flip in the imperative setters (startDrag,
+  // setCollapsed, expandFromCollapsed, setSize); the viewport re-clamp effect
+  // deliberately leaves them alone.
+  const sizeInteracted = useRef(false);
+  const collapsedInteracted = useRef(false);
   useEffect(() => {
-    writeNumber(key, size);
+    if (sizeInteracted.current) writeNumber(key, size);
   }, [key, size]);
   useEffect(() => {
-    writeBool(collapsedKey, collapsed);
+    if (collapsedInteracted.current) writeBool(collapsedKey, collapsed);
   }, [collapsedKey, collapsed]);
 
   // Re-clamp on viewport resize (cheap)
@@ -134,6 +145,8 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
         const signedDelta = drag.invert ? -delta : delta;
         const proposed = drag.startSize + signedDelta;
 
+        sizeInteracted.current = true;
+        collapsedInteracted.current = true;
         if (collapseThreshold !== undefined && proposed < collapseThreshold) {
           setCollapsedState(true);
           // Keep last good size at min so expand restores to a sensible value.
@@ -168,20 +181,26 @@ export function useResizablePane(options: UseResizablePaneOptions): UseResizable
   );
 
   const setCollapsed = useCallback((value: boolean) => {
+    collapsedInteracted.current = true;
     setCollapsedState(value);
     if (!value) {
       // Restoring: ensure size is at least defaultSize so expand looks sensible.
+      sizeInteracted.current = true;
       setSize((s) => (s < defaultSize ? defaultSize : s));
     }
   }, [defaultSize]);
 
   const expandFromCollapsed = useCallback(() => {
+    collapsedInteracted.current = true;
+    sizeInteracted.current = true;
     setCollapsedState(false);
     setSize((s) => (s < defaultSize ? defaultSize : s));
   }, [defaultSize]);
 
   const setSizeClamped = useCallback(
     (px: number) => {
+      sizeInteracted.current = true;
+      collapsedInteracted.current = true;
       setSize(clamp(px));
       setCollapsedState(false);
     },

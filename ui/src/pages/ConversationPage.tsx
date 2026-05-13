@@ -268,13 +268,16 @@ function ConversationPageContent() {
     seedHydratedRef.current = null;
     cachedMsgCountRef.current = 0;
   }
-  // Terminal split-pane height — collapses to a 32px header strip
+  // Terminal split-pane height — collapses to a 32px header strip.
+  // Default collapsed: most conversations don't use the terminal, and an
+  // expanded default eats vertical space + spins up the WebSocket/xterm.
   const terminalPane = useResizablePane({
     key: 'terminal-height',
     min: TERMINAL_COLLAPSED_PX,
     max: () => Math.min(800, Math.floor(window.innerHeight * 0.75)),
     defaultSize: 300,
     collapseThreshold: 60,
+    defaultCollapsed: true,
   });
 
   // Credential helper auto-open — shared hook consolidates the pattern.
