@@ -500,20 +500,21 @@ describe('ChainPage — pair-card state matrix', () => {
     const reaskButtons = screen.getAllByRole('button', { name: 'Re-ask' });
     expect(reaskButtons).toHaveLength(2);
 
-    // Re-ask on a failed/abandoned pair populates the active textarea with
-    // the original question and keeps focus there. (No auto-submit — user
-    // agency, REQ-CHN-007 precedent.) Click the second Re-ask button (which
-    // belongs to the failed pair — pairs render in reverse-chronological
-    // order so the abandoned pair, last in the qa_history input, appears
-    // first in DOM order).
+    // Re-ask on a failed/abandoned pair appends the original question to the
+    // active textarea and keeps focus there, preserving any current draft. (No
+    // auto-submit — user agency, REQ-CHN-007 precedent.) Click the second
+    // Re-ask button (which belongs to the failed pair — pairs render in
+    // reverse-chronological order so the abandoned pair, last in the qa_history
+    // input, appears first in DOM order).
     const submitMock = api.submitChainQuestion as ReturnType<typeof vi.fn>;
     submitMock.mockReset();
-    fireEvent.click(reaskButtons[1]!);
     const textarea = screen.getByRole('textbox', {
       name: 'Question',
     }) as HTMLTextAreaElement;
+    fireEvent.change(textarea, { target: { value: 'current draft' } });
+    fireEvent.click(reaskButtons[1]!);
     await waitFor(() => {
-      expect(textarea.value).toBe('failed question');
+      expect(textarea.value).toBe('current draft\n\nfailed question');
     });
     expect(submitMock).not.toHaveBeenCalled();
   });

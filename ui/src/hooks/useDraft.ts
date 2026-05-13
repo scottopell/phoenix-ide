@@ -71,6 +71,7 @@ export function useDraftValue(slug: string): string {
 
 export interface DraftActions {
   setDraft: (text: string) => void;
+  setDraftIfEmpty: (text: string) => void;
   appendDraft: (text: string) => void;
   clearDraft: () => void;
 }
@@ -85,6 +86,8 @@ export function useDraftActions(slug: string): DraftActions {
   return useMemo(
     () => ({
       setDraft: (text: string) => store.dispatch(slug, { type: 'set_draft', text }),
+      setDraftIfEmpty: (text: string) =>
+        store.dispatch(slug, { type: 'set_draft_if_empty', text }),
       appendDraft: (text: string) =>
         store.dispatch(slug, { type: 'append_draft', text }),
       clearDraft: () => store.dispatch(slug, { type: 'clear_draft' }),

@@ -133,6 +133,17 @@ export function ChainPage() {
     };
   }, [rootConvId, dispatch]);
 
+  const appendDraftText = (current: string, text: string): string => {
+    return current.trim() ? current + '\n\n' + text : text;
+  };
+
+  const draftRef = useRef(draft);
+  useEffect(() => {
+    draftRef.current = draft;
+  }, [draft]);
+
+  const hydratedDraftForRef = useRef<string | null>(null);
+
   // Hydrate the draft from localStorage on chain mount so a refresh / iOS
   // PWA cold reload mid-typing doesn't lose the user's in-progress
   // question. Mirrors the conversation draft pattern in useDraft. Uses
@@ -140,13 +151,15 @@ export function ChainPage() {
   // but DRAFT_SET semantically signals a non-keystroke source).
   useEffect(() => {
     if (!rootConvId) return;
+    if (hydratedDraftForRef.current === rootConvId) return;
+    hydratedDraftForRef.current = rootConvId;
     let saved: string | null = null;
     try {
       saved = localStorage.getItem(`phoenix:chain-draft:${rootConvId}`);
     } catch {
       // storage disabled — degrade gracefully
     }
-    if (saved) {
+    if (saved && !draftRef.current.trim()) {
       dispatch({ type: 'DRAFT_SET', value: saved });
     }
   }, [rootConvId, dispatch]);
@@ -178,13 +191,6 @@ export function ChainPage() {
     return () => window.clearTimeout(timer);
   }, [rootConvId, draft]);
 
-  // Flush the latest draft on unmount or root change so a quick reload
-  // mid-debounce-window still restores the most recent text. Mirrors the
-  // pattern in useDraft (ui/src/hooks/useDraft.ts).
-  const draftRef = useRef(draft);
-  useEffect(() => {
-    draftRef.current = draft;
-  }, [draft]);
   useEffect(() => {
     if (!rootConvId) return undefined;
     const key = `phoenix:chain-draft:${rootConvId}`;
@@ -309,7 +315,7 @@ export function ChainPage() {
    *  focus it. Do NOT auto-submit — REQ-CHN-007's editing pattern preserves
    *  user agency, and consistency with that precedent matters here. */
   const handleReask = (question: string) => {
-    dispatch({ type: 'DRAFT_SET', value: question });
+    dispatch({ type: 'DRAFT_SET', value: appendDraftText(draft, question) });
     queueMicrotask(() => {
       activeTextareaRef.current?.focus();
     });

@@ -646,8 +646,6 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
     ? (response['lines'] as Array<{ offset?: number; bytes?: string }>)
     : [];
 
-  const isLive = status === 'running' || status === 'still_running';
-  const isKillPending = status === 'kill_pending_kernel';
   const isExited = status === 'exited';
   const isKilled = status === 'killed';
   const isTombstone = status === 'tombstoned';
@@ -693,24 +691,6 @@ function BashResponseView({ response }: { response: Record<string, unknown> }) {
           <span className="bash-duration">duration {Math.round(durationMs)} ms</span>
         )}
       </div>
-      {(isLive || isKillPending) && handle && (
-        <div className="bash-running-actions">
-          <button
-            type="button"
-            className="bash-peek-button"
-            onClick={() => {
-              window.dispatchEvent(
-                new CustomEvent('phoenix:insert-draft', {
-                  detail: { text: `peek bash handle ${handle}` },
-                }),
-              );
-            }}
-            title="Insert a draft message asking the agent to peek this handle"
-          >
-            peek {handle}
-          </button>
-        </div>
-      )}
       {truncatedBefore && (
         <div className="bash-truncated-notice">[output truncated before this view]</div>
       )}

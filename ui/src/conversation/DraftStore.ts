@@ -18,6 +18,7 @@ export interface DraftAtom {
 
 export type DraftAction =
   | { type: 'set_draft'; text: string }
+  | { type: 'set_draft_if_empty'; text: string }
   | { type: 'append_draft'; text: string }
   | { type: 'clear_draft' };
 
@@ -25,6 +26,10 @@ export function draftReducer(atom: DraftAtom, action: DraftAction): DraftAtom {
   switch (action.type) {
     case 'set_draft':
       if (atom.draft === action.text) return atom;
+      return { draft: action.text };
+
+    case 'set_draft_if_empty':
+      if (atom.draft.trim() || atom.draft === action.text) return atom;
       return { draft: action.text };
 
     case 'append_draft': {

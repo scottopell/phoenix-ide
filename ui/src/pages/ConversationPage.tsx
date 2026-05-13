@@ -217,7 +217,7 @@ function ConversationPageContent() {
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
 
-  const { setDraft: setDraftCb, appendDraft: appendDraftCb } = useDraftActions(slug!);
+  const { setDraftIfEmpty: setDraftIfEmptyCb, appendDraft: appendDraftCb } = useDraftActions(slug!);
 
   // Monotonic focus-request counter. Any time we mutate the draft from
   // outside the textarea (terminal selection, prose-reader notes, retry,
@@ -435,7 +435,7 @@ function ConversationPageContent() {
 
   // REQ-SEED-001: hydrate the draft from `seed-draft:<id>` localStorage when
   // a seeded conversation first mounts, then clear the key so revisits don't
-  // re-hydrate it. Dispatches through `setDraftCb` into `DraftStore`;
+  // re-hydrate it. Dispatches through `setDraftIfEmptyCb` into `DraftStore`;
   // `<DraftLifecycle>` mirrors the value to `phoenix:draft:<id>` after that.
   // (`seedHydratedRef` is declared with the per-slug reset block above so it
   //  resets to null on slug change.)
@@ -451,14 +451,14 @@ function ConversationPageContent() {
     }
     if (!seed) return;
     seedHydratedRef.current = conversationId;
-    setDraftCb(seed);
+    setDraftIfEmptyCb(seed);
     requestComposerFocus();
     try {
       localStorage.removeItem(key);
     } catch {
       // ignore
     }
-  }, [conversationId, setDraftCb, requestComposerFocus]);
+  }, [conversationId, setDraftIfEmptyCb, requestComposerFocus]);
 
   // Auto-open/close task approval overlay on state transitions
   useEffect(() => {
@@ -647,9 +647,9 @@ function ConversationPageContent() {
     // instead of directly resending (the banner truncates content and
     // the user may want to fix the issue that caused the failure).
     dismiss(localId);
-    setDraftCb(msg.text);
+    appendDraftCb(msg.text);
     requestComposerFocus();
-  }, [queuedMessages, dismiss, setDraftCb, requestComposerFocus]);
+  }, [queuedMessages, dismiss, appendDraftCb, requestComposerFocus]);
 
   const handleCancel = async () => {
     if (!conversationId || !isAgentWorking(atom.phase)) return;
@@ -828,20 +828,21 @@ function ConversationPageContent() {
     [conversation?.cwd, conversation?.terminal_uses_tmux, appendDraftCb, requestComposerFocus]
   );
 
-  // External "set this as the draft" trigger fired by surfaces that don't
-  // hold a ref to the composer (skill viewer, message context menu).
+  // External draft insertion trigger fired by surfaces that don't hold a ref
+  // to the composer (skill viewer, message context menu). Preserve existing
+  // user text by appending instead of replacing.
   // Dispatching into `DraftStore` works regardless of whether `<InputArea>`
   // is currently mounted — narrow-desktop fullscreen flows unmount it.
   useEffect(() => {
     const handler = (e: Event) => {
       const text = (e as CustomEvent<{ text: string }>).detail?.text;
       if (!text) return;
-      setDraftCb(text);
+      appendDraftCb(text);
       requestComposerFocus();
     };
     window.addEventListener('phoenix:insert-draft', handler);
     return () => window.removeEventListener('phoenix:insert-draft', handler);
-  }, [setDraftCb, requestComposerFocus]);
+  }, [appendDraftCb, requestComposerFocus]);
 
   const handleSendNotes = useCallback(
     (formattedNotes: string) => {
