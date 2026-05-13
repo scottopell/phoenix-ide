@@ -336,18 +336,25 @@ rule SubAgentRegistryOnFreshSpawn {
 rule SubAgentRegistryOnResume {
     when: SubAgentRuntimeResumed(sub_agent)
     ensures:
-        if sub_agent.mode in { work, branch }:
-            sub_agent.tool_registry = subagent_work
-        else:
+        if sub_agent.mode = explore:
             sub_agent.tool_registry = subagent_explore
+        else:
+            sub_agent.tool_registry = subagent_work
     ensures: sub_agent.mcp_enabled = true
 
     @guidance
-        -- `conv_mode` is the persisted source of truth (DB column
-        -- `conv_mode`). The runtime maps Work/Branch -> subagent_work,
-        -- Explore -> subagent_explore, Direct -> subagent_explore (a
-        -- sub-agent in Direct mode has no worktree of its own and is
-        -- treated as read-only).
+        -- The persisted `conv_mode` encodes the explore/work distinction:
+        --   Explore sub-agents are spawned with
+        --     ConvMode::Explore { worktree_path: None }
+        --   Work sub-agents inherit the parent's `conv_mode`, which is one
+        --     of Direct, Work, or Branch (never Explore -- an Explore
+        --     parent cannot spawn a Work sub-agent; see
+        --     WorkSubAgentRequiresWriteableParent).
+        --
+        -- So the resume mapping is: Explore variant -> subagent_explore;
+        -- Direct / Work / Branch -> subagent_work. A Work sub-agent
+        -- spawned from a Direct parent therefore keeps `patch` across
+        -- runtime re-creation despite being persisted as Direct.
 }
 
 ------------------------------------------------------------
@@ -376,13 +383,18 @@ invariant WorkSubAgentCwdInsideWorktree {
 }
 
 -- Explore sub-agents always carry the explore tool registry; Work
--- sub-agents always carry the work tool registry. Restated against the
--- persisted `conv_mode` so it survives runtime re-creation.
+-- sub-agents always carry the work tool registry. The persisted
+-- discriminator is the `conv_mode` variant:
+--   Explore variant <=> Explore sub-agent
+--   Direct / Work / Branch variant <=> Work sub-agent
+-- (A Work sub-agent inherits the parent's mode at spawn time and the
+-- parent is never Explore -- so the Work side covers Direct, Work, and
+-- Branch.)
 invariant ToolRegistryMatchesMode {
     for sa in SubAgents:
-        (sa.mode in { work, branch }
-            implies sa.tool_registry = subagent_work)
-        and
-        (sa.mode not in { work, branch }
+        (sa.mode = explore
             implies sa.tool_registry = subagent_explore)
+        and
+        (sa.mode != explore
+            implies sa.tool_registry = subagent_work)
 }

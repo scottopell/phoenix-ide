@@ -1270,18 +1270,22 @@ impl RuntimeManager {
         // their registry with `with_mcp` so MCP tool defs resolve live from
         // the manager on every `definitions()` call.
         let tool_executor = if is_sub_agent {
-            // Resumed sub-agents inherit their persisted `conv_mode` so a
-            // Work sub-agent does not lose write capability across a runtime
-            // re-creation (e.g. model-upgrade eviction). Sub-agents don't
-            // normally survive server restart; the alignment matters for
-            // in-process re-creation. See subagents.allium
+            // Resumed sub-agents recover the explore/work distinction from
+            // their persisted `conv_mode`. Explore sub-agents are always
+            // persisted as `ConvMode::Explore { worktree_path: None }`
+            // (see `handle_spawn_request`); Work sub-agents inherit the
+            // parent's `conv_mode`, which is one of Direct, Work, or
+            // Branch (never Explore -- an Explore parent cannot spawn a
+            // Work sub-agent, guarded at spawn time). So the Explore
+            // variant means an Explore sub-agent, anything else means a
+            // Work sub-agent. See subagents.allium
             // `SubAgentRegistryOnResume`.
             use crate::db::ConvMode;
             let registry = match conv.conv_mode {
-                ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+                ConvMode::Explore { .. } => ToolRegistry::for_subagent_explore(),
+                ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
                     ToolRegistry::for_subagent_work()
                 }
-                ConvMode::Explore { .. } | ConvMode::Direct => ToolRegistry::for_subagent_explore(),
             };
             ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone())
         } else {

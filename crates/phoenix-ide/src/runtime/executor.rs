@@ -35,17 +35,34 @@ use tokio_util::sync::CancellationToken;
 /// Primary enforcement is max turns (REQ-PROJ-008). This catches stuck tool execution.
 const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 
-/// Decide whether `path` is inside the worktree rooted at `root`. Both
-/// arguments are canonicalised first so symlinks that escape the worktree
-/// are treated as outside it -- the canonical form puts a symlink target's
-/// real location into the comparison. When canonicalisation fails (e.g. the
-/// override `cwd` does not exist on disk yet) the fallback is a strict
-/// lexical comparison; that errs on the side of rejection rather than
-/// silently letting a nonexistent or unresolvable cwd through the guard.
+/// Decide whether `path` is inside the worktree rooted at `root`.
+///
+/// The guard rejects up front any path that is not absolute or that
+/// contains a `..` component. Without that sanitisation, `Path::starts_with`
+/// matches components lexically and `/worktree/../escape` satisfies
+/// `starts_with("/worktree")` -- the canonicalise-or-lexical fallback
+/// could then be bypassed by passing a `..`-traversing override that does
+/// not exist on disk yet (canonicalize fails, falls into the lexical
+/// branch, which then accepts the escape).
+///
+/// After that sanitisation, the comparison is: canonicalise both sides
+/// to follow symlinks and resolve `.`, then `starts_with`. If
+/// canonicalisation fails on either side (e.g. override `cwd` not yet
+/// created on disk) the lexical comparison is sound because the path
+/// has no `..` to escape with.
 fn path_is_within(path: &str, root: &str) -> bool {
-    use std::path::Path;
+    use std::path::{Component, Path};
     let raw_path = Path::new(path);
     let raw_root = Path::new(root);
+    if !raw_path.is_absolute() {
+        return false;
+    }
+    if raw_path
+        .components()
+        .any(|c| matches!(c, Component::ParentDir))
+    {
+        return false;
+    }
     match (
         std::fs::canonicalize(raw_path).ok(),
         std::fs::canonicalize(raw_root).ok(),
@@ -4876,5 +4893,76 @@ mod work_subagent_cwd_guard_tests {
         assert!(path_is_within("/nonexistent/root/sub", "/nonexistent/root"));
         assert!(!path_is_within("/nonexistent/other", "/nonexistent/root"));
         assert!(path_is_within("/nonexistent/root", "/nonexistent/root"));
+    }
+
+    #[test]
+    fn path_is_within_rejects_parent_dir_traversal() {
+        // Without the up-front `..` rejection, the lexical fallback would
+        // accept `/worktree/../escape`: Path::starts_with matches component
+        // by component, and the first component IS `/worktree`. Reject
+        // any `..` outright so the fallback is sound.
+        assert!(!path_is_within(
+            "/nonexistent/root/../escape",
+            "/nonexistent/root"
+        ));
+        assert!(!path_is_within(
+            "/nonexistent/root/sub/../../escape",
+            "/nonexistent/root"
+        ));
+    }
+
+    #[test]
+    fn path_is_within_rejects_relative_paths() {
+        // Relative paths are non-portable for an override -- reject them
+        // up front rather than guessing at what they should resolve
+        // against.
+        assert!(!path_is_within("sub/dir", "/worktree"));
+        assert!(!path_is_within("./sub", "/worktree"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_parent_dir_traversal_in_override() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        // Sibling dir that EXISTS on disk, so canonicalize succeeds for
+        // both sides -- the only thing keeping this safe is the `..`
+        // rejection up front.
+        let outside = TempDir::new().expect("outside tempdir");
+        let traversing = format!(
+            "{}/../{}",
+            worktree.path().display(),
+            outside
+                .path()
+                .file_name()
+                .expect("outside dir name")
+                .to_string_lossy()
+        );
+
+        let mut rt = runtime_in_work_mode(worktree.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "traverse out".to_string(),
+                    cwd: Some(traversing),
+                    mode: Some(SubAgentMode::Work),
+                    model: None,
+                    max_turns: None,
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                assert!(result.is_error(), "rejection must surface as a tool error");
+                let msg = tool_result_text(&result);
+                assert!(
+                    msg.contains("inside the parent's worktree"),
+                    "error message should explain the cwd-scoping rule, got: {msg}"
+                );
+            }
+            other => panic!("expected ..-traversal to be rejected, got {other:?}"),
+        }
     }
 }
