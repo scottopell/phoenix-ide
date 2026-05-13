@@ -593,6 +593,13 @@ pub struct EnrichedConversation {
     /// running session is updated via `SseEvent::BrowserSessionState`
     /// after init.
     pub browser_session_active: bool,
+    /// True when the in-app terminal for this conversation attaches to a
+    /// per-conversation tmux session (the default whenever `tmux` is on
+    /// PATH; see `TmuxRegistry::binary_available`). The UI uses this to
+    /// label terminal-selection snippets with `tmux pane main:0.0`, which
+    /// hints to the LLM that the existing `tmux` tool can pull the full
+    /// pane on follow-up. False when the PTY runs a direct `$SHELL`.
+    pub terminal_uses_tmux: bool,
 }
 
 /// Breadcrumb entry for showing LLM thought-process trail in the UI.

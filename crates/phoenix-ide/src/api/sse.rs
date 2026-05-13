@@ -315,6 +315,7 @@ mod tests {
             home_dir: Some("/home/alice".to_string()),
             seed_parent_slug: None,
             browser_session_active: false,
+            terminal_uses_tmux: false,
         }
     }
 

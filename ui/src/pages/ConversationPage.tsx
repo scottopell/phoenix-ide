@@ -757,17 +757,25 @@ function ConversationPageContent() {
   // Task 02672: terminal selection → composer draft.
   // TerminalPanel fires this when the user presses Cmd/Ctrl+Shift+L with
   // text selected. We fence the selection so it stays distinguishable from
-  // the user's in-flight prose, prefix it with a `From terminal` label that
-  // hints at the source (cwd if known), append to the existing draft (never
-  // replace), and focus the composer so the user can immediately type a
-  // follow-up question.
+  // the user's in-flight prose, prefix it with a label that names the source
+  // (tmux pane when the conversation is tmux-backed, plain "terminal"
+  // otherwise) plus the cwd, append to the existing draft (never replace),
+  // and focus the composer so the user can immediately type a follow-up.
+  //
+  // Naming the tmux pane (`main:0.0`) is deliberate: the LLM can then call
+  // the existing `tmux` tool (e.g. `capture-pane -p -t main:0.0 -S -200`)
+  // to pull the rest of the pane on follow-up — Phoenix injects the correct
+  // socket so no further coordinates are needed.
   const handleSendTerminalSelection = useCallback(
     (selection: string) => {
       if (!selection) return;
       const trimmed = selection.replace(/\s+$/u, '');
       if (!trimmed) return;
       const cwdHint = conversation?.cwd ? ` (cwd: \`${conversation.cwd}\`)` : '';
-      const fenced = `From terminal${cwdHint}:\n\`\`\`\n${trimmed}\n\`\`\``;
+      const sourceLabel = conversation?.terminal_uses_tmux
+        ? 'From tmux pane `main:0.0`'
+        : 'From terminal';
+      const fenced = `${sourceLabel}${cwdHint}:\n\`\`\`\n${trimmed}\n\`\`\``;
       if (inputRef.current) {
         inputRef.current.appendToDraft(fenced);
         inputRef.current.focus();

@@ -313,6 +313,11 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         // this from the manager's `HashMap` via
         // `enrich_conversation_with_seed`.
         browser_session_active: false,
+        // Same pattern: filled in by `enrich_conversation_with_seed`, since
+        // the tmux registry lives on the runtime. List endpoints (which
+        // call this stateless helper directly) don't need the flag — the
+        // UI consults it only on the active conversation's terminal.
+        terminal_uses_tmux: false,
         inner: conv.clone(),
     }
 }
@@ -337,6 +342,9 @@ async fn enrich_conversation_with_seed(
     // source of truth is the manager's `HashMap`; the SSE
     // `BrowserSessionState` event keeps the client in sync after this point.
     enriched.browser_session_active = state.runtime.browser_sessions().is_active(&conv.id).await;
+    // tmux availability is cached at registry init (`which("tmux")`), so this
+    // is a cheap field read — see `TmuxRegistry::binary_available`.
+    enriched.terminal_uses_tmux = state.runtime.tmux_registry().binary_available();
     enriched
 }
 
