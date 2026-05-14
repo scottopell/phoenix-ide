@@ -760,6 +760,25 @@ pub enum SseEvent {
     },
 }
 
+/// Pick the tool registry for a sub-agent runtime on (re-)creation from
+/// its persisted `conv_mode`.
+///
+/// Explore sub-agents are always persisted as `ConvMode::Explore`
+/// (see `handle_spawn_request`); Work sub-agents inherit the parent's
+/// `conv_mode`, which is one of Direct, Work, or Branch (never Explore --
+/// an Explore parent cannot spawn a Work sub-agent, guarded at spawn
+/// time). So `Explore` variant means an Explore sub-agent, anything
+/// else means a Work sub-agent. See subagents.allium
+/// `SubAgentRegistryOnResume`.
+fn sub_agent_registry_for_conv_mode(conv_mode: &ConvMode) -> ToolRegistry {
+    match conv_mode {
+        ConvMode::Explore { .. } => ToolRegistry::for_subagent_explore(),
+        ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
+            ToolRegistry::for_subagent_work()
+        }
+    }
+}
+
 impl RuntimeManager {
     pub fn new(
         db: Database,
@@ -1270,23 +1289,7 @@ impl RuntimeManager {
         // their registry with `with_mcp` so MCP tool defs resolve live from
         // the manager on every `definitions()` call.
         let tool_executor = if is_sub_agent {
-            // Resumed sub-agents recover the explore/work distinction from
-            // their persisted `conv_mode`. Explore sub-agents are always
-            // persisted as `ConvMode::Explore { worktree_path: None }`
-            // (see `handle_spawn_request`); Work sub-agents inherit the
-            // parent's `conv_mode`, which is one of Direct, Work, or
-            // Branch (never Explore -- an Explore parent cannot spawn a
-            // Work sub-agent, guarded at spawn time). So the Explore
-            // variant means an Explore sub-agent, anything else means a
-            // Work sub-agent. See subagents.allium
-            // `SubAgentRegistryOnResume`.
-            use crate::db::ConvMode;
-            let registry = match conv.conv_mode {
-                ConvMode::Explore { .. } => ToolRegistry::for_subagent_explore(),
-                ConvMode::Direct | ConvMode::Work { .. } | ConvMode::Branch { .. } => {
-                    ToolRegistry::for_subagent_work()
-                }
-            };
+            let registry = sub_agent_registry_for_conv_mode(&conv.conv_mode);
             ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone())
         } else {
             use crate::db::ConvMode;
@@ -1667,6 +1670,68 @@ fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
             worktree_path: worktree_path.to_string(),
         },
         ConvMode::Direct => ModeContext::Direct,
+    }
+}
+
+#[cfg(test)]
+mod sub_agent_registry_resume_tests {
+    //! Regression coverage for the resume-path tool-registry selection
+    //! (`runtime.rs` ~1267, subagents.allium `SubAgentRegistryOnResume`).
+    //!
+    //! Before task 13010 this branch hard-coded `for_subagent_explore()`,
+    //! silently stripping `patch` from a re-created Work sub-agent. The
+    //! `sub_agent_registry_for_conv_mode` helper now picks the right
+    //! registry from the persisted `conv_mode`; these tests pin that
+    //! contract so a future refactor cannot quietly regress it.
+    use super::sub_agent_registry_for_conv_mode;
+    use crate::db::{ConvMode, NonEmptyString};
+
+    fn registry_has(conv_mode: &ConvMode, tool: &str) -> bool {
+        sub_agent_registry_for_conv_mode(conv_mode)
+            .definitions()
+            .iter()
+            .any(|d| d.name == tool)
+    }
+
+    #[test]
+    fn explore_subagent_resume_excludes_patch() {
+        // An Explore sub-agent is read-only -- no `patch`.
+        let mode = ConvMode::Explore {
+            worktree_path: None,
+        };
+        assert!(!registry_has(&mode, "patch"));
+        assert!(registry_has(&mode, "submit_result"));
+    }
+
+    #[test]
+    fn direct_subagent_resume_keeps_patch() {
+        // A Work sub-agent spawned from a Direct parent persists as
+        // ConvMode::Direct (Work sub-agents inherit parent conv_mode).
+        // The previous bug mapped Direct -> Explore registry; the
+        // resumed sub-agent must keep `patch`.
+        assert!(registry_has(&ConvMode::Direct, "patch"));
+    }
+
+    #[test]
+    fn work_subagent_resume_keeps_patch() {
+        let mode = ConvMode::Work {
+            branch_name: NonEmptyString::new("task-0001-x").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/wt").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("0001").unwrap(),
+            task_title: NonEmptyString::new("x").unwrap(),
+        };
+        assert!(registry_has(&mode, "patch"));
+    }
+
+    #[test]
+    fn branch_subagent_resume_keeps_patch() {
+        let mode = ConvMode::Branch {
+            branch_name: NonEmptyString::new("feature-x").unwrap(),
+            worktree_path: NonEmptyString::new("/tmp/wt").unwrap(),
+            base_branch: NonEmptyString::new("feature-x").unwrap(),
+        };
+        assert!(registry_has(&mode, "patch"));
     }
 }
 

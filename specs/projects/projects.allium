@@ -938,7 +938,9 @@ rule ExploreSubAgentDirectory {
     requires: mode = explore
 
     ensures:
-        if parent.mode in { work, branch, explore }:
+        if parent.mode in { work, branch }:
+            sub_agent.working_dir = parent.worktree_path
+        else if parent.mode = explore and parent.worktree_path != "":
             sub_agent.working_dir = parent.worktree_path
         else:
             sub_agent.working_dir = parent.working_dir
@@ -947,12 +949,17 @@ rule ExploreSubAgentDirectory {
         -- Explore sub-agents are read-only regardless of parent mode.
         -- Multiple Explore sub-agents allowed in parallel.
         --
-        -- An Explore parent that has been promoted from Managed -> Work
-        -- via task approval (REQ-PROJ-028) already owns a worktree; even
-        -- before that promotion an Explore parent in Managed mode has
-        -- a worktree, so `parent.mode = explore` resolves to the
-        -- worktree path here. Only Direct parents fall through to
-        -- `parent.working_dir`.
+        -- Explore parents do not uniformly own a worktree. Per the
+        -- ConvMode::Explore schema (db::schema.rs), `worktree_path` is
+        -- `None` for sub-agent Explore conversations and may be absent
+        -- on legacy/non-managed rows (backfilled by migration 007).
+        -- The branches above match the spawn handler:
+        --   Work / Branch parent  -> always has a worktree
+        --   Explore parent with a worktree (post-REQ-PROJ-028 Managed)
+        --                         -> use it
+        --   Otherwise (Direct, or Explore with no worktree)
+        --                         -> parent's working_dir, which is
+        --                            the user-supplied cwd
 }
 
 -- ===========================================================

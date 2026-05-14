@@ -38,32 +38,27 @@ const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 /// Decide whether `path` is inside the worktree rooted at `root`.
 ///
 /// Three stages, each closing a class of bypass:
-///   1. Reject non-absolute paths and any `..` component up front.
-///      Without this, `Path::new("/worktree/../escape")` would
-///      lexically `starts_with("/worktree")` -- the first component
-///      matches.
-///   2. Canonicalise `root`. The worktree must exist; if it doesn't,
-///      the comparison is meaningless and we reject (fail closed).
-///   3. Canonicalise the deepest existing ancestor of `path` and check
-///      that ancestor lies inside the canonical root. This closes the
-///      "intermediate symlink, leaf doesn't exist yet" escape: if
-///      `/worktree/escape` is a symlink to `/outside` and the override
-///      is `/worktree/escape/newdir`, the deepest existing ancestor is
-///      `/worktree/escape`, canonical form `/outside`, which does not
-///      start with the canonical worktree -- rejected. Step 1 already
-///      guarantees the tail beyond the ancestor has no `..` to escape
-///      with, so an inside-ancestor satisfies the invariant once
-///      created.
+///
+/// 1. Reject non-absolute paths. Relative overrides are ambiguous (no
+///    defined resolution base) and not worth modelling.
+/// 2. Canonicalise `root`. The worktree must exist; if it doesn't,
+///    the comparison is meaningless and we reject (fail closed).
+/// 3. Canonicalise the deepest existing ancestor of `path` and check
+///    that ancestor lies inside the canonical root. `canonicalize`
+///    resolves `..` and symlinks together (it's a `realpath` call),
+///    so neither construct can escape:
+///    `/worktree/../escape` -> ancestor `/worktree/..` -> canonical
+///    `/parent_of_worktree` -> rejected.
+///    `/worktree/escape/newdir` where `escape` symlinks to `/outside`
+///    -> ancestor `/worktree/escape` -> canonical `/outside` ->
+///    rejected.
+///    Conversely, an in-worktree path that just happens to use `..`
+///    to traverse internally (e.g. `/worktree/src/../tests`)
+///    canonicalises back to a subpath of the worktree -> accepted.
 fn path_is_within(path: &str, root: &str) -> bool {
-    use std::path::{Component, Path, PathBuf};
+    use std::path::{Path, PathBuf};
     let raw_path = Path::new(path);
     if !raw_path.is_absolute() {
-        return false;
-    }
-    if raw_path
-        .components()
-        .any(|c| matches!(c, Component::ParentDir))
-    {
         return false;
     }
     let Ok(canon_root) = std::fs::canonicalize(Path::new(root)) else {
@@ -4918,12 +4913,24 @@ mod work_subagent_cwd_guard_tests {
     }
 
     #[test]
-    fn path_is_within_rejects_parent_dir_traversal() {
-        // `..` rejected up front, so `/worktree/../escape` never reaches
-        // the prefix check.
+    fn path_is_within_rejects_parent_dir_traversal_that_escapes() {
+        // `/worktree/../escape` -> canonical /parent_of_worktree, which
+        // is not a subpath of the worktree -> rejected. Canonicalise
+        // handles the `..` directly (it's a `realpath` call).
         let worktree = TempDir::new().expect("worktree tempdir");
         let bad = format!("{}/../escape", worktree.path().display());
         assert!(!path_is_within(&bad, worktree.path().to_str().unwrap()));
+    }
+
+    #[test]
+    fn path_is_within_accepts_internal_parent_dir_traversal() {
+        // `/worktree/src/../tests` is a legitimate in-worktree path --
+        // canonicalisation resolves it to `/worktree/tests`, which is a
+        // subpath of the worktree. Don't blanket-reject `..`.
+        let worktree = TempDir::new().expect("worktree tempdir");
+        std::fs::create_dir_all(worktree.path().join("src")).expect("src dir");
+        let inner = format!("{}/src/../tests", worktree.path().display());
+        assert!(path_is_within(&inner, worktree.path().to_str().unwrap()));
     }
 
     #[test]
