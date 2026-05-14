@@ -782,10 +782,14 @@ function ConversationPageContent() {
   // otherwise) plus the cwd, append to the existing draft (never replace),
   // and focus the composer so the user can immediately type a follow-up.
   //
-  // Naming the tmux pane (`main:0.0`) is deliberate: the LLM can then call
-  // the existing `tmux` tool (e.g. `capture-pane -p -t main:0.0 -S -200`)
-  // to pull the rest of the pane on follow-up — Phoenix injects the correct
-  // socket so no further coordinates are needed.
+  // Naming the tmux pane (`main:1.0` — first window 1 since `base-index 1`,
+  // first pane 0; see crates/phoenix-ide/src/tools/tmux/server.conf) is
+  // deliberate: the LLM can then call the existing `tmux` tool (e.g.
+  // `capture-pane -p -t main:1.0 -S -200`) to pull the rest of the pane
+  // on follow-up — Phoenix injects the correct socket so no further
+  // coordinates are needed. Drifts if the user splits the pane or opens
+  // additional windows; threading the live pane id through SSE is a
+  // future refinement.
   const handleSendTerminalSelection = useCallback(
     (selection: string) => {
       if (!selection) return;
@@ -793,7 +797,7 @@ function ConversationPageContent() {
       if (!trimmed) return;
       const cwdHint = conversation?.cwd ? ` (cwd: \`${conversation.cwd}\`)` : '';
       const sourceLabel = conversation?.terminal_uses_tmux
-        ? 'From tmux pane `main:0.0`'
+        ? 'From tmux pane `main:1.0`'
         : 'From terminal';
       // Fence length must exceed the longest backtick run in the selection
       // (CommonMark §4.5) so output containing literal triple-backticks —

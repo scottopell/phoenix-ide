@@ -54,6 +54,7 @@ function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
     task_title: 'Track PR status',
     conv_mode_label: 'Work',
     browser_session_active: false,
+    terminal_uses_tmux: false,
     ...overrides,
   };
 }

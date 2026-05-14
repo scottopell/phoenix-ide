@@ -100,8 +100,9 @@ export interface Conversation {
    *  per-conversation tmux session (server has tmux on PATH). The composer
    *  uses this to label terminal-selection snippets with the tmux pane id,
    *  so the LLM can follow up via the existing `tmux` tool to capture more
-   *  of the pane on demand. */
-  terminal_uses_tmux?: boolean;
+   *  of the pane on demand. Always populated by the server (defaulting to
+   *  false in the stateless list-endpoint enricher). */
+  terminal_uses_tmux: boolean;
 }
 
 export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';

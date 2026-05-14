@@ -17,6 +17,7 @@ function makeConv(id: string, updated_at: string, overrides: Partial<Conversatio
     state: { type: 'idle' },
     archived: false,
     browser_session_active: false,
+    terminal_uses_tmux: false,
     ...overrides,
   };
 }

@@ -49,6 +49,7 @@ const makeConv = (id: string, slug: string, overrides: Partial<Conversation> = {
   project_id: 'proj-1',
   conv_mode_label: 'EXPLORE',
   browser_session_active: false,
+  terminal_uses_tmux: false,
   ...overrides,
 });
 

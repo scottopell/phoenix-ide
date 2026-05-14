@@ -596,9 +596,11 @@ pub struct EnrichedConversation {
     /// True when the in-app terminal for this conversation attaches to a
     /// per-conversation tmux session (the default whenever `tmux` is on
     /// PATH; see `TmuxRegistry::binary_available`). The UI uses this to
-    /// label terminal-selection snippets with `tmux pane main:0.0`, which
-    /// hints to the LLM that the existing `tmux` tool can pull the full
-    /// pane on follow-up. False when the PTY runs a direct `$SHELL`.
+    /// label terminal-selection snippets with `tmux pane main:1.0` (first
+    /// window 1 because `base-index 1` in `tools/tmux/server.conf`, first
+    /// pane 0), hinting to the LLM that the existing `tmux` tool can pull
+    /// the full pane on follow-up. False when the PTY runs a direct
+    /// `$SHELL`.
     pub terminal_uses_tmux: bool,
 }
 

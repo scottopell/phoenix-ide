@@ -19,6 +19,7 @@ const testConversation: Conversation = {
   updated_at: '2024-01-01T00:00:00Z',
   message_count: 0,
   browser_session_active: false,
+  terminal_uses_tmux: false,
 };
 
 function makeMessage(sequenceId: number, messageType: 'user' | 'agent' = 'agent'): Message {

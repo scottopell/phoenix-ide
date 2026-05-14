@@ -18,6 +18,7 @@ const makeConv = (
   updated_at,
   message_count: 1,
   browser_session_active: false,
+  terminal_uses_tmux: false,
   ...overrides,
 });
 
