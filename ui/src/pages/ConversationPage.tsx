@@ -210,12 +210,20 @@ function ConversationPageContent() {
 
   // Page-scope draft control. Lives in the conversation atom; survives
   // viewer-driven unmount/remount of `<InputArea>`. See ui/src/hooks/useDraft.ts.
+  // Destructure the callbacks because `draftCtl` itself is a fresh object
+  // each render — depending on the object would tear down memoized handlers
+  // and event listeners every render. The inner callbacks are useCallback'd
+  // against `[conversationId, dispatch]`, so they're stable.
   const draftCtl = useDraft(slug);
+  const { draft: draftValue, setDraft: setDraftCb, appendDraft: appendDraftCb } = draftCtl;
 
   // Monotonic focus-request counter. Any time we mutate the draft from
   // outside the textarea (terminal selection, prose-reader notes, retry,
   // seed hydration, skill insert), we bump this so InputArea's focus
   // effect fires — including across an unmount/remount on narrow viewports.
+  // Reset on slug change in the per-slug reset block below — otherwise a
+  // non-zero token from the previous conversation would steal focus on the
+  // next remount of <InputArea> without an explicit request.
   const [focusToken, setFocusToken] = useState(0);
   const requestComposerFocus = useCallback(() => {
     setFocusToken((t) => t + 1);
@@ -276,6 +284,7 @@ function ConversationPageContent() {
     setShowFirstTaskWelcome(false);
     setContextExhaustedExpanded(true);
     setAbandoningContextExhausted(false);
+    setFocusToken(0);
     // Ref resets — immediate, no re-render.
     sendingMessagesRef.current = new Set();
     seedHydratedRef.current = null;
@@ -419,11 +428,11 @@ function ConversationPageContent() {
 
   // availableModels is populated by the shared useModels() poller above.
 
-  // REQ-SEED-001: hydrate the input area from `seed-draft:<id>` localStorage
-  // when a seeded conversation first mounts, then clear the key so revisits
-  // don't re-hydrate it. We push the draft into InputArea via its imperative
-  // `setDraft` handle, which routes through `useDraft` so persistence picks
-  // up normally from there.
+  // REQ-SEED-001: hydrate the draft from `seed-draft:<id>` localStorage when
+  // a seeded conversation first mounts, then clear the key so revisits don't
+  // re-hydrate it. Dispatches through `setDraftCb` (which dispatches
+  // `set_draft` on the conversation atom); the persistence side-effect in
+  // `useDraft` mirrors the value to `phoenix:draft:<id>` after that.
   // (`seedHydratedRef` is declared with the per-slug reset block above so it
   //  resets to null on slug change.)
   useEffect(() => {
@@ -438,14 +447,14 @@ function ConversationPageContent() {
     }
     if (!seed) return;
     seedHydratedRef.current = conversationId;
-    draftCtl.setDraft(seed);
+    setDraftCb(seed);
     requestComposerFocus();
     try {
       localStorage.removeItem(key);
     } catch {
       // ignore
     }
-  }, [conversationId, draftCtl, requestComposerFocus]);
+  }, [conversationId, setDraftCb, requestComposerFocus]);
 
   // Auto-open/close task approval overlay on state transitions
   useEffect(() => {
@@ -634,9 +643,9 @@ function ConversationPageContent() {
     // instead of directly resending (the banner truncates content and
     // the user may want to fix the issue that caused the failure).
     dismiss(localId);
-    draftCtl.setDraft(msg.text);
+    setDraftCb(msg.text);
     requestComposerFocus();
-  }, [queuedMessages, dismiss, draftCtl, requestComposerFocus]);
+  }, [queuedMessages, dismiss, setDraftCb, requestComposerFocus]);
 
   const handleCancel = async () => {
     if (!conversationId || !isAgentWorking(atom.phase)) return;
@@ -802,10 +811,10 @@ function ConversationPageContent() {
       }
       const fence = '`'.repeat(Math.max(3, longestRun + 1));
       const fenced = `${sourceLabel}${cwdHint}:\n${fence}\n${trimmed}\n${fence}`;
-      draftCtl.appendDraft(fenced);
+      appendDraftCb(fenced);
       requestComposerFocus();
     },
-    [conversation?.cwd, conversation?.terminal_uses_tmux, draftCtl, requestComposerFocus]
+    [conversation?.cwd, conversation?.terminal_uses_tmux, appendDraftCb, requestComposerFocus]
   );
 
   // External "set this as the draft" trigger fired by surfaces that don't
@@ -817,12 +826,12 @@ function ConversationPageContent() {
     const handler = (e: Event) => {
       const text = (e as CustomEvent<{ text: string }>).detail?.text;
       if (!text) return;
-      draftCtl.setDraft(text);
+      setDraftCb(text);
       requestComposerFocus();
     };
     window.addEventListener('phoenix:insert-draft', handler);
     return () => window.removeEventListener('phoenix:insert-draft', handler);
-  }, [draftCtl, requestComposerFocus]);
+  }, [setDraftCb, requestComposerFocus]);
 
   const handleSendNotes = useCallback(
     (formattedNotes: string) => {
@@ -831,11 +840,11 @@ function ConversationPageContent() {
       // or unmounted (narrow-desktop fullscreen flow — the viewer closes
       // immediately below). `requestComposerFocus()` is a token bump that
       // InputArea consumes on its next render, including after a remount.
-      draftCtl.appendDraft(formattedNotes);
+      appendDraftCb(formattedNotes);
       requestComposerFocus();
       fileExplorer.closeFile();
     },
-    [fileExplorer, draftCtl, requestComposerFocus]
+    [fileExplorer, appendDraftCb, requestComposerFocus]
   );
 
   const handleOpenFileFromPatch = useCallback(
@@ -1209,8 +1218,8 @@ function ConversationPageContent() {
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
-          draft={draftCtl.draft}
-          onDraftChange={draftCtl.setDraft}
+          draft={draftValue}
+          onDraftChange={setDraftCb}
           focusToken={focusToken}
           onSend={handleSend}
           onCancel={handleCancel}
@@ -1264,8 +1273,8 @@ function ConversationPageContent() {
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
-          draft={draftCtl.draft}
-          onDraftChange={draftCtl.setDraft}
+          draft={draftValue}
+          onDraftChange={setDraftCb}
           focusToken={focusToken}
           onSend={handleSend}
           onCancel={handleCancel}

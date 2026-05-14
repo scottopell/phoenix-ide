@@ -86,6 +86,19 @@ export function useDraft(slug: string | undefined): DraftControl {
     const pending = pendingRef.current;
     if (pending.timer !== null) {
       window.clearTimeout(pending.timer);
+      // If we're cancelling because the user switched conversations,
+      // flush the prior conversation's pending write synchronously.
+      // Otherwise the last ~300ms of typing in the old conversation
+      // never reaches localStorage and a refresh loses it. The atom
+      // still has the value in memory for same-session returns, but
+      // persistence has to survive page refresh too.
+      if (
+        pending.conversationId !== null &&
+        pending.conversationId !== conversationId &&
+        pending.value !== null
+      ) {
+        writeDraft(pending.conversationId, pending.value);
+      }
     }
     pending.conversationId = conversationId;
     pending.value = value;
