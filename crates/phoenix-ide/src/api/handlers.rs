@@ -332,7 +332,7 @@ async fn enrich_conversation_with_seed(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> crate::runtime::EnrichedConversation {
-    let mut enriched = enrich_conversation(conv);
+    let mut enriched = enrich_conversation_with_runtime(state, conv);
     if let Some(parent_id) = conv.seed_parent_id.as_deref() {
         if let Ok(parent) = state.runtime.db().get_conversation(parent_id).await {
             enriched.seed_parent_slug = parent.slug;
@@ -342,8 +342,27 @@ async fn enrich_conversation_with_seed(
     // source of truth is the manager's `HashMap`; the SSE
     // `BrowserSessionState` event keeps the client in sync after this point.
     enriched.browser_session_active = state.runtime.browser_sessions().is_active(&conv.id).await;
-    // tmux availability is cached at registry init (`which("tmux")`), so this
-    // is a cheap field read — see `TmuxRegistry::binary_available`.
+    enriched
+}
+
+/// Build an `EnrichedConversation` and apply runtime-derived fields that are
+/// process-wide and synchronously readable. Used by both the AppState-aware
+/// `enrich_conversation_with_seed` and the list-endpoint serializer
+/// `conversation_to_json` so the same fields land in every wire payload.
+///
+/// Without this routing, list endpoints (which used to call the stateless
+/// `enrich_conversation` directly) would emit `terminal_uses_tmux: false`
+/// for every row. The 5s `listConversations` poll then upserted those rows
+/// into the conversation atom's `Conversation` slot via
+/// `RoutedStore.upsertSnapshot`, clobbering the `true` value previously set
+/// by `sse_init` — and the terminal-selection composer label silently
+/// regressed from `From tmux pane main:1.0` to `From terminal` for ~5s
+/// windows. Codex review on PR #92.
+fn enrich_conversation_with_runtime(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+) -> crate::runtime::EnrichedConversation {
+    let mut enriched = enrich_conversation(conv);
     enriched.terminal_uses_tmux = state.runtime.tmux_registry().binary_available();
     enriched
 }
@@ -371,9 +390,11 @@ fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
 ///
 /// Used by endpoints that return `serde_json::Value` (conversation list, etc.).
 /// `presentation_mode` is injected here (not on `EnrichedConversation`) so REST
-/// clients still receive it while the typed struct stays clean.
-fn conversation_to_json(conv: &crate::db::Conversation) -> Value {
-    let mut val = serde_json::to_value(enrich_conversation(conv)).unwrap_or(Value::Null);
+/// clients still receive it while the typed struct stays clean. Routes through
+/// `enrich_conversation_with_runtime` so process-wide fields (`terminal_uses_tmux`)
+/// land in every list response — see that helper's comment for the bug it fixes.
+fn conversation_to_json(state: &AppState, conv: &crate::db::Conversation) -> Value {
+    let mut val = serde_json::to_value(enrich_conversation_with_runtime(state, conv)).unwrap_or(Value::Null);
     if let Value::Object(ref mut map) = val {
         map.insert(
             "presentation_mode".to_string(),
@@ -450,7 +471,7 @@ async fn list_conversations(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_convs: Vec<Value> = conversations.iter().map(conversation_to_json).collect();
+    let json_convs: Vec<Value> = conversations.iter().map(|c| conversation_to_json(&state, c)).collect();
 
     Ok(Json(ConversationListResponse {
         conversations: json_convs,
@@ -467,7 +488,7 @@ async fn list_archived_conversations(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_convs: Vec<Value> = conversations.iter().map(conversation_to_json).collect();
+    let json_convs: Vec<Value> = conversations.iter().map(|c| conversation_to_json(&state, c)).collect();
 
     Ok(Json(ConversationListResponse {
         conversations: json_convs,

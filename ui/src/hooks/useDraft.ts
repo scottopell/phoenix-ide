@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useRef } from 'react';
 import { useConversationAtom } from '../conversation/useConversationAtom';
 
 const DEBOUNCE_MS = 300;
@@ -47,16 +47,28 @@ export interface DraftControl {
  * observation of a conversationId the hook hydrates from localStorage if
  * the atom is empty, then a debounced effect mirrors every atom change
  * back to localStorage. The atom is canonical at all times in memory.
+ *
+ * `slug` is required (not optional). Callers in this codebase already assert
+ * the slug — `ConversationPageContent` does `useConversationAtom(slug!)` —
+ * so passing undefined here would be a programming error. Forcing the type
+ * keeps us from creating stray empty-string store entries during transient
+ * routing states.
  */
-export function useDraft(slug: string | undefined): DraftControl {
-  const [atom, dispatch] = useConversationAtom(slug ?? '');
+export function useDraft(slug: string): DraftControl {
+  const [atom, dispatch] = useConversationAtom(slug);
   const conversationId = atom.conversationId;
 
   // Hydrate from localStorage once per conversationId. Skipped if the atom
   // already has a draft — preserves in-memory edits when the user navigates
-  // away and back within the same session.
+  // away and back within the same session. useLayoutEffect (vs useEffect)
+  // runs synchronously after render but before browser paint, so the
+  // textarea's first paint shows the stored value rather than briefly
+  // popping from "" to the stored content. The pre-refactor `useDraft`
+  // achieved this via `useScopedState` reading localStorage during render;
+  // useLayoutEffect is the closest equivalent that's compatible with
+  // dispatching into the atom.
   const hydratedForRef = useRef<string | null>(null);
-  useEffect(() => {
+  useLayoutEffect(() => {
     if (!conversationId) return;
     if (hydratedForRef.current === conversationId) return;
     hydratedForRef.current = conversationId;

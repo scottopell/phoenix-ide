@@ -214,7 +214,7 @@ function ConversationPageContent() {
   // each render — depending on the object would tear down memoized handlers
   // and event listeners every render. The inner callbacks are useCallback'd
   // against `[conversationId, dispatch]`, so they're stable.
-  const draftCtl = useDraft(slug);
+  const draftCtl = useDraft(slug!);
   const { draft: draftValue, setDraft: setDraftCb, appendDraft: appendDraftCb } = draftCtl;
 
   // Monotonic focus-request counter. Any time we mutate the draft from
