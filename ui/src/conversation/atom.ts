@@ -37,6 +37,13 @@ export interface ConversationAtom {
   lastSequenceId: number;
   streamingBuffer: StreamingBuffer | null;
   uiError: UIError | null;
+  /** The user's in-flight message text. Single source of truth for the
+   *  composer textarea AND for every other surface that programmatically
+   *  inserts text (terminal selection, prose-reader notes, retry-of-failed,
+   *  seed hydration). `<InputArea>` is a controlled component over this
+   *  field. localStorage (`phoenix:draft:<id>`) is a write-through cache,
+   *  not a parallel source — see `useDraft.ts`. */
+  draft: string;
   /** `Date.now()` when the current `tool_executing` phase began. Reset on
    *  each new tool (a single agent turn may execute many tools sequentially).
    *  `null` when not in `tool_executing`. Used by StateBar to render a live
@@ -170,7 +177,15 @@ export type SSEAction =
       type: 'set_system_prompt';
       systemPrompt: string | null;
       expectedConversationId: string;
-    };
+    }
+  // Client-originated draft mutations. `<InputArea>` dispatches `set_draft`
+  // on every keystroke; external surfaces (terminal selection, prose-reader
+  // notes, retry-of-failed, seed hydration) dispatch the same actions —
+  // there is no longer a "imperative handle vs. localStorage" branch keyed
+  // on whether `<InputArea>` happens to be mounted.
+  | { type: 'set_draft'; text: string; expectedConversationId: string }
+  | { type: 'append_draft'; text: string; expectedConversationId: string }
+  | { type: 'clear_draft'; expectedConversationId: string };
 
 export function createInitialAtom(): ConversationAtom {
   return {
@@ -185,6 +200,7 @@ export function createInitialAtom(): ConversationAtom {
     lastSequenceId: 0,
     streamingBuffer: null,
     uiError: null,
+    draft: '',
     toolExecutingStartedAt: null,
     connectionEpoch: null,
     connectionState: 'connecting',
@@ -865,5 +881,29 @@ export function conversationReducer(
     case 'set_system_prompt':
       if (action.expectedConversationId !== atom.conversationId) return atom;
       return { ...atom, systemPrompt: action.systemPrompt };
+
+    case 'set_draft':
+      if (action.expectedConversationId !== atom.conversationId) return atom;
+      if (atom.draft === action.text) return atom;
+      return { ...atom, draft: action.text };
+
+    case 'append_draft': {
+      if (action.expectedConversationId !== atom.conversationId) return atom;
+      if (!action.text) return atom;
+      // Match the prior `appendToDraft` semantics: blank-line separator
+      // when the existing draft has visible content, otherwise replace.
+      // The read-modify-write happens inside the reducer so concurrent
+      // appends (notes + terminal selection in quick succession) compose
+      // deterministically.
+      const next = atom.draft.trim()
+        ? atom.draft + '\n\n' + action.text
+        : action.text;
+      return { ...atom, draft: next };
+    }
+
+    case 'clear_draft':
+      if (action.expectedConversationId !== atom.conversationId) return atom;
+      if (atom.draft === '') return atom;
+      return { ...atom, draft: '' };
   }
 }

@@ -28,7 +28,7 @@ import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkActions } from '../components/WorkActions';
 import { useConversationAtom, useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
-import { useResizablePane, useIsDesktop, useIsWideDesktop } from '../hooks';
+import { useResizablePane, useIsDesktop, useIsWideDesktop, useDraft } from '../hooks';
 
 // Conditional overlays / heavy panels — code-split so the default render path
 // (chat view with no overlay open) doesn't pay their bundle cost.
@@ -207,6 +207,19 @@ function ConversationPageContent() {
 
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
+
+  // Page-scope draft control. Lives in the conversation atom; survives
+  // viewer-driven unmount/remount of `<InputArea>`. See ui/src/hooks/useDraft.ts.
+  const draftCtl = useDraft(slug);
+
+  // Monotonic focus-request counter. Any time we mutate the draft from
+  // outside the textarea (terminal selection, prose-reader notes, retry,
+  // seed hydration, skill insert), we bump this so InputArea's focus
+  // effect fires — including across an unmount/remount on narrow viewports.
+  const [focusToken, setFocusToken] = useState(0);
+  const requestComposerFocus = useCallback(() => {
+    setFocusToken((t) => t + 1);
+  }, []);
 
   // App state for offline support
   const { isOnline, queueOperation } = useAppMachine();
@@ -417,25 +430,22 @@ function ConversationPageContent() {
     if (!conversationId) return;
     if (seedHydratedRef.current === conversationId) return;
     const key = `seed-draft:${conversationId}`;
-    let draft: string | null = null;
+    let seed: string | null = null;
     try {
-      draft = localStorage.getItem(key);
+      seed = localStorage.getItem(key);
     } catch {
       // ignore
     }
-    if (!draft) return;
+    if (!seed) return;
     seedHydratedRef.current = conversationId;
-    // Defer to the next tick so InputArea has mounted and inputRef is set.
-    const handle = window.setTimeout(() => {
-      inputRef.current?.setDraft(draft!);
-      try {
-        localStorage.removeItem(key);
-      } catch {
-        // ignore
-      }
-    }, 0);
-    return () => window.clearTimeout(handle);
-  }, [conversationId]);
+    draftCtl.setDraft(seed);
+    requestComposerFocus();
+    try {
+      localStorage.removeItem(key);
+    } catch {
+      // ignore
+    }
+  }, [conversationId, draftCtl, requestComposerFocus]);
 
   // Auto-open/close task approval overlay on state transitions
   useEffect(() => {
@@ -624,8 +634,9 @@ function ConversationPageContent() {
     // instead of directly resending (the banner truncates content and
     // the user may want to fix the issue that caused the failure).
     dismiss(localId);
-    inputRef.current?.setDraft(msg.text);
-  }, [queuedMessages, dismiss]);
+    draftCtl.setDraft(msg.text);
+    requestComposerFocus();
+  }, [queuedMessages, dismiss, draftCtl, requestComposerFocus]);
 
   const handleCancel = async () => {
     if (!conversationId || !isAgentWorking(atom.phase)) return;
@@ -791,44 +802,40 @@ function ConversationPageContent() {
       }
       const fence = '`'.repeat(Math.max(3, longestRun + 1));
       const fenced = `${sourceLabel}${cwdHint}:\n${fence}\n${trimmed}\n${fence}`;
-      if (inputRef.current) {
-        inputRef.current.appendToDraft(fenced);
-        inputRef.current.focus();
-      } else if (conversationId) {
-        const key = `phoenix:draft:${conversationId}`;
-        try {
-          const existing = localStorage.getItem(key) ?? '';
-          const next = existing.trim() ? existing + '\n\n' + fenced : fenced;
-          localStorage.setItem(key, next);
-        } catch (e) {
-          console.warn('Failed to save terminal selection to draft:', e);
-        }
-      }
+      draftCtl.appendDraft(fenced);
+      requestComposerFocus();
     },
-    [conversationId, conversation?.cwd, conversation?.terminal_uses_tmux]
+    [conversation?.cwd, conversation?.terminal_uses_tmux, draftCtl, requestComposerFocus]
   );
+
+  // External "set this as the draft" trigger fired by surfaces that don't
+  // hold a ref to the composer (skill viewer, message context menu). With
+  // draft state in the atom, this is a thin shim: dispatch + focus token.
+  // Replaces the prior InputArea-local listener that only worked when
+  // InputArea happened to be mounted.
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const text = (e as CustomEvent<{ text: string }>).detail?.text;
+      if (!text) return;
+      draftCtl.setDraft(text);
+      requestComposerFocus();
+    };
+    window.addEventListener('phoenix:insert-draft', handler);
+    return () => window.removeEventListener('phoenix:insert-draft', handler);
+  }, [draftCtl, requestComposerFocus]);
 
   const handleSendNotes = useCallback(
     (formattedNotes: string) => {
-      if (inputRef.current) {
-        // InputArea is mounted (mobile path) — update via React state.
-        inputRef.current.appendToDraft(formattedNotes);
-      } else if (conversationId) {
-        // Desktop early-return renders ProseReader instead of InputArea,
-        // so inputRef.current is null. Write directly to localStorage so
-        // InputArea picks it up when it mounts after the prose reader closes.
-        const key = `phoenix:draft:${conversationId}`;
-        try {
-          const existing = localStorage.getItem(key) ?? '';
-          const next = existing.trim() ? existing + '\n\n' + formattedNotes : formattedNotes;
-          localStorage.setItem(key, next);
-        } catch (e) {
-          console.warn('Failed to save notes to draft:', e);
-        }
-      }
+      // Draft lives in the conversation atom, so this works the same whether
+      // `<InputArea>` is currently mounted (right-pane / mobile-overlay flow)
+      // or unmounted (narrow-desktop fullscreen flow — the viewer closes
+      // immediately below). `requestComposerFocus()` is a token bump that
+      // InputArea consumes on its next render, including after a remount.
+      draftCtl.appendDraft(formattedNotes);
+      requestComposerFocus();
       fileExplorer.closeFile();
     },
-    [fileExplorer, conversationId]
+    [fileExplorer, draftCtl, requestComposerFocus]
   );
 
   const handleOpenFileFromPatch = useCallback(
@@ -1202,6 +1209,9 @@ function ConversationPageContent() {
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
+          draft={draftCtl.draft}
+          onDraftChange={draftCtl.setDraft}
+          focusToken={focusToken}
           onSend={handleSend}
           onCancel={handleCancel}
           onRetry={handleRetry}
@@ -1254,6 +1264,9 @@ function ConversationPageContent() {
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
+          draft={draftCtl.draft}
+          onDraftChange={draftCtl.setDraft}
+          focusToken={focusToken}
           onSend={handleSend}
           onCancel={handleCancel}
           onRetry={handleRetry}

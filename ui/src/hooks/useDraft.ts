@@ -1,102 +1,131 @@
 import { useCallback, useEffect, useRef } from 'react';
-import { useScopedState } from './useScopedState';
+import { useConversationAtom } from '../conversation/useConversationAtom';
 
 const DEBOUNCE_MS = 300;
+const STORAGE_PREFIX = 'phoenix:draft:';
 
-function readDraft(storageKey: string | null): string {
-  if (!storageKey) return '';
+function storageKey(conversationId: string): string {
+  return `${STORAGE_PREFIX}${conversationId}`;
+}
+
+function readDraft(conversationId: string): string {
   try {
-    return localStorage.getItem(storageKey) ?? '';
+    return localStorage.getItem(storageKey(conversationId)) ?? '';
   } catch (error) {
     console.warn('Error reading draft from localStorage:', error);
     return '';
   }
 }
 
+function writeDraft(conversationId: string, value: string): void {
+  try {
+    if (value === '') {
+      localStorage.removeItem(storageKey(conversationId));
+    } else {
+      localStorage.setItem(storageKey(conversationId), value);
+    }
+  } catch (error) {
+    console.warn('Error saving draft to localStorage:', error);
+  }
+}
+
+export interface DraftControl {
+  draft: string;
+  setDraft: (text: string) => void;
+  appendDraft: (text: string) => void;
+  clearDraft: () => void;
+}
+
 /**
- * Hook for managing draft message text with debounced localStorage persistence.
- * Draft is automatically saved on every keystroke (debounced) and restored on mount.
+ * Conversation-scoped draft. State lives in the conversation atom, NOT in
+ * `<InputArea>` — so every surface that mutates the draft (typing, terminal
+ * selection, prose-reader notes, retry-of-failed, seed hydration) talks to
+ * one source of truth, regardless of whether `<InputArea>` is currently
+ * mounted.
+ *
+ * localStorage (`phoenix:draft:<id>`) is a write-through cache. On first
+ * observation of a conversationId the hook hydrates from localStorage if
+ * the atom is empty, then a debounced effect mirrors every atom change
+ * back to localStorage. The atom is canonical at all times in memory.
  */
-export function useDraft(conversationId: string | undefined): [
-  string,
-  (value: string) => void,
-  () => void
-] {
-  const storageKey = conversationId ? `phoenix:draft:${conversationId}` : null;
-  const initialDraft = readDraft(storageKey);
-  const [draft, setDraftState] = useScopedState(conversationId, initialDraft);
-  const debounceRef = useRef<number | null>(null);
+export function useDraft(slug: string | undefined): DraftControl {
+  const [atom, dispatch] = useConversationAtom(slug ?? '');
+  const conversationId = atom.conversationId;
 
-  // Save to localStorage (debounced)
-  const saveToStorage = useCallback((value: string) => {
-    if (!storageKey) return;
-    try {
-      if (value === '') {
-        localStorage.removeItem(storageKey);
-      } else {
-        localStorage.setItem(storageKey, value);
-      }
-    } catch (error) {
-      console.warn('Error saving draft to localStorage:', error);
-    }
-  }, [storageKey]);
-
-  // Set draft with debounced persistence
-  const setDraft = useCallback((value: string) => {
-    setDraftState(value);
-    
-    // Cancel pending save
-    if (debounceRef.current !== null) {
-      clearTimeout(debounceRef.current);
-    }
-    
-    // Schedule new save
-    debounceRef.current = window.setTimeout(() => {
-      saveToStorage(value);
-      debounceRef.current = null;
-    }, DEBOUNCE_MS);
-  }, [saveToStorage, setDraftState]);
-
-  // Clear draft (immediate, no debounce)
-  const clearDraft = useCallback(() => {
-    // Cancel any pending save
-    if (debounceRef.current !== null) {
-      clearTimeout(debounceRef.current);
-      debounceRef.current = null;
-    }
-    
-    setDraftState('');
-    if (storageKey) {
-      try {
-        localStorage.removeItem(storageKey);
-      } catch (error) {
-        console.warn('Error clearing draft from localStorage:', error);
-      }
-    }
-  }, [storageKey, setDraftState]);
-
-  // Track current draft value for flush on unmount
-  const draftRef = useRef(draft);
+  // Hydrate from localStorage once per conversationId. Skipped if the atom
+  // already has a draft — preserves in-memory edits when the user navigates
+  // away and back within the same session.
+  const hydratedForRef = useRef<string | null>(null);
   useEffect(() => {
-    draftRef.current = draft;
-  }, [draft]);
+    if (!conversationId) return;
+    if (hydratedForRef.current === conversationId) return;
+    hydratedForRef.current = conversationId;
+    if (atom.draft) return;
+    const stored = readDraft(conversationId);
+    if (stored) {
+      dispatch({
+        type: 'set_draft',
+        text: stored,
+        expectedConversationId: conversationId,
+      });
+    }
+  }, [conversationId, atom.draft, dispatch]);
 
-  // Cleanup on unmount - flush any pending draft save
+  // Debounced write-through to localStorage. Flushes any pending write on
+  // unmount (component teardown, page close) so 300ms of typing isn't lost.
+  const pendingRef = useRef<{
+    timer: number | null;
+    conversationId: string | null;
+    value: string | null;
+  }>({ timer: null, conversationId: null, value: null });
+
+  useEffect(() => {
+    if (!conversationId) return;
+    if (hydratedForRef.current !== conversationId) return;
+    const value = atom.draft;
+    const pending = pendingRef.current;
+    if (pending.timer !== null) {
+      window.clearTimeout(pending.timer);
+    }
+    pending.conversationId = conversationId;
+    pending.value = value;
+    pending.timer = window.setTimeout(() => {
+      writeDraft(conversationId, value);
+      pending.timer = null;
+    }, DEBOUNCE_MS);
+  }, [conversationId, atom.draft]);
+
   useEffect(() => {
     return () => {
-      if (debounceRef.current !== null) {
-        clearTimeout(debounceRef.current);
-        // Flush the pending save immediately
-        if (storageKey && draftRef.current) {
-          try {
-            localStorage.setItem(storageKey, draftRef.current);
-          } catch (error) {
-            console.warn('Error flushing draft on unmount:', error);
-          }
+      const pending = pendingRef.current;
+      if (pending.timer !== null) {
+        window.clearTimeout(pending.timer);
+        pending.timer = null;
+        if (pending.conversationId !== null && pending.value !== null) {
+          writeDraft(pending.conversationId, pending.value);
         }
       }
     };
-  }, [storageKey]);
+  }, []);
 
-  return [draft, setDraft, clearDraft];
+  const setDraft = useCallback(
+    (text: string) => {
+      if (!conversationId) return;
+      dispatch({ type: 'set_draft', text, expectedConversationId: conversationId });
+    },
+    [conversationId, dispatch],
+  );
+  const appendDraft = useCallback(
+    (text: string) => {
+      if (!conversationId) return;
+      dispatch({ type: 'append_draft', text, expectedConversationId: conversationId });
+    },
+    [conversationId, dispatch],
+  );
+  const clearDraft = useCallback(() => {
+    if (!conversationId) return;
+    dispatch({ type: 'clear_draft', expectedConversationId: conversationId });
+  }, [conversationId, dispatch]);
+
+  return { draft: atom.draft, setDraft, appendDraft, clearDraft };
 }

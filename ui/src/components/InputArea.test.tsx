@@ -6,7 +6,17 @@ import { api } from '../api';
 
 const idleState: ConversationState = { type: 'idle' };
 
-function renderInput(conversationId: string | undefined) {
+interface InputAreaTestProps {
+  conversationId: string | undefined;
+  draft?: string;
+  onDraftChange?: (text: string) => void;
+}
+
+function renderInput({
+  conversationId,
+  draft = '',
+  onDraftChange = () => {},
+}: InputAreaTestProps) {
   return render(
     <InputArea
       conversationId={conversationId}
@@ -15,6 +25,8 @@ function renderInput(conversationId: string | undefined) {
       setImages={() => {}}
       isOffline={false}
       failedMessages={[]}
+      draft={draft}
+      onDraftChange={onDraftChange}
       onSend={() => {}}
       onCancel={() => {}}
       onRetry={() => {}}
@@ -22,12 +34,9 @@ function renderInput(conversationId: string | undefined) {
   );
 }
 
-describe('InputArea conversation scope', () => {
-  it('switches synchronously to the new conversation draft', () => {
-    localStorage.setItem('phoenix:draft:conv-a', 'draft A');
-    localStorage.setItem('phoenix:draft:conv-b', 'draft B');
-
-    const { rerender } = renderInput('conv-a');
+describe('InputArea controlled-draft contract', () => {
+  it('renders the draft prop and re-renders when the prop changes', () => {
+    const { rerender } = renderInput({ conversationId: 'conv-a', draft: 'draft A' });
     const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
     expect(textarea.value).toBe('draft A');
 
@@ -39,6 +48,8 @@ describe('InputArea conversation scope', () => {
         setImages={() => {}}
         isOffline={false}
         failedMessages={[]}
+        draft="draft B"
+        onDraftChange={() => {}}
         onSend={() => {}}
         onCancel={() => {}}
         onRetry={() => {}}
@@ -60,10 +71,34 @@ describe('InputArea conversation scope', () => {
     ];
     vi.spyOn(api, 'listConversationSkills').mockResolvedValue({ skills });
 
-    const { rerender } = renderInput('conv-a');
+    let currentDraft = '';
+    const onDraftChange = (text: string) => {
+      currentDraft = text;
+    };
+
+    const { rerender } = renderInput({
+      conversationId: 'conv-a',
+      draft: currentDraft,
+      onDraftChange,
+    });
     const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
 
     fireEvent.change(textarea, { target: { value: '/r' } });
+    rerender(
+      <InputArea
+        conversationId="conv-a"
+        convState={idleState}
+        images={[]}
+        setImages={() => {}}
+        isOffline={false}
+        failedMessages={[]}
+        draft={currentDraft}
+        onDraftChange={onDraftChange}
+        onSend={() => {}}
+        onCancel={() => {}}
+        onRetry={() => {}}
+      />,
+    );
     expect(await screen.findByRole('listbox', { name: '/ autocomplete' })).toBeInTheDocument();
 
     fireEvent.click(screen.getByRole('option', { name: /review/ }));
@@ -77,6 +112,8 @@ describe('InputArea conversation scope', () => {
         setImages={() => {}}
         isOffline={false}
         failedMessages={[]}
+        draft=""
+        onDraftChange={() => {}}
         onSend={() => {}}
         onCancel={() => {}}
         onRetry={() => {}}
