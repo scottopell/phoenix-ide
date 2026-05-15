@@ -99,6 +99,18 @@ export function ConversationPage() {
     <ReviewNotesProvider scopeKey={slug}>
       <DiffViewerStateProvider scopeKey={slug}>
         <BrowserViewWrapper slug={slug}>
+          {/*
+            DraftLifecycle hosts the localStorage hydration and debounced
+            write-through for the active conversation's draft. Mounted
+            here — above ConversationPageContent's fullscreen viewer
+            early-returns (ProseReader, Diff, Browser) — so the
+            persistence subscription survives every composer
+            unmount/remount cycle. If it lived inside the main-chat JSX,
+            switching to a fullscreen viewer would unmount it and any
+            external draft mutation (e.g. `phoenix:insert-draft`) would
+            never reach localStorage until the user returned to chat.
+          */}
+          {slug && <DraftLifecycle slug={slug} />}
           <ConversationPageContent />
         </BrowserViewWrapper>
       </DiffViewerStateProvider>
@@ -1024,14 +1036,6 @@ function ConversationPageContent() {
           : undefined
       }
     >
-      {/*
-        DraftLifecycle owns the conversation draft's localStorage hydration
-        and write-through persistence. Mounted at page level so it survives
-        any viewer-driven unmount of `<ConnectedInputArea>` on narrow
-        viewports. Renders null; serves only to host the keystroke-frequency
-        subscription without dragging it into the rest of the page.
-      */}
-      <DraftLifecycle slug={slug!} />
       <div className="conversation-column">
       {seedBreadcrumb}
       {browserView.browserSessionActive && !browserView.open && (
