@@ -337,12 +337,11 @@ pub fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<
     for block in blocks {
         if let ContentBlock::ToolUse { id, name, input } = block {
             if name == "bash" {
-                let Ok(input) =
-                    serde_json::from_value::<crate::tools::BashToolInput>(input.clone())
-                else {
-                    continue;
-                };
-                if let Some(display) = bash_input_display(&input, &cwd_str) {
+                let display = serde_json::from_value::<crate::tools::BashToolInput>(input.clone())
+                    .ok()
+                    .and_then(|input| bash_input_display(&input, &cwd_str))
+                    .or_else(|| legacy_bash_input_display(input, &cwd_str));
+                if let Some(display) = display {
                     bash_displays.push(serde_json::json!({
                         "tool_use_id": id,
                         "display": display
@@ -377,5 +376,29 @@ fn bash_input_display(input: &crate::tools::BashToolInput, cwd: &str) -> Option<
             let signal = input.signal.as_deref().unwrap_or("TERM");
             format!("kill {handle} ({signal})")
         }),
+    }
+}
+fn legacy_bash_input_display(input: &Value, cwd: &str) -> Option<String> {
+    input
+        .get("command")
+        .or_else(|| input.get("cmd"))
+        .and_then(Value::as_str)
+        .map(|cmd| display_command(cmd, cwd))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compute_bash_display_data_strips_cwd_for_legacy_command() {
+        let blocks = vec![ContentBlock::ToolUse {
+            id: "tool-1".to_string(),
+            name: "bash".to_string(),
+            input: serde_json::json!({ "command": "cd /repo && cargo test" }),
+        }];
+
+        let display = compute_bash_display_data(&blocks, Path::new("/repo")).unwrap();
+        assert_eq!(display["bash"][0]["display"], "cargo test");
     }
 }
