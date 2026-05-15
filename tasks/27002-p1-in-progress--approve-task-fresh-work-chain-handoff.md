@@ -1,0 +1,111 @@
+# Approve task into fresh Work conversation as a chain handoff
+
+## Problem
+
+Managed Explore/Work approval currently promotes the same conversation from Explore to Work. That means the first Work LLM request pays for the entire Explore transcript even though `propose_task` is explicitly designed to write a self-sufficient task brief.
+
+A naive "clear context" flag would be architecturally leaky: the visible transcript and the LLM-visible context would diverge, and every context-builder would need to remember an invisible truncation boundary.
+
+Chains define conversation lineage as a single linear graph rooted in `conversations.continued_in_conv_id`. Chain navigation and chain Q&A derive membership from that graph and answer over every member in the derived lineage. Therefore an "approve and clear context" flow must not introduce a parallel successor field outside the chain graph. The approval handoff should become a normal linear chain edge.
+
+## Desired behavior
+
+Add an approval option, tentatively labeled **Approve & start fresh**, with these semantics:
+
+1. The user reviews a `propose_task` plan in an Explore conversation.
+2. On **Approve & start fresh**, Phoenix performs the same task approval git work as today:
+   - parse the task file;
+   - rename the temp Explore branch to the final task branch;
+   - rename `ready` taskmd files to `in-progress`;
+   - commit the task file on the task branch.
+3. Phoenix creates a fresh Work conversation that owns the approved task branch/worktree.
+4. Phoenix links the Explore conversation to that Work conversation using `continued_in_conv_id`, preserving Chains' derived membership model.
+5. The Explore conversation becomes read-only/history-only, with UI copy like "Task approved. Work started in <conversation>."
+6. The new Work conversation's first LLM-visible context is seeded from the approved task brief and approval metadata only, not the Explore transcript.
+7. Chain navigation/Q&A sees the Explore investigation and the Work execution as one linear chain.
+
+The existing in-place approval path may remain as **Approve in this chat** for compatibility, but the new fresh handoff path should be the recommended/default UX.
+
+## Correct-by-construction design constraints
+
+- Do **not** represent this as message deletion, hidden transcript truncation, or a context boundary inside one conversation.
+- Do **not** add a parallel `successor_conv_id` / `successor_kind` for this flow unless Chains is first migrated off `continued_in_conv_id`. For this task, use `continued_in_conv_id` so chain membership remains one source of truth.
+- Avoid boolean approval flags such as `clear_context: bool`. Use typed outcomes/policies, e.g. `TaskApprovalOutcome::Approved { handoff: TaskApprovalHandoff }` with `ContinueInCurrentConversation` and `StartFreshWorkConversation`.
+- The fresh Work conversation, not the Explore predecessor, owns the worktree after handoff. Single-live-owner invariants must remain clear for abandon/mark-merged/restart reconciliation.
+- The fresh Work conversation should receive a compact seed/meta message containing branch, worktree, base branch, task file, title/priority, and the full approved plan body.
+
+## Specs to update
+
+### `specs/bedrock/requirements.md`
+
+Extend REQ-BED-028 to specify two approval handoff policies:
+
+- continue in current conversation: existing behavior;
+- start fresh Work conversation: create a new Work conversation, link the predecessor through `continued_in_conv_id`, and dispatch the Work LLM request only in the successor.
+
+Clarify that the fresh successor's LLM context excludes the Explore transcript.
+
+### `specs/bedrock/bedrock.allium`
+
+Split approval rules so the transition is typed:
+
+- `UserApprovesTaskCurrentConversation`
+- `UserApprovesTaskFreshWorkConversation`
+
+The fresh rule should ensure:
+
+- predecessor is no longer live for user messages/LLM requests;
+- predecessor points at successor via `continued_in_conv_id`;
+- successor is Work mode;
+- successor receives the LLM request.
+
+Consider adding a parent status/reason such as `handed_off` rather than overloading generic `terminal`, if that is compatible with the current state model.
+
+### `specs/projects/projects.allium`
+
+Add a project-side rule for task approval fresh handoff. It should parallel `TaskApprovalExecuted` but transfer Worktree ownership to the newly created Work successor.
+
+Update/confirm invariants:
+
+- `continued_in_conv_id` remains single-successor and linear;
+- a predecessor with `continued_in_conv_id` does not own the worktree;
+- abandon/mark-merged belongs to the live successor, not the handed-off predecessor.
+
+### `specs/chains/requirements.md` / `design.md`
+
+Update Chains to acknowledge that an approved-task handoff is also a chain edge, even though it is not caused by context exhaustion.
+
+Important design adjustment: non-leaf chain members are currently assumed to have trailing `MessageType::Continuation` summaries generated by context continuation. An approval-handoff predecessor may not have such a continuation summary. Chain Q&A bundling must therefore define a context source for non-leaf approved-task handoff members, likely one of:
+
+- a persisted handoff summary/message created during approval, or
+- a new non-leaf block kind derived from the approved task handoff seed.
+
+This must be explicit so chain Q&A does not show a degenerate `MissingContinuationSummary` block for every Explore→Work approval handoff.
+
+## Implementation plan
+
+1. Add typed approval handoff policy to API/types/state-machine events.
+2. Extend the approval endpoint to accept a request body selecting the policy; default old clients to current in-place behavior or intentionally default to fresh, depending on product choice.
+3. Split approval effects in the state machine/executor:
+   - current in-place approval keeps existing `ApproveTask` behavior;
+   - fresh approval performs git approval, creates the Work successor row, links `continued_in_conv_id`, seeds the successor, marks predecessor read-only, and starts the successor runtime.
+4. Add a DB helper for atomic approved-task handoff creation. It should resemble `continue_conversation`'s transaction shape but allow:
+   - parent state `AwaitingTaskApproval` / post-approval handed-off state rather than `ContextExhausted`;
+   - successor `ConvMode::Work` from `TaskApprovalResult`;
+   - predecessor `continued_in_conv_id` update guarded by `IS NULL`.
+5. Decide and implement the handed-off predecessor state representation.
+6. Update chain Q&A bundling for approved-task handoff non-leaf members so Chains remains useful and transparent.
+7. Update UI approval controls and navigation/linking after fresh handoff.
+8. Add tests:
+   - state-machine approval policy transitions;
+   - DB atomic handoff/linking and TOCTOU guard;
+   - worktree ownership/reconciliation behavior;
+   - chain membership includes Explore predecessor + Work successor;
+   - chain Q&A bundling handles approved-task handoff predecessor without `MissingContinuationSummary`;
+   - UI/API approval request body compatibility.
+
+## Validation
+
+- Run `./dev.py check`.
+- After Rust changes, run `./dev.py restart` and report the UI URL.
+- Manually verify a managed Explore conversation can propose a task, choose **Approve & start fresh**, land in a fresh Work conversation with only the approved task brief as execution context, and see the predecessor/successor grouped as a chain.
