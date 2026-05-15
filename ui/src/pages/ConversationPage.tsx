@@ -226,11 +226,12 @@ function ConversationPageContent() {
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
 
-  // Page-scope draft action handles. Only subscribes to the atom's
-  // `conversationId` slice (for `expectedConversationId` guarding), so
-  // ConversationPage does NOT re-render on every keystroke. The draft
-  // VALUE subscription lives inside `<ConnectedInputArea>` (composer
-  // subtree only) and `<DraftLifecycle>` (returns null — for persistence).
+  // Page-scope draft action handles. `useDraftActions` is a memoized
+  // dispatcher over the slug-keyed DraftStore — no atom subscription, no
+  // value subscription, so ConversationPage does not re-render on
+  // keystrokes. The draft VALUE subscription lives inside
+  // `<ConnectedInputArea>` (composer subtree only); persistence lives in
+  // `<DraftLifecycle>` (returns null — mounted at page level).
   const { setDraft: setDraftCb, appendDraft: appendDraftCb } = useDraftActions(slug!);
 
   // Monotonic focus-request counter. Any time we mutate the draft from
@@ -830,7 +831,10 @@ function ConversationPageContent() {
         }
       }
       const fence = '`'.repeat(Math.max(3, longestRun + 1));
-      const fenced = `${sourceLabel}${cwdHint}:\n${fence}\n${trimmed}\n${fence}`;
+      // Trailing `\n` keeps the closing fence on its own line per
+      // CommonMark §4.5 — without it, the next character the user types
+      // lands on the fence's line and extends the code block.
+      const fenced = `${sourceLabel}${cwdHint}:\n${fence}\n${trimmed}\n${fence}\n`;
       appendDraftCb(fenced);
       requestComposerFocus();
     },

@@ -57,4 +57,16 @@ export class DraftStore extends RoutedStore<string, DraftAtom, DraftAction> {
   constructor() {
     super(createInitialDraft, draftReducer);
   }
+
+  /**
+   * Drop the draft atom for `slug`. Called from the
+   * `phoenix:conversation-hard-deleted` cascade so a slug that the
+   * server later reuses for a new conversation (REQ-VS-014) doesn't
+   * surface the previous conversation's in-memory draft. The
+   * localStorage entry is keyed by conversation id and cleared
+   * separately at the cascade site.
+   */
+  remove(slug: string): void {
+    this.removeAtom(slug);
+  }
 }

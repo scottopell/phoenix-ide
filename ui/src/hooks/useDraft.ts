@@ -32,6 +32,19 @@ function writeDraft(conversationId: string, value: string): void {
   }
 }
 
+/**
+ * Remove a conversation's persisted draft from localStorage. Called from
+ * the `phoenix:conversation-hard-deleted` cascade so a deleted conversation
+ * doesn't leave stale draft text behind in the browser's storage.
+ */
+export function clearDraftStorage(conversationId: string): void {
+  try {
+    localStorage.removeItem(storageKey(conversationId));
+  } catch (error) {
+    console.warn('Error clearing draft from localStorage:', error);
+  }
+}
+
 function useDraftStore() {
   const store = useContext(DraftContext);
   if (!store) {

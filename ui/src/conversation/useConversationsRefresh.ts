@@ -1,9 +1,11 @@
 import { useCallback, useContext, useEffect, useRef } from 'react';
 import { ConversationContext } from './ConversationContext';
+import { DraftContext } from './DraftContext';
 import type { ConversationStore } from './ConversationStore';
 import { api } from '../api';
 import { cacheDB } from '../cache';
 import { clearLastViewer } from '../components/FileExplorer/lastViewerStorage';
+import { clearDraftStorage } from '../hooks/useDraft';
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -146,6 +148,12 @@ export function useConversationsRefresh(): {
  */
 export function useConversationsRefreshDriver(): void {
   const store = useStoreFromContext('useConversationsRefreshDriver');
+  const draftStore = useContext(DraftContext);
+  if (!draftStore) {
+    throw new Error(
+      'useConversationsRefreshDriver must be used within ConversationProvider (DraftContext missing)',
+    );
+  }
   // Stable refresh function for use inside effects.
   const refresh = useCallback(() => refreshOnce(store), [store]);
   // Ref so listeners don't re-bind every render.
@@ -174,10 +182,17 @@ export function useConversationsRefreshDriver(): void {
       const slug = store.slugForId(detail.conversationId);
       if (slug) {
         store.remove(slug);
-        // REQ-VS-014: drop the per-conversation last-viewer entry so a
-        // future conversation that reuses this slug doesn't inherit it.
+        // REQ-VS-014: drop per-conversation client state keyed by slug so a
+        // future conversation that reuses this slug doesn't inherit any of
+        // it. The DraftStore lives in its own RoutedStore (separate from
+        // the conversation atom — see PR #92 review) so the cascade has to
+        // reach it explicitly.
         clearLastViewer(slug);
+        draftStore.remove(slug);
       }
+      // localStorage drafts are keyed by conversationId, not slug — clear
+      // by id regardless of whether we still hold an atom for the slug.
+      clearDraftStorage(detail.conversationId);
       // Always re-poll — the deleted row may have been part of a chain
       // whose other members' counts are now stale.
       void refreshRef.current();
@@ -186,7 +201,7 @@ export function useConversationsRefreshDriver(): void {
     return () => {
       window.removeEventListener('phoenix:conversation-hard-deleted', handler);
     };
-  }, [store]);
+  }, [store, draftStore]);
 
   // Online → immediately reconcile (catches up after a sleep / network
   // outage).

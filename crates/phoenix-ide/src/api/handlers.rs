@@ -313,10 +313,14 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         // this from the manager's `HashMap` via
         // `enrich_conversation_with_seed`.
         browser_session_active: false,
-        // Same pattern: filled in by `enrich_conversation_with_seed`, since
-        // the tmux registry lives on the runtime. List endpoints (which
-        // call this stateless helper directly) don't need the flag — the
-        // UI consults it only on the active conversation's terminal.
+        // Stateless default. Both SSE init *and* the list-endpoint
+        // serializer route through `enrich_conversation_with_runtime`,
+        // which overwrites this with `TmuxRegistry::binary_available()`
+        // — so consumers of `EnrichedConversation` never observe the
+        // `false` default for a real conversation. The list path is
+        // required because the 5s `listConversations` poll's
+        // `upsertSnapshot` would otherwise regress an SSE-set `true`
+        // back to `false` whenever a newer row landed.
         terminal_uses_tmux: false,
         inner: conv.clone(),
     }

@@ -14,6 +14,8 @@ import {
   ConversationStore,
 } from './';
 import { ConversationContext } from './ConversationContext';
+import { DraftContext } from './DraftContext';
+import type { DraftStore } from './DraftStore';
 import {
   getLastViewer,
   setLastViewer,
@@ -99,6 +101,52 @@ describe('useConversationsRefreshDriver — REQ-VS-014 hard-delete cascade', () 
 
     await waitFor(() => {
       expect(getLastViewer('doomed')).toBeNull();
+    });
+  });
+
+  it('clears the slug-keyed DraftStore atom and the conversationId-keyed localStorage draft', async () => {
+    // PR #92 review: when a conversation is hard-deleted, the per-slug
+    // DraftStore atom and the localStorage entry keyed by conversationId
+    // both have to go — otherwise a slug the server later recycles for
+    // a new conversation surfaces stale text in the composer (or worse,
+    // re-persists it under the new id once the user types).
+    let store: ConversationStore | undefined;
+    let draftStore: DraftStore | undefined;
+    function CaptureBoth() {
+      store = useContext(ConversationContext) ?? undefined;
+      draftStore = useContext(DraftContext) ?? undefined;
+      return null;
+    }
+
+    render(
+      <ConversationProvider>
+        <CaptureBoth />
+      </ConversationProvider>,
+    );
+    expect(store).toBeDefined();
+    expect(draftStore).toBeDefined();
+
+    act(() => {
+      store!.upsertSnapshot('doomed', makeConv('doomed', 'conv-doomed'));
+      draftStore!.dispatch('doomed', { type: 'set_draft', text: 'half-typed' });
+    });
+    localStorage.setItem('phoenix:draft:conv-doomed', 'half-typed');
+    expect(draftStore!.getSnapshot('doomed').draft).toBe('half-typed');
+    expect(localStorage.getItem('phoenix:draft:conv-doomed')).toBe('half-typed');
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent('phoenix:conversation-hard-deleted', {
+          detail: { conversationId: 'conv-doomed' },
+        }),
+      );
+    });
+
+    await waitFor(() => {
+      // After remove, getSnapshot lazy-creates a fresh initial atom —
+      // the assertion is that the previous draft text is gone.
+      expect(draftStore!.getSnapshot('doomed').draft).toBe('');
+      expect(localStorage.getItem('phoenix:draft:conv-doomed')).toBeNull();
     });
   });
 
