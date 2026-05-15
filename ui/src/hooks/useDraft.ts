@@ -158,8 +158,8 @@ export function useDraftLifecycle(slug: string): void {
 
   // Flush any pending write on unmount (page close, navigation away).
   useEffect(() => {
+    const pending = pendingRef.current;
     return () => {
-      const pending = pendingRef.current;
       if (pending.timer !== null) {
         window.clearTimeout(pending.timer);
         pending.timer = null;

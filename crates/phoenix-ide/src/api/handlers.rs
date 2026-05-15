@@ -398,7 +398,8 @@ fn conv_presentation_mode(conv: &crate::db::Conversation) -> &'static str {
 /// `enrich_conversation_with_runtime` so process-wide fields (`terminal_uses_tmux`)
 /// land in every list response — see that helper's comment for the bug it fixes.
 fn conversation_to_json(state: &AppState, conv: &crate::db::Conversation) -> Value {
-    let mut val = serde_json::to_value(enrich_conversation_with_runtime(state, conv)).unwrap_or(Value::Null);
+    let mut val =
+        serde_json::to_value(enrich_conversation_with_runtime(state, conv)).unwrap_or(Value::Null);
     if let Value::Object(ref mut map) = val {
         map.insert(
             "presentation_mode".to_string(),
@@ -475,7 +476,10 @@ async fn list_conversations(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_convs: Vec<Value> = conversations.iter().map(|c| conversation_to_json(&state, c)).collect();
+    let json_convs: Vec<Value> = conversations
+        .iter()
+        .map(|c| conversation_to_json(&state, c))
+        .collect();
 
     Ok(Json(ConversationListResponse {
         conversations: json_convs,
@@ -492,7 +496,10 @@ async fn list_archived_conversations(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let json_convs: Vec<Value> = conversations.iter().map(|c| conversation_to_json(&state, c)).collect();
+    let json_convs: Vec<Value> = conversations
+        .iter()
+        .map(|c| conversation_to_json(&state, c))
+        .collect();
 
     Ok(Json(ConversationListResponse {
         conversations: json_convs,
