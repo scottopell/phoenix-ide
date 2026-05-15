@@ -1,9 +1,8 @@
-import { useCallback, useEffect, useLayoutEffect, useRef } from 'react';
+import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react';
+import { DraftContext } from '../conversation/DraftContext';
+import type { DraftAtom } from '../conversation/DraftStore';
+import { useConversationSlice } from '../conversation/useConversationAtom';
 import type { ConversationAtom } from '../conversation/atom';
-import {
-  useConversationDispatch,
-  useConversationSlice,
-} from '../conversation/useConversationAtom';
 
 const DEBOUNCE_MS = 300;
 const STORAGE_PREFIX = 'phoenix:draft:';
@@ -33,23 +32,35 @@ function writeDraft(conversationId: string, value: string): void {
   }
 }
 
-// Hoisted selectors — module-scoped so they're referentially stable and
-// `useConversationSlice`'s `Object.is` comparison short-circuits cleanly.
-const selectDraft = (atom: ConversationAtom): string => atom.draft;
+function useDraftStore() {
+  const store = useContext(DraftContext);
+  if (!store) {
+    throw new Error('useDraft* hooks must be used within ConversationProvider');
+  }
+  return store;
+}
+
+const selectDraft = (atom: DraftAtom): string => atom.draft;
 const selectConversationId = (atom: ConversationAtom): string | null =>
   atom.conversationId;
 
 /**
- * Subscribe to the draft text only. The calling component re-renders on
- * draft changes — and nothing else. Use in `<InputArea>` (the only
- * component that needs to *display* the draft).
- *
- * Other surfaces (page-level handlers, side-effect drivers) should reach
- * for {@link useDraftActions} or {@link useDraftLifecycle} instead so
- * keystrokes don't broadcast through the rest of the page.
+ * Subscribe to the draft text only. Re-renders the calling component on
+ * draft changes and nothing else. The draft lives in `DraftStore` (sibling
+ * to `ConversationStore`), so consumers of the conversation atom — message
+ * list, terminal, breadcrumbs — never see keystroke mutations.
  */
 export function useDraftValue(slug: string): string {
-  return useConversationSlice(slug, selectDraft);
+  const store = useDraftStore();
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => selectDraft(store.getSnapshot(slug)),
+    [store, slug],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
 }
 
 export interface DraftActions {
@@ -59,60 +70,49 @@ export interface DraftActions {
 }
 
 /**
- * Stable dispatchers for the conversation's draft. Subscribes to the atom's
- * `conversationId` only (used for `expectedConversationId` guarding), so the
- * caller re-renders at most when the conversation changes — never on
- * keystrokes.
+ * Stable dispatchers for the slug's draft. No atom subscription — the
+ * returned object identity is stable across re-renders (memoized on
+ * `(store, slug)`), so the caller never re-renders on keystrokes.
+ *
+ * Slug-keying replaces the prior `expectedConversationId` guard: a
+ * stale-closure dispatch from a previous conversation's effect lands on
+ * the old slug's draft (which is just persistence — re-visiting that
+ * conversation surfaces the typed text again); it cannot corrupt the
+ * active draft.
  */
 export function useDraftActions(slug: string): DraftActions {
-  const conversationId = useConversationSlice(slug, selectConversationId);
-  const dispatch = useConversationDispatch(slug);
-
-  const setDraft = useCallback(
-    (text: string) => {
-      if (!conversationId) return;
-      dispatch({ type: 'set_draft', text, expectedConversationId: conversationId });
-    },
-    [conversationId, dispatch],
+  const store = useDraftStore();
+  return useMemo(
+    () => ({
+      setDraft: (text: string) => store.dispatch(slug, { type: 'set_draft', text }),
+      appendDraft: (text: string) =>
+        store.dispatch(slug, { type: 'append_draft', text }),
+      clearDraft: () => store.dispatch(slug, { type: 'clear_draft' }),
+    }),
+    [store, slug],
   );
-  const appendDraft = useCallback(
-    (text: string) => {
-      if (!conversationId) return;
-      dispatch({ type: 'append_draft', text, expectedConversationId: conversationId });
-    },
-    [conversationId, dispatch],
-  );
-  const clearDraft = useCallback(() => {
-    if (!conversationId) return;
-    dispatch({ type: 'clear_draft', expectedConversationId: conversationId });
-  }, [conversationId, dispatch]);
-
-  return { setDraft, appendDraft, clearDraft };
 }
 
 /**
  * Owns the draft's persistence side-effects: hydrate from localStorage on
  * first observation of a conversationId, then debounced write-through on
- * every atom change.
+ * every draft change.
  *
- * This hook DOES subscribe to the draft value (it has to — the persistence
- * effect reads it), so the calling component re-renders on every keystroke.
- * Mount it inside a dedicated wrapper component (`<DraftLifecycle>`) that
- * returns null, so those re-renders never produce DOM work and never
- * touch sibling subtrees.
- *
- * localStorage is a write-through cache; the atom is canonical at all
- * times. See the file header for the parallel-representations rationale.
+ * The conversationId still lives on the conversation atom (it's the
+ * canonical identity for the localStorage key, server-assigned). This hook
+ * subscribes to just that slice (re-renders only on conversationId
+ * changes — once per slug) and to the draft value. The keystroke-frequency
+ * re-renders are confined to whoever mounts the wrapper component
+ * `<DraftLifecycle>` (which returns null — zero DOM work).
  */
 export function useDraftLifecycle(slug: string): void {
-  const draft = useConversationSlice(slug, selectDraft);
+  const draft = useDraftValue(slug);
   const conversationId = useConversationSlice(slug, selectConversationId);
-  const dispatch = useConversationDispatch(slug);
+  const store = useDraftStore();
 
   // Hydrate once per conversationId. `useLayoutEffect` runs after render
-  // but before browser paint — so the first frame already reflects the
-  // stored draft, matching the pre-refactor `useDraft`'s synchronous
-  // localStorage read.
+  // but before browser paint, so the first frame already reflects the
+  // stored draft.
   const hydratedForRef = useRef<string | null>(null);
   useLayoutEffect(() => {
     if (!conversationId) return;
@@ -121,18 +121,14 @@ export function useDraftLifecycle(slug: string): void {
     if (draft) return;
     const stored = readDraft(conversationId);
     if (stored) {
-      dispatch({
-        type: 'set_draft',
-        text: stored,
-        expectedConversationId: conversationId,
-      });
+      store.dispatch(slug, { type: 'set_draft', text: stored });
     }
-  }, [conversationId, draft, dispatch]);
+  }, [conversationId, draft, slug, store]);
 
   // Debounced write-through. On a conversationId change with a pending
   // write for the prior conversation, flush it synchronously before
-  // scheduling for the new one — otherwise the last ~300ms of typing
-  // in the previous conversation would never reach localStorage.
+  // scheduling the new one — otherwise the last ~300ms of typing in the
+  // previous conversation never reaches localStorage.
   const pendingRef = useRef<{
     timer: number | null;
     conversationId: string | null;
@@ -178,14 +174,11 @@ export function useDraftLifecycle(slug: string): void {
 
 /**
  * Wrapper component that hosts {@link useDraftLifecycle} in isolation.
- * Renders `null` — its only purpose is to be the re-render target for the
- * draft-value subscription, so the page-level component doesn't churn on
- * keystrokes.
+ * Renders `null` — its only purpose is to absorb the draft-value
+ * subscription's re-renders so the page-level component stays still on
+ * keystrokes. Mount exactly once per conversation page:
  *
- * Mount exactly once per conversation page:
- *   ```
- *   <DraftLifecycle slug={slug!} />
- *   ```
+ *   `<DraftLifecycle slug={slug!} />`
  */
 export function DraftLifecycle({ slug }: { slug: string }): null {
   useDraftLifecycle(slug);
