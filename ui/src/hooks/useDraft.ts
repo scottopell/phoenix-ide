@@ -1,8 +1,7 @@
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { DraftContext } from '../conversation/DraftContext';
 import type { DraftAtom } from '../conversation/DraftStore';
-import { useConversationSlice } from '../conversation/useConversationAtom';
-import type { ConversationAtom } from '../conversation/atom';
+import { useConversationSnapshot } from '../conversation/useConversationAtom';
 
 const DEBOUNCE_MS = 300;
 const STORAGE_PREFIX = 'phoenix:draft:';
@@ -54,12 +53,6 @@ function useDraftStore() {
 }
 
 const selectDraft = (atom: DraftAtom): string => atom.draft;
-// Read the conversation id from the snapshot rather than the SSE-init-only
-// `atom.conversationId` so hydration triggers on cache-warm navigations
-// (snapshot present, SSE init still in flight) — without forcing
-// `ConversationStore.upsertSnapshot` to maintain a parallel id field.
-const selectConversationId = (atom: ConversationAtom): string | null =>
-  atom.conversation?.id ?? null;
 
 /**
  * Subscribe to the draft text only. Re-renders the calling component on
@@ -115,16 +108,15 @@ export function useDraftActions(slug: string): DraftActions {
  * first observation of a conversationId, then debounced write-through on
  * every draft change.
  *
- * The conversationId still lives on the conversation atom (it's the
- * canonical identity for the localStorage key, server-assigned). This hook
- * subscribes to just that slice (re-renders only on conversationId
- * changes — once per slug) and to the draft value. The keystroke-frequency
- * re-renders are confined to whoever mounts the wrapper component
- * `<DraftLifecycle>` (which returns null — zero DOM work).
+ * The conversation id (server-assigned, canonical for the localStorage key)
+ * is read from the conversation snapshot — so hydration triggers on
+ * cache-warm navigations (snapshot present, SSE init still in flight).
+ * Re-renders are confined to the `<DraftLifecycle>` wrapper component,
+ * which returns null — zero DOM work.
  */
 export function useDraftLifecycle(slug: string): void {
   const draft = useDraftValue(slug);
-  const conversationId = useConversationSlice(slug, selectConversationId);
+  const conversationId = useConversationSnapshot(slug)?.id ?? null;
   const store = useDraftStore();
 
   // Hydrate once per conversationId. `useLayoutEffect` runs after render
