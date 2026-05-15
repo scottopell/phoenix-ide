@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { DraftStore, draftReducer, createInitialDraft } from './DraftStore';
+import { DraftStore, draftReducer } from './DraftStore';
 
 describe('draftReducer', () => {
   describe('set_draft', () => {
@@ -60,10 +60,6 @@ describe('draftReducer', () => {
       const next = draftReducer(atom, { type: 'clear_draft' });
       expect(next).toBe(atom);
     });
-  });
-
-  it('createInitialDraft returns an empty draft', () => {
-    expect(createInitialDraft()).toEqual({ draft: '' });
   });
 });
 

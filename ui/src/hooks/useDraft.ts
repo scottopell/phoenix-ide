@@ -1,6 +1,5 @@
 import { useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useSyncExternalStore } from 'react';
 import { DraftContext } from '../conversation/DraftContext';
-import type { DraftAtom } from '../conversation/DraftStore';
 import { useConversationSnapshot } from '../conversation/useConversationAtom';
 
 const DEBOUNCE_MS = 300;
@@ -52,13 +51,10 @@ function useDraftStore() {
   return store;
 }
 
-const selectDraft = (atom: DraftAtom): string => atom.draft;
-
 /**
  * Subscribe to the draft text only. Re-renders the calling component on
- * draft changes and nothing else. The draft lives in `DraftStore` (sibling
- * to `ConversationStore`), so consumers of the conversation atom — message
- * list, terminal, breadcrumbs — never see keystroke mutations.
+ * draft changes and nothing else. Consumers of the conversation atom —
+ * message list, terminal, breadcrumbs — never see keystroke mutations.
  */
 export function useDraftValue(slug: string): string {
   const store = useDraftStore();
@@ -67,7 +63,7 @@ export function useDraftValue(slug: string): string {
     [store, slug],
   );
   const getSnapshot = useCallback(
-    () => selectDraft(store.getSnapshot(slug)),
+    () => store.getSnapshot(slug).draft,
     [store, slug],
   );
   return useSyncExternalStore(subscribe, getSnapshot);
@@ -80,15 +76,9 @@ export interface DraftActions {
 }
 
 /**
- * Stable dispatchers for the slug's draft. No atom subscription — the
- * returned object identity is stable across re-renders (memoized on
- * `(store, slug)`), so the caller never re-renders on keystrokes.
- *
- * Slug-keying replaces the prior `expectedConversationId` guard: a
- * stale-closure dispatch from a previous conversation's effect lands on
- * the old slug's draft (which is just persistence — re-visiting that
- * conversation surfaces the typed text again); it cannot corrupt the
- * active draft.
+ * Stable dispatchers for the slug's draft. No subscription — the returned
+ * object is memoized on `(store, slug)`, so the caller never re-renders
+ * on keystrokes.
  */
 export function useDraftActions(slug: string): DraftActions {
   const store = useDraftStore();
@@ -181,14 +171,8 @@ export function useDraftLifecycle(slug: string): void {
   }, []);
 }
 
-/**
- * Wrapper component that hosts {@link useDraftLifecycle} in isolation.
- * Renders `null` — its only purpose is to absorb the draft-value
- * subscription's re-renders so the page-level component stays still on
- * keystrokes. Mount exactly once per conversation page:
- *
- *   `<DraftLifecycle slug={slug!} />`
- */
+/** Hosts {@link useDraftLifecycle} in isolation so the keystroke-frequency
+ *  draft-value subscription doesn't re-render any sibling subtree. */
 export function DraftLifecycle({ slug }: { slug: string }): null {
   useDraftLifecycle(slug);
   return null;

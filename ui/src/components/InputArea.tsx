@@ -741,19 +741,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 });
 
 /**
- * Atom-connected `<InputArea>` wrapper. Subscribes to the draft slice and
- * derives the change handler from the atom-action hooks, then passes both
- * down to the presentational `<InputArea>` (which stays a controlled
- * component over `draft` + `onDraftChange` — testable in isolation).
- *
- * Why this exists: putting `useDraftValue` directly in a page-level
- * component would re-render the whole conversation page on every keystroke.
- * Hoisting the subscription into this thin wrapper isolates the re-render
- * to the composer subtree. Sibling components (`<MessageList>`,
- * `<TerminalPanel>`, etc.) don't see the keystroke churn.
+ * Subscribes to the draft slice and feeds the presentational `<InputArea>`.
+ * Hosting the subscription in this wrapper keeps the re-render scoped to
+ * the composer subtree — sibling components don't see keystroke churn.
  */
 export type ConnectedInputAreaProps = Omit<InputAreaProps, 'draft' | 'onDraftChange'> & {
-  /** Conversation slug — the atom key. Required (caller asserts via `slug!`). */
   slug: string;
 };
 

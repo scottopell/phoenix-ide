@@ -99,17 +99,8 @@ export function ConversationPage() {
     <ReviewNotesProvider scopeKey={slug}>
       <DiffViewerStateProvider scopeKey={slug}>
         <BrowserViewWrapper slug={slug}>
-          {/*
-            DraftLifecycle hosts the localStorage hydration and debounced
-            write-through for the active conversation's draft. Mounted
-            here — above ConversationPageContent's fullscreen viewer
-            early-returns (ProseReader, Diff, Browser) — so the
-            persistence subscription survives every composer
-            unmount/remount cycle. If it lived inside the main-chat JSX,
-            switching to a fullscreen viewer would unmount it and any
-            external draft mutation (e.g. `phoenix:insert-draft`) would
-            never reach localStorage until the user returned to chat.
-          */}
+          {/* Mounted above ConversationPageContent's viewer early-returns
+              so draft persistence survives composer unmounts. */}
           {slug && <DraftLifecycle slug={slug} />}
           <ConversationPageContent />
         </BrowserViewWrapper>
@@ -226,12 +217,6 @@ function ConversationPageContent() {
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
 
-  // Page-scope draft action handles. `useDraftActions` is a memoized
-  // dispatcher over the slug-keyed DraftStore — no atom subscription, no
-  // value subscription, so ConversationPage does not re-render on
-  // keystrokes. The draft VALUE subscription lives inside
-  // `<ConnectedInputArea>` (composer subtree only); persistence lives in
-  // `<DraftLifecycle>` (returns null — mounted at page level).
   const { setDraft: setDraftCb, appendDraft: appendDraftCb } = useDraftActions(slug!);
 
   // Monotonic focus-request counter. Any time we mutate the draft from

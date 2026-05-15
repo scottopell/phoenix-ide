@@ -14,7 +14,7 @@ import { useConversationsRefreshDriver } from './useConversationsRefresh';
  *
  * Also mounts a sibling per-slug `DraftStore`. Drafts live in a separate
  * store so keystroke mutations don't invalidate the conversation atom's
- * whole-snapshot subscriptions (Codex review on PR #92).
+ * whole-snapshot subscriptions.
  */
 export function ConversationProvider({ children }: { children: React.ReactNode }) {
   // Single store instances for the app. Refs are fine here because the stores

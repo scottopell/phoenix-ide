@@ -181,12 +181,9 @@ export function useConversationsRefreshDriver(): void {
       if (!detail?.conversationId) return;
       const slug = store.slugForId(detail.conversationId);
       if (slug) {
+        // REQ-VS-014: drop all per-slug state so a future conversation
+        // that reuses this slug doesn't inherit any of it.
         store.remove(slug);
-        // REQ-VS-014: drop per-conversation client state keyed by slug so a
-        // future conversation that reuses this slug doesn't inherit any of
-        // it. The DraftStore lives in its own RoutedStore (separate from
-        // the conversation atom — see PR #92 review) so the cascade has to
-        // reach it explicitly.
         clearLastViewer(slug);
         draftStore.remove(slug);
       }
