@@ -256,10 +256,22 @@ describe('bash tool rendering', () => {
     renderBashTool({ bogus: true });
     expect(screen.getByText('bash {"bogus":true}')).toBeInTheDocument();
 
+    renderBashTool({ op: 'peek', handle: 'b-13', since: 0 });
+    expect(screen.getByText('peek b-13')).toBeInTheDocument();
+
     renderBashTool({ op: 'kill', handle: 'b-13', signal: 'NOPE' });
     expect(screen.getByText('bash {"op":"kill","handle":"b-13","signal":"NOPE"}')).toBeInTheDocument();
 
+    renderBashTool({ op: 'run', cmd: 'echo hi', command: 'legacy extra' });
+    expect(screen.getByText('bash {"op":"run","cmd":"echo hi","command":"legacy extra"}')).toBeInTheDocument();
+
     expect(screen.queryByText('$ <bash>')).not.toBeInTheDocument();
+  });
+
+  it('renders legacy cmd-only bash input as a command', () => {
+    renderBashTool({ cmd: 'echo legacy' });
+
+    expect(screen.getByText('$ echo legacy')).toBeInTheDocument();
   });
 
   it('does not render a peek draft mutation action for running output', () => {

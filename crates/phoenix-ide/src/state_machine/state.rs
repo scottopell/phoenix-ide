@@ -170,6 +170,18 @@ impl<'de> Deserialize<'de> for ToolInput {
             .unwrap_or_else(|| "unknown".to_string());
         let payload = Value::Object(obj.clone());
 
+        if tool_name == "unknown" {
+            if let (Some(name), Some(input)) = (
+                payload.get("name").and_then(Value::as_str),
+                payload.get("input").cloned(),
+            ) {
+                return Ok(ToolInput::Unknown {
+                    name: name.to_string(),
+                    input,
+                });
+            }
+        }
+
         Ok(match tool_name.as_str() {
             "bash" => match serde_json::from_value::<BashToolInput>(payload.clone()) {
                 Ok(input) => ToolInput::Bash(input),
@@ -399,6 +411,23 @@ mod tests {
         };
         assert_eq!(input.op, crate::tools::BashOp::Run);
         assert_eq!(input.cmd.as_deref(), Some("echo legacy"));
+    }
+
+    #[test]
+    fn unknown_tool_input_preserves_original_name_and_payload() {
+        let input: ToolInput = serde_json::from_value(serde_json::json!({
+            "_tool": "unknown",
+            "name": "bash",
+            "input": { "op": "run", "command": "bad" }
+        }))
+        .expect("unknown tool state should deserialize");
+
+        let ToolInput::Unknown { name, input } = input else {
+            panic!("expected unknown input");
+        };
+        assert_eq!(name, "bash");
+        assert_eq!(input["op"], "run");
+        assert_eq!(input["command"], "bad");
     }
 }
 

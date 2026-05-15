@@ -120,19 +120,22 @@ function isFiniteInteger(value: unknown): value is number {
 function isBashToolInput(input: Record<string, unknown>): input is BashToolInput {
   const op = input['op'];
   if (op !== 'run' && op !== 'peek' && op !== 'wait' && op !== 'kill') return false;
+  for (const retiredKey of ['command', 'mode', 'peek', 'wait', 'kill']) {
+    if (input[retiredKey] !== undefined) return false;
+  }
   if (input['cmd'] !== undefined && typeof input['cmd'] !== 'string') return false;
   if (input['handle'] !== undefined && typeof input['handle'] !== 'string') return false;
   if (input['label'] !== undefined && typeof input['label'] !== 'string') return false;
   if (input['wait_seconds'] !== undefined && (!isFiniteInteger(input['wait_seconds']) || input['wait_seconds'] < 0)) return false;
   if (input['signal'] !== undefined && input['signal'] !== 'TERM' && input['signal'] !== 'KILL') return false;
   if (input['lines'] !== undefined && (!isFiniteInteger(input['lines']) || input['lines'] < 1)) return false;
-  if (input['since'] !== undefined && (!isFiniteInteger(input['since']) || input['since'] < 1)) return false;
+  if (input['since'] !== undefined && (!isFiniteInteger(input['since']) || input['since'] < 0)) return false;
   return true;
 }
 
 function readWindowSuffix(input: Pick<BashToolInput, 'lines' | 'since'>): string {
   if (typeof input.lines === 'number') return ` · last ${input.lines} lines`;
-  if (typeof input.since === 'number') return ` · since ${input.since}`;
+  if (typeof input.since === 'number' && input.since > 0) return ` · since ${input.since}`;
   return '';
 }
 
@@ -167,7 +170,11 @@ function bashInputCopyText(input: Record<string, unknown>): string {
     if (input.op === 'run') return input.cmd || JSON.stringify(input);
     return JSON.stringify(input);
   }
-  return String(input['command'] || input['peek'] || input['wait'] || input['kill'] || JSON.stringify(input, null, 2));
+  if (input['op'] === undefined) {
+    const legacyText = input['command'] || input['cmd'] || input['peek'] || input['wait'] || input['kill'];
+    if (legacyText) return String(legacyText);
+  }
+  return JSON.stringify(input, null, 2);
 }
 
 function formatToolInput(name: string, input: Record<string, unknown>, displayOverride?: string): { display: string; isMultiline: boolean } {
@@ -176,7 +183,7 @@ function formatToolInput(name: string, input: Record<string, unknown>, displayOv
       if (isBashToolInput(input)) {
         return formatModernBashInput(input, displayOverride);
       }
-      const legacyCommand = String(input['command'] || '');
+      const legacyCommand = input['op'] === undefined ? String(input['command'] || input['cmd'] || '') : '';
       if (legacyCommand) {
         const displayCmd = displayOverride || legacyCommand;
         return { display: `$ ${displayCmd}`, isMultiline: legacyCommand.includes('\n') };
