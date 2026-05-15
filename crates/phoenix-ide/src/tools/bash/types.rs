@@ -53,7 +53,6 @@ pub struct BashToolInput {
     pub since: Option<i64>,
 }
 impl BashToolInput {
-    #[cfg(test)]
     pub fn run(cmd: impl Into<String>) -> Self {
         Self {
             op: BashOp::Run,

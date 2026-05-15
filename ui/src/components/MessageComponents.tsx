@@ -113,16 +113,20 @@ function cleanThoughts(raw: string): string {
   return text.trim();
 }
 
+function isFiniteInteger(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value) && Number.isInteger(value);
+}
+
 function isBashToolInput(input: Record<string, unknown>): input is BashToolInput {
   const op = input['op'];
   if (op !== 'run' && op !== 'peek' && op !== 'wait' && op !== 'kill') return false;
   if (input['cmd'] !== undefined && typeof input['cmd'] !== 'string') return false;
   if (input['handle'] !== undefined && typeof input['handle'] !== 'string') return false;
   if (input['label'] !== undefined && typeof input['label'] !== 'string') return false;
-  if (input['wait_seconds'] !== undefined && typeof input['wait_seconds'] !== 'number') return false;
-  if (input['signal'] !== undefined && typeof input['signal'] !== 'string') return false;
-  if (input['lines'] !== undefined && typeof input['lines'] !== 'number') return false;
-  if (input['since'] !== undefined && typeof input['since'] !== 'number') return false;
+  if (input['wait_seconds'] !== undefined && (!isFiniteInteger(input['wait_seconds']) || input['wait_seconds'] < 0)) return false;
+  if (input['signal'] !== undefined && input['signal'] !== 'TERM' && input['signal'] !== 'KILL') return false;
+  if (input['lines'] !== undefined && (!isFiniteInteger(input['lines']) || input['lines'] < 1)) return false;
+  if (input['since'] !== undefined && (!isFiniteInteger(input['since']) || input['since'] < 1)) return false;
   return true;
 }
 

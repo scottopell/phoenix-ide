@@ -35,10 +35,10 @@ describe('draftReducer', () => {
       expect(next).toBe(atom);
     });
 
-    it('does not replace whitespace-only user input', () => {
+    it('sets the draft when current draft is whitespace-only', () => {
       const atom = { draft: '   ' };
       const next = draftReducer(atom, { type: 'set_draft_if_empty', text: 'seed' });
-      expect(next).toBe(atom);
+      expect(next.draft).toBe('seed');
     });
   });
 

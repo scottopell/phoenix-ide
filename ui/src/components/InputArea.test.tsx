@@ -254,8 +254,11 @@ describe('bash tool rendering', () => {
 
   it('renders malformed bash input as explicit JSON instead of placeholder text', () => {
     renderBashTool({ bogus: true });
-
     expect(screen.getByText('bash {"bogus":true}')).toBeInTheDocument();
+
+    renderBashTool({ op: 'kill', handle: 'b-13', signal: 'NOPE' });
+    expect(screen.getByText('bash {"op":"kill","handle":"b-13","signal":"NOPE"}')).toBeInTheDocument();
+
     expect(screen.queryByText('$ <bash>')).not.toBeInTheDocument();
   });
 

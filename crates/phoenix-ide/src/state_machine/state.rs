@@ -121,7 +121,7 @@ pub struct QuestionMetadata {
 }
 
 /// Strongly typed tool input enum
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(tag = "_tool", rename_all = "snake_case")]
 pub enum ToolInput {
     Bash(BashToolInput),
@@ -139,6 +139,125 @@ pub enum ToolInput {
         name: String,
         input: Value,
     },
+}
+
+fn parse_tool_input_or_unknown<T>(name: &str, payload: Value) -> ToolInput
+where
+    T: serde::de::DeserializeOwned,
+    ToolInput: From<T>,
+{
+    serde_json::from_value(payload.clone()).map_or_else(
+        |_| ToolInput::Unknown {
+            name: name.to_string(),
+            input: payload,
+        },
+        ToolInput::from,
+    )
+}
+
+impl<'de> Deserialize<'de> for ToolInput {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut value = Value::deserialize(deserializer)?;
+        let Some(obj) = value.as_object_mut() else {
+            return Err(serde::de::Error::custom("tool input must be an object"));
+        };
+        let tool_name = obj
+            .remove("_tool")
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "unknown".to_string());
+        let payload = Value::Object(obj.clone());
+
+        Ok(match tool_name.as_str() {
+            "bash" => match serde_json::from_value::<BashToolInput>(payload.clone()) {
+                Ok(input) => ToolInput::Bash(input),
+                Err(_) => payload
+                    .get("command")
+                    .and_then(Value::as_str)
+                    .map(BashToolInput::run)
+                    .map_or_else(
+                        || ToolInput::Unknown {
+                            name: "bash".to_string(),
+                            input: payload,
+                        },
+                        ToolInput::Bash,
+                    ),
+            },
+            "think" => parse_tool_input_or_unknown::<ThinkInput>("think", payload),
+            "patch" => parse_tool_input_or_unknown::<PatchInput>("patch", payload),
+            "keyword_search" => {
+                parse_tool_input_or_unknown::<KeywordSearchInput>("keyword_search", payload)
+            }
+            "read_image" => parse_tool_input_or_unknown::<ReadImageInput>("read_image", payload),
+            "spawn_agents" => {
+                parse_tool_input_or_unknown::<SpawnAgentsInput>("spawn_agents", payload)
+            }
+            "submit_result" => {
+                parse_tool_input_or_unknown::<SubmitResultInput>("submit_result", payload)
+            }
+            "submit_error" => {
+                parse_tool_input_or_unknown::<SubmitErrorInput>("submit_error", payload)
+            }
+            "propose_task" => {
+                parse_tool_input_or_unknown::<ProposeTaskInput>("propose_task", payload)
+            }
+            "ask_user_question" => {
+                parse_tool_input_or_unknown::<AskUserQuestionInput>("ask_user_question", payload)
+            }
+            other => ToolInput::Unknown {
+                name: other.to_string(),
+                input: payload,
+            },
+        })
+    }
+}
+
+impl From<ThinkInput> for ToolInput {
+    fn from(input: ThinkInput) -> Self {
+        ToolInput::Think(input)
+    }
+}
+impl From<PatchInput> for ToolInput {
+    fn from(input: PatchInput) -> Self {
+        ToolInput::Patch(input)
+    }
+}
+impl From<KeywordSearchInput> for ToolInput {
+    fn from(input: KeywordSearchInput) -> Self {
+        ToolInput::KeywordSearch(input)
+    }
+}
+impl From<ReadImageInput> for ToolInput {
+    fn from(input: ReadImageInput) -> Self {
+        ToolInput::ReadImage(input)
+    }
+}
+impl From<SpawnAgentsInput> for ToolInput {
+    fn from(input: SpawnAgentsInput) -> Self {
+        ToolInput::SpawnAgents(input)
+    }
+}
+impl From<SubmitResultInput> for ToolInput {
+    fn from(input: SubmitResultInput) -> Self {
+        ToolInput::SubmitResult(input)
+    }
+}
+impl From<SubmitErrorInput> for ToolInput {
+    fn from(input: SubmitErrorInput) -> Self {
+        ToolInput::SubmitError(input)
+    }
+}
+impl From<ProposeTaskInput> for ToolInput {
+    fn from(input: ProposeTaskInput) -> Self {
+        ToolInput::ProposeTask(input)
+    }
+}
+impl From<AskUserQuestionInput> for ToolInput {
+    fn from(input: AskUserQuestionInput) -> Self {
+        ToolInput::AskUserQuestion(input)
+    }
 }
 
 impl ToolInput {
@@ -262,9 +381,26 @@ impl ToolInput {
     }
 }
 
-// ============================================================================
-// Tool Call - A tool invocation with ID and typed input
-// ============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_bash_tool_input_deserializes_as_modern_run() {
+        let input: ToolInput = serde_json::from_value(serde_json::json!({
+            "_tool": "bash",
+            "command": "echo legacy",
+            "mode": "default"
+        }))
+        .expect("legacy bash state should deserialize");
+
+        let ToolInput::Bash(input) = input else {
+            panic!("expected bash input");
+        };
+        assert_eq!(input.op, crate::tools::BashOp::Run);
+        assert_eq!(input.cmd.as_deref(), Some("echo legacy"));
+    }
+}
 
 /// A tool call from the LLM with typed input.
 ///
