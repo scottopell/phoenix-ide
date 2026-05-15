@@ -45,11 +45,12 @@ interface InputAreaProps {
   failedMessages: QueuedMessage[];
   /** Conversation mode label (e.g. "Explore", "Work", "Direct") */
   convModeLabel?: string | undefined;
-  /** Controlled draft text. Lives in the conversation atom — this component
-   *  is presentational. */
+  /** Controlled draft text. This component is purely presentational —
+   *  the source of truth lives in `DraftStore`, fed in by
+   *  `<ConnectedInputArea>`. */
   draft: string;
   /** Called for every draft mutation (keystroke, autocomplete apply, voice
-   *  commit, paste). Replaces the prior internal `useDraft` ownership. */
+   *  commit, paste). */
   onDraftChange: (text: string) => void;
   /**
    * Monotonic counter bumped by the parent when it wants the textarea

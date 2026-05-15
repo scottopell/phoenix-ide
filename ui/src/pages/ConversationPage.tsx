@@ -432,9 +432,8 @@ function ConversationPageContent() {
 
   // REQ-SEED-001: hydrate the draft from `seed-draft:<id>` localStorage when
   // a seeded conversation first mounts, then clear the key so revisits don't
-  // re-hydrate it. Dispatches through `setDraftCb` (which dispatches
-  // `set_draft` on the conversation atom); the persistence side-effect in
-  // `useDraft` mirrors the value to `phoenix:draft:<id>` after that.
+  // re-hydrate it. Dispatches through `setDraftCb` into `DraftStore`;
+  // `<DraftLifecycle>` mirrors the value to `phoenix:draft:<id>` after that.
   // (`seedHydratedRef` is declared with the per-slug reset block above so it
   //  resets to null on slug change.)
   useEffect(() => {
@@ -827,10 +826,9 @@ function ConversationPageContent() {
   );
 
   // External "set this as the draft" trigger fired by surfaces that don't
-  // hold a ref to the composer (skill viewer, message context menu). With
-  // draft state in the atom, this is a thin shim: dispatch + focus token.
-  // Replaces the prior InputArea-local listener that only worked when
-  // InputArea happened to be mounted.
+  // hold a ref to the composer (skill viewer, message context menu).
+  // Dispatching into `DraftStore` works regardless of whether `<InputArea>`
+  // is currently mounted — narrow-desktop fullscreen flows unmount it.
   useEffect(() => {
     const handler = (e: Event) => {
       const text = (e as CustomEvent<{ text: string }>).detail?.text;
@@ -844,11 +842,11 @@ function ConversationPageContent() {
 
   const handleSendNotes = useCallback(
     (formattedNotes: string) => {
-      // Draft lives in the conversation atom, so this works the same whether
-      // `<InputArea>` is currently mounted (right-pane / mobile-overlay flow)
-      // or unmounted (narrow-desktop fullscreen flow — the viewer closes
-      // immediately below). `requestComposerFocus()` is a token bump that
-      // InputArea consumes on its next render, including after a remount.
+      // Dispatching into `DraftStore` works the same whether `<InputArea>`
+      // is currently mounted (right-pane / mobile-overlay flow) or unmounted
+      // (narrow-desktop fullscreen flow — the viewer closes immediately
+      // below). `requestComposerFocus()` is a token bump that InputArea
+      // consumes on its next render, including after a remount.
       appendDraftCb(formattedNotes);
       requestComposerFocus();
       fileExplorer.closeFile();
