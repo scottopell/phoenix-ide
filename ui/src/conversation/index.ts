@@ -10,7 +10,6 @@ export {
   useConversationsList,
   useConversationSelectors,
   useConversationSlice,
-  useConversationDispatch,
 } from './useConversationAtom';
 export { conversationReducer, createInitialAtom, breadcrumbFromPhase } from './atom';
 export type {

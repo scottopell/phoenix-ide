@@ -1602,7 +1602,6 @@ describe('conversationReducer', () => {
       expect(next).toBe(atom);
     });
   });
-
 });
 
 describe('breadcrumbFromPhase', () => {

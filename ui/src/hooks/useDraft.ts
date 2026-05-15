@@ -41,8 +41,12 @@ function useDraftStore() {
 }
 
 const selectDraft = (atom: DraftAtom): string => atom.draft;
+// Read the conversation id from the snapshot rather than the SSE-init-only
+// `atom.conversationId` so hydration triggers on cache-warm navigations
+// (snapshot present, SSE init still in flight) — without forcing
+// `ConversationStore.upsertSnapshot` to maintain a parallel id field.
 const selectConversationId = (atom: ConversationAtom): string | null =>
-  atom.conversationId;
+  atom.conversation?.id ?? null;
 
 /**
  * Subscribe to the draft text only. Re-renders the calling component on
