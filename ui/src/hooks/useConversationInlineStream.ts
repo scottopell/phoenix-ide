@@ -1,0 +1,304 @@
+import { useEffect, useReducer } from 'react';
+import type { Message } from '../api';
+import { api, type Conversation } from '../api';
+import {
+  SseAgentDoneDataSchema,
+  SseErrorDataSchema,
+  SseInitDataSchema,
+  SseMessageDataSchema,
+  SseMessageUpdatedDataSchema,
+  SseStateChangeDataSchema,
+  SseTokenDataSchema,
+  type SseBreadcrumb,
+  type SseInitData,
+} from '../sseSchemas';
+import type { Breadcrumb } from '../types';
+import { parseConversationState } from '../utils';
+import { conversationReducer, createInitialAtom, type ConversationAtom, type InitPayload } from '../conversation/atom';
+import * as v from 'valibot';
+
+type InlineStreamState =
+  | { type: 'idle'; atom: ConversationAtom; error: null }
+  | { type: 'connecting'; atom: ConversationAtom; error: null }
+  | { type: 'ready'; atom: ConversationAtom; error: null }
+  | { type: 'error'; atom: ConversationAtom; error: string };
+
+type InlineStreamAction =
+  | { type: 'reset' }
+  | { type: 'connecting' }
+  | { type: 'error'; error: string }
+  | { type: 'atom'; atomAction: Parameters<typeof conversationReducer>[1] };
+
+function initialState(): InlineStreamState {
+  return { type: 'idle', atom: createInitialAtom(), error: null };
+}
+
+function reducer(state: InlineStreamState, action: InlineStreamAction): InlineStreamState {
+  switch (action.type) {
+    case 'reset': return initialState();
+    case 'connecting': return { type: 'connecting', atom: state.atom, error: null };
+    case 'error': return { type: 'error', atom: state.atom, error: action.error };
+    case 'atom': {
+      const atom = conversationReducer(state.atom, action.atomAction);
+      return { type: 'ready', atom, error: null };
+    }
+    default: action satisfies never; return state;
+  }
+}
+
+function transformBreadcrumb(b: SseBreadcrumb): Breadcrumb {
+  return {
+    type: b.type,
+    label: b.label,
+    toolId: b.tool_id,
+    sequenceId: b.sequence_id,
+    preview: b.preview,
+  };
+}
+
+function transformInitData(raw: SseInitData): InitPayload {
+  const conversation = raw.project_name != null
+    ? { ...raw.conversation, project_name: raw.project_name }
+    : raw.conversation;
+  const breadcrumbs = (raw.breadcrumbs || []).map(transformBreadcrumb);
+  return {
+    conversation,
+    messages: raw.messages || [],
+    phase: parseConversationState(conversation?.state),
+    breadcrumbs,
+    breadcrumbSequenceIds: new Set(
+      breadcrumbs
+        .filter((b): b is Breadcrumb & { sequenceId: number } => b.sequenceId !== undefined)
+        .map((b) => b.sequenceId),
+    ),
+    contextWindow: { used: raw.context_window_size ?? 0 },
+    lastSequenceId: raw.last_sequence_id ?? 0,
+    pendingAnchorSequenceId: raw.pending_anchor_sequence_id,
+    pendingEvents: raw.pending_events,
+    pendingTruncated: raw.pending_truncated,
+  };
+}
+
+function parseEventData(event: Event): unknown | null {
+  try {
+    return JSON.parse((event as MessageEvent).data);
+  } catch {
+    return null;
+  }
+}
+
+let liveStreamOwner: string | null = null;
+
+function acquireLiveStream(conversationId: string): boolean {
+  if (liveStreamOwner === null || liveStreamOwner === conversationId) {
+    liveStreamOwner = conversationId;
+    return true;
+  }
+  return false;
+}
+
+function releaseLiveStream(conversationId: string): void {
+  if (liveStreamOwner === conversationId) {
+    liveStreamOwner = null;
+  }
+}
+
+function maxMessageSequence(messages: Message[]): number {
+  let max = 0;
+  for (const message of messages) {
+    if (message.sequence_id > max) max = message.sequence_id;
+  }
+  return max;
+}
+
+function snapshotPayload(conversation: Conversation, messages: Message[], contextWindowSize: number): InitPayload {
+  const lastSequenceId = maxMessageSequence(messages);
+  return {
+    conversation,
+    messages,
+    phase: conversation.state ? parseConversationState(conversation.state) : { type: 'idle' },
+    breadcrumbs: [],
+    breadcrumbSequenceIds: new Set(),
+    contextWindow: { used: contextWindowSize },
+    lastSequenceId,
+    pendingAnchorSequenceId: lastSequenceId,
+    pendingEvents: [],
+    pendingTruncated: false,
+  };
+}
+
+function isNotFound(error: unknown): boolean {
+  return error instanceof Error && /not found/i.test(error.message);
+}
+
+/**
+ * Inline, read-only conversation stream for embedded child conversation views.
+ *
+ * Uses the same conversation reducer as the full page, including init pending
+ * event replay, so sequence floors/token buffering/message updates follow one
+ * protocol contract instead of a parallel sub-agent-specific implementation.
+ */
+export function useConversationInlineStream(conversationId: string, enabled: boolean, live: boolean): InlineStreamState {
+  const [state, dispatch] = useReducer(reducer, undefined, initialState);
+
+  useEffect(() => {
+    if (!enabled) {
+      dispatch({ type: 'reset' });
+    }
+  }, [enabled]);
+
+  useEffect(() => {
+    if (!enabled) return;
+    let cancelled = false;
+    let source: EventSource | null = null;
+    let retryTimer: number | null = null;
+
+    const closeSource = () => {
+      if (source) {
+        source.close();
+        source = null;
+      }
+      releaseLiveStream(conversationId);
+    };
+
+    const openLiveStream = () => {
+      if (cancelled) return;
+      if (!acquireLiveStream(conversationId)) {
+        dispatch({ type: 'error', error: 'Another live sub-agent stream is already open. Collapse it before opening this one live.' });
+        return;
+      }
+      source = new EventSource(`/api/conversations/${encodeURIComponent(conversationId)}/stream`);
+
+      source.addEventListener('init', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseInitDataSchema, raw);
+        if (!res.success) return;
+        dispatch({ type: 'atom', atomAction: { type: 'sse_init', payload: transformInitData(res.output) } });
+      });
+
+      source.addEventListener('message', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseMessageDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_message',
+            message: res.output.message,
+            sequenceId: res.output.sequence_id,
+          },
+        });
+      });
+
+      source.addEventListener('message_updated', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseMessageUpdatedDataSchema, raw);
+        if (!res.success) return;
+        const data = res.output;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_message_updated',
+            sequenceId: data.sequence_id,
+            messageId: data.message_id,
+            ...(data.display_data != null && { displayData: data.display_data as Record<string, unknown> }),
+            ...(data.content != null && { content: data.content as Message['content'] }),
+            ...(data.duration_ms != null && { durationMs: data.duration_ms }),
+          },
+        });
+      });
+
+      source.addEventListener('state_change', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseStateChangeDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_state_change',
+            sequenceId: res.output.sequence_id,
+            phase: parseConversationState(res.output.state),
+          },
+        });
+      });
+
+      source.addEventListener('token', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseTokenDataSchema, raw);
+        if (!res.success) return;
+        dispatch({
+          type: 'atom',
+          atomAction: {
+            type: 'sse_token',
+            sequenceId: res.output.sequence_id,
+            delta: res.output.text,
+          },
+        });
+      });
+
+      source.addEventListener('agent_done', (event) => {
+        const raw = parseEventData(event);
+        if (raw === null) return;
+        const res = v.safeParse(SseAgentDoneDataSchema, raw);
+        if (!res.success) return;
+        dispatch({ type: 'atom', atomAction: { type: 'sse_agent_done', sequenceId: res.output.sequence_id } });
+      });
+
+      source.addEventListener('error', (event) => {
+        const messageEvent = event as MessageEvent;
+        if (messageEvent.data) {
+          const raw = parseEventData(event);
+          if (raw === null) return;
+          const res = v.safeParse(SseErrorDataSchema, raw);
+          if (res.success) {
+            dispatch({ type: 'error', error: res.output.message });
+          }
+          return;
+        }
+        if (source?.readyState === EventSource.CLOSED) {
+          dispatch({ type: 'error', error: 'Sub-agent stream closed' });
+          closeSource();
+        }
+      });
+    };
+
+    const loadSnapshot = () => {
+      dispatch({ type: 'connecting' });
+      api.getConversation(conversationId)
+        .then((data) => {
+          if (cancelled) return;
+          dispatch({
+            type: 'atom',
+            atomAction: {
+              type: 'sse_init',
+              payload: snapshotPayload(data.conversation, data.messages, data.context_window_size ?? 0),
+            },
+          });
+          if (live) openLiveStream();
+        })
+        .catch((err) => {
+          if (cancelled) return;
+          if (live && isNotFound(err)) {
+            retryTimer = window.setTimeout(loadSnapshot, 500);
+            return;
+          }
+          dispatch({ type: 'error', error: err instanceof Error ? err.message : 'Failed to load sub-agent' });
+        });
+    };
+
+    loadSnapshot();
+
+    return () => {
+      cancelled = true;
+      if (retryTimer !== null) window.clearTimeout(retryTimer);
+      closeSource();
+    };
+  }, [conversationId, enabled, live]);
+
+  return state;
+}

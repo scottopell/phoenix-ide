@@ -22,6 +22,7 @@ import type { Message, ContentBlock, ToolResultContent, ConversationState, Pendi
 import { cacheDB } from '../cache';
 import type { QueuedMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
+import { useConversationInlineStream } from '../hooks/useConversationInlineStream';
 
 import { linkifyText } from '../utils/linkify';
 import { CopyButton } from './CopyButton';
@@ -995,6 +996,198 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
 // Sub-Agent Summary (persistent view after completion)
 // ============================================================================
 
+type SubAgentStatusKind = 'running' | 'success' | 'failure' | 'timed_out';
+
+function statusKindFromOutcome(outcome: SubAgentResult['outcome'] | null): SubAgentStatusKind {
+  if (!outcome) return 'running';
+  return outcome.type;
+}
+
+function getStatusLabel(status: SubAgentStatusKind): string {
+  switch (status) {
+    case 'running': return 'running…';
+    case 'success': return 'success';
+    case 'failure': return 'failed';
+    case 'timed_out': return 'timed out';
+    default: status satisfies never; return '';
+  }
+}
+
+function getOutcomeText(outcome: SubAgentResult['outcome']): string {
+  switch (outcome.type) {
+    case 'success': return outcome.result || 'Completed successfully';
+    case 'failure': return outcome.error || 'Failed';
+    case 'timed_out': return 'Timed out: sub-agent exceeded its time limit';
+    default: outcome satisfies never; return '';
+  }
+}
+
+function getToolResultText(result: Message | undefined): string {
+  if (!result) return '';
+  const content = result.content as ToolResultContent | undefined;
+  return content?.content || content?.result || content?.error || '';
+}
+
+function summarizeToolInput(name: string, input: Record<string, unknown>, display?: string): string {
+  const formatted = formatToolInput(name, input, display).display.replace(/^\$\s*/, '').replace(/\s+/g, ' ').trim();
+  return formatted.length > 120 ? `${formatted.slice(0, 119)}…` : formatted;
+}
+
+function buildToolResults(messages: Message[]): Map<string, Message> {
+  const map = new Map<string, Message>();
+  for (const msg of messages) {
+    if (msg.message_type !== 'tool' && msg.type !== 'tool') continue;
+    const content = msg.content as ToolResultContent;
+    if (content?.tool_use_id) map.set(content.tool_use_id, msg);
+  }
+  return map;
+}
+
+function countToolUses(messages: Message[]): number {
+  let count = 0;
+  for (const msg of messages) {
+    if (msg.message_type !== 'agent' && msg.type !== 'agent') continue;
+    const blocks = Array.isArray(msg.content) ? (msg.content as ContentBlock[]) : [];
+    count += blocks.filter((b) => b.type === 'tool_use').length;
+  }
+  return count;
+}
+
+function SubAgentStatusIcon({ status }: { status: SubAgentStatusKind }) {
+  if (status === 'running') {
+    return <span className="spinner"></span>;
+  }
+  if (status === 'success') return <CheckIcon />;
+  return <XIcon />;
+}
+
+function ChildToolActivity({ block, result }: { block: ContentBlock; result: Message | undefined }) {
+  const name = block.name || 'tool';
+  const input = (block.input || {}) as Record<string, unknown>;
+  const output = getToolResultText(result);
+  const firstOutputLine = output.split('\n').find((line) => line.trim())?.trim() ?? '';
+  const outputPreview = firstOutputLine ? truncate(firstOutputLine, 140) : result ? '(empty)' : 'running…';
+  const outputClass = firstOutputLine ? '' : result ? 'empty' : 'pending';
+  const isError = (result?.content as ToolResultContent | undefined)?.is_error || (result?.content as ToolResultContent | undefined)?.error;
+
+  return (
+    <div className={`subagent-activity-event tool ${isError ? 'error' : ''}`}>
+      <span className="subagent-activity-tag">{name}</span>
+      <code className="subagent-activity-command">{summarizeToolInput(name, input, block.display)}</code>
+      <span className="subagent-activity-arrow">→</span>
+      <span className={`subagent-activity-output ${outputClass}`} title={firstOutputLine || outputPreview}>
+        {outputPreview}
+      </span>
+    </div>
+  );
+}
+
+function ChildAgentActivity({ message, toolResults }: { message: Message; toolResults: Map<string, Message> }) {
+  const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
+  return (
+    <>
+      {blocks.map((block, idx) => {
+        if (block.type === 'text') {
+          const text = block.text?.trim();
+          if (!text) return null;
+          return (
+            <div key={`${message.message_id}-text-${idx}`} className="subagent-activity-event agent-text">
+              <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{text.length > 900 ? `${text.slice(0, 900)}…` : text}</ReactMarkdown>
+            </div>
+          );
+        }
+        if (block.type === 'tool_use') {
+          return (
+            <ChildToolActivity
+              key={block.id || `${message.message_id}-tool-${idx}`}
+              block={block}
+              result={toolResults.get(block.id || '')}
+            />
+          );
+        }
+        return null;
+      })}
+    </>
+  );
+}
+
+function ChildConversationActivity({ agentId, expanded, running }: { agentId: string; expanded: boolean; running: boolean }) {
+  const inline = useConversationInlineStream(agentId, expanded, running);
+
+  if (!expanded) return null;
+
+  const { atom } = inline;
+  const toolResults = buildToolResults(atom.messages);
+  const agentMessages = atom.messages.filter((m) => m.message_type === 'agent' || m.type === 'agent');
+  const visibleAgentMessages = agentMessages.slice(-12);
+  const hiddenCount = Math.max(0, agentMessages.length - visibleAgentMessages.length);
+  const toolCount = countToolUses(atom.messages);
+
+  return (
+    <div className="subagent-activity-panel">
+      <div className="subagent-activity-meta">
+        <span>{toolCount} tool{toolCount === 1 ? '' : 's'}</span>
+        <span>{atom.messages.length} messages</span>
+        {running && <span>live</span>}
+      </div>
+      {inline.type === 'connecting' && <div className="subagent-activity-placeholder">Loading sub-agent activity…</div>}
+      {inline.type === 'error' && <div className="subagent-activity-error">{inline.error}</div>}
+      {hiddenCount > 0 && (
+        <div className="subagent-activity-placeholder">Showing latest {visibleAgentMessages.length} agent steps ({hiddenCount} earlier hidden)</div>
+      )}
+      {visibleAgentMessages.map((message) => (
+        <ChildAgentActivity key={message.message_id} message={message} toolResults={toolResults} />
+      ))}
+      {atom.streamingBuffer?.text && (
+        <div className="subagent-activity-event agent-text streaming">
+          <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{atom.streamingBuffer.text}</ReactMarkdown>
+        </div>
+      )}
+      {inline.type !== 'connecting' && inline.type !== 'error' && visibleAgentMessages.length === 0 && !atom.streamingBuffer?.text && (
+        <div className="subagent-activity-placeholder">No sub-agent activity yet.</div>
+      )}
+    </div>
+  );
+}
+
+function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; task: string; outcome: SubAgentResult['outcome'] | null }) {
+  const [expanded, setExpanded] = useState(false);
+  const status = statusKindFromOutcome(outcome);
+  const statusClass = status.replace('_', '-');
+  const running = status === 'running';
+  const resultText = outcome ? getOutcomeText(outcome) : '';
+
+  return (
+    <div className={`subagent-item activity ${statusClass}`}>
+      <div className="subagent-item-header">
+        <button
+          type="button"
+          className="subagent-expand-button"
+          onClick={() => setExpanded((v) => !v)}
+          aria-expanded={expanded}
+        >
+          <span className="subagent-icon"><SubAgentStatusIcon status={status} /></span>
+          <span className="subagent-label" title={task}>{truncate(task, 72)}</span>
+          <span className="subagent-activity-count">activity</span>
+          <span className={`subagent-status ${statusClass}`}>{getStatusLabel(status)}</span>
+          <span className="subagent-expand-toggle">{expanded ? <ChevronUpIcon /> : <ChevronDownIcon />}</span>
+        </button>
+        <OpenConversationButton agentId={agentId} />
+      </div>
+      {resultText && !expanded && (
+        <div className="subagent-result preview">{truncate(resultText, 180)}</div>
+      )}
+      <ChildConversationActivity agentId={agentId} expanded={expanded} running={running} />
+      {expanded && resultText && (
+        <div className={`subagent-final-result ${statusClass}`}>
+          <div className="subagent-final-result-label">final outcome</div>
+          <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{resultText}</ReactMarkdown>
+        </div>
+      )}
+    </div>
+  );
+}
+
 /** Display data format for subagent_summary */
 interface SubAgentSummaryData {
   type: 'subagent_summary';
@@ -1013,43 +1206,14 @@ function isSubAgentSummaryData(data: unknown): data is SubAgentSummaryData {
 
 /** Single completed sub-agent row with expandable conversation view */
 function SubAgentSummaryRow({ result }: { result: SubAgentResult }) {
-  const [conversationExpanded, setConversationExpanded] = useState(false);
-  const isError = result.outcome.type === 'failure';
-  const resultText = getOutcomeText(result.outcome);
-
-  return (
-    <div className={`subagent-summary-row ${isError ? 'error' : ''}`}>
-      <div
-        className="subagent-summary-header"
-        onClick={() => setConversationExpanded(!conversationExpanded)}
-      >
-        <span className={`subagent-summary-icon ${isError ? 'error' : 'success'}`}>
-          {isError ? <XIcon /> : <CheckIcon />}
-        </span>
-        <span className="subagent-summary-task" title={result.task}>
-          {truncate(result.task, 60)}
-        </span>
-        <span className="subagent-summary-outcome">
-          {truncate(resultText, 50)}
-        </span>
-        <OpenConversationButton agentId={result.agent_id} />
-        <span className="subagent-summary-expand">
-          {conversationExpanded ? <ChevronUpIcon /> : <ChevronDownIcon />}
-        </span>
-      </div>
-      {conversationExpanded && (
-        <div className="subagent-expanded-result">
-          <ReactMarkdown remarkPlugins={[remarkGfm]}>{resultText}</ReactMarkdown>
-        </div>
-      )}
-    </div>
-  );
+  return <SubAgentActivityCard agentId={result.agent_id} task={result.task} outcome={result.outcome} />;
 }
 
 /** Persistent summary of completed subagents (shown in spawn_agents tool result) */
 function SubAgentSummary({ results }: { results: SubAgentResult[] }) {
   const successCount = results.filter(r => r.outcome.type === 'success').length;
-  const failCount = results.length - successCount;
+  const timeoutCount = results.filter(r => r.outcome.type === 'timed_out').length;
+  const failCount = results.filter(r => r.outcome.type === 'failure').length;
 
   return (
     <div className="subagent-summary-block">
@@ -1057,6 +1221,7 @@ function SubAgentSummary({ results }: { results: SubAgentResult[] }) {
         <span className="subagent-summary-stats">
           {successCount > 0 && <span className="success"><CheckIcon /> {successCount}</span>}
           {failCount > 0 && <span className="error"><XIcon /> {failCount}</span>}
+          {timeoutCount > 0 && <span className="error">⏱ {timeoutCount}</span>}
         </span>
         <span>completed</span>
       </div>
@@ -1077,14 +1242,6 @@ function SubAgentSummary({ results }: { results: SubAgentResult[] }) {
 function truncate(text: string, maxLen: number): string {
   if (text.length <= maxLen) return text;
   return text.slice(0, maxLen - 1) + '…';
-}
-
-/** Get the result text from an outcome */
-function getOutcomeText(outcome: SubAgentResult['outcome']): string {
-  if (outcome.type === 'success') {
-    return outcome.result || 'Completed successfully';
-  }
-  return outcome.error || 'Failed';
 }
 
 const ExternalLinkIcon = () => (
@@ -1156,34 +1313,6 @@ function OpenConversationButton({ agentId }: { agentId: string }) {
   );
 }
 
-/** Single completed sub-agent with expandable result */
-function CompletedSubAgent({ result }: { result: SubAgentResult }) {
-  const [expanded, setExpanded] = useState(false);
-  const isError = result.outcome.type === 'failure';
-  const resultText = getOutcomeText(result.outcome);
-  const hasLongResult = resultText.length > 100;
-
-  return (
-    <div className={`subagent-item completed ${isError ? 'error' : ''}`}>
-      <div className="subagent-item-header" onClick={() => hasLongResult && setExpanded(!expanded)}>
-        <span className="subagent-icon">{isError ? <XIcon /> : <CheckIcon />}</span>
-        <span className="subagent-label" title={result.task}>
-          {truncate(result.task, 50)}
-        </span>
-        <OpenConversationButton agentId={result.agent_id} />
-        {hasLongResult && (
-          <span className="subagent-expand-toggle">
-            {expanded ? <ChevronUpIcon /> : <ChevronDownIcon />}
-          </span>
-        )}
-      </div>
-      <div className={`subagent-result ${expanded ? 'expanded' : ''}`}>
-        {expanded ? resultText : truncate(resultText, 100)}
-      </div>
-    </div>
-  );
-}
-
 type AwaitingSubAgentsState = Extract<ConversationState, { type: 'awaiting_sub_agents' }>;
 
 export const SubAgentStatus = memo(SubAgentStatusImpl);
@@ -1192,6 +1321,18 @@ function SubAgentStatusImpl({ stateData }: { stateData: AwaitingSubAgentsState }
   const pending: PendingSubAgent[] = stateData.pending;
   const completed: SubAgentResult[] = stateData.completed_results;
   const total = pending.length + completed.length;
+  const agents = [
+    ...completed.map((result) => ({
+      agentId: result.agent_id,
+      task: result.task,
+      outcome: result.outcome,
+    })),
+    ...pending.map((agent) => ({
+      agentId: agent.agent_id,
+      task: agent.task,
+      outcome: null,
+    })),
+  ];
 
   return (
     <div className="subagent-status-block">
@@ -1202,20 +1343,13 @@ function SubAgentStatusImpl({ stateData }: { stateData: AwaitingSubAgentsState }
         </span>
       </div>
       <div className="subagent-list">
-        {completed.map((result) => (
-          <CompletedSubAgent key={result.agent_id} result={result} />
-        ))}
-        {pending.map((agent) => (
-          <div key={agent.agent_id} className="subagent-item pending">
-            <span className="subagent-icon">
-              <span className="spinner"></span>
-            </span>
-            <span className="subagent-label" title={agent.task}>
-              {truncate(agent.task, 50)}
-            </span>
-            <span className="subagent-status">running...</span>
-            <OpenConversationButton agentId={agent.agent_id} />
-          </div>
+        {agents.map((agent) => (
+          <SubAgentActivityCard
+            key={agent.agentId}
+            agentId={agent.agentId}
+            task={agent.task}
+            outcome={agent.outcome}
+          />
         ))}
       </div>
     </div>

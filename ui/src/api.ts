@@ -139,12 +139,10 @@ export interface PendingSubAgent {
   task: string;
 }
 
-export interface SubAgentOutcome {
-  type: 'success' | 'failure';
-  result?: string;
-  error?: string;
-  error_kind?: string;
-}
+export type SubAgentOutcome =
+  | { type: 'success'; result?: string }
+  | { type: 'failure'; error?: string; error_kind?: string }
+  | { type: 'timed_out' };
 
 export interface SubAgentResult {
   agent_id: string;
@@ -591,6 +589,15 @@ export const api = {
       throw new Error(err.error || 'Failed to create conversation');
     }
     return (await resp.json()).conversation;
+  },
+
+  async getConversation(id: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean; presentation_mode: string; context_window_size: number }> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(id)}`);
+    if (!resp.ok) {
+      if (resp.status === 404) throw new Error('Conversation not found');
+      throw new Error('Failed to get conversation');
+    }
+    return resp.json();
   },
 
   async getConversationBySlug(slug: string): Promise<{ conversation: Conversation; messages: Message[]; agent_working: boolean; presentation_mode: string; context_window_size: number }> {
