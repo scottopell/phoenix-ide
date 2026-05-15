@@ -324,7 +324,13 @@ fn arb_retry_timeout_event() -> impl Strategy<Value = Event> {
 
 fn arb_task_approval_outcome() -> impl Strategy<Value = TaskApprovalOutcome> {
     prop_oneof![
-        Just(TaskApprovalOutcome::Approved),
+        Just(TaskApprovalOutcome::Approved {
+            handoff:
+                crate::state_machine::state::TaskApprovalHandoff::ContinueInCurrentConversation,
+        }),
+        Just(TaskApprovalOutcome::Approved {
+            handoff: crate::state_machine::state::TaskApprovalHandoff::StartFreshWorkConversation,
+        }),
         Just(TaskApprovalOutcome::Rejected),
         "[a-zA-Z ]{1,30}"
             .prop_map(|annotations| TaskApprovalOutcome::FeedbackProvided { annotations }),

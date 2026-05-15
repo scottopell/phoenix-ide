@@ -9,7 +9,10 @@
 //! The executor wraps received outcomes in `EffectOutcome` for `handle_outcome()`.
 
 use super::traits::{LlmClient, Storage, ToolExecutor};
-use super::{SseBroadcaster, SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest};
+use super::{
+    SseBroadcaster, SseEvent, SubAgentCancelRequest, SubAgentSpawnRequest, TaskApprovalHandoffData,
+    TaskApprovalHandoffRequest,
+};
 
 use crate::db::{MessageContent, ToolOutcome, ToolResult};
 use crate::llm::{
@@ -138,6 +141,7 @@ where
     spawn_tx: Option<mpsc::Sender<SubAgentSpawnRequest>>,
     /// Channel to request sub-agent cancellation (parent only)
     cancel_tx: Option<mpsc::Sender<SubAgentCancelRequest>>,
+    handoff_tx: Option<mpsc::Sender<TaskApprovalHandoffRequest>>,
     /// Buffer for `SubAgentResult` events received before entering `AwaitingSubAgents`.
     /// Pre-allocated with capacity = sub-agent count when spawning (FM-6 prevention).
     sub_agent_result_buffer: Vec<Event>,
@@ -225,6 +229,7 @@ where
             parent_event_tx: None,
             spawn_tx: None,
             cancel_tx: None,
+            handoff_tx: None,
             sub_agent_result_buffer: Vec::new(),
             steering_queue: Vec::new(),
             sub_agent_deadline: None,
@@ -273,6 +278,14 @@ where
         self
     }
 
+    pub fn with_task_handoff_channel(
+        mut self,
+        handoff_tx: mpsc::Sender<TaskApprovalHandoffRequest>,
+    ) -> Self {
+        self.handoff_tx = Some(handoff_tx);
+        self
+    }
+
     /// Initialise the steering queue from a previously-persisted snapshot
     /// (loaded from `conversations.steering_queue` at executor startup).
     pub fn with_steering_queue(
@@ -289,7 +302,8 @@ where
 
         // Check if we need to resume an interrupted operation
         // This handles crash recovery for in-flight LLM requests
-        if let ConvState::LlmRequesting { .. } = &self.state {
+        if let ConvState::LlmRequesting { .. } | ConvState::SeededLlmRequesting { .. } = &self.state
+        {
             tracing::info!(conv_id = %self.context.conversation_id, "Resuming interrupted LLM request");
             if let Err(e) = self.execute_effect(Effect::RequestLlm).await {
                 tracing::error!(error = %e, "Failed to resume LLM request");
@@ -469,16 +483,18 @@ where
     /// reaching `ConvState::Terminal`, so this is a no-op for them in the
     /// normal case.
     ///
-    /// REQ-BED-031: `ContextExhausted` is also a terminal state, but its
-    /// worktree must be preserved pending a user action (Continue / Abandon
-    /// / `MarkAsMerged`) — or transferred to a continuation under
-    /// REQ-BED-030. Skip cleanup in that case; reconcile / abandon /
-    /// mark-merged are the only paths permitted to remove the worktree.
+    /// REQ-BED-031 / approved-task handoff: `ContextExhausted` and
+    /// `HandedOff` are terminal states whose worktree must be preserved for a
+    /// successor conversation. Skip cleanup in those states; reconcile /
+    /// abandon / mark-merged are the only paths permitted to remove the worktree.
     fn cleanup_worktree_if_present(&self) {
-        if matches!(self.state, ConvState::ContextExhausted { .. }) {
+        if matches!(
+            self.state,
+            ConvState::ContextExhausted { .. } | ConvState::HandedOff { .. }
+        ) {
             tracing::debug!(
                 conv_id = %self.context.conversation_id,
-                "REQ-BED-031: skipping terminal worktree cleanup for ContextExhausted"
+                "skipping terminal worktree cleanup for successor-owned worktree"
             );
             return;
         }
@@ -688,6 +704,7 @@ where
                         | ConvState::Failed { .. }
                         | ConvState::Error { .. }
                         | ConvState::ContextExhausted { .. }
+                        | ConvState::HandedOff { .. }
                         | ConvState::AwaitingTaskApproval { .. }
                         | ConvState::AwaitingUserResponse { .. }
                         | ConvState::Terminal
@@ -1531,6 +1548,16 @@ where
                 self.execute_approve_task(task_file, title, priority, plan)
                     .await?;
                 Ok(None)
+            }
+
+            Effect::ApproveTaskFreshHandoff {
+                task_file,
+                title,
+                priority,
+                plan,
+            } => {
+                self.execute_approve_task_fresh_handoff(task_file, title, priority, plan)
+                    .await
             }
 
             Effect::ResolveTask {
@@ -2585,6 +2612,95 @@ where
             }
         }
     }
+    async fn execute_approve_task_fresh_handoff(
+        &mut self,
+        task_file: String,
+        title: String,
+        priority: String,
+        plan: String,
+    ) -> Result<Option<Event>, String> {
+        let cwd = self.context.working_dir.clone();
+        let repo_root =
+            crate::git_ops::repo_root_from_phoenix_worktree(&cwd).unwrap_or_else(|| cwd.clone());
+        let conv_id = self.context.conversation_id.clone();
+        let desired_base_branch = self.context.desired_base_branch.clone();
+        let tasks_dir_name = self.context.tasks_dir_name.clone();
+
+        let task_file_backup = task_file.clone();
+        let title_backup = title.clone();
+        let priority_backup = priority.clone();
+        let plan_backup = plan.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            execute_approve_task_blocking(
+                &cwd,
+                &repo_root,
+                &conv_id,
+                &tasks_dir_name,
+                &task_file,
+                &title,
+                desired_base_branch.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| format!("Task approval join error: {e}"))?;
+
+        let approval_result = match result {
+            Ok(result) => result,
+            Err(e) => {
+                tracing::error!(error = %e, "Fresh task approval git operations failed");
+                self.state = ConvState::AwaitingTaskApproval {
+                    task_file: task_file_backup,
+                    title: title_backup,
+                    priority: priority_backup,
+                    plan: plan_backup,
+                };
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
+                    sequence_id: seq,
+                    error: crate::runtime::user_facing_error::UserFacingError::retryable(
+                        "Task approval failed",
+                        format!(
+                            "Phoenix could not finalise the task: {e}. The conversation \
+                             stays in approval state — try approving again or abandon."
+                        ),
+                    ),
+                });
+                return Ok(None);
+            }
+        };
+
+        let Some(handoff_tx) = &self.handoff_tx else {
+            return Err(
+                "fresh task approval unavailable: runtime handoff channel missing".to_string(),
+            );
+        };
+        let (response_tx, response_rx) = oneshot::channel();
+        let request = TaskApprovalHandoffRequest {
+            parent_conversation_id: self.context.conversation_id.clone(),
+            approval: TaskApprovalHandoffData {
+                task_id: approval_result.task_id,
+                task_title: approval_result.task_title,
+                branch_name: approval_result.branch_name,
+                worktree_path: approval_result.worktree_path,
+                base_branch: approval_result.base_branch,
+                title: title_backup,
+                priority: priority_backup,
+                plan: plan_backup,
+                task_file: approval_result.task_file,
+            },
+            response_tx,
+        };
+        handoff_tx
+            .send(request)
+            .await
+            .map_err(|e| format!("failed to request fresh task handoff: {e}"))?;
+        let response = response_rx
+            .await
+            .map_err(|e| format!("fresh task handoff response dropped: {e}"))??;
+        Ok(Some(Event::TaskHandoffComplete {
+            successor_conv_id: response.successor_conv_id,
+        }))
+    }
 }
 
 /// Result of a successful task approval
@@ -2593,6 +2709,7 @@ struct TaskApprovalResult {
     task_title: String,
     branch_name: String,
     first_task: bool,
+    task_file: String,
     /// Absolute path to the git worktree created for this conversation
     worktree_path: String,
     /// The branch that was checked out when the task was approved (merge target)
@@ -3249,6 +3366,7 @@ fn execute_approve_task_blocking(
         task_title: title.to_string(),
         branch_name,
         first_task: false,
+        task_file: format!("{tasks_dir_name}/{final_filename}"),
         worktree_path: worktree_path_str,
         base_branch,
     })
@@ -3339,6 +3457,7 @@ fn execute_approve_plain_markdown_blocking(
         task_title: title.to_string(),
         branch_name,
         first_task: false,
+        task_file: task_file.to_string(),
         worktree_path: worktree_path_str,
         base_branch,
     })

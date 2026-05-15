@@ -16,7 +16,7 @@ use super::event::{CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAg
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
     AssistantMessage, ContextExhaustionBehavior, CoreState, ModeKind, ParentState, RecoveryKind,
-    SubAgentResult, SubAgentState, TaskApprovalOutcome, ToolCall, ToolInput,
+    SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
@@ -269,6 +269,7 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
 
         // transition_core: AgentBusy
         ConvState::LlmRequesting { .. }
+        | ConvState::SeededLlmRequesting { .. }
         | ConvState::ToolExecuting { .. }
         | ConvState::AwaitingSubAgents { .. } => Err(TransitionError::AgentBusy),
 
@@ -281,7 +282,9 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
         ConvState::AwaitingTaskApproval { .. } => Err(TransitionError::AwaitingTaskApproval),
         ConvState::AwaitingUserResponse { .. } => Err(TransitionError::AwaitingUserResponse),
         ConvState::ContextExhausted { .. } => Err(TransitionError::ContextExhausted),
-        ConvState::Terminal => Err(TransitionError::ConversationTerminal),
+        ConvState::HandedOff { .. } | ConvState::Terminal => {
+            Err(TransitionError::ConversationTerminal)
+        }
 
         // No explicit arm in transition_core/transition_parent — falls through
         // to the catch-all `InvalidTransition`. Enumerated explicitly so
@@ -1366,7 +1369,10 @@ pub fn transition_parent(
                 plan,
             },
             ParentEvent::Parent(ParentOnlyEvent::TaskApprovalResponse {
-                outcome: TaskApprovalOutcome::Approved,
+                outcome:
+                    TaskApprovalOutcome::Approved {
+                        handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
+                    },
             }),
         ) => Ok(
             ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting { attempt: 1 }))
@@ -1380,6 +1386,41 @@ pub fn transition_parent(
                 .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
+        (
+            ParentState::AwaitingTaskApproval {
+                task_file,
+                title,
+                priority,
+                plan,
+            },
+            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalResponse {
+                outcome:
+                    TaskApprovalOutcome::Approved {
+                        handoff: TaskApprovalHandoff::StartFreshWorkConversation,
+                    },
+            }),
+        ) => Ok(ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
+            task_file: task_file.clone(),
+            title: title.clone(),
+            priority: priority.clone(),
+            plan: plan.clone(),
+        })
+        .with_effect(Effect::ApproveTaskFreshHandoff {
+            task_file: task_file.clone(),
+            title: title.clone(),
+            priority: priority.clone(),
+            plan: plan.clone(),
+        })),
+
+        (
+            ParentState::AwaitingTaskApproval { .. },
+            ParentEvent::Parent(ParentOnlyEvent::TaskHandoffComplete { successor_conv_id }),
+        ) => Ok(ParentTransitionResult::new(ParentState::HandedOff {
+            successor_conv_id: successor_conv_id.clone(),
+        })
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::NotifyStateChange)
+        .with_effect(Effect::notify_agent_done())),
 
         (
             ParentState::AwaitingTaskApproval { .. },
@@ -1560,10 +1601,15 @@ pub fn transition_parent(
         }
 
         // ============================================================
-        // Parent-only state: Terminal
+        // Parent-only state: Terminal / handed-off
         // ============================================================
-        (ParentState::Terminal, ParentEvent::Core(CoreEvent::UserMessage { .. })) => {
+        (ParentState::HandedOff { .. }, ParentEvent::Core(CoreEvent::UserMessage { .. }))
+        | (ParentState::Terminal, ParentEvent::Core(CoreEvent::UserMessage { .. })) => {
             Err(TransitionError::ConversationTerminal)
+        }
+
+        (state @ ParentState::HandedOff { .. }, _event) => {
+            Ok(ParentTransitionResult::new(state.clone()))
         }
 
         (ParentState::Terminal, _event) => Ok(ParentTransitionResult::new(ParentState::Terminal)),
@@ -2323,9 +2369,9 @@ fn handle_persist_outcome(
 /// Extract the current attempt number from state (for LLM error conversion).
 fn current_attempt(state: &ConvState) -> u32 {
     match state {
-        ConvState::LlmRequesting { attempt } | ConvState::AwaitingContinuation { attempt, .. } => {
-            *attempt
-        }
+        ConvState::LlmRequesting { attempt }
+        | ConvState::SeededLlmRequesting { attempt, .. }
+        | ConvState::AwaitingContinuation { attempt, .. } => *attempt,
         _ => 1,
     }
 }

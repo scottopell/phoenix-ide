@@ -109,6 +109,11 @@ pub enum Event {
     TaskApprovalResponse {
         outcome: TaskApprovalOutcome,
     },
+    /// Internal completion event emitted after fresh task approval creates the
+    /// successor Work conversation.
+    TaskHandoffComplete {
+        successor_conv_id: String,
+    },
 
     // Ask user question events (REQ-AUQ-001)
     /// User answered the pending questions (POST /api/conversations/{id}/respond)
@@ -204,6 +209,7 @@ impl Event {
             Event::ContinuationFailed { .. } => "ContinuationFailed",
             Event::UserTriggerContinuation => "UserTriggerContinuation",
             Event::TaskApprovalResponse { .. } => "TaskApprovalResponse",
+            Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             Event::CredentialBecameAvailable => "CredentialBecameAvailable",
@@ -290,6 +296,9 @@ pub enum CoreEvent {
 pub enum ParentOnlyEvent {
     TaskApprovalResponse {
         outcome: TaskApprovalOutcome,
+    },
+    TaskHandoffComplete {
+        successor_conv_id: String,
     },
     UserQuestionResponse {
         answers: HashMap<String, String>,
@@ -447,6 +456,11 @@ impl TryFrom<Event> for ParentEvent {
                     outcome,
                 }))
             }
+            Event::TaskHandoffComplete { successor_conv_id } => {
+                Ok(ParentEvent::Parent(ParentOnlyEvent::TaskHandoffComplete {
+                    successor_conv_id,
+                }))
+            }
             Event::UserQuestionResponse {
                 answers,
                 annotations,
@@ -578,6 +592,7 @@ impl TryFrom<Event> for SubAgentEvent {
             // conversation feature, and the executor's drain detector guards
             // against firing for sub-agents.
             Event::TaskApprovalResponse { .. }
+            | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
             | Event::CredentialBecameAvailable
             | Event::CredentialHelperFailed { .. }
@@ -621,6 +636,7 @@ impl ParentEvent {
             ParentEvent::Core(e) => e.variant_name(),
             ParentEvent::Parent(e) => match e {
                 ParentOnlyEvent::TaskApprovalResponse { .. } => "TaskApprovalResponse",
+                ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
                 ParentOnlyEvent::CredentialBecameAvailable => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",

@@ -169,6 +169,7 @@ export type ConversationState =
   | { type: 'idle' }
   | { type: 'awaiting_llm' }
   | { type: 'llm_requesting'; attempt: number }
+  | { type: 'seeded_llm_requesting'; seed_message_id: string; attempt: number }
   | { type: 'tool_executing'; current_tool: ToolCall; remaining_tools: ToolCall[] }
   | { type: 'awaiting_sub_agents'; pending: PendingSubAgent[]; completed_results: SubAgentResult[] }
   | { type: 'awaiting_continuation'; attempt: number }
@@ -178,6 +179,7 @@ export type ConversationState =
   | { type: 'awaiting_task_approval'; title: string; priority: string; plan: string }
   | { type: 'awaiting_user_response'; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }
+  | { type: 'handed_off'; successor_conv_id: string }
   | { type: 'error'; message: string }
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
   | { type: 'terminal' };
@@ -194,6 +196,7 @@ function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'e
   switch (stateType) {
     case 'idle': return 'idle';
     case 'terminal': return 'terminal';
+    case 'handed_off': return 'terminal';
     case 'error': return 'error';
     case 'context_exhausted': return 'idle';
     case 'awaiting_task_approval': return 'awaiting-approval';
@@ -229,7 +232,7 @@ export interface Message {
   message_id: string;
   sequence_id: number;
   conversation_id: string;
-  message_type: 'user' | 'agent' | 'tool' | 'system' | 'skill';
+  message_type: 'user' | 'agent' | 'tool' | 'system' | 'error' | 'continuation' | 'skill';
   type?: string; // legacy
   content: MessageContent;
   display_data?: ImageData | Record<string, unknown> | null; // For tool results with images (e.g., screenshots)
@@ -892,8 +895,15 @@ export const api = {
     return resp.json();
   },
 
-  async approveTask(convId: string): Promise<{ success: boolean; first_task?: boolean }> {
-    const resp = await fetch(`/api/conversations/${convId}/approve-task`, { method: 'POST' });
+  async approveTask(
+    convId: string,
+    handoff: 'continue_in_current_conversation' | 'start_fresh_work_conversation' = 'start_fresh_work_conversation',
+  ): Promise<{ success: boolean; first_task?: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/approve-task`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ handoff }),
+    });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to approve task'); }
     return resp.json();
   },

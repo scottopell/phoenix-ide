@@ -3,7 +3,9 @@
 ## Architecture Overview
 
 Chains are a *derived navigation primitive* over Phoenix's existing
-`conversations.continued_in_conv_id` graph. The only schema change to
+`conversations.continued_in_conv_id` graph. Edges in that graph are
+linear handoffs: context continuation, and managed Explore approval into
+a fresh Work conversation. The only schema change to
 `conversations` is a single nullable `chain_name TEXT` column carrying
 the user-set name on chain root conversations. One new persistence
 table: `chain_qa` for Q&A history. No `chains` table; membership is
@@ -170,7 +172,7 @@ against the model's own prior answers.
 
 | Member kind | Context source |
 |---|---|
-| **Non-leaf** (`Mᵢ` where `i < n`, continued into a successor) | The trailing `MessageType::Continuation` message at the end of `Mᵢ` itself, persisted by `Effect::persist_continuation_message` during the `AwaitingContinuation → ContextExhausted` transition (`src/state_machine/transition.rs`). Its payload describes the work done in `Mᵢ`. |
+| **Non-leaf** (`Mᵢ` where `i < n`, continued into a successor) | The trailing `MessageType::Continuation` message at the end of `Mᵢ` itself. For context continuation this is persisted by `Effect::persist_continuation_message` during the `AwaitingContinuation → ContextExhausted` transition; for approved-task fresh handoff this is the approved-plan handoff summary persisted when the Explore predecessor becomes `HandedOff`. Its payload describes the work or approved plan represented by `Mᵢ`. |
 | **Leaf** (`Mₙ`, never continued) | Transcript sent directly when the leaf has ≤ 20 messages and approximate token count ≤ 4000; otherwise an on-demand summary generated **in-process** by the same mid-tier model in a pre-step before the main answer call. |
 
 Every non-leaf member carries its own summary on its own tail because

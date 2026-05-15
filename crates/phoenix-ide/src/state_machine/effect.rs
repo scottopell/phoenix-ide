@@ -175,6 +175,12 @@ pub enum Effect {
         priority: String,
         plan: String,
     },
+    ApproveTaskFreshHandoff {
+        task_file: String,
+        title: String,
+        priority: String,
+        plan: String,
+    },
     /// Task completed or abandoned: finalize conversation state, mode, and cwd.
     /// Executor calls `finalize_conversation`, injects system message, broadcasts SSE.
     ResolveTask {

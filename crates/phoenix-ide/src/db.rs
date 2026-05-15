@@ -19,6 +19,40 @@ use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 use thiserror::Error;
 
+fn render_approved_task_brief(
+    intro: &str,
+    approval: &crate::runtime::TaskApprovalHandoffData,
+) -> String {
+    format!(
+        "{intro}\n\n\
+         Branch: {}\n\
+         Worktree: {}\n\
+         Base branch: {}\n\
+         Task file: {}\n\n\
+         ## Approved plan: {}\n\n\
+         Priority: {}\n\n\
+         {}",
+        approval.branch_name,
+        approval.worktree_path,
+        approval.base_branch,
+        approval.task_file,
+        approval.title,
+        approval.priority,
+        approval.plan
+    )
+}
+
+fn approved_task_seed_message(approval: &crate::runtime::TaskApprovalHandoffData) -> String {
+    render_approved_task_brief("Task approved. Execute the approved plan below.", approval)
+}
+
+fn approved_task_handoff_summary(approval: &crate::runtime::TaskApprovalHandoffData) -> String {
+    render_approved_task_brief(
+        "Task approved and handed off to a fresh Work conversation.",
+        approval,
+    )
+}
+
 #[derive(Error, Debug)]
 pub enum DbError {
     #[error("Database error: {0}")]
@@ -723,6 +757,183 @@ impl Database {
         Ok(())
     }
 
+    /// Create a fresh Work conversation for an approved-task handoff and link
+    /// the Explore predecessor through `continued_in_conv_id`.
+    #[allow(clippy::too_many_lines)]
+    pub async fn create_task_approval_handoff_conversation(
+        &self,
+        parent_id: &str,
+        approval: &crate::runtime::TaskApprovalHandoffData,
+    ) -> DbResult<Conversation> {
+        let parent = self.get_conversation(parent_id).await?;
+        if let Some(existing_id) = parent.continued_in_conv_id.as_deref() {
+            return self.get_conversation(existing_id).await;
+        }
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        let root_id = self
+            .chain_root_of(parent_id)
+            .await?
+            .unwrap_or_else(|| parent_id.to_string());
+        let root = self.get_conversation(&root_id).await?;
+        let chain_len = self.chain_members_forward(&root_id).await?.len();
+        let root_slug = root.slug.as_deref().unwrap_or("conversation");
+        let mut candidate_slug = format!("{root_slug}-{}", chain_len + 1);
+        let mut slug_offset = 0usize;
+        let now = Utc::now();
+        let now_str = now.to_rfc3339();
+        let handed_off_state = serde_json::to_string(&ConvState::HandedOff {
+            successor_conv_id: new_id.clone(),
+        })
+        .unwrap();
+        let work_mode = ConvMode::Work {
+            branch_name: schema::NonEmptyString::new(approval.branch_name.clone())
+                .expect("approved branch name is non-empty"),
+            worktree_path: schema::NonEmptyString::new(approval.worktree_path.clone())
+                .expect("approved worktree path is non-empty"),
+            base_branch: schema::NonEmptyString::new(approval.base_branch.clone())
+                .expect("approved base branch is non-empty"),
+            task_id: schema::NonEmptyString::new(approval.task_id.clone())
+                .expect("approved task id is non-empty"),
+            task_title: schema::NonEmptyString::new(approval.task_title.clone())
+                .expect("approved task title is non-empty"),
+        };
+        let work_mode_json = serde_json::to_string(&work_mode).unwrap();
+        let seed_message_id = uuid::Uuid::new_v4().to_string();
+        let seeded_state = serde_json::to_string(&ConvState::SeededLlmRequesting {
+            seed_message_id: seed_message_id.clone(),
+            attempt: 1,
+        })
+        .unwrap();
+        let seed_content =
+            MessageContent::User(UserContent::meta(approved_task_seed_message(approval)));
+        let seed_content_str = serde_json::to_string(&seed_content.to_json()).unwrap();
+        let seed_display = serde_json::json!({ "user_agent": "Phoenix Task Handoff" });
+        let seed_display_str = serde_json::to_string(&seed_display).unwrap();
+        let handoff_summary = MessageContent::continuation(approved_task_handoff_summary(approval));
+        let handoff_summary_str = serde_json::to_string(&handoff_summary.to_json()).unwrap();
+
+        let mut tx = self.pool.begin().await?;
+        let actual_slug = loop {
+            let title_for_insert = schema::title_from_slug(&candidate_slug);
+            let result = sqlx::query(
+                "INSERT INTO conversations (id, slug, title, cwd, parent_conversation_id, user_initiated, state, state_updated_at, created_at, updated_at, archived, model, project_id, conv_mode, desired_base_branch, seed_parent_id, seed_label, continued_in_conv_id)
+                 VALUES (?1, ?2, ?3, ?4, NULL, 1, ?5, ?6, ?6, ?6, 0, ?7, ?8, ?9, ?10, NULL, NULL, NULL)",
+            )
+            .bind(&new_id)
+            .bind(&candidate_slug)
+            .bind(&title_for_insert)
+            .bind(&approval.worktree_path)
+            .bind(&seeded_state)
+            .bind(&now_str)
+            .bind(parent.model.as_deref())
+            .bind(parent.project_id.as_deref())
+            .bind(&work_mode_json)
+            .bind(parent.desired_base_branch.as_deref())
+            .execute(&mut *tx)
+            .await;
+
+            match result {
+                Ok(_) => break candidate_slug,
+                Err(sqlx::Error::Database(ref e)) if e.code().as_deref() == Some("2067") => {
+                    slug_offset += 1;
+                    candidate_slug = if slug_offset <= 20 {
+                        format!("{root_slug}-{}", chain_len + 1 + slug_offset)
+                    } else {
+                        let uid = uuid::Uuid::new_v4().to_string();
+                        format!(
+                            "{root_slug}-{}-{}",
+                            chain_len + 1,
+                            uid.get(..8).unwrap_or(&uid)
+                        )
+                    };
+                }
+                Err(e) => return Err(DbError::Sqlx(e)),
+            }
+        };
+
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
+             VALUES (?1, ?2, 1, ?3, ?4, ?5, NULL, ?6)",
+        )
+        .bind(&seed_message_id)
+        .bind(&new_id)
+        .bind(seed_content.message_type().to_string())
+        .bind(&seed_content_str)
+        .bind(&seed_display_str)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+
+        let parent_next_sequence_id: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
+        )
+        .bind(parent_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        sqlx::query(
+            "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
+        )
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(parent_id)
+        .bind(parent_next_sequence_id)
+        .bind(handoff_summary.message_type().to_string())
+        .bind(&handoff_summary_str)
+        .bind(&now_str)
+        .execute(&mut *tx)
+        .await?;
+
+        let updated = sqlx::query(
+            "UPDATE conversations
+             SET continued_in_conv_id = ?1, state = ?2, state_updated_at = ?3, updated_at = ?3
+             WHERE id = ?4 AND continued_in_conv_id IS NULL",
+        )
+        .bind(&new_id)
+        .bind(&handed_off_state)
+        .bind(&now_str)
+        .bind(parent_id)
+        .execute(&mut *tx)
+        .await?;
+        if updated.rows_affected() == 0 {
+            drop(tx);
+            let refetched = self.get_conversation(parent_id).await?;
+            if let Some(existing_id) = refetched.continued_in_conv_id.as_deref() {
+                return self.get_conversation(existing_id).await;
+            }
+            return Err(DbError::ConversationNotFound(parent_id.to_string()));
+        }
+        tx.commit().await?;
+
+        Ok(Conversation {
+            id: new_id,
+            slug: Some(actual_slug.clone()),
+            title: Some(schema::title_from_slug(&actual_slug)),
+            cwd: approval.worktree_path.clone(),
+            parent_conversation_id: None,
+            user_initiated: true,
+            state: ConvState::SeededLlmRequesting {
+                seed_message_id,
+                attempt: 1,
+            },
+            state_updated_at: now,
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            model: parent.model,
+            project_id: parent.project_id,
+            conv_mode: work_mode,
+            desired_base_branch: parent.desired_base_branch,
+            message_count: 1,
+            seed_parent_id: None,
+            seed_label: None,
+            continued_in_conv_id: None,
+            chain_name: None,
+            steering_queue: vec![],
+        })
+    }
+
     /// Create a continuation conversation for a context-exhausted parent, atomically.
     ///
     /// Implements REQ-BED-030 (see `specs/bedrock/design.md` §"Context Continuation
@@ -1279,7 +1490,7 @@ impl Database {
         //   - terminal: task lifecycle ended (complete/abandon) — permanently read-only
         sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2
-             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')",
+             WHERE json_extract(state, '$.type') NOT IN ('idle', 'context_exhausted', 'handed_off', 'seeded_llm_requesting', 'awaiting_task_approval', 'awaiting_user_response', 'terminal')",
         )
         .bind(&idle_state)
         .bind(now.to_rfc3339())
@@ -1306,7 +1517,7 @@ impl Database {
         let conv_rows: Vec<String> = sqlx::query(
             "SELECT id FROM conversations
              WHERE json_extract(state, '$.type') NOT IN
-                 ('context_exhausted', 'terminal',
+                 ('context_exhausted', 'handed_off', 'terminal',
                   'awaiting_task_approval', 'awaiting_user_response')",
         )
         .try_map(|row: SqliteRow| row.try_get("id"))
@@ -2888,6 +3099,86 @@ mod tests {
                 .execute(&db.pool)
                 .await
                 .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn test_create_task_approval_handoff_links_parent_to_work_successor() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("handoff-parent", "handoff-parent", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.add_message_with_seq(
+            "preexisting-parent-message",
+            "handoff-parent",
+            42,
+            &MessageContent::user("existing parent message"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let approval = crate::runtime::TaskApprovalHandoffData {
+            task_id: "27002".to_string(),
+            task_title: "Approve Fresh".to_string(),
+            branch_name: "task-27002-approve-fresh".to_string(),
+            worktree_path: "/tmp/.phoenix/worktrees/handoff-parent".to_string(),
+            base_branch: "main".to_string(),
+            title: "Approve Fresh".to_string(),
+            priority: "p1".to_string(),
+            plan: "Do the work".to_string(),
+            task_file: "tasks/27002-p1-ready--approve-fresh.md".to_string(),
+        };
+
+        let successor = db
+            .create_task_approval_handoff_conversation("handoff-parent", &approval)
+            .await
+            .unwrap();
+
+        let parent = db.get_conversation("handoff-parent").await.unwrap();
+        assert_eq!(
+            parent.continued_in_conv_id.as_deref(),
+            Some(successor.id.as_str())
+        );
+        assert!(matches!(
+            parent.state,
+            ConvState::HandedOff { ref successor_conv_id } if successor_conv_id == &successor.id
+        ));
+        assert!(matches!(
+            successor.state,
+            ConvState::SeededLlmRequesting { ref seed_message_id, attempt: 1 } if !seed_message_id.is_empty()
+        ));
+        assert_eq!(successor.message_count, 1);
+        let successor_messages = db.get_messages(&successor.id).await.unwrap();
+        assert_eq!(successor_messages.len(), 1);
+        match &successor_messages[0].content {
+            MessageContent::User(user) => {
+                assert!(user.is_meta);
+                assert!(user.text.contains(&approval.task_file));
+                assert!(user.text.contains(&approval.branch_name));
+            }
+            other => panic!("expected meta user seed message, got {other:?}"),
+        }
+        let parent_messages = db.get_messages("handoff-parent").await.unwrap();
+        assert!(parent_messages.iter().any(|m| {
+            matches!(m.content, MessageContent::Continuation(_)) && m.sequence_id == 43
+        }));
+        match successor.conv_mode {
+            ConvMode::Work {
+                branch_name,
+                worktree_path,
+                base_branch,
+                task_id,
+                task_title,
+            } => {
+                assert_eq!(branch_name.as_str(), approval.branch_name);
+                assert_eq!(worktree_path.as_str(), approval.worktree_path);
+                assert_eq!(base_branch.as_str(), approval.base_branch);
+                assert_eq!(task_id.as_str(), approval.task_id);
+                assert_eq!(task_title.as_str(), approval.task_title);
+            }
+            other => panic!("successor should be Work mode, got {other:?}"),
         }
     }
 

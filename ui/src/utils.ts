@@ -52,10 +52,10 @@ export function formatShortDateTime(isoStr: string): string {
 
 export function isAgentWorking(state: ConversationState): boolean {
   switch (state.type) {
-    case 'idle': case 'error': case 'terminal': case 'context_exhausted':
+    case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_task_approval': case 'awaiting_user_response':
       return false;
-    case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
+    case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
     case 'awaiting_recovery':
@@ -68,9 +68,9 @@ export function isCancellingState(state: ConversationState): boolean {
   switch (state.type) {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return true;
-    case 'idle': case 'error': case 'terminal': case 'context_exhausted':
+    case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
     case 'awaiting_task_approval': case 'awaiting_user_response':
-    case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
+    case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
     case 'awaiting_sub_agents': case 'awaiting_continuation':
     case 'awaiting_recovery':
       return false;
@@ -84,6 +84,8 @@ export function getStateDescription(state: ConversationState): string {
       return 'preparing request...';
     case 'llm_requesting':
       return state.attempt > 1 ? `thinking (retry ${state.attempt})...` : 'thinking...';
+    case 'seeded_llm_requesting':
+      return state.attempt > 1 ? `starting (retry ${state.attempt})...` : 'starting...';
     case 'tool_executing': {
       // `current_tool.name` is authoritative on both wire paths; see
       // ToolCall's custom Serialize impl in state_machine/state.rs.
@@ -104,6 +106,8 @@ export function getStateDescription(state: ConversationState): string {
       return 'cancelling...';
     case 'idle': case 'terminal':
       return 'ready';
+    case 'handed_off':
+      return 'handed off';
     case 'awaiting_task_approval':
       return 'awaiting approval';
     case 'awaiting_user_response':
@@ -133,6 +137,17 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'llm_requesting':
     case 'awaiting_continuation':
       return { type, attempt: (obj['attempt'] as number) ?? 1 };
+    case 'seeded_llm_requesting': {
+      const seed = obj['seed_message_id'];
+      if (typeof seed !== 'string' || seed.trim() === '') {
+        return { type: 'error', message: 'Invalid seeded request state: missing seed message' };
+      }
+      return {
+        type: 'seeded_llm_requesting',
+        seed_message_id: seed,
+        attempt: (obj['attempt'] as number) ?? 1,
+      };
+    }
     case 'tool_executing':
       return {
         type: 'tool_executing',
@@ -163,6 +178,13 @@ export function parseConversationState(raw: unknown): ConversationState {
       };
     case 'context_exhausted':
       return { type: 'context_exhausted', summary: (obj['summary'] as string) ?? '' };
+    case 'handed_off': {
+      const successor = obj['successor_conv_id'];
+      if (typeof successor !== 'string' || successor.trim() === '') {
+        return { type: 'error', message: 'Invalid handed-off state: missing successor conversation' };
+      }
+      return { type: 'handed_off', successor_conv_id: successor };
+    }
     case 'error':
       return { type: 'error', message: (obj['message'] as string) ?? 'Unknown error' };
     case 'awaiting_recovery':

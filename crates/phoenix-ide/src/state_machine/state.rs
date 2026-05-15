@@ -510,6 +510,13 @@ mod tests {
             ConvState::ContextExhausted {
                 summary: "s".into(),
             },
+            ConvState::HandedOff {
+                successor_conv_id: "next".into(),
+            },
+            ConvState::SeededLlmRequesting {
+                seed_message_id: "seed".into(),
+                attempt: 1,
+            },
             ConvState::Terminal,
         ];
 
@@ -519,6 +526,7 @@ mod tests {
             let expected = match state {
                 ConvState::Idle | ConvState::Error { .. } => true,
                 ConvState::LlmRequesting { .. }
+                | ConvState::SeededLlmRequesting { .. }
                 | ConvState::ToolExecuting { .. }
                 | ConvState::CancellingTool { .. }
                 | ConvState::AwaitingSubAgents { .. }
@@ -530,6 +538,7 @@ mod tests {
                 | ConvState::AwaitingTaskApproval { .. }
                 | ConvState::AwaitingUserResponse { .. }
                 | ConvState::ContextExhausted { .. }
+                | ConvState::HandedOff { .. }
                 | ConvState::Terminal => false,
             };
             assert_eq!(
@@ -673,6 +682,14 @@ pub enum ConvState {
     /// LLM request in flight, with retry tracking
     LlmRequesting { attempt: u32 },
 
+    /// Fresh handoff successor whose approved-plan seed is already durable.
+    /// Runtime resume treats this as `LlmRequesting` so the first request can
+    /// be replayed after a crash without reinserting or reconstructing the seed.
+    SeededLlmRequesting {
+        seed_message_id: String,
+        attempt: u32,
+    },
+
     /// Executing tools serially.
     /// The assistant message is held here (NOT yet persisted) — persistence is atomic
     /// at the end of the tool round via `CheckpointData::ToolRound` (REQ-BED-007).
@@ -796,6 +813,9 @@ pub enum ConvState {
         summary: String,
     },
 
+    /// This conversation handed live work to a successor conversation.
+    HandedOff { successor_conv_id: String },
+
     /// Task lifecycle completed or abandoned — conversation is permanently read-only.
     /// Rejects all events. Preserved on server restart (not reset to Idle).
     Terminal,
@@ -885,6 +905,9 @@ pub enum ParentState {
     ContextExhausted {
         summary: String,
     },
+    HandedOff {
+        successor_conv_id: String,
+    },
     Terminal,
 }
 
@@ -939,6 +962,9 @@ impl From<ParentState> for ConvState {
                 tool_use_id,
             },
             ParentState::ContextExhausted { summary } => ConvState::ContextExhausted { summary },
+            ParentState::HandedOff { successor_conv_id } => {
+                ConvState::HandedOff { successor_conv_id }
+            }
             ParentState::Terminal => ConvState::Terminal,
         }
     }
@@ -1041,11 +1067,13 @@ impl std::error::Error for StateConversionError {}
 impl TryFrom<ConvState> for ParentState {
     type Error = StateConversionError;
 
+    #[allow(clippy::too_many_lines)]
     fn try_from(cs: ConvState) -> Result<Self, Self::Error> {
         match cs {
             // Core states
             ConvState::Idle => Ok(ParentState::Core(CoreState::Idle)),
-            ConvState::LlmRequesting { attempt } => {
+            ConvState::LlmRequesting { attempt }
+            | ConvState::SeededLlmRequesting { attempt, .. } => {
                 Ok(ParentState::Core(CoreState::LlmRequesting { attempt }))
             }
             ConvState::ToolExecuting {
@@ -1135,6 +1163,9 @@ impl TryFrom<ConvState> for ParentState {
             ConvState::ContextExhausted { summary } => {
                 Ok(ParentState::ContextExhausted { summary })
             }
+            ConvState::HandedOff { successor_conv_id } => {
+                Ok(ParentState::HandedOff { successor_conv_id })
+            }
             ConvState::Terminal => Ok(ParentState::Terminal),
             // Sub-agent-only states are invalid for parent
             ConvState::Completed { .. } | ConvState::Failed { .. } => Err(StateConversionError {
@@ -1152,7 +1183,8 @@ impl TryFrom<ConvState> for SubAgentState {
         match cs {
             // Core states
             ConvState::Idle => Ok(SubAgentState::Core(CoreState::Idle)),
-            ConvState::LlmRequesting { attempt } => {
+            ConvState::LlmRequesting { attempt }
+            | ConvState::SeededLlmRequesting { attempt, .. } => {
                 Ok(SubAgentState::Core(CoreState::LlmRequesting { attempt }))
             }
             ConvState::ToolExecuting {
@@ -1221,6 +1253,7 @@ impl TryFrom<ConvState> for SubAgentState {
             | ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::ContextExhausted { .. }
+            | ConvState::HandedOff { .. }
             | ConvState::Terminal => Err(StateConversionError {
                 from_variant: cs.variant_name(),
                 target_type: "SubAgentState",
@@ -1254,6 +1287,7 @@ impl ParentState {
             ParentState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
             ParentState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
             ParentState::ContextExhausted { .. } => "ContextExhausted",
+            ParentState::HandedOff { .. } => "HandedOff",
             ParentState::Terminal => "Terminal",
         }
     }
@@ -1261,7 +1295,9 @@ impl ParentState {
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
-            ParentState::ContextExhausted { .. } | ParentState::Terminal
+            ParentState::ContextExhausted { .. }
+                | ParentState::HandedOff { .. }
+                | ParentState::Terminal
         )
     }
 }
@@ -1298,9 +1334,22 @@ impl SubAgentState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TaskApprovalOutcome {
-    Approved,
+    Approved {
+        #[serde(default)]
+        handoff: TaskApprovalHandoff,
+    },
     Rejected,
-    FeedbackProvided { annotations: String },
+    FeedbackProvided {
+        annotations: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskApprovalHandoff {
+    #[default]
+    ContinueInCurrentConversation,
+    StartFreshWorkConversation,
 }
 
 /// Semantic state category for UI display.
@@ -1355,6 +1404,7 @@ impl ConvState {
             ConvState::Completed { .. }
                 | ConvState::Failed { .. }
                 | ConvState::ContextExhausted { .. }
+                | ConvState::HandedOff { .. }
                 | ConvState::Terminal
         )
     }
@@ -1373,6 +1423,7 @@ impl ConvState {
         matches!(
             self,
             ConvState::LlmRequesting { .. }
+                | ConvState::SeededLlmRequesting { .. }
                 | ConvState::ToolExecuting { .. }
                 | ConvState::CancellingTool { .. }
                 | ConvState::AwaitingSubAgents { .. }
@@ -1397,6 +1448,7 @@ impl ConvState {
         match self {
             ConvState::Idle => "Idle",
             ConvState::LlmRequesting { .. } => "LlmRequesting",
+            ConvState::SeededLlmRequesting { .. } => "SeededLlmRequesting",
             ConvState::ToolExecuting { .. } => "ToolExecuting",
             ConvState::CancellingTool { .. } => "CancellingTool",
             ConvState::AwaitingSubAgents { .. } => "AwaitingSubAgents",
@@ -1407,6 +1459,7 @@ impl ConvState {
             ConvState::AwaitingRecovery { .. } => "AwaitingRecovery",
             ConvState::AwaitingContinuation { .. } => "AwaitingContinuation",
             ConvState::ContextExhausted { .. } => "ContextExhausted",
+            ConvState::HandedOff { .. } => "HandedOff",
             ConvState::AwaitingTaskApproval { .. } => "AwaitingTaskApproval",
             ConvState::AwaitingUserResponse { .. } => "AwaitingUserResponse",
             ConvState::Terminal => "Terminal",
@@ -1430,9 +1483,12 @@ impl ConvState {
                     summary: summary.clone(),
                 })
             }
-            ConvState::Terminal => StepResult::Terminal(TerminalOutcome::TaskResolved),
+            ConvState::Terminal | ConvState::HandedOff { .. } => {
+                StepResult::Terminal(TerminalOutcome::TaskResolved)
+            }
             ConvState::Idle
             | ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }
@@ -1458,8 +1514,12 @@ impl ConvState {
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::ContextExhausted { .. } => "needs_action",
-            ConvState::Terminal | ConvState::Completed { .. } | ConvState::Failed { .. } => "done",
+            ConvState::HandedOff { .. }
+            | ConvState::Terminal
+            | ConvState::Completed { .. }
+            | ConvState::Failed { .. } => "done",
             ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }
@@ -1479,10 +1539,12 @@ impl ConvState {
                 DisplayState::AwaitingApproval
             }
             ConvState::ContextExhausted { .. }
+            | ConvState::HandedOff { .. }
             | ConvState::Completed { .. }
             | ConvState::Failed { .. }
             | ConvState::Terminal => DisplayState::Terminal,
             ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
             | ConvState::ToolExecuting { .. }
             | ConvState::CancellingTool { .. }
             | ConvState::AwaitingSubAgents { .. }

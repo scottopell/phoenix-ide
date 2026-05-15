@@ -266,8 +266,9 @@ export function StateBar({
             stateText = 'ready';
             break;
           case 'terminal':
+          case 'handed_off':
             dotClass += ' terminal';
-            stateText = 'completed';
+            stateText = convState.type === 'handed_off' ? 'handed off' : 'completed';
             break;
           case 'awaiting_task_approval':
             dotClass += ' approval';
@@ -285,7 +286,7 @@ export function StateBar({
             dotClass += ' error';
             stateText = 'context full';
             break;
-          case 'awaiting_llm': case 'llm_requesting': case 'tool_executing':
+          case 'awaiting_llm': case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
           case 'awaiting_sub_agents': case 'awaiting_continuation':
           case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
           case 'awaiting_recovery':

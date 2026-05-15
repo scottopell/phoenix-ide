@@ -2,7 +2,8 @@
 
 use super::handlers::AppError;
 use super::types::{
-    ConflictErrorResponse, SuccessResponse, TaskApprovalResponse, TaskFeedbackRequest,
+    ConflictErrorResponse, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
+    TaskFeedbackRequest,
 };
 use super::AppState;
 use crate::db::{ConvMode, Conversation, MessageContent};
@@ -57,6 +58,7 @@ fn reject_if_continued(conv: &Conversation, action: &str) -> Result<(), AppError
 pub(crate) async fn approve_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    body: Option<Json<TaskApprovalRequest>>,
 ) -> Result<Json<TaskApprovalResponse>, AppError> {
     // 1. Validate conversation exists and is in AwaitingTaskApproval state
     let conv = state
@@ -79,13 +81,14 @@ pub(crate) async fn approve_task(
         ));
     }
 
+    let handoff = body.map(|Json(req)| req.handoff).unwrap_or_default();
     // 3. Dispatch approval event to state machine
     state
         .runtime
         .send_event(
             &id,
             Event::TaskApprovalResponse {
-                outcome: TaskApprovalOutcome::Approved,
+                outcome: TaskApprovalOutcome::Approved { handoff },
             },
         )
         .await

@@ -37,7 +37,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 
 /// Request to spawn a sub-agent
 #[derive(Debug)]
@@ -64,6 +64,31 @@ pub enum EvictionReason {
     /// The conversation's model was changed; the runtime is recreated so the
     /// new model takes effect.
     ModelUpgrade,
+}
+
+#[derive(Debug)]
+pub struct TaskApprovalHandoffRequest {
+    pub parent_conversation_id: String,
+    pub approval: TaskApprovalHandoffData,
+    pub response_tx: oneshot::Sender<Result<TaskApprovalHandoffResponse, String>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskApprovalHandoffData {
+    pub task_id: String,
+    pub task_title: String,
+    pub branch_name: String,
+    pub worktree_path: String,
+    pub base_branch: String,
+    pub title: String,
+    pub priority: String,
+    pub plan: String,
+    pub task_file: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TaskApprovalHandoffResponse {
+    pub successor_conv_id: String,
 }
 
 /// Manager for all conversation runtimes
@@ -114,6 +139,8 @@ pub struct RuntimeManager {
     /// Channel for sub-agent cancel requests
     cancel_tx: mpsc::Sender<SubAgentCancelRequest>,
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
+    handoff_tx: mpsc::Sender<TaskApprovalHandoffRequest>,
+    handoff_rx: RwLock<Option<mpsc::Receiver<TaskApprovalHandoffRequest>>>,
     /// Credential helper for recovery settlement (REQ-BED-030).
     credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
     /// Receiver for browser session lifecycle edges. Taken once by
@@ -822,6 +849,7 @@ impl RuntimeManager {
     ) -> Self {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
+        let (handoff_tx, handoff_rx) = mpsc::channel(32);
         // Browser session lifecycle channel. Unbounded because the volume is
         // O(user-clicks-on-browser-tools) — a tightly bounded channel could
         // drop edges and desync the UI's "session live" indicator. The
@@ -845,6 +873,8 @@ impl RuntimeManager {
             spawn_rx: RwLock::new(Some(spawn_rx)),
             cancel_tx,
             cancel_rx: RwLock::new(Some(cancel_rx)),
+            handoff_tx,
+            handoff_rx: RwLock::new(Some(handoff_rx)),
             credential_helper,
             browser_lifecycle_rx: RwLock::new(Some(browser_lifecycle_rx)),
         }
@@ -938,8 +968,11 @@ impl RuntimeManager {
         // Take the receivers (can only be done once)
         let spawn_rx = self.spawn_rx.write().await.take();
         let cancel_rx = self.cancel_rx.write().await.take();
+        let handoff_rx = self.handoff_rx.write().await.take();
 
-        if let (Some(mut spawn_rx), Some(mut cancel_rx)) = (spawn_rx, cancel_rx) {
+        if let (Some(mut spawn_rx), Some(mut cancel_rx), Some(mut handoff_rx)) =
+            (spawn_rx, cancel_rx, handoff_rx)
+        {
             tokio::spawn(async move {
                 loop {
                     tokio::select! {
@@ -949,12 +982,35 @@ impl RuntimeManager {
                         Some(req) = cancel_rx.recv() => {
                             manager.handle_cancel_request(req).await;
                         }
+                        Some(req) = handoff_rx.recv() => {
+                            manager.handle_task_handoff_request(req).await;
+                        }
                         else => break,
                     }
                 }
-                tracing::info!("Sub-agent handler stopped");
+                tracing::info!("Sub-agent/task-handoff handler stopped");
             });
         }
+    }
+
+    async fn handle_task_handoff_request(self: &Arc<Self>, req: TaskApprovalHandoffRequest) {
+        let result = self.create_and_start_task_handoff(&req).await;
+        let _ = req.response_tx.send(result);
+    }
+
+    async fn create_and_start_task_handoff(
+        self: &Arc<Self>,
+        req: &TaskApprovalHandoffRequest,
+    ) -> Result<TaskApprovalHandoffResponse, String> {
+        let successor = self
+            .db
+            .create_task_approval_handoff_conversation(&req.parent_conversation_id, &req.approval)
+            .await
+            .map_err(|e| e.to_string())?;
+        let _ = self.get_or_create(&successor.id).await?;
+        Ok(TaskApprovalHandoffResponse {
+            successor_conv_id: successor.id,
+        })
     }
 
     /// Handle a sub-agent spawn request
@@ -1120,6 +1176,7 @@ impl RuntimeManager {
         )
         .with_parent(parent_event_tx.clone())
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
+        .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
 
         // 7. Store handle
@@ -1382,6 +1439,7 @@ impl RuntimeManager {
         )
         .with_steering_queue(conv.steering_queue)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
+        .with_task_handoff_channel(self.handoff_tx.clone())
         .with_credential_helper(self.credential_helper.clone());
 
         // If auto-continuing, inject a system message so the LLM knows a restart
@@ -1654,6 +1712,8 @@ impl RuntimeManager {
             ConvState::AwaitingTaskApproval { .. }
             | ConvState::AwaitingUserResponse { .. }
             | ConvState::ContextExhausted { .. }
+            | ConvState::HandedOff { .. }
+            | ConvState::SeededLlmRequesting { .. }
             | ConvState::Terminal => {
                 tracing::debug!(
                     conv_id = %conversation_id,

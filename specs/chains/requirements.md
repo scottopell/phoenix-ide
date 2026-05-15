@@ -61,8 +61,10 @@ latest conversation in the chain would be misleading.
 
 ### REQ-CHN-002: Continuation Chains Surface as First-Class Entities
 
-WHEN two or more conversations share a continuation lineage (one was
-created via "continue in new conversation" from another)
+WHEN two or more conversations share a linear handoff lineage through
+`continued_in_conv_id` (one was created via "continue in new conversation"
+from another, or a managed Explore task approval was handed off to a fresh
+Work conversation)
 THE SYSTEM SHALL present them as a grouped chain in conversation
 navigation surfaces, identifiable by the chain's root conversation as
 its identity
@@ -226,7 +228,8 @@ configurable object.
   card to resume.
 - **Manual chain membership editing.** Adding or removing arbitrary
   conversations from a chain. Membership stays derived from
-  `continued_in_conv_id`.
+  `continued_in_conv_id`; supported edges are context continuation and
+  approved-task fresh Work handoff.
 - **Q&A editing or deletion.** Q&A history is append-only.
 - **Follow-up Q&A with prior-Q&A model context.** REQ-CHN-006 keeps
   invocations stateless; the model never sees prior Q&A from the

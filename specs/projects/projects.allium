@@ -461,7 +461,8 @@ rule MaterializeBranch {
 -- uncommitted. Tool availability (Explore only, no sub-agents) enforced
 -- by bedrock.
 
--- REQ-PROJ-004/006/028: User approves task — permission upgrade + commit
+-- REQ-PROJ-004/006/028: User approves task into the current conversation —
+-- permission upgrade + commit
 -- the (already-written) task file on the task branch.
 -- Subscribes to bedrock's UserApprovesTask event (see bedrock.allium).
 --
@@ -474,6 +475,7 @@ rule MaterializeBranch {
 -- `task_id` is the sanitized stem. See the guidance below.
 rule TaskApprovalExecuted {
     when: UserApprovesTask(conversation, decision)
+    requires: decision = approved_continue_current
 
     -- Bedrock handles the state transition (AwaitingTaskApproval -> LlmRequesting).
     -- This rule specifies the git side effects.
@@ -538,6 +540,30 @@ rule TaskApprovalExecuted {
         --
         -- Rollback: branch-rename failure keeps the temp name and logs a
         -- warning; a failed commit leaves the index/worktree as-is.
+}
+
+-- Fresh approval performs the same git approval work but creates a Work
+-- successor and links the Explore predecessor through continued_in_conv_id so
+-- Chains retain one derived lineage graph.
+rule TaskApprovalFreshHandoffExecuted {
+    when: UserApprovesTask(conversation, decision)
+    requires: decision = approved_start_fresh
+
+    let worktree = Worktree{conversation: conversation}
+    let task_id = parse_task_id(conversation.proposal.task_file)
+    let slug = parse_slug(conversation.proposal.task_file)
+    let branch_name = "task-" + task_id + "-" + slug
+    let successor = conversation.continued_in_conv_id
+
+    ensures: worktree.branch_name = branch_name
+    ensures: TaskFileCommittedOnBranch(worktree, task_id)
+    ensures: FreshWorkConversationCreated(conversation, successor)
+    ensures: successor.mode = work
+    ensures: successor.worktree_path = conversation.worktree_path
+    ensures: successor.task_id = task_id
+    ensures: conversation.continued_in_conv_id = successor
+    ensures: worktree.conversation = successor
+    ensures: conversation.parent_status = handed_off
 }
 
 -- REQ-PROJ-004 propose/feedback/reject loop: no git operations. Until

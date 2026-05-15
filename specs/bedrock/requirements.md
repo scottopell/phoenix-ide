@@ -527,11 +527,26 @@ THE AwaitingTaskApproval state SHALL carry: `task_file` (the path), plus a displ
   as a rollout shim; a row with an empty `task_file` is surfaced as a "reject and
   re-propose" error rather than silently resetting to Idle.)
 
-WHEN the user approves the task while in AwaitingTaskApproval
+THE HandedOff state SHALL carry `successor_conv_id` and reject further user messages;
+  it represents a read-only predecessor whose live work belongs to the successor
+  linked by `continued_in_conv_id`.
+
+WHEN the user approves the task while in AwaitingTaskApproval with the
+`continue_in_current_conversation` handoff policy
 THE SYSTEM SHALL rename the worktree's temp branch in place to `task-{NNNN}-{slug}`
   (the worktree already exists — REQ-PROJ-028), promote the task file's status to
   `in-progress` if needed, commit it on that branch (never on main), and transition the
   conversation to Idle in Work mode
+
+WHEN the user approves the task while in AwaitingTaskApproval with the
+`start_fresh_work_conversation` handoff policy
+THE SYSTEM SHALL perform the same task approval git operations
+AND create a fresh Work conversation that owns the approved task branch/worktree
+AND link the Explore predecessor to that Work successor through `continued_in_conv_id`
+AND mark the Explore predecessor read-only as `HandedOff`
+AND dispatch the next LLM request only in the Work successor
+AND seed the Work successor's first LLM-visible context from the approved task brief
+  and approval metadata, excluding the Explore transcript
 
 WHEN the user provides annotation feedback while in AwaitingTaskApproval
 THE SYSTEM SHALL close the prose reader

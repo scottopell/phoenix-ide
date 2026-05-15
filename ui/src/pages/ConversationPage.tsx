@@ -976,6 +976,7 @@ function ConversationPageContent() {
   const showTerminal =
     !!conversationId &&
     convStateForChildren.type !== 'terminal' &&
+    convStateForChildren.type !== 'handed_off' &&
     convStateForChildren.type !== 'context_exhausted';
 
   // Derived: model context window is a pure function of the current model's
@@ -1201,6 +1202,31 @@ function ConversationPageContent() {
           </div>
         </div>
       )}
+      {convStateForChildren.type === 'handed_off' && (
+        <div className="terminal-banner">
+          <span>Task approved. Work started in a fresh conversation.</span>
+          <button
+            type="button"
+            className="context-exhausted-continue"
+            onClick={async () => {
+              const successorId =
+                convStateForChildren.type === 'handed_off'
+                  ? convStateForChildren.successor_conv_id
+                  : null;
+              if (!successorId) return;
+              try {
+                const slug = await api.getConversationSlug(successorId);
+                if (slug) navigate(`/c/${slug}`);
+                else showInfo('Work conversation no longer exists');
+              } catch (err) {
+                showInfo(err instanceof Error ? err.message : 'Failed to open work conversation');
+              }
+            }}
+          >
+            {'→'} Open work conversation
+          </button>
+        </div>
+      )}
       {convStateForChildren.type === 'terminal' && (
         <div className="terminal-banner">
           <button
@@ -1251,7 +1277,7 @@ function ConversationPageContent() {
           showToast={showInfo}
           onSubmitted={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
         />
-      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'terminal' ? (
+      ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
         <>
         {conversationId && (
           <WorkActions

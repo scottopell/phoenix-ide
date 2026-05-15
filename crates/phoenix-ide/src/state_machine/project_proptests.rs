@@ -558,7 +558,7 @@ mod random_walk {
                 _ => Event::UserTriggerContinuation,
             },
 
-            ConvState::LlmRequesting { attempt } => {
+            ConvState::LlmRequesting { attempt } | ConvState::SeededLlmRequesting { attempt, .. } => {
                 match rng.gen_range(0..4) {
                     0 => {
                         // LlmResponse: text-only or with tool calls
@@ -722,14 +722,21 @@ mod random_walk {
                 _ => Event::UserCancel { reason: None },
             },
 
-            ConvState::AwaitingTaskApproval { .. } => match rng.gen_range(0..4) {
+            ConvState::AwaitingTaskApproval { .. } => match rng.gen_range(0..5) {
                 0 => Event::TaskApprovalResponse {
-                    outcome: TaskApprovalOutcome::Approved,
+                    outcome: TaskApprovalOutcome::Approved {
+                        handoff: crate::state_machine::state::TaskApprovalHandoff::ContinueInCurrentConversation,
+                    },
                 },
                 1 => Event::TaskApprovalResponse {
-                    outcome: TaskApprovalOutcome::Rejected,
+                    outcome: TaskApprovalOutcome::Approved {
+                        handoff: crate::state_machine::state::TaskApprovalHandoff::StartFreshWorkConversation,
+                    },
                 },
                 2 => Event::TaskApprovalResponse {
+                    outcome: TaskApprovalOutcome::Rejected,
+                },
+                3 => Event::TaskApprovalResponse {
                     outcome: TaskApprovalOutcome::FeedbackProvided {
                         annotations: random_string(rng, 20),
                     },
@@ -763,6 +770,7 @@ mod random_walk {
 
             // Terminal states -- events are absorbed, generate anything
             ConvState::ContextExhausted { .. }
+            | ConvState::HandedOff { .. }
             | ConvState::Terminal
             | ConvState::Completed { .. }
             | ConvState::Failed { .. } => Event::UserCancel { reason: None },

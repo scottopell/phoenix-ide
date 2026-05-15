@@ -204,15 +204,16 @@ entity Conversation {
 -- CANNOT reach Completed or Failed (sub-agent-only).
 variant Parent : Conversation {
     parent_status: awaiting_recovery | awaiting_task_approval
-                  | awaiting_user_response | context_exhausted | terminal
+                  | awaiting_user_response | context_exhausted | handed_off | terminal
 
     proposal: TaskProposal when parent_status = awaiting_task_approval
     pending_questions: List<UserQuestion> when parent_status = awaiting_user_response
     recovery_kind: RecoveryKind when parent_status = awaiting_recovery
     recovery_message: String when parent_status = awaiting_recovery
     continuation_summary: String when parent_status = context_exhausted
+    successor: Conversation when parent_status = handed_off
 
-    is_terminal: parent_status in { context_exhausted, terminal }
+    is_terminal: parent_status in { context_exhausted, handed_off, terminal }
 
     -- Parent-only status transitions.
     -- Recovery/approval/question states exit by resetting to a core_status
@@ -223,7 +224,8 @@ variant Parent : Conversation {
     -- the Allium v3 grammar does not currently support transitions or
     -- invariants inside `variant` bodies — see the triage note below):
     --
-    --   awaiting_task_approval -> idle            (task approval exits)
+    --   awaiting_task_approval -> idle            (approval in current exits)
+    --   awaiting_task_approval -> handed_off      (approval into fresh Work exits)
     --   awaiting_user_response -> idle            (user question exits)
     --   awaiting_recovery      -> idle            (recovery exits)
     --   awaiting_continuation  -> context_exhausted (continuation -> terminal)
@@ -661,15 +663,28 @@ rule CancelDuringRecovery {
 -- PARENT 5. TASK APPROVAL (REQ-BED-028)
 -- ===========================================================
 
-rule UserApprovesTask {
+rule UserApprovesTaskCurrentConversation {
     when: TaskApprovalDecided(conversation, decision)
     requires: conversation.parent_status = awaiting_task_approval
-    requires: decision = approved
+    requires: decision = approved_continue_current
     ensures: conversation.mode = work
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: ModeTransitioned(conversation, from: explore, to: work)
     ensures: LlmRequestDispatched(conversation)
+}
+
+rule UserApprovesTaskFreshWorkConversation {
+    when: TaskApprovalDecided(conversation, decision)
+    requires: conversation.parent_status = awaiting_task_approval
+    requires: decision = approved_start_fresh
+    let successor = conversation.continued_in_conv_id
+    ensures: FreshWorkConversationCreated(conversation, successor)
+    ensures: conversation.continued_in_conv_id = successor
+    ensures: conversation.parent_status = handed_off
+    ensures: conversation.successor = successor
+    ensures: successor.mode = work
+    ensures: LlmRequestDispatched(successor)
 }
 
 rule UserProvidesFeedback {

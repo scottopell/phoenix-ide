@@ -344,6 +344,13 @@ pub struct ExpansionErrorResponse {
     pub reference: String,
 }
 
+/// Request to approve a proposed task plan.
+#[derive(Debug, Deserialize, Default)]
+pub struct TaskApprovalRequest {
+    #[serde(default)]
+    pub handoff: crate::state_machine::state::TaskApprovalHandoff,
+}
+
 /// Request to provide feedback on a proposed task plan
 #[derive(Debug, Deserialize)]
 pub struct TaskFeedbackRequest {
