@@ -100,8 +100,11 @@ export interface Conversation {
    *  per-conversation tmux session (server has tmux on PATH). The composer
    *  uses this to label terminal-selection snippets with the tmux pane id,
    *  so the LLM can follow up via the existing `tmux` tool to capture more
-   *  of the pane on demand. Always populated by the server (defaulting to
-   *  false in the stateless list-endpoint enricher). */
+   *  of the pane on demand. Server populates from
+   *  `TmuxRegistry::binary_available()` on every payload — SSE init *and*
+   *  list-endpoint serialization route through `enrich_conversation_with_runtime`,
+   *  so the 5s poll's snapshot upsert never clobbers a true value back to
+   *  false (regression history: PR #92). */
   terminal_uses_tmux: boolean;
 }
 

@@ -76,7 +76,19 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       }
     }
     this.slugByConvId.set(conversation.id, slug);
-    return this.setAtom(slug, { ...current, conversation });
+    // Populate `conversationId` at the same time as `conversation`. Without
+    // this, an atom hydrated via snapshot (sidebar cache / list-page nav)
+    // has `conversation` but a null `conversationId`. The draft action
+    // dispatchers (`set_draft` / `append_draft` / `clear_draft`) guard on
+    // `expectedConversationId === atom.conversationId`, so they were
+    // silently no-ops until SSE init arrived and bumped `conversationId` —
+    // meaning users could not type into the composer for the first ~RTT of
+    // every cold conversation-page open. Copilot review on PR #92.
+    return this.setAtom(slug, {
+      ...current,
+      conversation,
+      conversationId: current.conversationId ?? conversation.id,
+    });
   }
 
   /**

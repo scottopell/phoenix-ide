@@ -32,6 +32,17 @@ describe('ConversationStore.upsertSnapshot (task 08684)', () => {
     expect(atom.lastSequenceId).toBe(0);
   });
 
+  it('populates conversationId from the snapshot id so draft dispatch is not gated on SSE init', () => {
+    // Regression: useDraftActions guards on `expectedConversationId ===
+    // atom.conversationId`. If `upsertSnapshot` leaves `conversationId`
+    // null, dispatches are silent no-ops until SSE init arrives — users
+    // cannot type into the composer for the first ~RTT of every cold open.
+    const store = new ConversationStore();
+    const conv = makeConv('alpha', { id: 'conv-123' });
+    store.upsertSnapshot('alpha', conv);
+    expect(store.getSnapshot('alpha').conversationId).toBe('conv-123');
+  });
+
   it('is a no-op when the row is identical to the held one', () => {
     const store = new ConversationStore();
     const conv = makeConv('alpha', { updated_at: '2024-06-01T00:00:00Z' });
