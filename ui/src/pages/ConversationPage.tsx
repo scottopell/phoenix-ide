@@ -6,7 +6,7 @@ import { isAgentWorking, isCancellingState, parseConversationState } from '../ut
 import { copyToClipboard } from '../utils/clipboard';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
-import { InputArea } from '../components/InputArea';
+import { ConnectedInputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
@@ -28,7 +28,13 @@ import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkActions } from '../components/WorkActions';
 import { useConversationAtom, useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
-import { useResizablePane, useIsDesktop, useIsWideDesktop, useDraft } from '../hooks';
+import {
+  useResizablePane,
+  useIsDesktop,
+  useIsWideDesktop,
+  useDraftActions,
+  DraftLifecycle,
+} from '../hooks';
 
 // Conditional overlays / heavy panels — code-split so the default render path
 // (chat view with no overlay open) doesn't pay their bundle cost.
@@ -208,14 +214,12 @@ function ConversationPageContent() {
   const sendingMessagesRef = useRef<Set<string>>(new Set());
   const inputRef = useRef<InputAreaHandle>(null);
 
-  // Page-scope draft control. Lives in the conversation atom; survives
-  // viewer-driven unmount/remount of `<InputArea>`. See ui/src/hooks/useDraft.ts.
-  // Destructure the callbacks because `draftCtl` itself is a fresh object
-  // each render — depending on the object would tear down memoized handlers
-  // and event listeners every render. The inner callbacks are useCallback'd
-  // against `[conversationId, dispatch]`, so they're stable.
-  const draftCtl = useDraft(slug!);
-  const { draft: draftValue, setDraft: setDraftCb, appendDraft: appendDraftCb } = draftCtl;
+  // Page-scope draft action handles. Only subscribes to the atom's
+  // `conversationId` slice (for `expectedConversationId` guarding), so
+  // ConversationPage does NOT re-render on every keystroke. The draft
+  // VALUE subscription lives inside `<ConnectedInputArea>` (composer
+  // subtree only) and `<DraftLifecycle>` (returns null — for persistence).
+  const { setDraft: setDraftCb, appendDraft: appendDraftCb } = useDraftActions(slug!);
 
   // Monotonic focus-request counter. Any time we mutate the draft from
   // outside the textarea (terminal selection, prose-reader notes, retry,
@@ -1020,6 +1024,14 @@ function ConversationPageContent() {
           : undefined
       }
     >
+      {/*
+        DraftLifecycle owns the conversation draft's localStorage hydration
+        and write-through persistence. Mounted at page level so it survives
+        any viewer-driven unmount of `<ConnectedInputArea>` on narrow
+        viewports. Renders null; serves only to host the keystroke-frequency
+        subscription without dragging it into the rest of the page.
+      */}
+      <DraftLifecycle slug={slug!} />
       <div className="conversation-column">
       {seedBreadcrumb}
       {browserView.browserSessionActive && !browserView.open && (
@@ -1213,8 +1225,9 @@ function ConversationPageContent() {
             />
           </Suspense>
         )}
-        <InputArea
+        <ConnectedInputArea
           ref={inputRef}
+          slug={slug!}
           conversationId={conversationId}
           convState={convStateForChildren}
           images={images}
@@ -1222,8 +1235,6 @@ function ConversationPageContent() {
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
-          draft={draftValue}
-          onDraftChange={setDraftCb}
           focusToken={focusToken}
           onSend={handleSend}
           onCancel={handleCancel}
@@ -1268,8 +1279,9 @@ function ConversationPageContent() {
             />
           </Suspense>
         )}
-        <InputArea
+        <ConnectedInputArea
           ref={inputRef}
+          slug={slug!}
           conversationId={conversationId}
           convState={convStateForChildren}
           images={images}
@@ -1277,8 +1289,6 @@ function ConversationPageContent() {
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
-          draft={draftValue}
-          onDraftChange={setDraftCb}
           focusToken={focusToken}
           onSend={handleSend}
           onCancel={handleCancel}

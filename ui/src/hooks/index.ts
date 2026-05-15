@@ -1,6 +1,12 @@
 export { useLocalStorage, useLocalStorageString } from './useLocalStorage';
 export { useKeyboardNav, useGlobalKeyboardShortcuts } from './useKeyboardNav';
-export { useDraft } from './useDraft';
+export {
+  useDraftValue,
+  useDraftActions,
+  useDraftLifecycle,
+  DraftLifecycle,
+} from './useDraft';
+export type { DraftActions } from './useDraft';
 export { FocusScopeProvider, useFocusScope, useRegisterFocusScope } from './useFocusScope';
 export {
   useMessageQueue,

@@ -155,3 +155,46 @@ function byUpdatedAtDesc(a: Conversation, b: Conversation): number {
   if (a.updated_at < b.updated_at) return 1;
   return 0;
 }
+
+/**
+ * Subscribe to a slice of `ConversationAtom` via a selector. The component
+ * re-renders only when the selector's return value changes (via
+ * `useSyncExternalStore`'s `Object.is` comparison) — so keystroke-level
+ * mutations to one field don't ripple through every consumer of the atom.
+ *
+ * The selector must be stable across renders OR return values that compare
+ * equal by `Object.is` (i.e. primitives or referentially-equal references).
+ * For object selectors, hoist them to module scope or memoize them.
+ *
+ * Companion primitives:
+ *   - `useConversationDispatch(slug)` returns just the dispatch function,
+ *     stable across renders, without subscribing to any state at all. Use
+ *     it from components that mutate the atom but never need to display
+ *     its content.
+ */
+export function useConversationSlice<T>(
+  slug: string,
+  selector: (atom: ConversationAtom) => T,
+): T {
+  const store = useConversationStore();
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => selector(store.getSnapshot(slug)),
+    [store, slug, selector],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+/**
+ * Returns a stable `dispatch(action)` for `slug`, without subscribing to
+ * any atom state. Components that only mutate (no display) never re-render
+ * on atom changes. Pair with {@link useConversationSlice} when a component
+ * also needs to read selected fields.
+ */
+export function useConversationDispatch(slug: string): Dispatch<SSEAction> {
+  const store = useConversationStore();
+  return useCallback((action: SSEAction) => store.dispatch(slug, action), [store, slug]);
+}
