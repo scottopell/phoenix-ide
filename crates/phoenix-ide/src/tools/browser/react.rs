@@ -104,6 +104,12 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
   var __commits = [];
   var __COMMITS_CAP = 500;
   var __TOP_N = 20;
+  // REQ-BT-019.13: set true the first time any commit carries a numeric
+  // fiber.actualDuration. Distinguishes a profiling-capable React build
+  // (measured) from a production build that never exposes actualDuration
+  // (no_profiling_build). Reset by __resetCommits() so a per-run bracket
+  // re-derives it from that run's commits.
+  var __sawActualDuration = false;
 
   // Walk the fiber tree from a root collecting per-component render cost
   // plus a best-effort why-did-render attribution. Defensive throughout:
@@ -120,6 +126,7 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
         if (fiber.child) stack.push(fiber.child);
         var dur = fiber.actualDuration;
         if (typeof dur !== 'number') continue;
+        __sawActualDuration = true;
         var name = 'Unknown';
         try {
           var t = fiber.type;
@@ -144,7 +151,30 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
             for (k in cur) keys[k] = true;
             for (k in prev) keys[k] = true;
             for (k in keys) {
-              if (cur[k] !== prev[k]) rec.changedProps.push(k);
+              if (cur[k] !== prev[k]) {
+                // REQ-BT-019.17: label, do not diagnose. A bare !== flags
+                // an inline object/array/fn prop (new reference every
+                // render) the same as a real value change; an agent reads
+                // the bare key as a root cause. Classify cheaply so the
+                // #1 false positive is labelled, not stated as fact.
+                var cv = cur[k];
+                var pv = prev[k];
+                var ct = typeof cv;
+                var pt = typeof pv;
+                var curRef = (cv !== null && (ct === 'object' || ct === 'function'));
+                var prevRef = (pv !== null && (pt === 'object' || pt === 'function'));
+                var kind;
+                if (curRef || prevRef) {
+                  kind = 'reference_changed';
+                } else if (ct !== pt) {
+                  kind = 'value_changed';
+                } else if (ct === 'undefined' || cv === null || pv === null) {
+                  kind = 'value_changed';
+                } else {
+                  kind = 'value_changed';
+                }
+                rec.changedProps.push({ key: k, kind: kind });
+              }
             }
           } catch (e) {}
           try {
@@ -504,8 +534,9 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
      *
      * Each record: { ts, count, mountCount, updateCount,
      * totalActualDuration, components: [{name, actualDuration, phase,
-     * changedProps, changedHooks}, ...] }. Used by the run_scenario
-     * harness (REQ-BT-019.4) to read React commit metrics per run.
+     * changedProps: [{key, kind}], changedHooks}, ...] }. kind is
+     * reference_changed | value_changed | unknown (REQ-BT-019.17). Used
+     * by the run_scenario harness (REQ-BT-019.4) per run.
      */
     __getCommits: function() {
       return __commits.slice();
@@ -519,15 +550,42 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
      */
     __resetCommits: function() {
       __commits.length = 0;
+      __sawActualDuration = false;
     },
 
     /**
-     * __getWhyRender() → array of {name, changedProps, changedHooks}
+     * __reactStatus() returns 'measured' | 'absent' | 'no_profiling_build'
+     *
+     * REQ-BT-019.13 React-capability probe. The harness reads this so a
+     * not-taken React measurement is never a numeric 0:
+     *   - absent              no renderers / no fiber roots (no React).
+     *   - no_profiling_build  React present but no commit ever carried a
+     *                         numeric actualDuration (production build).
+     *   - measured            React present and actualDuration seen.
+     * Defensive: any throw returns absent (the safe no-data default).
+     */
+    __reactStatus: function() {
+      try {
+        var roots = getAllFiberRoots();
+        if (!roots || roots.length === 0) return 'absent';
+        return __sawActualDuration ? 'measured' : 'no_profiling_build';
+      } catch (e) {
+        return 'absent';
+      }
+    },
+
+    /**
+     * __getWhyRender() → { note, components: [{name, changedProps,
+     *                       changedHooks}] }
      *
      * Best-effort why-did-render attribution (REQ-BT-019.8) derived from
      * the recorded commits: every update-phase component that re-rendered
      * with at least one changed prop or hook, with the changed keys merged
-     * across all commits in the buffer.
+     * across all commits in the buffer. Each changedProps entry is
+     * {key, kind} where kind is reference_changed | value_changed |
+     * unknown (REQ-BT-019.17); reference_changed wins on conflict. `note`
+     * states the comparison is a shallow reference compare so an agent
+     * does not read a new-reference-every-render prop as a root cause.
      */
     __getWhyRender: function() {
       var byName = {};
@@ -543,19 +601,39 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
             byName[c.name] = { name: c.name, changedProps: {}, changedHooks: {} };
           }
           var k;
-          for (k = 0; k < cp.length; k++) byName[c.name].changedProps[cp[k]] = true;
+          // REQ-BT-019.17: each changedProps entry is {key, kind}.
+          // reference_changed wins over value_changed when the same prop
+          // appears with both kinds across commits (it is the louder
+          // false-positive signal an agent must see).
+          for (k = 0; k < cp.length; k++) {
+            var e = cp[k];
+            var pk = (e && e.key != null) ? e.key : e;
+            var pkind = (e && e.kind) ? e.kind : 'unknown';
+            var existing = byName[c.name].changedProps[pk];
+            if (!existing || existing !== 'reference_changed') {
+              byName[c.name].changedProps[pk] = pkind;
+            }
+          }
           for (k = 0; k < ch.length; k++) byName[c.name].changedHooks[ch[k]] = true;
         }
       }
       var out = [];
       for (var name in byName) {
+        var cpMap = byName[name].changedProps;
+        var props = [];
+        for (var pk2 in cpMap) {
+          props.push({ key: pk2, kind: cpMap[pk2] });
+        }
         out.push({
           name: name,
-          changedProps: Object.keys(byName[name].changedProps),
+          changedProps: props,
           changedHooks: Object.keys(byName[name].changedHooks).map(Number)
         });
       }
-      return out;
+      return {
+        note: 'shallow reference compare; inline object/array/fn props change reference every render (reference_changed), which is not necessarily a real value change',
+        components: out
+      };
     }
   };
 })();

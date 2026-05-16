@@ -2097,6 +2097,60 @@ async fn test_browser_profile_help_no_browser() {
     manager.shutdown_all().await;
 }
 
+/// REQ-BT-019.14 / Allium RunScenarioRejectsInlineNavigation: a
+/// `navigate` (or `reload`) step inside `steps` resets the cumulative
+/// Performance counters mid-bracket. The harness must reject it BEFORE
+/// any run — naming the offending step — and produce NO sample set.
+/// Non-gated: rejection happens at validation, before any browser use.
+#[tokio::test]
+async fn test_browser_profile_rejects_inline_navigation() {
+    let (ctx, manager) = test_context("test-profile-reject-nav");
+
+    let nav = BrowserProfileTool
+        .run(
+            json!({
+                "action": "run_scenario",
+                "runs": 2,
+                "steps": [
+                    { "kind": "eval", "expression": "1+1" },
+                    { "kind": "navigate", "url": "about:blank" }
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(!nav.success, "navigate in steps must be rejected");
+    assert!(
+        nav.output.contains("steps[1]") && nav.output.contains("navigate"),
+        "error must name the offending step index/kind: {}",
+        nav.output
+    );
+    assert!(
+        nav.display_data.is_none(),
+        "rejection must produce NO ScenarioRunResult/display_data: {:?}",
+        nav.display_data
+    );
+
+    let rel = BrowserProfileTool
+        .run(
+            json!({
+                "action": "run_scenario",
+                "runs": 2,
+                "steps": [ { "kind": "reload" } ]
+            }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(!rel.success, "reload in steps must be rejected");
+    assert!(
+        rel.output.contains("steps[0]") && rel.output.contains("reload"),
+        "error must name the reload step: {}",
+        rel.output
+    );
+
+    manager.shutdown_all().await;
+}
+
 /// Gated end-to-end test: `metrics` returns numbers, and `run_scenario`
 /// with runs>=2 returns a RAW array of length == runs (asserting it is NOT
 /// statistically reduced — the REQ-BT-019.5 hard constraint).
@@ -2188,4 +2242,84 @@ async fn test_browser_profile_metrics_and_raw_scenario() {
     );
 
     shutdown_test(manager, server).await;
+}
+
+/// Gated: REQ-BT-019.16/.18 — a run with `reset:"none"` and no throttle
+/// must surface a non-empty `methodology_warnings` containing the reset
+/// and throttle warnings, ALONGSIDE a `raw_samples` array whose length
+/// still equals `runs` (the REQ-BT-019.5 hard constraint is intact —
+/// warnings are sibling metadata, never a reduction of the samples).
+#[tokio::test]
+async fn test_browser_profile_methodology_warnings_intact_raw_samples() {
+    require_chrome!();
+
+    let (ctx, manager) = test_context("test-profile-warnings");
+    // about:blank is the default page; no server needed.
+    BrowserNavigateTool
+        .run(json!({"url": "about:blank"}), ctx.clone())
+        .await;
+
+    let runs = 2u32;
+    let r = BrowserProfileTool
+        .run(
+            json!({
+                "action": "run_scenario",
+                "runs": runs,
+                "warmup": 0,
+                "reset": "none",
+                "steps": [ { "kind": "eval", "expression": "1+1" } ]
+            }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(r.success, "run_scenario should succeed: {}", r.output);
+    let display = r.display_data.expect("must attach display_data");
+
+    let warnings = display["methodology_warnings"]
+        .as_array()
+        .expect("methodology_warnings must be an array");
+    assert!(
+        !warnings.is_empty(),
+        "warnings must be non-empty for reset=none + no throttle: {display}"
+    );
+    let joined = warnings
+        .iter()
+        .filter_map(|w| w.as_str())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        joined.contains("reset disabled"),
+        "must warn about disabled reset: {joined}"
+    );
+    assert!(
+        joined.contains("no CPU throttle"),
+        "must warn about missing throttle: {joined}"
+    );
+
+    // Hard constraint still intact: raw_samples length == runs, and the
+    // warnings did NOT replace or reduce the sample array.
+    let raw = display["raw_samples"]
+        .as_array()
+        .expect("raw_samples must be an ARRAY (never a reduction)");
+    assert_eq!(
+        raw.len(),
+        runs as usize,
+        "raw_samples length must still equal runs ({runs}) with warnings present"
+    );
+    // Each sample carries the tri-state discriminators (REQ-BT-019.13/.15).
+    for (i, s) in raw.iter().enumerate() {
+        assert!(s.get("run_index").is_some(), "sample {i} missing run_index");
+        assert!(
+            s.get("react_status").is_some(),
+            "sample {i} missing react_status: {s}"
+        );
+        assert!(s.get("gc_ran").is_some(), "sample {i} missing gc_ran: {s}");
+        // gc_per_run defaulted true → js_heap_used should be a number here.
+        assert!(
+            s.get("js_heap_used").is_some(),
+            "sample {i} missing js_heap_used key (must be present even if null): {s}"
+        );
+    }
+
+    manager.shutdown_all().await;
 }

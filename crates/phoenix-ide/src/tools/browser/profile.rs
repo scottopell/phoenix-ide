@@ -89,15 +89,84 @@ struct ProfileInput {
     /// `run_scenario`: measured runs (>= 1).
     #[serde(default)]
     runs: Option<u32>,
-    /// `run_scenario`: discarded warmup runs (default 0).
+    /// `run_scenario`: discarded warmup runs. Default is 1
+    /// (REQ-BT-019.16) — see [`resolve_warmup`]. `Some(0)` is honoured
+    /// but raises a methodology warning.
     #[serde(default)]
     warmup: Option<u32>,
     /// `run_scenario`: throttle applied for the scenario only.
     #[serde(default)]
     throttle_rate: Option<f64>,
+    /// `run_scenario`: force a full GC once per run and read the live
+    /// heap at that single post-GC point (REQ-BT-019.15). Default true.
+    /// When false, `js_heap_used` is null and a warning is raised.
+    #[serde(default)]
+    gc_per_run: Option<bool>,
+    /// `run_scenario`: per-run reset (REQ-BT-019.18). Omitted = reload
+    /// the current URL before every run. `{"kind":"navigate","url":...}`
+    /// or `{"kind":"reload"}` for an explicit reset; the string `"none"`
+    /// opts out (and raises a methodology warning).
+    #[serde(default)]
+    reset: Option<ResetSpec>,
     /// `heap_snapshot`: optional baseline snapshot path to diff against.
     #[serde(default)]
     baseline: Option<String>,
+}
+
+/// Per-run reset directive (REQ-BT-019.18). Accepts either the string
+/// `"none"` or an object `{kind: "navigate"|"reload", url?}`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum ResetSpec {
+    /// The literal string `"none"` — opt out of per-run reset.
+    None(NoneLiteral),
+    /// `{kind:"navigate", url}` or `{kind:"reload"}`.
+    Action(ResetAction),
+}
+
+/// Deserialises only from the exact string `"none"`. A misspelt opt-out
+/// must not silently fall through to "no reset"; it errors at parse.
+#[derive(Debug, Clone, Deserialize)]
+enum NoneLiteral {
+    #[serde(rename = "none")]
+    None,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ResetAction {
+    Navigate { url: String },
+    Reload,
+}
+
+/// Resolved per-run reset behaviour after applying the default.
+#[derive(Debug, Clone)]
+enum Reset {
+    /// Reload the current URL (the default — REQ-BT-019.18).
+    ReloadCurrent,
+    /// Explicit `navigate{url}`.
+    Navigate(String),
+    /// Explicit `reload`.
+    Reload,
+    /// Explicit opt-out (`reset:"none"`) — raises a methodology warning.
+    Skip,
+}
+
+impl Reset {
+    fn resolve(spec: Option<&ResetSpec>) -> Reset {
+        match spec {
+            None => Reset::ReloadCurrent,
+            Some(ResetSpec::None(_)) => Reset::Skip,
+            Some(ResetSpec::Action(ResetAction::Navigate { url })) => Reset::Navigate(url.clone()),
+            Some(ResetSpec::Action(ResetAction::Reload)) => Reset::Reload,
+        }
+    }
+}
+
+/// REQ-BT-019.16: `warmup` defaults to 1 (cold JIT/first-paint excluded
+/// by default). An explicit `Some(0)` is honoured but flagged.
+fn resolve_warmup(warmup: Option<u32>) -> u32 {
+    warmup.unwrap_or(1)
 }
 
 /// One scenario step (REQ-BT-019.1). Readiness steps (`wait_*`) block the
@@ -237,7 +306,7 @@ impl Tool for BrowserProfileTool {
                 },
                 "steps": {
                     "type": "array",
-                    "description": "run_scenario only: ordered steps. Each step is an object with a `kind`: navigate{url}, reload, click{selector}, type{selector,text}, key{key,modifiers?}, eval{expression}, wait_selector{selector,timeout?}, wait_timing{mark,timeout?}, wait_eval{expression,timeout?}.",
+                    "description": "run_scenario only: ordered steps. Each step is an object with a `kind`: click{selector}, type{selector,text}, key{key,modifiers?}, eval{expression}, wait_selector{selector,timeout?}, wait_timing{mark,timeout?}, wait_eval{expression,timeout?}. NOTE: navigate/reload are NOT allowed in steps (they reset the cumulative Performance counters mid-run) — put navigation in `reset` instead. Include at least one wait_* readiness step or methodology_warnings will flag it.",
                     "items": { "type": "object" }
                 },
                 "runs": {
@@ -246,11 +315,22 @@ impl Tool for BrowserProfileTool {
                 },
                 "warmup": {
                     "type": "integer",
-                    "description": "run_scenario only: warmup runs discarded from results (default 0)."
+                    "description": "run_scenario only: warmup runs discarded from results. Default 1 (cold JIT/first-paint excluded). An explicit 0 is honoured but raises a methodology warning."
                 },
                 "throttle_rate": {
                     "type": "number",
-                    "description": "run_scenario only: CPU slowdown applied for the scenario, restored after (>= 1)."
+                    "description": "run_scenario only: CPU slowdown applied for the scenario, restored after (>= 1). Omitting it raises a methodology warning (host noise dominates)."
+                },
+                "gc_per_run": {
+                    "type": "boolean",
+                    "description": "run_scenario only: force a full GC once per run (outside the duration bracket) and read JSHeapUsedSize at that single post-GC point. Default true. When false, each sample's js_heap_used is null and a methodology warning is raised."
+                },
+                "reset": {
+                    "description": "run_scenario only: per-run reset for determinism. Omitted = reload the current URL before every run. Object {\"kind\":\"navigate\",\"url\":...} or {\"kind\":\"reload\"} for an explicit reset; the string \"none\" opts out (raises a methodology warning). Reset runs before the before-snapshot, so this is where navigation belongs (NOT in steps).",
+                    "oneOf": [
+                        { "type": "string", "enum": ["none"] },
+                        { "type": "object" }
+                    ]
                 },
                 "baseline": {
                     "type": "string",
@@ -320,17 +400,37 @@ Actions:
                     JSHeapUsedSize, so the memory number is deterministic.
 
   run_scenario    — THE harness. Params: steps (non-empty array), runs
-                    (int >= 1), warmup (int >= 0, default 0), throttle_rate
-                    (optional, restored after). Step kinds: navigate{url},
-                    reload, click{selector}, type{selector,text},
+                    (int >= 1), warmup (int >= 0, DEFAULT 1 — cold
+                    JIT/first-paint excluded; explicit 0 is allowed but
+                    warned), throttle_rate (optional, restored after),
+                    gc_per_run (bool, DEFAULT true), reset (see below).
+                    Step kinds: click{selector}, type{selector,text},
                     key{key,modifiers?}, eval{expression},
                     wait_selector{selector,timeout?},
                     wait_timing{mark,timeout?},
                     wait_eval{expression,timeout?}.
+                    navigate/reload are REJECTED inside steps (they reset
+                    the cumulative Performance counters mid-run) — put
+                    navigation in `reset`.
+                    reset (per-run determinism, REQ-BT-019.18): omitted =
+                    reload the current URL before every run;
+                    {\"kind\":\"navigate\",\"url\":...} or {\"kind\":\"reload\"}
+                    for an explicit reset; the string \"none\" opts out
+                    (and raises a methodology warning).
                     Returns the RAW per-run sample array — never a mean,
                     stddev, or any reduction. YOU own the statistics. If a
                     readiness step times out the whole operation fails,
                     names the blocking step, and returns ZERO samples.
+                    Each sample carries: react_status (measured | absent
+                    | no_profiling_build — a not-measured React timing is
+                    null, NEVER 0), react_commits (null only when React
+                    is absent), react_actual_ms (null unless measured),
+                    gc_ran (bool) and js_heap_used (post-GC live heap;
+                    null unless gc_ran). The result also carries a
+                    methodology_warnings list ALONGSIDE raw_samples
+                    (metadata only — not a statistical reduction): it
+                    flags no throttle, warmup=0, no readiness step, GC
+                    disabled, or reset disabled.
 
   cpu_start       — Start a Profiler CPU sampling session.
   cpu_stop        — Stop it; save the profile JSON (loadable in the
@@ -344,7 +444,11 @@ Actions:
                     {\"traceEvents\":[...]} JSON, and summarise tasks > 50ms.
 
   why_render      — Best-effort why-did-render: per re-rendered component,
-                    the changed prop keys and changed hook indices.
+                    the changed props (each labelled reference_changed |
+                    value_changed | unknown) and changed hook indices,
+                    plus a note that the compare is a shallow reference
+                    compare (an inline object/array/fn prop changes
+                    reference every render — labelled, NOT a root cause).
 
   heap_snapshot   — Take a .heapsnapshot to disk. Param: baseline
                     (optional path) — when given, diff: node-count delta,
@@ -498,8 +602,38 @@ async fn action_gc_heap(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
 // run_scenario (Tier 0, REQ-BT-019.1/.3/.4/.5) — THE harness
 // ============================================================================
 
+/// React measurement capability for a run (REQ-BT-019.13 / Allium
+/// `ReactStatus`). Serialises to the snake-case discriminator string.
+/// The whole point: `absent` / `no_profiling_build` are NOT a numeric 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ReactStatus {
+    Measured,
+    Absent,
+    NoProfilingBuild,
+}
+
+/// Typed tri-state result of probing React for one run (REQ-BT-019.13).
+/// Replaces the old `(0, 0.0)` return that conflated "no React", "no
+/// __phoenix", "eval error", and "production build".
+enum ReactReading {
+    /// Profiling-capable build: commit count + summed actualDuration.
+    Measured { commits: u64, actual_ms: f64 },
+    /// React present (production build) — count fires, no actualDuration.
+    NoProfilingBuild { commits: u64 },
+    /// No React on the page (or probe threw — the safe default).
+    Absent,
+}
+
 /// One raw per-run sample. Serialised verbatim into `raw_samples`; the
 /// harness never reduces these (invariant `RawSamplesNeverReduced`).
+///
+/// Every "not measured" field is `Option<T>` WITHOUT
+/// `skip_serializing_if`: the key is always present and serialises as
+/// JSON `null` so a not-taken measurement is visibly absent rather than
+/// looking like a real zero (REQ-BT-019.13/.15, invariants
+/// `ReactTimingOnlyWhenMeasured` / `ReactCommitsAbsentOnlyWhenNoReact` /
+/// `HeapOnlyWhenGc`).
 #[derive(Debug, Clone, serde::Serialize)]
 struct RunSample {
     run_index: u32,
@@ -507,11 +641,22 @@ struct RunSample {
     task_duration: f64,
     layout_count: f64,
     recalc_style_count: f64,
-    js_heap_used_size: f64,
     nodes: f64,
     js_event_listeners: f64,
-    react_commits: u64,
-    react_actual_ms: f64,
+    /// True iff a forced GC ran for this run (REQ-BT-019.15).
+    gc_ran: bool,
+    /// Post-full-GC live-heap read. `Some` ONLY when `gc_ran`; `None`
+    /// (JSON null) otherwise — invariant `HeapOnlyWhenGc`.
+    js_heap_used: Option<f64>,
+    /// Always present; discriminates the two Option fields below.
+    react_status: ReactStatus,
+    /// `Some` whenever React is on the page (incl. production builds —
+    /// the commit hook fires regardless); `None` (null) when React is
+    /// absent — invariant `ReactCommitsAbsentOnlyWhenNoReact`.
+    react_commits: Option<u64>,
+    /// `Some` ONLY when `react_status == measured`; `None` (null)
+    /// otherwise — invariant `ReactTimingOnlyWhenMeasured`.
+    react_actual_ms: Option<f64>,
 }
 
 fn metric_or_zero(m: &std::collections::BTreeMap<String, f64>, k: &str) -> f64 {
@@ -527,15 +672,49 @@ enum RunError {
     Infra(String),
 }
 
+/// Perform the per-run reset (REQ-BT-019.18) BEFORE the before-snapshot.
+/// A reset failure is an infra error for the run — never a bogus sample.
+async fn do_reset(session: &Arc<RwLock<BrowserSession>>, reset: &Reset) -> Result<(), RunError> {
+    let guard = session.read().await;
+    match reset {
+        Reset::Skip => Ok(()),
+        Reset::ReloadCurrent | Reset::Reload => guard
+            .page
+            .reload()
+            .await
+            .map(|_| ())
+            .map_err(|e| RunError::Infra(format!("per-run reset (reload) failed: {e}"))),
+        Reset::Navigate(url) => guard
+            .page
+            .goto(url)
+            .await
+            .map(|_| ())
+            .map_err(|e| RunError::Infra(format!("per-run reset (navigate {url}) failed: {e}"))),
+    }
+}
+
 /// Execute one scenario run with atomic before/after bracketing
 /// (Allium @guidance). `Ok(sample)` carries the bracketed metrics for
 /// this single execution; the caller decides whether to keep it (warmup
 /// runs are executed identically but discarded).
+///
+/// Per-run sequence (REQ-BT-019.14/.15/.18, Allium @guidance):
+///   reset → before-counters snapshot → reset `__phoenix` commit buffer →
+///   steps → after-counters snapshot (durations = after − before,
+///   computed HERE so the GC pause is outside the bracket) → if
+///   `gc_per_run`: collectGarbage then a heap-only read → React status +
+///   commits → emit one sample.
 async fn run_one(
     session: &Arc<RwLock<BrowserSession>>,
     steps: &[Step],
     run_index: u32,
+    reset: &Reset,
+    gc_per_run: bool,
 ) -> Result<RunSample, RunError> {
+    // Reset to a fixed state BEFORE the before-snapshot so runs are
+    // mutually comparable. Reset failure aborts the run cleanly.
+    do_reset(session, reset).await?;
+
     let before = read_metrics(session)
         .await
         .map_err(|e| RunError::Infra(format!("metrics snapshot failed: {e}")))?;
@@ -553,10 +732,50 @@ async fn run_one(
             return Err(RunError::Blocked(reason));
         }
     }
+    // AFTER snapshot — duration deltas are computed from THIS read so the
+    // forced-GC pause below is strictly outside the duration bracket
+    // (REQ-BT-019.15). nodes / js_event_listeners keep their absolute
+    // semantics from this pre-GC snapshot.
     let after = read_metrics(session)
         .await
         .map_err(|e| RunError::Infra(format!("metrics snapshot failed: {e}")))?;
-    let (react_commits, react_actual_ms) = read_commit_totals(session).await;
+
+    // Forced GC + heap read, strictly AFTER the duration bracket
+    // (REQ-BT-019.15 / invariant HeapOnlyWhenGc). When GC is disabled the
+    // heap field is null + gc_ran=false — never a mid-cycle value.
+    let (gc_ran, js_heap_used) = if gc_per_run {
+        {
+            let guard = session.read().await;
+            if let Err(e) = guard.page.execute(HeapEnableParams::default()).await {
+                return Err(RunError::Infra(format!(
+                    "per-run forced GC (HeapProfiler.enable) failed: {e}"
+                )));
+            }
+            if let Err(e) = guard.page.execute(CollectGarbageParams::default()).await {
+                return Err(RunError::Infra(format!(
+                    "per-run forced GC (collectGarbage) failed: {e}"
+                )));
+            }
+        }
+        // Heap-only read at the single post-full-GC point.
+        match read_metrics(session).await {
+            Ok(m) => (true, m.get("JSHeapUsedSize").copied()),
+            Err(e) => return Err(RunError::Infra(format!("post-GC heap read failed: {e}"))),
+        }
+    } else {
+        (false, None)
+    };
+
+    let (react_status, react_commits, react_actual_ms) = match read_react_reading(session).await {
+        ReactReading::Measured { commits, actual_ms } => {
+            (ReactStatus::Measured, Some(commits), Some(actual_ms))
+        }
+        ReactReading::NoProfilingBuild { commits } => {
+            (ReactStatus::NoProfilingBuild, Some(commits), None)
+        }
+        ReactReading::Absent => (ReactStatus::Absent, None, None),
+    };
+
     Ok(RunSample {
         run_index,
         script_duration: metric_or_zero(&after, "ScriptDuration")
@@ -567,9 +786,11 @@ async fn run_one(
             - metric_or_zero(&before, "LayoutCount"),
         recalc_style_count: metric_or_zero(&after, "RecalcStyleCount")
             - metric_or_zero(&before, "RecalcStyleCount"),
-        js_heap_used_size: metric_or_zero(&after, "JSHeapUsedSize"),
         nodes: metric_or_zero(&after, "Nodes"),
         js_event_listeners: metric_or_zero(&after, "JSEventListeners"),
+        gc_ran,
+        js_heap_used,
+        react_status,
         react_commits,
         react_actual_ms,
     })
@@ -577,7 +798,14 @@ async fn run_one(
 
 /// Build the success `ToolOutput`, escaping large raw-sample arrays to
 /// `/tmp`. `samples` is the untouched per-run vector — never reduced.
-async fn scenario_success_output(samples: &[RunSample], runs: u32, warmup: u32) -> ToolOutput {
+/// `warnings` is carried ALONGSIDE the samples (REQ-BT-019.16) — it is
+/// metadata, never a reduction of the samples (REQ-BT-019.5 still holds).
+async fn scenario_success_output(
+    samples: &[RunSample],
+    runs: u32,
+    warmup: u32,
+    warnings: &[String],
+) -> ToolOutput {
     // HARD CONSTRAINT (REQ-BT-019.5 / invariant RawSamplesNeverReduced):
     // emit the RAW per-run array verbatim. No mean/stddev/any reduction.
     let raw = serde_json::to_value(samples).unwrap_or(Value::Array(vec![]));
@@ -586,8 +814,10 @@ async fn scenario_success_output(samples: &[RunSample], runs: u32, warmup: u32) 
         "requested_runs": runs,
         "warmup": warmup,
         "raw_samples": raw,
+        "methodology_warnings": warnings,
         "note": "RAW per-run samples. The harness computes NO statistics — \
-                 compute mean/variance/significance yourself.",
+                 compute mean/variance/significance yourself. \
+                 methodology_warnings is metadata only (not a reduction).",
     });
     let pretty = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
     if pretty.len() > OUTPUT_ESCAPE_BYTES {
@@ -605,6 +835,57 @@ async fn scenario_success_output(samples: &[RunSample], runs: u32, warmup: u32) 
     }
 }
 
+/// REQ-BT-019.16/.18: build the `methodology_warnings` list — metadata
+/// flagging a run that is unguarded in a way that invalidates a naive
+/// reading. This is NOT a statistical reduction; it rides alongside the
+/// raw samples (REQ-BT-019.5 still holds).
+fn build_methodology_warnings(
+    input: &ProfileInput,
+    steps: &[Step],
+    gc_per_run: bool,
+    reset: &Reset,
+) -> Vec<String> {
+    let mut w: Vec<String> = Vec::new();
+    if input.throttle_rate.is_none() {
+        w.push(
+            "no CPU throttle — host/thermal noise dominates; results are not \
+             comparable across machines or thermal states"
+                .to_string(),
+        );
+    }
+    if input.warmup == Some(0) {
+        w.push(
+            "warmup=0 — cold JIT/first-paint is in the sample set; the first \
+             run(s) measure compilation, not steady state"
+                .to_string(),
+        );
+    }
+    let has_readiness = steps.iter().any(|s| {
+        matches!(
+            s,
+            Step::WaitSelector { .. } | Step::WaitTiming { .. } | Step::WaitEval { .. }
+        )
+    });
+    if !has_readiness {
+        w.push(
+            "no readiness step — measuring an indeterminate point (no \
+             wait_selector/wait_timing/wait_eval in steps)"
+                .to_string(),
+        );
+    }
+    if !gc_per_run {
+        w.push("per-run GC disabled — js_heap_used is null, heap not measured".to_string());
+    }
+    if matches!(reset, Reset::Skip) {
+        w.push(
+            "per-run reset disabled (reset=\"none\") — state bleeds across \
+             runs; runs are not mutually comparable"
+                .to_string(),
+        );
+    }
+    w
+}
+
 async fn action_run_scenario(
     session: &Arc<RwLock<BrowserSession>>,
     input: &ProfileInput,
@@ -614,11 +895,37 @@ async fn action_run_scenario(
         Some(s) if !s.is_empty() => s.clone(),
         _ => return ToolOutput::error("run_scenario requires a non-empty `steps` array"),
     };
+
+    // REQ-BT-019.14 / Allium RunScenarioRejectsInlineNavigation: a
+    // navigate/reload inside `steps` resets the cumulative Performance
+    // counters mid-bracket, making after−before negative or meaningless.
+    // Reject BEFORE any run executes — no ScenarioRunResult is produced,
+    // so there is no sample set to misread. Navigation belongs in `reset`.
+    for (i, step) in steps.iter().enumerate() {
+        let kind = match step {
+            Step::Navigate { .. } => Some("navigate"),
+            Step::Reload => Some("reload"),
+            _ => None,
+        };
+        if let Some(kind) = kind {
+            return ToolOutput::error(format!(
+                "run_scenario: steps[{i}] is a `{kind}` step. Navigation/reload \
+                 inside `steps` resets the cumulative Performance.getMetrics \
+                 counters mid-run, so the after−before delta is negative or \
+                 meaningless. Put navigation in the per-run `reset` instead \
+                 (it runs before the before-snapshot). No samples produced."
+            ));
+        }
+    }
+
     let runs = input.runs.unwrap_or(1);
     if runs < 1 {
         return ToolOutput::error("run_scenario requires `runs` >= 1");
     }
-    let warmup = input.warmup.unwrap_or(0);
+    // REQ-BT-019.16: warmup defaults to 1 (cold JIT/first-paint excluded).
+    let warmup = resolve_warmup(input.warmup);
+    let gc_per_run = input.gc_per_run.unwrap_or(true);
+    let reset = Reset::resolve(input.reset.as_ref());
     if let Some(tr) = input.throttle_rate {
         if tr < 1.0 {
             return ToolOutput::error(format!(
@@ -626,6 +933,10 @@ async fn action_run_scenario(
             ));
         }
     }
+
+    // REQ-BT-019.16/.18: methodology warnings — metadata flagging an
+    // unguarded run. Carried ALONGSIDE samples, never in place of them.
+    let warnings = build_methodology_warnings(input, &steps, gc_per_run, &reset);
 
     // Capture the prior throttle so it can be restored on return — whether
     // the operation completes OR is blocked (Allium @guidance).
@@ -647,7 +958,17 @@ async fn action_run_scenario(
     // (Allium @guidance). Throttle is restored on every exit path below.
     for global_idx in 0..total_runs {
         let is_warmup = global_idx < warmup;
-        match run_one(session, &steps, global_idx.saturating_sub(warmup)).await {
+        // Warmup runs execute identically (including the per-run reset)
+        // but are discarded.
+        match run_one(
+            session,
+            &steps,
+            global_idx.saturating_sub(warmup),
+            &reset,
+            gc_per_run,
+        )
+        .await
+        {
             Ok(sample) => {
                 if !is_warmup {
                     samples.push(sample);
@@ -665,6 +986,7 @@ async fn action_run_scenario(
                     "outcome": "blocked",
                     "blocked_step": reason,
                     "raw_samples": [],
+                    "methodology_warnings": warnings,
                 }));
             }
             Err(RunError::Infra(msg)) => {
@@ -676,7 +998,7 @@ async fn action_run_scenario(
 
     // Restore throttle on success too (Allium @guidance).
     restore_throttle(session, prior_throttle).await;
-    scenario_success_output(&samples, runs, warmup).await
+    scenario_success_output(&samples, runs, warmup, &warnings).await
 }
 
 /// Restore the throttle to its pre-scenario value. `None` means "browser
@@ -690,25 +1012,40 @@ async fn restore_throttle(session: &Arc<RwLock<BrowserSession>>, prior: Option<f
     with_profiling(session, |st| st.throttle_rate = prior).await;
 }
 
-/// Read total React commit count + summed actualDuration (ms) from the
-/// __phoenix buffer for the current run. Zeroes on non-React pages.
-async fn read_commit_totals(session: &Arc<RwLock<BrowserSession>>) -> (u64, f64) {
+/// Probe React status + commit totals in one eval round-trip
+/// (REQ-BT-019.13). Returns a typed tri-state so "no React", "no
+/// __phoenix", "eval error", and "production build" are no longer all
+/// the silent `(0, 0.0)` they used to be.
+///
+/// The script returns `[status, commitCount, totalActualMs]`. `status`
+/// is the `window.__phoenix.__reactStatus()` discriminator; on any throw
+/// or missing helper it yields `"absent"` (the safe no-data default).
+async fn read_react_reading(session: &Arc<RwLock<BrowserSession>>) -> ReactReading {
     let guard = session.read().await;
     let script = "(function(){\
         try {\
-          if (!window.__phoenix || !window.__phoenix.__getCommits) return [0,0];\
+          if (!window.__phoenix || !window.__phoenix.__getCommits \
+              || !window.__phoenix.__reactStatus) return ['absent',0,0];\
+          var status = window.__phoenix.__reactStatus();\
           var c = window.__phoenix.__getCommits();\
           var total = 0;\
           for (var i=0;i<c.length;i++) total += (c[i].totalActualDuration||0);\
-          return [c.length, total];\
-        } catch(e) { return [0,0]; }\
+          return [status, c.length, total];\
+        } catch(e) { return ['absent',0,0]; }\
       })()";
-    match guard.page.evaluate(script).await {
-        Ok(res) => match res.into_value::<(u64, f64)>() {
-            Ok((n, ms)) => (n, ms),
-            Err(_) => (0, 0.0),
+    let (status, commits, actual_ms): (String, u64, f64) = match guard.page.evaluate(script).await {
+        Ok(res) => match res.into_value::<(String, u64, f64)>() {
+            Ok(v) => v,
+            // Shape mismatch is treated as the safe no-data default.
+            Err(_) => ("absent".to_string(), 0, 0.0),
         },
-        Err(_) => (0, 0.0),
+        Err(_) => ("absent".to_string(), 0, 0.0),
+    };
+    match status.as_str() {
+        "measured" => ReactReading::Measured { commits, actual_ms },
+        "no_profiling_build" => ReactReading::NoProfilingBuild { commits },
+        // "absent" and any unrecognised value → absent (safe default).
+        _ => ReactReading::Absent,
     }
 }
 
@@ -1059,16 +1396,29 @@ async fn action_why_render(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput 
     match guard.page.evaluate(script).await {
         Ok(res) => match res.into_value::<Option<String>>() {
             Ok(Some(s)) => {
-                let parsed: Value = serde_json::from_str(&s).unwrap_or(Value::Array(vec![]));
-                let pretty =
-                    serde_json::to_string_pretty(&parsed).unwrap_or_else(|_| "[]".to_string());
-                if pretty == "[]" {
-                    ToolOutput::success(
+                // __getWhyRender() now returns {note, components:[...]}
+                // (REQ-BT-019.17): each changedProps entry is {key, kind}
+                // where kind ∈ reference_changed | value_changed | unknown.
+                let parsed: Value = serde_json::from_str(&s).unwrap_or(Value::Null);
+                let components = parsed.get("components").and_then(Value::as_array);
+                match components {
+                    Some(comps) if !comps.is_empty() => {
+                        let note = parsed
+                            .get("note")
+                            .and_then(Value::as_str)
+                            .unwrap_or("shallow reference compare");
+                        let pretty = serde_json::to_string_pretty(&parsed)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        ToolOutput::success(format!(
+                            "why-did-render ({} component(s)). NOTE: {note}\n\n{pretty}",
+                            comps.len()
+                        ))
+                        .with_display(json!({ "why_render": parsed }))
+                    }
+                    _ => ToolOutput::success(
                         "No re-renders with attributable prop/hook changes recorded \
                          (run a scenario or interact first, then call why_render).",
-                    )
-                } else {
-                    ToolOutput::success(pretty).with_display(json!({ "why_render": parsed }))
+                    ),
                 }
             }
             _ => ToolOutput::success(
@@ -1390,5 +1740,101 @@ mod tests {
         let w: Step = serde_json::from_value(json!({"kind":"wait_timing","mark":"ready"}))
             .expect("wait_timing");
         matches!(w, Step::WaitTiming { .. });
+    }
+
+    /// REQ-BT-019.13/.15 + cross-cutting: a not-measured field MUST
+    /// serialise as JSON `null` with the key PRESENT — absence visible,
+    /// never a real-looking zero. `react_status` / `gc_ran` always present.
+    #[test]
+    fn run_sample_not_measured_serializes_as_present_null() {
+        let s = RunSample {
+            run_index: 0,
+            script_duration: 1.0,
+            task_duration: 2.0,
+            layout_count: 0.0,
+            recalc_style_count: 0.0,
+            nodes: 10.0,
+            js_event_listeners: 3.0,
+            gc_ran: false,
+            js_heap_used: None,
+            react_status: ReactStatus::Absent,
+            react_commits: None,
+            react_actual_ms: None,
+        };
+        let v = serde_json::to_value(&s).expect("serialize");
+        let obj = v.as_object().expect("object");
+        // Keys PRESENT and explicitly null (not skipped).
+        for k in ["js_heap_used", "react_commits", "react_actual_ms"] {
+            assert!(obj.contains_key(k), "key {k} must be present");
+            assert!(
+                v[k].is_null(),
+                "key {k} must serialize as JSON null, got {}",
+                v[k]
+            );
+        }
+        // Always-present discriminators.
+        assert_eq!(v["react_status"], "absent");
+        assert_eq!(v["gc_ran"], false);
+
+        // Measured + GC variant: the same keys carry real numbers.
+        let s2 = RunSample {
+            react_status: ReactStatus::Measured,
+            react_commits: Some(4),
+            react_actual_ms: Some(12.5),
+            gc_ran: true,
+            js_heap_used: Some(2048.0),
+            ..s
+        };
+        let v2 = serde_json::to_value(&s2).expect("serialize2");
+        assert_eq!(v2["react_status"], "measured");
+        assert_eq!(v2["react_commits"], 4);
+        assert_eq!(v2["react_actual_ms"], 12.5);
+        assert_eq!(v2["gc_ran"], true);
+        assert_eq!(v2["js_heap_used"], 2048.0);
+
+        // no_profiling_build: commits present, timing still null.
+        let s3 = RunSample {
+            react_status: ReactStatus::NoProfilingBuild,
+            react_commits: Some(7),
+            react_actual_ms: None,
+            ..s2
+        };
+        let v3 = serde_json::to_value(&s3).expect("serialize3");
+        assert_eq!(v3["react_status"], "no_profiling_build");
+        assert_eq!(v3["react_commits"], 7);
+        assert!(
+            v3["react_actual_ms"].is_null(),
+            "no_profiling_build must keep react_actual_ms null"
+        );
+    }
+
+    /// REQ-BT-019.16: warmup defaults to 1 when omitted; an explicit
+    /// value (including 0) is honoured verbatim.
+    #[test]
+    fn warmup_defaults_to_one() {
+        assert_eq!(resolve_warmup(None), 1, "omitted warmup must default to 1");
+        assert_eq!(resolve_warmup(Some(0)), 0, "explicit 0 honoured");
+        assert_eq!(resolve_warmup(Some(5)), 5, "explicit value honoured");
+    }
+
+    /// REQ-BT-019.18: reset resolution. Omitted = reload current URL;
+    /// the string "none" = opt out; objects map to explicit actions.
+    #[test]
+    fn reset_resolves_per_spec() {
+        assert!(matches!(Reset::resolve(None), Reset::ReloadCurrent));
+
+        let none: ResetSpec = serde_json::from_value(json!("none")).expect("none string");
+        assert!(matches!(Reset::resolve(Some(&none)), Reset::Skip));
+
+        let nav: ResetSpec = serde_json::from_value(json!({"kind":"navigate","url":"about:blank"}))
+            .expect("navigate reset");
+        assert!(matches!(Reset::resolve(Some(&nav)), Reset::Navigate(u) if u == "about:blank"));
+
+        let rel: ResetSpec =
+            serde_json::from_value(json!({"kind":"reload"})).expect("reload reset");
+        assert!(matches!(Reset::resolve(Some(&rel)), Reset::Reload));
+
+        // A misspelt opt-out must NOT silently become "no reset".
+        assert!(serde_json::from_value::<ResetSpec>(json!("non")).is_err());
     }
 }

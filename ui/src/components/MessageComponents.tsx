@@ -327,11 +327,19 @@ function formatBrowserInput(name: string, input: Record<string, unknown>): strin
       switch (action) {
         case 'run_scenario': {
           const runs = input['runs'] ?? 1;
-          const warmup = input['warmup'] ?? 0;
+          const warmup = input['warmup'] ?? 1;
           const steps = Array.isArray(input['steps']) ? (input['steps'] as unknown[]).length : 0;
           const tr = input['throttle_rate'];
           const thr = tr !== undefined && tr !== null ? `, throttle ${String(tr)}x` : '';
-          return `profile: scenario (${steps} steps × ${String(runs)} runs, ${String(warmup)} warmup${thr})`;
+          const reset = input['reset'];
+          const resetStr =
+            reset === 'none'
+              ? ', reset:none'
+              : reset && typeof reset === 'object'
+                ? `, reset:${String((reset as Record<string, unknown>)['kind'] ?? '?')}`
+                : '';
+          const gcStr = input['gc_per_run'] === false ? ', gc:off' : '';
+          return `profile: scenario (${steps} steps × ${String(runs)} runs, ${String(warmup)} warmup${thr}${resetStr}${gcStr})`;
         }
         case 'throttle':
           return `profile: throttle ${String(input['rate'] ?? '')}x`;
