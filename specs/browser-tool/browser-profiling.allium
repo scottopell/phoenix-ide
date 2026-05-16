@@ -76,10 +76,23 @@ value RunSample {
 }
 
 -- A heap snapshot reference (file on disk). Diffing a baseline
--- against a post snapshot yields retained-size growth and detached
--- DOM node count (REQ-BT-019.10).
+-- against a post snapshot yields retained-size growth (approximated
+-- by self-size delta — full dominator-tree retained size is out of
+-- scope) and detached-DOM-node count (REQ-BT-019.10).
 value HeapSnapshotRef {
     path: String
+}
+
+-- The outcome of one HeapDiff invocation. Modelled as an entity so
+-- the two-snapshot precondition is checkable. Both refs are explicit
+-- caller-supplied file paths — there is no in-session baseline.
+entity HeapDiffResult {
+    session:  ProfilingSession
+    baseline: HeapSnapshotRef
+    post:     HeapSnapshotRef
+    node_count_delta:    Integer
+    self_size_delta:     Decimal
+    detached_dom_nodes:  Integer
 }
 
 -- The outcome of one transactional RunScenario invocation. Modelled
@@ -124,12 +137,13 @@ entity ProfilingSession {
     -- trace_stop. Empty whenever tracing = idle.
     trace_event_count: Integer
 
-    -- Optional baseline heap snapshot held for a later diff
-    -- (REQ-BT-019.10). Set when the agent captures a "before"
-    -- snapshot; HeapDiff compares a "post" snapshot against it.
-    -- null until a baseline is taken; survives across scenario runs
-    -- so leak detection can bracket repeated mount/unmount.
-    heap_baseline: HeapSnapshotRef?
+    -- NOTE: heap-snapshot baselines are NOT session state. A snapshot
+    -- is a file on disk (HeapSnapshotRef); a diff takes two explicit
+    -- path arguments (REQ-BT-019.10). This is correct-by-construction
+    -- — the baseline is an explicit argument, never hidden mutable
+    -- session state that could go stale or leak across scenarios.
+    -- Leak detection brackets repeated mount/unmount by the caller
+    -- capturing "before"/"after" snapshots and passing both paths.
 
     transitions cpu {
         idle   -> active     -- cpu_start
@@ -161,8 +175,9 @@ entity ProfilingSession {
 -- One-shot reads (no state change; included for completeness):
 --   MetricsSnapshot(ps)           -- Performance.getMetrics (REQ-BT-019.3)
 --   GcThenHeap(ps)                -- collectGarbage + heap read (.6)
---   HeapSnapshot(ps) -> HeapSnapshotRef
---   HeapDiff(ps, baseline, post)  -- (.10)
+--   HeapSnapshot(ps) -> HeapSnapshotRef   -- writes a .heapsnapshot file
+--   HeapDiff(ps, baseline, post, result)  -- (.10); both refs are
+--       explicit caller-supplied paths, no in-session baseline
 --   WhyRender(ps)                 -- read __phoenix commit reasons (.8)
 --
 -- The transactional harness:
@@ -304,11 +319,15 @@ rule RunScenarioBlockedOnReadiness {
 ------------------------------------------------------------
 
 rule HeapDiffRequiresTwoSnapshots {
-    when: HeapDiff(ps, baseline, post)
+    when: HeapDiff(ps, baseline, post, result)
     requires: baseline != null
     requires: post != null
-    -- Reports retained-size growth and detached-DOM-node count.
-    -- A diff against a missing/!= snapshot is an error, not a
+    ensures: result.session = ps
+    ensures: result.baseline = baseline
+    ensures: result.post = post
+    -- Reports node-count + self-size deltas (self-size approximates
+    -- retained-size growth) and detached-DOM-node count. A diff
+    -- against a missing/unreadable snapshot path is an error, not a
     -- zero-delta result, so "no leak" and "never measured" are
     -- distinguishable.
 }
@@ -331,7 +350,6 @@ rule SessionDeathResetsAllCaptures {
     ensures: ps.coverage = idle
     ensures: ps.throttle_rate = null
     ensures: ps.trace_event_count = 0
-    ensures: ps.heap_baseline = null
 }
 
 ------------------------------------------------------------
@@ -379,4 +397,16 @@ invariant RawSamplesNeverReduced {
 invariant BlockedScenarioYieldsNoSamples {
     for r in ScenarioRunResult where r.outcome = blocked:
         count(r.samples) = 0
+}
+
+-- REQ-BT-019.10: a heap diff that exists always carries BOTH the
+-- baseline and post snapshot refs (non-null by type). This is the
+-- structural form of HeapDiffRequiresTwoSnapshots: a one-sided diff
+-- is unrepresentable, so "no leak" (real zero deltas) and "never
+-- measured" (no HeapDiffResult) stay distinguishable, and there is
+-- no hidden in-session baseline that could go stale.
+invariant HeapDiffAlwaysTwoSnapshots {
+    for d in HeapDiffResult:
+        d.baseline != null
+        d.post != null
 }

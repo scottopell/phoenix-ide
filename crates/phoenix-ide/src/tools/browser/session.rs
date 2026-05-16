@@ -62,6 +62,32 @@ pub struct ConsoleEntry {
     pub timestamp: Instant,
 }
 
+/// Conversation-scoped performance-profiling state (REQ-BT-019).
+///
+/// Models the three independent capture sub-machines plus the CPU-throttle
+/// override and trace buffer from `browser-profiling.allium`. It hangs off
+/// [`BrowserSession`] so the precondition gates are enforced per conversation
+/// (invariant `ProfilingConversationScoped`) and reset structurally when the
+/// session dies (rule `SessionDeathResetsAllCaptures`) — dropping the session
+/// drops this state, no stop edge is issued to a dead browser.
+#[derive(Debug, Default)]
+pub struct ProfilingState {
+    /// CPU sampling sub-machine (REQ-BT-019.7). idle when false.
+    pub cpu_active: bool,
+    /// Tracing sub-machine (REQ-BT-019.9). idle when false.
+    pub tracing_active: bool,
+    /// JS coverage sub-machine (REQ-BT-019.11). idle when false.
+    pub coverage_active: bool,
+    /// CPU-throttle override (REQ-BT-019.2). `None` = browser default; a
+    /// `Some(rate)` always carries `rate >= 1` (invariant
+    /// `ThrottleRateWellFormed`), set only via the gated throttle action.
+    pub throttle_rate: Option<f64>,
+    /// Buffered `Tracing.dataCollected` events. Non-empty only while
+    /// `tracing_active` (invariant `TraceBufferOnlyWhileActive`): cleared
+    /// before arming on start, drained-then-cleared on stop.
+    pub trace_events: Vec<serde_json::Value>,
+}
+
 /// Per-conversation browser instance
 pub struct BrowserSession {
     #[allow(dead_code)] // Browser must stay alive
@@ -70,8 +96,19 @@ pub struct BrowserSession {
     handler_task: JoinHandle<()>,
     #[allow(dead_code)] // Task must stay alive
     console_task: Option<JoinHandle<()>>,
+    /// Background tasks for the profiling listener (trace dataCollected /
+    /// tracingComplete). Aborted on drop alongside `console_task`.
+    profiling_tasks: Vec<JoinHandle<()>>,
     /// The current page (public for tool access)
     pub page: Page,
+    /// Conversation-scoped profiling state (REQ-BT-019). The
+    /// `browser_profile` tool reads/mutates this through the session guard;
+    /// the trace-listener task appends events when `tracing_active`.
+    pub profiling: Arc<StdMutex<ProfilingState>>,
+    /// Notified by the profiling listener when `Tracing.tracingComplete`
+    /// fires, so `trace_stop` can drain the buffer only once all
+    /// asynchronously-delivered events have arrived.
+    pub trace_complete: Arc<tokio::sync::Notify>,
     /// Console logs captured from the page (separate lock to avoid contention)
     pub console_logs: Arc<StdMutex<VecDeque<ConsoleEntry>>>,
     /// Last activity timestamp (for idle timeout)
@@ -257,7 +294,10 @@ impl BrowserSession {
             browser,
             handler_task,
             console_task: None,
+            profiling_tasks: Vec::new(),
             page,
+            profiling: Arc::new(StdMutex::new(ProfilingState::default())),
+            trace_complete: Arc::new(tokio::sync::Notify::new()),
             console_logs: Arc::new(StdMutex::new(VecDeque::with_capacity(MAX_CONSOLE_LOGS))),
             last_activity: Instant::now(),
             screencast: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
@@ -409,6 +449,69 @@ impl BrowserSession {
         {
             let mut guard = session.write().await;
             guard.console_task = Some(task);
+        }
+
+        Ok(())
+    }
+
+    /// Set up the profiling trace listener (REQ-BT-019.9 / .12).
+    ///
+    /// Mirrors [`Self::setup_console_listener`]: subscribes to
+    /// `Tracing.dataCollected` and `Tracing.tracingComplete` once and spawns
+    /// long-lived tasks. `dataCollected` events are appended to the trace
+    /// buffer **only while `tracing_active`** so a stray late event after a
+    /// stop cannot resurrect the buffer (invariant `TraceBufferOnlyWhileActive`).
+    /// `tracingComplete` signals the notifier so `trace_stop` can drain only
+    /// after all asynchronously-delivered events have arrived.
+    pub async fn setup_profiling_listener(session: Arc<RwLock<Self>>) -> Result<(), BrowserError> {
+        use chromiumoxide::cdp::browser_protocol::tracing::{
+            EventDataCollected, EventTracingComplete,
+        };
+
+        let (mut data_events, mut complete_events, profiling, notify) = {
+            let guard = session.read().await;
+            let data = guard.page.event_listener::<EventDataCollected>().await?;
+            let complete = guard.page.event_listener::<EventTracingComplete>().await?;
+            (
+                data,
+                complete,
+                guard.profiling.clone(),
+                guard.trace_complete.clone(),
+            )
+        };
+
+        let profiling_for_data = profiling.clone();
+        let data_task = tokio::spawn(async move {
+            while let Some(event) = data_events.next().await {
+                if let Ok(mut state) = profiling_for_data.lock() {
+                    if state.tracing_active {
+                        state.trace_events.extend(event.value.iter().cloned());
+                    } else {
+                        // Capability gap: a dataCollected event arrived while
+                        // tracing is idle (late flush after stop). Dropped on
+                        // purpose to keep the idle-buffer-empty invariant.
+                        tracing::debug!(
+                            n = event.value.len(),
+                            "dropping Tracing.dataCollected events — tracing not active"
+                        );
+                    }
+                }
+            }
+        });
+
+        let complete_task = tokio::spawn(async move {
+            while let Some(event) = complete_events.next().await {
+                if event.data_loss_occurred {
+                    tracing::debug!("Tracing.tracingComplete reported data loss");
+                }
+                notify.notify_waiters();
+            }
+        });
+
+        {
+            let mut guard = session.write().await;
+            guard.profiling_tasks.push(data_task);
+            guard.profiling_tasks.push(complete_task);
         }
 
         Ok(())
@@ -603,6 +706,11 @@ impl BrowserSessionManager {
             tracing::warn!(error = %e, "Failed to set up console listener");
         }
 
+        // Set up the profiling trace listener (REQ-BT-019.9 / .12).
+        if let Err(e) = BrowserSession::setup_profiling_listener(session_arc.clone()).await {
+            tracing::warn!(error = %e, "Failed to set up profiling listener");
+        }
+
         sessions.insert(conversation_id.to_string(), session_arc.clone());
         // Drop the write lock before emitting — the receiver may grab the
         // sessions read lock to confirm state, and we don't want to hold
@@ -702,6 +810,9 @@ impl Drop for BrowserSession {
         // Dropping a JoinHandle does NOT abort the task — explicit abort is required.
         self.handler_task.abort();
         if let Some(task) = &self.console_task {
+            task.abort();
+        }
+        for task in &self.profiling_tasks {
             task.abort();
         }
     }

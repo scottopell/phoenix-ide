@@ -5,6 +5,7 @@
 //! REQ-BT-012: Stateless Tools with Context Injection
 //! REQ-BT-017: React Component Access
 
+pub mod profile;
 pub mod react;
 pub mod screencast;
 pub mod session;
@@ -13,6 +14,7 @@ mod tools;
 #[cfg(test)]
 mod tests;
 
+pub use profile::BrowserProfileTool;
 pub use session::{BrowserError, BrowserSessionManager};
 pub use tools::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserEvalTool, BrowserKeyPressTool,

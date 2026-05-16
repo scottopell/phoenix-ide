@@ -95,10 +95,109 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
     return;
   }
 
+  // ── Commit metrics ring buffer (REQ-BT-019.4 / .8) ──────────────────────────
+  // Hoisted to the IIFE scope (NOT the hook-install block) so it exists
+  // whether we install our own hook OR wrap a pre-existing one, and so the
+  // __phoenix API methods below can read it. Bounded so a long-lived page
+  // can't grow this unboundedly. The run_scenario harness brackets a run
+  // with __resetCommits()/__getCommits().
+  var __commits = [];
+  var __COMMITS_CAP = 500;
+  var __TOP_N = 20;
+
+  // Walk the fiber tree from a root collecting per-component render cost
+  // plus a best-effort why-did-render attribution. Defensive throughout:
+  // must be harmless and never throw on non-React or exotic pages.
+  function __collectCommit(root) {
+    try {
+      if (!root || !root.current) return null;
+      var components = [];
+      var stack = [root.current];
+      while (stack.length > 0) {
+        var fiber = stack.pop();
+        if (!fiber) continue;
+        if (fiber.sibling) stack.push(fiber.sibling);
+        if (fiber.child) stack.push(fiber.child);
+        var dur = fiber.actualDuration;
+        if (typeof dur !== 'number') continue;
+        var name = 'Unknown';
+        try {
+          var t = fiber.type;
+          if (typeof t === 'string') name = t;
+          else if (t && (t.displayName || t.name)) name = t.displayName || t.name;
+        } catch (e) {}
+        var isMount = fiber.alternate == null;
+        var rec = {
+          name: name,
+          actualDuration: dur,
+          phase: isMount ? 'mount' : 'update',
+          changedProps: [],
+          changedHooks: []
+        };
+        // why-did-render: only meaningful for update-phase fibers.
+        if (!isMount) {
+          try {
+            var cur = fiber.memoizedProps || {};
+            var prev = (fiber.alternate && fiber.alternate.memoizedProps) || {};
+            var keys = {};
+            var k;
+            for (k in cur) keys[k] = true;
+            for (k in prev) keys[k] = true;
+            for (k in keys) {
+              if (cur[k] !== prev[k]) rec.changedProps.push(k);
+            }
+          } catch (e) {}
+          try {
+            var a = fiber.memoizedState;
+            var b = fiber.alternate ? fiber.alternate.memoizedState : null;
+            var idx = 0;
+            while (a && b) {
+              if (a.memoizedState !== b.memoizedState) rec.changedHooks.push(idx);
+              a = a.next;
+              b = b.next;
+              idx++;
+              if (idx > 256) break;
+            }
+          } catch (e) {}
+        }
+        components.push(rec);
+      }
+      var total = 0;
+      for (var i = 0; i < components.length; i++) total += components[i].actualDuration;
+      components.sort(function(x, y) { return y.actualDuration - x.actualDuration; });
+      var mountCount = 0;
+      var updateCount = 0;
+      for (var j = 0; j < components.length; j++) {
+        if (components[j].phase === 'mount') mountCount++; else updateCount++;
+      }
+      return {
+        ts: (typeof performance !== 'undefined' && performance.now) ? performance.now() : Date.now(),
+        count: components.length,
+        mountCount: mountCount,
+        updateCount: updateCount,
+        totalActualDuration: total,
+        components: components.slice(0, __TOP_N)
+      };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function __recordCommit(root) {
+    try {
+      var rec = __collectCommit(root);
+      if (rec) {
+        __commits.push(rec);
+        if (__commits.length > __COMMITS_CAP) __commits.shift();
+      }
+    } catch (e) {}
+  }
+
   // ── React DevTools hook (vendored from react-devtools-shared/src/hook.js) ──
   //
   // If a hook already exists (e.g. React DevTools extension installed it),
-  // we DON'T replace it — we just add our __phoenix helpers on top.
+  // we DON'T replace it — but we DO wrap its onCommitFiberRoot so commit
+  // metrics are still recorded (REQ-BT-017: wrap, don't replace).
   // If no hook exists, we install one with the shape React expects.
   if (!window.__REACT_DEVTOOLS_GLOBAL_HOOK__) {
     // --- Event emitter ---
@@ -156,6 +255,9 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
       } else if (isKnownRoot && isUnmounting) {
         mountedRoots.delete(root);
       }
+      // Record per-commit render metrics (REQ-BT-019.4 / .8) into the
+      // bounded ring buffer. Best-effort; never blocks React's commit.
+      __recordCommit(root);
       var iface = rendererInterfaces.get(rendererID);
       if (iface != null && iface.handleCommitFiberRoot) {
         iface.handleCommitFiberRoot(root, priorityLevel);
@@ -210,6 +312,22 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
       enumerable: false,
       get: function() { return hook; }
     });
+  } else {
+    // A hook already exists (DevTools extension or the app's own). Per
+    // REQ-BT-017 we wrap rather than replace: chain our commit recorder
+    // onto the existing onCommitFiberRoot so metrics still flow without
+    // breaking the incumbent hook.
+    var existing = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+    if (existing && !existing.__phoenixWrapped) {
+      var prevOCFR = existing.onCommitFiberRoot;
+      existing.onCommitFiberRoot = function(rendererID, root, priorityLevel) {
+        __recordCommit(root);
+        if (typeof prevOCFR === 'function') {
+          return prevOCFR.call(existing, rendererID, root, priorityLevel);
+        }
+      };
+      existing.__phoenixWrapped = true;
+    }
   }
 
   // ── Reference to the hook (ours or pre-existing) ───────────────────────────
@@ -379,6 +497,65 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
         })(roots[r]);
       }
       return results;
+    },
+
+    /**
+     * __getCommits() → array of recorded commit records (copy)
+     *
+     * Each record: { ts, count, mountCount, updateCount,
+     * totalActualDuration, components: [{name, actualDuration, phase,
+     * changedProps, changedHooks}, ...] }. Used by the run_scenario
+     * harness (REQ-BT-019.4) to read React commit metrics per run.
+     */
+    __getCommits: function() {
+      return __commits.slice();
+    },
+
+    /**
+     * __resetCommits() → void
+     *
+     * Clears the commit ring buffer. The run_scenario harness calls this
+     * at the start of each run so commits are attributed to that run only.
+     */
+    __resetCommits: function() {
+      __commits.length = 0;
+    },
+
+    /**
+     * __getWhyRender() → array of {name, changedProps, changedHooks}
+     *
+     * Best-effort why-did-render attribution (REQ-BT-019.8) derived from
+     * the recorded commits: every update-phase component that re-rendered
+     * with at least one changed prop or hook, with the changed keys merged
+     * across all commits in the buffer.
+     */
+    __getWhyRender: function() {
+      var byName = {};
+      for (var i = 0; i < __commits.length; i++) {
+        var comps = __commits[i].components || [];
+        for (var j = 0; j < comps.length; j++) {
+          var c = comps[j];
+          if (c.phase !== 'update') continue;
+          var cp = c.changedProps || [];
+          var ch = c.changedHooks || [];
+          if (cp.length === 0 && ch.length === 0) continue;
+          if (!byName[c.name]) {
+            byName[c.name] = { name: c.name, changedProps: {}, changedHooks: {} };
+          }
+          var k;
+          for (k = 0; k < cp.length; k++) byName[c.name].changedProps[cp[k]] = true;
+          for (k = 0; k < ch.length; k++) byName[c.name].changedHooks[ch[k]] = true;
+        }
+      }
+      var out = [];
+      for (var name in byName) {
+        out.push({
+          name: name,
+          changedProps: Object.keys(byName[name].changedProps),
+          changedHooks: Object.keys(byName[name].changedHooks).map(Number)
+        });
+      }
+      return out;
     }
   };
 })();

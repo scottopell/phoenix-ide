@@ -2,6 +2,7 @@
 //!
 //! Chrome/Chromium is auto-downloaded via the fetcher if not in PATH.
 
+use super::profile::BrowserProfileTool;
 use super::session::BrowserSessionManager;
 use super::tools::*;
 use crate::tools::{Tool, ToolContext};
@@ -2038,6 +2039,153 @@ async fn test_screencast_attach_emits_frames_and_url() {
         "new broker after all viewers dropped"
     );
     drop(broker_c);
+
+    shutdown_test(manager, server).await;
+}
+
+// ============================================================================
+// browser_profile (REQ-BT-019)
+// ============================================================================
+
+/// Non-browser unit test: the tool is registered and its input schema
+/// advertises every action. No Chrome required.
+#[test]
+fn test_browser_profile_registered_and_schema_lists_actions() {
+    use super::profile::PROFILE_ACTIONS;
+
+    let registry = crate::tools::ToolRegistry::standard();
+    let names: Vec<String> = registry
+        .definitions()
+        .iter()
+        .map(|d| d.name.clone())
+        .collect();
+    assert!(
+        names.contains(&"browser_profile".to_string()),
+        "browser_profile not registered"
+    );
+
+    let schema = BrowserProfileTool.input_schema();
+    let enum_vals = schema["properties"]["action"]["enum"]
+        .as_array()
+        .expect("action enum present in schema");
+    let action_names: Vec<&str> = enum_vals.iter().filter_map(|v| v.as_str()).collect();
+    for a in PROFILE_ACTIONS {
+        assert!(action_names.contains(a), "input_schema missing action {a}");
+    }
+    // The Tier-0 method-critical actions must all be present.
+    for required in ["help", "metrics", "throttle", "gc_heap", "run_scenario"] {
+        assert!(
+            action_names.contains(&required),
+            "schema missing required action {required}"
+        );
+    }
+}
+
+/// help works without a browser session.
+#[tokio::test]
+async fn test_browser_profile_help_no_browser() {
+    let (ctx, manager) = test_context("test-profile-help");
+    let result = BrowserProfileTool
+        .run(json!({"action": "help"}), ctx.clone())
+        .await;
+    assert!(result.success, "help should succeed: {}", result.output);
+    assert!(result.output.contains("run_scenario"));
+    assert!(
+        result.output.contains("RAW per-run"),
+        "help must state the raw-samples constraint"
+    );
+    manager.shutdown_all().await;
+}
+
+/// Gated end-to-end test: `metrics` returns numbers, and `run_scenario`
+/// with runs>=2 returns a RAW array of length == runs (asserting it is NOT
+/// statistically reduced — the REQ-BT-019.5 hard constraint).
+#[tokio::test]
+async fn test_browser_profile_metrics_and_raw_scenario() {
+    require_chrome!();
+
+    let server =
+        TestServer::start("<html><body><h1 id='ready'>profile probe</h1></body></html>").await;
+    let (ctx, manager) = test_context("test-profile-scenario");
+    BrowserNavigateTool
+        .run(json!({"url": server.url()}), ctx.clone())
+        .await;
+
+    // metrics: must succeed and surface a tracked counter.
+    let m = BrowserProfileTool
+        .run(json!({"action": "metrics"}), ctx.clone())
+        .await;
+    assert!(m.success, "metrics should succeed: {}", m.output);
+    assert!(
+        m.output.contains("JSHeapUsedSize") || m.output.contains("Performance metrics"),
+        "metrics output unexpected: {}",
+        m.output
+    );
+
+    // run_scenario with runs=3: a trivial deterministic scenario.
+    let runs = 3u32;
+    let r = BrowserProfileTool
+        .run(
+            json!({
+                "action": "run_scenario",
+                "runs": runs,
+                "warmup": 1,
+                "steps": [
+                    { "kind": "wait_selector", "selector": "#ready", "timeout": "5s" },
+                    { "kind": "eval", "expression": "1+1" }
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(r.success, "run_scenario should succeed: {}", r.output);
+
+    // The raw-samples hard constraint: display_data.raw_samples is an
+    // array of EXACTLY `runs` entries — NOT a reduced scalar/object.
+    let display = r
+        .display_data
+        .expect("run_scenario must attach display_data");
+    assert_eq!(
+        display["outcome"], "completed",
+        "expected completed outcome: {display}"
+    );
+    let raw = display["raw_samples"]
+        .as_array()
+        .expect("raw_samples must be an ARRAY (never a reduction)");
+    assert_eq!(
+        raw.len(),
+        runs as usize,
+        "raw_samples length must equal runs ({runs}); a reduced result is non-conforming"
+    );
+    // Each entry is a per-run sample object (has run_index), not an aggregate.
+    for (i, s) in raw.iter().enumerate() {
+        assert!(
+            s.get("run_index").is_some(),
+            "sample {i} missing run_index — not a raw per-run sample: {s}"
+        );
+    }
+
+    // A blocked readiness step must yield ZERO samples and fail.
+    let blocked = BrowserProfileTool
+        .run(
+            json!({
+                "action": "run_scenario",
+                "runs": 2,
+                "steps": [
+                    { "kind": "wait_selector", "selector": "#never-exists", "timeout": "500ms" }
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(!blocked.success, "blocked scenario must fail");
+    let bd = blocked.display_data.expect("blocked attaches display_data");
+    assert_eq!(bd["outcome"], "blocked");
+    assert_eq!(
+        bd["raw_samples"].as_array().map(Vec::len),
+        Some(0),
+        "blocked scenario must return ZERO samples"
+    );
 
     shutdown_test(manager, server).await;
 }

@@ -322,6 +322,29 @@ function formatBrowserInput(name: string, input: Record<string, unknown>): strin
       const chord = modifiers.length > 0 ? `${modifiers.join('+')}+${key}` : key;
       return `key: ${chord}`;
     }
+    case 'browser_profile': {
+      const action = String(input['action'] || '');
+      switch (action) {
+        case 'run_scenario': {
+          const runs = input['runs'] ?? 1;
+          const warmup = input['warmup'] ?? 0;
+          const steps = Array.isArray(input['steps']) ? (input['steps'] as unknown[]).length : 0;
+          const tr = input['throttle_rate'];
+          const thr = tr !== undefined && tr !== null ? `, throttle ${String(tr)}x` : '';
+          return `profile: scenario (${steps} steps × ${String(runs)} runs, ${String(warmup)} warmup${thr})`;
+        }
+        case 'throttle':
+          return `profile: throttle ${String(input['rate'] ?? '')}x`;
+        case 'trace_start': {
+          const cats = input['categories'] ? ` [${String(input['categories'])}]` : '';
+          return `profile: trace_start${cats}`;
+        }
+        case 'heap_snapshot':
+          return input['baseline'] ? 'profile: heap_snapshot (diff)' : 'profile: heap_snapshot';
+        default:
+          return action ? `profile: ${action}` : 'profile';
+      }
+    }
     default: {
       return JSON.stringify(input, null, 2);
     }

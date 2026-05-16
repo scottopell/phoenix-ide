@@ -27,8 +27,9 @@ pub use bash::{
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
-    BrowserKeyPressTool, BrowserNavigateTool, BrowserRecentConsoleLogsTool, BrowserResizeTool,
-    BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool, BrowserWaitForSelectorTool,
+    BrowserKeyPressTool, BrowserNavigateTool, BrowserProfileTool, BrowserRecentConsoleLogsTool,
+    BrowserResizeTool, BrowserSessionManager, BrowserTakeScreenshotTool, BrowserTypeTool,
+    BrowserWaitForSelectorTool,
 };
 pub use keyword_search::KeywordSearchTool;
 pub use patch::PatchTool;
@@ -348,6 +349,7 @@ fn browser_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(BrowserClickTool),
         Arc::new(BrowserTypeTool),
         Arc::new(BrowserKeyPressTool),
+        Arc::new(BrowserProfileTool),
     ]
 }
 
@@ -557,6 +559,7 @@ mod tests {
             "browser_recent_console_logs",
             "browser_clear_console_logs",
             "browser_resize",
+            "browser_profile",
         ] {
             assert!(names.contains(expected), "Missing {expected}");
         }
