@@ -117,6 +117,10 @@ def do_step(step, table, bin_):
         ab(["reload"], bin_)
     elif verb == "click":
         ab(["click", subst(val, table)], bin_)
+    elif verb == "click-text":
+        # click by visible text — for SPA targets with no stable selector
+        # (e.g. a conversation-list row). Maps to agent-browser find.
+        ab(["find", "text", subst(val, table), "click"], bin_)
     elif verb == "type":
         ab(["fill", subst(val["selector"], table), subst(val["text"], table)], bin_)
     elif verb == "key":
@@ -175,8 +179,15 @@ def establish_pristine_state(scn, table, bin_):
     # Hard document load (about:blank -> url) so React mounts fresh and
     # identically every run — never a SPA client-nav that includes/excludes
     # the mount nondeterministically (the bimodal-sample root cause).
+    #
+    # `open` can return before navigation commits, so probes would otherwise
+    # install on the PREVIOUS run's settled page and the measured window
+    # would span the real nav + mount + seed (intermittent ~400x outliers).
+    # Block on a settled new document before anything else proceeds.
     ab(["open", "about:blank"], bin_)
+    ab(["wait", "--load", "networkidle"], bin_)
     ab(["open", subst(reset["url"], table)], bin_)
+    ab(["wait", "--load", "networkidle"], bin_)
     if reset.get("wait_app_ready"):
         do_step({"wait-for-eval-predicate": reset["wait_app_ready"]}, table, bin_)
 

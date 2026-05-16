@@ -1,6 +1,24 @@
-# Scenario: load and render a many-message conversation cold.
-# Exercises MessageList / MessageListBody / message components and the
-# no-virtualization pattern (cost scales with conversation size).
+# Scenario: switch INTO a large conversation (the user's reported pain:
+# "slow to switch / load on bigger convos"). Driven by run-scenario
+# (agent-browser).
+#
+# Exercises MessageList / MessageListBody with NO virtualization: the cost
+# of rendering a large non-virtualized message DOM on a client-side switch.
+#
+# ISOLATION: reset hard-loads the conversation LIST and resets probes AFTER
+# it is ready, so the list mount is excluded from the window. The MEASURED
+# action is the SPA switch into the big fixture (click its list row) — this
+# is exactly the user's "switch" path, and the per-frame React render +
+# layout of the big list lands inside the window.
+#
+# FIXTURE: fixture-turn-one — 47 deterministic large mock messages
+# ([[perf:600-700]] turns). Immutable for the load test (reused on purpose,
+# not mutated): a fixed-size big conversation = a stable fingerprint.
+#
+# METRICS: script_ms + long_tasks (layout/paint over the big DOM) and
+# react_commit_ms (rendering ~47 message subtrees). dom_nodes is expected
+# to legitimately differ here (small list vs big conv) — for THIS scenario
+# dom_nodes IS signal, unlike sse-streaming where it was an artifact.
 
 name: conversation-load
 covers:
@@ -9,26 +27,35 @@ covers:
   - ui/src/pages/ConversationPage.tsx
 
 params:
-  slug: "{SLUG_LARGE}"          # the largest seeded conversation; find-target
-                                # picks it by max message count from the DB
   base_url: "{UI_URL}"
+  fixture: "fixture-turn-one"       # the big conversation to switch INTO
 
-throttle_rate: 4
-runs: 30
+runs: 20
 warmup: 3
 
-steps:
-  - navigate: "{base_url}/about:blank"   # cold start each run
-  - navigate: "{base_url}/c/{slug}"
-  # Readiness = the message list has painted all server messages.
-  - wait-for-eval-predicate:
-      expr: "document.querySelectorAll('[data-message]').length >= window.__EXPECTED_MSG_COUNT"
-      timeout_ms: 30000
+reset:
+  url: "{base_url}/"                # the conversation LIST
+  wait_app_ready:
+    expr: >
+      document.querySelectorAll('li.conv-item').length > 0
+      && document.readyState === 'complete'
+    timeout_ms: 60000
 
-# find-target sets window.__EXPECTED_MSG_COUNT via an eval step using the
-# message count from getConversationBySlug, so readiness is exact, not a
-# fixed sleep (REQ-BT-019.1: deterministic readiness, never a timing guess).
-#
-# Primary signals: mount-phase commit count + actualDuration for the message
-# list subtree; Nodes delta; ScriptDuration delta. Plot vs message count
-# across the seeded conversations to confirm/deny no-virtualization scaling.
+steps:
+  # SPA switch into the big conversation. The list row has no stable
+  # selector and its text is "<slug>Direct" (slug+badge), and the row is
+  # far down a 100+ item list — so locate it by slug-prefix and fire its
+  # click programmatically (React's delegated onClick still routes).
+  - eval: >
+      (() => {
+        const row = [...document.querySelectorAll('li.conv-item')].find(
+          li => li.querySelector('.conv-item-slug')
+                && li.querySelector('.conv-item-slug').textContent.startsWith('{fixture}'));
+        if (!row) throw new Error('fixture row not found: {fixture}');
+        row.scrollIntoView();
+        (row.querySelector('.conv-item-main') || row).click();
+      })()
+  # Readiness: the big conversation view has rendered its message set.
+  - wait-for-eval-predicate:
+      expr: "location.pathname.endsWith('/{fixture}') && document.querySelectorAll('.message').length >= 40"
+      timeout_ms: 60000
