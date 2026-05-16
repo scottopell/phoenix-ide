@@ -2323,3 +2323,103 @@ async fn test_browser_profile_methodology_warnings_intact_raw_samples() {
 
     manager.shutdown_all().await;
 }
+
+/// Gated (chrome + network): the React `measured` path end-to-end.
+///
+/// This is the marquee REQ-BT-019.4/.13 signal and was previously only
+/// exercised against about:blank (status `absent`). Here a REAL React
+/// **profiling** build (records `actualDuration` unconditionally) is
+/// driven through the auto-injected `__phoenix` commit hook and the
+/// `read_react_reading` Rust mapping, asserting `react_status ==
+/// "measured"` with a non-null `react_actual_ms` — proving the happy
+/// path the rest of the suite never reaches.
+#[tokio::test]
+async fn test_browser_profile_react_measured_path() {
+    require_chrome!();
+    require_network!(); // pulls React UMD from unpkg
+
+    // Profiling build => fibers carry numeric `actualDuration` without
+    // any DevTools backend toggle (our hook does not implement that).
+    // Script order matters: react -> scheduler -> react-dom.profiling.
+    let html = r#"<!doctype html><html><head><meta charset="utf-8"></head>
+<body><div id="root"></div>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/scheduler@0.23.2/umd/scheduler.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.profiling.min.js"></script>
+<script>
+window.__renders = 0;
+var e = React.createElement;
+function App() {
+  var st = React.useState(0); var n = st[0], set = st[1];
+  window.__renders++;
+  React.useEffect(function () { window.__ready = true; }, []);
+  return e('div', null,
+    e('div', { id: 'ready' }, 'ready'),
+    e('button', { id: 'inc', onClick: function () { set(function (x) { return x + 1; }); } }, 'n=' + n));
+}
+ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+</script></body></html>"#;
+
+    let server = TestServer::start(html).await;
+    let (ctx, manager) = test_context("test-profile-react-measured");
+
+    let nav = BrowserNavigateTool
+        .run(
+            json!({ "url": server.url(), "timeout": "30s" }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(nav.success, "navigate failed: {}", nav.output);
+
+    // Mount confirmed once React renders the #ready node.
+    let waited = BrowserWaitForSelectorTool
+        .run(
+            json!({ "selector": "#ready", "timeout": "30s" }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(
+        waited.success,
+        "React did not mount (unpkg/profiling build issue?): {}",
+        waited.output
+    );
+
+    // reset:"none" keeps the mounted app (one unpkg fetch); the click
+    // forces an update-phase commit whose fiber carries actualDuration.
+    let r = BrowserProfileTool
+        .run(
+            json!({
+                "action": "run_scenario",
+                "runs": 1,
+                "warmup": 0,
+                "reset": "none",
+                "gc_per_run": false,
+                "steps": [
+                    { "kind": "click", "selector": "#inc" },
+                    { "kind": "wait_eval", "expression": "window.__renders >= 2", "timeout": "20s" }
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(r.success, "run_scenario failed: {}", r.output);
+
+    let display = r.display_data.expect("display_data present");
+    let sample = &display["raw_samples"][0];
+
+    assert_eq!(
+        sample["react_status"].as_str(),
+        Some("measured"),
+        "real React profiling build must read as `measured`, not absent/no_profiling_build: {sample}"
+    );
+    assert!(
+        sample["react_actual_ms"].is_number(),
+        "measured path must carry a non-null react_actual_ms: {sample}"
+    );
+    assert!(
+        sample["react_commits"].as_u64().is_some_and(|c| c >= 1),
+        "at least one commit must be recorded for a re-rendering app: {sample}"
+    );
+
+    shutdown_test(manager, server).await;
+}
