@@ -55,7 +55,15 @@ steps:
         row.scrollIntoView();
         (row.querySelector('.conv-item-main') || row).click();
       })()
-  # Readiness: the big conversation view has rendered its message set.
+  # Readiness — BUILD-EQUIVALENT (must mean the same thing with and without
+  # virtualization, or the A/B is apples-vs-oranges):
+  #   [data-sequence-id] == 47 in BOTH builds (non-virtualized: each message
+  #   div carries it; virtualized: each row carries it once — real child when
+  #   visible, spacer when offscreen). >=40 ⇒ the full row set is committed.
+  #   AND >=5 real .message ⇒ the on-screen rows actually rendered (so the
+  #   virtualized run is NOT read before its visible subtree paints, which
+  #   would under-measure it). Both conditions hold trivially in the
+  #   non-virtualized build (all 47 are real .message).
   - wait-for-eval-predicate:
-      expr: "location.pathname.endsWith('/{fixture}') && document.querySelectorAll('.message').length >= 40"
+      expr: "location.pathname.endsWith('/{fixture}') && document.querySelectorAll('[data-sequence-id]').length >= 40 && document.querySelectorAll('.message').length >= 5 && !document.querySelector('.streaming-message')"
       timeout_ms: 60000

@@ -46,3 +46,41 @@ ACCEPTANCE (via the phoenix-perf suite — this is checklist item 1)
  - Record in skills/phoenix-perf-hunt/resources/db.yaml.
 
 Its own PR. Suite + harness already validated and on this branch.
+
+---
+
+## MEASURED 2026-05-16 — upside CONFIRMED, naive design REJECTED on correctness
+
+A geometry-preserving render-virtualization attempt was implemented, measured
+through the suite, and REJECTED. Full record:
+skills/phoenix-perf-hunt/resources/db/MessageList-virtualize-render.yaml
+
+PERF UPSIDE (real, huge, significant — the lever is correct):
+  react_commit_ms  642 -> 243   (-62%, p=1.8e-14)
+  script_ms        422 -> 226   (-46%, p=1.3e-4)
+  dom_nodes        2813 -> 2509 (-11%)
+Baseline re-measured on old code with a build-equivalent readiness predicate
+(stash impl / measure / pop) so the A/B was valid.
+
+WHY REJECTED — two QA-confirmed behavior regressions (perf cannot rescue):
+  1. Switch no longer lands pinned-to-bottom: after switch, scrollTop ~25k,
+     distFromBottom ~31k, newest row an unrendered spacer. User stops seeing
+     the latest message on switch.
+  2. estimate->measured height correction shifts scrollHeight ~5.5% =
+     visible scroll jump.
+
+A CORRECT DESIGN MUST SOLVE BY CONSTRUCTION (not patch):
+  (a) Pinned-to-bottom on switch: seed visibility from the BOTTOM (render the
+      last screenful real on mount), not "all rows start hidden, let
+      IntersectionObserver flip them" — that fundamentally fights the
+      ResizeObserver scroll-to-bottom (chicken/egg).
+  (b) No estimate-driven jump: bottom-anchored layout, OR render-real until a
+      measured height is cached, OR a measure-pass before virtualizing. Never
+      lay out on a guessed height that later corrects under the user.
+  (c) Validate REQ-CONV-013 scroll-restore against (b).
+  (d) Re-use the suite: scenario conversation-load + the build-equivalent
+      predicate already in place; baseline ~635ms react_commit_ms (CV 3%).
+
+STATUS: stays p1/ready. Upside (~-62% commit) justifies the dedicated
+redesign. This is checklist item 1's path — but only with (a)-(c) solved and
+QA-2 behavior verification green.

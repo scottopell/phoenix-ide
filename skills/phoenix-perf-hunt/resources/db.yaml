@@ -20,3 +20,10 @@ entries:
     status: failure
     verdict: rejected
     file: resources/db/StreamingMessage-open-tail-plaintext.yaml
+  - id: MessageList-virtualize-render
+    target: ui/src/components/MessageList.tsx:MessageListBody
+    technique: render-virtualization
+    scenario: conversation-load
+    status: failure
+    verdict: rejected
+    file: resources/db/MessageList-virtualize-render.yaml

@@ -1,0 +1,108 @@
+id: MessageList-virtualize-render
+target: ui/src/components/MessageList.tsx:MessageListBody
+technique: render-virtualization
+scenario: conversation-load
+date: 2026-05-16
+status: failure
+verdict: rejected
+
+# REJECTED ON CORRECTNESS despite an overwhelming, significant perf win.
+# This is the methodology's sharpest outcome: it measured a huge improvement
+# AND refused to ship it because QA confirmed two behavior regressions. The
+# perf result also proves the lever is right — a CORRECT virtualization is
+# high-value (-62% commit) and warrants a dedicated redesign (task 65002).
+
+hypothesis: >
+  conversation-load measured ~640ms react_commit / ~390ms script / 2 long
+  tasks / >1s wall switching into a 47-message conversation (no
+  virtualization — every message subtree renders). Geometry-preserving
+  render-virtualization (offscreen rows = same-height spacer, real subtree
+  only near viewport) will cut react_commit_ms past the gate.
+
+method:
+  scenario: resources/scenarios/conversation-load.yaml (fixture-turn-one,
+    47 large mock messages)
+  harness: skills/phoenix-perf-shared/scripts/run-scenario (agent-browser)
+  baseline: OLD code re-measured with the build-equivalent predicate
+    (git-stash the impl, measure, pop) — n=12, react_commit_ms med 635.5
+    sd 20.9 (CV 3.3%). Predicate made build-equivalent
+    ([data-sequence-id]==47 in both builds; >=5 real .message) so the A/B
+    is not apples-vs-oranges — a cross-cutting fix the implementing agent
+    could not see, applied by the orchestrator.
+  optimized: n=8.
+
+measurements:
+  react_commit_ms:    "642.2 ± 21.8 -> 243.2 ± 26.2  (-62.13%, p=1.8e-14)"
+  react_commit_count: "13.5 -> 22.5 (+66.7%, p=1e-11)  # more, smaller commits"
+  script_ms:          "422.5 ± 119 -> 225.9 ± 56.5  (-46.54%, p=1.3e-4)"
+  dom_nodes:          "2813 -> 2509 (-10.79%, p<1e-25)"
+  wall_ms:            "1141 -> 1095 (-3.96%, p=0.40; click/nav overhead bound)"
+  long_tasks:         "~2 -> ~2 (n.s.)"
+  perf_gate: "PASSES overwhelmingly (react_commit_ms -62% >> 10%, p<<0.05)."
+
+qa_behavior_regressions:   # QA-2, agent-browser, BEFORE accepting any perf
+  - id: switch-not-pinned-to-bottom
+    severity: disqualifying
+    evidence: >
+      After switching into the fixture and a 4s settle, distFromBottom =
+      31663px (scrollTop 25239), lastRowReal = false. Baseline behavior is
+      to land pinned at the bottom showing the newest message. With
+      virtualization the view stays mid/top and the newest row is an
+      unrendered spacer — the user no longer sees the latest message on
+      switch. Core UX regression.
+  - id: estimate-to-real-scroll-jump
+    severity: disqualifying
+    evidence: >
+      Scrolling to bottom changed scrollHeight 57338 -> 54209 (-3129px,
+      ~5.5%) as estimated placeholder heights were replaced by measured
+      heights — a visible scroll jump. Exactly the risk the implementing
+      agent flagged; QA confirmed it.
+
+root_cause: |
+  Chicken-and-egg between the existing scroll model and the naive
+  virtualization design ("all rows start isVisible=false; IntersectionObserver
+  flips the ones that intersect"):
+   - pinned-to-bottom on switch needs the BOTTOM rows rendered real so the
+     ResizeObserver can scroll to the true bottom; but a row only renders
+     real once it intersects; but it can't intersect until the view scrolls
+     there; but the scroll-to-bottom can't compute the true bottom while the
+     bottom rows are estimated spacers. Net: it never reaches the bottom.
+   - content-length height estimates (CHARS_PER_PX) are necessarily wrong
+     per-row; summed error shifts scrollHeight, so any estimate->measured
+     correction moves already-laid-out content = scroll jump.
+
+votes:
+  duplicate_hunter: approve   # new technique + surface, not in db
+  skeptic: approve            # perf win is real, huge, significant
+  conservative: reject        # two confirmed behavior regressions (above)
+  react_expert: reject        # design fundamentally fights pinned-to-bottom
+                              # + variable-height estimate => layout shift
+  greybeard: reject           # shipping broken-switch + 5.5% jump for speed
+                              # is the wrong trade; correct design is bigger
+
+verdict_rationale: |
+  Perf gate passes by a landslide (-62% react_commit_ms, p=1.8e-14) but the
+  review rule is explicit: a scroll-jump on placeholder swap is REJECT
+  regardless of the perf win — and "switch no longer lands on the newest
+  message" is a worse regression still. REJECTED on correctness. Code
+  reverted; db record kept.
+
+lessons: |
+  1. HIGHEST-VALUE FINDING of the whole campaign: virtualization on
+     conversation-load is a real, massive win (react_commit_ms -62%,
+     script_ms -46%, both p<1e-3) — the lever is correct, unlike the three
+     streaming hunts which found no real cost. A correctly-designed
+     virtualization is worth a dedicated effort (task 65002, re-scoped).
+  2. A correct design MUST solve, by construction:
+     (a) Pinned-to-bottom on switch: render the LAST screenful real on
+         mount (seed visibility from the bottom, not "all hidden"), so the
+         ResizeObserver scroll-to-bottom sees true geometry.
+     (b) No estimate-driven jump: bottom-anchored layout, or render-real
+         (not spacer) for unmeasured rows until a height is cached, or a
+         measure-pass before virtualizing — never lay out on a guessed
+         height that later corrects under the user.
+     (c) REQ-CONV-013 scroll-restore must be validated against (b).
+  3. Methodology proof point: measured a landslide win and still rejected
+     it on QA-confirmed correctness. The build-equivalent-predicate fix
+     (orchestrator-level, cross-cutting) was essential — without it the A/B
+     would have been invalid and the regression possibly missed.
