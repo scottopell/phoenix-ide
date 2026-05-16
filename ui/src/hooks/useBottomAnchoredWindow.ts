@@ -80,6 +80,7 @@ export function useBottomAnchoredWindow({
   // scroll-up "pins" the window to a lower index; until then it tracks the
   // bottom reactively.
   const [userExpandedIndex, setUserExpandedIndex] = useState<number | null>(null);
+  const prevScrollHeightRef = useRef<number | null>(null);
 
   // Reset the user-pin SYNCHRONOUSLY during render on conversation switch
   // (an effect is one render too late). Same last-id-ref pattern as the
@@ -87,6 +88,7 @@ export function useBottomAnchoredWindow({
   const lastConversationId = useRef(conversationId);
   if (lastConversationId.current !== conversationId) {
     lastConversationId.current = conversationId;
+    prevScrollHeightRef.current = null;
     if (userExpandedIndex !== null) setUserExpandedIndex(null);
   }
 
@@ -98,7 +100,6 @@ export function useBottomAnchoredWindow({
   // Scroll-compensation bookkeeping: capture scrollHeight BEFORE the state
   // update that shrinks firstRenderedIndex, then in a layout effect add the
   // net growth back to scrollTop so viewport content stays visually fixed.
-  const prevScrollHeightRef = useRef<number | null>(null);
   const pendingFirstIndexRef = useRef(firstRenderedIndex);
 
   useLayoutEffect(() => {
