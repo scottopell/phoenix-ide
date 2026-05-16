@@ -33,7 +33,7 @@ use crate::db::{ConvMode, Database};
 use crate::llm::ModelRegistry;
 use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -54,6 +54,16 @@ pub struct SubAgentCancelRequest {
     #[allow(dead_code)] // Used for logging/debugging
     pub parent_conversation_id: String,
     pub parent_event_tx: mpsc::Sender<Event>,
+}
+
+/// Why a runtime was evicted. Passed to `evict_runtime` so the next
+/// `get_or_create` can describe the real cause in the auto-continue recovery
+/// message instead of always blaming a server restart (task 02710).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionReason {
+    /// The conversation's model was changed; the runtime is recreated so the
+    /// new model takes effect.
+    ModelUpgrade,
 }
 
 /// Manager for all conversation runtimes
@@ -84,6 +94,14 @@ pub struct RuntimeManager {
     /// it. Without inheritance the clients would sit on a dead channel until
     /// the axum keep-alive ping eventually expired or the user refreshed.
     evicted_broadcasters: RwLock<HashMap<String, SseBroadcaster>>,
+    /// Why each pending-eviction runtime was evicted, keyed by conversation
+    /// id. Deposited by `evict_runtime` alongside the broadcaster and consumed
+    /// by the next `get_or_create` so the auto-continue recovery message says
+    /// "model was upgraded" rather than "server restart" (task 02710). A plain
+    /// in-process server restart clears this map, so absence = server restart.
+    /// A set, not a map: model upgrade is currently the only eviction cause;
+    /// add a `HashMap<String, EvictionReason>` if a second cause appears.
+    evicted_model_upgrades: RwLock<HashSet<String>>,
     /// Channel for sub-agent spawn requests
     spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,
     spawn_rx: RwLock<Option<mpsc::Receiver<SubAgentSpawnRequest>>>,
@@ -816,6 +834,7 @@ impl RuntimeManager {
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
             evicted_broadcasters: RwLock::new(HashMap::new()),
+            evicted_model_upgrades: RwLock::new(HashSet::new()),
             spawn_tx,
             spawn_rx: RwLock::new(Some(spawn_rx)),
             cancel_tx,
@@ -1288,6 +1307,15 @@ impl RuntimeManager {
             }
         };
 
+        // Consume any recorded model-upgrade eviction for this conversation.
+        // Drives the wording of the auto-continue recovery message below
+        // (task 02710).
+        let evicted_for_model_upgrade = self
+            .evicted_model_upgrades
+            .write()
+            .await
+            .remove(conversation_id);
+
         // Create production adapters
         let storage = DatabaseStorage::new(self.db.clone());
         let llm_client = RegistryLlmClient::new(self.llm_registry.clone(), model_id);
@@ -1353,12 +1381,25 @@ impl RuntimeManager {
             use crate::db::SystemContent;
             use crate::runtime::recovery::RESTART_SYSTEM_MESSAGE_MARKER;
 
-            let restart_msg = format!(
-                "{RESTART_SYSTEM_MESSAGE_MARKER} This conversation was interrupted \
-                 by a server restart. The last tool execution may have caused the \
-                 restart. Review the tool results above before deciding what to do \
-                 next. Do NOT re-execute the same command that was just running."
-            );
+            // Keep the marker prefix regardless of cause: recovery.rs counts
+            // consecutive marker messages at the tail as the restart-loop
+            // guard. Only the human-readable cause differs (task 02710).
+            let restart_msg = if evicted_for_model_upgrade {
+                format!(
+                    "{RESTART_SYSTEM_MESSAGE_MARKER} This conversation was resumed \
+                     because its model was upgraded. The last tool execution was \
+                     interrupted by the model switch. Review the tool results \
+                     above before deciding what to do next. Do NOT re-execute the \
+                     same command that was just running."
+                )
+            } else {
+                format!(
+                    "{RESTART_SYSTEM_MESSAGE_MARKER} This conversation was interrupted \
+                     by a server restart. The last tool execution may have caused the \
+                     restart. Review the tool results above before deciding what to do \
+                     next. Do NOT re-execute the same command that was just running."
+                )
+            };
             let msg_id = uuid::Uuid::new_v4().to_string();
             if let Err(e) = self
                 .db
@@ -1432,11 +1473,23 @@ impl RuntimeManager {
     /// same channel without needing to reconnect. A `Shutdown` event is sent
     /// to the old runtime so it exits cleanly and releases its broadcaster
     /// clone, completing the hand-off.
-    pub async fn evict_runtime(&self, conversation_id: &str) {
+    pub async fn evict_runtime(&self, conversation_id: &str, reason: EvictionReason) {
         let old = {
             let mut runtimes = self.runtimes.write().await;
             runtimes.remove(conversation_id)
         };
+
+        // Record the cause unconditionally (even if no runtime was live): the
+        // next get_or_create recreates the conversation with the new model and
+        // its recovery message should name the real cause (task 02710).
+        match reason {
+            EvictionReason::ModelUpgrade => {
+                self.evicted_model_upgrades
+                    .write()
+                    .await
+                    .insert(conversation_id.to_string());
+            }
+        }
 
         if let Some(handle) = old {
             let receivers = handle.broadcast_tx.receiver_count();

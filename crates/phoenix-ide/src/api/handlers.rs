@@ -1710,7 +1710,10 @@ async fn upgrade_conversation_model(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     // Evict the active runtime so it gets recreated with the new model
-    state.runtime.evict_runtime(&id).await;
+    state
+        .runtime
+        .evict_runtime(&id, crate::runtime::EvictionReason::ModelUpgrade)
+        .await;
 
     tracing::info!(
         conv_id = %id,
