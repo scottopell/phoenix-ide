@@ -411,9 +411,15 @@ THE SYSTEM SHALL emit a `methodology_warnings` list alongside (never in place of
 THE SYSTEM SHALL classify each changed prop reported by `why_render` as `reference_changed` vs `value_changed` where cheaply determinable, and annotate that the comparison is a shallow reference compare.
 **Rationale:** inline object/array/function props mint a new reference every render (the most common React pattern); a bare `!==` reports them as "changed" and an agent reads that as a root cause. Labeling stops the #1 false positive being stated as fact.
 
-**REQ-BT-019.18 — Determinism by construction (per-run reset).**
-THE SYSTEM SHALL reset to a fixed state before each run's before-snapshot, by default, so runs are mutually comparable (the "fingerprint"): an explicit `reset` (`navigate{url}` or `reload`) if supplied, otherwise a reload of the current URL.
-THE SYSTEM SHALL require an explicit `reset: "none"` to opt out of per-run reset, AND emit a `methodology_warnings` entry when it is used. State bleed across runs SHALL NOT be the silent default for a tool whose contract is a deterministic scenario driver.
+**REQ-BT-019.18 — Determinism by construction (per-run reset + readiness-anchored window).**
+THE SYSTEM SHALL, before each run, reset to a fixed state, by default: an explicit `reset` (`navigate{url}` or `reload`) if supplied, otherwise a reload of the current URL. `reset: "none"` opts out and MUST emit a `methodology_warnings` entry. State bleed across runs SHALL NOT be the silent default.
+THE SYSTEM SHALL treat the `reset` AND the first readiness step (`wait_selector`/`wait_timing`/`wait_eval`) as **untimed setup**: page load, framework mount, and async settle happen BEFORE the measured window opens. The window opens only once readiness is satisfied (REQ-BT-019.20). A scenario with no readiness step opens the window immediately after reset and MUST emit a `methodology_warnings` entry (the mount/settle is then unavoidably in-window — the F3 footgun).
+
+**REQ-BT-019.20 — Page-anchored measurement window (F3/F5 root-cause fix).**
+The measured window SHALL be defined IN THE PAGE, not inferred from two host-side `Performance.getMetrics` round-trips. A document-start-injected harness SHALL install a `longtask` `PerformanceObserver` and expose reset/read entry points.
+- **Open:** immediately after the first readiness step satisfies, the harness resets in-page accumulators — `t0 = performance.now()`, longtask sum/count zeroed, the `__phoenix` React commit buffer cleared.
+- **Close:** after the remaining (measured) steps, the harness reads the accumulators in one in-page call.
+**Rationale:** host-bracketed CDP counter deltas are unanchored to the page's own scheduling and collapse to ~0 when a renderer-blocking burst delays the *before* read past itself (F5), or capture the mount when it lands between the two reads (F3). A page-anchored window is immune to renderer-block and CDP timing because the boundaries are `performance.now()` marks the page sets itself. This mirrors the validated consuming methodology.
 
 **REQ-BT-019.19 — Canonical per-run sample schema (the contract consumers adapt to).**
 The raw per-run sample emitted by `run_scenario` has a canonical key set. THESE NAMES ARE AUTHORITATIVE; a downstream statistics/significance consumer adapts its extraction to these — the harness does not rename to match a consumer, and (per REQ-BT-019-NG-STATS) does not reduce. The canonical keys are:
@@ -421,18 +427,17 @@ The raw per-run sample emitted by `run_scenario` has a canonical key set. THESE 
 | key | meaning | null when |
 |-----|---------|-----------|
 | `run_index` | 0-based post-warmup run ordinal | never |
-| `script_duration` | ScriptDuration delta over the measured window (ms) | never |
-| `task_duration` | TaskDuration delta (ms) | never |
-| `layout_count`, `recalc_style_count` | layout / style-recalc count deltas | never |
-| `nodes` | DOM node count (absolute, post-window) | never |
-| `js_event_listeners` | listener count (absolute) | never |
-| `gc_ran` | whether a forced GC ran this run | never |
-| `js_heap_used` | post-full-GC live heap bytes (REQ-BT-019.15) | `gc_ran=false` |
+| `script_ms` | sum of `longtask` durations within the page-anchored window (ms) — REQ-BT-019.20, NOT a CDP `ScriptDuration` delta | never |
+| `long_tasks` | count of `longtask` entries (>50 ms) within the window | never |
+| `wall_ms` | `performance.now()` span of the measured window | never |
+| `dom_nodes` | `document.getElementsByTagName('*').length` at window close (absolute) | never |
+| `gc_ran` | whether a forced GC ran this run (REQ-BT-019.15) | never |
+| `js_heap_used` | post-full-GC live-heap bytes — a one-shot gauge read once post-GC (F5 does not apply to gauges) | `gc_ran=false` |
 | `react_status` | `measured` \| `absent` \| `no_profiling_build` | never |
-| `react_commits` | commit count (React present) | `react_status=absent` |
-| `react_actual_ms` | committed-tree actualDuration sum, ms (REQ-BT-019.4 — the ROOT fiber's value per commit, never a per-fiber sum) | `react_status≠measured` |
+| `react_commits` | commit count over the window (React present) | `react_status=absent` |
+| `react_actual_ms` | summed per-commit ROOT-fiber `actualDuration` over the window, ms (REQ-BT-019.4 — never a per-fiber sum) | `react_status≠measured` |
 
-A consumer keying off other names (e.g. `script_ms`, `react_commit_count`, `macro_delta.*`) and silently skipping absent metrics will reduce to "heap only" against this schema — a methodology failure that looks like success. The fix belongs in the consumer's extraction table, not in renaming this schema. A change to any key here is a breaking change and MUST update this table.
+The pre-REQ-BT-019.20 CDP-counter delta keys (`script_duration`, `task_duration`, `layout_count`, `recalc_style_count`, `nodes`, `js_event_listeners`) are **removed**: F5 proved the host-bracketed counter delta reads ~0 for real in-window work. The standalone `metrics` action still exposes a one-shot `Performance.getMetrics` snapshot (a gauge read, honest); only the per-run *windowed delta* use was unsound. A consumer keying off the old names, or off other names while silently skipping absent metrics, reduces to "heap only" — a methodology failure that looks like success; the fix belongs in the consumer's extraction table. Any change to a key here is breaking and MUST update this table.
 
 #### Non-goals (this requirement)
 
