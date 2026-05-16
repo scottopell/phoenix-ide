@@ -192,8 +192,24 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
         }
         components.push(rec);
       }
-      var total = 0;
-      for (var i = 0; i < components.length; i++) total += components[i].actualDuration;
+      // REQ-BT-019.4: the commit's cost is the ROOT fiber's
+      // actualDuration — React already accumulates the whole committed
+      // subtree there. Summing every fiber double-counts: a parent's
+      // actualDuration already includes its children's, so a naive sum
+      // inflates roughly by tree depth/fan-out. Fall back to the
+      // largest single subtree (never the sum) if the root frame did
+      // not carry a number.
+      var rootDur = (root.current && typeof root.current.actualDuration === 'number')
+        ? root.current.actualDuration : null;
+      var total;
+      if (rootDur !== null) {
+        total = rootDur;
+      } else {
+        total = 0;
+        for (var i = 0; i < components.length; i++) {
+          if (components[i].actualDuration > total) total = components[i].actualDuration;
+        }
+      }
       components.sort(function(x, y) { return y.actualDuration - x.actualDuration; });
       var mountCount = 0;
       var updateCount = 0;

@@ -2423,3 +2423,489 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
 
     shutdown_test(manager, server).await;
 }
+
+/// Extract the first `prefix...suffix` path substring from a tool's
+/// output. Avoids pulling the `regex` crate into test code (the path
+/// format is a fixed prefix + uuid + fixed extension). Uses `split_once`
+/// rather than byte-index slicing so it cannot panic on multi-byte UTF-8.
+fn extract_tmp_path(haystack: &str, prefix: &str, suffix: &str) -> Option<String> {
+    let (_, after_prefix) = haystack.split_once(prefix)?;
+    let (uuid, _) = after_prefix.split_once(suffix)?;
+    Some(format!("{prefix}{uuid}{suffix}"))
+}
+
+/// Gated (chrome only): real `Profiler.Profile` round-trip.
+///
+/// The CPU summarizer (`summarize_cpu_profile`/`cpu_self_times`) was only
+/// ever unit-tested against hand-built JSON. This drives a live Chrome
+/// capture: `cpu_start` → a real ~400ms busy loop → `cpu_stop`, proving
+/// the chromiumoxide `Profile` struct deserialises and summarises. It
+/// then re-summarises the written file via `cpu_summary` to prove the
+/// serde round-trip through disk is independent and lossless.
+#[tokio::test]
+async fn test_browser_profile_cpu_start_stop_real_profile_serde() {
+    require_chrome!();
+
+    let (ctx, manager) = test_context("test-profile-cpu-real");
+    let nav = BrowserNavigateTool
+        .run(json!({ "url": "about:blank" }), ctx.clone())
+        .await;
+    assert!(nav.success, "navigate failed: {}", nav.output);
+
+    let start = BrowserProfileTool
+        .run(json!({ "action": "cpu_start" }), ctx.clone())
+        .await;
+    assert!(start.success, "cpu_start should succeed: {}", start.output);
+
+    // ~400ms busy loop so the sampler collects real frames/timeDeltas.
+    let busy = BrowserEvalTool
+        .run(
+            json!({
+                "expression": "var s=0; var t=Date.now(); while(Date.now()-t<400){ s+=Math.sqrt(s+1); } s"
+            }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(busy.success, "busy-loop eval failed: {}", busy.output);
+
+    let stop = BrowserProfileTool
+        .run(json!({ "action": "cpu_stop" }), ctx.clone())
+        .await;
+    // Primary assertion: real Profile deserialisation + summary did NOT error.
+    assert!(stop.success, "cpu_stop should succeed: {}", stop.output);
+    assert!(
+        stop.output.contains("Sampled wall time:"),
+        "cpu_stop summary must report sampled wall time (real timeDeltas path): {}",
+        stop.output
+    );
+    assert!(
+        stop.output.contains("by SELF time"),
+        "cpu_stop summary must rank functions by SELF time: {}",
+        stop.output
+    );
+    let path = extract_tmp_path(&stop.output, "/tmp/phoenix-cpu-profile-", ".json")
+        .unwrap_or_else(|| panic!("cpu_stop must report a profile path: {}", stop.output));
+
+    // Independent round-trip: cpu_summary reads the file back through
+    // `serde_json::from_str::<CpuProfile>` and re-summarises it.
+    let summ = BrowserProfileTool
+        .run(
+            json!({ "action": "cpu_summary", "path": path }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(
+        summ.success,
+        "cpu_summary must NOT error on a real cpu_stop file (proves serde round-trip): {}",
+        summ.output
+    );
+    assert!(
+        !summ.output.trim().is_empty(),
+        "cpu_summary output must be non-empty: {}",
+        summ.output
+    );
+    // A 400ms busy loop normally yields samples → "by SELF time"; tolerate
+    // a very fast machine producing too few samples (the "carries no
+    // samples" / "empty" fallbacks) — it must still parse without error.
+    assert!(
+        summ.output.contains("by SELF time")
+            || summ.output.contains("Sampled wall time")
+            || summ.output.contains("carries no samples")
+            || summ.output.contains("CPU profile is empty"),
+        "cpu_summary must produce a parseable summary (not a serde error): {}",
+        summ.output
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// Gated (chrome only): real Tracing long-task extraction.
+///
+/// The `Tracing.dataCollected` listener, the `tracingComplete`
+/// notify-wait (with the `Notified::enable()` lost-wakeup fix), and the
+/// `dur > 50_000us` long-task parse have never run against a live trace.
+/// A single >50ms blocking task is generated; the load-bearing assertion
+/// is that `trace_stop` completes without timing out and reports a
+/// long-task count (trace category timing varies by Chrome build, so the
+/// count itself is not hard-asserted).
+#[tokio::test]
+async fn test_browser_profile_trace_stop_long_task_real() {
+    require_chrome!();
+
+    let (ctx, manager) = test_context("test-profile-trace-real");
+    let nav = BrowserNavigateTool
+        .run(json!({ "url": "about:blank" }), ctx.clone())
+        .await;
+    assert!(nav.success, "navigate failed: {}", nav.output);
+
+    let start = BrowserProfileTool
+        .run(json!({ "action": "trace_start" }), ctx.clone())
+        .await;
+    assert!(
+        start.success,
+        "trace_start should succeed: {}",
+        start.output
+    );
+
+    // One blocking task well over the 50ms long-task threshold.
+    let block = BrowserEvalTool
+        .run(
+            json!({ "expression": "var t=Date.now(); while(Date.now()-t<120){}; 'done'" }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(block.success, "blocking eval failed: {}", block.output);
+
+    let stop = BrowserProfileTool
+        .run(json!({ "action": "trace_stop" }), ctx.clone())
+        .await;
+    // Load-bearing: trace_stop completed (drain path + enable() race fix
+    // worked end-to-end; a timeout would still succeed but append a note).
+    assert!(stop.success, "trace_stop should succeed: {}", stop.output);
+    assert!(
+        stop.output.contains("Trace saved to"),
+        "trace_stop must report a saved trace: {}",
+        stop.output
+    );
+    assert!(
+        extract_tmp_path(&stop.output, "/tmp/phoenix-trace-", ".json").is_some(),
+        "trace_stop must report a /tmp/phoenix-trace- path: {}",
+        stop.output
+    );
+    // The extraction ran and reported a count: "Long tasks (>50ms): <n>".
+    let marker = "Long tasks (>50ms):";
+    let (_, after) = stop
+        .output
+        .split_once(marker)
+        .unwrap_or_else(|| panic!("trace_stop must report a long-task count: {}", stop.output));
+    let after = after.trim_start();
+    assert!(
+        after.chars().next().is_some_and(|c| c.is_ascii_digit()),
+        "long-task marker must be followed by a numeric count: {}",
+        stop.output
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// Gated (chrome only): real heap snapshot streaming + diff.
+///
+/// The `EventAddHeapSnapshotChunk` collector, the 2s post-completion
+/// drain, and `parse_heap_stats` (flat-node parse, "Detached" string
+/// match, `self_size` sum) have zero real coverage. Two snapshots are
+/// taken around extra allocations; the load-bearing assertion is that
+/// the diff call parsed BOTH real Chrome snapshots and produced a
+/// node-count / detached / `self_size` delta without error.
+#[tokio::test]
+async fn test_browser_profile_heap_snapshot_streaming_and_diff() {
+    require_chrome!();
+
+    let (ctx, manager) = test_context("test-profile-heap-real");
+    let nav = BrowserNavigateTool
+        .run(json!({ "url": "about:blank" }), ctx.clone())
+        .await;
+    assert!(nav.success, "navigate failed: {}", nav.output);
+
+    // Retain detached DOM nodes (held by a JS array) + a big array.
+    let alloc1 = BrowserEvalTool
+        .run(
+            json!({
+                "expression": "window.__leak=[]; for(var i=0;i<50;i++){var d=document.createElement('div'); d.innerHTML='x'.repeat(100); window.__leak.push(d);} window.__leak.push(new Array(100000).fill(7)); 'ok'"
+            }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(alloc1.success, "alloc1 eval failed: {}", alloc1.output);
+
+    let snap1 = BrowserProfileTool
+        .run(json!({ "action": "heap_snapshot" }), ctx.clone())
+        .await;
+    assert!(
+        snap1.success,
+        "first heap_snapshot should succeed (chunk streaming): {}",
+        snap1.output
+    );
+    let baseline = extract_tmp_path(&snap1.output, "/tmp/phoenix-heap-", ".heapsnapshot")
+        .unwrap_or_else(|| {
+            panic!(
+                "first heap_snapshot must report a snapshot path: {}",
+                snap1.output
+            )
+        });
+    assert!(
+        snap1.output.contains("Heap snapshot saved to"),
+        "no-baseline heap_snapshot must report the saved path: {}",
+        snap1.output
+    );
+
+    // Allocate more so the diff has a positive delta to report.
+    let alloc2 = BrowserEvalTool
+        .run(
+            json!({ "expression": "window.__leak.push(new Array(200000).fill(9)); 'ok'" }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(alloc2.success, "alloc2 eval failed: {}", alloc2.output);
+
+    let snap2 = BrowserProfileTool
+        .run(
+            json!({ "action": "heap_snapshot", "baseline": baseline }),
+            ctx.clone(),
+        )
+        .await;
+    // Load-bearing: the second call parsed BOTH real snapshots and
+    // produced a diff without error.
+    assert!(
+        snap2.success,
+        "heap_snapshot diff must NOT error (proves chunk streaming + parse_heap_stats on real snapshots): {}",
+        snap2.output
+    );
+    assert!(
+        snap2.output.contains("Heap diff (post"),
+        "diff output must be a heap diff: {}",
+        snap2.output
+    );
+    assert!(
+        snap2.output.contains("node count:"),
+        "diff must report a node-count line: {}",
+        snap2.output
+    );
+    assert!(
+        snap2.output.contains("detached DOM nodes:"),
+        "diff must report a detached-DOM-node count: {}",
+        snap2.output
+    );
+    assert!(
+        snap2.output.contains("self_size:"),
+        "diff must report a self_size line: {}",
+        snap2.output
+    );
+    let display = snap2
+        .display_data
+        .expect("heap diff must attach display_data");
+    assert!(
+        display.get("node_count_delta").is_some(),
+        "display_data must carry node_count_delta: {display}"
+    );
+    assert!(
+        display.get("self_size_delta_bytes").is_some(),
+        "display_data must carry self_size_delta_bytes: {display}"
+    );
+    assert!(
+        display
+            .get("detached_dom_nodes")
+            .and_then(|d| d.get("post"))
+            .is_some(),
+        "display_data must carry detached_dom_nodes.post: {display}"
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// Gated (chrome + network): the React `no_profiling_build` tri-state
+/// branch.
+///
+/// Clones `test_browser_profile_react_measured_path` but loads the
+/// **production** react-dom build. React is present and the auto-injected
+/// commit hook still fires (commit COUNT observed), but a production
+/// build exposes no `actualDuration` — so the status must read
+/// `no_profiling_build` and `react_actual_ms` must be null, NOT a silent
+/// zero. This is the footgun that fix #1 closed; only `measured` and
+/// `absent` were previously proven against real Chrome.
+#[tokio::test]
+async fn test_browser_profile_react_no_profiling_build_path() {
+    require_chrome!();
+    require_network!(); // pulls React UMD from unpkg
+
+    // Production react-dom => fibers do NOT carry actualDuration even
+    // though the commit hook fires. Script order: react -> scheduler ->
+    // react-dom.production.
+    let html = r#"<!doctype html><html><head><meta charset="utf-8"></head>
+<body><div id="root"></div>
+<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/scheduler@0.23.2/umd/scheduler.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+<script>
+window.__renders = 0;
+var e = React.createElement;
+function App() {
+  var st = React.useState(0); var n = st[0], set = st[1];
+  window.__renders++;
+  React.useEffect(function () { window.__ready = true; }, []);
+  return e('div', null,
+    e('div', { id: 'ready' }, 'ready'),
+    e('button', { id: 'inc', onClick: function () { set(function (x) { return x + 1; }); } }, 'n=' + n));
+}
+ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+</script></body></html>"#;
+
+    let server = TestServer::start(html).await;
+    let (ctx, manager) = test_context("test-profile-react-noprof");
+
+    let nav = BrowserNavigateTool
+        .run(
+            json!({ "url": server.url(), "timeout": "30s" }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(nav.success, "navigate failed: {}", nav.output);
+
+    let waited = BrowserWaitForSelectorTool
+        .run(
+            json!({ "selector": "#ready", "timeout": "30s" }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(
+        waited.success,
+        "React did not mount (unpkg/production build issue?): {}",
+        waited.output
+    );
+
+    let r = BrowserProfileTool
+        .run(
+            json!({
+                "action": "run_scenario",
+                "runs": 1,
+                "warmup": 0,
+                "reset": "none",
+                "gc_per_run": false,
+                "steps": [
+                    { "kind": "click", "selector": "#inc" },
+                    { "kind": "wait_eval", "expression": "window.__renders >= 2", "timeout": "20s" }
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(r.success, "run_scenario failed: {}", r.output);
+
+    let display = r.display_data.expect("display_data present");
+    let sample = &display["raw_samples"][0];
+
+    assert_eq!(
+        sample["react_status"].as_str(),
+        Some("no_profiling_build"),
+        "production React build (commit hook fires but no actualDuration) must read as `no_profiling_build`: {sample}"
+    );
+    assert!(
+        sample["react_actual_ms"].is_null(),
+        "no_profiling_build must NOT carry a numeric react_actual_ms (the whole point of the tri-state — no silent zero): {sample}"
+    );
+    assert!(
+        sample["react_commits"].as_u64().is_some_and(|c| c >= 1),
+        "commit COUNT must still be observed on a production build: {sample}"
+    );
+
+    shutdown_test(manager, server).await;
+}
+
+/// F3 CHARACTERIZATION (gated: chrome only, network-free).
+///
+/// Empirically proves the mount-in-measured-window footgun the
+/// consuming skill engineers around (it calls unmanaged async-mount
+/// cost "the bimodal-sample root cause / intermittent ~400x outliers").
+///
+/// The page schedules heavy work via `setTimeout(...,0)` AFTER `load`,
+/// mimicking React's post-load async render. `run_scenario`'s default
+/// `reset` (reload) resolves at `load` — BEFORE that work — and the
+/// before-snapshot is taken immediately, so the first readiness step
+/// runs INSIDE the measured window and the ~180ms "mount" is charged
+/// to the sample. There is currently NO API knob to start the window
+/// AFTER readiness; that absence IS the F3 gap.
+///
+/// This asserts the bug is present (script_duration carries the async
+/// work). When F3 is fixed (window opens at the first readiness step,
+/// or a `measure_from` marker), flip this to assert the work is
+/// EXCLUDED — the test then guards the fix instead of the footgun.
+#[tokio::test]
+async fn test_browser_profile_f3_mount_in_window_characterization() {
+    require_chrome!();
+
+    let html = r#"<!doctype html><html><body><button id="ping">ping</button>
+<script>
+window.__ready = false; window.__pinged = false;
+document.getElementById('ping').addEventListener('click', function () {
+  var t = Date.now(); while (Date.now() - t < 5) {}   // ~5ms cheap interaction
+  window.__pinged = true;
+});
+// Heavy work scheduled AFTER load — the async-mount shape that leaks
+// into a window opened at `load`. ~180ms busy + 8000 DOM nodes.
+setTimeout(function () {
+  var t = Date.now(); while (Date.now() - t < 180) {}
+  var box = document.createElement('div');
+  for (var i = 0; i < 8000; i++) { var d = document.createElement('div'); d.textContent = i; box.appendChild(d); }
+  document.body.appendChild(box);
+  window.__ready = true;
+}, 0);
+</script></body></html>"#;
+
+    let server = TestServer::start(html).await;
+    let (ctx, manager) = test_context("test-profile-f3");
+
+    BrowserNavigateTool
+        .run(
+            json!({ "url": server.url(), "timeout": "20s" }),
+            ctx.clone(),
+        )
+        .await;
+
+    // Default reset (reload) + first step is the readiness wait → the
+    // post-load heavy work runs inside the measured window.
+    let r = BrowserProfileTool
+        .run(
+            json!({
+                "action": "run_scenario",
+                "runs": 1,
+                "warmup": 0,
+                "gc_per_run": false,
+                "steps": [
+                    { "kind": "wait_eval", "expression": "window.__ready === true", "timeout": "20s" },
+                    { "kind": "click", "selector": "#ping" },
+                    { "kind": "wait_eval", "expression": "window.__pinged === true", "timeout": "10s" }
+                ]
+            }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(r.success, "run_scenario failed: {}", r.output);
+
+    let display = r.display_data.expect("display_data present");
+    let sample = &display["raw_samples"][0];
+    let nodes = sample["nodes"].as_f64().expect("nodes is a number");
+    let script_ms = sample["script_duration"]
+        .as_f64()
+        .expect("script_duration is a number");
+
+    // F3 (mount-in-window) — `nodes` is the load-bearing signal: the
+    // 8000-node subtree built by the post-load `setTimeout` is present
+    // in the sample, so the heavy async work ran INSIDE the measured
+    // window (window opened at `load`, before the readiness step). A
+    // clean interaction-only window would see single-digit nodes. When
+    // F3 is fixed (window starts at the first readiness step / a
+    // `measure_from` marker) flip this to assert `nodes` is small — the
+    // test then guards the fix instead of the footgun.
+    assert!(
+        nodes >= 8000.0,
+        "F3 repro: the post-load 8000-node build must land in the \
+         measured window (nodes >= 8000); got {nodes}. sample: {sample}"
+    );
+
+    // F5 (metric validity) — the SAME run burned ~180ms of synchronous
+    // JS and built 8000 nodes in-window, yet `script_duration`
+    // (Performance.getMetrics ScriptDuration delta) is ~0. The macro
+    // scripting counter does NOT reflect real in-window work; an agent
+    // reading it concludes "no scripting cost" while `nodes` proves
+    // otherwise. The consuming skill sidesteps this by summing
+    // `longtask` durations instead of trusting ScriptDuration. This
+    // pins the broken behaviour so a future fix (longtask-backed script
+    // time / corrected counter source) must update it deliberately.
+    assert!(
+        script_ms < 50.0,
+        "F5 characterization: script_duration unexpectedly captured the \
+         work ({script_ms}ms) — if real, ScriptDuration may now be \
+         trustworthy; revisit F5 and flip this. sample: {sample}"
+    );
+
+    shutdown_test(manager, server).await;
+}

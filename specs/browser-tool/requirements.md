@@ -415,6 +415,25 @@ THE SYSTEM SHALL classify each changed prop reported by `why_render` as `referen
 THE SYSTEM SHALL reset to a fixed state before each run's before-snapshot, by default, so runs are mutually comparable (the "fingerprint"): an explicit `reset` (`navigate{url}` or `reload`) if supplied, otherwise a reload of the current URL.
 THE SYSTEM SHALL require an explicit `reset: "none"` to opt out of per-run reset, AND emit a `methodology_warnings` entry when it is used. State bleed across runs SHALL NOT be the silent default for a tool whose contract is a deterministic scenario driver.
 
+**REQ-BT-019.19 — Canonical per-run sample schema (the contract consumers adapt to).**
+The raw per-run sample emitted by `run_scenario` has a canonical key set. THESE NAMES ARE AUTHORITATIVE; a downstream statistics/significance consumer adapts its extraction to these — the harness does not rename to match a consumer, and (per REQ-BT-019-NG-STATS) does not reduce. The canonical keys are:
+
+| key | meaning | null when |
+|-----|---------|-----------|
+| `run_index` | 0-based post-warmup run ordinal | never |
+| `script_duration` | ScriptDuration delta over the measured window (ms) | never |
+| `task_duration` | TaskDuration delta (ms) | never |
+| `layout_count`, `recalc_style_count` | layout / style-recalc count deltas | never |
+| `nodes` | DOM node count (absolute, post-window) | never |
+| `js_event_listeners` | listener count (absolute) | never |
+| `gc_ran` | whether a forced GC ran this run | never |
+| `js_heap_used` | post-full-GC live heap bytes (REQ-BT-019.15) | `gc_ran=false` |
+| `react_status` | `measured` \| `absent` \| `no_profiling_build` | never |
+| `react_commits` | commit count (React present) | `react_status=absent` |
+| `react_actual_ms` | committed-tree actualDuration sum, ms (REQ-BT-019.4 — the ROOT fiber's value per commit, never a per-fiber sum) | `react_status≠measured` |
+
+A consumer keying off other names (e.g. `script_ms`, `react_commit_count`, `macro_delta.*`) and silently skipping absent metrics will reduce to "heap only" against this schema — a methodology failure that looks like success. The fix belongs in the consumer's extraction table, not in renaming this schema. A change to any key here is a breaking change and MUST update this table.
+
 #### Non-goals (this requirement)
 
 - **REQ-BT-019-NG-NETEMU** — Network emulation (`Network.emulateNetworkConditions`, table item 2.1) is deferred. It introduces a stateful mode that interacts with scenario determinism and is the least method-critical item; tracked separately.
