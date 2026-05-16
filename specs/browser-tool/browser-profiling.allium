@@ -55,24 +55,47 @@ enum CaptureState { idle | active }
 -- produces no sample and the operation fails (REQ-BT-019.1).
 enum RunOutcome { completed | blocked }
 
+-- React measurement capability for a run (REQ-BT-019.13). The whole
+-- point of this enum is that `absent` and `no_profiling_build` are
+-- NOT representable as a numeric 0 — a not-taken measurement must
+-- never look taken. `measured` = profiling-capable build with
+-- actualDuration; `absent` = no React; `no_profiling_build` = React
+-- present but production build (no actualDuration exposed).
+enum ReactStatus { measured | absent | no_profiling_build }
+
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
 
 -- The macro counter + React commit snapshot taken around one run.
--- Fields are illustrative of REQ-BT-019.3 / .4; the contract is that
--- a sample is captured per run and never reduced before delivery.
+-- Fields are illustrative of REQ-BT-019.3 / .4 / .13 / .15; the
+-- contract is that a sample is captured per run and never reduced
+-- before delivery, AND that a not-taken sub-measurement is null +
+-- discriminated, never a value that looks taken.
 value RunSample {
     run_index:        Integer    -- 0-based, post-warmup
-    script_duration:  Decimal
-    task_duration:    Decimal
+    script_duration:  Decimal    -- delta; GC taken strictly outside this bracket
+    task_duration:    Decimal    -- delta; GC taken strictly outside this bracket
     layout_count:     Decimal
     recalc_style:     Decimal
-    js_heap_used:     Decimal
     nodes:            Decimal
     js_event_listeners: Decimal
-    react_commits:    Integer    -- 0 when React absent
-    react_actual_ms:  Decimal    -- summed actualDuration; 0 when absent
+
+    -- REQ-BT-019.15. gc_ran discriminates: js_heap_used is the
+    -- post-full-GC live-heap read and is present ONLY when GC ran;
+    -- structurally absent when GC was disabled — a mid-cycle sample
+    -- under this key is unrepresentable, not merely discouraged.
+    gc_ran:           Boolean
+    js_heap_used:     Decimal? when gc_ran
+
+    -- REQ-BT-019.13. status is always present and discriminates the
+    -- other two. react_commits is present whenever React is on the
+    -- page (the commit hook fires even on production builds); null
+    -- when React is absent. react_actual_ms is present ONLY when
+    -- status = measured; null otherwise (absent OR no_profiling_build).
+    react_status:     ReactStatus
+    react_commits:    Integer? when react_status != absent
+    react_actual_ms:  Decimal?  when react_status = measured
 }
 
 -- A heap snapshot reference (file on disk). Diffing a baseline
@@ -108,6 +131,12 @@ entity ScenarioRunResult {
     requested_runs: Integer        -- >= 1, excludes warmup
     samples:        List<RunSample>
     blocked_step:   String? when outcome = blocked
+
+    -- REQ-BT-019.16/.18: metadata flagging an unguarded run (no
+    -- throttle, warmup 0, no readiness step, GC disabled, reset
+    -- disabled). Carried ALONGSIDE samples, never in place of them
+    -- — this is not a statistical reduction (REQ-BT-019.5 holds).
+    warnings:       List<String>
 }
 
 ------------------------------------------------------------
@@ -181,8 +210,16 @@ entity ProfilingSession {
 --   WhyRender(ps)                 -- read __phoenix commit reasons (.8)
 --
 -- The transactional harness:
---   RunScenario(ps, steps, runs, warmup, throttle_rate?)
---     steps: non-empty ordered list; runs >= 1; warmup >= 0.
+--   RunScenario(ps, steps, runs, warmup, reset, gc_per_run,
+--               throttle_rate?, result)
+--     steps: non-empty ordered list, NO navigate/reload inside it
+--            (REQ-BT-019.14 — those reset the cumulative counters);
+--     runs >= 1; warmup defaults to >= 1 (REQ-BT-019.16);
+--     reset: navigate{url} | reload | "none". Default is a reload of
+--            the current URL — per-run reset is on by construction
+--            (REQ-BT-019.18); "none" requires explicit opt-out and
+--            forces a methodology warning;
+--     gc_per_run: default true (REQ-BT-019.15).
 --
 -- Session-death cascade (from bedrock / session manager):
 --   BrowserSessionDestroyed(ps)   -- idle reap, conv delete, shutdown
@@ -278,19 +315,27 @@ rule ThrottleClearRestoresDefault {
 ------------------------------------------------------------
 
 -- @guidance
---   One run = (optional reset: navigate/reload to fixed state) ->
---   apply throttle_rate if supplied -> snapshot macro counters +
---   reset __phoenix commit buffer -> dispatch steps in order ->
---   block on the run's readiness step -> snapshot macro counters +
---   read commit buffer -> emit one RunSample. Warmup runs execute
---   identically but their samples are discarded. Throttle applied
---   for the scenario is restored to its prior value when the
---   operation returns (whether it completed or was blocked).
---   The per-run snapshot bracketing is atomic within the harness so
---   the caller never has to reason about interleaving — that is the
---   reason this is harness-owned and not skill-driven primitives.
+--   Per-run sequence (REQ-BT-019.14/.15/.18):
+--     reset (reload current URL by default, or explicit
+--       navigate/reload; skipped only on reset="none") ->
+--     apply throttle_rate if supplied ->
+--     snapshot duration counters (BEFORE) + reset __phoenix
+--       commit buffer ->
+--     dispatch steps (steps contain NO navigate/reload — those
+--       reset cumulative counters and belong in reset) ->
+--     block on the run's readiness step ->
+--     snapshot duration counters (AFTER) — durations = AFTER-BEFORE,
+--       computed here so the GC pause is NOT inside this bracket ->
+--     if gc_per_run: HeapProfiler.collectGarbage -> read JSHeapUsedSize
+--       at this single post-full-GC point (else js_heap_used absent) ->
+--     read commit buffer + React status -> emit one RunSample.
+--   Warmup runs (default >= 1) execute identically but are discarded.
+--   Throttle applied for the scenario is restored on return (completed
+--   OR blocked). The per-run snapshot bracketing is atomic within the
+--   harness so the caller never reasons about interleaving — the
+--   reason this is harness-owned, not skill-driven primitives.
 rule RunScenarioCollectsRawSamples {
-    when: RunScenario(ps, steps, runs, warmup, result)
+    when: RunScenario(ps, steps, runs, warmup, reset, gc_per_run, result)
     requires: count(steps) >= 1
     requires: runs >= 1
     requires: warmup >= 0
@@ -305,13 +350,30 @@ rule RunScenarioCollectsRawSamples {
 -- A readiness step that never satisfies its condition fails the
 -- whole operation; no partial/averaged result is substituted.
 rule RunScenarioBlockedOnReadiness {
-    when: RunScenario(ps, steps, runs, warmup, result)
+    when: RunScenario(ps, steps, runs, warmup, reset, gc_per_run, result)
     requires: count(steps) >= 1
     ensures: result.outcome = blocked implies count(result.samples) = 0
     -- The failure names the blocking step (result.blocked_step). A
     -- blocked run does NOT degrade into "best effort" samples — an
     -- indeterminate-state measurement is worse than no measurement
     -- (REQ-BT-019.1).
+}
+
+-- @guidance
+--   REQ-BT-019.14: a navigate/reload inside `steps` resets the
+--   cumulative Performance counters mid-bracket, so AFTER-BEFORE is
+--   negative or meaningless. The harness rejects such a scenario
+--   before run 0 with an error naming the offending step — it does
+--   NOT emit a bogus delta. Navigation belongs in `reset`, which
+--   runs before the BEFORE snapshot.
+rule RunScenarioRejectsInlineNavigation {
+    when: RunScenario(ps, steps, runs, warmup, reset, gc_per_run, result)
+    -- Modelled as a precondition the harness enforces structurally
+    -- (steps is validated to contain no navigate/reload kind before
+    -- any run executes). On violation the operation does not produce
+    -- a ScenarioRunResult at all — it errors out, so there is no
+    -- sample set to misread.
+    requires: count(steps) >= 1
 }
 
 ------------------------------------------------------------
@@ -397,6 +459,31 @@ invariant RawSamplesNeverReduced {
 invariant BlockedScenarioYieldsNoSamples {
     for r in ScenarioRunResult where r.outcome = blocked:
         count(r.samples) = 0
+}
+
+-- REQ-BT-019.13: a not-measured React timing is NEVER a number. When
+-- the status is not `measured` (no React, or a production build with
+-- no actualDuration) the timing field is absent — "zero React cost"
+-- and "React cost not measured" are different values by construction.
+invariant ReactTimingOnlyWhenMeasured {
+    for s in RunSample where s.react_status != measured:
+        s.react_actual_ms = null
+}
+
+-- REQ-BT-019.13: React commit *count* is reported whenever React is
+-- present (the commit hook fires even on production builds) and is
+-- absent only when there is no React at all.
+invariant ReactCommitsAbsentOnlyWhenNoReact {
+    for s in RunSample where s.react_status = absent:
+        s.react_commits = null
+}
+
+-- REQ-BT-019.15: the heap number exists at exactly one point in the
+-- GC cycle — post-full-GC — or not at all. A heap value without a GC
+-- behind it (a mid-cycle sample) is structurally unrepresentable.
+invariant HeapOnlyWhenGc {
+    for s in RunSample where not s.gc_ran:
+        s.js_heap_used = null
 }
 
 -- REQ-BT-019.10: a heap diff that exists always carries BOTH the

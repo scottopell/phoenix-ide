@@ -384,6 +384,35 @@ THE SYSTEM SHALL start/stop `Profiler` precise coverage and persist per-script c
 **REQ-BT-019.12 — Trace persisted to disk.**
 THE SYSTEM SHALL write traces (REQ-BT-019.9) as `{"traceEvents":[...]}` JSON for human audit.
 
+#### Hardening — pit-of-success (a misread sample is worse than no sample)
+
+These exist because the tool is consumed by LLM agents doing performance work, where a plausible-looking wrong number is the dominant failure mode. The governing rule: a measurement that was not actually taken MUST NOT be representable as a value that looks taken. Loud-wrong or labeled-absent always beats silent-wrong.
+
+**REQ-BT-019.13 — No silent "not measured" for React metrics.**
+THE SYSTEM SHALL distinguish, in every run sample, three React states: `measured` (a profiling-capable build, `actualDuration` available), `absent` (no React on the page), and `no_profiling_build` (React present but a production build that does not expose `actualDuration`).
+WHEN the state is not `measured` THE SYSTEM SHALL report the React timing field as null (not `0`) and carry the state discriminator, so "zero React cost" and "React cost not measured" are not the same value. Commit *count* MAY still be reported when React is present (the commit hook fires regardless of build), with the timing field null.
+
+**REQ-BT-019.14 — Counter-reset safety.**
+`Performance.getMetrics` counters are cumulative since document load and reset on navigation. THE SYSTEM SHALL NOT compute a before/after delta across a navigation within a run.
+THE SYSTEM SHALL reject a `run_scenario` whose `steps` contain a `navigate` or `reload` step (these belong in the per-run `reset`, REQ-BT-019.18, which executes before the before-snapshot), with an error that names the offending step and explains the counter reset — rather than returning a negative or meaningless delta.
+
+**REQ-BT-019.15 — Forced-GC heap inside the run loop, default-on.**
+THE SYSTEM SHALL, by default, force a full GC (`HeapProfiler.collectGarbage`) once per run and read `JSHeapUsedSize` only at that post-GC point — the single consistent point in the GC cycle (the V8 analog of a post-mark live-heap read).
+THE SYSTEM SHALL take the GC strictly outside the duration bracket (snapshot the duration counters, then GC, then read heap) so the collect pause does not inflate ScriptDuration/TaskDuration.
+WHEN per-run GC is explicitly disabled THE SYSTEM SHALL report the heap field as null plus a flag — never a populated mid-cycle sample under the same key as a real metric.
+
+**REQ-BT-019.16 — Method-safe defaults and methodology warnings.**
+THE SYSTEM SHALL default `warmup` to at least 1 (cold JIT/first-paint excluded by default).
+THE SYSTEM SHALL emit a `methodology_warnings` list alongside (never in place of) the raw samples, populated when the run was unguarded in a way that invalidates a naive reading: no CPU throttle, `warmup` explicitly 0, no readiness step present in `steps`, per-run GC disabled, or per-run reset disabled. This is metadata, not a statistical reduction — REQ-BT-019.5 still holds.
+
+**REQ-BT-019.17 — why_render: label, do not diagnose.**
+THE SYSTEM SHALL classify each changed prop reported by `why_render` as `reference_changed` vs `value_changed` where cheaply determinable, and annotate that the comparison is a shallow reference compare.
+**Rationale:** inline object/array/function props mint a new reference every render (the most common React pattern); a bare `!==` reports them as "changed" and an agent reads that as a root cause. Labeling stops the #1 false positive being stated as fact.
+
+**REQ-BT-019.18 — Determinism by construction (per-run reset).**
+THE SYSTEM SHALL reset to a fixed state before each run's before-snapshot, by default, so runs are mutually comparable (the "fingerprint"): an explicit `reset` (`navigate{url}` or `reload`) if supplied, otherwise a reload of the current URL.
+THE SYSTEM SHALL require an explicit `reset: "none"` to opt out of per-run reset, AND emit a `methodology_warnings` entry when it is used. State bleed across runs SHALL NOT be the silent default for a tool whose contract is a deterministic scenario driver.
+
 #### Non-goals (this requirement)
 
 - **REQ-BT-019-NG-NETEMU** — Network emulation (`Network.emulateNetworkConditions`, table item 2.1) is deferred. It introduces a stateful mode that interacts with scenario determinism and is the least method-critical item; tracked separately.
