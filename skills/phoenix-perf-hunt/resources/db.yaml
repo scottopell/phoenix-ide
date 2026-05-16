@@ -13,3 +13,10 @@ entries:
     status: failure
     verdict: rejected
     file: resources/db/StreamingMessage-memo-completed-blocks.yaml
+  - id: StreamingMessage-open-tail-plaintext
+    target: ui/src/components/StreamingMessage.tsx:StreamingBlock
+    technique: open-tail-plaintext
+    scenario: sse-streaming
+    status: failure
+    verdict: rejected
+    file: resources/db/StreamingMessage-open-tail-plaintext.yaml

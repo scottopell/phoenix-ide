@@ -1,0 +1,92 @@
+id: StreamingMessage-open-tail-plaintext
+target: ui/src/components/StreamingMessage.tsx:StreamingBlock
+technique: open-tail-plaintext
+scenario: sse-streaming
+date: 2026-05-16
+status: failure
+verdict: rejected
+
+# Third StreamingMessage hunt. Valid instrument (fresh baseline this run:
+# median 70.6, sd 2.6, CV 3.7%, zero outliers). Optimization MEASURED and
+# REJECTED. Together with the two prior rejections this TRIANGULATES the
+# real cost — the suite's highest-value output so far.
+
+hypothesis: >
+  ReactMarkdown rebuilds the full mdast of the whole accumulated open-tail
+  prose on every rAF frame; that per-frame mdast rebuild is the dominant
+  streaming cost. Rendering the open/last markdown block as plain
+  pre-wrapped text while it streams (settled blocks + finalized message
+  still rich) will cut react_commit_ms.
+
+change_under_test: >
+  StreamingBlock gains isOpenTail; markdown + isOpenTail -> plain
+  <div white-space:pre-wrap> instead of <ReactMarkdown>. One change.
+  ./dev.py authoritative tsc -b = 0, eslint = 0.
+
+method:
+  scenario: resources/scenarios/sse-streaming.yaml (mock, words=1800)
+  n: 12 + 3 warmup, identical baseline/optimized, same session
+  baseline: median 70.6 sd 2.6 (CV 3.7%) — note ~10% run-to-run baseline
+    drift vs an earlier session's 64.0; this is why baseline is recaptured
+    immediately before every change, never reused.
+  stats: phoenix-perf-review/scripts/stats.py (Welch t-test, raw samples)
+
+measurements:
+  react_commit_ms:    "71.06 ± 2.75 -> 74.03 ± 5.11  (+4.19%, p=0.0936)"
+  react_commit_count: "35.42 ± 1.68 -> 35.42 ± 1.38  (+0.00%, p=1.0)"
+  js_heap_used_mib:   "28.02 -> 29.59 (+5.59%, p=0.032)  # tiny, adverse, not under test"
+  dom_nodes:          "2192 -> 2396 (+9.31%, p=1.2e-08)  # see instrument_finding"
+  wall_ms:            "41460 -> 41790 (+0.80%, p=0.12; mock-cadence bound)"
+
+votes:
+  duplicate_hunter: approve   # distinct technique/node from the 2 prior entries
+  skeptic: reject             # react_commit_ms +4.2%, p=0.094 — no improvement,
+                              # not significant, wrong direction
+  conservative: reject        # would also trade away live markdown formatting
+                              # mid-stream for ZERO measured gain
+  react_expert: reject        # confirms: markdown render is not the cost;
+                              # commit_count identical, ms unchanged
+  greybeard: reject           # behavior tradeoff + complexity for nothing
+
+verdict_rationale: |
+  Replacing the per-frame ReactMarkdown of the open block with plain text
+  left react_commit_ms statistically unchanged (commit_count IDENTICAL,
+  35.42 -> 35.42). The markdown mdast rebuild is therefore NOT the
+  bottleneck. REJECTED.
+
+triangulation: |
+  Three rejected/refuted hypotheses now bound the real cause:
+    - reparse-growing-buffer  -> refuted (sublinear scaling)
+    - memo-completed-blocks   -> rejected (+1.2%, p=0.73)
+    - open-tail-plaintext     -> rejected (+4.2%, p=0.094; count unchanged)
+  react_commit_ms ~= react_commit_count x ~constant per-commit cost, and
+  NOTHING about block rendering moves either factor. The cost is the
+  intrinsic React commit/reconcile of the streaming-message subtree, once
+  per rAF flush. The only remaining levers are STRUCTURAL, not render-level:
+    (A) reduce commit COUNT — coarsen the rAF coalescing in
+        StreamingMessage's effect (flush at most every ~50-100ms instead of
+        every animation frame). Directly attacks the count factor. Behavior
+        tradeoff: slightly chunkier streaming cadence. <- recommended next.
+    (B) shrink the reconciled subtree per flush (render the streaming
+        message as a single text node until settle, structure on finalize).
+  Both are DIFFERENT techniques on a DIFFERENT node (the rAF effect /
+  subtree shape, not StreamingBlock) — eligible, not duplicates.
+
+instrument_finding: |
+  dom_nodes rises +9% to +15% (p<1e-7) in EVERY StreamingMessage hunt
+  regardless of the change — including this one, where plain text has
+  strictly FEWER nodes than the ReactMarkdown it replaced. So the dom_nodes
+  delta is a scenario/measurement artifact (readiness-snapshot timing /
+  fresh-conversation content variance), NOT a code effect. Action: drop
+  dom_nodes from the significance gate for sse-streaming (or anchor the
+  snapshot deterministically) before it produces a false "regression".
+  Tracked as a checklist hardening item.
+
+lessons: |
+  1. Negative results compound: three rejections triangulated the true
+     cost (intrinsic per-flush reconcile) far more reliably than any single
+     "obvious" fix would have. This IS the methodology's value.
+  2. Stop probing block rendering. Next hunt targets commit FREQUENCY
+     (rAF-coalescing interval) — lever (A) above.
+  3. dom_nodes is not a trustworthy metric in this scenario; gate must be
+     corrected before it false-positives a regression.
