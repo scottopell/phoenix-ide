@@ -147,12 +147,16 @@ def one_run(scn, table, bin_):
     ab_eval(RESET_JS, bin_)
     for st in steps[1:]:
         do_step(st, table, bin_)
-    raw = ab_eval(READ_JS, bin_)
-    # agent-browser may wrap eval output; extract the JSON object.
-    i, j = raw.find("{"), raw.rfind("}")
-    if i < 0 or j < 0:
-        raise RuntimeError(f"could not parse metrics from eval output: {raw!r}")
-    return json.loads(raw[i:j + 1])
+    raw = ab_eval(READ_JS, bin_).strip()
+    # `agent-browser eval` prints the value JSON-string-encoded, e.g.
+    #   "{\"script_ms\":1,...}"
+    # so unwrap the outer string literal once, then parse the object.
+    try:
+        if raw.startswith('"'):
+            raw = json.loads(raw)  # -> the inner JSON text
+        return json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"could not parse metrics from eval output: {raw!r}") from e
 
 
 def main():

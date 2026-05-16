@@ -41,14 +41,16 @@ warmup: 3
 
 steps:
   - navigate: "{base_url}/c/{slug}"
-  - wait-for-selector: "textarea"
-  - click: "textarea"
-  - type: { selector: "textarea", text: "{prompt}" }
+  - wait-for-selector: 'textarea[placeholder="Type a message..."]'
+  # Snapshot the pre-send finalized-agent-message count so readiness can key
+  # on "a NEW agent message landed", independent of pre-existing content.
+  - eval: "window.__pp_pre = document.querySelectorAll('.message.agent').length"
+  - click: 'textarea[placeholder="Type a message..."]'
+  - type: { selector: 'textarea[placeholder="Type a message..."]', text: "{prompt}" }
   - key: "Enter"
-  # Readiness: streaming finished — the live StreamingMessage container
-  # (.streaming-message, StreamingMessage.tsx:65) is gone and a finalized
-  # agent message (.agent-message) has landed. find-target must confirm
-  # these class selectors against ui/src before the first run.
+  # Readiness: a NEW finalized agent message (.message.agent,
+  # MessageComponents) has landed AND the live streaming container
+  # (.streaming-message, StreamingMessage.tsx:65) is gone.
   - wait-for-eval-predicate:
-      expr: "document.querySelectorAll('.agent-message').length > 0 && !document.querySelector('.streaming-message')"
-      timeout_ms: 60000
+      expr: "document.querySelectorAll('.message.agent').length > window.__pp_pre && !document.querySelector('.streaming-message')"
+      timeout_ms: 180000
