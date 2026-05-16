@@ -4,6 +4,16 @@
   background: var(--bg-secondary);
   font-size: 12px;
   color: var(--text-muted);
+  /* Header-sized when collapsed; flex-shares the column when expanded
+   * (task 13004) so stacked panels can't squeeze the FileTree to 0. */
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 auto;
+  min-height: 0;
+}
+
+.tasks-panel.is-expanded {
+  flex: 1 1 auto;
 }
 
 .tasks-panel-header {
@@ -52,10 +62,12 @@
   opacity: 0.7;
 }
 
-/* ISSUE-001 fix: constrain panel height with independent scroll */
+/* Shares column height with sibling sections instead of a fixed cap
+ * (task 13004); min-height:0 lets it shrink below content and scroll. */
 .tasks-panel-body {
   padding: 0 8px 8px;
-  max-height: 300px;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
 }
 

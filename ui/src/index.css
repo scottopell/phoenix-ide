@@ -6877,9 +6877,13 @@ html * {
 }
 
 /* Tree scroll container */
+/* FileTree shares column height with the expanded sub-panels (task 13004):
+ * flex-grow with min-height:0 so it can shrink below content and scroll
+ * internally instead of being squeezed to 0 by stacked panel maxima. */
 .fe-tree-scroll {
-  flex: 1;
-  overflow: hidden auto;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 /* FileTree styles */

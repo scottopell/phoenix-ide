@@ -129,7 +129,7 @@ export function SkillsPanel({ conversationId, onSkillClick, expanded: controlled
   };
 
   return (
-    <div className="skills-panel">
+    <div className={`skills-panel${expanded ? ' is-expanded' : ''}`}>
       <button className="skills-panel-header" onClick={() => setExpanded(!expanded)}>
         <span className={`skills-panel-chevron ${expanded ? 'expanded' : ''}`}>&#9654;</span>
         <span className="skills-panel-summary">

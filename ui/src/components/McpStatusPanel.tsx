@@ -145,7 +145,7 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
   }
 
   return (
-    <div className="mcp-panel">
+    <div className={`mcp-panel${expanded ? ' is-expanded' : ''}`}>
       {!reloading && pendingOAuth.map(s => (
         <div key={s.name} className="mcp-oauth-banner">
           <span className="mcp-oauth-label">Auth required:</span>

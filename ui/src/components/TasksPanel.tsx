@@ -91,7 +91,7 @@ export function TasksPanel({ conversationId, currentTaskId, onTaskClick }: Tasks
   };
 
   return (
-    <div className="tasks-panel">
+    <div className={`tasks-panel${expanded ? ' is-expanded' : ''}`}>
       <button
         className="tasks-panel-header"
         onClick={() => setExpanded(!expanded)}
