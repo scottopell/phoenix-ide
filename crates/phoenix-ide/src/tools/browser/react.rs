@@ -90,8 +90,9 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
 (function() {
   // ── Idempotency guard ──────────────────────────────────────────────────────
   // Skip installation if the helper is already present (e.g. tool called twice
-  // before a navigation, or the page ships its own __phoenix).
-  if (window.__phoenix && window.__phoenix.__installed) {
+  // before a navigation, or the page ships its own __phoenix). Guard also on
+  // __perfRead so a re-injection cannot double-install the longtask observer.
+  if (window.__phoenix && window.__phoenix.__installed && window.__phoenix.__perfRead) {
     return;
   }
 
@@ -110,6 +111,25 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
   // (no_profiling_build). Reset by __resetCommits() so a per-run bracket
   // re-derives it from that run's commits.
   var __sawActualDuration = false;
+
+  // ── Page-anchored measurement window (REQ-BT-019.20) ────────────────────────
+  // The measured window is defined IN THE PAGE, not inferred from two host-side
+  // Performance.getMetrics round-trips (F5: those collapse to ~0 for real
+  // in-window work). A longtask PerformanceObserver installed here (at
+  // document-start, BEFORE page scripts) accumulates blocking-task duration
+  // from the very start. __perfReset opens a window (t0 = performance.now(),
+  // accumulators zeroed, React commit buffer cleared); __perfRead closes it
+  // and returns the in-page accumulators in one call.
+  var __lt_ms = 0, __lt_n = 0, __win_t0 = null;
+  try {
+    var __po = new PerformanceObserver(function (l) {
+      l.getEntries().forEach(function (e) {
+        __lt_ms += e.duration;
+        __lt_n += 1;
+      });
+    });
+    __po.observe({ entryTypes: ['longtask'] });
+  } catch (e) {}
 
   // Walk the fiber tree from a root collecting per-component render cost
   // plus a best-effort why-did-render attribution. Defensive throughout:
@@ -650,6 +670,65 @@ pub const PHOENIX_REACT_HELPER_SCRIPT: &str = r"
         note: 'shallow reference compare; inline object/array/fn props change reference every render (reference_changed), which is not necessarily a real value change',
         components: out
       };
+    },
+
+    /**
+     * __perfReset() → 'ok'
+     *
+     * REQ-BT-019.20: OPEN the page-anchored measurement window. Records
+     * t0 = performance.now(), zeroes the longtask accumulators, and
+     * clears the __phoenix React commit buffer so the React commit
+     * measurement is window-scoped too. The run_scenario harness calls
+     * this immediately after the first readiness step satisfies.
+     */
+    __perfReset: function () {
+      __lt_ms = 0;
+      __lt_n = 0;
+      __win_t0 = (typeof performance !== 'undefined' && performance.now)
+        ? performance.now() : Date.now();
+      if (window.__phoenix.__resetCommits) window.__phoenix.__resetCommits();
+      return 'ok';
+    },
+
+    /**
+     * __perfRead() → JSON string of the windowed accumulators
+     *
+     * REQ-BT-019.20: CLOSE the page-anchored window and read the
+     * accumulators in one in-page call. Returns a JSON string:
+     *   { script_ms, long_tasks, wall_ms, dom_nodes,
+     *     react_status, react_commits, react_actual_ms }
+     * script_ms/long_tasks are the longtask sum/count since
+     * __perfReset; wall_ms is the performance.now() span; React fields
+     * mirror __reactStatus()/__getCommits() over the same window.
+     */
+    __perfRead: function () {
+      var t0 = __win_t0;
+      var wall = (t0 != null)
+        ? (((typeof performance !== 'undefined' && performance.now)
+            ? performance.now() : Date.now()) - t0)
+        : null;
+      var dom = 0;
+      try { dom = document.getElementsByTagName('*').length; } catch (e) {}
+      var status = 'absent', commits = null, ams = null;
+      try {
+        if (window.__phoenix.__reactStatus) {
+          status = window.__phoenix.__reactStatus();
+          var c = window.__phoenix.__getCommits ? window.__phoenix.__getCommits() : [];
+          var n = c.length, s = 0;
+          for (var i = 0; i < c.length; i++) s += (c[i].totalActualDuration || 0);
+          if (status !== 'absent') commits = n;
+          if (status === 'measured') ams = s;
+        }
+      } catch (e) {}
+      return JSON.stringify({
+        script_ms: __lt_ms,
+        long_tasks: __lt_n,
+        wall_ms: wall,
+        dom_nodes: dom,
+        react_status: status,
+        react_commits: commits,
+        react_actual_ms: ams
+      });
     }
   };
 })();

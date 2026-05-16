@@ -2330,9 +2330,9 @@ async fn test_browser_profile_methodology_warnings_intact_raw_samples() {
 /// exercised against about:blank (status `absent`). Here a REAL React
 /// **profiling** build (records `actualDuration` unconditionally) is
 /// driven through the auto-injected `__phoenix` commit hook and the
-/// `read_react_reading` Rust mapping, asserting `react_status ==
-/// "measured"` with a non-null `react_actual_ms` — proving the happy
-/// path the rest of the suite never reaches.
+/// page-anchored `__perfRead` → `PerfReading` Rust mapping, asserting
+/// `react_status == "measured"` with a non-null `react_actual_ms` —
+/// proving the happy path the rest of the suite never reaches.
 #[tokio::test]
 async fn test_browser_profile_react_measured_path() {
     require_chrome!();
@@ -2384,8 +2384,11 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
         waited.output
     );
 
-    // reset:"none" keeps the mounted app (one unpkg fetch); the click
-    // forces an update-phase commit whose fiber carries actualDuration.
+    // reset:"none" keeps the mounted app (one unpkg fetch). Readiness
+    // step FIRST (`window.__ready` set in the App's useEffect) → the
+    // page-anchored window opens AFTER mount/settle; the click then
+    // forces an in-window update-phase commit whose fiber carries
+    // actualDuration.
     let r = BrowserProfileTool
         .run(
             json!({
@@ -2395,6 +2398,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
                 "reset": "none",
                 "gc_per_run": false,
                 "steps": [
+                    { "kind": "wait_eval", "expression": "window.__ready === true", "timeout": "20s" },
                     { "kind": "click", "selector": "#inc" },
                     { "kind": "wait_eval", "expression": "window.__renders >= 2", "timeout": "20s" }
                 ]
@@ -2762,6 +2766,10 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
         waited.output
     );
 
+    // Readiness step FIRST (`window.__ready` set in the App's
+    // useEffect) → the page-anchored window opens after mount/settle;
+    // the in-window click commit count is still observed even though a
+    // production build never exposes actualDuration.
     let r = BrowserProfileTool
         .run(
             json!({
@@ -2771,6 +2779,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
                 "reset": "none",
                 "gc_per_run": false,
                 "steps": [
+                    { "kind": "wait_eval", "expression": "window.__ready === true", "timeout": "20s" },
                     { "kind": "click", "selector": "#inc" },
                     { "kind": "wait_eval", "expression": "window.__renders >= 2", "timeout": "20s" }
                 ]
@@ -2800,37 +2809,42 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
     shutdown_test(manager, server).await;
 }
 
-/// F3 CHARACTERIZATION (gated: chrome only, network-free).
+/// F3/F5 FIX GUARD (gated: chrome only, network-free).
 ///
-/// Empirically proves the mount-in-measured-window footgun the
-/// consuming skill engineers around (it calls unmanaged async-mount
-/// cost "the bimodal-sample root cause / intermittent ~400x outliers").
+/// Was `test_browser_profile_f3_mount_in_window_characterization` — a
+/// characterization that pinned the BUG. Now flipped to guard the
+/// PAGE-ANCHORED measurement window fix (REQ-BT-019.20): one test that
+/// proves BOTH F3 (pre-readiness mount/settle excluded) and F5
+/// (real in-window work captured) are fixed.
 ///
-/// The page schedules heavy work via `setTimeout(...,0)` AFTER `load`,
-/// mimicking React's post-load async render. `run_scenario`'s default
-/// `reset` (reload) resolves at `load` — BEFORE that work — and the
-/// before-snapshot is taken immediately, so the first readiness step
-/// runs INSIDE the measured window and the ~180ms "mount" is charged
-/// to the sample. There is currently NO API knob to start the window
-/// AFTER readiness; that absence IS the F3 gap.
-///
-/// This asserts the bug is present (script_duration carries the async
-/// work). When F3 is fixed (window opens at the first readiness step,
-/// or a `measure_from` marker), flip this to assert the work is
-/// EXCLUDED — the test then guards the fix instead of the footgun.
+/// The page burns ~180ms of synchronous JS and builds an 8000-node
+/// subtree BEFORE setting `window.__ready` (the async-mount shape). The
+/// scenario's FIRST step is `wait_eval window.__ready` — the readiness
+/// step — so the page-anchored window opens AFTER it: that pre-readiness
+/// burn is structurally outside the window (F3 fixed). A post-readiness
+/// ~70ms blocking task is then run as a positive control: it lands in
+/// the window and must be captured (F5 fixed — `script_ms` reflects real
+/// in-window longtask cost, where the old host-bracketed ScriptDuration
+/// delta collapsed to ~0).
 #[tokio::test]
-async fn test_browser_profile_f3_mount_in_window_characterization() {
+async fn test_browser_profile_window_excludes_pre_readiness_work() {
     require_chrome!();
 
+    // The in-window positive control is the CLICK HANDLER's ~70ms
+    // blocking loop, not a CDP `eval` step: a Runtime.evaluate task is
+    // NOT observed by the page's `longtask` PerformanceObserver, but a
+    // page-driven event handler IS. The pre-readiness ~180ms burn runs
+    // in a post-load `setTimeout` BEFORE `__ready` (untimed setup).
     let html = r#"<!doctype html><html><body><button id="ping">ping</button>
 <script>
 window.__ready = false; window.__pinged = false;
 document.getElementById('ping').addEventListener('click', function () {
-  var t = Date.now(); while (Date.now() - t < 5) {}   // ~5ms cheap interaction
+  var t = Date.now(); while (Date.now() - t < 70) {}   // ~70ms in-window longtask
   window.__pinged = true;
 });
-// Heavy work scheduled AFTER load — the async-mount shape that leaks
-// into a window opened at `load`. ~180ms busy + 8000 DOM nodes.
+// Heavy work scheduled AFTER load, BEFORE __ready — the async-mount
+// shape. ~180ms busy + 8000 DOM nodes. With a page-anchored window
+// that opens after the readiness step this is UNTIMED setup.
 setTimeout(function () {
   var t = Date.now(); while (Date.now() - t < 180) {}
   var box = document.createElement('div');
@@ -2841,7 +2855,7 @@ setTimeout(function () {
 </script></body></html>"#;
 
     let server = TestServer::start(html).await;
-    let (ctx, manager) = test_context("test-profile-f3");
+    let (ctx, manager) = test_context("test-profile-window-anchor");
 
     BrowserNavigateTool
         .run(
@@ -2850,8 +2864,11 @@ setTimeout(function () {
         )
         .await;
 
-    // Default reset (reload) + first step is the readiness wait → the
-    // post-load heavy work runs inside the measured window.
+    // First step is the readiness wait → the page-anchored window opens
+    // AFTER `window.__ready` (the ~180ms pre-readiness burn is untimed
+    // setup). The post-readiness click fires the page's ~70ms blocking
+    // handler — a page-driven task the `longtask` observer DOES see —
+    // as the positive control: it must be captured in `script_ms`.
     let r = BrowserProfileTool
         .run(
             json!({
@@ -2872,39 +2889,38 @@ setTimeout(function () {
 
     let display = r.display_data.expect("display_data present");
     let sample = &display["raw_samples"][0];
-    let nodes = sample["nodes"].as_f64().expect("nodes is a number");
-    let script_ms = sample["script_duration"]
+    let script_ms = sample["script_ms"]
         .as_f64()
-        .expect("script_duration is a number");
+        .expect("script_ms is a number (page-anchored longtask sum)");
+    let long_tasks = sample["long_tasks"]
+        .as_u64()
+        .expect("long_tasks is a number");
+    let wall_ms = sample["wall_ms"]
+        .as_f64()
+        .expect("wall_ms is a number (window performance.now span)");
 
-    // F3 (mount-in-window) — `nodes` is the load-bearing signal: the
-    // 8000-node subtree built by the post-load `setTimeout` is present
-    // in the sample, so the heavy async work ran INSIDE the measured
-    // window (window opened at `load`, before the readiness step). A
-    // clean interaction-only window would see single-digit nodes. When
-    // F3 is fixed (window starts at the first readiness step / a
-    // `measure_from` marker) flip this to assert `nodes` is small — the
-    // test then guards the fix instead of the footgun.
+    // F3 FIXED — the ~180ms pre-readiness burn is EXCLUDED: it ran
+    // before `window.__ready`, i.e. before the readiness step that
+    // opens the window. F5 FIXED — the ~70ms post-readiness blocking
+    // task IS captured (the old host-bracketed ScriptDuration delta
+    // read ~0 here). So `script_ms` must include the in-window ~70ms
+    // longtask but exclude the pre-window 180ms.
     assert!(
-        nodes >= 8000.0,
-        "F3 repro: the post-load 8000-node build must land in the \
-         measured window (nodes >= 8000); got {nodes}. sample: {sample}"
+        (50.0..160.0).contains(&script_ms),
+        "page-anchored window: script_ms must capture the in-window \
+         ~70ms longtask (>= 50ms, F5 fixed) but exclude the \
+         pre-readiness ~180ms burn (< 160ms, F3 fixed); got \
+         {script_ms}ms. sample: {sample}"
     );
-
-    // F5 (metric validity) — the SAME run burned ~180ms of synchronous
-    // JS and built 8000 nodes in-window, yet `script_duration`
-    // (Performance.getMetrics ScriptDuration delta) is ~0. The macro
-    // scripting counter does NOT reflect real in-window work; an agent
-    // reading it concludes "no scripting cost" while `nodes` proves
-    // otherwise. The consuming skill sidesteps this by summing
-    // `longtask` durations instead of trusting ScriptDuration. This
-    // pins the broken behaviour so a future fix (longtask-backed script
-    // time / corrected counter source) must update it deliberately.
     assert!(
-        script_ms < 50.0,
-        "F5 characterization: script_duration unexpectedly captured the \
-         work ({script_ms}ms) — if real, ScriptDuration may now be \
-         trustworthy; revisit F5 and flip this. sample: {sample}"
+        long_tasks >= 1,
+        "the in-window ~70ms blocking task must register at least one \
+         longtask entry; got {long_tasks}. sample: {sample}"
+    );
+    assert!(
+        wall_ms > 0.0,
+        "wall_ms must be a positive performance.now() span; got \
+         {wall_ms}. sample: {sample}"
     );
 
     shutdown_test(manager, server).await;

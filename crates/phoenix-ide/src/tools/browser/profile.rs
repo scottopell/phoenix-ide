@@ -311,7 +311,7 @@ impl Tool for BrowserProfileTool {
                 },
                 "steps": {
                     "type": "array",
-                    "description": "run_scenario only: ordered steps. Each step is an object with a `kind`: click{selector}, type{selector,text}, key{key,modifiers?}, eval{expression}, wait_selector{selector,timeout?}, wait_timing{mark,timeout?}, wait_eval{expression,timeout?}. NOTE: navigate/reload are NOT allowed in steps (they reset the cumulative Performance counters mid-run) — put navigation in `reset` instead. Include at least one wait_* readiness step or methodology_warnings will flag it.",
+                    "description": "run_scenario only: ordered steps. Each step is an object with a `kind`: click{selector}, type{selector,text}, key{key,modifiers?}, eval{expression}, wait_selector{selector,timeout?}, wait_timing{mark,timeout?}, wait_eval{expression,timeout?}. The page-anchored measurement window opens AFTER the FIRST wait_* readiness step satisfies (REQ-BT-019.20): steps up to and including it are UNTIMED setup (page load + framework mount + async settle), the remaining steps are measured. Put the readiness wait FIRST so mount/settle is excluded. NOTE: navigate/reload are NOT allowed in steps — put navigation in `reset` instead. With no wait_* step the window opens immediately after reset and methodology_warnings flags it (mount/settle then unavoidably in-window).",
                     "items": { "type": "object" }
                 },
                 "runs": {
@@ -422,9 +422,16 @@ Actions:
                     wait_selector{selector,timeout?},
                     wait_timing{mark,timeout?},
                     wait_eval{expression,timeout?}.
-                    navigate/reload are REJECTED inside steps (they reset
-                    the cumulative Performance counters mid-run) — put
+                    navigate/reload are REJECTED inside steps — put
                     navigation in `reset`.
+                    PAGE-ANCHORED WINDOW (REQ-BT-019.20): the measured
+                    window opens AFTER the FIRST wait_* readiness step
+                    satisfies. Steps up to and including it are UNTIMED
+                    setup (page load + framework mount + async settle);
+                    the remaining steps are measured. Put the readiness
+                    wait FIRST so mount/settle is excluded (the F3 fix).
+                    The window boundaries are performance.now() marks the
+                    page sets — NOT host-side CDP getMetrics reads (F5).
                     reset (per-run determinism, REQ-BT-019.18): omitted =
                     reload the current URL before every run;
                     {\"kind\":\"navigate\",\"url\":...} or {\"kind\":\"reload\"}
@@ -434,8 +441,13 @@ Actions:
                     stddev, or any reduction. YOU own the statistics. If a
                     readiness step times out the whole operation fails,
                     names the blocking step, and returns ZERO samples.
-                    Each sample carries: react_status (measured | absent
-                    | no_profiling_build — a not-measured React timing is
+                    Each sample carries: script_ms (sum of in-window
+                    longtask durations, ms — NOT a CDP ScriptDuration
+                    delta), long_tasks (count of >50ms longtasks
+                    in-window), wall_ms (performance.now() span of the
+                    window), dom_nodes (getElementsByTagName('*') at
+                    window close), react_status (measured | absent |
+                    no_profiling_build — a not-measured React timing is
                     null, NEVER 0), react_commits (null only when React
                     is absent), react_actual_ms (null unless measured),
                     gc_ran (bool) and js_heap_used (post-GC live heap;
@@ -623,7 +635,7 @@ async fn action_gc_heap(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
 /// React measurement capability for a run (REQ-BT-019.13 / Allium
 /// `ReactStatus`). Serialises to the snake-case discriminator string.
 /// The whole point: `absent` / `no_profiling_build` are NOT a numeric 0.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum ReactStatus {
     Measured,
@@ -631,36 +643,72 @@ enum ReactStatus {
     NoProfilingBuild,
 }
 
-/// Typed tri-state result of probing React for one run (REQ-BT-019.13).
-/// Replaces the old `(0, 0.0)` return that conflated "no React", "no
-/// __phoenix", "eval error", and "production build".
-enum ReactReading {
-    /// Profiling-capable build: commit count + summed actualDuration.
-    Measured { commits: u64, actual_ms: f64 },
-    /// React present (production build) — count fires, no actualDuration.
-    NoProfilingBuild { commits: u64 },
-    /// No React on the page (or probe threw — the safe default).
-    Absent,
+/// The in-page accumulators read once at window close via
+/// `window.__phoenix.__perfRead()` (REQ-BT-019.20). `__perfRead` returns
+/// a JSON *string* (from `evaluate`), which is parsed into this; the
+/// harness never derives these from host-side CDP counter deltas (F5).
+#[derive(Debug, Clone, Deserialize)]
+struct PerfReading {
+    /// Sum of `longtask` durations within the page-anchored window (ms).
+    script_ms: f64,
+    /// Count of `longtask` entries (>50 ms) within the window.
+    long_tasks: u64,
+    /// `performance.now()` span of the window; null if it never opened.
+    wall_ms: Option<f64>,
+    /// `document.getElementsByTagName('*').length` at window close.
+    dom_nodes: u64,
+    /// `measured` | `absent` | `no_profiling_build` discriminator.
+    react_status: ReactStatus,
+    /// Commit count over the window; null when React is absent.
+    react_commits: Option<u64>,
+    /// Summed root-fiber `actualDuration` over the window; null unless
+    /// `react_status == measured`.
+    react_actual_ms: Option<f64>,
 }
 
-/// One raw per-run sample. Serialised verbatim into `raw_samples`; the
-/// harness never reduces these (invariant `RawSamplesNeverReduced`).
+impl PerfReading {
+    /// The defensive default if `__perfRead` is missing (non-React /
+    /// exotic page) — mirrors the in-page absent defaults.
+    fn absent_default() -> Self {
+        PerfReading {
+            script_ms: 0.0,
+            long_tasks: 0,
+            wall_ms: None,
+            dom_nodes: 0,
+            react_status: ReactStatus::Absent,
+            react_commits: None,
+            react_actual_ms: None,
+        }
+    }
+}
+
+/// One raw per-run sample from the PAGE-ANCHORED window (REQ-BT-019.20).
+/// Serialised verbatim into `raw_samples`; the harness never reduces
+/// these (invariant `RawSamplesNeverReduced`).
+///
+/// `script_ms`/`long_tasks`/`wall_ms`/`dom_nodes` come from in-page
+/// accumulators reset after readiness and read at window close — NOT
+/// host-bracketed CDP counter deltas (F5: those collapse to ~0 for real
+/// in-window work).
 ///
 /// Every "not measured" field is `Option<T>` WITHOUT
 /// `skip_serializing_if`: the key is always present and serialises as
 /// JSON `null` so a not-taken measurement is visibly absent rather than
-/// looking like a real zero (REQ-BT-019.13/.15, invariants
+/// looking like a real zero (REQ-BT-019.13/.15/.19, invariants
 /// `ReactTimingOnlyWhenMeasured` / `ReactCommitsAbsentOnlyWhenNoReact` /
 /// `HeapOnlyWhenGc`).
 #[derive(Debug, Clone, serde::Serialize)]
 struct RunSample {
     run_index: u32,
-    script_duration: f64,
-    task_duration: f64,
-    layout_count: f64,
-    recalc_style_count: f64,
-    nodes: f64,
-    js_event_listeners: f64,
+    /// Sum of `longtask` durations within the page-anchored window (ms).
+    script_ms: f64,
+    /// Count of `longtask` entries (>50 ms) within the window.
+    long_tasks: u64,
+    /// `performance.now()` span of the measured window; `None` (JSON
+    /// null) only defensively when the window never opened.
+    wall_ms: Option<f64>,
+    /// `document.getElementsByTagName('*').length` at window close.
+    dom_nodes: u64,
     /// True iff a forced GC ran for this run (REQ-BT-019.15).
     gc_ran: bool,
     /// Post-full-GC live-heap read. `Some` ONLY when `gc_ran`; `None`
@@ -675,10 +723,6 @@ struct RunSample {
     /// `Some` ONLY when `react_status == measured`; `None` (null)
     /// otherwise — invariant `ReactTimingOnlyWhenMeasured`.
     react_actual_ms: Option<f64>,
-}
-
-fn metric_or_zero(m: &std::collections::BTreeMap<String, f64>, k: &str) -> f64 {
-    m.get(k).copied().unwrap_or(0.0)
 }
 
 /// Why a single run did not yield a sample.
@@ -711,17 +755,20 @@ async fn do_reset(session: &Arc<RwLock<BrowserSession>>, reset: &Reset) -> Resul
     }
 }
 
-/// Execute one scenario run with atomic before/after bracketing
-/// (Allium @guidance). `Ok(sample)` carries the bracketed metrics for
-/// this single execution; the caller decides whether to keep it (warmup
-/// runs are executed identically but discarded).
+/// Execute one scenario run with a PAGE-ANCHORED measurement window
+/// (REQ-BT-019.18/.20, Allium @guidance). `Ok(sample)` carries the
+/// windowed metrics for this single execution; the caller decides
+/// whether to keep it (warmup runs are executed identically but
+/// discarded).
 ///
-/// Per-run sequence (REQ-BT-019.14/.15/.18, Allium @guidance):
-///   reset → before-counters snapshot → reset `__phoenix` commit buffer →
-///   steps → after-counters snapshot (durations = after − before,
-///   computed HERE so the GC pause is outside the bracket) → if
-///   `gc_per_run`: collectGarbage then a heap-only read → React status +
-///   commits → emit one sample.
+/// Per-run sequence (REQ-BT-019.18/.20, Allium @guidance):
+///   reset → dispatch steps up to and INCLUDING the first readiness step
+///   as UNTIMED setup → OPEN the window (`__phoenix.__perfReset()`:
+///   `t0 = performance.now()`, longtask accumulators zeroed, React
+///   commit buffer cleared) → dispatch the REMAINING measured steps → READ the
+///   window once (`__phoenix.__perfRead()`) → if `gc_per_run`:
+///   collectGarbage then a heap-only read (strictly outside the window,
+///   F5 does not apply to a one-shot gauge) → emit one sample.
 async fn run_one(
     session: &Arc<RwLock<BrowserSession>>,
     steps: &[Step],
@@ -729,38 +776,82 @@ async fn run_one(
     reset: &Reset,
     gc_per_run: bool,
 ) -> Result<RunSample, RunError> {
-    // Reset to a fixed state BEFORE the before-snapshot so runs are
-    // mutually comparable. Reset failure aborts the run cleanly.
+    // Reset to a fixed state so runs are mutually comparable. Reset
+    // failure aborts the run cleanly.
     do_reset(session, reset).await?;
 
-    let before = read_metrics(session)
-        .await
-        .map_err(|e| RunError::Infra(format!("metrics snapshot failed: {e}")))?;
+    // REQ-BT-019.18: the reset AND the first readiness step are UNTIMED
+    // setup — page load + framework mount + async settle happen before
+    // the window opens. `setup_end` is the index of the FIRST readiness
+    // step; steps `0..=setup_end` are dispatched untimed. With no
+    // readiness step the window opens immediately after reset (degraded;
+    // build_methodology_warnings flags it).
+    let setup_end = steps.iter().position(|s| {
+        matches!(
+            s,
+            Step::WaitSelector { .. } | Step::WaitTiming { .. } | Step::WaitEval { .. }
+        )
+    });
+
+    // Dispatch the UNTIMED setup steps (`0..=setup_end`, or none).
+    let measured_start = match setup_end {
+        Some(idx) => {
+            for step in &steps[..=idx] {
+                if let Err(reason) = run_step(session, step).await {
+                    return Err(RunError::Blocked(reason));
+                }
+            }
+            idx + 1
+        }
+        None => 0,
+    };
+
+    // OPEN the page-anchored window (REQ-BT-019.20). Best-effort: if
+    // `__perfReset` is missing (non-React/exotic page) the read still
+    // returns defaults, and the longtask observer is installed regardless
+    // via document-start injection.
     {
         let guard = session.read().await;
         let _ = guard
             .page
-            .evaluate(
-                "window.__phoenix && window.__phoenix.__resetCommits && window.__phoenix.__resetCommits()",
-            )
+            .evaluate("window.__phoenix && window.__phoenix.__perfReset && window.__phoenix.__perfReset()")
             .await;
     }
-    for step in steps {
+
+    // Dispatch the REMAINING (measured) steps. A readiness failure here
+    // also blocks the whole operation (REQ-BT-019.1).
+    for step in &steps[measured_start..] {
         if let Err(reason) = run_step(session, step).await {
             return Err(RunError::Blocked(reason));
         }
     }
-    // AFTER snapshot — duration deltas are computed from THIS read so the
-    // forced-GC pause below is strictly outside the duration bracket
-    // (REQ-BT-019.15). nodes / js_event_listeners keep their absolute
-    // semantics from this pre-GC snapshot.
-    let after = read_metrics(session)
-        .await
-        .map_err(|e| RunError::Infra(format!("metrics snapshot failed: {e}")))?;
 
-    // Forced GC + heap read, strictly AFTER the duration bracket
-    // (REQ-BT-019.15 / invariant HeapOnlyWhenGc). When GC is disabled the
-    // heap field is null + gc_ran=false — never a mid-cycle value.
+    // CLOSE the window: read the in-page accumulators in one call
+    // (REQ-BT-019.20). `__perfRead` returns a JSON *string* (evaluate
+    // returns a String); parse it into the typed reading. A missing
+    // helper / shape mismatch is the absent default, never a fabricated
+    // value.
+    let reading: PerfReading = {
+        let guard = session.read().await;
+        let script = "window.__phoenix && window.__phoenix.__perfRead \
+            ? window.__phoenix.__perfRead() \
+            : JSON.stringify({script_ms:0,long_tasks:0,wall_ms:null,dom_nodes:0,\
+            react_status:'absent',react_commits:null,react_actual_ms:null})";
+        match guard.page.evaluate(script).await {
+            Ok(res) => match res.into_value::<String>() {
+                Ok(json) => {
+                    serde_json::from_str(&json).unwrap_or_else(|_| PerfReading::absent_default())
+                }
+                Err(_) => PerfReading::absent_default(),
+            },
+            Err(_) => PerfReading::absent_default(),
+        }
+    };
+
+    // Forced GC + heap read, strictly AFTER the window closes
+    // (REQ-BT-019.15 / invariant HeapOnlyWhenGc). The heap is a one-shot
+    // post-GC gauge — F5 does not apply to a gauge. When GC is disabled
+    // the heap field is null + gc_ran=false — never a mid-cycle value.
     let (gc_ran, js_heap_used) = if gc_per_run {
         {
             let guard = session.read().await;
@@ -784,33 +875,17 @@ async fn run_one(
         (false, None)
     };
 
-    let (react_status, react_commits, react_actual_ms) = match read_react_reading(session).await {
-        ReactReading::Measured { commits, actual_ms } => {
-            (ReactStatus::Measured, Some(commits), Some(actual_ms))
-        }
-        ReactReading::NoProfilingBuild { commits } => {
-            (ReactStatus::NoProfilingBuild, Some(commits), None)
-        }
-        ReactReading::Absent => (ReactStatus::Absent, None, None),
-    };
-
     Ok(RunSample {
         run_index,
-        script_duration: metric_or_zero(&after, "ScriptDuration")
-            - metric_or_zero(&before, "ScriptDuration"),
-        task_duration: metric_or_zero(&after, "TaskDuration")
-            - metric_or_zero(&before, "TaskDuration"),
-        layout_count: metric_or_zero(&after, "LayoutCount")
-            - metric_or_zero(&before, "LayoutCount"),
-        recalc_style_count: metric_or_zero(&after, "RecalcStyleCount")
-            - metric_or_zero(&before, "RecalcStyleCount"),
-        nodes: metric_or_zero(&after, "Nodes"),
-        js_event_listeners: metric_or_zero(&after, "JSEventListeners"),
+        script_ms: reading.script_ms,
+        long_tasks: reading.long_tasks,
+        wall_ms: reading.wall_ms,
+        dom_nodes: reading.dom_nodes,
         gc_ran,
         js_heap_used,
-        react_status,
-        react_commits,
-        react_actual_ms,
+        react_status: reading.react_status,
+        react_commits: reading.react_commits,
+        react_actual_ms: reading.react_actual_ms,
     })
 }
 
@@ -1028,43 +1103,6 @@ async fn restore_throttle(session: &Arc<RwLock<BrowserSession>>, prior: Option<f
         tracing::debug!(error = %e, "run_scenario: failed to restore CPU throttle");
     }
     with_profiling(session, |st| st.throttle_rate = prior).await;
-}
-
-/// Probe React status + commit totals in one eval round-trip
-/// (REQ-BT-019.13). Returns a typed tri-state so "no React", "no
-/// __phoenix", "eval error", and "production build" are no longer all
-/// the silent `(0, 0.0)` they used to be.
-///
-/// The script returns `[status, commitCount, totalActualMs]`. `status`
-/// is the `window.__phoenix.__reactStatus()` discriminator; on any throw
-/// or missing helper it yields `"absent"` (the safe no-data default).
-async fn read_react_reading(session: &Arc<RwLock<BrowserSession>>) -> ReactReading {
-    let guard = session.read().await;
-    let script = "(function(){\
-        try {\
-          if (!window.__phoenix || !window.__phoenix.__getCommits \
-              || !window.__phoenix.__reactStatus) return ['absent',0,0];\
-          var status = window.__phoenix.__reactStatus();\
-          var c = window.__phoenix.__getCommits();\
-          var total = 0;\
-          for (var i=0;i<c.length;i++) total += (c[i].totalActualDuration||0);\
-          return [status, c.length, total];\
-        } catch(e) { return ['absent',0,0]; }\
-      })()";
-    let (status, commits, actual_ms): (String, u64, f64) = match guard.page.evaluate(script).await {
-        Ok(res) => match res.into_value::<(String, u64, f64)>() {
-            Ok(v) => v,
-            // Shape mismatch is treated as the safe no-data default.
-            Err(_) => ("absent".to_string(), 0, 0.0),
-        },
-        Err(_) => ("absent".to_string(), 0, 0.0),
-    };
-    match status.as_str() {
-        "measured" => ReactReading::Measured { commits, actual_ms },
-        "no_profiling_build" => ReactReading::NoProfilingBuild { commits },
-        // "absent" and any unrecognised value → absent (safe default).
-        _ => ReactReading::Absent,
-    }
 }
 
 /// Execute one scenario step. `Err(reason)` means a readiness step did not
@@ -1974,12 +2012,10 @@ mod tests {
     fn run_sample_not_measured_serializes_as_present_null() {
         let s = RunSample {
             run_index: 0,
-            script_duration: 1.0,
-            task_duration: 2.0,
-            layout_count: 0.0,
-            recalc_style_count: 0.0,
-            nodes: 10.0,
-            js_event_listeners: 3.0,
+            script_ms: 1.0,
+            long_tasks: 2,
+            wall_ms: Some(42.0),
+            dom_nodes: 10,
             gc_ran: false,
             js_heap_used: None,
             react_status: ReactStatus::Absent,
