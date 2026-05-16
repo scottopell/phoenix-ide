@@ -105,6 +105,8 @@ describe('MessageList', () => {
         streamingBuffer={null}
       />,
     );
+    triggerResize(messages, 500);
+    expect(main.scrollTop).toBe(1000);
 
     rerender(
       <MessageList
