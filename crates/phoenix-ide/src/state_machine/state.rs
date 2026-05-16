@@ -429,6 +429,116 @@ mod tests {
         assert_eq!(input["op"], "run");
         assert_eq!(input["command"], "bad");
     }
+
+    /// Task 02713: model change is allowed from `Idle` and `Error` only.
+    ///
+    /// The `match` below is intentionally wildcard-free: adding a new
+    /// `ConvState` variant breaks this test's compilation, forcing an
+    /// explicit decision about whether a mid-state model swap is safe
+    /// for that variant (correct-by-construction guard).
+    #[test]
+    fn allows_model_change_only_from_idle_and_error() {
+        fn err() -> ConvState {
+            ConvState::Error {
+                message: "overloaded".into(),
+                error_kind: ErrorKind::ServerOverloaded,
+            }
+        }
+        fn tool_call() -> ToolCall {
+            ToolCall::new(
+                "t1",
+                ToolInput::Think(ThinkInput {
+                    thoughts: String::new(),
+                }),
+            )
+        }
+
+        let all = [
+            ConvState::Idle,
+            ConvState::LlmRequesting { attempt: 1 },
+            ConvState::ToolExecuting {
+                current_tool: tool_call(),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message: AssistantMessage::default(),
+            },
+            ConvState::CancellingTool {
+                tool_use_id: "t1".into(),
+                skipped_tools: vec![],
+                completed_results: vec![],
+                assistant_message: AssistantMessage::default(),
+                pending_sub_agents: vec![],
+            },
+            ConvState::AwaitingSubAgents {
+                pending: vec![],
+                completed_results: vec![],
+                spawn_tool_id: None,
+            },
+            ConvState::CancellingSubAgents {
+                pending: vec![],
+                completed_results: vec![],
+            },
+            ConvState::Completed {
+                result: "ok".into(),
+            },
+            ConvState::Failed {
+                error: "boom".into(),
+                error_kind: ErrorKind::SubAgentError,
+            },
+            err(),
+            ConvState::AwaitingRecovery {
+                message: "auth".into(),
+                error_kind: ErrorKind::Auth,
+                recovery_kind: RecoveryKind::Credential,
+            },
+            ConvState::AwaitingContinuation {
+                rejected_tool_calls: vec![],
+                attempt: 1,
+            },
+            ConvState::AwaitingTaskApproval {
+                task_file: "tasks/x.md".into(),
+                title: "t".into(),
+                priority: "p1".into(),
+                plan: "plan".into(),
+            },
+            ConvState::AwaitingUserResponse {
+                questions: vec![],
+                tool_use_id: "t1".into(),
+            },
+            ConvState::ContextExhausted {
+                summary: "s".into(),
+            },
+            ConvState::Terminal,
+        ];
+
+        for state in &all {
+            // Independent restatement of the predicate. Exhaustive (no
+            // `_` arm) so a new variant fails to compile here.
+            let expected = match state {
+                ConvState::Idle | ConvState::Error { .. } => true,
+                ConvState::LlmRequesting { .. }
+                | ConvState::ToolExecuting { .. }
+                | ConvState::CancellingTool { .. }
+                | ConvState::AwaitingSubAgents { .. }
+                | ConvState::CancellingSubAgents { .. }
+                | ConvState::Completed { .. }
+                | ConvState::Failed { .. }
+                | ConvState::AwaitingRecovery { .. }
+                | ConvState::AwaitingContinuation { .. }
+                | ConvState::AwaitingTaskApproval { .. }
+                | ConvState::AwaitingUserResponse { .. }
+                | ConvState::ContextExhausted { .. }
+                | ConvState::Terminal => false,
+            };
+            assert_eq!(
+                state.allows_model_change(),
+                expected,
+                "allows_model_change mismatch for {}",
+                state.variant_name()
+            );
+        }
+    }
 }
 
 /// A tool call from the LLM with typed input.
@@ -1267,6 +1377,20 @@ impl ConvState {
                 | ConvState::AwaitingSubAgents { .. }
                 | ConvState::CancellingSubAgents { .. }
         )
+    }
+
+    /// Whether the user may switch the conversation's model from this
+    /// state. Allowed only when nothing is in flight that a mid-operation
+    /// model swap would race or invalidate: `Idle` (no operation) and
+    /// `Error` (the operation already failed; "pick another model" is the
+    /// documented recovery for overload/quota errors — see
+    /// `specs/llm/requirements.md` REQ-LLM-006). The new model is picked
+    /// up on the next retry because the runtime is evicted and recreated
+    /// from the persisted DB row. Every other state has an LLM request,
+    /// tool execution, sub-agent, recovery subprocess, or user/approval
+    /// handshake in flight.
+    pub fn allows_model_change(&self) -> bool {
+        matches!(self, ConvState::Idle | ConvState::Error { .. })
     }
 
     /// Stable, payload-free name of this variant. Used by structured

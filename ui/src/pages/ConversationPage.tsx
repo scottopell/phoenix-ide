@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, ExpansionError, type Conversation, type ImageData } from '../api';
+import { api, canChangeModelInState, ExpansionError, type Conversation, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -683,7 +683,7 @@ function ConversationPageContent() {
   };
 
   const handleUpgradeModel = async (newModelId: string) => {
-    if (!conversationId || atom.phase.type !== 'idle') return;
+    if (!conversationId || !canChangeModelInState(atom.phase)) return;
 
     try {
       await api.upgradeModel(conversationId, newModelId);

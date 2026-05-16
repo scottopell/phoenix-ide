@@ -6,7 +6,7 @@
 // client-side race resolution.
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { api, ConflictError } from './api';
+import { api, canChangeModelInState, ConflictError, type ConversationState } from './api';
 
 describe('api.continueConversation', () => {
   beforeEach(() => {
@@ -83,5 +83,32 @@ describe('api.continueConversation', () => {
     await expect(api.continueConversation('parent-id')).rejects.toThrow(
       /Conversation not found/,
     );
+  });
+});
+
+describe('canChangeModelInState (task 02713)', () => {
+  // One representative value per ConversationState variant. `cases`
+  // is typed so adding a union member without classifying it here is
+  // a tsc error (mirrors the Rust exhaustiveness guard).
+  const cases: ReadonlyArray<readonly [ConversationState, boolean]> = [
+    [{ type: 'idle' }, true],
+    [{ type: 'error', message: 'overloaded' }, true],
+    [{ type: 'awaiting_llm' }, false],
+    [{ type: 'llm_requesting', attempt: 1 }, false],
+    [{ type: 'tool_executing', current_tool: { id: 't', name: 'bash', input: {} }, remaining_tools: [] }, false],
+    [{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }, false],
+    [{ type: 'awaiting_continuation', attempt: 1 }, false],
+    [{ type: 'cancelling' }, false],
+    [{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }, false],
+    [{ type: 'cancelling_sub_agents', pending: [] }, false],
+    [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, false],
+    [{ type: 'awaiting_user_response', questions: [] }, false],
+    [{ type: 'context_exhausted', summary: 's' }, false],
+    [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential' }, false],
+    [{ type: 'terminal' }, false],
+  ];
+
+  it.each(cases)('%o -> %s', (state, expected) => {
+    expect(canChangeModelInState(state)).toBe(expected);
   });
 });

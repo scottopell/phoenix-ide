@@ -182,6 +182,15 @@ export type ConversationState =
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
   | { type: 'terminal' };
 
+/** Whether the user may switch the conversation's model from this state.
+ *  Mirrors the backend `ConvState::allows_model_change`: only `idle` (no
+ *  operation in flight) and `error` (failed; "pick another model" is the
+ *  documented recovery). The retried request uses the new model because
+ *  the backend evicts and recreates the runtime from the persisted row. */
+export function canChangeModelInState(state: ConversationState): boolean {
+  return state.type === 'idle' || state.type === 'error';
+}
+
 /** Derive the coarse display category from a conversation's raw state type string.
  *  Internal fallback — prefer `getConvDisplayState` which reads `presentation_mode`. */
 function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting-approval' {

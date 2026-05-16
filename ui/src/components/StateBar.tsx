@@ -1,7 +1,7 @@
 import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { FolderTree } from 'lucide-react';
-import { api, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
+import { api, canChangeModelInState, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 import type { ConnectionState } from '../hooks';
 import { useIsMobile } from '../hooks';
 import { getStateDescription } from '../utils';
@@ -307,14 +307,16 @@ export function StateBar({
   const modelAbbrev = conversation ? abbreviateModel(conversation.model ?? '') : '';
   const projectName = conversation ? getProjectName(conversation) : null;
 
-  // Model picker: available on idle conversations when we have models and a callback.
+  // Model picker: available when no operation is in flight (idle or error)
+  // and we have models and a callback. Error-state switch lets the user
+  // recover from overload/quota by picking another model, then retrying.
   const currentModel = conversation?.model ?? '';
   const is1m = currentModel.endsWith('-1m');
   const canPickModel = !!(
     onUpgradeModel &&
     availableModels &&
     availableModels.length > 0 &&
-    convState.type === 'idle'
+    canChangeModelInState(convState)
   );
 
   // Shortcut: one-click upgrade to the 1M variant of the current model, if it
@@ -324,7 +326,7 @@ export function StateBar({
   const canUpgradeTo1m = !!(
     upgradeTo1mId &&
     availableModels?.some(m => m.id === upgradeTo1mId) &&
-    convState.type === 'idle' &&
+    canChangeModelInState(convState) &&
     onUpgradeModel
   );
 

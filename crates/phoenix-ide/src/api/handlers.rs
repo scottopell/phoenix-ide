@@ -1669,7 +1669,9 @@ async fn cancel_conversation(
 }
 
 /// Upgrade a conversation's model (e.g., from 200k to 1M context).
-/// Requires the conversation to be idle -- cannot upgrade mid-turn.
+/// Allowed from `Idle` or `Error` -- cannot upgrade while an LLM request,
+/// tool execution, or other operation is in flight (see
+/// `ConvState::allows_model_change`).
 async fn upgrade_conversation_model(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1684,7 +1686,7 @@ async fn upgrade_conversation_model(
         )));
     }
 
-    // Validate conversation exists and is idle
+    // Validate conversation exists and is in a state that allows model change
     let conv = state
         .runtime
         .db()
@@ -1692,10 +1694,11 @@ async fn upgrade_conversation_model(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !matches!(conv.state, ConvState::Idle) {
-        return Err(AppError::BadRequest(
-            "Conversation must be idle to upgrade model".to_string(),
-        ));
+    if !conv.state.allows_model_change() {
+        return Err(AppError::BadRequest(format!(
+            "Cannot change model while conversation is {} -- finish or cancel the current operation first",
+            conv.state.variant_name()
+        )));
     }
 
     // Update in DB
@@ -3907,5 +3910,169 @@ mod hard_delete_cascade_tests {
         // Both rows still present.
         assert!(state.db.get_conversation("cb-a").await.is_ok());
         assert!(state.db.get_conversation("cb-b").await.is_ok());
+    }
+}
+
+/// Task 02713: `upgrade_conversation_model` must accept the change from
+/// `Idle` and `Error`, and reject it while an operation is in flight.
+/// Exercises the real axum handler end to end against an in-memory DB.
+#[cfg(test)]
+mod upgrade_model_state_guard_tests {
+    use super::*;
+    use crate::chain_qa::ChainQa;
+    use crate::db::Database;
+    use crate::llm::{
+        ContentBlock, LlmError, LlmRequest, LlmResponse, LlmService, ModelRegistry, Usage,
+    };
+    use crate::platform::PlatformCapability;
+    use crate::runtime::RuntimeManager;
+    use crate::state_machine::ConvState;
+    use crate::tools::mcp::McpClientManager;
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use tokio::sync::broadcast;
+
+    #[derive(Debug)]
+    struct StubLlm;
+    #[async_trait]
+    impl LlmService for StubLlm {
+        async fn complete(&self, _r: &LlmRequest) -> Result<LlmResponse, LlmError> {
+            Ok(LlmResponse {
+                content: vec![ContentBlock::text("stub")],
+                end_turn: true,
+                usage: Usage::default(),
+            })
+        }
+        async fn complete_streaming(
+            &self,
+            r: &LlmRequest,
+            _: &broadcast::Sender<crate::llm::TokenChunk>,
+        ) -> Result<LlmResponse, LlmError> {
+            self.complete(r).await
+        }
+        #[allow(clippy::unnecessary_literal_bound)]
+        fn model_id(&self) -> &str {
+            "claude-sonnet-4-6"
+        }
+    }
+
+    async fn make_test_state() -> AppState {
+        let db = Database::open_in_memory().await.expect("open db");
+        let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(StubLlm)));
+        let platform = PlatformCapability::None;
+        let mcp_manager = Arc::new(McpClientManager::new());
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            llm_registry.clone(),
+            platform,
+            mcp_manager.clone(),
+            None,
+        ));
+        let terminals = runtime.terminals.clone();
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
+        AppState {
+            runtime,
+            llm_registry,
+            db,
+            platform,
+            mcp_manager,
+            credential_helper: None,
+            password: None,
+            terminals,
+            chain_qa,
+            codex_login: super::super::codex_login::CodexLoginManager::new(),
+        }
+    }
+
+    async fn upgrade(state: &AppState, id: &str, model: &str) -> Result<(), AppError> {
+        upgrade_conversation_model(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(UpgradeModelRequest {
+                model: model.to_string(),
+            }),
+        )
+        .await
+        .map(|_| ())
+    }
+
+    async fn seed(state: &AppState, id: &str) {
+        state
+            .db
+            .create_conversation(id, "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        // Start from a non-default model so a successful switch is observable.
+        state
+            .db
+            .update_conversation_model(id, "claude-opus-4-7")
+            .await
+            .expect("seed model");
+    }
+
+    #[tokio::test]
+    async fn allows_switch_from_error_and_persists() {
+        let state = make_test_state().await;
+        seed(&state, "c-err").await;
+        state
+            .db
+            .update_conversation_state(
+                "c-err",
+                &ConvState::Error {
+                    message: "overloaded".into(),
+                    error_kind: crate::db::ErrorKind::ServerOverloaded,
+                },
+            )
+            .await
+            .expect("set error");
+
+        upgrade(&state, "c-err", "claude-sonnet-4-6")
+            .await
+            .expect("model switch must be allowed from Error");
+
+        let conv = state.db.get_conversation("c-err").await.expect("reload");
+        assert_eq!(
+            conv.model.as_deref(),
+            Some("claude-sonnet-4-6"),
+            "new model must be persisted so the next retry picks it up"
+        );
+    }
+
+    #[tokio::test]
+    async fn allows_switch_from_idle() {
+        let state = make_test_state().await;
+        seed(&state, "c-idle").await;
+        // create_conversation leaves the row Idle by default.
+        upgrade(&state, "c-idle", "claude-sonnet-4-6")
+            .await
+            .expect("model switch must be allowed from Idle");
+        let conv = state.db.get_conversation("c-idle").await.expect("reload");
+        assert_eq!(conv.model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[tokio::test]
+    async fn rejects_switch_while_llm_request_in_flight() {
+        let state = make_test_state().await;
+        seed(&state, "c-busy").await;
+        state
+            .db
+            .update_conversation_state("c-busy", &ConvState::LlmRequesting { attempt: 1 })
+            .await
+            .expect("set busy");
+
+        let err = upgrade(&state, "c-busy", "claude-sonnet-4-6")
+            .await
+            .expect_err("must reject while an LLM request is in flight");
+        match err {
+            AppError::BadRequest(msg) => assert!(
+                msg.contains("LlmRequesting"),
+                "error should name the blocking state, got: {msg}"
+            ),
+            other => panic!("expected 400 BadRequest, got {other:?}"),
+        }
+
+        // Model must be unchanged.
+        let conv = state.db.get_conversation("c-busy").await.expect("reload");
+        assert_eq!(conv.model.as_deref(), Some("claude-opus-4-7"));
     }
 }

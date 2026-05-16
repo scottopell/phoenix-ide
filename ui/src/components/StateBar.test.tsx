@@ -2,7 +2,7 @@ import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { StateBar } from './StateBar';
-import { api, type Conversation, type PrStatusResponse } from '../api';
+import { api, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
@@ -135,5 +135,55 @@ describe('StateBar PR badge', () => {
 
     await waitFor(() => expect(screen.getByText('track-pr-status')).toBeInTheDocument());
     expect(api.getPrStatus).not.toHaveBeenCalled();
+  });
+});
+
+describe('StateBar model picker enablement (task 02713)', () => {
+  const models: ModelInfo[] = [
+    { id: 'claude-sonnet-4-6', provider: 'anthropic', description: '', context_window: 200_000, recommended: true },
+    { id: 'claude-opus-4-7', provider: 'anthropic', description: '', context_window: 200_000, recommended: true },
+  ];
+
+  function renderWithState(convState: ConversationState) {
+    return render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={convState}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          availableModels={models}
+          onUpgradeModel={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+  }
+
+  it('renders the model picker as an interactive button in error state', () => {
+    const { container } = renderWithState({ type: 'error', message: 'overloaded' });
+    expect(container.querySelector('button.conv-model--button')).not.toBeNull();
+  });
+
+  it('renders the model picker as an interactive button when idle', () => {
+    const { container } = renderWithState({ type: 'idle' });
+    expect(container.querySelector('button.conv-model--button')).not.toBeNull();
+  });
+
+  it('disables the model picker (read-only span) while an LLM request is in flight', () => {
+    const { container } = renderWithState({ type: 'llm_requesting', attempt: 1 });
+    expect(container.querySelector('button.conv-model--button')).toBeNull();
+    expect(container.querySelector('span.conv-model')).not.toBeNull();
+  });
+
+  it('disables the model picker while a tool is executing', () => {
+    const { container } = renderWithState({
+      type: 'tool_executing',
+      current_tool: { id: 't', name: 'bash', input: {} },
+      remaining_tools: [],
+    });
+    expect(container.querySelector('button.conv-model--button')).toBeNull();
   });
 });
