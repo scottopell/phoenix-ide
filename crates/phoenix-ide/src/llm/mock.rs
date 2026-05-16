@@ -131,6 +131,50 @@ re-reads the graph, but between the event being queued and processed, Task B \
 may have already modified the graph. The fix is to make the completion + graph \
 update + notification atomic.";
 
+/// Perf-fixture marker: a user message containing `[[perf:N]]` forces a
+/// fully deterministic text-only response of ~N whitespace-separated words,
+/// bypassing scenario selection and `rand`. This makes the streaming path a
+/// reproducible performance fingerprint at a caller-chosen length — the same
+/// N always yields byte-identical content at a fixed cadence. Dev-only: mock
+/// is opt-in (`PHOENIX_ENABLE_MOCK_MODEL=1`).
+fn parse_perf_words(request: &LlmRequest) -> Option<usize> {
+    let text = request.messages.iter().rev().find_map(|m| {
+        if m.role == super::types::MessageRole::User {
+            Some(
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            )
+        } else {
+            None
+        }
+    })?;
+    let start = text.find("[[perf:")? + "[[perf:".len();
+    let end = text[start..].find("]]")? + start;
+    text[start..end].trim().parse::<usize>().ok()
+}
+
+/// Deterministic text of exactly `n_words` words, built by cycling the words
+/// of `LONG_TEXT`. Pure function of `n_words` — no rand, no time, no state.
+fn perf_text(n_words: usize) -> String {
+    let words: Vec<&str> = LONG_TEXT.split_whitespace().collect();
+    if words.is_empty() || n_words == 0 {
+        return String::new();
+    }
+    let mut out = String::with_capacity(n_words * 8);
+    for i in 0..n_words {
+        if i > 0 {
+            out.push(' ');
+        }
+        out.push_str(words[i % words.len()]);
+    }
+    out
+}
+
 fn tool_use_id() -> String {
     format!("mock_toolu_{:016x}", rand_u64())
 }
@@ -288,8 +332,11 @@ async fn stream_text(text: &str, chunk_tx: &broadcast::Sender<TokenChunk>) {
 #[async_trait]
 impl LlmService for MockLlmService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let scenario = Scenario::from_message(request);
-        let (content, _) = build_response(&scenario);
+        let content = if let Some(n) = parse_perf_words(request) {
+            vec![ContentBlock::Text { text: perf_text(n) }]
+        } else {
+            build_response(&Scenario::from_message(request)).0
+        };
 
         Ok(LlmResponse {
             content,
@@ -308,8 +355,12 @@ impl LlmService for MockLlmService {
         request: &LlmRequest,
         chunk_tx: &broadcast::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
-        let scenario = Scenario::from_message(request);
-        let (content, streamable_text) = build_response(&scenario);
+        let (content, streamable_text) = if let Some(n) = parse_perf_words(request) {
+            let t = perf_text(n);
+            (vec![ContentBlock::Text { text: t.clone() }], t)
+        } else {
+            build_response(&Scenario::from_message(request))
+        };
 
         // Simulate initial latency (time-to-first-token)
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -334,5 +385,45 @@ impl LlmService for MockLlmService {
     #[allow(clippy::unnecessary_literal_bound)] // trait signature requires &str, not &'static str
     fn model_id(&self) -> &str {
         "mock"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::llm::types::{LlmMessage, MessageRole, PromptCacheKey};
+
+    fn user_req(text: &str) -> LlmRequest {
+        LlmRequest {
+            system: vec![],
+            messages: vec![LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::Text {
+                    text: text.to_string(),
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            cache_key: PromptCacheKey::ephemeral(),
+        }
+    }
+
+    #[test]
+    fn perf_marker_parsed() {
+        assert_eq!(parse_perf_words(&user_req("[[perf:800]] go")), Some(800));
+        assert_eq!(parse_perf_words(&user_req("no marker here")), None);
+        assert_eq!(parse_perf_words(&user_req("[[perf:bad]]")), None);
+    }
+
+    #[test]
+    fn perf_text_deterministic_and_sized() {
+        // Same N -> byte-identical output (the fingerprint invariant).
+        assert_eq!(perf_text(800), perf_text(800));
+        // Exactly N whitespace-separated words.
+        assert_eq!(perf_text(800).split_whitespace().count(), 800);
+        assert_eq!(perf_text(3200).split_whitespace().count(), 3200);
+        // Longer N strictly contains more bytes (scaling-curve precondition).
+        assert!(perf_text(3200).len() > perf_text(800).len());
+        assert_eq!(perf_text(0), "");
     }
 }
