@@ -1,27 +1,28 @@
 # Scenario: SSE token streaming into the conversation view.
 # Driven by skills/phoenix-perf-shared/scripts/run-scenario (agent-browser).
-# Step verbs: navigate, reload, click, type, key, eval, wait-for-selector,
-# wait-for-eval-predicate.
 #
 # Exercises the per-frame hot path: SSE token -> atom reducer -> streamingBuffer
 # -> StreamingMessage re-render + FULL markdown re-parse per rAF
 # (StreamingMessage.tsx:62, displayText = whole accumulated buffer).
 #
-# DETERMINISM (resolved): driven by the Mock LLM provider, NOT a live API.
-# The prompt carries a `[[perf:N]]` marker -> mock.rs parse_perf_words/perf_text
-# streams EXACTLY N deterministic words at a fixed 20ms cadence, no rand, no
-# scenario hashing. Same N => byte-identical stream every run (unit-tested in
-# llm::mock::tests). This is the reproducible fingerprint the method requires.
-# Setup: dev server must run the mock model (PHOENIX_ENABLE_MOCK_MODEL=1 and
-# the conversation's model set to "mock").
+# DETERMINISM: driven by the Mock LLM provider (not a live API). The prompt
+# carries `[[perf:N]]` -> mock.rs streams exactly N deterministic words at a
+# fixed cadence. Same N => byte-identical stream every run.
 #
-# METRICS: measure script_ms / react_commit_count / long_tasks (work done).
-# Do NOT gate on wall_ms here — the mock's fixed sleeps dominate wall time and
-# would mask the script cost under test.
+# PER-RUN STATE ISOLATION (the reset block): every run gets a BRAND-NEW mock
+# conversation (no cross-run history accumulation) and a HARD document load
+# (React mounts fresh + identically every run). Probes reset AFTER app-ready,
+# so the React mount and the tiny seed response are excluded from the
+# measured window identically on every run. Without this the samples are
+# bimodal/incoherent and the harness is not a valid instrument.
 #
-# SCALING: run this scenario at several `words` values (e.g. 200 / 800 / 3200).
-# The reparse-growing-buffer hypothesis predicts script_ms grows
-# super-linearly in `words`; a fixed buffer would grow ~linearly.
+# METRICS: react_commit_count / react_commit_ms are the live signal (React
+# DevTools hook present under Vite). script_ms only trips on >50ms longtasks.
+# Do NOT gate on wall_ms — mock's fixed cadence dominates wall time.
+#
+# SCALING: run at several `words` (e.g. 200/800/1800). reparse-growing-buffer
+# predicts react_commit_ms grows super-linearly in `words`; a bounded buffer
+# would grow ~linearly. A coherent monotone curve is required before any fix.
 
 name: sse-streaming
 covers:
@@ -31,26 +32,36 @@ covers:
   - ui/src/conversation/atom.ts
 
 params:
-  slug: "{SLUG}"
-  base_url: "{UI_URL}"
-  words: "800"                       # caller overrides via --subst words=N
+  base_url: "{UI_URL}"              # Vite origin; proxies /api to Phoenix
+  words: "800"                      # caller overrides via --subst words=N
   prompt: "[[perf:{words}]] stream the deterministic perf fixture"
 
 runs: 20
 warmup: 3
 
+# Untimed per-run setup. Establishes an identical pristine state and puts the
+# React mount + seed response OUTSIDE the measured window.
+reset:
+  fresh_conversation:
+    api_base: "{base_url}"
+    model: mock
+    cwd: /tmp
+    seed_text: "[[perf:5]]"         # tiny deterministic seed; fast, no rand
+  url: "{base_url}/c/{slug}"        # {slug} is bound by fresh_conversation
+  wait_app_ready:
+    expr: >
+      document.querySelector('textarea[placeholder="Type a message..."]')
+      && document.readyState === 'complete'
+      && document.querySelectorAll('.message.agent').length >= 1
+      && !document.querySelector('.streaming-message')
+    timeout_ms: 60000
+
+# Measured interaction only — navigation is owned by reset.
 steps:
-  - navigate: "{base_url}/c/{slug}"
-  - wait-for-selector: 'textarea[placeholder="Type a message..."]'
-  # Snapshot the pre-send finalized-agent-message count so readiness can key
-  # on "a NEW agent message landed", independent of pre-existing content.
   - eval: "window.__pp_pre = document.querySelectorAll('.message.agent').length"
   - click: 'textarea[placeholder="Type a message..."]'
   - type: { selector: 'textarea[placeholder="Type a message..."]', text: "{prompt}" }
   - key: "Enter"
-  # Readiness: a NEW finalized agent message (.message.agent,
-  # MessageComponents) has landed AND the live streaming container
-  # (.streaming-message, StreamingMessage.tsx:65) is gone.
   - wait-for-eval-predicate:
       expr: "document.querySelectorAll('.message.agent').length > window.__pp_pre && !document.querySelector('.streaming-message')"
       timeout_ms: 180000

@@ -3,6 +3,6 @@ entries:
     target: ui/src/components/StreamingMessage.tsx:StreamingMessage
     technique: reparse-growing-buffer
     scenario: sse-streaming
-    status: blocked
-    verdict: pending
+    status: failure
+    verdict: rejected
     file: resources/db/StreamingMessage-reparse-growing-buffer.yaml

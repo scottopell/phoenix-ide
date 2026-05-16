@@ -33,7 +33,7 @@ Usage:
   run-scenario SCENARIO.yaml --out raw.json \
     [--runs N] [--warmup W] [--subst KEY=VAL ...] [--browser-bin agent-browser]
 """
-import argparse, json, subprocess, sys, time, pathlib
+import argparse, json, subprocess, sys, time, pathlib, urllib.request, uuid
 import yaml
 
 # ---- measurement JS (run via `agent-browser eval`) ------------------------
@@ -138,14 +138,65 @@ def do_step(step, table, bin_):
         raise ValueError(f"unknown step verb: {verb}")
 
 
+def fresh_conversation(cfg, table):
+    """POST /api/conversations/new -> a brand-new conversation slug.
+
+    Per-run state isolation (correct-by-construction): a fresh backend
+    conversation every run means run k cannot measure run k-1's content.
+    A shared, growing conversation is structurally not a fingerprint.
+    """
+    base = subst(str(cfg.get("api_base", "{base_url}")), table).rstrip("/")
+    payload = {
+        "cwd": subst(str(cfg.get("cwd", "/tmp")), table),
+        "text": subst(str(cfg.get("seed_text", "ready")), table),
+        "images": [],
+        "message_id": str(uuid.uuid4()),
+    }
+    if cfg.get("model"):
+        payload["model"] = subst(str(cfg["model"]), table)
+    req = urllib.request.Request(
+        f"{base}/api/conversations/new",
+        data=json.dumps(payload).encode(),
+        headers={"content-type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=30) as r:
+        conv = json.loads(r.read())["conversation"]
+    return conv.get("slug") or conv["id"]
+
+
+def establish_pristine_state(scn, table, bin_):
+    """Untimed per-run setup: identical fresh state every run, with the
+    React mount deterministically OUTSIDE the measured window. This is what
+    makes runs comparable; without it the harness is broken."""
+    reset = scn["reset"]
+    if "fresh_conversation" in reset:
+        table["slug"] = fresh_conversation(reset["fresh_conversation"], table)
+    # Hard document load (about:blank -> url) so React mounts fresh and
+    # identically every run — never a SPA client-nav that includes/excludes
+    # the mount nondeterministically (the bimodal-sample root cause).
+    ab(["open", "about:blank"], bin_)
+    ab(["open", subst(reset["url"], table)], bin_)
+    if reset.get("wait_app_ready"):
+        do_step({"wait-for-eval-predicate": reset["wait_app_ready"]}, table, bin_)
+
+
 def one_run(scn, table, bin_):
-    steps = scn["steps"]
-    # Step 0 must be a navigate so the page exists; install probes, then a
-    # fresh reset right before the readiness-bearing remainder.
-    do_step(steps[0], table, bin_)
-    ab_eval(INSTALL_JS, bin_)
-    ab_eval(RESET_JS, bin_)
-    for st in steps[1:]:
+    table = dict(table)  # run-local: slug rebind must not leak across runs
+    if "reset" in scn:
+        # reset owns navigation; steps are ONLY the measured interaction.
+        establish_pristine_state(scn, table, bin_)
+        ab_eval(INSTALL_JS, bin_)
+        ab_eval(RESET_JS, bin_)  # zero counters AFTER mount -> mount excluded
+        measured_steps = scn["steps"]
+    else:
+        # legacy: step 0 navigates, probes installed after.
+        steps = scn["steps"]
+        do_step(steps[0], table, bin_)
+        ab_eval(INSTALL_JS, bin_)
+        ab_eval(RESET_JS, bin_)
+        measured_steps = steps[1:]
+    for st in measured_steps:
         do_step(st, table, bin_)
     raw = ab_eval(READ_JS, bin_).strip()
     # `agent-browser eval` prints the value JSON-string-encoded, e.g.

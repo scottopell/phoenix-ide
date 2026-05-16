@@ -3,128 +3,82 @@ target: ui/src/components/StreamingMessage.tsx:StreamingMessage
 technique: reparse-growing-buffer
 scenario: sse-streaming
 date: 2026-05-15
-status: blocked
-verdict: pending
+status: failure
+verdict: rejected
 
-# Honest first-hunt record. find-target's STATIC phase ran and localized the
-# target with file:line evidence. The MEASURED baseline has not been captured
-# this session — and per the method that is a recorded `blocked`, never an
-# estimated number. The blocker evolved as the work uncovered the real issue:
-#   1. first thought: blocked on Phoenix's browser_profile tool (task 62003).
-#      WRONG — these skills are run by Claude Code, which has `agent-browser`.
-#      Harness retargeted to skills/phoenix-perf-shared/scripts/run-scenario.
-#   2. real blocker surfaced: a live LLM stream is NOT reproducible, so it
-#      cannot be a valid fingerprint. The method's own rigor rejected the
-#      naive scenario before any number was produced.
-#   3. resolved: the Mock LLM provider is the deterministic source. A
-#      dev-only `[[perf:N]]` marker was added (mock.rs parse_perf_words /
-#      perf_text, unit-tested in llm::mock::tests) so the stream is
-#      byte-identical at a caller-chosen length.
-# What remains before this flips to success/failure: stand up the dev server
-# on the mock model, capture the pre-change baseline, implement the ONE fix,
-# hand to review. Not done this session; not faked.
+# First completed hunt. Outcome: the statically-suspected O(n^2) reparse is
+# REFUTED BY MEASUREMENT. This is the suite working as designed — a code
+# smell that looked like a bug is killed by the measurement gate before any
+# optimization is written. A recorded rejection so find-target does not
+# re-pick this target without a genuinely new angle.
 
-find_target_output:
-  pattern: >
-    During streaming StreamingMessage re-renders once per animation frame
-    (setDisplayText, StreamingMessage.tsx:47, ~60fps). Each render calls
-    parseStreamingBlocks(displayText) at StreamingMessage.tsx:62 where
-    displayText is the ENTIRE accumulated stream (set to full buffer.text at
-    L43/47). The whole growing buffer is re-parsed from scratch every frame
-    -> per-frame cost grows with stream length -> O(n^2) total scripting over
-    one streamed message. Compounding: index-based block keys
-    (`${block.type}-${i}`, L68) and no per-block memoization, so every
-    finalized ReactMarkdown / SyntaxHighlighter child re-renders each frame.
-  technique: reparse-growing-buffer
-  target: StreamingMessage.tsx:StreamingMessage
-  file: ui/src/components/StreamingMessage.tsx
+hypothesis: >
+  StreamingMessage.tsx:62 calls parseStreamingBlocks(displayText) on every
+  rAF-driven render, displayText = the entire accumulated stream
+  (StreamingMessage.tsx:43/47). Static reading predicts the whole growing
+  buffer is re-parsed each frame -> per-message scripting cost O(n^2) in
+  stream length.
+
+method:
+  harness: skills/phoenix-perf-shared/scripts/run-scenario (agent-browser)
+  app: running dev server, mock model (PHOENIX_ENABLE_MOCK_MODEL=1)
   scenario: resources/scenarios/sse-streaming.yaml
-  profiled: false
-  profiled_cost: "unprofiled: baseline not yet captured (see resume_steps)"
+  per_run_isolation: >
+    Each run uses a BRAND-NEW mock conversation + a hard document load, with
+    probes reset AFTER app-ready so the React mount and the deterministic
+    seed are excluded from the measured window identically every run. This
+    isolation is what made the instrument valid (see harness_fix below).
+  signal: react_commit_ms (summed React commit actualDuration; React
+    DevTools global hook present under Vite). n=4 per size, warmup=1.
+  determinism: mock [[perf:N]] marker -> exactly N deterministic words.
 
-secondary_observations:
-  - "index-key at StreamingMessage.tsx:68 — blocks keyed by array index; a
-     code fence opening/closing mid-stream shifts indices, forcing remounts."
-  - "derive-in-render at StreamingMessage.tsx:62 — parse not memoized, not
-     split into frozen (completed) vs live (open tail) blocks."
+measurements:
+  # raw react_commit_ms per run (un-averaged), by deterministic stream length
+  words_200:  [24.9, 26.3, 27.1, 22.8]   # median 25.6
+  words_800:  [44.7, 42.0, 46.8, 41.4]   # median 43.4
+  words_1800: [51.1, 62.5, 54.8, 52.7]   # median 53.8
+  scaling:
+    words_x4_200_to_800:  "react_commit_ms x1.70 (O(n^2) predicts ~x16; linear ~x4)"
+    words_x9_200_to_1800: "react_commit_ms x2.10"
+    commit_count: "23 -> ~29 -> ~37 (barely grows; rAF coalesces frames)"
+  variance: low and unimodal at every size (no bimodality).
 
-proposed_fix_sketch: |
-  Parse incrementally: freeze already-completed blocks, only re-parse the
-  open tail past the last completed fence/paragraph boundary. Memoize
-  completed blocks; give them stable identity keys (a monotonic block index
-  assigned at completion, not array position). Target: per-frame parse cost
-  O(tail) not O(whole buffer); finalized subtrees stop re-rendering each
-  frame. SKETCH ONLY — the method forbids committing this without a measured,
-  significant, peer-reviewed result.
+verdict_rationale: |
+  react_commit_ms scales markedly SUB-LINEARLY with stream length. O(n^2)
+  would require roughly x16 for x4 words; even linear would require x4;
+  measured is x1.70. The rAF gate coalesces commits so longer streams add
+  frames slowly, and parseStreamingBlocks over a few-KB string is cheap
+  relative to React commit / markdown render. The hot path the static smell
+  implied does not exist at realistic sizes. REJECTED: there is no measured
+  performance problem here; an incremental-parse rewrite would add
+  complexity for no measurable gain (Greybeard + Skeptic both reject).
+  Limitation: n=4 per size — small, but the refutation margin (x1.70 vs the
+  x16 the hypothesis requires) is far larger than any plausible n=4 noise,
+  and variance was low and unimodal. A larger N would tighten the curve,
+  not flip its shape.
 
-first_real_run_finding:
-  date: 2026-05-15
-  what_ran: >
-    Full harness validated end-to-end against the running app on the mock
-    model (PHOENIX_ENABLE_MOCK_MODEL=1, conv slug ready-response). Pipeline
-    works: agent-browser drives the scenario, the React DevTools global hook
-    is present under Vite so react_commit_count/react_commit_ms populate,
-    raw samples persist un-averaged.
-  scaling_probe: >
-    words=200 -> commit_ms raw [78, 695.7, 74, 696.1] (bimodal/alternating);
-    words=800 -> commit_count med 30 (LOWER than 200's 238 — inverted);
-    words=1800 -> rising [236.7, 342.2, 487.6, 562.4].
-  verdict: >
-    Data incoherent -> the O(n^2) hypothesis is NOT confirmed and NOT
-    refuted. The method correctly blocks the hunt rather than accept a
-    clean-looking but invalid result.
-  root_cause: >
-    Per-run state contamination. The scenario reuses ONE conversation; each
-    run appends a large finalized message and the SPA client-nav does not
-    remount React, so run k measures accumulated history + reparse of run
-    k-1's content, not the isolated stream. Alternating 200-word values are
-    the signature of this confound (warmup/measured + history parity).
-  required_fix_before_baseline:
-    - "Per-run state isolation: each run must start from an identical
-       pristine conversation (create a fresh mock conversation via API per
-       run, OR a hard reload to a conversation reset endpoint). A growing
-       shared conversation is not a fingerprint."
-    - "Then re-probe scaling; only a coherent monotone curve justifies
-       proceeding to implement the fix."
-  status_meaning: >
-    Still status=blocked / verdict=pending — correctly. The blocker moved
-    from 'no harness' to 'harness works but scenario lacks per-run state
-    isolation'. No number about the StreamingMessage reparse has been
-    legitimately measured; none is recorded.
-
-apparatus_built_this_session:
-  harness: skills/phoenix-perf-shared/scripts/run-scenario (agent-browser; raw samples)
-  stats:   skills/phoenix-perf-review/scripts/stats.py (Welch t-test; smoke-tested)
-  deterministic_source: >
-    crates/phoenix-ide/src/llm/mock.rs — [[perf:N]] marker -> exactly N
-    deterministic words, fixed 20ms cadence, no rand. Tests:
-    llm::mock::tests::{perf_marker_parsed,perf_text_deterministic_and_sized}
-    pass.
-
-resume_steps:
-  - "PHOENIX_ENABLE_MOCK_MODEL=1 ./dev.py up   (capture UI URL); ./dev.py seed"
-  - "set the test conversation's model to \"mock\""
-  - "/phoenix-perf-preflight   (expect all [*])"
-  - "/phoenix-perf-hunt — Phase 2 baseline:
-     run-scenario sse-streaming --subst SLUG=<slug> --subst UI_URL=<url>
-       --subst words=800 --out /tmp/phoenix-perf-baseline.json
-     (confirm .streaming-message/.agent-message selectors first)"
-  - "implement proposed_fix_sketch as the ONE change; ./dev.py check && restart"
-  - "/phoenix-perf-review sse-streaming
-       ui/src/components/StreamingMessage.tsx StreamingMessage
-       reparse-growing-buffer
-     (review re-runs same scenario, stats.py gates significance, 5 personas)"
-  - "scaling check: re-run baseline+optimized at words=200/800/3200; confirm
-     baseline script_ms super-linear in words, optimized ~linear"
-  - "on 5/5 approve: overwrite this file verbatim with review's report; flip
-     db.yaml entry to status: success / verdict: approved"
+harness_fix: |
+  The first attempt produced bimodal, incoherent samples
+  (200w: [78, 696, 74, 696]). Root cause was NOT "accumulated history"
+  (that would rise monotonically, not alternate). True root cause: the
+  scenario reused one conversation AND `navigate` to the same URL reloaded
+  nondeterministically, so some runs included the full React mount (~696ms)
+  in the window and some did not. Fixed structurally in run-scenario: a
+  generic `reset:` block — per-run fresh backend conversation
+  (POST /api/conversations/new) + hard document load + probe-reset AFTER
+  app-ready. Bimodality vanished ([24.9,26.3,27.1,22.8]); the instrument is
+  now valid. This isolation is generic to every scenario, not patched for
+  this one.
 
 lessons: |
-  Methodological (no perf measured yet). The scaffold paid off before a single
-  benchmark: (1) find-target's static phase localized a concrete O(n^2) hot
-  path from source alone; (2) the baseline-before-change + reproducible-
-  fingerprint invariants refused a live-LLM measurement and instead forced a
-  real, permanent codebase improvement — a deterministic mock length knob —
-  that future perf work also benefits from. A `blocked` record that drove a
-  merged determinism fix is a more valuable scientific outcome than a fast
-  number measured against a non-reproducible baseline would have been.
+  1. A static O(n^2)-looking pattern is a HYPOTHESIS, not a defect. The
+     measurement gate refuted it; recording the rejection prevents the next
+     find-target run (and the next engineer) from "fixing" a non-problem.
+  2. Instrument validity precedes any result. Incoherent samples were the
+     instrument telling the truth — chasing the wrong root cause
+     ("accumulated history") nearly produced a plausible-but-invalid story;
+     the alternation signature forced the correct root cause (mount in/out
+     of window) and a structural fix.
+  3. Re-pick StreamingMessage only with a NEW angle (e.g. very long single
+     messages >> 1800 words, or measured layout/paint cost, not commit_ms),
+     not the reparse-growing-buffer technique again.
