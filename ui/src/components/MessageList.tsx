@@ -11,6 +11,10 @@ import {
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
 import { MessageContextMenu } from './MessageContextMenu';
+import {
+  useBottomAnchoredWindow,
+  COLLAPSED_EST_PX,
+} from '../hooks/useBottomAnchoredWindow';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -67,6 +71,13 @@ interface MessageListBodyProps {
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  /**
+   * Bottom-anchored window boundary: messages at index >= this render REAL
+   * (byte-identical to non-virtualized). [0, firstRenderedIndex) collapse into
+   * ONE estimated-height spacer that is always offscreen above the viewport
+   * when pinned to bottom.
+   */
+  firstRenderedIndex: number;
 }
 
 /**
@@ -84,22 +95,37 @@ const MessageListBody = memo(function MessageListBody({
   onRetry,
   onCancelSteering,
   onOpenFile,
+  firstRenderedIndex,
 }: MessageListBodyProps) {
   // Tracks whether the previous rendered message was an agent message, so
   // we can suppress the "Phoenix HH:MM" header on consecutive agent messages
   // within the same turn. Any user / skill message resets the run; system
   // messages and tool messages (which don't render as their own block here)
   // leave the run intact — they don't represent a new turn.
+  //
+  // inAgentRun is advanced over the FULL message list (before the window
+  // slice) so a row reveals with the SAME header it would have had
+  // non-virtualized — the window boundary must not change turn grouping.
   let inAgentRun = false;
   return (
     <>
-      {messages.map((msg) => {
+      {firstRenderedIndex > 0 && (
+        <div
+          className="message-collapsed-spacer"
+          style={{ height: firstRenderedIndex * COLLAPSED_EST_PX }}
+          aria-hidden="true"
+        />
+      )}
+      {messages.map((msg, idx) => {
         const type = msg.message_type || msg.type;
+        const rendered = idx >= firstRenderedIndex;
         if (type === 'user') {
           inAgentRun = false;
+          if (!rendered) return null;
           return <UserMessage key={msg.sequence_id} message={msg} />;
         } else if (type === 'skill') {
           inAgentRun = false;
+          if (!rendered) return null;
           const skillContent = msg.content as { name?: string; trigger?: string };
           const skillTrigger = skillContent.trigger || '';
           const triggerArgs = extractSkillArgs(skillTrigger, skillContent.name || '');
@@ -126,6 +152,7 @@ const MessageListBody = memo(function MessageListBody({
         } else if (type === 'agent') {
           const isFirstInTurn = !inAgentRun;
           inAgentRun = true;
+          if (!rendered) return null;
           return (
             <AgentMessage
               key={msg.sequence_id}
@@ -137,6 +164,7 @@ const MessageListBody = memo(function MessageListBody({
           );
         }
         if (type === 'system') {
+          if (!rendered) return null;
           const text = (msg.content as { text?: string })?.text;
           if (text) {
             return (
@@ -193,6 +221,35 @@ export function MessageList({
   // 'soft'  = new non-system message → scroll only if pinned.
   // 'none'  = no new message this render.
   const scrollTriggerRef = useRef<'none' | 'soft' | 'force'>('none');
+
+  // Saved scroll pixel for REQ-CONV-013, read synchronously and memoized per
+  // conversation so the bottom-anchored window can widen far enough that the
+  // restored scrollTop lands inside REAL rendered content (not the estimated
+  // spacer). Recomputed on conversationId change, same render-time pattern as
+  // the rest of this component.
+  const savedScrollLookupRef = useRef<{ id: string | undefined; pos: number | null }>({
+    id: undefined,
+    pos: null,
+  });
+  if (savedScrollLookupRef.current.id !== conversationId) {
+    let pos: number | null = null;
+    if (conversationId) {
+      try {
+        const raw = localStorage.getItem(`${SCROLL_KEY_PREFIX}${conversationId}`);
+        pos = raw !== null ? parseInt(raw, 10) : null;
+        if (pos !== null && Number.isNaN(pos)) pos = null;
+      } catch { pos = null; }
+    }
+    savedScrollLookupRef.current = { id: conversationId, pos };
+  }
+
+  const { firstRenderedIndex } = useBottomAnchoredWindow({
+    messageCount: messages.length,
+    conversationId,
+    scrollRootRef: mainRef,
+    savedScrollPos: savedScrollLookupRef.current.pos,
+  });
+
   if (messages.length > prevMessageCountRef.current) {
     const newMsgs = messages.slice(prevMessageCountRef.current);
     const hasSystem = newMsgs.some(m => (m.message_type || m.type) === 'system');
@@ -369,6 +426,7 @@ export function MessageList({
               onRetry={onRetry}
               onCancelSteering={onCancelSteering}
               onOpenFile={onOpenFile}
+              firstRenderedIndex={firstRenderedIndex}
             />
           )}
           {/* Streaming text — cleared atomically when sse_message arrives (REQ-CONV-019).

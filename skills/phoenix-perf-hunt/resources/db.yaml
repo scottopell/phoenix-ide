@@ -27,3 +27,10 @@ entries:
     status: failure
     verdict: rejected
     file: resources/db/MessageList-virtualize-render.yaml
+  - id: MessageList-bottom-anchored-window
+    target: ui/src/components/MessageList.tsx:MessageListBody
+    technique: bottom-anchored-render-virtualization
+    scenario: conversation-load
+    status: success
+    verdict: approved
+    file: resources/db/MessageList-bottom-anchored-window.yaml

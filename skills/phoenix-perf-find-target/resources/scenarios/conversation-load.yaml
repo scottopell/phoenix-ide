@@ -42,6 +42,20 @@ reset:
     timeout_ms: 60000
 
 steps:
+  # Clear persisted scroll state for the fixture so EVERY run measures the
+  # canonical cold "switch -> land pinned at bottom" path (the user's actual
+  # complaint), not a stale REQ-CONV-013 restore to a previous run's saved
+  # offset. Without this the agent-browser profile's localStorage leaks
+  # scroll positions across runs -> non-deterministic, and (with bottom-
+  # anchored virtualization) the restore-coverage logic correctly disables
+  # windowing for a stale near-top offset. Build-agnostic; both arms benefit.
+  - eval: >
+      (() => {
+        try {
+          localStorage.removeItem('phoenix:scroll:{fixture}');
+          localStorage.removeItem('phoenix:msgcount:{fixture}');
+        } catch (e) {}
+      })()
   # SPA switch into the big conversation. The list row has no stable
   # selector and its text is "<slug>Direct" (slug+badge), and the row is
   # far down a 100+ item list — so locate it by slug-prefix and fire its
@@ -55,15 +69,21 @@ steps:
         row.scrollIntoView();
         (row.querySelector('.conv-item-main') || row).click();
       })()
-  # Readiness — BUILD-EQUIVALENT (must mean the same thing with and without
-  # virtualization, or the A/B is apples-vs-oranges):
-  #   [data-sequence-id] == 47 in BOTH builds (non-virtualized: each message
-  #   div carries it; virtualized: each row carries it once — real child when
-  #   visible, spacer when offscreen). >=40 ⇒ the full row set is committed.
-  #   AND >=5 real .message ⇒ the on-screen rows actually rendered (so the
-  #   virtualized run is NOT read before its visible subtree paints, which
-  #   would under-measure it). Both conditions hold trivially in the
-  #   non-virtualized build (all 47 are real .message).
+  # Readiness — BUILD-EQUIVALENT "switch render complete":
+  #   - url is the fixture
+  #   - >=5 real .message rendered: the heavy render commit has landed (in
+  #     the non-virtualized build all 47 commit together so this == fully
+  #     rendered; in the windowed build the ~12-row window has committed).
+  #     The window measurement (longtask/commit accumulators read here)
+  #     therefore captures the full per-build render cost in both arms.
+  #   - not streaming
+  # Pinned-to-bottom / no-scroll-jump are NOT asserted here on purpose: the
+  # genuine cold switch (no saved scroll) does not pixel-pin within the
+  # window even in the baseline build, so requiring it would make the
+  # predicate non-build-equivalent. Those properties are the REGRESSION
+  # surface and are verified explicitly in QA-2 behavior checks instead.
+  # Independent of per-message DOM count, so a collapsed top spacer (one
+  # element for many old messages) does not break it.
   - wait-for-eval-predicate:
-      expr: "location.pathname.endsWith('/{fixture}') && document.querySelectorAll('[data-sequence-id]').length >= 40 && document.querySelectorAll('.message').length >= 5 && !document.querySelector('.streaming-message')"
+      expr: "location.pathname.endsWith('/{fixture}') && document.querySelectorAll('.message').length>=5 && !document.querySelector('.streaming-message')"
       timeout_ms: 60000

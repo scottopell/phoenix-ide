@@ -1,0 +1,103 @@
+id: MessageList-bottom-anchored-window
+target: ui/src/components/MessageList.tsx:MessageListBody
+technique: bottom-anchored-render-virtualization
+scenario: conversation-load
+date: 2026-05-16
+status: success
+verdict: approved
+
+# FIRST ACCEPTED OPTIMIZATION (phoenix-perf checklist item 1). The redesign
+# called for by the rejected v1 (MessageList-virtualize-render): bottom-
+# anchored windowing that fixes both v1 regressions BY CONSTRUCTION, measured
+# significant, behavior verified, 5/5 approved.
+
+hypothesis: >
+  Switching into a large conversation cost ~640ms react_commit / ~390ms
+  script (no virtualization — all 47 message subtrees render). Render only
+  the last K messages real with older messages collapsed into ONE offscreen
+  estimated-height spacer; reveal older rows on scroll-up as REAL measured
+  rows with scrollTop compensation. Newest always in the initial window so
+  pinned-to-bottom holds; only-real-rows-in-viewport so no estimate jump.
+
+method:
+  scenario: resources/scenarios/conversation-load.yaml (fixture-turn-one,
+    47 large mock messages). SPA switch via conv-list click.
+  harness: skills/phoenix-perf-shared/scripts/run-scenario (agent-browser)
+  predicate: build-equivalent "render complete" (url + >=5 real .message +
+    not streaming); pinned-to-bottom / no-jump asserted in QA-2, not the
+    perf predicate (genuine cold switch does not pixel-pin even in baseline).
+  scenario hardened: clears persisted phoenix:scroll:* so every run measures
+    the canonical cold switch, not a stale REQ-CONV-013 restore.
+  N: 4 + 1 warmup per arm. Low N forced by agent-browser daemon instability
+    over this long session ("Event stream closed" on larger batches; fresh
+    daemon per arm). Effect magnitude (~300ms, ~25x the per-arm sd) makes
+    4v4 Welch decisively significant; documented limitation.
+  baseline re-measured on old code (git-stash impl / measure / pop) with the
+    identical final predicate.
+
+measurements:
+  react_commit_ms:    "639.5 ± 12.9 -> 341.2 ± 4.55  (-46.64%, p=3.4e-06)"   # WIN (gate >=10%)
+  js_heap_used_mib:   "38.15 -> 30.12  (-21.06%, p=8.8e-09)"                  # WIN (gate >=15%)
+  wall_ms:            "1290 -> 1154  (-10.55%, p=1.1e-04)"                    # switch faster end-to-end
+  dom_nodes:          "2853 -> 2513  (-11.92%)"
+  react_commit_count: "13.5 -> 17.5  (+29.6%, p=1e-03)  # more, smaller commits"
+  script_ms:          "384 -> 430.5  (+12.11%, p=1.4e-06)  # ADVERSE — scroll-compensation/listener/window scripting"
+  long_tasks:         "2 -> 4  (+100%)  # ADVERSE — extra main-thread stalls; tradeoff, see follow-up"
+
+qa_behavior:   # QA-2, agent-browser, fresh-state (localStorage cleared)
+  R1_pinned_to_bottom_on_switch: "PASS — distFromBottom 32; newest message
+    real; 12 rows real + spacer (virtualization active). v1's killer
+    regression FIXED by construction (newest always in initial window)."
+  R2_scroll_up_no_jump: "PASS — expansion 12->24 real, spacer shrank
+    12960->8640, scrollTop compensated (300 -> 3177, not raw). Only real
+    measured rows enter the viewport; the sole estimate (top spacer) is
+    offscreen. v1's estimate-jump regression FIXED by construction."
+  R3_scroll_restore_REQ_CONV_013: "PASS — saved 4000 -> restored 4043
+    (within 43px), into real measured content (window widened to cover it)."
+  R4_streaming_sibling_REQ_CONV_019: "PASS — message sent, agent streamed,
+    appended; list functional; StreamingMessage sibling intact."
+
+votes:
+  duplicate_hunter: approve   # distinct CORRECT design; the redesign 65002
+                              # demanded after MessageList-virtualize-render
+  skeptic: approve            # react_commit_ms -46.6% p=3.4e-6 decisive even
+                              # at N=4 (effect >> noise); wall -10.6% confirms
+                              # the switch is genuinely faster. script_ms /
+                              # long_tasks adverse but acknowledged, not hidden
+  conservative: approve       # both v1 regressions fixed; REQ-CONV-013 (43px)
+                              # & REQ-CONV-019 preserved; guard rails intact;
+                              # tsc 0 / eslint 0 / vitest 435. long_tasks is a
+                              # perf-quality tradeoff, not a correctness break
+  react_expert: approve       # correct-by-construction; init-timing bug
+                              # (async message load froze the window) found by
+                              # measurement & fixed; standard scroll-compensation
+  greybeard: approve          # complexity justified by -46% commit / -21%
+                              # heap / -10.6% wall on the user's real
+                              # complaint; recommends trimming compensation
+                              # scripting (follow-up)
+
+verdict_rationale: |
+  All gate metrics that improve are decisive wins: react_commit_ms -46.6%
+  (p=3.4e-6, >> 10% gate), js_heap -21% (p=9e-9, >> 15% gate), and wall_ms
+  -10.6% (p=1e-4) — the user-facing "slow to switch" is measurably faster.
+  Behavior fully verified: both v1 regressions fixed by construction,
+  REQ-CONV-013 restore within 43px, streaming intact. The script_ms +12% /
+  long_tasks 2->4 is a real secondary tradeoff (scroll listener + layout-
+  effect compensation + per-render window recompute), explicitly recorded,
+  net-positive on wall time, and tracked as a tuning follow-up — not a
+  correctness regression and not a blocker. 5/5 APPROVE. Code KEPT.
+
+lessons: |
+  1. CHECKLIST ITEM 1 LANDED: the suite proved it can measure AND ship a
+     correct, significant optimization — not only reject. Full arc:
+     find-target localized a real cost; v1 measured a huge win but was
+     REJECTED on correctness; the rejection record specified the must-solve
+     constraints; v2 solved them by construction and is ACCEPTED.
+  2. Measurement caught a silent init-timing bug (one-shot useState froze
+     the window at messageCount=0 because messages load async) — "no
+     improvement vs baseline" is a signal to investigate, not to accept.
+  3. Orchestrator-level cross-cutting fixes were essential and invisible to
+     the implementing sub-agent: build-equivalent predicate, localStorage
+     determinism, fresh-daemon lean-N measurement around harness instability.
+  4. Follow-up: reduce the scroll-compensation/window-recompute scripting
+     that turned ~-46% commit into only ~-10% wall and doubled long_tasks.
