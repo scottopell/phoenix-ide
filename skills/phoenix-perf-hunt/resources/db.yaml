@@ -6,3 +6,10 @@ entries:
     status: failure
     verdict: rejected
     file: resources/db/StreamingMessage-reparse-growing-buffer.yaml
+  - id: StreamingMessage-memo-completed-blocks
+    target: ui/src/components/StreamingMessage.tsx:StreamingBlock
+    technique: memo-completed-blocks
+    scenario: sse-streaming
+    status: failure
+    verdict: rejected
+    file: resources/db/StreamingMessage-memo-completed-blocks.yaml

@@ -1,0 +1,75 @@
+id: StreamingMessage-memo-completed-blocks
+target: ui/src/components/StreamingMessage.tsx:StreamingBlock
+technique: memo-completed-blocks
+scenario: sse-streaming
+date: 2026-05-15
+status: failure
+verdict: rejected
+
+# Full hunt loop, valid instrument (hardened per-run isolation; clean
+# baseline sd=5.7, no outliers). Optimization MEASURED and REJECTED. This is
+# the suite proving it can reject a plausible optimization with data.
+
+hypothesis: >
+  Wrapping StreamingBlock in React.memo (content comparator) + stable keys
+  so finalized blocks skip reconciliation each rAF frame will cut per-frame
+  React work and lower react_commit_ms during streaming.
+
+change_under_test: >
+  React.memo(StreamingBlockImpl, content-equality comparator);
+  key changed from `${block.type}-${i}` to `i`. One focused change.
+  Passed ./dev.py check (tsc/eslint/vitest/cargo/codegen green; tsc caught a
+  union-safety bug in the comparator first — fixed before measuring).
+
+method:
+  scenario: resources/scenarios/sse-streaming.yaml (mock, words=1800)
+  n: 12 + 3 warmup, identical for baseline and optimized
+  isolation: per-run fresh conversation + hard load + networkidle wait +
+    location guard + probe-reset after app-ready (instrument validated:
+    baseline [69.4,54.8,...] sd 5.7, zero 400x outliers)
+  stats: phoenix-perf-review/scripts/stats.py (Welch t-test on raw samples)
+
+measurements:
+  react_commit_ms:    "64.24 ± 5.91 -> 65.03 ± 5.20  (+1.22%, p=0.7336)"
+  react_commit_count: "34.33 ± 2.31 -> 34.92 ± 1.83  (+1.70%, p=0.5006)"
+  js_heap_used_mib:   "28.69 ± 0.94 -> 28.16 ± 0.86  (-1.85%, p=0.1646)"
+  dom_nodes:          "1647 ± 55 -> 1898 ± 81  (+15.28%, p=3.0e-08)"
+  wall_ms:            "40260 -> 40700 (+1.08%, p=0.070; mock-cadence bound)"
+
+votes:
+  duplicate_hunter: approve   # new technique, distinct from reparse entry
+  skeptic: reject             # react_commit_ms +1.2%, p=0.73 — no improvement,
+                              # nowhere near the >=10% threshold
+  conservative: reject        # dom_nodes +15.3%, p=3e-8 — significant adverse
+                              # reconciliation change from the key={i} switch;
+                              # a possible regression, not a no-op
+  react_expert: reject        # memo on completed blocks cannot help: the
+                              # dominant per-frame cost is the OPEN block
+                              # (whole growing prose re-mdast'd by
+                              # react-markdown every frame); its content
+                              # changes every frame so memo never skips it
+  greybeard: reject           # added complexity (custom comparator + key
+                              # change) for zero measured gain
+
+verdict_rationale: |
+  No metric clears its gate. react_commit_ms is statistically unchanged
+  (+1.2%, p=0.73). dom_nodes significantly WORSENS (+15.3%, p=3e-8) due to
+  the key={i} reconciliation change. Reverted (a rejected change must not
+  remain); the db record persists to teach.
+
+lessons: |
+  1. The reframed theory holds: at realistic sizes per-commit cost is flat;
+     finalized blocks were NOT the cost. memo on them is dead weight.
+  2. REAL next-angle (recorded so a future hunt targets the right thing):
+     the dominant per-frame cost is the OPEN/growing block — react-markdown
+     re-parses the entire open prose's mdast on every rAF commit. memo
+     cannot touch it (content changes each frame). Candidate techniques:
+     throttle/skip markdown rendering of the open block until a pause
+     (render plain text while streaming, rich-render on settle), or
+     incremental mdast. That is a DIFFERENT technique on a DIFFERENT node
+     than this entry and the reparse-growing-buffer entry; eligible.
+  3. The key={i} change is independently adverse (dom_nodes regression) —
+     do not reuse it.
+  4. Process win: tsc caught a union-safety bug in the comparator before any
+     measurement; the gate rejected a plausible-but-useless optimization
+     with numbers. Both are the suite working as intended.
