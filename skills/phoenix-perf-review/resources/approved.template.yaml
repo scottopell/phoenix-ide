@@ -1,0 +1,30 @@
+id: <file-stem>-<technique>
+target: <ui/src/file:Component>
+technique: <technique>
+scenario: <scenario-name>
+date: <YYYY-MM-DD>
+status: success
+verdict: approved
+votes:
+  duplicate_hunter: approve
+  skeptic: approve
+  conservative: approve
+  react_expert: approve
+  greybeard: approve
+methodology:
+  runs: <N>
+  warmup: <N>
+  throttle_rate: <N>
+  harness: browser_profile
+measurements:
+  # raw values -> reduced by scripts/stats.py; format:
+  # <metric>: <baseline mean±sd> -> <optimized mean±sd> (<%change>, p=<welch p>)
+  commit_count:
+  commit_actual_duration_ms:
+  script_duration_ms:
+  js_heap_used_mib:
+  long_tasks:
+reason: |
+  <why approved — which thresholds were cleared, panel summary>
+lessons: |
+  <pattern learned; suggested next target if any>

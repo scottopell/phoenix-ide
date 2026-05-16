@@ -1,0 +1,34 @@
+# Scenario: rapid typing in the composer.
+# Exercises InputArea / DraftStore isolation and the state-too-high /
+# over-subscription patterns: a keystroke must NOT re-render the message list.
+
+name: composer-typing
+covers:
+  - ui/src/components/InputArea.tsx
+  - ui/src/hooks/useDraft.ts
+  - ui/src/conversation/DraftStore.ts
+
+params:
+  slug: "{SLUG}"
+  base_url: "{UI_URL}"
+  text: "The quick brown fox jumps over the lazy dog. 0123456789. "  # ~60 chars/burst
+
+throttle_rate: 4
+runs: 30
+warmup: 3
+
+steps:
+  - navigate: "{base_url}/c/{slug}"
+  - wait-for-selector: "textarea"
+  - click: "textarea"
+  # Type a long burst; each char is a keystroke -> draft state update.
+  - type: { selector: "textarea", text: "{text}{text}{text}{text}{text}" }
+  - wait-for-eval-predicate:
+      expr: "document.querySelector('textarea').value.length >= 300"
+      timeout_ms: 10000
+
+# Primary signal: React commit count keyed by component during the burst.
+# EXPECT: commits attributed to InputArea only. ANY message-list / MessageListBody
+# commit during a pure keystroke burst is a state-too-high / over-subscription
+# regression -> a target. This scenario is also the guard test that the
+# current DraftStore isolation actually holds.

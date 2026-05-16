@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Validate environment for Phoenix React performance hunting.
+# Exit code: 0 = PASS, 1 = a required check failed.
+# Auto-detects repo root via git so it runs from anywhere in the worktree.
+
+REPO_ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || {
+  echo "ERROR: not inside a git repository."
+  exit 1
+}
+cd "$REPO_ROOT"
+
+PASS=0
+FAIL=0
+REPORT=""
+pass() { REPORT+="  [*] $1"$'\n'; PASS=$((PASS + 1)); }
+fail() { REPORT+="  [X] $1"$'\n'; FAIL=$((FAIL + 1)); }
+warn() { REPORT+="  [ ] $1 (optional)"$'\n'; }
+section() { REPORT+=$'\n'"$1:"$'\n'; }
+
+# ── Dev server ───────────────────────────────────────────────
+section "Dev server"
+STATUS="$(./dev.py status 2>/dev/null || true)"
+PHX_PORT="$(echo "$STATUS" | grep -oE 'Phoenix=[0-9]+' | head -1 | cut -d= -f2 || true)"
+if echo "$STATUS" | grep -qi 'Phoenix:[[:space:]]*running'; then
+  pass "Phoenix running (port ${PHX_PORT:-?})"
+  if [[ -n "${PHX_PORT:-}" ]] && curl -fsS -m 3 "http://127.0.0.1:${PHX_PORT}/" >/dev/null 2>&1; then
+    pass "Phoenix HTTP responding at http://127.0.0.1:${PHX_PORT}/"
+  else
+    fail "Phoenix port ${PHX_PORT:-?} not responding to HTTP"
+  fi
+else
+  fail "Phoenix dev server not running (run ./dev.py up)"
+fi
+
+# ── agent-browser harness ────────────────────────────────────
+section "agent-browser harness"
+if command -v agent-browser >/dev/null 2>&1; then
+  pass "agent-browser on PATH ($(agent-browser --version 2>/dev/null | head -1 || echo present))"
+else
+  fail "agent-browser not found — the scenario harness needs it (skill: agent-browser)"
+fi
+RS="skills/phoenix-perf-shared/scripts/run-scenario"
+[[ -x "$RS" ]] && pass "run-scenario harness present" || fail "run-scenario missing/!exec at $RS"
+
+# ── Seed data ────────────────────────────────────────────────
+section "Seed data"
+DB_PATH="$(echo "$STATUS" | grep -oE 'Database: .*' | head -1 | awk '{print $2}' || true)"
+if [[ -n "${DB_PATH:-}" && -f "$DB_PATH" ]]; then
+  CONV_COUNT="$(sqlite3 "$DB_PATH" 'SELECT COUNT(*) FROM conversations;' 2>/dev/null || echo 0)"
+  if [[ "${CONV_COUNT:-0}" -gt 0 ]]; then
+    pass "DB has $CONV_COUNT conversation(s)"
+  else
+    fail "DB has no conversations (run ./dev.py seed)"
+  fi
+else
+  warn "DB path not resolvable from ./dev.py status — verify seed manually"
+fi
+
+# ── Stats helper ─────────────────────────────────────────────
+section "Stats helper"
+STATS=".claude/skills/phoenix-perf-review/scripts/stats.py"
+if [[ -f "$STATS" ]]; then
+  if command -v uv >/dev/null 2>&1; then
+    pass "uv present (stats.py runnable via uv run)"
+  elif python3 -c 'import sys; raise SystemExit(0 if sys.version_info>=(3,11) else 1)' 2>/dev/null; then
+    pass "python3 >= 3.11 present (stats.py runnable, stdlib only)"
+  else
+    fail "neither uv nor python3>=3.11 available for stats.py"
+  fi
+else
+  fail "stats.py missing at $STATS"
+fi
+
+# ── Git ──────────────────────────────────────────────────────
+section "Git"
+git config user.name  >/dev/null 2>&1 && pass "git user.name set"  || fail "git user.name not set"
+git config user.email >/dev/null 2>&1 && pass "git user.email set" || fail "git user.email not set"
+if [[ -z "$(git status --porcelain)" ]]; then
+  pass "working tree clean"
+else
+  warn "working tree dirty — baseline should be captured on a clean tree"
+fi
+
+# ── Report ───────────────────────────────────────────────────
+echo "$REPORT"
+echo "  ----"
+echo "  PASS=$PASS FAIL=$FAIL"
+[[ "$FAIL" -eq 0 ]] && { echo "  PREFLIGHT OK"; exit 0; } || { echo "  PREFLIGHT FAILED — stop and fix [X] items"; exit 1; }

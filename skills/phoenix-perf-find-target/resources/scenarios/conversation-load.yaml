@@ -1,0 +1,34 @@
+# Scenario: load and render a many-message conversation cold.
+# Exercises MessageList / MessageListBody / message components and the
+# no-virtualization pattern (cost scales with conversation size).
+
+name: conversation-load
+covers:
+  - ui/src/components/MessageList.tsx
+  - ui/src/components/MessageComponents.tsx
+  - ui/src/pages/ConversationPage.tsx
+
+params:
+  slug: "{SLUG_LARGE}"          # the largest seeded conversation; find-target
+                                # picks it by max message count from the DB
+  base_url: "{UI_URL}"
+
+throttle_rate: 4
+runs: 30
+warmup: 3
+
+steps:
+  - navigate: "{base_url}/about:blank"   # cold start each run
+  - navigate: "{base_url}/c/{slug}"
+  # Readiness = the message list has painted all server messages.
+  - wait-for-eval-predicate:
+      expr: "document.querySelectorAll('[data-message]').length >= window.__EXPECTED_MSG_COUNT"
+      timeout_ms: 30000
+
+# find-target sets window.__EXPECTED_MSG_COUNT via an eval step using the
+# message count from getConversationBySlug, so readiness is exact, not a
+# fixed sleep (REQ-BT-019.1: deterministic readiness, never a timing guess).
+#
+# Primary signals: mount-phase commit count + actualDuration for the message
+# list subtree; Nodes delta; ScriptDuration delta. Plot vs message count
+# across the seeded conversations to confirm/deny no-virtualization scaling.

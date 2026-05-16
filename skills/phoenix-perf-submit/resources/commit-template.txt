@@ -1,0 +1,18 @@
+perf(ui): <≤50-char summary of the re-render/scripting win>
+
+<1-2 sentences: the pattern removed and the technique applied.>
+
+Target: <ui/src/file>::<Component>
+Technique: <technique>
+Scenario: <scenario-name> (run-scenario / agent-browser, N=<n>, warmup=<w>)
+
+Measured (raw samples, Welch t-test):
+  react_commit_count:   <base> -> <opt> (<-%>, p=<p>)
+  react_commit_ms:      <base> -> <opt> (<-%>, p=<p>)
+  script_ms:            <base> -> <opt> (<-%>, p=<p>)
+  js_heap_used:         <base> -> <opt> (<-%>)
+
+5-persona review: unanimous approve
+(db: skills/phoenix-perf-hunt/resources/db/<id>.yaml)
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>

@@ -1,0 +1,8 @@
+entries:
+  - id: <descriptive-name>
+    target: <ui/src/file:Component>
+    technique: <technique>
+    scenario: <scenario-name>
+    status: <success|failure|blocked>
+    verdict: <approved|rejected|pending>
+    file: assets/db/<name>.yaml

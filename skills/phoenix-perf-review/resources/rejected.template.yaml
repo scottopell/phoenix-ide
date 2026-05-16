@@ -1,0 +1,30 @@
+id: <file-stem>-<technique>
+target: <ui/src/file:Component>
+technique: <technique>
+scenario: <scenario-name>
+date: <YYYY-MM-DD>
+status: failure
+verdict: rejected
+votes:
+  duplicate_hunter: approve|reject
+  skeptic: approve|reject
+  conservative: approve|reject
+  react_expert: approve|reject
+  greybeard: approve|reject
+methodology:
+  runs: <N>
+  warmup: <N>
+  throttle_rate: <N>
+  harness: browser_profile
+measurements:
+  commit_count:
+  commit_actual_duration_ms:
+  script_duration_ms:
+  js_heap_used_mib:
+  long_tasks:
+reason: |
+  <why rejected — which gate failed: duplicate / sub-threshold / p>=0.05 /
+   correctness regression / bug / scope creep>
+lessons: |
+  <pattern learned — a rejected hunt still teaches; e.g. "this technique
+   does not move this scenario; do not retry without a new angle">

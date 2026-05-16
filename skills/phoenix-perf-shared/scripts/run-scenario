@@ -1,0 +1,199 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["pyyaml"]
+# ///
+"""agent-browser-backed scenario harness — emits RAW per-run samples.
+
+This is the Claude-Code-side harness (the lading analog of payloadtool +
+hyperfine). It drives the `agent-browser` CLI; it does NOT use Phoenix's
+in-agent `browser_profile` tool (that is for the LLM inside Phoenix, not for
+the runner of these skills).
+
+Hard contract (REQ-BT-019.5 / NG-STATS, unchanged): this emits a JSON array
+of raw RunSample objects, one per post-warmup run. It NEVER averages or
+reduces. Significance is owned by phoenix-perf-review/scripts/stats.py.
+
+Metrics (no app code change required, read via `agent-browser eval`):
+  script_ms        sum of longtask durations during the measured window
+  long_tasks       count of longtasks (>50ms) during the window
+  wall_ms          performance.now() across the measured window
+  js_heap_used     performance.memory.usedJSHeapSize (Chrome) after readiness
+  dom_nodes        document.getElementsByTagName('*').length after readiness
+  react_commit_count / react_commit_ms
+                   best-effort: only if a React commit counter is observable
+                   via __REACT_DEVTOOLS_GLOBAL_HOOK__. Absent -> omitted, never
+                   invented (stats.py skips absent metrics by design).
+
+CPU throttling and forced-GC heap are the optional CDP add-on (best-effort,
+not required for the method's core); see resources/CDP.md. Without it, run
+warmups and keep the host quiet — variance is handled by N runs + Welch.
+
+Usage:
+  run-scenario SCENARIO.yaml --out raw.json \
+    [--runs N] [--warmup W] [--subst KEY=VAL ...] [--browser-bin agent-browser]
+"""
+import argparse, json, subprocess, sys, time, pathlib
+import yaml
+
+# ---- measurement JS (run via `agent-browser eval`) ------------------------
+INSTALL_JS = r"""
+(() => {
+  const w = window;
+  if (!w.__pp) {
+    w.__pp = { lt_ms: 0, lt_n: 0, t0: 0 };
+    try {
+      const po = new PerformanceObserver((l) => {
+        for (const e of l.getEntries()) { w.__pp.lt_ms += e.duration; w.__pp.lt_n += 1; }
+      });
+      po.observe({ entryTypes: ['longtask'] });
+      w.__pp.po = po;
+    } catch (e) { w.__pp.lt_err = String(e); }
+    // Best-effort React commit counter via the DevTools global hook, IF a
+    // backend installed one. We never fabricate this; absent => omitted.
+    try {
+      const h = w.__REACT_DEVTOOLS_GLOBAL_HOOK__;
+      if (h && typeof h.onCommitFiberRoot === 'function' && !h.__pp_wrapped) {
+        const orig = h.onCommitFiberRoot.bind(h);
+        w.__pp.rc_n = 0; w.__pp.rc_ms = 0;
+        h.onCommitFiberRoot = (id, root, prio) => {
+          try {
+            const cur = root && root.current;
+            const ad = cur && cur.actualDuration;
+            if (typeof ad === 'number') w.__pp.rc_ms += ad;
+            w.__pp.rc_n += 1;
+          } catch (e) {}
+          return orig(id, root, prio);
+        };
+        h.__pp_wrapped = true;
+      }
+    } catch (e) {}
+  }
+  return 'ok';
+})()
+"""
+
+RESET_JS = r"""
+(() => { const p = window.__pp; if (!p) return 'no-pp';
+  p.lt_ms = 0; p.lt_n = 0; if ('rc_n' in p) { p.rc_n = 0; p.rc_ms = 0; }
+  p.t0 = performance.now(); return 'reset'; })()
+"""
+
+READ_JS = r"""
+(() => { const p = window.__pp || {};
+  const m = (performance.memory && performance.memory.usedJSHeapSize) || null;
+  const o = { script_ms: p.lt_ms||0, long_tasks: p.lt_n||0,
+    wall_ms: p.t0 ? (performance.now()-p.t0) : null,
+    js_heap_used: m, dom_nodes: document.getElementsByTagName('*').length };
+  if ('rc_n' in p) { o.react_commit_count = p.rc_n; o.react_commit_ms = p.rc_ms; }
+  return JSON.stringify(o); })()
+"""
+
+
+def ab(args, bin_):
+    """Run an agent-browser subcommand, return stdout (stripped)."""
+    r = subprocess.run([bin_, *args], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"agent-browser {args!r} failed: {r.stderr.strip()}")
+    return r.stdout.strip()
+
+
+def ab_eval(js, bin_):
+    return ab(["eval", js], bin_)
+
+
+def subst(s, table):
+    for k, v in table.items():
+        s = s.replace("{" + k + "}", str(v))
+    return s
+
+
+def do_step(step, table, bin_):
+    """Map a scenario step to agent-browser. Verbs = REQ-BT-019.1 set."""
+    (verb, val), = step.items()
+    if verb == "navigate":
+        ab(["open", subst(val, table)], bin_)
+    elif verb == "reload":
+        ab(["reload"], bin_)
+    elif verb == "click":
+        ab(["click", subst(val, table)], bin_)
+    elif verb == "type":
+        ab(["fill", subst(val["selector"], table), subst(val["text"], table)], bin_)
+    elif verb == "key":
+        ab(["press", subst(val, table)], bin_)
+    elif verb == "eval":
+        ab_eval(subst(val, table), bin_)
+    elif verb == "wait-for-selector":
+        ab(["wait", subst(val, table)], bin_)
+    elif verb == "wait-for-eval-predicate":
+        expr = subst(val["expr"], table)
+        deadline = time.time() + val.get("timeout_ms", 30000) / 1000.0
+        while time.time() < deadline:
+            out = ab_eval(f"!!({expr})", bin_)
+            if out.strip().lower().endswith("true"):
+                return
+            time.sleep(0.1)
+        raise TimeoutError(f"readiness predicate never satisfied: {expr}")
+    else:
+        raise ValueError(f"unknown step verb: {verb}")
+
+
+def one_run(scn, table, bin_):
+    steps = scn["steps"]
+    # Step 0 must be a navigate so the page exists; install probes, then a
+    # fresh reset right before the readiness-bearing remainder.
+    do_step(steps[0], table, bin_)
+    ab_eval(INSTALL_JS, bin_)
+    ab_eval(RESET_JS, bin_)
+    for st in steps[1:]:
+        do_step(st, table, bin_)
+    raw = ab_eval(READ_JS, bin_)
+    # agent-browser may wrap eval output; extract the JSON object.
+    i, j = raw.find("{"), raw.rfind("}")
+    if i < 0 or j < 0:
+        raise RuntimeError(f"could not parse metrics from eval output: {raw!r}")
+    return json.loads(raw[i:j + 1])
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("scenario")
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--runs", type=int)
+    ap.add_argument("--warmup", type=int)
+    ap.add_argument("--subst", action="append", default=[],
+                    help="KEY=VAL substituted into scenario {KEY} placeholders")
+    ap.add_argument("--browser-bin", default="agent-browser")
+    a = ap.parse_args()
+
+    scn = yaml.safe_load(pathlib.Path(a.scenario).read_text())
+    runs = a.runs if a.runs is not None else scn.get("runs", 30)
+    warmup = a.warmup if a.warmup is not None else scn.get("warmup", 3)
+    table = dict(scn.get("params", {}))
+    for kv in a.subst:
+        k, _, v = kv.partition("=")
+        table[k] = v
+    # resolve nested placeholders in params (e.g. base_url referenced by steps)
+    for k in list(table):
+        table[k] = subst(str(table[k]), table)
+
+    samples = []
+    total = warmup + runs
+    for i in range(total):
+        tag = "warmup" if i < warmup else f"run {i - warmup}"
+        try:
+            s = one_run(scn, table, a.browser_bin)
+        except Exception as e:
+            print(f"[{tag}] FAILED: {e}", file=sys.stderr)
+            raise
+        if i >= warmup:
+            s["run_index"] = i - warmup
+            samples.append(s)
+        print(f"[{tag}] {json.dumps(s)}", file=sys.stderr)
+
+    pathlib.Path(a.out).write_text(json.dumps(samples, indent=2))
+    print(f"wrote {len(samples)} raw samples -> {a.out} (NOT averaged)")
+
+
+if __name__ == "__main__":
+    main()

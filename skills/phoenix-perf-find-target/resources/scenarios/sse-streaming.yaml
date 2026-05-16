@@ -1,0 +1,54 @@
+# Scenario: SSE token streaming into the conversation view.
+# Driven by skills/phoenix-perf-shared/scripts/run-scenario (agent-browser).
+# Step verbs: navigate, reload, click, type, key, eval, wait-for-selector,
+# wait-for-eval-predicate.
+#
+# Exercises the per-frame hot path: SSE token -> atom reducer -> streamingBuffer
+# -> StreamingMessage re-render + FULL markdown re-parse per rAF
+# (StreamingMessage.tsx:62, displayText = whole accumulated buffer).
+#
+# DETERMINISM (resolved): driven by the Mock LLM provider, NOT a live API.
+# The prompt carries a `[[perf:N]]` marker -> mock.rs parse_perf_words/perf_text
+# streams EXACTLY N deterministic words at a fixed 20ms cadence, no rand, no
+# scenario hashing. Same N => byte-identical stream every run (unit-tested in
+# llm::mock::tests). This is the reproducible fingerprint the method requires.
+# Setup: dev server must run the mock model (PHOENIX_ENABLE_MOCK_MODEL=1 and
+# the conversation's model set to "mock").
+#
+# METRICS: measure script_ms / react_commit_count / long_tasks (work done).
+# Do NOT gate on wall_ms here — the mock's fixed sleeps dominate wall time and
+# would mask the script cost under test.
+#
+# SCALING: run this scenario at several `words` values (e.g. 200 / 800 / 3200).
+# The reparse-growing-buffer hypothesis predicts script_ms grows
+# super-linearly in `words`; a fixed buffer would grow ~linearly.
+
+name: sse-streaming
+covers:
+  - ui/src/components/StreamingMessage.tsx
+  - ui/src/components/MessageList.tsx
+  - ui/src/hooks/useConnection.ts
+  - ui/src/conversation/atom.ts
+
+params:
+  slug: "{SLUG}"
+  base_url: "{UI_URL}"
+  words: "800"                       # caller overrides via --subst words=N
+  prompt: "[[perf:{words}]] stream the deterministic perf fixture"
+
+runs: 20
+warmup: 3
+
+steps:
+  - navigate: "{base_url}/c/{slug}"
+  - wait-for-selector: "textarea"
+  - click: "textarea"
+  - type: { selector: "textarea", text: "{prompt}" }
+  - key: "Enter"
+  # Readiness: streaming finished — the live StreamingMessage container
+  # (.streaming-message, StreamingMessage.tsx:65) is gone and a finalized
+  # agent message (.agent-message) has landed. find-target must confirm
+  # these class selectors against ui/src before the first run.
+  - wait-for-eval-predicate:
+      expr: "document.querySelectorAll('.agent-message').length > 0 && !document.querySelector('.streaming-message')"
+      timeout_ms: 60000

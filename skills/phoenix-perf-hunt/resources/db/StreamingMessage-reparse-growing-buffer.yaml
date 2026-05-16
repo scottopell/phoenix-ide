@@ -1,0 +1,95 @@
+id: StreamingMessage-reparse-growing-buffer
+target: ui/src/components/StreamingMessage.tsx:StreamingMessage
+technique: reparse-growing-buffer
+scenario: sse-streaming
+date: 2026-05-15
+status: blocked
+verdict: pending
+
+# Honest first-hunt record. find-target's STATIC phase ran and localized the
+# target with file:line evidence. The MEASURED baseline has not been captured
+# this session — and per the method that is a recorded `blocked`, never an
+# estimated number. The blocker evolved as the work uncovered the real issue:
+#   1. first thought: blocked on Phoenix's browser_profile tool (task 62003).
+#      WRONG — these skills are run by Claude Code, which has `agent-browser`.
+#      Harness retargeted to skills/phoenix-perf-shared/scripts/run-scenario.
+#   2. real blocker surfaced: a live LLM stream is NOT reproducible, so it
+#      cannot be a valid fingerprint. The method's own rigor rejected the
+#      naive scenario before any number was produced.
+#   3. resolved: the Mock LLM provider is the deterministic source. A
+#      dev-only `[[perf:N]]` marker was added (mock.rs parse_perf_words /
+#      perf_text, unit-tested in llm::mock::tests) so the stream is
+#      byte-identical at a caller-chosen length.
+# What remains before this flips to success/failure: stand up the dev server
+# on the mock model, capture the pre-change baseline, implement the ONE fix,
+# hand to review. Not done this session; not faked.
+
+find_target_output:
+  pattern: >
+    During streaming StreamingMessage re-renders once per animation frame
+    (setDisplayText, StreamingMessage.tsx:47, ~60fps). Each render calls
+    parseStreamingBlocks(displayText) at StreamingMessage.tsx:62 where
+    displayText is the ENTIRE accumulated stream (set to full buffer.text at
+    L43/47). The whole growing buffer is re-parsed from scratch every frame
+    -> per-frame cost grows with stream length -> O(n^2) total scripting over
+    one streamed message. Compounding: index-based block keys
+    (`${block.type}-${i}`, L68) and no per-block memoization, so every
+    finalized ReactMarkdown / SyntaxHighlighter child re-renders each frame.
+  technique: reparse-growing-buffer
+  target: StreamingMessage.tsx:StreamingMessage
+  file: ui/src/components/StreamingMessage.tsx
+  scenario: resources/scenarios/sse-streaming.yaml
+  profiled: false
+  profiled_cost: "unprofiled: baseline not yet captured (see resume_steps)"
+
+secondary_observations:
+  - "index-key at StreamingMessage.tsx:68 — blocks keyed by array index; a
+     code fence opening/closing mid-stream shifts indices, forcing remounts."
+  - "derive-in-render at StreamingMessage.tsx:62 — parse not memoized, not
+     split into frozen (completed) vs live (open tail) blocks."
+
+proposed_fix_sketch: |
+  Parse incrementally: freeze already-completed blocks, only re-parse the
+  open tail past the last completed fence/paragraph boundary. Memoize
+  completed blocks; give them stable identity keys (a monotonic block index
+  assigned at completion, not array position). Target: per-frame parse cost
+  O(tail) not O(whole buffer); finalized subtrees stop re-rendering each
+  frame. SKETCH ONLY — the method forbids committing this without a measured,
+  significant, peer-reviewed result.
+
+apparatus_built_this_session:
+  harness: skills/phoenix-perf-shared/scripts/run-scenario (agent-browser; raw samples)
+  stats:   skills/phoenix-perf-review/scripts/stats.py (Welch t-test; smoke-tested)
+  deterministic_source: >
+    crates/phoenix-ide/src/llm/mock.rs — [[perf:N]] marker -> exactly N
+    deterministic words, fixed 20ms cadence, no rand. Tests:
+    llm::mock::tests::{perf_marker_parsed,perf_text_deterministic_and_sized}
+    pass.
+
+resume_steps:
+  - "PHOENIX_ENABLE_MOCK_MODEL=1 ./dev.py up   (capture UI URL); ./dev.py seed"
+  - "set the test conversation's model to \"mock\""
+  - "/phoenix-perf-preflight   (expect all [*])"
+  - "/phoenix-perf-hunt — Phase 2 baseline:
+     run-scenario sse-streaming --subst SLUG=<slug> --subst UI_URL=<url>
+       --subst words=800 --out /tmp/phoenix-perf-baseline.json
+     (confirm .streaming-message/.agent-message selectors first)"
+  - "implement proposed_fix_sketch as the ONE change; ./dev.py check && restart"
+  - "/phoenix-perf-review sse-streaming
+       ui/src/components/StreamingMessage.tsx StreamingMessage
+       reparse-growing-buffer
+     (review re-runs same scenario, stats.py gates significance, 5 personas)"
+  - "scaling check: re-run baseline+optimized at words=200/800/3200; confirm
+     baseline script_ms super-linear in words, optimized ~linear"
+  - "on 5/5 approve: overwrite this file verbatim with review's report; flip
+     db.yaml entry to status: success / verdict: approved"
+
+lessons: |
+  Methodological (no perf measured yet). The scaffold paid off before a single
+  benchmark: (1) find-target's static phase localized a concrete O(n^2) hot
+  path from source alone; (2) the baseline-before-change + reproducible-
+  fingerprint invariants refused a live-LLM measurement and instead forced a
+  real, permanent codebase improvement — a deterministic mock length knob —
+  that future perf work also benefits from. A `blocked` record that drove a
+  merged determinism fix is a more valuable scientific outcome than a fast
+  number measured against a non-reproducible baseline would have been.
