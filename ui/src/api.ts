@@ -182,11 +182,8 @@ export type ConversationState =
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
   | { type: 'terminal' };
 
-/** Whether the user may switch the conversation's model from this state.
- *  Mirrors the backend `ConvState::allows_model_change`: only `idle` (no
- *  operation in flight) and `error` (failed; "pick another model" is the
- *  documented recovery). The retried request uses the new model because
- *  the backend evicts and recreates the runtime from the persisted row. */
+/** Mirror of the backend `ConvState::allows_model_change`: true only for
+ *  `idle` and `error`. */
 export function canChangeModelInState(state: ConversationState): boolean {
   return state.type === 'idle' || state.type === 'error';
 }

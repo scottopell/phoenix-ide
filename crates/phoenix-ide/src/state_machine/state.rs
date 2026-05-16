@@ -1379,16 +1379,9 @@ impl ConvState {
         )
     }
 
-    /// Whether the user may switch the conversation's model from this
-    /// state. Allowed only when nothing is in flight that a mid-operation
-    /// model swap would race or invalidate: `Idle` (no operation) and
-    /// `Error` (the operation already failed; "pick another model" is the
-    /// documented recovery for overload/quota errors — see
-    /// `specs/llm/requirements.md` REQ-LLM-006). The new model is picked
-    /// up on the next retry because the runtime is evicted and recreated
-    /// from the persisted DB row. Every other state has an LLM request,
-    /// tool execution, sub-agent, recovery subprocess, or user/approval
-    /// handshake in flight.
+    /// True only for `Idle` and `Error` — the states with nothing in
+    /// flight that a model swap would race. Error-state recovery
+    /// ("pick another model") is specified by REQ-LLM-006.
     pub fn allows_model_change(&self) -> bool {
         matches!(self, ConvState::Idle | ConvState::Error { .. })
     }
