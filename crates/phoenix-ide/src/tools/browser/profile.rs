@@ -365,6 +365,25 @@ impl Tool for BrowserProfileTool {
             return action_cpu_summary(input.path.as_deref()).await;
         }
 
+        // run_scenario's structural validation (empty steps, navigate/
+        // reload-in-steps, runs/throttle bounds) is pure input checking
+        // and MUST run BEFORE acquiring the browser — otherwise an
+        // invalid scenario in a no-Chrome env returns "Failed to get
+        // browser" instead of the real validation error, defeating the
+        // non-browser validation guarantee (Codex P2). Mirrors how
+        // `help` / `cpu_summary` are dispatched pre-browser.
+        if input.action == "run_scenario" {
+            let plan = match validate_run_scenario(&input) {
+                Ok(p) => p,
+                Err(e) => return e,
+            };
+            let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
+                Ok(s) => s,
+                Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
+            };
+            return action_run_scenario(&session, &input, plan).await;
+        }
+
         let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
             Ok(s) => s,
             Err(e) => return ToolOutput::error(format!("Failed to get browser: {e}")),
@@ -374,7 +393,6 @@ impl Tool for BrowserProfileTool {
             "metrics" => action_metrics(&session).await,
             "throttle" => action_throttle(&session, input.rate).await,
             "gc_heap" => action_gc_heap(&session).await,
-            "run_scenario" => action_run_scenario(&session, &input).await,
             "cpu_start" => action_cpu_start(&session).await,
             "cpu_stop" => action_cpu_stop(&session).await,
             "trace_start" => action_trace_start(&session, input.categories.as_deref()).await,
@@ -979,21 +997,37 @@ fn build_methodology_warnings(
     w
 }
 
-async fn action_run_scenario(
-    session: &Arc<RwLock<BrowserSession>>,
-    input: &ProfileInput,
-) -> ToolOutput {
-    // Allium RunScenarioCollectsRawSamples preconditions.
+/// The validated, browser-independent plan for one `run_scenario`
+/// invocation. Produced by [`validate_run_scenario`] BEFORE the browser
+/// is acquired, so a structurally invalid scenario fails with the real
+/// error even when Chrome is unavailable (Codex P2). Single validation
+/// site — no parallel re-checking in [`action_run_scenario`].
+struct ScenarioPlan {
+    steps: Vec<Step>,
+    runs: u32,
+    warmup: u32,
+    gc_per_run: bool,
+    reset: Reset,
+}
+
+/// Pure, no-browser validation of a `run_scenario` request. Mirrors the
+/// preconditions in `browser-profiling.allium`
+/// (`RunScenarioCollectsRawSamples` / `RunScenarioRejectsInlineNavigation`).
+fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutput> {
     let steps = match &input.steps {
         Some(s) if !s.is_empty() => s.clone(),
-        _ => return ToolOutput::error("run_scenario requires a non-empty `steps` array"),
+        _ => {
+            return Err(ToolOutput::error(
+                "run_scenario requires a non-empty `steps` array",
+            ))
+        }
     };
 
-    // REQ-BT-019.14 / Allium RunScenarioRejectsInlineNavigation: a
-    // navigate/reload inside `steps` resets the cumulative Performance
-    // counters mid-bracket, making after−before negative or meaningless.
-    // Reject BEFORE any run executes — no ScenarioRunResult is produced,
-    // so there is no sample set to misread. Navigation belongs in `reset`.
+    // REQ-BT-019.14 / RunScenarioRejectsInlineNavigation: a navigate/
+    // reload inside `steps` would reset cumulative page state mid-run.
+    // Reject before anything runs — no sample set to misread. This is
+    // the path the non-browser validation test depends on; it must not
+    // require Chrome to reach it.
     for (i, step) in steps.iter().enumerate() {
         let kind = match step {
             Step::Navigate { .. } => Some("navigate"),
@@ -1001,31 +1035,49 @@ async fn action_run_scenario(
             _ => None,
         };
         if let Some(kind) = kind {
-            return ToolOutput::error(format!(
+            return Err(ToolOutput::error(format!(
                 "run_scenario: steps[{i}] is a `{kind}` step. Navigation/reload \
-                 inside `steps` resets the cumulative Performance.getMetrics \
-                 counters mid-run, so the after−before delta is negative or \
-                 meaningless. Put navigation in the per-run `reset` instead \
-                 (it runs before the before-snapshot). No samples produced."
-            ));
+                 inside `steps` resets cumulative page state mid-run. Put \
+                 navigation in the per-run `reset` instead (it runs before the \
+                 measured window opens). No samples produced."
+            )));
         }
     }
 
     let runs = input.runs.unwrap_or(1);
     if runs < 1 {
-        return ToolOutput::error("run_scenario requires `runs` >= 1");
+        return Err(ToolOutput::error("run_scenario requires `runs` >= 1"));
     }
-    // REQ-BT-019.16: warmup defaults to 1 (cold JIT/first-paint excluded).
-    let warmup = resolve_warmup(input.warmup);
-    let gc_per_run = input.gc_per_run.unwrap_or(true);
-    let reset = Reset::resolve(input.reset.as_ref());
     if let Some(tr) = input.throttle_rate {
         if tr < 1.0 {
-            return ToolOutput::error(format!(
+            return Err(ToolOutput::error(format!(
                 "Invalid throttle_rate {tr}: must be >= 1 (1 = no throttling)"
-            ));
+            )));
         }
     }
+
+    Ok(ScenarioPlan {
+        steps,
+        runs,
+        // REQ-BT-019.16: warmup defaults to 1 (cold JIT/first-paint excluded).
+        warmup: resolve_warmup(input.warmup),
+        gc_per_run: input.gc_per_run.unwrap_or(true),
+        reset: Reset::resolve(input.reset.as_ref()),
+    })
+}
+
+async fn action_run_scenario(
+    session: &Arc<RwLock<BrowserSession>>,
+    input: &ProfileInput,
+    plan: ScenarioPlan,
+) -> ToolOutput {
+    let ScenarioPlan {
+        steps,
+        runs,
+        warmup,
+        gc_per_run,
+        reset,
+    } = plan;
 
     // REQ-BT-019.16/.18: methodology warnings — metadata flagging an
     // unguarded run. Carried ALONGSIDE samples, never in place of them.
