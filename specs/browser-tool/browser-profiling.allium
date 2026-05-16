@@ -1,0 +1,382 @@
+-- allium: 3
+-- browser-profiling.allium
+--
+-- Browser Performance Profiling: Behavioural Specification
+--
+-- Scope: the `browser_profile` tool's stateful lifecycles and the
+--        multi-run scenario harness. Covers the three independent
+--        start/stop sub-machines (CPU sampling, tracing, JS coverage),
+--        the CPU-throttle override lifecycle, the transactional
+--        run_scenario operation, and the heap-snapshot diff pairing.
+-- Includes: precondition gates on every start/stop edge, the
+--           raw-per-run-samples invariant (REQ-BT-019.5 hard
+--           constraint), throttle set/restore pairing, scenario
+--           readiness-or-fail semantics, session-death cascade.
+-- Excludes:
+--   - The interaction primitives themselves (navigate/click/type/
+--     wait): scenario steps reuse their semantics but their specs
+--     live in specs/browser-tool/requirements.md (REQ-BT-001..016).
+--   - Console-log capture, screencast/live-view (REQ-BT-004/018).
+--   - Network emulation (REQ-BT-019-NG-NETEMU, deferred).
+--   - The caller's statistics: significance, mean, variance are the
+--     skill's, never the harness's (REQ-BT-019-NG-STATS). This spec
+--     only guarantees the raw samples are delivered intact.
+--   - React-helper injection mechanics (REQ-BT-017); here we only
+--     reference that commit data is read through __phoenix.
+--
+-- Requirement traceability: REQ-BT-019 (.1 .. .12)
+-- Dependencies: specs/bedrock/bedrock.allium
+
+use "../bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The agent calling browser_profile. Identity is the conversation;
+-- profiling state is conversation-scoped because it lives on the
+-- conversation's BrowserSession. An agent in conversation A cannot
+-- observe or stop a profiling session owned by conversation B.
+actor LlmAgent {
+    identified_by: bedrock/Conversation
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Each profiling capability with a start/stop pair is a two-state
+-- sub-machine. They are independent: CPU sampling, tracing, and
+-- coverage may each be active or idle in any combination.
+enum CaptureState { idle | active }
+
+-- A scenario run's terminal outcome. `blocked` means a readiness
+-- step did not satisfy its condition within its timeout; the run
+-- produces no sample and the operation fails (REQ-BT-019.1).
+enum RunOutcome { completed | blocked }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The macro counter + React commit snapshot taken around one run.
+-- Fields are illustrative of REQ-BT-019.3 / .4; the contract is that
+-- a sample is captured per run and never reduced before delivery.
+value RunSample {
+    run_index:        Integer    -- 0-based, post-warmup
+    script_duration:  Decimal
+    task_duration:    Decimal
+    layout_count:     Decimal
+    recalc_style:     Decimal
+    js_heap_used:     Decimal
+    nodes:            Decimal
+    js_event_listeners: Decimal
+    react_commits:    Integer    -- 0 when React absent
+    react_actual_ms:  Decimal    -- summed actualDuration; 0 when absent
+}
+
+-- A heap snapshot reference (file on disk). Diffing a baseline
+-- against a post snapshot yields retained-size growth and detached
+-- DOM node count (REQ-BT-019.10).
+value HeapSnapshotRef {
+    path: String
+}
+
+-- The outcome of one transactional RunScenario invocation. Modelled
+-- as an entity (not an inline event payload) so the raw-samples
+-- invariant can quantify over it. `samples` is the raw per-run
+-- array delivered to the caller; the harness fills it and never
+-- reduces it (REQ-BT-019.5 / -NG-STATS). `requested_runs` excludes
+-- warmup. On a blocked outcome `samples` is empty and
+-- `blocked_step` names the readiness step that did not satisfy.
+entity ScenarioRunResult {
+    session:        ProfilingSession
+    outcome:        RunOutcome
+    requested_runs: Integer        -- >= 1, excludes warmup
+    samples:        List<RunSample>
+    blocked_step:   String? when outcome = blocked
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- Exactly one per conversation that has launched a BrowserSession.
+-- Created lazily alongside the session; destroyed when the session
+-- dies (idle reap, conversation delete, shutdown). All three capture
+-- sub-machines and the throttle override hang off this entity so the
+-- precondition gates are structurally enforced per conversation.
+entity ProfilingSession {
+    conversation: bedrock/Conversation
+
+    -- The three independent start/stop sub-machines.
+    cpu:      CaptureState
+    tracing:  CaptureState
+    coverage: CaptureState
+
+    -- CPU-throttle override (REQ-BT-019.2). null = no override in
+    -- force (browser default). A non-null rate means setCPUThrottlingRate
+    -- was issued and a matching restore is owed.
+    throttle_rate: Decimal?
+
+    -- Buffered trace events accumulated while tracing = active, via
+    -- the Tracing.dataCollected listener. Drained and cleared on
+    -- trace_stop. Empty whenever tracing = idle.
+    trace_event_count: Integer
+
+    -- Optional baseline heap snapshot held for a later diff
+    -- (REQ-BT-019.10). Set when the agent captures a "before"
+    -- snapshot; HeapDiff compares a "post" snapshot against it.
+    -- null until a baseline is taken; survives across scenario runs
+    -- so leak detection can bracket repeated mount/unmount.
+    heap_baseline: HeapSnapshotRef?
+
+    transitions cpu {
+        idle   -> active     -- cpu_start
+        active -> idle       -- cpu_stop
+    }
+    transitions tracing {
+        idle   -> active     -- trace_start
+        active -> idle       -- trace_stop
+    }
+    transitions coverage {
+        idle   -> active     -- coverage_start
+        active -> idle       -- coverage_stop
+    }
+}
+
+------------------------------------------------------------
+-- Events (referenced inline by rules; not declared separately)
+------------------------------------------------------------
+
+-- Lifecycle edges (each carries the owning ProfilingSession):
+--   CpuStart(ps)        CpuStop(ps)
+--   TraceStart(ps, categories?)   TraceStop(ps)
+--   CoverageStart(ps)   CoverageStop(ps)
+--
+-- Throttle override:
+--   ThrottleSet(ps, rate)         -- rate >= 1; 1 == "no throttling"
+--   ThrottleClear(ps)
+--
+-- One-shot reads (no state change; included for completeness):
+--   MetricsSnapshot(ps)           -- Performance.getMetrics (REQ-BT-019.3)
+--   GcThenHeap(ps)                -- collectGarbage + heap read (.6)
+--   HeapSnapshot(ps) -> HeapSnapshotRef
+--   HeapDiff(ps, baseline, post)  -- (.10)
+--   WhyRender(ps)                 -- read __phoenix commit reasons (.8)
+--
+-- The transactional harness:
+--   RunScenario(ps, steps, runs, warmup, throttle_rate?)
+--     steps: non-empty ordered list; runs >= 1; warmup >= 0.
+--
+-- Session-death cascade (from bedrock / session manager):
+--   BrowserSessionDestroyed(ps)   -- idle reap, conv delete, shutdown
+
+------------------------------------------------------------
+-- Rules: CPU sampling lifecycle (REQ-BT-019.7)
+------------------------------------------------------------
+
+rule CpuStartWhenIdle {
+    when: CpuStart(ps)
+    requires: ps.cpu = idle
+    ensures: ps.cpu = active
+    -- A CpuStart while already active is a no-op success ("already
+    -- active") at the tool surface, NOT a transition. Modelled as
+    -- guarded so a double-start cannot silently restart the profiler
+    -- and discard the in-progress profile.
+}
+
+rule CpuStopWhenActive {
+    when: CpuStop(ps)
+    requires: ps.cpu = active
+    ensures: ps.cpu = idle
+    -- A CpuStop while idle is an error at the tool surface
+    -- ("CPU profiling is not active — call cpu_start first").
+    -- It is NOT a transition; the requires-clause makes the
+    -- forgot-to-start case structurally explicit rather than
+    -- producing an empty/garbage profile file.
+}
+
+------------------------------------------------------------
+-- Rules: Tracing lifecycle (REQ-BT-019.9, .12)
+------------------------------------------------------------
+
+-- @guidance
+--   trace_start clears any prior buffered events and arms the
+--   Tracing.dataCollected listener BEFORE issuing Tracing.start, so
+--   no early events are lost. trace_stop issues Tracing.end and then
+--   waits for Tracing.tracingComplete (bounded timeout) before
+--   draining the buffer — events arrive asynchronously after end.
+--   Sequence: clear buffer -> arm listener -> Tracing.start ->
+--   (page interaction) -> Tracing.end -> await tracingComplete ->
+--   drain+write {"traceEvents":[...]} -> extract tasks > 50ms.
+rule TraceStartWhenIdle {
+    when: TraceStart(ps, categories?)
+    requires: ps.tracing = idle
+    ensures: ps.tracing = active
+    ensures: ps.trace_event_count = 0
+}
+
+rule TraceStopWhenActive {
+    when: TraceStop(ps)
+    requires: ps.tracing = active
+    ensures: ps.tracing = idle
+    ensures: ps.trace_event_count = 0
+    -- Buffer is drained to the output file then cleared. tracing=idle
+    -- and an empty buffer are restored together so a subsequent
+    -- TraceStart starts from a clean slate.
+}
+
+------------------------------------------------------------
+-- Rules: JS coverage lifecycle (REQ-BT-019.11)
+------------------------------------------------------------
+
+rule CoverageStartWhenIdle {
+    when: CoverageStart(ps)
+    requires: ps.coverage = idle
+    ensures: ps.coverage = active
+}
+
+rule CoverageStopWhenActive {
+    when: CoverageStop(ps)
+    requires: ps.coverage = active
+    ensures: ps.coverage = idle
+}
+
+------------------------------------------------------------
+-- Rules: CPU throttle override (REQ-BT-019.2)
+------------------------------------------------------------
+
+rule ThrottleSetEstablishesOverride {
+    when: ThrottleSet(ps, rate)
+    requires: rate >= 1
+    ensures: ps.throttle_rate = rate
+}
+
+rule ThrottleClearRestoresDefault {
+    when: ThrottleClear(ps)
+    ensures: ps.throttle_rate = null
+}
+
+------------------------------------------------------------
+-- Rules: the multi-run scenario harness (REQ-BT-019.1, .3, .4, .5)
+------------------------------------------------------------
+
+-- @guidance
+--   One run = (optional reset: navigate/reload to fixed state) ->
+--   apply throttle_rate if supplied -> snapshot macro counters +
+--   reset __phoenix commit buffer -> dispatch steps in order ->
+--   block on the run's readiness step -> snapshot macro counters +
+--   read commit buffer -> emit one RunSample. Warmup runs execute
+--   identically but their samples are discarded. Throttle applied
+--   for the scenario is restored to its prior value when the
+--   operation returns (whether it completed or was blocked).
+--   The per-run snapshot bracketing is atomic within the harness so
+--   the caller never has to reason about interleaving — that is the
+--   reason this is harness-owned and not skill-driven primitives.
+rule RunScenarioCollectsRawSamples {
+    when: RunScenario(ps, steps, runs, warmup, result)
+    requires: count(steps) >= 1
+    requires: runs >= 1
+    requires: warmup >= 0
+    ensures: result.session = ps
+    ensures: result.requested_runs = runs
+    -- On success the operation returns exactly `runs` RunSample
+    -- values, in run order, each carrying the bracketed metrics for
+    -- that single execution. Warmup runs are excluded from the count.
+    ensures: result.outcome = completed implies count(result.samples) = runs
+}
+
+-- A readiness step that never satisfies its condition fails the
+-- whole operation; no partial/averaged result is substituted.
+rule RunScenarioBlockedOnReadiness {
+    when: RunScenario(ps, steps, runs, warmup, result)
+    requires: count(steps) >= 1
+    ensures: result.outcome = blocked implies count(result.samples) = 0
+    -- The failure names the blocking step (result.blocked_step). A
+    -- blocked run does NOT degrade into "best effort" samples — an
+    -- indeterminate-state measurement is worse than no measurement
+    -- (REQ-BT-019.1).
+}
+
+------------------------------------------------------------
+-- Rules: heap-snapshot diff (REQ-BT-019.10)
+------------------------------------------------------------
+
+rule HeapDiffRequiresTwoSnapshots {
+    when: HeapDiff(ps, baseline, post)
+    requires: baseline != null
+    requires: post != null
+    -- Reports retained-size growth and detached-DOM-node count.
+    -- A diff against a missing/!= snapshot is an error, not a
+    -- zero-delta result, so "no leak" and "never measured" are
+    -- distinguishable.
+}
+
+------------------------------------------------------------
+-- Rules: session-death cascade
+------------------------------------------------------------
+
+-- @guidance
+--   The ProfilingSession has no lifetime independent of the
+--   BrowserSession. When the session is reaped (30-min idle),
+--   killed (conversation delete), or torn down (shutdown), every
+--   capture sub-machine is forced to idle and any throttle override
+--   is dropped along with the Chrome instance. No stop edge is
+--   issued to a dead browser; the state is reset structurally.
+rule SessionDeathResetsAllCaptures {
+    when: BrowserSessionDestroyed(ps)
+    ensures: ps.cpu = idle
+    ensures: ps.tracing = idle
+    ensures: ps.coverage = idle
+    ensures: ps.throttle_rate = null
+    ensures: ps.trace_event_count = 0
+    ensures: ps.heap_baseline = null
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-BT-019: profiling state is conversation-scoped, mirroring the
+-- BrowserSession it hangs off (cf. bash HandleConversationScoped).
+invariant ProfilingConversationScoped {
+    for ps in ProfilingSession:
+        ps.conversation != null
+}
+
+-- REQ-BT-019.9 / .12: a non-empty trace buffer can only exist while
+-- tracing is active. trace_stop drains-then-clears; trace_start
+-- clears before arming. So idle + buffered events is unrepresentable.
+invariant TraceBufferOnlyWhileActive {
+    for ps in ProfilingSession where ps.tracing = idle:
+        ps.trace_event_count = 0
+}
+
+-- REQ-BT-019.2: a throttle override in force always carries a rate
+-- of at least 1 (1 == no throttling). A rate < 1 is not a valid
+-- override and must never be representable as established state.
+invariant ThrottleRateWellFormed {
+    for ps in ProfilingSession where ps.throttle_rate != null:
+        ps.throttle_rate >= 1
+}
+
+-- REQ-BT-019.5 (hard constraint): the harness delivers raw per-run
+-- samples and never a statistically reduced stand-in. A completed
+-- RunScenario yields one sample per (non-warmup) run; the harness
+-- computes no mean/variance/significance. This invariant is the
+-- structural statement of REQ-BT-019-NG-STATS: if the result ever
+-- carries fewer samples than runs on a completed operation, the
+-- harness has reduced the data and is non-conforming.
+invariant RawSamplesNeverReduced {
+    for r in ScenarioRunResult where r.outcome = completed:
+        count(r.samples) = r.requested_runs
+}
+
+-- REQ-BT-019.1: a blocked scenario yields zero samples — never a
+-- partial set presented as if complete. "Measured against an
+-- indeterminate state" is structurally excluded.
+invariant BlockedScenarioYieldsNoSamples {
+    for r in ScenarioRunResult where r.outcome = blocked:
+        count(r.samples) = 0
+}
