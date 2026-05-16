@@ -208,6 +208,9 @@ entity ProfilingSession {
 --   HeapDiff(ps, baseline, post, result)  -- (.10); both refs are
 --       explicit caller-supplied paths, no in-session baseline
 --   WhyRender(ps)                 -- read __phoenix commit reasons (.8)
+--   CpuSummary(path)              -- parse a saved CPU profile to a
+--       hot-function ranking (.7); no ProfilingSession — pure file
+--       read, works after the session died
 --
 -- The transactional harness:
 --   RunScenario(ps, steps, runs, warmup, reset, gc_per_run,

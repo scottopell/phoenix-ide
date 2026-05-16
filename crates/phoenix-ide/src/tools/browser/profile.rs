@@ -37,8 +37,9 @@ use chromiumoxide::cdp::js_protocol::heap_profiler::{
 };
 use chromiumoxide::cdp::js_protocol::profiler::{
     DisableParams as ProfilerDisableParams, EnableParams as ProfilerEnableParams,
-    StartParams as ProfilerStartParams, StartPreciseCoverageParams,
-    StopParams as ProfilerStopParams, StopPreciseCoverageParams, TakePreciseCoverageParams,
+    Profile as CpuProfile, ProfileNode as CpuProfileNode, StartParams as ProfilerStartParams,
+    StartPreciseCoverageParams, StopParams as ProfilerStopParams, StopPreciseCoverageParams,
+    TakePreciseCoverageParams,
 };
 use futures::StreamExt;
 use serde::Deserialize;
@@ -111,6 +112,9 @@ struct ProfileInput {
     /// `heap_snapshot`: optional baseline snapshot path to diff against.
     #[serde(default)]
     baseline: Option<String>,
+    /// `cpu_summary`: path to a saved CPU profile JSON to summarise.
+    #[serde(default)]
+    path: Option<String>,
 }
 
 /// Per-run reset directive (REQ-BT-019.18). Accepts either the string
@@ -262,6 +266,7 @@ pub const PROFILE_ACTIONS: &[&str] = &[
     "run_scenario",
     "cpu_start",
     "cpu_stop",
+    "cpu_summary",
     "trace_start",
     "trace_stop",
     "why_render",
@@ -335,6 +340,10 @@ impl Tool for BrowserProfileTool {
                 "baseline": {
                     "type": "string",
                     "description": "heap_snapshot only: path to a baseline .heapsnapshot to diff against."
+                },
+                "path": {
+                    "type": "string",
+                    "description": "cpu_summary only: path to a saved CPU profile JSON (from cpu_stop). Returns top hot functions by self/total time — no browser needed."
                 }
             },
             "required": ["action"]
@@ -347,9 +356,13 @@ impl Tool for BrowserProfileTool {
             Err(e) => return ToolOutput::error(format!("Invalid input: {e}")),
         };
 
-        // help needs no browser.
+        // help and cpu_summary need no browser (cpu_summary parses a
+        // file on disk — works even after the session died).
         if input.action == "help" {
             return ToolOutput::success(help_text());
+        }
+        if input.action == "cpu_summary" {
+            return action_cpu_summary(input.path.as_deref()).await;
         }
 
         let session: Arc<RwLock<BrowserSession>> = match ctx.browser().await {
@@ -434,7 +447,12 @@ Actions:
 
   cpu_start       — Start a Profiler CPU sampling session.
   cpu_stop        — Stop it; save the profile JSON (loadable in the
-                    DevTools Performance tab). Returns the file path.
+                    DevTools Performance tab) AND return an inline
+                    top-function ranking by self/total time.
+  cpu_summary     — Re-summarise a saved CPU profile. Param: path (a
+                    JSON from cpu_stop). No browser needed — parses the
+                    file. Top hot functions by self (where CPU is
+                    spent) and by call-tree total time.
 
   trace_start     — Start a Tracing session. Param: categories (optional,
                     comma-separated; default devtools.timeline,
@@ -1224,9 +1242,216 @@ async fn action_cpu_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
     if let Err(e) = tokio::fs::write(&path, data).await {
         return ToolOutput::error(format!("Failed to write CPU profile: {e}"));
     }
+    // REQ-BT-019.7: return the summary INLINE, not just a file path. A
+    // file an agent cannot read is an artifact, not an answer; the file
+    // is still kept for a human / DevTools deep-dive.
+    let summary = summarize_cpu_profile(&profile, CPU_SUMMARY_TOP_N);
     ToolOutput::success(format!(
-        "CPU profile saved to {path} (load in Chrome DevTools → Performance)."
+        "CPU profile saved to {path} (load in Chrome DevTools → Performance for the full tree).\n\n{summary}"
     ))
+}
+
+/// `cpu_summary`: re-summarise a saved CPU profile JSON without a
+/// browser. Lets an agent re-read an earlier `cpu_stop` profile (or one
+/// captured elsewhere) for the hot-function ranking.
+async fn action_cpu_summary(path: Option<&str>) -> ToolOutput {
+    let Some(path) = path else {
+        return ToolOutput::error("cpu_summary requires `path` (a saved CPU profile JSON)");
+    };
+    let data = match tokio::fs::read_to_string(path).await {
+        Ok(d) => d,
+        Err(e) => return ToolOutput::error(format!("Failed to read {path}: {e}")),
+    };
+    let profile: CpuProfile = match serde_json::from_str(&data) {
+        Ok(p) => p,
+        Err(e) => {
+            return ToolOutput::error(format!(
+                "{path} is not a valid CPU profile JSON (expected Profiler.Profile shape): {e}"
+            ))
+        }
+    };
+    ToolOutput::success(format!(
+        "CPU profile {path}\n\n{}",
+        summarize_cpu_profile(&profile, CPU_SUMMARY_TOP_N)
+    ))
+}
+
+/// How many hot functions to show in a CPU summary.
+const CPU_SUMMARY_TOP_N: usize = 15;
+
+type CpuNodeMap<'a> = std::collections::HashMap<i64, &'a CpuProfileNode>;
+
+/// Per-node self microseconds (or hit counts when sampling data is
+/// absent). Returns `(self_by_id, total, used_hitcount_fallback)`.
+///
+/// Each `timeDeltas[i]` (microseconds) is attributed to `samples[i]` —
+/// the standard `.cpuprofile` attribution (matches `speedscope` /
+/// `DevTools` for ranking). When `samples`/`timeDeltas` are absent the
+/// profile carries only `hitCount`, so the ranking falls back to hit
+/// counts (relative weight, no absolute time) and the summary says so.
+//
+// cast_precision_loss: sample µs deltas and hit counts are small
+// positive integers, orders of magnitude below f64's 2^52 — no real
+// precision is at stake here.
+#[allow(clippy::cast_precision_loss)]
+fn cpu_self_times(p: &CpuProfile) -> (std::collections::HashMap<i64, f64>, f64, bool) {
+    let mut self_us: std::collections::HashMap<i64, f64> = std::collections::HashMap::new();
+    let mut total = 0.0_f64;
+    match (&p.samples, &p.time_deltas) {
+        (Some(samples), Some(deltas)) if !samples.is_empty() => {
+            for (i, &sid) in samples.iter().enumerate() {
+                let d = deltas.get(i).copied().unwrap_or(0).max(0) as f64;
+                *self_us.entry(sid).or_default() += d;
+                total += d;
+            }
+            (self_us, total, false)
+        }
+        _ => {
+            for n in &p.nodes {
+                let h = n.hit_count.unwrap_or(0).max(0) as f64;
+                *self_us.entry(n.id).or_default() += h;
+                total += h;
+            }
+            (self_us, total, true)
+        }
+    }
+}
+
+/// Per-node total = self + sum(children totals). Memoised, with a
+/// visited-stack guard so a malformed (cyclic) children graph cannot
+/// infinitely recurse.
+fn cpu_node_total(
+    id: i64,
+    nodes: &CpuNodeMap,
+    self_us: &std::collections::HashMap<i64, f64>,
+    memo: &mut std::collections::HashMap<i64, f64>,
+    stack: &mut Vec<i64>,
+) -> f64 {
+    if let Some(&v) = memo.get(&id) {
+        return v;
+    }
+    if stack.contains(&id) {
+        return self_us.get(&id).copied().unwrap_or(0.0); // break cycle
+    }
+    let mut t = self_us.get(&id).copied().unwrap_or(0.0);
+    if let Some(node) = nodes.get(&id) {
+        if let Some(children) = &node.children {
+            stack.push(id);
+            for &c in children {
+                t += cpu_node_total(c, nodes, self_us, memo, stack);
+            }
+            stack.pop();
+        }
+    }
+    memo.insert(id, t);
+    t
+}
+
+/// `name  url:line` (1-based line) for a node id; `(anonymous)` for
+/// nameless frames, `<node N>` for a dangling id.
+fn cpu_node_label(nodes: &CpuNodeMap, id: i64) -> String {
+    match nodes.get(&id) {
+        Some(n) => {
+            let cf = &n.call_frame;
+            let name = if cf.function_name.is_empty() {
+                "(anonymous)"
+            } else {
+                cf.function_name.as_str()
+            };
+            if cf.url.is_empty() {
+                name.to_string()
+            } else {
+                format!("{name}  {}:{}", cf.url, cf.line_number + 1)
+            }
+        }
+        None => format!("<node {id}>"),
+    }
+}
+
+/// Render a `Profiler.Profile` as a human/agent-readable hot-function
+/// ranking (REQ-BT-019.7). Self is aggregated per function (the robust
+/// "where is CPU spent" metric, no double-count); total (self +
+/// descendants) is per node and labelled as possibly double-counting
+/// recursion — deliberately not summed across nodes.
+fn summarize_cpu_profile(p: &CpuProfile, top_n: usize) -> String {
+    use std::collections::HashMap;
+    use std::fmt::Write as _;
+
+    if p.nodes.is_empty() {
+        return "CPU profile is empty (no nodes — was the session too short?).".to_string();
+    }
+    let nodes: CpuNodeMap = p.nodes.iter().map(|n| (n.id, n)).collect();
+    let (self_us, total_us, hitcount) = cpu_self_times(p);
+    if total_us <= 0.0 {
+        return "CPU profile carries no samples or hit counts (session too short to sample)."
+            .to_string();
+    }
+
+    // Aggregate self by function identity (label collapses name+url+line).
+    let mut agg: HashMap<String, f64> = HashMap::new();
+    for (&id, &us) in &self_us {
+        *agg.entry(cpu_node_label(&nodes, id)).or_default() += us;
+    }
+    let mut by_self: Vec<(&String, &f64)> = agg.iter().collect();
+    by_self.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut memo = HashMap::new();
+    let mut by_total: Vec<(i64, f64)> = p
+        .nodes
+        .iter()
+        .map(|n| {
+            let mut stack = Vec::new();
+            (
+                n.id,
+                cpu_node_total(n.id, &nodes, &self_us, &mut memo, &mut stack),
+            )
+        })
+        .collect();
+    by_total.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+
+    let unit = if hitcount { "hits" } else { "ms" };
+    let conv = |us: f64| if hitcount { us } else { us / 1000.0 };
+    let mut out = String::new();
+    if hitcount {
+        out.push_str(
+            "NOTE: profile has no samples/timeDeltas — ranking by hitCount \
+             (relative weight, NOT absolute time).\n\n",
+        );
+    } else {
+        let _ = writeln!(out, "Sampled wall time: {:.1}ms.\n", total_us / 1000.0);
+    }
+    let _ = writeln!(
+        out,
+        "Top {} by SELF time (aggregated per function — where CPU is actually spent):",
+        top_n.min(by_self.len())
+    );
+    for (lbl, us) in by_self.into_iter().take(top_n) {
+        let _ = writeln!(
+            out,
+            "  {:>9.1}{unit}  {:>5.1}%  {lbl}",
+            conv(*us),
+            us / total_us * 100.0
+        );
+    }
+    let _ = writeln!(
+        out,
+        "\nTop {} call-tree nodes by TOTAL time (self + descendants; \
+         per node — may double-count recursion):",
+        top_n.min(by_total.len())
+    );
+    for (id, us) in by_total.into_iter().take(top_n) {
+        if us <= 0.0 {
+            break;
+        }
+        let _ = writeln!(
+            out,
+            "  {:>9.1}{unit}  {:>5.1}%  {}",
+            conv(us),
+            us / total_us * 100.0,
+            cpu_node_label(&nodes, id)
+        );
+    }
+    out
 }
 
 // ============================================================================
@@ -1836,5 +2061,68 @@ mod tests {
 
         // A misspelt opt-out must NOT silently become "no reset".
         assert!(serde_json::from_value::<ResetSpec>(json!("non")).is_err());
+    }
+
+    /// REQ-BT-019.7: a saved CPU profile is summarised into a readable
+    /// hot-function ranking — the agent gets an answer, not just a file.
+    #[test]
+    fn cpu_summary_ranks_hot_functions() {
+        // Two fns; `hot` sampled 9ms, `cold` 1ms (timeDeltas in µs).
+        let profile = json!({
+            "nodes": [
+                { "id": 1, "callFrame": { "functionName": "(root)", "scriptId": "0",
+                    "url": "", "lineNumber": -1, "columnNumber": -1 }, "children": [2, 3] },
+                { "id": 2, "callFrame": { "functionName": "hot", "scriptId": "1",
+                    "url": "app.js", "lineNumber": 41, "columnNumber": 2 } },
+                { "id": 3, "callFrame": { "functionName": "cold", "scriptId": "1",
+                    "url": "app.js", "lineNumber": 99, "columnNumber": 4 } }
+            ],
+            "startTime": 0, "endTime": 10000,
+            "samples":    [2, 2, 2, 3],
+            "timeDeltas": [3000, 3000, 3000, 1000]
+        });
+        let p: CpuProfile = serde_json::from_value(profile).expect("valid Profile");
+        let out = summarize_cpu_profile(&p, 15);
+        assert!(out.contains("Sampled wall time: 10.0ms"), "{out}");
+        // hot = 9ms self, must rank above cold and show its location.
+        let hot_idx = out
+            .find("hot  app.js:42")
+            .expect("hot listed with 1-based line");
+        let cold_idx = out.find("cold  app.js:100").expect("cold listed");
+        assert!(hot_idx < cold_idx, "hot must rank before cold:\n{out}");
+        assert!(out.contains("90.0%"), "hot self share shown:\n{out}");
+    }
+
+    /// hitCount fallback when samples/timeDeltas absent — labelled, not
+    /// silently presented as absolute time.
+    #[test]
+    fn cpu_summary_hitcount_fallback_is_labelled() {
+        let profile = json!({
+            "nodes": [
+                { "id": 1, "callFrame": { "functionName": "f", "scriptId": "1",
+                    "url": "a.js", "lineNumber": 0, "columnNumber": 0 }, "hitCount": 7 }
+            ],
+            "startTime": 0, "endTime": 1
+        });
+        let p: CpuProfile = serde_json::from_value(profile).expect("valid Profile");
+        let out = summarize_cpu_profile(&p, 5);
+        assert!(
+            out.contains("hitCount"),
+            "fallback must be disclosed:\n{out}"
+        );
+        assert!(
+            out.contains("7.0hits"),
+            "hit weight shown, not fake ms:\n{out}"
+        );
+    }
+
+    /// Empty profile says so rather than emitting a misleading table.
+    #[test]
+    fn cpu_summary_empty_profile_is_honest() {
+        let p: CpuProfile = serde_json::from_value(json!({
+            "nodes": [], "startTime": 0, "endTime": 0
+        }))
+        .expect("valid empty Profile");
+        assert!(summarize_cpu_profile(&p, 5).contains("empty"));
     }
 }

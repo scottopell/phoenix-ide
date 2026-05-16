@@ -366,6 +366,8 @@ THE SYSTEM SHALL, on request, force garbage collection (`HeapProfiler.collectGar
 
 **REQ-BT-019.7 — CPU sampling profile.**
 THE SYSTEM SHALL start/stop a `Profiler` CPU sampling session and persist the profile to a file loadable in Chrome DevTools.
+THE SYSTEM SHALL additionally return, inline on stop, an agent-readable hot-function ranking: top-N by self time aggregated per function (the non-double-counting "where is CPU spent" metric) and top-N call-tree nodes by total time (self + descendants, labelled as possibly double-counting recursion). A profile file an agent cannot parse is an artifact, not an answer; the file is still kept for a human/DevTools deep-dive.
+THE SYSTEM SHALL provide a `cpu_summary` action that re-renders that ranking from a saved profile path without a browser (so an earlier or externally-captured profile can be re-read). WHEN sampling data (`samples`/`timeDeltas`) is absent THE SYSTEM SHALL fall back to `hitCount` weighting and label it as relative weight, not absolute time — never present hit counts as milliseconds.
 
 **REQ-BT-019.8 — Why-did-render.**
 WHEN React is present THE SYSTEM SHALL report, per commit, which components re-rendered and a best-effort attribution of the cause (changed props/state/hooks keys) derived from the fiber alternate.
