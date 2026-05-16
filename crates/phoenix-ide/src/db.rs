@@ -107,6 +107,14 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
+        // Drop the dead state_data column (task 02667). Ignored on fresh DBs
+        // where SCHEMA no longer creates it; drops it on upgraded DBs that
+        // still carry it from the pre-typed-state schema. Never read or
+        // written by any query.
+        let _ = sqlx::raw_sql("ALTER TABLE conversations DROP COLUMN state_data")
+            .execute(&self.pool)
+            .await;
+
         // Try to add model column - ignore error if it already exists
         let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN model TEXT")
             .execute(&self.pool)
@@ -3178,5 +3186,74 @@ mod tests {
         // Missing conversation surfaces as a typed error, not silent no-op.
         let err = db.set_chain_name("ghost", Some("x")).await.unwrap_err();
         matches!(err, DbError::ConversationNotFound(_));
+    }
+
+    /// Task 02667: a fresh DB's `conversations` table must not carry the
+    /// dead `state_data` column (SCHEMA no longer creates it).
+    #[tokio::test]
+    async fn fresh_db_has_no_state_data_column() {
+        let db = Database::open_in_memory().await.unwrap();
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(
+            !columns.iter().any(|c| c == "state_data"),
+            "fresh schema must not create state_data, got: {columns:?}"
+        );
+    }
+
+    /// Task 02667: an upgraded DB that still carries `state_data` from the
+    /// pre-typed-state schema gets the column dropped by `run_migrations`.
+    #[tokio::test]
+    async fn state_data_column_is_dropped_on_upgrade() {
+        let opts = SqliteConnectOptions::from_str("sqlite::memory:")
+            .unwrap()
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(std::time::Duration::from_secs(5));
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await
+            .unwrap();
+
+        // Pre-2667 shape: conversations table still has state_data. SCHEMA's
+        // CREATE TABLE IF NOT EXISTS will not overwrite this.
+        sqlx::raw_sql(
+            "CREATE TABLE conversations (\
+                id TEXT PRIMARY KEY, \
+                slug TEXT UNIQUE, \
+                cwd TEXT NOT NULL DEFAULT '/tmp', \
+                parent_conversation_id TEXT, \
+                user_initiated BOOLEAN NOT NULL DEFAULT 1, \
+                state TEXT NOT NULL DEFAULT '{\"type\":\"idle\"}', \
+                state_data TEXT, \
+                state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
+                created_at TEXT NOT NULL DEFAULT '2025-01-01', \
+                updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
+                archived BOOLEAN NOT NULL DEFAULT 0\
+            )",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let db = Database { pool };
+        db.run_migrations().await.unwrap();
+
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
+            .fetch_all(db.pool())
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(
+            !columns.iter().any(|c| c == "state_data"),
+            "state_data should be dropped on upgrade, got: {columns:?}"
+        );
     }
 }
