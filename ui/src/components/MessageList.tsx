@@ -220,10 +220,10 @@ export function MessageList({
   // 'soft'  = new non-system message → scroll only if pinned.
   // 'none'  = no new message this render.
   const scrollTriggerRef = useRef<'none' | 'soft' | 'force'>('none');
-  const resetConversationStateRef = useRef<string | undefined>(conversationId);
+  const lastConversationIdRef = useRef<string | undefined>(conversationId);
 
-  if (resetConversationStateRef.current !== conversationId) {
-    resetConversationStateRef.current = conversationId;
+  if (lastConversationIdRef.current !== conversationId) {
+    lastConversationIdRef.current = conversationId;
     prevMessagesHeight.current = 0;
     prevMessageCountRef.current = 0;
     scrollTriggerRef.current = 'none';
