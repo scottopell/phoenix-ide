@@ -21,10 +21,14 @@ const CheckIcon = () => (
  * `onTriggerContinuation` and a separate `convState.type === 'idle'` read
  * could disagree (task 04001). Consumers narrow on `.phase`; TypeScript
  * forbids reaching `.onTrigger` without it, so no ad-hoc guard is needed.
+ *
+ * `unavailable` covers every non-idle phase (working, terminal, error,
+ * awaiting-approval, …) — the only relevant fact is that continuation
+ * cannot be triggered, not that the agent is "busy".
  */
 export type ContinuationState =
   | { phase: 'idle'; onTrigger: () => void }
-  | { phase: 'busy' };
+  | { phase: 'unavailable' };
 
 interface StateBarProps {
   conversation: Conversation | null;
@@ -39,7 +43,7 @@ interface StateBarProps {
   availableModels?: ModelInfo[];
   onRetryNow?: () => void;
   /** Continuation trigger, structurally bound to the idle phase. Absent or
-   *  `{ phase: 'busy' }` means the trigger is unavailable. */
+   *  `{ phase: 'unavailable' }` means the trigger is unavailable. */
   continuation?: ContinuationState;
   /** Callback invoked when the user selects a different model for this conversation */
   onUpgradeModel?: (newModelId: string) => void;

@@ -111,9 +111,16 @@ impl Database {
         // where SCHEMA no longer creates it; drops it on upgraded DBs that
         // still carry it from the pre-typed-state schema. Never read or
         // written by any query.
-        let _ = sqlx::raw_sql("ALTER TABLE conversations DROP COLUMN state_data")
+        if let Err(e) = sqlx::raw_sql("ALTER TABLE conversations DROP COLUMN state_data")
             .execute(&self.pool)
-            .await;
+            .await
+        {
+            // Expected on fresh DBs ("no such column: state_data"). Logged at
+            // debug (not silent) so a genuine failure on an upgraded DB — a
+            // SQLite version refusing the drop, an unexpected dependent
+            // index/view — is visible without being startup noise.
+            tracing::debug!(error = %e, "ALTER TABLE conversations DROP COLUMN state_data not applied");
+        }
 
         // Try to add model column - ignore error if it already exists
         let _ = sqlx::raw_sql("ALTER TABLE conversations ADD COLUMN model TEXT")

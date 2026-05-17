@@ -77,6 +77,13 @@ pub fn tool_result_message_id(tool_use_id: &str) -> String {
     format!("{tool_use_id}-result")
 }
 
+/// `NotifyClient.event_type` value for conversation state-change pushes.
+/// Shared by the producer (`Effect::notify_state_change`) and every consumer
+/// (the executor's `NotifyClient` dispatch and the inline-drain flicker
+/// suppression) so the relationship is checked by the compiler rather than
+/// silently coupled through a duplicated string literal.
+pub const STATE_CHANGE_EVENT_TYPE: &str = "state_change";
+
 /// Effects to be executed after state transition
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -284,7 +291,7 @@ impl Effect {
             obj.insert("type".to_string(), serde_json::json!(state_type));
         }
         Effect::NotifyClient {
-            event_type: "state_change".to_string(),
+            event_type: STATE_CHANGE_EVENT_TYPE.to_string(),
             data: serde_json::json!({
                 "state": data
             }),

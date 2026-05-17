@@ -6,7 +6,7 @@
  * Dismisses on click or after the first message is sent, and never reappears
  * (dismissal persisted in localStorage). Task 08628.
  */
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
 const DISMISSED_KEY = 'phoenix:explore-onboarding-dismissed';
 
@@ -38,16 +38,28 @@ interface Props {
 
 export function ExploreOnboardingBanner({ convModeLabel, messageCount }: Props) {
   const [dismissed, setDismissed] = useState(alreadyDismissed);
+  const visible =
+    !dismissed && convModeLabel === 'Explore' && messageCount === 0;
 
-  // First message sent — retire the banner permanently.
+  // Track whether the banner was ever actually on screen this mount. We must
+  // NOT persist the one-time dismissal just because we observed a non-Explore
+  // conversation, or an existing Explore conversation that already had
+  // messages (banner never shown) — that would consume the user's first
+  // real onboarding opportunity. Only the 0->>0 message transition while the
+  // banner is mounted-and-shown counts as "user saw it and moved on".
+  const wasShownRef = useRef(false);
+  if (visible) {
+    wasShownRef.current = true;
+  }
+
   useEffect(() => {
-    if (messageCount > 0 && !dismissed) {
+    if (wasShownRef.current && messageCount > 0 && !dismissed) {
       persistDismissed();
       setDismissed(true);
     }
   }, [messageCount, dismissed]);
 
-  if (dismissed || convModeLabel !== 'Explore' || messageCount > 0) {
+  if (!visible) {
     return null;
   }
 

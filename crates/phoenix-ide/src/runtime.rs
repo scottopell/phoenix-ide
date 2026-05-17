@@ -1608,6 +1608,15 @@ impl RuntimeManager {
     /// caller that needs to push a final event — most notably the hard-delete cascade
     /// — must also check here.
     pub async fn take_evicted_broadcaster(&self, conversation_id: &str) -> Option<SseBroadcaster> {
+        // The model-upgrade marker is normally consumed by the next
+        // get_or_create. The hard-delete cascade is the one path that takes
+        // the evicted broadcaster without a subsequent get_or_create, so the
+        // marker would leak forever for a conversation deleted before
+        // re-access. Drop it here too — these are the same lifecycle.
+        self.evicted_model_upgrades
+            .write()
+            .await
+            .remove(conversation_id);
         self.evicted_broadcasters
             .write()
             .await

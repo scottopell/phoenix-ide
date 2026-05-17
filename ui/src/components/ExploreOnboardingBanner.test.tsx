@@ -23,12 +23,35 @@ describe('ExploreOnboardingBanner', () => {
     }
   });
 
-  it('hides once the first message has been sent and persists dismissal', () => {
-    const { container } = render(
-      <ExploreOnboardingBanner convModeLabel="Explore" messageCount={1} />,
+  it('retires after the first message is sent while it was on screen', () => {
+    const { container, rerender } = render(
+      <ExploreOnboardingBanner convModeLabel="Explore" messageCount={0} />,
     );
+    expect(screen.getByRole('note')).toBeInTheDocument();
+
+    // First message sent in this conversation -> banner retires for good.
+    rerender(<ExploreOnboardingBanner convModeLabel="Explore" messageCount={1} />);
     expect(container).toBeEmptyDOMElement();
     expect(localStorage.getItem(DISMISSED_KEY)).toBe('1');
+  });
+
+  it('does NOT persist dismissal for an existing Explore conv it never showed in', () => {
+    // User lands on an old Explore conversation that already has messages
+    // (shared link / resumed session): banner was never shown, so the
+    // one-time dismissal must be preserved for their first fresh Explore.
+    const { container } = render(
+      <ExploreOnboardingBanner convModeLabel="Explore" messageCount={5} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+    expect(localStorage.getItem(DISMISSED_KEY)).toBeNull();
+  });
+
+  it('does NOT persist dismissal when only non-Explore conversations are seen', () => {
+    const { container } = render(
+      <ExploreOnboardingBanner convModeLabel="Work" messageCount={3} />,
+    );
+    expect(container).toBeEmptyDOMElement();
+    expect(localStorage.getItem(DISMISSED_KEY)).toBeNull();
   });
 
   it('dismisses on click and does not reappear', () => {

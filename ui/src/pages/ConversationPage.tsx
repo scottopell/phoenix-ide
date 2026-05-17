@@ -1311,7 +1311,7 @@ function ConversationPageContent() {
         continuation={
           convStateForChildren.type === 'idle'
             ? { phase: 'idle', onTrigger: handleTriggerContinuation }
-            : { phase: 'busy' }
+            : { phase: 'unavailable' }
         }
         onUpgradeModel={handleUpgradeModel}
         toolExecutingStartedAt={atom.toolExecutingStartedAt}
