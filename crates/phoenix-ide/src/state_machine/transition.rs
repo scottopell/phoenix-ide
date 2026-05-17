@@ -1855,10 +1855,18 @@ pub fn transition_parent(
                 ..
             }),
         ) => {
-            let summary = format!(
-                "Context limit reached before the turn could complete: {message}. \
-                Continue to compact and resume, or start a new conversation."
+            // Stable, human-oriented summary — the raw backend message can
+            // carry provider-specific strings and is persisted for the UI
+            // banner / clipboard / seed-draft, so it is logged separately
+            // rather than interpolated into user-facing text.
+            tracing::warn!(
+                backend_message = %message,
+                "backend rejected request with context_length_exceeded; \
+                converging parent to ContextExhausted"
             );
+            let summary = "Context limit reached before the turn could complete. \
+                Continue to compact and resume, or start a new conversation."
+                .to_string();
             Ok(ParentTransitionResult::new(ParentState::ContextExhausted {
                 summary: summary.clone(),
             })
@@ -2557,7 +2565,10 @@ mod tests {
 
         match &result.new_state {
             ConvState::ContextExhausted { summary } => {
-                assert!(summary.contains("context_length_exceeded"));
+                // Stable summary — the raw backend message must NOT leak
+                // into user-facing persisted text.
+                assert!(summary.contains("Context limit reached"));
+                assert!(!summary.contains("context_length_exceeded"));
             }
             other => panic!("expected ContextExhausted, got {other:?}"),
         }

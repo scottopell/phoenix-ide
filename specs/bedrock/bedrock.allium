@@ -586,7 +586,8 @@ rule BackendRejectsContextExhausted {
     requires: error_kind = context_exhausted
     ensures: conversation.parent_status = context_exhausted
     ensures: conversation.continuation_summary =
-        "Context limit reached before the turn could complete."
+        "Context limit reached before the turn could complete. " +
+        "Continue to compact and resume, or start a new conversation."
 
     @guidance
         -- Checked before ParentLlmErrorNonRecoverable, mirroring

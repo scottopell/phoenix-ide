@@ -31,17 +31,28 @@ function makeRequest(): FakeRequest {
 
 describe('CacheDB.init() never deadlocks (task 60006)', () => {
   let openImpl: () => FakeRequest;
+  let priorIndexedDB: unknown;
+  let hadPriorIndexedDB: boolean;
 
   beforeEach(() => {
     vi.useFakeTimers();
-    (globalThis as unknown as { indexedDB: unknown }).indexedDB = {
-      open: () => openImpl(),
-    };
+    const g = globalThis as unknown as { indexedDB?: unknown };
+    hadPriorIndexedDB = 'indexedDB' in g;
+    priorIndexedDB = g.indexedDB;
+    g.indexedDB = { open: () => openImpl() };
   });
 
   afterEach(() => {
     vi.useRealTimers();
     vi.restoreAllMocks();
+    // Restore the shared global so the stub does not pollute later
+    // tests (ui/src/test-setup.ts initializes global.indexedDB).
+    const g = globalThis as unknown as { indexedDB?: unknown };
+    if (hadPriorIndexedDB) {
+      g.indexedDB = priorIndexedDB;
+    } else {
+      delete g.indexedDB;
+    }
   });
 
   it('rejects within 5s when open hangs (no callback ever fires)', async () => {
