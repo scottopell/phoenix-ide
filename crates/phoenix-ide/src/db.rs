@@ -671,8 +671,19 @@ impl Database {
         Ok(count > 0)
     }
 
-    /// Update conversation working directory (e.g., after worktree creation).
-    pub async fn update_conversation_cwd(&self, id: &str, cwd: &str) -> DbResult<()> {
+    /// Update a conversation's working directory.
+    ///
+    /// Conversation `cwd` is immutable post-creation. The only legitimate
+    /// mutations are recovery/teardown fallbacks: promoting an Explore
+    /// worktree in place at task approval, and pointing a terminal
+    /// conversation at the repo root after its worktree is deleted. The
+    /// `_recovery_only` suffix exists so this mutation is not casually
+    /// reachable — see task 13012 and `cwd_immutability_tests`.
+    pub async fn update_conversation_cwd_recovery_only(&self, id: &str, cwd: &str) -> DbResult<()> {
+        debug_assert!(
+            !cwd.is_empty() && std::path::Path::new(cwd).is_absolute(),
+            "conversation cwd must be a non-empty absolute path, got {cwd:?}"
+        );
         let now = Utc::now();
         let result =
             sqlx::query("UPDATE conversations SET cwd = ?1, updated_at = ?2 WHERE id = ?3")

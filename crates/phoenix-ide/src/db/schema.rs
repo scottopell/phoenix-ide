@@ -70,6 +70,9 @@ pub const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS conversations (
     id TEXT PRIMARY KEY,
     slug TEXT UNIQUE,
+    -- cwd is immutable post-creation. The only writers are the
+    -- recovery/teardown fallbacks via update_conversation_cwd_recovery_only
+    -- (task 13012); nothing else may mutate it.
     cwd TEXT NOT NULL,
     parent_conversation_id TEXT,
     user_initiated BOOLEAN NOT NULL,

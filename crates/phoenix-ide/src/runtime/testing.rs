@@ -590,7 +590,11 @@ impl StateStore for InMemoryStorage {
             .unwrap_or_default())
     }
 
-    async fn update_conversation_cwd(&self, _conv_id: &str, _cwd: &str) -> Result<(), String> {
+    async fn update_conversation_cwd_recovery_only(
+        &self,
+        _conv_id: &str,
+        _cwd: &str,
+    ) -> Result<(), String> {
         // In-memory storage doesn't track cwd separately
         Ok(())
     }

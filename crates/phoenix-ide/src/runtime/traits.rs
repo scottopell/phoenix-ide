@@ -115,8 +115,15 @@ pub trait StateStore: Send + Sync {
     /// `ModeKind` discriminant, not the concrete paths).
     async fn get_conversation_mode(&self, conv_id: &str) -> Result<ConvMode, String>;
 
-    /// Update the conversation working directory (e.g., after worktree creation)
-    async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String>;
+    /// Update the conversation working directory. Conversation cwd is
+    /// immutable post-creation; the only legitimate callers are
+    /// recovery/teardown fallbacks (task 13012). The `_recovery_only`
+    /// suffix keeps this off the casual-mutation path.
+    async fn update_conversation_cwd_recovery_only(
+        &self,
+        conv_id: &str,
+        cwd: &str,
+    ) -> Result<(), String>;
 
     /// Record token usage for one LLM turn. Fire-and-forget; errors are logged
     /// by the caller and do not affect the conversation.
@@ -307,8 +314,14 @@ impl<T: StateStore + ?Sized> StateStore for Arc<T> {
         (**self).get_conversation_mode(conv_id).await
     }
 
-    async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String> {
-        (**self).update_conversation_cwd(conv_id, cwd).await
+    async fn update_conversation_cwd_recovery_only(
+        &self,
+        conv_id: &str,
+        cwd: &str,
+    ) -> Result<(), String> {
+        (**self)
+            .update_conversation_cwd_recovery_only(conv_id, cwd)
+            .await
     }
 
     async fn insert_turn_usage(
@@ -541,9 +554,13 @@ impl StateStore for DatabaseStorage {
         Ok(conv.conv_mode)
     }
 
-    async fn update_conversation_cwd(&self, conv_id: &str, cwd: &str) -> Result<(), String> {
+    async fn update_conversation_cwd_recovery_only(
+        &self,
+        conv_id: &str,
+        cwd: &str,
+    ) -> Result<(), String> {
         self.db
-            .update_conversation_cwd(conv_id, cwd)
+            .update_conversation_cwd_recovery_only(conv_id, cwd)
             .await
             .map_err(|e| e.to_string())
     }
