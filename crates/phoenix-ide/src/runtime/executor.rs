@@ -2637,13 +2637,6 @@ fn strip_all_tool_blocks(messages: Vec<LlmMessage>) -> Vec<LlmMessage> {
         .collect()
 }
 
-/// Remove `tool_use` and `tool_result` blocks that reference tools not in the current set.
-///
-/// Handles mode transitions (e.g., Explore -> Work) where the tool set changes
-/// but the conversation history contains `tool_use` blocks for the old set.
-/// Anthropic's API rejects requests where `tool_use` blocks reference unavailable tools.
-///
-/// The DB history is not modified -- this operates on the in-memory message Vec only.
 /// Merge a `duration_ms` value into an existing `display_data` JSON blob.
 ///
 /// If `duration_ms` is `None`, returns a clone of the existing data unchanged.
@@ -2671,6 +2664,13 @@ fn merge_duration_into_display_data(
     }
 }
 
+/// Remove `tool_use` and `tool_result` blocks that reference tools not in the current set.
+///
+/// Handles mode transitions (e.g., Explore -> Work) where the tool set changes
+/// but the conversation history contains `tool_use` blocks for the old set.
+/// Anthropic's API rejects requests where `tool_use` blocks reference unavailable tools.
+///
+/// The DB history is not modified -- this operates on the in-memory message Vec only.
 fn strip_unavailable_tool_blocks(
     messages: Vec<LlmMessage>,
     available_tools: &std::collections::HashSet<&str>,
