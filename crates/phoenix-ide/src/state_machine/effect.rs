@@ -84,6 +84,42 @@ pub fn tool_result_message_id(tool_use_id: &str) -> String {
 /// silently coupled through a duplicated string literal.
 pub const STATE_CHANGE_EVENT_TYPE: &str = "state_change";
 
+/// The `type` discriminant of a `state_change` push payload.
+///
+/// These values mirror the `#[serde(tag = "type", rename_all = "snake_case")]`
+/// discriminants of `ConvState`. Passing a typed value to
+/// `notify_state_change` rather than a bare `&str` makes a hand-typed
+/// drift (a typo, or a label that no longer matches the state) a compile
+/// error rather than a silently wrong wire payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateType {
+    Idle,
+    LlmRequesting,
+    ToolExecuting,
+    AwaitingSubAgents,
+    AwaitingTaskApproval,
+    AwaitingUserResponse,
+    AwaitingContinuation,
+    AwaitingRecovery,
+    Error,
+}
+
+impl StateType {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            StateType::Idle => "idle",
+            StateType::LlmRequesting => "llm_requesting",
+            StateType::ToolExecuting => "tool_executing",
+            StateType::AwaitingSubAgents => "awaiting_sub_agents",
+            StateType::AwaitingTaskApproval => "awaiting_task_approval",
+            StateType::AwaitingUserResponse => "awaiting_user_response",
+            StateType::AwaitingContinuation => "awaiting_continuation",
+            StateType::AwaitingRecovery => "awaiting_recovery",
+            StateType::Error => "error",
+        }
+    }
+}
+
 /// Effects to be executed after state transition
 #[derive(Debug, Clone)]
 pub enum Effect {
@@ -285,10 +321,10 @@ impl Effect {
     /// Create a `state_change` notification with the state as an object
     /// This merges the state type with the additional data into a single object
     #[allow(clippy::needless_pass_by_value)] // data is consumed by json! macro
-    pub fn notify_state_change(state_type: &str, mut data: Value) -> Self {
+    pub fn notify_state_change(state_type: StateType, mut data: Value) -> Self {
         // Merge type into the data object to create a state-like structure
         if let Some(obj) = data.as_object_mut() {
-            obj.insert("type".to_string(), serde_json::json!(state_type));
+            obj.insert("type".to_string(), serde_json::json!(state_type.as_str()));
         }
         Effect::NotifyClient {
             event_type: STATE_CHANGE_EVENT_TYPE.to_string(),

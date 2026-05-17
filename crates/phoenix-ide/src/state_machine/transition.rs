@@ -11,7 +11,7 @@
 //! REQ-BED-005: Cancellation Handling
 //! REQ-BED-006: Error Recovery
 
-use super::effect::{compute_bash_display_data, CheckpointData};
+use super::effect::{compute_bash_display_data, CheckpointData, StateType};
 use super::event::{CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent};
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
@@ -1234,7 +1234,7 @@ fn handle_core_error_retry(
                 attempt: new_attempt,
             })
             .with_effect(Effect::notify_state_change(
-                "llm_requesting",
+                StateType::LlmRequesting,
                 json!({
                     "attempt": new_attempt,
                     "max_attempts": MAX_RETRY_ATTEMPTS,
@@ -1264,7 +1264,7 @@ fn handle_core_error_retry(
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change(
-                "error",
+                StateType::Error,
                 json!({
                     "message": error_message
                 }),
@@ -1319,7 +1319,7 @@ fn handle_core_continuation(
                 attempt: new_attempt,
             })
             .with_effect(Effect::notify_state_change(
-                "awaiting_continuation",
+                StateType::AwaitingContinuation,
                 json!({
                     "attempt": new_attempt,
                     "max_attempts": MAX_RETRY_ATTEMPTS,
@@ -1355,7 +1355,7 @@ fn handle_core_continuation(
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change(
-                "awaiting_continuation",
+                StateType::AwaitingContinuation,
                 json!({ "manual_trigger": true }),
             ))
             .with_effect(Effect::RequestContinuation {
@@ -1570,7 +1570,7 @@ pub fn transition_parent(
             }))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change(
-                "error",
+                StateType::Error,
                 json!({ "message": message }),
             )),
         ),
@@ -1579,7 +1579,7 @@ pub fn transition_parent(
             Ok(
                 ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
                     .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change("idle", json!({}))),
+                    .with_effect(Effect::notify_state_change(StateType::Idle, json!({}))),
             )
         }
 
@@ -1651,7 +1651,7 @@ pub fn transition_parent(
                         }))
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::notify_state_change(
-                            "error",
+                            StateType::Error,
                             json!({"message": "propose_task not available in this mode"}),
                         )),
                     );
@@ -1729,7 +1729,7 @@ pub fn transition_parent(
                         .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::notify_state_change(
-                            "awaiting_task_approval",
+                            StateType::AwaitingTaskApproval,
                             json!({
                                 "task_file": snapshot.task_file,
                                 "title": snapshot.title,
@@ -1788,7 +1788,7 @@ pub fn transition_parent(
                         .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::notify_state_change(
-                            "awaiting_user_response",
+                            StateType::AwaitingUserResponse,
                             json!({ "questions": input.questions }),
                         )),
                     );
@@ -1837,7 +1837,7 @@ pub fn transition_parent(
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change(
-                "awaiting_recovery",
+                StateType::AwaitingRecovery,
                 json!({
                     "message": message,
                     "recovery_kind": "credential"
@@ -2396,7 +2396,7 @@ fn handle_context_exhaustion(
             ))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change(
-                "awaiting_continuation",
+                StateType::AwaitingContinuation,
                 json!({
                     "rejected_tools": tool_calls.iter().map(ToolCall::name).collect::<Vec<_>>()
                 }),
@@ -2447,7 +2447,7 @@ fn retry_delay(attempt: u32) -> Duration {
 /// Helper to create `state_change` notification for `LlmRequesting`
 fn notify_llm_requesting(attempt: u32) -> Effect {
     Effect::notify_state_change(
-        "llm_requesting",
+        StateType::LlmRequesting,
         json!({
             "attempt": attempt
         }),
@@ -2462,7 +2462,7 @@ fn notify_tool_executing(
     completed_count: usize,
 ) -> Effect {
     Effect::notify_state_change(
-        "tool_executing",
+        StateType::ToolExecuting,
         json!({
             "current_tool": {
                 "name": tool_name,
@@ -2477,7 +2477,7 @@ fn notify_tool_executing(
 /// Helper to create `state_change` notification for `AwaitingSubAgents`
 fn notify_awaiting_sub_agents(pending: &[PendingSubAgent], completed: &[SubAgentResult]) -> Effect {
     Effect::notify_state_change(
-        "awaiting_sub_agents",
+        StateType::AwaitingSubAgents,
         json!({
             "pending": pending,
             "completed_results": completed
