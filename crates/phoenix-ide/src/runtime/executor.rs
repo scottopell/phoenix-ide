@@ -776,10 +776,30 @@ where
         generated_events: &mut Vec<Event>,
     ) -> Result<(), String> {
         let mut deferred_request_llm: Option<Effect> = None;
+        // Cosmetic (task 60004): when the inline drain enters from Idle, the
+        // original transition's Idle state-change SSE would briefly render the
+        // conversation as Idle before the drain's Idle->LlmRequesting notify.
+        // Persist the Idle state to the DB but suppress its broadcast (and any
+        // explicit state_change notify); the drain emits the authoritative
+        // LlmRequesting state-change. Mid-turn drains enter from LlmRequesting,
+        // not Idle, so their state-change is correct and not suppressed.
+        let suppress_intermediate_state_change = matches!(self.state, ConvState::Idle);
         for effect in original_effects {
             if matches!(effect, Effect::RequestLlm) {
                 deferred_request_llm = Some(effect);
                 continue;
+            }
+            if suppress_intermediate_state_change {
+                match &effect {
+                    Effect::PersistState => {
+                        self.persist_state_effect(false).await?;
+                        continue;
+                    }
+                    Effect::NotifyClient { event_type, .. } if event_type == "state_change" => {
+                        continue;
+                    }
+                    _ => {}
+                }
             }
             if let Some(gen_event) = self.execute_effect(effect).await? {
                 generated_events.push(gen_event);
@@ -808,6 +828,25 @@ where
             }
         }
         Ok(())
+    }
+
+    /// Persist the current state to the DB. When `broadcast` is true, also
+    /// emit the `StateChange` SSE; the inline-drain path persists with
+    /// `broadcast = false` to suppress an intermediate Idle flicker (task
+    /// 60004) since the drain emits its own authoritative state-change.
+    async fn persist_state_effect(&mut self, broadcast: bool) -> Result<Option<Event>, String> {
+        self.storage
+            .update_state(&self.context.conversation_id, &self.state)
+            .await?;
+
+        if broadcast {
+            let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                sequence_id: seq,
+                state: self.state.clone(),
+                presentation_mode: self.state.presentation_mode().to_string(),
+            });
+        }
+        Ok(None)
     }
 
     /// If the current state transition is a steering-queue drain hook point and
@@ -1300,20 +1339,7 @@ where
                 Ok(None)
             }
 
-            Effect::PersistState => {
-                // Persist the full state as JSON
-                self.storage
-                    .update_state(&self.context.conversation_id, &self.state)
-                    .await?;
-
-                // Broadcast state change with full state data
-                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                    sequence_id: seq,
-                    state: self.state.clone(),
-                    presentation_mode: self.state.presentation_mode().to_string(),
-                });
-                Ok(None)
-            }
+            Effect::PersistState => self.persist_state_effect(true).await,
 
             Effect::RequestLlm => self.dispatch_llm_request().await,
 
@@ -2321,13 +2347,14 @@ where
         self.storage
             .update_state(conv_id, &ConvState::Terminal)
             .await?;
-        // Load-bearing cwd reset: the worktree is gone by this point, but API
-        // handlers (search_files, list_skills, list_tasks, get_system_prompt)
-        // read conv.cwd for terminal conversations without a state guard.
-        // Resetting to repo_root gives them a valid directory rather than a
-        // deleted worktree path.
+        // Legitimate cwd mutation (task 13012, teardown fallback): the
+        // worktree is gone by this point, but API handlers (search_files,
+        // list_skills, list_tasks, get_system_prompt) read conv.cwd for
+        // terminal conversations without a state guard. Resetting to
+        // repo_root gives them a valid directory rather than a deleted
+        // worktree path.
         self.storage
-            .update_conversation_cwd(conv_id, &repo_root)
+            .update_conversation_cwd_recovery_only(conv_id, &repo_root)
             .await?;
 
         // Inject system message
@@ -2442,13 +2469,14 @@ where
                     .update_conversation_mode(&self.context.conversation_id, &work_mode)
                     .await?;
 
+                // Legitimate cwd mutation (task 13012, in-place promotion).
                 // For Managed conversations (REQ-PROJ-028): the early Explore
                 // worktree is promoted in place (branch rename, same path), so
                 // this write is a no-op — worktree_path == conv.cwd already.
                 // For legacy Managed conversations whose cwd was the repo root,
                 // this is load-bearing: it moves cwd to the new worktree path.
                 storage
-                    .update_conversation_cwd(
+                    .update_conversation_cwd_recovery_only(
                         &self.context.conversation_id,
                         &approval_result.worktree_path,
                     )
@@ -4379,6 +4407,54 @@ mod steer_drain_detector_tests {
         );
         // Drain transition lands in LlmRequesting (Idle → LlmRequesting via the
         // SteerDrainedUserMessages arm).
+        assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
+    }
+
+    /// Task 60004: entering Idle with a non-empty steering queue must NOT
+    /// broadcast an intermediate `StateChange { Idle }` before the drain's
+    /// `StateChange { LlmRequesting }`. The Idle state is still persisted to
+    /// the DB; only its SSE broadcast is suppressed.
+    #[tokio::test]
+    async fn entering_idle_with_queued_steer_suppresses_idle_state_change() {
+        let queue = vec![mk_entry("s1", "first")];
+        let (mut rt, _storage) = build_runtime_with_state_and_queue(
+            "conv-no-flicker",
+            ConvState::LlmRequesting { attempt: 1 },
+            queue,
+        );
+
+        let mut rx = rt.broadcast_tx.subscribe();
+
+        // Original transition LlmRequesting -> Idle carries a PersistState
+        // effect (the usual turn-end shape).
+        let result = TransitionResult::new(ConvState::Idle)
+            .with_effect(crate::state_machine::effect::Effect::PersistState);
+        rt.apply_transition_result(result)
+            .await
+            .expect("apply_transition_result must succeed");
+
+        let mut saw_idle_state_change = false;
+        let mut saw_llm_requesting_state_change = false;
+        while let Ok(ev) = rx.try_recv() {
+            if let SseEvent::StateChange { state, .. } = ev {
+                match state {
+                    ConvState::Idle => saw_idle_state_change = true,
+                    ConvState::LlmRequesting { .. } => {
+                        saw_llm_requesting_state_change = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        assert!(
+            !saw_idle_state_change,
+            "intermediate Idle StateChange must be suppressed during inline drain"
+        );
+        assert!(
+            saw_llm_requesting_state_change,
+            "drain must still broadcast the authoritative LlmRequesting StateChange"
+        );
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
     }
 
