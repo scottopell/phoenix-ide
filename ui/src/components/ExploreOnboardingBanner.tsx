@@ -28,8 +28,10 @@ function persistDismissed(): void {
 }
 
 interface Props {
-  /** Server-computed mode label ("Explore" | "Direct" | "Work" | "Branch"). */
-  convModeLabel?: string;
+  /** Server-computed mode label ("Explore" | "Direct" | "Work" | "Branch").
+   *  Explicit `| undefined` for `exactOptionalPropertyTypes`: the call site
+   *  passes `conversation.conv_mode_label` (string | undefined). */
+  convModeLabel?: string | undefined;
   /** Message count for this conversation; >0 means the first message was sent. */
   messageCount: number;
 }

@@ -4,6 +4,7 @@
   background: var(--bg-secondary);
   font-size: 12px;
   color: var(--text-muted);
+
   /* Header-sized when collapsed; flex-shares the column when expanded
    * (task 13004) so stacked panels can't squeeze the FileTree to 0. */
   display: flex;
