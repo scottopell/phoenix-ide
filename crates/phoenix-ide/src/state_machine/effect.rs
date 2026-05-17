@@ -84,13 +84,21 @@ pub fn tool_result_message_id(tool_use_id: &str) -> String {
 /// silently coupled through a duplicated string literal.
 pub const STATE_CHANGE_EVENT_TYPE: &str = "state_change";
 
-/// The `type` discriminant of a `state_change` push payload.
+/// Symbolic label for a `state_change` notification's intended state.
 ///
-/// These values mirror the `#[serde(tag = "type", rename_all = "snake_case")]`
-/// discriminants of `ConvState`. Passing a typed value to
-/// `notify_state_change` rather than a bare `&str` makes a hand-typed
-/// drift (a typo, or a label that no longer matches the state) a compile
-/// error rather than a silently wrong wire payload.
+/// Scope: this replaces the bare `&str` literals previously hand-typed at
+/// every `notify_state_change` call site, so a typo or a label no longer
+/// in the known set is a compile error and the full set is greppable.
+///
+/// It is NOT a binding between the label and the conversation's actual
+/// state: `notify_state_change` takes this value independently of the
+/// `ParentState` the transition produces, so passing the wrong variant
+/// still compiles. It also does not affect the wire payload — the
+/// executor reconstructs `SseEvent::StateChange` from `self.state`
+/// directly and discards the effect's `data`/label (the tracked
+/// `Effect::NotifyClient { data: _ }` drop, REQ-BED follow-up). Deriving
+/// the label from the typed state is that follow-up's job, not this
+/// enum's.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateType {
     Idle,
@@ -432,6 +440,36 @@ fn legacy_bash_input_display(input: &Value, cwd: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn state_type_as_str_is_stable_and_unique() {
+        // Pins each label so a typo in `as_str` (which would silently
+        // recreate the magic-string drift this enum exists to prevent)
+        // fails the build. Values mirror `ConvState`'s snake_case serde
+        // `type` discriminants.
+        let table = [
+            (StateType::Idle, "idle"),
+            (StateType::LlmRequesting, "llm_requesting"),
+            (StateType::ToolExecuting, "tool_executing"),
+            (StateType::AwaitingSubAgents, "awaiting_sub_agents"),
+            (StateType::AwaitingTaskApproval, "awaiting_task_approval"),
+            (StateType::AwaitingUserResponse, "awaiting_user_response"),
+            (StateType::AwaitingContinuation, "awaiting_continuation"),
+            (StateType::AwaitingRecovery, "awaiting_recovery"),
+            (StateType::Error, "error"),
+        ];
+        for (variant, expected) in table {
+            assert_eq!(variant.as_str(), expected, "label drift for {variant:?}");
+        }
+        let mut seen = std::collections::HashSet::new();
+        for (variant, _) in table {
+            assert!(
+                seen.insert(variant.as_str()),
+                "duplicate label {:?}",
+                variant.as_str()
+            );
+        }
+    }
 
     #[test]
     fn compute_bash_display_data_strips_cwd_for_legacy_command() {
