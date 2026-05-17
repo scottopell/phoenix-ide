@@ -13,6 +13,19 @@ const CheckIcon = () => (
   </svg>
 );
 
+/**
+ * Continuation can only be triggered from the idle phase. The trigger is
+ * bundled with the `idle` discriminant so a non-idle phase structurally
+ * cannot carry one — there is exactly one source of truth (the phase the
+ * caller derived this from), eliminating the old two-prop race where
+ * `onTriggerContinuation` and a separate `convState.type === 'idle'` read
+ * could disagree (task 04001). Consumers narrow on `.phase`; TypeScript
+ * forbids reaching `.onTrigger` without it, so no ad-hoc guard is needed.
+ */
+export type ContinuationState =
+  | { phase: 'idle'; onTrigger: () => void }
+  | { phase: 'busy' };
+
 interface StateBarProps {
   conversation: Conversation | null;
   convState: ConversationState;
@@ -25,8 +38,9 @@ interface StateBarProps {
   /** Available models from the API (used to populate the model picker) */
   availableModels?: ModelInfo[];
   onRetryNow?: () => void;
-  /** Callback to manually trigger continuation */
-  onTriggerContinuation?: () => void;
+  /** Continuation trigger, structurally bound to the idle phase. Absent or
+   *  `{ phase: 'busy' }` means the trigger is unavailable. */
+  continuation?: ContinuationState;
   /** Callback invoked when the user selects a different model for this conversation */
   onUpgradeModel?: (newModelId: string) => void;
   /** `Date.now()` timestamp when the current tool_executing phase began.
@@ -148,7 +162,7 @@ export function StateBar({
   modelContextWindow,
   availableModels,
   onRetryNow,
-  onTriggerContinuation,
+  continuation,
   onUpgradeModel,
   toolExecutingStartedAt,
   onOpenFiles,
@@ -293,8 +307,12 @@ export function StateBar({
 
   // Context window indicator -- use model-specific limit, fallback for legacy
   const maxTokens = modelContextWindow || 200_000;
-  // Trigger menu only available in idle phase, regardless of threshold (the indicator gates on threshold itself).
-  const indicatorTrigger = convState.type === 'idle' ? onTriggerContinuation : undefined;
+  // Trigger menu only available in idle phase (the indicator gates on the
+  // context threshold itself). The capability is structurally inseparable
+  // from the idle discriminant, so no `convState.type` re-check is needed
+  // here — narrowing the discriminated union is the guard (task 04001).
+  const indicatorTrigger =
+    continuation?.phase === 'idle' ? continuation.onTrigger : undefined;
 
   // Derived display values
   const mode = conversation?.conv_mode_label?.toLowerCase();
