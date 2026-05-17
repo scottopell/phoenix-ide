@@ -580,6 +580,31 @@ rule ParentCancelDuringLlmRequest {
 -- PARENT 3. NON-RETRYABLE ERROR (parent -> error)
 -- ===========================================================
 
+rule BackendRejectsContextExhausted {
+    when: LlmErrors(conversation, message, error_class, attempt)
+    requires: conversation.core_status = llm_requesting
+    requires: error_kind = context_exhausted
+    ensures: conversation.parent_status = context_exhausted
+    ensures: conversation.continuation_summary =
+        "Context limit reached before the turn could complete."
+
+    @guidance
+        -- Checked before ParentLlmErrorNonRecoverable, mirroring
+        -- AuthErrorWithActiveRecovery. The backend can terminate a
+        -- request with context_length_exceeded even when Phoenix's own
+        -- usage tracking did not trip the continuation threshold
+        -- (ContextThresholdReachedParent, REQ-BED-019) — wrong declared
+        -- context window, a tightened backend cap, or a large attachment
+        -- landing mid-turn. Both the internal-threshold and
+        -- backend-rejection paths must converge on context_exhausted so
+        -- the message-rejection / continuation-recovery precondition
+        -- (RejectMessageContextExhausted) is satisfiable. Routing through
+        -- `error` is unrecoverable: there is no transition out of the
+        -- error state into continuation, so the conversation is stranded.
+        -- Sub-agents are unaffected — they have no context_exhausted
+        -- parent_status and keep SubAgentContextExhausted -> failed.
+}
+
 rule ParentLlmErrorNonRecoverable {
     when: LlmErrors(conversation, message, error_class, attempt)
     requires: conversation.core_status = llm_requesting

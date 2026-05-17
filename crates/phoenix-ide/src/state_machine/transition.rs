@@ -1845,6 +1845,28 @@ pub fn transition_parent(
             )))
         }
 
+        // Intercepted before core delegation — spec rule
+        // BackendRejectsContextExhausted (bedrock.allium).
+        (
+            ParentState::Core(CoreState::LlmRequesting { .. }),
+            ParentEvent::Core(CoreEvent::LlmError {
+                message,
+                error_kind: ErrorKind::ContextExhausted,
+                ..
+            }),
+        ) => {
+            let summary = format!(
+                "Context limit reached before the turn could complete: {message}. \
+                Continue to compact and resume, or start a new conversation."
+            );
+            Ok(ParentTransitionResult::new(ParentState::ContextExhausted {
+                summary: summary.clone(),
+            })
+            .with_effect(Effect::persist_continuation_message(&summary))
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyContextExhausted { summary }))
+        }
+
         // ============================================================
         // Parent-specific continuation transitions
         // ============================================================
@@ -2510,6 +2532,90 @@ mod tests {
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+    }
+
+    // Bug class (task 60008): a parent that exhausts context must never
+    // land in ConvState::Error — the /continue recovery precondition
+    // (db.rs) gates on ConvState::ContextExhausted, so an Error landing
+    // strands the conversation with no recovery path. Both the
+    // internal-threshold path and the backend-rejection path
+    // (LlmErrorKind::ContextWindowExceeded → ErrorKind::ContextExhausted)
+    // must converge on ContextExhausted.
+    #[test]
+    fn parent_context_exhausted_llm_error_routes_to_context_exhausted() {
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            Event::LlmError {
+                message: "context_length_exceeded".to_string(),
+                error_kind: ErrorKind::ContextExhausted,
+                attempt: 1,
+                recovery_in_progress: false,
+            },
+        )
+        .unwrap();
+
+        match &result.new_state {
+            ConvState::ContextExhausted { summary } => {
+                assert!(summary.contains("context_length_exceeded"));
+            }
+            other => panic!("expected ContextExhausted, got {other:?}"),
+        }
+        // The resulting state must satisfy the /continue precondition.
+        assert!(matches!(
+            result.new_state,
+            ConvState::ContextExhausted { .. }
+        ));
+    }
+
+    // The interception is scoped to ContextExhausted only — other
+    // non-retryable kinds must still reach Error so this fix does not
+    // silently swallow auth/invalid-request failures.
+    #[test]
+    fn parent_other_non_retryable_llm_error_still_routes_to_error() {
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            Event::LlmError {
+                message: "bad request".to_string(),
+                error_kind: ErrorKind::InvalidRequest,
+                attempt: 1,
+                recovery_in_progress: false,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::Error {
+                error_kind: ErrorKind::InvalidRequest,
+                ..
+            }
+        ));
+    }
+
+    // Retries are exhausted in one step for ContextExhausted because it is
+    // non-retryable; assert the attempt counter is irrelevant (any attempt
+    // value still converges on ContextExhausted, never Error).
+    #[test]
+    fn parent_context_exhausted_converges_regardless_of_attempt() {
+        for attempt in 1..=MAX_RETRY_ATTEMPTS {
+            let result = transition(
+                &ConvState::LlmRequesting { attempt },
+                &test_context(),
+                Event::LlmError {
+                    message: "ctx".to_string(),
+                    error_kind: ErrorKind::ContextExhausted,
+                    attempt,
+                    recovery_in_progress: false,
+                },
+            )
+            .unwrap();
+            assert!(
+                matches!(result.new_state, ConvState::ContextExhausted { .. }),
+                "attempt {attempt} should converge on ContextExhausted"
+            );
+        }
     }
 
     #[test]
