@@ -6876,7 +6876,6 @@ html * {
   border-color: var(--text-muted);
 }
 
-/* Tree scroll container */
 /* FileTree shares column height with the expanded sub-panels (task 13004):
  * flex-grow with min-height:0 so it can shrink below content and scroll
  * internally instead of being squeezed to 0 by stacked panel maxima. */
@@ -10146,4 +10145,47 @@ html * {
 .browser-view-launcher-btn:hover {
   background: var(--surface-3, #2c2c2c);
   color: var(--fg-default, #fff);
+}
+
+/* Explore onboarding banner (task 08628) — one-time, dismissible, sits
+   directly above the input area. */
+.explore-onboarding-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 0 0 8px;
+  padding: 10px 12px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border-color);
+  border-left: 3px solid var(--accent-blue);
+  border-radius: 6px;
+}
+
+.explore-onboarding-text {
+  flex: 1;
+}
+
+.explore-onboarding-text strong {
+  color: var(--accent-blue);
+  font-weight: 600;
+}
+
+.explore-onboarding-dismiss {
+  flex-shrink: 0;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 16px;
+  line-height: 1;
+  padding: 0 2px;
+  border-radius: 4px;
+}
+
+.explore-onboarding-dismiss:hover {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
 }

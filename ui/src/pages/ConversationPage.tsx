@@ -8,6 +8,7 @@ import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
 import { ConnectedInputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
+import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
 import { MessageListSkeleton } from '../components/Skeleton';
 import { FileBrowserOverlay, useFileExplorer } from '../components/FileExplorer';
 import { PaneDivider } from '../components/PaneDivider';
@@ -1274,6 +1275,10 @@ function ConversationPageContent() {
             />
           </Suspense>
         )}
+        <ExploreOnboardingBanner
+          convModeLabel={conversation.conv_mode_label}
+          messageCount={conversation.message_count}
+        />
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
@@ -1303,7 +1308,11 @@ function ConversationPageContent() {
         modelContextWindow={modelContextWindow}
         availableModels={availableModels}
         onRetryNow={connectionInfo.retryNow}
-        onTriggerContinuation={handleTriggerContinuation}
+        continuation={
+          convStateForChildren.type === 'idle'
+            ? { phase: 'idle', onTrigger: handleTriggerContinuation }
+            : { phase: 'busy' }
+        }
         onUpgradeModel={handleUpgradeModel}
         toolExecutingStartedAt={atom.toolExecutingStartedAt}
         onOpenFiles={isDesktop ? undefined : () => setShowFileBrowser(true)}
