@@ -45,12 +45,19 @@ export function ExploreOnboardingBanner({ convModeLabel, messageCount }: Props) 
   // NOT persist the one-time dismissal just because we observed a non-Explore
   // conversation, or an existing Explore conversation that already had
   // messages (banner never shown) — that would consume the user's first
-  // real onboarding opportunity. Only the 0->>0 message transition while the
-  // banner is mounted-and-shown counts as "user saw it and moved on".
+  // real onboarding opportunity. Only a message-count transition from 0 to
+  // a positive value, while the banner was mounted and shown, counts as
+  // "user saw it and moved on".
+  //
+  // `wasShownRef` is updated in an effect (not during render) so a discarded
+  // or double-invoked render under Strict Mode / concurrent rendering can't
+  // mark it shown for a render that was never committed.
   const wasShownRef = useRef(false);
-  if (visible) {
-    wasShownRef.current = true;
-  }
+  useEffect(() => {
+    if (visible) {
+      wasShownRef.current = true;
+    }
+  }, [visible]);
 
   useEffect(() => {
     if (wasShownRef.current && messageCount > 0 && !dismissed) {

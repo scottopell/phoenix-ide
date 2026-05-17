@@ -101,6 +101,12 @@ pub struct RuntimeManager {
     /// in-process server restart clears this map, so absence = server restart.
     /// A set, not a map: model upgrade is currently the only eviction cause;
     /// add a `HashMap<String, EvictionReason>` if a second cause appears.
+    ///
+    /// Lifetime is bounded and self-limiting: consumed by the next
+    /// `get_or_create`, dropped by `take_evicted_broadcaster` on hard-delete,
+    /// and the whole in-memory set is gone on process restart. Worst case is
+    /// a handful of small `String`s for conversations evicted-for-upgrade but
+    /// never re-accessed within one process lifetime — not worth a TTL.
     evicted_model_upgrades: RwLock<HashSet<String>>,
     /// Channel for sub-agent spawn requests
     spawn_tx: mpsc::Sender<SubAgentSpawnRequest>,

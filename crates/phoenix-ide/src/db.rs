@@ -111,15 +111,24 @@ impl Database {
         // where SCHEMA no longer creates it; drops it on upgraded DBs that
         // still carry it from the pre-typed-state schema. Never read or
         // written by any query.
+        // DROP COLUMN needs SQLite >= 3.35. SQLite is bundled via sqlx's
+        // `sqlite` feature (libsqlite3-sys, build-controlled and modern), so
+        // the host SQLite version is not a factor here. The benign case is a
+        // fresh DB where the column never existed ("no such column"); a real
+        // failure on an upgraded DB leaves the dead column in place (harmless
+        // — never read/written — but worth a warn so it's not invisible).
         if let Err(e) = sqlx::raw_sql("ALTER TABLE conversations DROP COLUMN state_data")
             .execute(&self.pool)
             .await
         {
-            // Expected on fresh DBs ("no such column: state_data"). Logged at
-            // debug (not silent) so a genuine failure on an upgraded DB — a
-            // SQLite version refusing the drop, an unexpected dependent
-            // index/view — is visible without being startup noise.
-            tracing::debug!(error = %e, "ALTER TABLE conversations DROP COLUMN state_data not applied");
+            if e.to_string().contains("no such column") {
+                tracing::debug!("state_data column already absent; nothing to drop");
+            } else {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to drop dead state_data column on an upgraded DB; it will remain (unused)"
+                );
+            }
         }
 
         // Try to add model column - ignore error if it already exists
@@ -687,10 +696,19 @@ impl Database {
     /// `_recovery_only` suffix exists so this mutation is not casually
     /// reachable — see task 13012 and `cwd_immutability_tests`.
     pub async fn update_conversation_cwd_recovery_only(&self, id: &str, cwd: &str) -> DbResult<()> {
-        debug_assert!(
-            !cwd.is_empty() && std::path::Path::new(cwd).is_absolute(),
-            "conversation cwd must be a non-empty absolute path, got {cwd:?}"
-        );
+        // Expected invariant: callers (repo_root, worktree_path — both
+        // git-derived) pass a non-empty absolute path. This is the only
+        // mutation path and runs during recovery/teardown, so a panic here
+        // would be worse than tolerating an unexpected value — log loudly
+        // and still perform the write rather than crashing recovery.
+        if cwd.is_empty() || !std::path::Path::new(cwd).is_absolute() {
+            tracing::error!(
+                conv_id = %id,
+                cwd,
+                "update_conversation_cwd_recovery_only called with a non-absolute or empty cwd; \
+                 proceeding but this violates the cwd contract (task 13012)"
+            );
+        }
         let now = Utc::now();
         let result =
             sqlx::query("UPDATE conversations SET cwd = ?1, updated_at = ?2 WHERE id = ?3")
