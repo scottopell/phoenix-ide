@@ -122,7 +122,7 @@ pub enum ContentBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
-        /// Images to include in the tool result (`Anthropic` only; `OpenAI` drops them).
+        /// Images to include in the tool result.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ImageSource>,
         #[serde(default)]
