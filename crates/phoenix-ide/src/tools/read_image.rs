@@ -130,7 +130,10 @@ impl Tool for ReadImageTool {
 
         let base64_data = BASE64.encode(&data);
 
-        // Return text summary for LLM context; image data goes via typed channel
+        // Text summary for LLM context. The base64 payload is carried ONLY by
+        // the typed `images` channel (single source of truth, persisted into
+        // `ToolContent.images` and rendered by the UI from there) — it is
+        // deliberately NOT duplicated into `display_data`.
         ToolOutput::success(format!(
             "Image loaded: {} ({} bytes)",
             path.display(),
@@ -138,13 +141,8 @@ impl Tool for ReadImageTool {
         ))
         .with_images(vec![ToolImage {
             media_type: media_type.to_string(),
-            data: base64_data.clone(),
+            data: base64_data,
         }])
-        .with_display(json!({
-            "type": "image",
-            "media_type": media_type,
-            "data": base64_data,
-        }))
     }
 }
 
@@ -209,11 +207,14 @@ mod tests {
         assert_eq!(result.images[0].media_type, "image/png");
         assert!(!result.images[0].data.is_empty());
 
-        // Display data still present for UI thumbnail rendering
-        let display = result.display_data.as_ref().expect("Expected display_data");
-        assert_eq!(display["type"], "image");
-        assert_eq!(display["media_type"], "image/png");
-        assert!(!display["data"].as_str().unwrap().is_empty());
+        // The base64 payload must NOT also be duplicated into display_data:
+        // the typed `images` channel is the single source of truth, so the
+        // two representations cannot diverge.
+        assert!(
+            result.display_data.is_none(),
+            "read_image must not duplicate the image payload into display_data, got {:?}",
+            result.display_data
+        );
     }
 
     #[tokio::test]

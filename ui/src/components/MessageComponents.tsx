@@ -884,11 +884,18 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
   const resultText = patchDiff || rawResultText;
   const resultLength = resultText.length;
   
-  // Check if this is an image result
-  // First check display_data (preferred for browser_take_screenshot)
-  // Then fall back to parsing the result content (for read_image)
+  // Check if this is an image result.
+  // 1. Typed `images` channel (read_image — single source of truth, no
+  //    longer duplicated into display_data).
+  // 2. display_data (browser_take_screenshot; also legacy read_image rows
+  //    persisted before the payload was removed from display_data).
+  // 3. parseImageResult fallback for the oldest legacy rows.
   let imageResult: { media_type: string; data: string } | null = null;
-  if (result?.display_data) {
+  const typedImage = resultContent?.images?.[0];
+  if (typedImage?.data && typedImage.media_type) {
+    imageResult = { media_type: typedImage.media_type, data: typedImage.data };
+  }
+  if (!imageResult && result?.display_data) {
     const dd = result.display_data as { type?: string; media_type?: string; data?: string };
     if (dd.type === 'image' && dd.media_type && dd.data) {
       imageResult = { media_type: dd.media_type, data: dd.data };

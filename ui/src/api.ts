@@ -258,6 +258,9 @@ export interface ToolResultContent {
   result?: string;
   error?: string;
   is_error?: boolean;
+  /** Typed image payloads (mirrors Rust `ToolContent.images`). Single source
+   *  of truth for tool-result images — not duplicated into `display_data`. */
+  images?: ImageData[];
 }
 
 export interface ImageData {
