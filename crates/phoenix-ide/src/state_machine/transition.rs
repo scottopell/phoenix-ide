@@ -322,8 +322,13 @@ pub fn transition(
             Ok(e) => e,
             Err(e) => {
                 // Parent-only events reaching a sub-agent context are invalid.
-                // Terminal states absorb silently; non-terminal states reject.
+                // Terminal states absorb; non-terminal states reject.
                 if sub_state.is_terminal() {
+                    tracing::debug!(
+                        event = e.event_variant,
+                        state = state.variant_name(),
+                        "absorbing parent-only event in terminal sub-agent state"
+                    );
                     return Ok(TransitionResult::new(state.clone()));
                 }
                 return Err(TransitionError::InvalidTransition {
@@ -345,8 +350,13 @@ pub fn transition(
             Ok(e) => e,
             Err(e) => {
                 // Sub-agent-only events reaching a parent context are stale/invalid.
-                // Terminal states absorb silently; non-terminal states reject.
+                // Terminal states absorb; non-terminal states reject.
                 if parent_state.is_terminal() {
+                    tracing::debug!(
+                        event = e.event_variant,
+                        state = state.variant_name(),
+                        "absorbing sub-agent-only event in terminal parent state"
+                    );
                     return Ok(TransitionResult::new(state.clone()));
                 }
                 return Err(TransitionError::InvalidTransition {
