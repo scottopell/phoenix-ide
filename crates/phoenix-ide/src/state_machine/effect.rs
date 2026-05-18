@@ -424,7 +424,9 @@ fn bash_input_display(input: &crate::tools::BashToolInput, cwd: &str) -> Option<
             format!("wait {handle}{suffix}")
         }),
         crate::tools::BashOp::Kill => input.handle.as_deref().map(|handle| {
-            let signal = input.signal.as_deref().unwrap_or("TERM");
+            let signal = input
+                .signal
+                .map_or("TERM", crate::tools::bash::handle::KillSignal::as_str);
             format!("kill {handle} ({signal})")
         }),
     }

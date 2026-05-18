@@ -1,5 +1,6 @@
 //! Request parsing and validation for the modern bash tool input schema.
 
+use super::handle::KillSignal;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -43,8 +44,8 @@ pub struct BashToolInput {
     #[ts(optional)]
     pub wait_seconds: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[ts(optional, type = "'TERM' | 'KILL'")]
-    pub signal: Option<String>,
+    #[ts(optional)]
+    pub signal: Option<KillSignal>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub lines: Option<i64>,
@@ -64,5 +65,37 @@ impl BashToolInput {
             lines: None,
             since: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn signal_wire_form_is_uppercase_and_round_trips() {
+        let term: BashToolInput =
+            serde_json::from_value(serde_json::json!({"op": "kill", "signal": "TERM"})).unwrap();
+        assert_eq!(term.signal, Some(KillSignal::Term));
+        let kill: BashToolInput =
+            serde_json::from_value(serde_json::json!({"op": "kill", "signal": "KILL"})).unwrap();
+        assert_eq!(kill.signal, Some(KillSignal::Kill));
+
+        let serialized = serde_json::to_value(&kill).unwrap();
+        assert_eq!(serialized["signal"], "KILL");
+
+        let absent: BashToolInput =
+            serde_json::from_value(serde_json::json!({"op": "kill"})).unwrap();
+        assert_eq!(absent.signal, None);
+    }
+
+    #[test]
+    fn unknown_signal_value_is_rejected_at_the_type_boundary() {
+        let parsed: Result<BashToolInput, _> =
+            serde_json::from_value(serde_json::json!({"op": "kill", "signal": "HUP"}));
+        assert!(
+            parsed.is_err(),
+            "an out-of-domain signal must fail to deserialize, not reach a runtime guard"
+        );
     }
 }

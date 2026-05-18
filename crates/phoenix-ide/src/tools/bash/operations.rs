@@ -299,20 +299,7 @@ pub fn parse_request(input: Value) -> Result<BashRequest, BashError> {
         }
         BashOp::Kill => {
             let handle_id = resolve_handle(&raw, BashOp::Kill)?;
-            let signal = match raw.signal.as_deref() {
-                None | Some("TERM") => KillSignal::Term,
-                Some("KILL") => KillSignal::Kill,
-                Some(other) => {
-                    return Err(BashError::MutuallyExclusiveModes {
-                        message: format!(
-                            "signal='{other}' is not recognized; valid values are 'TERM' or 'KILL'"
-                        ),
-                        conflicting_args: vec!["signal"],
-                        recommended_action: "use signal='TERM' (default) or signal='KILL'".into(),
-                        extra: None,
-                    });
-                }
-            };
+            let signal = raw.signal.unwrap_or(KillSignal::Term);
             Ok(BashRequest::Kill { handle_id, signal })
         }
     }
