@@ -11,6 +11,7 @@ use unicode_security::skeleton;
 /// 1. Exact match
 /// 2. Dedent matching (different indentation levels)
 /// 3. Trimmed line matching (first/last line variations)
+/// 4. NFKC-normalised match (handles Unicode lookalike characters)
 pub fn find_unique_match(content: &str, old_text: &str) -> Result<EditSpec, PatchError> {
     // 1. Try exact match
     if let Some(spec) = find_exact_unique(content, old_text) {
