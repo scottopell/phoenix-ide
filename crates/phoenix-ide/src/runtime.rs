@@ -1081,7 +1081,9 @@ impl RuntimeManager {
         // Sub-agent inherits parent's worktree cwd; discover the project's
         // tasks directory the same way the parent did.
         conv_context.tasks_dir_name =
-            crate::tasks_dir::discover_tasks_dir_name(&conv_context.working_dir);
+            taskmd_core::discover::discover_or_default(&conv_context.working_dir)
+                .to_string_lossy()
+                .into_owned();
 
         // 4. Create channels for the sub-agent runtime. The broadcaster
         // seeds its counter from the message we just inserted (sequence_id=1)
@@ -1286,7 +1288,9 @@ impl RuntimeManager {
         // startup; cached for the lifetime of this runtime so state machine,
         // executor, patch tool registration, and system prompt all agree on
         // the same name without re-walking the worktree.
-        context.tasks_dir_name = crate::tasks_dir::discover_tasks_dir_name(&context.working_dir);
+        context.tasks_dir_name = taskmd_core::discover::discover_or_default(&context.working_dir)
+            .to_string_lossy()
+            .into_owned();
 
         let (event_tx, event_rx) = mpsc::channel(32);
         // Inherit the broadcaster from an eviction if available (e.g. model

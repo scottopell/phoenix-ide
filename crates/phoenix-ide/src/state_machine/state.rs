@@ -68,9 +68,10 @@ pub struct SubmitErrorInput {
 ///
 /// The agent passes a path (relative to the repo root) to an existing task
 /// file under the project's tasks directory (typically `tasks/`, discovered
-/// per project via `_TEMPLATE.md` — see `crate::tasks_dir`). Title, priority,
-/// status, and plan body are all read from disk by the state-machine
-/// interception layer.
+/// per project via `_TEMPLATE.md` — see
+/// `taskmd_core::discover::discover_or_default`). Title, priority, status,
+/// and plan body are all read from disk by the state-machine interception
+/// layer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposeTaskInput {
     pub task_file: String,
@@ -1602,7 +1603,7 @@ pub struct ConvContext {
     pub mode: ModeKind,
     /// Relative name of the project's tasks directory (e.g. `"tasks"` or
     /// `"taskmds"`). Discovered at conversation startup via
-    /// `crate::tasks_dir::discover_tasks_dir_name` and cached here so the
+    /// `taskmd_core::discover::discover_or_default` and cached here so the
     /// state machine, executor, patch-tool registration, and system prompt
     /// all agree on the same name without re-walking the worktree on every
     /// reference.
@@ -1632,7 +1633,7 @@ impl ConvContext {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
-            tasks_dir_name: crate::tasks_dir::DEFAULT_TASKS_DIR_NAME.to_string(),
+            tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
         }
     }
 
@@ -1656,7 +1657,7 @@ impl ConvContext {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
-            tasks_dir_name: crate::tasks_dir::DEFAULT_TASKS_DIR_NAME.to_string(),
+            tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
         }
     }
 }
