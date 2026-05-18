@@ -638,7 +638,6 @@ impl ToolResult {
         }
     }
 
-    #[allow(dead_code)] // Public API for completeness; used by tests
     pub fn images(&self) -> &[ToolContentImage] {
         match &self.outcome {
             ToolOutcome::Success { images, .. } | ToolOutcome::Error { images, .. } => images,
@@ -885,13 +884,30 @@ impl MessageContent {
         Self::Agent(blocks)
     }
 
-    /// Create tool content
+    /// Create tool content with no images. Use [`MessageContent::tool_with_images`]
+    /// when the source `ToolResult` carries images — passing none here would
+    /// silently strand image bytes (the LLM/UI read images from this struct).
     pub fn tool(
         tool_use_id: impl Into<String>,
         content: impl Into<String>,
         is_error: bool,
     ) -> Self {
         Self::Tool(ToolContent::new(tool_use_id, content, is_error))
+    }
+
+    /// Create tool content carrying typed images for LLM/UI consumption.
+    pub fn tool_with_images(
+        tool_use_id: impl Into<String>,
+        content: impl Into<String>,
+        is_error: bool,
+        images: Vec<ToolContentImage>,
+    ) -> Self {
+        Self::Tool(ToolContent {
+            tool_use_id: tool_use_id.into(),
+            content: content.into(),
+            is_error,
+            images,
+        })
     }
 
     /// Create system content

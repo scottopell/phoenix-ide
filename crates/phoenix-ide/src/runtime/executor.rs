@@ -1415,10 +1415,11 @@ where
 
             Effect::PersistToolResults { results } => {
                 for result in results {
-                    let content = MessageContent::tool(
+                    let content = MessageContent::tool_with_images(
                         &result.tool_use_id,
                         result.output(),
                         result.is_error(),
+                        result.images().to_vec(),
                     );
                     let tool_msg_id = uuid::Uuid::new_v4().to_string();
                     let seq = self.broadcast_tx.next_seq();
@@ -1994,10 +1995,11 @@ where
 
                 // Persist all tool results
                 for result in tool_results {
-                    let tool_content = MessageContent::tool(
+                    let tool_content = MessageContent::tool_with_images(
                         &result.tool_use_id,
                         result.output(),
                         result.is_error(),
+                        result.images().to_vec(),
                     );
                     let tool_msg_id = tool_result_message_id(&result.tool_use_id);
                     let tool_seq = self.broadcast_tx.next_seq();
@@ -4764,6 +4766,68 @@ mod steer_drain_detector_tests {
         .expect("non-idempotent PersistMessage must succeed");
 
         assert_eq!(storage.get_all_messages("conv-non-idem").len(), 1);
+    }
+
+    /// Regression: a tool result carrying typed images must survive the
+    /// normal `PersistCheckpoint` round into `ToolContent.images`. Before
+    /// this was threaded, `MessageContent::tool(...)` dropped the field, so
+    /// read_image (which now relies solely on the typed channel) lost its
+    /// image bytes for both the UI and the next LLM turn.
+    #[tokio::test]
+    async fn persist_checkpoint_preserves_tool_result_images() {
+        use crate::db::{MessageContent, ToolContentImage, ToolOutcome, ToolResult};
+        use crate::llm::ContentBlock;
+        use crate::state_machine::{AssistantMessage, CheckpointData};
+
+        let (mut rt, storage) = build_runtime_with_state_and_queue(
+            "conv-img",
+            ConvState::LlmRequesting { attempt: 1 },
+            vec![],
+        );
+
+        let assistant = AssistantMessage::new(
+            vec![ContentBlock::ToolUse {
+                id: "tool-img-1".to_string(),
+                name: "read_image".to_string(),
+                input: serde_json::json!({"path": "x.png"}),
+            }],
+            None,
+            None,
+        );
+        let result = ToolResult {
+            tool_use_id: "tool-img-1".to_string(),
+            outcome: ToolOutcome::Success {
+                output: "Image loaded: x.png (3 bytes)".to_string(),
+                display_data: None,
+                images: vec![ToolContentImage {
+                    media_type: "image/png".to_string(),
+                    data: "QUJD".to_string(),
+                }],
+            },
+            duration_ms: None,
+        };
+        let data = CheckpointData::tool_round(assistant, vec![result]).expect("tool_round");
+
+        rt.execute_effect(Effect::PersistCheckpoint { data })
+            .await
+            .expect("PersistCheckpoint must succeed");
+
+        let msgs = storage.get_all_messages("conv-img");
+        let tool_msg = msgs
+            .iter()
+            .find_map(|m| match &m.content {
+                MessageContent::Tool(tc) if tc.tool_use_id == "tool-img-1" => Some(tc),
+                _ => None,
+            })
+            .expect("persisted tool result message");
+        assert_eq!(
+            tool_msg.images,
+            vec![ToolContentImage {
+                media_type: "image/png".to_string(),
+                data: "QUJD".to_string(),
+            }],
+            "typed images must not be dropped at checkpoint persistence"
+        );
     }
 }
 
