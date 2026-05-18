@@ -66,7 +66,10 @@ Usage:
     [--runs N] [--warmup W] [--subst KEY=VAL ...] \\
     [--transport {browser_profile,agent-browser}] [--browser-bin agent-browser]
 
-  run-scenario --self-test
+  browser_profile request/response bridge (for LLM tool runtimes):
+    run-scenario SCENARIO.yaml --request-out request.json [...]
+    # parent agent calls browser_profile(action='run_scenario', **request.json)
+    run-scenario --response-in response.json --out raw.json
 """
 import argparse, json, os, subprocess, sys, time, pathlib, urllib.request, uuid
 import yaml
@@ -723,7 +726,8 @@ def main():
     ap = argparse.ArgumentParser(
         description=(
             "Scenario harness — emits RAW per-run samples. "
-            "Default transport: browser_profile (requires BROWSER_PROFILE_CMD env). "
+            "Default transport: browser_profile (BROWSER_PROFILE_CMD bridge, or "
+            "--request-out/--response-in for LLM tool runtimes). "
             "Legacy transport: agent-browser (requires agent-browser CLI)."
         )
     )
@@ -731,6 +735,21 @@ def main():
     ap.add_argument("--self-test", action="store_true",
                     help="run unit tests on translation functions and exit")
     ap.add_argument("--out", help="output path for raw samples JSON")
+    ap.add_argument(
+        "--request-out",
+        help=(
+            "browser_profile transport only: write translated run_scenario request JSON "
+            "and exit without executing it. Use when the LLM runtime exposes "
+            "browser_profile as a tool rather than a shell bridge."
+        ),
+    )
+    ap.add_argument(
+        "--response-in",
+        help=(
+            "read a browser_profile run_scenario JSON response, extract raw_samples, "
+            "write --out, and exit"
+        ),
+    )
     ap.add_argument("--runs", type=int, help="number of measured runs (overrides scenario)")
     ap.add_argument("--warmup", type=int, help="warmup runs discarded from results (overrides scenario)")
     ap.add_argument(
@@ -744,7 +763,9 @@ def main():
         help=(
             "Measurement transport. "
             "'browser_profile' (default): uses BROWSER_PROFILE_CMD env bridge to "
-            "Phoenix's in-agent browser_profile run_scenario tool. "
+            "Phoenix's in-agent browser_profile run_scenario tool, or use "
+            "--request-out/--response-in when the LLM runtime exposes browser_profile "
+            "as a tool rather than a shell command. "
             "'agent-browser': legacy harness, drives the agent-browser CLI directly."
         ),
     )
@@ -758,10 +779,19 @@ def main():
         _self_test()
         return  # _self_test calls sys.exit, but keep for clarity
 
+    if a.response_in:
+        if not a.out:
+            ap.error("--out is required with --response-in")
+        bp_response = json.loads(pathlib.Path(a.response_in).read_text())
+        samples = map_bp_samples(bp_response)
+        pathlib.Path(a.out).write_text(json.dumps(samples, indent=2))
+        print(f"wrote {len(samples)} raw samples -> {a.out} (NOT averaged)")
+        return
+
     if not a.scenario:
-        ap.error("SCENARIO.yaml is required (unless --self-test is given)")
-    if not a.out:
-        ap.error("--out is required")
+        ap.error("SCENARIO.yaml is required (unless --self-test or --response-in is given)")
+    if not a.out and not a.request_out:
+        ap.error("--out is required unless --request-out is given")
 
     scn = yaml.safe_load(pathlib.Path(a.scenario).read_text())
     runs = a.runs if a.runs is not None else scn.get("runs", 30)
@@ -773,6 +803,14 @@ def main():
     # resolve nested placeholders in params (e.g. base_url referenced by steps)
     for k in list(table):
         table[k] = subst(str(table[k]), table)
+
+    if a.request_out:
+        if a.transport != "browser_profile":
+            ap.error("--request-out is only valid with --transport browser_profile")
+        request = translate_scenario_to_bp_request(scn, table, runs, warmup)
+        pathlib.Path(a.request_out).write_text(json.dumps(request, indent=2))
+        print(f"wrote browser_profile run_scenario request -> {a.request_out}")
+        return
 
     if a.transport == "browser_profile":
         samples = run_browser_profile(scn, table, runs, warmup)

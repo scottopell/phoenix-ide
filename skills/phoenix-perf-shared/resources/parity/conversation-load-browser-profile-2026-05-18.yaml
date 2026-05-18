@@ -1,0 +1,62 @@
+id: conversation-load-browser-profile-2026-05-18
+scenario: skills/phoenix-perf-find-target/resources/scenarios/conversation-load.yaml
+fixture: fixture-turn-one
+runs: 5
+warmup: 1
+verdict: failed
+summary: >
+  Mandatory parity gate found that browser_profile and legacy agent-browser do
+  not produce equivalent baselines for conversation-load on this branch. Do not
+  compare new browser_profile runs against historical agent-browser db numbers;
+  recapture browser_profile baselines immediately before each change.
+methodology:
+  legacy_transport: agent-browser
+  new_transport: browser_profile run_scenario
+  raw_samples:
+    legacy: /tmp/pp-parity-conversation-load-agent-browser.json
+    browser_profile: /tmp/pp-parity-conversation-load-browser-profile-resized.json
+  notes:
+    - First browser_profile run used default 1024x768 viewport and differed in DOM/window size.
+    - Second browser_profile run resized to 1280x633 to match observed agent-browser viewport.
+    - Even after viewport alignment, React/script/wall/heap baselines remained materially shifted.
+    - browser_profile emitted no-throttle methodology warning; conversation-load scenario also has no throttle under legacy history.
+comparison_after_viewport_alignment:
+  react_commit_count:
+    legacy_mean: 18.4
+    browser_profile_mean: 10.8
+    change: -41.30%
+    p: 0.000176
+  react_commit_ms:
+    legacy_mean: 337.0
+    browser_profile_mean: 185.0
+    change: -45.09%
+    p: 1.532e-06
+  script_ms:
+    legacy_mean: 476.8
+    browser_profile_mean: 313.8
+    change: -34.19%
+    p: 4.378e-07
+  wall_ms:
+    legacy_mean: 1125.0
+    browser_profile_mean: 403.5
+    change: -64.15%
+    p: 7.379e-07
+  js_heap_used_mib:
+    legacy_mean: 33.84
+    browser_profile_mean: 21.0
+    change: -37.94%
+    p: 5.628e-06
+  long_tasks:
+    legacy_mean: 4.0
+    browser_profile_mean: 2.0
+    change: -50.00%
+    p: 1.0
+  dom_nodes:
+    legacy_mean: 1048.0
+    browser_profile_mean: 1129.0
+    change: +7.75%
+    p: 5.649e-08
+required_followup:
+  - Treat cross-harness historical db records as technique/lesson history only, not numeric baselines.
+  - Reconfirm MessageList-bottom-anchored-window with browser_profile A/B before using its numeric deltas.
+  - For task 65003 and future hunts, capture baseline and optimized samples with browser_profile in the same session.

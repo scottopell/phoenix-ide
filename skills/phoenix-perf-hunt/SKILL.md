@@ -27,12 +27,29 @@ after the change, or reconstructed, is not a baseline — abort the hunt.**
    `SLUG_LARGE` / `UI_URL` from `./dev.py status` (DB path → query
    conversations for a slug) and the preflight UI URL.
 
-2. Run the scenario through the harness with the scenario's `runs`/`warmup`:
+2. Run the scenario through the harness with the scenario's `runs`/`warmup`.
+   If `BROWSER_PROFILE_CMD` is configured, the default command writes raw
+   samples directly:
 
    ```bash
    skills/phoenix-perf-shared/scripts/run-scenario \
      skills/phoenix-perf-find-target/<scenario> \
      --subst SLUG=<slug> --subst UI_URL=<url> \
+     --out /tmp/phoenix-perf-baseline.json
+   ```
+
+   If `browser_profile` is available only as an LLM tool, generate the exact
+   tool request, call `browser_profile(action="run_scenario", ...)`, save the
+   JSON response, then extract raw samples:
+
+   ```bash
+   skills/phoenix-perf-shared/scripts/run-scenario \
+     skills/phoenix-perf-find-target/<scenario> \
+     --subst SLUG=<slug> --subst UI_URL=<url> \
+     --request-out /tmp/phoenix-perf-request.json
+   # LLM tool call: browser_profile run_scenario with /tmp/phoenix-perf-request.json
+   skills/phoenix-perf-shared/scripts/run-scenario \
+     --response-in /tmp/phoenix-perf-response.json \
      --out /tmp/phoenix-perf-baseline.json
    ```
 

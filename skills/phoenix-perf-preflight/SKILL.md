@@ -25,7 +25,7 @@ auto-execute fixes.
 | Phoenix port not responding | `./dev.py status`, then `./dev.py restart` |
 | `run-scenario` missing/not exec | `chmod +x skills/phoenix-perf-shared/scripts/run-scenario` |
 | `run-scenario --self-test` failed | Check for regression in `skills/phoenix-perf-shared/scripts/run-scenario` |
-| `BROWSER_PROFILE_CMD` not set (warning) | Normal in plain shell context; `browser_profile` tool is provided by the LLM runtime. Verify the tool is available before running a hunt. |
+| `BROWSER_PROFILE_CMD` not set (warning) | Normal in plain shell context; `browser_profile` tool is provided by the LLM runtime. Verify the tool is available, then use `run-scenario --request-out` / direct tool call / `--response-in` if no shell bridge exists. |
 | `agent-browser` not found (warning) | Optional legacy transport. Only needed for `--transport agent-browser`. |
 | DB has no conversations | `./dev.py seed` |
 | `uv` not found | `brew install uv` (or system `python3` ≥ 3.11) |
@@ -41,7 +41,9 @@ auto-execute fixes.
   transport (Phoenix's in-agent tool); `agent-browser` is legacy/optional. Because
   a shell script cannot inspect LLM tool availability, `browser_profile` tool
   presence is a manual context check — confirm it is available before starting a
-  hunt. `BROWSER_PROFILE_CMD` warns (not fails) if unset in the shell.
+  hunt. `BROWSER_PROFILE_CMD` warns (not fails) if unset in the shell; without a
+  bridge, generate the tool input with `run-scenario --request-out` and extract
+  returned `raw_samples` with `run-scenario --response-in`.
 - **Seed data**: load scenarios need a deterministic many-message
   conversation; without it the scenario is not reproducible.
 - **Clean git tree**: baseline must be captured against a known commit so the

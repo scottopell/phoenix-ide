@@ -18,7 +18,7 @@ eligible surface.
 ## Phase 2 — Profile scenario cost
 
 For each scenario, run it through the harness with small N to see where the
-cost is (not where you guessed):
+cost is (not where you guessed). If `BROWSER_PROFILE_CMD` is configured:
 
 ```bash
 skills/phoenix-perf-shared/scripts/run-scenario \
@@ -26,6 +26,9 @@ skills/phoenix-perf-shared/scripts/run-scenario \
   --runs 5 --warmup 1 --subst SLUG=<slug> --subst UI_URL=<url> \
   --out /tmp/pp-profile-<name>.json
 ```
+
+If `browser_profile` is available only as an LLM tool, use `--request-out`, call
+the tool with that JSON, then `--response-in ... --out /tmp/pp-profile-<name>.json`.
 
 Reduce each with `phoenix-perf-review/scripts/stats.py` against itself is not
 meaningful; instead read the raw file and take the median `react_commits` /

@@ -31,7 +31,9 @@ report to the caller. Hunt persists it. Review never writes the db.
 2. Re-run the **same** `$0` scenario via the same harness
    (`skills/phoenix-perf-shared/scripts/run-scenario`) with the **same**
    runs / warmup / subst. Persist raw samples
-   `/tmp/phoenix-perf-optimized.json`.
+   `/tmp/phoenix-perf-optimized.json`. If `browser_profile` is available only
+   as an LLM tool, use the same `--request-out` → tool call → `--response-in`
+   flow used for the baseline.
 3. Compute significance from raw samples — the skill owns stats, not the
    harness:
 

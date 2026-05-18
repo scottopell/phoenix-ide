@@ -23,10 +23,12 @@ two measurement transports selectable via `--transport`:
 
 ### `browser_profile` transport (default)
 
-Delegates measurement to Phoenix's in-agent `browser_profile run_scenario` tool
-via an environment-provided command bridge (`BROWSER_PROFILE_CMD`). The parent
-LLM agent sets `BROWSER_PROFILE_CMD` to a command that forwards the
-`run_scenario` request to the tool. Preferred when running inside Phoenix.
+Delegates measurement to Phoenix's in-agent `browser_profile run_scenario` tool.
+When a shell bridge exists, set `BROWSER_PROFILE_CMD` to a command that forwards
+the `run_scenario` request to the tool. In Phoenix LLM-tool runtimes where no
+shell bridge exists, use `--request-out` to write the translated request, call
+the `browser_profile` tool directly, then use `--response-in` to extract the
+raw sample array. Preferred when running inside Phoenix.
 
 Metrics per run:
 
