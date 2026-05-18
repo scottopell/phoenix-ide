@@ -198,6 +198,8 @@ fn classify_responses_error(code: &str, message: &str) -> LlmError {
 struct ResponsesStreamAccumulator {
     input_tokens: u32,
     output_tokens: u32,
+    /// Cached subset of `input_tokens` (`OpenAI` `input_tokens_details.cached_tokens`).
+    cached_tokens: u32,
     /// Completed output items collected from `response.output_item.done` events.
     output_items: Vec<ResponsesApiOutput>,
     /// Set true when `response.done` is received.
@@ -215,6 +217,7 @@ impl ResponsesStreamAccumulator {
         Self {
             input_tokens: 0,
             output_tokens: 0,
+            cached_tokens: 0,
             output_items: Vec::new(),
             done: false,
             logged_empty_dispatch: false,
@@ -352,6 +355,13 @@ impl ResponsesStreamAccumulator {
                             .unwrap_or(0),
                     )
                     .unwrap_or(0);
+                    self.cached_tokens = u32::try_from(
+                        usage
+                            .pointer("/input_tokens_details/cached_tokens")
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0),
+                    )
+                    .unwrap_or(0);
                 } else {
                     tracing::warn!(data, "responses_api terminal event had no /response/usage");
                 }
@@ -429,6 +439,9 @@ impl ResponsesStreamAccumulator {
             usage: ResponsesApiUsage {
                 input_tokens: self.input_tokens,
                 output_tokens: self.output_tokens,
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: self.cached_tokens,
+                },
             },
         })
     }
@@ -773,11 +786,20 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
     LlmResponse {
         content,
         end_turn,
-        usage: Usage {
-            input_tokens: u64::from(resp.usage.input_tokens),
-            output_tokens: u64::from(resp.usage.output_tokens),
-            cache_creation_tokens: 0,
-            cache_read_tokens: 0,
+        usage: {
+            // OpenAI's `input_tokens` is inclusive of `cached_tokens`, whereas
+            // `Usage::context_window_used()` sums input + cache_read. Split the
+            // cached subset out of `input_tokens` so the sum stays accurate
+            // and the cached count is no longer silently discarded.
+            let cached = u64::from(resp.usage.input_tokens_details.cached_tokens);
+            Usage {
+                input_tokens: u64::from(resp.usage.input_tokens).saturating_sub(cached),
+                output_tokens: u64::from(resp.usage.output_tokens),
+                // The Responses API has no cache-*creation* concept; this is a
+                // typed sink for OpenAI, not an unparsed field.
+                cache_creation_tokens: 0,
+                cache_read_tokens: cached,
+            }
         },
     }
 }
@@ -1022,10 +1044,24 @@ pub(crate) struct ResponsesApiContent {
     pub(crate) text: Option<String>,
 }
 
+/// `usage.input_tokens_details` on the Responses API wire. Only the cached
+/// subset is consumed; the field defaults to zero when the gateway omits it.
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ResponsesApiInputTokensDetails {
+    #[serde(default)]
+    pub(crate) cached_tokens: u32,
+}
+
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesApiUsage {
     pub(crate) input_tokens: u32,
     pub(crate) output_tokens: u32,
+    /// `OpenAI`'s `input_tokens` already *includes* `cached_tokens` — cached
+    /// is a subset of input, not an additional bucket. This is a typed parse
+    /// site (not a bare `0`) so "`OpenAI` doesn't report this" is no longer
+    /// indistinguishable from "we forgot to parse it".
+    #[serde(default)]
+    pub(crate) input_tokens_details: ResponsesApiInputTokensDetails,
 }
 
 #[cfg(test)]
@@ -1382,6 +1418,68 @@ mod tests {
         );
         assert_eq!(acc.input_tokens, 320682);
         assert_eq!(acc.output_tokens, 5);
+    }
+
+    /// OpenAI reports the cached input subset under
+    /// `usage.input_tokens_details.cached_tokens`. It must reach `Usage` and
+    /// must not double-count: `input_tokens` already includes the cached
+    /// portion, so `context_window_used()` (which sums input + cache_read)
+    /// stays equal to OpenAI's reported input+output.
+    #[test]
+    fn responses_api_cached_tokens_are_threaded_without_double_counting() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(8);
+        let mut acc = ResponsesStreamAccumulator::new();
+        let data = r#"{
+            "type":"response.completed",
+            "response":{
+                "usage":{
+                    "input_tokens":1000,
+                    "output_tokens":50,
+                    "input_tokens_details":{"cached_tokens":800}
+                },
+                "output":[
+                    {"type":"message","role":"assistant","content":[
+                        {"type":"output_text","text":"Pong"}
+                    ]}
+                ]
+            }
+        }"#;
+        acc.process_event("response.completed", data, &tx)
+            .expect("handler should not error");
+        assert_eq!(acc.cached_tokens, 800);
+
+        let resp = normalize_responses_api_response(ResponsesApiResponse {
+            status: "completed".to_string(),
+            output: acc.output_items,
+            usage: ResponsesApiUsage {
+                input_tokens: acc.input_tokens,
+                output_tokens: acc.output_tokens,
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: acc.cached_tokens,
+                },
+            },
+        });
+        assert_eq!(resp.usage.cache_read_tokens, 800);
+        assert_eq!(resp.usage.input_tokens, 200);
+        assert_eq!(resp.usage.cache_creation_tokens, 0);
+        assert_eq!(resp.usage.context_window_used(), 1050);
+    }
+
+    /// A gateway that omits `input_tokens_details` must not panic or shift
+    /// accounting: cached defaults to 0 and `input_tokens` is unchanged.
+    #[test]
+    fn responses_api_usage_without_cached_details_defaults_to_zero() {
+        let usage: ResponsesApiUsage =
+            serde_json::from_str(r#"{"input_tokens":10,"output_tokens":2}"#).unwrap();
+        assert_eq!(usage.input_tokens_details.cached_tokens, 0);
+        let resp = normalize_responses_api_response(ResponsesApiResponse {
+            status: "completed".to_string(),
+            output: vec![],
+            usage,
+        });
+        assert_eq!(resp.usage.input_tokens, 10);
+        assert_eq!(resp.usage.cache_read_tokens, 0);
+        assert_eq!(resp.usage.context_window_used(), 12);
     }
 
     /// If both `response.output_item.done` and `response.completed` carry
