@@ -3,41 +3,90 @@
 # requires-python = ">=3.11"
 # dependencies = ["pyyaml"]
 # ///
-"""agent-browser-backed scenario harness — emits RAW per-run samples.
+"""Scenario harness — emits RAW per-run samples.
 
-This is the Claude-Code-side harness (the lading analog of payloadtool +
-hyperfine). It drives the `agent-browser` CLI; it does NOT use Phoenix's
-in-agent `browser_profile` tool (that is for the LLM inside Phoenix, not for
-the runner of these skills).
+Two transports (--transport flag, default: browser_profile):
 
-Hard contract (REQ-BT-019.5 / NG-STATS, unchanged): this emits a JSON array
-of raw RunSample objects, one per post-warmup run. It NEVER averages or
-reduces. Significance is owned by phoenix-perf-review/scripts/stats.py.
+  browser_profile (default)
+    Delegates measurement to Phoenix's in-agent browser_profile run_scenario
+    tool via an environment-provided command bridge (BROWSER_PROFILE_CMD).
+    The parent LLM agent sets BROWSER_PROFILE_CMD to a command that accepts
+    a browser_profile run_scenario JSON request on stdin and writes the
+    response JSON to stdout. If BROWSER_PROFILE_CMD is not set, the script
+    fails with a clear actionable message.
 
-Metrics (no app code change required, read via `agent-browser eval`):
-  script_ms        sum of longtask durations during the measured window
-  long_tasks       count of longtasks (>50ms) during the window
-  wall_ms          performance.now() across the measured window
-  js_heap_used     performance.memory.usedJSHeapSize (Chrome) after readiness
-  dom_nodes        document.getElementsByTagName('*').length after readiness
-  react_commit_count / react_commit_ms
-                   best-effort: only if a React commit counter is observable
-                   via __REACT_DEVTOOLS_GLOBAL_HOOK__. Absent -> omitted, never
-                   invented (stats.py skips absent metrics by design).
+    Scenario YAML is translated to browser_profile step vocabulary:
+      click           -> click{selector}
+      type            -> type{selector, text}
+      key             -> key{key[, modifiers]}
+      eval            -> eval{expression}
+      wait-for-selector         -> wait_selector{selector}
+      wait-for-eval-predicate   -> wait_eval{expression[, timeout]}
+      navigate / reload         -> reset.navigate / reset.reload (per-run reset only)
+      click-text      -> NOT SUPPORTED; fails loudly
 
-CPU throttling and forced-GC heap are the optional CDP add-on (best-effort,
-not required for the method's core); see resources/CDP.md. Without it, run
-warmups and keep the host quiet — variance is handled by N runs + Welch.
+    The first wait_* step anchors the measurement window so load/mount are
+    excluded. reset.wait_app_ready becomes that first step. For scenarios
+    without a reset block the first step must be navigate/reload (becomes the
+    per-run reset) and the next wait_* step becomes the anchor.
+
+    fresh_conversation in reset: translated to a browser-side fetch+navigate
+    eval (first untimed step) so each run gets a genuinely fresh conversation.
+    browser_profile must support navigation from within an eval step for this
+    to work correctly.
+
+  agent-browser (legacy)
+    Original harness: drives the agent-browser CLI directly and reads metrics
+    via agent-browser eval. Preserved for baseline/parity. Use --browser-bin
+    to point at a non-default binary.
+
+Hard contract (REQ-BT-019.5 / NG-STATS, unchanged): emits a JSON array of
+raw RunSample objects, one per post-warmup run. NEVER averages or reduces.
+Significance is owned by phoenix-perf-review/scripts/stats.py.
+
+Metrics per run:
+
+  browser_profile transport:
+    react_commits      React commit count during the measured window
+    react_actual_ms    Σ React actualDuration during the window
+    js_heap_used       post-GC JSHeapUsedSize (bytes)
+    (plus any additional keys browser_profile emits — passed through verbatim)
+
+  agent-browser transport (legacy):
+    script_ms        Σ longtask duration in the measured window
+    long_tasks       count of longtasks (>50ms)
+    wall_ms          performance.now() across the measured window
+    js_heap_used     performance.memory.usedJSHeapSize after readiness
+    dom_nodes        element count after readiness
+    react_commit_count / react_commit_ms
+                     best-effort via __REACT_DEVTOOLS_GLOBAL_HOOK__
 
 Usage:
-  run-scenario SCENARIO.yaml --out raw.json \
-    [--runs N] [--warmup W] [--subst KEY=VAL ...] [--browser-bin agent-browser]
+  run-scenario SCENARIO.yaml --out raw.json \\
+    [--runs N] [--warmup W] [--subst KEY=VAL ...] \\
+    [--transport {browser_profile,agent-browser}] [--browser-bin agent-browser]
+
+  run-scenario --self-test
 """
-import argparse, json, subprocess, sys, time, pathlib, urllib.request, uuid
+import argparse, json, os, subprocess, sys, time, pathlib, urllib.request, uuid
 import yaml
 
-# ---- measurement JS (run via `agent-browser eval`) ------------------------
-INSTALL_JS = r"""
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
+
+def subst(s, table):
+    for k, v in table.items():
+        s = s.replace("{" + k + "}", str(v))
+    return s
+
+
+# ---------------------------------------------------------------------------
+# agent-browser transport — legacy, preserved for parity
+# ---------------------------------------------------------------------------
+
+# measurement JS (run via `agent-browser eval`)
+_INSTALL_JS = r"""
 (() => {
   const w = window;
   if (!w.__pp) {
@@ -73,13 +122,13 @@ INSTALL_JS = r"""
 })()
 """
 
-RESET_JS = r"""
+_RESET_JS = r"""
 (() => { const p = window.__pp; if (!p) return 'no-pp';
   p.lt_ms = 0; p.lt_n = 0; if ('rc_n' in p) { p.rc_n = 0; p.rc_ms = 0; }
   p.t0 = performance.now(); return 'reset'; })()
 """
 
-READ_JS = r"""
+_READ_JS = r"""
 (() => { const p = window.__pp || {};
   const m = (performance.memory && performance.memory.usedJSHeapSize) || null;
   const o = { script_ms: p.lt_ms||0, long_tasks: p.lt_n||0,
@@ -90,7 +139,7 @@ READ_JS = r"""
 """
 
 
-def ab(args, bin_):
+def _ab(args, bin_):
     """Run an agent-browser subcommand, return stdout (stripped)."""
     r = subprocess.run([bin_, *args], capture_output=True, text=True)
     if r.returncode != 0:
@@ -98,42 +147,35 @@ def ab(args, bin_):
     return r.stdout.strip()
 
 
-def ab_eval(js, bin_):
-    return ab(["eval", js], bin_)
+def _ab_eval(js, bin_):
+    return _ab(["eval", js], bin_)
 
 
-def subst(s, table):
-    for k, v in table.items():
-        s = s.replace("{" + k + "}", str(v))
-    return s
-
-
-def do_step(step, table, bin_):
+def _do_step_ab(step, table, bin_):
     """Map a scenario step to agent-browser. Verbs = REQ-BT-019.1 set."""
     (verb, val), = step.items()
     if verb == "navigate":
-        ab(["open", subst(val, table)], bin_)
+        _ab(["open", subst(val, table)], bin_)
     elif verb == "reload":
-        ab(["reload"], bin_)
+        _ab(["reload"], bin_)
     elif verb == "click":
-        ab(["click", subst(val, table)], bin_)
+        _ab(["click", subst(val, table)], bin_)
     elif verb == "click-text":
         # click by visible text — for SPA targets with no stable selector
-        # (e.g. a conversation-list row). Maps to agent-browser find.
-        ab(["find", "text", subst(val, table), "click"], bin_)
+        _ab(["find", "text", subst(val, table), "click"], bin_)
     elif verb == "type":
-        ab(["fill", subst(val["selector"], table), subst(val["text"], table)], bin_)
+        _ab(["fill", subst(val["selector"], table), subst(val["text"], table)], bin_)
     elif verb == "key":
-        ab(["press", subst(val, table)], bin_)
+        _ab(["press", subst(val, table)], bin_)
     elif verb == "eval":
-        ab_eval(subst(val, table), bin_)
+        _ab_eval(subst(val, table), bin_)
     elif verb == "wait-for-selector":
-        ab(["wait", subst(val, table)], bin_)
+        _ab(["wait", subst(val, table)], bin_)
     elif verb == "wait-for-eval-predicate":
         expr = subst(val["expr"], table)
         deadline = time.time() + val.get("timeout_ms", 30000) / 1000.0
         while time.time() < deadline:
-            out = ab_eval(f"!!({expr})", bin_)
+            out = _ab_eval(f"!!({expr})", bin_)
             if out.strip().lower().endswith("true"):
                 return
             time.sleep(0.1)
@@ -142,12 +184,11 @@ def do_step(step, table, bin_):
         raise ValueError(f"unknown step verb: {verb}")
 
 
-def fresh_conversation(cfg, table):
+def _fresh_conversation_ab(cfg, table):
     """POST /api/conversations/new -> a brand-new conversation slug.
 
     Per-run state isolation (correct-by-construction): a fresh backend
     conversation every run means run k cannot measure run k-1's content.
-    A shared, growing conversation is structurally not a fingerprint.
     """
     base = subst(str(cfg.get("api_base", "{base_url}")), table).rstrip("/")
     payload = {
@@ -169,68 +210,558 @@ def fresh_conversation(cfg, table):
     return conv.get("slug") or conv["id"]
 
 
-def establish_pristine_state(scn, table, bin_):
-    """Untimed per-run setup: identical fresh state every run, with the
-    React mount deterministically OUTSIDE the measured window. This is what
-    makes runs comparable; without it the harness is broken."""
+def _establish_pristine_state_ab(scn, table, bin_):
+    """Untimed per-run setup for agent-browser transport."""
     reset = scn["reset"]
     if "fresh_conversation" in reset:
-        table["slug"] = fresh_conversation(reset["fresh_conversation"], table)
-    # Hard document load (about:blank -> url) so React mounts fresh and
-    # identically every run — never a SPA client-nav that includes/excludes
-    # the mount nondeterministically (the bimodal-sample root cause).
-    #
-    # `open` can return before navigation commits, so probes would otherwise
-    # install on the PREVIOUS run's settled page and the measured window
-    # would span the real nav + mount + seed (intermittent ~400x outliers).
-    # Block on a settled new document before anything else proceeds.
-    ab(["open", "about:blank"], bin_)
-    ab(["wait", "--load", "networkidle"], bin_)
-    ab(["open", subst(reset["url"], table)], bin_)
-    ab(["wait", "--load", "networkidle"], bin_)
+        table["slug"] = _fresh_conversation_ab(reset["fresh_conversation"], table)
+    _ab(["open", "about:blank"], bin_)
+    _ab(["wait", "--load", "networkidle"], bin_)
+    _ab(["open", subst(reset["url"], table)], bin_)
+    _ab(["wait", "--load", "networkidle"], bin_)
     if reset.get("wait_app_ready"):
-        do_step({"wait-for-eval-predicate": reset["wait_app_ready"]}, table, bin_)
+        _do_step_ab({"wait-for-eval-predicate": reset["wait_app_ready"]}, table, bin_)
 
 
-def one_run(scn, table, bin_):
+def _one_run_ab(scn, table, bin_):
     table = dict(table)  # run-local: slug rebind must not leak across runs
     if "reset" in scn:
-        # reset owns navigation; steps are ONLY the measured interaction.
-        establish_pristine_state(scn, table, bin_)
-        ab_eval(INSTALL_JS, bin_)
-        ab_eval(RESET_JS, bin_)  # zero counters AFTER mount -> mount excluded
+        _establish_pristine_state_ab(scn, table, bin_)
+        _ab_eval(_INSTALL_JS, bin_)
+        _ab_eval(_RESET_JS, bin_)  # zero counters AFTER mount -> mount excluded
         measured_steps = scn["steps"]
     else:
-        # legacy: step 0 navigates, probes installed after.
         steps = scn["steps"]
-        do_step(steps[0], table, bin_)
-        ab_eval(INSTALL_JS, bin_)
-        ab_eval(RESET_JS, bin_)
+        _do_step_ab(steps[0], table, bin_)
+        _ab_eval(_INSTALL_JS, bin_)
+        _ab_eval(_RESET_JS, bin_)
         measured_steps = steps[1:]
     for st in measured_steps:
-        do_step(st, table, bin_)
-    raw = ab_eval(READ_JS, bin_).strip()
-    # `agent-browser eval` prints the value JSON-string-encoded, e.g.
-    #   "{\"script_ms\":1,...}"
-    # so unwrap the outer string literal once, then parse the object.
+        _do_step_ab(st, table, bin_)
+    raw = _ab_eval(_READ_JS, bin_).strip()
     try:
         if raw.startswith('"'):
-            raw = json.loads(raw)  # -> the inner JSON text
+            raw = json.loads(raw)  # unwrap outer string literal
         return json.loads(raw)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"could not parse metrics from eval output: {raw!r}") from e
+        raise RuntimeError(
+            f"could not parse metrics from eval output: {raw!r}"
+        ) from e
 
+
+def run_agent_browser(scn, table, runs, warmup, browser_bin):
+    """Run all runs via agent-browser transport, return raw samples list."""
+    samples = []
+    total = warmup + runs
+    for i in range(total):
+        tag = "warmup" if i < warmup else f"run {i - warmup}"
+        try:
+            s = _one_run_ab(scn, dict(table), browser_bin)
+        except Exception as e:
+            print(f"[{tag}] FAILED: {e}", file=sys.stderr)
+            raise
+        if i >= warmup:
+            s["run_index"] = i - warmup
+            samples.append(s)
+        print(f"[{tag}] {json.dumps(s)}", file=sys.stderr)
+    return samples
+
+
+# ---------------------------------------------------------------------------
+# browser_profile transport — default
+# ---------------------------------------------------------------------------
+
+_BP_UNSUPPORTED_VERBS = {
+    "navigate": (
+        "'navigate' step inside measured steps is not supported by browser_profile transport; "
+        "navigation belongs in the scenario 'reset' block for proper per-run isolation."
+    ),
+    "reload": (
+        "'reload' step inside measured steps is not supported by browser_profile transport; "
+        "use the scenario 'reset' block instead."
+    ),
+    "click-text": (
+        "'click-text' is not supported by the browser_profile transport. "
+        "Use 'click' with a stable CSS selector, or translate to an 'eval' step "
+        "that locates the element by text and calls .click()."
+    ),
+}
+
+
+def _translate_step_bp(step, table):
+    """Translate one scenario step dict to a browser_profile step dict.
+
+    Raises ValueError for unsupported verbs with a clear message.
+    """
+    items = list(step.items())
+    if len(items) != 1:
+        raise ValueError(f"step must have exactly one verb, got: {step!r}")
+    verb, val = items[0]
+
+    if verb in _BP_UNSUPPORTED_VERBS:
+        raise ValueError(_BP_UNSUPPORTED_VERBS[verb])
+
+    if verb == "click":
+        return {"kind": "click", "selector": subst(val, table)}
+
+    if verb == "type":
+        return {
+            "kind": "type",
+            "selector": subst(val["selector"], table),
+            "text": subst(val["text"], table),
+        }
+
+    if verb == "key":
+        if isinstance(val, dict):
+            step_d = {"kind": "key", "key": subst(val["key"], table)}
+            if "modifiers" in val:
+                step_d["modifiers"] = val["modifiers"]
+            return step_d
+        return {"kind": "key", "key": subst(str(val), table)}
+
+    if verb == "eval":
+        return {"kind": "eval", "expression": subst(val, table)}
+
+    if verb == "wait-for-selector":
+        return {"kind": "wait_selector", "selector": subst(str(val), table)}
+
+    if verb == "wait-for-eval-predicate":
+        timeout_ms = val.get("timeout_ms", 30000)
+        return {
+            "kind": "wait_eval",
+            "expression": subst(val["expr"], table),
+            "timeout": f"{timeout_ms}ms",
+        }
+
+    raise ValueError(f"unknown step verb: {verb!r}")
+
+
+def _build_fresh_conv_eval_bp(fc_cfg, table):
+    """Build a browser eval step that creates a fresh conversation + navigates.
+
+    Translates reset.fresh_conversation into an untimed browser-side fetch call.
+    The eval creates the conversation via /api/conversations/new, stores the
+    slug in window.__bp_fresh_slug, then navigates to the conversation URL.
+    browser_profile must support navigation triggered from within an eval step.
+    """
+    api_base = subst(str(fc_cfg.get("api_base", "{base_url}")), table).rstrip("/")
+    model = subst(str(fc_cfg.get("model", "")), table)
+    cwd = subst(str(fc_cfg.get("cwd", "/tmp")), table)
+    seed_text = subst(str(fc_cfg.get("seed_text", "ready")), table)
+
+    # Build JS object literal parts — avoids JSON serialization quoting issues
+    # in a multi-line JS string.
+    payload_parts = [
+        f"cwd: {json.dumps(cwd)}",
+        f"text: {json.dumps(seed_text)}",
+        "images: []",
+        "message_id: crypto.randomUUID()",
+    ]
+    if model:
+        payload_parts.append(f"model: {json.dumps(model)}")
+    payload_js = "{" + ", ".join(payload_parts) + "}"
+    api_base_js = json.dumps(api_base)
+
+    expr = (
+        f"(async () => {{\n"
+        f"  const _apiBase = {api_base_js};\n"
+        f"  const _payload = {payload_js};\n"
+        f"  const _r = await fetch(_apiBase + '/api/conversations/new', {{\n"
+        f"    method: 'POST',\n"
+        f"    headers: {{'content-type': 'application/json'}},\n"
+        f"    body: JSON.stringify(_payload)\n"
+        f"  }});\n"
+        f"  if (!_r.ok) throw new Error('fresh_conversation failed: ' + _r.status + ' ' + await _r.text());\n"
+        f"  const _d = await _r.json();\n"
+        f"  window.__bp_fresh_slug = _d.conversation.slug || _d.conversation.id;\n"
+        f"  window.location.href = _apiBase + '/c/' + window.__bp_fresh_slug;\n"
+        f"  return window.__bp_fresh_slug;\n"
+        f"}})()"
+    )
+    return {"kind": "eval", "expression": expr}
+
+
+def translate_scenario_to_bp_request(scn, table, runs, warmup):
+    """Translate a YAML scenario dict to a browser_profile run_scenario request.
+
+    Returns a dict suitable for JSON-serialisation and passing to the
+    browser_profile transport command (BROWSER_PROFILE_CMD).
+
+    This function is a public testable seam.
+    """
+    steps = []
+    reset = None
+    throttle_rate = scn.get("throttle_rate")
+
+    if "reset" in scn:
+        r = scn["reset"]
+
+        if "fresh_conversation" in r:
+            # fresh_conversation cannot be expressed as a simple navigate URL
+            # (slug is unknown at construction time). Translate to an untimed
+            # eval+navigate step that runs inside the browser before the
+            # readiness anchor. This means the conversation-creation HTTP call
+            # happens browser-side, preserving per-run isolation.
+            reset = {"kind": "navigate", "url": "about:blank"}
+            steps.append(_build_fresh_conv_eval_bp(r["fresh_conversation"], table))
+        else:
+            reset = {"kind": "navigate", "url": subst(r["url"], table)}
+
+        # Readiness anchor — first wait_* step in browser_profile steps.
+        # The measurement window opens AFTER this step satisfies.
+        if "wait_app_ready" in r:
+            wa = r["wait_app_ready"]
+            steps.append({
+                "kind": "wait_eval",
+                "expression": subst(wa["expr"], table),
+                "timeout": f"{wa.get('timeout_ms', 30000)}ms",
+            })
+
+        for step in scn.get("steps", []):
+            steps.append(_translate_step_bp(step, table))
+
+    else:
+        # Legacy scenario: no reset block; first step must navigate.
+        all_steps = scn.get("steps", [])
+        if not all_steps:
+            raise ValueError("scenario has no steps and no reset block")
+
+        first_verb, first_val = next(iter(all_steps[0].items()))
+        if first_verb == "navigate":
+            reset = {"kind": "navigate", "url": subst(first_val, table)}
+        elif first_verb == "reload":
+            reset = {"kind": "reload"}
+        else:
+            raise ValueError(
+                f"scenario has no reset block and first step is '{first_verb}' (not navigate/reload). "
+                "Add a reset block to properly isolate per-run state for the browser_profile transport."
+            )
+
+        for step in all_steps[1:]:
+            steps.append(_translate_step_bp(step, table))
+
+    # Validate: at least one wait_* step must be present to anchor the
+    # measurement window and exclude load/React mount from measurement.
+    first_wait_idx = next(
+        (i for i, s in enumerate(steps) if s["kind"].startswith("wait_")), None
+    )
+    if first_wait_idx is None:
+        raise ValueError(
+            "No readiness step found in scenario steps. "
+            "The browser_profile transport requires at least one wait-for-selector or "
+            "wait-for-eval-predicate step to anchor the measurement window so that "
+            "page load and React mount are excluded from the measured window. "
+            "Add a wait-for-selector or wait-for-eval-predicate step, or add "
+            "wait_app_ready to the reset block."
+        )
+
+    request = {"runs": runs, "warmup": warmup, "steps": steps}
+    if reset is not None:
+        request["reset"] = reset
+    if throttle_rate is not None:
+        request["throttle_rate"] = throttle_rate
+
+    return request
+
+
+def map_bp_samples(bp_response):
+    """Extract the raw_samples list from a browser_profile run_scenario response.
+
+    Passes samples through verbatim (no reductions). Prints methodology_warnings
+    to stderr. This function is a public testable seam.
+    """
+    if isinstance(bp_response, list):
+        # Already a raw array (direct samples passthrough).
+        return bp_response
+
+    warnings = bp_response.get("methodology_warnings", [])
+    for w in warnings:
+        print(f"[browser_profile warning] {w}", file=sys.stderr)
+
+    samples = bp_response.get("raw_samples")
+    if samples is None:
+        raise RuntimeError(
+            f"browser_profile response missing 'raw_samples' key. "
+            f"Keys present: {list(bp_response.keys())!r}. "
+            f"Full response: {json.dumps(bp_response)[:500]}"
+        )
+    if not isinstance(samples, list):
+        raise RuntimeError(
+            f"browser_profile 'raw_samples' must be a list, got {type(samples).__name__}"
+        )
+    return samples
+
+
+def run_browser_profile(scn, table, runs, warmup):
+    """Run scenario via browser_profile transport, return raw samples list."""
+    cmd = os.environ.get("BROWSER_PROFILE_CMD")
+    if not cmd:
+        raise RuntimeError(
+            "browser_profile transport requires the BROWSER_PROFILE_CMD environment "
+            "variable to be set to a command that bridges to the browser_profile "
+            "run_scenario tool.\n"
+            "\n"
+            "The bridge command must:\n"
+            "  - read a browser_profile run_scenario JSON request from stdin\n"
+            "  - call browser_profile(action='run_scenario', ...) \n"
+            "  - write the JSON response to stdout\n"
+            "\n"
+            "When running inside Phoenix's in-agent context, the parent LLM agent "
+            "provides this bridge. Outside that context, use:\n"
+            "  --transport agent-browser   (legacy harness, requires agent-browser CLI)"
+        )
+
+    request = translate_scenario_to_bp_request(scn, table, runs, warmup)
+
+    print(
+        f"[browser_profile] invoking '{cmd}' with {runs} runs, {warmup} warmup, "
+        f"{len(request['steps'])} steps",
+        file=sys.stderr,
+    )
+    if request.get("throttle_rate"):
+        print(
+            f"[browser_profile] throttle_rate={request['throttle_rate']}",
+            file=sys.stderr,
+        )
+    print(
+        f"[browser_profile] request: {json.dumps(request)[:600]}",
+        file=sys.stderr,
+    )
+
+    r = subprocess.run(
+        cmd,
+        shell=True,
+        input=json.dumps(request),
+        capture_output=True,
+        text=True,
+    )
+    if r.returncode != 0:
+        raise RuntimeError(
+            f"browser_profile transport command failed (exit {r.returncode}):\n"
+            f"{r.stderr.strip()}"
+        )
+
+    try:
+        bp_response = json.loads(r.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"browser_profile transport command produced non-JSON output:\n"
+            f"{r.stdout[:500]!r}"
+        ) from e
+
+    samples = map_bp_samples(bp_response)
+    for i, s in enumerate(samples):
+        print(f"[run {i}] {json.dumps(s)}", file=sys.stderr)
+    return samples
+
+
+# ---------------------------------------------------------------------------
+# Self-tests
+# ---------------------------------------------------------------------------
+
+def _self_test():
+    """Smoke-test translation and mapping functions. Exits 0 on pass, 1 on fail."""
+    failures = []
+
+    def check(name, got, expected):
+        if got != expected:
+            failures.append(f"FAIL {name}:\n  got      {got!r}\n  expected {expected!r}")
+
+    def raises(name, fn):
+        try:
+            fn()
+            failures.append(f"FAIL {name}: expected ValueError, got no exception")
+        except (ValueError, RuntimeError):
+            pass  # expected
+        except Exception as e:
+            failures.append(f"FAIL {name}: expected ValueError/RuntimeError, got {type(e).__name__}: {e}")
+
+    tbl = {"base_url": "http://localhost:8000", "slug": "test-slug"}
+
+    # translate_step: click
+    check(
+        "step/click",
+        _translate_step_bp({"click": "textarea"}, tbl),
+        {"kind": "click", "selector": "textarea"},
+    )
+
+    # translate_step: type
+    check(
+        "step/type",
+        _translate_step_bp({"type": {"selector": "textarea", "text": "hello"}}, tbl),
+        {"kind": "type", "selector": "textarea", "text": "hello"},
+    )
+
+    # translate_step: key (plain string)
+    check(
+        "step/key-string",
+        _translate_step_bp({"key": "Enter"}, tbl),
+        {"kind": "key", "key": "Enter"},
+    )
+
+    # translate_step: key (dict with modifiers)
+    check(
+        "step/key-dict",
+        _translate_step_bp({"key": {"key": "k", "modifiers": ["ctrl"]}}, tbl),
+        {"kind": "key", "key": "k", "modifiers": ["ctrl"]},
+    )
+
+    # translate_step: eval
+    check(
+        "step/eval",
+        _translate_step_bp({"eval": "1+1"}, tbl),
+        {"kind": "eval", "expression": "1+1"},
+    )
+
+    # translate_step: wait-for-selector
+    check(
+        "step/wait-for-selector",
+        _translate_step_bp({"wait-for-selector": "textarea"}, tbl),
+        {"kind": "wait_selector", "selector": "textarea"},
+    )
+
+    # translate_step: wait-for-eval-predicate
+    check(
+        "step/wait-for-eval-predicate",
+        _translate_step_bp(
+            {"wait-for-eval-predicate": {"expr": "document.readyState==='complete'", "timeout_ms": 5000}},
+            tbl,
+        ),
+        {"kind": "wait_eval", "expression": "document.readyState==='complete'", "timeout": "5000ms"},
+    )
+
+    # translate_step: substitution in selector
+    check(
+        "step/click-subst",
+        _translate_step_bp({"click": "#{base_url}"}, tbl),
+        {"kind": "click", "selector": "#http://localhost:8000"},
+    )
+
+    # translate_step: click-text -> unsupported
+    raises("step/click-text", lambda: _translate_step_bp({"click-text": "Submit"}, tbl))
+
+    # translate_step: navigate inside steps -> unsupported
+    raises("step/navigate-in-steps", lambda: _translate_step_bp({"navigate": "http://x"}, tbl))
+
+    # translate_step: reload inside steps -> unsupported
+    raises("step/reload-in-steps", lambda: _translate_step_bp({"reload": None}, tbl))
+
+    # translate_scenario_to_bp_request: minimal scenario with reset + wait_app_ready
+    minimal_scn = {
+        "reset": {
+            "url": "{base_url}/",
+            "wait_app_ready": {"expr": "document.readyState==='complete'", "timeout_ms": 5000},
+        },
+        "steps": [{"click": "button"}],
+    }
+    req = translate_scenario_to_bp_request(minimal_scn, tbl, runs=5, warmup=1)
+    check("bp_request/runs", req["runs"], 5)
+    check("bp_request/warmup", req["warmup"], 1)
+    check("bp_request/reset_kind", req["reset"]["kind"], "navigate")
+    check("bp_request/reset_url", req["reset"]["url"], "http://localhost:8000/")
+    check("bp_request/step0_kind", req["steps"][0]["kind"], "wait_eval")
+    check("bp_request/step1_kind", req["steps"][1]["kind"], "click")
+    check("bp_request/step_count", len(req["steps"]), 2)
+
+    # translate_scenario_to_bp_request: throttle_rate propagated
+    throttled_scn = {
+        "throttle_rate": 4,
+        "reset": {"url": "{base_url}/",
+                  "wait_app_ready": {"expr": "true"}},
+        "steps": [{"click": "button"}],
+    }
+    req2 = translate_scenario_to_bp_request(throttled_scn, tbl, runs=3, warmup=1)
+    check("bp_request/throttle_rate", req2.get("throttle_rate"), 4)
+
+    # translate_scenario_to_bp_request: legacy (no reset, navigate first step)
+    legacy_scn = {
+        "steps": [
+            {"navigate": "{base_url}/c/{slug}"},
+            {"wait-for-selector": "textarea"},
+            {"click": "textarea"},
+        ],
+    }
+    req3 = translate_scenario_to_bp_request(legacy_scn, tbl, runs=2, warmup=1)
+    check("legacy/reset_kind", req3["reset"]["kind"], "navigate")
+    check("legacy/step0_kind", req3["steps"][0]["kind"], "wait_selector")
+    check("legacy/step1_kind", req3["steps"][1]["kind"], "click")
+    check("legacy/step_count", len(req3["steps"]), 2)
+
+    # translate_scenario_to_bp_request: no wait_* step -> error
+    no_wait_scn = {
+        "reset": {"url": "{base_url}/"},
+        "steps": [{"click": "button"}],
+    }
+    raises("bp_request/no-wait", lambda: translate_scenario_to_bp_request(no_wait_scn, tbl, runs=1, warmup=1))
+
+    # map_bp_samples: list passthrough
+    samples_in = [{"react_commits": 3, "react_actual_ms": 12.5}]
+    check("map_samples/list", map_bp_samples(samples_in), samples_in)
+
+    # map_bp_samples: dict with raw_samples
+    bp_resp = {"raw_samples": samples_in, "methodology_warnings": []}
+    check("map_samples/dict", map_bp_samples(bp_resp), samples_in)
+
+    # map_bp_samples: missing raw_samples -> error
+    raises("map_samples/missing", lambda: map_bp_samples({"methodology_warnings": []}))
+
+    if failures:
+        for f in failures:
+            print(f, file=sys.stderr)
+        print(f"\nself-test FAILED: {len(failures)} failure(s)", file=sys.stderr)
+        sys.exit(1)
+    else:
+        print(f"self-test: all tests passed")
+        sys.exit(0)
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("scenario")
-    ap.add_argument("--out", required=True)
-    ap.add_argument("--runs", type=int)
-    ap.add_argument("--warmup", type=int)
-    ap.add_argument("--subst", action="append", default=[],
-                    help="KEY=VAL substituted into scenario {KEY} placeholders")
-    ap.add_argument("--browser-bin", default="agent-browser")
+    ap = argparse.ArgumentParser(
+        description=(
+            "Scenario harness — emits RAW per-run samples. "
+            "Default transport: browser_profile (requires BROWSER_PROFILE_CMD env). "
+            "Legacy transport: agent-browser (requires agent-browser CLI)."
+        )
+    )
+    ap.add_argument("scenario", nargs="?", help="YAML scenario file")
+    ap.add_argument("--self-test", action="store_true",
+                    help="run unit tests on translation functions and exit")
+    ap.add_argument("--out", help="output path for raw samples JSON")
+    ap.add_argument("--runs", type=int, help="number of measured runs (overrides scenario)")
+    ap.add_argument("--warmup", type=int, help="warmup runs discarded from results (overrides scenario)")
+    ap.add_argument(
+        "--subst", action="append", default=[],
+        help="KEY=VAL substituted into scenario {KEY} placeholders (may repeat)",
+    )
+    ap.add_argument(
+        "--transport",
+        choices=["browser_profile", "agent-browser"],
+        default="browser_profile",
+        help=(
+            "Measurement transport. "
+            "'browser_profile' (default): uses BROWSER_PROFILE_CMD env bridge to "
+            "Phoenix's in-agent browser_profile run_scenario tool. "
+            "'agent-browser': legacy harness, drives the agent-browser CLI directly."
+        ),
+    )
+    ap.add_argument(
+        "--browser-bin", default="agent-browser",
+        help="agent-browser binary path (agent-browser transport only)",
+    )
     a = ap.parse_args()
+
+    if a.self_test:
+        _self_test()
+        return  # _self_test calls sys.exit, but keep for clarity
+
+    if not a.scenario:
+        ap.error("SCENARIO.yaml is required (unless --self-test is given)")
+    if not a.out:
+        ap.error("--out is required")
 
     scn = yaml.safe_load(pathlib.Path(a.scenario).read_text())
     runs = a.runs if a.runs is not None else scn.get("runs", 30)
@@ -243,19 +774,10 @@ def main():
     for k in list(table):
         table[k] = subst(str(table[k]), table)
 
-    samples = []
-    total = warmup + runs
-    for i in range(total):
-        tag = "warmup" if i < warmup else f"run {i - warmup}"
-        try:
-            s = one_run(scn, table, a.browser_bin)
-        except Exception as e:
-            print(f"[{tag}] FAILED: {e}", file=sys.stderr)
-            raise
-        if i >= warmup:
-            s["run_index"] = i - warmup
-            samples.append(s)
-        print(f"[{tag}] {json.dumps(s)}", file=sys.stderr)
+    if a.transport == "browser_profile":
+        samples = run_browser_profile(scn, table, runs, warmup)
+    else:
+        samples = run_agent_browser(scn, table, runs, warmup, a.browser_bin)
 
     pathlib.Path(a.out).write_text(json.dumps(samples, indent=2))
     print(f"wrote {len(samples)} raw samples -> {a.out} (NOT averaged)")

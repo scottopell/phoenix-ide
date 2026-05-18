@@ -16,22 +16,32 @@ The rigor is **not** in the tools. It is in the contract:
 - **Persistent `db.yaml`** — every outcome (success, failure, blocked) recorded,
   so future hunts dedup and bias toward proven techniques.
 
-## Harness: `agent-browser` (not Phoenix's `browser_profile`)
+## Harness: transport-abstracted (`browser_profile` default, `agent-browser` legacy)
 
-These skills are run by **Claude Code**, not by the LLM agent inside Phoenix.
-So the harness is the `agent-browser` CLI (available as a Claude skill),
-wrapped by `phoenix-perf-shared/scripts/run-scenario`, which:
+`phoenix-perf-shared/scripts/run-scenario` is the scenario harness, supporting
+two measurement transports selectable via `--transport`:
 
-- drives a declarative scenario (open/click/type/press/wait/reload),
-- reads metrics via `agent-browser eval` (no app code change),
-- loops N+warmup and emits a **raw `RunSample[]` JSON array** — never averaged.
+### `browser_profile` transport (default)
 
-Phoenix's in-agent `browser_profile` tool (spec `specs/browser-tool/`
-REQ-BT-019, task 62003) is a *different* harness for the LLM inside Phoenix.
-The contract (tiered capabilities, raw-sample invariant) is shared; the
-transport is not. `run-scenario` is what Claude Code uses here.
+Delegates measurement to Phoenix's in-agent `browser_profile run_scenario` tool
+via an environment-provided command bridge (`BROWSER_PROFILE_CMD`). The parent
+LLM agent sets `BROWSER_PROFILE_CMD` to a command that forwards the
+`run_scenario` request to the tool. Preferred when running inside Phoenix.
 
-Metrics emitted per run (see `scripts/run-scenario`):
+Metrics per run:
+
+| Key | Meaning |
+|-----|---------|
+| `react_commits` | React commit count during the measured window |
+| `react_actual_ms` | Σ React `actualDuration` during the window |
+| `js_heap_used` | post-GC JSHeapUsedSize (bytes) |
+
+### `agent-browser` transport (legacy, `--transport agent-browser`)
+
+Drives the `agent-browser` CLI directly, reads metrics via `agent-browser eval`.
+Requires `agent-browser` on PATH.
+
+Metrics per run:
 
 | Key | Meaning |
 |-----|---------|
@@ -40,12 +50,9 @@ Metrics emitted per run (see `scripts/run-scenario`):
 | `wall_ms` | `performance.now()` across the window |
 | `js_heap_used` | `performance.memory.usedJSHeapSize` after readiness |
 | `dom_nodes` | element count after readiness |
-| `react_commit_count` / `react_commit_ms` | best-effort, only if a React commit counter is observable via the DevTools global hook; absent → omitted, never invented |
+| `react_commit_count` / `react_commit_ms` | best-effort via DevTools hook; absent → omitted |
 
-Tier-1 CDP extras (fixed CPU throttle, forced-GC heap, full timeline trace,
-CPU profile) are an **optional best-effort add-on** via `agent-browser`'s
-`cdp-url`. Not required for the method's core — N runs + warmup + Welch
-absorb host noise. (Deliberately not copying every lading detail.)
+`stats.py` resolves both transport key sets via candidate path lists in `METRICS`.
 
 ## Skills
 

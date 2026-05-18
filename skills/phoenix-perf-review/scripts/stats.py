@@ -30,12 +30,14 @@ METRICS = {
     # primary keys = what phoenix-perf-shared/scripts/run-scenario emits.
     # extra paths = tolerance for the optional CDP add-on / schema drift.
     "react_commit_count": [
-        ("react_commit_count",),
+        ("react_commit_count",),   # agent-browser transport key
+        ("react_commits",),        # browser_profile transport key
         ("react", "commit_count"),
         ("commits", "*len"),
     ],
     "react_commit_ms": [
-        ("react_commit_ms",),
+        ("react_commit_ms",),      # agent-browser transport key
+        ("react_actual_ms",),      # browser_profile transport key
         ("react", "actual_duration_ms"),
         ("commits", "*sum:actualDuration"),
     ],
