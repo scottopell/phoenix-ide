@@ -78,12 +78,12 @@ Rust, so floors are higher than lading's 5/10/20.
 
 | Metric | Threshold |
 |--------|-----------|
-| `script_ms` (Σ longtask) | ≥ 10% |
-| `react_commit_count` | ≥ 20% fewer |
-| `react_commit_ms` | ≥ 10% |
-| `wall_ms` | ≥ 10% |
+| `react_commits` / `react_commit_count` (legacy) | ≥ 20% fewer |
+| `react_actual_ms` / `react_commit_ms` (legacy) | ≥ 10% |
 | `js_heap_used` | ≥ 15% |
-| `long_tasks` | ≥ 1 fewer OR ≥ 20% total |
+| `script_ms` (Σ longtask, legacy transport) | ≥ 10% |
+| `wall_ms` (legacy transport) | ≥ 10% |
+| `long_tasks` (>50ms, legacy transport) | ≥ 1 fewer OR ≥ 20% total |
 
 A win also requires Welch's t-test **p < 0.05** over the raw samples.
 Threshold met but p ≥ 0.05 → noise → REJECT.
@@ -102,5 +102,7 @@ cat skills/phoenix-perf-hunt/resources/db/<id>.yaml
 ## Prerequisites
 
 - Phoenix dev server running (`./dev.py up`) + seeded DB (`./dev.py seed`)
-- `agent-browser` available
+- `browser_profile` tool available in the LLM runtime (default transport; provided by
+  Phoenix's in-agent context — confirm before a hunt; cannot be shell-checked)
+- `agent-browser` on PATH (optional; only needed for `--transport agent-browser` legacy parity)
 - `uv` (for the PEP-723 scripts) or Python ≥ 3.11

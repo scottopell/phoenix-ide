@@ -47,12 +47,12 @@ report to the caller. Hunt persists it. Review never writes the db.
 
 | Metric | Threshold |
 |--------|-----------|
-| `script_ms` (Σ longtask) | ≥ 10% |
-| `react_commit_count` | ≥ 20% fewer |
-| `react_commit_ms` | ≥ 10% |
-| `wall_ms` | ≥ 10% |
+| `react_commits` / `react_commit_count` (legacy) | ≥ 20% fewer |
+| `react_actual_ms` / `react_commit_ms` (legacy) | ≥ 10% |
 | `js_heap_used` | ≥ 15% |
-| `long_tasks` (>50ms) | ≥ 1 fewer OR ≥ 20% total |
+| `script_ms` (Σ longtask, legacy transport) | ≥ 10% |
+| `wall_ms` (legacy transport) | ≥ 10% |
+| `long_tasks` (>50ms, legacy transport) | ≥ 1 fewer OR ≥ 20% total |
 
 AND Welch p < 0.05. Threshold met but p ≥ 0.05 → it is noise → REJECT.
 

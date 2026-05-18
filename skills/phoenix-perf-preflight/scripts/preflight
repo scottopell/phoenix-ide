@@ -34,15 +34,33 @@ else
   fail "Phoenix dev server not running (run ./dev.py up)"
 fi
 
-# ── agent-browser harness ────────────────────────────────────
-section "agent-browser harness"
-if command -v agent-browser >/dev/null 2>&1; then
-  pass "agent-browser on PATH ($(agent-browser --version 2>/dev/null | head -1 || echo present))"
-else
-  fail "agent-browser not found — the scenario harness needs it (skill: agent-browser)"
-fi
+# ── run-scenario harness ─────────────────────────────────────
+section "run-scenario harness"
 RS="skills/phoenix-perf-shared/scripts/run-scenario"
-[[ -x "$RS" ]] && pass "run-scenario harness present" || fail "run-scenario missing/!exec at $RS"
+if [[ -x "$RS" ]]; then
+  pass "run-scenario harness present and executable"
+  if "$RS" --self-test >/dev/null 2>&1; then
+    pass "run-scenario --self-test passed"
+  else
+    fail "run-scenario --self-test FAILED (translation/mapping regression)"
+  fi
+else
+  fail "run-scenario missing/not exec at $RS"
+fi
+# browser_profile is the default transport; it is provided by the LLM runtime
+# (browser_profile tool) and cannot be inspected from a shell script.
+# Verify availability in the skill context before running a hunt.
+if [[ -n "${BROWSER_PROFILE_CMD:-}" ]]; then
+  pass "BROWSER_PROFILE_CMD set (browser_profile bridge configured)"
+else
+  warn "BROWSER_PROFILE_CMD not set — browser_profile transport unavailable in this shell context; ensure browser_profile tool is available in the LLM runtime before running a hunt"
+fi
+# agent-browser is the legacy transport (optional, for parity only)
+if command -v agent-browser >/dev/null 2>&1; then
+  pass "agent-browser on PATH (legacy transport available)"
+else
+  warn "agent-browser not found — legacy transport unavailable; only needed for --transport agent-browser"
+fi
 
 # ── Seed data ────────────────────────────────────────────────
 section "Seed data"

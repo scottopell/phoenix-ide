@@ -1,6 +1,6 @@
 ---
 name: phoenix-perf-hunt
-description: Coordinates a Phoenix React performance attempt. Captures the scenario baseline (raw samples) BEFORE any change via the agent-browser harness, implements one focused fix, hands off to review, and records every outcome in db.yaml. Does not judge.
+description: Coordinates a Phoenix React performance attempt. Captures the scenario baseline (raw samples) BEFORE any change via the run-scenario harness (default transport: browser_profile), implements one focused fix, hands off to review, and records every outcome in db.yaml. Does not judge.
 allowed-tools: Bash Read Write Edit Glob Grep Skill
 ---
 

@@ -1,6 +1,6 @@
 ---
 name: phoenix-perf-find-target
-description: Finds one valid React performance target in the Phoenix UI. Profiles scenarios via the agent-browser harness, scans for known React anti-patterns, learns from db.yaml history, ranks, and returns a filled target.yaml. Use before /phoenix-perf-hunt.
+description: Finds one valid React performance target in the Phoenix UI. Profiles scenarios via the run-scenario harness (default transport: browser_profile), scans for known React anti-patterns, learns from db.yaml history, ranks, and returns a filled target.yaml. Use before /phoenix-perf-hunt.
 allowed-tools: Bash Read Glob Grep
 context: fork
 ---
@@ -28,9 +28,10 @@ skills/phoenix-perf-shared/scripts/run-scenario \
 ```
 
 Reduce each with `phoenix-perf-review/scripts/stats.py` against itself is not
-meaningful; instead read the raw file and take the median `script_ms`,
-`react_commit_count` (if present), `long_tasks` per scenario. The harness
-returns **raw samples** — never a pre-average.
+meaningful; instead read the raw file and take the median `react_commits` /
+`react_actual_ms` (browser_profile transport) or `script_ms` /
+`react_commit_count` (agent-browser legacy transport) and `long_tasks` per
+scenario. The harness returns **raw samples** — never a pre-average.
 
 If a scenario cannot run (server down, selector drift), fix it or mark its
 targets `profiled: false`; never invent numbers.
