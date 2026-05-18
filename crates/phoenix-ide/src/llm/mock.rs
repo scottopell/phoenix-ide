@@ -154,8 +154,9 @@ fn parse_perf_words(request: &LlmRequest) -> Option<usize> {
         }
     })?;
     let start = text.find("[[perf:")? + "[[perf:".len();
-    let end = text[start..].find("]]")? + start;
-    text[start..end].trim().parse::<usize>().ok()
+    let rest = text.get(start..)?;
+    let end = rest.find("]]")?;
+    rest.get(..end)?.trim().parse::<usize>().ok()
 }
 
 /// Deterministic text of exactly `n_words` words, built by cycling the words
