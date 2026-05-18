@@ -22,7 +22,7 @@ steps:
   - wait-for-selector: "textarea"
   - click: "textarea"
   # Type a long burst; each char is a keystroke -> draft state update.
-  - type: { selector: "textarea", text: "{text}{text}{text}{text}{text}" }
+  - type: { selector: "textarea", text: "{text}{text}{text}{text}{text}{text}" }
   - wait-for-eval-predicate:
       expr: "document.querySelector('textarea').value.length >= 300"
       timeout_ms: 10000

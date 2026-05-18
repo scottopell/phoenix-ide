@@ -61,7 +61,7 @@ steps:
   - eval: "window.__pp_pre = document.querySelectorAll('.message.agent').length"
   - click: 'textarea[placeholder="Type a message..."]'
   - type: { selector: 'textarea[placeholder="Type a message..."]', text: "{prompt}" }
-  - key: "Enter"
+  - click: '.input-send-btn'
   - wait-for-eval-predicate:
       expr: "document.querySelectorAll('.message.agent').length > window.__pp_pre && !document.querySelector('.streaming-message')"
       timeout_ms: 180000

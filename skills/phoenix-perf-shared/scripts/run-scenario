@@ -343,7 +343,8 @@ def _build_fresh_conv_eval_bp(fc_cfg, table):
     """Build a browser eval step that creates a fresh conversation + navigates.
 
     Translates reset.fresh_conversation into an untimed browser-side fetch call.
-    The eval creates the conversation via /api/conversations/new, stores the
+    The run resets to the app origin first so the fetch is same-origin; the eval
+    then creates the conversation via /api/conversations/new, stores the slug in
     slug in window.__bp_fresh_slug, then navigates to the conversation URL.
     browser_profile must support navigation triggered from within an eval step.
     """
@@ -358,7 +359,8 @@ def _build_fresh_conv_eval_bp(fc_cfg, table):
         f"cwd: {json.dumps(cwd)}",
         f"text: {json.dumps(seed_text)}",
         "images: []",
-        "message_id: crypto.randomUUID()",
+        "message_id: (typeof crypto !== 'undefined' && crypto.randomUUID ? crypto.randomUUID() : "
+        "'pp-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2))",
     ]
     if model:
         payload_parts.append(f"model: {json.dumps(model)}")
@@ -405,7 +407,10 @@ def translate_scenario_to_bp_request(scn, table, runs, warmup):
             # eval+navigate step that runs inside the browser before the
             # readiness anchor. This means the conversation-creation HTTP call
             # happens browser-side, preserving per-run isolation.
-            reset = {"kind": "navigate", "url": "about:blank"}
+            origin = subst(
+                str(r["fresh_conversation"].get("api_base", "{base_url}")), table
+            ).rstrip("/")
+            reset = {"kind": "navigate", "url": origin + "/"}
             steps.append(_build_fresh_conv_eval_bp(r["fresh_conversation"], table))
         else:
             reset = {"kind": "navigate", "url": subst(r["url"], table)}

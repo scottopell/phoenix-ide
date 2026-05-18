@@ -1,0 +1,58 @@
+id: new-harness-validation-2026-05-18
+transport: browser_profile run_scenario
+verdict: usable_with_caveats
+preflight:
+  status: pass
+  ui: http://localhost:8045
+  api: http://localhost:8036
+  mock_model: enabled_for_streaming_validation
+checks:
+  react_metric_presence_guard:
+    scenario: conversation-load
+    runs: 30
+    warmup: 3
+    result: pass
+    evidence: react_status was measured for all 30 raw samples
+  larger_n_outlier_audit:
+    scenario: conversation-load
+    runs: 30
+    warmup: 3
+    result: pass_with_outliers
+    summary:
+      react_actual_ms_mean: 150.78
+      react_actual_ms_sd: 7.39
+      script_ms_mean: 266.4
+      script_ms_sd: 13.106
+      wall_ms_mean: 348.28
+      wall_ms_sd: 13.931
+      outliers:
+        - metric: react_actual_ms
+          run_index: 5
+          z: 2.87
+        - metric: script_ms
+          run_index: 6
+          z: 4.32
+        - metric: wall_ms
+          run_index: 6
+          z: 4.44
+    note: >
+      N=30 completed without transport instability. Outliers remain possible but
+      are visible in raw samples and can be handled by Welch/significance review.
+  composer_typing_coverage:
+    result: pass_after_scenario_fix
+    runs: 10
+    warmup: 2
+    fix: composer-typing now types six bursts (342 chars) before waiting for >=300 chars; previous five-burst scenario was unsatisfiable from a clean draft.
+    evidence: browser_profile completed with react_status measured and no methodology warnings.
+  streaming_coverage:
+    result: pass_after_scenario_fix
+    runs: 3
+    warmup: 1
+    fix: sse-streaming uses .input-send-btn click instead of Enter key for browser_profile reliability; fresh_conversation reset now starts at the app origin so browser-side fetch is same-origin.
+    evidence: browser_profile completed for words=80 with react_status measured.
+parity_gate:
+  result: fail
+  record: skills/phoenix-perf-shared/resources/parity/conversation-load-browser-profile-2026-05-18.yaml
+next_steps:
+  - Do not use legacy agent-browser numeric baselines for browser_profile hunts.
+  - Reconfirm MessageList-bottom-anchored-window using browser_profile A/B before task 65003 optimization work.
