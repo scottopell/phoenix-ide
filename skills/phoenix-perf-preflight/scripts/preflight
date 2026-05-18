@@ -78,8 +78,12 @@ fi
 
 # ── Stats helper ─────────────────────────────────────────────
 section "Stats helper"
-STATS=".claude/skills/phoenix-perf-review/scripts/stats.py"
+STATS="skills/phoenix-perf-review/scripts/stats.py"
+if [[ ! -f "$STATS" && -f ".claude/skills/phoenix-perf-review/scripts/stats.py" ]]; then
+  STATS=".claude/skills/phoenix-perf-review/scripts/stats.py"
+fi
 if [[ -f "$STATS" ]]; then
+  pass "stats.py present at $STATS"
   if command -v uv >/dev/null 2>&1; then
     pass "uv present (stats.py runnable via uv run)"
   elif python3 -c 'import sys; raise SystemExit(0 if sys.version_info>=(3,11) else 1)' 2>/dev/null; then
@@ -88,7 +92,7 @@ if [[ -f "$STATS" ]]; then
     fail "neither uv nor python3>=3.11 available for stats.py"
   fi
 else
-  fail "stats.py missing at $STATS"
+  fail "stats.py missing at skills/phoenix-perf-review/scripts/stats.py"
 fi
 
 # ── Git ──────────────────────────────────────────────────────
