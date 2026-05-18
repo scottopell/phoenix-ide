@@ -22,7 +22,7 @@ use crate::state_machine::state::{
 };
 use crate::state_machine::{
     handle_outcome, tool_result_message_id, transition, CheckpointData, ConvContext, ConvState,
-    Effect, Event, StepResult, STATE_CHANGE_EVENT_TYPE,
+    Effect, Event, StepResult,
 };
 use crate::system_prompt::{build_system_prompt, ModeContext};
 use crate::tools::{BrowserSessionManager, ToolContext};
@@ -795,9 +795,7 @@ where
                         self.persist_state_effect(false).await?;
                         continue;
                     }
-                    Effect::NotifyClient { event_type, .. }
-                        if event_type == STATE_CHANGE_EVENT_TYPE =>
-                    {
+                    Effect::NotifyStateChange => {
                         continue;
                     }
                     _ => {}
@@ -1359,25 +1357,19 @@ where
                 Ok(None)
             }
 
-            Effect::NotifyClient {
-                event_type,
-                data: _,
-            } => {
-                match event_type.as_str() {
-                    "agent_done" => {
-                        let _ = self
-                            .broadcast_tx
-                            .send_seq(|seq| SseEvent::AgentDone { sequence_id: seq });
-                    }
-                    s if s == STATE_CHANGE_EVENT_TYPE => {
-                        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
-                            sequence_id: seq,
-                            state: self.state.clone(),
-                            presentation_mode: self.state.presentation_mode().to_string(),
-                        });
-                    }
-                    _ => {}
-                }
+            Effect::NotifyAgentDone => {
+                let _ = self
+                    .broadcast_tx
+                    .send_seq(|seq| SseEvent::AgentDone { sequence_id: seq });
+                Ok(None)
+            }
+
+            Effect::NotifyStateChange => {
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::StateChange {
+                    sequence_id: seq,
+                    state: self.state.clone(),
+                    presentation_mode: self.state.presentation_mode().to_string(),
+                });
                 Ok(None)
             }
 

@@ -11,16 +11,15 @@
 //! REQ-BED-005: Cancellation Handling
 //! REQ-BED-006: Error Recovery
 
-use super::effect::{compute_bash_display_data, CheckpointData, StateType};
+use super::effect::{compute_bash_display_data, CheckpointData};
 use super::event::{CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent};
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
-    AssistantMessage, ContextExhaustionBehavior, CoreState, ModeKind, ParentState, PendingSubAgent,
-    RecoveryKind, SubAgentResult, SubAgentState, TaskApprovalOutcome, ToolCall, ToolInput,
+    AssistantMessage, ContextExhaustionBehavior, CoreState, ModeKind, ParentState, RecoveryKind,
+    SubAgentResult, SubAgentState, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
-use serde_json::json;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -507,7 +506,7 @@ pub fn transition_core(
                     false,
                 ))
                 .with_effect(Effect::PersistState)
-                .with_effect(notify_llm_requesting(1))
+                .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
 
@@ -604,7 +603,7 @@ pub fn transition_core(
                 .with_effect(Effect::ClearSteeringQueueEntries {
                     message_ids: drained_ids,
                 })
-                .with_effect(notify_llm_requesting(1))
+                .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm))
         }
 
@@ -702,7 +701,6 @@ fn handle_core_llm_response(
     // Has tools -> ToolExecuting
     let first = tool_calls[0].clone();
     let rest = tool_calls[1..].to_vec();
-    let remaining_count = rest.len();
     let display_data = compute_bash_display_data(&content, &context.working_dir);
     let assistant_message = AssistantMessage::new(content, Some(usage_data), display_data);
     // Broadcast (not persist) the assistant message now so the UI's main
@@ -722,12 +720,7 @@ fn handle_core_llm_response(
     })
     .with_effect(Effect::PersistState)
     .with_effect(broadcast_effect)
-    .with_effect(notify_tool_executing(
-        first.name(),
-        &first.id,
-        remaining_count,
-        0,
-    ))
+    .with_effect(Effect::notify_state_change())
     .with_effect(Effect::execute_tool(first)))
 }
 
@@ -756,11 +749,9 @@ fn handle_core_tool_complete(
         } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
             new_results.push(result);
-            let completed_count = new_results.len();
 
             let next_tool = remaining_tools[0].clone();
             let new_remaining = remaining_tools[1..].to_vec();
-            let remaining_count = new_remaining.len();
 
             Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
                 current_tool: next_tool.clone(),
@@ -770,12 +761,7 @@ fn handle_core_tool_complete(
                 assistant_message: assistant_message.clone(),
             })
             .with_effect(Effect::PersistState)
-            .with_effect(notify_tool_executing(
-                next_tool.name(),
-                &next_tool.id,
-                remaining_count,
-                completed_count,
-            ))
+            .with_effect(Effect::notify_state_change())
             .with_effect(Effect::execute_tool(next_tool)))
         }
 
@@ -797,7 +783,7 @@ fn handle_core_tool_complete(
                 CoreTransitionResult::new(CoreState::LlmRequesting { attempt: 1 })
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
-                    .with_effect(notify_llm_requesting(1))
+                    .with_effect(Effect::notify_state_change())
                     .with_effect(Effect::RequestLlm),
             )
         }
@@ -825,7 +811,7 @@ fn handle_core_tool_complete(
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
-            .with_effect(notify_awaiting_sub_agents(pending_sub_agents, &[])))
+            .with_effect(Effect::notify_state_change()))
         }
 
         // SpawnAgentsComplete (more tools) -> accumulate
@@ -836,14 +822,12 @@ fn handle_core_tool_complete(
         } if tool_use_id == current_tool.id && !remaining_tools.is_empty() => {
             let mut new_results = completed_results.clone();
             new_results.push(result);
-            let completed_count = new_results.len();
 
             let mut new_pending = pending_sub_agents.clone();
             new_pending.extend(spawned);
 
             let next_tool = remaining_tools[0].clone();
             let new_remaining = remaining_tools[1..].to_vec();
-            let remaining_count = new_remaining.len();
 
             Ok(CoreTransitionResult::new(CoreState::ToolExecuting {
                 current_tool: next_tool.clone(),
@@ -853,12 +837,7 @@ fn handle_core_tool_complete(
                 assistant_message: assistant_message.clone(),
             })
             .with_effect(Effect::PersistState)
-            .with_effect(notify_tool_executing(
-                next_tool.name(),
-                &next_tool.id,
-                remaining_count,
-                completed_count,
-            ))
+            .with_effect(Effect::notify_state_change())
             .with_effect(Effect::execute_tool(next_tool)))
         }
 
@@ -885,7 +864,7 @@ fn handle_core_tool_complete(
             })
             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
             .with_effect(Effect::PersistState)
-            .with_effect(notify_awaiting_sub_agents(&all_pending, &[])))
+            .with_effect(Effect::notify_state_change()))
         }
 
         // tool_use_id mismatch or unexpected event variant
@@ -1129,7 +1108,7 @@ fn handle_core_sub_agents(
                 outcome,
             });
 
-            let notify = notify_awaiting_sub_agents(&new_pending, &new_results);
+            let notify = Effect::notify_state_change();
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingSubAgents {
                 pending: new_pending,
@@ -1168,7 +1147,7 @@ fn handle_core_sub_agents(
                         spawn_tool_id: spawn_tool_id.clone(),
                     })
                     .with_effect(Effect::PersistState)
-                    .with_effect(notify_llm_requesting(1))
+                    .with_effect(Effect::notify_state_change())
                     .with_effect(Effect::RequestLlm),
             )
         }
@@ -1243,14 +1222,7 @@ fn handle_core_error_retry(
                 delay,
                 attempt: new_attempt,
             })
-            .with_effect(Effect::notify_state_change(
-                StateType::LlmRequesting,
-                json!({
-                    "attempt": new_attempt,
-                    "max_attempts": MAX_RETRY_ATTEMPTS,
-                    "message": format!("Retrying... (attempt {new_attempt})")
-                }),
-            )))
+            .with_effect(Effect::notify_state_change()))
         }
 
         // Non-retryable or exhausted LlmError -> Error (core default)
@@ -1273,12 +1245,7 @@ fn handle_core_error_retry(
                 error_kind,
             })
             .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change(
-                StateType::Error,
-                json!({
-                    "message": error_message
-                }),
-            )))
+            .with_effect(Effect::notify_state_change()))
         }
 
         // RetryTimeout -> Make LLM request
@@ -1328,14 +1295,7 @@ fn handle_core_continuation(
                 delay,
                 attempt: new_attempt,
             })
-            .with_effect(Effect::notify_state_change(
-                StateType::AwaitingContinuation,
-                json!({
-                    "attempt": new_attempt,
-                    "max_attempts": MAX_RETRY_ATTEMPTS,
-                    "message": format!("Retrying continuation... (attempt {new_attempt})")
-                }),
-            )))
+            .with_effect(Effect::notify_state_change()))
         }
 
         // RetryTimeout during continuation
@@ -1364,10 +1324,7 @@ fn handle_core_continuation(
                 attempt: 1,
             })
             .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change(
-                StateType::AwaitingContinuation,
-                json!({ "manual_trigger": true }),
-            ))
+            .with_effect(Effect::notify_state_change())
             .with_effect(Effect::RequestContinuation {
                 rejected_tool_calls: vec![],
             }))
@@ -1420,7 +1377,7 @@ pub fn transition_parent(
                     plan: plan.clone(),
                 })
                 .with_effect(Effect::PersistState)
-                .with_effect(notify_llm_requesting(1))
+                .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
 
@@ -1450,7 +1407,7 @@ pub fn transition_parent(
                     idempotent: false,
                 })
                 .with_effect(Effect::PersistState)
-                .with_effect(notify_llm_requesting(1))
+                .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
         ),
 
@@ -1531,7 +1488,7 @@ pub fn transition_parent(
                     idempotent: false,
                 })
                 .with_effect(Effect::PersistState)
-                .with_effect(notify_llm_requesting(1))
+                .with_effect(Effect::notify_state_change())
                 .with_effect(Effect::RequestLlm),
             )
         }
@@ -1554,7 +1511,7 @@ pub fn transition_parent(
                 idempotent: false,
             })
             .with_effect(Effect::PersistState)
-            .with_effect(notify_llm_requesting(1))
+            .with_effect(Effect::notify_state_change())
             .with_effect(Effect::RequestLlm),
         ),
 
@@ -1579,17 +1536,14 @@ pub fn transition_parent(
                 error_kind: error_kind.clone(),
             }))
             .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change(
-                StateType::Error,
-                json!({ "message": message }),
-            )),
+            .with_effect(Effect::notify_state_change()),
         ),
 
         (ParentState::AwaitingRecovery { .. }, ParentEvent::Core(CoreEvent::UserCancel { .. })) => {
             Ok(
                 ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
                     .with_effect(Effect::PersistState)
-                    .with_effect(Effect::notify_state_change(StateType::Idle, json!({}))),
+                    .with_effect(Effect::notify_state_change()),
             )
         }
 
@@ -1660,10 +1614,7 @@ pub fn transition_parent(
                             error_kind: ErrorKind::InvalidRequest,
                         }))
                         .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change(
-                            StateType::Error,
-                            json!({"message": "propose_task not available in this mode"}),
-                        )),
+                        .with_effect(Effect::notify_state_change()),
                     );
                 }
 
@@ -1684,7 +1635,7 @@ pub fn transition_parent(
                     ))
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
-                    .with_effect(notify_llm_requesting(1))
+                    .with_effect(Effect::notify_state_change())
                     .with_effect(Effect::RequestLlm));
                 }
                 if let ToolInput::ProposeTask(ref input) = tool.input {
@@ -1713,7 +1664,7 @@ pub fn transition_parent(
                             ))
                             .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                             .with_effect(Effect::PersistState)
-                            .with_effect(notify_llm_requesting(1))
+                            .with_effect(Effect::notify_state_change())
                             .with_effect(Effect::RequestLlm));
                         }
                     };
@@ -1738,15 +1689,7 @@ pub fn transition_parent(
                         })
                         .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                         .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change(
-                            StateType::AwaitingTaskApproval,
-                            json!({
-                                "task_file": snapshot.task_file,
-                                "title": snapshot.title,
-                                "priority": snapshot.priority,
-                                "plan": snapshot.plan,
-                            }),
-                        )),
+                        .with_effect(Effect::notify_state_change()),
                     );
                 }
                 unreachable!("propose_task_tool matched but input was not ProposeTask");
@@ -1774,7 +1717,7 @@ pub fn transition_parent(
                     ))
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
-                    .with_effect(notify_llm_requesting(1))
+                    .with_effect(Effect::notify_state_change())
                     .with_effect(Effect::RequestLlm));
                 }
                 if let ToolInput::AskUserQuestion(ref input) = tool.input {
@@ -1797,10 +1740,7 @@ pub fn transition_parent(
                         })
                         .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                         .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change(
-                            StateType::AwaitingUserResponse,
-                            json!({ "questions": input.questions }),
-                        )),
+                        .with_effect(Effect::notify_state_change()),
                     );
                 }
                 unreachable!("ask_question_tool matched but input was not AskUserQuestion");
@@ -1846,13 +1786,7 @@ pub fn transition_parent(
                 recovery_kind: RecoveryKind::Credential,
             })
             .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change(
-                StateType::AwaitingRecovery,
-                json!({
-                    "message": message,
-                    "recovery_kind": "credential"
-                }),
-            )))
+            .with_effect(Effect::notify_state_change()))
         }
 
         // Intercepted before core delegation — spec rule
@@ -2150,7 +2084,7 @@ pub fn transition_sub_agent(
                     ))
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                     .with_effect(Effect::PersistState)
-                    .with_effect(notify_llm_requesting(1))
+                    .with_effect(Effect::notify_state_change())
                     .with_effect(Effect::RequestLlm));
                 }
 
@@ -2435,12 +2369,7 @@ fn handle_context_exhaustion(
                 &ctx.working_dir,
             ))
             .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change(
-                StateType::AwaitingContinuation,
-                json!({
-                    "rejected_tools": tool_calls.iter().map(ToolCall::name).collect::<Vec<_>>()
-                }),
-            ))
+            .with_effect(Effect::notify_state_change())
             .with_effect(Effect::RequestContinuation {
                 rejected_tool_calls: tool_calls,
             })
@@ -2482,47 +2411,6 @@ fn extract_text_from_content(blocks: &[crate::llm::ContentBlock]) -> String {
 fn retry_delay(attempt: u32) -> Duration {
     // Exponential backoff: 1s, 2s, 4s
     Duration::from_secs(1 << (attempt - 1))
-}
-
-/// Helper to create `state_change` notification for `LlmRequesting`
-fn notify_llm_requesting(attempt: u32) -> Effect {
-    Effect::notify_state_change(
-        StateType::LlmRequesting,
-        json!({
-            "attempt": attempt
-        }),
-    )
-}
-
-/// Helper to create `state_change` notification for `ToolExecuting`
-fn notify_tool_executing(
-    tool_name: &str,
-    tool_id: &str,
-    remaining_count: usize,
-    completed_count: usize,
-) -> Effect {
-    Effect::notify_state_change(
-        StateType::ToolExecuting,
-        json!({
-            "current_tool": {
-                "name": tool_name,
-                "id": tool_id
-            },
-            "remaining_count": remaining_count,
-            "completed_count": completed_count
-        }),
-    )
-}
-
-/// Helper to create `state_change` notification for `AwaitingSubAgents`
-fn notify_awaiting_sub_agents(pending: &[PendingSubAgent], completed: &[SubAgentResult]) -> Effect {
-    Effect::notify_state_change(
-        StateType::AwaitingSubAgents,
-        json!({
-            "pending": pending,
-            "completed_results": completed
-        }),
-    )
 }
 
 #[allow(dead_code)] // Conversion utility
@@ -3025,10 +2913,10 @@ mod tests {
 
         // Should NOT emit notify_agent_done (that's for parent conversations)
         assert!(
-            !result.effects.iter().any(|e| matches!(
-                e,
-                Effect::NotifyClient { event_type, .. } if event_type == "agent_done"
-            )),
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyAgentDone)),
             "Sub-agent should NOT emit agent_done SSE event"
         );
     }
@@ -3511,10 +3399,10 @@ mod tests {
         );
 
         assert!(
-            !result.effects.iter().any(|e| matches!(
-                e,
-                Effect::NotifyClient { event_type, .. } if event_type == "agent_done"
-            )),
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyAgentDone)),
             "Decline must not notify agent_done — the agent is resuming, not stopping"
         );
     }
@@ -3744,7 +3632,7 @@ mod tests {
         let notify_count = result
             .effects
             .iter()
-            .filter(|e| matches!(e, Effect::NotifyClient { .. }))
+            .filter(|e| matches!(e, Effect::NotifyStateChange))
             .count();
         assert_eq!(
             notify_count, 1,
@@ -3823,7 +3711,7 @@ mod tests {
             !result
                 .effects
                 .iter()
-                .any(|e| matches!(e, Effect::NotifyClient { .. })),
+                .any(|e| matches!(e, Effect::NotifyStateChange)),
             "mid-turn drain must NOT emit state-change notification — state unchanged"
         );
 
