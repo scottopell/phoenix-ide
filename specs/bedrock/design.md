@@ -1288,7 +1288,7 @@ fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
 
 ### Manual Continuation Trigger (REQ-BED-023)
 
-Users can trigger continuation from Idle state when warning threshold (80%) is reached:
+Users can trigger continuation from Idle state whenever context usage has been recorded. The warning threshold (80%) only changes the indicator styling; it does not gate the manual action.
 
 ```rust
 // User manually triggers continuation
@@ -1309,7 +1309,7 @@ Users can trigger continuation from Idle state when warning threshold (80%) is r
 /// Threshold as fraction of context window (REQ-BED-019)
 pub const CONTINUATION_THRESHOLD: f64 = 0.90;
 
-/// Warning threshold for UI indicator (REQ-BED-023)
+/// Warning threshold for UI indicator styling (REQ-BED-023)
 pub const WARNING_THRESHOLD: f64 = 0.80;
 
 /// Threshold check function
@@ -1498,12 +1498,13 @@ on-disk-missing `worktree_path`:
 ### Implementation sketch
 
 On the backend, a new `UserStartsContinuationConversation` handler
-(distinct from the existing `UserTriggersContinuation` event which
-fires at the 80% warning threshold per REQ-BED-023) constructs the new
-conversation's `ConvMode` variant by cloning the parent's and applying
-the inheritance table above. Exposed on the `UserConversation` surface
-in bedrock.allium with the precondition `parent_status = context_exhausted
-and continued_in_conv_id = absent`. The DB transaction shape:
+(distinct from the existing `UserTriggersContinuation` event, which ends
+an idle conversation and requests its summary per REQ-BED-023) constructs
+the new conversation's `ConvMode` variant by cloning the parent's and
+applying the inheritance table above. Exposed on the `UserConversation`
+surface in bedrock.allium with the precondition `parent_status =
+context_exhausted and continued_in_conv_id = absent`. The DB transaction
+shape:
 
 ```sql
 BEGIN;

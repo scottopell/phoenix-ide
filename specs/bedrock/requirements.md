@@ -409,12 +409,14 @@ THE SYSTEM SHALL use the smallest known model limit as default
 
 WHEN context usage exceeds 80% of model's context window
 THE SYSTEM SHALL display a warning indicator to the user
-AND offer option to trigger continuation manually
+
+WHEN an idle conversation has recorded context usage
+THE SYSTEM SHALL offer an option to trigger continuation manually regardless of warning threshold
 
 WHEN user manually triggers continuation
 THE SYSTEM SHALL behave identically to automatic continuation at threshold
 
-**Rationale:** Users may want to wrap up conversations naturally before hitting the hard limit. Early warning with manual trigger gives control.
+**Rationale:** Users may want to wrap up conversations naturally before quality degrades or before hitting the hard limit. Always-available manual continuation gives control, while the warning threshold still draws attention when context is objectively high.
 
 ---
 

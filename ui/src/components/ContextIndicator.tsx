@@ -10,8 +10,7 @@ interface ContextIndicatorProps {
   used: number;
   max: number;
   conversationId: string;
-  /** When provided AND the warning threshold is crossed, a trigger menu appears with an
-   *  "End & summarize" action that invokes this callback. */
+  /** When provided, the trigger menu includes an "End & summarize now" action. */
   onTriggerContinuation?: (() => void) | undefined;
 }
 
@@ -80,13 +79,16 @@ export function ContextIndicator({ used, max, conversationId, onTriggerContinuat
   const fraction = percent / 100;
   const warning = fraction >= WARNING_THRESHOLD;
   const critical = fraction >= CONTINUATION_THRESHOLD;
-  const canTrigger = warning && !!onTriggerContinuation;
+  const canTrigger = !!onTriggerContinuation;
 
   let className = 'context-indicator';
   if (critical) className += ' critical';
   else if (warning) className += ' warning';
 
-  const tooltipText = `Context window usage: ${formatTokens(used)} / ${formatTokens(max)} tokens (${percent.toFixed(1)}%). When full, the conversation will need to be summarized.`;
+  const usageText = `Context window usage: ${formatTokens(used)} / ${formatTokens(max)} tokens (${percent.toFixed(1)}%).`;
+  const tooltipText = canTrigger
+    ? `${usageText} You can end and summarize this conversation to continue in a new one.`
+    : usageText;
 
   const handleTrigger = () => {
     setPanelOpen(false);
@@ -125,10 +127,10 @@ export function ContextIndicator({ used, max, conversationId, onTriggerContinuat
             <>
               <div className="context-menu-divider" />
               <button className="context-menu-item" onClick={handleTrigger}>
-                End &amp; summarize conversation
+                End &amp; summarize now
               </button>
               <div className="context-menu-hint">
-                Creates a summary to continue in a new conversation
+                Creates a summary so you can continue in a new conversation
               </div>
             </>
           )}

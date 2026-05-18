@@ -735,6 +735,8 @@ rule CancelDuringUserQuestion {
 -- PARENT 7. CONTEXT CONTINUATION (REQ-BED-019 through 024)
 -- ===========================================================
 
+-- Manual continuation is user-gated only by idle status. The UI warning
+-- threshold changes indicator styling; it does not hide this action.
 rule UserTriggersContinuation {
     when: UserTriggersContinuation(conversation)
     requires: conversation.core_status = idle

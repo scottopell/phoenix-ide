@@ -1,5 +1,6 @@
 import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, fireEvent } from '@testing-library/react';
+import type { ComponentProps } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { StateBar } from './StateBar';
 import { api, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
@@ -11,6 +12,7 @@ vi.mock('../api', async (importOriginal) => {
     api: {
       ...actual.api,
       getPrStatus: vi.fn(),
+      getConversationUsage: vi.fn(),
     },
   };
 });
@@ -36,6 +38,10 @@ beforeAll(() => {
 beforeEach(() => {
   vi.clearAllMocks();
   (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ found: false });
+  (api.getConversationUsage as ReturnType<typeof vi.fn>).mockResolvedValue({
+    own: { input_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, output_tokens: 0, turns: 0 },
+    total: { input_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, output_tokens: 0, turns: 0 },
+  });
 });
 
 function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
@@ -59,18 +65,34 @@ function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
   };
 }
 
-function renderStateBar(conversation: Conversation = makeConversation()) {
+function renderStateBar({
+  conversation = makeConversation(),
+  convState = { type: 'idle' } as const,
+  contextWindowUsed = 0,
+  modelContextWindow = 200_000,
+  continuation,
+}: {
+  conversation?: Conversation;
+  convState?: ComponentProps<typeof StateBar>['convState'];
+  contextWindowUsed?: number;
+  modelContextWindow?: number;
+  continuation?: ComponentProps<typeof StateBar>['continuation'];
+} = {}) {
+  const props: ComponentProps<typeof StateBar> = {
+    conversation,
+    convState,
+    connectionState: 'connected',
+    connectionAttempt: 0,
+    nextRetryIn: null,
+    contextWindowUsed,
+    modelContextWindow,
+  };
+  if (continuation) {
+    props.continuation = continuation;
+  }
   return render(
     <MemoryRouter>
-      <StateBar
-        conversation={conversation}
-        convState={{ type: 'idle' }}
-        connectionState="connected"
-        connectionAttempt={0}
-        nextRetryIn={null}
-        contextWindowUsed={0}
-        modelContextWindow={200_000}
-      />
+      <StateBar {...props} />
     </MemoryRouter>,
   );
 }
@@ -131,7 +153,7 @@ describe('StateBar PR badge', () => {
   });
 
   it('does not fetch PR status for conversations without a branch', async () => {
-    renderStateBar(makeConversation({ branch_name: null, base_branch: null }));
+    renderStateBar({ conversation: makeConversation({ branch_name: null, base_branch: null }) });
 
     await waitFor(() => expect(screen.getByText('track-pr-status')).toBeInTheDocument());
     expect(api.getPrStatus).not.toHaveBeenCalled();
@@ -185,5 +207,38 @@ describe('StateBar model picker enablement (task 02713)', () => {
       remaining_tools: [],
     });
     expect(container.querySelector('button.conv-model--button')).toBeNull();
+  });
+});
+
+describe('StateBar manual continuation action', () => {
+  it('offers manual continuation below the warning threshold while idle', async () => {
+    const onTriggerContinuation = vi.fn();
+    renderStateBar({
+      contextWindowUsed: 100_000,
+      modelContextWindow: 1_000_000,
+      continuation: { phase: 'idle', onTrigger: onTriggerContinuation },
+    });
+
+    fireEvent.click(screen.getByText('100k'));
+
+    const action = await screen.findByRole('button', { name: /end & summarize now/i });
+    expect(screen.getByText(/continue in a new conversation/i)).toBeInTheDocument();
+
+    fireEvent.click(action);
+
+    expect(onTriggerContinuation).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not offer manual continuation while the conversation is busy', () => {
+    renderStateBar({
+      convState: { type: 'awaiting_llm' },
+      contextWindowUsed: 100_000,
+      modelContextWindow: 1_000_000,
+      continuation: { phase: 'unavailable' },
+    });
+
+    fireEvent.click(screen.getByText('100k'));
+
+    expect(screen.queryByRole('button', { name: /end & summarize now/i })).not.toBeInTheDocument();
   });
 });
