@@ -17,11 +17,13 @@ methodology:
   throttle_rate: <N>
   harness: browser_profile
 measurements:
-  commit_count:
-  commit_actual_duration_ms:
-  script_duration_ms:
+  react_commits:
+  react_actual_ms:
+  script_ms:
+  wall_ms:
   js_heap_used_mib:
   long_tasks:
+  dom_nodes:
 reason: |
   <why rejected — which gate failed: duplicate / sub-threshold / p>=0.05 /
    correctness regression / bug / scope creep>

@@ -19,11 +19,13 @@ methodology:
 measurements:
   # raw values -> reduced by scripts/stats.py; format:
   # <metric>: <baseline mean±sd> -> <optimized mean±sd> (<%change>, p=<welch p>)
-  commit_count:
-  commit_actual_duration_ms:
-  script_duration_ms:
+  react_commits:
+  react_actual_ms:
+  script_ms:
+  wall_ms:
   js_heap_used_mib:
   long_tasks:
+  dom_nodes:
 reason: |
   <why approved — which thresholds were cleared, panel summary>
 lessons: |

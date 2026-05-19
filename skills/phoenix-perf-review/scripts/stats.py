@@ -29,13 +29,13 @@ import sys
 METRICS = {
     # primary keys = what phoenix-perf-shared/scripts/run-scenario emits.
     # extra paths = tolerance for the optional CDP add-on / schema drift.
-    "react_commit_count": [
+    "react_commits": [
         ("react_commit_count",),   # agent-browser transport key
         ("react_commits",),        # browser_profile transport key
         ("react", "commit_count"),
         ("commits", "*len"),
     ],
-    "react_commit_ms": [
+    "react_actual_ms": [
         ("react_commit_ms",),      # agent-browser transport key
         ("react_actual_ms",),      # browser_profile transport key
         ("react", "actual_duration_ms"),
@@ -161,7 +161,7 @@ def welch_p(a, b):
     sa, sb = va / na, vb / nb
     denom = sa + sb
     if denom == 0:
-        return 1.0
+        return 1.0 if mean(a) == mean(b) else 0.0
     t = (mean(a) - mean(b)) / math.sqrt(denom)
     df = denom**2 / ((sa**2 / (na - 1)) + (sb**2 / (nb - 1)))
     return _betai(0.5 * df, 0.5, df / (df + t * t))

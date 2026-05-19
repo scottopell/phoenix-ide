@@ -53,11 +53,11 @@ gh pr create --title "perf(ui): <short>" --body "$(cat <<'EOF'
 ## Summary
 <what re-render / scripting cost was removed and why>
 
-## Measured (run-scenario / agent-browser, scenario <name>, N=<n>)
+## Measured (run-scenario / browser_profile, scenario <name>, N=<n>)
 - script_ms: <base> -> <opt> (<-%>, p=<p>)
-- react_commit_count: <base> -> <opt> (<-%>, p=<p>)
-- react_commit_ms: <base> -> <opt> (<-%>, p=<p>)
-- js_heap_used: <base> -> <opt> (<-%>)
+- react_commits: <base> -> <opt> (<-%>, p=<p>)
+- react_actual_ms: <base> -> <opt> (<-%>, p=<p>)
+- js_heap_used_mib: <base> -> <opt> (<-%>, p=<p>)
 
 ## Validation
 - [x] ./dev.py check passes

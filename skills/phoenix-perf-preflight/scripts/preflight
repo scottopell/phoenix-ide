@@ -23,10 +23,14 @@ section() { REPORT+=$'\n'"$1:"$'\n'; }
 section "Dev server"
 STATUS="$(./dev.py status 2>/dev/null || true)"
 PHX_PORT="$(echo "$STATUS" | grep -oE 'Phoenix=[0-9]+' | head -1 | cut -d= -f2 || true)"
+PHX_URL="$(echo "$STATUS" | awk '/^[[:space:]]*URL: / {print $2; exit}' || true)"
+if [[ -z "${PHX_URL:-}" && -n "${PHX_PORT:-}" ]]; then
+  PHX_URL="http://127.0.0.1:${PHX_PORT}"
+fi
 if echo "$STATUS" | grep -qi 'Phoenix:[[:space:]]*running'; then
   pass "Phoenix running (port ${PHX_PORT:-?})"
-  if [[ -n "${PHX_PORT:-}" ]] && curl -fsS -m 3 "http://127.0.0.1:${PHX_PORT}/version" >/dev/null 2>&1; then
-    pass "Phoenix HTTP responding at http://127.0.0.1:${PHX_PORT}/version"
+  if [[ -n "${PHX_URL:-}" ]] && curl -fsS -m 3 "${PHX_URL%/}/version" >/dev/null 2>&1; then
+    pass "Phoenix HTTP responding at ${PHX_URL%/}/version"
   else
     fail "Phoenix port ${PHX_PORT:-?} not responding to HTTP"
   fi
@@ -66,11 +70,15 @@ fi
 section "Seed data"
 DB_PATH="$(echo "$STATUS" | grep -oE 'Database: .*' | head -1 | awk '{print $2}' || true)"
 if [[ -n "${DB_PATH:-}" && -f "$DB_PATH" ]]; then
-  CONV_COUNT="$(sqlite3 "$DB_PATH" 'SELECT COUNT(*) FROM conversations;' 2>/dev/null || echo 0)"
-  if [[ "${CONV_COUNT:-0}" -gt 0 ]]; then
-    pass "DB has $CONV_COUNT conversation(s)"
+  if ! command -v sqlite3 >/dev/null 2>&1; then
+    fail "sqlite3 not found — needed to validate seed data"
   else
-    fail "DB has no conversations (run ./dev.py seed)"
+    CONV_COUNT="$(sqlite3 "$DB_PATH" 'SELECT COUNT(*) FROM conversations;' 2>/dev/null || echo 0)"
+    if [[ "${CONV_COUNT:-0}" -gt 0 ]]; then
+      pass "DB has $CONV_COUNT conversation(s)"
+    else
+      fail "DB has no conversations (run ./dev.py seed)"
+    fi
   fi
 else
   warn "DB path not resolvable from ./dev.py status — verify seed manually"

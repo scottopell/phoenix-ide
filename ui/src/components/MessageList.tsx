@@ -205,7 +205,10 @@ export function MessageList({
   streamingBuffer,
 }: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
-  const [showJumpToNewest, setShowJumpToNewest] = useState(false);
+  const [jumpToNewestState, setJumpToNewestState] = useState<{
+    conversationId: string | undefined;
+    visible: boolean;
+  }>({ conversationId, visible: false });
   const mainRef = useRef<HTMLElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const isPinnedToBottom = useRef(true); // Start pinned to bottom
@@ -228,7 +231,6 @@ export function MessageList({
     prevMessageCountRef.current = 0;
     scrollTriggerRef.current = 'none';
     isPinnedToBottom.current = true;
-    if (showJumpToNewest) setShowJumpToNewest(false);
   }
 
   // Saved scroll pixel for REQ-CONV-013, read synchronously and memoized per
@@ -266,6 +268,10 @@ export function MessageList({
     prevMessageCountRef.current = messages.length;
   }
 
+  const showJumpToNewest = jumpToNewestState.conversationId === conversationId
+    ? jumpToNewestState.visible
+    : false;
+
   // Check if user is near bottom of scroll
   const checkIfPinnedToBottom = useCallback(() => {
     const el = mainRef.current;
@@ -279,8 +285,14 @@ export function MessageList({
     isPinnedToBottom.current = checkIfPinnedToBottom();
     const el = mainRef.current;
     if (el) lastScrollTop.current = el.scrollTop;
-    if (isPinnedToBottom.current) setShowJumpToNewest(false);
-  }, [checkIfPinnedToBottom]);
+    if (isPinnedToBottom.current) {
+      setJumpToNewestState((prev) => (
+        prev.conversationId === conversationId && !prev.visible
+          ? prev
+          : { conversationId, visible: false }
+      ));
+    }
+  }, [checkIfPinnedToBottom, conversationId]);
 
   // Scroll to bottom helper
   const scrollToBottom = useCallback(() => {
@@ -315,7 +327,11 @@ export function MessageList({
             lastScrollTop.current = mainRef.current!.scrollTop;
             if (trigger === 'force') isPinnedToBottom.current = true;
           } else {
-            setShowJumpToNewest(true);
+            setJumpToNewestState((prev) => (
+              prev.conversationId === conversationId && prev.visible
+                ? prev
+                : { conversationId, visible: true }
+            ));
           }
         }
         prevMessagesHeight.current = newHeight;
@@ -324,7 +340,7 @@ export function MessageList({
 
     observer.observe(messagesEl);
     return () => observer.disconnect();
-  }, []);
+  }, [conversationId]);
 
   // Save scroll position on unmount / visibility change (REQ-CONV-013)
   useEffect(() => {
@@ -364,7 +380,11 @@ export function MessageList({
         lastScrollTop.current = pos;
         isPinnedToBottom.current = checkIfPinnedToBottom();
         if (messages.length > prevCount && !isPinnedToBottom.current) {
-          setShowJumpToNewest(true);
+          setJumpToNewestState((prev) => (
+            prev.conversationId === conversationId && prev.visible
+              ? prev
+              : { conversationId, visible: true }
+          ));
         }
       }
     }
@@ -437,7 +457,14 @@ export function MessageList({
       {showJumpToNewest && (
         <button
           className="jump-to-newest"
-          onClick={() => { scrollToBottom(); setShowJumpToNewest(false); }}
+          onClick={() => {
+            scrollToBottom();
+            setJumpToNewestState((prev) => (
+              prev.conversationId === conversationId && !prev.visible
+                ? prev
+                : { conversationId, visible: false }
+            ));
+          }}
         >
           ↓ New messages
         </button>

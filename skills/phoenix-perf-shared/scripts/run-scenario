@@ -93,12 +93,14 @@ _INSTALL_JS = r"""
 (() => {
   const w = window;
   if (!w.__pp) {
-    w.__pp = { lt_ms: 0, lt_n: 0, t0: 0 };
+        w.__pp = { lt_ms: 0, lt_n: 0, t0: 0, lt_ok: false };
+
     try {
       const po = new PerformanceObserver((l) => {
         for (const e of l.getEntries()) { w.__pp.lt_ms += e.duration; w.__pp.lt_n += 1; }
       });
       po.observe({ entryTypes: ['longtask'] });
+      w.__pp.lt_ok = true;
       w.__pp.po = po;
     } catch (e) { w.__pp.lt_err = String(e); }
     // Best-effort React commit counter via the DevTools global hook, IF a
@@ -134,9 +136,13 @@ _RESET_JS = r"""
 _READ_JS = r"""
 (() => { const p = window.__pp || {};
   const m = (performance.memory && performance.memory.usedJSHeapSize) || null;
-  const o = { script_ms: p.lt_ms||0, long_tasks: p.lt_n||0,
+  const o = {
     wall_ms: p.t0 ? (performance.now()-p.t0) : null,
-    js_heap_used: m, dom_nodes: document.getElementsByTagName('*').length };
+    js_heap_used: m,
+    dom_nodes: document.getElementsByTagName('*').length
+  };
+  if (p.lt_ok) { o.script_ms = p.lt_ms; o.long_tasks = p.lt_n; }
+  else if (p.lt_err) { o.longtask_error = p.lt_err; }
   if ('rc_n' in p) { o.react_commit_count = p.rc_n; o.react_commit_ms = p.rc_ms; }
   return JSON.stringify(o); })()
 """

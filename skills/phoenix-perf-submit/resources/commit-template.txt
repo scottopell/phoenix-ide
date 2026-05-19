@@ -4,13 +4,13 @@ perf(ui): <≤50-char summary of the re-render/scripting win>
 
 Target: <ui/src/file>::<Component>
 Technique: <technique>
-Scenario: <scenario-name> (run-scenario / agent-browser, N=<n>, warmup=<w>)
+Scenario: <scenario-name> (run-scenario / browser_profile, N=<n>, warmup=<w>)
 
 Measured (raw samples, Welch t-test):
-  react_commit_count:   <base> -> <opt> (<-%>, p=<p>)
-  react_commit_ms:      <base> -> <opt> (<-%>, p=<p>)
+  react_commits:        <base> -> <opt> (<-%>, p=<p>)
+  react_actual_ms:      <base> -> <opt> (<-%>, p=<p>)
   script_ms:            <base> -> <opt> (<-%>, p=<p>)
-  js_heap_used:         <base> -> <opt> (<-%>)
+  js_heap_used_mib:     <base> -> <opt> (<-%>, p=<p>)
 
 5-persona review: unanimous approve
 (db: skills/phoenix-perf-hunt/resources/db/<id>.yaml)
