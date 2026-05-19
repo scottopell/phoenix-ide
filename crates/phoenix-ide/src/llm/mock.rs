@@ -131,6 +131,8 @@ re-reads the graph, but between the event being queued and processed, Task B \
 may have already modified the graph. The fix is to make the completion + graph \
 update + notification atomic.";
 
+const MAX_PERF_WORDS: usize = 5_000;
+
 /// Perf-fixture marker: a user message containing `[[perf:N]]` forces a
 /// fully deterministic text-only response of ~N whitespace-separated words,
 /// bypassing scenario selection and `rand`. This makes the streaming path a
@@ -156,7 +158,11 @@ fn parse_perf_words(request: &LlmRequest) -> Option<usize> {
     let start = text.find("[[perf:")? + "[[perf:".len();
     let rest = text.get(start..)?;
     let end = rest.find("]]")?;
-    rest.get(..end)?.trim().parse::<usize>().ok()
+    rest.get(..end)?
+        .trim()
+        .parse::<usize>()
+        .ok()
+        .map(|n| n.min(MAX_PERF_WORDS))
 }
 
 /// Deterministic text of exactly `n_words` words, built by cycling the words
@@ -412,6 +418,10 @@ mod tests {
     #[test]
     fn perf_marker_parsed() {
         assert_eq!(parse_perf_words(&user_req("[[perf:800]] go")), Some(800));
+        assert_eq!(
+            parse_perf_words(&user_req("[[perf:999999]] go")),
+            Some(MAX_PERF_WORDS)
+        );
         assert_eq!(parse_perf_words(&user_req("no marker here")), None);
         assert_eq!(parse_perf_words(&user_req("[[perf:bad]]")), None);
     }

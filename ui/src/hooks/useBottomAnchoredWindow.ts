@@ -30,10 +30,11 @@ interface UseBottomAnchoredWindowArgs {
   scrollRootRef: RefObject<HTMLElement | null>;
   /**
    * Saved scroll pixel offset for REQ-CONV-013 restore, read synchronously on
-   * the restoring mount. When present, the initial window is widened so the
-   * restored scrollTop lands inside REAL rendered content rather than inside
-   * the estimated top spacer. Residual: the still-collapsed remainder ABOVE
-   * the restored position only mis-sizes the scrollbar, not the viewport.
+   * the restoring mount. When the saved offset is near the top, the initial
+   * window widens to the first row so the restored scrollTop lands on real
+   * content rather than inside the estimated spacer. Deeper saved offsets keep
+   * the normal bottom window; the render-units follow-up will replace this
+   * estimate-bound compromise with measured render-unit geometry.
    */
   savedScrollPos?: number | null;
 }
@@ -58,7 +59,7 @@ function computeInitialStart(
   savedScrollPos: number | null | undefined,
 ): number {
   const defaultStart = computeDefaultStart(messageCount);
-  if (savedScrollPos != null) {
+  if (savedScrollPos != null && savedScrollPos <= INITIAL_WINDOW * COLLAPSED_EST_PX) {
     return 0;
   }
   return defaultStart;
