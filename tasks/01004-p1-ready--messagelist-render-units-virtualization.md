@@ -11,7 +11,10 @@ The current bottom-anchored window uses a raw message index/count as its window 
 - queued pending messages and sub-agent status are rendered outside the historical message map.
 - future grouping behavior may add more non-1:1 mappings.
 
-This caused a review finding: many recent tool-result records can consume the bottom window while the owning agent row — the actual visible UI — is collapsed behind the spacer. The current patch filters renderable IDs, but the deeper model is still raw-message-oriented.
+This caused two review findings:
+
+1. Many recent tool-result records can consume the bottom window while the owning agent row — the actual visible UI — is collapsed behind the spacer. The current patch filters renderable IDs, but the deeper model is still raw-message-oriented.
+2. Saved-scroll restore exposes the limits of estimated spacer geometry. Rendering from the top for every saved scroll is correct but disables virtualization on common revisits; estimating how many rows are above a saved pixel offset preserves perf but can restore into the wrong content when row heights vary. The current compromise only disables virtualization for near-top saved offsets. The render-units implementation should replace this estimate-bound compromise with a structural/measurement-based restore model.
 
 ## Goal
 
@@ -42,6 +45,7 @@ Then window over `RenderUnit[]`, not `Message[]`.
 - Consecutive-agent header suppression (`isFirstInTurn`) is computed before windowing so revealing older rows preserves the same grouping/header behavior as a non-virtualized list.
 - Pending queued messages and sub-agent status are represented as render units or explicitly documented as non-virtualized tail units; there must be no ambiguity about whether they count toward the window.
 - The latest visible work is always inside the initial bottom window, even when the tail contains many raw tool result records.
+- Saved scroll restore is not decided solely by `savedScrollTop / estimatedRowHeight`; if restore uses an estimate, it must be conservative enough to avoid landing inside a synthetic spacer, while still preserving bottom-window virtualization for common bottom-pinned revisits.
 
 ## Boundary expansion design
 
@@ -73,7 +77,8 @@ Do not adopt `react-window`, `@tanstack/react-virtual`, `react-virtuoso`, or ano
 - Tool-result-heavy tails are covered by a regression test: an agent message with many following raw `tool` messages remains visible in the initial bottom window.
 - Boundary expansion uses an IntersectionObserver sentinel at the spacer/rendered-window boundary; no `scrollTop - spacerHeight` trigger heuristic remains.
 - Saved scroll restore to top (`scrollTop=0`) renders real content at the top, not an estimated spacer.
-- Saved mid-conversation scroll restore widens the initial render-unit window enough that the restored viewport lands on real rendered units.
+- Saved bottom-pinned revisit keeps virtualization active; a saved scroll key alone must not force rendering every historical row.
+- Saved mid-conversation scroll restore either uses measured render-unit geometry or a documented conservative fallback; it must not restore into an estimated spacer that skips the content the user was reading.
 - Switch into a large conversation still lands pinned to bottom.
 - No visible scroll jump when expanding older units.
 - Streaming message updates remain outside the historical render-unit list unless intentionally modeled; token updates must not re-render the historical unit list.
