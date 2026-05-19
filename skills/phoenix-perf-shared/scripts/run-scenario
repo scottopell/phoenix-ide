@@ -71,7 +71,7 @@ Usage:
     # parent agent calls browser_profile(action='run_scenario', **request.json)
     run-scenario --response-in response.json --out raw.json
 """
-import argparse, json, os, subprocess, sys, time, pathlib, urllib.request, uuid
+import argparse, json, os, shlex, subprocess, sys, time, pathlib, urllib.request, uuid
 import yaml
 
 # ---------------------------------------------------------------------------
@@ -542,9 +542,12 @@ def run_browser_profile(scn, table, runs, warmup):
         file=sys.stderr,
     )
 
+    argv = shlex.split(cmd)
+    if not argv:
+        raise RuntimeError("BROWSER_PROFILE_CMD parsed to an empty command")
+
     r = subprocess.run(
-        cmd,
-        shell=True,
+        argv,
         input=json.dumps(request),
         capture_output=True,
         text=True,

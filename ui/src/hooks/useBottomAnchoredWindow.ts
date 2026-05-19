@@ -59,10 +59,7 @@ function computeInitialStart(
 ): number {
   const defaultStart = computeDefaultStart(messageCount);
   if (savedScrollPos != null) {
-    // Ensure firstRenderedIndex * COLLAPSED_EST_PX <= savedScrollPos so the
-    // restored scrollTop falls within measured rows, not the estimated spacer.
-    const coversSaved = Math.floor(savedScrollPos / COLLAPSED_EST_PX);
-    return Math.max(0, Math.min(defaultStart, coversSaved));
+    return 0;
   }
   return defaultStart;
 }

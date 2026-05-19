@@ -235,7 +235,7 @@ export function MessageList({
   if (lastConversationIdRef.current !== conversationId) {
     lastConversationIdRef.current = conversationId;
     prevMessagesHeight.current = 0;
-    prevMessageCountRef.current = 0;
+    prevMessageCountRef.current = messages.length;
     scrollTriggerRef.current = 'none';
     isPinnedToBottom.current = true;
   }

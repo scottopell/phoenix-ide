@@ -94,10 +94,17 @@ def _resolve(sample, path):
 def extract(samples, label):
     for path in METRICS[label]:
         vals = [_resolve(s, path) for s in samples]
-        if all(v is not None for v in vals) and vals:
+        present = sum(v is not None for v in vals)
+        if present == len(vals) and vals:
             if label in HEAP_KEYS and any(v > 1 << 20 for v in vals):
                 vals = [v / (1 << 20) for v in vals]
             return vals
+        if present != 0:
+            path_s = ".".join(path)
+            raise ValueError(
+                f"metric {label!r} is partially present at path {path_s!r}: "
+                f"{present}/{len(vals)} samples resolved; refusing to skip incomplete instrumentation"
+            )
     return None
 
 
