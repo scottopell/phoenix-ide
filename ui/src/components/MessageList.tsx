@@ -63,6 +63,15 @@ function extractSkillArgs(trigger: string, name: string): string {
   return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
 }
 
+function isRenderableHistoricalMessage(msg: Message): boolean {
+  const type = msg.message_type || msg.type;
+  if (type === 'tool') return false;
+  if (type === 'system') {
+    return Boolean((msg.content as { text?: string })?.text);
+  }
+  return type === 'user' || type === 'skill' || type === 'agent';
+}
+
 interface MessageListBodyProps {
   messages: Message[];
   pendingMessages: QueuedMessage[];
@@ -71,13 +80,10 @@ interface MessageListBodyProps {
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
-  /**
-   * Bottom-anchored window boundary: messages at index >= this render REAL
-   * (byte-identical to non-virtualized). [0, firstRenderedIndex) collapse into
-   * ONE estimated-height spacer that is always offscreen above the viewport
-   * when pinned to bottom.
-   */
-  firstRenderedIndex: number;
+  /** Number of renderable historical rows collapsed into the top spacer. */
+  collapsedRenderableCount: number;
+  /** Message IDs whose renderable rows are collapsed. Tool rows never render standalone. */
+  collapsedRenderableIds: Set<string>;
 }
 
 /**
@@ -95,7 +101,8 @@ const MessageListBody = memo(function MessageListBody({
   onRetry,
   onCancelSteering,
   onOpenFile,
-  firstRenderedIndex,
+  collapsedRenderableCount,
+  collapsedRenderableIds,
 }: MessageListBodyProps) {
   // Tracks whether the previous rendered message was an agent message, so
   // we can suppress the "Phoenix HH:MM" header on consecutive agent messages
@@ -109,16 +116,16 @@ const MessageListBody = memo(function MessageListBody({
   let inAgentRun = false;
   return (
     <>
-      {firstRenderedIndex > 0 && (
+      {collapsedRenderableCount > 0 && (
         <div
           className="message-collapsed-spacer"
-          style={{ height: firstRenderedIndex * COLLAPSED_EST_PX }}
+          style={{ height: collapsedRenderableCount * COLLAPSED_EST_PX }}
           aria-hidden="true"
         />
       )}
-      {messages.map((msg, idx) => {
+      {messages.map((msg) => {
         const type = msg.message_type || msg.type;
-        const rendered = idx >= firstRenderedIndex;
+        const rendered = !collapsedRenderableIds.has(msg.message_id);
         if (type === 'user') {
           inAgentRun = false;
           if (!rendered) return null;
@@ -254,12 +261,22 @@ export function MessageList({
     savedScrollLookupRef.current = { id: conversationId, pos };
   }
 
+  const renderableMessages = useMemo(
+    () => messages.filter(isRenderableHistoricalMessage),
+    [messages],
+  );
+
   const { firstRenderedIndex } = useBottomAnchoredWindow({
-    messageCount: messages.length,
+    messageCount: renderableMessages.length,
     conversationId,
     scrollRootRef: mainRef,
     savedScrollPos: savedScrollLookupRef.current.pos,
   });
+
+  const collapsedRenderableIds = useMemo(
+    () => new Set(renderableMessages.slice(0, firstRenderedIndex).map((msg) => msg.message_id)),
+    [firstRenderedIndex, renderableMessages],
+  );
 
   if (messages.length > prevMessageCountRef.current) {
     const newMsgs = messages.slice(prevMessageCountRef.current);
@@ -369,11 +386,19 @@ export function MessageList({
   useLayoutEffect(() => {
     if (!conversationId || messages.length === 0 || lastRestoredConversationId.current === conversationId) return;
     lastRestoredConversationId.current = conversationId;
-    const savedPos = localStorage.getItem(`${SCROLL_KEY_PREFIX}${conversationId}`);
-    const savedCount = localStorage.getItem(`${MSGCOUNT_KEY_PREFIX}${conversationId}`);
+    let savedPos: string | null = null;
+    let savedCount: string | null = null;
+    try {
+      savedPos = localStorage.getItem(`${SCROLL_KEY_PREFIX}${conversationId}`);
+      savedCount = localStorage.getItem(`${MSGCOUNT_KEY_PREFIX}${conversationId}`);
+    } catch {
+      return;
+    }
     if (savedPos !== null) {
       const pos = parseInt(savedPos, 10);
-      const prevCount = savedCount ? parseInt(savedCount, 10) : messages.length;
+      if (Number.isNaN(pos)) return;
+      const parsedCount = savedCount ? parseInt(savedCount, 10) : messages.length;
+      const prevCount = Number.isNaN(parsedCount) ? messages.length : parsedCount;
       const el = mainRef.current;
       if (el) {
         el.scrollTop = pos;
@@ -445,7 +470,8 @@ export function MessageList({
               onRetry={onRetry}
               onCancelSteering={onCancelSteering}
               onOpenFile={onOpenFile}
-              firstRenderedIndex={firstRenderedIndex}
+              collapsedRenderableCount={firstRenderedIndex}
+              collapsedRenderableIds={collapsedRenderableIds}
             />
           )}
           {/* Streaming text — cleared atomically when sse_message arrives (REQ-CONV-019).

@@ -29,7 +29,11 @@ if [[ -z "${PHX_URL:-}" && -n "${PHX_PORT:-}" ]]; then
 fi
 if echo "$STATUS" | grep -qi 'Phoenix:[[:space:]]*running'; then
   pass "Phoenix running (port ${PHX_PORT:-?})"
-  if [[ -n "${PHX_URL:-}" ]] && curl -fsS -m 3 "${PHX_URL%/}/version" >/dev/null 2>&1; then
+  CURL_ARGS=(-fsS -m 3)
+  if [[ "${PHX_URL}" == https://* ]]; then
+    CURL_ARGS+=(-k)
+  fi
+  if [[ -n "${PHX_URL:-}" ]] && curl "${CURL_ARGS[@]}" "${PHX_URL%/}/version" >/dev/null 2>&1; then
     pass "Phoenix HTTP responding at ${PHX_URL%/}/version"
   else
     fail "Phoenix port ${PHX_PORT:-?} not responding to HTTP"
@@ -43,7 +47,9 @@ section "run-scenario harness"
 RS="skills/phoenix-perf-shared/scripts/run-scenario"
 if [[ -x "$RS" ]]; then
   pass "run-scenario harness present and executable"
-  if "$RS" --self-test >/dev/null 2>&1; then
+  if ! command -v uv >/dev/null 2>&1; then
+    fail "uv not found — run-scenario uses a uv script environment for PyYAML"
+  elif "$RS" --self-test >/dev/null 2>&1; then
     pass "run-scenario --self-test passed"
   else
     fail "run-scenario --self-test FAILED (translation/mapping regression)"

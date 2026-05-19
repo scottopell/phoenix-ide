@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, render, waitFor } from '@testing-library/react';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
@@ -24,6 +24,8 @@ vi.mock('./MessageContextMenu', () => ({
 }));
 
 let resizeCallback: ResizeObserverCallback | null = null;
+let scrollHeightDescriptor: PropertyDescriptor | undefined;
+let clientHeightDescriptor: PropertyDescriptor | undefined;
 
 class MockResizeObserver {
   constructor(callback: ResizeObserverCallback) {
@@ -43,15 +45,18 @@ function triggerResize(target: Element, height: number) {
   });
 }
 
-function makeMessage(sequence_id: number): Message {
+function makeMessage(sequence_id: number, message_type: Message['message_type'] = 'user'): Message {
+  const content = message_type === 'tool'
+    ? { tool_use_id: `tool-${sequence_id}`, content: 'tool result', is_error: false }
+    : { text: `message ${sequence_id}` };
   return {
     message_id: `msg-${sequence_id}`,
     sequence_id,
-    message_type: 'user',
+    message_type,
     conversation_id: 'conv-under-test',
-    content: { text: `message ${sequence_id}` },
+    content,
     created_at: '2024-01-01T00:00:00Z',
-  };
+  } as Message;
 }
 
 const idleState: ConversationState = { type: 'idle' };
@@ -60,6 +65,8 @@ describe('MessageList', () => {
   beforeEach(() => {
     localStorage.clear();
     resizeCallback = null;
+    scrollHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollHeight');
+    clientHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
     vi.stubGlobal('ResizeObserver', MockResizeObserver);
     Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
       configurable: true,
@@ -69,6 +76,20 @@ describe('MessageList', () => {
       configurable: true,
       get: () => 400,
     });
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    if (scrollHeightDescriptor) {
+      Object.defineProperty(HTMLElement.prototype, 'scrollHeight', scrollHeightDescriptor);
+    } else {
+      delete (HTMLElement.prototype as unknown as { scrollHeight?: unknown }).scrollHeight;
+    }
+    if (clientHeightDescriptor) {
+      Object.defineProperty(HTMLElement.prototype, 'clientHeight', clientHeightDescriptor);
+    } else {
+      delete (HTMLElement.prototype as unknown as { clientHeight?: unknown }).clientHeight;
+    }
   });
 
   it('restores saved scroll when revisiting a cached conversation and does not snap back to bottom', async () => {
@@ -123,5 +144,28 @@ describe('MessageList', () => {
     await waitFor(() => expect(main.scrollTop).toBe(450));
     triggerResize(messages, 500);
     expect(main.scrollTop).toBe(450);
+  });
+
+  it('windows renderable rows so recent tool results do not hide their owning agent row', () => {
+    const historical = [
+      ...Array.from({ length: 20 }, (_, i) => makeMessage(i + 1, 'user')),
+      makeMessage(21, 'agent'),
+      ...Array.from({ length: 20 }, (_, i) => makeMessage(22 + i, 'tool')),
+    ];
+
+    const { container } = render(
+      <MessageList
+        messages={historical}
+        pendingMessages={[]}
+        convState={idleState}
+        onRetry={vi.fn()}
+        onOpenFile={undefined}
+        conversationId="conv-a"
+        streamingBuffer={null}
+      />,
+    );
+
+    expect(container.querySelector('[data-sequence-id="21"]')).not.toBeNull();
+    expect(container.querySelectorAll('.message.agent')).toHaveLength(1);
   });
 });

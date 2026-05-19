@@ -123,7 +123,8 @@ export function useBottomAnchoredWindow({
 
     const onScroll = () => {
       if (pendingFirstIndexRef.current <= 0) return;
-      if (el.scrollTop >= EXPAND_TRIGGER_PX) return;
+      const spacerHeight = pendingFirstIndexRef.current * COLLAPSED_EST_PX;
+      if (el.scrollTop - spacerHeight > EXPAND_TRIGGER_PX) return;
       // Capture pre-update geometry for exact scroll compensation.
       prevScrollHeightRef.current = el.scrollHeight;
       const next = Math.max(0, pendingFirstIndexRef.current - EXPAND_BATCH);
