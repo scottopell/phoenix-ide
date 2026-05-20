@@ -23,6 +23,7 @@ export const INITIAL_WINDOW = 12;
 export const EXPAND_BATCH = 12;
 export const EXPAND_TRIGGER_PX = 600;
 export const COLLAPSED_EST_PX = 360;
+export const RESTORE_OVERSCAN = 4;
 
 interface UseBottomAnchoredWindowArgs {
   messageCount: number;
@@ -30,11 +31,12 @@ interface UseBottomAnchoredWindowArgs {
   scrollRootRef: RefObject<HTMLElement | null>;
   /**
    * Saved scroll pixel offset for REQ-CONV-013 restore, read synchronously on
-   * the restoring mount. When the saved offset is near the top, the initial
-   * window widens to the first row so the restored scrollTop lands on real
-   * content rather than inside the estimated spacer. Deeper saved offsets keep
-   * the normal bottom window; the render-units follow-up will replace this
-   * estimate-bound compromise with measured render-unit geometry.
+   * the restoring mount. The initial window widens so the estimated spacer ends
+   * before the saved offset, with extra real rows above the viewport as a buffer.
+   * This preserves bottom-window virtualization for common bottom-pinned revisits
+   * while avoiding a restored viewport that lands wholly inside the spacer. The
+   * render-units follow-up will replace this estimate-bound compromise with
+   * measured render-unit geometry.
    */
   savedScrollPos?: number | null;
 }
@@ -59,8 +61,9 @@ function computeInitialStart(
   savedScrollPos: number | null | undefined,
 ): number {
   const defaultStart = computeDefaultStart(messageCount);
-  if (savedScrollPos != null && savedScrollPos <= INITIAL_WINDOW * COLLAPSED_EST_PX) {
-    return 0;
+  if (savedScrollPos != null) {
+    const rowsBeforeRestore = Math.floor(savedScrollPos / COLLAPSED_EST_PX);
+    return Math.max(0, Math.min(defaultStart, rowsBeforeRestore - RESTORE_OVERSCAN));
   }
   return defaultStart;
 }

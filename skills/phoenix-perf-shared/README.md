@@ -107,4 +107,4 @@ cat skills/phoenix-perf-hunt/resources/db/<id>.yaml
 - `browser_profile` tool available in the LLM runtime (default transport; provided by
   Phoenix's in-agent context — confirm before a hunt; cannot be shell-checked)
 - `agent-browser` on PATH (optional; only needed for `--transport agent-browser` legacy parity)
-- `uv` (for the PEP-723 scripts) or Python ≥ 3.11
+- `uv` (required for the PEP-723 `run-scenario` harness)

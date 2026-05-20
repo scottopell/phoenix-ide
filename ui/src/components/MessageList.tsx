@@ -237,6 +237,7 @@ export function MessageList({
     prevMessagesHeight.current = 0;
     prevMessageCountRef.current = messages.length;
     scrollTriggerRef.current = 'none';
+    lastScrollTop.current = mainRef.current?.scrollTop ?? 0;
     isPinnedToBottom.current = true;
   }
 

@@ -28,7 +28,7 @@ auto-execute fixes.
 | `BROWSER_PROFILE_CMD` not set (warning) | Normal in plain shell context; `browser_profile` tool is provided by the LLM runtime. Verify the tool is available, then use `run-scenario --request-out` / direct tool call / `--response-in` if no shell bridge exists. |
 | `agent-browser` not found (warning) | Optional legacy transport. Only needed for `--transport agent-browser`. |
 | DB has no conversations | `./dev.py seed` |
-| `uv` not found | `brew install uv` (or system `python3` ≥ 3.11) |
+| `uv` not found | `brew install uv` (required for the PEP-723 `run-scenario` harness) |
 | git user.name/email unset | `git config user.name/email` |
 | working tree dirty | commit/stash before a hunt (baseline must be on a clean tree) |
 
