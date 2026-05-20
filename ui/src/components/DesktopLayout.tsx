@@ -54,7 +54,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const activeSlug = slugMatch?.[1] ?? null;
   const activeConversation = useConversationSnapshot(activeSlug);
 
-  const effectiveCwd = activeConversation?.cwd ?? '/';
+  const effectiveCwd = activeConversation?.worktree_path ?? activeConversation?.cwd ?? '/';
 
   // Always render a single stable tree so children never unmounts across the
   // desktop/mobile breakpoint. Conditionally show sidebar and file-explorer
@@ -108,7 +108,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
         <div className={isDesktop ? 'desktop-main' : undefined}>
           {children}
         </div>
-        {isDesktop && <CommandPalette conversations={conversations} />}
+        {isDesktop && <CommandPalette conversations={conversations} activeConversation={activeConversation} />}
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
     </FileExplorerProvider>

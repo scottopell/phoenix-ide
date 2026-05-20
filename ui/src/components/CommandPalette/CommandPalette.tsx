@@ -13,14 +13,16 @@ import { useFileExplorer } from '../../hooks/useFileExplorer';
 import { computeChainRoots } from '../../utils/chains';
 import { useFocusScope } from '../../hooks/useFocusScope';
 import { useIsDesktop } from '../../hooks/useMediaQuery';
+import { activeConversationFileRoot } from './fileRoot';
 
 const SEARCH_DEBOUNCE_MS = 120;
 
 interface CommandPaletteProps {
   conversations: readonly Conversation[];
+  activeConversation: Conversation | null;
 }
 
-export function CommandPalette({ conversations }: CommandPaletteProps) {
+export function CommandPalette({ conversations, activeConversation }: CommandPaletteProps) {
   const [state, setState] = useState<PaletteState>(initialState);
   const isDesktop = useIsDesktop();
   const navigate = useNavigate();
@@ -35,11 +37,8 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const currentSlug = slugMatch?.[1] ?? null;
 
-  // Stable scalars for the active conversation — only update when id/cwd actually change,
-  // not on every 5s poll that produces a new array reference from DesktopLayout.
-  const activeConversationRaw = conversations.find(c => c.slug === currentSlug) ?? null;
-  const activeConvId = activeConversationRaw?.id ?? null;
-  const activeConvCwd = activeConversationRaw?.cwd ?? null;
+  const activeConvId = activeConversation?.id ?? null;
+  const activeFileRoot = activeConversationFileRoot(activeConversation);
 
   // Stable conversation ids string — only changes when the *set* of conversations changes.
   const conversationIdsKey = useMemo(
@@ -56,13 +55,13 @@ export function CommandPalette({ conversations }: CommandPaletteProps) {
     [conversationIdsKey, navigate],
   );
 
-  // FileSource — recomputed only when conversation id or cwd actually changes.
+  // FileSource — recomputed only when conversation id or file root actually changes.
   const fileSource = useMemo(
     () =>
-      activeConvId && activeConvCwd
-        ? createFileSource(activeConvId, activeConvCwd, (path, rootDir) => openFile(path, rootDir))
+      activeConvId && activeFileRoot
+        ? createFileSource(activeConvId, activeFileRoot, (path, rootDir) => openFile(path, rootDir))
         : null,
-    [activeConvId, activeConvCwd, openFile],
+    [activeConvId, activeFileRoot, openFile],
   );
 
   // Stable sources array — changes only when conversationSource or fileSource identity changes.

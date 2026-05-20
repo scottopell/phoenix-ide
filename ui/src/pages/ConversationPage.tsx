@@ -861,11 +861,11 @@ function ConversationPageContent() {
 
   const handleOpenFileFromPatch = useCallback(
     (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => {
-      const rootDir = conversation?.cwd || '/';
+      const rootDir = conversation?.worktree_path ?? conversation?.cwd ?? '/';
       const fullPath = filePath.startsWith('/') ? filePath : `${rootDir}/${filePath}`;
       fileExplorer.openFile(fullPath, rootDir, { modifiedLines, firstModifiedLine });
     },
-    [conversation?.cwd, fileExplorer]
+    [conversation?.worktree_path, conversation?.cwd, fileExplorer]
   );
 
   // REQ-SEED-003: click handler for the seed-parent breadcrumb link.
@@ -1409,7 +1409,7 @@ function ConversationPageContent() {
       {/* Mobile file browser overlay */}
       <FileBrowserOverlay
         isOpen={showFileBrowser}
-        rootPath={conversation.cwd}
+        rootPath={conversation.worktree_path ?? conversation.cwd}
         conversationId={conversation.id}
         onClose={() => setShowFileBrowser(false)}
         onFileSelect={handleFileSelect}

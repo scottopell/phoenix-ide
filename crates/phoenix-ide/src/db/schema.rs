@@ -460,6 +460,10 @@ impl Conversation {
     pub fn is_agent_working(&self) -> bool {
         self.state.display_state() == crate::state_machine::state::DisplayState::Working
     }
+
+    pub fn file_root(&self) -> &str {
+        self.conv_mode.worktree_path().unwrap_or(&self.cwd)
+    }
 }
 
 /// Error classification for UI display.

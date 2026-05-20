@@ -2764,7 +2764,7 @@ async fn serve_preview_file(
 // Conversation-scoped File Search (REQ-IR-004)
 // ============================================================
 
-/// Gitignore-aware recursive file search within the conversation's working directory.
+/// Gitignore-aware recursive file search within the conversation's file root.
 ///
 /// Uses the `ignore` crate to respect `.gitignore`, `.ignore`, and other standard
 /// exclusion files. Results are fuzzy-matched against the query when provided.
@@ -2780,10 +2780,10 @@ async fn search_conversation_files(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let root = std::path::PathBuf::from(&conversation.cwd);
+    let root = std::path::PathBuf::from(conversation.file_root());
     if !root.exists() {
         return Err(AppError::NotFound(
-            "Conversation working directory does not exist".to_string(),
+            "Conversation file root does not exist".to_string(),
         ));
     }
 
@@ -3580,6 +3580,99 @@ mod hard_delete_cascade_tests {
             chain_qa,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn search_conversation_files_uses_worktree_path_when_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("repo");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(cwd.join("src")).expect("cwd dirs");
+        std::fs::create_dir_all(worktree.join("src")).expect("worktree dirs");
+        std::fs::write(cwd.join("src/wrong.rs"), "fn wrong() {}\n").expect("cwd file");
+        std::fs::write(worktree.join("src/right.rs"), "fn right() {}\n").expect("worktree file");
+
+        let state = make_test_state().await;
+        let mode = crate::db::ConvMode::Work {
+            branch_name: crate::db::NonEmptyString::new("task-93001").unwrap(),
+            worktree_path: crate::db::NonEmptyString::new(worktree.to_string_lossy().to_string())
+                .unwrap(),
+            base_branch: crate::db::NonEmptyString::new("main").unwrap(),
+            task_id: crate::db::NonEmptyString::new("93001").unwrap(),
+            task_title: crate::db::NonEmptyString::new("Restore Cmd P").unwrap(),
+        };
+        state
+            .db
+            .create_conversation_with_project(
+                "c-file-root",
+                "file-root",
+                cwd.to_str().unwrap(),
+                true,
+                None,
+                None,
+                None,
+                &mode,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+
+        let Json(response) = search_conversation_files(
+            State(state),
+            Path("c-file-root".to_string()),
+            Query(FileSearchQuery {
+                q: "right".to_string(),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .expect("search");
+
+        let paths: Vec<_> = response.items.into_iter().map(|item| item.path).collect();
+        assert_eq!(paths, vec!["src/right.rs"]);
+    }
+
+    #[tokio::test]
+    async fn search_conversation_files_falls_back_to_cwd_for_direct_conversations() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(cwd.join("src")).expect("dirs");
+        std::fs::write(cwd.join("src/direct.rs"), "fn direct() {}\n").expect("file");
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation_with_project(
+                "c-direct-root",
+                "direct-root",
+                cwd.to_str().unwrap(),
+                true,
+                None,
+                None,
+                None,
+                &crate::db::ConvMode::Direct,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("create");
+
+        let Json(response) = search_conversation_files(
+            State(state),
+            Path("c-direct-root".to_string()),
+            Query(FileSearchQuery {
+                q: "direct".to_string(),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .expect("search");
+
+        let paths: Vec<_> = response.items.into_iter().map(|item| item.path).collect();
+        assert_eq!(paths, vec!["src/direct.rs"]);
     }
 
     #[tokio::test]
