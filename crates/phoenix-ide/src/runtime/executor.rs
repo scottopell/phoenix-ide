@@ -2431,7 +2431,7 @@ where
         &mut self,
         task_file: String,
         title: String,
-        priority: String,
+        priority: crate::task_source::Priority,
         plan: String,
     ) -> Result<(), String> {
         let cwd = self.context.working_dir.clone();
@@ -2449,7 +2449,7 @@ where
         // Clone for state revert on failure (originals moved into spawn_blocking)
         let task_file_backup = task_file.clone();
         let title_backup = title.clone();
-        let priority_backup = priority.clone();
+        let priority_backup = priority;
         let plan_backup = plan.clone();
 
         // Run blocking git/fs operations on a blocking thread
@@ -2616,7 +2616,7 @@ where
         &mut self,
         task_file: String,
         title: String,
-        priority: String,
+        priority: crate::task_source::Priority,
         plan: String,
     ) -> Result<Option<Event>, String> {
         let cwd = self.context.working_dir.clone();
@@ -2628,7 +2628,7 @@ where
 
         let task_file_backup = task_file.clone();
         let title_backup = title.clone();
-        let priority_backup = priority.clone();
+        let priority_backup = priority;
         let plan_backup = plan.clone();
 
         let result = tokio::task::spawn_blocking(move || {
@@ -4327,7 +4327,7 @@ mod approve_task_refreshes_mode_context_tests {
             ConvState::AwaitingTaskApproval {
                 task_file: format!("tasks/{task_filename}"),
                 title: "Spawn work subagents".to_string(),
-                priority: "p2".to_string(),
+                priority: crate::task_source::Priority::P2,
                 plan: "Plan and spawn".to_string(),
             },
             storage,
@@ -4346,7 +4346,7 @@ mod approve_task_refreshes_mode_context_tests {
         rt.execute_effect(Effect::ApproveTask {
             task_file: format!("tasks/{task_filename}"),
             title: "Spawn work subagents".to_string(),
-            priority: "p2".to_string(),
+            priority: crate::task_source::Priority::P2,
             plan: "Plan and spawn".to_string(),
         })
         .await

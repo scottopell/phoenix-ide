@@ -183,9 +183,9 @@ fn arb_awaiting_task_approval_state() -> impl Strategy<Value = ConvState> {
     (
         "[a-zA-Z ]{1,30}",
         prop_oneof![
-            Just("p0".to_string()),
-            Just("p1".to_string()),
-            Just("p2".to_string())
+            Just(crate::task_source::Priority::P0),
+            Just(crate::task_source::Priority::P1),
+            Just(crate::task_source::Priority::P2),
         ],
         "[a-zA-Z0-9 .,\n]{1,100}",
         "[0-9]{5}",
@@ -194,7 +194,7 @@ fn arb_awaiting_task_approval_state() -> impl Strategy<Value = ConvState> {
         .prop_map(|(title, priority, plan, id, slug)| {
             let status = "ready";
             ConvState::AwaitingTaskApproval {
-                task_file: format!("tasks/{id}-{priority}-{status}--{slug}.md"),
+                task_file: format!("tasks/{id}-{}-{status}--{slug}.md", priority.as_str()),
                 title,
                 priority,
                 plan,

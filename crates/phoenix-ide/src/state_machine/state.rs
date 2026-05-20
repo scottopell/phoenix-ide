@@ -545,7 +545,7 @@ mod tests {
             ConvState::AwaitingTaskApproval {
                 task_file: "tasks/x.md".into(),
                 title: "t".into(),
-                priority: "p1".into(),
+                priority: crate::task_source::Priority::P1,
                 plan: "plan".into(),
             },
             ConvState::AwaitingUserResponse {
@@ -840,7 +840,7 @@ pub enum ConvState {
         #[serde(default)]
         task_file: String,
         title: String,
-        priority: String,
+        priority: crate::task_source::Priority,
         plan: String,
     },
 
@@ -940,7 +940,7 @@ pub enum ParentState {
     AwaitingTaskApproval {
         task_file: String,
         title: String,
-        priority: String,
+        priority: crate::task_source::Priority,
         plan: String,
     },
     AwaitingUserResponse {

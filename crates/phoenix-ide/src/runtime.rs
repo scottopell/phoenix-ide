@@ -81,7 +81,7 @@ pub struct TaskApprovalHandoffData {
     pub worktree_path: String,
     pub base_branch: String,
     pub title: String,
-    pub priority: String,
+    pub priority: crate::task_source::Priority,
     pub plan: String,
     pub task_file: String,
 }

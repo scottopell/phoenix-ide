@@ -19,8 +19,73 @@
 //! slot in behind this same seam; that is deliberately out of scope for v1.
 
 use std::path::Path;
+use std::str::FromStr;
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use taskmd_core::constants::Status;
+
+/// Task priority — `p0` (highest) .. `p4` (lowest).
+///
+/// Newtype wrapper around `taskmd_core::constants::Priority` so the
+/// authoritative enum is reused (no parallel set of variants), with serde
+/// support added at the Phoenix-side type. The wire/persisted form is the
+/// same lowercase string (`"p0"` .. `"p4"`) that taskmd filenames carry, so
+/// existing DB rows round-trip unchanged; a payload with any other value
+/// fails deserialisation loudly rather than being threaded through as bare
+/// text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Priority(pub taskmd_core::constants::Priority);
+
+impl Priority {
+    pub const P0: Self = Priority(taskmd_core::constants::Priority::P0);
+    pub const P1: Self = Priority(taskmd_core::constants::Priority::P1);
+    pub const P2: Self = Priority(taskmd_core::constants::Priority::P2);
+    pub const P3: Self = Priority(taskmd_core::constants::Priority::P3);
+    pub const P4: Self = Priority(taskmd_core::constants::Priority::P4);
+
+    pub fn as_str(self) -> &'static str {
+        self.0.as_str()
+    }
+}
+
+impl Default for Priority {
+    fn default() -> Self {
+        Priority::P2
+    }
+}
+
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.0.as_str())
+    }
+}
+
+impl From<taskmd_core::constants::Priority> for Priority {
+    fn from(p: taskmd_core::constants::Priority) -> Self {
+        Priority(p)
+    }
+}
+
+impl From<Priority> for taskmd_core::constants::Priority {
+    fn from(p: Priority) -> Self {
+        p.0
+    }
+}
+
+impl Serialize for Priority {
+    fn serialize<S: Serializer>(&self, ser: S) -> Result<S::Ok, S::Error> {
+        ser.serialize_str(self.0.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for Priority {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(de)?;
+        taskmd_core::constants::Priority::from_str(&s)
+            .map(Priority)
+            .map_err(serde::de::Error::custom)
+    }
+}
 
 /// Classification of a task file referenced by `propose_task`, derived purely
 /// from its filename.
@@ -29,8 +94,8 @@ pub enum TaskSource {
     /// Filename parsed as a taskmd 1.0 filename.
     Taskmd {
         id: String,
-        /// `p0`..`p4`, as it appears in the filename.
-        priority: String,
+        /// `p0`..`p4`, from the filename.
+        priority: Priority,
         status: Status,
         slug: String,
     },
@@ -52,7 +117,7 @@ impl TaskSource {
         if let Some(parsed) = taskmd_core::filename::parse_filename(filename) {
             return Some(Self::Taskmd {
                 id: parsed.id,
-                priority: parsed.priority.to_string(),
+                priority: Priority::from(parsed.priority),
                 status: parsed.status,
                 slug: parsed.slug,
             });
@@ -76,10 +141,10 @@ impl TaskSource {
 
     /// Display priority for the approval UI. taskmd files carry one in the
     /// filename; plain-markdown files default to `p2`.
-    pub fn priority(&self) -> &str {
+    pub fn priority(&self) -> Priority {
         match self {
-            Self::Taskmd { priority, .. } => priority,
-            Self::PlainMarkdown { .. } => "p2",
+            Self::Taskmd { priority, .. } => *priority,
+            Self::PlainMarkdown { .. } => Priority::P2,
         }
     }
 
@@ -180,13 +245,13 @@ mod tests {
                 slug,
             } => {
                 assert_eq!(id, "12345");
-                assert_eq!(priority, "p1");
+                assert_eq!(*priority, Priority::P1);
                 assert_eq!(*status, Status::Ready);
                 assert_eq!(slug, "fix-the-login-bug");
             }
             other => panic!("expected Taskmd, got {other:?}"),
         }
-        assert_eq!(src.priority(), "p1");
+        assert_eq!(src.priority(), Priority::P1);
         let (branch, id) = src.branch_and_id("conversation-abcdef");
         assert_eq!(branch, "task-12345-fix-the-login-bug");
         assert_eq!(id, "12345");
@@ -201,7 +266,7 @@ mod tests {
                 stem: "plan".to_string()
             }
         );
-        assert_eq!(src.priority(), "p2");
+        assert_eq!(src.priority(), Priority::P2);
         // README.md is a valid plain-markdown task brief.
         assert_eq!(
             TaskSource::detect("README.md"),
@@ -249,6 +314,42 @@ mod tests {
         let (branch, id) = src.branch_and_id("abcdefghij-extra");
         assert_eq!(id, "abcdefgh");
         assert_eq!(branch, "task-abcdefgh-abcdefgh");
+    }
+
+    /// Priority round-trips through the same string form taskmd uses on disk;
+    /// any other value fails deserialisation loudly. This is the
+    /// correct-by-construction guard: an invalid priority cannot reach the
+    /// approval UI as a bare String the way it could under task 13016.
+    #[test]
+    fn priority_round_trips_lowercase_string() {
+        for (p, s) in [
+            (Priority::P0, "p0"),
+            (Priority::P1, "p1"),
+            (Priority::P2, "p2"),
+            (Priority::P3, "p3"),
+            (Priority::P4, "p4"),
+        ] {
+            let v = serde_json::to_value(p).unwrap();
+            assert_eq!(v, serde_json::Value::String(s.to_string()));
+            let back: Priority = serde_json::from_value(v).unwrap();
+            assert_eq!(back, p);
+            assert_eq!(p.as_str(), s);
+            assert_eq!(p.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn priority_rejects_unknown_values() {
+        let v = serde_json::Value::String("p9".to_string());
+        assert!(
+            serde_json::from_value::<Priority>(v).is_err(),
+            "p9 must not deserialise into Priority"
+        );
+        let v = serde_json::Value::String(String::new());
+        assert!(
+            serde_json::from_value::<Priority>(v).is_err(),
+            "empty string must not deserialise into Priority"
+        );
     }
 
     #[test]

@@ -2313,7 +2313,7 @@ mod tests {
         let approval_state = ConvState::AwaitingTaskApproval {
             task_file: "tasks/12345-p1-ready--fix-the-widget.md".to_string(),
             title: "Fix the widget".to_string(),
-            priority: "p1".to_string(),
+            priority: crate::task_source::Priority::P1,
             plan: "Step 1: read code\nStep 2: fix bug".to_string(),
         };
         db.update_conversation_state("conv-1", &approval_state)
@@ -2337,7 +2337,7 @@ mod tests {
         {
             assert_eq!(task_file, "tasks/12345-p1-ready--fix-the-widget.md");
             assert_eq!(title, "Fix the widget");
-            assert_eq!(priority, "p1");
+            assert_eq!(priority, crate::task_source::Priority::P1);
             assert_eq!(plan, "Step 1: read code\nStep 2: fix bug");
         }
     }
@@ -3126,7 +3126,7 @@ mod tests {
             worktree_path: "/tmp/.phoenix/worktrees/handoff-parent".to_string(),
             base_branch: "main".to_string(),
             title: "Approve Fresh".to_string(),
-            priority: "p1".to_string(),
+            priority: crate::task_source::Priority::P1,
             plan: "Do the work".to_string(),
             task_file: "tasks/27002-p1-ready--approve-fresh.md".to_string(),
         };

@@ -41,7 +41,7 @@ const ACCEPTABLE_PROPOSE_STATUSES: &[taskmd_core::constants::Status] = &[
 struct TaskFileSnapshot {
     task_file: String,
     title: String,
-    priority: String,
+    priority: crate::task_source::Priority,
     plan: String,
 }
 
@@ -164,7 +164,7 @@ fn resolve_task_file(
         .map_err(|e| format!("Failed to read task file '{task_file}': {e}"))?;
 
     let title = source.title(&body);
-    let priority = source.priority().to_string();
+    let priority = source.priority();
     let plan = body.trim().to_string();
 
     Ok(TaskFileSnapshot {
@@ -1379,7 +1379,7 @@ pub fn transition_parent(
                 .with_effect(Effect::ApproveTask {
                     task_file: task_file.clone(),
                     title: title.clone(),
-                    priority: priority.clone(),
+                    priority: *priority,
                     plan: plan.clone(),
                 })
                 .with_effect(Effect::PersistState)
@@ -1402,13 +1402,13 @@ pub fn transition_parent(
         ) => Ok(ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
             task_file: task_file.clone(),
             title: title.clone(),
-            priority: priority.clone(),
+            priority: *priority,
             plan: plan.clone(),
         })
         .with_effect(Effect::ApproveTaskFreshHandoff {
             task_file: task_file.clone(),
             title: title.clone(),
-            priority: priority.clone(),
+            priority: *priority,
             plan: plan.clone(),
         })),
 
@@ -1728,7 +1728,7 @@ pub fn transition_parent(
                     ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
                         task_file: snapshot.task_file.clone(),
                         title: snapshot.title.clone(),
-                        priority: snapshot.priority.clone(),
+                        priority: snapshot.priority,
                         plan: snapshot.plan.clone(),
                     })
                     .with_effect(Effect::PersistCheckpoint { data: checkpoint })
@@ -3892,7 +3892,7 @@ mod resolve_task_file_tests {
         let snap = resolve_task_file(tmp.path(), "tasks", "tasks/12345-p1-ready--fix-login.md")
             .expect("taskmd file should resolve");
         assert_eq!(snap.title, "Repair login");
-        assert_eq!(snap.priority, "p1");
+        assert_eq!(snap.priority, crate::task_source::Priority::P1);
         assert!(snap.plan.contains("plan body"));
     }
 
@@ -3935,7 +3935,7 @@ mod resolve_task_file_tests {
         let snap = resolve_task_file(tmp.path(), "tasks", "docs/plan.md")
             .expect("plain markdown should resolve");
         assert_eq!(snap.title, "Migrate the database");
-        assert_eq!(snap.priority, "p2");
+        assert_eq!(snap.priority, crate::task_source::Priority::P2);
         assert_eq!(snap.task_file, "docs/plan.md");
         assert!(snap.plan.contains("step one"));
 
