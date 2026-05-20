@@ -1646,10 +1646,10 @@ pub fn transition_parent(
             }),
         ) => {
             // REQ-BED-028: propose_task interception (checked first)
-            if let Some(tool) = tool_calls
-                .iter()
-                .find(|t| matches!(t.input, ToolInput::ProposeTask(_)))
-            {
+            if let Some((tool, input)) = tool_calls.iter().find_map(|t| match &t.input {
+                ToolInput::ProposeTask(input) => Some((t, input)),
+                _ => None,
+            }) {
                 // propose_task is only valid in Managed mode (Explore/Work lifecycle).
                 // Direct and Branch mode should never produce this tool call.
                 if context.mode == ModeKind::Direct || context.mode == ModeKind::Branch {
@@ -1684,68 +1684,64 @@ pub fn transition_parent(
                     .with_effect(Effect::notify_state_change())
                     .with_effect(Effect::RequestLlm));
                 }
-                if let ToolInput::ProposeTask(ref input) = tool.input {
-                    let snapshot = match resolve_task_file(
-                        &context.working_dir,
-                        &context.tasks_dir_name,
-                        &input.task_file,
-                    ) {
-                        Ok(s) => s,
-                        Err(err_msg) => {
-                            // Validation failed: surface the error as a tool_result and
-                            // re-request the LLM so it can fix the file (or pick another)
-                            // and retry.
-                            let display_data =
-                                compute_bash_display_data(&content, &context.working_dir);
-                            let assistant_message =
-                                AssistantMessage::new(content, Some(usage_data), display_data);
-                            let tool_result = ToolResult::error(tool.id.clone(), err_msg);
-                            let checkpoint = CheckpointData::tool_round(
-                                assistant_message,
-                                vec![tool_result],
-                            )
-                            .expect("propose_task produces exactly one tool_use and one result");
-                            return Ok(ParentTransitionResult::new(ParentState::Core(
-                                CoreState::LlmRequesting { attempt: 1 },
-                            ))
-                            .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                            .with_effect(Effect::PersistState)
-                            .with_effect(Effect::notify_state_change())
-                            .with_effect(Effect::RequestLlm));
-                        }
-                    };
 
-                    let tool_result = ToolResult::success(
-                        tool.id.clone(),
-                        "Plan submitted for review".to_string(),
-                    );
-                    let display_data = compute_bash_display_data(&content, &context.working_dir);
-                    let assistant_message =
-                        AssistantMessage::new(content, Some(usage_data), display_data);
-                    let checkpoint =
-                        CheckpointData::tool_round(assistant_message, vec![tool_result])
-                            .expect("propose_task produces exactly one tool_use and one result");
-
-                    return Ok(
-                        ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
-                            task_file: snapshot.task_file.clone(),
-                            title: snapshot.title.clone(),
-                            priority: snapshot.priority.clone(),
-                            plan: snapshot.plan.clone(),
-                        })
+                let snapshot = match resolve_task_file(
+                    &context.working_dir,
+                    &context.tasks_dir_name,
+                    &input.task_file,
+                ) {
+                    Ok(s) => s,
+                    Err(err_msg) => {
+                        // Validation failed: surface the error as a tool_result and
+                        // re-request the LLM so it can fix the file (or pick another)
+                        // and retry.
+                        let display_data =
+                            compute_bash_display_data(&content, &context.working_dir);
+                        let assistant_message =
+                            AssistantMessage::new(content, Some(usage_data), display_data);
+                        let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                        let checkpoint =
+                            CheckpointData::tool_round(assistant_message, vec![tool_result])
+                                .expect(
+                                    "propose_task produces exactly one tool_use and one result",
+                                );
+                        return Ok(ParentTransitionResult::new(ParentState::Core(
+                            CoreState::LlmRequesting { attempt: 1 },
+                        ))
                         .with_effect(Effect::PersistCheckpoint { data: checkpoint })
                         .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change()),
-                    );
-                }
-                unreachable!("propose_task_tool matched but input was not ProposeTask");
+                        .with_effect(Effect::notify_state_change())
+                        .with_effect(Effect::RequestLlm));
+                    }
+                };
+
+                let tool_result =
+                    ToolResult::success(tool.id.clone(), "Plan submitted for review".to_string());
+                let display_data = compute_bash_display_data(&content, &context.working_dir);
+                let assistant_message =
+                    AssistantMessage::new(content, Some(usage_data), display_data);
+                let checkpoint =
+                    CheckpointData::tool_round(assistant_message, vec![tool_result])
+                        .expect("propose_task produces exactly one tool_use and one result");
+
+                return Ok(
+                    ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
+                        task_file: snapshot.task_file.clone(),
+                        title: snapshot.title.clone(),
+                        priority: snapshot.priority.clone(),
+                        plan: snapshot.plan.clone(),
+                    })
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change()),
+                );
             }
 
             // REQ-AUQ-001: ask_user_question interception
-            if let Some(tool) = tool_calls
-                .iter()
-                .find(|t| matches!(t.input, ToolInput::AskUserQuestion(_)))
-            {
+            if let Some((tool, input)) = tool_calls.iter().find_map(|t| match &t.input {
+                ToolInput::AskUserQuestion(input) => Some((t, input)),
+                _ => None,
+            }) {
                 if tool_calls.len() > 1 {
                     let msg = "ask_user_question must be the only tool in response".to_string();
                     let display_data = compute_bash_display_data(&content, &context.working_dir);
@@ -1766,30 +1762,26 @@ pub fn transition_parent(
                     .with_effect(Effect::notify_state_change())
                     .with_effect(Effect::RequestLlm));
                 }
-                if let ToolInput::AskUserQuestion(ref input) = tool.input {
-                    let tool_result = ToolResult::success(
-                        tool.id.clone(),
-                        "Awaiting user response. See following message for answers.".to_string(),
-                    );
-                    let display_data = compute_bash_display_data(&content, &context.working_dir);
-                    let assistant_message =
-                        AssistantMessage::new(content, Some(usage_data), display_data);
-                    let checkpoint =
-                        CheckpointData::tool_round(assistant_message, vec![tool_result]).expect(
-                            "ask_user_question produces exactly one tool_use and one result",
-                        );
 
-                    return Ok(
-                        ParentTransitionResult::new(ParentState::AwaitingUserResponse {
-                            questions: input.questions.clone(),
-                            tool_use_id: tool.id.clone(),
-                        })
-                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
-                        .with_effect(Effect::PersistState)
-                        .with_effect(Effect::notify_state_change()),
-                    );
-                }
-                unreachable!("ask_question_tool matched but input was not AskUserQuestion");
+                let tool_result = ToolResult::success(
+                    tool.id.clone(),
+                    "Awaiting user response. See following message for answers.".to_string(),
+                );
+                let display_data = compute_bash_display_data(&content, &context.working_dir);
+                let assistant_message =
+                    AssistantMessage::new(content, Some(usage_data), display_data);
+                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])
+                    .expect("ask_user_question produces exactly one tool_use and one result");
+
+                return Ok(
+                    ParentTransitionResult::new(ParentState::AwaitingUserResponse {
+                        questions: input.questions.clone(),
+                        tool_use_id: tool.id.clone(),
+                    })
+                    .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                    .with_effect(Effect::PersistState)
+                    .with_effect(Effect::notify_state_change()),
+                );
             }
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
