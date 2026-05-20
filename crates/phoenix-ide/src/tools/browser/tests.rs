@@ -686,21 +686,25 @@ async fn test_browser_screenshot_local() {
 
     assert!(result.success, "Screenshot failed: {}", result.output);
 
-    // Check that we got image data (either inline base64 or file path)
-    let has_image = result.output.contains("Screenshot saved")
-        || result.output.contains("Screenshot captured")
-        || result.display_data.is_some();
-    assert!(has_image, "No screenshot data: {}", result.output);
-
-    // If we have display_data, verify it's valid PNG
-    if let Some(ref display) = result.display_data {
-        if let Some(data) = display.get("data") {
-            if let Some(base64_data) = data.as_str() {
-                // PNG magic bytes after base64 decode start with iVBORw0KGgo
-                assert!(base64_data.starts_with("iVBORw0KGgo"), "Not valid PNG data");
-            }
-        }
-    }
+    // The screenshot must flow to the LLM via the typed `images` channel,
+    // not via `display_data` (which is UI-only and never threaded to the
+    // LLM). Mirrors the read_image.rs regression assertion.
+    assert_eq!(
+        result.images.len(),
+        1,
+        "Expected 1 image in images field, got {}",
+        result.images.len()
+    );
+    assert_eq!(result.images[0].media_type, "image/png");
+    assert!(
+        result.images[0].data.starts_with("iVBORw0KGgo"),
+        "image data is not a valid PNG (base64 should start with iVBORw0KGgo)"
+    );
+    assert!(
+        result.display_data.is_none(),
+        "browser_take_screenshot must not duplicate the image payload into display_data, got {:?}",
+        result.display_data
+    );
 
     shutdown_test(_manager, server).await;
 }

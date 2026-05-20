@@ -360,16 +360,18 @@ impl Tool for BrowserTakeScreenshotTool {
                     return ToolOutput::error(format!("Failed to save screenshot: {e}"));
                 }
 
-                // Return base64 for vision
+                // Carry the base64 payload via the typed `images` channel so it
+                // reaches the LLM. `display_data` is UI-only and is never threaded
+                // to the LLM (it terminates at the UI), so storing the screenshot
+                // there would silently drop the image. Mirrors read_image.rs.
                 let base64_data =
                     base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_data);
 
-                ToolOutput::success(format!("Screenshot taken (saved as {path})")).with_display(
-                    json!({
-                        "type": "image",
-                        "media_type": "image/png",
-                        "data": base64_data,
-                    }),
+                ToolOutput::success(format!("Screenshot taken (saved as {path})")).with_images(
+                    vec![crate::tools::ToolImage {
+                        media_type: "image/png".to_string(),
+                        data: base64_data,
+                    }],
                 )
             }
             Ok(Err(e)) => ToolOutput::error(format!("Screenshot failed: {e}")),
