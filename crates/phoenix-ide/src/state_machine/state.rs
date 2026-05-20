@@ -135,25 +135,47 @@ pub enum ToolInput {
     SubmitError(SubmitErrorInput),
     ProposeTask(ProposeTaskInput),
     AskUserQuestion(AskUserQuestionInput),
-    /// Fallback for unknown tools or parsing failures
+    /// The tool name did not match any registered tool. Carries the original
+    /// name and payload so the executor can still dispatch by name (e.g. MCP
+    /// tools registered at runtime that the state machine does not know about).
     Unknown {
         name: String,
         input: Value,
     },
+    /// The tool name matched a registered tool, but the payload failed to
+    /// deserialize into the typed input. Structurally distinct from `Unknown`
+    /// so callers can tell "the LLM called a tool we don't have" from "the
+    /// LLM called a tool we do have but with a bad payload." Captures the
+    /// serde error so it can be surfaced to the LLM or logged.
+    Malformed {
+        name: String,
+        input: Value,
+        error: String,
+    },
 }
 
-fn parse_tool_input_or_unknown<T>(name: &str, payload: Value) -> ToolInput
+fn malformed_known_input(name: &str, payload: Value, err: &str) -> ToolInput {
+    tracing::warn!(
+        tool = name,
+        error = err,
+        "known tool input failed to deserialize; emitting Malformed"
+    );
+    ToolInput::Malformed {
+        name: name.to_string(),
+        input: payload,
+        error: err.to_string(),
+    }
+}
+
+fn parse_tool_input_or_malformed<T>(name: &str, payload: Value) -> ToolInput
 where
     T: serde::de::DeserializeOwned,
     ToolInput: From<T>,
 {
-    serde_json::from_value(payload.clone()).map_or_else(
-        |_| ToolInput::Unknown {
-            name: name.to_string(),
-            input: payload,
-        },
-        ToolInput::from,
-    )
+    match serde_json::from_value::<T>(payload.clone()) {
+        Ok(value) => ToolInput::from(value),
+        Err(err) => malformed_known_input(name, payload, &err.to_string()),
+    }
 }
 
 impl<'de> Deserialize<'de> for ToolInput {
@@ -183,41 +205,52 @@ impl<'de> Deserialize<'de> for ToolInput {
             }
         }
 
+        if tool_name == "malformed" {
+            if let (Some(name), Some(input), Some(error)) = (
+                payload.get("name").and_then(Value::as_str),
+                payload.get("input").cloned(),
+                payload.get("error").and_then(Value::as_str),
+            ) {
+                return Ok(ToolInput::Malformed {
+                    name: name.to_string(),
+                    input,
+                    error: error.to_string(),
+                });
+            }
+        }
+
         Ok(match tool_name.as_str() {
             "bash" => match serde_json::from_value::<BashToolInput>(payload.clone()) {
                 Ok(input) => ToolInput::Bash(input),
-                Err(_) => payload
+                Err(err) => payload
                     .get("command")
                     .and_then(Value::as_str)
                     .map(BashToolInput::run)
                     .map_or_else(
-                        || ToolInput::Unknown {
-                            name: "bash".to_string(),
-                            input: payload,
-                        },
+                        || malformed_known_input("bash", payload, &err.to_string()),
                         ToolInput::Bash,
                     ),
             },
-            "think" => parse_tool_input_or_unknown::<ThinkInput>("think", payload),
-            "patch" => parse_tool_input_or_unknown::<PatchInput>("patch", payload),
+            "think" => parse_tool_input_or_malformed::<ThinkInput>("think", payload),
+            "patch" => parse_tool_input_or_malformed::<PatchInput>("patch", payload),
             "keyword_search" => {
-                parse_tool_input_or_unknown::<KeywordSearchInput>("keyword_search", payload)
+                parse_tool_input_or_malformed::<KeywordSearchInput>("keyword_search", payload)
             }
-            "read_image" => parse_tool_input_or_unknown::<ReadImageInput>("read_image", payload),
+            "read_image" => parse_tool_input_or_malformed::<ReadImageInput>("read_image", payload),
             "spawn_agents" => {
-                parse_tool_input_or_unknown::<SpawnAgentsInput>("spawn_agents", payload)
+                parse_tool_input_or_malformed::<SpawnAgentsInput>("spawn_agents", payload)
             }
             "submit_result" => {
-                parse_tool_input_or_unknown::<SubmitResultInput>("submit_result", payload)
+                parse_tool_input_or_malformed::<SubmitResultInput>("submit_result", payload)
             }
             "submit_error" => {
-                parse_tool_input_or_unknown::<SubmitErrorInput>("submit_error", payload)
+                parse_tool_input_or_malformed::<SubmitErrorInput>("submit_error", payload)
             }
             "propose_task" => {
-                parse_tool_input_or_unknown::<ProposeTaskInput>("propose_task", payload)
+                parse_tool_input_or_malformed::<ProposeTaskInput>("propose_task", payload)
             }
             "ask_user_question" => {
-                parse_tool_input_or_unknown::<AskUserQuestionInput>("ask_user_question", payload)
+                parse_tool_input_or_malformed::<AskUserQuestionInput>("ask_user_question", payload)
             }
             other => ToolInput::Unknown {
                 name: other.to_string(),
@@ -227,6 +260,11 @@ impl<'de> Deserialize<'de> for ToolInput {
     }
 }
 
+impl From<BashToolInput> for ToolInput {
+    fn from(input: BashToolInput) -> Self {
+        ToolInput::Bash(input)
+    }
+}
 impl From<ThinkInput> for ToolInput {
     fn from(input: ThinkInput) -> Self {
         ToolInput::Think(input)
@@ -287,7 +325,7 @@ impl ToolInput {
             ToolInput::SubmitError(_) => "submit_error",
             ToolInput::ProposeTask(_) => "propose_task",
             ToolInput::AskUserQuestion(_) => "ask_user_question",
-            ToolInput::Unknown { name, .. } => name,
+            ToolInput::Unknown { name, .. } | ToolInput::Malformed { name, .. } => name,
         }
     }
 
@@ -309,83 +347,39 @@ impl ToolInput {
             ToolInput::SubmitError(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::ProposeTask(input) => serde_json::to_value(input).unwrap_or(Value::Null),
             ToolInput::AskUserQuestion(input) => serde_json::to_value(input).unwrap_or(Value::Null),
-            ToolInput::Unknown { input, .. } => input.clone(),
+            ToolInput::Unknown { input, .. } | ToolInput::Malformed { input, .. } => input.clone(),
         }
     }
 
-    /// Parse from tool name and JSON value
+    /// Parse from tool name and JSON value.
+    ///
+    /// Returns `ToolInput::Malformed` (carrying the serde error) when the
+    /// tool name matches a registered tool but the payload fails to parse,
+    /// and `ToolInput::Unknown` only when the tool name itself is not
+    /// registered. The two cases are structurally distinct so callers can
+    /// surface a malformed-known input separately from an unsupported tool.
     pub fn from_name_and_value(name: &str, value: Value) -> Self {
+        fn parse<T>(name: &str, value: Value) -> ToolInput
+        where
+            T: serde::de::DeserializeOwned,
+            ToolInput: From<T>,
+        {
+            match serde_json::from_value::<T>(value.clone()) {
+                Ok(parsed) => ToolInput::from(parsed),
+                Err(err) => malformed_known_input(name, value, &err.to_string()),
+            }
+        }
         match name {
-            "bash" => serde_json::from_value(value.clone()).map_or_else(
-                |_| ToolInput::Unknown {
-                    name: name.to_string(),
-                    input: value,
-                },
-                ToolInput::Bash,
-            ),
-            "think" => serde_json::from_value(value.clone()).map_or_else(
-                |_| ToolInput::Unknown {
-                    name: name.to_string(),
-                    input: value,
-                },
-                ToolInput::Think,
-            ),
-            "patch" => serde_json::from_value(value.clone()).map_or_else(
-                |_| ToolInput::Unknown {
-                    name: name.to_string(),
-                    input: value,
-                },
-                ToolInput::Patch,
-            ),
-            "keyword_search" => serde_json::from_value(value.clone()).map_or_else(
-                |_| ToolInput::Unknown {
-                    name: name.to_string(),
-                    input: value,
-                },
-                ToolInput::KeywordSearch,
-            ),
-            "read_image" => serde_json::from_value(value.clone()).map_or_else(
-                |_| ToolInput::Unknown {
-                    name: name.to_string(),
-                    input: value,
-                },
-                ToolInput::ReadImage,
-            ),
-            "spawn_agents" => serde_json::from_value(value.clone()).map_or_else(
-                |_| ToolInput::Unknown {
-                    name: name.to_string(),
-                    input: value,
-                },
-                ToolInput::SpawnAgents,
-            ),
-            "submit_result" => serde_json::from_value(value.clone()).map_or_else(
-                |_| ToolInput::Unknown {
-                    name: name.to_string(),
-                    input: value,
-                },
-                ToolInput::SubmitResult,
-            ),
-            "submit_error" => serde_json::from_value(value.clone()).map_or_else(
-                |_| ToolInput::Unknown {
-                    name: name.to_string(),
-                    input: value,
-                },
-                ToolInput::SubmitError,
-            ),
-            "propose_task" => serde_json::from_value(value.clone()).map_or_else(
-                |_| ToolInput::Unknown {
-                    name: name.to_string(),
-                    input: value,
-                },
-                ToolInput::ProposeTask,
-            ),
-            "ask_user_question" => serde_json::from_value(value.clone()).map_or_else(
-                |_| ToolInput::Unknown {
-                    name: name.to_string(),
-                    input: value,
-                },
-                ToolInput::AskUserQuestion,
-            ),
+            "bash" => parse::<BashToolInput>(name, value),
+            "think" => parse::<ThinkInput>(name, value),
+            "patch" => parse::<PatchInput>(name, value),
+            "keyword_search" => parse::<KeywordSearchInput>(name, value),
+            "read_image" => parse::<ReadImageInput>(name, value),
+            "spawn_agents" => parse::<SpawnAgentsInput>(name, value),
+            "submit_result" => parse::<SubmitResultInput>(name, value),
+            "submit_error" => parse::<SubmitErrorInput>(name, value),
+            "propose_task" => parse::<ProposeTaskInput>(name, value),
+            "ask_user_question" => parse::<AskUserQuestionInput>(name, value),
             _ => ToolInput::Unknown {
                 name: name.to_string(),
                 input: value,
@@ -429,6 +423,57 @@ mod tests {
         assert_eq!(name, "bash");
         assert_eq!(input["op"], "run");
         assert_eq!(input["command"], "bad");
+    }
+
+    /// A known tool name with a payload that fails to deserialize must produce
+    /// `ToolInput::Malformed` — structurally distinct from `Unknown` (which is
+    /// reserved for unsupported tool names). This is the regression guard for
+    /// task 13018: previously both cases collapsed into the same `Unknown`
+    /// variant, hiding "schema drift / bad LLM output" inside "tool we don't
+    /// have."
+    #[test]
+    fn malformed_known_tool_is_distinct_from_unknown() {
+        // `think` is a registered tool; `thoughts` is required as a string, but
+        // here it's an integer — deserialisation fails.
+        let bad_payload = serde_json::json!({ "thoughts": 42 });
+        let parsed = ToolInput::from_name_and_value("think", bad_payload.clone());
+        match parsed {
+            ToolInput::Malformed { name, input, error } => {
+                assert_eq!(name, "think");
+                assert_eq!(input, bad_payload);
+                assert!(
+                    !error.is_empty(),
+                    "Malformed must carry the serde error string"
+                );
+            }
+            other => panic!("expected Malformed for malformed known tool, got {other:?}"),
+        }
+
+        // A genuinely-unknown tool name still produces `Unknown` — the two
+        // cases must not collapse in either direction.
+        let parsed =
+            ToolInput::from_name_and_value("tool_we_do_not_have", serde_json::json!({"x": 1}));
+        assert!(
+            matches!(parsed, ToolInput::Unknown { .. }),
+            "expected Unknown for unregistered name, got {parsed:?}"
+        );
+    }
+
+    /// `ToolInput::Malformed` must round-trip through the persisted
+    /// `_tool`-tagged JSON used for ConvState serialisation, so a tool call
+    /// captured mid-execution can survive a server restart with its serde
+    /// error attached for surfacing on resume.
+    #[test]
+    fn malformed_tool_input_round_trips() {
+        let original = ToolInput::Malformed {
+            name: "propose_task".to_string(),
+            input: serde_json::json!({"unexpected": "shape"}),
+            error: "missing field `task_file`".to_string(),
+        };
+        let encoded = serde_json::to_value(&original).unwrap();
+        assert_eq!(encoded["_tool"], "malformed");
+        let decoded: ToolInput = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded, original);
     }
 
     /// Task 02713: model change is allowed from `Idle` and `Error` only.
