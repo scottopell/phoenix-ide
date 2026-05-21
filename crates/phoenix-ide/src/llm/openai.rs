@@ -589,18 +589,33 @@ fn translate_to_responses_request(
                 ContentBlock::Image { source } => image_blocks.push(source),
                 ContentBlock::ToolUse { .. } => tool_calls.push(block),
                 ContentBlock::ToolResult { .. } => tool_results.push(block),
-                // Anthropic-specific server blocks -- no OpenAI equivalent; skip.
-                ContentBlock::ServerToolUse { .. }
-                | ContentBlock::ToolSearchToolResult { .. }
-                | ContentBlock::WebSearchToolResult { .. }
-                | ContentBlock::WebFetchToolResult { .. }
-                | ContentBlock::CodeExecutionToolResult { .. }
-                | ContentBlock::BashCodeExecutionToolResult { .. }
-                | ContentBlock::TextEditorCodeExecutionToolResult { .. }
-                | ContentBlock::McpToolUse { .. }
-                | ContentBlock::McpToolResult { .. } => {
+                // Anthropic-specific server blocks: executed by the Anthropic API,
+                // with no representable equivalent in the OpenAI Responses wire
+                // format — dropped from the OpenAI request. Logged per-block with
+                // the discriminant + id so a provider-switch context gap is
+                // diagnosable, not a static content-free line.
+                ContentBlock::ServerToolUse { id, .. } | ContentBlock::McpToolUse { id, .. } => {
                     tracing::debug!(
-                        "Skipping Anthropic server block in OpenAI message translation"
+                        block_type = block.type_tag(),
+                        block_id = %id,
+                        role,
+                        "dropping Anthropic server block in OpenAI message translation \
+                         — no OpenAI wire equivalent"
+                    );
+                }
+                ContentBlock::ToolSearchToolResult { tool_use_id, .. }
+                | ContentBlock::WebSearchToolResult { tool_use_id, .. }
+                | ContentBlock::WebFetchToolResult { tool_use_id, .. }
+                | ContentBlock::CodeExecutionToolResult { tool_use_id, .. }
+                | ContentBlock::BashCodeExecutionToolResult { tool_use_id, .. }
+                | ContentBlock::TextEditorCodeExecutionToolResult { tool_use_id, .. }
+                | ContentBlock::McpToolResult { tool_use_id, .. } => {
+                    tracing::debug!(
+                        block_type = block.type_tag(),
+                        tool_use_id = %tool_use_id,
+                        role,
+                        "dropping Anthropic server block in OpenAI message translation \
+                         — no OpenAI wire equivalent"
                     );
                 }
             }

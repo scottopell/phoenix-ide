@@ -209,6 +209,30 @@ impl ContentBlock {
         ContentBlock::Text { text: s.into() }
     }
 
+    /// Wire discriminant for this block — the same string serde emits as the
+    /// `type` tag. Single source of truth for the variant name in logs and
+    /// diagnostics; `prop_content_block_type_tag_valid` asserts it stays in
+    /// lockstep with the serde output.
+    pub fn type_tag(&self) -> &'static str {
+        match self {
+            ContentBlock::Text { .. } => "text",
+            ContentBlock::Image { .. } => "image",
+            ContentBlock::ToolUse { .. } => "tool_use",
+            ContentBlock::ToolResult { .. } => "tool_result",
+            ContentBlock::ServerToolUse { .. } => "server_tool_use",
+            ContentBlock::ToolSearchToolResult { .. } => "tool_search_tool_result",
+            ContentBlock::WebSearchToolResult { .. } => "web_search_tool_result",
+            ContentBlock::WebFetchToolResult { .. } => "web_fetch_tool_result",
+            ContentBlock::CodeExecutionToolResult { .. } => "code_execution_tool_result",
+            ContentBlock::BashCodeExecutionToolResult { .. } => "bash_code_execution_tool_result",
+            ContentBlock::TextEditorCodeExecutionToolResult { .. } => {
+                "text_editor_code_execution_tool_result"
+            }
+            ContentBlock::McpToolUse { .. } => "mcp_tool_use",
+            ContentBlock::McpToolResult { .. } => "mcp_tool_result",
+        }
+    }
+
     #[cfg(test)]
     pub fn tool_use(
         id: impl Into<String>,

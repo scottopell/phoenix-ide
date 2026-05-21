@@ -580,7 +580,9 @@ proptest! {
         prop_assert_eq!(block, round_tripped);
     }
 
-    /// Every serialized ContentBlock has a non-empty snake_case "type" tag
+    /// Every serialized ContentBlock has a non-empty snake_case "type" tag,
+    /// and `ContentBlock::type_tag()` returns exactly that string — the helper
+    /// cannot drift from the serde wire format.
     #[test]
     fn prop_content_block_type_tag_valid(block in arb_content_block()) {
         let json = serde_json::to_value(&block).unwrap();
@@ -591,6 +593,10 @@ proptest! {
         prop_assert!(
             t.chars().all(|c| c.is_ascii_lowercase() || c == '_' || c.is_ascii_digit()),
             "type tag not snake_case: {t}"
+        );
+        prop_assert_eq!(
+            block.type_tag(), t,
+            "type_tag() drifted from the serde `type` tag"
         );
     }
 
