@@ -177,6 +177,22 @@ fn resolve_task_file(
 
 const MAX_RETRY_ATTEMPTS: u32 = 3;
 
+/// Discriminator for a `propose_task` tool call found in an LLM response: the
+/// payload either parsed into the typed input or failed serde (carrying the
+/// error string). Both cases are intercepted in the same arm of
+/// `transition_parent`; this enum keeps the dispatch exhaustive without an
+/// `unreachable!()`. See task 13018 follow-up.
+enum ProposeTaskCall<'a> {
+    Typed(&'a super::state::ProposeTaskInput),
+    Malformed(&'a str),
+}
+
+/// Sibling of [`ProposeTaskCall`] for `ask_user_question`.
+enum AskUserQuestionCall<'a> {
+    Typed(&'a super::state::AskUserQuestionInput),
+    Malformed(&'a str),
+}
+
 /// Result of a state transition
 #[derive(Debug)]
 pub struct TransitionResult {
@@ -1645,9 +1661,18 @@ pub fn transition_parent(
                 ..
             }),
         ) => {
-            // REQ-BED-028: propose_task interception (checked first)
-            if let Some((tool, input)) = tool_calls.iter().find_map(|t| match &t.input {
-                ToolInput::ProposeTask(input) => Some((t, input)),
+            // REQ-BED-028: propose_task interception (checked first).
+            //
+            // Find the propose_task call whether it parsed as typed input or
+            // failed serde (ToolInput::Malformed{name: "propose_task"}). The
+            // two cases dispatch differently but share the same pre-checks
+            // (mode, "must be the only tool") because they are both the LLM
+            // calling propose_task — only the payload differs.
+            if let Some((tool, call)) = tool_calls.iter().find_map(|t| match &t.input {
+                ToolInput::ProposeTask(input) => Some((t, ProposeTaskCall::Typed(input))),
+                ToolInput::Malformed { name, error, .. } if name == "propose_task" => {
+                    Some((t, ProposeTaskCall::Malformed(error.as_str())))
+                }
                 _ => None,
             }) {
                 // propose_task is only valid in Managed mode (Explore/Work lifecycle).
@@ -1684,6 +1709,39 @@ pub fn transition_parent(
                     .with_effect(Effect::notify_state_change())
                     .with_effect(Effect::RequestLlm));
                 }
+
+                let input = match call {
+                    ProposeTaskCall::Typed(input) => input,
+                    ProposeTaskCall::Malformed(err) => {
+                        // The payload failed to deserialise into ProposeTaskInput.
+                        // Surface the serde error as a tool_result and re-request
+                        // the LLM so it can fix the payload, mirroring the
+                        // resolve_task_file Err branch below — without this the
+                        // typed interception is bypassed and the malformed call
+                        // falls through to propose_task's fallback run().
+                        let err_msg = format!(
+                            "propose_task input failed to parse: {err}. Re-emit the \
+                             call with a valid payload (expected `{{\"task_file\": \"<path>\"}}`)."
+                        );
+                        let display_data =
+                            compute_bash_display_data(&content, &context.working_dir);
+                        let assistant_message =
+                            AssistantMessage::new(content, Some(usage_data), display_data);
+                        let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                        let checkpoint =
+                            CheckpointData::tool_round(assistant_message, vec![tool_result])
+                                .expect(
+                                    "propose_task produces exactly one tool_use and one result",
+                                );
+                        return Ok(ParentTransitionResult::new(ParentState::Core(
+                            CoreState::LlmRequesting { attempt: 1 },
+                        ))
+                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_state_change())
+                        .with_effect(Effect::RequestLlm));
+                    }
+                };
 
                 let snapshot = match resolve_task_file(
                     &context.working_dir,
@@ -1737,9 +1795,16 @@ pub fn transition_parent(
                 );
             }
 
-            // REQ-AUQ-001: ask_user_question interception
-            if let Some((tool, input)) = tool_calls.iter().find_map(|t| match &t.input {
-                ToolInput::AskUserQuestion(input) => Some((t, input)),
+            // REQ-AUQ-001: ask_user_question interception. Same shape as
+            // propose_task: typed input takes the AwaitingUserResponse path,
+            // a malformed payload surfaces the serde error to the LLM so it
+            // can re-emit. The latter is the structural backstop for the
+            // Malformed variant added in task 13018.
+            if let Some((tool, call)) = tool_calls.iter().find_map(|t| match &t.input {
+                ToolInput::AskUserQuestion(input) => Some((t, AskUserQuestionCall::Typed(input))),
+                ToolInput::Malformed { name, error, .. } if name == "ask_user_question" => {
+                    Some((t, AskUserQuestionCall::Malformed(error.as_str())))
+                }
                 _ => None,
             }) {
                 if tool_calls.len() > 1 {
@@ -1762,6 +1827,33 @@ pub fn transition_parent(
                     .with_effect(Effect::notify_state_change())
                     .with_effect(Effect::RequestLlm));
                 }
+
+                let input = match call {
+                    AskUserQuestionCall::Typed(input) => input,
+                    AskUserQuestionCall::Malformed(err) => {
+                        let err_msg = format!(
+                            "ask_user_question input failed to parse: {err}. Re-emit the \
+                             call with a valid `questions` array."
+                        );
+                        let display_data =
+                            compute_bash_display_data(&content, &context.working_dir);
+                        let assistant_message =
+                            AssistantMessage::new(content, Some(usage_data), display_data);
+                        let tool_result = ToolResult::error(tool.id.clone(), err_msg);
+                        let checkpoint =
+                            CheckpointData::tool_round(assistant_message, vec![tool_result])
+                                .expect(
+                                    "ask_user_question produces exactly one tool_use and one result",
+                                );
+                        return Ok(ParentTransitionResult::new(ParentState::Core(
+                            CoreState::LlmRequesting { attempt: 1 },
+                        ))
+                        .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                        .with_effect(Effect::PersistState)
+                        .with_effect(Effect::notify_state_change())
+                        .with_effect(Effect::RequestLlm));
+                    }
+                };
 
                 let tool_result = ToolResult::success(
                     tool.id.clone(),
@@ -3333,6 +3425,139 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::RequestLlm)),
             "Should have RequestLlm effect to feed errors back"
+        );
+    }
+
+    /// Task 13018 follow-up: a propose_task whose payload failed to
+    /// deserialise (`ToolInput::Malformed{name: "propose_task", ...}`) must
+    /// be intercepted in the typed approval flow — the serde error is
+    /// surfaced as a tool_result and the LLM is re-requested. Without this
+    /// interception the malformed call would fall through to the executor
+    /// where propose_task's fallback `run()` returns a generic error, hiding
+    /// the precise serde diagnostic and skipping the typed approval path.
+    #[test]
+    fn test_malformed_propose_task_surfaces_serde_error_to_llm() {
+        use crate::llm::{ContentBlock, Usage};
+        use crate::state_machine::state::ToolInput;
+
+        let ctx = test_context();
+        // Construct via from_name_and_value so we exercise the same path the
+        // runtime takes when parsing an LLM tool call with a bad payload.
+        let bad_payload = serde_json::json!({"unexpected": "shape"});
+        let parsed = ToolInput::from_name_and_value("propose_task", bad_payload.clone());
+        assert!(
+            matches!(parsed, ToolInput::Malformed { .. }),
+            "test setup: expected Malformed, got {parsed:?}"
+        );
+        let propose_tool = ToolCall::new("tool-propose-1", parsed);
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ctx,
+            Event::LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-propose-1".to_string(),
+                    name: "propose_task".to_string(),
+                    input: bad_payload,
+                }],
+                tool_calls: vec![propose_tool],
+                end_turn: false,
+                usage: Usage::default(),
+            },
+        )
+        .expect("transition must succeed");
+
+        // The structural backstop: a malformed propose_task neither falls
+        // through to ToolExecuting (executor dispatch) nor advances to the
+        // approval state — it goes back to LlmRequesting with a tool_result
+        // error in the persisted checkpoint.
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "malformed propose_task must re-request the LLM, got {:?}",
+            result.new_state
+        );
+        assert!(
+            !matches!(result.new_state, ConvState::ToolExecuting { .. }),
+            "malformed propose_task must not fall through to ToolExecuting"
+        );
+        assert!(
+            !matches!(result.new_state, ConvState::AwaitingTaskApproval { .. }),
+            "malformed propose_task must not enter the approval state"
+        );
+
+        let has_checkpoint = result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::PersistCheckpoint { .. }));
+        assert!(
+            has_checkpoint,
+            "must persist a tool_result checkpoint with the serde error"
+        );
+        let has_request_llm = result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::RequestLlm));
+        assert!(has_request_llm, "must re-request the LLM");
+    }
+
+    /// Task 13018 follow-up: same structural backstop for ask_user_question.
+    #[test]
+    fn test_malformed_ask_user_question_surfaces_serde_error_to_llm() {
+        use crate::llm::{ContentBlock, Usage};
+        use crate::state_machine::state::ToolInput;
+
+        let ctx = test_context();
+        let bad_payload = serde_json::json!({"questions": "not-an-array"});
+        let parsed = ToolInput::from_name_and_value("ask_user_question", bad_payload.clone());
+        assert!(
+            matches!(parsed, ToolInput::Malformed { .. }),
+            "test setup: expected Malformed, got {parsed:?}"
+        );
+        let auq_tool = ToolCall::new("tool-auq-1", parsed);
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &ctx,
+            Event::LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-auq-1".to_string(),
+                    name: "ask_user_question".to_string(),
+                    input: bad_payload,
+                }],
+                tool_calls: vec![auq_tool],
+                end_turn: false,
+                usage: Usage::default(),
+            },
+        )
+        .expect("transition must succeed");
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "malformed ask_user_question must re-request the LLM, got {:?}",
+            result.new_state
+        );
+        assert!(
+            !matches!(result.new_state, ConvState::ToolExecuting { .. }),
+            "malformed ask_user_question must not fall through to ToolExecuting"
+        );
+        assert!(
+            !matches!(result.new_state, ConvState::AwaitingUserResponse { .. }),
+            "malformed ask_user_question must not enter the awaiting-response state"
+        );
+
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistCheckpoint { .. })),
+            "must persist a tool_result checkpoint with the serde error"
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "must re-request the LLM"
         );
     }
 
