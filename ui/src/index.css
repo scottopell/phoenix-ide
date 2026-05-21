@@ -777,11 +777,30 @@ body {
 }
 
 /* Tables in agent messages */
+.markdown-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+  margin: 12px 0;
+}
+
+.markdown-table-scroll table {
+  min-width: 100%;
+  width: max-content;
+  margin: 0;
+}
+
 .agent-text-block table {
   width: 100%;
   border-collapse: collapse;
   margin: 12px 0;
   font-size: 14px;
+}
+
+.agent-text-block .markdown-table-scroll table {
+  min-width: 100%;
+  width: max-content;
+  margin: 0;
 }
 
 .agent-text-block th,

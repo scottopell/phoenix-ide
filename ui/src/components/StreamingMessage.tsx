@@ -6,8 +6,16 @@ import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter
 import type { StreamingBuffer } from '../conversation/atom';
 import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
 
-// Stable plugin array — avoids creating a new array reference on every render
+// Stable markdown configuration — avoids creating new references on every render
 const REMARK_PLUGINS = [remarkGfm];
+
+const MARKDOWN_COMPONENTS = {
+  table: ({ children, ...props }: React.ComponentPropsWithoutRef<'table'>) => (
+    <div className="markdown-table-scroll">
+      <table {...props}>{children}</table>
+    </div>
+  ),
+};
 
 interface StreamingMessageProps {
   buffer: StreamingBuffer | null;
@@ -77,7 +85,7 @@ function StreamingBlock({ block, syntaxStyle }: { block: StreamingBlock; syntaxS
   if (block.type === 'markdown') {
     return (
       <div className="agent-text-block">
-        <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>
+        <ReactMarkdown remarkPlugins={REMARK_PLUGINS} components={MARKDOWN_COMPONENTS}>
           {block.content}
         </ReactMarkdown>
       </div>

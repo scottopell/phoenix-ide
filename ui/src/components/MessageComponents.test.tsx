@@ -1,7 +1,8 @@
 import { describe, expect, it, vi, beforeEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
-import { SubAgentStatus } from './MessageComponents';
+import { SubAgentStatus, AgentMessage } from './MessageComponents';
+import { StreamingMessage } from './StreamingMessage';
 import { api, type ConversationState, type Message } from '../api';
 
 vi.mock('../api', async (importOriginal) => {
@@ -98,6 +99,45 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     pending_truncated: false,
   });
 }
+
+describe('markdown table rendering', () => {
+  const wideTableMarkdown = [
+    '| Alpha | Beta | Gamma | Delta | Epsilon | Zeta |',
+    '| --- | --- | --- | --- | --- | --- |',
+    '| one | two | three | four | five | six |',
+  ].join('\n');
+
+  it('wraps finalized agent message tables in a local horizontal scroll container', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-1', [{ type: 'text', text: wideTableMarkdown }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    const table = screen.getByRole('table');
+    const wrapper = table.parentElement;
+    expect(wrapper).toHaveClass('markdown-table-scroll');
+    expect(wrapper?.parentElement).toHaveClass('agent-text-block');
+  });
+
+  it('wraps streaming message tables in a local horizontal scroll container', async () => {
+    render(
+      <MemoryRouter>
+        <StreamingMessage buffer={{ text: wideTableMarkdown, lastSequence: 1, startedAt: Date.now() }} />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      const table = screen.getByRole('table');
+      const wrapper = table.parentElement;
+      expect(wrapper).toHaveClass('markdown-table-scroll');
+      expect(wrapper?.parentElement).toHaveClass('agent-text-block');
+    });
+  });
+});
 
 describe('SubAgentStatus inline activity', () => {
   beforeEach(() => {

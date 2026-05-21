@@ -549,6 +549,11 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
       };
       return <li>{processChildren(children)}</li>;
     },
+    table: ({ children, ...props }: React.ComponentPropsWithoutRef<'table'>) => (
+      <div className="markdown-table-scroll">
+        <table {...props}>{children}</table>
+      </div>
+    ),
   }), [onOpenFile, syntaxStyle]);
 
   // Check if there's any renderable content
