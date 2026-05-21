@@ -154,16 +154,16 @@ pub enum ToolInput {
     },
 }
 
-fn malformed_known_input(name: &str, payload: Value, err: &str) -> ToolInput {
+fn malformed_known_input(name: &str, payload: Value, error: String) -> ToolInput {
     tracing::warn!(
         tool = name,
-        error = err,
+        error = %error,
         "known tool input failed to deserialize; emitting Malformed"
     );
     ToolInput::Malformed {
         name: name.to_string(),
         input: payload,
-        error: err.to_string(),
+        error,
     }
 }
 
@@ -174,7 +174,7 @@ where
 {
     match serde_json::from_value::<T>(payload.clone()) {
         Ok(value) => ToolInput::from(value),
-        Err(err) => malformed_known_input(name, payload, &err.to_string()),
+        Err(err) => malformed_known_input(name, payload, err.to_string()),
     }
 }
 
@@ -217,6 +217,13 @@ impl<'de> Deserialize<'de> for ToolInput {
                     error: error.to_string(),
                 });
             }
+            // A `_tool: malformed` tag with a missing field is persisted-state
+            // corruption — fail loudly rather than masking it as a tool
+            // literally named "malformed" (which would reach executor dispatch).
+            return Err(serde::de::Error::custom(
+                "tool input tagged `_tool: malformed` is missing a required \
+                 name/input/error field",
+            ));
         }
 
         Ok(match tool_name.as_str() {
@@ -227,7 +234,7 @@ impl<'de> Deserialize<'de> for ToolInput {
                     .and_then(Value::as_str)
                     .map(BashToolInput::run)
                     .map_or_else(
-                        || malformed_known_input("bash", payload, &err.to_string()),
+                        || malformed_known_input("bash", payload, err.to_string()),
                         ToolInput::Bash,
                     ),
             },
@@ -366,7 +373,7 @@ impl ToolInput {
         {
             match serde_json::from_value::<T>(value.clone()) {
                 Ok(parsed) => ToolInput::from(parsed),
-                Err(err) => malformed_known_input(name, value, &err.to_string()),
+                Err(err) => malformed_known_input(name, value, err.to_string()),
             }
         }
         match name {
@@ -474,6 +481,24 @@ mod tests {
         assert_eq!(encoded["_tool"], "malformed");
         let decoded: ToolInput = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, original);
+    }
+
+    /// A `_tool: malformed` payload missing a required field is persisted-state
+    /// corruption — deserialization must fail loudly rather than silently
+    /// degrade to `Unknown { name: "malformed" }` (which would reach executor
+    /// dispatch as a tool literally named "malformed").
+    #[test]
+    fn malformed_tool_input_with_missing_field_is_rejected() {
+        for partial in [
+            serde_json::json!({"_tool": "malformed", "input": {}, "error": "e"}),
+            serde_json::json!({"_tool": "malformed", "name": "bash", "error": "e"}),
+            serde_json::json!({"_tool": "malformed", "name": "bash", "input": {}}),
+        ] {
+            assert!(
+                serde_json::from_value::<ToolInput>(partial.clone()).is_err(),
+                "corrupt malformed payload must fail to deserialize: {partial}"
+            );
+        }
     }
 
     /// Task 13014: `ConvState::ToolExecuting` is strict-deserialized — a
