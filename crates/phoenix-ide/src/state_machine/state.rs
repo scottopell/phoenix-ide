@@ -476,6 +476,44 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
+    /// Task 13014: `ConvState::ToolExecuting` is strict-deserialized — a
+    /// persisted row missing a field is corruption, not a defaultable absence
+    /// (`reset_all_to_idle` wipes this transient state on startup, so a
+    /// cross-version row can never legitimately reach this code path). This
+    /// test locks the strictness: re-adding `#[serde(default)]` would silently
+    /// regress it.
+    #[test]
+    fn tool_executing_rejects_rows_missing_fields() {
+        // A complete row deserializes fine.
+        let complete = serde_json::json!({
+            "type": "tool_executing",
+            "current_tool": { "id": "t1", "name": "think",
+                "input": { "_tool": "think", "thoughts": "" } },
+            "remaining_tools": [],
+            "completed_results": [],
+            "pending_sub_agents": [],
+            "assistant_message": AssistantMessage::default(),
+        });
+        assert!(
+            serde_json::from_value::<ConvState>(complete.clone()).is_ok(),
+            "a complete tool_executing row must deserialize"
+        );
+
+        // Dropping any field is now a loud error, not a silent default.
+        for field in [
+            "completed_results",
+            "pending_sub_agents",
+            "assistant_message",
+        ] {
+            let mut partial = complete.clone();
+            partial.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<ConvState>(partial).is_err(),
+                "tool_executing missing `{field}` must fail to deserialize"
+            );
+        }
+    }
+
     /// Task 02713: model change is allowed from `Idle` and `Error` only.
     ///
     /// The `match` below is intentionally wildcard-free: adding a new
@@ -738,6 +776,12 @@ pub enum ConvState {
     /// Executing tools serially.
     /// The assistant message is held here (NOT yet persisted) — persistence is atomic
     /// at the end of the tool round via `CheckpointData::ToolRound` (REQ-BED-007).
+    ///
+    /// Fields are strict-deserialized (no `serde(default)`): `reset_all_to_idle`
+    /// resets this transient state to `Idle` on startup before any row is read,
+    /// so a cross-version row missing a field is never observed by a recovered
+    /// conversation — a missing field instead signals corruption and must fail
+    /// loudly rather than default silently (task 13014).
     ToolExecuting {
         /// The current tool being executed
         current_tool: ToolCall,
@@ -745,13 +789,10 @@ pub enum ConvState {
         remaining_tools: Vec<ToolCall>,
         /// Completed tool results — single source of truth (FM-4 Prevention).
         /// No parallel `persisted_tool_ids` tracking set.
-        #[serde(default)]
         completed_results: Vec<ToolResult>,
         /// Sub-agents spawned during this tool execution phase
-        #[serde(default)]
         pending_sub_agents: Vec<PendingSubAgent>,
         /// Assistant message held until all tools complete (not yet persisted)
-        #[serde(default)]
         assistant_message: AssistantMessage,
     },
 
@@ -772,22 +813,23 @@ pub enum ConvState {
         pending_sub_agents: Vec<PendingSubAgent>,
     },
 
-    /// Waiting for sub-agents to complete
+    /// Waiting for sub-agents to complete.
+    ///
+    /// Strict-deserialized — see `ToolExecuting` (task 13014).
     AwaitingSubAgents {
         /// Sub-agents still running (id + task co-located)
         pending: Vec<PendingSubAgent>,
-        #[serde(default)]
         completed_results: Vec<SubAgentResult>,
         /// `tool_use_id` of the `spawn_agents` call (to update `display_data` when done)
-        #[serde(default)]
         spawn_tool_id: Option<String>,
     },
 
-    /// User requested cancellation while waiting for sub-agents
+    /// User requested cancellation while waiting for sub-agents.
+    ///
+    /// Strict-deserialized — see `ToolExecuting` (task 13014).
     CancellingSubAgents {
         /// Sub-agents still running (id + task co-located)
         pending: Vec<PendingSubAgent>,
-        #[serde(default)]
         completed_results: Vec<SubAgentResult>,
     },
 
@@ -890,11 +932,8 @@ pub enum CoreState {
     ToolExecuting {
         current_tool: ToolCall,
         remaining_tools: Vec<ToolCall>,
-        #[serde(default)]
         completed_results: Vec<ToolResult>,
-        #[serde(default)]
         pending_sub_agents: Vec<PendingSubAgent>,
-        #[serde(default)]
         assistant_message: AssistantMessage,
     },
     CancellingTool {
@@ -906,14 +945,11 @@ pub enum CoreState {
     },
     AwaitingSubAgents {
         pending: Vec<PendingSubAgent>,
-        #[serde(default)]
         completed_results: Vec<SubAgentResult>,
-        #[serde(default)]
         spawn_tool_id: Option<String>,
     },
     CancellingSubAgents {
         pending: Vec<PendingSubAgent>,
-        #[serde(default)]
         completed_results: Vec<SubAgentResult>,
     },
     Error {
@@ -1630,12 +1666,16 @@ pub enum SubAgentOutcome {
     TimedOut,
 }
 
-/// A sub-agent that is still running
+/// A sub-agent that is still running.
+///
+/// Only ever held inside transient states (`ToolExecuting`, `CancellingTool`,
+/// `AwaitingSubAgents`, `CancellingSubAgents`), all of which `reset_all_to_idle`
+/// resets on startup — so `mode` is strict-deserialized with no `serde(default)`
+/// (task 13014).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PendingSubAgent {
     pub agent_id: String,
     pub task: String,
-    #[serde(default)]
     pub mode: SubAgentMode,
 }
 
