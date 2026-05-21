@@ -92,7 +92,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             showToast={showSuccess}
             showError={showError}
             branchName={activeConversation?.branch_name}
-            parentConversation={activeConversation}
+            activeSlug={activeSlug}
             width={fileExplorerPane.collapsed ? undefined : fileExplorerPane.size}
           />
         )}

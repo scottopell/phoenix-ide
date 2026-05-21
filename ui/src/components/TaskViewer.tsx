@@ -1,16 +1,16 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import type { TaskEntry, Conversation } from '../api';
-import { useCreateConversationWithStore } from '../conversation';
+import type { TaskEntry } from '../api';
+import { useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
 import './TaskViewer.css';
 
 interface TaskViewerProps {
   task: TaskEntry;
   tasksDir: string;
-  /** The conversation the user is currently viewing — used as the seed parent
-   *  when starting a "work on this task" sub-conversation. May be null if the
-   *  task viewer is shown outside a conversation context. */
-  parentConversation: Conversation | null;
+  /** Slug of the conversation the user is currently viewing. TaskViewer reads
+   *  the live conversation row from the store; it is used as the seed parent
+   *  when starting a "work on this task" sub-conversation. */
+  activeSlug: string;
   onBack: () => void;
 }
 
@@ -25,9 +25,13 @@ const STATUS_CLASS: Record<string, string> = {
 
 const TERMINAL_STATUSES = new Set(['done', 'wont-do']);
 
-export function TaskViewer({ task, tasksDir, parentConversation, onBack }: TaskViewerProps) {
+export function TaskViewer({ task, tasksDir, activeSlug, onBack }: TaskViewerProps) {
   const navigate = useNavigate();
   const createConversationWithStore = useCreateConversationWithStore();
+  // Read the parent conversation live from the store rather than receiving a
+  // snapshot threaded through props — the store is the single source of truth
+  // (task 08684) so cwd/model/id never go stale here.
+  const parentConversation = useConversationSnapshot(activeSlug);
   const [content, setContent] = useState<string | null>(null);
   const [rawContent, setRawContent] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);

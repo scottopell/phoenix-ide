@@ -11,7 +11,7 @@ import { SkillViewer } from '../SkillViewer';
 import { TasksPanel } from '../TasksPanel';
 import { TaskViewer } from '../TaskViewer';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
-import type { SkillEntry, TaskEntry, Conversation } from '../../api';
+import type { SkillEntry, TaskEntry } from '../../api';
 
 interface Props {
   collapsed: boolean;
@@ -25,9 +25,10 @@ interface Props {
   showError: (message: string, duration?: number) => void;
   /** Branch name of the current conversation (for extracting task ID in Work mode) */
   branchName?: string | null | undefined;
-  /** Active conversation, used by TaskViewer to seed a "start working on this task"
-   *  sub-conversation (REQ-SEED-001 through -004). */
-  parentConversation?: Conversation | null;
+  /** Slug of the active conversation. Passed to TaskViewer, which reads the
+   *  live conversation row from the store to seed a "start working on this
+   *  task" sub-conversation (REQ-SEED-001 through -004). */
+  activeSlug: string;
   /** Width in px when expanded — driven by useResizablePane */
   width?: number | undefined;
 }
@@ -39,7 +40,7 @@ function extractTaskId(branchName: string | null | undefined): string | undefine
   return match ? match[1] : undefined;
 }
 
-export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, parentConversation, width }: Props) {
+export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationId, showToast, showError, branchName, activeSlug, width }: Props) {
   const { openFile, activeFile } = useFileExplorer();
   const [refreshKey, setRefreshKey] = useState(0);
   const handleRefresh = useCallback(() => setRefreshKey(k => k + 1), []);
@@ -84,7 +85,7 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
       ? <TaskViewer
           task={selectedTask}
           tasksDir={`${rootPath}/tasks`}
-          parentConversation={parentConversation ?? null}
+          activeSlug={activeSlug}
           onBack={() => setSelectedTask(null)}
         />
       : null;
