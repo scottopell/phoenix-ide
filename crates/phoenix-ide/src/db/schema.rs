@@ -531,6 +531,11 @@ pub enum ToolOutcome {
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         display_data: Option<serde_json::Value>,
+        // serde(default): owned backward-compat decision, not a pending-migration
+        // shim (task 13023). Tool-result rows in `messages.content` written
+        // before the `images` feature existed genuinely carried no images, so an
+        // absent key correctly deserialises to an empty vec — there is no data to
+        // backfill and no migration is owed.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ToolContentImage>,
     },
@@ -538,6 +543,8 @@ pub enum ToolOutcome {
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         display_data: Option<serde_json::Value>,
+        // serde(default): see `ToolOutcome::Success::images` — owned
+        // backward-compat decision for pre-images rows (task 13023).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<ToolContentImage>,
     },
@@ -747,7 +754,12 @@ pub struct ToolContent {
     pub content: String,
     pub is_error: bool,
     /// Images to send to the LLM as image content blocks (not tokenized as text).
-    /// `#[serde(default)]` ensures old DB rows (no `images` key) deserialize to empty vec.
+    ///
+    /// serde(default): owned backward-compat decision, not a pending-migration
+    /// shim (task 13023). Old `messages.content` rows written before the
+    /// `images` feature existed genuinely carried no images, so an absent key
+    /// correctly deserialises to an empty vec — there is no data to backfill
+    /// and no migration is owed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ToolContentImage>,
 }
@@ -1351,5 +1363,34 @@ mod conversation_serde_tests {
         }
         let parsed: Conversation = serde_json::from_value(json).unwrap();
         assert_eq!(parsed.continued_in_conv_id, None);
+    }
+
+    /// Task 13023: tool-result rows in `messages.content` written before the
+    /// `images` feature deserialize cleanly to an empty `images` vec. This is
+    /// an owned backward-compat decision (those rows genuinely had no images),
+    /// not a pending-migration shim — this test locks the contract so a future
+    /// change to a hard error is a deliberate, visible break.
+    #[test]
+    fn pre_images_tool_rows_deserialize_to_empty_images() {
+        // ToolOutcome::Success / Error — the persisted tag-shaped JSON with no
+        // `images` key, as old rows were written.
+        let success: ToolOutcome =
+            serde_json::from_str(r#"{"type":"success","output":"ok"}"#).unwrap();
+        match success {
+            ToolOutcome::Success { images, .. } => assert!(images.is_empty()),
+            other => panic!("expected Success, got {other:?}"),
+        }
+        let error: ToolOutcome =
+            serde_json::from_str(r#"{"type":"error","output":"boom"}"#).unwrap();
+        match error {
+            ToolOutcome::Error { images, .. } => assert!(images.is_empty()),
+            other => panic!("expected Error, got {other:?}"),
+        }
+
+        // ToolContent — old tool-result message content with no `images` key.
+        let content: ToolContent =
+            serde_json::from_str(r#"{"tool_use_id":"t1","content":"out","is_error":false}"#)
+                .unwrap();
+        assert!(content.images.is_empty());
     }
 }
