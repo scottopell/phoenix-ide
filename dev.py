@@ -2,7 +2,7 @@
 # /// script
 # requires-python = ">=3.12"
 # dependencies = [
-#   "taskmd>=1.0",
+#   "taskmd>=1.0,<2",
 # ]
 # ///
 """Development tasks for phoenix-ide."""
@@ -1636,13 +1636,16 @@ def cmd_check():
     def lane_fast():
         """Fast lane: cargo fmt then task validation."""
         run_step("cargo fmt", ["cargo", "fmt", "--check"])
-        # Task validation (Python, not a subprocess)
+        # Task validation runs in-process (taskmd is a Python dep, not a
+        # subprocess) so it can't go through run_step. detail carries the
+        # error list into the results tuple so a failure is readable in
+        # the end-of-run summary.
         t0 = time.monotonic()
-        ok = cmd_tasks_validate(quiet=True)
+        ok, detail = cmd_tasks_validate(quiet=True)
         elapsed = time.monotonic() - t0
         with results_lock:
             sym = "\u2713" if ok else "\u2717"
-            results.append(("task validation", 0 if ok else 1, elapsed, ""))
+            results.append(("task validation", 0 if ok else 1, elapsed, detail))
             print(f"  {sym} {'task validation':<18s} ({elapsed:.1f}s)")
 
     def check_package_lock_clean():
@@ -1996,27 +1999,33 @@ def cmd_codegen() -> bool:
     return True
 
 
-def cmd_tasks_validate(quiet: bool = False) -> bool:
+def cmd_tasks_validate(quiet: bool = False) -> tuple[bool, str]:
     """Validate all task files using taskmd.
 
-    Checks filename pattern conformance and duplicate IDs. Returns True if
-    all tasks pass, False otherwise.
+    Checks filename pattern conformance and duplicate IDs. Returns
+    (ok, detail): detail is the formatted error block, empty when ok, so a
+    quiet caller can still surface it (e.g. `./dev.py check`'s summary).
     """
     import taskmd
     tasks_dir = ROOT / "tasks"
     result = taskmd.validate(tasks_dir)
 
-    if not result.ok:
+    if result.ok:
         if not quiet:
-            print(f"✗ {len(result.errors)} task validation error(s):")
-            for err in result.errors:
-                print(f"  - {err}")
-            print("\nRun './dev.py tasks fix' to auto-fix (legacy IDs, duplicate IDs).")
-        return False
+            print(f"✓ {result.file_count} task files validated")
+        return True, ""
 
+    # taskmd version in the header: a floating dependency that resolved to
+    # a newer, stricter taskmd is a common cause of a fail-CI/pass-local split.
+    version = getattr(taskmd, "__version__", "unknown")
+    lines = [f"✗ {len(result.errors)} task validation error(s) (taskmd {version}):"]
+    lines += [f"  - {err}" for err in result.errors]
+    lines.append("")
+    lines.append("Run './dev.py tasks fix' to auto-fix (legacy IDs, duplicate IDs).")
+    detail = "\n".join(lines)
     if not quiet:
-        print(f"✓ {result.file_count} task files validated")
-    return True
+        print(detail)
+    return False, detail
 
 
 # REQ-* anchor regex. Matches `REQ-{PREFIX}-{NUM}` where PREFIX is one
@@ -3775,7 +3784,8 @@ def main():
             cmd_prod_override_unset(args.name)
     elif args.command == "tasks":
         if args.tasks_command == "validate":
-            if not cmd_tasks_validate():
+            ok, _ = cmd_tasks_validate()
+            if not ok:
                 sys.exit(1)
         elif args.tasks_command == "fix":
             if not cmd_tasks_fix():
