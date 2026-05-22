@@ -1,4 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
+import type { MouseEvent } from 'react';
+import { createPortal } from 'react-dom';
+import { calcTooltipPosition } from './breadcrumbTooltipPosition';
 import type { Breadcrumb } from '../types';
 
 const BREADCRUMB_TITLES: Record<string, string> = {
@@ -13,37 +16,10 @@ interface BreadcrumbBarProps {
   visible: boolean;
 }
 
-interface TooltipPosition {
-  /** Left edge of the tooltip box in viewport px */
-  tooltipLeft: number;
-  /** Left position of the arrow within the tooltip box in px */
-  arrowLeft: number;
-}
-
-const TOOLTIP_WIDTH = 280;
-const TOOLTIP_MARGIN = 8; // min distance from viewport edge
-
-function calcTooltipPosition(rect: DOMRect): TooltipPosition {
-  const itemCenterX = rect.left + rect.width / 2;
-  const viewportWidth = window.innerWidth;
-
-  // Ideal: center tooltip over the item
-  let tooltipLeft = itemCenterX - TOOLTIP_WIDTH / 2;
-
-  // Clamp to viewport edges
-  tooltipLeft = Math.max(TOOLTIP_MARGIN, tooltipLeft);
-  tooltipLeft = Math.min(viewportWidth - TOOLTIP_WIDTH - TOOLTIP_MARGIN, tooltipLeft);
-
-  // Arrow should always point at the item center, relative to tooltip box
-  const arrowLeft = Math.max(12, Math.min(TOOLTIP_WIDTH - 12, itemCenterX - tooltipLeft));
-
-  return { tooltipLeft, arrowLeft };
-}
-
 export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
   const barRef = useRef<HTMLElement>(null);
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
-  const [tooltipPos, setTooltipPos] = useState<TooltipPosition | null>(null);
+  const [tooltipPos, setTooltipPos] = useState<ReturnType<typeof calcTooltipPosition> | null>(null);
   const hoverTimeoutRef = useRef<number | null>(null);
 
   // Auto-scroll to end when breadcrumbs change
@@ -78,7 +54,7 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
     }
   };
 
-  const handleMouseEnter = (index: number, e: React.MouseEvent<HTMLSpanElement>) => {
+  const handleMouseEnter = (index: number, e: MouseEvent<HTMLSpanElement>) => {
     const target = e.currentTarget;
     // Clear any pending hide
     if (hoverTimeoutRef.current) {
@@ -104,51 +80,63 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
     setTooltipPos(null);
   };
 
+  const hoveredBreadcrumb = hoveredIndex !== null ? breadcrumbs[hoveredIndex] : null;
+  const tooltipText = hoveredBreadcrumb?.resultSummary ?? hoveredBreadcrumb?.preview;
+  const tooltip = hoveredBreadcrumb && tooltipText && tooltipPos !== null && typeof document !== 'undefined'
+    ? createPortal(
+        <span
+          className="breadcrumb-tooltip"
+          style={{
+            left: tooltipPos.tooltipLeft,
+            top: tooltipPos.tooltipTop,
+            transform: 'translateY(-100%)',
+          }}
+        >
+          <strong>{hoveredBreadcrumb.label.replace(/^LLM/, 'AI')}</strong>
+          <span className="breadcrumb-tooltip-preview">{tooltipText}</span>
+          <span
+            className="breadcrumb-tooltip-arrow"
+            style={{ left: tooltipPos.arrowLeft }}
+          />
+        </span>,
+        document.body,
+      )
+    : null;
+
   return (
-    <nav id="breadcrumb-bar" ref={barRef}>
-      <div id="breadcrumb-trail">
-        {breadcrumbs.map((b, i) => {
-          const isLast = i === breadcrumbs.length - 1;
-          const classes = [
-            'breadcrumb-item',
-            isLast ? 'active' : '',
-            b.type === 'tool' ? 'tool' : '',
-            b.type === 'subagents' ? 'subagents' : '',
-          ].filter(Boolean).join(' ');
+    <>
+      <nav id="breadcrumb-bar" ref={barRef}>
+        <div id="breadcrumb-trail">
+          {breadcrumbs.map((b, i) => {
+            const isLast = i === breadcrumbs.length - 1;
+            const classes = [
+              'breadcrumb-item',
+              isLast ? 'active' : '',
+              b.type === 'tool' ? 'tool' : '',
+              b.type === 'subagents' ? 'subagents' : '',
+            ].filter(Boolean).join(' ');
 
-          const tooltipText = b.resultSummary ?? b.preview;
-          const showTooltip = hoveredIndex === i && !!tooltipText && tooltipPos !== null;
+            const accessibleLabel = BREADCRUMB_TITLES[b.type] || b.label;
 
-          return (
-            <span key={`${b.type}-${i}-${b.toolId || ''}`}>
-              <span
-                className={classes}
-                data-index={i}
-                onClick={() => handleClick(b)}
-                onMouseEnter={(e) => handleMouseEnter(i, e)}
-                onMouseLeave={handleMouseLeave}
-                title={BREADCRUMB_TITLES[b.type] || b.label}
-              >
-                {b.label.replace(/^LLM/, 'AI')}
-                {showTooltip && (
-                  <span
-                    className="breadcrumb-tooltip"
-                    style={{ left: tooltipPos!.tooltipLeft, transform: 'none' }}
-                  >
-                    <strong>{b.label.replace(/^LLM/, 'AI')}</strong>
-                    <span className="breadcrumb-tooltip-preview">{tooltipText}</span>
-                    <span
-                      className="breadcrumb-tooltip-arrow"
-                      style={{ left: tooltipPos!.arrowLeft }}
-                    />
-                  </span>
-                )}
+            return (
+              <span key={`${b.type}-${i}-${b.toolId || ''}`}>
+                <span
+                  className={classes}
+                  data-index={i}
+                  onClick={() => handleClick(b)}
+                  onMouseEnter={(e) => handleMouseEnter(i, e)}
+                  onMouseLeave={handleMouseLeave}
+                  aria-label={accessibleLabel}
+                >
+                  {b.label.replace(/^LLM/, 'AI')}
+                </span>
+                {!isLast && <span className="breadcrumb-arrow">→</span>}
               </span>
-              {!isLast && <span className="breadcrumb-arrow">→</span>}
-            </span>
-          );
-        })}
-      </div>
-    </nav>
+            );
+          })}
+        </div>
+      </nav>
+      {tooltip}
+    </>
   );
 }

@@ -1,0 +1,89 @@
+import { act, fireEvent, render, screen, within } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { BreadcrumbBar } from './BreadcrumbBar';
+import { calcTooltipPosition } from './breadcrumbTooltipPosition';
+import type { Breadcrumb } from '../types';
+
+const breadcrumbs: Breadcrumb[] = [
+  { type: 'user', label: 'User', sequenceId: 1, preview: 'Asked a question' },
+  {
+    type: 'tool',
+    label: 'bash',
+    toolId: 'tool-1',
+    sequenceId: 2,
+    resultSummary: 'pwd returned /tmp/project',
+  },
+];
+
+describe('BreadcrumbBar', () => {
+  it('uses accessible labels instead of native title tooltips', () => {
+    render(<BreadcrumbBar breadcrumbs={breadcrumbs} visible />);
+
+    const toolBreadcrumb = screen.getByLabelText('Running a tool');
+    expect(toolBreadcrumb).toHaveClass('breadcrumb-item', 'tool');
+    expect(toolBreadcrumb).not.toHaveAttribute('title');
+  });
+
+  it('renders rich tooltip through a body portal on hover', async () => {
+    vi.useFakeTimers();
+    try {
+      render(<BreadcrumbBar breadcrumbs={breadcrumbs} visible />);
+
+      const bar = document.querySelector<HTMLElement>('#breadcrumb-bar');
+      expect(bar).toBeInTheDocument();
+
+      const toolBreadcrumb = screen.getByLabelText('Running a tool');
+      vi.spyOn(toolBreadcrumb, 'getBoundingClientRect').mockReturnValue({
+        left: 320,
+        right: 380,
+        top: 640,
+        bottom: 664,
+        width: 60,
+        height: 24,
+        x: 320,
+        y: 640,
+        toJSON: () => ({}),
+      } as DOMRect);
+
+      fireEvent.mouseEnter(toolBreadcrumb);
+      act(() => {
+        vi.advanceTimersByTime(150);
+      });
+
+      expect(screen.getByText('pwd returned /tmp/project')).toBeInTheDocument();
+
+      const tooltip = screen.getByText('pwd returned /tmp/project').closest('.breadcrumb-tooltip');
+      expect(tooltip).not.toBeNull();
+      expect(tooltip!.parentElement).toBe(document.body);
+      expect(within(bar!).queryByText('pwd returned /tmp/project')).not.toBeInTheDocument();
+      expect(tooltip).toHaveStyle({ top: '632px', transform: 'translateY(-100%)' });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('positions tooltip above the breadcrumb and clamps to viewport margins', () => {
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 });
+
+    const position = calcTooltipPosition({
+      left: 0,
+      right: 40,
+      top: 4,
+      bottom: 28,
+      width: 40,
+      height: 24,
+      x: 0,
+      y: 4,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    expect(position).toEqual({
+      tooltipLeft: 8,
+      tooltipTop: 8,
+      arrowLeft: 12,
+    });
+
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+  });
+});
