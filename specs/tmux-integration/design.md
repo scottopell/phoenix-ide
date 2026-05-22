@@ -49,6 +49,16 @@ is fixed by Phoenix and cannot be overridden by passing -L or -S in args.
 If you do pass them, tmux will reject the duplicate server-selection flag
 with a usage error.
 
+Use `tmux_run` for starting dev servers, watchers, REPLs, or other
+inspectable shell commands. It chooses the current project/worktree directory,
+wraps the command with bash -lc, prints a visible exit marker, and keeps the
+pane inspectable after exit by default.
+
+Use this raw tmux tool for detailed tmux operations: `capture-pane`,
+`send-keys`, `list-windows`, `kill-window`, or lower-level tmux commands.
+Raw tmux is pass-through except for Phoenix's socket/config injection; it does
+not enforce a cwd for newly-created windows or panes.
+
 Common subcommands:
   new-window -d -n NAME COMMAND     spawn a new window running COMMAND
   list-windows                       enumerate windows in the current session
@@ -59,12 +69,6 @@ Common subcommands:
   kill-server                        terminate this conversation's tmux server
                                      (rare; conversation hard-delete does
                                       this automatically)
-
-Use this tool — not bash — for processes that:
-  * need a TTY (REPLs, programs that detect isatty)
-  * should survive Phoenix process restart
-  * you want to interact with via stdin
-  * are servers, watchers, or other long-lived processes
 
 Use bash for one-shot non-interactive commands.
 
@@ -95,6 +99,48 @@ fresh server.
 
 `stdout` and `stderr` are returned separately because tmux subcommands
 emit structured CLI output where the distinction matters.
+
+## `tmux_run` Helper Tool (REQ-TMUX-014)
+
+`tmux_run` uses the same `TmuxRegistry` and socket/config injection as raw
+`tmux`, but fixes the common command-start path:
+
+1. Resolve the effective file root: `ToolContext.worktree_path` when present,
+   otherwise `ToolContext.working_dir`.
+2. Ensure the conversation/worktree tmux server is live through the registry.
+3. Create a detached window with `tmux new-window -d -P -F '#{window_name}'
+   -n <name> -c <file-root> <shell-command>`.
+4. Run `<shell-command>` as `bash -lc '<wrapper>'`, where the wrapper executes
+   the agent command, captures `$?`, prints
+   `[phoenix] process exited with code <code>`, then either opens an
+   interactive shell (`keep_open_on_exit=true`) or exits with the same code.
+5. If readiness is `wait_for_text`, poll `capture-pane -p -t <window_name>
+   -S -2000` until the text appears, the exit marker appears, cancellation is
+   requested, or the bounded timeout expires.
+
+The readiness input is a tagged enum, not independent nullable fields:
+
+```json
+{ "readiness": { "mode": "return_immediately" } }
+```
+
+or:
+
+```json
+{
+  "readiness": {
+    "mode": "wait_for_text",
+    "text": "Phoenix backend listening",
+    "timeout_seconds": 120
+  }
+}
+```
+
+`return_immediately` rejects extra timeout/text fields; `wait_for_text` requires
+trimmed non-empty text and a bounded timeout. The response nests truncation under
+`captured_output` because only the returned snippet is bounded — tmux scrollback
+remains inspectable via raw `tmux capture-pane` using the returned
+`window_name`.
 
 ## Per-Conversation Tmux Server Registry
 

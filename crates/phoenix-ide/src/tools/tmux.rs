@@ -12,8 +12,10 @@
 pub mod invoke;
 pub mod probe;
 pub mod registry;
+pub mod run;
 
 pub use registry::{TmuxError, TmuxRegistry, TmuxServer};
+pub use run::TmuxRunTool;
 
 // `cascade_tmux_on_delete`, `socket_path_for`, `CascadeReport`, and
 // `ServerStatus` exist on the registry for task 02696 (bedrock hard-
@@ -59,7 +61,7 @@ impl Tool for TmuxTool {
     }
 
     fn description(&self) -> String {
-        // Verbatim from specs/tmux-integration/design.md §"Description
+        // Mirrors specs/tmux-integration/design.md §"Description
         // Template", with the configured byte limit interpolated.
         let max_kb = TMUX_OUTPUT_MAX_BYTES / 1024;
         format!(
@@ -72,6 +74,16 @@ is fixed by Phoenix and cannot be overridden by passing -L or -S in args.
 If you do pass them, tmux will reject the duplicate server-selection flag
 with a usage error.
 
+Use `tmux_run` for starting dev servers, watchers, REPLs, or other
+inspectable shell commands. It chooses the current project/worktree directory,
+wraps the command with bash -lc, prints a visible exit marker, and keeps the
+pane inspectable after exit by default.
+
+Use this raw tmux tool for detailed tmux operations: `capture-pane`,
+`send-keys`, `list-windows`, `kill-window`, or lower-level tmux commands.
+Raw tmux is pass-through except for Phoenix's socket/config injection; it does
+not enforce a cwd for newly-created windows or panes.
+
 Common subcommands:
   new-window -d -n NAME COMMAND     spawn a new window running COMMAND
   list-windows                       enumerate windows in the current session
@@ -82,12 +94,6 @@ Common subcommands:
   kill-server                        terminate this conversation's tmux server
                                      (rare; conversation hard-delete does
                                       this automatically)
-
-Use this tool — not bash — for processes that:
-  * need a TTY (REPLs, programs that detect isatty)
-  * should survive Phoenix process restart
-  * you want to interact with via stdin
-  * are servers, watchers, or other long-lived processes
 
 Use bash for one-shot non-interactive commands.
 

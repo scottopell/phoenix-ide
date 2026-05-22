@@ -42,7 +42,7 @@ pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
 pub use terminal_command_history::TerminalCommandHistoryTool;
 pub use terminal_last_command::TerminalLastCommandTool;
 pub use think::ThinkTool;
-pub use tmux::{TmuxError, TmuxRegistry, TmuxServer, TmuxTool};
+pub use tmux::{TmuxError, TmuxRegistry, TmuxRunTool, TmuxServer, TmuxTool};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -389,6 +389,7 @@ fn write_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(BashTool),
         Arc::new(PatchTool::default()),
+        Arc::new(TmuxRunTool),
         Arc::new(TmuxTool),
     ]
 }
@@ -731,6 +732,7 @@ mod tests {
         let direct = names(&ToolRegistry::direct());
         assert!(direct.contains("bash"));
         assert!(direct.contains("patch"));
+        assert!(direct.contains("tmux_run"));
         assert!(direct.contains("tmux"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(direct.contains(*tool), "Direct missing {tool}");
@@ -745,6 +747,7 @@ mod tests {
         let work = names(&ToolRegistry::explore_with_sandbox("tasks"));
         assert!(work.contains("bash"));
         assert!(work.contains("patch"));
+        assert!(work.contains("tmux_run"));
         assert!(work.contains("tmux"));
         assert!(work.contains("propose_task"));
         for tool in PARENT_TERMINAL_TOOLS {
@@ -760,6 +763,7 @@ mod tests {
         assert!(explore.contains("ask_user_question"));
         assert!(explore.contains("patch"));
         assert!(!explore.contains("bash"));
+        assert!(!explore.contains("tmux_run"));
         assert!(!explore.contains("tmux"));
         for tool in PARENT_TERMINAL_TOOLS {
             assert!(
@@ -772,6 +776,10 @@ mod tests {
         // no ask_user, no propose_task, no parent-terminal tools.
         let sub_explore = names(&ToolRegistry::for_subagent_explore());
         assert!(sub_explore.contains("bash"));
+        assert!(
+            !sub_explore.contains("tmux_run"),
+            "sub-agent explore must not have tmux_run (task 94001)"
+        );
         assert!(
             !sub_explore.contains("tmux"),
             "sub-agent explore must not have tmux (task 03001)"
@@ -793,6 +801,10 @@ mod tests {
         let sub_work = names(&ToolRegistry::for_subagent_work());
         assert!(sub_work.contains("bash"));
         assert!(sub_work.contains("patch"));
+        assert!(
+            !sub_work.contains("tmux_run"),
+            "sub-agent work must not have tmux_run (task 94001)"
+        );
         assert!(
             !sub_work.contains("tmux"),
             "sub-agent work must not have tmux (task 03001)"
