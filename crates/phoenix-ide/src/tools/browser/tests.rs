@@ -27,6 +27,18 @@ fn chrome_available() -> bool {
     )
 }
 
+/// True when the suite is running outside `./dev.py` — neither signal var
+/// (`PHOENIX_CHROME_EXECUTABLE`, set when dev.py locates a Chromium;
+/// `PHOENIX_SKIP_BROWSER_TESTS`, set when it cannot) is present, so the
+/// environment was never classified. A Chrome-launch failure in this state
+/// is environmental (no usable Chromium on this host found by chromiumoxide's
+/// own lookup), not a code bug — `require_chrome!` prints a hint pointing at
+/// `./dev.py` so a bare `cargo test` failure doesn't read as broken code.
+fn env_unclassified() -> bool {
+    std::env::var_os("PHOENIX_CHROME_EXECUTABLE").is_none()
+        && std::env::var_os("PHOENIX_SKIP_BROWSER_TESTS").is_none()
+}
+
 /// Check if outbound HTTPS to the public internet is available. The
 /// `*_remote` browser tests navigate to real websites (example.com)
 /// and need real network. `dev.py check` probes reachability and sets
@@ -40,12 +52,25 @@ fn network_available() -> bool {
     )
 }
 
-/// Skip macro for tests that require Chrome
+/// Skip macro for tests that require Chrome.
+///
+/// When the suite is run outside `./dev.py` the environment was never
+/// classified, so a Chrome-launch failure below is environmental. The
+/// `eprintln!` is captured by the test harness and surfaced only if the
+/// test actually fails — green raw runs (Chrome on `PATH`) stay quiet.
 macro_rules! require_chrome {
     () => {
         if !chrome_available() {
             eprintln!("Skipping test: Chrome/Chromium not available");
             return;
+        }
+        if env_unclassified() {
+            eprintln!(
+                "note: browser tests are running outside `./dev.py` — the environment was \
+                 not classified. If Chrome fails to launch below, the failure is \
+                 environmental, not a code bug: run `./dev.py check`, which locates a \
+                 usable Chromium (or cleanly skips browser tests when none exists)."
+            );
         }
     };
 }
