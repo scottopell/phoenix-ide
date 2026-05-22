@@ -19,7 +19,7 @@ describe('BreadcrumbBar', () => {
   it('uses accessible labels instead of native title tooltips', () => {
     render(<BreadcrumbBar breadcrumbs={breadcrumbs} visible />);
 
-    const toolBreadcrumb = screen.getByLabelText('Running a tool');
+    const toolBreadcrumb = screen.getByLabelText('bash: Running a tool');
     expect(toolBreadcrumb).toHaveClass('breadcrumb-item', 'tool');
     expect(toolBreadcrumb).not.toHaveAttribute('title');
   });
@@ -32,7 +32,7 @@ describe('BreadcrumbBar', () => {
       const bar = document.querySelector<HTMLElement>('#breadcrumb-bar');
       expect(bar).toBeInTheDocument();
 
-      const toolBreadcrumb = screen.getByLabelText('Running a tool');
+      const toolBreadcrumb = screen.getByLabelText('bash: Running a tool');
       vi.spyOn(toolBreadcrumb, 'getBoundingClientRect').mockReturnValue({
         left: 320,
         right: 380,
@@ -83,6 +83,28 @@ describe('BreadcrumbBar', () => {
       tooltipTop: 8,
       arrowLeft: 12,
     });
+
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
+  });
+
+  it('keeps tooltip left non-negative on very narrow viewports', () => {
+    const originalInnerWidth = window.innerWidth;
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 120 });
+
+    const position = calcTooltipPosition({
+      left: 44,
+      right: 76,
+      top: 100,
+      bottom: 124,
+      width: 32,
+      height: 24,
+      x: 44,
+      y: 100,
+      toJSON: () => ({}),
+    } as DOMRect);
+
+    expect(position.tooltipLeft).toBe(8);
+    expect(position.arrowLeft).toBe(52);
 
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: originalInnerWidth });
   });

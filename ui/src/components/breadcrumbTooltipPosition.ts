@@ -12,11 +12,14 @@ export function calcTooltipPosition(rect: DOMRect): TooltipPosition {
   const itemCenterX = rect.left + rect.width / 2;
   const viewportWidth = window.innerWidth;
 
-  let tooltipLeft = itemCenterX - TOOLTIP_WIDTH / 2;
-  tooltipLeft = Math.max(TOOLTIP_MARGIN, tooltipLeft);
-  tooltipLeft = Math.min(viewportWidth - TOOLTIP_WIDTH - TOOLTIP_MARGIN, tooltipLeft);
+  const tooltipWidth = Math.min(TOOLTIP_WIDTH, Math.max(0, viewportWidth - TOOLTIP_MARGIN * 2));
+  const maxTooltipLeft = Math.max(TOOLTIP_MARGIN, viewportWidth - tooltipWidth - TOOLTIP_MARGIN);
 
-  const arrowLeft = Math.max(12, Math.min(TOOLTIP_WIDTH - 12, itemCenterX - tooltipLeft));
+  let tooltipLeft = itemCenterX - tooltipWidth / 2;
+  tooltipLeft = Math.max(TOOLTIP_MARGIN, tooltipLeft);
+  tooltipLeft = Math.min(maxTooltipLeft, tooltipLeft);
+
+  const arrowLeft = Math.max(12, Math.min(tooltipWidth - 12, itemCenterX - tooltipLeft));
 
   return {
     tooltipLeft,

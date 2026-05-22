@@ -116,7 +116,8 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
               b.type === 'subagents' ? 'subagents' : '',
             ].filter(Boolean).join(' ');
 
-            const accessibleLabel = BREADCRUMB_TITLES[b.type] || b.label;
+            const displayLabel = b.label.replace(/^LLM/, 'AI');
+            const accessibleLabel = `${displayLabel}: ${BREADCRUMB_TITLES[b.type] || b.label}`;
 
             return (
               <span key={`${b.type}-${i}-${b.toolId || ''}`}>
@@ -128,7 +129,7 @@ export function BreadcrumbBar({ breadcrumbs, visible }: BreadcrumbBarProps) {
                   onMouseLeave={handleMouseLeave}
                   aria-label={accessibleLabel}
                 >
-                  {b.label.replace(/^LLM/, 'AI')}
+                  {displayLabel}
                 </span>
                 {!isLast && <span className="breadcrumb-arrow">→</span>}
               </span>
