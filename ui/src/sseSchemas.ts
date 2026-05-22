@@ -480,8 +480,9 @@ const BashKillPendingKernelPayloadSchema = v.looseObject({
   label: v.exactOptional(v.nullable(v.string())),
   kill_signal_sent: v.string(),
   kill_attempted_at: v.string(),
-  display: v.string(),
-  signal_sent: v.string(),
+  display: v.exactOptional(v.nullable(v.string())),
+  signal_sent: v.exactOptional(v.nullable(v.string())),
+  waited_ms: v.exactOptional(v.nullable(v.number())),
   ...BashRingWindowFieldsSchema,
 });
 
@@ -497,7 +498,7 @@ const BashTombstonedPayloadSchema = v.looseObject({
   finished_at: v.string(),
   kill_signal_sent: v.exactOptional(v.nullable(v.string())),
   kill_attempted_at: v.exactOptional(v.nullable(v.string())),
-  display: v.string(),
+  display: v.exactOptional(v.nullable(v.string())),
   signal_sent: v.exactOptional(v.nullable(v.string())),
   ...BashRingWindowFieldsSchema,
 });

@@ -9,7 +9,13 @@ export type BashTombstonedPayload = { handle: string, cmd: string,
 /**
  * Optional handle label set on the run call (REQ-BASH-002).
  */
-label?: string | null, final_cause: string, exit_code: number | null, signal_number?: number | null, duration_ms: number, finished_at: string, kill_signal_sent?: string | null, kill_attempted_at?: string | null, display: string, 
+label?: string | null, final_cause: string, exit_code: number | null, signal_number?: number | null, duration_ms: number, finished_at: string, kill_signal_sent?: string | null, kill_attempted_at?: string | null, 
+/**
+ * Display label (REQ-BASH-015) — present on the kill path; absent on
+ * peek/wait of an already-terminal handle (run-path uses the
+ * separate [`BashRunTombstonePayload`]).
+ */
+display?: string | null, 
 /**
  * Echo of the kill signal on the `kill` operation (None on peek/wait
  * of an already-terminal handle).
