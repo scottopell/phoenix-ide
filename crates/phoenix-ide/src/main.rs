@@ -300,22 +300,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Phoenix IDE server listening"
         );
 
-        // Run server with graceful shutdown on signals, bounded by
-        // SHUTDOWN_GRACE. axum's graceful path waits for every in-flight
-        // request to complete; an SSE stream completes only when the client
-        // disconnects, which it may never do. The HTTPS path in `tls::serve_https`
-        // applies the same bound — without it here, one stuck SSE stream pins
-        // the old process alive past a deploy until SIGKILL.
-        let server = axum::serve(listener, app)
-            .with_graceful_shutdown(hot_restart::shutdown_signal())
-            .into_future();
-        match tokio::time::timeout(tls::SHUTDOWN_GRACE, server).await {
-            Ok(result) => result?,
-            Err(_elapsed) => {
-                tracing::warn!(
-                    timeout_seconds = tls::SHUTDOWN_GRACE.as_secs(),
-                    "Timed out waiting for HTTP connections to drain; forcing shutdown"
-                );
+        // Run the server with graceful shutdown on signals. The graceful
+        // drain is bounded by SHUTDOWN_GRACE so a never-disconnecting client
+        // (an SSE stream with keepalive pings) cannot pin the process past a
+        // deploy. The bound must start when the shutdown signal fires, not at
+        // startup — so the server runs as a task, the signal is awaited
+        // separately, and `drain_tx` forks that signal into axum's own
+        // graceful-shutdown hook. The HTTPS path applies the same bound after
+        // its accept loop breaks.
+        let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
+        let mut server = tokio::spawn(
+            axum::serve(listener, app)
+                .with_graceful_shutdown(async move {
+                    let _ = drain_rx.await;
+                })
+                .into_future(),
+        );
+        let server_abort = server.abort_handle();
+
+        tokio::select! {
+            // The server task ends on its own only via a fatal accept error.
+            joined = &mut server => joined??,
+            () = hot_restart::shutdown_signal() => {
+                let _ = drain_tx.send(());
+                match tokio::time::timeout(tls::SHUTDOWN_GRACE, &mut server).await {
+                    Ok(joined) => joined??,
+                    Err(_elapsed) => {
+                        server_abort.abort();
+                        tracing::warn!(
+                            timeout_seconds = tls::SHUTDOWN_GRACE.as_secs(),
+                            "Timed out waiting for HTTP connections to drain; forcing shutdown"
+                        );
+                    }
+                }
             }
         }
     }
