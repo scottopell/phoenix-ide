@@ -9,12 +9,19 @@ import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreami
 // Stable markdown configuration — avoids creating new references on every render
 const REMARK_PLUGINS = [remarkGfm];
 
-const MARKDOWN_COMPONENTS = {
-  table: ({ children, ...props }: React.ComponentPropsWithoutRef<'table'>) => (
+type MarkdownTableProps = React.ComponentPropsWithoutRef<'table'> & { node?: unknown };
+
+function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
+  void node;
+  return (
     <div className="markdown-table-scroll">
       <table {...props}>{children}</table>
     </div>
-  ),
+  );
+}
+
+const MARKDOWN_COMPONENTS = {
+  table: MarkdownTable,
 };
 
 interface StreamingMessageProps {
