@@ -4,6 +4,7 @@ import type { SseInitData, SseBreadcrumb } from '../api';
 import type { SSEAction, InitPayload } from '../conversation/atom';
 import type { Breadcrumb } from '../types';
 import { parseConversationState } from '../utils';
+import { notifyConversationStateChange } from '../notifications';
 import {
   SseInitDataSchema,
   SseMessageDataSchema,
@@ -215,6 +216,8 @@ export function useConnection({
   // exactly once per dispatchMachine call.
   const machineStateRef = useRef(machineState);
   machineStateRef.current = machineState;
+  const latestConversationRef = useRef<import('../api').Conversation | null>(null);
+  const latestPhaseRef = useRef<import('../api').ConversationState | null>(null);
 
   useEffect(() => {
     dispatchRef.current = dispatch;
@@ -282,9 +285,12 @@ export function useConnection({
             if (!res.ok) return;
 
             dispatchMachineRef.current({ type: 'SSE_OPEN' });
+            const payload = transformInitData(res.data);
+            latestConversationRef.current = payload.conversation;
+            latestPhaseRef.current = payload.phase;
             stampedDispatch({
               type: 'sse_init',
-              payload: transformInitData(res.data),
+              payload,
             });
           });
 
@@ -328,10 +334,17 @@ export function useConnection({
             if (!res.ok) return;
             // `data.state` is opaque at the SSE boundary; parseConversationState
             // performs its own discriminated-union validation.
+            const nextPhase = parseConversationState(res.data.state);
+            notifyConversationStateChange(
+              latestConversationRef.current,
+              latestPhaseRef.current,
+              nextPhase,
+            );
+            latestPhaseRef.current = nextPhase;
             stampedDispatch({
               type: 'sse_state_change',
               sequenceId: res.data.sequence_id,
-              phase: parseConversationState(res.data.state),
+              phase: nextPhase,
             });
           });
 
@@ -343,6 +356,14 @@ export function useConnection({
               stampedDispatch,
             );
             if (!res.ok) return;
+            if (latestPhaseRef.current) {
+              notifyConversationStateChange(
+                latestConversationRef.current,
+                latestPhaseRef.current,
+                { type: 'idle' },
+              );
+              latestPhaseRef.current = { type: 'idle' };
+            }
             stampedDispatch({ type: 'sse_agent_done', sequenceId: res.data.sequence_id });
           });
 
@@ -367,10 +388,14 @@ export function useConnection({
               stampedDispatch,
             );
             if (!res.ok) return;
+            const updates = res.data.conversation as Partial<import('../api').Conversation>;
+            if (latestConversationRef.current) {
+              latestConversationRef.current = { ...latestConversationRef.current, ...updates };
+            }
             stampedDispatch({
               type: 'sse_conversation_update',
               sequenceId: res.data.sequence_id,
-              updates: res.data.conversation as Partial<import('../api').Conversation>,
+              updates,
             });
           });
 

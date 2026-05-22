@@ -1704,6 +1704,60 @@ pre:hover .copy-btn {
 }
 
 /* Empty State */
+
+.notification-settings {
+  margin: 8px 12px;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.notification-settings__title {
+  margin-bottom: 6px;
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.notification-settings label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 4px 0;
+}
+
+.notification-settings input[type="checkbox"] {
+  margin: 0;
+}
+
+.notification-settings button {
+  margin: 6px 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.notification-settings__permission,
+.notification-settings__hint {
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+
+.notification-settings__events {
+  margin-top: 6px;
+}
+
+.notification-settings__error {
+  margin-top: 4px;
+  color: var(--accent-red);
+}
+
 .empty-state {
   text-align: center;
   padding: 40px 20px;

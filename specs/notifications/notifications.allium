@@ -177,12 +177,13 @@ rule EmitErrorCatchupNotification {
     )
 
     @guidance
-        -- Implementation: in the SSE init handler (which fires on every
-        -- connect/reconnect), iterate the conversation list and check
-        -- each conversation's state. Use the same DeliverNotification
-        -- pipeline (checks settings, permission, tab focus).
-        -- This runs AFTER the conversation list is loaded from the init
-        -- event, so all data is available.
+        -- Implementation: catch-up is driven by successful conversation-list
+        -- refreshes, not by per-conversation SSE init. The current frontend
+        -- opens SSE per conversation; init contains that conversation snapshot
+        -- plus pending events, not the full conversation list. After
+        -- api.listConversations() refreshes the ConversationStore,
+        -- DesktopLayout scans active top-level conversations and uses the
+        -- same DeliverNotification pipeline (settings, permission, focus).
         --
         -- The intermediate event (CatchupCheckTaskApproval) lets the
         -- three branches fire as separate rules without a top-level

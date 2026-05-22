@@ -8,6 +8,7 @@ import { ChainDeleteConfirm } from './ChainDeleteConfirm';
 import { RenameDialog } from './RenameDialog';
 import { ThemeToggle } from './ThemeToggle';
 import { AccountChip } from './AccountChip';
+import { NotificationSettingsPanel } from './NotificationSettingsPanel';
 import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
@@ -306,6 +307,7 @@ export function Sidebar({
         <ThemeToggle theme={theme} onToggle={toggleTheme} />
         <AccountChip preflight={codexPreflight} onPreflightInvalidated={refetchCodexPreflight} />
       </div>
+      <NotificationSettingsPanel compact />
       {projects.length > 0 && (
         <div className="project-tabs">
           <button

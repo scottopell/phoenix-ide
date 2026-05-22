@@ -31,6 +31,23 @@ pub struct CreateConversationRequest {
     pub seed_label: Option<String>,
 }
 
+/// Request body for persisted desktop notification preferences (REQ-NOTIF-006/009).
+#[derive(Debug, Deserialize)]
+pub struct NotificationSettingsRequest {
+    pub enabled: crate::db::NotificationToggle,
+    #[serde(flatten)]
+    pub events: crate::db::NotificationEventSettings,
+}
+
+impl From<NotificationSettingsRequest> for crate::db::NotificationSettings {
+    fn from(value: NotificationSettingsRequest) -> Self {
+        Self {
+            enabled: value.enabled,
+            events: value.events,
+        }
+    }
+}
+
 /// Request to upgrade a conversation's model
 #[derive(Debug, Deserialize)]
 pub struct UpgradeModelRequest {

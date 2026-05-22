@@ -49,6 +49,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "backfill_explore_worktree_path",
         sql: MIGRATION_007,
     },
+    Migration {
+        version: 8,
+        name: "create_notification_settings",
+        sql: MIGRATION_008,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -227,6 +232,13 @@ WHERE json_extract(conv_mode, '$.mode') = 'Explore'
   AND json_extract(conv_mode, '$.worktree_path') IS NULL;
 ";
 
+const MIGRATION_008: &str = r"
+CREATE TABLE IF NOT EXISTS notification_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -327,7 +339,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 7);
+        assert_eq!(first, 8);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

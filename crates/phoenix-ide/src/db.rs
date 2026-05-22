@@ -239,6 +239,54 @@ impl Database {
         Ok(())
     }
 
+    // ==================== Notification Settings ====================
+
+    pub async fn get_notification_settings(&self) -> DbResult<NotificationSettings> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT key, value FROM notification_settings")
+                .fetch_all(&self.pool)
+                .await?;
+        let mut settings = NotificationSettings::default();
+        for (key, value) in rows {
+            let parsed = value == "true";
+            match key.as_str() {
+                "notifications_enabled" => settings.enabled = parsed.into(),
+                "notify_task_approval" => settings.events.task_approval = parsed.into(),
+                "notify_question" => settings.events.question = parsed.into(),
+                "notify_error" => settings.events.error = parsed.into(),
+                "notify_idle" => settings.events.idle = parsed.into(),
+                _ => {}
+            }
+        }
+        Ok(settings)
+    }
+
+    pub async fn set_notification_settings(&self, settings: &NotificationSettings) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+        let pairs = [
+            ("notifications_enabled", settings.enabled.as_bool()),
+            (
+                "notify_task_approval",
+                settings.events.task_approval.as_bool(),
+            ),
+            ("notify_question", settings.events.question.as_bool()),
+            ("notify_error", settings.events.error.as_bool()),
+            ("notify_idle", settings.events.idle.as_bool()),
+        ];
+        for (key, enabled) in pairs {
+            sqlx::query(
+                "INSERT INTO notification_settings (key, value) VALUES (?1, ?2) \
+                 ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            )
+            .bind(key)
+            .bind(if enabled { "true" } else { "false" })
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     // ==================== MCP Disabled Servers ====================
 
     /// Return the set of MCP server names that have been disabled.

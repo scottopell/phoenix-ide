@@ -2,6 +2,7 @@ import { createInitialAtom, conversationReducer } from './atom';
 import type { ConversationAtom, SSEAction } from './atom';
 import type { Conversation } from '../api';
 import { RoutedStore } from './RoutedStore';
+import { notifyConversationSnapshotChange } from '../notifications';
 
 /**
  * Per-slug conversation atoms.
@@ -76,6 +77,7 @@ export class ConversationStore extends RoutedStore<string, ConversationAtom, SSE
       }
     }
     this.slugByConvId.set(conversation.id, slug);
+    notifyConversationSnapshotChange(conversation);
     return this.setAtom(slug, { ...current, conversation });
   }
 

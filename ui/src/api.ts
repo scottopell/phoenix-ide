@@ -413,6 +413,14 @@ export interface AuthStatus {
   authenticated: boolean;
 }
 
+export interface NotificationSettings {
+  enabled: boolean;
+  notify_task_approval: boolean;
+  notify_question: boolean;
+  notify_error: boolean;
+  notify_idle: boolean;
+}
+
 export interface UsageTotals {
   input_tokens: number;
   output_tokens: number;
@@ -477,6 +485,23 @@ export const api = {
     if (!resp.ok) throw new Error('Failed to check auth status');
     return resp.json();
   },
+
+  async getNotificationSettings(): Promise<NotificationSettings> {
+    const resp = await fetch('/api/settings/notifications');
+    if (!resp.ok) throw new Error('Failed to load notification settings');
+    return resp.json();
+  },
+
+  async updateNotificationSettings(settings: NotificationSettings): Promise<NotificationSettings> {
+    const resp = await fetch('/api/settings/notifications', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(settings),
+    });
+    if (!resp.ok) throw new Error('Failed to save notification settings');
+    return resp.json();
+  },
+
 
   async login(password: string): Promise<void> {
     const resp = await fetch('/api/auth/login', {

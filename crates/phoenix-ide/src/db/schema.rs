@@ -8,6 +8,85 @@ use serde_json::Value;
 use std::fmt;
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum NotificationToggle {
+    Enabled,
+    Disabled,
+}
+
+impl NotificationToggle {
+    pub fn as_bool(self) -> bool {
+        matches!(self, Self::Enabled)
+    }
+}
+
+impl From<bool> for NotificationToggle {
+    fn from(value: bool) -> Self {
+        if value {
+            Self::Enabled
+        } else {
+            Self::Disabled
+        }
+    }
+}
+
+impl Serialize for NotificationToggle {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_bool(self.as_bool())
+    }
+}
+
+impl<'de> Deserialize<'de> for NotificationToggle {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        bool::deserialize(deserializer).map(Self::from)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NotificationEventSettings {
+    #[serde(rename = "notify_task_approval")]
+    pub task_approval: NotificationToggle,
+    #[serde(rename = "notify_question")]
+    pub question: NotificationToggle,
+    #[serde(rename = "notify_error")]
+    pub error: NotificationToggle,
+    #[serde(rename = "notify_idle")]
+    pub idle: NotificationToggle,
+}
+
+impl Default for NotificationEventSettings {
+    fn default() -> Self {
+        Self {
+            task_approval: NotificationToggle::Enabled,
+            question: NotificationToggle::Enabled,
+            error: NotificationToggle::Enabled,
+            idle: NotificationToggle::Enabled,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NotificationSettings {
+    pub enabled: NotificationToggle,
+    #[serde(flatten)]
+    pub events: NotificationEventSettings,
+}
+
+impl Default for NotificationSettings {
+    fn default() -> Self {
+        Self {
+            enabled: NotificationToggle::Enabled,
+            events: NotificationEventSettings::default(),
+        }
+    }
+}
+
 /// A string guaranteed to be non-empty at construction time.
 /// Serde deserialization rejects empty strings.
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -120,6 +199,11 @@ CREATE TABLE IF NOT EXISTS turn_usage (
 
 CREATE INDEX IF NOT EXISTS idx_turn_usage_conversation ON turn_usage(conversation_id);
 CREATE INDEX IF NOT EXISTS idx_turn_usage_root ON turn_usage(root_conversation_id);
+
+CREATE TABLE IF NOT EXISTS notification_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 "#;
 
 /// Migration SQL to convert old state format to typed JSON

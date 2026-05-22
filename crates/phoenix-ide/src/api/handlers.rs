@@ -18,11 +18,15 @@ use super::types::{
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
-    SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
+    NotificationSettingsRequest, ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse,
+    SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
+    ValidateCwdResponse,
 };
 use super::AppState;
-use crate::db::{ConvMode, ConversationUsage, ImageData, Message, MessageContent, MessageType};
+use crate::db::{
+    ConvMode, ConversationUsage, ImageData, Message, MessageContent, MessageType,
+    NotificationSettings,
+};
 use crate::git_ops::{
     check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict, GitOpError,
 };
@@ -199,6 +203,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/mcp/reload", post(reload_mcp))
         .route("/api/mcp/servers/:name/disable", post(disable_mcp_server))
         .route("/api/mcp/servers/:name/enable", post(enable_mcp_server))
+        // Notification settings (REQ-NOTIF-006, REQ-NOTIF-009)
+        .route(
+            "/api/settings/notifications",
+            get(get_notification_settings).put(update_notification_settings),
+        )
         // Version
         .route("/version", get(get_version))
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
@@ -504,6 +513,34 @@ async fn list_archived_conversations(
     Ok(Json(ConversationListResponse {
         conversations: json_convs,
     }))
+}
+
+// ============================================================
+// Notification Settings (REQ-NOTIF-006, REQ-NOTIF-009)
+// ============================================================
+
+async fn get_notification_settings(
+    State(state): State<AppState>,
+) -> Result<Json<NotificationSettings>, AppError> {
+    let settings = state
+        .db
+        .get_notification_settings()
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(settings))
+}
+
+async fn update_notification_settings(
+    State(state): State<AppState>,
+    Json(req): Json<NotificationSettingsRequest>,
+) -> Result<Json<NotificationSettings>, AppError> {
+    let settings: NotificationSettings = req.into();
+    state
+        .db
+        .set_notification_settings(&settings)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(settings))
 }
 
 // ============================================================

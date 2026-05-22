@@ -183,12 +183,16 @@ Background tabs degrade over time:
 - **Extended background:** the tab may be discarded; SSE dies.
 
 The notification system handles this via the catch-up rule
-(REQ-NOTIF-008): on SSE reconnect, scan the conversation list for any
-non-sub-agent in a notification-worthy state and emit notifications
-per the same gating rules. If the agent asked a question while the tab
-was suspended, the question's notification fires when the tab wakes up
-and the SSE reconnects. Not as instant as a service-worker push, but
-functionally correct.
+(REQ-NOTIF-008): after a successful conversation-list refresh, scan the
+conversation list for any non-sub-agent in a notification-worthy state and
+emit notifications per the same gating rules. The catch-up pass is tied to
+conversation-list refresh rather than the per-conversation SSE `init` payload:
+the current SSE stream is scoped to one conversation and does not carry the
+full list. Online/wake and visible-tab polling already trigger list refreshes,
+so missed blocking states are surfaced when Phoenix becomes live again. If the
+agent asked a question while the tab was suspended, the question's notification
+fires when the tab wakes up and the list refresh succeeds. Not as instant as a
+service-worker push, but functionally correct.
 
 A service-worker push channel could be added later if instant
 notifications during long-background sessions become a requirement.
@@ -218,9 +222,11 @@ button when `'default'`. When `'denied'`, no programmatic re-prompt is
 possible — the UI shows guidance to change it in browser settings.
 
 The first attempt to fire a notification when the permission is still
-`'default'` should call `Notification.requestPermission()` rather than
-silently dropping. The user has notifications enabled in Phoenix
-settings; the browser-level prompt is the next gate.
+`'default'` silently drops the SSE/list-driven trigger and queues an in-app cue
+for the next Phoenix focus. Browsers generally require
+`Notification.requestPermission()` to run in a user-gesture context, so the
+settings panel's "Enable desktop notifications" button is the only place that
+calls it.
 
 ## Why Two Channels, Not One
 
