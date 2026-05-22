@@ -92,9 +92,10 @@ enum ResponsesOutputKind { message | function_call | reasoning | other }
 -- cached_tokens — a subset already counted inside raw_input_tokens.
 --
 -- `has_output_content` is true iff at least one content block resulted
--- (non-empty message text, or a function_call). It is false when every
--- output item was discarded (reasoning) or empty — the condition the
--- billed-but-empty guard pairs with raw_output_tokens.
+-- (non-empty message text — an output_text or a refusal part — or a
+-- function_call). It is false when every output item was discarded
+-- (reasoning) or empty — the condition the billed-but-empty guard
+-- pairs with raw_output_tokens.
 value ResponsesRawResponse {
     status: String
     raw_input_tokens: Integer
@@ -303,9 +304,10 @@ rule ResponsesServerBlockDropped {
 --      dropping the output array). Yields a RETRYABLE server_error
 --      rather than a silently-empty agent turn the user was billed for.
 --   2. Otherwise a normalized llm/LlmResponse. Output items map:
---      message -> text content, function_call -> tool_use, reasoning ->
---      discarded, other -> ignored. end_turn holds iff the status is
---      "completed" AND no tool call is pending.
+--      message -> text content (both output_text and refusal parts),
+--      function_call -> tool_use, reasoning -> discarded, other ->
+--      ignored. end_turn holds iff the status is "completed" AND no
+--      tool call is pending.
 --
 -- Token accounting de-duplicates the cached subset: OpenAI's
 -- raw_input_tokens already includes cached_tokens, so the cached count
@@ -351,7 +353,9 @@ rule ResponsesResponseNormalized {
         -- guarantees cached_tokens <= raw_input_tokens
         -- (ResponsesCachedSubsetOfInput), so the floor is defensive.
         -- A "reasoning" item is dropped silently (internal thinking,
-        -- not transcript).
+        -- not transcript). A message's "refusal" part surfaces as text
+        -- content — a declined turn is a real final answer, not a
+        -- lost message to retry.
 }
 
 ------------------------------------------------------------

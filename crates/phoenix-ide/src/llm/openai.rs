@@ -749,9 +749,7 @@ fn translate_to_responses_request(
 }
 
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
-fn normalize_responses_api_response(
-    resp: ResponsesApiResponse,
-) -> Result<LlmResponse, LlmError> {
+fn normalize_responses_api_response(resp: ResponsesApiResponse) -> Result<LlmResponse, LlmError> {
     let mut content = Vec::new();
 
     for output in resp.output {
@@ -759,11 +757,25 @@ fn normalize_responses_api_response(
             "message" => {
                 if let Some(output_content) = output.content {
                     for item in output_content {
-                        if item.r#type == "output_text" {
-                            if let Some(text) = item.text {
-                                if !text.is_empty() {
-                                    content.push(ContentBlock::Text { text });
-                                }
+                        let text = match item.r#type.as_str() {
+                            "output_text" => item.text,
+                            // A refusal is the model's actual reply — it
+                            // declined. Surface it as text (Anthropic returns
+                            // refusals as plain text too) so the turn is
+                            // non-empty and the billed-but-empty guard below
+                            // does not retry a final answer.
+                            "refusal" => item.refusal,
+                            other => {
+                                tracing::debug!(
+                                    part_type = %other,
+                                    "ignoring unknown message content part"
+                                );
+                                None
+                            }
+                        };
+                        if let Some(text) = text {
+                            if !text.is_empty() {
+                                content.push(ContentBlock::Text { text });
                             }
                         }
                     }
@@ -1067,6 +1079,8 @@ pub(crate) struct ResponsesApiContent {
     pub(crate) r#type: String,
     #[serde(default)]
     pub(crate) text: Option<String>,
+    #[serde(default)]
+    pub(crate) refusal: Option<String>,
 }
 
 /// `usage.input_tokens_details` on the Responses API wire. Only the cached
@@ -1555,9 +1569,7 @@ mod tests {
             usage: ResponsesApiUsage {
                 input_tokens: 1000,
                 output_tokens: 42,
-                input_tokens_details: ResponsesApiInputTokensDetails {
-                    cached_tokens: 0,
-                },
+                input_tokens_details: ResponsesApiInputTokensDetails { cached_tokens: 0 },
             },
         })
         .expect_err("empty content with billed output tokens must fail");
@@ -1566,6 +1578,39 @@ mod tests {
             err.kind.is_retryable(),
             "a lost-message response must be retryable so the executor retries"
         );
+    }
+
+    /// A `refusal` message part is the model's actual reply — it declined.
+    /// It must surface as non-empty text content so the billed-but-empty
+    /// guard does not mistake a final answer for a lost message and retry.
+    #[test]
+    fn responses_api_refusal_message_surfaces_as_text_not_retried() {
+        let resp = normalize_responses_api_response(ResponsesApiResponse {
+            status: "completed".to_string(),
+            output: vec![ResponsesApiOutput {
+                r#type: "message".to_string(),
+                content: Some(vec![ResponsesApiContent {
+                    r#type: "refusal".to_string(),
+                    text: None,
+                    refusal: Some("I can't help with that.".to_string()),
+                }]),
+                name: None,
+                arguments: None,
+                call_id: None,
+            }],
+            usage: ResponsesApiUsage {
+                input_tokens: 1000,
+                output_tokens: 7,
+                input_tokens_details: ResponsesApiInputTokensDetails { cached_tokens: 0 },
+            },
+        })
+        .expect("a refusal is valid content, not a billed-but-empty failure");
+        assert!(resp.end_turn);
+        assert_eq!(resp.content.len(), 1);
+        match &resp.content[0] {
+            ContentBlock::Text { text } => assert_eq!(text, "I can't help with that."),
+            other => panic!("expected refusal surfaced as Text, got {other:?}"),
+        }
     }
 
     /// If both `response.output_item.done` and `response.completed` carry
