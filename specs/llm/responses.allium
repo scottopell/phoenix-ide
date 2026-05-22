@@ -90,12 +90,18 @@ enum ResponsesOutputKind { message | function_call | reasoning | other }
 -- A raw Responses API response, summarized to the facts normalization
 -- branches on. `cached_tokens` is OpenAI's input_tokens_details.
 -- cached_tokens — a subset already counted inside raw_input_tokens.
+--
+-- `has_output_content` is true iff at least one content block resulted
+-- (non-empty message text, or a function_call). It is false when every
+-- output item was discarded (reasoning) or empty — the condition the
+-- billed-but-empty guard pairs with raw_output_tokens.
 value ResponsesRawResponse {
     status: String
     raw_input_tokens: Integer
     raw_output_tokens: Integer
     cached_tokens: Integer
     has_function_call: Boolean
+    has_output_content: Boolean
 }
 
 ------------------------------------------------------------
@@ -291,10 +297,15 @@ rule ResponsesServerBlockDropped {
 -- Rules — response normalization
 ------------------------------------------------------------
 
--- Normalize a Responses API response into an llm/LlmResponse. Output
--- items map: message -> text content, function_call -> tool_use,
--- reasoning -> discarded, other -> ignored. end_turn holds iff the
--- status is "completed" AND no tool call is pending.
+-- Normalize a Responses API response. Two outcomes:
+--   1. Billed-but-empty — no content block resulted yet OpenAI reported
+--      output tokens. The assembled message was lost (a gateway
+--      dropping the output array). Yields a RETRYABLE server_error
+--      rather than a silently-empty agent turn the user was billed for.
+--   2. Otherwise a normalized llm/LlmResponse. Output items map:
+--      message -> text content, function_call -> tool_use, reasoning ->
+--      discarded, other -> ignored. end_turn holds iff the status is
+--      "completed" AND no tool call is pending.
 --
 -- Token accounting de-duplicates the cached subset: OpenAI's
 -- raw_input_tokens already includes cached_tokens, so the cached count
@@ -306,25 +317,41 @@ rule ResponsesResponseNormalized {
 
     let end_turn = raw.status = "completed" and not raw.has_function_call
 
-    ensures: llm/LlmResponse.created(
-        end_turn: end_turn,
-        usage: {
-            input_tokens: saturating_sub(raw.raw_input_tokens, raw.cached_tokens),
-            output_tokens: raw.raw_output_tokens,
-            cache_creation_tokens: 0,
-            cache_read_tokens: raw.cached_tokens
-        }
-    )
+    ensures:
+        if not raw.has_output_content and raw.raw_output_tokens > 0:
+            llm/LlmError.created(
+                kind: server_error,
+                message: "OpenAI returned empty response with output tokens billed",
+                recovery_in_progress: false,
+                has_quota: false
+            )
+        else:
+            llm/LlmResponse.created(
+                end_turn: end_turn,
+                usage: {
+                    input_tokens: saturating_sub(raw.raw_input_tokens, raw.cached_tokens),
+                    output_tokens: raw.raw_output_tokens,
+                    cache_creation_tokens: 0,
+                    cache_read_tokens: raw.cached_tokens
+                }
+            )
 
     @guidance
-        -- normalize_responses_api_response. cache_creation_tokens is
-        -- fixed at 0 — the Responses API has no cache-creation concept;
-        -- the field is a typed sink for this provider, not an unparsed
-        -- value. saturating_sub floors at 0; OpenAI guarantees
-        -- cached_tokens <= raw_input_tokens (ResponsesCachedSubsetOfInput),
-        -- so the floor is defensive. A "message" item with empty
-        -- output_text contributes no content block; a "reasoning" item
-        -- is dropped silently (internal thinking, not transcript).
+        -- normalize_responses_api_response, called by both the
+        -- non-streaming path and the streaming accumulator's
+        -- into_response. The billed-but-empty branch complements the
+        -- ResponsesStreamCompleted recovery fallback: the fallback
+        -- salvages a message that arrived only in /response/output,
+        -- this branch catches the case where even that is empty though
+        -- tokens were billed. An empty response with output_tokens = 0
+        -- is a genuinely-empty valid turn and takes the LlmResponse
+        -- branch. cache_creation_tokens is fixed at 0 — the Responses
+        -- API has no cache-creation concept; the field is a typed sink
+        -- for this provider. saturating_sub floors at 0; OpenAI
+        -- guarantees cached_tokens <= raw_input_tokens
+        -- (ResponsesCachedSubsetOfInput), so the floor is defensive.
+        -- A "reasoning" item is dropped silently (internal thinking,
+        -- not transcript).
 }
 
 ------------------------------------------------------------
@@ -654,43 +681,51 @@ invariant ResponsesCachedSubsetOfInput {
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
--- Kept as prose so the file stays parseable.
+-- All resolved 2026-05-22. Kept as prose so the file stays parseable.
 --
--- Q1. ResponsesStreamCompleted's recovery fallback fires when zero
---     output items were collected. If response.completed ALSO carries an
---     empty /response/output, the stream finalizes genuinely empty and
---     Phoenix persists an end_turn-with-empty-content response. That is
---     valid for a model that finished a tool loop with nothing to say —
---     but it is wire-indistinguishable from a gateway that dropped the
---     whole message. Today both resolve to the same empty LlmResponse.
---     A future signal (output_tokens > 0 with empty output) could
---     promote the second case to a retryable error.
+-- Q1. RESOLVED — billed-but-empty is now a distinct outcome of
+--     ResponsesResponseNormalized. A completed response with no content
+--     block but raw_output_tokens > 0 yields a retryable server_error:
+--     OpenAI billed for a message it did not deliver. The
+--     wire-indistinguishable "genuinely empty valid turn" case
+--     (output_tokens = 0) still resolves to an empty llm/LlmResponse —
+--     correct, a model can finish a tool loop with nothing to add. The
+--     residual case (a reasoning-only turn with output_tokens > 0 and
+--     no message) takes the error branch: a degenerate turn is better
+--     retried than persisted empty.
 --
--- Q2. classify_responses_error routes a code merely *containing* "quota"
---     to the retryable rate_limit family, while the exact code
---     "usage_limit_reached" is terminal. A backend that emits, say,
---     "monthly_quota_exhausted" as a code (rather than as an error.type)
---     would be misclassified as retryable. No such code is known today;
---     flagged because the substring scan is inherently fragile against
---     new code spellings.
+-- Q2. RESOLVED — keep as-is. classify_responses_error routes a code
+--     *containing* "quota" to the retryable rate_limit family; only the
+--     exact code "usage_limit_reached" is terminal. A hypothetical code
+--     such as "insufficient_quota" would be retried rather than failing
+--     terminally. Accepted: no such code is observed on the Responses
+--     path today, and the path that actually matters for quota
+--     exhaustion — the codex backend — signals it via the structured
+--     error.type field (ResponsesCodex429Classified), not the code
+--     string. The substring scan is a heuristic for the platform API's
+--     less-structured errors; pre-emptively guessing an unobserved code
+--     spelling would itself be a guess. Revisit if such a code appears
+--     in logs.
 --
--- Q3. The reasoning output item is discarded during normalization, so a
---     multi-turn conversation loses the model's reasoning context
---     between turns. The Responses API can return encrypted reasoning
---     for replay (the `include` request field), but Phoenix sends an
---     empty `include` until it has a durable transcript representation
---     for reasoning items. Tracked as a deferred capability, not a bug.
+-- Q3. RESOLVED — accept as a deferred capability. The reasoning output
+--     item is discarded during normalization, so multi-turn reasoning
+--     context is not carried between turns. The Responses API can
+--     return encrypted reasoning for replay via the `include` request
+--     field, but Phoenix sends an empty `include` until it has a
+--     durable transcript representation for reasoning items. A known
+--     limitation, not a bug; reasoning replay is separate work.
 --
--- Q4. ResponsesCodex429Classified / ResponsesCodex503Classified apply
---     only when use_codex_backend is true. The platform Responses API
---     uses ResponsesSseErrorClassified (SSE) or from_http_status (HTTP)
---     instead. The backend selector is request-scoped configuration,
---     not modelled here; both per-backend paths are specified so the
---     selector's two outcomes are each covered.
+-- Q4. RESOLVED — scoping note, no decision needed.
+--     ResponsesCodex429Classified / ResponsesCodex503Classified apply
+--     only when use_codex_backend is true; the platform Responses API
+--     uses ResponsesSseErrorClassified (SSE) or from_http_status (HTTP).
+--     The backend selector is request-scoped configuration, modelled in
+--     neither branch's trigger; both per-backend paths are specified so
+--     the selector's two outcomes are each covered.
 --
 -- Note (stream exhausted without response.completed): if the byte
 --     stream ends before a response.completed event, the accumulator
---     still assembles whatever it collected — there is no `done`
---     transition and no error. This is a degenerate path; it is not
---     modelled as a rule because it produces no distinct observable
---     outcome beyond a possibly-empty LlmResponse (see Q1).
+--     still assembles whatever it collected — no `done` transition, no
+--     error. A degenerate path; not modelled as a rule because it
+--     produces no distinct observable outcome beyond a possibly-empty
+--     response, which the billed-but-empty guard (Q1) now screens.

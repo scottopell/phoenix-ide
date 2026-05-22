@@ -263,20 +263,24 @@ invariant UsageNonNegative {
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
--- Kept as prose so the file stays parseable. Each is a deferred
--- follow-up the next reader should be aware of.
+-- Both resolved 2026-05-22. Kept as prose so the file stays parseable.
 --
--- Q1. TokenChunk is text-only. design.md describes a richer four-variant
---     TokenChunk (ToolUseStart / ToolUseInput / ToolUseDone) for
---     streaming tool-call construction to the UI. The shipped enum in
---     llm.rs has only Text; tool arguments are accumulated provider-side
---     and never streamed. This spec models the shipped behaviour. If
---     streamed tool-call construction is ever built, this value type and
---     the per-provider streaming rules both grow.
+-- Q1. RESOLVED — accept as shipped behaviour. TokenChunk is text-only.
+--     design.md describes a richer four-variant TokenChunk
+--     (ToolUseStart / ToolUseInput / ToolUseDone) for streaming
+--     tool-call construction to the UI, but the shipped enum in llm.rs
+--     has only Text; tool arguments are accumulated provider-side and
+--     never streamed. This spec models the shipped behaviour. If
+--     streamed tool-call construction is built, this value type and the
+--     per-provider streaming rules grow together.
 --
--- Q2. content_filter and context_window_exceeded are in the taxonomy and
---     reachable from the Responses classifier (classify_responses_error)
---     but the Anthropic provider never produces them — its SSE error
---     mapping has no branch for either. Whether Anthropic should detect
---     `invalid_request_error` bodies that are really context-window
---     overflows and reclassify is an open product question, not a bug.
+-- Q2. RESOLVED — keep as-is. content_filter and context_window_exceeded
+--     are in the taxonomy and reachable from the Responses classifier
+--     (classify_responses_error) but the Anthropic provider never
+--     produces them — its SSE error mapping has no branch for either, so
+--     an Anthropic context-window overflow surfaces as the generic
+--     invalid_request kind. Accepted: invalid_request and
+--     context_window_exceeded are both terminal/non-retryable, so retry
+--     behaviour is identical, and nothing currently consumes the finer
+--     kinds (both are #[allow(dead_code)] in error.rs). Revisit if a
+--     consumer needs the finer Anthropic classification.

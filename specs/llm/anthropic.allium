@@ -530,29 +530,30 @@ invariant AnthropicNoOpenBlockSurvivesDone {
 ------------------------------------------------------------
 -- Open Questions
 ------------------------------------------------------------
--- Kept as prose so the file stays parseable.
+-- All resolved 2026-05-22. Kept as prose so the file stays parseable.
 --
--- Q1. Tool-call argument fragments (input_json_delta) are accumulated
---     silently and never forwarded as a TokenChunk, so the UI shows no
---     progress while a large tool call is being constructed. This
---     matches llm.allium Q1 (TokenChunk is text-only). Modelled as
---     shipped behaviour; revisit only if streamed tool-call
---     construction is built.
+-- Q1. RESOLVED — accept as shipped behaviour. Tool-call argument
+--     fragments (input_json_delta) are accumulated silently and never
+--     forwarded as a TokenChunk, so the UI shows no progress while a
+--     large tool call is constructed. Matches llm.allium Q1 (TokenChunk
+--     is text-only). The spec models the shipped code; streamed
+--     tool-call construction is separate future work.
 --
--- Q2. An Unknown response block (serde `other`) is logged loudly and
---     dropped. It is deliberately absent from llm/ContentKind because by
---     construction it never reaches an llm/LlmResponse. If Anthropic
---     ships a block type Phoenix must preserve for history,
---     AnthropicContentBlock needs a real variant and llm/ContentKind a
---     matching kind — at which point this stops being an open question
---     and becomes a translation rule.
+-- Q2. RESOLVED — accept as shipped behaviour. An Unknown response block
+--     (serde `other`) is logged loudly and dropped; it is deliberately
+--     absent from llm/ContentKind because by construction it never
+--     reaches an llm/LlmResponse. If Anthropic ships a block type
+--     Phoenix must preserve for history, AnthropicContentBlock needs a
+--     real variant and llm/ContentKind a matching kind — at which point
+--     a translation rule replaces this note.
 --
--- Q3. The `failed` terminal state can be reached by an SSE `error` event
---     mid-stream, after some blocks already committed. The committed
---     blocks are discarded — the whole turn becomes the classified
---     error. Whether a partial-then-errored stream should ever surface
---     its partial content is unresolved; today both providers discard
---     partial-on-error.
+-- Q3. RESOLVED — keep as-is. The `failed` terminal state can be reached
+--     by an SSE `error` event mid-stream after some blocks already
+--     committed; the committed blocks are discarded and the whole turn
+--     becomes the classified error. Accepted: both providers behave
+--     this way, it is consistent and simple, and surfacing partial
+--     content on a hard error would touch the executor's error path for
+--     marginal benefit.
 --
 -- Note (text-part ordering): AnthropicToolResultTranslated always
 --     creates the text part before the image parts, so the text part is
