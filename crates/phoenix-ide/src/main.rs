@@ -459,6 +459,9 @@ mod reconcile_worktrees_tests {
                 "user.email=t@example.com",
                 "-c",
                 "user.name=t",
+                // Don't depend on the host's commit-signing setup in tests.
+                "-c",
+                "commit.gpgsign=false",
                 "commit",
                 "--allow-empty",
                 "-m",
