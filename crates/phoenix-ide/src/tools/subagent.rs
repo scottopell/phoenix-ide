@@ -9,10 +9,6 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-// ============================================================================
-// submit_result - Sub-agent successful completion
-// ============================================================================
-
 /// Tool for sub-agents to submit their final result
 pub struct SubmitResultTool;
 
@@ -58,10 +54,6 @@ impl Tool for SubmitResultTool {
     }
 }
 
-// ============================================================================
-// submit_error - Sub-agent error completion
-// ============================================================================
-
 /// Tool for sub-agents to report failure
 pub struct SubmitErrorTool;
 
@@ -103,10 +95,6 @@ impl Tool for SubmitErrorTool {
         }
     }
 }
-
-// ============================================================================
-// spawn_agents - Parent spawns sub-agents
-// ============================================================================
 
 /// Tool for parent conversations to spawn sub-agents
 pub struct SpawnAgentsTool;
