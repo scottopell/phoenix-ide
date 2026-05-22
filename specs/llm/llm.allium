@@ -1,0 +1,282 @@
+-- allium: 3
+-- llm.allium
+--
+-- LLM Provider: shared vocabulary and provider-agnostic contracts.
+--
+-- Scope: The internal request/response vocabulary every LLM provider
+--        translates to and from, the exhaustive error taxonomy, and the
+--        invariants that hold regardless of which provider served a turn.
+--        This is the base module imported by the per-provider wire specs.
+--
+-- Includes: The internal ContentBlock kinds; LlmRequest / LlmResponse /
+--           LlmMessage shape; the Usage token-accounting value; the
+--           streaming TokenChunk; the LlmErrorKind taxonomy and its
+--           retryable/terminal partition; the rule that structured quota
+--           detail is carried by an error iff it is a usage-limit
+--           exhaustion.
+--
+-- Excludes: Provider wire formats — request translation, response
+--           normalization, the SSE streaming accumulators (see
+--           anthropic.allium and responses.allium).
+--           Error *classification* — the mapping from an HTTP status or
+--           SSE payload to an LlmErrorKind. That is per-provider; this
+--           module only fixes the taxonomy the classifiers must target.
+--           Gateway routing, model registry, model discovery.
+--
+-- Self-contained: no `use` imports. The two per-provider specs import
+--           this file as `llm` and create llm/LlmError and
+--           llm/LlmResponse instances through their own rules.
+--
+-- Rationale: a 2026-05 production incident (a tool-result image fed back
+--            to an OpenAI model produced HTTP 400 "Invalid value: 'text'")
+--            showed the request-translation layer had no normative
+--            contract. The wire discriminant a content block serializes
+--            to is provider-specific; naming the internal vocabulary once
+--            here lets each provider spec state its own discriminant
+--            contract against a shared anchor.
+--
+-- Normative companions:
+--   specs/llm/requirements.md  — REQ-LLM-001..009
+--   specs/llm/design.md        — LlmService, LlmError, LlmErrorKind
+--   specs/llm/anthropic.allium — Anthropic Messages wire contract
+--   specs/llm/responses.allium — OpenAI Responses API wire contract
+--
+-- Cross-references:
+--   crates/phoenix-ide/src/llm/types.rs — ContentBlock, LlmRequest,
+--                                         LlmResponse, Usage, ImageSource
+--   crates/phoenix-ide/src/llm/error.rs — LlmError, LlmErrorKind
+--   crates/phoenix-ide/src/llm.rs       — TokenChunk, LlmService trait
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- Role of a conversation message. Phoenix has no `system` role: system
+-- prompt content is carried separately on LlmRequest.system and each
+-- provider places it in its own format (Anthropic top-level `system`,
+-- Responses API `instructions`).
+enum MessageRole { user | assistant }
+
+-- The discriminant of an internal ContentBlock. The string values are
+-- exactly ContentBlock::type_tag() in types.rs — the serde `type` tag of
+-- the internal representation, which is NOT necessarily the wire tag any
+-- provider emits (that mapping is the subject of the per-provider specs).
+--
+-- text, image, tool_use and tool_result are the portable kinds: every
+-- provider can represent them. The remaining nine are Anthropic
+-- server-handled blocks — executed by the Anthropic API and preserved
+-- verbatim for multi-turn history fidelity. A provider with no wire
+-- equivalent must drop them through a logged capability gap, never
+-- silently (see responses.allium ResponsesServerBlockDropped).
+enum ContentKind {
+    text
+    | image
+    | tool_use
+    | tool_result
+    | server_tool_use
+    | tool_search_tool_result
+    | web_search_tool_result
+    | web_fetch_tool_result
+    | code_execution_tool_result
+    | bash_code_execution_tool_result
+    | text_editor_code_execution_tool_result
+    | mcp_tool_use
+    | mcp_tool_result
+}
+
+-- Exhaustive error taxonomy. No `Unknown`, no catch-all: adding a class
+-- forces a variant here and an explicit decision in every classifier and
+-- every consumer (REQ-LLM-006). The retryable/terminal split is a
+-- structural property — see the `retryable` derived field on LlmError
+-- and the RetryablePartition invariant.
+--
+-- rate_limit and usage_limit_reached are deliberately distinct: a 429
+-- can be a transient per-window throttle (retry in seconds) or a quota
+-- window exhausted on a calendar boundary (retry next week). Collapsing
+-- them either wastes retries or misclassifies recovery.
+enum LlmErrorKind {
+    network
+    | rate_limit
+    | usage_limit_reached
+    | server_error
+    | server_overloaded
+    | auth
+    | invalid_request
+    | content_filter
+    | context_window_exceeded
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A base64-encoded image. The only ImageSource variant in types.rs.
+value ImageBase64 {
+    media_type: String
+    data: String
+}
+
+-- One system-prompt segment. `cache` requests a provider cache anchor on
+-- this segment (Anthropic per-block cache_control; the Responses API has
+-- no per-segment cache control and ignores the flag).
+value SystemContent {
+    text: String
+    cache: Boolean
+}
+
+-- Token accounting for one completed turn. `context_window_used` is the
+-- single definition of "how full is the window" — input + output + both
+-- cache buckets. Each provider's normalizer must populate the buckets so
+-- this sum equals the provider's own reported total (see
+-- ResponsesCachedSubsetOfInput in responses.allium).
+value Usage {
+    input_tokens: Integer
+    output_tokens: Integer
+    cache_creation_tokens: Integer
+    cache_read_tokens: Integer
+
+    context_window_used:
+        input_tokens + output_tokens + cache_creation_tokens + cache_read_tokens
+}
+
+-- One content block inside a message. Phoenix's internal representation,
+-- before any provider translation. `kind` is the discriminator.
+--
+-- `tool_result_images` is the load-bearing field for the wire
+-- discriminant contract: a tool_result with a non-empty image list
+-- forces a structured (multi-part) wire encoding, and that is exactly
+-- the path the 2026-05 OpenAI 400 incident exercised. The list is empty
+-- for every kind other than tool_result.
+value ContentBlock {
+    kind: ContentKind
+    tool_result_images: List<ImageBase64>
+    tool_result_is_error: Boolean
+}
+
+-- One conversation message handed to a provider.
+value LlmMessage {
+    role: MessageRole
+    content: List<ContentBlock>
+}
+
+-- A provider-agnostic completion request. `tool_count` abstracts the
+-- ToolDefinition list (the spec cares whether tools are present, not
+-- their schemas). `cache_key` is the caller-chosen prompt-cache cohort
+-- id (PromptCacheKey) — mandatory on the typed request; consumed by the
+-- Responses API as `prompt_cache_key`, ignored by Anthropic.
+value LlmRequest {
+    system: List<SystemContent>
+    messages: List<LlmMessage>
+    tool_count: Integer
+    max_tokens: Integer?
+    cache_key: String
+}
+
+-- A streaming chunk forwarded to the UI mid-turn. Phoenix's TokenChunk
+-- has exactly one variant: a text delta. Tool-call argument fragments
+-- are NOT streamed — they are accumulated provider-side and only appear
+-- in the final assembled LlmResponse. See the per-provider streaming
+-- accumulators for where text chunks are forwarded.
+value TokenChunk {
+    text: String
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A provider-agnostic completion response. Created by each provider's
+-- normalizer. `end_turn` means the model has nothing further to do (no
+-- pending tool calls). The normalized content blocks are not modelled as
+-- a field — per-block normalization is documented in each provider
+-- spec's @guidance; this entity exists so cross-provider invariants
+-- (token accounting) can range over completed responses.
+entity LlmResponse {
+    end_turn: Boolean
+    usage: Usage
+}
+
+-- A classified LLM failure. Created by the per-provider error
+-- classifiers (Anthropic SSE / HTTP status; Responses SSE / codex
+-- backend). `kind` is set once at creation and never transitions.
+--
+-- `retryable` is derived, not stored: the retry decision is a pure
+-- function of `kind`, so it cannot drift out of sync with the taxonomy.
+-- `has_quota` records whether structured QuotaDetails is attached; it is
+-- bound to `usage_limit_reached` by QuotaBoundToUsageLimit.
+entity LlmError {
+    kind: LlmErrorKind
+    message: String
+    -- True when a recovery mechanism (e.g. the credential helper) is
+    -- already running and may resolve this error; the state machine
+    -- waits rather than treating the error as terminal.
+    recovery_in_progress: Boolean
+    -- True iff structured codex QuotaDetails (plan, reset time, window
+    -- snapshots, credits) is attached to this error.
+    has_quota: Boolean
+
+    -- The retry decision. Exactly three kinds are retryable; every other
+    -- kind is terminal. usage_limit_reached and server_overloaded are
+    -- terminal on purpose — retrying them is wasted work and the
+    -- user-facing recovery differs (wait for reset / pick another model).
+    retryable: kind = network or kind = rate_limit or kind = server_error
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Structured quota detail is attached to an error if and only if the
+-- error is a usage-limit exhaustion. The `usage_limit_reached`
+-- constructor in error.rs always builds QuotaDetails; no other
+-- constructor sets it. A violation would mean either a quota indicator
+-- with no backing data, or an exhaustion error the UI cannot render
+-- plan-aware recovery for.
+invariant QuotaBoundToUsageLimit {
+    for e in LlmErrors:
+        e.has_quota implies e.kind = usage_limit_reached
+        (e.kind = usage_limit_reached) implies e.has_quota
+}
+
+-- The retryable set is exactly {network, rate_limit, server_error}.
+-- Because `retryable` is a derived field this holds by construction; the
+-- invariant is the place a future taxonomy change is forced to restate
+-- the partition deliberately rather than let a new kind default into
+-- either bucket.
+invariant RetryablePartition {
+    for e in LlmErrors:
+        e.retryable = (e.kind = network or e.kind = rate_limit or e.kind = server_error)
+}
+
+-- Token accounting is non-negative. Each count is an unsigned quantity
+-- from the provider; the normalizers must not produce a negative bucket
+-- (the Responses normalizer subtracts cached tokens out of input_tokens
+-- and must saturate at zero — see responses.allium).
+invariant UsageNonNegative {
+    for r in LlmResponses:
+        r.usage.input_tokens >= 0
+        r.usage.output_tokens >= 0
+        r.usage.cache_creation_tokens >= 0
+        r.usage.cache_read_tokens >= 0
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+-- Kept as prose so the file stays parseable. Each is a deferred
+-- follow-up the next reader should be aware of.
+--
+-- Q1. TokenChunk is text-only. design.md describes a richer four-variant
+--     TokenChunk (ToolUseStart / ToolUseInput / ToolUseDone) for
+--     streaming tool-call construction to the UI. The shipped enum in
+--     llm.rs has only Text; tool arguments are accumulated provider-side
+--     and never streamed. This spec models the shipped behaviour. If
+--     streamed tool-call construction is ever built, this value type and
+--     the per-provider streaming rules both grow.
+--
+-- Q2. content_filter and context_window_exceeded are in the taxonomy and
+--     reachable from the Responses classifier (classify_responses_error)
+--     but the Anthropic provider never produces them — its SSE error
+--     mapping has no branch for either. Whether Anthropic should detect
+--     `invalid_request_error` bodies that are really context-window
+--     overflows and reclassify is an open product question, not a bug.

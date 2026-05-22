@@ -1,0 +1,562 @@
+-- allium: 3
+-- anthropic.allium
+--
+-- Anthropic Messages API: wire contract.
+--
+-- Scope: How Phoenix translates an llm/LlmRequest to the Anthropic
+--        Messages wire format, normalizes an Anthropic response back to
+--        an llm/LlmResponse, accumulates a streaming SSE response, and
+--        classifies Anthropic failures into the llm/LlmErrorKind
+--        taxonomy.
+--
+-- Includes: Endpoint resolution precedence; the tool_result content
+--           encoding (plain string vs. an array of text+image parts);
+--           the three deterministic cache breakpoints; response
+--           normalization including the empty-content classification;
+--           the streaming StreamAccumulator state machine and its
+--           truncated-stream flush safety net; SSE-error and HTTP-status
+--           classification.
+--
+-- Excludes: The internal vocabulary and error taxonomy (see llm.allium).
+--           The OpenAI Responses wire format (see responses.allium).
+--           Model registry, model discovery, gateway model listing.
+--           HTTP/TLS transport, SSE byte framing (see sse_wire.allium
+--           for the *server-emitted* SSE contract — unrelated to this
+--           file, which consumes a *provider-emitted* SSE stream).
+--
+-- Contrast with responses.allium: the same internal tool_result-with-
+--           images block lands on `text` / `image` wire discriminants
+--           here and on `input_text` / `input_image` there. The
+--           discriminant is provider-specific; neither file may assume
+--           the other's set. That contrast is why the two specs are
+--           split rather than merged.
+--
+-- Normative companions:
+--   specs/llm/requirements.md  — REQ-LLM-001, 002, 004, 005, 006, 009
+--   specs/llm/design.md        — Anthropic provider, translation tables
+--
+-- Cross-references:
+--   crates/phoenix-ide/src/llm/anthropic.rs — translate_request,
+--       translate_message, normalize_response, StreamAccumulator,
+--       parse_anthropic_sse_error, resolve_anthropic_url
+--   crates/phoenix-ide/src/llm/error.rs     — from_http_status
+
+use "./llm.allium" as llm
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How the Anthropic endpoint URL was resolved. Precedence is strict: an
+-- explicit base-url override is used verbatim; otherwise a gateway gets
+-- the provider path suffix appended; otherwise the public default.
+enum AnthropicEndpointSource { base_url_override | gateway | provider_default }
+
+-- Lifecycle of a streaming SSE accumulation. `accumulating` is the only
+-- non-terminal state; a stream ends either `done` (finalized normally)
+-- or `failed` (an `error` SSE event).
+enum AnthropicStreamStatus { accumulating | done | failed }
+
+-- The shape of a block being accumulated from the SSE stream. `text` and
+-- `tool` blocks arrive incrementally as deltas; `server` blocks
+-- (server_tool_use results, mcp results) arrive whole inside the
+-- content_block_start event and need no deltas.
+enum AnthropicBlockShape { text | tool | server }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A raw Anthropic response, summarized to the facts normalization
+-- branches on. The full per-block loop in normalize_response is not
+-- re-encoded here — the spec governs the decisions, not the copy.
+--
+-- `has_client_content` is true iff at least one block is text or
+-- tool_use; Anthropic server blocks are preserved for history but do not
+-- satisfy it (a response of only server blocks leaves the state machine
+-- with nothing to execute).
+--
+-- `has_response_position_image_or_tool_result` is true iff a block of
+-- kind image or tool_result appears — both are request-only kinds and
+-- their presence in a response is a hard wire violation.
+value AnthropicRawResponse {
+    has_client_content: Boolean
+    has_response_position_image_or_tool_result: Boolean
+    stop_reason: String?
+    usage: llm/Usage
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The resolved Anthropic endpoint for one request.
+entity AnthropicEndpoint {
+    source: AnthropicEndpointSource
+    -- True when the provider path suffix (/anthropic/v1/messages) was
+    -- appended. False only for the verbatim base-url override.
+    path_suffix_appended: Boolean
+}
+
+-- The cache-breakpoint plan for one translated request. Anthropic gets
+-- up to three deterministic prefix-cache anchors per request.
+entity AnthropicCachePlan {
+    system_anchor: Boolean
+    last_tool_anchor: Boolean
+    last_user_block_anchor: Boolean
+}
+
+-- A streaming SSE accumulation in progress against the Anthropic
+-- Messages API. Created when the streaming HTTP response returns a
+-- success status; driven to a terminal state by SSE events.
+entity AnthropicStream {
+    status: AnthropicStreamStatus
+    -- Token counts: input/cache from message_start, output from
+    -- message_delta. Zero until the corresponding event arrives.
+    input_tokens: Integer
+    output_tokens: Integer
+    -- The stop_reason from message_delta, if seen.
+    stop_reason: String?
+
+    -- All blocks opened on this stream.
+    blocks: AnthropicAccumulatedBlock with stream = this
+
+    -- A block is still being accumulated iff it has not been committed.
+    open_blocks: blocks where committed = false
+
+    transitions status {
+        accumulating -> done
+        accumulating -> failed
+        terminal: done
+        terminal: failed
+    }
+}
+
+-- One content block being assembled from the SSE stream. Opened by a
+-- content_block_start event; committed by the matching content_block_stop
+-- event, or — if the stream is truncated before that arrives — by the
+-- finalize-time flush safety net.
+entity AnthropicAccumulatedBlock {
+    stream: AnthropicStream
+    -- The block's position in the message, from the SSE `index` field.
+    index: Integer
+    shape: AnthropicBlockShape
+    -- False while deltas are still arriving; true once the block's
+    -- content is frozen into the assembled response.
+    committed: Boolean
+
+    transitions committed {
+        false -> true
+        terminal: true
+    }
+}
+
+-- A tool_result block translated to the Anthropic wire format. With no
+-- images the wire content is a bare String (multipart = false, no
+-- parts). With images the wire content is an array (multipart = true):
+-- one text part followed by one image part per image.
+entity AnthropicWireToolResult {
+    is_error: Boolean
+    multipart: Boolean
+
+    parts: AnthropicWireToolResultPart with result = this
+}
+
+-- One entry in a multipart tool_result content array. `wire_type` is the
+-- serialized `type` discriminant Anthropic accepts in this position.
+entity AnthropicWireToolResultPart {
+    result: AnthropicWireToolResult
+    wire_type: String
+}
+
+------------------------------------------------------------
+-- Rules — endpoint resolution
+------------------------------------------------------------
+
+-- Endpoint precedence (resolve_anthropic_url): an ANTHROPIC_BASE_URL
+-- override wins and is used verbatim with no path appended; otherwise a
+-- configured gateway gets `/anthropic/v1/messages` appended after its
+-- trailing slash is trimmed; otherwise the public API default.
+rule AnthropicEndpointResolved {
+    when: ResolveAnthropicEndpoint(gateway_url?, override_url?)
+
+    ensures:
+        if override_url != null:
+            AnthropicEndpoint.created(source: base_url_override, path_suffix_appended: false)
+        else:
+            if gateway_url != null:
+                AnthropicEndpoint.created(source: gateway, path_suffix_appended: true)
+            else:
+                AnthropicEndpoint.created(source: provider_default, path_suffix_appended: true)
+
+    @guidance
+        -- The override branch is used as-is precisely because a
+        -- datacenter AI gateway exposes a full `/v1/messages` URL that
+        -- is not under an `/anthropic/...` prefix. Appending a suffix
+        -- there would 404. The gateway branch trims one trailing slash
+        -- before appending so `gw/` and `gw` resolve identically.
+}
+
+------------------------------------------------------------
+-- Rules — request translation
+------------------------------------------------------------
+
+-- A tool_result block is translated to Anthropic wire form. With no
+-- images the result content is a plain string and no parts are created.
+-- With images it becomes a multipart array: one text part, then one
+-- image part per image. Anthropic's accepted inner discriminants are
+-- `text` and `image` — see AnthropicToolResultPartTypesValid.
+rule AnthropicToolResultTranslated {
+    when: TranslateAnthropicToolResult(block)
+
+    requires: block.kind = tool_result
+
+    ensures:
+        let result = AnthropicWireToolResult.created(
+            is_error: block.tool_result_is_error,
+            multipart: block.tool_result_images.count > 0
+        )
+        if block.tool_result_images.count > 0:
+            AnthropicWireToolResultPart.created(result: result, wire_type: "text")
+            for _ in block.tool_result_images:
+                AnthropicWireToolResultPart.created(result: result, wire_type: "image")
+
+    @guidance
+        -- translate_message tool_result arm. The no-image case sets the
+        -- wire `content` field to a JSON string; the image case sets it
+        -- to a JSON array whose first entry is the text part and whose
+        -- remaining entries nest a base64 image source:
+        --   { type: "image", source: { type: "base64", media_type, data } }.
+        -- These discriminants are Anthropic-native. The OpenAI Responses
+        -- API rejects them (it wants input_text / input_image) — that
+        -- divergence is the whole reason the wire specs are split.
+}
+
+-- The three deterministic cache breakpoints translate_request places so
+-- Anthropic has stable prefix-cache anchors: (1) the last system block,
+-- (2) the last tool entry, (3) the last text/image block of the last
+-- user message. Breakpoint (2) is skipped when tool search is active,
+-- because the injected tool_search entry becomes the final tool entry
+-- and cannot itself carry cache_control.
+rule AnthropicCacheBreakpointsPlaced {
+    when: TranslateAnthropicRequest(request, has_deferred_tools)
+
+    ensures: AnthropicCachePlan.created(
+        system_anchor: request.system.count > 0,
+        last_tool_anchor: request.tool_count > 0 and not has_deferred_tools,
+        last_user_block_anchor: request.messages.count > 0
+    )
+
+    @guidance
+        -- has_deferred_tools is `spec.supports_tool_search and any tool
+        -- has defer_loading`. When true, translate_request appends an
+        -- AnthropicToolSearchTool entry after the function tools and
+        -- attaches no cache_control to it; the last *function* tool also
+        -- gets none (the `is_last && !has_deferred` guard). So with
+        -- deferred tools the request has at most two cache anchors.
+        -- max_tokens defaults to 16384 when llm/LlmRequest.max_tokens is
+        -- absent (request.max_tokens.unwrap_or(16_384)).
+}
+
+------------------------------------------------------------
+-- Rules — response normalization
+------------------------------------------------------------
+
+-- Normalize a non-streaming Anthropic response. Three outcomes:
+--   1. A response-position image or tool_result block — a hard wire
+--      violation — yields a terminal invalid_request error.
+--   2. No client content (text or tool_use) and stop_reason is not
+--      end_turn — most likely a gateway returning an empty stream —
+--      yields a RETRYABLE server_error.
+--   3. Otherwise a normalized llm/LlmResponse. Empty content WITH
+--      end_turn is valid: the model finished a tool loop with nothing
+--      to add, and the response is content: [].
+rule AnthropicResponseNormalized {
+    when: NormalizeAnthropicResponse(raw)
+
+    let end_turn = raw.stop_reason = "end_turn"
+
+    ensures:
+        if raw.has_response_position_image_or_tool_result:
+            llm/LlmError.created(
+                kind: invalid_request,
+                message: "Unexpected image or tool_result block in Anthropic response",
+                recovery_in_progress: false,
+                has_quota: false
+            )
+        else:
+            if not raw.has_client_content and not end_turn:
+                llm/LlmError.created(
+                    kind: server_error,
+                    message: "Anthropic returned empty response",
+                    recovery_in_progress: false,
+                    has_quota: false
+                )
+            else:
+                llm/LlmResponse.created(end_turn: end_turn, usage: raw.usage)
+
+    @guidance
+        -- has_client_content counts only text and tool_use blocks.
+        -- Anthropic server blocks (server_tool_use, *_tool_result,
+        -- mcp_*) are preserved verbatim in the normalized content for
+        -- multi-turn history fidelity but do NOT satisfy the non-empty
+        -- guard: a response of only server blocks with
+        -- stop_reason="tool_use" would strand the state machine.
+        --
+        -- An Unknown block (the serde `other` catch-all) is dropped with
+        -- a loud tracing::error! — it means Anthropic shipped a new
+        -- block type and AnthropicContentBlock needs a new variant. It
+        -- does not by itself fail normalization. Because such a block
+        -- never reaches an llm/LlmResponse it is intentionally absent
+        -- from llm/ContentKind; see Open Question Q2.
+}
+
+------------------------------------------------------------
+-- Rules — streaming accumulator
+------------------------------------------------------------
+
+-- The streaming HTTP response returned success; begin accumulating.
+rule AnthropicStreamOpened {
+    when: AnthropicStreamingResponseAccepted(request_id)
+
+    ensures: AnthropicStream.created(
+        status: accumulating,
+        input_tokens: 0,
+        output_tokens: 0
+    )
+}
+
+-- content_block_start opens a new block. `index` is the SSE index; the
+-- shape is text, tool (regular or server_tool_use — both accumulate
+-- incrementally) or server (a result/mcp block delivered whole).
+rule AnthropicBlockOpened {
+    when: AnthropicContentBlockStart(stream, index, shape)
+
+    requires: stream.status = accumulating
+
+    ensures: AnthropicAccumulatedBlock.created(
+        stream: stream,
+        index: index,
+        shape: shape,
+        committed: false
+    )
+
+    @guidance
+        -- on_block_start. A `server` block is captured whole from the
+        -- content_block_start payload and has no deltas; it is still
+        -- modelled as opened-then-committed so the truncation invariant
+        -- ranges over it uniformly. An unrecognised block type is
+        -- logged at warn and opens nothing.
+}
+
+-- content_block_delta with a text_delta. The text fragment is forwarded
+-- to the UI immediately as an llm/TokenChunk. The block stays open.
+rule AnthropicTextDeltaForwarded {
+    when: AnthropicTextDelta(stream, fragment)
+
+    requires: stream.status = accumulating
+
+    ensures: AnthropicTextChunkForwarded(text: fragment)
+
+    @guidance
+        -- on_block_delta `text_delta` arm: chunk_tx.send(TokenChunk::
+        -- Text(..)). The send result is intentionally discarded — a
+        -- token stream with no UI subscriber is normal, not an error.
+        -- input_json_delta fragments (tool-call arguments) are NOT
+        -- forwarded — they are appended to an internal buffer and only
+        -- parsed when the block commits. See Open Question Q1.
+}
+
+-- content_block_stop commits the currently open block.
+rule AnthropicBlockCommitted {
+    when: AnthropicContentBlockStop(block)
+
+    requires: block.committed = false
+    requires: block.stream.status = accumulating
+
+    ensures: block.committed = true
+
+    @guidance
+        -- on_block_stop -> flush_current_block. A text block with empty
+        -- accumulated text commits to nothing (it is dropped from the
+        -- assembled content); a tool block parses its accumulated JSON
+        -- buffer, defaulting to {} on parse failure.
+}
+
+-- message_delta carries the stop_reason and the final output token count.
+rule AnthropicStopReasonRecorded {
+    when: AnthropicMessageDelta(stream, stop_reason, output_tokens)
+
+    requires: stream.status = accumulating
+
+    ensures:
+        stream.stop_reason = stop_reason
+        stream.output_tokens = output_tokens
+}
+
+-- An `error` SSE event terminates the stream. The error_type is mapped
+-- to a typed llm/LlmErrorKind by AnthropicSseErrorClassified.
+rule AnthropicStreamFailed {
+    when: AnthropicSseErrorEvent(stream, error_type, message)
+
+    requires: stream.status = accumulating
+
+    ensures:
+        stream.status = failed
+        AnthropicSseErrorRaised(error_type: error_type, message: message)
+}
+
+-- Finalize: the stream ended — either message_stop was seen or the byte
+-- stream was exhausted. Any block still open is a truncated block:
+-- Anthropic skips content_block_stop for the in-progress block when it
+-- cuts a response off at max_tokens. The flush safety net commits every
+-- open block so its partial content still reaches the assembled
+-- response, then the stream transitions to done.
+rule AnthropicStreamCompleted {
+    when: AnthropicStreamFinalized(stream)
+
+    requires: stream.status = accumulating
+
+    ensures:
+        for block in stream.open_blocks:
+            block.committed = true
+        stream.status = done
+
+    @guidance
+        -- into_response_with_diagnostics calls flush_current_block once
+        -- more before assembling. Without it, a stop_reason=max_tokens
+        -- response would silently drop its final (partial) text or
+        -- tool_use block. Flush and the done transition happen together
+        -- so AnthropicNoOpenBlockSurvivesDone holds with no intermediate
+        -- window. A stream that already `failed` (an SSE error event) is
+        -- excluded by the precondition: its partial blocks are discarded
+        -- and the whole turn becomes the classified error.
+}
+
+------------------------------------------------------------
+-- Rules — error classification
+------------------------------------------------------------
+
+-- Map an Anthropic SSE `error` event's error_type to the taxonomy
+-- (parse_anthropic_sse_error). overloaded_error is terminal and distinct
+-- from a generic server error so the executor does not retry a model
+-- that is at capacity.
+rule AnthropicSseErrorClassified {
+    when: AnthropicSseErrorRaised(error_type, message)
+
+    ensures:
+        if error_type = "overloaded_error":
+            llm/LlmError.created(kind: server_overloaded, message: message,
+                recovery_in_progress: false, has_quota: false)
+        else:
+            if error_type = "rate_limit_error":
+                llm/LlmError.created(kind: rate_limit, message: message,
+                    recovery_in_progress: false, has_quota: false)
+            else:
+                if error_type = "authentication_error" or error_type = "permission_error":
+                    llm/LlmError.created(kind: auth, message: message,
+                        recovery_in_progress: false, has_quota: false)
+                else:
+                    if error_type = "invalid_request_error":
+                        llm/LlmError.created(kind: invalid_request, message: message,
+                            recovery_in_progress: false, has_quota: false)
+                    else:
+                        llm/LlmError.created(kind: server_error, message: message,
+                            recovery_in_progress: false, has_quota: false)
+}
+
+-- Map a non-success HTTP status to the taxonomy (error.rs
+-- from_http_status). Note the contrast with the SSE path: a raw HTTP 429
+-- here is always a transient `rate_limit` — only the codex backend
+-- (responses.allium) parses a 429 body deeply enough to promote it to
+-- usage_limit_reached. Anthropic has no quota-exhaustion HTTP path.
+rule AnthropicHttpStatusClassified {
+    when: AnthropicHttpError(status, body)
+
+    ensures:
+        if status = 401 or status = 403:
+            llm/LlmError.created(kind: auth, message: body,
+                recovery_in_progress: false, has_quota: false)
+        else:
+            if status = 429:
+                llm/LlmError.created(kind: rate_limit, message: body,
+                    recovery_in_progress: false, has_quota: false)
+            else:
+                if status >= 400 and status <= 499:
+                    llm/LlmError.created(kind: invalid_request, message: body,
+                        recovery_in_progress: false, has_quota: false)
+                else:
+                    llm/LlmError.created(kind: server_error, message: body,
+                        recovery_in_progress: false, has_quota: false)
+
+    @guidance
+        -- from_http_status folds 5xx and every unexpected status (1xx,
+        -- 3xx) into a retryable server_error: an unexpected status is
+        -- safer treated as transient than as a permanent failure.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- LOAD-BEARING. Every part of a multipart tool_result content array
+-- carries a discriminant Anthropic accepts: `text` or `image`. The
+-- internal-to-wire mapping is fixed in AnthropicToolResultTranslated;
+-- this invariant is the assertion a future edit cannot quietly emit a
+-- Chat-Completions-style `image_url` (or anything else) here.
+invariant AnthropicToolResultPartTypesValid {
+    for result in AnthropicWireToolResults:
+        for part in result.parts:
+            part.wire_type in { "text", "image" }
+}
+
+-- A tool_result has parts iff it is multipart. The no-image case encodes
+-- content as a bare string and creates no parts.
+invariant AnthropicToolResultPartsIffMultipart {
+    for result in AnthropicWireToolResults:
+        (result.parts.count > 0) = result.multipart
+}
+
+-- LOAD-BEARING. A finalized (done) stream has no open block. The
+-- truncated-stream flush in AnthropicStreamCompleted is what makes this
+-- hold; a violation means a partial block — the final text or tool_use
+-- of a max_tokens-truncated response — was dropped from the assembled
+-- response.
+invariant AnthropicNoOpenBlockSurvivesDone {
+    for stream in AnthropicStreams:
+        stream.status = done implies stream.open_blocks.count = 0
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+-- Kept as prose so the file stays parseable.
+--
+-- Q1. Tool-call argument fragments (input_json_delta) are accumulated
+--     silently and never forwarded as a TokenChunk, so the UI shows no
+--     progress while a large tool call is being constructed. This
+--     matches llm.allium Q1 (TokenChunk is text-only). Modelled as
+--     shipped behaviour; revisit only if streamed tool-call
+--     construction is built.
+--
+-- Q2. An Unknown response block (serde `other`) is logged loudly and
+--     dropped. It is deliberately absent from llm/ContentKind because by
+--     construction it never reaches an llm/LlmResponse. If Anthropic
+--     ships a block type Phoenix must preserve for history,
+--     AnthropicContentBlock needs a real variant and llm/ContentKind a
+--     matching kind — at which point this stops being an open question
+--     and becomes a translation rule.
+--
+-- Q3. The `failed` terminal state can be reached by an SSE `error` event
+--     mid-stream, after some blocks already committed. The committed
+--     blocks are discarded — the whole turn becomes the classified
+--     error. Whether a partial-then-errored stream should ever surface
+--     its partial content is unresolved; today both providers discard
+--     partial-on-error.
+--
+-- Note (text-part ordering): AnthropicToolResultTranslated always
+--     creates the text part before the image parts, so the text part is
+--     first in the wire array. This ordering is not expressible as a
+--     structural invariant in this dialect (no list-index primitive); it
+--     is guaranteed by the rule's construction order and mirrors
+--     translate_message.

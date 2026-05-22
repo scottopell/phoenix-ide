@@ -1,0 +1,696 @@
+-- allium: 3
+-- responses.allium
+--
+-- OpenAI Responses API: wire contract.
+--
+-- Scope: How Phoenix translates an llm/LlmRequest to the OpenAI
+--        Responses API wire format, normalizes a Responses API response
+--        back to an llm/LlmResponse, accumulates a streaming SSE
+--        response, and classifies Responses API failures — including the
+--        codex ChatGPT-backend quota-exhaustion path — into the
+--        llm/LlmErrorKind taxonomy.
+--
+-- Includes: Endpoint resolution; the request-translation discriminant
+--           contract — the load-bearing ResponsesContentPartTypeValid
+--           invariant; the capability gap where Anthropic server blocks
+--           are dropped; response normalization with cached-token
+--           de-duplication; the ResponsesStreamAccumulator state machine
+--           including the response.completed output-recovery fallback;
+--           SSE error classification; codex-backend 429/503 parsing
+--           (REQ-LLM-006a).
+--
+-- Excludes: The internal vocabulary and error taxonomy (see llm.allium).
+--           The Anthropic Messages wire format (see anthropic.allium).
+--           The plan-aware quota *message wording* (render_usage_limit_
+--           message in error.rs) — this file governs the classification,
+--           not the localized string. Model registry / discovery.
+--
+-- Why this file exists: a 2026-05 production incident. A read_image tool
+--           result fed back to an OpenAI model produced HTTP 400:
+--             "Invalid value: 'text'. Supported values are: 'input_text',
+--              'input_image', 'output_text', ..."
+--           The request translator emitted a function_call_output content
+--           part with the Chat-Completions discriminant `text` instead of
+--           the Responses API discriminant `input_text`. There was no
+--           normative contract on the wire discriminant; the proptest in
+--           place asserted the broken shape. ResponsesContentPartTypeValid
+--           is that contract.
+--
+-- Contrast with anthropic.allium: the same internal tool_result-with-
+--           images block lands on `input_text` / `input_image` here and
+--           on `text` / `image` there. The discriminant is provider-
+--           specific.
+--
+-- Normative companions:
+--   specs/llm/requirements.md  — REQ-LLM-001, 002, 004, 005, 006, 006a, 009
+--   specs/llm/design.md        — OpenAI provider, codex 429 parsing
+--
+-- Cross-references:
+--   crates/phoenix-ide/src/llm/openai.rs — translate_to_responses_request,
+--       normalize_responses_api_response, ResponsesStreamAccumulator,
+--       classify_responses_error, parse_codex_error, resolve_endpoint
+--   crates/phoenix-ide/src/llm/rate_limit.rs — QuotaDetails, header parse
+--   crates/phoenix-ide/src/llm/error.rs      — from_http_status
+
+use "./llm.allium" as llm
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- How the Responses endpoint URL was resolved. Same precedence shape as
+-- the Anthropic provider: explicit override verbatim, else gateway with
+-- `/openai/v1/responses` appended, else the public default.
+enum ResponsesEndpointSource { base_url_override | gateway | provider_default }
+
+-- Lifecycle of a streaming SSE accumulation. `accumulating` is the only
+-- non-terminal state. `done` is reached by response.completed; `failed`
+-- by an `error` event, response.failed, or response.incomplete.
+enum ResponsesStreamStatus { accumulating | done | failed }
+
+-- Where a translated wire content part sits. Both surfaces draw from the
+-- same accepted-discriminant set — that shared set is exactly what the
+-- 2026-05 incident violated for `function_call_output`.
+--   message_content       — the `content` array of an input message item
+--   function_call_output  — the `output` array of a function_call_output
+--                           item (a tool result fed back to the model)
+enum ResponsesPartSurface { message_content | function_call_output }
+
+-- Discriminant of an output item in a Responses API response.
+--   message       — assistant text, carried as `output_text` parts
+--   function_call — a tool call the model wants Phoenix to run
+--   reasoning     — internal model thinking; intentionally discarded
+--   other         — any unrecognised item type; ignored with a debug log
+enum ResponsesOutputKind { message | function_call | reasoning | other }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A raw Responses API response, summarized to the facts normalization
+-- branches on. `cached_tokens` is OpenAI's input_tokens_details.
+-- cached_tokens — a subset already counted inside raw_input_tokens.
+value ResponsesRawResponse {
+    status: String
+    raw_input_tokens: Integer
+    raw_output_tokens: Integer
+    cached_tokens: Integer
+    has_function_call: Boolean
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- The resolved Responses endpoint for one request.
+entity ResponsesEndpoint {
+    source: ResponsesEndpointSource
+    -- True when the provider path suffix (/openai/v1/responses) was
+    -- appended. False only for the verbatim base-url override.
+    path_suffix_appended: Boolean
+}
+
+-- A streaming SSE accumulation in progress against the Responses API.
+-- Created when the streaming HTTP response returns success.
+--
+-- `recovered_from_completed` records that the output items were salvaged
+-- from the response.completed terminal payload because no per-item
+-- `response.output_item.done` events arrived — a real gateway behaviour
+-- (observed 2026-05-11) that otherwise persisted an empty agent message.
+--
+-- `input_tokens` is the raw count OpenAI reports; it is inclusive of
+-- `cached_tokens`. The cached subset is split out only at normalization.
+entity ResponsesStream {
+    status: ResponsesStreamStatus
+    input_tokens: Integer
+    output_tokens: Integer
+    cached_tokens: Integer
+    recovered_from_completed: Boolean
+
+    output_items: ResponsesOutputItem with stream = this
+
+    transitions status {
+        accumulating -> done
+        accumulating -> failed
+        terminal: done
+        terminal: failed
+    }
+}
+
+-- One completed output item collected from the stream — either from a
+-- `response.output_item.done` event or, in the fallback path, from the
+-- `/response/output` array of the `response.completed` event.
+entity ResponsesOutputItem {
+    stream: ResponsesStream
+    item_kind: ResponsesOutputKind
+}
+
+-- One content part emitted into a Responses API request — an entry in
+-- either a message `content` array or a function_call_output `output`
+-- array. `wire_type` is the serialized `type` discriminant.
+--
+-- This entity exists so ResponsesContentPartTypeValid can range over
+-- every emitted part. Before the 2026-05 fix the function_call_output
+-- path produced parts with wire_type `text` / `image_url`; the message
+-- path correctly produced `input_text` / `input_image`. The two paths
+-- now share one part type, so they cannot diverge again.
+entity ResponsesWireContentPart {
+    surface: ResponsesPartSurface
+    wire_type: String
+}
+
+-- A capability gap: an Anthropic server-handled block (server_tool_use,
+-- *_tool_result, mcp_*) reached the Responses translator, which has no
+-- wire equivalent for it. Recorded — not silent — so a provider-switch
+-- context loss is diagnosable. Carries the dropped block's kind.
+entity ResponsesDroppedServerBlock {
+    block_kind: llm/ContentKind
+    logged: Boolean
+}
+
+------------------------------------------------------------
+-- Rules — endpoint resolution
+------------------------------------------------------------
+
+-- Endpoint precedence (resolve_endpoint): an explicit base-url override
+-- is used verbatim; otherwise a gateway gets `/openai/v1/responses`
+-- appended after its trailing slash is trimmed; otherwise the public API
+-- default.
+rule ResponsesEndpointResolved {
+    when: ResolveResponsesEndpoint(gateway_url?, override_url?)
+
+    ensures:
+        if override_url != null:
+            ResponsesEndpoint.created(source: base_url_override, path_suffix_appended: false)
+        else:
+            if gateway_url != null:
+                ResponsesEndpoint.created(source: gateway, path_suffix_appended: true)
+            else:
+                ResponsesEndpoint.created(source: provider_default, path_suffix_appended: true)
+}
+
+------------------------------------------------------------
+-- Rules — request translation
+------------------------------------------------------------
+
+-- A message carrying at least one image is translated to a Responses API
+-- message item whose `content` is an array of parts: one input_text part
+-- per text block, one input_image part per image block. A message with
+-- no images collapses to a plain-string `content` and emits no parts.
+rule ResponsesMessageContentTranslated {
+    when: TranslateResponsesMessage(message)
+
+    requires: message.content.any(b => b.kind = image)
+
+    ensures:
+        for block in message.content:
+            if block.kind = text:
+                ResponsesWireContentPart.created(
+                    surface: message_content, wire_type: "input_text"
+                )
+            if block.kind = image:
+                ResponsesWireContentPart.created(
+                    surface: message_content, wire_type: "input_image"
+                )
+
+    @guidance
+        -- translate_to_responses_request, the text+image grouping branch.
+        -- An input_image part's `image_url` is a bare data: URL string
+        -- (data:{media_type};base64,{data}) — NOT a nested { url: ... }
+        -- object. The nested form is the Chat Completions shape and the
+        -- Responses API rejects it. tool_use and tool_result blocks in
+        -- the same message are handled by separate function_call and
+        -- function_call_output items, not by this rule.
+}
+
+-- LOAD-BEARING — the regression locus. A tool_result carrying images is
+-- translated to a function_call_output item whose `output` is an array:
+-- one input_text part, then one input_image part per image. A tool_result
+-- with no images collapses to a plain-string `output` and emits no parts.
+--
+-- The discriminants MUST be input_text / input_image. The 2026-05
+-- incident emitted `text` / `image_url` here — the Chat Completions
+-- shape — and every OpenAI conversation that fed an image back through a
+-- tool result became unrecoverable (the bad item stays in history, so a
+-- retry re-sends it and re-fails).
+rule ResponsesToolResultOutputTranslated {
+    when: TranslateResponsesToolResult(block)
+
+    requires: block.kind = tool_result
+    requires: block.tool_result_images.count > 0
+
+    ensures:
+        ResponsesWireContentPart.created(
+            surface: function_call_output, wire_type: "input_text"
+        )
+        for _ in block.tool_result_images:
+            ResponsesWireContentPart.created(
+                surface: function_call_output, wire_type: "input_image"
+            )
+
+    @guidance
+        -- A function_call_output payload is model *input*, so its parts
+        -- use the input_* discriminants — the same ones a user message's
+        -- content array uses. The message path and the tool-result path
+        -- emit the identical ResponsesWireContentPart type precisely so
+        -- a future edit cannot make one correct and the other wrong.
+        -- The text-only tool_result takes a separate string-output
+        -- branch and creates no parts (the second requires clause).
+}
+
+-- Capability gap. An Anthropic server-handled block has no Responses API
+-- wire equivalent and is dropped from the request. The drop is recorded
+-- and logged at debug with the block kind — a silent omission would be
+-- indistinguishable from a translator bug.
+rule ResponsesServerBlockDropped {
+    when: TranslateResponsesBlock(block)
+
+    requires: block.kind in {
+        server_tool_use, mcp_tool_use,
+        tool_search_tool_result, web_search_tool_result, web_fetch_tool_result,
+        code_execution_tool_result, bash_code_execution_tool_result,
+        text_editor_code_execution_tool_result, mcp_tool_result
+    }
+
+    ensures: ResponsesDroppedServerBlock.created(
+        block_kind: block.kind,
+        logged: true
+    )
+
+    @guidance
+        -- translate_to_responses_request, the ServerToolUse / McpToolUse
+        -- and the *_tool_result match arms. Each emits a tracing::debug!
+        -- naming the block discriminant and id. CLAUDE.md: "capability
+        -- gaps are logged, not silenced." The Anthropic provider
+        -- round-trips these same blocks verbatim — switching a
+        -- conversation from Claude to an OpenAI model is where the gap
+        -- becomes observable, and the log is what makes it diagnosable.
+}
+
+------------------------------------------------------------
+-- Rules — response normalization
+------------------------------------------------------------
+
+-- Normalize a Responses API response into an llm/LlmResponse. Output
+-- items map: message -> text content, function_call -> tool_use,
+-- reasoning -> discarded, other -> ignored. end_turn holds iff the
+-- status is "completed" AND no tool call is pending.
+--
+-- Token accounting de-duplicates the cached subset: OpenAI's
+-- raw_input_tokens already includes cached_tokens, so the cached count
+-- is split out into cache_read_tokens and subtracted from input_tokens.
+-- This keeps llm/Usage.context_window_used equal to OpenAI's own
+-- input+output total instead of double-counting the cache.
+rule ResponsesResponseNormalized {
+    when: NormalizeResponsesResponse(raw)
+
+    let end_turn = raw.status = "completed" and not raw.has_function_call
+
+    ensures: llm/LlmResponse.created(
+        end_turn: end_turn,
+        usage: {
+            input_tokens: saturating_sub(raw.raw_input_tokens, raw.cached_tokens),
+            output_tokens: raw.raw_output_tokens,
+            cache_creation_tokens: 0,
+            cache_read_tokens: raw.cached_tokens
+        }
+    )
+
+    @guidance
+        -- normalize_responses_api_response. cache_creation_tokens is
+        -- fixed at 0 — the Responses API has no cache-creation concept;
+        -- the field is a typed sink for this provider, not an unparsed
+        -- value. saturating_sub floors at 0; OpenAI guarantees
+        -- cached_tokens <= raw_input_tokens (ResponsesCachedSubsetOfInput),
+        -- so the floor is defensive. A "message" item with empty
+        -- output_text contributes no content block; a "reasoning" item
+        -- is dropped silently (internal thinking, not transcript).
+}
+
+------------------------------------------------------------
+-- Rules — streaming accumulator
+------------------------------------------------------------
+
+-- The streaming HTTP response returned success; begin accumulating.
+rule ResponsesStreamOpened {
+    when: ResponsesStreamingResponseAccepted(request_id)
+
+    ensures: ResponsesStream.created(
+        status: accumulating,
+        input_tokens: 0,
+        output_tokens: 0,
+        cached_tokens: 0,
+        recovered_from_completed: false
+    )
+}
+
+-- A response.output_text.delta event. The non-empty text delta is
+-- forwarded to the UI immediately as an llm/TokenChunk.
+rule ResponsesTextDeltaForwarded {
+    when: ResponsesOutputTextDelta(stream, fragment)
+
+    requires: stream.status = accumulating
+    requires: fragment != ""
+
+    ensures: ResponsesTextChunkForwarded(text: fragment)
+}
+
+-- A response.output_item.done event. The completed output item is
+-- collected; its kind drives normalization.
+rule ResponsesOutputItemCollected {
+    when: ResponsesOutputItemDone(stream, item_kind)
+
+    requires: stream.status = accumulating
+
+    ensures: ResponsesOutputItem.created(stream: stream, item_kind: item_kind)
+}
+
+-- A response.completed event ends the stream successfully. Usage is
+-- recorded. Fallback: if no per-item.done events were seen, the output
+-- items are recovered from the terminal event's /response/output array.
+rule ResponsesStreamCompleted {
+    when: ResponsesCompletedEvent(stream, input_tokens, output_tokens, cached_tokens, terminal_output)
+
+    requires: stream.status = accumulating
+
+    ensures:
+        stream.input_tokens = input_tokens
+        stream.output_tokens = output_tokens
+        stream.cached_tokens = cached_tokens
+        if stream.output_items.count = 0:
+            stream.recovered_from_completed = true
+            for kind in terminal_output:
+                ResponsesOutputItem.created(stream: stream, item_kind: kind)
+        stream.status = done
+
+    @guidance
+        -- response.completed handler. The fallback exists because a
+        -- gateway path (observed 2026-05-11) emitted output_item.added
+        -- and content_part.added events but no output_item.done, then
+        -- response.completed carrying the full assembled message.
+        -- Without recovery the accumulator finalized empty and Phoenix
+        -- persisted "end_turn with empty content" despite being billed
+        -- for output tokens. /response/output in the terminal event is
+        -- authoritative when the per-item stream produced nothing.
+        -- The `if` guard reads resulting state: output_items.count
+        -- reflects items created by prior ResponsesOutputItemCollected
+        -- firings, before this rule creates any.
+}
+
+-- An `error` SSE event terminates the stream. The error code is routed
+-- through classification (ResponsesSseErrorClassified).
+rule ResponsesStreamFailedByError {
+    when: ResponsesErrorEvent(stream, code, message)
+
+    requires: stream.status = accumulating
+
+    ensures:
+        stream.status = failed
+        ClassifyResponsesError(code: code, message: message)
+}
+
+-- A response.failed event terminates the stream. Same classification
+-- path as a bare `error` event — the codes are the same family.
+rule ResponsesStreamFailedByResponseFailed {
+    when: ResponsesResponseFailedEvent(stream, code, message)
+
+    requires: stream.status = accumulating
+
+    ensures:
+        stream.status = failed
+        ClassifyResponsesError(code: code, message: message)
+}
+
+-- A response.incomplete event terminates the stream. A content_filter
+-- reason is a terminal content_filter error; any other reason is a
+-- retryable server_error.
+rule ResponsesStreamIncomplete {
+    when: ResponsesIncompleteEvent(stream, reason)
+
+    requires: stream.status = accumulating
+
+    ensures:
+        stream.status = failed
+        if reason = "content_filter":
+            llm/LlmError.created(kind: content_filter,
+                message: "Response incomplete: content_filter",
+                recovery_in_progress: false, has_quota: false)
+        else:
+            llm/LlmError.created(kind: server_error,
+                message: "Response incomplete",
+                recovery_in_progress: false, has_quota: false)
+}
+
+------------------------------------------------------------
+-- Rules — SSE error classification
+------------------------------------------------------------
+
+-- Classify a Responses API SSE error. Codex-specific terminal codes are
+-- matched exactly and FIRST: usage_limit_reached and the overloaded
+-- signals must not be collapsed into the generic substring buckets
+-- (which would make a quota exhaustion look retryable). Anything else
+-- falls through to the substring scan.
+rule ResponsesSseErrorClassified {
+    when: ClassifyResponsesError(code, message)
+
+    let lower = lowercase(code)
+
+    ensures:
+        if lower = "usage_limit_reached":
+            llm/LlmError.created(kind: usage_limit_reached, message: message,
+                recovery_in_progress: false, has_quota: true)
+        else:
+            if lower = "usage_not_included":
+                llm/LlmError.created(kind: auth,
+                    message: "Upgrade required: this plan does not include Codex usage.",
+                    recovery_in_progress: false, has_quota: false)
+            else:
+                if lower = "server_is_overloaded" or lower = "slow_down":
+                    llm/LlmError.created(kind: server_overloaded,
+                        message: "Selected model is at capacity. Try a different model.",
+                        recovery_in_progress: false, has_quota: false)
+                else:
+                    ResponsesGenericErrorScan(code: lower, message: message)
+
+    @guidance
+        -- classify_responses_error. `lowercase` is the ASCII lowercasing
+        -- the implementation applies to `code` before matching. The SSE
+        -- path has no response headers, so a usage_limit_reached from a
+        -- stream carries an all-None QuotaDetails — has_quota is still
+        -- true (a details struct exists) and llm/QuotaBoundToUsageLimit
+        -- holds. The plan-aware message formatter renders generic
+        -- wording when plan_type is None.
+}
+
+-- The substring fallback for a non-codex error code. Precedence order is
+-- significant — the first matching family wins — and the default is a
+-- RETRYABLE server_error so the executor's retry loop engages on a code
+-- Phoenix has never seen.
+rule ResponsesGenericErrorClassified {
+    when: ResponsesGenericErrorScan(code, message)
+
+    ensures:
+        if contains(code, "rate_limit") or contains(code, "quota") or contains(code, "requests_per"):
+            llm/LlmError.created(kind: rate_limit, message: message,
+                recovery_in_progress: false, has_quota: false)
+        else:
+            if contains(code, "auth") or contains(code, "invalid_api_key") or contains(code, "permission"):
+                llm/LlmError.created(kind: auth, message: message,
+                    recovery_in_progress: false, has_quota: false)
+            else:
+                if contains(code, "context_length") or contains(code, "token_limit") or contains(code, "max_tokens"):
+                    llm/LlmError.created(kind: context_window_exceeded, message: message,
+                        recovery_in_progress: false, has_quota: false)
+                else:
+                    if contains(code, "content_filter") or contains(code, "safety"):
+                        llm/LlmError.created(kind: content_filter, message: message,
+                            recovery_in_progress: false, has_quota: false)
+                    else:
+                        if contains(code, "invalid") or contains(code, "bad_request"):
+                            llm/LlmError.created(kind: invalid_request, message: message,
+                                recovery_in_progress: false, has_quota: false)
+                        else:
+                            llm/LlmError.created(kind: server_error, message: message,
+                                recovery_in_progress: false, has_quota: false)
+
+    @guidance
+        -- classify_responses_error's precedence-ordered substring scan.
+        -- `contains` is a substring test against the already-lowercased
+        -- code (ResponsesSseErrorClassified lowercases it first). First
+        -- match wins, in this exact order:
+        --   1. rate_limit              — "rate_limit" / "quota" / "requests_per"
+        --   2. auth                    — "auth" / "invalid_api_key" / "permission"
+        --   3. context_window_exceeded — "context_length" / "token_limit" / "max_tokens"
+        --   4. content_filter          — "content_filter" / "safety"
+        --   5. invalid_request         — "invalid" / "bad_request"
+        --   6. server_error            — no substring matched (retryable default)
+        -- "quota" lands in branch 1 (rate_limit): only the exact code
+        -- "usage_limit_reached" — matched before this rule — becomes the
+        -- terminal usage_limit_reached kind. See Q2.
+}
+
+------------------------------------------------------------
+-- Rules — codex backend HTTP error parsing (REQ-LLM-006a)
+------------------------------------------------------------
+
+-- A codex-backend HTTP 429. Only when the body's error.type is
+-- "usage_limit_reached" is this a terminal quota exhaustion — and only
+-- then are the x-codex-* response headers parsed into structured
+-- QuotaDetails (plan, reset time, window snapshots, credits, promo).
+-- error.type "usage_not_included" is an auth/upgrade error. Any other
+-- recognised-envelope 429 is a transient throttle and falls through to
+-- the generic HTTP path (which yields a retryable rate_limit).
+rule ResponsesCodex429Classified {
+    when: CodexBackendHttpError(status, error_type?, body)
+
+    requires: status = 429
+
+    ensures:
+        if error_type = "usage_limit_reached":
+            llm/LlmError.created(kind: usage_limit_reached, message: body,
+                recovery_in_progress: false, has_quota: true)
+        else:
+            if error_type = "usage_not_included":
+                llm/LlmError.created(kind: auth,
+                    message: "Upgrade required: this plan does not include Codex usage.",
+                    recovery_in_progress: false, has_quota: false)
+            else:
+                llm/LlmError.created(kind: rate_limit, message: body,
+                    recovery_in_progress: false, has_quota: false)
+
+    @guidance
+        -- parse_codex_error 429 arm. usage_limit_reached is the only
+        -- branch that populates QuotaDetails from headers
+        -- (parse_active_limit, parse_rate_limit_for_limit,
+        -- parse_credits_snapshot, parse_promo_message) and the body's
+        -- resets_at. The fall-through `rate_limit` models parse_codex_
+        -- error returning None and the caller invoking from_http_status,
+        -- whose 429 arm is rate_limit. This rule applies only to the
+        -- codex backend; the platform Responses API never reaches it.
+}
+
+-- A codex-backend HTTP 503. The overloaded signals are a terminal
+-- server_overloaded; any other 503 falls through to the generic HTTP
+-- path (a retryable server_error).
+rule ResponsesCodex503Classified {
+    when: CodexBackendHttpError(status, error_type?, body)
+
+    requires: status = 503
+
+    ensures:
+        if error_type = "server_is_overloaded" or error_type = "slow_down":
+            llm/LlmError.created(kind: server_overloaded,
+                message: "Selected model is at capacity. Try a different model.",
+                recovery_in_progress: false, has_quota: false)
+        else:
+            llm/LlmError.created(kind: server_error, message: body,
+                recovery_in_progress: false, has_quota: false)
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- LOAD-BEARING. Every content part emitted into a Responses API request
+-- — message content OR function_call_output — carries a discriminant the
+-- API accepts. This is the formal statement of the contract the 2026-05
+-- incident violated. A part with wire_type `text` or `image_url` (the
+-- Chat Completions shape) fails this invariant; the API failed the
+-- request with HTTP 400. The accepted set is verbatim from that 400.
+invariant ResponsesContentPartTypeValid {
+    for part in ResponsesWireContentParts:
+        part.wire_type in {
+            "input_text",
+            "input_image",
+            "output_text",
+            "refusal",
+            "input_file",
+            "computer_screenshot",
+            "summary_text"
+        }
+}
+
+-- Tighter than the validity boundary: Phoenix only ever emits the two
+-- input discriminants. Both translation rules
+-- (ResponsesMessageContentTranslated, ResponsesToolResultOutputTranslated)
+-- produce exactly input_text and input_image. The wider accepted set in
+-- ResponsesContentPartTypeValid is what the API tolerates on input
+-- (output_text / refusal / summary_text appear on the response side);
+-- this invariant pins what Phoenix actually generates.
+invariant ResponsesEmitsOnlyInputParts {
+    for part in ResponsesWireContentParts:
+        part.wire_type in { "input_text", "input_image" }
+}
+
+-- The "no parallel representations" guarantee. A part on the
+-- function_call_output surface obeys the same discriminant rule as one
+-- on the message_content surface — they cannot diverge the way they did
+-- before the 2026-05 fix merged the two part types into one.
+invariant ResponsesPartContractSurfaceIndependent {
+    for part in ResponsesWireContentParts:
+        (part.surface = function_call_output) implies
+            part.wire_type in { "input_text", "input_image" }
+}
+
+-- A dropped Anthropic server block is always logged. Silent omission is
+-- indistinguishable from a translator bug (CLAUDE.md). The drop is
+-- intentional — the Responses API has no wire equivalent — but it must
+-- leave a trace.
+invariant ResponsesDroppedBlockAlwaysLogged {
+    for dropped in ResponsesDroppedServerBlocks:
+        dropped.logged = true
+}
+
+-- The cached-token count is a subset of the raw input-token count. This
+-- is the OpenAI guarantee that makes the cached-token de-duplication in
+-- ResponsesResponseNormalized (saturating_sub of cached out of input)
+-- never underflow, so the four llm/Usage buckets sum to OpenAI's own
+-- input+output total rather than double-counting the cache.
+invariant ResponsesCachedSubsetOfInput {
+    for stream in ResponsesStreams:
+        stream.status = done implies stream.cached_tokens <= stream.input_tokens
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+-- Kept as prose so the file stays parseable.
+--
+-- Q1. ResponsesStreamCompleted's recovery fallback fires when zero
+--     output items were collected. If response.completed ALSO carries an
+--     empty /response/output, the stream finalizes genuinely empty and
+--     Phoenix persists an end_turn-with-empty-content response. That is
+--     valid for a model that finished a tool loop with nothing to say —
+--     but it is wire-indistinguishable from a gateway that dropped the
+--     whole message. Today both resolve to the same empty LlmResponse.
+--     A future signal (output_tokens > 0 with empty output) could
+--     promote the second case to a retryable error.
+--
+-- Q2. classify_responses_error routes a code merely *containing* "quota"
+--     to the retryable rate_limit family, while the exact code
+--     "usage_limit_reached" is terminal. A backend that emits, say,
+--     "monthly_quota_exhausted" as a code (rather than as an error.type)
+--     would be misclassified as retryable. No such code is known today;
+--     flagged because the substring scan is inherently fragile against
+--     new code spellings.
+--
+-- Q3. The reasoning output item is discarded during normalization, so a
+--     multi-turn conversation loses the model's reasoning context
+--     between turns. The Responses API can return encrypted reasoning
+--     for replay (the `include` request field), but Phoenix sends an
+--     empty `include` until it has a durable transcript representation
+--     for reasoning items. Tracked as a deferred capability, not a bug.
+--
+-- Q4. ResponsesCodex429Classified / ResponsesCodex503Classified apply
+--     only when use_codex_backend is true. The platform Responses API
+--     uses ResponsesSseErrorClassified (SSE) or from_http_status (HTTP)
+--     instead. The backend selector is request-scoped configuration,
+--     not modelled here; both per-backend paths are specified so the
+--     selector's two outcomes are each covered.
+--
+-- Note (stream exhausted without response.completed): if the byte
+--     stream ends before a response.completed event, the accumulator
+--     still assembles whatever it collected — there is no `done`
+--     transition and no error. This is a degenerate path; it is not
+--     modelled as a rule because it produces no distinct observable
+--     outcome beyond a possibly-empty LlmResponse (see Q1).
