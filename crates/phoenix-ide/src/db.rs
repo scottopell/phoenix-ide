@@ -688,14 +688,17 @@ impl Database {
     }
 
     /// Update the steering queue for a conversation. Persists the FIFO queue
-    /// of pending steering messages to `conversations.steering_queue`.
+    /// of pending steering messages to `conversations.steering_queue` wrapped
+    /// in the versioned [`SteeringQueueEnvelope`] (see
+    /// [`crate::state_machine::event`]).
     pub async fn update_steering_queue(
         &self,
         id: &str,
         queue: &[crate::state_machine::event::SteerEntry],
     ) -> DbResult<()> {
         let now = Utc::now();
-        let queue_json = serde_json::to_string(queue).unwrap_or_else(|_| "[]".to_string());
+        let queue_json = crate::state_machine::event::SteeringQueueEnvelope::to_json(queue)
+            .unwrap_or_else(|_| r#"{"v":"v1","entries":[]}"#.to_string());
         let result = sqlx::query(
             "UPDATE conversations SET steering_queue = ?1, updated_at = ?2 WHERE id = ?3",
         )
@@ -729,12 +732,12 @@ impl Database {
         };
         let queue_str: Option<String> = row.try_get("steering_queue")?;
         let queue_str = queue_str.unwrap_or_else(|| "[]".to_string());
-        let mut queue: Vec<crate::state_machine::event::SteerEntry> =
-            serde_json::from_str(&queue_str).unwrap_or_default();
+        let mut queue = crate::state_machine::event::decode_steering_queue(id, &queue_str);
         let to_remove: std::collections::HashSet<&str> =
             message_ids.iter().map(String::as_str).collect();
         queue.retain(|entry| !to_remove.contains(entry.message_id.as_str()));
-        let new_json = serde_json::to_string(&queue).unwrap_or_else(|_| "[]".to_string());
+        let new_json = crate::state_machine::event::SteeringQueueEnvelope::to_json(&queue)
+            .unwrap_or_else(|_| r#"{"v":"v1","entries":[]}"#.to_string());
         sqlx::query("UPDATE conversations SET steering_queue = ?1, updated_at = ?2 WHERE id = ?3")
             .bind(&new_json)
             .bind(now.to_rfc3339())
@@ -2081,11 +2084,11 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         .try_get::<Option<String>, _>("chain_name")
         .unwrap_or(None);
 
-    let steering_queue: Vec<crate::state_machine::event::SteerEntry> = row
+    let steering_queue = row
         .try_get::<Option<String>, _>("steering_queue")
         .unwrap_or(None)
         .as_deref()
-        .and_then(|s| serde_json::from_str(s).ok())
+        .map(|s| crate::state_machine::event::decode_steering_queue(&id, s))
         .unwrap_or_default();
 
     Ok(Conversation {
