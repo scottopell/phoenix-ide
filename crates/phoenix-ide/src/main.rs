@@ -24,6 +24,7 @@ mod tools;
 use api::{create_router, AppState};
 use db::Database;
 use llm::{LlmConfig, ModelRegistry};
+use std::future::IntoFuture;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -299,11 +300,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "Phoenix IDE server listening"
         );
 
-        // Run server with graceful shutdown on signals
-        let server = axum::serve(listener, app);
-        server
+        // Run server with graceful shutdown on signals, bounded by
+        // SHUTDOWN_GRACE. axum's graceful path waits for every in-flight
+        // request to complete; an SSE stream completes only when the client
+        // disconnects, which it may never do. The HTTPS path in `tls::serve_https`
+        // applies the same bound — without it here, one stuck SSE stream pins
+        // the old process alive past a deploy until SIGKILL.
+        let server = axum::serve(listener, app)
             .with_graceful_shutdown(hot_restart::shutdown_signal())
-            .await?;
+            .into_future();
+        match tokio::time::timeout(tls::SHUTDOWN_GRACE, server).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    timeout_seconds = tls::SHUTDOWN_GRACE.as_secs(),
+                    "Timed out waiting for HTTP connections to drain; forcing shutdown"
+                );
+            }
+        }
     }
 
     // REQ-BASH-007: after the server stops accepting requests, walk the

@@ -20,7 +20,11 @@ use std::{
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// Upper bound on how long either server path (HTTP in `main`, HTTPS here)
+/// waits for in-flight connections to drain on shutdown. An SSE stream with
+/// keepalive pings never completes on its own, so without this bound a
+/// single such client pins the process alive past a deploy indefinitely.
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone)]
 pub(crate) enum ConfigSource {
