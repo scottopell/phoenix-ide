@@ -123,7 +123,7 @@ pub async fn complete(
         LlmError::invalid_response(format!("Failed to parse response: {e} - body: {body}"))
     })?;
 
-    Ok(normalize_responses_api_response(responses_response))
+    normalize_responses_api_response(responses_response)
 }
 
 // ---------------------------------------------------------------------------
@@ -426,7 +426,7 @@ impl ResponsesStreamAccumulator {
         Ok(())
     }
 
-    fn into_response(self) -> LlmResponse {
+    fn into_response(self) -> Result<LlmResponse, LlmError> {
         tracing::debug!(
             output_items = self.output_items.len(),
             input_tokens = self.input_tokens,
@@ -534,7 +534,7 @@ pub async fn complete_streaming(
         acc.process_event(&event.event_type, &event.data, chunk_tx)?;
     }
 
-    Ok(acc.into_response())
+    acc.into_response()
 }
 
 /// Translate `LlmRequest` to `ResponsesApiRequest`.
@@ -749,7 +749,9 @@ fn translate_to_responses_request(
 }
 
 /// Normalize `ResponsesApiResponse` to `LlmResponse`.
-fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
+fn normalize_responses_api_response(
+    resp: ResponsesApiResponse,
+) -> Result<LlmResponse, LlmError> {
     let mut content = Vec::new();
 
     for output in resp.output {
@@ -796,7 +798,25 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
         .any(|b| matches!(b, ContentBlock::ToolUse { .. }));
     let end_turn = resp.status == "completed" && !has_tool_calls;
 
-    LlmResponse {
+    // Billed-but-empty guard: OpenAI reported output tokens but the
+    // assembled response carried no content block — the message was
+    // lost, most often a gateway dropping the output array. Surface a
+    // retryable server error instead of persisting an empty agent turn
+    // the user was billed for. Complements the response.completed
+    // output-recovery fallback, which handles the partial-loss case.
+    if content.is_empty() && resp.usage.output_tokens > 0 {
+        tracing::error!(
+            output_tokens = resp.usage.output_tokens,
+            status = %resp.status,
+            "responses_api returned empty content with output tokens billed"
+        );
+        return Err(LlmError::server_error(format!(
+            "OpenAI returned empty response ({} output tokens billed, status={})",
+            resp.usage.output_tokens, resp.status
+        )));
+    }
+
+    Ok(LlmResponse {
         content,
         end_turn,
         usage: {
@@ -814,7 +834,7 @@ fn normalize_responses_api_response(resp: ResponsesApiResponse) -> LlmResponse {
                 cache_read_tokens: cached,
             }
         },
-    }
+    })
 }
 
 // ===========================================================================
@@ -1495,7 +1515,8 @@ mod tests {
                     cached_tokens: acc.cached_tokens,
                 },
             },
-        });
+        })
+        .expect("a response with a message item normalizes");
         assert_eq!(resp.usage.cache_read_tokens, 800);
         assert_eq!(resp.usage.input_tokens, 200);
         assert_eq!(resp.usage.cache_creation_tokens, 0);
@@ -1504,19 +1525,47 @@ mod tests {
 
     /// A gateway that omits `input_tokens_details` must not panic or shift
     /// accounting: cached defaults to 0 and `input_tokens` is unchanged.
+    /// output_tokens is 0 here — an empty, unbilled response, so the
+    /// billed-but-empty guard does not fire.
     #[test]
     fn responses_api_usage_without_cached_details_defaults_to_zero() {
         let usage: ResponsesApiUsage =
-            serde_json::from_str(r#"{"input_tokens":10,"output_tokens":2}"#).unwrap();
+            serde_json::from_str(r#"{"input_tokens":10,"output_tokens":0}"#).unwrap();
         assert_eq!(usage.input_tokens_details.cached_tokens, 0);
         let resp = normalize_responses_api_response(ResponsesApiResponse {
             status: "completed".to_string(),
             output: vec![],
             usage,
-        });
+        })
+        .expect("an empty, unbilled response normalizes");
         assert_eq!(resp.usage.input_tokens, 10);
         assert_eq!(resp.usage.cache_read_tokens, 0);
-        assert_eq!(resp.usage.context_window_used(), 12);
+        assert_eq!(resp.usage.context_window_used(), 10);
+    }
+
+    /// Billed-but-empty guard: OpenAI reporting output tokens for a
+    /// response with no content block means the assembled message was
+    /// lost in transit (a gateway dropping the output array). Normalization
+    /// must surface a retryable error, not a silently-empty agent turn.
+    #[test]
+    fn responses_api_empty_content_with_billed_tokens_is_retryable_error() {
+        let err = normalize_responses_api_response(ResponsesApiResponse {
+            status: "completed".to_string(),
+            output: vec![],
+            usage: ResponsesApiUsage {
+                input_tokens: 1000,
+                output_tokens: 42,
+                input_tokens_details: ResponsesApiInputTokensDetails {
+                    cached_tokens: 0,
+                },
+            },
+        })
+        .expect_err("empty content with billed output tokens must fail");
+        assert_eq!(err.kind, crate::llm::LlmErrorKind::ServerError);
+        assert!(
+            err.kind.is_retryable(),
+            "a lost-message response must be retryable so the executor retries"
+        );
     }
 
     /// If both `response.output_item.done` and `response.completed` carry
