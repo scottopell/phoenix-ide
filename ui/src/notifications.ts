@@ -100,7 +100,7 @@ function deliverNotification(event: NotificationEvent): void {
 
   const notification = new Notification(event.title, {
     body: event.conversation.slug,
-    tag: `${event.type}:${event.conversation.id}`,
+    tag: `${event.type}:${event.conversation.id}:${event.conversation.updated_at}`,
   });
   notification.onclick = () => {
     window.focus();
