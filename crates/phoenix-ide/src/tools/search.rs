@@ -435,9 +435,9 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success);
-        assert!(result.output.contains("hello.rs"));
-        assert!(result.output.contains("println"));
+        assert!(result.is_success());
+        assert!(result.output().contains("hello.rs"));
+        assert!(result.output().contains("println"));
     }
 
     #[tokio::test]
@@ -453,9 +453,9 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success);
-        assert!(result.output.contains("code.rs"));
-        assert!(!result.output.contains("code.txt"));
+        assert!(result.is_success());
+        assert!(result.output().contains("code.rs"));
+        assert!(!result.output().contains("code.txt"));
     }
 
     #[tokio::test]
@@ -475,8 +475,8 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success);
-        assert!(result.output.contains("Results limited to 5"));
+        assert!(result.is_success());
+        assert!(result.output().contains("Results limited to 5"));
     }
 
     #[tokio::test]
@@ -491,8 +491,8 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success);
-        assert!(result.output.contains("No matches found"));
+        assert!(result.is_success());
+        assert!(result.output().contains("No matches found"));
     }
 
     #[tokio::test]
@@ -505,8 +505,8 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(!result.success);
-        assert!(result.output.contains("Invalid regex"));
+        assert!(!result.is_success());
+        assert!(result.output().contains("Invalid regex"));
     }
 
     #[tokio::test]
@@ -527,11 +527,11 @@ mod tests {
             )
             .await;
         assert!(
-            result.success,
+            result.is_success(),
             "search should resolve paths outside the working dir: {}",
-            result.output
+            result.output()
         );
-        assert!(result.output.contains("findme"));
+        assert!(result.output().contains("findme"));
     }
 
     #[test]
@@ -573,17 +573,17 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success, "{}", result.output);
+        assert!(result.is_success(), "{}", result.output());
         assert!(
-            result.output.contains("real.rs"),
+            result.output().contains("real.rs"),
             "should find real source: {}",
-            result.output
+            result.output()
         );
         for skipped in &["node_modules", "target", "vendor", "dist", ".git"] {
             assert!(
-                !result.output.contains(skipped),
+                !result.output().contains(skipped),
                 "should not descend into {skipped}: {}",
-                result.output
+                result.output()
             );
         }
     }
@@ -607,12 +607,12 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("small.txt"), "{}", result.output);
+        assert!(result.is_success(), "{}", result.output());
+        assert!(result.output().contains("small.txt"), "{}", result.output());
         assert!(
-            !result.output.contains("big.log"),
+            !result.output().contains("big.log"),
             "oversize file should be skipped: {}",
-            result.output
+            result.output()
         );
     }
 
@@ -636,13 +636,17 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success, "{}", result.output);
-        assert!(result.output.contains(".github"), "{}", result.output);
-        assert!(result.output.contains(".env.example"), "{}", result.output);
+        assert!(result.is_success(), "{}", result.output());
+        assert!(result.output().contains(".github"), "{}", result.output());
         assert!(
-            !result.output.contains(".git/config") && !result.output.contains(".git\\config"),
+            result.output().contains(".env.example"),
+            "{}",
+            result.output()
+        );
+        assert!(
+            !result.output().contains(".git/config") && !result.output().contains(".git\\config"),
             ".git should still be pruned: {}",
-            result.output
+            result.output()
         );
     }
 
@@ -662,12 +666,12 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("real.rs"), "{}", result.output);
+        assert!(result.is_success(), "{}", result.output());
+        assert!(result.output().contains("real.rs"), "{}", result.output());
         assert!(
-            !result.output.contains("blob.wasm"),
+            !result.output().contains("blob.wasm"),
             ".wasm should be skipped by extension: {}",
-            result.output
+            result.output()
         );
     }
 
@@ -685,12 +689,12 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("deep.rs"), "{}", result.output);
+        assert!(result.is_success(), "{}", result.output());
+        assert!(result.output().contains("deep.rs"), "{}", result.output());
         assert!(
-            !result.output.contains("other.rs"),
+            !result.output().contains("other.rs"),
             "outside src should be excluded by glob: {}",
-            result.output
+            result.output()
         );
     }
 
@@ -707,12 +711,12 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("real.ts"), "{}", result.output);
+        assert!(result.is_success(), "{}", result.output());
+        assert!(result.output().contains("real.ts"), "{}", result.output());
         assert!(
-            !result.output.contains("real.test.ts"),
+            !result.output().contains("real.test.ts"),
             "exclude should drop test files: {}",
-            result.output
+            result.output()
         );
     }
 
@@ -739,7 +743,11 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success, "{}", result.output);
-        assert!(result.output.contains("medium.txt"), "{}", result.output);
+        assert!(result.is_success(), "{}", result.output());
+        assert!(
+            result.output().contains("medium.txt"),
+            "{}",
+            result.output()
+        );
     }
 }

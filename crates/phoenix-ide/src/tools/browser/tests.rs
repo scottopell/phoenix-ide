@@ -170,11 +170,11 @@ async fn test_browser_navigate_local() {
 
     let result = tool.run(json!({"url": server.url()}), ctx).await;
 
-    assert!(result.success, "Navigate failed: {}", result.output);
+    assert!(result.is_success(), "Navigate failed: {}", result.output());
     assert!(
-        result.output.contains("done"),
+        result.output().contains("done"),
         "Unexpected output: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -200,7 +200,11 @@ async fn test_browser_eval_local() {
     let nav_result = nav_tool
         .run(json!({"url": server.url()}), ctx.clone())
         .await;
-    assert!(nav_result.success, "Navigate failed: {}", nav_result.output);
+    assert!(
+        nav_result.is_success(),
+        "Navigate failed: {}",
+        nav_result.output()
+    );
 
     // Then eval
     let eval_tool = BrowserEvalTool;
@@ -209,11 +213,11 @@ async fn test_browser_eval_local() {
     let result = eval_tool
         .run(json!({"expression": "document.title"}), ctx.clone())
         .await;
-    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(result.is_success(), "Eval failed: {}", result.output());
     assert!(
-        result.output.contains("Eval Test"),
+        result.output().contains("Eval Test"),
         "Title not found: {}",
-        result.output
+        result.output()
     );
 
     // Test getting element attribute
@@ -223,22 +227,22 @@ async fn test_browser_eval_local() {
             ctx.clone(),
         )
         .await;
-    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(result.is_success(), "Eval failed: {}", result.output());
     assert!(
-        result.output.contains("42"),
+        result.output().contains("42"),
         "Data value not found: {}",
-        result.output
+        result.output()
     );
 
     // Test arithmetic
     let result = eval_tool
         .run(json!({"expression": "2 + 2"}), ctx.clone())
         .await;
-    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(result.is_success(), "Eval failed: {}", result.output());
     assert!(
-        result.output.contains('4'),
+        result.output().contains('4'),
         "Arithmetic wrong: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -275,16 +279,16 @@ async fn test_eval_inner_text_not_undefined() {
         )
         .await;
 
-    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(result.is_success(), "Eval failed: {}", result.output());
     assert!(
-        !result.output.contains("undefined"),
+        !result.output().contains("undefined"),
         "Got undefined instead of text: {}",
-        result.output
+        result.output()
     );
     assert!(
-        result.output.contains("Hello from innerText"),
+        result.output().contains("Hello from innerText"),
         "Expected page text, got: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -316,16 +320,16 @@ async fn test_eval_inner_html_slice_not_undefined() {
         )
         .await;
 
-    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(result.is_success(), "Eval failed: {}", result.output());
     assert!(
-        !result.output.contains("undefined"),
+        !result.output().contains("undefined"),
         "Got undefined instead of HTML: {}",
-        result.output
+        result.output()
     );
     assert!(
-        result.output.contains("content") || result.output.len() > 10,
+        result.output().contains("content") || result.output().len() > 10,
         "Expected HTML content, got: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -358,16 +362,16 @@ async fn test_eval_json_stringify_dom_not_undefined() {
         )
         .await;
 
-    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(result.is_success(), "Eval failed: {}", result.output());
     assert!(
-        !result.output.contains("undefined"),
+        !result.output().contains("undefined"),
         "Got undefined instead of JSON: {}",
-        result.output
+        result.output()
     );
     assert!(
-        result.output.contains("bodyText"),
+        result.output().contains("bodyText"),
         "Expected JSON with bodyText key, got: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -425,16 +429,20 @@ async fn test_eval_complex_page_inner_text() {
             ctx.clone(),
         )
         .await;
-    assert!(result.success, "innerText eval failed: {}", result.output);
     assert!(
-        !result.output.contains("undefined"),
-        "innerText returned undefined: {}",
-        result.output
+        result.is_success(),
+        "innerText eval failed: {}",
+        result.output()
     );
     assert!(
-        result.output.contains("Article Title"),
+        !result.output().contains("undefined"),
+        "innerText returned undefined: {}",
+        result.output()
+    );
+    assert!(
+        result.output().contains("Article Title"),
         "Missing article title from innerText: {}",
-        result.output
+        result.output()
     );
 
     // Test 2: innerHTML.slice on complex page
@@ -444,11 +452,15 @@ async fn test_eval_complex_page_inner_text() {
             ctx.clone(),
         )
         .await;
-    assert!(result.success, "innerHTML.slice failed: {}", result.output);
     assert!(
-        !result.output.contains("undefined"),
+        result.is_success(),
+        "innerHTML.slice failed: {}",
+        result.output()
+    );
+    assert!(
+        !result.output().contains("undefined"),
         "innerHTML.slice returned undefined: {}",
-        result.output
+        result.output()
     );
 
     // Test 3: JSON.stringify of DOM properties
@@ -458,16 +470,20 @@ async fn test_eval_complex_page_inner_text() {
             ctx.clone(),
         )
         .await;
-    assert!(result.success, "JSON.stringify failed: {}", result.output);
     assert!(
-        !result.output.contains("undefined"),
-        "JSON.stringify returned undefined: {}",
-        result.output
+        result.is_success(),
+        "JSON.stringify failed: {}",
+        result.output()
     );
     assert!(
-        result.output.contains("Complex Page"),
+        !result.output().contains("undefined"),
+        "JSON.stringify returned undefined: {}",
+        result.output()
+    );
+    assert!(
+        result.output().contains("Complex Page"),
         "Missing title in JSON: {}",
-        result.output
+        result.output()
     );
 
     // Test 4: Reading script-set global variable
@@ -477,11 +493,15 @@ async fn test_eval_complex_page_inner_text() {
             ctx.clone(),
         )
         .await;
-    assert!(result.success, "Global var eval failed: {}", result.output);
     assert!(
-        result.output.contains("100"),
+        result.is_success(),
+        "Global var eval failed: {}",
+        result.output()
+    );
+    assert!(
+        result.output().contains("100"),
         "Expected 100 items, got: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -514,11 +534,11 @@ async fn test_eval_await_false_returns_value() {
             ctx.clone(),
         )
         .await;
-    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(result.is_success(), "Eval failed: {}", result.output());
     assert!(
-        result.output.contains("Await Test"),
+        result.output().contains("Await Test"),
         "Expected title, got: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -553,16 +573,20 @@ async fn test_eval_promise_chain_awaited() {
             ctx.clone(),
         )
         .await;
-    assert!(result.success, "Promise eval failed: {}", result.output);
     assert!(
-        !result.output.contains("undefined"),
-        "Promise returned undefined: {}",
-        result.output
+        result.is_success(),
+        "Promise eval failed: {}",
+        result.output()
     );
     assert!(
-        result.output.contains("ok") && result.output.contains("42"),
+        !result.output().contains("undefined"),
+        "Promise returned undefined: {}",
+        result.output()
+    );
+    assert!(
+        result.output().contains("ok") && result.output().contains("42"),
         "Expected resolved data, got: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -620,40 +644,44 @@ async fn test_browser_console_logs_local() {
     let logs_tool = BrowserRecentConsoleLogsTool;
     let result = logs_tool.run(json!({}), ctx.clone()).await;
 
-    assert!(result.success, "Get logs failed: {}", result.output);
+    assert!(result.is_success(), "Get logs failed: {}", result.output());
     assert!(
-        result.output.contains("test message"),
+        result.output().contains("test message"),
         "Log message not found: {}",
-        result.output
+        result.output()
     );
     assert!(
-        result.output.contains("warning message"),
+        result.output().contains("warning message"),
         "Warning not found: {}",
-        result.output
+        result.output()
     );
     assert!(
-        result.output.contains("error message"),
+        result.output().contains("error message"),
         "Error not found: {}",
-        result.output
+        result.output()
     );
 
     // Clear logs
     let clear_tool = BrowserClearConsoleLogsTool;
     let result = clear_tool.run(json!({}), ctx.clone()).await;
-    assert!(result.success, "Clear logs failed: {}", result.output);
     assert!(
-        result.output.contains("Cleared"),
+        result.is_success(),
+        "Clear logs failed: {}",
+        result.output()
+    );
+    assert!(
+        result.output().contains("Cleared"),
         "Clear message missing: {}",
-        result.output
+        result.output()
     );
 
     // Verify cleared
     let result = logs_tool.run(json!({}), ctx.clone()).await;
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("[]"),
+        result.output().contains("[]"),
         "Logs not cleared: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -684,26 +712,30 @@ async fn test_browser_screenshot_local() {
     let screenshot_tool = BrowserTakeScreenshotTool;
     let result = screenshot_tool.run(json!({}), ctx.clone()).await;
 
-    assert!(result.success, "Screenshot failed: {}", result.output);
+    assert!(
+        result.is_success(),
+        "Screenshot failed: {}",
+        result.output()
+    );
 
     // The screenshot must flow to the LLM via the typed `images` channel,
     // not via `display_data` (which is UI-only and never threaded to the
     // LLM). Mirrors the read_image.rs regression assertion.
     assert_eq!(
-        result.images.len(),
+        result.images().len(),
         1,
         "Expected 1 image in images field, got {}",
-        result.images.len()
+        result.images().len()
     );
-    assert_eq!(result.images[0].media_type, "image/png");
+    assert_eq!(result.images()[0].media_type, "image/png");
     assert!(
-        result.images[0].data.starts_with("iVBORw0KGgo"),
+        result.images()[0].data.starts_with("iVBORw0KGgo"),
         "image data is not a valid PNG (base64 should start with iVBORw0KGgo)"
     );
     assert!(
-        result.display_data.is_none(),
+        result.display_data().is_none(),
         "browser_take_screenshot must not duplicate the image payload into display_data, got {:?}",
-        result.display_data
+        result.display_data()
     );
 
     shutdown_test(_manager, server).await;
@@ -736,19 +768,19 @@ async fn test_browser_resize_local() {
         .run(json!({"width": 1024, "height": 768}), ctx.clone())
         .await;
 
-    assert!(result.success, "Resize failed: {}", result.output);
+    assert!(result.is_success(), "Resize failed: {}", result.output());
 
     // Verify via JS
     let eval_tool = BrowserEvalTool;
     let result = eval_tool
         .run(json!({"expression": "window.innerWidth"}), ctx.clone())
         .await;
-    assert!(result.success);
+    assert!(result.is_success());
     // innerWidth should be close to 1024 (may vary slightly due to scrollbars)
     assert!(
-        result.output.contains("1024") || result.output.contains("1008"),
+        result.output().contains("1024") || result.output().contains("1008"),
         "Width mismatch: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -793,11 +825,11 @@ async fn test_browser_session_persistence() {
         .run(json!({"expression": "window.testCounter"}), ctx.clone())
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains('3'),
+        result.output().contains('3'),
         "Counter should be 3, got: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -820,7 +852,7 @@ async fn test_browser_navigate_remote() {
         .run(json!({"url": "https://example.com"}), ctx.clone())
         .await;
 
-    assert!(result.success, "Navigate failed: {}", result.output);
+    assert!(result.is_success(), "Navigate failed: {}", result.output());
 
     // Verify we can read the page
     let eval_tool = BrowserEvalTool;
@@ -828,11 +860,11 @@ async fn test_browser_navigate_remote() {
         .run(json!({"expression": "document.title"}), ctx.clone())
         .await;
 
-    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(result.is_success(), "Eval failed: {}", result.output());
     assert!(
-        result.output.contains("Example Domain"),
+        result.output().contains("Example Domain"),
         "Wrong title: {}",
-        result.output
+        result.output()
     );
 
     // Verify page content
@@ -843,11 +875,11 @@ async fn test_browser_navigate_remote() {
         )
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("Example Domain"),
+        result.output().contains("Example Domain"),
         "Wrong h1: {}",
-        result.output
+        result.output()
     );
 }
 
@@ -868,11 +900,11 @@ async fn test_browser_eval_before_navigate() {
         .await;
 
     // This should work - browser starts on about:blank
-    assert!(result.success, "Eval failed: {}", result.output);
+    assert!(result.is_success(), "Eval failed: {}", result.output());
     assert!(
-        result.output.contains('2'),
+        result.output().contains('2'),
         "Wrong result: {}",
-        result.output
+        result.output()
     );
 }
 
@@ -897,12 +929,12 @@ async fn test_browser_eval_syntax_error() {
         .await;
 
     // Should fail gracefully
-    assert!(!result.success, "Should have failed");
+    assert!(!result.is_success(), "Should have failed");
     assert!(
-        result.output.to_lowercase().contains("error")
-            || result.output.to_lowercase().contains("syntaxerror"),
+        result.output().to_lowercase().contains("error")
+            || result.output().to_lowercase().contains("syntaxerror"),
         "Should mention error: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -938,11 +970,11 @@ async fn test_wait_for_selector_immediate() {
         .run(json!({"selector": "#exists"}), ctx.clone())
         .await;
 
-    assert!(result.success, "Wait failed: {}", result.output);
+    assert!(result.is_success(), "Wait failed: {}", result.output());
     assert!(
-        result.output.contains("found") || result.output.contains("visible"),
+        result.output().contains("found") || result.output().contains("visible"),
         "Should indicate element found: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -984,7 +1016,7 @@ async fn test_wait_for_selector_delayed() {
         )
         .await;
 
-    assert!(result.success, "Wait failed: {}", result.output);
+    assert!(result.is_success(), "Wait failed: {}", result.output());
 
     shutdown_test(_manager, server).await;
 }
@@ -1018,12 +1050,12 @@ async fn test_wait_for_selector_timeout() {
         )
         .await;
 
-    assert!(!result.success, "Should have timed out");
+    assert!(!result.is_success(), "Should have timed out");
     assert!(
-        result.output.to_lowercase().contains("timeout")
-            || result.output.to_lowercase().contains("not found"),
+        result.output().to_lowercase().contains("timeout")
+            || result.output().to_lowercase().contains("not found"),
         "Should mention timeout: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1067,7 +1099,11 @@ async fn test_wait_for_selector_hidden_then_visible() {
         )
         .await;
 
-    assert!(result.success, "Wait for visible failed: {}", result.output);
+    assert!(
+        result.is_success(),
+        "Wait for visible failed: {}",
+        result.output()
+    );
 
     shutdown_test(_manager, server).await;
 }
@@ -1089,13 +1125,13 @@ async fn test_wait_for_selector_invalid_selector() {
         .run(json!({"selector": "###invalid[[["}), ctx.clone())
         .await;
 
-    assert!(!result.success, "Should fail on invalid selector");
+    assert!(!result.is_success(), "Should fail on invalid selector");
     assert!(
-        result.output.to_lowercase().contains("invalid")
-            || result.output.to_lowercase().contains("error")
-            || result.output.to_lowercase().contains("syntax"),
+        result.output().to_lowercase().contains("invalid")
+            || result.output().to_lowercase().contains("error")
+            || result.output().to_lowercase().contains("syntax"),
         "Should mention invalid selector: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1134,7 +1170,7 @@ async fn test_click_button() {
         .run(json!({"selector": "#btn"}), ctx.clone())
         .await;
 
-    assert!(result.success, "Click failed: {}", result.output);
+    assert!(result.is_success(), "Click failed: {}", result.output());
 
     // Verify the click worked
     let eval_tool = BrowserEvalTool;
@@ -1145,11 +1181,11 @@ async fn test_click_button() {
         )
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("clicked"),
+        result.output().contains("clicked"),
         "Button click didn't work: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1183,7 +1219,7 @@ async fn test_click_link() {
         .run(json!({"selector": "#link"}), ctx.clone())
         .await;
 
-    assert!(result.success, "Click failed: {}", result.output);
+    assert!(result.is_success(), "Click failed: {}", result.output());
 
     // Verify URL changed
     let eval_tool = BrowserEvalTool;
@@ -1191,11 +1227,11 @@ async fn test_click_link() {
         .run(json!({"expression": "window.location.hash"}), ctx.clone())
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("clicked"),
+        result.output().contains("clicked"),
         "Link click didn't navigate: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1218,13 +1254,13 @@ async fn test_click_element_not_found() {
         .run(json!({"selector": "#nonexistent"}), ctx.clone())
         .await;
 
-    assert!(!result.success, "Should fail when element not found");
+    assert!(!result.is_success(), "Should fail when element not found");
     assert!(
-        result.output.to_lowercase().contains("not found")
-            || result.output.to_lowercase().contains("no element")
-            || result.output.to_lowercase().contains("could not find"),
+        result.output().to_lowercase().contains("not found")
+            || result.output().to_lowercase().contains("no element")
+            || result.output().to_lowercase().contains("could not find"),
         "Should mention element not found: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1261,14 +1297,14 @@ async fn test_click_checkbox() {
             ctx.clone(),
         )
         .await;
-    assert!(result.output.contains("false"), "Should start unchecked");
+    assert!(result.output().contains("false"), "Should start unchecked");
 
     // Click the checkbox
     let click_tool = BrowserClickTool;
     let result = click_tool
         .run(json!({"selector": "#check"}), ctx.clone())
         .await;
-    assert!(result.success, "Click failed: {}", result.output);
+    assert!(result.is_success(), "Click failed: {}", result.output());
 
     // Verify checked
     let result = eval_tool
@@ -1278,9 +1314,9 @@ async fn test_click_checkbox() {
         )
         .await;
     assert!(
-        result.output.contains("true"),
+        result.output().contains("true"),
         "Checkbox should be checked: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1328,7 +1364,11 @@ async fn test_click_with_wait() {
         )
         .await;
 
-    assert!(result.success, "Click with wait failed: {}", result.output);
+    assert!(
+        result.is_success(),
+        "Click with wait failed: {}",
+        result.output()
+    );
 
     // Verify click worked
     let eval_tool = BrowserEvalTool;
@@ -1339,9 +1379,9 @@ async fn test_click_with_wait() {
         )
         .await;
     assert!(
-        result.output.contains("success"),
+        result.output().contains("success"),
         "Click didn't work: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1382,7 +1422,7 @@ async fn test_type_in_input() {
         )
         .await;
 
-    assert!(result.success, "Type failed: {}", result.output);
+    assert!(result.is_success(), "Type failed: {}", result.output());
 
     // Verify value
     let eval_tool = BrowserEvalTool;
@@ -1393,11 +1433,11 @@ async fn test_type_in_input() {
         )
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("Hello World"),
+        result.output().contains("Hello World"),
         "Input value wrong: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1434,7 +1474,7 @@ async fn test_type_in_textarea() {
         )
         .await;
 
-    assert!(result.success, "Type failed: {}", result.output);
+    assert!(result.is_success(), "Type failed: {}", result.output());
 
     // Verify value
     let eval_tool = BrowserEvalTool;
@@ -1445,11 +1485,11 @@ async fn test_type_in_textarea() {
         )
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("Line 1") && result.output.contains("Line 2"),
+        result.output().contains("Line 1") && result.output().contains("Line 2"),
         "Textarea value wrong: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1497,7 +1537,7 @@ async fn test_type_triggers_react_events() {
         )
         .await;
 
-    assert!(result.success, "Type failed: {}", result.output);
+    assert!(result.is_success(), "Type failed: {}", result.output());
 
     // Verify event handler was triggered
     let eval_tool = BrowserEvalTool;
@@ -1508,11 +1548,11 @@ async fn test_type_triggers_react_events() {
         )
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("React test"),
+        result.output().contains("React test"),
         "React-style event not triggered: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1549,7 +1589,7 @@ async fn test_type_with_clear() {
         )
         .await;
 
-    assert!(result.success, "Type failed: {}", result.output);
+    assert!(result.is_success(), "Type failed: {}", result.output());
 
     // Verify old text is gone
     let eval_tool = BrowserEvalTool;
@@ -1560,11 +1600,11 @@ async fn test_type_with_clear() {
         )
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("new text") && !result.output.contains("existing"),
+        result.output().contains("new text") && !result.output().contains("existing"),
         "Clear didn't work: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1598,7 +1638,7 @@ async fn test_type_append() {
         .run(json!({"selector": "#input", "text": "World"}), ctx.clone())
         .await;
 
-    assert!(result.success, "Type failed: {}", result.output);
+    assert!(result.is_success(), "Type failed: {}", result.output());
 
     // Verify text was appended
     let eval_tool = BrowserEvalTool;
@@ -1609,11 +1649,11 @@ async fn test_type_append() {
         )
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("Hello World") || result.output.contains("Hello  World"),
+        result.output().contains("Hello World") || result.output().contains("Hello  World"),
         "Append didn't work: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1639,13 +1679,13 @@ async fn test_type_element_not_found() {
         )
         .await;
 
-    assert!(!result.success, "Should fail when element not found");
+    assert!(!result.is_success(), "Should fail when element not found");
     assert!(
-        result.output.to_lowercase().contains("not found")
-            || result.output.to_lowercase().contains("no element")
-            || result.output.to_lowercase().contains("could not find"),
+        result.output().to_lowercase().contains("not found")
+            || result.output().to_lowercase().contains("no element")
+            || result.output().to_lowercase().contains("could not find"),
         "Should mention element not found: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1682,7 +1722,7 @@ async fn test_type_special_characters() {
         )
         .await;
 
-    assert!(result.success, "Type failed: {}", result.output);
+    assert!(result.is_success(), "Type failed: {}", result.output());
 
     // Verify value
     let eval_tool = BrowserEvalTool;
@@ -1693,11 +1733,11 @@ async fn test_type_special_characters() {
         )
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("<>&"),
+        result.output().contains("<>&"),
         "Special chars not typed: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1734,7 +1774,7 @@ async fn test_type_password_field() {
         )
         .await;
 
-    assert!(result.success, "Type failed: {}", result.output);
+    assert!(result.is_success(), "Type failed: {}", result.output());
 
     // Verify value (password fields still have value attribute)
     let eval_tool = BrowserEvalTool;
@@ -1745,11 +1785,11 @@ async fn test_type_password_field() {
         )
         .await;
 
-    assert!(result.success);
+    assert!(result.is_success());
     assert!(
-        result.output.contains("secret123"),
+        result.output().contains("secret123"),
         "Password not typed: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1790,11 +1830,11 @@ async fn test_key_press_escape_fires_keydown_listener() {
         .run(json!({"key": "Escape"}), ctx.clone())
         .await;
 
-    assert!(result.success, "key_press failed: {}", result.output);
+    assert!(result.is_success(), "key_press failed: {}", result.output());
     assert!(
-        result.output.contains("Escape"),
+        result.output().contains("Escape"),
         "Output should mention key: {}",
-        result.output
+        result.output()
     );
 
     let eval_result = BrowserEvalTool
@@ -1804,9 +1844,9 @@ async fn test_key_press_escape_fires_keydown_listener() {
         )
         .await;
     assert!(
-        eval_result.output.contains("closed"),
+        eval_result.output().contains("closed"),
         "Escape keydown listener not fired: {}",
-        eval_result.output
+        eval_result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1843,7 +1883,7 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
         .run(json!({"key": "k", "modifiers": ["ctrl"]}), ctx.clone())
         .await;
 
-    assert!(result.success, "key_press failed: {}", result.output);
+    assert!(result.is_success(), "key_press failed: {}", result.output());
 
     let eval_result = BrowserEvalTool
         .run(
@@ -1852,9 +1892,9 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
         )
         .await;
     assert!(
-        eval_result.output.contains("ctrl+k"),
+        eval_result.output().contains("ctrl+k"),
         "Ctrl+K capture listener not fired: {}",
-        eval_result.output
+        eval_result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1891,7 +1931,7 @@ async fn test_key_press_arrow_down() {
         .run(json!({"key": "ArrowDown"}), ctx.clone())
         .await;
 
-    assert!(result.success, "key_press failed: {}", result.output);
+    assert!(result.is_success(), "key_press failed: {}", result.output());
 
     let eval_result = BrowserEvalTool
         .run(
@@ -1900,9 +1940,9 @@ async fn test_key_press_arrow_down() {
         )
         .await;
     assert!(
-        eval_result.output.contains("down"),
+        eval_result.output().contains("down"),
         "ArrowDown keydown not received: {}",
-        eval_result.output
+        eval_result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1922,11 +1962,11 @@ async fn test_key_press_unknown_key_returns_error() {
         .run(json!({"key": "NotAKey"}), ctx.clone())
         .await;
 
-    assert!(!result.success, "Should have failed for unknown key");
+    assert!(!result.is_success(), "Should have failed for unknown key");
     assert!(
-        result.output.to_lowercase().contains("unknown"),
+        result.output().to_lowercase().contains("unknown"),
         "Should mention unknown key: {}",
-        result.output
+        result.output()
     );
 
     shutdown_test(_manager, server).await;
@@ -1959,7 +1999,7 @@ async fn test_screencast_attach_emits_frames_and_url() {
     let nav = BrowserNavigateTool
         .run(json!({ "url": server.url() }), ctx.clone())
         .await;
-    assert!(nav.success, "navigate failed: {}", nav.output);
+    assert!(nav.is_success(), "navigate failed: {}", nav.output());
 
     let session_arc = manager
         .get_existing("test-screencast-frames")
@@ -2092,10 +2132,14 @@ async fn test_browser_profile_help_no_browser() {
     let result = BrowserProfileTool
         .run(json!({"action": "help"}), ctx.clone())
         .await;
-    assert!(result.success, "help should succeed: {}", result.output);
-    assert!(result.output.contains("run_scenario"));
     assert!(
-        result.output.contains("RAW per-run"),
+        result.is_success(),
+        "help should succeed: {}",
+        result.output()
+    );
+    assert!(result.output().contains("run_scenario"));
+    assert!(
+        result.output().contains("RAW per-run"),
         "help must state the raw-samples constraint"
     );
     manager.shutdown_all().await;
@@ -2123,16 +2167,16 @@ async fn test_browser_profile_rejects_inline_navigation() {
             ctx.clone(),
         )
         .await;
-    assert!(!nav.success, "navigate in steps must be rejected");
+    assert!(!nav.is_success(), "navigate in steps must be rejected");
     assert!(
-        nav.output.contains("steps[1]") && nav.output.contains("navigate"),
+        nav.output().contains("steps[1]") && nav.output().contains("navigate"),
         "error must name the offending step index/kind: {}",
-        nav.output
+        nav.output()
     );
     assert!(
-        nav.display_data.is_none(),
+        nav.display_data().is_none(),
         "rejection must produce NO ScenarioRunResult/display_data: {:?}",
-        nav.display_data
+        nav.display_data()
     );
 
     let rel = BrowserProfileTool
@@ -2145,11 +2189,11 @@ async fn test_browser_profile_rejects_inline_navigation() {
             ctx.clone(),
         )
         .await;
-    assert!(!rel.success, "reload in steps must be rejected");
+    assert!(!rel.is_success(), "reload in steps must be rejected");
     assert!(
-        rel.output.contains("steps[0]") && rel.output.contains("reload"),
+        rel.output().contains("steps[0]") && rel.output().contains("reload"),
         "error must name the reload step: {}",
-        rel.output
+        rel.output()
     );
 
     manager.shutdown_all().await;
@@ -2173,11 +2217,11 @@ async fn test_browser_profile_metrics_and_raw_scenario() {
     let m = BrowserProfileTool
         .run(json!({"action": "metrics"}), ctx.clone())
         .await;
-    assert!(m.success, "metrics should succeed: {}", m.output);
+    assert!(m.is_success(), "metrics should succeed: {}", m.output());
     assert!(
-        m.output.contains("JSHeapUsedSize") || m.output.contains("Performance metrics"),
+        m.output().contains("JSHeapUsedSize") || m.output().contains("Performance metrics"),
         "metrics output unexpected: {}",
-        m.output
+        m.output()
     );
 
     // run_scenario with runs=3: a trivial deterministic scenario.
@@ -2196,12 +2240,16 @@ async fn test_browser_profile_metrics_and_raw_scenario() {
             ctx.clone(),
         )
         .await;
-    assert!(r.success, "run_scenario should succeed: {}", r.output);
+    assert!(
+        r.is_success(),
+        "run_scenario should succeed: {}",
+        r.output()
+    );
 
     // The raw-samples hard constraint: display_data.raw_samples is an
     // array of EXACTLY `runs` entries — NOT a reduced scalar/object.
     let display = r
-        .display_data
+        .display_data()
         .expect("run_scenario must attach display_data");
     assert_eq!(
         display["outcome"], "completed",
@@ -2236,8 +2284,10 @@ async fn test_browser_profile_metrics_and_raw_scenario() {
             ctx.clone(),
         )
         .await;
-    assert!(!blocked.success, "blocked scenario must fail");
-    let bd = blocked.display_data.expect("blocked attaches display_data");
+    assert!(!blocked.is_success(), "blocked scenario must fail");
+    let bd = blocked
+        .display_data()
+        .expect("blocked attaches display_data");
     assert_eq!(bd["outcome"], "blocked");
     assert_eq!(
         bd["raw_samples"].as_array().map(Vec::len),
@@ -2276,8 +2326,12 @@ async fn test_browser_profile_methodology_warnings_intact_raw_samples() {
             ctx.clone(),
         )
         .await;
-    assert!(r.success, "run_scenario should succeed: {}", r.output);
-    let display = r.display_data.expect("must attach display_data");
+    assert!(
+        r.is_success(),
+        "run_scenario should succeed: {}",
+        r.output()
+    );
+    let display = r.display_data().expect("must attach display_data");
 
     let warnings = display["methodology_warnings"]
         .as_array()
@@ -2373,7 +2427,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
             ctx.clone(),
         )
         .await;
-    assert!(nav.success, "navigate failed: {}", nav.output);
+    assert!(nav.is_success(), "navigate failed: {}", nav.output());
 
     // Mount confirmed once React renders the #ready node.
     let waited = BrowserWaitForSelectorTool
@@ -2383,9 +2437,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
         )
         .await;
     assert!(
-        waited.success,
+        waited.is_success(),
         "React did not mount (unpkg/profiling build issue?): {}",
-        waited.output
+        waited.output()
     );
 
     // reset:"none" keeps the mounted app (one unpkg fetch). Readiness
@@ -2410,9 +2464,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
             ctx.clone(),
         )
         .await;
-    assert!(r.success, "run_scenario failed: {}", r.output);
+    assert!(r.is_success(), "run_scenario failed: {}", r.output());
 
-    let display = r.display_data.expect("display_data present");
+    let display = r.display_data().expect("display_data present");
     let sample = &display["raw_samples"][0];
 
     assert_eq!(
@@ -2458,12 +2512,16 @@ async fn test_browser_profile_cpu_start_stop_real_profile_serde() {
     let nav = BrowserNavigateTool
         .run(json!({ "url": "about:blank" }), ctx.clone())
         .await;
-    assert!(nav.success, "navigate failed: {}", nav.output);
+    assert!(nav.is_success(), "navigate failed: {}", nav.output());
 
     let start = BrowserProfileTool
         .run(json!({ "action": "cpu_start" }), ctx.clone())
         .await;
-    assert!(start.success, "cpu_start should succeed: {}", start.output);
+    assert!(
+        start.is_success(),
+        "cpu_start should succeed: {}",
+        start.output()
+    );
 
     // ~400ms busy loop so the sampler collects real frames/timeDeltas.
     let busy = BrowserEvalTool
@@ -2474,25 +2532,33 @@ async fn test_browser_profile_cpu_start_stop_real_profile_serde() {
             ctx.clone(),
         )
         .await;
-    assert!(busy.success, "busy-loop eval failed: {}", busy.output);
+    assert!(
+        busy.is_success(),
+        "busy-loop eval failed: {}",
+        busy.output()
+    );
 
     let stop = BrowserProfileTool
         .run(json!({ "action": "cpu_stop" }), ctx.clone())
         .await;
     // Primary assertion: real Profile deserialisation + summary did NOT error.
-    assert!(stop.success, "cpu_stop should succeed: {}", stop.output);
     assert!(
-        stop.output.contains("Sampled wall time:"),
+        stop.is_success(),
+        "cpu_stop should succeed: {}",
+        stop.output()
+    );
+    assert!(
+        stop.output().contains("Sampled wall time:"),
         "cpu_stop summary must report sampled wall time (real timeDeltas path): {}",
-        stop.output
+        stop.output()
     );
     assert!(
-        stop.output.contains("by SELF time"),
+        stop.output().contains("by SELF time"),
         "cpu_stop summary must rank functions by SELF time: {}",
-        stop.output
+        stop.output()
     );
-    let path = extract_tmp_path(&stop.output, "/tmp/phoenix-cpu-profile-", ".json")
-        .unwrap_or_else(|| panic!("cpu_stop must report a profile path: {}", stop.output));
+    let path = extract_tmp_path(stop.output(), "/tmp/phoenix-cpu-profile-", ".json")
+        .unwrap_or_else(|| panic!("cpu_stop must report a profile path: {}", stop.output()));
 
     // Independent round-trip: cpu_summary reads the file back through
     // `serde_json::from_str::<CpuProfile>` and re-summarises it.
@@ -2503,25 +2569,25 @@ async fn test_browser_profile_cpu_start_stop_real_profile_serde() {
         )
         .await;
     assert!(
-        summ.success,
+        summ.is_success(),
         "cpu_summary must NOT error on a real cpu_stop file (proves serde round-trip): {}",
-        summ.output
+        summ.output()
     );
     assert!(
-        !summ.output.trim().is_empty(),
+        !summ.output().trim().is_empty(),
         "cpu_summary output must be non-empty: {}",
-        summ.output
+        summ.output()
     );
     // A 400ms busy loop normally yields samples → "by SELF time"; tolerate
     // a very fast machine producing too few samples (the "carries no
     // samples" / "empty" fallbacks) — it must still parse without error.
     assert!(
-        summ.output.contains("by SELF time")
-            || summ.output.contains("Sampled wall time")
-            || summ.output.contains("carries no samples")
-            || summ.output.contains("CPU profile is empty"),
+        summ.output().contains("by SELF time")
+            || summ.output().contains("Sampled wall time")
+            || summ.output().contains("carries no samples")
+            || summ.output().contains("CPU profile is empty"),
         "cpu_summary must produce a parseable summary (not a serde error): {}",
-        summ.output
+        summ.output()
     );
 
     manager.shutdown_all().await;
@@ -2544,15 +2610,15 @@ async fn test_browser_profile_trace_stop_long_task_real() {
     let nav = BrowserNavigateTool
         .run(json!({ "url": "about:blank" }), ctx.clone())
         .await;
-    assert!(nav.success, "navigate failed: {}", nav.output);
+    assert!(nav.is_success(), "navigate failed: {}", nav.output());
 
     let start = BrowserProfileTool
         .run(json!({ "action": "trace_start" }), ctx.clone())
         .await;
     assert!(
-        start.success,
+        start.is_success(),
         "trace_start should succeed: {}",
-        start.output
+        start.output()
     );
 
     // One blocking task well over the 50ms long-task threshold.
@@ -2562,35 +2628,45 @@ async fn test_browser_profile_trace_stop_long_task_real() {
             ctx.clone(),
         )
         .await;
-    assert!(block.success, "blocking eval failed: {}", block.output);
+    assert!(
+        block.is_success(),
+        "blocking eval failed: {}",
+        block.output()
+    );
 
     let stop = BrowserProfileTool
         .run(json!({ "action": "trace_stop" }), ctx.clone())
         .await;
     // Load-bearing: trace_stop completed (drain path + enable() race fix
     // worked end-to-end; a timeout would still succeed but append a note).
-    assert!(stop.success, "trace_stop should succeed: {}", stop.output);
     assert!(
-        stop.output.contains("Trace saved to"),
-        "trace_stop must report a saved trace: {}",
-        stop.output
+        stop.is_success(),
+        "trace_stop should succeed: {}",
+        stop.output()
     );
     assert!(
-        extract_tmp_path(&stop.output, "/tmp/phoenix-trace-", ".json").is_some(),
+        stop.output().contains("Trace saved to"),
+        "trace_stop must report a saved trace: {}",
+        stop.output()
+    );
+    assert!(
+        extract_tmp_path(stop.output(), "/tmp/phoenix-trace-", ".json").is_some(),
         "trace_stop must report a /tmp/phoenix-trace- path: {}",
-        stop.output
+        stop.output()
     );
     // The extraction ran and reported a count: "Long tasks (>50ms): <n>".
     let marker = "Long tasks (>50ms):";
-    let (_, after) = stop
-        .output
-        .split_once(marker)
-        .unwrap_or_else(|| panic!("trace_stop must report a long-task count: {}", stop.output));
+    let (_, after) = stop.output().split_once(marker).unwrap_or_else(|| {
+        panic!(
+            "trace_stop must report a long-task count: {}",
+            stop.output()
+        )
+    });
     let after = after.trim_start();
     assert!(
         after.chars().next().is_some_and(|c| c.is_ascii_digit()),
         "long-task marker must be followed by a numeric count: {}",
-        stop.output
+        stop.output()
     );
 
     manager.shutdown_all().await;
@@ -2612,7 +2688,7 @@ async fn test_browser_profile_heap_snapshot_streaming_and_diff() {
     let nav = BrowserNavigateTool
         .run(json!({ "url": "about:blank" }), ctx.clone())
         .await;
-    assert!(nav.success, "navigate failed: {}", nav.output);
+    assert!(nav.is_success(), "navigate failed: {}", nav.output());
 
     // Retain detached DOM nodes (held by a JS array) + a big array.
     let alloc1 = BrowserEvalTool
@@ -2623,27 +2699,31 @@ async fn test_browser_profile_heap_snapshot_streaming_and_diff() {
             ctx.clone(),
         )
         .await;
-    assert!(alloc1.success, "alloc1 eval failed: {}", alloc1.output);
+    assert!(
+        alloc1.is_success(),
+        "alloc1 eval failed: {}",
+        alloc1.output()
+    );
 
     let snap1 = BrowserProfileTool
         .run(json!({ "action": "heap_snapshot" }), ctx.clone())
         .await;
     assert!(
-        snap1.success,
+        snap1.is_success(),
         "first heap_snapshot should succeed (chunk streaming): {}",
-        snap1.output
+        snap1.output()
     );
-    let baseline = extract_tmp_path(&snap1.output, "/tmp/phoenix-heap-", ".heapsnapshot")
+    let baseline = extract_tmp_path(snap1.output(), "/tmp/phoenix-heap-", ".heapsnapshot")
         .unwrap_or_else(|| {
             panic!(
                 "first heap_snapshot must report a snapshot path: {}",
-                snap1.output
+                snap1.output()
             )
         });
     assert!(
-        snap1.output.contains("Heap snapshot saved to"),
+        snap1.output().contains("Heap snapshot saved to"),
         "no-baseline heap_snapshot must report the saved path: {}",
-        snap1.output
+        snap1.output()
     );
 
     // Allocate more so the diff has a positive delta to report.
@@ -2653,7 +2733,11 @@ async fn test_browser_profile_heap_snapshot_streaming_and_diff() {
             ctx.clone(),
         )
         .await;
-    assert!(alloc2.success, "alloc2 eval failed: {}", alloc2.output);
+    assert!(
+        alloc2.is_success(),
+        "alloc2 eval failed: {}",
+        alloc2.output()
+    );
 
     let snap2 = BrowserProfileTool
         .run(
@@ -2664,32 +2748,32 @@ async fn test_browser_profile_heap_snapshot_streaming_and_diff() {
     // Load-bearing: the second call parsed BOTH real snapshots and
     // produced a diff without error.
     assert!(
-        snap2.success,
+        snap2.is_success(),
         "heap_snapshot diff must NOT error (proves chunk streaming + parse_heap_stats on real snapshots): {}",
-        snap2.output
+        snap2.output()
     );
     assert!(
-        snap2.output.contains("Heap diff (post"),
+        snap2.output().contains("Heap diff (post"),
         "diff output must be a heap diff: {}",
-        snap2.output
+        snap2.output()
     );
     assert!(
-        snap2.output.contains("node count:"),
+        snap2.output().contains("node count:"),
         "diff must report a node-count line: {}",
-        snap2.output
+        snap2.output()
     );
     assert!(
-        snap2.output.contains("detached DOM nodes:"),
+        snap2.output().contains("detached DOM nodes:"),
         "diff must report a detached-DOM-node count: {}",
-        snap2.output
+        snap2.output()
     );
     assert!(
-        snap2.output.contains("self_size:"),
+        snap2.output().contains("self_size:"),
         "diff must report a self_size line: {}",
-        snap2.output
+        snap2.output()
     );
     let display = snap2
-        .display_data
+        .display_data()
         .expect("heap diff must attach display_data");
     assert!(
         display.get("node_count_delta").is_some(),
@@ -2756,7 +2840,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
             ctx.clone(),
         )
         .await;
-    assert!(nav.success, "navigate failed: {}", nav.output);
+    assert!(nav.is_success(), "navigate failed: {}", nav.output());
 
     let waited = BrowserWaitForSelectorTool
         .run(
@@ -2765,9 +2849,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
         )
         .await;
     assert!(
-        waited.success,
+        waited.is_success(),
         "React did not mount (unpkg/production build issue?): {}",
-        waited.output
+        waited.output()
     );
 
     // Readiness step FIRST (`window.__ready` set in the App's
@@ -2791,9 +2875,9 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
             ctx.clone(),
         )
         .await;
-    assert!(r.success, "run_scenario failed: {}", r.output);
+    assert!(r.is_success(), "run_scenario failed: {}", r.output());
 
-    let display = r.display_data.expect("display_data present");
+    let display = r.display_data().expect("display_data present");
     let sample = &display["raw_samples"][0];
 
     assert_eq!(
@@ -2889,9 +2973,9 @@ setTimeout(function () {
             ctx.clone(),
         )
         .await;
-    assert!(r.success, "run_scenario failed: {}", r.output);
+    assert!(r.is_success(), "run_scenario failed: {}", r.output());
 
-    let display = r.display_data.expect("display_data present");
+    let display = r.display_data().expect("display_data present");
     let sample = &display["raw_samples"][0];
     let script_ms = sample["script_ms"]
         .as_f64()

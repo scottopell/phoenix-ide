@@ -869,7 +869,7 @@ mod tests {
             .execute("bash", serde_json::json!({ "cmd": "ls" }), test_context())
             .await;
         assert!(result.is_some());
-        assert!(result.unwrap().success);
+        assert!(result.unwrap().is_success());
 
         let result = executor
             .execute("unknown", serde_json::json!({}), test_context())

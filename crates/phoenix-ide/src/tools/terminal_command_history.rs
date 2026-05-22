@@ -130,8 +130,8 @@ mod tests {
     async fn no_terminal_returns_error() {
         let tool = TerminalCommandHistoryTool;
         let result = tool.run(json!({}), test_context()).await;
-        assert!(!result.success);
-        assert!(result.output.contains("no terminal"));
+        assert!(!result.is_success());
+        assert!(result.output().contains("no terminal"));
     }
 
     #[tokio::test]

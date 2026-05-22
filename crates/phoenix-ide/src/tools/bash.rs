@@ -194,9 +194,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn parse_response(out: &ToolOutput) -> Value {
-        out.display_data
-            .clone()
-            .or_else(|| serde_json::from_str(&out.output).ok())
+        out.display_data()
+            .cloned()
+            .or_else(|| serde_json::from_str(out.output()).ok())
             .expect("response should be JSON")
     }
 
@@ -245,7 +245,7 @@ mod tests {
                 ctx(),
             )
             .await;
-        assert!(result.success, "got: {}", result.output);
+        assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert_eq!(v["status"], "exited");
         assert_eq!(v["exit_code"], 0);
@@ -303,7 +303,7 @@ mod tests {
                 ctx(),
             )
             .await;
-        assert!(result.success, "got: {}", result.output);
+        assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert_eq!(v["status"], "still_running");
         let handle = v["handle"].as_str().expect("handle present");
@@ -618,7 +618,7 @@ mod tests {
                 c.clone(),
             )
             .await;
-        assert!(!r3.success);
+        assert!(!r3.is_success());
         let v = parse_response(&r3);
         assert_eq!(v["error"], "handle_cap_reached");
         assert_eq!(v["cap"], 2);
@@ -663,7 +663,7 @@ mod tests {
         let foreign = tool
             .run(json!({"op": "peek", "handle": handle.clone()}), conv_b)
             .await;
-        assert!(!foreign.success);
+        assert!(!foreign.is_success());
         let v = parse_response(&foreign);
         assert_eq!(v["error"], "handle_not_found");
         assert_eq!(v["handle_id"], handle);
@@ -690,7 +690,7 @@ mod tests {
                 ctx(),
             )
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "wait_seconds_out_of_range");
         assert_eq!(v["max_wait_seconds"], 900);
@@ -733,7 +733,7 @@ mod tests {
                 c.clone(),
             )
             .await;
-        assert!(peek.success, "got: {}", peek.output);
+        assert!(peek.is_success(), "got: {}", peek.output());
         let _ = tool
             .run(json!({"op": "kill", "handle": handle, "signal": "KILL"}), c)
             .await;
@@ -763,7 +763,7 @@ mod tests {
                 c.clone(),
             )
             .await;
-        assert!(peek.success, "got: {}", peek.output);
+        assert!(peek.is_success(), "got: {}", peek.output());
         let _ = tool
             .run(json!({"op": "kill", "handle": handle, "signal": "KILL"}), c)
             .await;
@@ -773,7 +773,7 @@ mod tests {
     async fn missing_op_returns_mutually_exclusive_modes() {
         let tool = BashTool;
         let result = tool.run(json!({}), ctx()).await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "mutually_exclusive_modes");
         assert!(v["recommended_action"].as_str().unwrap().contains("run"));
@@ -785,7 +785,7 @@ mod tests {
         let result = tool
             .run(json!({"op": "frobnicate", "cmd": "echo hi"}), ctx())
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "mutually_exclusive_modes");
     }
@@ -798,7 +798,7 @@ mod tests {
         let result = tool
             .run(json!({"op": "spawn", "cmd": "echo hi"}), ctx())
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "mutually_exclusive_modes");
     }
@@ -810,7 +810,7 @@ mod tests {
     async fn legacy_top_level_peek_key_returns_parse_error() {
         let tool = BashTool;
         let result = tool.run(json!({"peek": "b-3"}), ctx()).await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "mutually_exclusive_modes");
         assert!(v["error_message"]
@@ -829,7 +829,7 @@ mod tests {
                 ctx(),
             )
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "mutually_exclusive_modes");
     }
@@ -841,7 +841,7 @@ mod tests {
         let result = tool
             .run(json!({"op": "run", "command": "echo hi"}), ctx())
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "mutually_exclusive_modes");
     }
@@ -851,7 +851,7 @@ mod tests {
     async fn bare_cmd_without_op_returns_mutually_exclusive_modes() {
         let tool = BashTool;
         let result = tool.run(json!({"cmd": "echo hi"}), ctx()).await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "mutually_exclusive_modes");
     }
@@ -928,7 +928,7 @@ mod tests {
                 c.clone(),
             )
             .await;
-        assert!(!r2.success);
+        assert!(!r2.is_success());
         let v = parse_response(&r2);
         assert_eq!(v["error"], "handle_cap_reached");
         let live = v["live_handles"].as_array().unwrap();
@@ -954,7 +954,7 @@ mod tests {
                 ctx(),
             )
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "label_too_long");
         assert_eq!(v["max_label_length"], 64);
@@ -974,7 +974,7 @@ mod tests {
                 ctx(),
             )
             .await;
-        assert!(result.success, "got: {}", result.output);
+        assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert!(v.get("label").is_none());
     }
@@ -989,7 +989,7 @@ mod tests {
         let result = tool
             .run(json!({"op": "run", "cmd": "git add -A"}), ctx())
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "command_safety_rejected");
         assert!(v["reason"].as_str().unwrap().contains("blind git add"));
@@ -1001,7 +1001,7 @@ mod tests {
         let result = tool
             .run(json!({"op": "run", "cmd": "rm -rf /"}), ctx())
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "command_safety_rejected");
         assert!(v["reason"].as_str().unwrap().contains("critical data"));
@@ -1013,7 +1013,7 @@ mod tests {
         let result = tool
             .run(json!({"op": "run", "cmd": "git push --force"}), ctx())
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "command_safety_rejected");
         assert!(v["reason"]
@@ -1028,7 +1028,7 @@ mod tests {
         let result = tool
             .run(json!({"op": "run", "cmd": "echo hello"}), ctx())
             .await;
-        assert!(result.success, "got: {}", result.output);
+        assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert!(matches!(
             v["status"].as_str().unwrap(),

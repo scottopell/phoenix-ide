@@ -45,7 +45,6 @@ pub use think::ThinkTool;
 pub use tmux::{TmuxError, TmuxRegistry, TmuxServer, TmuxTool};
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,22 +61,40 @@ pub struct ToolImage {
     pub data: String, // base64-encoded
 }
 
-/// Result from tool execution
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ToolOutput {
-    pub success: bool,
-    pub output: String,
-    /// Typed images for LLM consumption (sent as image content blocks, not text).
-    #[serde(skip)]
-    pub images: Vec<ToolImage>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub display_data: Option<Value>,
+/// Result from tool execution.
+///
+/// An enum, not a `struct { success: bool, output: String, .. }`: those two
+/// fields were independently settable, so a tool returning `success: true`
+/// with error-shaped `output` was structurally indistinguishable from a real
+/// success — the bug class behind P1 incident 08545 (conversation-stuck),
+/// which inferred outcome state from `output` string content. The sibling
+/// persisted type [`crate::db::ToolOutcome`] already made this distinction
+/// structural; this is the producer-side counterpart every `Tool::run()`
+/// returns.
+///
+/// There is deliberately no `Cancelled` variant. Cancellation is detected by
+/// the executor via the cancellation token, never returned by `Tool::run()`;
+/// a `Cancelled` variant here would just relocate the wrong-state problem
+/// into this type.
+#[derive(Debug, Clone)]
+pub enum ToolOutput {
+    Success {
+        output: String,
+        /// Typed images for LLM consumption (sent as image content blocks,
+        /// not text).
+        images: Vec<ToolImage>,
+        display_data: Option<Value>,
+    },
+    Error {
+        output: String,
+        images: Vec<ToolImage>,
+        display_data: Option<Value>,
+    },
 }
 
 impl ToolOutput {
     pub fn success(output: impl Into<String>) -> Self {
-        Self {
-            success: true,
+        Self::Success {
             output: output.into(),
             images: vec![],
             display_data: None,
@@ -85,8 +102,7 @@ impl ToolOutput {
     }
 
     pub fn error(message: impl Into<String>) -> Self {
-        Self {
-            success: false,
+        Self::Error {
             output: message.into(),
             images: vec![],
             display_data: None,
@@ -94,14 +110,55 @@ impl ToolOutput {
     }
 
     pub fn with_display(mut self, data: Value) -> Self {
-        self.display_data = Some(data);
+        match &mut self {
+            Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
+                *display_data = Some(data);
+            }
+        }
         self
     }
 
     /// Attach typed images for LLM consumption.
-    pub fn with_images(mut self, images: Vec<ToolImage>) -> Self {
-        self.images = images;
+    pub fn with_images(mut self, imgs: Vec<ToolImage>) -> Self {
+        match &mut self {
+            Self::Success { images, .. } | Self::Error { images, .. } => *images = imgs,
+        }
         self
+    }
+
+    /// Whether the tool reported success.
+    pub fn is_success(&self) -> bool {
+        matches!(self, Self::Success { .. })
+    }
+
+    /// The tool's textual output — success payload or error message.
+    ///
+    /// `dead_code`: production code destructures the enum directly (see
+    /// `tool_output_to_outcome` in the executor); these accessors exist for
+    /// test assertions that only need to read one field.
+    #[allow(dead_code)]
+    pub fn output(&self) -> &str {
+        match self {
+            Self::Success { output, .. } | Self::Error { output, .. } => output,
+        }
+    }
+
+    /// Typed images for LLM consumption.
+    #[allow(dead_code)]
+    pub fn images(&self) -> &[ToolImage] {
+        match self {
+            Self::Success { images, .. } | Self::Error { images, .. } => images,
+        }
+    }
+
+    /// Free-form UI hinting payload, if the tool attached one.
+    #[allow(dead_code)]
+    pub fn display_data(&self) -> Option<&Value> {
+        match self {
+            Self::Success { display_data, .. } | Self::Error { display_data, .. } => {
+                display_data.as_ref()
+            }
+        }
     }
 }
 
@@ -540,6 +597,49 @@ impl ToolRegistry {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// The whole point of `ToolOutput` being an enum: `::success` carries any
+    /// string — including error-shaped text — and is still structurally a
+    /// success. There is no field to flip and no constructor that yields a
+    /// `Success` reporting `is_success() == false`. The contradictory state
+    /// the old `success: bool` + `output: String` pair allowed (P1 incident
+    /// 08545) is unrepresentable.
+    #[test]
+    fn success_constructor_is_always_a_success() {
+        let out = ToolOutput::success("Error: command failed with exit code 1");
+        assert!(out.is_success());
+        assert!(matches!(out, ToolOutput::Success { .. }));
+    }
+
+    #[test]
+    fn error_constructor_is_always_an_error() {
+        let out = ToolOutput::error("ok, completed successfully");
+        assert!(!out.is_success());
+        assert!(matches!(out, ToolOutput::Error { .. }));
+    }
+
+    #[test]
+    fn builders_preserve_the_variant() {
+        let img = || ToolImage {
+            media_type: "image/png".to_string(),
+            data: "Zm9v".to_string(),
+        };
+
+        let s = ToolOutput::success("done")
+            .with_display(serde_json::json!({ "k": "v" }))
+            .with_images(vec![img()]);
+        assert!(s.is_success());
+        assert_eq!(s.output(), "done");
+        assert_eq!(s.display_data(), Some(&serde_json::json!({ "k": "v" })));
+        assert_eq!(s.images().len(), 1);
+
+        let e = ToolOutput::error("boom")
+            .with_display(serde_json::json!({ "k": "v" }))
+            .with_images(vec![img()]);
+        assert!(!e.is_success());
+        assert_eq!(e.output(), "boom");
+        assert!(matches!(e, ToolOutput::Error { .. }));
+    }
 
     fn names(registry: &ToolRegistry) -> BTreeSet<String> {
         registry

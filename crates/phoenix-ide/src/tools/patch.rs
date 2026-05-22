@@ -368,7 +368,7 @@ mod tests {
             )
             .await;
 
-        assert!(result.success, "Error: {}", result.output);
+        assert!(result.is_success(), "Error: {}", result.output());
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "Hello Rust");
     }
 
@@ -397,16 +397,16 @@ mod tests {
             )
             .await;
         assert!(
-            !blocked.success,
+            !blocked.is_success(),
             "expected rejection, got: {}",
-            blocked.output
+            blocked.output()
         );
         assert!(
             blocked
-                .output
+                .output()
                 .contains("restricted to 'tasks/' task proposal drafts"),
             "missing task proposal scope hint: {}",
-            blocked.output
+            blocked.output()
         );
         assert_eq!(
             fs::read_to_string(dir.path().join("source.md")).unwrap(),
@@ -431,9 +431,9 @@ mod tests {
             )
             .await;
         assert!(
-            !traversal.success,
+            !traversal.is_success(),
             "expected rejection of '..' traversal, got: {}",
-            traversal.output
+            traversal.output()
         );
         assert!(
             !dir.path().join("escape.rs").exists(),
@@ -454,13 +454,17 @@ mod tests {
                 ctx,
             )
             .await;
-        assert!(allowed.success, "expected success, got: {}", allowed.output);
+        assert!(
+            allowed.is_success(),
+            "expected success, got: {}",
+            allowed.output()
+        );
         assert!(
             allowed
-                .output
+                .output()
                 .contains("<next_step>Call propose_task with task_file=\"tasks/note.md\""),
             "missing proposal next-step reminder: {}",
-            allowed.output
+            allowed.output()
         );
         assert_eq!(
             fs::read_to_string(dir.path().join("tasks/note.md")).unwrap(),
@@ -488,25 +492,25 @@ mod tests {
             .await;
 
         assert!(
-            !result.success,
+            !result.is_success(),
             "expected rejection, got: {}",
-            result.output
+            result.output()
         );
         assert!(
             result
-                .output
+                .output()
                 .contains("restricted to markdown task proposal drafts"),
             "missing markdown-task-source hint: {}",
-            result.output
+            result.output()
         );
         assert!(
             !dir.path().join("tasks/note.txt").exists(),
             "non-markdown task proposal draft must not be created"
         );
         assert!(
-            !result.output.contains("propose_task"),
+            !result.output().contains("propose_task"),
             "failed patches must not include the success next-step reminder: {}",
-            result.output
+            result.output()
         );
     }
 
@@ -529,8 +533,12 @@ mod tests {
             )
             .await;
 
-        assert!(result.success, "expected success, got: {}", result.output);
-        assert_eq!(result.output, "<patches_applied>all</patches_applied>");
+        assert!(
+            result.is_success(),
+            "expected success, got: {}",
+            result.output()
+        );
+        assert_eq!(result.output(), "<patches_applied>all</patches_applied>");
     }
 
     #[tokio::test]
@@ -552,7 +560,7 @@ mod tests {
             )
             .await;
 
-        assert!(result.success);
+        assert!(result.is_success());
         let test_file = dir.path().join("new_file.txt");
         assert_eq!(fs::read_to_string(&test_file).unwrap(), "New content");
     }

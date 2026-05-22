@@ -176,10 +176,10 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success);
-        assert!(result.output.contains("line1"));
-        assert!(result.output.contains("line2"));
-        assert!(result.output.contains("line3"));
+        assert!(result.is_success());
+        assert!(result.output().contains("line1"));
+        assert!(result.output().contains("line2"));
+        assert!(result.output().contains("line3"));
     }
 
     #[tokio::test]
@@ -195,10 +195,10 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success);
-        assert!(result.output.contains('b'));
-        assert!(result.output.contains('c'));
-        assert!(!result.output.contains("\ta\n"));
+        assert!(result.is_success());
+        assert!(result.output().contains('b'));
+        assert!(result.output().contains('c'));
+        assert!(!result.output().contains("\ta\n"));
     }
 
     #[tokio::test]
@@ -219,11 +219,11 @@ mod tests {
             )
             .await;
         assert!(
-            result.success,
+            result.is_success(),
             "read_file should resolve paths outside the working dir: {}",
-            result.output
+            result.output()
         );
-        assert!(result.output.contains("reachable"));
+        assert!(result.output().contains("reachable"));
     }
 
     #[tokio::test]
@@ -236,7 +236,7 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
     }
 
     #[tokio::test]
@@ -257,7 +257,7 @@ mod tests {
                 test_context(dir.path().to_path_buf()),
             )
             .await;
-        assert!(result.success);
-        assert!(result.output.contains("more lines not shown"));
+        assert!(result.is_success());
+        assert!(result.output().contains("more lines not shown"));
     }
 }

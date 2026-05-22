@@ -375,9 +375,9 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     fn parse_response(out: &ToolOutput) -> Value {
-        out.display_data
-            .clone()
-            .or_else(|| serde_json::from_str(&out.output).ok())
+        out.display_data()
+            .cloned()
+            .or_else(|| serde_json::from_str(out.output()).ok())
             .expect("response should be JSON")
     }
 
@@ -412,7 +412,7 @@ mod tests {
         ));
         let ctx = ctx_with_registry(registry);
         let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx).await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "tmux_binary_unavailable");
     }
@@ -431,7 +431,7 @@ mod tests {
                 ctx,
             )
             .await;
-        assert!(!result.success);
+        assert!(!result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["error"], "wait_seconds_out_of_range");
     }
@@ -476,7 +476,7 @@ mod tests {
                 ctx,
             )
             .await;
-        assert!(r.success, "got: {}", r.output);
+        assert!(r.is_success(), "got: {}", r.output());
         let v = parse_response(&r);
         let stdout = v["stdout"].as_str().unwrap().trim();
         let actual = std::path::PathBuf::from(stdout)
@@ -504,7 +504,7 @@ mod tests {
         let ctx = ctx_with_registry_for("conv-fresh", registry.clone());
 
         let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx).await;
-        assert!(result.success, "got: {}", result.output);
+        assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert_eq!(v["status"], "ok");
         assert_eq!(v["exit_code"], 0);
@@ -546,7 +546,7 @@ mod tests {
         let ctx2 = ctx_with_registry_for("conv-reuse", registry2.clone());
 
         let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx2).await;
-        assert!(result.success);
+        assert!(result.is_success());
         let v = parse_response(&result);
         assert_eq!(v["status"], "ok");
         assert!(v["stdout"].as_str().unwrap().contains("main"));
@@ -577,7 +577,7 @@ mod tests {
         let ctx = ctx_with_registry_for("conv-stale", registry);
 
         let result = TmuxTool.run(json!({"args": ["list-sessions"]}), ctx).await;
-        assert!(result.success, "got: {}", result.output);
+        assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert_eq!(v["status"], "ok");
         assert!(v["stdout"].as_str().unwrap().contains("main"));

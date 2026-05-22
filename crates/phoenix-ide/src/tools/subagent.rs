@@ -256,15 +256,15 @@ mod tests {
                 test_context(),
             )
             .await;
-        assert!(result.success);
-        assert!(result.output.contains("Result submitted"));
+        assert!(result.is_success());
+        assert!(result.output().contains("Result submitted"));
     }
 
     #[tokio::test]
     async fn test_submit_result_missing_field() {
         let tool = SubmitResultTool;
         let result = tool.run(json!({}), test_context()).await;
-        assert!(!result.success);
+        assert!(!result.is_success());
     }
 
     #[tokio::test]
@@ -273,8 +273,8 @@ mod tests {
         let result = tool
             .run(json!({"error": "Could not find the file"}), test_context())
             .await;
-        assert!(result.success); // Tool execution succeeds, even though it reports an error
-        assert!(result.output.contains("Error submitted"));
+        assert!(result.is_success()); // Tool execution succeeds, even though it reports an error
+        assert!(result.output().contains("Error submitted"));
     }
 
     #[tokio::test]
@@ -291,21 +291,21 @@ mod tests {
                 test_context(),
             )
             .await;
-        assert!(result.success);
-        assert!(result.output.contains("Spawning 2 sub-agent(s)"));
+        assert!(result.is_success());
+        assert!(result.output().contains("Spawning 2 sub-agent(s)"));
     }
 
     #[tokio::test]
     async fn test_spawn_agents_empty_tasks() {
         let tool = SpawnAgentsTool;
         let result = tool.run(json!({"tasks": []}), test_context()).await;
-        assert!(!result.success);
+        assert!(!result.is_success());
     }
 
     #[tokio::test]
     async fn test_spawn_agents_missing_tasks() {
         let tool = SpawnAgentsTool;
         let result = tool.run(json!({}), test_context()).await;
-        assert!(!result.success);
+        assert!(!result.is_success());
     }
 }

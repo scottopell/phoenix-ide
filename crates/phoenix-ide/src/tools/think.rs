@@ -81,21 +81,21 @@ mod tests {
                 test_context(),
             )
             .await;
-        assert!(result.success);
-        assert!(result.output.contains("Thoughts recorded"));
+        assert!(result.is_success());
+        assert!(result.output().contains("Thoughts recorded"));
     }
 
     #[tokio::test]
     async fn test_think_empty_thoughts() {
         let tool = ThinkTool;
         let result = tool.run(json!({"thoughts": ""}), test_context()).await;
-        assert!(result.success);
+        assert!(result.is_success());
     }
 
     #[tokio::test]
     async fn test_think_missing_thoughts() {
         let tool = ThinkTool;
         let result = tool.run(json!({}), test_context()).await;
-        assert!(!result.success);
+        assert!(!result.is_success());
     }
 }

@@ -111,8 +111,8 @@ mod tests {
                 test_context(tmp.path().to_path_buf()),
             )
             .await;
-        assert!(!result.success);
-        assert!(result.output.contains("skill_name is required"));
+        assert!(!result.is_success());
+        assert!(result.output().contains("skill_name is required"));
     }
 
     #[tokio::test]
@@ -122,8 +122,8 @@ mod tests {
         let result = tool
             .run(json!({}), test_context(tmp.path().to_path_buf()))
             .await;
-        assert!(!result.success);
-        assert!(result.output.contains("skill_name is required"));
+        assert!(!result.is_success());
+        assert!(result.output().contains("skill_name is required"));
     }
 
     // -- Delegation to invoke_skill (smoke tests through the tool interface) --
@@ -138,8 +138,8 @@ mod tests {
                 test_context(tmp.path().to_path_buf()),
             )
             .await;
-        assert!(!result.success);
-        assert!(result.output.contains("not found"));
+        assert!(!result.is_success());
+        assert!(result.output().contains("not found"));
     }
 
     #[tokio::test]
@@ -154,8 +154,8 @@ mod tests {
                 test_context(tmp.path().to_path_buf()),
             )
             .await;
-        assert!(!result.success);
-        assert!(result.output.contains("build"));
+        assert!(!result.is_success());
+        assert!(result.output().contains("build"));
     }
 
     #[tokio::test]
@@ -176,11 +176,11 @@ mod tests {
                 test_context(tmp.path().to_path_buf()),
             )
             .await;
-        assert!(result.success);
+        assert!(result.is_success());
         // invoke_skill strips frontmatter and prepends base directory
-        assert!(result.output.contains("Run cargo build."));
-        assert!(result.output.contains("Base directory for this skill:"));
-        assert!(!result.output.contains("---"));
+        assert!(result.output().contains("Run cargo build."));
+        assert!(result.output().contains("Base directory for this skill:"));
+        assert!(!result.output().contains("---"));
     }
 
     #[tokio::test]
@@ -201,9 +201,9 @@ mod tests {
                 test_context(tmp.path().to_path_buf()),
             )
             .await;
-        assert!(result.success);
+        assert!(result.is_success());
         assert!(result
-            .output
+            .output()
             .contains("Please review src/main.rs carefully."));
     }
 }

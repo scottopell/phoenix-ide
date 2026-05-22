@@ -193,27 +193,27 @@ mod tests {
         create_test_image(dir.path(), "test.png", MINIMAL_PNG);
 
         let result = tool.run(json!({"path": "test.png"}), ctx).await;
-        assert!(result.success, "Failed: {}", result.output);
+        assert!(result.is_success(), "Failed: {}", result.output());
 
         // Output is a human-readable summary (not base64)
         assert!(
-            result.output.starts_with("Image loaded:"),
+            result.output().starts_with("Image loaded:"),
             "Unexpected output: {}",
-            result.output
+            result.output()
         );
 
         // Image data goes through the typed images channel
-        assert_eq!(result.images.len(), 1, "Expected 1 image in images field");
-        assert_eq!(result.images[0].media_type, "image/png");
-        assert!(!result.images[0].data.is_empty());
+        assert_eq!(result.images().len(), 1, "Expected 1 image in images field");
+        assert_eq!(result.images()[0].media_type, "image/png");
+        assert!(!result.images()[0].data.is_empty());
 
         // The base64 payload must NOT also be duplicated into display_data:
         // the typed `images` channel is the single source of truth, so the
         // two representations cannot diverge.
         assert!(
-            result.display_data.is_none(),
+            result.display_data().is_none(),
             "read_image must not duplicate the image payload into display_data, got {:?}",
-            result.display_data
+            result.display_data()
         );
     }
 
@@ -227,7 +227,7 @@ mod tests {
         let result = tool
             .run(json!({"path": img_path.to_str().unwrap()}), ctx)
             .await;
-        assert!(result.success, "Failed: {}", result.output);
+        assert!(result.is_success(), "Failed: {}", result.output());
     }
 
     #[tokio::test]
@@ -237,8 +237,8 @@ mod tests {
         let ctx = test_context(dir.path().to_path_buf());
 
         let result = tool.run(json!({"path": "nonexistent.png"}), ctx).await;
-        assert!(!result.success);
-        assert!(result.output.contains("not found"));
+        assert!(!result.is_success());
+        assert!(result.output().contains("not found"));
     }
 
     #[tokio::test]
@@ -249,8 +249,8 @@ mod tests {
         create_test_image(dir.path(), "test.bmp", b"fake bmp data");
 
         let result = tool.run(json!({"path": "test.bmp"}), ctx).await;
-        assert!(!result.success);
-        assert!(result.output.contains("Unsupported"));
+        assert!(!result.is_success());
+        assert!(result.output().contains("Unsupported"));
     }
 
     #[tokio::test]
@@ -261,8 +261,8 @@ mod tests {
         std::fs::create_dir(dir.path().join("subdir")).unwrap();
 
         let result = tool.run(json!({"path": "subdir"}), ctx).await;
-        assert!(!result.success);
-        assert!(result.output.contains("Not a file"));
+        assert!(!result.is_success());
+        assert!(result.output().contains("Not a file"));
     }
 
     #[tokio::test]
@@ -276,10 +276,15 @@ mod tests {
 
             let ctx = test_context(dir.path().to_path_buf());
             let result = tool.run(json!({"path": filename}), ctx).await;
-            assert!(result.success, "Failed for {}: {}", ext, result.output);
+            assert!(
+                result.is_success(),
+                "Failed for {}: {}",
+                ext,
+                result.output()
+            );
 
-            assert_eq!(result.images.len(), 1, "Expected image for {ext}");
-            assert_eq!(result.images[0].media_type, *expected_type);
+            assert_eq!(result.images().len(), 1, "Expected image for {ext}");
+            assert_eq!(result.images()[0].media_type, *expected_type);
         }
     }
 }

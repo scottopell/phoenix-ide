@@ -38,6 +38,49 @@ use tokio_util::sync::CancellationToken;
 /// Primary enforcement is max turns (REQ-PROJ-008). This catches stuck tool execution.
 const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 
+/// Map a producer-side [`crate::tools::ToolOutput`] onto a persisted
+/// [`ToolOutcome`].
+///
+/// A total match on the `ToolOutput` enum — the structural payoff of making
+/// it an enum: the variant, not an independently-settable `success: bool`,
+/// decides the outcome, so a success can never be persisted as an error or
+/// vice versa. There is deliberately no `Cancelled` arm — cancellation is
+/// detected by the executor via the cancellation token before this mapping
+/// is ever reached.
+fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
+    use crate::db::ToolContentImage;
+    use crate::tools::{ToolImage, ToolOutput};
+    let convert = |images: Vec<ToolImage>| -> Vec<ToolContentImage> {
+        images
+            .into_iter()
+            .map(|img| ToolContentImage {
+                media_type: img.media_type,
+                data: img.data,
+            })
+            .collect()
+    };
+    match out {
+        ToolOutput::Success {
+            output,
+            images,
+            display_data,
+        } => ToolOutcome::Success {
+            output,
+            display_data,
+            images: convert(images),
+        },
+        ToolOutput::Error {
+            output,
+            images,
+            display_data,
+        } => ToolOutcome::Error {
+            output,
+            display_data,
+            images: convert(images),
+        },
+    }
+}
+
 /// Decide whether `path` is inside the worktree rooted at `root`.
 ///
 /// Three stages, each closing a class of bypass:
@@ -1920,56 +1963,33 @@ where
                     tool_use_id,
                     reason: crate::state_machine::AbortReason::CancellationRequested,
                 }
+            } else if let Some(out) = output {
+                let duration_ms =
+                    u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX);
+                tracing::info!(
+                    conv_id = %conv_id,
+                    tool = %tool_name,
+                    id = %tool_use_id,
+                    duration_ms,
+                    success = out.is_success(),
+                    "Tool completed"
+                );
+                let outcome = tool_output_to_outcome(out);
+                ToolExecOutcome::Completed(ToolResult {
+                    tool_use_id: tool_use_id.clone(),
+                    outcome,
+                    duration_ms: Some(duration_ms),
+                })
             } else {
-                use crate::db::ToolContentImage;
-                if let Some(out) = output {
-                    let duration_ms =
-                        u64::try_from(tool_start.elapsed().as_millis()).unwrap_or(u64::MAX);
-                    tracing::info!(
-                        conv_id = %conv_id,
-                        tool = %tool_name,
-                        id = %tool_use_id,
-                        duration_ms,
-                        success = out.success,
-                        "Tool completed"
-                    );
-                    let images: Vec<ToolContentImage> = out
-                        .images
-                        .into_iter()
-                        .map(|img| ToolContentImage {
-                            media_type: img.media_type,
-                            data: img.data,
-                        })
-                        .collect();
-                    let outcome = if out.success {
-                        ToolOutcome::Success {
-                            output: out.output,
-                            display_data: out.display_data,
-                            images,
-                        }
-                    } else {
-                        ToolOutcome::Error {
-                            output: out.output,
-                            display_data: out.display_data,
-                            images,
-                        }
-                    };
-                    ToolExecOutcome::Completed(ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        outcome,
-                        duration_ms: Some(duration_ms),
-                    })
-                } else {
-                    tracing::warn!(
-                        conv_id = %conv_id,
-                        tool = %tool_name,
-                        id = %tool_use_id,
-                        "Tool not found"
-                    );
-                    ToolExecOutcome::Failed {
-                        tool_use_id,
-                        error: format!("Unknown tool: {tool_name}"),
-                    }
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    tool = %tool_name,
+                    id = %tool_use_id,
+                    "Tool not found"
+                );
+                ToolExecOutcome::Failed {
+                    tool_use_id,
+                    error: format!("Unknown tool: {tool_name}"),
                 }
             };
             // Send typed outcome through oneshot channel
@@ -5257,6 +5277,52 @@ mod work_subagent_cwd_guard_tests {
                 );
             }
             other => panic!("expected ..-traversal to be rejected, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tool_output_to_outcome_tests {
+    use super::tool_output_to_outcome;
+    use crate::db::ToolOutcome;
+    use crate::tools::{ToolImage, ToolOutput};
+
+    #[test]
+    fn success_output_maps_to_success_outcome() {
+        let out = ToolOutput::success("ran clean")
+            .with_display(serde_json::json!({ "k": "v" }))
+            .with_images(vec![ToolImage {
+                media_type: "image/png".to_string(),
+                data: "Zm9v".to_string(),
+            }]);
+
+        match tool_output_to_outcome(out) {
+            ToolOutcome::Success {
+                output,
+                display_data,
+                images,
+            } => {
+                assert_eq!(output, "ran clean");
+                assert_eq!(display_data, Some(serde_json::json!({ "k": "v" })));
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].media_type, "image/png");
+                assert_eq!(images[0].data, "Zm9v");
+            }
+            other => panic!("expected ToolOutcome::Success, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn error_output_maps_to_error_outcome() {
+        // Error-shaped text the executor must NOT misclassify: with the old
+        // `success: bool`, only the string distinguished this from a success.
+        let out = ToolOutput::error("looks fine but failed");
+
+        match tool_output_to_outcome(out) {
+            ToolOutcome::Error { output, .. } => {
+                assert_eq!(output, "looks fine but failed");
+            }
+            other => panic!("expected ToolOutcome::Error, got {other:?}"),
         }
     }
 }
