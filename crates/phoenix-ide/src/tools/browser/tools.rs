@@ -444,7 +444,7 @@ impl Tool for BrowserRecentConsoleLogsTool {
                 .iter()
                 .rev()
                 .take(input.limit)
-                .map(|entry| (entry.level.clone(), entry.text.clone()))
+                .map(|entry| (entry.level, entry.text.clone()))
                 .collect()
         };
 

@@ -7,11 +7,12 @@
 
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
-    cdp::js_protocol::runtime::{EventConsoleApiCalled, RemoteObject},
+    cdp::js_protocol::runtime::{ConsoleApiCalledType, EventConsoleApiCalled, RemoteObject},
     fetcher::{BrowserFetcher, BrowserFetcherOptions, BrowserKind},
     Page,
 };
 use futures::StreamExt;
+use serde::{Serialize, Serializer};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -54,10 +55,104 @@ impl From<chromiumoxide::error::CdpError> for BrowserError {
     }
 }
 
+/// Browser console message level.
+///
+/// Phoenix-owned enum mirroring the CDP `Runtime.consoleAPICalled.type` value
+/// set (see chromiumoxide's `ConsoleApiCalledType`). Stored on
+/// [`ConsoleEntry`] as a typed value rather than a string so a level the LLM
+/// or UI filters on (e.g. `"error"`) cannot drift onto an arbitrary string.
+/// The [`From<ConsoleApiCalledType>`] impl is a total match: if chromiumoxide
+/// adds a CDP variant, conversion stops compiling rather than silently
+/// flattening to an unknown level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConsoleLevel {
+    Log,
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Dir,
+    Dirxml,
+    Table,
+    Trace,
+    Clear,
+    StartGroup,
+    StartGroupCollapsed,
+    EndGroup,
+    Assert,
+    Profile,
+    ProfileEnd,
+    Count,
+    TimeEnd,
+}
+
+impl ConsoleLevel {
+    /// Canonical CDP wire identifier (`"log"`, `"warning"`, `"startGroup"`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Dir => "dir",
+            Self::Dirxml => "dirxml",
+            Self::Table => "table",
+            Self::Trace => "trace",
+            Self::Clear => "clear",
+            Self::StartGroup => "startGroup",
+            Self::StartGroupCollapsed => "startGroupCollapsed",
+            Self::EndGroup => "endGroup",
+            Self::Assert => "assert",
+            Self::Profile => "profile",
+            Self::ProfileEnd => "profileEnd",
+            Self::Count => "count",
+            Self::TimeEnd => "timeEnd",
+        }
+    }
+}
+
+impl std::fmt::Display for ConsoleLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ConsoleLevel {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl From<ConsoleApiCalledType> for ConsoleLevel {
+    fn from(t: ConsoleApiCalledType) -> Self {
+        match t {
+            ConsoleApiCalledType::Log => Self::Log,
+            ConsoleApiCalledType::Debug => Self::Debug,
+            ConsoleApiCalledType::Info => Self::Info,
+            ConsoleApiCalledType::Warning => Self::Warning,
+            ConsoleApiCalledType::Error => Self::Error,
+            ConsoleApiCalledType::Dir => Self::Dir,
+            ConsoleApiCalledType::Dirxml => Self::Dirxml,
+            ConsoleApiCalledType::Table => Self::Table,
+            ConsoleApiCalledType::Trace => Self::Trace,
+            ConsoleApiCalledType::Clear => Self::Clear,
+            ConsoleApiCalledType::StartGroup => Self::StartGroup,
+            ConsoleApiCalledType::StartGroupCollapsed => Self::StartGroupCollapsed,
+            ConsoleApiCalledType::EndGroup => Self::EndGroup,
+            ConsoleApiCalledType::Assert => Self::Assert,
+            ConsoleApiCalledType::Profile => Self::Profile,
+            ConsoleApiCalledType::ProfileEnd => Self::ProfileEnd,
+            ConsoleApiCalledType::Count => Self::Count,
+            ConsoleApiCalledType::TimeEnd => Self::TimeEnd,
+        }
+    }
+}
+
 /// Console log entry captured from the browser
 #[derive(Debug, Clone)]
 pub struct ConsoleEntry {
-    pub level: String,
+    pub level: ConsoleLevel,
     pub text: String,
     pub timestamp: Instant,
 }
@@ -421,8 +516,10 @@ impl BrowserSession {
         // Spawn task to capture console events (uses separate lock, no contention)
         let task = tokio::spawn(async move {
             while let Some(event) = console_events.next().await {
-                // Extract log level and message
-                let level = format!("{:?}", event.r#type).to_lowercase();
+                // Convert the chromiumoxide CDP enum into Phoenix's owned
+                // `ConsoleLevel` via a total `From` match; downgrading to a
+                // free-form string here would lose the closed-set invariant.
+                let level: ConsoleLevel = event.r#type.clone().into();
                 let text = event
                     .args
                     .iter()
@@ -935,6 +1032,59 @@ mod lifecycle_hook_tests {
     /// chrome-gated tests.
     #[allow(dead_code)]
     fn _phantom_uses(_b: Option<BrowserSession>, _r: Option<RwLock<()>>, _i: Option<Instant>) {}
+}
+
+#[cfg(test)]
+mod console_level_tests {
+    use super::ConsoleLevel;
+    use chromiumoxide::cdp::js_protocol::runtime::ConsoleApiCalledType;
+
+    /// All 18 CDP variants round-trip through the typed conversion to the
+    /// canonical CDP wire identifier. If chromiumoxide adds a variant, the
+    /// `From<ConsoleApiCalledType>` impl stops compiling — guaranteeing the
+    /// "stringly-typed level" bug class cannot regress.
+    #[test]
+    fn from_cdp_total_and_canonical() {
+        let cases = [
+            (ConsoleApiCalledType::Log, "log"),
+            (ConsoleApiCalledType::Debug, "debug"),
+            (ConsoleApiCalledType::Info, "info"),
+            (ConsoleApiCalledType::Warning, "warning"),
+            (ConsoleApiCalledType::Error, "error"),
+            (ConsoleApiCalledType::Dir, "dir"),
+            (ConsoleApiCalledType::Dirxml, "dirxml"),
+            (ConsoleApiCalledType::Table, "table"),
+            (ConsoleApiCalledType::Trace, "trace"),
+            (ConsoleApiCalledType::Clear, "clear"),
+            (ConsoleApiCalledType::StartGroup, "startGroup"),
+            (
+                ConsoleApiCalledType::StartGroupCollapsed,
+                "startGroupCollapsed",
+            ),
+            (ConsoleApiCalledType::EndGroup, "endGroup"),
+            (ConsoleApiCalledType::Assert, "assert"),
+            (ConsoleApiCalledType::Profile, "profile"),
+            (ConsoleApiCalledType::ProfileEnd, "profileEnd"),
+            (ConsoleApiCalledType::Count, "count"),
+            (ConsoleApiCalledType::TimeEnd, "timeEnd"),
+        ];
+        for (cdp, expected) in cases {
+            let level: ConsoleLevel = cdp.into();
+            assert_eq!(level.as_str(), expected, "wrong wire form for {expected}");
+        }
+    }
+
+    /// Wire serialization matches `as_str` so consumers downstream of
+    /// `json!({"level": entry.level})` see the canonical identifier and not
+    /// the `Debug` spelling the previous `format!("{:?}", …).to_lowercase()`
+    /// produced (e.g. `"startgroup"` rather than CDP's `"startGroup"`).
+    #[test]
+    fn serializes_as_canonical_string() {
+        let value = serde_json::to_value(ConsoleLevel::StartGroup).unwrap();
+        assert_eq!(value, serde_json::Value::String("startGroup".into()));
+        let value = serde_json::to_value(ConsoleLevel::Error).unwrap();
+        assert_eq!(value, serde_json::Value::String("error".into()));
+    }
 }
 
 #[cfg(test)]
