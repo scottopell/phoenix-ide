@@ -4,7 +4,7 @@ import { DraftContext } from './DraftContext';
 import type { ConversationStore } from './ConversationStore';
 import { api } from '../api';
 import { cacheDB } from '../cache';
-import { clearLastViewer } from '../components/FileExplorer/lastViewerStorage';
+import { clearLastViewer } from '../storage/lastViewerStorage';
 import { clearDraftStorage } from '../hooks/useDraft';
 
 const POLL_INTERVAL_MS = 5000;

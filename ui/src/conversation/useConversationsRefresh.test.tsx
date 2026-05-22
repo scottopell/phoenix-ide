@@ -19,7 +19,7 @@ import type { DraftStore } from './DraftStore';
 import {
   getLastViewer,
   setLastViewer,
-} from '../components/FileExplorer/lastViewerStorage';
+} from '../storage/lastViewerStorage';
 import type { Conversation } from '../api';
 
 // The polling refresh tries to call api.listConversations on mount.

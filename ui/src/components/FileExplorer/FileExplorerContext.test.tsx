@@ -21,7 +21,7 @@ import {
   clearLastViewer,
   getLastViewer,
   setLastViewer,
-} from './lastViewerStorage';
+} from '../../storage/lastViewerStorage';
 
 // Tiny consumer that exposes the context via a callback so the test can
 // observe state and drive openFile/closeFile imperatively.

@@ -8,7 +8,7 @@ import {
   clearLastViewer,
   getLastViewer,
   setLastViewer,
-} from './lastViewerStorage';
+} from '../../storage/lastViewerStorage';
 
 interface FileExplorerProviderProps {
   children: ReactNode;
