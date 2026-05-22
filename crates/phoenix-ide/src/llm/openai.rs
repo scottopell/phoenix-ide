@@ -674,13 +674,11 @@ fn translate_to_responses_request(
                 let output = if images.is_empty() {
                     ResponsesApiFunctionOutput::Text(text)
                 } else {
-                    let mut parts = vec![ResponsesApiOutputPart::Text { text }];
+                    let mut parts = vec![ResponsesApiContentPart::InputText { text }];
                     for img in images {
                         let ImageSource::Base64 { media_type, data } = img;
-                        parts.push(ResponsesApiOutputPart::ImageUrl {
-                            image_url: ResponsesApiImageUrl {
-                                url: format!("data:{media_type};base64,{data}"),
-                            },
+                        parts.push(ResponsesApiContentPart::InputImage {
+                            image_url: format!("data:{media_type};base64,{data}"),
                         });
                     }
                     ResponsesApiFunctionOutput::Parts(parts)
@@ -1004,24 +1002,16 @@ pub(crate) enum ResponsesApiContentPart {
     InputImage { image_url: String }, // "data:{media_type};base64,{data}"
 }
 
-/// Function call output: plain string when text-only, array of parts when images present
+/// Function call output: plain string when text-only, array of parts when images present.
+///
+/// The Responses API treats a `function_call_output` payload as model *input*,
+/// so its content parts use the same `input_text`/`input_image` discriminants as
+/// `ResponsesApiContentPart` — not `text`/`image_url`, which the API rejects.
 #[derive(Debug, Serialize)]
 #[serde(untagged)]
 pub(crate) enum ResponsesApiFunctionOutput {
     Text(String),
-    Parts(Vec<ResponsesApiOutputPart>),
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub(crate) enum ResponsesApiOutputPart {
-    Text { text: String },
-    ImageUrl { image_url: ResponsesApiImageUrl },
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct ResponsesApiImageUrl {
-    pub(crate) url: String, // "data:{media_type};base64,{data}"
+    Parts(Vec<ResponsesApiContentPart>),
 }
 
 #[derive(Debug, Serialize)]
@@ -1092,6 +1082,38 @@ mod tests {
             max_tokens: None,
             cache_key: PromptCacheKey::stable("test"),
         }
+    }
+
+    /// A tool result carrying an image (e.g. `read_image`) serialises its
+    /// `function_call_output` parts with the Responses API's `input_text` /
+    /// `input_image` discriminants. Regression guard: the API rejects the
+    /// Chat-Completions-style `text` / `image_url` types with HTTP 400.
+    #[test]
+    fn tool_result_image_serialises_with_responses_api_part_types() {
+        use crate::llm::types::{ContentBlock, ImageSource, LlmMessage, MessageRole};
+
+        let mut req = empty_request();
+        req.messages = vec![LlmMessage {
+            role: MessageRole::User,
+            content: vec![ContentBlock::ToolResult {
+                tool_use_id: "call_1".to_string(),
+                content: "here is the screenshot".to_string(),
+                images: vec![ImageSource::Base64 {
+                    media_type: "image/png".to_string(),
+                    data: "aGVsbG8=".to_string(),
+                }],
+                is_error: false,
+            }],
+        }];
+
+        let translated = translate_to_responses_request("gpt-5.5", &req, false);
+        let json = serde_json::to_value(&translated).unwrap();
+        let parts = &json["input"][0]["output"];
+
+        assert_eq!(parts[0]["type"], "input_text");
+        assert_eq!(parts[0]["text"], "here is the screenshot");
+        assert_eq!(parts[1]["type"], "input_image");
+        assert_eq!(parts[1]["image_url"], "data:image/png;base64,aGVsbG8=");
     }
 
     #[test]

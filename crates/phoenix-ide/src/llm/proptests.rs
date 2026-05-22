@@ -11,7 +11,7 @@
 use super::anthropic::{self, AnthropicContentBlock, AnthropicResponse, AnthropicUsage};
 use super::openai::{
     self, ResponsesApiContentPart, ResponsesApiFunctionOutput, ResponsesApiInputItem,
-    ResponsesApiMessageContent, ResponsesApiOutputPart,
+    ResponsesApiMessageContent,
 };
 use super::types::{
     ContentBlock, ImageSource, LlmMessage, LlmRequest, MessageRole, ToolReference,
@@ -419,8 +419,8 @@ proptest! {
         }
     }
 
-    /// H4 — Tool result with N images → Parts(N+1): Parts[0] is Text, Parts[1..] are ImageUrl
-    ///      with correct data URLs
+    /// H4 — Tool result with N images → Parts(N+1): Parts[0] is InputText, Parts[1..] are
+    ///      InputImage with correct data URLs
     #[test]
     fn prop_responses_tool_result_with_images_uses_parts(
         tool_use_id in "[a-z0-9_]{5,20}",
@@ -453,17 +453,17 @@ proptest! {
             if let ResponsesApiFunctionOutput::Parts(parts) = output {
                 prop_assert_eq!(parts.len(), 1 + n_images, "Expected 1 text + {} image parts", n_images);
                 prop_assert!(
-                    matches!(&parts[0], ResponsesApiOutputPart::Text { .. }),
-                    "Parts[0] must be Text"
+                    matches!(&parts[0], ResponsesApiContentPart::InputText { .. }),
+                    "Parts[0] must be InputText"
                 );
                 for (i, expected_url) in expected_urls.iter().enumerate() {
-                    if let ResponsesApiOutputPart::ImageUrl { image_url } = &parts[1 + i] {
+                    if let ResponsesApiContentPart::InputImage { image_url } = &parts[1 + i] {
                         prop_assert_eq!(
-                            &image_url.url, expected_url,
-                            "ImageUrl data URL mismatch at index {}", i
+                            image_url, expected_url,
+                            "InputImage data URL mismatch at index {}", i
                         );
                     } else {
-                        prop_assert!(false, "Parts[{}] must be ImageUrl", 1 + i);
+                        prop_assert!(false, "Parts[{}] must be InputImage", 1 + i);
                     }
                 }
             } else {
