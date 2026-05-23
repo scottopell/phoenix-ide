@@ -111,7 +111,7 @@ impl Database {
             // only a power-failure between WAL append and the next checkpoint
             // fsync can lose the last commit. Default FULL fsyncs every
             // commit, which under concurrent I/O load (e.g. ./dev.py check)
-            // can stretch single-row INSERTs to 1+s. See task 13033.
+            // can stretch single-row INSERTs to 1+s. See task 13042.
             .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);

@@ -564,7 +564,7 @@ def main() -> int:
             log_text = log_path.read_text()
 
     # Tripwire: surface sqlx slow-statement WARNs so cross-lane I/O
-    # contention can't silently bloat write latency (task 13033). Filter
+    # contention can't silently bloat write latency (task 13042). Filter
     # out the one-time startup PRAGMA (WAL+synchronous setup) — that's an
     # admin call, not a steady-state regression signal.
     slow_lines = [
