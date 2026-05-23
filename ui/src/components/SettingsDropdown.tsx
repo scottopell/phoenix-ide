@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { api, type CodexLoginPreflight, type NotificationSettings } from '../api';
 import { refreshModels } from '../modelsPoller';
 import {
@@ -57,7 +57,8 @@ export function SettingsDropdown({
   const wrapRef = useRef<HTMLDivElement | null>(null);
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
-  const [menuPos, setMenuPos] = useState<{ top: number; left: number } | null>(null);
+  const titleId = useId();
+  const [menuPos, setMenuPos] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
 
   useEffect(() => {
     if (!open) return undefined;
@@ -79,24 +80,41 @@ export function SettingsDropdown({
   }, [open]);
 
   // Position the menu in viewport coords so it escapes the sidebar's
-  // overflow:hidden clip. Prefer right-align under the trigger; clamp into
-  // the viewport so the left edge can't go off-screen on a narrow sidebar.
-  useLayoutEffect(() => {
-    if (!open) { setMenuPos(null); return; }
+  // overflow:hidden clip. Recompute on resize/scroll/sidebar-animate so
+  // the menu tracks the trigger instead of drifting once open.
+  const computePosition = useCallback(() => {
     const trigger = triggerRef.current;
     const menu = menuRef.current;
     if (!trigger || !menu) return;
     const tRect = trigger.getBoundingClientRect();
-    const menuWidth = menu.offsetWidth;
     const margin = 8;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+    const menuWidth = Math.min(menu.offsetWidth, vw - 2 * margin);
+    // Prefer right-aligned to trigger; clamp both edges into viewport, and
+    // floor at `margin` last so an oversized menu never produces negative left.
     let left = tRect.right - menuWidth;
+    if (left + menuWidth > vw - margin) left = vw - menuWidth - margin;
     if (left < margin) left = margin;
-    if (left + menuWidth > window.innerWidth - margin) {
-      left = window.innerWidth - menuWidth - margin;
-    }
     const top = tRect.bottom + 6;
-    setMenuPos({ top, left });
-  }, [open]);
+    const maxHeight = Math.max(120, vh - top - margin);
+    setMenuPos({ top, left, maxHeight });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!open) { setMenuPos(null); return undefined; }
+    computePosition();
+    const onWinChange = () => computePosition();
+    window.addEventListener('resize', onWinChange);
+    window.addEventListener('scroll', onWinChange, true);
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => computePosition()) : null;
+    if (ro && triggerRef.current) ro.observe(triggerRef.current);
+    return () => {
+      window.removeEventListener('resize', onWinChange);
+      window.removeEventListener('scroll', onWinChange, true);
+      ro?.disconnect();
+    };
+  }, [open, computePosition]);
 
   return (
     <div className={`settings-dropdown-wrap${compact ? ' settings-dropdown-wrap--compact' : ''}`} ref={wrapRef}>
@@ -106,7 +124,7 @@ export function SettingsDropdown({
         className="settings-dropdown-trigger"
         title="Settings"
         aria-label="Settings"
-        aria-haspopup="menu"
+        aria-haspopup="dialog"
         aria-expanded={open}
         onClick={() => setOpen((v) => !v)}
       >
@@ -116,9 +134,13 @@ export function SettingsDropdown({
         <div
           ref={menuRef}
           className="settings-dropdown-menu"
-          role="menu"
-          style={menuPos ? { top: `${menuPos.top}px`, left: `${menuPos.left}px` } : { visibility: 'hidden' }}
+          role="dialog"
+          aria-labelledby={titleId}
+          style={menuPos
+            ? { top: `${menuPos.top}px`, left: `${menuPos.left}px`, maxHeight: `${menuPos.maxHeight}px` }
+            : { visibility: 'hidden' }}
         >
+          <h2 id={titleId} className="settings-dropdown-title">Settings</h2>
           <ThemeSection theme={theme} onToggle={onToggleTheme} />
           {codexPreflight?.already_signed_in && (
             <CodexSection
@@ -170,6 +192,11 @@ function CodexSection({
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const mountedRef = useRef(true);
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
 
   const identity = preflight.account_email ?? (preflight.account_id ? shortAccount(preflight.account_id) : null);
 
@@ -183,9 +210,9 @@ function CodexSection({
       onPreflightInvalidated();
       onCloseMenu();
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (mountedRef.current) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setBusy(false);
+      if (mountedRef.current) setBusy(false);
     }
   }, [busy, onPreflightInvalidated, onCloseMenu]);
 
@@ -223,18 +250,23 @@ function NotificationsSection() {
   const latestSaveRef = useRef(0);
   const saveChainRef = useRef(Promise.resolve());
   const editedRef = useRef(false);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
-    let cancelled = false;
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  useEffect(() => {
     loadNotificationSettings()
       .then((loaded) => {
-        if (cancelled || editedRef.current) return;
+        if (!mountedRef.current || editedRef.current) return;
         setSettings(loaded);
       })
       .catch((err) => {
-        if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load notification settings');
+        if (!mountedRef.current) return;
+        setError(err instanceof Error ? err.message : 'Failed to load notification settings');
       });
-    return () => { cancelled = true; };
   }, []);
 
   const save = useCallback((next: NotificationSettings) => {
@@ -249,16 +281,17 @@ function NotificationsSection() {
       .catch(() => {})
       .then(async () => {
         const saved = await api.updateNotificationSettings(next);
-        if (latestSaveRef.current !== saveId) return;
-        setSettings(saved);
+        // Runtime mirror update is safe post-unmount — it writes module state,
+        // not React state. setState calls are guarded.
         updateNotificationRuntimeSettings(saved);
+        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
+        setSettings(saved);
         setSaving(false);
       })
       .catch((err: unknown) => {
-        if (latestSaveRef.current === saveId) {
-          setError(err instanceof Error ? err.message : 'Failed to save notification settings');
-          setSaving(false);
-        }
+        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
+        setError(err instanceof Error ? err.message : 'Failed to save notification settings');
+        setSaving(false);
       });
   }, []);
 
@@ -272,11 +305,11 @@ function NotificationsSection() {
 
   const requestPermission = useCallback(async () => {
     if (!('Notification' in window) || Notification.permission !== 'default') {
-      setPermission(getBrowserNotificationPermission());
+      if (mountedRef.current) setPermission(getBrowserNotificationPermission());
       return;
     }
     const result = await Notification.requestPermission();
-    setPermission(result);
+    if (mountedRef.current) setPermission(result);
   }, []);
 
   return (

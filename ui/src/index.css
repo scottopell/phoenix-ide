@@ -3387,12 +3387,22 @@ pre:hover .copy-btn {
   color: var(--text-primary);
 }
 
+/* Collapsed icon-strip: match .sidebar-icon-btn 36×36 box so the gear
+   aligns with the other vertically-stacked controls. */
+.settings-dropdown-wrap--compact .settings-dropdown-trigger {
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  color: var(--text-muted);
+}
+
 /* position-fixed escapes the sidebar's overflow:hidden clip. Top/left are
  * computed in JS from the trigger's bounding rect and clamped to viewport,
  * so a narrow sidebar can't push the left edge off-screen. */
 .settings-dropdown-menu {
   position: fixed;
   width: 280px;
+  max-width: calc(100vw - 16px);
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -3402,6 +3412,20 @@ pre:hover .copy-btn {
   display: flex;
   flex-direction: column;
   gap: 4px;
+  overflow-y: auto;
+}
+
+.settings-dropdown-title {
+  /* Visually hidden but exposed to assistive tech via aria-labelledby. */
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  border: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
 }
 
 .settings-section {
