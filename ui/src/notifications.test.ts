@@ -123,7 +123,7 @@ describe('browser desktop notifications', () => {
     expect(notifications[0]?.title).toBe('Agent finished');
   });
 
-  it('catch-up dedupes by overwriting the per-conversation last key', () => {
+  it('catch-up dedupes blocking events by unresolved conversation state', () => {
     grantSettings();
     const blocked = conversation({ state: { type: 'context_exhausted', summary: 'full' } });
 
@@ -132,10 +132,56 @@ describe('browser desktop notifications', () => {
     expect(notifications).toHaveLength(1);
 
     notifyCatchUp([conversation({
-      state: { type: 'context_exhausted', summary: 'full' },
+      state: { type: 'context_exhausted', summary: 'still full' },
       updated_at: '2026-01-01T00:01:00Z',
     })]);
+    expect(notifications).toHaveLength(1);
+
+    notifyConversationStateChange(blocked, { type: 'context_exhausted', summary: 'full' }, { type: 'idle' });
+    notifyCatchUp([conversation({
+      state: { type: 'context_exhausted', summary: 'full again' },
+      updated_at: '2026-01-01T00:02:00Z',
+    })]);
     expect(notifications).toHaveLength(2);
+  });
+
+  it('live notification dedupes the following catch-up pass for the same blocking state', () => {
+    grantSettings();
+    const blocked = conversation({ state: { type: 'awaiting_user_response', questions: [] } });
+
+    notifyConversationStateChange(blocked, { type: 'idle' }, { type: 'awaiting_user_response', questions: [] });
+    notifyCatchUp([blocked]);
+
+    expect(notifications).toHaveLength(1);
+  });
+
+  it('catch-up does not consume dedupe before settings load allows delivery', () => {
+    const blocked = conversation({ state: { type: 'context_exhausted', summary: 'full' } });
+
+    notifyCatchUp([blocked]);
+    expect(notifications).toHaveLength(0);
+
+    grantSettings();
+    notifyCatchUp([blocked]);
+    expect(notifications).toHaveLength(1);
+  });
+
+  it('notification construction failures fail closed', () => {
+    grantSettings();
+    Object.defineProperty(window, 'Notification', {
+      configurable: true,
+      writable: true,
+      value: class ThrowingNotification {
+        static permission: NotificationPermission = 'granted';
+        constructor() { throw new Error('blocked'); }
+      },
+    });
+
+    expect(() => notifyConversationStateChange(
+      conversation(),
+      { type: 'idle' },
+      { type: 'awaiting_user_response', questions: [] },
+    )).not.toThrow();
   });
 
   it('catch-up skips sub-agent conversations', () => {

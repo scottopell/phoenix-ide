@@ -32,12 +32,15 @@ type NotificationEvent = {
   conversation: Conversation;
 };
 
+type DeliveryResult = 'delivered' | 'suppressed_focus' | 'not_delivered';
+
 const notificationRuntime = {
   settings: DISABLED_NOTIFICATION_SETTINGS,
   settingsLoaded: false,
   settingsLoading: null as Promise<NotificationSettings> | null,
+  settingsRevision: 0,
   permissionCuePending: false,
-  lastCatchupKeyByConversationId: new Map<string, string>(),
+  lastAttentionKeyByConversationId: new Map<string, string>(),
 };
 
 export function getBrowserNotificationPermission(): BrowserPermission {
@@ -58,6 +61,7 @@ export function consumeNotificationPermissionCue(): boolean {
 export function updateNotificationRuntimeSettings(settings: NotificationSettings): void {
   notificationRuntime.settings = settings;
   notificationRuntime.settingsLoaded = true;
+  notificationRuntime.settingsRevision++;
 }
 
 export function getNotificationRuntimeSettings(): NotificationSettings {
@@ -67,10 +71,14 @@ export function getNotificationRuntimeSettings(): NotificationSettings {
 export function loadNotificationSettings(): Promise<NotificationSettings> {
   if (notificationRuntime.settingsLoaded) return Promise.resolve(notificationRuntime.settings);
   if (!notificationRuntime.settingsLoading) {
+    const startRevision = notificationRuntime.settingsRevision;
     notificationRuntime.settingsLoading = api.getNotificationSettings()
       .then((settings) => {
-        updateNotificationRuntimeSettings(settings);
-        return settings;
+        if (notificationRuntime.settingsRevision === startRevision) {
+          updateNotificationRuntimeSettings(settings);
+          return settings;
+        }
+        return notificationRuntime.settings;
       })
       .catch((err: unknown) => {
         notificationRuntime.settingsLoading = null;
@@ -84,8 +92,9 @@ export function resetNotificationRuntimeForTest(settings?: NotificationSettings)
   notificationRuntime.settings = settings ?? DISABLED_NOTIFICATION_SETTINGS;
   notificationRuntime.settingsLoaded = settings !== undefined;
   notificationRuntime.settingsLoading = null;
+  notificationRuntime.settingsRevision = 0;
   notificationRuntime.permissionCuePending = false;
-  notificationRuntime.lastCatchupKeyByConversationId.clear();
+  notificationRuntime.lastAttentionKeyByConversationId.clear();
   busyStartedAtByConversation.clear();
   previousSnapshotsById.clear();
 }
@@ -125,31 +134,52 @@ function shouldSuppressForFocus(conversation: Conversation): boolean {
     && currentActiveSlug() === conversation.slug;
 }
 
-function deliverNotification(event: NotificationEvent): void {
-  if (!notificationRuntime.settingsLoaded) return;
-  if (!notificationEnabled(event.type, notificationRuntime.settings)) return;
-  if (shouldSuppressForFocus(event.conversation)) return;
+function attentionKey(event: NotificationEvent): string | null {
+  return event.type === 'agent_finished' ? null : `${event.conversation.id}:${event.type}`;
+}
+
+function markAttentionSeen(event: NotificationEvent): void {
+  const key = attentionKey(event);
+  if (key) notificationRuntime.lastAttentionKeyByConversationId.set(event.conversation.id, key);
+}
+
+function clearAttentionSeen(conversation: Conversation): void {
+  notificationRuntime.lastAttentionKeyByConversationId.delete(conversation.id);
+}
+
+function deliverNotification(event: NotificationEvent): DeliveryResult {
+  if (!notificationRuntime.settingsLoaded) return 'not_delivered';
+  if (!notificationEnabled(event.type, notificationRuntime.settings)) return 'not_delivered';
+  if (shouldSuppressForFocus(event.conversation)) return 'suppressed_focus';
 
   const permission = getBrowserNotificationPermission();
   if (permission === 'default') {
     queueNotificationPermissionCue();
-    return;
+    return 'not_delivered';
   }
-  if (permission !== 'granted') return;
+  if (permission !== 'granted') return 'not_delivered';
 
-  const notification = new Notification(event.title, {
-    body: event.conversation.slug,
-    tag: `${event.type}:${event.conversation.id}:${event.conversation.updated_at}`,
-  });
-  notification.onclick = () => {
-    window.focus();
-    window.dispatchEvent(
-      new CustomEvent('phoenix:navigate-to-conversation', {
-        detail: { slug: event.conversation.slug },
-      }),
-    );
-    notification.close();
-  };
+  try {
+    const notification = new Notification(event.title, {
+      body: event.conversation.slug,
+      tag: `${event.type}:${event.conversation.id}`,
+    });
+    notification.onclick = () => {
+      window.focus();
+      window.dispatchEvent(
+        new CustomEvent('phoenix:navigate-to-conversation', {
+          detail: { slug: event.conversation.slug },
+        }),
+      );
+      notification.close();
+    };
+  } catch (err) {
+    if (import.meta.env.DEV && typeof process === 'undefined') {
+      console.debug('Failed to create browser notification', err);
+    }
+    return 'not_delivered';
+  }
+  return 'delivered';
 }
 
 export function notifyConversationStateChange(
@@ -166,7 +196,8 @@ export function notifyConversationStateChange(
   const stateEvent = eventForState(nextState, conversation);
   if (stateEvent) {
     busyStartedAtByConversation.delete(conversation.id);
-    deliverNotification(stateEvent);
+    const result = deliverNotification(stateEvent);
+    if (result === 'delivered' || result === 'suppressed_focus') markAttentionSeen(stateEvent);
     return;
   }
 
@@ -181,10 +212,12 @@ export function notifyConversationStateChange(
     if (busyStartedAt && Date.now() - busyStartedAt >= AGENT_FINISHED_THRESHOLD_MS) {
       deliverNotification({ type: 'agent_finished', title: 'Agent finished', conversation });
     }
+    clearAttentionSeen(conversation);
     return;
   }
 
   busyStartedAtByConversation.delete(conversation.id);
+  clearAttentionSeen(conversation);
 }
 
 const busyStartedAtByConversation = new Map<string, number>();
@@ -202,6 +235,7 @@ function rememberBusyState(conversation: Conversation, state: ConversationState)
 const previousSnapshotsById = new Map<string, Conversation>();
 
 export function notifyConversationSnapshotChange(next: Conversation): void {
+  if (next.parent_conversation_id) return;
   const previous = previousSnapshotsById.get(next.id);
   const nextState = next.state ? parseConversationState(next.state) : { type: 'idle' as const };
   if (!previous) {
@@ -220,11 +254,11 @@ export function notifyCatchUp(conversations: readonly Conversation[]): void {
     const state = conversation.state ? parseConversationState(conversation.state) : { type: 'idle' as const };
     const event = eventForState(state, conversation);
     if (!event) continue;
-    const key = `${conversation.id}:${state.type}:${conversation.updated_at}`;
-    const previousKey = notificationRuntime.lastCatchupKeyByConversationId.get(conversation.id);
+    const key = attentionKey(event);
+    const previousKey = key ? notificationRuntime.lastAttentionKeyByConversationId.get(conversation.id) : null;
     if (previousKey === key) continue;
-    notificationRuntime.lastCatchupKeyByConversationId.set(conversation.id, key);
-    deliverNotification(event);
+    const result = deliverNotification(event);
+    if (result === 'delivered' || result === 'suppressed_focus') markAttentionSeen(event);
   }
 }
 

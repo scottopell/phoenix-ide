@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import { api, type NotificationSettings } from '../api';
 import {
   getBrowserNotificationPermission,
@@ -18,12 +18,14 @@ export function NotificationSettingsPanel({ compact = false }: Props) {
   const [permission, setPermission] = useState<BrowserPermission>(() => getBrowserNotificationPermission());
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const latestSaveRef = useRef(0);
+  const editedRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
     loadNotificationSettings()
       .then((loaded) => {
-        if (cancelled) return;
+        if (cancelled || editedRef.current) return;
         setSettings(loaded);
         updateNotificationRuntimeSettings(loaded);
       })
@@ -34,18 +36,24 @@ export function NotificationSettingsPanel({ compact = false }: Props) {
   }, []);
 
   const save = useCallback(async (next: NotificationSettings) => {
+    const saveId = latestSaveRef.current + 1;
+    latestSaveRef.current = saveId;
+    editedRef.current = true;
     setSettings(next);
     updateNotificationRuntimeSettings(next);
     setSaving(true);
     setError(null);
     try {
       const saved = await api.updateNotificationSettings(next);
+      if (latestSaveRef.current !== saveId) return;
       setSettings(saved);
       updateNotificationRuntimeSettings(saved);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to save notification settings');
+      if (latestSaveRef.current === saveId) {
+        setError(err instanceof Error ? err.message : 'Failed to save notification settings');
+      }
     } finally {
-      setSaving(false);
+      if (latestSaveRef.current === saveId) setSaving(false);
     }
   }, []);
 
