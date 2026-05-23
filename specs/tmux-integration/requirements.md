@@ -400,8 +400,8 @@ file root: `ToolContext.worktree_path` for worktree-scoped conversations, or
 AND SHALL create a new tmux window in the conversation's tmux server with
 `-c <effective-file-root>`
 AND SHALL run the command through `bash -lc`
-AND SHALL print a visible standardized exit marker containing the command's
-exit code
+AND SHALL search the raw tmux pane capture for readiness text and exit markers
+before truncating the snippet returned to the agent
 AND SHALL keep the pane inspectable after exit by default
 
 THE `tmux_run` tool SHALL return responses with this shape:
@@ -410,6 +410,7 @@ THE `tmux_run` tool SHALL return responses with this shape:
 {
   "status": "started" | "ready" | "exited" | "readiness_timed_out" | "start_failed",
   "window_name": "<tmux-window-name>",
+  "window_id": "<unique-tmux-window-id>",
   "cwd": "<absolute-effective-file-root>",
   "command": "<cmd>",
   "exit_code": <int | null>,
@@ -421,10 +422,14 @@ THE `tmux_run` tool SHALL return responses with this shape:
 }
 ```
 
+THE `window_id` field SHALL be a unique tmux target for the created window.
+Agents SHOULD use `window_id` for later raw tmux `capture-pane`, `send-keys`,
+or `kill-window` operations; `window_name` is human-readable but not unique.
+
 THE `captured_output.truncated` field SHALL describe only the bounded snippet
 returned by that single tool call. It SHALL NOT imply that the tmux pane or
 window scrollback has been truncated; the agent can inspect later via raw tmux
-using `window_name`.
+using `window_id`.
 
 **Rationale:** `tmux_run` is a pit-of-success wrapper for the common “start a
 server/watch command in the shared inspectable surface” use case. Raw tmux

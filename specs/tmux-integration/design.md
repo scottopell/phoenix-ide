@@ -108,15 +108,19 @@ emit structured CLI output where the distinction matters.
 1. Resolve the effective file root: `ToolContext.worktree_path` when present,
    otherwise `ToolContext.working_dir`.
 2. Ensure the conversation/worktree tmux server is live through the registry.
-3. Create a detached window with `tmux new-window -d -P -F '#{window_name}'
-   -n <name> -c <file-root> <shell-command>`.
+3. Create a detached window with `tmux new-window -d -P -F
+   '#{window_name}|#{window_id}' -n <name> -c <file-root> <shell-command>`.
 4. Run `<shell-command>` as `bash -lc '<wrapper>'`, where the wrapper executes
    the agent command, captures `$?`, prints
    `[phoenix] process exited with code <code>`, then either opens an
    interactive shell (`keep_open_on_exit=true`) or exits with the same code.
-5. If readiness is `wait_for_text`, poll `capture-pane -p -t <window_name>
-   -S -2000` until the text appears, the exit marker appears, cancellation is
-   requested, or the bounded timeout expires.
+   The command is embedded on its own line so trailing shell comments in the
+   agent command do not consume Phoenix's exit-marker logic.
+5. If readiness is `wait_for_text`, poll `capture-pane -p -t <window_id>
+   -S -2000` until the text appears in the raw pane capture, the exit marker
+   appears, cancellation is requested, or the bounded timeout expires. The raw
+   capture is searched before middle-truncating the snippet returned to the
+   agent.
 
 The readiness input is a tagged enum, not independent nullable fields:
 
@@ -139,8 +143,9 @@ or:
 `return_immediately` rejects extra timeout/text fields; `wait_for_text` requires
 trimmed non-empty text and a bounded timeout. The response nests truncation under
 `captured_output` because only the returned snippet is bounded — tmux scrollback
-remains inspectable via raw `tmux capture-pane` using the returned
-`window_name`.
+remains inspectable via raw `tmux capture-pane` using the returned unique
+`window_id`. `window_name` is returned for human readability but is not a unique
+handle.
 
 ## Per-Conversation Tmux Server Registry
 

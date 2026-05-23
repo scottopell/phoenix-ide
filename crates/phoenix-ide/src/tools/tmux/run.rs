@@ -15,6 +15,7 @@ use crate::tools::{Tool, ToolContext, ToolOutput};
 const EXIT_MARKER_PREFIX: &str = "[phoenix] process exited with code ";
 const TMUX_RUN_SUBPROCESS_TIMEOUT: Duration = Duration::from_secs(10);
 const READINESS_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const TMUX_RUN_CAPTURE_START: &str = "-2000";
 
 pub struct TmuxRunTool;
 
@@ -58,6 +59,12 @@ struct CapturedOutput {
 struct RunObservation {
     captured_output: CapturedOutput,
     exit_code: Option<i32>,
+    readiness_seen: bool,
+}
+
+struct TmuxRunTarget {
+    window_name: String,
+    window_id: String,
 }
 
 #[async_trait]
@@ -67,7 +74,7 @@ impl Tool for TmuxRunTool {
     }
 
     fn description(&self) -> String {
-        "Run a shell command in this conversation's shared tmux surface. Use this for dev servers, watchers, REPLs, and commands the user may want to inspect later. Phoenix starts the command in the current project/worktree automatically. The command runs via bash -lc, prints a standardized exit-code marker, and the pane stays inspectable after exit by default. Use the returned window_name with the raw tmux tool for later capture-pane, send-keys, or kill-window operations.".to_string()
+        "Run a shell command in this conversation's shared tmux surface. Use this for dev servers, watchers, REPLs, and commands the user may want to inspect later. Phoenix starts the command in the current project/worktree automatically. The command runs via bash -lc, prints a standardized exit-code marker, and the pane stays inspectable after exit by default. Use the returned window_id with the raw tmux tool for later capture-pane, send-keys, or kill-window operations.".to_string()
     }
 
     fn input_schema(&self) -> Value {
@@ -155,7 +162,7 @@ impl Tool for TmuxRunTool {
             Ok(paths) => paths,
             Err(out) => return out,
         };
-        let window_name = match start_tmux_window(
+        let target = match start_tmux_window(
             &config_path,
             &socket_path,
             &cwd,
@@ -171,15 +178,14 @@ impl Tool for TmuxRunTool {
 
         match readiness {
             ValidReadiness::ReturnImmediately => {
-                return_immediately_response(&config_path, &socket_path, &window_name, &cwd, cmd)
-                    .await
+                return_immediately_response(&config_path, &socket_path, &target, &cwd, cmd).await
             }
             ValidReadiness::WaitForText { text, timeout } => {
                 wait_for_text_response(
                     &ctx,
                     &config_path,
                     &socket_path,
-                    &window_name,
+                    &target,
                     &cwd,
                     cmd,
                     &text,
@@ -267,7 +273,7 @@ async fn start_tmux_window(
     requested_name: &str,
     cmd: &str,
     keep_open_on_exit: bool,
-) -> Result<String, ToolOutput> {
+) -> Result<TmuxRunTarget, ToolOutput> {
     let wrapper = shell_wrapper(cmd, keep_open_on_exit);
     let shell_command = format!("bash -lc {}", shell_quote(&wrapper));
     let start_output = run_tmux_cli(
@@ -278,7 +284,7 @@ async fn start_tmux_window(
             "-d".to_string(),
             "-P".to_string(),
             "-F".to_string(),
-            "#{window_name}".to_string(),
+            "#{window_name}|#{window_id}".to_string(),
             "-n".to_string(),
             requested_name.to_string(),
             "-c".to_string(),
@@ -292,7 +298,10 @@ async fn start_tmux_window(
         let (stdout, stderr, truncated) = truncate_pair(&start_output.stdout, &start_output.stderr);
         return Err(structured_response(
             "start_failed",
-            requested_name,
+            &TmuxRunTarget {
+                window_name: requested_name.to_string(),
+                window_id: requested_name.to_string(),
+            },
             cwd,
             cmd,
             None,
@@ -305,23 +314,37 @@ async fn start_tmux_window(
         ));
     }
 
-    Ok(String::from_utf8_lossy(&start_output.stdout)
+    let start_stdout = String::from_utf8_lossy(&start_output.stdout);
+    let mut parts = start_stdout
         .lines()
         .next()
-        .map(str::trim)
+        .unwrap_or_default()
+        .splitn(2, '|')
+        .map(str::trim);
+    let window_name = parts
+        .next()
         .filter(|s| !s.is_empty())
         .unwrap_or(requested_name)
-        .to_string())
+        .to_string();
+    let window_id = parts
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&window_name)
+        .to_string();
+    Ok(TmuxRunTarget {
+        window_name,
+        window_id,
+    })
 }
 
 async fn return_immediately_response(
     config_path: &Path,
     socket_path: &Path,
-    window_name: &str,
+    target: &TmuxRunTarget,
     cwd: &Path,
     cmd: &str,
 ) -> ToolOutput {
-    let observation = observe_window(config_path, socket_path, window_name)
+    let observation = observe_window(config_path, socket_path, &target.window_id, None)
         .await
         .unwrap_or_else(|stderr| RunObservation {
             captured_output: CapturedOutput {
@@ -330,6 +353,7 @@ async fn return_immediately_response(
                 truncated: false,
             },
             exit_code: None,
+            readiness_seen: false,
         });
     let status = if observation.exit_code.is_some() {
         "exited"
@@ -338,7 +362,7 @@ async fn return_immediately_response(
     };
     structured_response(
         status,
-        window_name,
+        target,
         cwd,
         cmd,
         observation.exit_code,
@@ -352,7 +376,7 @@ async fn wait_for_text_response(
     ctx: &ToolContext,
     config_path: &Path,
     socket_path: &Path,
-    window_name: &str,
+    target: &TmuxRunTarget,
     cwd: &Path,
     cmd: &str,
     text: &str,
@@ -360,7 +384,7 @@ async fn wait_for_text_response(
 ) -> ToolOutput {
     let deadline = Instant::now() + timeout;
     loop {
-        let observation = observe_window(config_path, socket_path, window_name)
+        let observation = observe_window(config_path, socket_path, &target.window_id, Some(text))
             .await
             .unwrap_or_else(|stderr| RunObservation {
                 captured_output: CapturedOutput {
@@ -369,11 +393,10 @@ async fn wait_for_text_response(
                     truncated: false,
                 },
                 exit_code: None,
+                readiness_seen: false,
             });
-        let ready = observation.captured_output.stdout.contains(text)
-            || observation.captured_output.stderr.contains(text);
         let exited = observation.exit_code.is_some();
-        let status = if ready {
+        let status = if observation.readiness_seen {
             Some("ready")
         } else if exited {
             Some("exited")
@@ -385,7 +408,7 @@ async fn wait_for_text_response(
         if let Some(status) = status {
             return structured_response(
                 status,
-                window_name,
+                target,
                 cwd,
                 cmd,
                 observation.exit_code,
@@ -434,7 +457,7 @@ fn shell_wrapper(cmd: &str, keep_open_on_exit: bool) -> String {
     } else {
         "exit $code"
     };
-    format!("({cmd}); code=$?; echo; echo \"{EXIT_MARKER_PREFIX}$code\"; {after_exit}")
+    format!("(\n{cmd}\n); code=$?; echo; echo \"{EXIT_MARKER_PREFIX}$code\"; {after_exit}")
 }
 
 fn shell_quote(s: &str) -> String {
@@ -454,26 +477,27 @@ async fn run_tmux_cli(
     ];
     full_args.extend(args.iter().cloned());
 
-    let output = tokio::time::timeout(TMUX_RUN_SUBPROCESS_TIMEOUT, async move {
-        tokio::process::Command::new("tmux")
+    tokio::time::timeout(TMUX_RUN_SUBPROCESS_TIMEOUT, async move {
+        let mut command = tokio::process::Command::new("tmux");
+        command
             .args(&full_args)
             .env_remove("TMUX")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            .output()
-            .await
+            .kill_on_drop(true);
+        command.output().await
     })
     .await
     .map_err(|_| "tmux subprocess timed out".to_string())?
-    .map_err(|e| format!("failed to spawn tmux subprocess: {e}"))?;
-    Ok(output)
+    .map_err(|e| format!("failed to spawn tmux subprocess: {e}"))
 }
 
 async fn observe_window(
     config_path: &Path,
     socket_path: &Path,
-    window_name: &str,
+    target: &str,
+    readiness_text: Option<&str>,
 ) -> Result<RunObservation, String> {
     let output = run_tmux_cli(
         config_path,
@@ -482,22 +506,39 @@ async fn observe_window(
             "capture-pane".to_string(),
             "-p".to_string(),
             "-t".to_string(),
-            window_name.to_string(),
+            target.to_string(),
             "-S".to_string(),
-            "-2000".to_string(),
+            TMUX_RUN_CAPTURE_START.to_string(),
         ],
     )
     .await?;
-    let (stdout, stderr, truncated) = truncate_pair(&output.stdout, &output.stderr);
-    let exit_code = parse_exit_marker(&stdout);
-    Ok(RunObservation {
+    Ok(observation_from_bytes(
+        &output.stdout,
+        &output.stderr,
+        readiness_text,
+    ))
+}
+
+fn observation_from_bytes(
+    stdout_bytes: &[u8],
+    stderr_bytes: &[u8],
+    readiness_text: Option<&str>,
+) -> RunObservation {
+    let raw_stdout = String::from_utf8_lossy(stdout_bytes);
+    let raw_stderr = String::from_utf8_lossy(stderr_bytes);
+    let exit_code = parse_exit_marker(&raw_stdout);
+    let readiness_seen =
+        readiness_text.is_some_and(|text| raw_stdout.contains(text) || raw_stderr.contains(text));
+    let (stdout, stderr, truncated) = truncate_pair(stdout_bytes, stderr_bytes);
+    RunObservation {
         captured_output: CapturedOutput {
             stdout,
             stderr,
             truncated,
         },
         exit_code,
-    })
+        readiness_seen,
+    }
 }
 
 fn parse_exit_marker(output: &str) -> Option<i32> {
@@ -510,7 +551,7 @@ fn parse_exit_marker(output: &str) -> Option<i32> {
 
 fn structured_response(
     status: &str,
-    window_name: &str,
+    target: &TmuxRunTarget,
     cwd: &Path,
     command: &str,
     exit_code: Option<i32>,
@@ -519,7 +560,8 @@ fn structured_response(
 ) -> ToolOutput {
     let value = json!({
         "status": status,
-        "window_name": window_name,
+        "window_name": target.window_name,
+        "window_id": target.window_id,
         "cwd": cwd.to_string_lossy(),
         "command": command,
         "exit_code": exit_code,
@@ -711,6 +753,10 @@ mod tests {
         assert!(result.is_success(), "got: {}", result.output());
         let v = parse_response(&result);
         assert_eq!(v["window_name"], "tmux-run-quick-failure");
+        assert!(
+            v["window_id"].as_str().unwrap().starts_with('@'),
+            "window_id should be a unique tmux id: {v}"
+        );
         assert_eq!(v["exit_code"], 7);
         let pane = v["captured_output"]["stdout"].as_str().unwrap();
         assert!(pane.contains("before-failure"), "pane output: {pane}");
@@ -721,6 +767,73 @@ mod tests {
         assert_eq!(v["captured_output"]["truncated"], false);
 
         kill_socket(&socket_tmp.path().join("conv-tmux-run-quick-failure.sock")).await;
+    }
+
+    #[test]
+    fn readiness_matching_uses_raw_output_before_truncation() {
+        let mut stdout = vec![b'A'; 70_000];
+        stdout.extend_from_slice(b"READY_IN_RAW_MIDDLE");
+        stdout.extend(vec![b'B'; 70_000]);
+
+        let observation = observation_from_bytes(&stdout, b"", Some("READY_IN_RAW_MIDDLE"));
+        assert!(observation.readiness_seen);
+        assert!(observation.captured_output.truncated);
+        assert!(
+            !observation
+                .captured_output
+                .stdout
+                .contains("READY_IN_RAW_MIDDLE"),
+            "test fixture should place readiness text outside the returned snippet"
+        );
+    }
+
+    #[tokio::test]
+    async fn wrapper_preserves_commands_with_trailing_comments() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let ctx = ctx(
+            "tmux-run-trailing-comment",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "echo trailing-comment-ok # comment",
+                    "name": "tmux-run-trailing-comment",
+                    "readiness": {
+                        "mode": "wait_for_text",
+                        "text": EXIT_MARKER_PREFIX,
+                        "timeout_seconds": 5
+                    }
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        assert_eq!(v["exit_code"], 0);
+        let pane = v["captured_output"]["stdout"].as_str().unwrap();
+        assert!(pane.contains("trailing-comment-ok"), "pane output: {pane}");
+        assert!(
+            pane.contains("[phoenix] process exited with code 0"),
+            "pane output: {pane}"
+        );
+
+        kill_socket(
+            &socket_tmp
+                .path()
+                .join("conv-tmux-run-trailing-comment.sock"),
+        )
+        .await;
     }
 
     #[tokio::test]
