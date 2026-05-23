@@ -5,6 +5,7 @@ import type { SSEAction, InitPayload } from '../conversation/atom';
 import type { Breadcrumb } from '../types';
 import { parseConversationState } from '../utils';
 import { notifyConversationStateChange } from '../notifications';
+import { setCodexQuota } from '../codexQuota';
 import {
   SseInitDataSchema,
   SseMessageDataSchema,
@@ -18,6 +19,7 @@ import {
   SseConversationHardDeletedDataSchema,
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
+  SseRateLimitSnapshotDataSchema,
 } from '../sseSchemas';
 import {
   ConnectionState,
@@ -465,6 +467,21 @@ export function useConnection({
               stampedDispatch,
             );
             // no-op: bubble state driven by POST response + message echo
+          });
+
+          // Codex quota snapshot (task 67003). Account-global, not
+          // conversation-scoped — push straight to the module-level
+          // store; no reducer dispatch. SettingsDropdown subscribes via
+          // useCodexQuota().
+          on('rate_limit_snapshot', (e) => {
+            const res = parseEvent(
+              SseRateLimitSnapshotDataSchema,
+              e,
+              'rate_limit_snapshot',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            setCodexQuota(res.data.snapshot);
           });
 
           on('error', (e) => {

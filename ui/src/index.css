@@ -3544,6 +3544,73 @@ pre:hover .copy-btn {
   background: var(--bg-tertiary);
 }
 
+.settings-codex-quota {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px dashed var(--border-color);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-codex-quota__row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.settings-codex-quota__label {
+  flex: 0 0 56px;
+  color: var(--text-muted);
+}
+
+.settings-codex-quota__bar {
+  flex: 1 1 auto;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg-tertiary);
+  overflow: hidden;
+}
+
+.settings-codex-quota__fill {
+  height: 100%;
+  border-radius: 3px;
+  transition: width 0.2s;
+}
+
+.settings-codex-quota__fill--low {
+  background: var(--accent-green, #2a9);
+}
+
+.settings-codex-quota__fill--mid {
+  background: var(--accent-amber, #d80);
+}
+
+.settings-codex-quota__fill--high {
+  background: var(--accent-red, #c44);
+}
+
+.settings-codex-quota__pct {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  min-width: 38px;
+  text-align: right;
+}
+
+.settings-codex-quota__reset {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-left: 4px;
+}
+
+.settings-codex-quota__credits {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
 .settings-checkbox {
   display: flex;
   align-items: center;

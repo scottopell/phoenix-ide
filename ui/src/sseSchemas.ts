@@ -39,6 +39,10 @@ import type {
   SseConversationHardDeletedData as WireConversationHardDeletedData,
   SseBrowserSessionStateData as WireBrowserSessionStateData,
   SseSteerMessageQueuedData as WireSteerMessageQueuedData,
+  SseRateLimitSnapshotData as WireRateLimitSnapshotData,
+  QuotaDetails as WireQuotaDetails,
+  RateLimitWindow as WireRateLimitWindow,
+  CreditsSnapshot as WireCreditsSnapshot,
   SseBreadcrumb as GeneratedSseBreadcrumb,
   ChainQaTokenData as WireChainQaTokenData,
   ChainQaCompletedData as WireChainQaCompletedData,
@@ -314,6 +318,45 @@ export const SseSteerMessageQueuedDataSchema = v.looseObject({
   queue_position: v.number(),
 }) satisfies v.GenericSchema<unknown, WireSteerMessageQueuedData>;
 
+/** Per-window quota state (`primary` / `secondary` slots inside QuotaDetails).
+ *  `used_percent` is the only guaranteed field; `window_minutes` and
+ *  `resets_at` are absent on minimal codex payloads. */
+const RateLimitWindowSchema = v.looseObject({
+  used_percent: v.number(),
+  window_minutes: v.nullable(v.number()),
+  resets_at: v.nullable(v.number()),
+}) satisfies v.GenericSchema<unknown, WireRateLimitWindow>;
+
+const CreditsSnapshotSchema = v.looseObject({
+  has_credits: v.boolean(),
+  unlimited: v.boolean(),
+  balance: v.nullable(v.string()),
+}) satisfies v.GenericSchema<unknown, WireCreditsSnapshot>;
+
+/** Structured quota state — every field is nullable per the Rust spec
+ *  (`crates/phoenix-ide/src/llm/rate_limit.rs`). The SSE-event path
+ *  (task 67003) populates `primary` / `secondary` / `credits` /
+ *  `plan_type` / `limit_id`; the 429-header path adds `resets_at`,
+ *  `limit_name`, `promo_message`. */
+const QuotaDetailsSchema = v.looseObject({
+  plan_type: v.nullable(v.string()),
+  resets_at: v.nullable(v.string()),
+  limit_id: v.nullable(v.string()),
+  limit_name: v.nullable(v.string()),
+  primary: v.nullable(RateLimitWindowSchema),
+  secondary: v.nullable(RateLimitWindowSchema),
+  credits: v.nullable(CreditsSnapshotSchema),
+  promo_message: v.nullable(v.string()),
+}) satisfies v.GenericSchema<unknown, WireQuotaDetails>;
+
+/** `rate_limit_snapshot`: mid-stream quota update from the codex backend
+ *  (task 67003). Ephemeral — not persisted; the latest snapshot drives
+ *  the Settings dropdown's quota row. */
+export const SseRateLimitSnapshotDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  snapshot: QuotaDetailsSchema,
+}) satisfies v.GenericSchema<unknown, WireRateLimitSnapshotData>;
+
 // ---------------------------------------------------------------------------
 // Chain Q&A wire-event schemas (Phoenix Chains v1, REQ-CHN-004 / 005).
 //
@@ -376,6 +419,10 @@ export type SseBrowserSessionStateData = v.InferOutput<
   typeof SseBrowserSessionStateDataSchema
 >;
 export type SseSteerMessageQueuedData = v.InferOutput<typeof SseSteerMessageQueuedDataSchema>;
+export type SseRateLimitSnapshotData = v.InferOutput<typeof SseRateLimitSnapshotDataSchema>;
+export type QuotaDetails = v.InferOutput<typeof QuotaDetailsSchema>;
+export type RateLimitWindow = v.InferOutput<typeof RateLimitWindowSchema>;
+export type CreditsSnapshot = v.InferOutput<typeof CreditsSnapshotSchema>;
 
 // ---------------------------------------------------------------------------
 // Bash and tmux tool response schemas (task 02697).

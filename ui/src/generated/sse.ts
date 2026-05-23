@@ -35,6 +35,11 @@ export type { BashLiveHandleSummary } from './BashLiveHandleSummary';
 export type { TmuxToolResponse } from './TmuxToolResponse';
 export type { TmuxErrorResponse } from './TmuxErrorResponse';
 
+// Codex quota snapshot types (task 67003).
+export type { QuotaDetails } from './QuotaDetails';
+export type { RateLimitWindow } from './RateLimitWindow';
+export type { CreditsSnapshot } from './CreditsSnapshot';
+
 import type { SseWireEvent } from './SseWireEvent';
 import type { ChainSseWireEvent } from './ChainSseWireEvent';
 
@@ -76,6 +81,10 @@ export type SseBrowserSessionStateData = Omit<
 >;
 export type SseSteerMessageQueuedData = Omit<
   Extract<SseWireEvent, { type: 'steer_message_queued' }>,
+  'type'
+>;
+export type SseRateLimitSnapshotData = Omit<
+  Extract<SseWireEvent, { type: 'rate_limit_snapshot' }>,
   'type'
 >;
 
