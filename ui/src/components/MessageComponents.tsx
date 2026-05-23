@@ -83,9 +83,9 @@ function DeferredSyntaxHighlighter({ language, syntaxStyle, children, ...props }
 
   if (!highlight) {
     return (
-      <pre>
-        <code className={`language-${language}`} {...props}>{code}</code>
-      </pre>
+      <div className="deferred-code-pre">
+        <code className={`deferred-code language-${language}`} {...props}>{code}</code>
+      </div>
     );
   }
 

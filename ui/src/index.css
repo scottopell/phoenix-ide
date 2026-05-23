@@ -888,6 +888,34 @@ body {
   hyphens: none;
 }
 
+.deferred-code-pre {
+  margin: 0.5em 0;
+  padding: 1em;
+  background: hsl(220deg 13% 18%);
+  color: hsl(220deg 14% 71%);
+  border-radius: 0.3em;
+  overflow: auto;
+  text-shadow: 0 1px rgb(0 0 0 / 30%);
+  font-family: var(--font-mono);
+  direction: ltr;
+  text-align: left;
+  white-space: pre;
+  word-spacing: normal;
+  word-break: normal;
+  line-height: 1.5;
+  tab-size: 2;
+  hyphens: none;
+}
+
+.deferred-code {
+  display: block;
+  font-family: inherit;
+  font-size: 1em;
+  white-space: pre;
+  background: transparent;
+  color: inherit;
+}
+
 /* Images in messages */
 .message-images {
   display: flex;
