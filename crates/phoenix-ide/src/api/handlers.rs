@@ -2001,15 +2001,111 @@ async fn archive_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "archive").await?;
+    run_archive_cascade(&state, &id).await?;
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+/// Archive cascade: same resource cleanup as hard-delete (bash kill, tmux
+/// kill, worktree/branch removal) but flips `archived = 1` instead of
+/// deleting the row. "Done-but-keep-history": the conversation, its
+/// messages, and tool calls remain queryable; live resources are gone.
+///
+/// Rejects busy conversations with the same `cancel_first` 409 as
+/// hard-delete — cleanup would race in-flight tool execution otherwise.
+/// Resource cleanup failures (bash / tmux / worktree) log WARN and
+/// continue; only the final `archived = 1` write is fatal.
+pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if conv.state.is_busy() {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot archive a busy conversation. Cancel the in-flight \
+             operation first, then retry.",
+            "cancel_first",
+        ))));
+    }
+
+    run_resource_cleanup_cascade(state, &conv).await;
 
     state
         .runtime
         .db()
-        .archive_conversation(&id)
+        .archive_conversation(id)
         .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
+        .map_err(|e| AppError::Internal(format!("Failed to set archived flag: {e}")))?;
 
-    Ok(Json(SuccessResponse { success: true }))
+    Ok(())
+}
+
+/// REQ-BED-032 steps 2-4 (bash + tmux + projects cleanup), factored out
+/// so hard-delete, archive, abandon, and mark-merged share the exact same
+/// resource teardown. All failures log WARN and continue — callers own
+/// the final DB write and any state-machine transition.
+pub(super) async fn run_resource_cleanup_cascade(state: &AppState, conv: &crate::db::Conversation) {
+    let id = conv.id.as_str();
+
+    // Step 2: bash handles.
+    let bash_report =
+        crate::tools::bash::registry::cascade_bash_on_delete(state.runtime.bash_handles(), id)
+            .await;
+    let had_live_handles = !bash_report.live_handle_pgids.is_empty();
+    let had_kill_failures = !bash_report.kill_failures.is_empty();
+    if had_kill_failures {
+        tracing::warn!(
+            conv_id = %id,
+            live_handle_pids = ?bash_report.live_handle_pids,
+            live_handle_pgids = ?bash_report.live_handle_pgids,
+            kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
+            kill_failures = ?bash_report.kill_failures,
+            "bash cleanup had kill failures; orphan process groups may remain"
+        );
+    } else if had_live_handles {
+        tracing::debug!(
+            conv_id = %id,
+            live_handle_pids = ?bash_report.live_handle_pids,
+            live_handle_pgids = ?bash_report.live_handle_pgids,
+            kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
+            "bash cascade: SIGKILL'd live process groups"
+        );
+    }
+
+    // Step 3: tmux server.
+    let tmux_worktree_buf: Option<std::path::PathBuf> =
+        conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
+    let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
+        state.runtime.tmux_registry(),
+        id,
+        tmux_worktree_buf.as_deref(),
+        conv.continued_in_conv_id.as_deref(),
+    )
+    .await;
+    if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
+        let kill_status = tmux_report.kill_server_error.as_deref().unwrap_or("ok");
+        tracing::warn!(
+            conv_id = %id,
+            socket_path = %tmux_report.socket_path.display(),
+            kill_server_status = %kill_status,
+            unlink_error = ?tmux_report.unlink_error,
+            "tmux cleanup partial failure; orphan socket/server may remain"
+        );
+    }
+
+    // Step 4: project worktree.
+    let project_report = cascade_projects_on_delete(state, conv).await;
+    if let Some(err) = &project_report.error {
+        tracing::warn!(
+            conv_id = %id,
+            worktree_path = ?project_report.worktree_path,
+            branch_name = ?project_report.branch_name,
+            error = %err,
+            "project cleanup failed; orphan worktree/branch may remain"
+        );
+    }
 }
 
 async fn unarchive_conversation(
@@ -2090,73 +2186,10 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         ))));
     }
 
-    // Step 2: bash handles.
-    let bash_report =
-        crate::tools::bash::registry::cascade_bash_on_delete(state.runtime.bash_handles(), id)
-            .await;
-    let had_live_handles = !bash_report.live_handle_pgids.is_empty();
-    let had_kill_failures = !bash_report.kill_failures.is_empty();
-    if had_kill_failures {
-        tracing::warn!(
-            conv_id = %id,
-            live_handle_pids = ?bash_report.live_handle_pids,
-            live_handle_pgids = ?bash_report.live_handle_pgids,
-            kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
-            kill_failures = ?bash_report.kill_failures,
-            "bash cleanup had kill failures; orphan process groups may remain"
-        );
-    } else if had_live_handles {
-        // We killed handles cleanly — log at debug so an operator
-        // chasing leaks can correlate. Skipping the log entirely on the
-        // pure no-op path keeps test output and prod logs quiet.
-        tracing::debug!(
-            conv_id = %id,
-            live_handle_pids = ?bash_report.live_handle_pids,
-            live_handle_pgids = ?bash_report.live_handle_pgids,
-            kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
-            "bash cascade: SIGKILL'd live process groups"
-        );
-    }
-
-    // Step 3: tmux server.
-    //
-    // worktree_path for socket keying (task 03001): use the typed worktree
-    // field for Work/Branch, cwd for Explore (REQ-PROJ-028 guarantees cwd IS
-    // the worktree for Explore), None for Direct. Mirrors the Explore
-    // fallback in src/terminal/ws.rs — without it, the cascade looks up the
-    // wrong (conv-{id}.sock) deterministic socket and the actual
-    // wt-{hash}.sock tmux server is orphaned.
-    let tmux_worktree_buf: Option<std::path::PathBuf> =
-        conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
-    let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
-        state.runtime.tmux_registry(),
-        id,
-        tmux_worktree_buf.as_deref(),
-        conv.continued_in_conv_id.as_deref(),
-    )
-    .await;
-    if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
-        let kill_status = tmux_report.kill_server_error.as_deref().unwrap_or("ok");
-        tracing::warn!(
-            conv_id = %id,
-            socket_path = %tmux_report.socket_path.display(),
-            kill_server_status = %kill_status,
-            unlink_error = ?tmux_report.unlink_error,
-            "tmux cleanup partial failure; orphan socket/server may remain"
-        );
-    }
-
-    // Step 4: project worktree.
-    let project_report = cascade_projects_on_delete(state, &conv).await;
-    if let Some(err) = &project_report.error {
-        tracing::warn!(
-            conv_id = %id,
-            worktree_path = ?project_report.worktree_path,
-            branch_name = ?project_report.branch_name,
-            error = %err,
-            "project cleanup failed; orphan worktree/branch may remain"
-        );
-    }
+    // Steps 2-4: bash handles, tmux server, project worktree. All
+    // failures are non-fatal (log WARN and continue). Shared with the
+    // archive cascade so the resource teardown is byte-for-byte identical.
+    run_resource_cleanup_cascade(state, &conv).await;
 
     // Step 5: row deletion. SQLite ON DELETE CASCADE removes dependent
     // rows. This is the only step whose failure is fatal to the request
@@ -4104,6 +4137,166 @@ mod hard_delete_cascade_tests {
         // Both rows still present.
         assert!(state.db.get_conversation("cb-a").await.is_ok());
         assert!(state.db.get_conversation("cb-b").await.is_ok());
+    }
+
+    /// Archive cascade rejects a busy conversation with the same
+    /// `cancel_first` 409 as hard-delete, leaves the row unarchived,
+    /// then succeeds once the conversation settles to idle.
+    #[tokio::test]
+    async fn archive_rejects_busy_with_409_then_succeeds() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-arc-1", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+
+        state
+            .db
+            .update_conversation_state("c-arc-1", &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .expect("set busy");
+
+        let err = run_archive_cascade(&state, "c-arc-1")
+            .await
+            .expect_err("must reject while busy");
+        match err {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "cancel_first");
+                assert!(detail.error.contains("Cancel"));
+            }
+            other => panic!("expected 409 Conflict, got {other:?}"),
+        }
+
+        let conv = state
+            .db
+            .get_conversation("c-arc-1")
+            .await
+            .expect("row still present");
+        assert!(
+            !conv.archived,
+            "archived flag must NOT be set after refused archive"
+        );
+
+        state
+            .db
+            .update_conversation_state("c-arc-1", &ConvState::Idle)
+            .await
+            .expect("settle");
+
+        run_archive_cascade(&state, "c-arc-1")
+            .await
+            .expect("archive");
+
+        let conv = state
+            .db
+            .get_conversation("c-arc-1")
+            .await
+            .expect("row preserved");
+        assert!(conv.archived, "archived flag must be set after archive");
+    }
+
+    /// Archive cascade preserves the conversation row + messages (done-but-
+    /// keep-history) while running the same resource cleanup as hard-delete
+    /// — verified here via the bash registry, which the cascade must drop.
+    #[tokio::test]
+    async fn archive_sets_flag_and_drops_bash_registry() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-arc-2", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let _ = state.runtime.bash_handles().get_or_create("c-arc-2").await;
+
+        run_archive_cascade(&state, "c-arc-2")
+            .await
+            .expect("archive");
+
+        let conv = state
+            .db
+            .get_conversation("c-arc-2")
+            .await
+            .expect("row preserved");
+        assert!(conv.archived, "archived flag must be set");
+
+        assert!(
+            state
+                .runtime
+                .bash_handles()
+                .remove_conversation("c-arc-2")
+                .await
+                .is_none(),
+            "bash registry entry must be dropped by archive cascade"
+        );
+    }
+
+    /// `archive_chain_handler` runs the cascade against every member and
+    /// flips `archived = 1` on each — symmetrical with chain delete.
+    #[tokio::test]
+    async fn archive_chain_handler_archives_every_member() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["ca-a", "ca-b", "ca-c"]).await;
+        for id in ["ca-a", "ca-b", "ca-c"] {
+            let _ = state.runtime.bash_handles().get_or_create(id).await;
+        }
+
+        let _ = crate::api::chains::archive_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("ca-a".to_string()),
+        )
+        .await
+        .expect("chain archive");
+
+        for id in ["ca-a", "ca-b", "ca-c"] {
+            let conv = state
+                .db
+                .get_conversation(id)
+                .await
+                .unwrap_or_else(|_| panic!("{id} row preserved"));
+            assert!(conv.archived, "{id} must be archived");
+            assert!(
+                state
+                    .runtime
+                    .bash_handles()
+                    .remove_conversation(id)
+                    .await
+                    .is_none(),
+                "bash registry leaked entry for {id}"
+            );
+        }
+    }
+
+    /// If any member of a chain is busy, `archive_chain_handler` refuses
+    /// the whole operation up-front — no flags flipped, no cleanup.
+    #[tokio::test]
+    async fn archive_chain_refuses_if_any_member_busy() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["cab-a", "cab-b"]).await;
+        state
+            .db
+            .update_conversation_state("cab-b", &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .expect("set busy");
+
+        let err = crate::api::chains::archive_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("cab-a".to_string()),
+        )
+        .await
+        .expect_err("must refuse while busy");
+        match err {
+            AppError::Conflict(detail) => assert_eq!(detail.error_type, "cancel_first"),
+            other => panic!("expected 409, got {other:?}"),
+        }
+
+        for id in ["cab-a", "cab-b"] {
+            let conv = state.db.get_conversation(id).await.expect("row preserved");
+            assert!(
+                !conv.archived,
+                "{id} must NOT be archived after refused chain archive"
+            );
+        }
     }
 }
 
