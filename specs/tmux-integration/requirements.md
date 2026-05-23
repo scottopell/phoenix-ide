@@ -397,12 +397,21 @@ WHEN the agent calls `tmux_run`
 THE SYSTEM SHALL resolve the command directory to the conversation's effective
 file root: `ToolContext.worktree_path` for worktree-scoped conversations, or
 `ToolContext.working_dir` for Direct conversations
-AND SHALL create a new tmux window in the conversation's tmux server with
+AND SHALL create a new tmux window in the conversation's `main` session with
 `-c <effective-file-root>`
 AND SHALL run the command through `bash -lc`
 AND SHALL search the raw tmux pane capture for readiness text and exit markers
 before truncating the snippet returned to the agent
 AND SHALL keep the pane inspectable after exit by default
+
+WHEN `keep_open_on_exit = false` and readiness waiting is requested
+THE SYSTEM SHALL keep the window available until the final readiness / exit
+observation is captured
+AND THEN SHALL close the window after observing command completion
+
+WHEN `name` contains `:`, `|`, newline, or carriage return
+THE SYSTEM SHALL reject the input with `invalid_window_name` before creating a
+tmux window
 
 THE `tmux_run` tool SHALL return responses with this shape:
 

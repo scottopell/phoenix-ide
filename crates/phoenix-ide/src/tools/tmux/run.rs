@@ -162,13 +162,15 @@ impl Tool for TmuxRunTool {
             Ok(paths) => paths,
             Err(out) => return out,
         };
+        let wait_for_readiness = matches!(readiness, ValidReadiness::WaitForText { .. });
+        let keep_open_for_observation = parsed.keep_open_on_exit || wait_for_readiness;
         let target = match start_tmux_window(
             &config_path,
             &socket_path,
             &cwd,
             &requested_name,
             cmd,
-            parsed.keep_open_on_exit,
+            keep_open_for_observation,
         )
         .await
         {
@@ -190,6 +192,7 @@ impl Tool for TmuxRunTool {
                     cmd,
                     &text,
                     timeout,
+                    !parsed.keep_open_on_exit,
                 )
                 .await
             }
@@ -284,7 +287,9 @@ async fn start_tmux_window(
             "-d".to_string(),
             "-P".to_string(),
             "-F".to_string(),
-            "#{window_name}|#{window_id}".to_string(),
+            "#{window_id}|#{window_name}".to_string(),
+            "-t".to_string(),
+            "main".to_string(),
             "-n".to_string(),
             requested_name.to_string(),
             "-c".to_string(),
@@ -321,15 +326,15 @@ async fn start_tmux_window(
         .unwrap_or_default()
         .splitn(2, '|')
         .map(str::trim);
-    let window_name = parts
+    let window_id = parts
         .next()
         .filter(|s| !s.is_empty())
         .unwrap_or(requested_name)
         .to_string();
-    let window_id = parts
+    let window_name = parts
         .next()
         .filter(|s| !s.is_empty())
-        .unwrap_or(&window_name)
+        .unwrap_or(requested_name)
         .to_string();
     Ok(TmuxRunTarget {
         window_name,
@@ -381,6 +386,7 @@ async fn wait_for_text_response(
     cmd: &str,
     text: &str,
     timeout: Duration,
+    close_after_completion: bool,
 ) -> ToolOutput {
     let deadline = Instant::now() + timeout;
     loop {
@@ -406,7 +412,7 @@ async fn wait_for_text_response(
             None
         };
         if let Some(status) = status {
-            return structured_response(
+            let response = structured_response(
                 status,
                 target,
                 cwd,
@@ -415,6 +421,10 @@ async fn wait_for_text_response(
                 &observation.captured_output,
                 true,
             );
+            if close_after_completion && observation.exit_code.is_some() {
+                let _ = kill_window(config_path, socket_path, &target.window_id).await;
+            }
+            return response;
         }
         tokio::select! {
             () = ctx.cancel.cancelled() => {
@@ -433,10 +443,14 @@ fn normalize_window_name(name: &str) -> Result<String, ToolOutput> {
             "name must be non-empty after trimming",
         ));
     }
-    if trimmed.contains(':') || trimmed.contains('\n') || trimmed.contains('\r') {
+    if trimmed.contains(':')
+        || trimmed.contains('|')
+        || trimmed.contains('\n')
+        || trimmed.contains('\r')
+    {
         return Err(error_envelope(
             "invalid_window_name",
-            "name must not contain ':', newline, or carriage return",
+            "name must not contain ':', '|', newline, or carriage return",
         ));
     }
     Ok(trimmed.to_string())
@@ -491,6 +505,25 @@ async fn run_tmux_cli(
     .await
     .map_err(|_| "tmux subprocess timed out".to_string())?
     .map_err(|e| format!("failed to spawn tmux subprocess: {e}"))
+}
+
+async fn kill_window(config_path: &Path, socket_path: &Path, target: &str) -> Result<(), String> {
+    let output = run_tmux_cli(
+        config_path,
+        socket_path,
+        &[
+            "kill-window".to_string(),
+            "-t".to_string(),
+            target.to_string(),
+        ],
+    )
+    .await?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let (_, stderr, _) = truncate_pair(&output.stdout, &output.stderr);
+        Err(stderr)
+    }
 }
 
 async fn observe_window(
@@ -834,6 +867,169 @@ mod tests {
                 .join("conv-tmux-run-trailing-comment.sock"),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn window_name_rejects_pipe_delimiter() {
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir_and_binary(
+            socket_tmp.path().to_path_buf(),
+            false,
+        ));
+        let ctx = ctx(
+            "tmux-run-name-pipe",
+            cwd_tmp.path().to_path_buf(),
+            registry,
+            None,
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "echo hi",
+                    "name": "api|watch"
+                }),
+                ctx,
+            )
+            .await;
+        let v = parse_response(&result);
+        assert_eq!(v["error"], "invalid_window_name");
+    }
+
+    #[tokio::test]
+    async fn wait_for_text_with_keep_closed_observes_then_kills_window() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let ctx = ctx(
+            "tmux-run-close-after-ready",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+        );
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "echo closes-after-ready",
+                    "name": "tmux-run-close-after-ready",
+                    "keep_open_on_exit": false,
+                    "readiness": {
+                        "mode": "wait_for_text",
+                        "text": EXIT_MARKER_PREFIX,
+                        "timeout_seconds": 5
+                    }
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        assert_eq!(v["status"], "ready");
+        assert_eq!(v["exit_code"], 0);
+        let window_id = v["window_id"].as_str().unwrap();
+        let sock = socket_tmp
+            .path()
+            .join("conv-tmux-run-close-after-ready.sock");
+        let capture = tokio::process::Command::new("tmux")
+            .args([
+                "-S",
+                &sock.to_string_lossy(),
+                "capture-pane",
+                "-p",
+                "-t",
+                window_id,
+            ])
+            .env_remove("TMUX")
+            .status()
+            .await
+            .unwrap();
+        assert!(
+            !capture.success(),
+            "window should be killed after observation"
+        );
+        kill_socket(&sock).await;
+    }
+
+    #[tokio::test]
+    async fn tmux_run_targets_main_session() {
+        if skip_unless_tmux() {
+            return;
+        }
+        let socket_tmp = TempDir::new().unwrap();
+        let cwd_tmp = TempDir::new().unwrap();
+        let registry = Arc::new(TmuxRegistry::with_socket_dir(
+            socket_tmp.path().to_path_buf(),
+        ));
+        let ctx = ctx(
+            "tmux-run-main-session",
+            cwd_tmp.path().canonicalize().unwrap(),
+            registry,
+            None,
+        );
+
+        let server = ctx
+            .tmux_registry()
+            .ensure_live(
+                &ctx.conversation_id,
+                ctx.worktree_path.as_deref(),
+                &ctx.working_dir,
+            )
+            .await
+            .unwrap();
+        let socket_path = server.read().await.socket_path.clone();
+        let config_path = ctx.tmux_registry().config_path();
+        let _ = run_tmux_cli(
+            &config_path,
+            &socket_path,
+            &[
+                "new-session".to_string(),
+                "-d".to_string(),
+                "-s".to_string(),
+                "other".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let result = TmuxRunTool
+            .run(
+                json!({
+                    "cmd": "echo session-target",
+                    "name": "tmux-run-main-session",
+                    "readiness": {
+                        "mode": "wait_for_text",
+                        "text": EXIT_MARKER_PREFIX,
+                        "timeout_seconds": 5
+                    }
+                }),
+                ctx,
+            )
+            .await;
+        assert!(result.is_success(), "got: {}", result.output());
+        let v = parse_response(&result);
+        let window_id = v["window_id"].as_str().unwrap();
+        let display = run_tmux_cli(
+            &config_path,
+            &socket_path,
+            &[
+                "display-message".to_string(),
+                "-p".to_string(),
+                "-t".to_string(),
+                window_id.to_string(),
+                "#{session_name}".to_string(),
+            ],
+        )
+        .await
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&display.stdout).trim(), "main");
+        kill_socket(&socket_path).await;
     }
 
     #[tokio::test]

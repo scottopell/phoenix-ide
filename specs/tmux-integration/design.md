@@ -108,14 +108,17 @@ emit structured CLI output where the distinction matters.
 1. Resolve the effective file root: `ToolContext.worktree_path` when present,
    otherwise `ToolContext.working_dir`.
 2. Ensure the conversation/worktree tmux server is live through the registry.
-3. Create a detached window with `tmux new-window -d -P -F
-   '#{window_name}|#{window_id}' -n <name> -c <file-root> <shell-command>`.
+3. Create a detached window in the `main` session with `tmux new-window -d -P
+   -F '#{window_id}|#{window_name}' -t main -n <name> -c <file-root>
+   <shell-command>`.
 4. Run `<shell-command>` as `bash -lc '<wrapper>'`, where the wrapper executes
    the agent command, captures `$?`, prints
    `[phoenix] process exited with code <code>`, then either opens an
    interactive shell (`keep_open_on_exit=true`) or exits with the same code.
    The command is embedded on its own line so trailing shell comments in the
-   agent command do not consume Phoenix's exit-marker logic.
+   agent command do not consume Phoenix's exit-marker logic. If readiness is
+   requested with `keep_open_on_exit=false`, Phoenix keeps the window open until
+   it observes completion and then kills the window.
 5. If readiness is `wait_for_text`, poll `capture-pane -p -t <window_id>
    -S -2000` until the text appears in the raw pane capture, the exit marker
    appears, cancellation is requested, or the bounded timeout expires. The raw
@@ -145,7 +148,8 @@ trimmed non-empty text and a bounded timeout. The response nests truncation unde
 `captured_output` because only the returned snippet is bounded — tmux scrollback
 remains inspectable via raw `tmux capture-pane` using the returned unique
 `window_id`. `window_name` is returned for human readability but is not a unique
-handle.
+handle. Window names containing the id/name delimiter (`|`) are rejected so the
+`#{window_id}|#{window_name}` parser cannot be confused by user input.
 
 ## Per-Conversation Tmux Server Registry
 

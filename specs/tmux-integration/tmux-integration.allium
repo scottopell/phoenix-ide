@@ -440,6 +440,7 @@ rule TmuxRunToolCalled {
     ensures: TmuxRunWindowCreated(
         conversation: conversation,
         socket_path:  socket,
+        session:      config.tmux_default_session,
         cwd:          file_root,
         command:      command,
         name:         requested_name
@@ -454,18 +455,23 @@ rule TmuxRunToolCalled {
         -- Effective file root:
         --   Work/Branch/managed-Explore: ToolContext.worktree_path.
         --   Direct: ToolContext.working_dir.
-        -- The helper passes `-c <file_root>` on new-window even if the
-        -- default `main` session already exists elsewhere.
+        -- The helper passes `-t main -c <file_root>` on new-window even if
+        -- another session exists or was used most recently.
         --
         -- The shell wrapper embeds the agent command on its own line inside
         -- the subshell. This preserves normal bash semantics for commands
         -- ending with trailing comments (`# note`), so Phoenix's closing
         -- delimiter and exit-marker logic are not swallowed by the comment.
         --
-        -- The tmux new-window call observes both `#{window_name}` and the
-        -- unique `#{window_id}`. Later polling and agent inspection use the
+        -- The tmux new-window call observes both `#{window_id}` and
+        -- `#{window_name}`. Later polling and agent inspection use the
         -- unique id; the human-readable name is not a stable target because
-        -- tmux permits duplicate window names.
+        -- tmux permits duplicate window names. Window names containing the
+        -- id/name delimiter are rejected before the tmux call.
+        --
+        -- If keep_open_on_exit=false and readiness waiting is requested,
+        -- Phoenix keeps the window open through observation, then kills it
+        -- after observing the exit marker so completion/output are not lost.
 }
 
 -- REQ-TMUX-014: return_immediately starts the command and returns the first
@@ -544,16 +550,18 @@ rule TmuxRunReadinessTimedOut {
 }
 
 -- REQ-TMUX-014: invalid or unavailable inputs fail before creating a tmux
--- window.
+-- window. Error ids remain specific so agents can recover precisely.
 rule TmuxRunRejectedBeforeStart {
     when: AgentCallsTmuxRun(conversation, command, requested_name, readiness_mode, keep_open_on_exit)
 
     requires: not tmux_binary_available()
         or command = ""
+        or requested_name = ""
+        or window_name_has_invalid_character(requested_name)
         or (readiness_mode != return_immediately and readiness_mode != wait_for_text)
 
     ensures: AgentReceivesError(
-        error: "tmux_run_rejected_before_start"
+        error: "tmux_binary_unavailable | empty_command | empty_window_name | invalid_window_name | invalid_input | empty_readiness_text | readiness_timeout_out_of_range"
     )
 }
 
