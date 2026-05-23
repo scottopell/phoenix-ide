@@ -49,7 +49,6 @@ Adding a new scenario
 
 from __future__ import annotations
 
-import base64
 import json
 import os
 import socket
@@ -139,13 +138,16 @@ def _server():
     base_url = f"http://127.0.0.1:{port}"
     deadline = time.monotonic() + 30.0
     last_err: Exception | None = None
+    import shutil
     while time.monotonic() < deadline:
         if proc.poll() is not None:
             log_file.close()
-            raise RuntimeError(
+            err = RuntimeError(
                 f"phoenix-ide exited during startup (code {proc.returncode})\n"
                 f"--- log ({log_path}) ---\n{log_path.read_text()}"
             )
+            shutil.rmtree(tmpdir, ignore_errors=True)
+            raise err
         try:
             r = httpx.get(f"{base_url}/version", timeout=2.0)
             if r.status_code == 200:
@@ -157,10 +159,12 @@ def _server():
         proc.kill()
         proc.wait(timeout=5)
         log_file.close()
-        raise RuntimeError(
+        err = RuntimeError(
             f"phoenix-ide did not become healthy in 30s: {last_err}\n"
             f"--- log ({log_path}) ---\n{log_path.read_text()}"
         )
+        shutil.rmtree(tmpdir, ignore_errors=True)
+        raise err
 
     try:
         yield base_url, log_path
@@ -172,6 +176,9 @@ def _server():
             proc.kill()
             proc.wait(timeout=5)
         log_file.close()
+        # Clean up the per-run tempdir (DB + log). Without this, repeated
+        # local / CI runs leak /tmp/phoenix-e2e-* directories.
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 # ----------------------- minimal client helpers -----------------------
@@ -265,7 +272,10 @@ def _stream_to_terminal(base_url: str, conv_id: str, timeout: float = 30.0) -> N
                 elif event.event == "agent_done":
                     return
                 elif event.event == "error":
-                    raise RuntimeError(f"sse error: {data.get('message')}")
+                    # Include raw event.data so an empty/malformed error
+                    # payload doesn't degrade to "sse error: None".
+                    msg = data.get("message") or event.data or "(no data)"
+                    raise RuntimeError(f"sse error: {msg}")
     except Exception as e:
         # Watchdog-triggered close manifests as a transport error or runtime
         # error from the SSE library. Map to a clean TimeoutError if the
