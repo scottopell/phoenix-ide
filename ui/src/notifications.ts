@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react';
+import { useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { api, type Conversation, type ConversationState, type NotificationSettings } from './api';
 import { isAgentWorking, parseConversationState } from './utils';
@@ -17,6 +17,11 @@ export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
   notify_idle: true,
 };
 
+const DISABLED_NOTIFICATION_SETTINGS: NotificationSettings = {
+  ...DEFAULT_NOTIFICATION_SETTINGS,
+  enabled: false,
+};
+
 export const AGENT_FINISHED_THRESHOLD_MS = 30_000;
 
 type BrowserPermission = NotificationPermission | 'unsupported';
@@ -28,9 +33,11 @@ type NotificationEvent = {
 };
 
 const notificationRuntime = {
-  settings: DEFAULT_NOTIFICATION_SETTINGS,
+  settings: DISABLED_NOTIFICATION_SETTINGS,
+  settingsLoaded: false,
+  settingsLoading: null as Promise<NotificationSettings> | null,
   permissionCuePending: false,
-  seenCatchupKeys: new Set<string>(),
+  lastCatchupKeyByConversationId: new Map<string, string>(),
 };
 
 export function getBrowserNotificationPermission(): BrowserPermission {
@@ -50,6 +57,37 @@ export function consumeNotificationPermissionCue(): boolean {
 
 export function updateNotificationRuntimeSettings(settings: NotificationSettings): void {
   notificationRuntime.settings = settings;
+  notificationRuntime.settingsLoaded = true;
+}
+
+export function getNotificationRuntimeSettings(): NotificationSettings {
+  return notificationRuntime.settings;
+}
+
+export function loadNotificationSettings(): Promise<NotificationSettings> {
+  if (notificationRuntime.settingsLoaded) return Promise.resolve(notificationRuntime.settings);
+  if (!notificationRuntime.settingsLoading) {
+    notificationRuntime.settingsLoading = api.getNotificationSettings()
+      .then((settings) => {
+        updateNotificationRuntimeSettings(settings);
+        return settings;
+      })
+      .catch((err: unknown) => {
+        notificationRuntime.settingsLoading = null;
+        throw err;
+      });
+  }
+  return notificationRuntime.settingsLoading;
+}
+
+export function resetNotificationRuntimeForTest(settings?: NotificationSettings): void {
+  notificationRuntime.settings = settings ?? DISABLED_NOTIFICATION_SETTINGS;
+  notificationRuntime.settingsLoaded = settings !== undefined;
+  notificationRuntime.settingsLoading = null;
+  notificationRuntime.permissionCuePending = false;
+  notificationRuntime.lastCatchupKeyByConversationId.clear();
+  busyStartedAtByConversation.clear();
+  previousSnapshotsById.clear();
 }
 
 function notificationEnabled(type: NotificationEventType, settings: NotificationSettings): boolean {
@@ -88,6 +126,7 @@ function shouldSuppressForFocus(conversation: Conversation): boolean {
 }
 
 function deliverNotification(event: NotificationEvent): void {
+  if (!notificationRuntime.settingsLoaded) return;
   if (!notificationEnabled(event.type, notificationRuntime.settings)) return;
   if (shouldSuppressForFocus(event.conversation)) return;
 
@@ -177,33 +216,16 @@ export function notifyConversationSnapshotChange(next: Conversation): void {
 
 export function notifyCatchUp(conversations: readonly Conversation[]): void {
   for (const conversation of conversations) {
-    if ((conversation as { parent_conversation_id?: string | null }).parent_conversation_id) continue;
+    if (conversation.parent_conversation_id) continue;
     const state = conversation.state ? parseConversationState(conversation.state) : { type: 'idle' as const };
     const event = eventForState(state, conversation);
     if (!event) continue;
     const key = `${conversation.id}:${state.type}:${conversation.updated_at}`;
-    if (notificationRuntime.seenCatchupKeys.has(key)) continue;
-    notificationRuntime.seenCatchupKeys.add(key);
+    const previousKey = notificationRuntime.lastCatchupKeyByConversationId.get(conversation.id);
+    if (previousKey === key) continue;
+    notificationRuntime.lastCatchupKeyByConversationId.set(conversation.id, key);
     deliverNotification(event);
   }
-}
-
-export function useNotificationSettings() {
-  const settingsRef = useRef(DEFAULT_NOTIFICATION_SETTINGS);
-  useEffect(() => {
-    let cancelled = false;
-    api.getNotificationSettings()
-      .then((settings) => {
-        if (cancelled) return;
-        settingsRef.current = settings;
-        updateNotificationRuntimeSettings(settings);
-      })
-      .catch(() => {
-        updateNotificationRuntimeSettings(DEFAULT_NOTIFICATION_SETTINGS);
-      });
-    return () => { cancelled = true; };
-  }, []);
-  return settingsRef;
 }
 
 export function useNotificationClickNavigationBridge(): void {

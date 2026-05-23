@@ -14,9 +14,9 @@ import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';
 import {
   consumeNotificationPermissionCue,
+  loadNotificationSettings,
   notifyCatchUp,
   useNotificationClickNavigationBridge,
-  useNotificationSettings,
 } from '../notifications';
 
 interface DesktopLayoutProps {
@@ -41,7 +41,6 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   });
   const location = useLocation();
   const { toasts, dismissToast, showSuccess, showError, showInfo } = useToast();
-  useNotificationSettings();
   useNotificationClickNavigationBridge();
 
   // Task 08684: ConversationStore is the single source of truth.
@@ -52,6 +51,10 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // `Conversation[]` state, no per-field bridge hooks.
   const { refresh: refreshConversations } = useConversationsRefresh();
   const { active: conversations, archived: archivedConversations } = useConversationsList();
+
+  useEffect(() => {
+    void loadNotificationSettings().catch(() => {});
+  }, []);
 
   useEffect(() => {
     notifyCatchUp(conversations);

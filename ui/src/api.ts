@@ -61,6 +61,8 @@ export interface Conversation {
   project_id?: string | null;
   conv_mode_label?: string;
   project_name?: string | null;
+  parent_conversation_id?: string | null;
+  user_initiated?: boolean;
   /** Server-user's $SHELL (e.g. "/bin/zsh"); used to tailor the
    *  OSC 133 enablement snippet in the terminal HUD. REQ-TERM-017. */
   shell?: string | null;

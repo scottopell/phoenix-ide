@@ -1,8 +1,9 @@
 import { useState, useEffect, useCallback } from 'react';
 import { api, type NotificationSettings } from '../api';
 import {
-  DEFAULT_NOTIFICATION_SETTINGS,
   getBrowserNotificationPermission,
+  getNotificationRuntimeSettings,
+  loadNotificationSettings,
   updateNotificationRuntimeSettings,
 } from '../notifications';
 
@@ -13,14 +14,14 @@ interface Props {
 }
 
 export function NotificationSettingsPanel({ compact = false }: Props) {
-  const [settings, setSettings] = useState<NotificationSettings>(DEFAULT_NOTIFICATION_SETTINGS);
+  const [settings, setSettings] = useState<NotificationSettings>(() => getNotificationRuntimeSettings());
   const [permission, setPermission] = useState<BrowserPermission>(() => getBrowserNotificationPermission());
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    api.getNotificationSettings()
+    loadNotificationSettings()
       .then((loaded) => {
         if (cancelled) return;
         setSettings(loaded);
@@ -49,8 +50,12 @@ export function NotificationSettingsPanel({ compact = false }: Props) {
   }, []);
 
   const setFlag = useCallback((key: keyof NotificationSettings, value: boolean) => {
-    void save({ ...settings, [key]: value });
-  }, [save, settings]);
+    setSettings((prev) => {
+      const next = { ...prev, [key]: value };
+      void save(next);
+      return next;
+    });
+  }, [save]);
 
   const requestPermission = useCallback(async () => {
     if (!('Notification' in window) || Notification.permission !== 'default') {
