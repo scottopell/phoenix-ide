@@ -1,4 +1,4 @@
-import { describe, expect, it, vi, beforeEach } from 'vitest';
+import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { SubAgentStatus, AgentMessage } from './MessageComponents';
@@ -194,6 +194,10 @@ describe('markdown table rendering', () => {
 
 
 describe('finalized code fence highlighting', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
   it('renders readable code immediately and upgrades highlighting during idle time', async () => {
     let idleCallback: (() => void) | undefined;
     const requestIdleCallback = vi.fn((callback: () => void) => {

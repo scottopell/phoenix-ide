@@ -71,7 +71,7 @@ function scheduleIdleCallback(callback: () => void): () => void {
     const handle = idleWindow.requestIdleCallback(callback, { timeout: 1500 });
     return () => idleWindow.cancelIdleCallback?.(handle);
   }
-  const handle = window.setTimeout(callback, 0);
+  const handle = window.setTimeout(callback, 1500);
   return () => window.clearTimeout(handle);
 }
 
@@ -558,7 +558,8 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
   const markdownComponents = useMemo(() => ({
     // Custom code block rendering with syntax highlighting
     // Inline code with file paths becomes clickable
-    code: ({ inline, className, children, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode }) => {
+    code: ({ inline, className, children, node, ...props }: { inline?: boolean | undefined; className?: string | undefined; children?: React.ReactNode; node?: unknown }) => {
+      void node;
       const match = /language-(\w+)/.exec(className || '');
       if (!inline && match?.[1]) {
         return (
