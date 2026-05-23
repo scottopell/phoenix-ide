@@ -2278,6 +2278,28 @@ async fn cascade_projects_on_delete(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> CascadeProjectsReport {
+    // Chain-member preservation: if this conversation has a successor in
+    // a continuation chain, the worktree + branch are shared with that
+    // successor -- only the leaf (continued_in_conv_id = None) actually
+    // owns them. Skip cleanup here; the leaf's cascade will handle it.
+    // Mirrors the tmux preservation logic at tools/tmux/registry.rs:456,
+    // making chain delete/archive correct by construction: no redundant
+    // worktree-remove or branch-D calls walking the chain, and no race
+    // window where root's cascade tears down resources the leaf is using.
+    //
+    // Per-conv archive/delete/unarchive are gated by `refuse_if_chain_member`
+    // so for those callers `continued_in_conv_id` is None and this check
+    // is a no-op. Abandon and mark-merged are gated by `reject_if_continued`
+    // (leaf-only), so this is also a no-op there.
+    if conv.continued_in_conv_id.is_some() {
+        tracing::debug!(
+            conv_id = %conv.id,
+            continuation = %conv.continued_in_conv_id.as_deref().unwrap_or(""),
+            "skipping worktree/branch cleanup -- transferred to continuation"
+        );
+        return CascadeProjectsReport::default();
+    }
+
     let (branch_name, worktree_path, is_work_mode) = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
@@ -4297,6 +4319,207 @@ mod hard_delete_cascade_tests {
                 "{id} must NOT be archived after refused chain archive"
             );
         }
+    }
+
+    /// Build a 3-member Work-mode chain (A -> A2 -> A3) sharing a real git
+    /// worktree + branch on disk. Returns the tempdir guard (kept alive by
+    /// caller), the repo path, the worktree path, and the branch name so
+    /// the test can assert against the filesystem after a chain operation.
+    async fn build_workmode_chain_with_shared_worktree(
+        state: &AppState,
+        ids: &[&str; 3],
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+
+        // Initial commit so `git worktree add <path> <branch>` has a
+        // commit to base the new branch on.
+        crate::git_ops::run_git(&repo, &["init", "--initial-branch=main"]).expect("git init");
+        crate::git_ops::run_git(&repo, &["config", "user.email", "test@phoenix"])
+            .expect("git config email");
+        crate::git_ops::run_git(&repo, &["config", "user.name", "phoenix-test"])
+            .expect("git config name");
+        crate::git_ops::run_git(&repo, &["commit", "--allow-empty", "-m", "init"])
+            .expect("initial commit");
+
+        let branch = format!("task-{}", ids[0]);
+        let worktree = tmp.path().join("worktree");
+        crate::git_ops::run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                worktree.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .expect("worktree add");
+
+        let project = state
+            .db
+            .find_or_create_project(repo.to_str().unwrap())
+            .await
+            .expect("project");
+        let mode = crate::db::ConvMode::Work {
+            branch_name: crate::db::NonEmptyString::new(branch.clone()).unwrap(),
+            worktree_path: crate::db::NonEmptyString::new(worktree.to_string_lossy().to_string())
+                .unwrap(),
+            base_branch: crate::db::NonEmptyString::new("main").unwrap(),
+            task_id: crate::db::NonEmptyString::new("00001").unwrap(),
+            task_title: crate::db::NonEmptyString::new("test chain").unwrap(),
+        };
+
+        for id in ids {
+            state
+                .db
+                .create_conversation_with_project(
+                    id,
+                    &format!("slug-{id}"),
+                    worktree.to_str().unwrap(),
+                    true,
+                    None,
+                    None,
+                    Some(&project.id),
+                    &mode,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("create conv");
+        }
+        for pair in ids.windows(2) {
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+                .bind(pair[1])
+                .bind(pair[0])
+                .execute(state.db.pool())
+                .await
+                .expect("link");
+        }
+
+        (tmp, repo, worktree, branch)
+    }
+
+    /// Chain archive must tear down the chain's shared worktree + branch
+    /// exactly once (from the leaf's cascade) and flip `archived = 1` on
+    /// every member. Verifies the correct-by-construction continuation
+    /// preservation: root + mid skip worktree cleanup, leaf actually
+    /// removes it. End state: shared resources gone, all rows archived.
+    #[tokio::test]
+    async fn archive_chain_cleans_shared_worktree_and_branch_once() {
+        let state = make_test_state().await;
+        let ids = ["sc-a", "sc-a2", "sc-a3"];
+        let (_tmp, repo, worktree, branch) =
+            build_workmode_chain_with_shared_worktree(&state, &ids).await;
+
+        assert!(worktree.exists(), "precondition: worktree must exist");
+        assert!(
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
+            "precondition: branch must exist"
+        );
+
+        let _ = crate::api::chains::archive_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("sc-a".to_string()),
+        )
+        .await
+        .expect("chain archive");
+
+        assert!(
+            !worktree.exists(),
+            "shared worktree must be removed after chain archive"
+        );
+        assert!(
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
+            "shared task branch must be deleted after chain archive (Work mode)"
+        );
+        for id in ids {
+            let conv = state
+                .db
+                .get_conversation(id)
+                .await
+                .unwrap_or_else(|_| panic!("{id} row preserved"));
+            assert!(conv.archived, "{id} must be archived");
+        }
+    }
+
+    /// Chain hard-delete must tear down the chain's shared worktree +
+    /// branch exactly once and remove every row. Root-first iteration
+    /// (FK on `continued_in_conv_id` requires it) plus the in-cascade
+    /// continuation-preservation check together ensure the worktree is
+    /// only touched at the leaf -- no race where root's cascade pulls
+    /// the worktree out from under the leaf's row before the leaf row
+    /// is even deleted.
+    #[tokio::test]
+    async fn delete_chain_cleans_shared_worktree_and_branch_once() {
+        let state = make_test_state().await;
+        let ids = ["dc-a", "dc-a2", "dc-a3"];
+        let (_tmp, repo, worktree, branch) =
+            build_workmode_chain_with_shared_worktree(&state, &ids).await;
+
+        assert!(worktree.exists(), "precondition: worktree must exist");
+
+        let _ = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("dc-a".to_string()),
+        )
+        .await
+        .expect("chain delete");
+
+        assert!(
+            !worktree.exists(),
+            "shared worktree must be removed after chain delete"
+        );
+        assert!(
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
+            "shared task branch must be deleted after chain delete (Work mode)"
+        );
+        for id in ids {
+            assert!(
+                state.db.get_conversation(id).await.is_err(),
+                "{id} row must be gone after chain delete"
+            );
+        }
+    }
+
+    /// Per-conversation cascade on a chain root must NOT touch the worktree
+    /// -- it belongs to the leaf. Pure invariant test for the new
+    /// `continued_in_conv_id` guard in `cascade_projects_on_delete`. Drives
+    /// the cascade directly (bypassing the chain-member API gate) so the
+    /// preservation logic is exercised in isolation.
+    #[tokio::test]
+    async fn cascade_skips_worktree_when_continuation_exists() {
+        let state = make_test_state().await;
+        let ids = ["pc-a", "pc-a2"];
+        let (_tmp, _repo, worktree, _branch) =
+            build_workmode_chain_with_shared_worktree(&state, &[ids[0], ids[1], "pc-a3"]).await;
+
+        let root_conv = state.db.get_conversation("pc-a").await.expect("root");
+        let report = cascade_projects_on_delete(&state, &root_conv).await;
+        assert!(
+            report.worktree_path.is_none(),
+            "cascade on chain root must report no worktree work (continuation owns it), got {report:?}"
+        );
+        assert!(
+            report.branch_name.is_none(),
+            "cascade on chain root must not name branch for deletion"
+        );
+        assert!(
+            report.error.is_none(),
+            "skip path must not surface an error"
+        );
+        assert!(
+            worktree.exists(),
+            "worktree must remain intact after non-leaf cascade"
+        );
     }
 }
 
