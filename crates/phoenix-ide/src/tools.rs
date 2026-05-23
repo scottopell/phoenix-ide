@@ -52,6 +52,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::ModelRegistry;
+use crate::work_scope::WorkScope;
 pub use browser::session::BrowserSession;
 
 /// Typed image data for LLM consumption.
@@ -207,6 +208,12 @@ pub struct ToolContext {
     /// key the socket to the worktree rather than the conversation ID so
     /// the session survives context-exhaustion continuations (task 03001).
     pub worktree_path: Option<PathBuf>,
+
+    /// Durable owner for work-affine resources created by this tool call.
+    /// Worktree-backed conversations scope to the worktree path so resources
+    /// survive context-exhaustion continuations; Direct conversations fall
+    /// back to the conversation id.
+    pub work_scope: WorkScope,
 }
 
 impl ToolContext {
@@ -223,6 +230,7 @@ impl ToolContext {
         tmux_registry: Arc<TmuxRegistry>,
         worktree_path: Option<PathBuf>,
     ) -> Self {
+        let work_scope = WorkScope::resolve(&conversation_id, worktree_path.as_deref());
         Self {
             cancel,
             conversation_id,
@@ -233,6 +241,7 @@ impl ToolContext {
             terminals,
             tmux_registry,
             worktree_path,
+            work_scope,
         }
     }
 
@@ -294,13 +303,12 @@ impl ToolContext {
         // re-attach (see `ensure_live` doc).
         //
         // `worktree_path` controls socket keying: worktree-scoped for
-        // Work/Branch/Explore, conv-scoped for Direct (task 03001).
+        // Work/Branch/Explore, conv-scoped for Direct (task 03001). The
+        // ToolContext computes `work_scope` from this at construction time;
+        // tmux ownership is keyed off the scope rather than re-deciding
+        // the worktree-vs-conversation fallback at each callsite.
         self.tmux_registry
-            .ensure_live(
-                &self.conversation_id,
-                self.worktree_path.as_deref(),
-                &self.working_dir,
-            )
+            .ensure_live(&self.conversation_id, &self.work_scope, &self.working_dir)
             .await
     }
 

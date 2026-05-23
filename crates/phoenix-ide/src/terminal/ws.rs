@@ -335,8 +335,9 @@ async fn resolve_exec_plan(
     if !registry.binary_available() {
         return PtyExecPlan::Shell;
     }
+    let work_scope = crate::work_scope::WorkScope::resolve(conversation_id, worktree_path);
     match registry
-        .ensure_live(conversation_id, worktree_path, cwd)
+        .ensure_live(conversation_id, &work_scope, cwd)
         .await
     {
         Ok(server_arc) => {

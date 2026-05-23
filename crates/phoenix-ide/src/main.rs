@@ -20,6 +20,7 @@ mod terminal;
 mod title_generator;
 mod tls;
 mod tools;
+mod work_scope;
 
 use api::{create_router, AppState};
 use db::Database;

@@ -250,7 +250,7 @@ async fn resolve_tmux_paths(
 ) -> Result<(PathBuf, PathBuf), ToolOutput> {
     let server_arc = match ctx
         .tmux_registry()
-        .ensure_live(&ctx.conversation_id, ctx.worktree_path.as_deref(), cwd)
+        .ensure_live(&ctx.conversation_id, &ctx.work_scope, cwd)
         .await
     {
         Ok(arc) => arc,
@@ -976,11 +976,7 @@ mod tests {
 
         let server = ctx
             .tmux_registry()
-            .ensure_live(
-                &ctx.conversation_id,
-                ctx.worktree_path.as_deref(),
-                &ctx.working_dir,
-            )
+            .ensure_live(&ctx.conversation_id, &ctx.work_scope, &ctx.working_dir)
             .await
             .unwrap();
         let socket_path = server.read().await.socket_path.clone();
