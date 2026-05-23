@@ -263,10 +263,11 @@ rule StreamOpened {
 
     @guidance
         -- Implementation sequence is load-bearing: subscribe to the live
-        -- broadcast receiver before reading DB messages and before
-        -- snapshotting the ReplayRing. A persisted message that commits during
-        -- stream open is then either present in the DB `messages` snapshot or
-        -- delivered on the subscribed live receiver; init must not set
+        -- broadcast receiver, snapshot the replay coverage / sequence floor,
+        -- then read DB messages last. A persisted message that commits during
+        -- stream open is then either present in the final DB `messages` snapshot
+        -- or has a sequence_id above the init floor and is delivered on the
+        -- subscribed live receiver; init must not set
         -- `last_sequence_id`/`pending_anchor_sequence_id` past a message absent
         -- from both delivery paths. This is the concrete construction for
         -- InitSnapshotNoDurableGap.
