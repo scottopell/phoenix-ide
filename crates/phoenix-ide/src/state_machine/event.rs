@@ -105,8 +105,16 @@ pub enum Event {
     UserTriggerContinuation,
 
     // Task approval events (REQ-BED-028)
-    /// User responded to a proposed task plan
-    TaskApprovalResponse {
+    /// User responded to a proposed task plan.
+    ///
+    /// Matches the `TaskApprovalDecided(conversation, decision)` trigger in
+    /// `specs/bedrock/bedrock.allium` (the surface's `provides:` block plus
+    /// the four `UserApprovesTaskCurrentConversation` /
+    /// `UserApprovesTaskFreshWorkConversation` / `UserProvidesFeedback` /
+    /// `UserRejectsTask` rules). The HTTP wire type `TaskApprovalResponse`
+    /// in `api/types.rs` is unrelated — it's the response body, not the
+    /// lifecycle event.
+    TaskApprovalDecided {
         outcome: TaskApprovalOutcome,
     },
     /// Internal completion event emitted after fresh task approval creates the
@@ -208,7 +216,7 @@ impl Event {
             Event::ContinuationResponse { .. } => "ContinuationResponse",
             Event::ContinuationFailed { .. } => "ContinuationFailed",
             Event::UserTriggerContinuation => "UserTriggerContinuation",
-            Event::TaskApprovalResponse { .. } => "TaskApprovalResponse",
+            Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
@@ -294,7 +302,7 @@ pub enum CoreEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
 pub enum ParentOnlyEvent {
-    TaskApprovalResponse {
+    TaskApprovalDecided {
         outcome: TaskApprovalOutcome,
     },
     TaskHandoffComplete {
@@ -451,8 +459,8 @@ impl TryFrom<Event> for ParentEvent {
                 }))
             }
             // Parent-only events
-            Event::TaskApprovalResponse { outcome } => {
-                Ok(ParentEvent::Parent(ParentOnlyEvent::TaskApprovalResponse {
+            Event::TaskApprovalDecided { outcome } => {
+                Ok(ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
                     outcome,
                 }))
             }
@@ -591,7 +599,7 @@ impl TryFrom<Event> for SubAgentEvent {
             // SteerDrainedUserMessages is parent-only: steering is a parent-
             // conversation feature, and the executor's drain detector guards
             // against firing for sub-agents.
-            Event::TaskApprovalResponse { .. }
+            Event::TaskApprovalDecided { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
             | Event::CredentialBecameAvailable
@@ -635,7 +643,7 @@ impl ParentEvent {
         match self {
             ParentEvent::Core(e) => e.variant_name(),
             ParentEvent::Parent(e) => match e {
-                ParentOnlyEvent::TaskApprovalResponse { .. } => "TaskApprovalResponse",
+                ParentOnlyEvent::TaskApprovalDecided { .. } => "TaskApprovalDecided",
                 ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
                 ParentOnlyEvent::CredentialBecameAvailable => "CredentialBecameAvailable",
@@ -656,5 +664,34 @@ impl SubAgentEvent {
                 SubAgentOnlyEvent::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod spec_runtime_name_alignment_tests {
+    use super::*;
+    use crate::state_machine::state::TaskApprovalOutcome;
+
+    /// Lock the event variant name to the spec trigger name. The four
+    /// `UserApprovesTaskCurrentConversation` / `UserApprovesTaskFreshWorkConversation`
+    /// / `UserProvidesFeedback` / `UserRejectsTask` rules in
+    /// `specs/bedrock/bedrock.allium` subscribe to
+    /// `TaskApprovalDecided(conversation, decision)`; the bedrock + auth
+    /// surfaces declare it under `provides:`. The Rust event name and that
+    /// spec name must match, or the audit-class drift task 02684 caught
+    /// returns. Renaming one without the other regresses; this test fails
+    /// at compile time (variant) and runtime (string) if so.
+    #[test]
+    fn task_approval_event_name_matches_spec_trigger() {
+        let event = Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Rejected,
+        };
+        assert_eq!(event.variant_name(), "TaskApprovalDecided");
+
+        let parent_only = ParentOnlyEvent::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Rejected,
+        };
+        let parent_event = ParentEvent::Parent(parent_only);
+        assert_eq!(parent_event.variant_name(), "TaskApprovalDecided");
     }
 }

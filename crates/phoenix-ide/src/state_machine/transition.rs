@@ -1384,7 +1384,7 @@ pub fn transition_parent(
                 priority,
                 plan,
             },
-            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalResponse {
+            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
                 outcome:
                     TaskApprovalOutcome::Approved {
                         handoff: TaskApprovalHandoff::ContinueInCurrentConversation,
@@ -1409,7 +1409,7 @@ pub fn transition_parent(
                 priority,
                 plan,
             },
-            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalResponse {
+            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
                 outcome:
                     TaskApprovalOutcome::Approved {
                         handoff: TaskApprovalHandoff::StartFreshWorkConversation,
@@ -1440,7 +1440,7 @@ pub fn transition_parent(
 
         (
             ParentState::AwaitingTaskApproval { .. },
-            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalResponse {
+            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
                 outcome: TaskApprovalOutcome::FeedbackProvided { annotations },
             }),
         ) => Ok(
@@ -1470,7 +1470,7 @@ pub fn transition_parent(
 
         (
             ParentState::AwaitingTaskApproval { .. },
-            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalResponse {
+            ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
                 outcome: TaskApprovalOutcome::Rejected,
             })
             | ParentEvent::Core(CoreEvent::UserCancel { .. }),
@@ -2024,9 +2024,9 @@ pub fn transition_parent(
             .with_effect(Effect::NotifyContextExhausted { summary: fallback }))
         }
 
-        // Stale TaskApprovalResponse
-        (state, ParentEvent::Parent(ParentOnlyEvent::TaskApprovalResponse { .. })) => {
-            tracing::debug!("Absorbing stale TaskApprovalResponse");
+        // Stale TaskApprovalDecided
+        (state, ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided { .. })) => {
+            tracing::debug!("Absorbing stale TaskApprovalDecided");
             Ok(ParentTransitionResult::new(state.clone()))
         }
 

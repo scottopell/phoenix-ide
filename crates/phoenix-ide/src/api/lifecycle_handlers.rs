@@ -87,7 +87,7 @@ pub(crate) async fn approve_task(
         .runtime
         .send_event(
             &id,
-            Event::TaskApprovalResponse {
+            Event::TaskApprovalDecided {
                 outcome: TaskApprovalOutcome::Approved { handoff },
             },
         )
@@ -122,7 +122,7 @@ pub(crate) async fn reject_task(
         .runtime
         .send_event(
             &id,
-            Event::TaskApprovalResponse {
+            Event::TaskApprovalDecided {
                 outcome: TaskApprovalOutcome::Rejected,
             },
         )
@@ -155,7 +155,7 @@ pub(crate) async fn task_feedback(
         .runtime
         .send_event(
             &id,
-            Event::TaskApprovalResponse {
+            Event::TaskApprovalDecided {
                 outcome: TaskApprovalOutcome::FeedbackProvided {
                     annotations: req.annotations,
                 },
