@@ -1439,18 +1439,18 @@ impl Database {
         Ok(())
     }
 
-    /// Archive every member of the chain rooted at `root_id` atomically.
+    /// Unarchive every member of the chain rooted at `root_id` atomically.
     ///
     /// Walks `continued_in_conv_id` forward via a recursive CTE and sets
-    /// `archived = 1` on every member in a single transaction. Caller must
+    /// `archived = 0` on every member in a single transaction. Caller must
     /// have already validated that `root_id` is a chain root (chain length
     /// ≥ 2); a single-member root is just a regular conversation and should
     /// take the per-conversation path.
-    pub async fn archive_chain(&self, root_id: &str) -> DbResult<u64> {
-        self.set_chain_archived(root_id, true).await
-    }
-
-    /// Unarchive every member of the chain rooted at `root_id` atomically.
+    ///
+    /// The archive direction does not have a matching DB primitive — chain
+    /// archive runs the full resource-cleanup cascade per member (bash kill,
+    /// tmux kill, worktree removal) and flips `archived = 1` row-by-row via
+    /// `archive_conversation`. See `api::chains::archive_chain_handler`.
     pub async fn unarchive_chain(&self, root_id: &str) -> DbResult<u64> {
         self.set_chain_archived(root_id, false).await
     }
@@ -3349,20 +3349,23 @@ mod tests {
         assert_eq!(root, None);
     }
 
-    /// `archive_chain` flips `archived = 1` on every member of the chain
-    /// in a single transaction. A non-chain id (single-member root) still
-    /// updates the row but is not exercised here — chain validation is
-    /// the API layer's responsibility.
+    /// `unarchive_chain` flips `archived = 0` on every member of the chain
+    /// in a single transaction. Exercises the recursive-CTE walk; the
+    /// archive-true direction has no DB primitive (see `unarchive_chain`
+    /// docstring) and is covered at the handler level instead.
     #[tokio::test]
-    async fn test_archive_chain_flips_all_members() {
+    async fn test_unarchive_chain_flips_all_members() {
         let db = Database::open_in_memory().await.unwrap();
         build_linear_chain(&db, &["arc-a", "arc-b", "arc-c"]).await;
 
-        let n = db.archive_chain("arc-a").await.unwrap();
-        assert_eq!(n, 3);
+        // Seed archived=1 on every member directly so the test starts from
+        // a state representative of a previously-archived chain.
+        for id in ["arc-a", "arc-b", "arc-c"] {
+            db.archive_conversation(id).await.unwrap();
+        }
         for id in ["arc-a", "arc-b", "arc-c"] {
             let conv = db.get_conversation(id).await.unwrap();
-            assert!(conv.archived, "{id} should be archived");
+            assert!(conv.archived, "{id} seed should be archived");
         }
 
         let n = db.unarchive_chain("arc-a").await.unwrap();

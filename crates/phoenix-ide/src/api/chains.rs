@@ -32,7 +32,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use ts_rs::TS;
 
-use super::handlers::{run_hard_delete_cascade, AppError};
+use super::handlers::{run_archive_cascade, run_hard_delete_cascade, AppError};
 use super::types::{ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
@@ -214,12 +214,45 @@ pub async fn set_chain_name(
 /// `POST /api/chains/:rootId/archive` — archive every member of the chain
 /// atomically. Single-member roots are not chains; the per-conversation
 /// `/archive` endpoint owns those.
+///
+/// Performs the same resource cleanup (bash kill, tmux kill, worktree /
+/// branch removal) per member as the per-conversation archive cascade,
+/// then flips `archived = 1` on every member via the recursive-CTE DB
+/// update. Pre-checks every member's busy state up front and refuses
+/// the whole operation if any member is busy (no partial cleanup).
 pub async fn archive_chain_handler(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     validate_chain_root(&state, &root_id).await?;
-    state.db.archive_chain(&root_id).await.map_err(db_to_app)?;
+
+    let member_ids = state
+        .db
+        .chain_members_forward(&root_id)
+        .await
+        .map_err(db_to_app)?;
+
+    for id in &member_ids {
+        let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
+        if conv.state.is_busy() {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                format!(
+                    "Cannot archive chain: member {id} is busy. Cancel the in-flight \
+                     operation first, then retry.",
+                ),
+                "cancel_first",
+            ))));
+        }
+    }
+
+    // TOCTOU note: the busy precheck is best-effort. Same shape as the
+    // delete-chain handler — a member can transition to busy after the
+    // loop and before its cascade runs, in which case `run_archive_cascade`
+    // returns 409 mid-iteration with earlier members already cleaned up.
+    for id in &member_ids {
+        run_archive_cascade(&state, id).await?;
+    }
+
     Ok(Json(SuccessResponse { success: true }))
 }
 

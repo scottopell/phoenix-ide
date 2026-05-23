@@ -1,13 +1,13 @@
 //! Conversation lifecycle HTTP handlers: task approval, abandon, mark-merged.
 
-use super::handlers::AppError;
+use super::handlers::{run_resource_cleanup_cascade, AppError};
 use super::types::{
     ConflictErrorResponse, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
     TaskFeedbackRequest,
 };
 use super::AppState;
 use crate::db::{ConvMode, Conversation, MessageContent};
-use crate::git_ops::{capture_branch_diff, run_git};
+use crate::git_ops::capture_branch_diff;
 use crate::state_machine::state::TaskApprovalOutcome;
 use crate::state_machine::{ConvState, Event};
 use std::fmt::Write as _;
@@ -206,32 +206,17 @@ pub(crate) async fn abandon_task(
     }
 
     // Accept both Work and Branch mode
-    let (branch_name, worktree_path, base_branch, task_id, is_work_mode) = match &conv.conv_mode {
+    let (worktree_path, base_branch, is_work_mode) = match &conv.conv_mode {
         ConvMode::Work {
-            branch_name,
             worktree_path,
             base_branch,
-            task_id,
             ..
-        } => (
-            branch_name.to_string(),
-            worktree_path.to_string(),
-            base_branch.to_string(),
-            task_id.to_string(),
-            true,
-        ),
+        } => (worktree_path.to_string(), base_branch.to_string(), true),
         ConvMode::Branch {
-            branch_name,
             worktree_path,
             base_branch,
             ..
-        } => (
-            branch_name.to_string(),
-            worktree_path.to_string(),
-            base_branch.to_string(),
-            String::new(), // Branch mode has no task
-            false,
-        ),
+        } => (worktree_path.to_string(), base_branch.to_string(), false),
         _ => {
             return Err(AppError::BadRequest(
                 "Conversation must be in Work or Branch mode to abandon".to_string(),
@@ -376,57 +361,11 @@ pub(crate) async fn abandon_task(
         None
     };
 
-    // 2c. Delete worktree + conditionally delete branch (blocking)
-    // Work mode: delete worktree AND branch (Phoenix-created), skip task file update
-    //   (the branch is being deleted, so any task file committed there goes with it).
-    // Branch mode: delete worktree only, keep user's branch, no task file.
-    let repo_root_clone = repo_root.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        // Worktree cleanup
-        let worktree_dir = PathBuf::from(&worktree_path);
-        if let Err(e) = run_git(
-            &repo_root_clone,
-            &["worktree", "remove", &worktree_path, "--force"],
-        ) {
-            tracing::warn!(
-                error = %e,
-                worktree = %worktree_path,
-                "Failed to remove worktree (non-fatal), trying filesystem fallback"
-            );
-            let _ = std::fs::remove_dir_all(&worktree_dir);
-            let _ = run_git(&repo_root_clone, &["worktree", "prune"]);
-        }
-
-        // Work mode: delete the managed branch.
-        // Branch mode: keep the user's branch.
-        if is_work_mode {
-            if let Err(e) = run_git(&repo_root_clone, &["branch", "-D", &branch_name]) {
-                tracing::warn!(
-                    error = %e,
-                    branch = %branch_name,
-                    "Failed to delete branch (non-fatal)"
-                );
-            }
-        } else {
-            tracing::info!(
-                branch = %branch_name,
-                "Branch mode abandon: keeping user's branch"
-            );
-        }
-
-        // Skip task file update entirely. For Work mode the branch (and its task file)
-        // is deleted above. For Branch mode there is no task file.
-        if !task_id.is_empty() {
-            tracing::info!(
-                task_id = %task_id,
-                "Skipping task file update -- branch deleted, task file goes with it"
-            );
-        }
-
-        Ok(())
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))??;
+    // 2c. Resource cleanup: bash kill, tmux kill, worktree remove, branch
+    // delete (Work mode only). Shared with hard-delete and archive so any
+    // attached terminal/process group is torn down here too. Work mode
+    // task files live on the deleted branch and go with it.
+    run_resource_cleanup_cascade(&state, &conv).await;
 
     // 3. Broadcast diff snapshot (persisted above, before state transition).
     // Reuses the handle obtained during seq pre-allocation at step 2b.
@@ -498,17 +437,9 @@ pub(crate) async fn mark_merged(
         ));
     }
 
-    let (branch_name, worktree_path, is_work_mode) = match &conv.conv_mode {
-        ConvMode::Work {
-            branch_name,
-            worktree_path,
-            ..
-        } => (branch_name.to_string(), worktree_path.to_string(), true),
-        ConvMode::Branch {
-            branch_name,
-            worktree_path,
-            ..
-        } => (branch_name.to_string(), worktree_path.to_string(), false),
+    let is_work_mode = match &conv.conv_mode {
+        ConvMode::Work { .. } => true,
+        ConvMode::Branch { .. } => false,
         _ => {
             return Err(AppError::BadRequest(
                 "Conversation must be in Work or Branch mode to mark as merged".to_string(),
@@ -529,45 +460,10 @@ pub(crate) async fn mark_merged(
     let repo_root = PathBuf::from(&project.canonical_path);
     let repo_root_str = repo_root.display().to_string();
 
-    // 2. Delete worktree + conditionally delete branch (blocking)
-    let repo_root_clone = repo_root.clone();
-    tokio::task::spawn_blocking(move || -> Result<(), AppError> {
-        // Remove worktree
-        let worktree_dir = PathBuf::from(&worktree_path);
-        if let Err(e) = run_git(
-            &repo_root_clone,
-            &["worktree", "remove", &worktree_path, "--force"],
-        ) {
-            tracing::warn!(
-                error = %e,
-                worktree = %worktree_path,
-                "Failed to remove worktree (non-fatal), trying filesystem fallback"
-            );
-            let _ = std::fs::remove_dir_all(&worktree_dir);
-            let _ = run_git(&repo_root_clone, &["worktree", "prune"]);
-        }
-
-        // Work mode (Managed): delete the task branch -- it was created by Phoenix.
-        // Branch mode: keep the branch -- it's the user's PR branch.
-        if is_work_mode {
-            if let Err(e) = run_git(&repo_root_clone, &["branch", "-D", &branch_name]) {
-                tracing::warn!(
-                    error = %e,
-                    branch = %branch_name,
-                    "Failed to delete managed branch (non-fatal)"
-                );
-            }
-        } else {
-            tracing::info!(
-                branch = %branch_name,
-                "Branch mode: keeping user's branch after mark-merged"
-            );
-        }
-
-        Ok(())
-    })
-    .await
-    .map_err(|e| AppError::Internal(format!("Blocking task failed: {e}")))??;
+    // 2. Resource cleanup: bash kill, tmux kill, worktree remove, branch
+    // delete (Work mode only). Shared with hard-delete and archive so any
+    // attached terminal/process group is torn down here too.
+    run_resource_cleanup_cascade(&state, &conv).await;
 
     // 3. Route through state machine -> Terminal
     let mode_label = if is_work_mode { "Work" } else { "Branch" };
