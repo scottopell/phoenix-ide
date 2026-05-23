@@ -72,12 +72,14 @@ const REMARK_PLUGINS = [remarkGfm];
 const NO_REMARK_PLUGINS: typeof REMARK_PLUGINS = [];
 
 function usesGfmSyntax(text: string): boolean {
-  return /(^|\n)\s*[-*]\s+\[[ xX]\]\s/.test(text)
+  return /(^|\n)\s*(?:[-*+]|\d+[.)])\s+\[[ xX]\]\s/.test(text)
     || /(^|\n)\s*\|.*\|/.test(text)
     || /(^|\n)\s*[-:| ]{3,}\|[-:| ]{3,}/.test(text)
+    || /(?:^|[^~])~[^\s~][^\n~]*[^\s~]~(?:[^~]|$)/.test(text)
     || /~~[^\n]+~~/.test(text)
     || /https?:\/\/\S+/.test(text)
     || /www\.\S+/.test(text)
+    || /(^|[^\w.+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/.test(text)
     || /\[\^[^\]]+\]/.test(text);
 }
 

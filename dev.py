@@ -1001,8 +1001,20 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
     ) -> bool:
         """Ensure the deterministic large conversation used by perf scenarios exists."""
         slug = "fixture-turn-one"
-        if conn.execute("SELECT 1 FROM conversations WHERE slug = ?", (slug,)).fetchone():
-            return False
+        existing = conn.execute(
+            "SELECT id, archived FROM conversations WHERE slug = ?",
+            (slug,),
+        ).fetchone()
+        if existing is not None:
+            conv_id, archived = existing
+            message_count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+                (conv_id,),
+            ).fetchone()[0]
+            if archived == 0 and message_count == 47:
+                return False
+            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+            conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
 
         conv_id = str(_uuid.uuid4())
         state_json = json.dumps({"type": "idle"})
@@ -1083,7 +1095,7 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             conn.commit()
             if not quiet_if_populated:
                 count = _existing_active_count(conn)
-                suffix = " + created perf fixture" if created_fixture else ""
+                suffix = " + repaired perf fixture" if created_fixture else ""
                 print(f"✓ Dev DB already populated ({count} conversations) — skipping seed{suffix}.")
             return
 

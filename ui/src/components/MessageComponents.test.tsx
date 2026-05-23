@@ -123,6 +123,42 @@ describe('markdown table rendering', () => {
     expect(wrapper?.parentElement).toHaveClass('agent-text-block');
   });
 
+  it('keeps finalized agent message task lists enabled for plus and ordered markers', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-tasks', [{
+            type: 'text',
+            text: '+ [ ] plus task\n1. [x] ordered task',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    const checkboxes = screen.getAllByRole('checkbox');
+    expect(checkboxes).toHaveLength(2);
+    expect(checkboxes[0]).not.toBeChecked();
+    expect(checkboxes[1]).toBeChecked();
+  });
+
+  it('keeps finalized agent message strikethrough and email autolinks enabled', () => {
+    const { container } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-inline-gfm', [{
+            type: 'text',
+            text: 'Contact contact@example.com and ignore ~obsolete~ text.',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByRole('link', { name: 'contact@example.com' })).toHaveAttribute('href', 'mailto:contact@example.com');
+    expect(container.querySelector('del')?.textContent).toBe('obsolete');
+  });
+
   it('keeps finalized agent message footnotes enabled when GFM syntax is present', () => {
     render(
       <MemoryRouter>
