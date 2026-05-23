@@ -192,6 +192,48 @@ describe('markdown table rendering', () => {
   });
 });
 
+
+describe('finalized code fence highlighting', () => {
+  it('renders readable code immediately and upgrades highlighting during idle time', async () => {
+    let idleCallback: (() => void) | undefined;
+    const requestIdleCallback = vi.fn((callback: () => void) => {
+      idleCallback = callback;
+      return 1;
+    });
+    const cancelIdleCallback = vi.fn();
+    vi.stubGlobal('requestIdleCallback', requestIdleCallback);
+    vi.stubGlobal('cancelIdleCallback', cancelIdleCallback);
+
+    const { container, unmount } = render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-code', [{
+            type: 'text',
+            text: '```ts\nconst answer: number = 42;\n```',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('const answer: number = 42;')).toBeInTheDocument();
+    expect(container.querySelector('code.language-ts')).toBeInTheDocument();
+    expect(container.querySelector('code.language-ts span.token')).not.toBeInTheDocument();
+    expect(requestIdleCallback).toHaveBeenCalledWith(expect.any(Function), { timeout: 1500 });
+
+    await act(async () => {
+      idleCallback?.();
+    });
+
+    await waitFor(() => {
+      expect(container.querySelector('code.language-ts span.token')).toBeInTheDocument();
+      expect(screen.getByText('const')).toBeInTheDocument();
+    });
+
+    unmount();
+  });
+});
+
 describe('SubAgentStatus inline activity', () => {
   beforeEach(() => {
     vi.clearAllMocks();

@@ -1,0 +1,52 @@
+id: MessageComponents-deferred-code-highlighting
+target: ui/src/components/MessageComponents.tsx:AgentMessage
+technique: defer-finalized-code-fence-highlighting
+scenario: conversation-load
+date: 2026-05-23
+status: success
+verdict: approved
+votes:
+  duplicate_hunter: approve
+  skeptic: approve
+  conservative: approve
+  react_expert: approve
+  greybeard: approve
+methodology:
+  runs: 20
+  warmup: 3
+  throttle_rate: 4
+  harness: browser_profile
+  reset: navigate to conversation list, clear fixture scroll localStorage, click fixture-turn-one
+  baseline_raw: /tmp/baseline09004-array.json
+  optimized_raw: /tmp/deferred-highlight09004-array.json
+measurements:
+  react_commits: "11.35 ± 0.671 -> 11.6 ± 0.503 (+2.20%, p=0.1908)"
+  react_actual_ms: "382.8 ± 19.5 -> 244.1 ± 11.2 (-36.24%, p=4.468e-23)"
+  script_ms: "828.8 ± 14.2 -> 666.6 ± 7.84 (-19.57%, p=1.069e-28)"
+  wall_ms: "1118 ± 21.3 -> 948.3 ± 10.9 (-15.19%, p=1.17e-23)"
+  js_heap_used_mib: "18.70 ± 0.113 -> 17.84 ± 0.0289 (-4.56%, p=7.935e-20)"
+  long_tasks: "2 ± 0 -> 2 ± 0 (+0.00%, p=1)"
+  dom_nodes: "363.4 ± 0.940 -> 170.3 ± 0.733 (-53.14%, p=2.759e-76)"
+reason: |
+  APPROVED by the shared Phoenix perf gate. The fresh post-GFM CPU profile still
+  showed finalized code-fence work in react-syntax-highlighter (Prism DFS,
+  createElement, and language registration) on the large-conversation load path.
+  AgentMessage now renders readable plain <pre><code> blocks for finalized code
+  fences during the initial commit and schedules the full SyntaxHighlighter swap
+  with requestIdleCallback. The measured load window captures the user-visible
+  switch render; highlighting still appears after idle and code remains readable
+  before the upgrade.
+
+  The change clears the required gates on react_actual_ms (-36.24%), script_ms
+  (-19.57%), and wall_ms (-15.19%) with p << 0.05. Heap improves but does not
+  clear the 15% heap threshold; commit count and long task count are neutral.
+qa_behavior: |
+  Smoke-tested fixture-turn-one after the change: initial load renders code text
+  in <pre><code>, and after a 2.5s idle wait highlighted spans are present
+  (126 span[style] nodes across visible code blocks). Message count and code text
+  remain correct.
+lessons: |
+  Syntax highlighting can be staged independently from Markdown parsing. For
+  historical finalized messages, readable code immediately plus idle
+  highlighting preserves perceived correctness while removing highlighter element
+  creation from the critical conversation-switch path.

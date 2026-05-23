@@ -1,0 +1,71 @@
+# Scenario: scroll within a large conversation after initial load.
+#
+# Complements `conversation-load`, which measures list-to-conversation navigation
+# and first render. This scenario excludes that load path: reset opens the large
+# fixture directly and the first readiness wait anchors the measurement window
+# after the bottom-anchored initial window is visible.
+#
+# Exercises post-load interaction costs in MessageList / MessageComponents:
+#   - revealing older bottom-anchored windows while scrolling upward
+#   - returning to the newest messages after leaving the bottom
+#
+# FIXTURE: fixture-turn-one — deterministic large mock conversation.
+
+name: large-conversation-scroll
+covers:
+  - ui/src/components/MessageList.tsx
+  - ui/src/components/MessageComponents.tsx
+
+params:
+  base_url: "{UI_URL}"
+  fixture: "fixture-turn-one"
+
+runs: 20
+warmup: 3
+
+reset:
+  url: "{base_url}/c/{fixture}"
+  wait_app_ready:
+    expr: >
+      location.pathname.endsWith('/{fixture}')
+      && document.querySelectorAll('.message').length >= 5
+      && !document.querySelector('.streaming-message')
+    timeout_ms: 60000
+
+steps:
+  - eval: >
+      (() => {
+        const scroller = document.querySelector('main#main-area');
+        if (!scroller) throw new Error('conversation scroller not found');
+        scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      })()
+  - wait-for-eval-predicate:
+      expr: >
+        (() => {
+          const scroller = document.querySelector('main#main-area');
+          return !!scroller && (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight) < 120;
+        })()
+      timeout_ms: 5000
+  - eval: >
+      (() => {
+        const scroller = document.querySelector('main#main-area');
+        if (!scroller) throw new Error('conversation scroller not found');
+        scroller.scrollBy({ top: -2400, behavior: 'instant' });
+      })()
+  - wait-for-eval-predicate:
+      expr: >
+        document.querySelectorAll('.message').length >= 10
+      timeout_ms: 5000
+  - eval: >
+      (() => {
+        const scroller = document.querySelector('main#main-area');
+        if (!scroller) throw new Error('conversation scroller not found');
+        scroller.scrollTop = Math.max(0, scroller.scrollHeight - scroller.clientHeight);
+      })()
+  - wait-for-eval-predicate:
+      expr: >
+        (() => {
+          const scroller = document.querySelector('main#main-area');
+          return !!scroller && (scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight) < 120;
+        })()
+      timeout_ms: 5000

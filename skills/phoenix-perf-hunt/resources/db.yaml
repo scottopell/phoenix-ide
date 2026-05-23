@@ -1,4 +1,11 @@
 entries:
+  - id: MessageComponents-deferred-code-highlighting
+    target: ui/src/components/MessageComponents.tsx:AgentMessage
+    technique: defer-finalized-code-fence-highlighting
+    scenario: conversation-load
+    status: success
+    verdict: approved
+    file: resources/db/MessageComponents-deferred-code-highlighting.yaml
   - id: StreamingMessage-reparse-growing-buffer
     target: ui/src/components/StreamingMessage.tsx:StreamingMessage
     technique: reparse-growing-buffer
