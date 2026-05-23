@@ -91,29 +91,32 @@ THE SYSTEM SHALL insert a newline
 
 ---
 
-### REQ-CONV-004: Message Delivery States
+### REQ-CONV-004: Message Delivery Confidence
 
 WHEN user sends a message
-THE SYSTEM SHALL immediately display it with "sending" indicator (optimistic UI)
-AND transition to "sent" indicator when server returns `{queued: true}`
-AND transition to "failed" state if request fails
+THE SYSTEM SHALL immediately display the message optimistically
+AND preserve the message until it is either reflected by the server or explicitly dismissed by the user
 
-WHEN message is in "failed" state
+THE SYSTEM SHALL distinguish delivery states that users can trust:
+- **not yet accepted**: local send is queued, offline, or request/SSE confirmation is still in flight
+- **accepted/durable or server-reflected**: authoritative server history contains the message, or later server activity is causally tied to the accepted send
+- **failed/retryable**: the send attempt failed and the user can retry or recover the draft
+
+WHEN server behavior proves a message was accepted
+THE SYSTEM SHALL NOT leave that message indefinitely marked as pending
+AND SHALL either reconcile it to authoritative history or surface an explicit recoverable inconsistency
+
+WHEN message delivery fails
 THE SYSTEM SHALL display retry affordance
-AND allow user to tap to retry sending
+AND allow user to retry or recover the message text and attachments
 
 WHEN user sends message while offline
 THE SYSTEM SHALL queue the message locally
-AND display "sending" state (same as online send)
-AND automatically send when connection is restored
-AND persist queued messages to localStorage
+AND display a not-yet-accepted state
+AND automatically retry when connection is restored
+AND persist queued messages to localStorage scoped to the conversation
 
-Message states:
-- **sending** (⏳): Not yet confirmed by server (queued offline or request in flight)
-- **sent** (✓): Server returned `{queued: true}`
-- **failed** (⚠️): Request failed, tap to retry
-
-**Rationale:** Users on unreliable networks need confidence their messages won't be lost. Three simple states (sending/sent/failed) are easy to understand without exposing internal queue mechanics.
+**Rationale:** Users on unreliable networks need durable confidence that their words were not lost. A POST acceptance response is not by itself the visual source of truth; SSE/history reconciliation must either reflect accepted messages or make recovery explicit rather than silently stranding a pending bubble.
 
 ---
 

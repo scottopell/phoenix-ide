@@ -262,13 +262,21 @@ rule StreamOpened {
     )
 
     @guidance
-        -- The init payload is a consistent DB snapshot taken at
-        -- subscribe time. It includes all persisted messages with
-        -- sequence_id <= snapshot.pending_anchor_sequence_id. Because
-        -- PersistBeforeBroadcast holds, any message that was already
-        -- broadcast before this subscribe has sequence_id <=
-        -- pending_anchor_sequence_id and appears in the snapshot — the
-        -- client receives no gaps for durable state.
+        -- Implementation sequence is load-bearing: subscribe to the live
+        -- broadcast receiver before reading DB messages and before
+        -- snapshotting the ReplayRing. A persisted message that commits during
+        -- stream open is then either present in the DB `messages` snapshot or
+        -- delivered on the subscribed live receiver; init must not set
+        -- `last_sequence_id`/`pending_anchor_sequence_id` past a message absent
+        -- from both delivery paths. This is the concrete construction for
+        -- InitSnapshotNoDurableGap.
+        --
+        -- The init payload is a consistent DB snapshot taken at subscribe
+        -- time. It includes all persisted messages with sequence_id <=
+        -- snapshot.pending_anchor_sequence_id. Because PersistBeforeBroadcast
+        -- holds, any message that was already broadcast before this subscribe
+        -- has sequence_id <= pending_anchor_sequence_id and appears in the
+        -- snapshot — the client receives no gaps for durable state.
         --
         -- snapshot.pending_events captures the ReplayRing contents at
         -- subscribe time. Each entry's sequence_id is in
@@ -307,6 +315,30 @@ rule LagCloseStream {
         -- equivalent to a fresh load — no gaps visible to the client.
         -- See connection_machine.allium (task 02681) for the client-side
         -- reconnect lifecycle.
+}
+
+------------------------------------------------------------
+-- Invariants — init snapshot gap freedom
+------------------------------------------------------------
+
+-- Init must never advance the client's sequence floor past durable or replayable
+-- facts that the client did not receive. For persisted Messages at or below the
+-- pending anchor, the DB `messages` snapshot is the delivery mechanism. For
+-- events above the anchor and at or below the init tip, either durable state in
+-- the DB snapshot subsumes them or the event appears in `pending_events`.
+invariant InitSnapshotNoDurableGap {
+    for stream in SseStreams:
+        for msg in PersistedMessages:
+            (msg.conversation_id = stream.conversation_id
+             and msg.sequence_id <= stream.init_snapshot.pending_anchor_sequence_id) implies
+                InitSnapshotIncludesMessage(stream.init_snapshot, msg)
+
+    for stream in SseStreams:
+        for entry in ReplayRing{conversation_id: stream.conversation_id}.entries:
+            (entry.sequence_id > stream.init_snapshot.pending_anchor_sequence_id
+             and entry.sequence_id <= stream.init_snapshot.last_sequence_id) implies
+                InitSnapshotIncludesPendingEvent(stream.init_snapshot, entry)
+                or InitSnapshotDurableStateSubsumesEvent(stream.init_snapshot, entry)
 }
 
 ------------------------------------------------------------

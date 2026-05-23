@@ -1356,6 +1356,23 @@ async fn stream_conversation(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    // Get the conversation handle and subscribe before DB snapshotting. This
+    // closes the stream-open gap where a persisted message could be broadcast
+    // after `get_messages()` but before `snapshot_pending()`: the live receiver
+    // now observes that message, and the init floor is bounded to facts covered
+    // by either the DB snapshot or the subscribed stream.
+    let handle = state
+        .runtime
+        .get_or_create(&id)
+        .await
+        .map_err(AppError::Internal)?;
+    tracing::debug!(
+        conv_id = %id,
+        receivers_before = handle.broadcast_tx.receiver_count(),
+        "SSE client subscribing"
+    );
+    let broadcast_rx = handle.broadcast_tx.subscribe();
+
     let messages = state
         .runtime
         .db()
@@ -1378,21 +1395,6 @@ async fn stream_conversation(
 
     // Extract breadcrumbs from the last turn
     let breadcrumbs = extract_breadcrumbs(&messages);
-
-    // Get the conversation handle (subscribes + gives us broadcast_tx for polling)
-    let handle = state
-        .runtime
-        .get_or_create(&id)
-        .await
-        .map_err(AppError::Internal)?;
-    // Diagnostic: log current receiver count so we can detect the
-    // "spinner-forever" scenario where clients subscribe to a dead channel.
-    tracing::debug!(
-        conv_id = %id,
-        receivers_before = handle.broadcast_tx.receiver_count(),
-        "SSE client subscribing"
-    );
-    let broadcast_rx = handle.broadcast_tx.subscribe();
 
     // Derive project_name from the project's canonical_path (repo root dirname).
     let project_name = if let Some(ref project_id) = conversation.project_id {
@@ -3416,6 +3418,13 @@ async fn shared_sse_stream(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
+    let handle = state
+        .runtime
+        .get_or_create(&conversation_id)
+        .await
+        .map_err(AppError::Internal)?;
+    let broadcast_rx = handle.broadcast_tx.subscribe();
+
     let messages = state
         .runtime
         .db()
@@ -3437,13 +3446,6 @@ async fn shared_sse_stream(
         .map_or(0, crate::db::UsageData::context_window_used);
 
     let breadcrumbs = extract_breadcrumbs(&messages);
-
-    let handle = state
-        .runtime
-        .get_or_create(&conversation_id)
-        .await
-        .map_err(AppError::Internal)?;
-    let broadcast_rx = handle.broadcast_tx.subscribe();
 
     let project_name = if let Some(ref project_id) = conversation.project_id {
         state.db.get_project(project_id).await.ok().and_then(|p| {
@@ -3579,6 +3581,64 @@ mod hard_delete_cascade_tests {
             terminals,
             chain_qa,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_subscribes_before_db_snapshot_so_persisted_gap_arrives_live() {
+        let state = make_test_state().await;
+        let conv_id = "c-sse-gap";
+        state
+            .db
+            .create_conversation(conv_id, "sse-gap", "/tmp", true, None, None)
+            .await
+            .expect("create conversation");
+
+        let handle = state.runtime.get_or_create(conv_id).await.expect("handle");
+        let mut broadcast_rx = handle.broadcast_tx.subscribe();
+
+        let seq = handle.broadcast_tx.next_seq();
+        let msg = state
+            .db
+            .add_message_with_seq(
+                "local-user-1",
+                conv_id,
+                seq,
+                &MessageContent::User(crate::db::UserContent::new("hello")),
+                None,
+                None,
+            )
+            .await
+            .expect("persist message");
+        handle
+            .broadcast_tx
+            .send_persisted_message(msg.clone())
+            .expect("subscribed receiver observes broadcast");
+
+        let messages = state.db.get_messages(conv_id).await.expect("messages");
+        let last_sequence_id = state
+            .db
+            .get_last_sequence_id(conv_id)
+            .await
+            .expect("last seq");
+        let (pending_anchor_sequence_id, _, highest_pending_seq, _) =
+            handle.broadcast_tx.snapshot_pending();
+        let init_seq = std::cmp::max(last_sequence_id, highest_pending_seq);
+
+        assert!(
+            messages.iter().any(|m| m.message_id == "local-user-1"),
+            "DB snapshot taken after subscribe includes the persisted user message"
+        );
+        assert_eq!(pending_anchor_sequence_id, seq);
+        assert_eq!(init_seq, seq);
+
+        let live = broadcast_rx
+            .recv()
+            .await
+            .expect("live message after subscribe");
+        match live {
+            SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
+            other => panic!("expected live message event, got {other:?}"),
         }
     }
 

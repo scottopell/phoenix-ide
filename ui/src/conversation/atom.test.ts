@@ -8,6 +8,7 @@ import {
   type InitPayload,
 } from './atom';
 import type { Conversation, Message } from '../api';
+import { derivePendingMessages, type QueuedMessage } from '../hooks/useMessageQueue';
 
 // Minimal test fixtures
 const testConversation: Conversation = {
@@ -264,6 +265,51 @@ describe('conversationReducer', () => {
       expect(atom.messages).toHaveLength(6);
       expect(atom.messages.map((m) => m.sequence_id)).toEqual([95, 96, 97, 98, 99, 100]);
       expect(atom.lastSequenceId).toBe(100);
+    });
+  });
+
+  describe('pending user-message reconciliation', () => {
+    const queued: QueuedMessage = {
+      localId: 'local-user-1',
+      text: 'hello',
+      images: [],
+      timestamp: 1,
+      status: 'pending',
+    };
+
+    it('keeps an omitted accepted local message pending when init advances past it without delivery evidence', () => {
+      const payload = makeInitPayload({
+        messages: [],
+        phase: { type: 'llm_requesting', attempt: 1 },
+        lastSequenceId: 12,
+        pendingAnchorSequenceId: 12,
+        pendingEvents: [],
+      });
+
+      const atom = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+      const pending = derivePendingMessages([queued], atom.messages.map((m) => m.message_id));
+
+      expect(atom.lastSequenceId).toBe(12);
+      expect(pending.map((m) => m.localId)).toEqual(['local-user-1']);
+    });
+
+    it('removes the local pending bubble when authoritative history contains the same message_id', () => {
+      const reflected: Message = {
+        ...makeMessage(12, 'user'),
+        message_id: 'local-user-1',
+        content: { text: 'hello' } as Message['content'],
+      };
+      const payload = makeInitPayload({
+        messages: [reflected],
+        lastSequenceId: 12,
+        pendingAnchorSequenceId: 12,
+      });
+
+      const atom = dispatch(createInitialAtom(), { type: 'sse_init', payload });
+      const pending = derivePendingMessages([queued], atom.messages.map((m) => m.message_id));
+
+      expect(atom.messages.map((m) => m.message_id)).toEqual(['local-user-1']);
+      expect(pending).toEqual([]);
     });
   });
 
