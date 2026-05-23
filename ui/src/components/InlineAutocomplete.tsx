@@ -17,7 +17,6 @@ import {
   useEffect,
   useRef,
 } from 'react';
-import { fuzzyMatch } from './CommandPalette/fuzzyMatch';
 
 // ============================================================================
 // Types
@@ -41,9 +40,7 @@ export interface AutocompleteItem {
 interface InlineAutocompleteProps {
   /** Trigger mode — controls prefix and display */
   mode: AutocompleteMode;
-  /** Current query string typed after the trigger character */
-  query: string;
-  /** Full candidate list (unfiltered; component applies fuzzy matching) */
+  /** Candidate list already filtered and ranked by the parent */
   items: AutocompleteItem[];
   /** Index of the selected item (driven by parent) */
   selectedIndex: number;
@@ -75,16 +72,12 @@ const MODE_HINT: Record<AutocompleteMode, string> = {
 
 export function InlineAutocomplete({
   mode,
-  query,
   items,
   selectedIndex,
   onSelect,
   visible,
 }: InlineAutocompleteProps) {
   const listRef = useRef<HTMLDivElement>(null);
-
-  // Filter and rank items using fuzzy matching
-  const filtered = fuzzyMatch(items, query, (item) => item.label);
 
   // Scroll selected item into view
   useEffect(() => {
@@ -93,7 +86,7 @@ export function InlineAutocomplete({
     selected?.scrollIntoView({ block: 'nearest' });
   }, [selectedIndex]);
 
-  if (!visible || filtered.length === 0) {
+  if (!visible || items.length === 0) {
     return null;
   }
 
@@ -107,7 +100,7 @@ export function InlineAutocomplete({
         <span className="iac-hint">{hint}</span>
       </div>
       <div className="iac-list" ref={listRef}>
-        {filtered.map((item, idx) => (
+        {items.map((item, idx) => (
           <button
             key={item.id}
             className={`iac-item ${idx === selectedIndex ? 'selected' : ''}`}

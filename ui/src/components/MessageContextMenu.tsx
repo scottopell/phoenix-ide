@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react';
+import { memo, useState, useEffect, useCallback, useRef } from 'react';
 import type { Message, ContentBlock } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
 import './MessageContextMenu.css';
@@ -45,7 +45,7 @@ function getPlainText(element: HTMLElement): string {
   return content?.textContent || '';
 }
 
-export function MessageContextMenu({ messages }: MessageContextMenuProps) {
+export const MessageContextMenu = memo(function MessageContextMenu({ messages }: MessageContextMenuProps) {
   const [menu, setMenu] = useState<MenuState | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -234,4 +234,4 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
       </button>
     </div>
   );
-}
+});
