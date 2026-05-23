@@ -4,19 +4,8 @@ import { useRef } from 'react';
 import { InputArea } from './InputArea';
 import { AgentMessage } from './MessageComponents';
 import type { InputAreaHandle } from './InputArea';
-import type { AutocompleteItem } from './InlineAutocomplete';
 import type { ConversationState, Message, SkillEntry } from '../api';
 import { api } from '../api';
-const { fuzzyMatchSpy } = vi.hoisted(() => ({
-  fuzzyMatchSpy: vi.fn(<T,>(items: T[], ...rest: unknown[]) => {
-    void rest;
-    return items;
-  }),
-}));
-
-vi.mock('./CommandPalette/fuzzyMatch', () => ({
-  fuzzyMatch: fuzzyMatchSpy,
-}));
 
 const idleState: ConversationState = { type: 'idle' };
 
@@ -75,66 +64,6 @@ describe('InputArea controlled-draft contract', () => {
     );
 
     expect(textarea.value).toBe('draft B');
-  });
-
-  it('filters autocomplete candidates in the parent only while rendering the dropdown', async () => {
-    const skills: SkillEntry[] = [
-      {
-        name: 'review',
-        description: 'Review changes',
-        argument_hint: '<path>',
-        source: 'project',
-        path: '/repo/.agents/skills/review/SKILL.md',
-      },
-      {
-        name: 'refactor',
-        description: 'Refactor code',
-        source: 'project',
-        path: '/repo/.agents/skills/refactor/SKILL.md',
-      },
-    ];
-    vi.spyOn(api, 'listConversationSkills').mockResolvedValue({ skills });
-    fuzzyMatchSpy.mockClear();
-
-    let currentDraft = '';
-    const onDraftChange = (text: string) => {
-      currentDraft = text;
-    };
-
-    const { rerender } = renderInput({
-      conversationId: 'conv-a',
-      draft: currentDraft,
-      onDraftChange,
-    });
-    const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
-
-    fireEvent.change(textarea, { target: { value: '/r' } });
-    rerender(
-      <InputArea
-        conversationId="conv-a"
-        convState={idleState}
-        images={[]}
-        setImages={() => {}}
-        isOffline={false}
-        failedMessages={[]}
-        draft={currentDraft}
-        onDraftChange={onDraftChange}
-        onSend={() => {}}
-        onCancel={() => {}}
-        onRetry={() => {}}
-      />,
-    );
-
-    expect(await screen.findByRole('listbox', { name: '/ autocomplete' })).toBeInTheDocument();
-    const rCalls = fuzzyMatchSpy.mock.calls.filter(([, query]) => query === 'r');
-    // Once with the empty candidate list before the async skill fetch resolves,
-    // and once after skills load. The dropdown receives that filtered list and
-    // must not run a second fuzzy pass during either render.
-    expect(rCalls).toHaveLength(2);
-    expect(rCalls.map(([items]) => (items as AutocompleteItem[]).map((item) => item.label))).toEqual([
-      [],
-      ['review', 'refactor'],
-    ]);
   });
 
   it('clears autocomplete and skill-hint state when conversation changes', async () => {

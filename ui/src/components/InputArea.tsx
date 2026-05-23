@@ -659,7 +659,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       <div className="iac-container">
         <InlineAutocomplete
           mode={activeTrigger?.mode ?? 'expand'}
-          items={filteredItems}
+          query={activeTrigger?.query ?? ''}
+          items={acItems}
           selectedIndex={acSelectedIndex}
           onSelect={handleAcSelect}
           visible={activeTrigger !== null}

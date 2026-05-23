@@ -1,0 +1,52 @@
+id: InputArea-parent-filter-autocomplete-candidates
+target: ui/src/components/InputArea.tsx:InputArea + ui/src/components/InlineAutocomplete.tsx:InlineAutocomplete
+technique: parent-filter-autocomplete-candidates
+scenario: composer-autocomplete-open
+date: 2026-05-23
+status: failure
+verdict: rejected
+votes:
+  duplicate_hunter: approve
+  skeptic: reject
+  conservative: approve
+  react_expert: reject
+  greybeard: reject
+methodology:
+  runs: 8
+  warmup: 1
+  throttle_rate: 4
+  harness: browser_profile
+  reset: navigate http://localhost:8042/c/phoenix-ide-log-inspector-web-app
+  readiness: textarea#message-input after clearing phoenix:draft:* localStorage
+measurements:
+  first_controlled_ab:
+    react_commits: "27.25 ± 1.39 -> 29.38 ± 1.69 (+7.80%, p=0.01599)"
+    react_actual_ms: "154.5 ± 86.6 -> 300.3 ± 76.1 (+94.45%, p=0.003097)"
+    script_ms: "709.5 ± 132 -> 894.9 ± 111 (+26.13%, p=0.009217)"
+    wall_ms: "1622 ± 141 -> 1913 ± 157 (+17.98%, p=0.00159)"
+    js_heap_used_mib: "24.46 ± 0.0251 -> 24.46 ± 0.00551 (-0.02%, p=0.665)"
+    long_tasks: "2.375 ± 0.518 -> 2.875 ± 0.354 (+21.05%, p=0.04289)"
+    dom_nodes: "548.8 ± 3.88 -> 549.2 ± 4.03 (+0.09%, p=0.8041)"
+  repeat_optimized_run:
+    react_commits: "27.25 ± 1.39 -> 27.88 ± 2.42 (+2.29%, p=0.5387)"
+    react_actual_ms: "154.5 ± 86.6 -> 189.7 ± 109 (+22.82%, p=0.4857)"
+    script_ms: "709.5 ± 132 -> 733.9 ± 165 (+3.44%, p=0.7493)"
+    wall_ms: "1622 ± 141 -> 1720 ± 247 (+6.07%, p=0.3493)"
+    js_heap_used_mib: "24.46 ± 0.0251 -> 24.91 ± 1.3 (+1.83%, p=0.3607)"
+    long_tasks: "2.375 ± 0.518 -> 2.375 ± 0.518 (+0.00%, p=1)"
+    dom_nodes: "548.8 ± 3.88 -> 549.9 ± 3.64 (+0.21%, p=0.5596)"
+reason: |
+  REJECTED by the shared Phoenix perf gate. The same browser_profile fingerprint
+  was run against the parent commit and the candidate commit with no methodology
+  warnings. The first controlled A/B showed statistically significant regression
+  in react_actual_ms, script_ms, wall_ms, and long_tasks. A repeat optimized run
+  was bimodal/noisy and did not produce any threshold-clearing significant win.
+  Per the skill contract, theoretical duplicate-work removal is not sufficient;
+  the raw samples do not support merging this as an optimization.
+lessons: |
+  Filtering autocomplete candidates in the parent and passing the filtered list
+  to the dropdown looks structurally cheaper, but it does not improve the
+  measured composer autocomplete-open scenario. Do not retry this technique
+  without a new angle that explains and controls the bimodal React/browser work
+  observed in the scenario. Treat previous no-reset measurements as invalid for
+  claims; controlled reset + stats are required.

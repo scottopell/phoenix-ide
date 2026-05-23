@@ -34,3 +34,10 @@ entries:
     status: success
     verdict: approved
     file: resources/db/MessageList-bottom-anchored-window.yaml
+  - id: InputArea-parent-filter-autocomplete-candidates
+    target: ui/src/components/InputArea.tsx:InputArea + ui/src/components/InlineAutocomplete.tsx:InlineAutocomplete
+    technique: parent-filter-autocomplete-candidates
+    scenario: composer-autocomplete-open
+    status: failure
+    verdict: rejected
+    file: resources/db/InputArea-parent-filter-autocomplete-candidates.yaml
