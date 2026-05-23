@@ -48,3 +48,10 @@ entries:
     status: failure
     verdict: rejected
     file: resources/db/InputArea-raf-coalesce-autoresize.yaml
+  - id: MessageContextMenu-memo-streaming
+    target: ui/src/components/MessageContextMenu.tsx:MessageContextMenu
+    technique: memo-streaming-stable-props
+    scenario: sse-streaming
+    status: failure
+    verdict: rejected
+    file: resources/db/MessageContextMenu-memo-streaming.yaml

@@ -1,0 +1,39 @@
+id: MessageContextMenu-memo-streaming
+target: ui/src/components/MessageContextMenu.tsx:MessageContextMenu
+technique: memo-streaming-stable-props
+scenario: sse-streaming
+date: 2026-05-23
+status: failure
+verdict: rejected
+votes:
+  duplicate_hunter: approve
+  skeptic: reject
+  conservative: approve
+  react_expert: reject
+  greybeard: reject
+methodology:
+  runs: 20
+  warmup: 3
+  throttle_rate: 4
+  harness: browser_profile
+  reset: fresh mock conversation via browser-side POST, then navigate to the new slug
+measurements:
+  react_commits: "74.85 ± 2.16 -> 74.9 ± 1.71 (+0.07%, p=0.9358)"
+  react_actual_ms: "158.1 ± 14.9 -> 155.7 ± 9.23 (-1.51%, p=0.5455)"
+  script_ms: "82.8 ± 11.4 -> 78.25 ± 9.24 (-5.50%, p=0.1749)"
+  wall_ms: "18510 ± 105 -> 18810 ± 141 (+1.59%, p=9.792e-09)"
+  js_heap_used_mib: "17.5 ± 0.0864 -> 17.47 ± 0.0714 (-0.16%, p=0.2774)"
+  long_tasks: "1 ± 0 -> 1 ± 0 (+0.00%, p=1)"
+  dom_nodes: "188.7 ± 4.6 -> 189.1 ± 4.18 (+0.21%, p=0.7751)"
+reason: |
+  REJECTED by the shared Phoenix perf gate. Wrapping MessageContextMenu in
+  React.memo did not produce a threshold-clearing, statistically significant
+  improvement in the sse-streaming scenario. React commit count was unchanged;
+  react_actual_ms and script_ms moved in the desired direction but stayed well
+  below thresholds with p >= 0.05. Wall time worsened slightly, likely dominated
+  by deterministic mock stream cadence rather than React work.
+lessons: |
+  Do not memoize MessageContextMenu solely to improve streaming performance.
+  The component is not a material contributor to the measured streaming hot path
+  under the current mock [[perf:800]] scenario. Future work should target paths
+  with proven self-time or scenario-level threshold potential.
