@@ -211,15 +211,24 @@ pub async fn set_chain_name(
     Ok(Json(view))
 }
 
-/// `POST /api/chains/:rootId/archive` — archive every member of the chain
-/// atomically. Single-member roots are not chains; the per-conversation
-/// `/archive` endpoint owns those.
+/// `POST /api/chains/:rootId/archive` — archive every member of the chain.
+/// Single-member roots are not chains; the per-conversation `/archive`
+/// endpoint owns those.
 ///
 /// Performs the same resource cleanup (bash kill, tmux kill, worktree /
 /// branch removal) per member as the per-conversation archive cascade,
-/// then flips `archived = 1` on every member via the recursive-CTE DB
-/// update. Pre-checks every member's busy state up front and refuses
-/// the whole operation if any member is busy (no partial cleanup).
+/// then sets `archived = 1` on each member row via `archive_conversation`.
+/// Pre-checks every member's busy state up front and refuses the whole
+/// operation if any member is busy (no partial cleanup).
+///
+/// **Not atomic.** Side effects + DB writes happen per member. If a later
+/// member errors (e.g. TOCTOU-races into busy after the precheck), earlier
+/// members may already be cleaned up + archived while later members are
+/// untouched. The cascade itself can't be atomic (worktree/tmux kills are
+/// non-transactional), and we don't wrap the per-row `archived = 1` writes
+/// in a transaction either — keeping cleanup and the flag flip in lockstep
+/// per member is more useful than rolling back the flag while the resources
+/// are gone. Same shape as `delete_chain_handler`.
 pub async fn archive_chain_handler(
     State(state): State<AppState>,
     Path(root_id): Path<String>,

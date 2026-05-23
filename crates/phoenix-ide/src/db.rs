@@ -1447,10 +1447,12 @@ impl Database {
     /// ≥ 2); a single-member root is just a regular conversation and should
     /// take the per-conversation path.
     ///
-    /// The archive direction does not have a matching DB primitive — chain
-    /// archive runs the full resource-cleanup cascade per member (bash kill,
-    /// tmux kill, worktree removal) and flips `archived = 1` row-by-row via
-    /// `archive_conversation`. See `api::chains::archive_chain_handler`.
+    /// No matching public archive-direction primitive exists by design.
+    /// `set_chain_archived` would support `archived = 1` too, but chain
+    /// archive requires per-member resource cleanup (bash kill, tmux kill,
+    /// worktree removal) that the DB layer can't express — so the API
+    /// handler runs the cascade per member and flips the flag row-by-row
+    /// via `archive_conversation`. See `api::chains::archive_chain_handler`.
     pub async fn unarchive_chain(&self, root_id: &str) -> DbResult<u64> {
         self.set_chain_archived(root_id, false).await
     }
