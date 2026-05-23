@@ -324,6 +324,11 @@ pub enum SseWireEvent {
         /// Zero-based position in the steering queue.
         queue_position: usize,
     },
+    /// Mid-stream quota snapshot from the codex backend. Ephemeral.
+    RateLimitSnapshot {
+        sequence_id: i64,
+        snapshot: crate::llm::QuotaDetails,
+    },
 }
 
 impl SseWireEvent {
@@ -343,6 +348,7 @@ impl SseWireEvent {
             SseWireEvent::ConversationHardDeleted { .. } => "conversation_hard_deleted",
             SseWireEvent::BrowserSessionState { .. } => "browser_session_state",
             SseWireEvent::SteerMessageQueued { .. } => "steer_message_queued",
+            SseWireEvent::RateLimitSnapshot { .. } => "rate_limit_snapshot",
         }
     }
 }
@@ -465,6 +471,13 @@ impl From<SseEvent> for SseWireEvent {
                 sequence_id,
                 message_id,
                 queue_position,
+            },
+            SseEvent::RateLimitSnapshot {
+                sequence_id,
+                snapshot,
+            } => SseWireEvent::RateLimitSnapshot {
+                sequence_id,
+                snapshot,
             },
         }
     }

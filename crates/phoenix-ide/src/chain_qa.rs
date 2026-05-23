@@ -421,6 +421,8 @@ impl ChainQa {
                             delta,
                         });
                     }
+                    // Chain Q&A has no UI surface for mid-stream quota state.
+                    Ok(TokenChunk::RateLimitSnapshot(_)) => {}
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         // The forwarder cannot keep up with the provider —

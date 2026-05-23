@@ -1748,6 +1748,13 @@ where
                             request_id: request_id_for_fwd.clone(),
                         });
                     }
+                    Ok(crate::llm::TokenChunk::RateLimitSnapshot(snapshot)) => {
+                        let _ =
+                            broadcast_tx_for_tokens.send_seq(|seq| SseEvent::RateLimitSnapshot {
+                                sequence_id: seq,
+                                snapshot: snapshot.clone(),
+                            });
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         tracing::debug!(n, "Token forwarding lagged — some tokens dropped");

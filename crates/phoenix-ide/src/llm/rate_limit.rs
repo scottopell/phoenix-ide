@@ -11,13 +11,16 @@
 
 use chrono::{DateTime, Utc};
 use reqwest::header::HeaderMap;
+use serde::{Deserialize, Serialize};
 
-/// Structured quota state extracted from the codex backend on 429.
+/// Structured quota state extracted from the codex backend on 429 (header path)
+/// or from a mid-stream `codex.rate_limits` SSE event.
 ///
 /// All fields are optional: the codex backend populates a subset depending on
 /// which limit was hit (per-model vs global), the user's plan, and whether
 /// credits are tracked. Consumers must handle every field being `None`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct QuotaDetails {
     pub plan_type: Option<String>,
     pub resets_at: Option<DateTime<Utc>>,
@@ -29,14 +32,16 @@ pub struct QuotaDetails {
     pub promo_message: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct RateLimitWindow {
     pub used_percent: f64,
     pub window_minutes: Option<i64>,
     pub resets_at: Option<i64>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct CreditsSnapshot {
     pub has_credits: bool,
     pub unlimited: bool,
@@ -83,6 +88,86 @@ pub fn parse_rate_limit_for_limit(
         .map(str::to_string);
 
     (primary, secondary, limit_name)
+}
+
+/// Parses a `codex.rate_limits` mid-stream SSE event payload into a
+/// `QuotaDetails` snapshot. Returns `None` if the payload is not a
+/// `codex.rate_limits` event or fails to deserialize.
+///
+/// Mirrors codex CLI's `parse_rate_limit_event` in
+/// `codex-rs/codex-api/src/rate_limits.rs:131-162`. The header path (429)
+/// populates `promo_message`, `resets_at`, and `limit_name`; the SSE path
+/// does not — those fields stay `None`.
+pub fn parse_rate_limit_event(payload: &str) -> Option<QuotaDetails> {
+    #[derive(Deserialize)]
+    struct EventWindow {
+        used_percent: f64,
+        window_minutes: Option<i64>,
+        reset_at: Option<i64>,
+    }
+
+    #[derive(Deserialize)]
+    struct EventDetails {
+        primary: Option<EventWindow>,
+        secondary: Option<EventWindow>,
+    }
+
+    #[derive(Deserialize)]
+    struct EventCredits {
+        has_credits: bool,
+        unlimited: bool,
+        balance: Option<String>,
+    }
+
+    #[derive(Deserialize)]
+    struct Event {
+        #[serde(rename = "type")]
+        kind: String,
+        plan_type: Option<String>,
+        rate_limits: Option<EventDetails>,
+        credits: Option<EventCredits>,
+        metered_limit_name: Option<String>,
+        limit_name: Option<String>,
+    }
+
+    let event: Event = serde_json::from_str(payload).ok()?;
+    if event.kind != "codex.rate_limits" {
+        return None;
+    }
+
+    let map_window = |w: EventWindow| RateLimitWindow {
+        used_percent: w.used_percent,
+        window_minutes: w.window_minutes,
+        resets_at: w.reset_at,
+    };
+
+    let (primary, secondary) = event.rate_limits.map_or((None, None), |d| {
+        (d.primary.map(map_window), d.secondary.map(map_window))
+    });
+
+    let credits = event.credits.map(|c| CreditsSnapshot {
+        has_credits: c.has_credits,
+        unlimited: c.unlimited,
+        balance: c.balance,
+    });
+
+    let limit_id = event
+        .metered_limit_name
+        .or(event.limit_name)
+        .map(|n| n.trim().to_ascii_lowercase().replace('-', "_"))
+        .filter(|n| !n.is_empty())
+        .or_else(|| Some("codex".to_string()));
+
+    Some(QuotaDetails {
+        plan_type: event.plan_type,
+        resets_at: None,
+        limit_id,
+        limit_name: None,
+        primary,
+        secondary,
+        credits,
+        promo_message: None,
+    })
 }
 
 pub fn parse_active_limit(headers: &HeaderMap) -> Option<String> {
@@ -236,5 +321,83 @@ mod tests {
             parse_promo_message(&headers).as_deref(),
             Some("Upgrade to Pro")
         );
+    }
+
+    #[test]
+    fn parse_rate_limit_event_full_payload() {
+        let payload = r#"{
+            "type": "codex.rate_limits",
+            "plan_type": "plus",
+            "rate_limits": {
+                "primary":   { "used_percent": 12.5, "window_minutes": 60,   "reset_at": 1704069000 },
+                "secondary": { "used_percent": 87.4, "window_minutes": 10080,"reset_at": 1704672000 }
+            },
+            "credits": { "has_credits": true, "unlimited": false, "balance": "$3.42" },
+            "metered_limit_name": "codex"
+        }"#;
+        let q = parse_rate_limit_event(payload).expect("parses");
+        assert_eq!(q.plan_type.as_deref(), Some("plus"));
+        let p = q.primary.expect("primary");
+        assert_eq!(p.used_percent, 12.5);
+        assert_eq!(p.window_minutes, Some(60));
+        assert_eq!(p.resets_at, Some(1704069000));
+        let s = q.secondary.expect("secondary");
+        assert_eq!(s.used_percent, 87.4);
+        let c = q.credits.expect("credits");
+        assert!(c.has_credits);
+        assert!(!c.unlimited);
+        assert_eq!(c.balance.as_deref(), Some("$3.42"));
+        assert_eq!(q.limit_id.as_deref(), Some("codex"));
+        assert!(q.limit_name.is_none());
+        assert!(q.promo_message.is_none());
+        assert!(q.resets_at.is_none());
+    }
+
+    #[test]
+    fn parse_rate_limit_event_minimal_primary_only() {
+        let payload = r#"{
+            "type": "codex.rate_limits",
+            "rate_limits": { "primary": { "used_percent": 50.0 } }
+        }"#;
+        let q = parse_rate_limit_event(payload).expect("parses");
+        let p = q.primary.expect("primary");
+        assert_eq!(p.used_percent, 50.0);
+        assert!(p.window_minutes.is_none());
+        assert!(p.resets_at.is_none());
+        assert!(q.secondary.is_none());
+        assert!(q.credits.is_none());
+        assert!(q.plan_type.is_none());
+        assert_eq!(q.limit_id.as_deref(), Some("codex"));
+    }
+
+    #[test]
+    fn parse_rate_limit_event_rejects_wrong_type() {
+        let payload = r#"{ "type": "response.completed" }"#;
+        assert!(parse_rate_limit_event(payload).is_none());
+    }
+
+    #[test]
+    fn parse_rate_limit_event_rejects_invalid_json() {
+        assert!(parse_rate_limit_event("not-json").is_none());
+    }
+
+    #[test]
+    fn parse_rate_limit_event_falls_back_to_limit_name_field() {
+        let payload = r#"{
+            "type": "codex.rate_limits",
+            "limit_name": "Codex-Other"
+        }"#;
+        let q = parse_rate_limit_event(payload).expect("parses");
+        assert_eq!(q.limit_id.as_deref(), Some("codex_other"));
+    }
+
+    #[test]
+    fn parse_rate_limit_event_no_rate_limits_field() {
+        let payload = r#"{ "type": "codex.rate_limits", "plan_type": "free" }"#;
+        let q = parse_rate_limit_event(payload).expect("parses");
+        assert_eq!(q.plan_type.as_deref(), Some("free"));
+        assert!(q.primary.is_none());
+        assert!(q.secondary.is_none());
+        assert_eq!(q.limit_id.as_deref(), Some("codex"));
     }
 }

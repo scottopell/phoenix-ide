@@ -98,6 +98,11 @@ use tokio::sync::broadcast;
 #[derive(Debug, Clone)]
 pub enum TokenChunk {
     Text(String),
+    /// Mid-stream quota snapshot from the codex backend's
+    /// `codex.rate_limits` SSE event. Emitted on every turn (not only
+    /// pre-429), so the UI can show usage trends before the user hits the
+    /// terminal `UsageLimitReached` state.
+    RateLimitSnapshot(QuotaDetails),
 }
 
 /// Common interface for LLM providers

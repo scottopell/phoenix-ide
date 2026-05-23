@@ -243,6 +243,14 @@ mod tests {
                 "message_id": message_id,
                 "queue_position": queue_position,
             }),
+            SseEvent::RateLimitSnapshot {
+                sequence_id,
+                snapshot,
+            } => json!({
+                "type": "rate_limit_snapshot",
+                "sequence_id": sequence_id,
+                "snapshot": snapshot,
+            }),
         }
     }
 
