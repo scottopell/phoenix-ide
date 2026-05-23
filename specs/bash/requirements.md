@@ -698,3 +698,10 @@ operations so the UI has a sensible display for non-run calls.
 | `DEFAULT_PEEK_LINES` | 200 | Lines returned when peek has no read modifier |
 | `MAX_LABEL_LENGTH` | 64 | Soft cap on `label` length; over-cap labels rejected with `error: "label_too_long"` |
 | `DEFAULT_WAIT_SECONDS` | 30 | Default `wait_seconds` when omitted |
+
+## Bash Watches and Work Scope Foundation
+
+- **REQ-BASH-WATCH-001:** Phoenix MUST treat ordinary bash process output and process exit as passive observations. They MUST NOT wake or resume a conversation unless an explicit `bash_watch` contract exists.
+- **REQ-BASH-WATCH-002:** A `bash_watch` contract MUST be owned by a `WorkScope`, not by the ordinary per-conversation bash handle table.
+- **REQ-BASH-WATCH-003:** A `bash_watch` contract MUST carry typed trigger intent and typed wake intent so a future wake is attributable to the contract that requested it.
+- **REQ-BASH-WATCH-004:** Ordinary bash handles, tombstones, and process-control operations remain scoped to the conversation/runtime that created them. A watch MAY reference a handle in its typed trigger, but Phoenix MUST NOT infer watch ownership or wake eligibility from handle existence alone.

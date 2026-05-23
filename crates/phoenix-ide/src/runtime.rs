@@ -23,7 +23,9 @@ pub use traits::*;
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
 use crate::tools::browser::session::BrowserSessionLifecycleEvent;
-use crate::tools::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry, ToolRegistry};
+use crate::tools::{
+    BashHandleRegistry, BashWatchRegistry, BrowserSessionManager, TmuxRegistry, ToolRegistry,
+};
 
 /// Type alias for production runtime with concrete implementations
 pub type ProductionRuntime =
@@ -101,6 +103,7 @@ pub struct RuntimeManager {
     /// `ToolContext`; each conversation gets its own `ConversationHandles`
     /// table inside (REQ-BASH-014).
     bash_handles: Arc<BashHandleRegistry>,
+    bash_watches: Arc<BashWatchRegistry>,
     /// Per-process tmux server registry. Shared by every conversation's
     /// `ToolContext`; each conversation gets its own `Arc<RwLock<TmuxServer>>`
     /// inside, keyed by `conversation_id`. The `which("tmux")` result is
@@ -863,6 +866,7 @@ impl RuntimeManager {
                 browser_lifecycle_tx,
             )),
             bash_handles: Arc::new(BashHandleRegistry::new()),
+            bash_watches: Arc::new(BashWatchRegistry::new()),
             tmux_registry: Arc::new(TmuxRegistry::new()),
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
@@ -894,6 +898,10 @@ impl RuntimeManager {
     /// REQ-BASH-006 hard-delete cascade).
     pub fn bash_handles(&self) -> &Arc<BashHandleRegistry> {
         &self.bash_handles
+    }
+
+    pub fn bash_watches(&self) -> &Arc<BashWatchRegistry> {
+        &self.bash_watches
     }
 
     /// Get the tmux server registry (REQ-TMUX-007 hard-delete cascade,
@@ -1167,6 +1175,7 @@ impl RuntimeManager {
             tool_executor,
             self.browser_sessions.clone(),
             self.bash_handles.clone(),
+            self.bash_watches.clone(),
             self.tmux_registry.clone(),
             self.llm_registry.clone(),
             self.terminals.clone(),
@@ -1430,6 +1439,7 @@ impl RuntimeManager {
             tool_executor,
             self.browser_sessions.clone(),
             self.bash_handles.clone(),
+            self.bash_watches.clone(),
             self.tmux_registry.clone(),
             self.llm_registry.clone(),
             self.terminals.clone(),
@@ -1590,6 +1600,52 @@ impl RuntimeManager {
             .send(event)
             .await
             .map_err(|e| format!("Failed to send event: {e}"))
+    }
+
+    /// Deliver a fired bash watch to the current active conversation for its
+    /// `WorkScope`. The fired watch is explicit typed intent; ordinary bash
+    /// process lifecycle observations never call this path by themselves.
+    pub async fn fire_bash_watch(
+        self: &Arc<Self>,
+        watch_id: &str,
+        observation: String,
+    ) -> Result<Option<String>, String> {
+        let Some(watch) = self.bash_watches.remove(watch_id).await else {
+            return Ok(None);
+        };
+        let target = self
+            .db
+            .active_conversation_for_work_scope(&watch.work_scope)
+            .await
+            .map_err(|e| format!("Failed to route bash watch: {e}"))?;
+        let Some(target) = target else {
+            tracing::info!(watch_id = %watch.watch_id, scope = %watch.work_scope, "dropping fired bash watch: work scope has no active conversation");
+            return Ok(None);
+        };
+        if matches!(target.state, crate::state_machine::ConvState::Terminal) {
+            tracing::info!(watch_id = %watch.watch_id, target = %target.id, "dropping fired bash watch: target conversation is terminal");
+            return Ok(None);
+        }
+
+        let crate::tools::bash_watch::BashWatchWakeIntent::ResumeAgent { instruction } =
+            watch.contract.wake;
+        let text = format!(
+            "Bash watch fired ({watch_id}).\nObservation: {observation}\nInstruction: {instruction}"
+        );
+        let message_id = uuid::Uuid::new_v4().to_string();
+        self.enqueue_steer_message(
+            &target.id,
+            Event::SteerMessage {
+                text,
+                llm_text: None,
+                images: vec![],
+                message_id,
+                user_agent: Some("Phoenix Bash Watch".to_string()),
+                skill_invocation: None,
+            },
+        )
+        .await?;
+        Ok(Some(target.id))
     }
 
     /// Queue a steering message to be delivered when the conversation next

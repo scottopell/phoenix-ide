@@ -961,3 +961,9 @@ updated to also accept `wait_seconds` and the operation modes.
   startup sequence.
 - Phoenix shutdown: `shutdown_kill_tree()` wired into the existing
   shutdown handler.
+
+## Bash Watch Foundation
+
+`bash_watch` is intentionally separate from the ordinary `bash` handle registry. The handle registry remains per-conversation so handle ids, tombstones, and process-control authority do not become implicitly cross-continuation. Watches are explicit contracts: a trigger describes what observation matters, and a wake intent describes what Phoenix should deliver if the contract fires.
+
+Watches are keyed by `WorkScope`. Managed/Branch work uses the worktree scope so a continuation can receive the wake. Direct conversations use `WorkScope::Conversation(conversation_id)` as the fallback, preserving existing Direct semantics.

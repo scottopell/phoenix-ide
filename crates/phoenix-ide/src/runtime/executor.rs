@@ -165,6 +165,7 @@ where
     browser_sessions: Arc<BrowserSessionManager>,
     /// Bash handle registry for `ToolContext` (REQ-BASH-014).
     bash_handles: Arc<crate::tools::BashHandleRegistry>,
+    bash_watches: Arc<crate::tools::BashWatchRegistry>,
     /// Tmux server registry for `ToolContext` (REQ-TMUX-013).
     tmux_registry: Arc<crate::tools::TmuxRegistry>,
     /// LLM registry for `ToolContext`
@@ -240,6 +241,7 @@ where
         tool_executor: T,
         browser_sessions: Arc<BrowserSessionManager>,
         bash_handles: Arc<crate::tools::BashHandleRegistry>,
+        bash_watches: Arc<crate::tools::BashWatchRegistry>,
         tmux_registry: Arc<crate::tools::TmuxRegistry>,
         llm_registry: Arc<ModelRegistry>,
         terminals: crate::terminal::ActiveTerminals,
@@ -261,6 +263,7 @@ where
             tool_executor: Arc::new(tool_executor),
             browser_sessions,
             bash_handles,
+            bash_watches,
             tmux_registry,
             llm_registry,
             terminals,
@@ -1926,6 +1929,7 @@ where
             self.llm_registry.clone(),
             self.terminals.clone(),
             self.tmux_registry.clone(),
+            self.bash_watches.clone(),
             tmux_worktree,
         );
 
@@ -3808,6 +3812,7 @@ mod context_exhausted_preserves_worktree_tests {
             Arc::new(MockToolExecutor::new()),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
             Arc::new(ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
@@ -4355,6 +4360,7 @@ mod approve_task_refreshes_mode_context_tests {
             Arc::new(MockToolExecutor::new()),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
             Arc::new(ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
@@ -4483,6 +4489,7 @@ mod steer_drain_detector_tests {
             Arc::new(MockToolExecutor::new()),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
             Arc::new(ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
@@ -4855,6 +4862,7 @@ mod steer_drain_detector_tests {
             Arc::new(MockToolExecutor::new()),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
             Arc::new(ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
@@ -5023,6 +5031,7 @@ mod work_subagent_cwd_guard_tests {
             Arc::new(MockToolExecutor::new()),
             Arc::new(BrowserSessionManager::default()),
             Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             Arc::new(crate::tools::TmuxRegistry::new()),
             Arc::new(ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),

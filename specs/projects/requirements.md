@@ -855,3 +855,7 @@ existing branch" (Branch). The branch picker is reused across Managed and
 Branch modes with different labeling to communicate the different semantics:
 "base branch" (starting point) vs "branch" (destination).
 
+
+## WorkScope Resource Ownership
+
+- **REQ-PROJ-WS-001:** Work-affine resources SHOULD be owned by `WorkScope`. Managed/Branch work uses the managed worktree path; Direct conversations use their conversation id as the fallback scope.

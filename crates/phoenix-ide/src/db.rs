@@ -1116,6 +1116,50 @@ impl Database {
         Ok(ContinueOutcome::Created(new_conversation))
     }
 
+    /// Resolve the current leaf conversation for a work-affine scope.
+    ///
+    /// Worktree scopes match conversations whose `conv_mode.worktree_path` equals the
+    /// scope path, then follow `continued_in_conv_id` links to the active leaf.
+    /// Conversation scopes are Direct-mode fallback scopes and therefore start from
+    /// the named conversation id. Returns `Ok(None)` when the scope no longer has a
+    /// live conversation row.
+    pub async fn active_conversation_for_work_scope(
+        &self,
+        scope: &crate::work_scope::WorkScope,
+    ) -> DbResult<Option<Conversation>> {
+        let start_id: Option<String> = match scope {
+            crate::work_scope::WorkScope::Conversation(id) => Some(id.clone()),
+            crate::work_scope::WorkScope::Worktree(path) => {
+                sqlx::query_scalar(
+                    "SELECT id FROM conversations
+                     WHERE json_extract(conv_mode, '$.worktree_path') = ?1
+                     ORDER BY created_at DESC LIMIT 1",
+                )
+                .bind(path)
+                .fetch_optional(&self.pool)
+                .await?
+            }
+        };
+
+        let Some(mut current_id) = start_id else {
+            return Ok(None);
+        };
+        for _ in 0..64 {
+            let conv = match self.get_conversation(&current_id).await {
+                Ok(conv) => conv,
+                Err(DbError::ConversationNotFound(_)) => return Ok(None),
+                Err(e) => return Err(e),
+            };
+            if let Some(next_id) = conv.continued_in_conv_id.clone() {
+                current_id = next_id;
+            } else {
+                return Ok(Some(conv));
+            }
+        }
+        tracing::warn!(scope = %scope, "work scope continuation chain exceeded routing limit");
+        Ok(None)
+    }
+
     /// Walk the continuation chain forward from `root_id` and return member
     /// conversation IDs in chain order (root first, leaf last). REQ-CHN-002.
     ///

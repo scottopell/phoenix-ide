@@ -401,6 +401,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             registry,
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             None,
         )
     }
@@ -471,6 +472,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             registry,
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             None,
         );
 
@@ -667,6 +669,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             registry.clone(),
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             None,
         );
 

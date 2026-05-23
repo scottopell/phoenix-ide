@@ -214,6 +214,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             None,
         )
     }
@@ -228,6 +229,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             None,
         )
     }
@@ -1053,6 +1055,7 @@ mod tests {
             Arc::new(crate::llm::ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
             Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(crate::tools::BashWatchRegistry::new()),
             None,
         );
 

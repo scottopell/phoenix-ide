@@ -5,6 +5,7 @@
 mod ask_user_question;
 pub mod bash;
 pub mod bash_check;
+pub mod bash_watch;
 pub mod browser;
 mod keyword_search;
 pub mod mcp;
@@ -25,6 +26,7 @@ pub use bash::{
     BashHandleError, BashHandleRegistry, BashOp, BashTool, BashToolInput,
     ConversationHandles as BashConversationHandles,
 };
+pub use bash_watch::{BashWatchRegistry, BashWatchTool};
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
     BrowserKeyPressTool, BrowserNavigateTool, BrowserProfileTool, BrowserRecentConsoleLogsTool,
@@ -52,6 +54,7 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::llm::ModelRegistry;
+use crate::work_scope::WorkScope;
 pub use browser::session::BrowserSession;
 
 /// Typed image data for LLM consumption.
@@ -196,6 +199,9 @@ pub struct ToolContext {
     /// (`terminal_last_command`, `terminal_command_history`).
     pub terminals: crate::terminal::ActiveTerminals,
 
+    /// Explicit bash wake contracts, owned by WorkScope.
+    bash_watches: Arc<BashWatchRegistry>,
+
     /// Per-process tmux server registry (access via `tmux()` method).
     /// Owns the per-conversation tmux server entries (`Arc<RwLock<TmuxServer>>`)
     /// and resolves the deterministic socket path. REQ-TMUX-001 /
@@ -207,6 +213,9 @@ pub struct ToolContext {
     /// key the socket to the worktree rather than the conversation ID so
     /// the session survives context-exhaustion continuations (task 03001).
     pub worktree_path: Option<PathBuf>,
+
+    /// Durable owner for work-affine resources created by this tool call.
+    pub work_scope: WorkScope,
 }
 
 impl ToolContext {
@@ -221,8 +230,10 @@ impl ToolContext {
         llm_registry: Arc<ModelRegistry>,
         terminals: crate::terminal::ActiveTerminals,
         tmux_registry: Arc<TmuxRegistry>,
+        bash_watches: Arc<BashWatchRegistry>,
         worktree_path: Option<PathBuf>,
     ) -> Self {
+        let work_scope = WorkScope::resolve(&conversation_id, worktree_path.as_deref());
         Self {
             cancel,
             conversation_id,
@@ -232,7 +243,9 @@ impl ToolContext {
             llm_registry,
             terminals,
             tmux_registry,
+            bash_watches,
             worktree_path,
+            work_scope,
         }
     }
 
@@ -270,6 +283,10 @@ impl ToolContext {
         &self.bash_handles
     }
 
+    pub fn bash_watch_registry(&self) -> &Arc<BashWatchRegistry> {
+        &self.bash_watches
+    }
+
     /// Get the LLM registry
     pub fn llm_registry(&self) -> &Arc<ModelRegistry> {
         &self.llm_registry
@@ -296,11 +313,7 @@ impl ToolContext {
         // `worktree_path` controls socket keying: worktree-scoped for
         // Work/Branch/Explore, conv-scoped for Direct (task 03001).
         self.tmux_registry
-            .ensure_live(
-                &self.conversation_id,
-                self.worktree_path.as_deref(),
-                &self.working_dir,
-            )
+            .ensure_live(&self.conversation_id, &self.work_scope, &self.working_dir)
             .await
     }
 
@@ -388,6 +401,7 @@ fn read_only_tools() -> Vec<Arc<dyn Tool>> {
 fn write_tools() -> Vec<Arc<dyn Tool>> {
     vec![
         Arc::new(BashTool),
+        Arc::new(BashWatchTool),
         Arc::new(PatchTool::default()),
         Arc::new(TmuxRunTool),
         Arc::new(TmuxTool),

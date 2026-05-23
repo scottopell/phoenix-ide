@@ -456,3 +456,8 @@ remains available for detailed tmux operations.
 | `TMUX_TRUNCATION_KEEP_BYTES` | 4096 | Bytes preserved from each end on truncation |
 | `TMUX_SOCKET_DIR` | `~/.phoenix-ide/tmux-sockets/` | Socket directory; permissions 0700 |
 | `TMUX_DEFAULT_SESSION` | `main` | Session name created on lazy spawn |
+
+## WorkScope Ownership
+
+- **REQ-TMUX-WS-001:** Phoenix MUST key tmux server ownership by `WorkScope`: `WorkScope::Worktree(path)` for managed/branch worktrees and `WorkScope::Conversation(conversation_id)` for Direct conversations.
+- **REQ-TMUX-WS-002:** Managed/Branch continuations that share a worktree MUST share the same tmux socket/session. Direct-mode conversations continue to use the conversation fallback scope.

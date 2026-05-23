@@ -27,6 +27,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use crate::work_scope::WorkScope;
 use std::process::Stdio;
 use std::sync::Arc;
 
@@ -317,7 +319,7 @@ impl TmuxRegistry {
     pub async fn ensure_live(
         &self,
         conversation_id: &str,
-        worktree_path: Option<&Path>,
+        work_scope: &WorkScope,
         cwd: &Path,
     ) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
         if !self.binary_available {
@@ -325,12 +327,16 @@ impl TmuxRegistry {
         }
         self.ensure_runtime_assets().await?;
 
-        let socket_path = match worktree_path {
-            Some(wt) => socket_path_for_worktree(&self.socket_dir, wt),
-            None => socket_path_for(&self.socket_dir, conversation_id),
+        let socket_path = match work_scope {
+            WorkScope::Worktree(path) => {
+                socket_path_for_worktree(&self.socket_dir, Path::new(path))
+            }
+            WorkScope::Conversation(id) => socket_path_for(&self.socket_dir, id),
         };
 
-        let server_arc = self.get_or_insert(conversation_id, socket_path).await;
+        let server_arc = self
+            .get_or_insert(&work_scope.stable_key(), conversation_id, socket_path)
+            .await;
 
         let mut server = server_arc.write().await;
         // Probe under the per-conversation write lock — the only
@@ -378,21 +384,22 @@ impl TmuxRegistry {
     /// always go through the probe-and-act sequence.
     async fn get_or_insert(
         &self,
+        registry_key: &str,
         conversation_id: &str,
         socket_path: PathBuf,
     ) -> Arc<RwLock<TmuxServer>> {
         {
             let map = self.inner.read().await;
-            if let Some(entry) = map.get(conversation_id) {
+            if let Some(entry) = map.get(registry_key) {
                 return entry.clone();
             }
         }
         let mut map = self.inner.write().await;
-        if let Some(entry) = map.get(conversation_id) {
+        if let Some(entry) = map.get(registry_key) {
             return entry.clone();
         }
         let entry = Arc::new(RwLock::new(TmuxServer::new(conversation_id, socket_path)));
-        map.insert(conversation_id.to_string(), entry.clone());
+        map.insert(registry_key.to_string(), entry.clone());
         entry
     }
 
@@ -683,7 +690,12 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         assert!(matches!(
-            reg.ensure_live("conv-x", None, tmp.path()).await,
+            reg.ensure_live(
+                "conv-x",
+                &crate::work_scope::WorkScope::Conversation("conv-x".to_string()),
+                tmp.path()
+            )
+            .await,
             Err(TmuxError::BinaryUnavailable)
         ));
     }

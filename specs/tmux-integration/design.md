@@ -621,3 +621,7 @@ src/terminal/
 
 The project's clippy convention requires `foo.rs + foo/` rather than
 `foo/mod.rs`; the layout above complies.
+
+## WorkScope Keying
+
+The tmux registry resolves a first-class `WorkScope` before computing socket paths. Worktree scopes hash the worktree path into a stable `wt-*.sock`; conversation fallback scopes use the existing `conv-*.sock` form. This makes the durable owner explicit instead of reimplementing "worktree if present, conversation otherwise" at each call site.

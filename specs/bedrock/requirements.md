@@ -772,3 +772,9 @@ postcondition before cascade fires.
 **Dependencies:** REQ-BASH-006 (`specs/bash/`), REQ-TMUX-007
 (`specs/tmux-integration/`), REQ-PROJ-`<new subscriber>`
 (`specs/projects/`).
+
+## WorkScope Watch Routing
+
+- **REQ-BED-WATCH-001:** When an explicit work-scope-owned watch fires, Phoenix MUST resolve the active leaf conversation for that `WorkScope` before delivery.
+- **REQ-BED-WATCH-002:** If the original conversation has continued, the synthetic wake MUST be delivered to the continuation rather than the stale predecessor.
+- **REQ-BED-WATCH-003:** If the work scope no longer has an active conversation, or the resolved conversation is terminal, Phoenix MUST drop/cancel the watch instead of waking stale work.
