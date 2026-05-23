@@ -1,10 +1,11 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import type { Conversation } from './api';
 import {
   AGENT_FINISHED_THRESHOLD_MS,
   DEFAULT_NOTIFICATION_SETTINGS,
   notifyCatchUp,
   notifyConversationStateChange,
+  notifyConversationSnapshotChange,
   resetNotificationRuntimeForTest,
 } from './notifications';
 
@@ -57,6 +58,11 @@ beforeEach(() => {
   });
   vi.spyOn(document, 'hasFocus').mockReturnValue(false);
   window.history.replaceState(null, '', '/');
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+  vi.restoreAllMocks();
 });
 
 describe('browser desktop notifications', () => {
@@ -121,6 +127,7 @@ describe('browser desktop notifications', () => {
     notifyConversationStateChange(conv, { type: 'llm_requesting', attempt: 1 }, { type: 'idle' });
     expect(notifications).toHaveLength(1);
     expect(notifications[0]?.title).toBe('Agent finished');
+    expect(notifications[0]?.options?.tag).toBe('agent_finished:conv-1:2026-01-01T00:00:31Z');
   });
 
   it('catch-up dedupes blocking events by unresolved conversation state', () => {
@@ -182,6 +189,29 @@ describe('browser desktop notifications', () => {
       { type: 'idle' },
       { type: 'awaiting_user_response', questions: [] },
     )).not.toThrow();
+  });
+
+  it('suppresses continued context-exhausted predecessors', () => {
+    grantSettings();
+
+    notifyConversationStateChange(
+      conversation({ continued_in_conv_id: 'next-1' }),
+      { type: 'idle' },
+      { type: 'context_exhausted', summary: 'continued' },
+    );
+
+    expect(notifications).toHaveLength(0);
+  });
+
+  it('live notification dedupes the following snapshot transition for the same blocking state', () => {
+    grantSettings();
+    const blocked = conversation({ state: { type: 'awaiting_user_response', questions: [] } });
+
+    notifyConversationStateChange(blocked, { type: 'idle' }, { type: 'awaiting_user_response', questions: [] });
+    notifyConversationSnapshotChange(blocked);
+    notifyConversationSnapshotChange({ ...blocked, updated_at: '2026-01-01T00:01:00Z' });
+
+    expect(notifications).toHaveLength(1);
   });
 
   it('catch-up skips sub-agent conversations', () => {

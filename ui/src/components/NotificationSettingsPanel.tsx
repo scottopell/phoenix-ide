@@ -19,6 +19,7 @@ export function NotificationSettingsPanel({ compact = false }: Props) {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const latestSaveRef = useRef(0);
+  const saveChainRef = useRef(Promise.resolve());
   const editedRef = useRef(false);
 
   useEffect(() => {
@@ -27,7 +28,6 @@ export function NotificationSettingsPanel({ compact = false }: Props) {
       .then((loaded) => {
         if (cancelled || editedRef.current) return;
         setSettings(loaded);
-        updateNotificationRuntimeSettings(loaded);
       })
       .catch((err) => {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load notification settings');
@@ -35,7 +35,7 @@ export function NotificationSettingsPanel({ compact = false }: Props) {
     return () => { cancelled = true; };
   }, []);
 
-  const save = useCallback(async (next: NotificationSettings) => {
+  const save = useCallback((next: NotificationSettings) => {
     const saveId = latestSaveRef.current + 1;
     latestSaveRef.current = saveId;
     editedRef.current = true;
@@ -43,18 +43,21 @@ export function NotificationSettingsPanel({ compact = false }: Props) {
     updateNotificationRuntimeSettings(next);
     setSaving(true);
     setError(null);
-    try {
-      const saved = await api.updateNotificationSettings(next);
-      if (latestSaveRef.current !== saveId) return;
-      setSettings(saved);
-      updateNotificationRuntimeSettings(saved);
-    } catch (err) {
-      if (latestSaveRef.current === saveId) {
-        setError(err instanceof Error ? err.message : 'Failed to save notification settings');
-      }
-    } finally {
-      if (latestSaveRef.current === saveId) setSaving(false);
-    }
+    saveChainRef.current = saveChainRef.current
+      .catch(() => {})
+      .then(async () => {
+        const saved = await api.updateNotificationSettings(next);
+        if (latestSaveRef.current !== saveId) return;
+        setSettings(saved);
+        updateNotificationRuntimeSettings(saved);
+        setSaving(false);
+      })
+      .catch((err: unknown) => {
+        if (latestSaveRef.current === saveId) {
+          setError(err instanceof Error ? err.message : 'Failed to save notification settings');
+          setSaving(false);
+        }
+      });
   }, []);
 
   const setFlag = useCallback((key: keyof NotificationSettings, value: boolean) => {

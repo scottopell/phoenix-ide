@@ -88,6 +88,13 @@ export function loadNotificationSettings(): Promise<NotificationSettings> {
   return notificationRuntime.settingsLoading;
 }
 
+export function loadNotificationSettingsAndCatchUp(conversations: readonly Conversation[]): Promise<NotificationSettings> {
+  return loadNotificationSettings().then((settings) => {
+    notifyCatchUp(conversations);
+    return settings;
+  });
+}
+
 export function resetNotificationRuntimeForTest(settings?: NotificationSettings): void {
   notificationRuntime.settings = settings ?? DISABLED_NOTIFICATION_SETTINGS;
   notificationRuntime.settingsLoaded = settings !== undefined;
@@ -115,8 +122,10 @@ function eventForState(state: ConversationState, conversation: Conversation): No
       return { type: 'task_approval_needed', title: 'Task approval needed', conversation };
     case 'awaiting_user_response':
       return { type: 'question_asked', title: 'Question asked', conversation };
-    case 'error':
     case 'context_exhausted':
+      if (conversation.continued_in_conv_id) return null;
+      return { type: 'agent_error', title: 'Agent error', conversation };
+    case 'error':
       return { type: 'agent_error', title: 'Agent error', conversation };
     default:
       return null;
@@ -147,6 +156,13 @@ function clearAttentionSeen(conversation: Conversation): void {
   notificationRuntime.lastAttentionKeyByConversationId.delete(conversation.id);
 }
 
+function notificationTag(event: NotificationEvent): string {
+  if (event.type === 'agent_finished') {
+    return `${event.type}:${event.conversation.id}:${event.conversation.updated_at}`;
+  }
+  return `${event.type}:${event.conversation.id}`;
+}
+
 function deliverNotification(event: NotificationEvent): DeliveryResult {
   if (!notificationRuntime.settingsLoaded) return 'not_delivered';
   if (!notificationEnabled(event.type, notificationRuntime.settings)) return 'not_delivered';
@@ -162,7 +178,7 @@ function deliverNotification(event: NotificationEvent): DeliveryResult {
   try {
     const notification = new Notification(event.title, {
       body: event.conversation.slug,
-      tag: `${event.type}:${event.conversation.id}`,
+      tag: notificationTag(event),
     });
     notification.onclick = () => {
       window.focus();
@@ -196,6 +212,10 @@ export function notifyConversationStateChange(
   const stateEvent = eventForState(nextState, conversation);
   if (stateEvent) {
     busyStartedAtByConversation.delete(conversation.id);
+    const key = attentionKey(stateEvent);
+    if (key && notificationRuntime.lastAttentionKeyByConversationId.get(conversation.id) === key) {
+      return;
+    }
     const result = deliverNotification(stateEvent);
     if (result === 'delivered' || result === 'suppressed_focus') markAttentionSeen(stateEvent);
     return;

@@ -14,7 +14,7 @@ import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';
 import {
   consumeNotificationPermissionCue,
-  loadNotificationSettings,
+  loadNotificationSettingsAndCatchUp,
   notifyCatchUp,
   useNotificationClickNavigationBridge,
 } from '../notifications';
@@ -53,8 +53,8 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const { active: conversations, archived: archivedConversations } = useConversationsList();
 
   useEffect(() => {
-    void loadNotificationSettings().catch(() => {});
-  }, []);
+    void loadNotificationSettingsAndCatchUp(conversations).catch(() => {});
+  }, [conversations]);
 
   useEffect(() => {
     notifyCatchUp(conversations);
