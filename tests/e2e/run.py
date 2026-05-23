@@ -17,6 +17,34 @@ Tests select mock scenarios with the `[[scenario:NAME]]` marker
 (see crates/phoenix-ide/src/llm/mock.rs).
 
 Exit code 0 if all scenarios pass; 1 otherwise.
+
+
+Adding a new scenario
+---------------------
+1. If you can express the test with one of the existing mock variants,
+   skip to step 3. Grep `[[scenario:` in this file for what already
+   exists; the marker name is the source-of-truth pointer — grep the
+   same string in `crates/phoenix-ide/src/llm/mock.rs` to see the
+   scripted response.
+
+2. If you need a new mock response shape:
+   - Add a variant to `enum Scenario` in mock.rs
+   - Add a `"name" => Some(Scenario::Variant)` match arm in
+     `parse_scenario`
+   - Add a `Scenario::Variant => (content, streamable_text)` arm in
+     `build_response`
+   - List the new NAME in the doc comment above `parse_scenario`
+   - Add a marker test in the `tests` module at the bottom
+
+3. Add a `scenario_xxx(base_url)` function below. Use the helpers
+   `_new_conv`, `_send_chat`, `_cancel`, `_get_conv`, `_drive`,
+   `_agent_text`, `_has_tool_use`, `_count_tool_use`, `_user_messages`,
+   `_user_message_images`. Raise `AssertionError` (with a useful
+   message) on failure.
+
+4. Register it in the `SCENARIOS` list near the bottom of this file.
+   The list is ordered: faster scenarios first so the slowest get the
+   tail of the wall clock if you're iterating locally.
 """
 
 from __future__ import annotations
@@ -149,9 +177,14 @@ def _server():
 # ----------------------- minimal client helpers -----------------------
 
 
-def _new_conv(base_url: str, text: str, images: list[dict] | None = None) -> dict:
+def _new_conv(
+    base_url: str,
+    text: str,
+    images: list[dict] | None = None,
+    cwd: str | None = None,
+) -> dict:
     payload = {
-        "cwd": str(ROOT),
+        "cwd": cwd if cwd is not None else str(ROOT),
         "text": text,
         "images": images or [],
         "message_id": str(uuid.uuid4()),
@@ -159,6 +192,11 @@ def _new_conv(base_url: str, text: str, images: list[dict] | None = None) -> dic
     r = httpx.post(f"{base_url}/api/conversations/new", json=payload, timeout=10.0)
     r.raise_for_status()
     return r.json()["conversation"]
+
+
+def _new_conv_in(base_url: str, cwd: str, text: str, images: list[dict] | None = None) -> dict:
+    """Convenience wrapper for scenarios that need an isolated cwd."""
+    return _new_conv(base_url, text, images=images, cwd=cwd)
 
 
 def _send_chat(base_url: str, conv_id: str, text: str) -> None:
@@ -435,15 +473,72 @@ def scenario_list_models(base_url: str) -> None:
     assert "mock" in ids, f"mock model missing from /api/models: {ids}"
 
 
+def scenario_read_file(base_url: str) -> None:
+    # Mock scenario: see [[scenario:read_file]] in mock.rs — reads Cargo.toml
+    # at the conversation's cwd (which is the project root here).
+    conv = _new_conv(base_url, "[[scenario:read_file]] inspect")
+    final = _drive(base_url, conv["id"], timeout=15.0)
+    assert _has_tool_use(final["messages"], "read_file"), "expected a 'read_file' tool use"
+    tool_msgs = [m for m in final["messages"] if m.get("message_type") == "tool"]
+    assert tool_msgs, "expected at least one tool result message"
+    for m in tool_msgs:
+        content = m.get("content") or {}
+        assert content.get("is_error") is False, (
+            f"read_file tool result reported error: {content!r}"
+        )
+
+
+def scenario_patch(base_url: str) -> None:
+    # Mock scenario: see [[scenario:patch]] in mock.rs — emits a patch tool
+    # call that overwrites e2e-mock-patch-out.txt in the conversation cwd.
+    # Use an isolated tempdir as cwd so this scenario doesn't write into the
+    # repo even if patch tool semantics ever change.
+    work_dir = tempfile.mkdtemp(prefix="phoenix-e2e-patch-")
+    try:
+        conv = _new_conv_in(base_url, work_dir, "[[scenario:patch]] write")
+        final = _drive(base_url, conv["id"], timeout=15.0)
+        assert _has_tool_use(final["messages"], "patch"), "expected a 'patch' tool use"
+        tool_msgs = [m for m in final["messages"] if m.get("message_type") == "tool"]
+        assert tool_msgs, "expected at least one tool result message"
+        for m in tool_msgs:
+            content = m.get("content") or {}
+            assert content.get("is_error") is False, (
+                f"patch tool result reported error: {content!r}"
+            )
+        out_path = Path(work_dir) / "e2e-mock-patch-out.txt"
+        assert out_path.exists(), f"patch tool did not create {out_path}"
+        body = out_path.read_text()
+        assert body == "hello from mock patch scenario\n", f"unexpected file body: {body!r}"
+    finally:
+        import shutil
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+
+def scenario_perf_stream(base_url: str) -> None:
+    # Uses the [[perf:N]] marker (see mock.rs `parse_perf_words`) — emits
+    # exactly N whitespace-separated deterministic words. Catches stream
+    # finalization or persistence regressions that only manifest on longer
+    # streams (most other scenarios finalize in <100 tokens).
+    n = 400
+    conv = _new_conv(base_url, f"[[perf:{n}]] go")
+    final = _drive(base_url, conv["id"], timeout=30.0)
+    text = _agent_text(final["messages"])
+    word_count = len(text.split())
+    assert word_count == n, f"expected {n} words from perf stream, got {word_count}"
+
+
 SCENARIOS = [
     ("list_models", scenario_list_models),
     ("text_streaming", scenario_text_streaming),
     ("multi_tool", scenario_multi_tool),
     ("think_tool", scenario_think_tool),
+    ("read_file", scenario_read_file),
+    ("patch", scenario_patch),
     ("polling_parity", scenario_polling_parity),
     ("continuation", scenario_continuation),
     ("mid_stream_cancel", scenario_mid_stream_cancel),
     ("image_roundtrip", scenario_image_roundtrip),
+    ("perf_stream", scenario_perf_stream),
 ]
 
 
