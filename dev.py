@@ -1751,6 +1751,20 @@ def cmd_check():
             results.append(("task validation", 0 if ok else 1, elapsed, detail))
             print(f"  {sym} {'task validation':<18s} ({elapsed:.1f}s)")
 
+    def lane_e2e():
+        """E2E API-boundary tests driven through a real running binary.
+
+        Spawns phoenix-ide on an ephemeral port with PHOENIX_ENABLE_MOCK_MODEL=1
+        and an isolated temp DB, then runs a battery of scripted conversations
+        through the same HTTP/SSE surface phoenix-client.py uses.
+
+        The cargo bin build inside this lane shares the workspace target dir
+        with `lane_rust`'s cargo invocations — cargo's target lock serializes
+        them, so the bin link is cheap once clippy/test compile have populated
+        target/. Designed to fit in lane_rust's wall-clock shadow.
+        """
+        run_step("e2e", ["uv", "run", "tests/e2e/run.py"])
+
     def check_package_lock_clean():
         """Tripwire: fail if `ui/pnpm-lock.yaml` has uncommitted changes.
 
@@ -2018,6 +2032,7 @@ def cmd_check():
         threading.Thread(target=check_allium),
         threading.Thread(target=check_spec_anchors),
         threading.Thread(target=check_package_lock_clean),
+        threading.Thread(target=lane_e2e),
     ]
     for t in threads:
         t.start()

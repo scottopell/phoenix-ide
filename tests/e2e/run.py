@@ -1,0 +1,447 @@
+#!/usr/bin/env -S uv run
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "httpx",
+#     "httpx-sse",
+# ]
+# ///
+"""E2E API-boundary tests using the mock LLM provider.
+
+Spawns a real phoenix-ide binary on an ephemeral port with an isolated
+SQLite DB and PHOENIX_ENABLE_MOCK_MODEL=1, then drives it through a
+battery of scripted conversations using the same HTTP/SSE surface that
+phoenix-client.py uses.
+
+Tests select mock scenarios with the `[[scenario:NAME]]` marker
+(see crates/phoenix-ide/src/llm/mock.rs).
+
+Exit code 0 if all scenarios pass; 1 otherwise.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+import os
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+from contextlib import contextmanager
+from pathlib import Path
+
+import httpx
+from httpx_sse import connect_sse
+
+ROOT = Path(__file__).resolve().parents[2]
+BINARY = ROOT / "target" / "debug" / "phoenix_ide"
+
+# 1x1 transparent PNG, base64-encoded.
+TINY_PNG_B64 = (
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAA"
+    "AAYAAjCB0C8AAAAASUVORK5CYII="
+)
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def _build_binary() -> None:
+    print("[e2e] cargo build --bin phoenix-ide ...", flush=True)
+    t0 = time.monotonic()
+    # --quiet keeps the lane's stdout focused on test results; rustc errors
+    # still surface on stderr and via the non-zero exit code.
+    res = subprocess.run(
+        ["cargo", "build", "--bin", "phoenix_ide", "--quiet"],
+        cwd=ROOT,
+    )
+    if res.returncode != 0:
+        sys.exit(res.returncode)
+    print(f"[e2e] build done in {time.monotonic() - t0:.1f}s", flush=True)
+
+
+@contextmanager
+def _server():
+    port = _free_port()
+    tmpdir = tempfile.mkdtemp(prefix="phoenix-e2e-")
+    db_path = Path(tmpdir) / "phoenix.db"
+    env = os.environ.copy()
+    # Strip every channel that could register a non-mock provider so the
+    # registry contains exactly one model and behavior is reproducible.
+    for k in (
+        "ANTHROPIC_API_KEY",
+        "OPENAI_API_KEY",
+        "LLM_GATEWAY",
+        "LLM_API_KEY_HELPER",
+        "OPENAI_USE_CODEX_AUTH",
+        "PHOENIX_PASSWORD",
+        "PHOENIX_TLS",
+        "PHOENIX_TLS_CERT_PATH",
+        "PHOENIX_TLS_KEY_PATH",
+    ):
+        env.pop(k, None)
+    env.update(
+        {
+            "PHOENIX_ENABLE_MOCK_MODEL": "1",
+            "DEFAULT_MODEL": "mock",
+            "PHOENIX_PORT": str(port),
+            "PHOENIX_DB_PATH": str(db_path),
+            # Quiet logs unless a test fails (we capture stderr and print on
+            # failure). RUST_LOG=warn drops the per-request access log too,
+            # which would otherwise spam the harness output.
+            "RUST_LOG": os.environ.get("E2E_RUST_LOG", "warn"),
+        },
+    )
+    log_path = Path(tmpdir) / "phoenix.log"
+    log_file = log_path.open("w")
+    proc = subprocess.Popen(
+        [str(BINARY)],
+        cwd=ROOT,
+        env=env,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+    )
+
+    base_url = f"http://127.0.0.1:{port}"
+    deadline = time.monotonic() + 30.0
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            log_file.close()
+            raise RuntimeError(
+                f"phoenix-ide exited during startup (code {proc.returncode})\n"
+                f"--- log ({log_path}) ---\n{log_path.read_text()}"
+            )
+        try:
+            r = httpx.get(f"{base_url}/version", timeout=2.0)
+            if r.status_code == 200:
+                break
+        except Exception as e:
+            last_err = e
+            time.sleep(0.1)
+    else:
+        proc.kill()
+        proc.wait(timeout=5)
+        log_file.close()
+        raise RuntimeError(
+            f"phoenix-ide did not become healthy in 30s: {last_err}\n"
+            f"--- log ({log_path}) ---\n{log_path.read_text()}"
+        )
+
+    try:
+        yield base_url, log_path
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+        log_file.close()
+
+
+# ----------------------- minimal client helpers -----------------------
+
+
+def _new_conv(base_url: str, text: str, images: list[dict] | None = None) -> dict:
+    payload = {
+        "cwd": str(ROOT),
+        "text": text,
+        "images": images or [],
+        "message_id": str(uuid.uuid4()),
+    }
+    r = httpx.post(f"{base_url}/api/conversations/new", json=payload, timeout=10.0)
+    r.raise_for_status()
+    return r.json()["conversation"]
+
+
+def _send_chat(base_url: str, conv_id: str, text: str) -> None:
+    r = httpx.post(
+        f"{base_url}/api/conversations/{conv_id}/chat",
+        json={"text": text, "images": [], "message_id": str(uuid.uuid4())},
+        timeout=10.0,
+    )
+    r.raise_for_status()
+
+
+def _cancel(base_url: str, conv_id: str) -> dict:
+    r = httpx.post(f"{base_url}/api/conversations/{conv_id}/cancel", timeout=10.0)
+    r.raise_for_status()
+    return r.json()
+
+
+def _get_conv(base_url: str, conv_id: str) -> dict:
+    r = httpx.get(f"{base_url}/api/conversations/{conv_id}", timeout=10.0)
+    r.raise_for_status()
+    return r.json()
+
+
+def _state_str(state) -> str:
+    if isinstance(state, dict):
+        return state.get("type", "unknown")
+    return str(state)
+
+
+def _stream_to_terminal(base_url: str, conv_id: str, timeout: float = 30.0) -> None:
+    """Drive the SSE stream until the conversation reaches a terminal state.
+
+    Returns nothing — callers should refetch via _get_conv for the authoritative
+    final message list. The stream is purely a synchronization barrier here
+    because message events fire incrementally during agent runs and would
+    double-count if naively accumulated.
+    """
+    url = f"{base_url}/api/conversations/{conv_id}/stream"
+    start = time.monotonic()
+    sse_timeout = httpx.Timeout(connect=5.0, read=max(timeout, 30.0), write=5.0, pool=5.0)
+    with httpx.Client(timeout=sse_timeout) as client:
+        with connect_sse(client, "GET", url) as src:
+            for event in src.iter_sse():
+                if time.monotonic() - start > timeout:
+                    raise TimeoutError(f"SSE timeout after {timeout}s")
+                data = json.loads(event.data) if event.data else {}
+                if event.event == "state_change":
+                    display = data.get("display_state")
+                    state = _state_str(data.get("state"))
+                    if state == "error":
+                        sd = data.get("state_data") or {}
+                        raise RuntimeError(f"conversation error: {sd.get('message')}")
+                    if display == "terminal":
+                        return
+                elif event.event == "agent_done":
+                    return
+                elif event.event == "error":
+                    raise RuntimeError(f"sse error: {data.get('message')}")
+
+
+def _poll_to_idle(base_url: str, conv_id: str, timeout: float = 30.0) -> None:
+    """Poll GET until the conversation is idle. Same barrier role as SSE."""
+    start = time.monotonic()
+    while time.monotonic() - start < timeout:
+        data = _get_conv(base_url, conv_id)
+        state = _state_str(data["conversation"]["state"])
+        if state == "idle":
+            return
+        if state == "error":
+            sd = data["conversation"].get("state_data") or {}
+            raise RuntimeError(f"conversation error: {sd.get('message')}")
+        time.sleep(0.1)
+    raise TimeoutError(f"poll timeout after {timeout}s")
+
+
+def _drive(base_url: str, conv_id: str, timeout: float = 30.0, use_polling: bool = False) -> dict:
+    """Wait for the conversation to settle, then return the authoritative
+    state via GET (not the in-flight stream snapshot)."""
+    if use_polling:
+        _poll_to_idle(base_url, conv_id, timeout)
+    else:
+        _stream_to_terminal(base_url, conv_id, timeout)
+    return _get_conv(base_url, conv_id)
+
+
+def _agent_text(messages: list[dict]) -> str:
+    """Concatenate all assistant-message text blocks.
+
+    Wire shape (verified against the running server): agent messages have
+    `message_type == "agent"` and `content` is a list of blocks with
+    `{"type": "text", "text": "..."}` for text blocks.
+    """
+    parts: list[str] = []
+    for m in messages:
+        if m.get("message_type") != "agent":
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text":
+                parts.append(block.get("text", ""))
+    return "\n".join(parts)
+
+
+def _has_tool_use(messages: list[dict], name: str) -> bool:
+    for m in messages:
+        if m.get("message_type") != "agent":
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == name:
+                return True
+    return False
+
+
+def _count_tool_use(messages: list[dict], name: str) -> int:
+    n = 0
+    for m in messages:
+        if m.get("message_type") != "agent":
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == name:
+                n += 1
+    return n
+
+
+def _user_messages(messages: list[dict]) -> list[dict]:
+    return [m for m in messages if m.get("message_type") == "user"]
+
+
+def _user_message_images(message: dict) -> list[dict]:
+    content = message.get("content")
+    if isinstance(content, dict):
+        return list(content.get("images") or [])
+    return []
+
+
+# ----------------------- scenarios -----------------------
+
+
+def scenario_text_streaming(base_url: str) -> None:
+    conv = _new_conv(base_url, "[[scenario:plain_text]] hello")
+    final = _drive(base_url, conv["id"], timeout=15.0)
+    text = _agent_text(final["messages"])
+    assert "analyzed the situation" in text, f"unexpected assistant text: {text[:200]!r}"
+
+
+def scenario_multi_tool(base_url: str) -> None:
+    conv = _new_conv(base_url, "[[scenario:multi_tool]] go")
+    final = _drive(base_url, conv["id"], timeout=30.0)
+    n_bash = _count_tool_use(final["messages"], "bash")
+    assert n_bash == 2, f"expected 2 bash tool uses, got {n_bash}"
+    state = _state_str(final["conversation"]["state"])
+    assert state == "idle", f"final state not idle: {state}"
+
+
+def scenario_think_tool(base_url: str) -> None:
+    conv = _new_conv(base_url, "[[scenario:think]] explain")
+    final = _drive(base_url, conv["id"], timeout=15.0)
+    assert _has_tool_use(final["messages"], "think"), "expected a 'think' tool use in transcript"
+
+
+def scenario_polling_parity(base_url: str) -> None:
+    """Final transcript via SSE should equal final transcript via polling."""
+    conv_a = _new_conv(base_url, "[[scenario:markdown]] sse path")
+    sse_text = _agent_text(_drive(base_url, conv_a["id"], timeout=15.0)["messages"])
+
+    conv_b = _new_conv(base_url, "[[scenario:markdown]] poll path")
+    poll_text = _agent_text(
+        _drive(base_url, conv_b["id"], timeout=15.0, use_polling=True)["messages"]
+    )
+
+    assert sse_text == poll_text, (
+        "SSE vs polling produced different assistant text:\n"
+        f"  sse:  {sse_text[:120]!r}\n"
+        f"  poll: {poll_text[:120]!r}"
+    )
+
+
+def scenario_continuation(base_url: str) -> None:
+    conv = _new_conv(base_url, "[[scenario:plain_text]] one")
+    _drive(base_url, conv["id"], timeout=15.0)
+    _send_chat(base_url, conv["id"], "[[scenario:markdown]] two")
+    final = _drive(base_url, conv["id"], timeout=15.0)
+    users = _user_messages(final["messages"])
+    assert len(users) >= 2, f"expected at least 2 user messages, got {len(users)}"
+    text = _agent_text(final["messages"])
+    assert "analyzed the situation" in text, "first turn's assistant text missing"
+    assert "## Analysis" in text, "second turn's assistant text missing"
+
+
+def scenario_mid_stream_cancel(base_url: str) -> None:
+    """Cancel during streaming; verify state reaches idle cleanly."""
+    conv = _new_conv(base_url, "[[scenario:long]] start streaming")
+    # Observe the stream just long enough to know it has started, then cancel.
+    url = f"{base_url}/api/conversations/{conv['id']}/stream"
+    with httpx.Client(timeout=httpx.Timeout(connect=5.0, read=10.0, write=5.0, pool=5.0)) as client:
+        with connect_sse(client, "GET", url) as src:
+            t_start = time.monotonic()
+            for event in src.iter_sse():
+                if event.event in ("init", "message", "state_change"):
+                    pass
+                if time.monotonic() - t_start > 0.3:
+                    break
+    resp = _cancel(base_url, conv["id"])
+    assert not resp.get("no_op", False), "cancel was a no-op — conversation already idle before we cancelled"
+    # State should converge to idle within a few seconds.
+    deadline = time.monotonic() + 5.0
+    last_state = None
+    while time.monotonic() < deadline:
+        snap = _get_conv(base_url, conv["id"])
+        last_state = _state_str(snap["conversation"]["state"])
+        if last_state == "idle":
+            return
+        time.sleep(0.1)
+    raise AssertionError(f"after cancel, state did not become idle (last: {last_state})")
+
+
+def scenario_image_roundtrip(base_url: str) -> None:
+    image = {"media_type": "image/png", "data": TINY_PNG_B64}
+    conv = _new_conv(base_url, "[[scenario:plain_text]] describe", images=[image])
+    final = _drive(base_url, conv["id"], timeout=15.0)
+    users = _user_messages(final["messages"])
+    assert users, "no user message in transcript"
+    images = _user_message_images(users[0])
+    assert images, "image attachment did not surface in user message content"
+    assert images[0].get("media_type") == "image/png"
+    assert images[0].get("data") == TINY_PNG_B64, "image bytes did not round-trip intact"
+
+
+def scenario_list_models(base_url: str) -> None:
+    r = httpx.get(f"{base_url}/api/models", timeout=5.0)
+    r.raise_for_status()
+    body = r.json()
+    ids = {m.get("id") for m in body.get("models", [])}
+    assert "mock" in ids, f"mock model missing from /api/models: {ids}"
+
+
+SCENARIOS = [
+    ("list_models", scenario_list_models),
+    ("text_streaming", scenario_text_streaming),
+    ("multi_tool", scenario_multi_tool),
+    ("think_tool", scenario_think_tool),
+    ("polling_parity", scenario_polling_parity),
+    ("continuation", scenario_continuation),
+    ("mid_stream_cancel", scenario_mid_stream_cancel),
+    ("image_roundtrip", scenario_image_roundtrip),
+]
+
+
+def main() -> int:
+    _build_binary()
+    failures: list[tuple[str, str]] = []
+    with _server() as (base_url, log_path):
+        print(f"[e2e] server up at {base_url}", flush=True)
+        for name, fn in SCENARIOS:
+            t0 = time.monotonic()
+            try:
+                fn(base_url)
+                dt = time.monotonic() - t0
+                print(f"  ✓ {name:<22s} {dt:6.2f}s", flush=True)
+            except Exception as e:
+                dt = time.monotonic() - t0
+                detail = f"{type(e).__name__}: {e}"
+                print(f"  ✗ {name:<22s} {dt:6.2f}s  {detail}", flush=True)
+                failures.append((name, detail))
+        if failures:
+            print(f"\n[e2e] server log tail ({log_path}):", flush=True)
+            tail = log_path.read_text().splitlines()[-80:]
+            for line in tail:
+                print(f"  | {line}")
+    if failures:
+        print(f"\n✗ {len(failures)}/{len(SCENARIOS)} e2e scenarios failed")
+        return 1
+    print(f"\n✓ all {len(SCENARIOS)} e2e scenarios passed")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
