@@ -1049,6 +1049,10 @@ async fn shape_handle_response(
         HandleState::Tombstoned(t) => {
             let view = read_window_from_tombstone(t, read_args);
             let window = window_to_typed(&view);
+            let display_field = match kind {
+                ResponseKind::Kill { .. } => Some(display),
+                ResponseKind::Peek | ResponseKind::Wait => None,
+            };
             BashResponse::Tombstoned(BashTombstonedPayload {
                 handle: handle.handle_id.to_string(),
                 cmd,
@@ -1061,7 +1065,7 @@ async fn shape_handle_response(
                 kill_signal_sent: t.kill_signal_sent.map(|s| s.as_str().to_string()),
                 kill_attempted_at: t.kill_attempted_at.map(format_systime),
                 window,
-                display: Some(display),
+                display: display_field,
                 signal_sent: signal_sent_top,
             })
         }
