@@ -984,6 +984,84 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             (state_json, now, now, conv_id),
         )
 
+    def _perf_text(n_words: int) -> str:
+        words = [
+            "phoenix", "runtime", "state", "message", "stream", "context",
+            "render", "profile", "deterministic", "fixture", "markdown", "token",
+            "conversation", "agent", "tool", "result", "baseline", "sample",
+        ]
+        return " ".join(words[i % len(words)] for i in range(n_words))
+
+    def _ensure_conversation_load_fixture(
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        conv_mode: dict,
+        cwd: str,
+    ) -> bool:
+        """Ensure the deterministic large conversation used by perf scenarios exists."""
+        slug = "fixture-turn-one"
+        if conn.execute("SELECT 1 FROM conversations WHERE slug = ?", (slug,)).fetchone():
+            return False
+
+        conv_id = str(_uuid.uuid4())
+        state_json = json.dumps({"type": "idle"})
+        mode_json = json.dumps(conv_mode)
+        conn.execute(
+            "INSERT INTO conversations ("
+            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
+            " state, state_updated_at, created_at, updated_at, archived,"
+            " model, project_id, conv_mode, desired_base_branch,"
+            " seed_parent_id, seed_label"
+            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, ?)",
+            (
+                conv_id,
+                slug,
+                "Fixture Turn One",
+                cwd,
+                state_json,
+                now,
+                now,
+                now,
+                project_id,
+                mode_json,
+                "perf:conversation-load",
+            ),
+        )
+
+        for seq in range(47):
+            msg_id = str(_uuid.uuid4())
+            if seq % 2 == 0:
+                content = {
+                    "text": f"Fixture user turn {seq // 2 + 1}: {_perf_text(80)}",
+                    "images": [],
+                }
+                message_type = "user"
+            else:
+                content = [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Fixture agent turn {seq // 2 + 1}.\n\n"
+                            f"{_perf_text(650)}\n\n"
+                            "```ts\n"
+                            "export function fixtureTurn(input: string): string {\n"
+                            "  return input.trim().toUpperCase();\n"
+                            "}\n"
+                            "```"
+                        ),
+                    }
+                ]
+                message_type = "agent"
+            conn.execute(
+                "INSERT INTO messages ("
+                " message_id, conversation_id, sequence_id, message_type,"
+                " content, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?)",
+                (msg_id, conv_id, seq, message_type, json.dumps(content), now),
+            )
+        return True
+
     # ----------------------------------------------------- the seed
 
     direct_mode = {"mode": "Direct"}
@@ -993,15 +1071,23 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
         conn.execute("PRAGMA foreign_keys = ON")
         _ensure_schema(conn)
 
+        project_id = _find_or_create_project(conn, str(ROOT))
+
         if _existing_active_count(conn) > 0:
+            created_fixture = _ensure_conversation_load_fixture(
+                conn,
+                project_id=project_id,
+                conv_mode=direct_mode,
+                cwd=str(ROOT),
+            )
+            conn.commit()
             if not quiet_if_populated:
                 count = _existing_active_count(conn)
-                print(f"✓ Dev DB already populated ({count} conversations) — skipping seed.")
+                suffix = " + created perf fixture" if created_fixture else ""
+                print(f"✓ Dev DB already populated ({count} conversations) — skipping seed{suffix}.")
             return
 
         print("Seeding dev DB with representative conversations...")
-
-        project_id = _find_or_create_project(conn, str(ROOT))
 
         # [1/3] Direct standalones
         print("  [1/3] Direct standalones")
@@ -1053,9 +1139,14 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             conv_mode=explore_mode, cwd=str(ROOT), project_id=project_id,
         )
 
-        conn.commit()
+        _ensure_conversation_load_fixture(
+            conn,
+            project_id=project_id,
+            conv_mode=direct_mode,
+            cwd=str(ROOT),
+        )
 
-    print("✓ Seed complete.")
+        conn.commit()
 
 
 # ---------------------------------------------------------------------------
