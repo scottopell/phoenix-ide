@@ -195,15 +195,26 @@ def _stream_to_terminal(base_url: str, conv_id: str, timeout: float = 30.0) -> N
     final message list. The stream is purely a synchronization barrier here
     because message events fire incrementally during agent runs and would
     double-count if naively accumulated.
+
+    A watchdog thread closes the client at `timeout` seconds. iter_sse() does
+    not yield items for keepalive pings, so a per-event deadline check is not
+    sufficient — if termination signaling is broken (renamed event labels,
+    missing state_change), pings keep the read socket alive indefinitely.
+    Closing the client from a watchdog is the only timing-robust escape hatch.
     """
+    import threading
     url = f"{base_url}/api/conversations/{conv_id}/stream"
-    start = time.monotonic()
-    sse_timeout = httpx.Timeout(connect=5.0, read=max(timeout, 30.0), write=5.0, pool=5.0)
-    with httpx.Client(timeout=sse_timeout) as client:
+    # Read timeout exceeds the server's 15s SSE keepalive so we don't fight
+    # pings during legitimate long-tool gaps; the watchdog is the actual
+    # deadline.
+    sse_timeout = httpx.Timeout(connect=5.0, read=20.0, write=5.0, pool=5.0)
+    client = httpx.Client(timeout=sse_timeout)
+    watchdog = threading.Timer(timeout, client.close)
+    watchdog.daemon = True
+    watchdog.start()
+    try:
         with connect_sse(client, "GET", url) as src:
             for event in src.iter_sse():
-                if time.monotonic() - start > timeout:
-                    raise TimeoutError(f"SSE timeout after {timeout}s")
                 data = json.loads(event.data) if event.data else {}
                 if event.event == "state_change":
                     display = data.get("display_state")
@@ -217,6 +228,18 @@ def _stream_to_terminal(base_url: str, conv_id: str, timeout: float = 30.0) -> N
                     return
                 elif event.event == "error":
                     raise RuntimeError(f"sse error: {data.get('message')}")
+    except Exception as e:
+        # Watchdog-triggered close manifests as a transport error or runtime
+        # error from the SSE library. Map to a clean TimeoutError if the
+        # deadline has actually elapsed, otherwise re-raise.
+        if not watchdog.is_alive():
+            raise TimeoutError(
+                f"SSE did not reach terminal in {timeout}s ({type(e).__name__})"
+            ) from e
+        raise
+    finally:
+        watchdog.cancel()
+        client.close()
 
 
 def _poll_to_idle(base_url: str, conv_id: str, timeout: float = 30.0) -> None:
@@ -446,8 +469,13 @@ def main() -> int:
             log_text = log_path.read_text()
 
     # Tripwire: surface sqlx slow-statement WARNs so cross-lane I/O
-    # contention can't silently bloat write latency (task 13033).
-    slow_lines = [l for l in log_text.splitlines() if "slow statement" in l]
+    # contention can't silently bloat write latency (task 13033). Filter
+    # out the one-time startup PRAGMA (WAL+synchronous setup) — that's an
+    # admin call, not a steady-state regression signal.
+    slow_lines = [
+        l for l in log_text.splitlines()
+        if "slow statement" in l and "PRAGMA " not in l
+    ]
     if slow_lines:
         print(f"\n[e2e] {len(slow_lines)} slow-statement WARN(s) in server log:")
         for line in slow_lines[:5]:
