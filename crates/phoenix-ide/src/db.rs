@@ -14,7 +14,9 @@ use schema::{
 };
 
 use chrono::{DateTime, Utc};
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
+};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 use thiserror::Error;
@@ -104,6 +106,13 @@ impl Database {
     pub async fn open(path: &str) -> DbResult<Self> {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
             .journal_mode(SqliteJournalMode::Wal)
+            // synchronous=NORMAL is safe under WAL: commits are durable across
+            // process crashes (the WAL append is what makes them durable),
+            // only a power-failure between WAL append and the next checkpoint
+            // fsync can lose the last commit. Default FULL fsyncs every
+            // commit, which under concurrent I/O load (e.g. ./dev.py check)
+            // can stretch single-row INSERTs to 1+s. See task 13033.
+            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new().connect_with(opts).await?;
@@ -122,6 +131,7 @@ impl Database {
     pub async fn open_in_memory() -> DbResult<Self> {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
             .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
         // In-memory SQLite DBs are per-connection, so limit to 1 connection

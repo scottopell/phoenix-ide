@@ -427,6 +427,7 @@ SCENARIOS = [
 def main() -> int:
     _build_binary()
     failures: list[tuple[str, str]] = []
+    log_text = ""
     with _server() as (base_url, log_path):
         print(f"[e2e] server up at {base_url}", flush=True)
         for name, fn in SCENARIOS:
@@ -440,15 +441,28 @@ def main() -> int:
                 detail = f"{type(e).__name__}: {e}"
                 print(f"  ✗ {name:<22s} {dt:6.2f}s  {detail}", flush=True)
                 failures.append((name, detail))
-        if failures:
-            print(f"\n[e2e] server log tail ({log_path}):", flush=True)
-            tail = log_path.read_text().splitlines()[-80:]
-            for line in tail:
-                print(f"  | {line}")
+        # Read log inside the context — the tempdir may be cleaned up after.
+        if log_path.exists():
+            log_text = log_path.read_text()
+
+    # Tripwire: surface sqlx slow-statement WARNs so cross-lane I/O
+    # contention can't silently bloat write latency (task 13033).
+    slow_lines = [l for l in log_text.splitlines() if "slow statement" in l]
+    if slow_lines:
+        print(f"\n[e2e] {len(slow_lines)} slow-statement WARN(s) in server log:")
+        for line in slow_lines[:5]:
+            print(f"  | {line}")
+        failures.append(
+            ("slow-statement-tripwire", f"{len(slow_lines)} slow sqlx WARN(s)")
+        )
+
     if failures:
-        print(f"\n✗ {len(failures)}/{len(SCENARIOS)} e2e scenarios failed")
+        print(f"\n[e2e] server log tail:", flush=True)
+        for line in log_text.splitlines()[-80:]:
+            print(f"  | {line}")
+        print(f"\n✗ {len(failures)} e2e check(s) failed")
         return 1
-    print(f"\n✓ all {len(SCENARIOS)} e2e scenarios passed")
+    print(f"\n✓ all {len(SCENARIOS)} e2e scenarios passed (no slow-statement WARNs)")
     return 0
 
 
