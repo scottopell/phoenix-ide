@@ -308,7 +308,7 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
                         id: tool_use_id(),
                         name: "think".to_string(),
                         input: serde_json::json!({
-                            "thought": think_text
+                            "thoughts": think_text
                         }),
                     },
                     ContentBlock::Text {

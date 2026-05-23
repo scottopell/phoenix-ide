@@ -325,6 +325,15 @@ def scenario_think_tool(base_url: str) -> None:
     conv = _new_conv(base_url, "[[scenario:think]] explain")
     final = _drive(base_url, conv["id"], timeout=15.0)
     assert _has_tool_use(final["messages"], "think"), "expected a 'think' tool use in transcript"
+    # Tool result must be a success — catches input-schema drift between the
+    # mock's ToolUse payload and the real tool's expected fields.
+    tool_msgs = [m for m in final["messages"] if m.get("message_type") == "tool"]
+    assert tool_msgs, "expected at least one tool result message"
+    for m in tool_msgs:
+        content = m.get("content") or {}
+        assert content.get("is_error") is False, (
+            f"think tool result reported error: {content!r}"
+        )
 
 
 def scenario_polling_parity(base_url: str) -> None:
