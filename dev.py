@@ -3336,19 +3336,29 @@ def capture_login_shell_path() -> tuple[str, str]:
     """Capture the user's login-shell PATH for injection into the launchd plist.
 
     Returns (path_string, source_description). Falls back to the ambient PATH
-    if the login shell can't be invoked — the source string makes the fallback
-    visible in deploy logs.
+    if the login shell can't be invoked, exits non-zero, or returns empty
+    output — every fallback path emits a stderr WARNING so the deploy log
+    matches what actually got injected.
     """
     shell = os.environ.get("SHELL", "/bin/zsh")
+    cmd = [shell, "-lc", 'printf %s "$PATH"']
+    cmd_display = f"`{shell} -lc 'printf %s \"$PATH\"'`"
+    reason: str | None = None
     try:
-        result = subprocess.run(
-            [shell, "-lc", "printf %s \"$PATH\""],
-            capture_output=True, text=True, timeout=10,
-        )
-        if result.returncode == 0 and result.stdout.strip():
-            return result.stdout.strip(), f"`{shell} -lc 'echo $PATH'`"
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        if result.returncode != 0:
+            reason = f"exit={result.returncode} stderr={result.stderr.strip()!r}"
+        elif not result.stdout.strip():
+            reason = "empty stdout"
+        else:
+            return result.stdout.strip(), cmd_display
     except (subprocess.SubprocessError, OSError) as e:
-        print(f"  WARNING: login-shell PATH capture failed ({e}); using ambient PATH", file=sys.stderr)
+        reason = str(e)
+    print(
+        f"  WARNING: login-shell PATH capture via {cmd_display} failed ({reason}); "
+        "using ambient PATH",
+        file=sys.stderr,
+    )
     return os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"), "ambient $PATH (fallback)"
 
 
@@ -3386,8 +3396,12 @@ def generate_launchd_plist(
     if extra_env:
         env_vars.update(extra_env)
 
+    # XML-escape both keys and values: PATH (and arbitrary env values from
+    # .phoenix-ide.env) can contain `&`, `<`, `>` which would otherwise
+    # produce an invalid plist.
+    from xml.sax.saxutils import escape as _xml_escape
     env_xml = "\n".join(
-        f"      <key>{k}</key>\n      <string>{v}</string>"
+        f"      <key>{_xml_escape(k)}</key>\n      <string>{_xml_escape(v)}</string>"
         for k, v in env_vars.items()
     )
 
