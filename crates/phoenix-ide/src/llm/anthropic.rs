@@ -11,6 +11,44 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+/// Apply `anthropic-beta` headers based on the request's needs, filtered by
+/// the active gateway's capability profile. Headers not in the profile's
+/// allowlist are dropped — the model picker should already prevent selecting
+/// a model that needs an unsupported beta, so a dropped header here indicates
+/// a code path that should never fire.
+fn apply_beta_headers(
+    builder: reqwest::RequestBuilder,
+    spec: &ModelSpec,
+    has_deferred: bool,
+    gateway: Option<&str>,
+) -> reqwest::RequestBuilder {
+    let profile = gateway.and_then(super::gateway_profiles::match_profile);
+    let mut betas: Vec<&'static str> = Vec::new();
+    if has_deferred {
+        betas.push("advanced-tool-use-2025-11-20");
+    }
+    if spec.context_window >= 1_000_000 {
+        betas.push("context-1m-2025-08-07");
+    }
+
+    let mut builder = builder;
+    for beta in betas {
+        if let Some(p) = profile {
+            if !p.allows_beta_header(beta) {
+                tracing::warn!(
+                    model = %spec.id,
+                    gateway = ?gateway,
+                    beta,
+                    "Dropping anthropic-beta header — not in gateway profile allowlist"
+                );
+                continue;
+            }
+        }
+        builder = builder.header("anthropic-beta", beta);
+    }
+    builder
+}
+
 /// Accumulates state across Anthropic SSE stream events to assemble the final response.
 struct StreamAccumulator {
     input_tokens: u64,
@@ -373,14 +411,7 @@ pub async fn complete_streaming(
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
-    // Tool search requires the advanced-tool-use beta header.
-    if has_deferred {
-        builder = builder.header("anthropic-beta", "advanced-tool-use-2025-11-20");
-    }
-    // 1M context requires the context-1m beta header.
-    if spec.context_window >= 1_000_000 {
-        builder = builder.header("anthropic-beta", "context-1m-2025-08-07");
-    }
+    builder = apply_beta_headers(builder, spec, has_deferred, gateway);
     builder = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")
@@ -472,12 +503,7 @@ pub async fn complete(
             builder.header("Authorization", format!("Bearer {}", auth.credential))
         }
     };
-    if has_deferred {
-        builder = builder.header("anthropic-beta", "advanced-tool-use-2025-11-20");
-    }
-    if spec.context_window >= 1_000_000 {
-        builder = builder.header("anthropic-beta", "context-1m-2025-08-07");
-    }
+    builder = apply_beta_headers(builder, spec, has_deferred, gateway);
     builder = builder
         .header("anthropic-version", "2023-06-01")
         .header("content-type", "application/json")

@@ -3,8 +3,8 @@
 #![allow(dead_code)] // new_empty() used in tests
 
 use super::{
-    all_models, codex_credential, discover_models, probe_gateway, CodexCredential, DiscoveryConfig,
-    LlmService, LlmServiceImpl, LoggingService, Provider,
+    all_models, codex_credential, discover_models, gateway_profiles, probe_gateway,
+    CodexCredential, DiscoveryConfig, LlmService, LlmServiceImpl, LoggingService, Provider,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -480,6 +480,40 @@ impl ModelRegistry {
         reg
     }
 
+    /// Create a registry filtered by a static gateway capability profile.
+    /// Used when the gateway does not implement `/v1/models` but is documented
+    /// in [`super::gateway_profiles::PROFILES`].
+    fn new_with_profile(
+        config: &LlmConfig,
+        profile: &super::gateway_profiles::GatewayProfile,
+    ) -> Self {
+        let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
+        let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
+
+        for spec in all_models() {
+            if !profile.allows_model(&spec.id) {
+                continue;
+            }
+            if let Some(service) = Self::try_create_model(&spec, config) {
+                services.insert(spec.id.clone(), service);
+                specs.insert(spec.id.clone(), spec);
+            }
+        }
+
+        let default_model = Self::pick_default_model(&services, config);
+
+        Self {
+            services: std::sync::RwLock::new(services),
+            specs: std::sync::RwLock::new(specs),
+            default_model,
+            gateway_status: GatewayStatus::Healthy,
+            codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
+            codex_loaded_path_at_startup: config.codex_credential_path.clone(),
+            current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
+            config: Arc::new(config.clone()),
+        }
+    }
+
     /// Pick the default model from available services.
     /// Prefers claude-sonnet-4-6 > claude-sonnet-4-5 > any available > hardcoded fallback.
     fn pick_default_model(
@@ -554,9 +588,22 @@ impl ModelRegistry {
 
         // If discovery returned no models but we're in gateway mode and the probe succeeded,
         // the gateway is reachable but doesn't expose a model-listing endpoint (e.g. exe.dev
-        // gateway only proxies inference). Fall back to hardcoded models with Healthy status.
+        // gateway only proxies inference). Consult the static gateway-profile table to
+        // filter the hardcoded model list to what this gateway is known to support; fall
+        // back to the full hardcoded list if no profile matches.
         if discovered.is_empty() {
             if is_gateway_mode {
+                if let Some(gw) = config.gateway.as_deref() {
+                    if let Some(profile) = gateway_profiles::match_profile(gw) {
+                        tracing::info!(
+                            gateway = %gw,
+                            host_substring = %profile.host_substring,
+                            supported = profile.supported_model_ids.len(),
+                            "Gateway has no /v1/models endpoint; applying static capability profile"
+                        );
+                        return Self::new_with_profile(config, profile);
+                    }
+                }
                 tracing::warn!(
                     "Gateway model discovery returned no models (gateway may not support listing); \
                      using hardcoded model list with Healthy status"
@@ -1145,6 +1192,33 @@ mod tests {
         // Should have models from multiple providers
         assert!(registry.get("claude-sonnet-4-6").is_some());
         assert!(registry.get("gpt-5.5").is_some());
+    }
+
+    #[test]
+    fn test_gateway_profile_filters_unsupported_models() {
+        // exe.dev gateway profile excludes -1m variants and the context-1m beta.
+        // Simulate the "discovery returned empty" branch by calling new_with_profile
+        // directly; this isolates the filter behavior from the network probe.
+        let config = LlmConfig {
+            gateway: Some("http://169.254.169.254/gateway/llm".to_string()),
+            ..Default::default()
+        };
+        let profile = super::gateway_profiles::match_profile(config.gateway.as_deref().unwrap())
+            .expect("exe.dev profile should match");
+        let registry = ModelRegistry::new_with_profile(&config, profile);
+
+        // Supported variants are registered.
+        assert!(registry.get("claude-sonnet-4-6").is_some());
+        assert!(registry.get("claude-opus-4-7").is_some());
+        assert!(registry.get("gpt-5.5").is_some());
+
+        // 1M variants — the bug 24695 targets — are NOT registered.
+        assert!(registry.get("claude-opus-4-7-1m").is_none());
+        assert!(registry.get("claude-opus-4-6-1m").is_none());
+        assert!(registry.get("claude-sonnet-4-6-1m").is_none());
+
+        // Gateway is healthy from the registry's perspective once the profile applies.
+        assert_eq!(registry.gateway_status, GatewayStatus::Healthy);
     }
 
     #[test]
