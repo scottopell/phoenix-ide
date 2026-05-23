@@ -6,12 +6,10 @@ fn main() {
     // available (e.g. tarball builds, where .git/ is absent).
     //
     // No `cargo:rerun-if-changed=.git/HEAD` directive: those paths may not
-    // exist in tarball builds, and watching only HEAD/index misses
-    // working-tree edits that would change `git describe`. By emitting no
-    // rerun directives we let cargo's default (rerun when any source in
-    // the package changes) handle invalidation. The script is cheap and
-    // its output is stable across runs at a given commit, so any cascade
-    // is bounded.
+    // exist in tarball builds. By emitting no rerun directives we let
+    // cargo's default (rerun when any source in the package changes)
+    // handle invalidation. The script is cheap and its output is stable
+    // across runs at a given commit, so any cascade is bounded.
     let sha = Command::new("git")
         .args(["rev-parse", "--short=12", "HEAD"])
         .output()

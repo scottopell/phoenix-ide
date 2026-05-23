@@ -81,7 +81,10 @@ export function SettingsDropdown({
 
   // Position the menu in viewport coords so it escapes the sidebar's
   // overflow:hidden clip. Recompute on resize/scroll/sidebar-animate so
-  // the menu tracks the trigger instead of drifting once open.
+  // the menu tracks the trigger instead of drifting once open. State
+  // updates are deduped (only when top/left/maxHeight actually change)
+  // and scroll bursts are coalesced via rAF so a fast scroll doesn't
+  // queue one React render per scroll event.
   const computePosition = useCallback(() => {
     const trigger = triggerRef.current;
     const menu = menuRef.current;
@@ -98,21 +101,33 @@ export function SettingsDropdown({
     if (left < margin) left = margin;
     const top = tRect.bottom + 6;
     const maxHeight = Math.max(120, vh - top - margin);
-    setMenuPos({ top, left, maxHeight });
+    setMenuPos((prev) =>
+      prev && prev.top === top && prev.left === left && prev.maxHeight === maxHeight
+        ? prev
+        : { top, left, maxHeight }
+    );
   }, []);
 
   useLayoutEffect(() => {
     if (!open) { setMenuPos(null); return undefined; }
     computePosition();
-    const onWinChange = () => computePosition();
-    window.addEventListener('resize', onWinChange);
-    window.addEventListener('scroll', onWinChange, true);
-    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(() => computePosition()) : null;
+    let rafId = 0;
+    const schedule = () => {
+      if (rafId) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = 0;
+        computePosition();
+      });
+    };
+    window.addEventListener('resize', schedule);
+    window.addEventListener('scroll', schedule, true);
+    const ro = typeof ResizeObserver !== 'undefined' ? new ResizeObserver(schedule) : null;
     if (ro && triggerRef.current) ro.observe(triggerRef.current);
     return () => {
-      window.removeEventListener('resize', onWinChange);
-      window.removeEventListener('scroll', onWinChange, true);
+      window.removeEventListener('resize', schedule);
+      window.removeEventListener('scroll', schedule, true);
       ro?.disconnect();
+      if (rafId) window.cancelAnimationFrame(rafId);
     };
   }, [open, computePosition]);
 
@@ -269,11 +284,14 @@ function NotificationsSection() {
       });
   }, []);
 
+  // Persists `next` to the runtime mirror + server. Does NOT call
+  // setSettings for the optimistic update — the caller (setFlag) already
+  // owns that via its functional updater. Only the post-roundtrip
+  // server-confirmed value resets settings here.
   const save = useCallback((next: NotificationSettings) => {
     const saveId = latestSaveRef.current + 1;
     latestSaveRef.current = saveId;
     editedRef.current = true;
-    setSettings(next);
     updateNotificationRuntimeSettings(next);
     setSaving(true);
     setError(null);
@@ -298,7 +316,7 @@ function NotificationsSection() {
   const setFlag = useCallback((key: keyof NotificationSettings, value: boolean) => {
     setSettings((prev) => {
       const next = { ...prev, [key]: value };
-      void save(next);
+      save(next);
       return next;
     });
   }, [save]);
