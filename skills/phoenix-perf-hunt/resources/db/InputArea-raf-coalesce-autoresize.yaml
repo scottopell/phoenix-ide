@@ -1,0 +1,40 @@
+id: InputArea-raf-coalesce-autoresize
+target: ui/src/components/InputArea.tsx:InputArea autoResize effect
+technique: raf-coalesce-layout-read-write
+scenario: composer-typing
+date: 2026-05-23
+status: failure
+verdict: rejected
+votes:
+  duplicate_hunter: approve
+  skeptic: reject
+  conservative: approve
+  react_expert: reject
+  greybeard: reject
+methodology:
+  runs: 30
+  warmup: 3
+  throttle_rate: 4
+  harness: browser_profile
+  reset: navigate http://localhost:8042/c/review-the-recent-changes-to-the-1db4
+  readiness: textarea after clearing phoenix:draft:* localStorage
+measurements:
+  react_commits: "350.6 ± 1.68 -> 351.7 ± 2.94 (+0.33%, p=0.06495)"
+  react_actual_ms: "290.8 ± 26.6 -> 333.2 ± 93 (+14.60%, p=0.02193)"
+  script_ms: "0 ± 0 -> 4.967 ± 19.6 (p=0.1754)"
+  wall_ms: "1994 ± 219 -> 2464 ± 1130 (+23.56%, p=0.03196)"
+  js_heap_used_mib: "17.15 ± 0.0822 -> 17.16 ± 0.0485 (+0.07%, p=0.4951)"
+  long_tasks: "0 ± 0 -> 0.06667 ± 0.254 (p=0.1608)"
+  dom_nodes: "136.3 ± 0.98 -> 136.7 ± 0.884 (+0.29%, p=0.1024)"
+reason: |
+  REJECTED by the shared Phoenix perf gate. The rAF-coalesced textarea
+  auto-resize change did not reduce React commits and significantly regressed
+  react_actual_ms and wall_ms on the same composer-typing fingerprint. The
+  optimization likely delayed resize work into additional frames rather than
+  removing work from the controlled-input hot path.
+lessons: |
+  Do not rAF-coalesce InputArea's draft-driven auto-resize effect for the
+  composer-typing scenario. The immediate layout read/write is not the measured
+  bottleneck; adding a scheduled frame can make the burst slower. A future angle
+  would need direct DOM/layout instrumentation that proves auto-resize itself is
+  hot before changing this path again.
