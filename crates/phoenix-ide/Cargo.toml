@@ -112,6 +112,10 @@ ts-rs = { version = "12", features = ["serde-compat", "chrono-impl"] }
 [dev-dependencies]
 tempfile = "3"
 proptest = "1"
+# `test-util` enables `tokio::time::pause`/`advance`, used by the
+# bounded-shutdown drain tests to exercise the SHUTDOWN_GRACE timeout
+# without waiting the full real-time deadline. `full` does not include it.
+tokio = { version = "1", features = ["test-util"] }
 
 [lints]
 workspace = true

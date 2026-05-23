@@ -301,13 +301,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
 
         // Run the server with graceful shutdown on signals. The graceful
-        // drain is bounded by SHUTDOWN_GRACE so a never-disconnecting client
-        // (an SSE stream with keepalive pings) cannot pin the process past a
-        // deploy. The bound must start when the shutdown signal fires, not at
-        // startup — so the server runs as a task, the signal is awaited
-        // separately, and `drain_tx` forks that signal into axum's own
-        // graceful-shutdown hook. The HTTPS path applies the same bound after
-        // its accept loop breaks.
+        // drain is bounded by `tls::bounded_post_shutdown_drain` — same
+        // deadline as the HTTPS path, single source of truth. The bound
+        // must start when the shutdown signal fires, not at startup — so
+        // the server runs as a task, the signal is awaited separately,
+        // and `drain_tx` forks that signal into axum's own
+        // graceful-shutdown hook.
         let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
         let mut server = tokio::spawn(
             axum::serve(listener, app)
@@ -323,15 +322,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             joined = &mut server => joined??,
             () = hot_restart::shutdown_signal() => {
                 let _ = drain_tx.send(());
-                match tokio::time::timeout(tls::SHUTDOWN_GRACE, &mut server).await {
-                    Ok(joined) => joined??,
-                    Err(_elapsed) => {
-                        server_abort.abort();
-                        tracing::warn!(
-                            timeout_seconds = tls::SHUTDOWN_GRACE.as_secs(),
-                            "Timed out waiting for HTTP connections to drain; forcing shutdown"
-                        );
-                    }
+                match tls::bounded_post_shutdown_drain(&mut server, "HTTP").await {
+                    Some(joined) => joined??,
+                    None => server_abort.abort(),
                 }
             }
         }
