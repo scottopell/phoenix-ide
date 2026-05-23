@@ -3323,9 +3323,59 @@ def native_prod_stop():
 # =============================================================================
 
 
-def generate_launchd_plist(version: str, llm_gateway: str | None, extra_env: dict[str, str] | None = None) -> str:
+# Tools we probe for visibility from the launchd PATH. Listed because each
+# is something a Phoenix bash-tool invocation has plausibly needed; MISSING
+# here means an agent will hit "command not found" at runtime.
+_LAUNCHD_PATH_PROBE_TOOLS = (
+    "git", "gh", "uv", "node", "pnpm", "cargo", "rustc",
+    "python3", "rg", "jq", "taskmd",
+)
+
+
+def capture_login_shell_path() -> tuple[str, str]:
+    """Capture the user's login-shell PATH for injection into the launchd plist.
+
+    Returns (path_string, source_description). Falls back to the ambient PATH
+    if the login shell can't be invoked — the source string makes the fallback
+    visible in deploy logs.
+    """
+    shell = os.environ.get("SHELL", "/bin/zsh")
+    try:
+        result = subprocess.run(
+            [shell, "-lc", "printf %s \"$PATH\""],
+            capture_output=True, text=True, timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return result.stdout.strip(), f"`{shell} -lc 'echo $PATH'`"
+    except (subprocess.SubprocessError, OSError) as e:
+        print(f"  WARNING: login-shell PATH capture failed ({e}); using ambient PATH", file=sys.stderr)
+    return os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"), "ambient $PATH (fallback)"
+
+
+def print_launchd_path_report(path_str: str, source: str) -> None:
+    """Print PATH dirs + tool-resolution probe for the launchd plist."""
+    import shutil as _shutil
+    dirs = [d for d in path_str.split(":") if d]
+    print(f"  PATH for launchd plist captured via {source} ({len(dirs)} dirs):")
+    for d in dirs:
+        print(f"    {d}")
+    print("  Resolved tools:")
+    width = max(len(t) for t in _LAUNCHD_PATH_PROBE_TOOLS)
+    for tool in _LAUNCHD_PATH_PROBE_TOOLS:
+        resolved = _shutil.which(tool, path=path_str)
+        print(f"    {tool:<{width}} -> {resolved if resolved else 'MISSING'}")
+
+
+def generate_launchd_plist(
+    version: str,
+    llm_gateway: str | None,
+    extra_env: dict[str, str] | None = None,
+    path_override: str | None = None,
+) -> str:
     """Generate a launchd plist for the Phoenix IDE server."""
+    path_str = path_override if path_override is not None else capture_login_shell_path()[0]
     env_vars = {
+        "PATH": path_str,
         "PHOENIX_DB_PATH": str(PROD_DB_PATH),
         "PHOENIX_PORT": str(PROD_PORT),
         "PHOENIX_VERSION": version,
@@ -3487,8 +3537,15 @@ def launchd_prod_deploy(version: str | None = None):
     # Auto-detect gateway only if the env file didn't already provide LLM config
     gateway = None if _env_provides_llm_config(env_overrides) else get_llm_gateway()
 
+    # Capture login-shell PATH so the launchd service sees user-installed
+    # tools (uv, gh, node, …). launchd's default PATH is just
+    # /usr/bin:/bin:/usr/sbin:/sbin and bash -c is non-interactive, so without
+    # this the bash tool can't find anything in Homebrew/MacPorts/Volta/cargo.
+    path_str, path_source = capture_login_shell_path()
+    print_launchd_path_report(path_str, path_source)
+
     # Generate and write plist
-    plist_content = generate_launchd_plist(version, gateway, env_overrides)
+    plist_content = generate_launchd_plist(version, gateway, env_overrides, path_override=path_str)
     LAUNCHD_PLIST_PATH.parent.mkdir(parents=True, exist_ok=True)
     LAUNCHD_PLIST_PATH.write_text(plist_content)
 
