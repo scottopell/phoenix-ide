@@ -68,7 +68,14 @@ describe('BASH_SNIPPET', () => {
   test('idempotent PROMPT_COMMAND install', () => {
     // The PROMPT_COMMAND prepend must be guarded — re-sourcing without a
     // guard would accumulate `__phoenix_precmd;__phoenix_precmd;…`.
-    expect(BASH_SNIPPET.snippet).toContain(';__phoenix_precmd;');
+    // Pin the guard structure (case-pattern + skip-branch + prepend
+    // fallback) so a regression that removes the guard but still
+    // happens to contain `;__phoenix_precmd;` somewhere fails the test.
+    expect(BASH_SNIPPET.snippet).toContain('case ";$PROMPT_COMMAND;" in');
+    expect(BASH_SNIPPET.snippet).toMatch(/\*";__phoenix_precmd;"\*\)\s*;;/);
+    expect(BASH_SNIPPET.snippet).toMatch(
+      /PROMPT_COMMAND='__phoenix_precmd'\$\{PROMPT_COMMAND:\+;\$PROMPT_COMMAND\}/,
+    );
   });
 
   test('does not claim to emit OSC 133;B', () => {

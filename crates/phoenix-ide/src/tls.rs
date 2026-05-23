@@ -312,11 +312,15 @@ mod bounded_drain_tests {
     /// through this helper makes that bug structurally unreachable —
     /// `bounded_post_shutdown_drain` *takes* the future, so the clock
     /// cannot start before the function is called.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn slow_drain_returns_none_after_grace_period() {
-        tokio::time::pause();
         let drain = std::future::pending::<()>();
         let join = tokio::spawn(async move { bounded_post_shutdown_drain(drain, "test").await });
+        // Yield so the spawned task is polled at least once and the
+        // inner `timeout()` registers its sleep before we advance the
+        // clock; otherwise the advance fires before the timer exists
+        // and the join hangs.
+        tokio::task::yield_now().await;
         // Advance just past SHUTDOWN_GRACE so the inner timeout fires.
         tokio::time::advance(super::SHUTDOWN_GRACE + std::time::Duration::from_secs(1)).await;
         let result = join.await.unwrap();

@@ -82,9 +82,9 @@ __phoenix_precmd() {
   printf '\\e]7;file://%s%s\\e\\\\' "\${HOSTNAME}" "$PWD"
   __phoenix_prompt_start
 }
-# Idempotent install: only prepend our precmd if it isn't already at the
-# head of PROMPT_COMMAND, otherwise re-sourcing .bashrc fires the hook
-# multiple times per prompt.
+# Idempotent install: only prepend our precmd if it isn't already
+# present somewhere in PROMPT_COMMAND, otherwise re-sourcing .bashrc
+# fires the hook multiple times per prompt.
 case ";$PROMPT_COMMAND;" in
   *";__phoenix_precmd;"*) ;;
   *) PROMPT_COMMAND='__phoenix_precmd'\${PROMPT_COMMAND:+;$PROMPT_COMMAND} ;;
