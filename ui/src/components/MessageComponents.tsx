@@ -69,6 +69,17 @@ function MarkdownTable({ node, children, ...props }: MarkdownTableProps) {
 
 // Stable plugin array -- avoids creating a new array reference on every render
 const REMARK_PLUGINS = [remarkGfm];
+const NO_REMARK_PLUGINS: typeof REMARK_PLUGINS = [];
+
+function usesGfmSyntax(text: string): boolean {
+  return /(^|\n)\s*[-*]\s+\[[ xX]\]\s/.test(text)
+    || /(^|\n)\s*\|.*\|/.test(text)
+    || /(^|\n)\s*[-:| ]{3,}\|[-:| ]{3,}/.test(text)
+    || /~~[^\n]+~~/.test(text)
+    || /https?:\/\/\S+/.test(text)
+    || /www\.\S+/.test(text)
+    || /\[\^[^\]]+\]/.test(text);
+}
 
 /** Format a tool execution duration for display in the tool block header.
  *  < 10s   -> "3.2s" (one decimal place)
@@ -601,7 +612,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
             return (
               <div key={i} className="agent-text-block">
                 <ReactMarkdown
-                  remarkPlugins={REMARK_PLUGINS}
+                  remarkPlugins={usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS}
                   components={markdownComponents}
                 >
                   {block.text}

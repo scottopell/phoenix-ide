@@ -69,3 +69,10 @@ entries:
     status: success
     verdict: approved
     file: resources/db/syntaxHighlighter-on-demand-registration.yaml
+  - id: MessageComponents-conditional-gfm
+    target: ui/src/components/MessageComponents.tsx:AgentMessage
+    technique: conditional-gfm-plugin
+    scenario: conversation-load
+    status: success
+    verdict: approved
+    file: resources/db/MessageComponents-conditional-gfm.yaml

@@ -1,0 +1,39 @@
+id: MessageComponents-conditional-gfm
+target: ui/src/components/MessageComponents.tsx:AgentMessage
+technique: conditional-gfm-plugin
+scenario: conversation-load
+date: 2026-05-23
+status: success
+verdict: approved
+votes:
+  duplicate_hunter: approve
+  skeptic: approve
+  conservative: approve
+  react_expert: approve
+  greybeard: approve
+methodology:
+  runs: 20
+  warmup: 3
+  throttle_rate: 4
+  harness: browser_profile
+  reset: navigate to conversation list, clear fixture scroll localStorage, click fixture-turn-one
+measurements:
+  react_commits: "10.9 ± 0.968 -> 11.8 ± 1.06 (+8.26%, p=0.007824)"
+  react_actual_ms: "716.5 ± 85.7 -> 539.5 ± 111 (-24.70%, p=2.232e-06)"
+  script_ms: "1260 ± 102 -> 1026 ± 83 (-18.58%, p=1.801e-09)"
+  wall_ms: "1694 ± 147 -> 1366 ± 91.8 (-19.36%, p=1.228e-09)"
+  js_heap_used_mib: "19.02 ± 0.548 -> 19.3 ± 0.384 (+1.50%, p=0.0652)"
+  long_tasks: "3.1 ± 0.308 -> 3.3 ± 0.47 (+6.45%, p=0.1211)"
+  dom_nodes: "362.4 ± 0.821 -> 362.7 ± 0.979 (+0.08%, p=0.3004)"
+reason: |
+  APPROVED by the shared Phoenix perf gate. The post-syntax-registration CPU
+  profile still showed GFM parsing work on the large-conversation load path.
+  AgentMessage now runs remark-gfm only for text blocks containing GFM-specific
+  syntax (tables, task lists, strikethrough, autolink literals, footnotes). The
+  change clears thresholds on react_actual_ms, script_ms, and wall_ms with
+  p < 0.05 while preserving GFM rendering when markers are present.
+lessons: |
+  Markdown plugins are meaningful load-path cost on large conversations. For
+  optional Markdown extensions, guard plugin activation by cheap syntax detection
+  instead of running the full plugin pipeline for every plain paragraph/code
+  response. Add tests for less-common GFM markers when adding detector gates.

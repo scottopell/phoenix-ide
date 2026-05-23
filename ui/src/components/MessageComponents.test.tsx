@@ -123,6 +123,23 @@ describe('markdown table rendering', () => {
     expect(wrapper?.parentElement).toHaveClass('agent-text-block');
   });
 
+  it('keeps finalized agent message footnotes enabled when GFM syntax is present', () => {
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-footnote', [{
+            type: 'text',
+            text: 'Phoenix has a note.[^1]\n\n[^1]: Footnote content',
+          }])}
+          toolResults={new Map()}
+        />
+      </MemoryRouter>,
+    );
+
+    expect(screen.getByText('Footnotes')).toBeInTheDocument();
+    expect(screen.getByText('Footnote content')).toBeInTheDocument();
+  });
+
   it('wraps streaming message tables in a local horizontal scroll container', async () => {
     render(
       <MemoryRouter>
