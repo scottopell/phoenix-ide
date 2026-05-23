@@ -55,3 +55,10 @@ entries:
     status: failure
     verdict: rejected
     file: resources/db/MessageContextMenu-memo-streaming.yaml
+  - id: MessageRows-content-visibility
+    target: ui/src/index.css:.message
+    technique: content-visibility-message-rows
+    scenario: conversation-load
+    status: failure
+    verdict: rejected
+    file: resources/db/MessageRows-content-visibility.yaml

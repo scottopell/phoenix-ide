@@ -1,0 +1,38 @@
+id: MessageRows-content-visibility
+target: ui/src/index.css:.message
+technique: content-visibility-message-rows
+scenario: conversation-load
+date: 2026-05-23
+status: failure
+verdict: rejected
+votes:
+  duplicate_hunter: approve
+  skeptic: reject
+  conservative: approve
+  react_expert: approve
+  greybeard: reject
+methodology:
+  runs: 20
+  warmup: 3
+  throttle_rate: 4
+  harness: browser_profile
+  reset: navigate to conversation list, clear fixture scroll localStorage, click fixture-turn-one
+measurements:
+  react_commits: "11.3 ± 0.801 -> 10.1 ± 0.308 (-10.62%, p=1.683e-06)"
+  react_actual_ms: "759.6 ± 147 -> 756.2 ± 29.2 (-0.45%, p=0.9195)"
+  script_ms: "1265 ± 91.9 -> 1169 ± 36.6 (-7.56%, p=0.0002156)"
+  wall_ms: "1654 ± 125 -> 1557 ± 54 (-5.86%, p=0.003849)"
+  js_heap_used_mib: "18.95 ± 0.466 -> 18.69 ± 0.548 (-1.38%, p=0.112)"
+  long_tasks: "3.25 ± 0.444 -> 3 ± 0 (-7.69%, p=0.02099)"
+  dom_nodes: "362.4 ± 0.821 -> 362.1 ± 0.447 (-0.08%, p=0.1618)"
+reason: |
+  REJECTED by the shared Phoenix perf gate. Applying content-visibility:auto and
+  contain-intrinsic-size to every .message row produced statistically significant
+  small improvements in react_commits, script_ms, wall_ms, and long_tasks, but
+  none cleared the required thresholds: commits improved 10.62% (<20%), script_ms
+  7.56% (<10%), wall_ms 5.86% (<10%), and long_tasks by 0.25 (<1 and <20%).
+lessons: |
+  CSS content-visibility on message rows moves the conversation-load scenario in
+  the right direction but not enough to justify shipping under the current gate.
+  It may become viable only combined with another larger load-path change, but
+  do not retry this exact standalone technique as a claimed optimization.
