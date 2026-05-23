@@ -1751,59 +1751,6 @@ pre:hover .copy-btn {
 
 /* Empty State */
 
-.notification-settings {
-  margin: 8px 12px;
-  padding: 8px;
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  background: var(--bg-primary);
-  color: var(--text-secondary);
-  font-size: 12px;
-}
-
-.notification-settings__title {
-  margin-bottom: 6px;
-  color: var(--text-primary);
-  font-weight: 600;
-}
-
-.notification-settings label {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin: 4px 0;
-}
-
-.notification-settings input[type="checkbox"] {
-  margin: 0;
-}
-
-.notification-settings button {
-  margin: 6px 0;
-  padding: 4px 8px;
-  border: 1px solid var(--border-color);
-  border-radius: 4px;
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-  cursor: pointer;
-  font-size: 12px;
-}
-
-.notification-settings__permission,
-.notification-settings__hint {
-  margin-top: 4px;
-  color: var(--text-muted);
-}
-
-.notification-settings__events {
-  margin-top: 6px;
-}
-
-.notification-settings__error {
-  margin-top: 4px;
-  color: var(--accent-red);
-}
-
 .empty-state {
   text-align: center;
   padding: 40px 20px;
@@ -3411,8 +3358,16 @@ pre:hover .copy-btn {
   cursor: not-allowed;
 }
 
-/* Theme Toggle */
-.theme-toggle {
+/* Settings Dropdown — gear-icon button + popover with theme / provider auth
+   / notification sections. Replaces the prior ThemeToggle + AccountChip +
+   inline NotificationSettingsPanel trio. */
+.settings-dropdown-wrap {
+  position: relative;
+  display: inline-flex;
+  flex-shrink: 0;
+}
+
+.settings-dropdown-trigger {
   background: transparent;
   border: none;
   cursor: pointer;
@@ -3426,58 +3381,18 @@ pre:hover .copy-btn {
   line-height: 0;
 }
 
-.theme-toggle:hover {
+.settings-dropdown-trigger:hover,
+.settings-dropdown-trigger[aria-expanded='true'] {
   background: var(--bg-tertiary);
   color: var(--text-primary);
 }
 
-/* Account chip — sidebar header sign-out menu (paired with ThemeToggle) */
-.account-chip-wrap {
-  position: relative;
-  display: inline-flex;
-  flex-shrink: 0;
-}
-
-.account-chip {
-  background: transparent;
-  border: 1px solid var(--border-color);
-  cursor: pointer;
-  padding: 2px 8px;
-  height: 24px;
-  border-radius: 6px;
-  font-size: 10px;
-  font-weight: 600;
-  letter-spacing: 0.04em;
-  color: var(--text-secondary);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-  white-space: nowrap;
-  transition: background 0.15s, color 0.15s, border-color 0.15s;
-}
-
-/* Compact variant for the 48px-wide collapsed sidebar — single-letter
- * label, tighter box. Paired with `compact` prop on AccountChip. */
-.account-chip--compact {
-  padding: 2px 0;
-  width: 24px;
-  letter-spacing: 0;
-  font-weight: 700;
-}
-
-.account-chip:hover,
-.account-chip[aria-expanded='true'] {
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
-  border-color: var(--text-secondary);
-}
-
-.account-chip-menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
-  min-width: 200px;
+/* position-fixed escapes the sidebar's overflow:hidden clip. Top/left are
+ * computed in JS from the trigger's bounding rect and clamped to viewport,
+ * so a narrow sidebar can't push the left edge off-screen. */
+.settings-dropdown-menu {
+  position: fixed;
+  width: 280px;
   background: var(--bg-secondary);
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -3486,40 +3401,97 @@ pre:hover .copy-btn {
   z-index: 100;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 4px;
 }
 
-/* On the collapsed icon-strip sidebar, the chip sits flush left; flip the
-   menu's anchor so it doesn't run off-screen. */
-.sidebar-collapsed .account-chip-menu {
-  right: auto;
-  left: 0;
-}
-
-.account-chip-menu-header {
-  padding: 4px 8px 6px;
+.settings-section {
+  padding: 8px;
   border-bottom: 1px solid var(--border-color);
 }
 
-.account-chip-menu-label {
-  font-size: 11px;
-  color: var(--text-muted);
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
+.settings-section:last-of-type {
+  border-bottom: none;
 }
 
-.account-chip-menu-id {
+.settings-section__title {
+  margin: 0 0 6px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+}
+
+.settings-section__hint {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.settings-section__error {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--accent-red, #c44);
+}
+
+.settings-theme-row {
+  display: flex;
+  gap: 4px;
+}
+
+.settings-theme-btn {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-secondary);
+  border-radius: 6px;
+  font-size: 12px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.settings-theme-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.settings-theme-btn.active {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-color: var(--text-secondary);
+}
+
+.settings-codex-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.settings-codex-identity {
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.settings-codex-provider {
   font-size: 13px;
   color: var(--text-primary);
+  font-weight: 600;
+}
+
+.settings-codex-account {
+  font-size: 11px;
+  color: var(--text-muted);
   margin-top: 2px;
   word-break: break-all;
 }
 
 /* stylelint-disable-next-line no-descending-specificity --
-   `.account-chip-menu-id code` follows `.message-content code:not(pre code)`
-   from the markdown section. Different DOM scopes; rule stays grouped with
-   the account-chip menu styles. */
-.account-chip-menu-id code {
+   `.settings-codex-account code` lives downstream of the global
+   `.message-content code:not(pre code)` rule. Scoped differently; grouped
+   here with the codex section. */
+.settings-codex-account code {
   background: var(--bg-tertiary);
   padding: 1px 5px;
   border-radius: 4px;
@@ -3527,31 +3499,72 @@ pre:hover .copy-btn {
   color: var(--text-primary);
 }
 
-.account-chip-menu-error {
-  font-size: 12px;
-  color: var(--accent-red, #c44);
-  padding: 0 8px;
-}
-
-.account-chip-menu-item {
+.settings-signout-btn {
   background: transparent;
-  border: none;
-  text-align: left;
-  padding: 6px 8px;
-  font-size: 13px;
+  border: 1px solid var(--border-color);
+  padding: 4px 10px;
+  font-size: 12px;
   color: var(--text-primary);
-  cursor: pointer;
   border-radius: 4px;
+  cursor: pointer;
   transition: background 0.1s;
+  flex-shrink: 0;
 }
 
-.account-chip-menu-item:disabled {
+.settings-signout-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
 }
 
-.account-chip-menu-item:hover:not(:disabled) {
+.settings-signout-btn:hover:not(:disabled) {
   background: var(--bg-tertiary);
+}
+
+.settings-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  margin: 4px 0;
+  cursor: pointer;
+}
+
+.settings-checkbox input[type="checkbox"] {
+  margin: 0;
+}
+
+.settings-checkbox-group {
+  margin-top: 6px;
+}
+
+.settings-inline-btn {
+  margin: 6px 0;
+  padding: 4px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  cursor: pointer;
+  font-size: 12px;
+}
+
+.settings-version-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 8px 2px;
+  font-size: 10px;
+  color: var(--text-muted);
+}
+
+/* stylelint-disable-next-line no-descending-specificity --
+   `.settings-version-footer code` is a one-off, scoped to the footer. */
+.settings-version-footer code {
+  font-size: 10px;
+  color: var(--text-muted);
+  background: transparent;
+  padding: 0;
 }
 
 /* Smooth theme transition */

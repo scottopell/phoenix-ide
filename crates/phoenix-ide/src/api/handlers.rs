@@ -210,6 +210,7 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Version
         .route("/version", get(get_version))
+        .route("/api/version", get(get_version_json))
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
@@ -3178,6 +3179,13 @@ async fn get_env() -> Json<serde_json::Value> {
 
 async fn get_version() -> &'static str {
     concat!("phoenix-ide ", env!("CARGO_PKG_VERSION"))
+}
+
+async fn get_version_json() -> impl IntoResponse {
+    Json(serde_json::json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_sha": env!("PHOENIX_GIT_SHA"),
+    }))
 }
 
 /// Return status of all connected MCP servers.

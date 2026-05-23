@@ -6,9 +6,7 @@ import { ConversationList } from './ConversationList';
 import { ConfirmDialog } from './ConfirmDialog';
 import { ChainDeleteConfirm } from './ChainDeleteConfirm';
 import { RenameDialog } from './RenameDialog';
-import { ThemeToggle } from './ThemeToggle';
-import { AccountChip } from './AccountChip';
-import { NotificationSettingsPanel } from './NotificationSettingsPanel';
+import { SettingsDropdown } from './SettingsDropdown';
 import { useTheme } from '../hooks';
 import type { CodexLoginPreflight } from '../api';
 import { subscribeModels } from '../modelsPoller';
@@ -259,9 +257,10 @@ export function Sidebar({
         >
           +
         </button>
-        <ThemeToggle theme={theme} onToggle={toggleTheme} />
-        <AccountChip
-          preflight={codexPreflight}
+        <SettingsDropdown
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          codexPreflight={codexPreflight}
           onPreflightInvalidated={refetchCodexPreflight}
           compact
         />
@@ -304,10 +303,13 @@ export function Sidebar({
         >
           + New
         </button>
-        <ThemeToggle theme={theme} onToggle={toggleTheme} />
-        <AccountChip preflight={codexPreflight} onPreflightInvalidated={refetchCodexPreflight} />
+        <SettingsDropdown
+          theme={theme}
+          onToggleTheme={toggleTheme}
+          codexPreflight={codexPreflight}
+          onPreflightInvalidated={refetchCodexPreflight}
+        />
       </div>
-      <NotificationSettingsPanel compact />
       {projects.length > 0 && (
         <div className="project-tabs">
           <button
