@@ -62,3 +62,10 @@ entries:
     status: failure
     verdict: rejected
     file: resources/db/MessageRows-content-visibility.yaml
+  - id: syntaxHighlighter-on-demand-registration
+    target: ui/src/utils/syntaxHighlighter.ts:SyntaxHighlighter
+    technique: on-demand-language-registration
+    scenario: conversation-load
+    status: success
+    verdict: approved
+    file: resources/db/syntaxHighlighter-on-demand-registration.yaml

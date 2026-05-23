@@ -11,7 +11,8 @@
  * a visually-tolerable degradation for unusual languages, and the user can
  * still read the code.
  */
-import { PrismLight as SyntaxHighlighter, createElement } from 'react-syntax-highlighter';
+import { createElement as reactCreateElement, type ComponentProps } from 'react';
+import { PrismLight as BaseSyntaxHighlighter, createElement } from 'react-syntax-highlighter';
 import type { createElementProps } from 'react-syntax-highlighter';
 
 // Language imports — each is its own ESM file under .../languages/prism/.
@@ -39,9 +40,7 @@ import tsx from 'react-syntax-highlighter/dist/esm/languages/prism/tsx';
 import typescript from 'react-syntax-highlighter/dist/esm/languages/prism/typescript';
 import yaml from 'react-syntax-highlighter/dist/esm/languages/prism/yaml';
 
-// Canonical names + common aliases. Case-insensitive matching happens inside
-// the highlighter, so we only register the lowercase forms.
-const registrations: Array<[string, Parameters<typeof SyntaxHighlighter.registerLanguage>[1]]> = [
+const registrations = new Map<string, Parameters<typeof BaseSyntaxHighlighter.registerLanguage>[1]>([
   ['bash', bash], ['sh', bash], ['shell', bash], ['zsh', bash],
   ['c', c],
   ['cpp', cpp], ['c++', cpp], ['cxx', cpp],
@@ -64,12 +63,27 @@ const registrations: Array<[string, Parameters<typeof SyntaxHighlighter.register
   ['tsx', tsx],
   ['typescript', typescript], ['ts', typescript],
   ['yaml', yaml], ['yml', yaml],
-];
+]);
 
-for (const [name, grammar] of registrations) {
-  SyntaxHighlighter.registerLanguage(name, grammar);
+const registeredLanguages = new Set<string>();
+
+function ensureLanguageRegistered(language: string | undefined): void {
+  if (!language) return;
+  const key = language.toLowerCase();
+  if (registeredLanguages.has(key)) return;
+  const grammar = registrations.get(key);
+  if (!grammar) return;
+  BaseSyntaxHighlighter.registerLanguage(key, grammar);
+  registeredLanguages.add(key);
 }
 
-export { SyntaxHighlighter, createElement };
+type SyntaxHighlighterProps = ComponentProps<typeof BaseSyntaxHighlighter>;
+
+export function SyntaxHighlighter({ language, ...props }: SyntaxHighlighterProps) {
+  ensureLanguageRegistered(typeof language === 'string' ? language : undefined);
+  return reactCreateElement(BaseSyntaxHighlighter, { language, ...props });
+}
+
+export { createElement };
 export type { createElementProps };
 export { oneDark, oneLight } from 'react-syntax-highlighter/dist/esm/styles/prism';

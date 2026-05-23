@@ -1,0 +1,43 @@
+id: syntaxHighlighter-on-demand-registration
+target: ui/src/utils/syntaxHighlighter.ts:SyntaxHighlighter
+technique: on-demand-language-registration
+scenario: conversation-load
+date: 2026-05-23
+status: success
+verdict: approved
+votes:
+  duplicate_hunter: approve
+  skeptic: approve
+  conservative: approve
+  react_expert: approve
+  greybeard: approve
+methodology:
+  runs: 20
+  warmup: 3
+  throttle_rate: 4
+  harness: browser_profile
+  reset: navigate to conversation list, clear fixture scroll localStorage, click fixture-turn-one
+measurements:
+  react_commits: "11.3 ± 0.801 -> 11.45 ± 0.759 (+1.33%, p=0.547)"
+  react_actual_ms: "759.6 ± 147 -> 609.8 ± 90.9 (-19.72%, p=0.0005067)"
+  script_ms: "1265 ± 91.9 -> 1069 ± 71.3 (-15.53%, p=6.494e-09)"
+  wall_ms: "1654 ± 125 -> 1398 ± 59.7 (-15.48%, p=6.97e-09)"
+  js_heap_used_mib: "18.95 ± 0.466 -> 19.54 ± 0.369 (+3.09%, p=8.928e-05)"
+  long_tasks: "3.25 ± 0.444 -> 3.2 ± 0.41 (-1.54%, p=0.7137)"
+  dom_nodes: "362.4 ± 0.821 -> 363.5 ± 0.889 (+0.30%, p=0.0002333)"
+reason: |
+  APPROVED by the shared Phoenix perf gate. The conversation-load CPU profile
+  showed Prism language registration and syntax-highlighter element creation on
+  the load path. Moving language registration from module import time to the
+  first highlighter render for the actually used language cleared thresholds on
+  three primary metrics: react_actual_ms improved 19.72% (>10%), script_ms
+  improved 15.53% (>10%), and wall_ms improved 15.48% (>10%), all with p < 0.05.
+  React commit count was unchanged, as expected: this removes work inside the
+  same render rather than changing render topology. Heap and DOM deltas are small
+  and not gating concerns.
+lessons: |
+  Syntax highlighter setup can dominate large conversation loads even after the
+  bundle is split. Prefer registering Prism languages on demand instead of
+  eagerly registering every supported alias at module import. Future load-path
+  hunts should inspect other one-time markdown/syntax-highlighter work before
+  adding render memoization ceremony.
