@@ -132,9 +132,13 @@ fn worktree_and_conversation_scopes_are_disjoint() {
     let conv = WorkScope::Conversation("shared-string".to_string());
     let wt = WorkScope::Worktree("shared-string".to_string());
 
-    assert!(registry.try_insert(conv.clone(), dummy_handle(dims)).is_some());
+    assert!(registry
+        .try_insert(conv.clone(), dummy_handle(dims))
+        .is_some());
     assert!(
-        registry.try_insert(wt.clone(), dummy_handle(dims)).is_some(),
+        registry
+            .try_insert(wt.clone(), dummy_handle(dims))
+            .is_some(),
         "Worktree scope must not collide with Conversation scope on the same inner string"
     );
     assert!(registry.get(&conv).is_some());
@@ -148,9 +152,13 @@ fn global_scope_is_disjoint_and_singleton() {
     let registry = ActiveTerminals::new();
     let dims = Dims { cols: 80, rows: 24 };
 
-    assert!(registry.try_insert(WorkScope::Global, dummy_handle(dims)).is_some());
+    assert!(registry
+        .try_insert(WorkScope::Global, dummy_handle(dims))
+        .is_some());
     assert!(
-        registry.try_insert(WorkScope::Global, dummy_handle(dims)).is_none(),
+        registry
+            .try_insert(WorkScope::Global, dummy_handle(dims))
+            .is_none(),
         "Global is singleton: a second insert must return None"
     );
 

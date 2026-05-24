@@ -48,33 +48,76 @@ pub async fn terminal_ws_handler(
     let terminals = state.terminals.clone();
     let db = state.db.clone();
     let runtime = Arc::clone(&state.runtime);
-    ws.on_upgrade(move |socket| handle_socket(socket, conversation_id, terminals, db, runtime))
+    ws.on_upgrade(move |socket| async move {
+        let (cwd, worktree_path) = match db.get_conversation(&conversation_id).await {
+            Ok(conv) => {
+                // worktree_path for socket keying (task 03001 / Phase 2): typed
+                // on `ConvMode` for Work, Branch, and managed Explore. Sub-agent
+                // Explore returns None and never reaches this code (no user PTY),
+                // so no fallback is needed. Direct returns None (per-conv socket).
+                let wt = conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
+                (std::path::PathBuf::from(&conv.cwd), wt)
+            }
+            Err(e) => {
+                tracing::warn!(conv_id = %conversation_id, error = %e, "Terminal: conversation not found");
+                return;
+            }
+        };
+        let scope = WorkScope::resolve(&conversation_id, worktree_path.as_deref());
+        handle_socket(
+            socket,
+            scope,
+            cwd,
+            worktree_path,
+            conversation_id,
+            terminals,
+            runtime,
+        )
+        .await;
+    })
 }
 
-#[allow(clippy::too_many_lines)] // inherently dense PTY lifecycle; see relay.rs for the testable core
+/// Axum handler: `GET /api/terminal/global` (WebSocket upgrade).
+///
+/// Singleton global terminal (REQ-TERM-WS-001). Not bound to any
+/// conversation; survives every individual conversation; lives for the
+/// lifetime of the Phoenix process. Used by `/new` (and any other surface
+/// that wants a terminal unbound from a single transcript).
+pub async fn terminal_ws_global_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let terminals = state.terminals.clone();
+    let runtime = Arc::clone(&state.runtime);
+    // Global terminal spawns in $HOME — the only stable cwd that doesn't
+    // depend on any conversation or worktree. Falls back to "/" if $HOME
+    // is unset, matching the safety net the shell would apply.
+    let cwd = std::env::var_os("HOME")
+        .map_or_else(|| std::path::PathBuf::from("/"), std::path::PathBuf::from);
+    ws.on_upgrade(move |socket| {
+        handle_socket(
+            socket,
+            WorkScope::Global,
+            cwd,
+            None,
+            "global".to_string(),
+            terminals,
+            runtime,
+        )
+    })
+}
+
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // inherently dense PTY lifecycle; see relay.rs for the testable core
 async fn handle_socket(
     socket: WebSocket,
-    conversation_id: String,
+    scope: WorkScope,
+    cwd: std::path::PathBuf,
+    worktree_path: Option<std::path::PathBuf>,
+    id_label: String,
     terminals: ActiveTerminals,
-    db: crate::db::Database,
     runtime: Arc<RuntimeManager>,
 ) {
-    let (cwd, worktree_path) = match db.get_conversation(&conversation_id).await {
-        Ok(conv) => {
-            // worktree_path for socket keying (task 03001 / Phase 2): typed
-            // on `ConvMode` for Work, Branch, and managed Explore. Sub-agent
-            // Explore returns None and never reaches this code (no user PTY),
-            // so no fallback is needed. Direct returns None (per-conv socket).
-            let wt = conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
-            (std::path::PathBuf::from(&conv.cwd), wt)
-        }
-        Err(e) => {
-            tracing::warn!(conv_id = %conversation_id, error = %e, "Terminal: conversation not found");
-            return;
-        }
-    };
-
-    let scope = WorkScope::resolve(&conversation_id, worktree_path.as_deref());
+    let conversation_id = id_label;
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 

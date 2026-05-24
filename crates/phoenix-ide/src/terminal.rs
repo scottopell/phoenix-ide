@@ -1,10 +1,12 @@
-//! PTY-backed terminal sessions — REQ-TERM-001 through REQ-TERM-014
+//! PTY-backed terminal sessions — REQ-TERM-001 through REQ-TERM-014,
+//! REQ-TERM-WS-001.
 //!
-//! Each conversation may have at most one active terminal session (REQ-TERM-003).
-//! Sessions are spawned on WebSocket upgrade and torn down on close or conversation
-//! lifecycle end.
+//! Sessions are keyed by `WorkScope`, so at most one terminal is active per
+//! scope (REQ-TERM-003 generalised). `WorkScope::Global` provides the
+//! singleton terminal surfaced on `/new`. Sessions spawn on WebSocket
+//! upgrade and tear down per the scope's lifecycle (REQ-TERM-012).
 //!
-//! See `specs/terminal/` for the full behavioral specification.
+//! See `specs/terminal/` for the full behavioural specification.
 
 pub mod command_tracker;
 #[cfg(test)]
@@ -18,4 +20,4 @@ mod ws;
 
 pub use session::ActiveTerminals;
 pub use session::ShellIntegrationStatus;
-pub use ws::terminal_ws_handler;
+pub use ws::{terminal_ws_global_handler, terminal_ws_handler};

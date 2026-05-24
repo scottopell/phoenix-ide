@@ -93,6 +93,9 @@ mod tests {
         let wt = WorkScope::Worktree("/tmp/x".to_string());
         assert_eq!(format!("{conv}"), conv.stable_key());
         assert_eq!(format!("{wt}"), wt.stable_key());
-        assert_eq!(format!("{}", WorkScope::Global), WorkScope::Global.stable_key());
+        assert_eq!(
+            format!("{}", WorkScope::Global),
+            WorkScope::Global.stable_key()
+        );
     }
 }

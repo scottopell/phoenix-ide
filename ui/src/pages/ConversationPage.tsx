@@ -1366,7 +1366,7 @@ function ConversationPageContent() {
           />
           <Suspense fallback={null}>
             <TerminalPanel
-              conversationId={conversationId!}
+              scope={{ kind: 'conversation', conversationId: conversationId! }}
               height={terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}
               collapsed={terminalPane.collapsed}
               onExpand={terminalPane.expandFromCollapsed}

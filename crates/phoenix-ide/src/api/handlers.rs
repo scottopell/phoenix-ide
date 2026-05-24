@@ -36,7 +36,7 @@ use crate::git_ops::{
 use crate::llm::{ContentBlock, GatewayStatus};
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
-use crate::terminal::terminal_ws_handler;
+use crate::terminal::{terminal_ws_global_handler, terminal_ws_handler};
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -90,6 +90,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/stream", get(stream_conversation))
         // Terminal WebSocket (REQ-TERM-001 through REQ-TERM-014)
         .route("/api/conversations/:id/terminal", get(terminal_ws_handler))
+        // Global terminal WebSocket — singleton scope, unbound to any
+        // conversation (REQ-TERM-WS-001). Surfaced on /new.
+        .route("/api/terminal/global", get(terminal_ws_global_handler))
         // Live browser view WebSocket (REQ-BT-018)
         .route(
             "/api/conversations/:id/browser-view",

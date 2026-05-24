@@ -1,10 +1,19 @@
-import { useEffect, useRef, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
+import { lazy, Suspense, useEffect, useRef, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ImageAttachments } from '../components/ImageAttachments';
 import { ConversationSettings } from '../components/ConversationSettings';
 import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
 import { useCreateConversation } from '../hooks/useCreateConversation';
+import { useResizablePane } from '../hooks/useResizablePane';
+
+// Lazy: xterm + addon are a non-trivial bundle slice; the global terminal
+// is opt-in (default collapsed) so users who never expand it never pay.
+const TerminalPanel = lazy(() =>
+  import('../components/TerminalPanel').then((m) => ({ default: m.TerminalPanel })),
+);
+
+const GLOBAL_TERMINAL_COLLAPSED_PX = 32;
 
 interface NewConversationPageProps {
   desktopMode?: boolean;
@@ -15,6 +24,18 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const conv = useCreateConversation(navigate);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Global terminal split-pane. Persistence key is distinct from the
+  // per-conversation terminal so the two heights don't fight. Default
+  // collapsed: opt-in surface, mirrors ConversationPage's default.
+  const terminalPane = useResizablePane({
+    key: 'global-terminal-height',
+    min: GLOBAL_TERMINAL_COLLAPSED_PX,
+    max: () => Math.min(800, Math.floor(window.innerHeight * 0.75)),
+    defaultSize: 300,
+    collapseThreshold: 60,
+    defaultCollapsed: true,
+  });
 
   // Auto-resize textarea
   useEffect(() => {
@@ -165,6 +186,21 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
           />
         </div>
       </main>
+
+      {/* Global terminal — singleton WorkScope::Global session,
+          survives navigation and conversation lifecycles. Always rendered;
+          default collapsed. Desktop only — mobile real-estate is tight. */}
+      <div className="desktop-only">
+        <Suspense fallback={null}>
+          <TerminalPanel
+            scope={{ kind: 'global' }}
+            height={terminalPane.collapsed ? GLOBAL_TERMINAL_COLLAPSED_PX : terminalPane.size}
+            collapsed={terminalPane.collapsed}
+            onExpand={terminalPane.expandFromCollapsed}
+            onCollapse={() => terminalPane.setCollapsed(true)}
+          />
+        </Suspense>
+      </div>
 
       {/* Mobile: bottom-anchored input — hidden until an LLM is configured */}
       {llmReady && (
