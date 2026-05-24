@@ -1,4 +1,6 @@
 import { useId, useRef, useState, useEffect, useCallback } from 'react';
+import ReactMarkdown from 'react-markdown';
+import remarkGfm from 'remark-gfm';
 import { LlmStatusBanner } from './LlmStatusBanner';
 import { SettingsFields } from './SettingsFields';
 import type { DirStatus } from './SettingsFields';
@@ -58,6 +60,8 @@ function branchTag(b: GitBranchEntry): { text: string; className: string } | nul
   if (b.local && !b.remote) return { text: 'local only', className: 'branch-tag branch-tag--local' };
   return null;
 }
+
+const REMARK_PLUGINS = [remarkGfm];
 
 export function ConversationSettings({
   cwd,
@@ -302,7 +306,11 @@ export function ConversationSettings({
             <div className="task-start-detail">
               <div className="task-start-detail-title">{selectedTask.id} · {selectedTask.slug}</div>
               <div className="task-start-detail-meta">{selectedTask.priority} · {selectedTask.status}</div>
-              <pre>{taskDetailLoading ? 'Loading task details...' : taskDetail?.content}</pre>
+              <div className="task-start-detail-markdown">
+                {taskDetailLoading
+                  ? 'Loading task details...'
+                  : <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{taskDetail?.content ?? ''}</ReactMarkdown>}
+              </div>
             </div>
           )}
 
@@ -323,6 +331,7 @@ export function ConversationSettings({
           </button>
           {branchPickerOpen && (
             <div className="branch-combobox">
+              <span className="settings-field-label">Branch to work in</span>
               <input
                 ref={inputRef}
                 type="text"

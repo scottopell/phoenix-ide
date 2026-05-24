@@ -5401,6 +5401,8 @@ html * {
   border: 1px solid var(--border-color);
   border-radius: 6px;
   background: var(--bg-secondary);
+  overflow: hidden;
+  min-width: 0;
 }
 
 .task-start-detail-title {
@@ -5408,15 +5410,50 @@ html * {
   font-weight: 600;
 }
 
-.task-start-detail pre {
+.task-start-detail-markdown {
   max-height: 160px;
   overflow: auto;
-  margin: 6px 0 0;
-  white-space: pre-wrap;
-  font-family: var(--font-mono, monospace);
+  margin-top: 6px;
   font-size: 11px;
   line-height: 1.4;
   color: var(--text-muted);
+  min-width: 0;
+}
+
+.task-start-detail-markdown * {
+  max-width: 100%;
+}
+
+.task-start-detail-markdown hr {
+  border: 0;
+  border-top: 1px solid var(--border-color);
+}
+
+.task-start-detail-markdown > :first-child {
+  margin-top: 0;
+}
+
+.task-start-detail-markdown > :last-child {
+  margin-bottom: 0;
+}
+
+.task-start-detail-markdown h1,
+.task-start-detail-markdown h2,
+.task-start-detail-markdown h3 {
+  margin: 8px 0 4px;
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.task-start-detail-markdown p,
+.task-start-detail-markdown ul,
+.task-start-detail-markdown ol {
+  margin: 4px 0;
+}
+
+.task-start-detail-markdown code {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
 }
 
 .new-conv-mode-selector {
