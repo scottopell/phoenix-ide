@@ -548,13 +548,35 @@ function MessageListImpl({
   // REQ-CONV-013). Replaces the prior scrollTop+messageCount save.
   useEffect(() => {
     if (!conversationId) return;
-    const save = () => {
-      const last = latestAnchorRef.current;
-      if (last && last.conversationId === conversationId) {
+    const save = (recomputeCurrent: boolean) => {
+      let anchorToSave: SavedScrollAnchor | null = null;
+      const root = mainRef.current;
+      if (recomputeCurrent && root) {
+        const { historicalUnits, firstRenderedUnitIndex } = captureStateRef.current;
+        anchorToSave = captureAnchor(
+          root.scrollTop,
+          historicalUnits,
+          firstRenderedUnitIndex,
+          root,
+          unitObserver.getElement,
+        );
+        if (anchorToSave) {
+          latestAnchorRef.current = { conversationId, anchor: anchorToSave };
+        }
+      }
+
+      if (!anchorToSave) {
+        const last = latestAnchorRef.current;
+        if (last && last.conversationId === conversationId) {
+          anchorToSave = last.anchor;
+        }
+      }
+
+      if (anchorToSave) {
         try {
           localStorage.setItem(
             `${ANCHOR_KEY_PREFIX}${conversationId}`,
-            JSON.stringify(last.anchor),
+            JSON.stringify(anchorToSave),
           );
         } catch {
           // Quota exceeded; the in-memory state is still correct.
@@ -573,14 +595,14 @@ function MessageListImpl({
       heightCache.flush();
     };
     const onVisChange = () => {
-      if (document.visibilityState === 'hidden') save();
+      if (document.visibilityState === 'hidden') save(true);
     };
     document.addEventListener('visibilitychange', onVisChange);
     return () => {
       document.removeEventListener('visibilitychange', onVisChange);
-      save();
+      save(false);
     };
-  }, [conversationId, heightCache]);
+  }, [conversationId, heightCache, unitObserver]);
 
   // Restore by unit anchor on first paint per conversation. Runs in
   // useLayoutEffect so it lands before the ResizeObserver's first
@@ -608,24 +630,40 @@ function MessageListImpl({
     if (!conversationId) return;
     if (lastRestoredConversationId.current === conversationId) return;
     if (historicalUnits.length === 0) return;
-    lastRestoredConversationId.current = conversationId;
-
     const root = mainRef.current;
     const messagesEl = messagesRef.current;
     if (!root || !messagesEl) return;
+
+    const savedAnchorIndex = savedAnchor
+      ? historicalUnits.findIndex((u) => u.key === savedAnchor.topVisibleUnitKey)
+      : -1;
+    const canRestoreSavedAnchor = savedAnchor !== null && savedAnchorIndex >= 0;
+
+    if (canRestoreSavedAnchor && savedAnchor) {
+      const anchorEl = unitObserver.getElement(savedAnchor.topVisibleUnitKey);
+      if (!anchorEl) return;
+    }
+
+    lastRestoredConversationId.current = conversationId;
 
     // (2) Seed prevMessagesHeight so the first ResizeObserver tick
     //     after this restore doesn't observe a spurious "height grew".
     prevMessagesHeight.current = messagesEl.getBoundingClientRect().height;
 
-    if (savedAnchor) {
+    if (canRestoreSavedAnchor && savedAnchor) {
       const el = unitObserver.getElement(savedAnchor.topVisibleUnitKey);
-      if (el) {
-        // (1) Restore with correct content-coordinate math.
-        const unitTop = unitTopInScrollRoot(el, root);
-        root.scrollTop = unitTop + savedAnchor.offsetWithinUnit;
-        lastScrollTop.current = root.scrollTop;
-        isPinnedToBottom.current = checkIfPinnedToBottom();
+      // Guarded above; keep the branch defensive for future refactors.
+      if (!el) return;
+      // (1) Restore with correct content-coordinate math.
+      const unitTop = unitTopInScrollRoot(el, root);
+      root.scrollTop = unitTop + savedAnchor.offsetWithinUnit;
+      lastScrollTop.current = root.scrollTop;
+      isPinnedToBottom.current = checkIfPinnedToBottom();
+    } else if (savedAnchor && conversationId) {
+      try {
+        localStorage.removeItem(`${ANCHOR_KEY_PREFIX}${conversationId}`);
+      } catch {
+        // ignored
       }
     }
 

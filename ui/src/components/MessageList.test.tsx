@@ -107,7 +107,10 @@ describe('MessageList', () => {
       }
       const root = this.ownerDocument.getElementById('main-area');
       const st = root?.scrollTop ?? 0;
-      return new DOMRect(0, -st, 0, 0);
+      const key = this.dataset?.['renderUnitKey'];
+      const seq = key?.startsWith('msg-') ? Number(key.slice(4)) : 0;
+      const contentTop = Number.isFinite(seq) && seq > 0 ? (seq - 1) * 100 : 0;
+      return new DOMRect(0, contentTop - st, 0, 80);
     };
   });
 
@@ -194,6 +197,37 @@ describe('MessageList', () => {
     await waitFor(() => expect(main.scrollTop).toBe(450));
     triggerResize(messages, 500);
     expect(main.scrollTop).toBe(450);
+  });
+
+  it('recomputes the current unit anchor on visibility-hidden even without a scroll event', () => {
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1), makeMessage(2), makeMessage(3)]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-a"
+        />,
+      ),
+    );
+
+    const main = container.querySelector('#main-area') as HTMLElement;
+    main.scrollTop = 250;
+
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => 'hidden',
+    });
+    document.dispatchEvent(new Event('visibilitychange'));
+
+    const saved = JSON.parse(localStorage.getItem('phoenix:msglist:anchor:conv-a') ?? 'null');
+    expect(saved).toMatchObject({
+      topVisibleUnitKey: 'msg-3',
+      offsetWithinUnit: 50,
+      unitCountAtSave: 3,
+    });
   });
 
   it('windows renderable rows so recent tool results do not hide their owning agent row', () => {

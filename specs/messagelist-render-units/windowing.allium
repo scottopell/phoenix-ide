@@ -35,12 +35,17 @@ use "./render_units.allium" as ru
 -- read on first mount with a non-empty historicalUnits list. The
 -- anchor identifies a unit by key (structural) and the per-pixel
 -- offset from that unit's top to the viewport top (positional within
--- the unit). Together they restore the viewport to the same content
--- the user was looking at, independent of any intervening row-height
--- variation in the prefix.
+-- the unit). Together, key and offset restore the viewport to the same
+-- content the user was looking at, independent of intervening row-height
+-- variation in the prefix. `unit_count_at_save` is optional
+-- compatibility metadata: anchors written before that field existed
+-- still restore by key+offset, while newer anchors preserve the prior
+-- REQ-CONV-013 new-message affordance by comparing save-time historical
+-- unit count with the current count on restore.
 value SavedScrollAnchor {
     top_visible_unit_key: String
     offset_within_unit: Integer
+    unit_count_at_save: Integer?
 }
 
 -- The measured height of a rendered historical unit, written by a
