@@ -85,44 +85,86 @@ function parseSavedAnchor(raw: string | null): SavedScrollAnchor | null {
     if (parsed === null || typeof parsed !== 'object') return null;
     const obj = parsed as Record<string, unknown>;
     if (typeof obj['topVisibleUnitKey'] !== 'string') return null;
-    if (typeof obj['offsetWithinUnit'] !== 'number') return null;
+    // typeof NaN === 'number' so the typeof check alone admits NaN
+    // (localStorage is user-mutable). Number.isFinite tightens to real
+    // finite numbers so a corrupted offsetWithinUnit can't coerce
+    // scrollTop to NaN at restore time.
+    const offset = obj['offsetWithinUnit'];
+    if (typeof offset !== 'number' || !Number.isFinite(offset)) return null;
+    const unitCountAtSave = obj['unitCountAtSave'];
+    const validCount = typeof unitCountAtSave === 'number'
+      && Number.isFinite(unitCountAtSave)
+      && unitCountAtSave >= 0
+      ? unitCountAtSave
+      : undefined;
     return {
       topVisibleUnitKey: obj['topVisibleUnitKey'],
-      offsetWithinUnit: obj['offsetWithinUnit'],
+      offsetWithinUnit: offset,
+      ...(validCount !== undefined ? { unitCountAtSave: validCount } : {}),
     };
   } catch {
     return null;
   }
 }
 
+/** Distance from the scroll root's content top to an element's top —
+ *  the correct generalization of `el.offsetTop` when the scroll root
+ *  is not the offsetParent. Uses `getBoundingClientRect` (viewport
+ *  coordinates) then converts to content coordinates by adding
+ *  `root.scrollTop` and subtracting the root's own viewport offset. */
+function unitTopInScrollRoot(el: HTMLElement, root: HTMLElement): number {
+  return el.getBoundingClientRect().top
+    - root.getBoundingClientRect().top
+    + root.scrollTop;
+}
+
 function captureAnchor(
   scrollTop: number,
   historicalUnits: HistoricalUnit[],
   firstRenderedUnitIndex: number,
+  root: HTMLElement,
   getElement: UnitHeightObserver['getElement'],
 ): SavedScrollAnchor | null {
-  // First rendered unit whose top is at or below the viewport top:
-  // anchor + offset-into-unit covers all positions including overflow
-  // past the last unit.
+  // Walk rendered units in DOM order; the LAST unit whose top is at or
+  // above scrollTop is the unit the viewport-top intersects (the unit
+  // the user is reading). offsetWithinUnit = positive distance from
+  // the unit's top to the viewport top.
+  //
+  // If no rendered unit's top is <= scrollTop (user is above all
+  // rendered units, i.e. inside the spacer), fall through to the
+  // fallback below.
+  let visibleTopUnit: { unit: HistoricalUnit; unitTop: number } | null = null;
   for (let i = firstRenderedUnitIndex; i < historicalUnits.length; i++) {
     const unit = historicalUnits[i]!;
     const el = getElement(unit.key);
-    if (el && el.offsetTop >= scrollTop) {
-      return {
-        topVisibleUnitKey: unit.key,
-        offsetWithinUnit: scrollTop - el.offsetTop,
-      };
+    if (!el) continue;
+    const unitTop = unitTopInScrollRoot(el, root);
+    if (unitTop <= scrollTop) {
+      visibleTopUnit = { unit, unitTop };
+    } else {
+      // Once we pass scrollTop, subsequent units are also below — done.
+      break;
     }
   }
-  // User has scrolled past the last unit's top — anchor to the last
-  // rendered unit; offsetWithinUnit absorbs the overflow.
-  for (let i = historicalUnits.length - 1; i >= firstRenderedUnitIndex; i--) {
+  if (visibleTopUnit) {
+    return {
+      topVisibleUnitKey: visibleTopUnit.unit.key,
+      offsetWithinUnit: scrollTop - visibleTopUnit.unitTop,
+      unitCountAtSave: historicalUnits.length,
+    };
+  }
+  // Fallback: user is above all rendered units (inside the spacer) —
+  // anchor to the first rendered unit. offsetWithinUnit is negative
+  // here, restore lands at unitTop + negativeOffset = the same spacer
+  // position. Restore math handles either sign.
+  for (let i = firstRenderedUnitIndex; i < historicalUnits.length; i++) {
     const unit = historicalUnits[i]!;
     const el = getElement(unit.key);
     if (el) {
       return {
         topVisibleUnitKey: unit.key,
-        offsetWithinUnit: scrollTop - el.offsetTop,
+        offsetWithinUnit: scrollTop - unitTopInScrollRoot(el, root),
+        unitCountAtSave: historicalUnits.length,
       };
     }
   }
@@ -422,6 +464,7 @@ function MessageListImpl({
           el.scrollTop,
           historicalUnits,
           firstRenderedUnitIndex,
+          el,
           unitObserver.getElement,
         );
         if (anchor) {
@@ -539,28 +582,90 @@ function MessageListImpl({
     };
   }, [conversationId, heightCache]);
 
-  // Restore by unit anchor on first paint per conversation. useLayoutEffect
-  // runs after DOM commit (unit elements registered with the observer) and
-  // before the ResizeObserver fires its initial auto-scroll, so
-  // isPinnedToBottom is set from the post-restore position rather than
-  // racing the bottom-pin pathway.
+  // Restore by unit anchor on first paint per conversation. Runs in
+  // useLayoutEffect so it lands before the ResizeObserver's first
+  // observation has a chance to interfere.
+  //
+  // Three things have to land together here (REQ-MLRU-009, REQ-CONV-013):
+  //   1. scrollTop placement at the saved anchor (when anchor + unit
+  //      both exist), using unitTopInScrollRoot so the math is
+  //      correct regardless of whether #main-area is the offsetParent.
+  //   2. prevMessagesHeight seeded from the current content height so
+  //      the first ResizeObserver tick (which compares against this
+  //      ref) does not see a bogus heightGrew=true and either snap to
+  //      bottom (clobbering the restore) or pop the "↓ New messages"
+  //      button on a fresh visit.
+  //   3. latestAnchorRef seeded so a quick visibility-hidden after
+  //      restore (user opens conversation and tab-switches) persists
+  //      the restored position rather than nothing — and so the saved
+  //      unitCountAtSave is preserved across save/restore cycles.
+  //
+  // The "new messages while away" surface is the saved
+  // unitCountAtSave vs current historicalUnits.length comparison: if
+  // the count grew and the restored position is not at bottom, show
+  // the jump-to-newest button.
   useLayoutEffect(() => {
     if (!conversationId) return;
     if (lastRestoredConversationId.current === conversationId) return;
     if (historicalUnits.length === 0) return;
     lastRestoredConversationId.current = conversationId;
-    if (!savedAnchor) return;
-    const el = unitObserver.getElement(savedAnchor.topVisibleUnitKey);
-    if (!el) return; // Anchor's unit missing or not yet committed; fall back to bottom-pin.
+
     const root = mainRef.current;
-    if (!root) return;
-    root.scrollTop = el.offsetTop + savedAnchor.offsetWithinUnit;
-    lastScrollTop.current = root.scrollTop;
-    isPinnedToBottom.current = checkIfPinnedToBottom();
-    // Seed latestAnchorRef so a save before the user's first scroll
-    // event still persists the restored position.
-    latestAnchorRef.current = { conversationId, anchor: savedAnchor };
-  }, [conversationId, historicalUnits, savedAnchor, unitObserver, checkIfPinnedToBottom]);
+    const messagesEl = messagesRef.current;
+    if (!root || !messagesEl) return;
+
+    // (2) Seed prevMessagesHeight so the first ResizeObserver tick
+    //     after this restore doesn't observe a spurious "height grew".
+    prevMessagesHeight.current = messagesEl.getBoundingClientRect().height;
+
+    if (savedAnchor) {
+      const el = unitObserver.getElement(savedAnchor.topVisibleUnitKey);
+      if (el) {
+        // (1) Restore with correct content-coordinate math.
+        const unitTop = unitTopInScrollRoot(el, root);
+        root.scrollTop = unitTop + savedAnchor.offsetWithinUnit;
+        lastScrollTop.current = root.scrollTop;
+        isPinnedToBottom.current = checkIfPinnedToBottom();
+      }
+    }
+
+    // (3) Seed latestAnchorRef with the current position (or, if the
+    //     anchor is missing, with whatever bottom-pin we landed on)
+    //     so a save before the first scroll persists meaningful state.
+    const initialAnchor = captureAnchor(
+      root.scrollTop,
+      historicalUnits,
+      firstRenderedUnitIndex,
+      root,
+      unitObserver.getElement,
+    );
+    if (initialAnchor) {
+      latestAnchorRef.current = { conversationId, anchor: initialAnchor };
+    }
+
+    // jumpToNewest surface for "new messages arrived while away":
+    // the saved anchor's unitCountAtSave (if present) tells us how
+    // many units existed at save time. If the count grew AND we're
+    // not currently pinned to bottom, surface the button.
+    if (
+      savedAnchor?.unitCountAtSave !== undefined
+      && historicalUnits.length > savedAnchor.unitCountAtSave
+      && !isPinnedToBottom.current
+    ) {
+      setJumpToNewestState((prev) => (
+        prev.conversationId === conversationId && prev.visible
+          ? prev
+          : { conversationId, visible: true }
+      ));
+    }
+  }, [
+    conversationId,
+    historicalUnits,
+    savedAnchor,
+    firstRenderedUnitIndex,
+    unitObserver,
+    checkIfPinnedToBottom,
+  ]);
 
 
 

@@ -41,6 +41,7 @@ vi.mock('./MessageContextMenu', () => ({
 let resizeCallback: ResizeObserverCallback | null = null;
 let scrollHeightDescriptor: PropertyDescriptor | undefined;
 let clientHeightDescriptor: PropertyDescriptor | undefined;
+let originalGetBCR: typeof HTMLElement.prototype.getBoundingClientRect | undefined;
 
 class MockResizeObserver {
   constructor(callback: ResizeObserverCallback) {
@@ -91,10 +92,30 @@ describe('MessageList', () => {
       configurable: true,
       get: () => 400,
     });
+    // Mock getBoundingClientRect so the unit-anchor scroll math (which
+    // uses bounding rects to compute content-relative positions) works
+    // in happy-dom. Default happy-dom returns zeros for everything and
+    // doesn't relayout when scrollTop changes, so the math otherwise
+    // produces stale results on subsequent visits. The simulation:
+    // every element's top in viewport = -scrollTop of the scroll root
+    // (i.e., element is at content position 0, viewport-shifted by the
+    // current scroll). #main-area itself stays at viewport top=0.
+    originalGetBCR = HTMLElement.prototype.getBoundingClientRect;
+    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
+      if (this.id === 'main-area') {
+        return new DOMRect(0, 0, 0, 400);
+      }
+      const root = this.ownerDocument.getElementById('main-area');
+      const st = root?.scrollTop ?? 0;
+      return new DOMRect(0, -st, 0, 0);
+    };
   });
 
   afterEach(() => {
     vi.unstubAllGlobals();
+    if (originalGetBCR) {
+      HTMLElement.prototype.getBoundingClientRect = originalGetBCR;
+    }
     if (scrollHeightDescriptor) {
       Object.defineProperty(HTMLElement.prototype, 'scrollHeight', scrollHeightDescriptor);
     } else {
