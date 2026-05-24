@@ -2818,6 +2818,7 @@ pre:hover .copy-btn {
   filter: brightness(1.15);
 }
 
+/* stylelint-disable-next-line no-duplicate-selectors -- upstream duplicate introduced in #140; first selector at line ~2726 sets overflow: hidden, this overrides to visible for the PR-popover surface. Fold these together in a follow-up. */
 .git-flow {
   overflow: visible;
 }
