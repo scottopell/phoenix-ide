@@ -245,16 +245,17 @@ impl ToolContext {
         }
     }
 
-    /// Get or create the browser session for this conversation.
+    /// Get or create the browser session for this conversation's
+    /// `WorkScope`.
     ///
-    /// Lazily initializes Chrome on first call. Subsequent calls return
-    /// the existing session. Conversation ID is derived internally.
+    /// Lazily initializes Chrome on first call. Subsequent calls — including
+    /// from a continuation that resolves to the same scope — return the
+    /// existing session, so the open tabs / cookies / dev-tools state of the
+    /// predecessor are inherited (REQ-BROWSER-WS-001).
     ///
     /// REQ-BT-010: Implicit Session Model
     pub async fn browser(&self) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
-        self.browser_sessions
-            .get_session(&self.conversation_id)
-            .await
+        self.browser_sessions.get_session(&self.work_scope).await
     }
 
     /// Get the per-conversation bash handle table.

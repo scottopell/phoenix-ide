@@ -938,32 +938,53 @@ impl RuntimeManager {
         let manager = Arc::clone(self);
         tokio::spawn(async move {
             while let Some(event) = rx.recv().await {
-                let BrowserSessionLifecycleEvent {
-                    conversation_id,
-                    active,
-                } = event;
-                let runtimes = manager.runtimes.read().await;
-                let Some(handle) = runtimes.get(&conversation_id) else {
-                    tracing::debug!(
-                        conversation_id,
-                        active,
-                        "dropping browser session lifecycle event — no live runtime handle"
-                    );
-                    continue;
+                let BrowserSessionLifecycleEvent { work_scope, active } = event;
+
+                // Fan out to every live runtime handle whose conversation
+                // resolves to this `WorkScope` (REQ-BROWSER-WS-002). A
+                // worktree-scoped session is shared across continuation
+                // members, so all of them need the lifecycle edge; a
+                // conversation-scoped session affects only one runtime.
+                let conv_ids: Vec<String> = {
+                    let runtimes = manager.runtimes.read().await;
+                    runtimes.keys().cloned().collect()
                 };
-                let broadcaster = handle.broadcast_tx.clone();
-                drop(runtimes);
-                if broadcaster
-                    .send_seq(|seq| SseEvent::BrowserSessionState {
-                        sequence_id: seq,
-                        active,
-                    })
-                    .is_err()
-                {
+
+                let mut delivered = 0usize;
+                for conv_id in conv_ids {
+                    let Ok(conv) = manager.db().get_conversation(&conv_id).await else {
+                        continue;
+                    };
+                    let conv_scope = crate::work_scope::WorkScope::resolve(
+                        &conv.id,
+                        conv.conv_mode.worktree_path().map(std::path::Path::new),
+                    );
+                    if conv_scope != work_scope {
+                        continue;
+                    }
+                    let broadcaster = {
+                        let runtimes = manager.runtimes.read().await;
+                        runtimes.get(&conv_id).map(|h| h.broadcast_tx.clone())
+                    };
+                    let Some(broadcaster) = broadcaster else {
+                        continue;
+                    };
+                    if broadcaster
+                        .send_seq(|seq| SseEvent::BrowserSessionState {
+                            sequence_id: seq,
+                            active,
+                        })
+                        .is_ok()
+                    {
+                        delivered += 1;
+                    }
+                }
+
+                if delivered == 0 {
                     tracing::debug!(
-                        conversation_id,
+                        work_scope = %work_scope,
                         active,
-                        "no SSE subscribers for browser session lifecycle event"
+                        "dropping browser session lifecycle event — no live runtime handle on scope"
                     );
                 }
             }

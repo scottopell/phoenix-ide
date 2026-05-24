@@ -350,7 +350,18 @@ async fn enrich_conversation_with_seed(
     // Reflect current `BrowserSessionManager` state at hydration. The single
     // source of truth is the manager's `HashMap`; the SSE
     // `BrowserSessionState` event keeps the client in sync after this point.
-    enriched.browser_session_active = state.runtime.browser_sessions().is_active(&conv.id).await;
+    // Sessions are keyed by `WorkScope` (REQ-BROWSER-WS-001), so a
+    // continuation of a worktree-backed conversation sees `true` here as
+    // soon as its predecessor's session is live.
+    let work_scope = crate::work_scope::WorkScope::resolve(
+        &conv.id,
+        conv.conv_mode.worktree_path().map(std::path::Path::new),
+    );
+    enriched.browser_session_active = state
+        .runtime
+        .browser_sessions()
+        .is_active(&work_scope)
+        .await;
     enriched
 }
 
@@ -2038,12 +2049,51 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
     Ok(())
 }
 
-/// REQ-BED-032 steps 2-4 (bash + tmux + projects cleanup), factored out
-/// so hard-delete, archive, abandon, and mark-merged share the exact same
-/// resource teardown. All failures log WARN and continue — callers own
-/// the final DB write and any state-machine transition.
+/// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
+/// factored out so hard-delete, archive, abandon, and mark-merged share the
+/// exact same resource teardown. All failures log WARN and continue —
+/// callers own the final DB write and any state-machine transition.
+///
+/// The `WorkScope` is resolved once from `conv` and passed to every
+/// scope-keyed cascade (tmux, browser) so the orchestrator owns the single
+/// derivation point. Bash and projects retain conv-shaped APIs: bash keys
+/// per-conversation handles by conv id (no scope inheritance), and projects
+/// inspects `conv.conv_mode` for the branch/worktree mode discriminant.
 pub(super) async fn run_resource_cleanup_cascade(state: &AppState, conv: &crate::db::Conversation) {
     let id = conv.id.as_str();
+    let work_scope = crate::work_scope::WorkScope::resolve(
+        &conv.id,
+        conv.conv_mode.worktree_path().map(std::path::Path::new),
+    );
+
+    // Resolve the continuation's `WorkScope` (if any) so the scope-keyed
+    // cascades can check inheritance via scope equality. A missing or
+    // unreadable continuation row treats the continuation as "no
+    // inheritor" — the conservative direction, since the alternative
+    // would over-preserve and leak resources.
+    let inheritor_scope: Option<crate::work_scope::WorkScope> =
+        if let Some(cont_id) = conv.continued_in_conv_id.as_deref() {
+            match state.runtime.db().get_conversation(cont_id).await {
+                Ok(continuation) => Some(crate::work_scope::WorkScope::resolve(
+                    &continuation.id,
+                    continuation
+                        .conv_mode
+                        .worktree_path()
+                        .map(std::path::Path::new),
+                )),
+                Err(e) => {
+                    tracing::debug!(
+                        conv_id = %id,
+                        continuation = %cont_id,
+                        error = %e,
+                        "cleanup cascade: continuation lookup failed; treating as no inheritor"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     // Step 2: bash handles.
     let bash_report =
@@ -2070,14 +2120,12 @@ pub(super) async fn run_resource_cleanup_cascade(state: &AppState, conv: &crate:
         );
     }
 
-    // Step 3: tmux server.
-    let tmux_worktree_buf: Option<std::path::PathBuf> =
-        conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
+    // Step 3: tmux server. Scope-equality preservation: skip kill iff the
+    // continuation inherited the same scope (REQ-TMUX-WS-002).
     let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
         state.runtime.tmux_registry(),
-        id,
-        tmux_worktree_buf.as_deref(),
-        conv.continued_in_conv_id.as_deref(),
+        &work_scope,
+        inheritor_scope.as_ref(),
     )
     .await;
     if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
@@ -2102,6 +2150,15 @@ pub(super) async fn run_resource_cleanup_cascade(state: &AppState, conv: &crate:
             "project cleanup failed; orphan worktree/branch may remain"
         );
     }
+
+    // Step 5: browser session. Same scope-equality rule as tmux
+    // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
+    crate::tools::browser::session::cascade_browser_on_delete(
+        state.runtime.browser_sessions(),
+        &work_scope,
+        inheritor_scope.as_ref(),
+    )
+    .await;
 }
 
 /// REQ-BED-032: Hard-delete cascade orchestrator.

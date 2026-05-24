@@ -10,7 +10,7 @@ The core set covers navigation, JavaScript evaluation, screenshots, viewport con
 
 Built using the `chromiumoxide` crate for async CDP communication. Tools are stateless, receiving all context via `ToolContext`. The `ctx.browser()` method provides correct-by-construction session access — conversation ID is derived internally, preventing cross-session contamination.
 
-`BrowserSessionManager` maps conversation IDs to Chrome instances. Sessions auto-start on first `browser()` call and auto-clean after 30-minute idle. When no system Chrome is present, `BrowserFetcher` downloads a compatible binary to `~/.cache/phoenix-ide/chromium/` and caches it for future runs.
+`BrowserSessionManager` maps `WorkScope` keys to Chrome instances (REQ-BROWSER-WS-001). Worktree-backed conversations share a single Chrome window across continuation members so context-exhaustion continuations inherit the same tabs, cookies, and dev-tools state; Direct conversations fall back to per-conversation scoping. Sessions auto-start on first `browser()` call and auto-clean after 30-minute idle. The resource-cleanup cascade tears the Chrome process down on archive/abandon/mark-merged/hard-delete using scope-equality preservation — the same shape as tmux (REQ-BROWSER-WS-003). When no system Chrome is present, `BrowserFetcher` downloads a compatible binary to `~/.cache/phoenix-ide/chromium/` and caches it for future runs.
 
 Console logs are captured via CDP event subscription. Objects and arrays are represented using the CDP preview field (key-value pairs) rather than generic type labels. Large output (>4096 bytes total) writes to a temp file with the path returned inline. Per-entry content is stored in full in the buffer (up to a memory-protection cap) and truncated only at retrieval time, ensuring the file escape hatch always contains complete entries.
 
@@ -40,6 +40,15 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-018:** Live Browser View Side Panel | ✅ Complete | View-only CDP screencast relay via `/api/conversations/:id/browser-view` WS; mutex with prose/diff slot; auto-mount-when-empty on first `browser_*` tool |
 | **REQ-BT-019:** Systematic Web Performance Testing | 🟡 In Progress | `browser_profile` tool (action enum). Tier 0+1 + cheap Tier 2; lading-style scenario harness returns raw per-run samples (never averaged). Lifecycle in `browser-profiling.allium`. Network emulation deferred (REQ-BT-019-NG-NETEMU) |
 
+### WorkScope Ownership
+
+| Requirement | Status | Notes |
+|-------------|--------|-------|
+| **REQ-BROWSER-WS-001:** Sessions Keyed by WorkScope | ✅ Complete | `BrowserSessionManager` map keyed by `WorkScope::stable_key()`; user_data_dir derived from same key |
+| **REQ-BROWSER-WS-002:** Continuation Inheritance and Lifecycle Fan-Out | ✅ Complete | `get_session` returns existing `Arc` on scope match; SSE bridge fans `BrowserSessionState` to every runtime resolving to the scope |
+| **REQ-BROWSER-WS-003:** Cascade Integration | ✅ Complete | `cascade_browser_on_delete` invoked from `run_resource_cleanup_cascade`; scope-equality preservation |
+| **REQ-BROWSER-WS-004:** Capability-Gap Logging | ✅ Complete | `debug`-level logs on `get_existing` miss, cascade-skip, and sink-drop |
+
 ### Post-MVP Requirements
 
 | Requirement | Status | Notes |
@@ -51,4 +60,5 @@ Console logs are captured via CDP event subscription. Objects and arrays are rep
 | **REQ-BT-024:** Capture Network Requests | ❌ Not Started | API debugging |
 
 **Core Progress:** 18 of 18 complete (REQ-BT-019 performance suite in progress)
-**Total Progress:** 18 of 24 complete
+**WorkScope Progress:** 4 of 4 complete
+**Total Progress:** 22 of 28 complete

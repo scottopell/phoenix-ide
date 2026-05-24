@@ -2027,7 +2027,9 @@ async fn test_screencast_attach_emits_frames_and_url() {
     assert!(nav.is_success(), "navigate failed: {}", nav.output());
 
     let session_arc = manager
-        .get_existing("test-screencast-frames")
+        .get_existing(&crate::work_scope::WorkScope::Conversation(
+            "test-screencast-frames".to_string(),
+        ))
         .await
         .expect("session should exist after navigate");
 
@@ -3037,4 +3039,169 @@ setTimeout(function () {
     );
 
     shutdown_test(manager, server).await;
+}
+
+// ============================================================================
+// WorkScope ownership tests (REQ-BROWSER-WS-001 / REQ-BROWSER-WS-002)
+// ============================================================================
+
+/// Worktree-scoped sessions are shared across continuations: two
+/// `get_session` calls with the same `WorkScope::Worktree` return the
+/// same `Arc<RwLock<BrowserSession>>`. This is the structural backing
+/// for REQ-BROWSER-WS-002 inheritance — agents driving a continuation
+/// see the predecessor's tabs and cookies because they're literally the
+/// same Chrome instance.
+#[tokio::test]
+async fn worktree_scope_shared_across_continuations() {
+    require_chrome!();
+
+    let manager = Arc::new(BrowserSessionManager::default());
+    let scope = crate::work_scope::WorkScope::Worktree("/tmp/phoenix-ws-shared-test".to_string());
+
+    let first = manager
+        .get_session(&scope)
+        .await
+        .expect("first get_session");
+    let second = manager
+        .get_session(&scope)
+        .await
+        .expect("second get_session on same scope");
+
+    assert!(
+        Arc::ptr_eq(&first, &second),
+        "WorkScope::Worktree sessions must share the same Arc — \
+         continuation inheritance depends on it"
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// Conversation-scoped sessions are isolated per conversation id:
+/// `WorkScope::Conversation("a")` and `WorkScope::Conversation("b")`
+/// resolve to different Chrome instances. Direct continuations always
+/// fall here (they each have their own scope), so this proves
+/// per-conversation isolation for the Direct-mode case.
+#[tokio::test]
+async fn conversation_scope_isolated_per_id() {
+    require_chrome!();
+
+    let manager = Arc::new(BrowserSessionManager::default());
+    let scope_a = crate::work_scope::WorkScope::Conversation("ws-conv-a".to_string());
+    let scope_b = crate::work_scope::WorkScope::Conversation("ws-conv-b".to_string());
+
+    let a = manager.get_session(&scope_a).await.expect("session a");
+    let b = manager.get_session(&scope_b).await.expect("session b");
+
+    assert!(
+        !Arc::ptr_eq(&a, &b),
+        "different Conversation scopes must produce isolated sessions"
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// Worktree and Conversation scopes with the same inner string land in
+/// disjoint namespaces (stable_key prefix). This guards against a path
+/// that happens to look like a conversation id colliding with a real
+/// Conversation-scoped session, and vice versa.
+#[tokio::test]
+async fn worktree_and_conversation_namespaces_disjoint() {
+    require_chrome!();
+
+    let manager = Arc::new(BrowserSessionManager::default());
+    let shared = "/tmp/phoenix-ws-namespace-test";
+    let wt = crate::work_scope::WorkScope::Worktree(shared.to_string());
+    let conv = crate::work_scope::WorkScope::Conversation(shared.to_string());
+
+    let wt_session = manager.get_session(&wt).await.expect("worktree session");
+    let conv_session = manager
+        .get_session(&conv)
+        .await
+        .expect("conversation session");
+
+    assert!(
+        !Arc::ptr_eq(&wt_session, &conv_session),
+        "Worktree and Conversation scopes with equal inner strings \
+         must occupy disjoint namespaces"
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// Cleanup-cascade preservation: when the inheritor's scope equals the
+/// torn-down conversation's scope (the worktree continuation case), the
+/// session survives and remains addressable by the same scope.
+#[tokio::test]
+async fn cascade_preserves_when_inheritor_scope_matches() {
+    require_chrome!();
+
+    let manager = Arc::new(BrowserSessionManager::default());
+    let scope =
+        crate::work_scope::WorkScope::Worktree("/tmp/phoenix-ws-cascade-preserve".to_string());
+
+    let original = manager.get_session(&scope).await.expect("create");
+    assert!(manager.is_active(&scope).await);
+
+    // Continuation inherits the same scope.
+    crate::tools::browser::session::cascade_browser_on_delete(&manager, &scope, Some(&scope)).await;
+
+    assert!(
+        manager.is_active(&scope).await,
+        "preservation must keep the session live for the inheritor"
+    );
+    let still_there = manager.get_session(&scope).await.expect("still live");
+    assert!(
+        Arc::ptr_eq(&original, &still_there),
+        "the inheritor must observe the same Arc — cascade must not \
+         have torn down and relaunched"
+    );
+
+    manager.shutdown_all().await;
+}
+
+/// Cleanup-cascade teardown: no inheritor (or different inheritor scope)
+/// tears the session down so the Chrome process is released. Mirrors
+/// `cascade_on_delete_direct_continuation_does_not_preserve` in
+/// `tmux/registry.rs` — same scope-equality rule.
+#[tokio::test]
+async fn cascade_tears_down_when_no_inheritor() {
+    require_chrome!();
+
+    let manager = Arc::new(BrowserSessionManager::default());
+    let scope = crate::work_scope::WorkScope::Conversation("ws-cascade-teardown".to_string());
+
+    let _ = manager.get_session(&scope).await.expect("create");
+    assert!(manager.is_active(&scope).await);
+
+    crate::tools::browser::session::cascade_browser_on_delete(&manager, &scope, None).await;
+
+    assert!(
+        !manager.is_active(&scope).await,
+        "no-inheritor cascade must tear the session down"
+    );
+}
+
+/// Direct continuations resolve to a *different* `Conversation` scope
+/// (their own id, not the parent's), so the scope-equality rule fires
+/// the kill path automatically. This is the structural reason Direct
+/// continuations cannot inherit — proven here without case-analysis on
+/// scope kind.
+#[tokio::test]
+async fn cascade_tears_down_when_inheritor_scope_differs() {
+    require_chrome!();
+
+    let manager = Arc::new(BrowserSessionManager::default());
+    let parent = crate::work_scope::WorkScope::Conversation("ws-cascade-parent".to_string());
+    let child = crate::work_scope::WorkScope::Conversation("ws-cascade-child".to_string());
+
+    let _ = manager.get_session(&parent).await.expect("create parent");
+    assert!(manager.is_active(&parent).await);
+
+    crate::tools::browser::session::cascade_browser_on_delete(&manager, &parent, Some(&child))
+        .await;
+
+    assert!(
+        !manager.is_active(&parent).await,
+        "different-scope inheritor must not preserve the parent's session"
+    );
 }

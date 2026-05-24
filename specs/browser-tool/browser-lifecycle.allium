@@ -1,0 +1,283 @@
+-- allium: 3
+-- browser-lifecycle.allium
+--
+-- Browser Session Lifecycle: Behavioural Specification
+--
+-- Scope: WorkScope-keyed ownership of BrowserSession, lifecycle transitions
+-- of BrowserSessionManager (create / kill / idle), the cleanup-cascade
+-- preservation rule, and the SSE lifecycle event semantics.
+--
+-- Excludes:
+--   - Chrome/CDP internals (page navigation, console capture, screencast).
+--   - Profiling sub-machines — see browser-profiling.allium.
+--   - Tool surfaces (browser_navigate etc) — covered in requirements.md.
+--
+-- Requirement traceability:
+--   REQ-BT-010, REQ-BT-011, REQ-BT-012 (existing per-conversation surface).
+--   REQ-BROWSER-WS-001..004 (WorkScope ownership).
+-- Dependencies: specs/bedrock/bedrock.allium
+
+use "../bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The agent driving browser tools. Identity scoping mirrors tmux/bash:
+-- the agent's tools resolve their conversation's WorkScope via
+-- ToolContext.work_scope.
+actor LlmAgent {
+    identified_by: bedrock/Conversation
+}
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- The Chrome / Chromium process the manager spawns. Phoenix owns the
+-- process lifetime: launched on first get_session per scope, dropped on
+-- kill_session or idle cleanup. Phoenix does not crash-recover Chrome
+-- across Phoenix restarts — sessions are in-memory only.
+external entity ChromeProcess {
+    user_data_dir: String
+}
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The durable-owner key for work-affine resources. Defined in
+-- crates/phoenix-ide/src/work_scope.rs. Variants carry the worktree path
+-- or the conversation id; stable_key() makes the two namespaces disjoint
+-- via "worktree:" and "conversation:" prefixes.
+value WorkScope {
+    kind: WorkScopeKind
+    inner: String
+}
+
+-- SSE-bound lifecycle event. Carries the WorkScope so the bridge can fan
+-- the edge out to every runtime handle whose conversation resolves to
+-- the same scope (continuation members).
+value BrowserSessionLifecycleEvent {
+    work_scope: WorkScope
+    active: Boolean
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum WorkScopeKind {
+    worktree
+    | conversation
+}
+
+-- Session lifecycle status. The HashMap membership is the single source of
+-- truth — `live` iff the manager holds a map entry for the scope.
+enum SessionStatus {
+    uninitialized
+    | live
+    | torn_down
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- One BrowserSession per WorkScope. Continuation conversations that
+-- resolve to the same scope share the entity rather than creating their
+-- own (REQ-BROWSER-WS-001, REQ-BROWSER-WS-002).
+entity BrowserSession {
+    scope: WorkScope
+
+    status: SessionStatus
+
+    transitions status {
+        uninitialized -> live
+        live -> torn_down
+        terminal: torn_down
+    }
+
+    -- The Chrome process this session owns. Created on the transition to
+    -- live, dropped on the transition to torn_down.
+    chrome: ChromeProcess
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-BROWSER-WS-001: at most one live session per scope. The HashMap is
+-- keyed by WorkScope::stable_key() and stable_key() is injective.
+invariant OneSessionPerScope {
+    for s in BrowserSession where s.status = live:
+        count(BrowserSession{scope: s.scope, status: live}) <= 1
+}
+
+-- Disjoint namespaces: a Worktree scope with the same `inner` as a
+-- Conversation scope addresses a different session.
+invariant ScopeNamespaceDisjoint {
+    for s1 in BrowserSession:
+        for s2 in BrowserSession where s1 != s2:
+            s1.scope = s2.scope implies s1.scope.kind = s2.scope.kind
+}
+
+-- The user data dir is derived from WorkScope::stable_key(). Two sessions
+-- that share a scope therefore share the on-disk Chrome profile (which is
+-- precisely why continuations inherit cookies / localStorage / open tabs).
+invariant UserDataDirDerivedFromScope {
+    for s in BrowserSession:
+        s.chrome.user_data_dir = user_data_dir_for_scope(s.scope)
+}
+
+------------------------------------------------------------
+-- Lifecycle Rules
+------------------------------------------------------------
+
+-- REQ-BROWSER-WS-001 / REQ-BT-010: lazy creation on first get_session for
+-- a given scope.
+rule SessionCreatedOnFirstGet {
+    when: AgentCallsBrowserSession(scope)
+
+    requires: not exists BrowserSession{scope: scope, status: live}
+
+    ensures: BrowserSession.created(
+        scope: scope,
+        status: live
+    )
+    ensures: BrowserSessionLifecycleEvent.emitted(
+        work_scope: scope,
+        active: true
+    )
+
+    @guidance
+        -- Probe under read lock; on miss, acquire write lock and
+        -- double-check before launching Chrome. The user_data_dir name
+        -- comes from WorkScope::stable_key() with `/` sanitized.
+        -- Emit the lifecycle event AFTER releasing the write lock so
+        -- subscribers can re-enter the manager without deadlocking.
+}
+
+-- REQ-BROWSER-WS-002: a continuation member calling get_session with the
+-- same scope as a still-live predecessor receives the predecessor's Arc.
+-- No new entity is created, no lifecycle event is emitted — the session
+-- was already active and the UI's initial enriched view will reflect it
+-- via is_active(&scope).
+rule ContinuationReusesSession {
+    when: AgentCallsBrowserSession(scope)
+
+    requires: exists BrowserSession{scope: scope, status: live}
+
+    ensures: not BrowserSession.created
+    ensures: not BrowserSessionLifecycleEvent.emitted
+}
+
+-- REQ-BROWSER-WS-003: cleanup-cascade tear-down when no continuation
+-- inherits the scope. The orchestrator resolves the continuation's scope
+-- (if any) and passes it as `inheritor_scope`. Preservation is purely
+-- scope equality — see CascadePreservesOnScopeMatch below.
+rule CascadeTearsDownWhenNoInheritor {
+    when: CleanupCascadeRunFor(conversation, inheritor_scope)
+
+    let work_scope = resolve_work_scope(conversation)
+
+    requires: inheritor_scope != Some(work_scope)
+    requires: exists BrowserSession{scope: work_scope, status: live}
+
+    ensures: BrowserSession.transitioned(
+        scope: work_scope,
+        from: live,
+        to: torn_down
+    )
+    ensures: BrowserSessionLifecycleEvent.emitted(
+        work_scope: work_scope,
+        active: false
+    )
+    ensures: UserDataDirRemoved(user_data_dir_for_scope(work_scope))
+
+    @guidance
+        -- The kill removes the map entry first, then drops the
+        -- ScopedSession value (which closes Chrome via Drop). The user
+        -- data dir is removed after the drop so the SingletonLock file
+        -- is released first.
+}
+
+-- REQ-BROWSER-WS-003: cleanup-cascade preservation when the continuation
+-- inherits the scope. Scope-equality subsumes per-kind case-analysis:
+-- Direct continuations always resolve to Conversation(<child_id>) which
+-- is never equal to the parent's Conversation(<parent_id>), so they fall
+-- through to CascadeTearsDownWhenNoInheritor automatically.
+rule CascadePreservesOnScopeMatch {
+    when: CleanupCascadeRunFor(conversation, inheritor_scope)
+
+    let work_scope = resolve_work_scope(conversation)
+
+    requires: inheritor_scope = Some(work_scope)
+
+    ensures: not BrowserSession.transitioned
+    ensures: not BrowserSessionLifecycleEvent.emitted
+    ensures: not UserDataDirRemoved
+
+    @guidance
+        -- The skip is observable only as a `debug` log line — the
+        -- absence of a kill is otherwise indistinguishable from "no
+        -- session existed." REQ-BROWSER-WS-004.
+}
+
+-- REQ-BT-010: 30-minute idle cleanup. The manager's background task drops
+-- live sessions whose last_activity timestamp is older than IDLE_TIMEOUT
+-- and emits the down-edge of the lifecycle event using the scope stored
+-- alongside the session in the map.
+rule IdleSessionCleanedUp {
+    when: IdleCleanupTickFires()
+
+    requires: exists BrowserSession{status: live} where
+        (now - this.last_activity) > IDLE_TIMEOUT
+
+    ensures: BrowserSession.transitioned(
+        from: live,
+        to: torn_down
+    )
+    ensures: BrowserSessionLifecycleEvent.emitted(
+        work_scope: this.scope,
+        active: false
+    )
+}
+
+------------------------------------------------------------
+-- Lifecycle Event Fan-Out
+------------------------------------------------------------
+
+-- REQ-BROWSER-WS-002: each emitted BrowserSessionLifecycleEvent is fanned
+-- out by the runtime bridge to every live runtime handle whose
+-- conversation resolves to the event's scope. A worktree-scoped session
+-- may have multiple continuation members subscribed to SSE; all of them
+-- need the state edge.
+rule LifecycleEventFannedOut {
+    when: BrowserSessionLifecycleEvent.emitted(scope, active)
+
+    ensures: for c in bedrock/Conversation
+             where resolve_work_scope(c) = scope
+             and live_runtime_exists(c):
+        SseEvent.BrowserSessionState.delivered(c, active)
+
+    @guidance
+        -- The bridge iterates the runtimes map and, for each handle,
+        -- looks up the conversation in the DB to derive its scope. N is
+        -- typically small (active runtimes only); the per-event cost is
+        -- one DB read per live runtime. No precomputed scope index is
+        -- maintained.
+}
+
+------------------------------------------------------------
+-- Capability-Gap Logging
+------------------------------------------------------------
+
+-- REQ-BROWSER-WS-004: the three known capability-gap edges (get_existing
+-- miss, cascade skip, sink-closed) MUST produce `debug` log lines so an
+-- operator can distinguish "no event" (working as intended) from "event
+-- got lost" (a bug to investigate).
+invariant DebugLogOnCapabilityGap {
+    for call in GetExistingCall where call.result = none:
+        DebugLog.emitted(call.scope)
+}
