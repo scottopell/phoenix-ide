@@ -23,13 +23,29 @@ use tokio::task::JoinHandle;
 
 use crate::work_scope::WorkScope;
 
-/// Sanitize a `WorkScope::stable_key()` into a filesystem-safe directory name
-/// for the per-session Chrome user data dir. `/` is the only character we
-/// need to neutralize for the `/tmp/phoenix-chrome-<key>` path; everything
-/// else passes through.
+/// Derive a Chrome user data dir from a `WorkScope::stable_key()`.
+///
+/// The `stable_key` embeds the worktree path for `Worktree` scopes, which can
+/// easily exceed Chrome's per-component path length limit (and the `SUN_PATH`
+/// max for any unix-domain socket Chrome opens beneath the profile dir) on
+/// deep checkouts. Hash the key to a bounded 16-hex-char prefix instead —
+/// same trick `socket_path_for_worktree` uses for tmux sockets — so the
+/// resulting path is filesystem-safe and bounded regardless of input length.
+///
+/// SHA-256 is used (rather than `DefaultHasher`) so the derivation is
+/// stable across Rust/Phoenix releases — a toolchain upgrade must not
+/// orphan an existing on-disk Chrome profile by re-keying.
 fn user_data_dir_for_key(scope_key: &str) -> String {
-    let sanitized = scope_key.replace('/', "_");
-    format!("/tmp/phoenix-chrome-{sanitized}")
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(scope_key.as_bytes());
+    let digest = h.finalize();
+    let prefix = u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest is 32 bytes; first 8 always fits a u64"),
+    );
+    format!("/tmp/phoenix-chrome-{prefix:016x}")
 }
 
 /// Maximum console log entries to keep per session
@@ -787,23 +803,33 @@ impl BrowserSessionManager {
 
     /// Kill the session belonging to `work_scope` (called from the cleanup
     /// cascade on archive/abandon/mark-merged/delete of the chain leaf).
+    ///
+    /// The sessions write lock is released as soon as the entry is removed.
+    /// `remove_dir_all` for the Chrome user data dir runs without holding
+    /// the lock so it doesn't block concurrent `get_session` / `get_existing`
+    /// / `is_active` calls on unrelated scopes for the duration of fs
+    /// deletion. Same goes for the Drop of the removed entry (which closes
+    /// Chrome) — performed after the lock is released.
     pub async fn kill_session(&self, work_scope: &WorkScope) {
         let key = work_scope.stable_key();
-        let mut sessions = self.sessions.write().await;
-        let removed = sessions.remove(&key);
+        let removed = {
+            let mut sessions = self.sessions.write().await;
+            sessions.remove(&key)
+        };
         let was_present = removed.is_some();
         if let Some(entry) = removed {
             tracing::info!(work_scope = %work_scope, "Killing browser session");
-            // Entry (with its session arc) will be dropped, which closes the browser
+            // Drop the entry (which closes the Chrome process) outside the
+            // sessions write lock — Drop work doesn't need exclusion from
+            // other scopes' lookups.
             drop(entry);
 
-            // Clean up user data directory
+            // Clean up user data directory — also lock-free.
             let user_data_dir = user_data_dir_for_key(&key);
             if let Err(e) = tokio::fs::remove_dir_all(&user_data_dir).await {
                 tracing::warn!(path = %user_data_dir, error = %e, "Failed to clean up browser data dir");
             }
         }
-        drop(sessions);
         // Lifecycle edge is "session was present and is now gone". A no-op
         // kill (no session existed) must NOT emit — that would falsely
         // signal a transition the UI hasn't seen the up-edge of.
