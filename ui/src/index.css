@@ -2871,6 +2871,10 @@ pre:hover .copy-btn {
   filter: brightness(1.15);
 }
 
+.git-flow {
+  overflow: visible;
+}
+
 .pr-control {
   position: relative;
   display: inline-flex;
