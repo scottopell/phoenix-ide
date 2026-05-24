@@ -1422,70 +1422,6 @@ impl Database {
         Ok(())
     }
 
-    /// Unarchive a conversation
-    pub async fn unarchive_conversation(&self, id: &str) -> DbResult<()> {
-        let now = Utc::now();
-
-        let result =
-            sqlx::query("UPDATE conversations SET archived = 0, updated_at = ?1 WHERE id = ?2")
-                .bind(now.to_rfc3339())
-                .bind(id)
-                .execute(&self.pool)
-                .await?;
-
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(id.to_string()));
-        }
-        Ok(())
-    }
-
-    /// Unarchive every member of the chain rooted at `root_id` atomically.
-    ///
-    /// Walks `continued_in_conv_id` forward via a recursive CTE and sets
-    /// `archived = 0` on every member in a single transaction. Caller must
-    /// have already validated that `root_id` is a chain root (chain length
-    /// ≥ 2); a single-member root is just a regular conversation and should
-    /// take the per-conversation path.
-    ///
-    /// No matching public archive-direction primitive exists by design.
-    /// `set_chain_archived` would support `archived = 1` too, but chain
-    /// archive requires per-member resource cleanup (bash kill, tmux kill,
-    /// worktree removal) that the DB layer can't express — so the API
-    /// handler runs the cascade per member and flips the flag row-by-row
-    /// via `archive_conversation`. See `api::chains::archive_chain_handler`.
-    pub async fn unarchive_chain(&self, root_id: &str) -> DbResult<u64> {
-        self.set_chain_archived(root_id, false).await
-    }
-
-    async fn set_chain_archived(&self, root_id: &str, archived: bool) -> DbResult<u64> {
-        let now = Utc::now().to_rfc3339();
-        let mut tx = self.pool.begin().await?;
-        let result = sqlx::query(
-            "UPDATE conversations
-             SET archived = ?1, updated_at = ?2
-             WHERE id IN (
-                 WITH RECURSIVE chain(id, next_id) AS (
-                     SELECT id, continued_in_conv_id FROM conversations WHERE id = ?3
-                     UNION ALL
-                     SELECT c.id, c.continued_in_conv_id
-                     FROM conversations c
-                     JOIN chain ON c.id = chain.next_id
-                 )
-                 SELECT id FROM chain
-             )",
-        )
-        .bind(archived)
-        .bind(&now)
-        .bind(root_id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-        if result.rows_affected() == 0 {
-            return Err(DbError::ConversationNotFound(root_id.to_string()));
-        }
-        Ok(result.rows_affected())
-    }
-
     /// Delete a conversation and all its messages
     pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
         // Messages are deleted by CASCADE
@@ -3349,33 +3285,6 @@ mod tests {
 
         let root = db.chain_root_of("ghost").await.unwrap();
         assert_eq!(root, None);
-    }
-
-    /// `unarchive_chain` flips `archived = 0` on every member of the chain
-    /// in a single transaction. Exercises the recursive-CTE walk; the
-    /// archive-true direction has no DB primitive (see `unarchive_chain`
-    /// docstring) and is covered at the handler level instead.
-    #[tokio::test]
-    async fn test_unarchive_chain_flips_all_members() {
-        let db = Database::open_in_memory().await.unwrap();
-        build_linear_chain(&db, &["arc-a", "arc-b", "arc-c"]).await;
-
-        // Seed archived=1 on every member directly so the test starts from
-        // a state representative of a previously-archived chain.
-        for id in ["arc-a", "arc-b", "arc-c"] {
-            db.archive_conversation(id).await.unwrap();
-        }
-        for id in ["arc-a", "arc-b", "arc-c"] {
-            let conv = db.get_conversation(id).await.unwrap();
-            assert!(conv.archived, "{id} seed should be archived");
-        }
-
-        let n = db.unarchive_chain("arc-a").await.unwrap();
-        assert_eq!(n, 3);
-        for id in ["arc-a", "arc-b", "arc-c"] {
-            let conv = db.get_conversation(id).await.unwrap();
-            assert!(!conv.archived, "{id} should be unarchived");
-        }
     }
 
     /// `chain_root_if_member` returns Some(root) for any chain member

@@ -138,17 +138,28 @@ THE SYSTEM SHALL include in state_data:
 WHEN client requests archive
 THE SYSTEM SHALL mark conversation as archived
 AND remove from active conversation list
+AND run the resource-cleanup cascade (REQ-BED-032) — releasing the
+    conversation's bash handles, tmux server (subject to scope-equality
+    preservation per REQ-TMUX-WS-002), worktree, and browser session
+    (subject to REQ-BROWSER-WS-002 preservation)
 
-WHEN client requests unarchive
-THE SYSTEM SHALL restore conversation to active list
+THE SYSTEM SHALL NOT expose an `unarchive` operation. Archive is a
+terminal lifecycle transition; the row is preserved for retrospection
+but the conversation cannot resume in-place. Reviewing the unified
+cleanup cascade in PR #135 made it clear that "live resources reclaimed
+but row claims it can be resumed" is structurally incoherent — see
+REQ-BED-032 rationale.
 
 WHEN client requests delete
 THE SYSTEM SHALL permanently remove conversation and all messages
+AND run the resource-cleanup cascade (REQ-BED-032)
 
 WHEN client requests rename with new slug
 THE SYSTEM SHALL update slug if not already taken
 
 **Rationale:** Users manage conversation lifecycle and organization.
+Archive and delete share the same resource-release semantics; they
+differ only in whether the DB row (and message history) is preserved.
 
 ---
 

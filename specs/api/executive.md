@@ -2,7 +2,7 @@
 
 ## Requirements Summary
 
-The HTTP API enables frontend clients to interact with PhoenixIDE conversations. Users list and create conversations, send messages with optional inline images, and receive real-time updates via Server-Sent Events. Conversations are created with a validated working directory and receive auto-generated slugs in format `{day}-{time}-{word}-{word}` (e.g., "monday-morning-autumn-river"). SSE streaming includes `after` query parameter for seamless reconnection without race conditions. User actions (chat, cancel) forward to the state machine with immediate acknowledgment. Lifecycle operations include archive, unarchive, delete, and rename. Directory browser endpoints support the conversation creation UI. Model information endpoint returns available models based on configured API keys.
+The HTTP API enables frontend clients to interact with PhoenixIDE conversations. Users list and create conversations, send messages with optional inline images, and receive real-time updates via Server-Sent Events. Conversations are created with a validated working directory and receive auto-generated slugs in format `{day}-{time}-{word}-{word}` (e.g., "monday-morning-autumn-river"). SSE streaming includes `after` query parameter for seamless reconnection without race conditions. User actions (chat, cancel) forward to the state machine with immediate acknowledgment. Lifecycle operations include archive (terminal — runs cleanup cascade, preserves row), delete (terminal — runs cleanup cascade, removes row), and rename. Directory browser endpoints support the conversation creation UI. Model information endpoint returns available models based on configured API keys.
 
 ## Technical Summary
 
@@ -17,7 +17,7 @@ RESTful API with JSON request/response bodies. SSE streaming broadcasts `init`, 
 | **REQ-API-003:** Message Retrieval | ✅ Complete | GET with after_sequence param |
 | **REQ-API-004:** User Actions | ✅ Complete | POST chat, cancel endpoints |
 | **REQ-API-005:** Real-time Streaming | ✅ Complete | Task 582. SSE with init, token events (`request_id` for correlation), and ?after reconnection |
-| **REQ-API-006:** Conversation Lifecycle | ✅ Complete | Archive, unarchive, delete, rename |
+| **REQ-API-006:** Conversation Lifecycle | ✅ Complete | Archive (terminal), delete (terminal), rename. Both terminal transitions run REQ-BED-032 cleanup cascade |
 | **REQ-API-007:** Slug Resolution | ✅ Complete | GET /api/conversation-by-slug/{slug} |
 | **REQ-API-008:** Directory Browser | ✅ Complete | validate-cwd and list-directory |
 | **REQ-API-009:** Model Information | ✅ Complete | GET /api/models with default |

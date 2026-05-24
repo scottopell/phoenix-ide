@@ -265,20 +265,6 @@ pub async fn archive_chain_handler(
     Ok(Json(SuccessResponse { success: true }))
 }
 
-/// `POST /api/chains/:rootId/unarchive`
-pub async fn unarchive_chain_handler(
-    State(state): State<AppState>,
-    Path(root_id): Path<String>,
-) -> Result<Json<SuccessResponse>, AppError> {
-    validate_chain_root(&state, &root_id).await?;
-    state
-        .db
-        .unarchive_chain(&root_id)
-        .await
-        .map_err(db_to_app)?;
-    Ok(Json(SuccessResponse { success: true }))
-}
-
 /// `DELETE /api/chains/:rootId` — hard-delete every member of the chain.
 ///
 /// Pre-checks every member's busy state up front and refuses the whole

@@ -995,9 +995,12 @@ rule UserHardDeletesConversationRule {
         -- have happened." A property test that runs the handler and
         -- checks the post-state suffices.
         --
-        -- Soft-state changes (archive, close-tab) do NOT trigger this
-        -- rule. Tmux servers and bash handles deliberately survive
-        -- archive (specs/tmux-integration/ REQ-TMUX-008).
+        -- Archive / abandon / mark-merged share this cascade (REQ-BED-032
+        -- now covers all four terminal transitions). UI-only state
+        -- changes (close-tab, blur) do NOT trigger this rule — tmux
+        -- servers and browser sessions deliberately survive them
+        -- (specs/tmux-integration/ REQ-TMUX-008; specs/browser-tool/
+        -- REQ-BROWSER-WS-003).
 }
 
 -- REQ-BED-032: Reject the hard-delete request when the conversation is

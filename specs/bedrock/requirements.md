@@ -682,24 +682,44 @@ ambiguous about which conversation the action affects.
 
 ---
 
-### REQ-BED-032: Conversation Hard-Delete Cascade
+### REQ-BED-032: Conversation Terminal-Transition Cascade
 
-WHEN the user initiates a hard-delete on a conversation
-THE SYSTEM SHALL run the hard-delete handler, which performs the
+A conversation transitions to a terminal lifecycle state via:
+- **hard-delete** — user permanently removes the conversation row and
+  all dependent rows
+- **archive** — user signals "this work is over"; row + messages
+  preserved for retrospection, live resources released
+- **abandon** (Work/Branch) — user signals "this work failed"; cleanup
+  matches archive plus the abandon-specific diff snapshot
+- **mark-merged** (Work/Branch) — user signals "this work shipped";
+  cleanup matches archive plus the post-merge state recording
+
+All four transitions are terminal — the conversation cannot resume in-
+place after them, and the live resources (bash handles, tmux server,
+worktree, browser session) MUST be released.
+
+WHEN any of the above terminal transitions fires
+THE SYSTEM SHALL run the resource-cleanup cascade, which performs the
 following sequence of direct calls in order:
 1. Cancel-or-reject if busy (REQ-BED-032 below)
 2. `cascade_bash_on_delete(conversation)` — kills live bash handles for
    the conversation and drops in-memory tombstones (REQ-BASH-006)
-3. `cascade_tmux_on_delete(conversation)` — runs `tmux kill-server`
-   against the conversation's socket, unlinks the socket file, removes
-   the registry entry (REQ-TMUX-007)
-4. `cascade_projects_on_delete(conversation)` — worktree/branch cleanup
-   for hard-delete on a non-terminal conversation
-   (REQ-PROJ-`<future>`: see specs/projects/ subscriber rule)
-5. `db.delete_conversation(conversation_id)` — SQLite ON DELETE CASCADE
-   removes messages, tool calls, and other dependent rows
-6. Broadcast a `ConversationHardDeleted` SSE wire event for UI consumers
-   (sidebar refresh, etc.)
+3. `cascade_tmux_on_delete(work_scope, inheritor_scope)` — runs
+   `tmux kill-server` against the scope's socket, unlinks the socket
+   file, removes the registry entry, unless the continuation inherits
+   the same `WorkScope` (REQ-TMUX-007, REQ-TMUX-WS-002)
+4. `cascade_projects_on_delete(conversation)` — worktree/branch
+   cleanup, leaf-only (chain non-leaf members skip)
+5. `cascade_browser_on_delete(work_scope, inheritor_scope)` — drops the
+   Chrome session for the scope unless the continuation inherits the
+   same `WorkScope` (REQ-BROWSER-WS-003)
+6. For hard-delete only: `db.delete_conversation(conversation_id)` —
+   SQLite ON DELETE CASCADE removes messages, tool calls, and other
+   dependent rows. Archive / abandon / mark-merged preserve the row,
+   flipping `archived = 1` (or recording mode-specific state) instead.
+7. Broadcast the matching SSE wire event for UI consumers —
+   `ConversationHardDeleted` for hard-delete, the existing
+   archive/abandon/merged events for the other three transitions.
 
 THE handler SHALL invoke each cascade step on its own; there is no
 event bus, no subscriber registration, and no dynamic dispatch. The
@@ -730,11 +750,24 @@ Phoenix startup. Orphans created by failed cleanup are the operator's
 problem; reconciliation machinery for hard-delete orphans is
 deliberately out of scope for v1.
 
-THE SYSTEM SHALL distinguish hard-delete from soft-state changes
-(archive, close-tab, etc.) — soft-state changes do NOT trigger the
-cascade. Long-lived per-conversation resources (tmux servers, bash
-handles) survive soft-state changes deliberately (REQ-TMUX-008 makes
-this explicit on the tmux side).
+THE SYSTEM SHALL distinguish terminal transitions (hard-delete,
+archive, abandon, mark-merged — all of which run the cascade) from
+UI-only state changes (close-tab, blur, parent window closed — which
+do NOT run the cascade). The latter category exists purely to support
+"close the tab, come back later" — for those, long-lived per-scope
+resources (tmux servers, browser sessions) survive (REQ-TMUX-008
+makes this explicit on the tmux side; REQ-BROWSER-WS-003 on the
+browser side).
+
+Archive is NOT reversible. The cascade releases live resources at
+archive time; the row is preserved for retrospection only. There is
+no `unarchive` operation — see REQ-API-006. Earlier drafts of this
+spec treated archive as a soft-state flag flip, but reviewing the
+unified-cleanup-cascade work (PR #135) made it obvious that "live
+resources reclaimed but row claims it can be resumed" is an
+incoherent state: an unarchived conversation would have no worktree
+or tmux session to resume into, so the resume promise would silently
+break.
 
 THE `ConversationHardDeleted` SSE wire event (step 6) SHALL be emitted
 exactly once per hard-delete operation, after all cascade steps have

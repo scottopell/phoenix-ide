@@ -612,13 +612,31 @@ process-tree recovery and a startup-time scan of
 `~/.phoenix-ide/tmux-sockets/` for orphan sockets — both are
 implementable later as a single PR if needed.
 
-### Soft-State Distinction
+### Terminal Transitions vs UI State
 
-Soft-state changes — archive, close-tab, conversation-tab-blur — do
-**not** trigger this cascade. Long-lived per-conversation resources are
-designed to survive these (REQ-TMUX-008 makes this explicit; REQ-BASH-006
-implicitly preserves tombstones across soft state). Hard-delete is the
-only path that runs cleanup.
+The cascade fires for every **terminal transition** — hard-delete,
+archive, abandon (Work/Branch), mark-merged (Work/Branch) — because
+all four signal that the conversation's work is over and its live
+resources should be released. The four differ only in what they leave
+behind in the DB:
+
+- **hard-delete** removes the row + all messages (`ON DELETE CASCADE`).
+- **archive / abandon / mark-merged** preserve the row + messages for
+  retrospection, flipping `archived = 1` (and recording
+  mode-specific state for abandon / mark-merged).
+
+Archive is NOT reversible. The earlier "archive is a soft-state flag
+flip" framing predated this cascade's existence; reviewing the unified
+cascade in PR #135 surfaced that "live resources gone but row says
+resumable" is structurally incoherent (the unarchive would resume into
+no worktree / no tmux / no Chrome). See REQ-BED-032 and REQ-API-006
+for the spec catch-up.
+
+**UI-only state changes** — close-tab, conversation-tab-blur, parent
+window closed — do **not** trigger the cascade. Long-lived per-scope
+resources (tmux servers, browser sessions) survive these (REQ-TMUX-008
+makes this explicit on the tmux side; REQ-BROWSER-WS-003 on the
+browser side; REQ-BASH-006 implicitly preserves bash tombstones).
 
 ---
 

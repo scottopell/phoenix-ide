@@ -5,7 +5,7 @@
 use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
 use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, set_chain_name, stream_chain,
-    submit_chain_question, unarchive_chain_handler,
+    submit_chain_question,
 };
 use super::git_handlers::{get_conversation_diff, get_conversation_pr_status, list_git_branches};
 use super::lifecycle_handlers::{
@@ -119,12 +119,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/abandon-task", post(abandon_task))
         // Mark as merged (REQ-PROJ-026)
         .route("/api/conversations/:id/mark-merged", post(mark_merged))
-        // Lifecycle (REQ-API-006)
+        // Lifecycle (REQ-API-006). Archive and delete are both terminal
+        // transitions that run the resource-cleanup cascade (REQ-BED-032);
+        // archive preserves the row, delete removes it. There is no
+        // unarchive — archive is not reversible.
         .route("/api/conversations/:id/archive", post(archive_conversation))
-        .route(
-            "/api/conversations/:id/unarchive",
-            post(unarchive_conversation),
-        )
         .route("/api/conversations/:id/delete", post(delete_conversation))
         .route("/api/conversations/:id/rename", post(rename_conversation))
         // Token usage (Phase 4)
@@ -148,10 +147,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/chains/:rootId/stream", get(stream_chain))
         .route("/api/chains/:rootId/archive", post(archive_chain_handler))
-        .route(
-            "/api/chains/:rootId/unarchive",
-            post(unarchive_chain_handler),
-        )
         .route(
             "/api/chains/:rootId",
             axum::routing::delete(delete_chain_handler),
@@ -2106,22 +2101,6 @@ pub(super) async fn run_resource_cleanup_cascade(state: &AppState, conv: &crate:
             "project cleanup failed; orphan worktree/branch may remain"
         );
     }
-}
-
-async fn unarchive_conversation(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<SuccessResponse>, AppError> {
-    refuse_if_chain_member(&state, &id, "unarchive").await?;
-
-    state
-        .runtime
-        .db()
-        .unarchive_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    Ok(Json(SuccessResponse { success: true }))
 }
 
 /// REQ-BED-032: Hard-delete cascade orchestrator.
