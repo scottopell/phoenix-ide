@@ -334,9 +334,11 @@ fn capture_pr_auto_fix_context_with_client(
     client: &dyn GhClient,
 ) -> Result<PrAutoFixContextResponse, PrMonitorError> {
     let prs = client.pr_list_for_head(branch_name).map_err(|e| {
+        let reason = e.kind.unavailable_reason();
+        tracing::debug!(branch = %branch_name, reason = ?reason, error = %e.message, "failed to capture PR context");
         PrMonitorError::BadRequest(format!(
-            "PR context unavailable: {:?}",
-            e.kind.unavailable_reason()
+            "PR context unavailable: {}",
+            unavailable_reason_message(&reason)
         ))
     })?;
     let pr = choose_pr(prs).ok_or_else(|| {
@@ -407,6 +409,15 @@ fn capture_pr_auto_fix_context_with_client(
     })
 }
 
+fn unavailable_reason_message(reason: &PrUnavailableReason) -> &'static str {
+    match reason {
+        PrUnavailableReason::GhMissing => "GitHub CLI is not installed",
+        PrUnavailableReason::NotAuthenticated => "GitHub CLI is not authenticated",
+        PrUnavailableReason::NotGitRepo => "conversation worktree is not a git repository",
+        PrUnavailableReason::CommandFailed => "GitHub CLI command failed",
+    }
+}
+
 fn capture_log_snippets(client: &dyn GhClient, checks: &[GhPrCheck]) -> Vec<PrCheckLogSnippet> {
     checks
         .iter()
@@ -422,7 +433,14 @@ fn capture_log_snippets(client: &dyn GhClient, checks: &[GhPrCheck]) -> Vec<PrCh
 
 fn limit_log_snippet(mut snippet: PrCheckLogSnippet) -> PrCheckLogSnippet {
     if snippet.snippet.len() > LOG_SNIPPET_LIMIT {
-        snippet.snippet.truncate(LOG_SNIPPET_LIMIT);
+        let boundary = snippet
+            .snippet
+            .char_indices()
+            .map(|(idx, _)| idx)
+            .take_while(|idx| *idx <= LOG_SNIPPET_LIMIT)
+            .last()
+            .unwrap_or(0);
+        snippet.snippet.truncate(boundary);
         snippet.truncated = true;
     }
     snippet
@@ -1241,6 +1259,28 @@ mod tests {
             "failure log"
         );
         assert!(artifact["feedback"]["coverage"].is_array());
+    }
+
+    #[test]
+    fn log_snippet_truncates_on_utf8_boundary() {
+        let snippet = limit_log_snippet(PrCheckLogSnippet {
+            check_name: "unicode".to_string(),
+            source: PrCheckLogSource::CheckUrl,
+            url: None,
+            snippet: format!("{}é", "x".repeat(LOG_SNIPPET_LIMIT - 1)),
+            truncated: false,
+        });
+        assert!(snippet.truncated);
+        assert_eq!(snippet.snippet.len(), LOG_SNIPPET_LIMIT - 1);
+        assert!(snippet.snippet.is_char_boundary(snippet.snippet.len()));
+    }
+
+    #[test]
+    fn unavailable_reason_messages_are_human_readable() {
+        assert_eq!(
+            unavailable_reason_message(&PrUnavailableReason::NotAuthenticated),
+            "GitHub CLI is not authenticated"
+        );
     }
 
     #[test]

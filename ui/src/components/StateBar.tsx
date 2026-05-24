@@ -321,7 +321,7 @@ export function StateBar({
   useEffect(() => {
     if (!prPopoverOpen) return;
     const handleClick = (e: MouseEvent) => {
-      if (prRef.current && !prRef.current.contains(e.target as Node)) {
+      if (!prRef.current || !prRef.current.contains(e.target as Node)) {
         setPrPopoverOpen(false);
       }
     };
