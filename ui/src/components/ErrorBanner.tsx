@@ -127,11 +127,16 @@ export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBan
   // The actionable next step is switching models or waiting until the
   // window resets, not re-sending the same prompt.
   const isUsageLimit = errorKind === 'usage_limit_reached';
+  // Mirror of backend `ErrorKind::is_retryable()` in
+  // `crates/phoenix-ide/src/db/schema.rs`. Strings are the serde
+  // snake_case wire form. Keep these in lockstep — a new retryable
+  // variant added there must be added here, or the UI will incorrectly
+  // hide the retry button.
   const isRetryable =
     !isUsageLimit &&
     (!errorKind ||
       errorKind === 'unknown' ||
-      ['rate_limit', 'overloaded', 'network', 'timeout'].includes(errorKind));
+      ['rate_limit', 'network', 'server_error', 'timed_out'].includes(errorKind));
 
   const { title, details } = humanizeError(message, errorKind);
   // For a usage-limit error, prefer a structured title that includes
