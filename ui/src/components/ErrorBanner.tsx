@@ -1,5 +1,8 @@
 import { AlertCircle } from 'lucide-react';
 import type { ReactNode } from 'react';
+import { useCodexQuota } from '../codexQuota';
+import type { QuotaDetails } from '../sseSchemas';
+import { CodexQuotaBlock } from './CodexQuotaBlock';
 
 interface ErrorBannerProps {
   message: string;
@@ -107,8 +110,18 @@ function linkify(text: string): ReactNode[] {
   return out;
 }
 
+// Suffix the title with the limit's display name when codex reports a
+// non-default limit family (e.g. `gpt-5.2-codex-sonic`). The string in
+// `message` already mentions this, but a structured title is clearer
+// — multi-model plans want to know exactly which limit they hit.
+function titleForUsageLimit(quota: QuotaDetails | null): string {
+  const name = quota?.limit_name?.trim();
+  if (name) return `Usage limit reached — ${name}`;
+  return 'Usage limit reached';
+}
+
 export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBannerProps) {
-  const { title, details } = humanizeError(message, errorKind);
+  const codexQuota = useCodexQuota();
 
   // `usage_limit_reached` is terminal — retry will hit the same wall.
   // The actionable next step is switching models or waiting until the
@@ -120,6 +133,11 @@ export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBan
       errorKind === 'unknown' ||
       ['rate_limit', 'overloaded', 'network', 'timeout'].includes(errorKind));
 
+  const { title, details } = humanizeError(message, errorKind);
+  // For a usage-limit error, prefer a structured title that includes
+  // the active limit's display name when present.
+  const displayTitle = isUsageLimit ? titleForUsageLimit(codexQuota) : title;
+
   return (
     <div className="error-input-area">
       {/* Error body — mirrors the conversation area */}
@@ -128,8 +146,9 @@ export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBan
           <AlertCircle size={20} />
         </div>
         <div className="error-body-content">
-          <div className="error-body-title">{title}</div>
+          <div className="error-body-title">{displayTitle}</div>
           {details && <div className="error-body-details">{linkify(details)}</div>}
+          {isUsageLimit && codexQuota && <CodexQuotaBlock quota={codexQuota} />}
         </div>
       </div>
 
