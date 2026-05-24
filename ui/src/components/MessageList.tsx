@@ -234,11 +234,10 @@ interface MessageListBodyProps {
 
 /**
  * Memoized subtree holding the slice over historical render units.
- * React.memo's shallow prop compare skips re-render when historicalUnits,
- * tailUnits, and the window outputs are reference-stable — which they are
- * across streaming token updates (the parent's streamingBuffer prop
- * changes, but buildRenderUnits is useMemo'd over messages so the unit
- * arrays don't reallocate per token).
+ * The parent <MessageList> is itself memo'd so token churn doesn't
+ * even reach this layer; this memo is the inner belt-and-suspenders
+ * boundary that keeps the historical render path stable when other
+ * props (e.g. callbacks) churn at the parent.
  *
  * Each rendered unit is wrapped in a `<div>` that owns the
  * ResizeObserver-attaching ref callback. The wrapper is a flex item of
