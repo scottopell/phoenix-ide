@@ -69,23 +69,32 @@ export function StreamingMessageView({ buffer }: StreamingMessageViewProps) {
 
   const incomingText = buffer?.text ?? '';
 
+  // Update the pending text and schedule a single rAF flush per frame.
+  // The previous cleanup-on-every-dep-change pattern cancelled in-flight
+  // frames on every token, defeating the coalescing intent — display
+  // would freeze during a burst and only catch up on idle. The
+  // scheduled rAF below is allowed to fire; subsequent token effects
+  // only update pendingText and skip re-scheduling because rafHandle
+  // is non-null.
   useEffect(() => {
     pendingText.current = incomingText;
-
     if (rafHandle.current === null) {
       rafHandle.current = requestAnimationFrame(() => {
         setDisplayText(pendingText.current);
         rafHandle.current = null;
       });
     }
+  }, [incomingText]);
 
+  // Cancel any pending frame on unmount only — not on every token.
+  useEffect(() => {
     return () => {
       if (rafHandle.current !== null) {
         cancelAnimationFrame(rafHandle.current);
         rafHandle.current = null;
       }
     };
-  }, [incomingText]);
+  }, []);
 
   if (!buffer) return null;
 

@@ -2,6 +2,21 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, render, waitFor } from '@testing-library/react';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
+import { ConversationContext } from '../conversation/ConversationContext';
+import { ConversationStore } from '../conversation/ConversationStore';
+
+// MessageList now subscribes to the conversation store for
+// useStreamingStartedAt (session-stable key). Wrap renders in a
+// minimal context — no driver, no polling — sufficient for the
+// selector to short-circuit on absent atoms.
+function withConvContext(ui: React.ReactElement): React.ReactElement {
+  const store = new ConversationStore();
+  return (
+    <ConversationContext.Provider value={store}>
+      {ui}
+    </ConversationContext.Provider>
+  );
+}
 
 vi.mock('./MessageComponents', () => ({
   UserMessage: ({ message }: { message: { sequence_id: number } }) => (
@@ -104,14 +119,16 @@ describe('MessageList', () => {
     );
 
     const { container, rerender } = render(
-      <MessageList
-        messages={[makeMessage(1)]}
-        pendingMessages={[]}
-        convState={idleState}
-        onRetry={vi.fn()}
-        onOpenFile={undefined}
-        conversationId="conv-a"
-      />,
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1)]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-a"
+        />,
+      ),
     );
 
     const main = container.querySelector('#main-area') as HTMLElement;
@@ -122,14 +139,16 @@ describe('MessageList', () => {
     expect(main.scrollTop).toBe(450);
 
     rerender(
-      <MessageList
-        messages={[makeMessage(2)]}
-        pendingMessages={[]}
-        convState={idleState}
-        onRetry={vi.fn()}
-        onOpenFile={undefined}
-        conversationId="conv-b"
-      />,
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(2)]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-b"
+        />,
+      ),
     );
     triggerResize(messages, 500);
     expect(main.scrollTop).toBe(1000);
@@ -139,14 +158,16 @@ describe('MessageList', () => {
     // topVisibleUnitKey ('msg-1') matches the rendered unit and the
     // restore lands the user back at the saved offset.
     rerender(
-      <MessageList
-        messages={[makeMessage(1)]}
-        pendingMessages={[]}
-        convState={idleState}
-        onRetry={vi.fn()}
-        onOpenFile={undefined}
-        conversationId="conv-a"
-      />,
+      withConvContext(
+        <MessageList
+          messages={[makeMessage(1)]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-a"
+        />,
+      ),
     );
 
     await waitFor(() => expect(main.scrollTop).toBe(450));
@@ -162,14 +183,16 @@ describe('MessageList', () => {
     ];
 
     const { container } = render(
-      <MessageList
-        messages={historical}
-        pendingMessages={[]}
-        convState={idleState}
-        onRetry={vi.fn()}
-        onOpenFile={undefined}
-        conversationId="conv-a"
-      />,
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-a"
+        />,
+      ),
     );
 
     expect(container.querySelector('[data-sequence-id="21"]')).not.toBeNull();

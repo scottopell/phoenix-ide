@@ -177,24 +177,26 @@ export function useStreamingBuffer(slug: string): StreamingBuffer | null {
 }
 
 /**
- * Returns whether `slug` has an active streaming buffer. Re-renders
- * only on streaming-start and streaming-end transitions (the boolean
- * stays `true` through every token mutation, and `Object.is(true, true)`
- * tells React to skip the render).
+ * Returns the streaming buffer's `startedAt` for `slug`, or null when
+ * no buffer is active. Re-renders the consumer on streaming-start,
+ * streaming-end, AND streaming-restart (a new buffer started with a
+ * fresh `startedAt`), because `Object.is` comparison on the returned
+ * number distinguishes those transitions.
  *
- * Use this in components that need to react to "is streaming happening"
- * but should NOT re-render per token — typically the parent that
- * decides whether to render a `<StreamingMessage>` leaf at all.
+ * Use this to derive a session-stable identity for a streaming view
+ * (e.g., a React `key` that forces a fresh component instance on each
+ * new streaming session). The boolean "is streaming active right now"
+ * is just `useStreamingStartedAt(slug) !== null`.
  */
-export function useStreamingActive(slug: string): boolean {
+export function useStreamingStartedAt(slug: string | undefined): number | null {
   const store = useConversationStore();
 
   const subscribe = useCallback(
-    (listener: () => void) => store.subscribe(slug, listener),
+    (listener: () => void) => (slug ? store.subscribe(slug, listener) : () => {}),
     [store, slug],
   );
   const getSnapshot = useCallback(
-    () => store.getSnapshot(slug).streamingBuffer != null,
+    () => (slug ? store.getSnapshot(slug).streamingBuffer?.startedAt ?? null : null),
     [store, slug],
   );
 

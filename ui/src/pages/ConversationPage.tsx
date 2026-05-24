@@ -1053,7 +1053,6 @@ function ConversationPageContent() {
         onOpenFile={handleOpenFileFromPatch}
         conversationId={conversationId}
         slug={slug}
-        isStreaming={atom.streamingBuffer != null}
         systemPrompt={atom.systemPrompt ?? undefined}
       />
       {atom.uiError && (

@@ -15,6 +15,7 @@ import {
   type SavedScrollAnchor,
 } from '../hooks/useBottomAnchoredWindow';
 import { useUnitHeightCache } from '../conversation/unitHeightCache';
+import { useStreamingStartedAt } from '../conversation/useConversationAtom';
 import { useUnitHeightObserver, type UnitHeightObserver } from '../hooks/useUnitHeightObserver';
 import {
   buildRenderUnits,
@@ -58,16 +59,12 @@ interface MessageListProps {
    *  localStorage namespace for the anchor and as the parent prop tying
    *  several pieces of internal state to a single conversation. */
   conversationId?: string | undefined;
-  /** URL slug — the key the conversation store is keyed by. Needed by
-   *  the streaming-buffer subscription in `<StreamingMessage>`. May be
-   *  undefined briefly during route transitions; when undefined, the
-   *  streaming tail unit is not emitted. */
+  /** URL slug — the key the conversation store is keyed by. Needed for
+   *  both the streaming-active subscription (via useStreamingStartedAt)
+   *  and the streaming-buffer subscription inside <StreamingMessage>.
+   *  May be undefined briefly during route transitions; when undefined,
+   *  no streaming tail unit is emitted. */
   slug?: string | undefined;
-  /** True while the conversation has an active streaming buffer. Stable
-   *  across token mutations (the boolean stays true through every
-   *  token), so this prop does not propagate per-token re-renders to
-   *  `<MessageList>`. The parent derives this via `useStreamingActive`. */
-  isStreaming?: boolean;
 }
 
 // Threshold in pixels - if user is within this distance of bottom, consider them "pinned"
@@ -294,7 +291,6 @@ function MessageListImpl({
   systemPrompt,
   conversationId,
   slug,
-  isStreaming = false,
 }: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [jumpToNewestState, setJumpToNewestState] = useState<{
@@ -347,15 +343,24 @@ function MessageListImpl({
   }
   const savedAnchor = savedAnchorLookupRef.current.anchor;
 
-  // streamingHandle is a tag-only TailUnit driver. The key changes only
-  // on streaming-start / streaming-end transitions; it's reference-
-  // stable across token mutations because `isStreaming` (boolean) is
-  // stable across tokens. This keeps `historicalUnits`/`tailUnits`
-  // reference-stable across tokens too — and the actual buffer text is
-  // subscribed inside <StreamingMessage> via useStreamingBuffer.
+  // Streaming session identity: useStreamingStartedAt subscribes to
+  // `streamingBuffer?.startedAt` for this slug and re-renders only when
+  // a session starts / ends / restarts (not per-token). The actual
+  // buffer text is subscribed inside <StreamingMessage> via
+  // useStreamingBuffer.
+  //
+  // Including startedAt in the key forces React to remount
+  // <StreamingMessage> across back-to-back sessions (e.g., when
+  // sse_message and sse_token land in the same React batch and the
+  // streaming-active boolean never observes false between sessions).
+  // Without it, the leaf's pendingText / displayText state from
+  // session N would briefly bleed into session N+1's first frame.
+  const streamingStartedAt = useStreamingStartedAt(slug);
   const streamingHandle = useMemo(
-    () => (isStreaming && slug ? { key: `streaming-${slug}` } : null),
-    [isStreaming, slug],
+    () => (streamingStartedAt !== null && slug
+      ? { key: `streaming-${slug}-${streamingStartedAt}` }
+      : null),
+    [streamingStartedAt, slug],
   );
 
   const { historicalUnits, tailUnits } = useMemo(
@@ -559,7 +564,14 @@ function MessageListImpl({
 
 
 
-  const isEmpty = messages.length === 0 && pendingMessages.length === 0;
+  // isEmpty reflects "nothing for MessageListBody to render". Includes
+  // tail units (pending_user, sub_agent_status, streaming_agent) so the
+  // empty-state placeholder doesn't hide an active streaming buffer or
+  // sub-agent status block when historical messages are still empty
+  // (e.g., sub-agent flow that begins streaming before the user message
+  // persists, or a reconnect race where pending events outpace the
+  // initial snapshot).
+  const isEmpty = historicalUnits.length === 0 && tailUnits.length === 0;
 
   return (
     <main id="main-area" ref={mainRef} onScroll={handleScroll}>
