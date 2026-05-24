@@ -30,29 +30,30 @@ A correct-by-construction rewrite of the message-list virtualization so the virt
 
 ## Technical Summary
 
-- `ui/src/lib/renderUnits.ts` — pure `buildRenderUnits(messages, pendingMessages, convState, isStreaming)` returns `{ historicalUnits: HistoricalUnit[]; tailUnits: TailUnit[] }`. Two discriminated unions; `agent_turn` carries `toolResultsByUseId: ReadonlyMap<string, Message>` and `isFirstInTurn: boolean` as fields, both computed at construction.
-- `ui/src/hooks/useBottomAnchoredWindow.ts` — refactored to take `HistoricalUnit[]` plus an optional `SavedScrollAnchor`. Returns `{ firstRenderedUnitIndex, spacerHeight, topSentinelRef }`. Boundary expansion driven by `IntersectionObserver` on the sentinel; exact-scroll-compensation pattern preserved.
-- `ui/src/lib/unitHeightCache.ts` — `Map<unitKey, number>` of measured heights, mirrored to `sessionStorage` keyed by `phoenix:hcache:{conversationId}:{unitKey}`. Cleared as part of the existing conversation-delete cascade.
-- `ui/src/components/MessageList.tsx` — derives units, slices, maps. Deletes `collapsedRenderableIds`, `isRenderableHistoricalMessage`, and render-time `inAgentRun` mutation. Streaming buffer no longer passed as a prop; the `<StreamingMessage />` leaf subscribes to the streaming-buffer atom directly via `useAtomValue`.
+- `ui/src/conversation/renderUnits.ts` — pure `buildRenderUnits({ messages, pendingMessages, convState, streamingHandle })` returns `{ historicalUnits: HistoricalUnit[]; tailUnits: TailUnit[] }`. Two discriminated unions; `agent_turn` carries `toolResultsByUseId: ReadonlyMap<string, Message>` and `isFirstInTurn: boolean` as fields, both computed at construction. `streamingHandle` is a tag (`{ key } | null`) — the buffer itself is subscribed inside the leaf.
+- `ui/src/hooks/useBottomAnchoredWindow.ts` — takes `HistoricalUnit[]` plus an optional `SavedScrollAnchor` and `UnitHeightCache`. Returns `{ firstRenderedUnitIndex, spacerHeight, topSentinelRef }` where `topSentinelRef` is a callback ref so the IntersectionObserver wires up the instant the DOM node mounts (empty-then-grow conversations). Exact-scroll-compensation preserved; an additional layout effect compensates spacer-height changes from measured-height writes.
+- `ui/src/conversation/unitHeightCache.ts` — `Map<unitKey, number>` of measured heights, mirrored to `sessionStorage` keyed by `phoenix:hcache:{conversationId}:{unitKey}`. `UnitHeightCache.clearConversation(id)` is called from the hard-delete cascade in `useConversationsRefresh`.
+- `ui/src/hooks/useUnitHeightObserver.ts` — returns `{ observe, getElement }` (memoized); `observe(unit)` is a stable per-unit-key ref callback that attaches a `ResizeObserver` and records the DOM node for the saved-anchor save/read to walk.
+- `ui/src/components/MessageList.tsx` — derives units, slices, maps. Deletes `collapsedRenderableIds`, `isRenderableHistoricalMessage`, and render-time `inAgentRun` mutation. Subscribes to `useStreamingStartedAt(slug)` for the streaming-active signal (stable Object.is across tokens). The `<StreamingMessage slug={slug} />` leaf subscribes to the buffer directly via `useStreamingBuffer(slug)`.
 
 ## Status Summary
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-MLRU-001:** Render Unit Layer | Planned | Replaces raw-message map with typed unions |
-| **REQ-MLRU-002:** Tool-Result Structural Ownership | Planned | `toolResultsByUseId` built at construction |
-| **REQ-MLRU-003:** Header Suppression by Construction | Planned | `isFirstInTurn` is a field, not a render mutation |
-| **REQ-MLRU-004:** Tail-Pinned Unit Typing | Planned | `TailUnit` separate from `HistoricalUnit` |
-| **REQ-MLRU-005:** Bottom-Anchored Initial Window | Planned | Window expressed in unit indexes |
-| **REQ-MLRU-006:** IntersectionObserver Boundary Expansion | Planned | Replaces `scrollTop - spacerHeight` heuristic |
-| **REQ-MLRU-007:** Exact Scroll Compensation | Carried | Pattern preserved verbatim from prior pass |
-| **REQ-MLRU-008:** Measured Spacer with Kind Fallback | Planned | Per-unit `ResizeObserver` writes cache |
-| **REQ-MLRU-009:** Unit-Anchor Saved-Scroll Restore | Planned | Kills `savedScrollTop / 360px` estimation |
-| **REQ-MLRU-010:** Streaming Subscription Isolation | Planned | `TailUnit` tag + leaf subscription |
-| **REQ-MLRU-011:** Capability-Gap Logging | Planned | `console.debug` on every skip path |
-| **REQ-MLRU-012:** Tool-Result-Heavy Tail Regression | Planned | Failing test prior to implementation |
-| **REQ-MLRU-013:** SessionStorage Height Cache | Planned | First-paint spacer is exact across remounts |
-| **REQ-MLRU-014:** Pinned-to-Bottom Preservation | Carried | Existing `isPinnedToBottom` behavior unchanged |
+| **REQ-MLRU-001:** Render Unit Layer | Complete | `renderUnits.ts` with discriminated unions |
+| **REQ-MLRU-002:** Tool-Result Structural Ownership | Complete | `toolResultsByUseId` built at construction |
+| **REQ-MLRU-003:** Header Suppression by Construction | Complete | `isFirstInTurn` is a field, computed pre-window |
+| **REQ-MLRU-004:** Tail-Pinned Unit Typing | Complete | `TailUnit` separate from `HistoricalUnit` |
+| **REQ-MLRU-005:** Bottom-Anchored Initial Window | Complete | Window expressed in unit indexes |
+| **REQ-MLRU-006:** IntersectionObserver Boundary Expansion | Complete | Sentinel callback ref; no scrollTop math |
+| **REQ-MLRU-007:** Exact Scroll Compensation | Complete | Pattern preserved; spacer-height delta path added |
+| **REQ-MLRU-008:** Measured Spacer with Kind Fallback | Complete | Per-unit `ResizeObserver` writes cache; spacer reads measured-when-present |
+| **REQ-MLRU-009:** Unit-Anchor Saved-Scroll Restore | Complete | `{ topVisibleUnitKey, offsetWithinUnit, unitCountAtSave }`; `getBoundingClientRect` math |
+| **REQ-MLRU-010:** Streaming Subscription Isolation | Complete | `TailUnit` tag + `useStreamingBuffer` in leaf; commit-count regression test |
+| **REQ-MLRU-011:** Capability-Gap Logging | Complete | `console.debug` on every skip path; no warn-or-higher |
+| **REQ-MLRU-012:** Tool-Result-Heavy Tail Regression | Complete | Test exists in `MessageList.test.tsx` |
+| **REQ-MLRU-013:** SessionStorage Height Cache | Complete | Hydrated synchronously on cache construct |
+| **REQ-MLRU-014:** Pinned-to-Bottom Preservation | Complete | Existing `isPinnedToBottom` flow unchanged |
 
 ## Lineage
 

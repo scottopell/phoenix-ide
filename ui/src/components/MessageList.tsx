@@ -752,11 +752,16 @@ function MessageListImpl({
  * props are reference-stable across token mutations:
  *   - messages / pendingMessages / convState come from atom slices that
  *     don't change on tokens
- *   - isStreaming is a boolean that stays true through every token
- *   - callbacks are useCallback'd at the parent
+ *   - callbacks (onRetry / onCancelSteering / onOpenFile) are
+ *     useCallback'd at the parent
  *   - slug / conversationId are URL/atom-derived strings
+ *   - systemPrompt is a string from the atom that doesn't mutate per token
  *
- * The streaming buffer itself is consumed by <StreamingMessage> via
- * useStreamingBuffer(slug); only that leaf re-renders per token.
+ * Internally, MessageList subscribes to `useStreamingStartedAt(slug)` —
+ * a primitive (number | null) that stays Object.is-stable through every
+ * token within a session, so the subscription notification on each token
+ * does not trigger a re-render. The buffer text itself is consumed by
+ * <StreamingMessage> via useStreamingBuffer(slug); only that leaf
+ * re-renders per token.
  */
 export const MessageList = memo(MessageListImpl);

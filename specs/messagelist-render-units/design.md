@@ -34,7 +34,7 @@ ui/src/
 ## Type Shapes
 
 ```ts
-// ui/src/lib/renderUnits.ts
+// ui/src/conversation/renderUnits.ts
 
 import type { Message, QueuedMessage, ConversationState } from '../api';
 
@@ -71,7 +71,10 @@ export interface BuildInputs {
   messages: Message[];
   pendingMessages: QueuedMessage[];
   convState: ConversationState;
-  isStreaming: boolean;
+  /** Tag for the active streaming session (null when no buffer). Built
+   *  by the caller from `useStreamingStartedAt(slug)`; the key
+   *  embeds startedAt so back-to-back sessions remount cleanly. */
+  streamingHandle: { key: string } | null;
 }
 
 export function buildRenderUnits(inputs: BuildInputs): RenderUnits;
@@ -94,7 +97,7 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits;
 
 ```ts
 export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
-  const { messages, pendingMessages, convState, isStreaming } = inputs;
+  const { messages, pendingMessages, convState, streamingHandle } = inputs;
   const historicalUnits: HistoricalUnit[] = [];
 
   let i = 0;
@@ -156,10 +159,10 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
     });
   }
 
-  if (isStreaming) {
+  if (streamingHandle !== null) {
     tailUnits.push({
       kind: 'streaming_agent',
-      key: streamingUnitKey(/* derived from atom buffer startedAt */),
+      key: streamingHandle.key,
     });
   }
 
@@ -202,8 +205,11 @@ function buildAgentTurn(
 ```
 
 The function is pure, takes only data, has no DOM dependencies, and is
-fully unit-testable. `isStreaming` is derived at the call site from the
-atom's `streamingBuffer != null`.
+fully unit-testable. `streamingHandle` is derived at the call site
+via `useStreamingStartedAt(slug)`: when streaming is active the hook
+returns the buffer's `startedAt` (a number stable across tokens but
+unique per session), which MessageList wraps into
+`{ key: \`streaming-${slug}-${startedAt}\` }`.
 
 ## Window Hook
 
@@ -213,20 +219,31 @@ atom's `streamingBuffer != null`.
 export interface SavedScrollAnchor {
   topVisibleUnitKey: string;
   offsetWithinUnit: number;
+  /** Number of historical units at save time. Restore compares this
+   *  to current `historicalUnits.length` to detect "messages arrived
+   *  while away" and surface the ↓ New messages button. Optional for
+   *  forward-compat with anchors written by older app builds. */
+  unitCountAtSave?: number;
 }
 
 export interface UseWindowInputs {
   historicalUnits: HistoricalUnit[];
   conversationId: string | undefined;
   scrollRootRef: React.RefObject<HTMLElement | null>;
-  savedAnchor: SavedScrollAnchor | null;
-  heightCache: UnitHeightCache;
+  savedAnchor?: SavedScrollAnchor | null;
+  heightCache?: UnitHeightCache | null;
 }
 
 export interface UseWindowOutputs {
   firstRenderedUnitIndex: number;
   spacerHeight: number;
-  topSentinelRef: React.RefObject<HTMLDivElement | null>;
+  /** Callback ref — when the sentinel DOM node mounts (which may
+   *  happen on a later render than the first, e.g. an empty
+   *  conversation that grows past INITIAL_WINDOW), this triggers the
+   *  IntersectionObserver setup effect via a state-backed ref. A
+   *  RefObject would not, because ref-mutation doesn't trigger
+   *  re-runs of useEffect. */
+  topSentinelRef: (node: HTMLDivElement | null) => void;
 }
 
 export function useBottomAnchoredWindow(inputs: UseWindowInputs): UseWindowOutputs;
@@ -277,7 +294,7 @@ correctly in the DOM:
 ## Height Cache
 
 ```ts
-// ui/src/lib/unitHeightCache.ts
+// ui/src/conversation/unitHeightCache.ts
 
 const STORAGE_PREFIX = 'phoenix:hcache:';
 

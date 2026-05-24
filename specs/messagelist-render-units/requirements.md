@@ -85,7 +85,11 @@ WHEN no preceding `agent_turn` exists for a `tool` message (e.g. first
 message in the conversation is a tool result, which would indicate a
 backend invariant violation)
 THE SYSTEM SHALL skip the tool message
-AND log a `console.debug` at warn-level severity
+AND log a `console.debug` recording the orphan with
+`reason: 'orphan_tool'` (per REQ-MLRU-011, all capability-gap skips
+log at `debug` level — never higher; a backend invariant violation
+manifesting here is still a UI-side recoverable skip, not a render-
+time error)
 
 **Rationale:** Today's code keeps tool results in a `Map<string, Message>`
 built at the MessageList level and looked up during render. Moving the

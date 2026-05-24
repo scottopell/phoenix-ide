@@ -11,11 +11,10 @@ import { useEffect, useMemo } from 'react';
 // availability failures degrade silently to memory-only operation.
 //
 // Eviction: sessionStorage entries persist for the browser session.
-// When a conversation is hard-deleted (REQ-CONV-...), the deletion
-// cascade should call `UnitHeightCache.clearConversation(id)` to drop
-// matching entries. Until that cascade is wired (task 02696
-// follow-up), entries leak per deleted conversation; the leak is
-// bounded by sessionStorage quota and the small per-entry size.
+// The hard-delete cascade in `useConversationsRefresh` calls
+// `UnitHeightCache.clearConversation(conversationId)` to drop matching
+// entries when a conversation is removed, so deleted conversations
+// don't leak per-unit entries.
 
 const STORAGE_PREFIX = 'phoenix:hcache:';
 const FLUSH_DELAY_MS = 16;
