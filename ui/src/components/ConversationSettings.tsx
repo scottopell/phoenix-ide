@@ -304,8 +304,10 @@ export function ConversationSettings({
           )}
           {selectedTask && (
             <div className="task-start-detail">
-              <div className="task-start-detail-title">{selectedTask.id} · {selectedTask.slug}</div>
-              <div className="task-start-detail-meta">{selectedTask.priority} · {selectedTask.status}</div>
+              <div className="task-start-detail-title">
+                <span>{selectedTask.id} · {selectedTask.slug}</span>
+                <span className="task-start-detail-meta">{selectedTask.priority} · {selectedTask.status}</span>
+              </div>
               <div className="task-start-detail-markdown">
                 {taskDetailLoading
                   ? 'Loading task details...'

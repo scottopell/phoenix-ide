@@ -5406,8 +5406,19 @@ html * {
 }
 
 .task-start-detail-title {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
   font-size: 12px;
   font-weight: 600;
+}
+
+.task-start-detail-meta {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-muted);
 }
 
 .task-start-detail-markdown {
