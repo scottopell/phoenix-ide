@@ -5263,11 +5263,170 @@ html * {
   flex-shrink: 0;
 }
 
-/* Mode selector (Direct vs Managed) */
+.new-conv-workflows {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.workflow-card {
+  display: flex;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.workflow-card--active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.workflow-card input[type="radio"] {
+  margin-top: 3px;
+  accent-color: var(--accent);
+}
+
+.workflow-card-content {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.workflow-card-content strong {
+  font-size: 12px;
+}
+
+.workflow-card-content span {
+  font-size: 11px;
+  color: var(--text-muted);
+  line-height: 1.4;
+}
+
+.git-workflow-panel {
+  margin-top: 10px;
+  display: grid;
+  gap: 6px;
+}
+
+.git-workflow-option {
+  text-align: left;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.git-workflow-option--active {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+}
+
+.git-workflow-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.git-workflow-desc {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.task-start-list {
+  display: grid;
+  gap: 4px;
+  padding-left: 10px;
+}
+
+.task-start-item {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  text-align: left;
+  padding: 6px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+
+.task-start-item--active {
+  border-color: var(--accent);
+}
+
+.task-start-priority {
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--bg-tertiary, rgb(255 255 255 / 8%));
+}
+
+.task-start-priority--p0,
+.task-start-priority--p1 {
+  color: #f87171;
+}
+
+.task-start-priority--p2 {
+  color: #facc15;
+}
+
+.task-start-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.task-start-title,
+.task-start-meta,
+.task-start-empty {
+  font-size: 11px;
+}
+
+.task-start-meta,
+.task-start-empty {
+  color: var(--text-muted);
+}
+
+.task-start-detail {
+  margin-left: 10px;
+  padding: 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+}
+
+.task-start-detail-title {
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.task-start-detail pre {
+  max-height: 160px;
+  overflow: auto;
+  margin: 6px 0 0;
+  white-space: pre-wrap;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
 .new-conv-mode-selector {
   display: flex;
   gap: 8px;
   margin-top: 8px;
+}
+
+.new-conv-intent-stack {
+  flex-direction: column;
 }
 
 .mode-option {
@@ -5291,6 +5450,10 @@ html * {
   background: color-mix(in srgb, var(--accent) 8%, transparent);
 }
 
+.mode-option--primary {
+  padding: 12px;
+}
+
 .mode-option input[type="radio"] {
   margin-top: 3px;
   accent-color: var(--accent);
@@ -5310,6 +5473,25 @@ html * {
   font-size: 11px;
   color: var(--text-muted);
   line-height: 1.4;
+}
+
+.mode-option-summary {
+  margin-top: 4px;
+  font-size: 11px;
+  color: var(--accent);
+}
+
+.starting-point-toggle {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.starting-point-toggle:hover {
+  text-decoration: underline;
 }
 
 /* Branch selector (appears in Managed mode) */

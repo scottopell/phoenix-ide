@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { api } from '../api';
 import { subscribeModels } from '../modelsPoller';
-import type { GitBranchEntry, ImageData, ModelsResponse } from '../api';
+import type { GitBranchEntry, ImageData, ModelsResponse, TaskEntry } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
 import { processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
@@ -12,6 +12,28 @@ const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const RECENT_DIRS_KEY = 'phoenix-recent-dirs';
 const MAX_RECENT = 5;
+
+function relativeTaskPath(cwd: string, taskPath: string): string {
+  const root = cwd.endsWith('/') ? cwd : `${cwd}/`;
+  return taskPath.startsWith(root) ? taskPath.slice(root.length) : taskPath;
+}
+
+function buildTaskStartPrompt(cwd: string, task: TaskEntry, extraInstructions: string): string {
+  const taskFile = relativeTaskPath(cwd, task.path);
+  const extra = extraInstructions.trim();
+  return [
+    `Start from the existing task file \`${taskFile}\`.`,
+    '',
+    `Call the propose_task tool with {"task_file":"${taskFile}"} as your only tool call so I can review and approve the task before Work mode begins.`,
+    extra ? `\nAdditional context from me:\n${extra}` : '',
+  ].filter(Boolean).join('\n');
+}
+
+export type ConversationIntent = 'direct' | 'fromExistingWork';
+export type StartingPoint =
+  | { kind: 'branch'; name: string }
+  | { kind: 'checkoutBranch'; name: string }
+  | { kind: 'task'; task: TaskEntry };
 
 function getRecentDirs(): string[] {
   try {
@@ -42,7 +64,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [creating, setCreating] = useState(false);
 
   const [recentDirs, setRecentDirs] = useState<string[]>(() => getRecentDirs());
-  const [mode, setMode] = useState<'direct' | 'managed' | 'branch'>('direct');
+  const [intent, setIntent] = useState<ConversationIntent>('direct');
+  const [startingPoint, setStartingPoint] = useState<StartingPoint | null>(null);
+  const [tasks, setTasks] = useState<TaskEntry[]>([]);
   const [branches, setBranches] = useState<GitBranchEntry[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [baseBranch, setBaseBranch] = useState<string | null>(null);
@@ -86,16 +110,16 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
 
-  // Reset to Direct when directory is not a git repo (Managed/Branch require git)
-  useEffect(() => { if (isGitDir === false) setMode('direct'); }, [isGitDir]);
+  useEffect(() => { if (isGitDir === false) setIntent('direct'); }, [isGitDir]);
 
-  // Fetch local branches when git dir is confirmed and mode needs branches (instant, no network)
   useEffect(() => {
-    if (!isGitDir || (mode !== 'managed' && mode !== 'branch')) {
+    if (!isGitDir || intent !== 'fromExistingWork') {
       setBranches([]);
+      setTasks([]);
       setCurrentBranch(null);
       setBaseBranch(null);
       setDefaultBranch(null);
+      setStartingPoint(null);
       setBranchSearch('');
       return;
     }
@@ -108,7 +132,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setBranches(resp.branches);
       setCurrentBranch(resp.current);
       setDefaultBranch(resp.default_branch ?? null);
-      setBaseBranch(null);
+      const initialBranch = resp.default_branch ?? resp.current;
+      setBaseBranch(initialBranch);
+      setStartingPoint(prev => prev ?? (initialBranch ? { kind: 'branch', name: initialBranch } : null));
     }).catch(err => {
       if (cancelled) return;
       console.warn('Failed to fetch git branches:', err);
@@ -117,13 +143,20 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setDefaultBranch(null);
       setBaseBranch(null);
     });
+    api.listProjectTasks(trimmedCwd).then(resp => {
+      if (cancelled) return;
+      setTasks(resp.tasks);
+    }).catch(err => {
+      if (cancelled) return;
+      console.warn('Failed to fetch tasks:', err);
+      setTasks([]);
+    });
 
     return () => { cancelled = true; };
-  }, [isGitDir, mode, cwd]);
+  }, [isGitDir, intent, cwd]);
 
-  // Debounced remote search when user types in the branch picker
   useEffect(() => {
-    if (!isGitDir || (mode !== 'managed' && mode !== 'branch') || !branchSearch.trim()) return;
+    if (!isGitDir || intent !== 'fromExistingWork' || !branchSearch.trim()) return;
     const trimmedCwd = cwd.trim();
     if (!trimmedCwd) return;
 
@@ -139,29 +172,25 @@ export function useCreateConversation(navigate: (path: string) => void) {
         console.warn('Branch search failed:', err);
         setBranchSearchLoading(false);
       });
-      // Stash the cancel fn for cleanup -- the timer already fired,
-      // but the fetch might still be in flight.
       return () => { cancelled = true; };
     }, 300);
 
     return () => { clearTimeout(timer); setBranchSearchLoading(false); };
-  }, [isGitDir, mode, cwd, branchSearch]);
+  }, [isGitDir, intent, cwd, branchSearch]);
 
-  // Resolve once and reuse: conflict check, canSend gating, and submission
-  // must all key off the same branch value. Detached-HEAD (currentBranch
-  // null) falls through to defaultBranch — and the conflict check has to
-  // see that fallback too, otherwise an active conversation on default
-  // would only surface as a backend 409 at submit time.
-  const effectiveBranch = (mode === 'branch' || mode === 'managed')
-    ? (baseBranch ?? currentBranch ?? defaultBranch)
+  const effectiveBranch = intent === 'fromExistingWork'
+    ? (startingPoint?.kind === 'branch' || startingPoint?.kind === 'checkoutBranch' ? startingPoint.name : (baseBranch ?? currentBranch ?? defaultBranch))
     : null;
-
-  // Check if selected branch has a conflict (active conversation already using it).
-  const selectedBranchConflict = effectiveBranch
+  const selectedBranchConflict = startingPoint?.kind === 'checkoutBranch' && effectiveBranch
     ? branches.find(b => b.name === effectiveBranch)?.conflict_slug ?? null
     : null;
+  const selectedTaskConflict = startingPoint?.kind === 'task'
+    ? startingPoint.task.conversation_slug ?? null
+    : null;
+  const selectedConflictSlug = selectedTaskConflict ?? selectedBranchConflict;
+  const hasStartingPoint = intent === 'direct' || Boolean(startingPoint);
 
-  const canSend = (draft.trim().length > 0 || images.length > 0) && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking' && !selectedBranchConflict;
+  const canSend = (draft.trim().length > 0 || images.length > 0) && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking' && hasStartingPoint && !selectedConflictSlug;
 
   const addImages = async (files: File[]) => {
     try {
@@ -223,14 +252,35 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
       const messageId = generateUUID();
       const trimmedCwd = cwd.trim();
-      if ((mode === 'managed' || mode === 'branch') && !effectiveBranch) {
-        setError('Pick a base branch for Managed/Branch mode.');
+      if (intent === 'fromExistingWork' && !startingPoint) {
+        setError('Pick a branch or task to start from.');
         setCreating(false);
         return;
       }
+      if (intent === 'fromExistingWork' && selectedConflictSlug) {
+        setError('That starting point already has an active conversation.');
+        setCreating(false);
+        return;
+      }
+      const backendMode = intent === 'direct'
+        ? 'direct'
+        : startingPoint?.kind === 'checkoutBranch'
+          ? 'branch'
+          : 'managed';
+      const submitBranch = intent === 'fromExistingWork'
+        ? (startingPoint?.kind === 'branch' || startingPoint?.kind === 'checkoutBranch' ? startingPoint.name : (baseBranch ?? currentBranch ?? defaultBranch))
+        : null;
+      if (intent === 'fromExistingWork' && !submitBranch) {
+        setError('Pick a Git starting point.');
+        setCreating(false);
+        return;
+      }
+      const submitText = startingPoint?.kind === 'task'
+        ? buildTaskStartPrompt(trimmedCwd, startingPoint.task, trimmed)
+        : trimmed;
       const conv = await createConversationWithStore(
-        trimmedCwd, trimmed, messageId, selectedModel || undefined, images, mode,
-        effectiveBranch,
+        trimmedCwd, submitText, messageId, selectedModel || undefined, images, backendMode,
+        submitBranch,
       );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
@@ -260,8 +310,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
     error,
     creating,
     canSend,
-    mode,
-    setMode,
+    intent,
+    setIntent,
+    startingPoint,
+    setStartingPoint,
+    tasks,
     branches,
     currentBranch,
     baseBranch,
@@ -278,6 +331,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     handleVoiceInterim,
     textareaValue,
     updateDraft,
+    selectedConflictSlug,
     handleSend,
   };
 }

@@ -18,9 +18,9 @@ use super::types::{
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse,
-    SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
-    ValidateCwdResponse,
+    NotificationSettingsRequest, ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry,
+    SkillsResponse, SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse,
+    UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{
@@ -194,6 +194,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/pr-status",
             get(get_conversation_pr_status),
         )
+        // Project task files available before a conversation exists
+        .route("/api/tasks", get(list_project_tasks))
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
         // Environment info
@@ -2989,25 +2991,12 @@ async fn list_conversation_skills(
 // Tasks
 // ============================================================
 
-/// List task files from the conversation's project tasks/ directory.
-async fn list_conversation_tasks(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<TasksResponse>, AppError> {
-    let conversation = state
-        .runtime
-        .db()
-        .get_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
-    let cwd = std::path::PathBuf::from(&conversation.cwd);
-    let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
+async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<TaskEntry> {
+    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
         .to_string_lossy()
         .into_owned();
     let tasks_dir = cwd.join(&tasks_dir_name);
 
-    // Build task_id -> conversation_slug map from active Work conversations
     let all_convs = state
         .runtime
         .db()
@@ -3023,7 +3012,7 @@ async fn list_conversation_tasks(
         })
         .collect();
 
-    let tasks = taskmd_core::tasks::list_tasks(&tasks_dir)
+    taskmd_core::tasks::list_tasks(&tasks_dir)
         .into_iter()
         .map(|t| {
             let conversation_slug = task_to_slug.get(&t.id).cloned();
@@ -3036,9 +3025,39 @@ async fn list_conversation_tasks(
                 conversation_slug,
             }
         })
-        .collect();
+        .collect()
+}
 
-    Ok(Json(TasksResponse { tasks }))
+/// List task files from a project's tasks/ directory before a conversation exists.
+async fn list_project_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectTasksQuery>,
+) -> Result<Json<TasksResponse>, AppError> {
+    let cwd = std::path::PathBuf::from(&query.cwd);
+    if !cwd.exists() || !cwd.is_dir() {
+        return Err(AppError::BadRequest("Directory does not exist".to_string()));
+    }
+    Ok(Json(TasksResponse {
+        tasks: task_entries_for_cwd(&state, &cwd).await,
+    }))
+}
+
+/// List task files from the conversation's project tasks/ directory.
+async fn list_conversation_tasks(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<TasksResponse>, AppError> {
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let cwd = std::path::PathBuf::from(&conversation.cwd);
+    Ok(Json(TasksResponse {
+        tasks: task_entries_for_cwd(&state, &cwd).await,
+    }))
 }
 
 /// Token usage totals for a conversation (own turns + root rollup including sub-agents).

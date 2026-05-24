@@ -352,6 +352,12 @@ pub struct TasksResponse {
     pub tasks: Vec<TaskEntry>,
 }
 
+/// Query parameters for listing project task files before a conversation exists.
+#[derive(Debug, Deserialize)]
+pub struct ProjectTasksQuery {
+    pub cwd: String,
+}
+
 /// Expansion error detail returned to the frontend (REQ-IR-007)
 #[derive(Debug, Clone, Serialize)]
 pub struct ExpansionErrorResponse {
