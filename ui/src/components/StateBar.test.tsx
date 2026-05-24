@@ -189,7 +189,7 @@ describe('StateBar PR badge', () => {
         failing_names: ['test'],
         pending_names: [],
       },
-      feedback_summary: { total: 2, unresolved: 2, items: [], coverage: [], limitations: [] },
+      feedback_summary: { total: 2, unresolved: 2, items: [], coverage: [] },
     });
 
     renderStateBar({ onSendMessage });

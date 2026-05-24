@@ -10,6 +10,7 @@ pub mod codex_login;
 mod git_handlers;
 mod handlers;
 mod lifecycle_handlers;
+mod pr_monitoring;
 mod sse;
 mod types;
 pub(crate) mod wire;

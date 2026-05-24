@@ -2886,7 +2886,7 @@ pre:hover .copy-btn {
   border: 1px solid var(--border-color);
   border-radius: 8px;
   background: var(--bg-elevated);
-  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  box-shadow: 0 10px 30px rgb(0 0 0 / 35%);
   color: var(--text-primary);
   font-size: 12px;
   line-height: 1.4;
@@ -2928,8 +2928,13 @@ pre:hover .copy-btn {
   opacity: 0.55;
   cursor: not-allowed;
 }
+
 .pr-hint {
   font-size: 10px;
+  color: var(--text-muted);
+  opacity: 0.75;
+  white-space: nowrap;
+}
 
 .statebar-project {
   margin-left: auto;
@@ -5913,8 +5918,6 @@ html * {
     justify-content: center;
     cursor: pointer;
     margin-left: 4px;
-   border: 0;
-  cursor: pointer;
   }
 
   .statebar-chevron:hover {

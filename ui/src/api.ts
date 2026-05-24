@@ -125,8 +125,17 @@ export interface PrCheckSummary {
 }
 
 export type PrFeedbackSource = 'issue_comment' | 'review_comment' | 'review_summary' | 'review_thread';
+export type PrFeedbackCoverageSurface = 'issue_comments' | 'review_comments' | 'review_summaries' | 'review_threads';
+export type PrFeedbackCoverageStatus = 'fetched' | 'unavailable' | 'auth_failed';
+
+export interface PrFeedbackCoverage {
+  surface: PrFeedbackCoverageSurface;
+  status: PrFeedbackCoverageStatus;
+  detail?: string;
+}
 
 export interface PrFeedbackItem {
+  id?: string;
   source: PrFeedbackSource;
   author: string;
   body: string;
@@ -140,8 +149,7 @@ export interface PrFeedbackSummary {
   total: number;
   unresolved: number;
   items: PrFeedbackItem[];
-  coverage: string[];
-  limitations: string[];
+  coverage: PrFeedbackCoverage[];
 }
 
 export interface PrAutoFixContextResponse {

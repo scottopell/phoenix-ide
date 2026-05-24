@@ -565,7 +565,50 @@ pub enum PrFeedbackSource {
 }
 
 #[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrCheckLogSource {
+    CheckUrl,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PrCheckLogSnippet {
+    pub check_name: String,
+    pub source: PrCheckLogSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    pub snippet: String,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFeedbackCoverageSurface {
+    IssueComments,
+    ReviewComments,
+    ReviewSummaries,
+    ReviewThreads,
+}
+
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFeedbackCoverageStatus {
+    Fetched,
+    Unavailable,
+    AuthFailed,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PrFeedbackCoverage {
+    pub surface: PrFeedbackCoverageSurface,
+    pub status: PrFeedbackCoverageStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
 pub struct PrFeedbackItem {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     pub source: PrFeedbackSource,
     pub author: String,
     pub body: String,
@@ -584,8 +627,7 @@ pub struct PrFeedbackSummary {
     pub total: u32,
     pub unresolved: u32,
     pub items: Vec<PrFeedbackItem>,
-    pub coverage: Vec<String>,
-    pub limitations: Vec<String>,
+    pub coverage: Vec<PrFeedbackCoverage>,
 }
 
 #[derive(Debug, Serialize)]

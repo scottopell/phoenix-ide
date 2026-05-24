@@ -58,8 +58,8 @@ interface StateBarProps {
    *  assigns `undefined` from a ternary, which the strict mode rejects
    *  without this annotation. */
   onOpenFiles?: (() => void) | undefined;
-  onSendMessage?: (text: string) => void;
-  showError?: (message: string) => void;
+  onSendMessage?: ((text: string) => void) | undefined;
+  showError?: ((message: string) => void) | undefined;
 }
 
 /** Format a context window size in tokens for compact display (e.g. 200k, 1M). */
@@ -163,9 +163,9 @@ function PrCiPopover({
 }: {
   pr: PrStatusResponse;
   conversationId: string;
-  onSendMessage?: (text: string) => void;
+  onSendMessage?: ((text: string) => void) | undefined;
   onClose: () => void;
-  showError?: (message: string) => void;
+  showError?: ((message: string) => void) | undefined;
   loading: boolean;
   setLoading: (loading: boolean) => void;
 }) {
