@@ -59,7 +59,7 @@ impl Tool for TerminalCommandHistoryTool {
         // Clamp count to [1, 5].
         let count = parsed.count.clamp(1, 5);
 
-        let Some(handle) = ctx.terminals.get(&ctx.conversation_id) else {
+        let Some(handle) = ctx.terminals.get(&ctx.work_scope) else {
             return ToolOutput::error("no terminal is open for this conversation");
         };
 

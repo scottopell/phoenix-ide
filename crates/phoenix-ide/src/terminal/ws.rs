@@ -13,6 +13,7 @@ use super::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
 use super::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
 use crate::api::AppState;
 use crate::runtime::{RuntimeManager, SseEvent};
+use crate::work_scope::WorkScope;
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{Path, State, WebSocketUpgrade},
@@ -73,6 +74,8 @@ async fn handle_socket(
         }
     };
 
+    let scope = WorkScope::resolve(&conversation_id, worktree_path.as_deref());
+
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     // Wait for the initial resize frame from xterm.js FitAddon (REQ-TERM-005).
@@ -90,6 +93,7 @@ async fn handle_socket(
     // branch (full_teardown / detach_only).
     let Some((arc_handle, attach_permit)) = acquire_handle(
         &conversation_id,
+        &scope,
         &terminals,
         &cwd,
         worktree_path.as_deref(),
@@ -125,7 +129,7 @@ async fn handle_socket(
         Err(reason) => {
             tracing::error!(conv_id = %conversation_id, error = %reason, "Terminal: fd setup failed");
             // Full teardown — we failed before the relay started.
-            full_teardown(&terminals, &conversation_id, arc_handle, child_pid).await;
+            full_teardown(&terminals, &conversation_id, &scope, arc_handle, child_pid).await;
             return;
         }
     };
@@ -137,23 +141,29 @@ async fn handle_socket(
     let _ = arc_handle.stop_tx.send(StopReason::Running);
     let stop_rx = arc_handle.stop_tx.subscribe();
 
-    // REQ-TERM-012: tear down terminal when conversation reaches a terminal state.
-    let teardown_stop = arc_handle.stop_tx.clone();
-    let teardown_conv_id = conversation_id.clone();
-    if let Ok(mut bcast_rx) = runtime.subscribe(&conversation_id).await {
-        tokio::spawn(async move {
-            loop {
-                match bcast_rx.recv().await {
-                    Ok(SseEvent::ConversationBecameTerminal { .. }) => {
-                        tracing::debug!(conv_id = %teardown_conv_id, "Terminal: conversation ended, tearing down PTY");
-                        let _ = teardown_stop.send(StopReason::TearDown);
-                        break;
+    // REQ-TERM-012 (per-scope): the conversation-end teardown only applies
+    // to Conversation-scoped terminals. Worktree-scoped terminals survive
+    // across conversation continuations and tear down only via the
+    // worktree cleanup cascade (REQ-TERM-WS-001, REQ-TMUX-WS-002). Global
+    // terminals never tear down on conversation lifecycle.
+    if matches!(scope, WorkScope::Conversation(_)) {
+        let teardown_stop = arc_handle.stop_tx.clone();
+        let teardown_conv_id = conversation_id.clone();
+        if let Ok(mut bcast_rx) = runtime.subscribe(&conversation_id).await {
+            tokio::spawn(async move {
+                loop {
+                    match bcast_rx.recv().await {
+                        Ok(SseEvent::ConversationBecameTerminal { .. }) => {
+                            tracing::debug!(conv_id = %teardown_conv_id, "Terminal: conversation ended, tearing down PTY");
+                            let _ = teardown_stop.send(StopReason::TearDown);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
                     }
-                    Ok(_) => {}
-                    Err(_) => break,
                 }
-            }
-        });
+            });
+        }
     }
 
     // Adapt WS sender: Sink<Message> → Sink<Vec<u8>> by wrapping in Message::Binary.
@@ -207,7 +217,7 @@ async fn handle_socket(
     //                             can recover the session.
     match exit {
         RelayExit::PtyEof | RelayExit::Stopped(StopReason::TearDown) => {
-            full_teardown(&terminals, &conversation_id, arc_handle, child_pid).await;
+            full_teardown(&terminals, &conversation_id, &scope, arc_handle, child_pid).await;
         }
         RelayExit::Stopped(StopReason::Detach | StopReason::Running) | RelayExit::WsClosed => {
             detach_only(&conversation_id, arc_handle);
@@ -244,8 +254,10 @@ async fn handle_socket(
 ///      winner so the caller still gets an attached session.
 ///   3. `acquire_owned()` the permit — available immediately since the
 ///      handle is fresh and nobody holds it yet.
+#[allow(clippy::too_many_arguments)]
 async fn acquire_handle(
     conversation_id: &str,
+    scope: &WorkScope,
     terminals: &ActiveTerminals,
     cwd: &std::path::Path,
     worktree_path: Option<&std::path::Path>,
@@ -253,11 +265,11 @@ async fn acquire_handle(
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     runtime: &Arc<RuntimeManager>,
 ) -> Option<(Arc<TerminalHandle>, OwnedSemaphorePermit)> {
-    // Fast path: reclaim if a handle already exists. The reclaim path
-    // does not consult the tmux registry because the existing PTY is
-    // already running whatever it was originally given (tmux attach or
-    // $SHELL); switching mid-session would require killing the child.
-    if let Some(existing) = terminals.get(conversation_id) {
+    // Fast path: reclaim if a handle already exists for this scope. The
+    // reclaim path does not consult the tmux registry because the existing
+    // PTY is already running whatever it was originally given (tmux attach
+    // or $SHELL); switching mid-session would require killing the child.
+    if let Some(existing) = terminals.get(scope) {
         return reclaim(conversation_id, existing).await;
     }
 
@@ -289,12 +301,12 @@ async fn acquire_handle(
     // Atomic check-and-insert. If we lose the race, the handle we just spawned
     // is dropped (closing master_fd → SIGHUP), and we fall back to reclaiming
     // the winner so the caller still gets an attached session.
-    if let Some(arc_handle) = terminals.try_insert(conversation_id.to_string(), handle) {
+    if let Some(arc_handle) = terminals.try_insert(scope.clone(), handle) {
         // Fresh handle — permit is available immediately (initialized with 1).
         return acquire_permit(conversation_id, arc_handle).await;
     }
 
-    tracing::warn!(conv_id = %conversation_id, "Terminal: post-spawn race lost, reclaiming winner");
+    tracing::warn!(conv_id = %conversation_id, scope = %scope, "Terminal: post-spawn race lost, reclaiming winner");
     // Reap the child from the losing spawn to avoid a zombie. The handle was
     // consumed by try_insert (on loss it was dropped), so master_fd is closed
     // and the child will receive SIGHUP.
@@ -303,7 +315,7 @@ async fn acquire_handle(
     })
     .await;
 
-    let Some(existing) = terminals.get(conversation_id) else {
+    let Some(existing) = terminals.get(scope) else {
         // Winner removed itself between try_insert and get. Report back to
         // the client and bail — retrying again could loop on edge-case timing.
         let _ = ws_sender
@@ -407,17 +419,18 @@ async fn acquire_permit(
 async fn full_teardown(
     terminals: &ActiveTerminals,
     conversation_id: &str,
+    scope: &WorkScope,
     arc_handle: Arc<TerminalHandle>,
     child_pid: nix::unistd::Pid,
 ) {
-    terminals.remove(conversation_id);
+    terminals.remove(scope);
     // When this and any other Arc clones drop, master_fd closes → SIGHUP → shell exits.
     drop(arc_handle);
     let _ = tokio::task::spawn_blocking(move || {
         let _ = waitpid(child_pid, None);
     })
     .await;
-    tracing::info!(conv_id = %conversation_id, "Terminal session ended");
+    tracing::info!(conv_id = %conversation_id, scope = %scope, "Terminal session ended");
 }
 
 /// Detach only: release our Arc clone but leave the registry entry intact so

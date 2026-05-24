@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
 use super::command_tracker::CommandTracker;
+use crate::work_scope::WorkScope;
 
 /// Why the current relay should stop.
 ///
@@ -109,56 +110,65 @@ impl std::fmt::Debug for TerminalHandle {
     }
 }
 
-/// Shared registry of active terminal sessions (REQ-TERM-003).
+/// Shared registry of active terminal sessions (REQ-TERM-003, REQ-TERM-WS-001).
+///
+/// Keyed by `WorkScope`: `WorkScope::Worktree(path)` for managed/branch
+/// worktrees, `WorkScope::Conversation(id)` for Direct conversations, and
+/// `WorkScope::Global` for the singleton scope surfaced on the /new page.
+/// Continuation conversations resolving to the same `WorkScope` therefore
+/// share a single entry rather than colliding — matching the ownership
+/// pattern of `TmuxRegistry` (REQ-TMUX-WS-001) and `BrowserSessionManager`
+/// (REQ-BROWSER-WS-001).
 ///
 /// `Arc`-wrapped so it can be cloned into `AppState` and into handlers.
-/// `Mutex` provides the atomic check-and-insert needed for the 409 guard.
+/// `Mutex` provides the atomic check-and-insert needed for the race guard
+/// on the fresh-session path.
 #[derive(Clone, Default)]
-pub struct ActiveTerminals(pub Arc<Mutex<HashMap<String, Arc<TerminalHandle>>>>);
+pub struct ActiveTerminals(pub Arc<Mutex<HashMap<WorkScope, Arc<TerminalHandle>>>>);
 
 impl ActiveTerminals {
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(HashMap::new())))
     }
 
-    /// Returns `true` if a terminal is currently active for `conversation_id`.
+    /// Returns `true` if a terminal is currently active for `scope`.
     ///
     /// Retained for tests / external consumers; the `ws.rs` handler now goes
     /// directly to `get` (reclaim path) or `try_insert` (fresh path) without
     /// a separate pre-check, since a pre-check can't avoid the reclaim race.
     #[cfg(test)]
     #[allow(dead_code)]
-    pub fn is_active(&self, conversation_id: &str) -> bool {
+    pub fn is_active(&self, scope: &WorkScope) -> bool {
         let map = self.0.lock().expect("terminal registry poisoned");
-        map.contains_key(conversation_id)
+        map.contains_key(scope)
     }
 
-    /// Attempt to register a new terminal for `conversation_id`.
+    /// Attempt to register a new terminal for `scope`.
     ///
-    /// Returns `None` if a terminal is already active (409 case).
+    /// Returns `None` if a terminal is already active for the scope.
     pub fn try_insert(
         &self,
-        conversation_id: String,
+        scope: WorkScope,
         handle: TerminalHandle,
     ) -> Option<Arc<TerminalHandle>> {
         let mut map = self.0.lock().expect("terminal registry poisoned");
-        if map.contains_key(&conversation_id) {
-            return None; // 409 — already active
+        if map.contains_key(&scope) {
+            return None;
         }
         let arc = Arc::new(handle);
-        map.insert(conversation_id, Arc::clone(&arc));
+        map.insert(scope, Arc::clone(&arc));
         Some(arc)
     }
 
-    /// Remove the terminal for `conversation_id`, if present.
-    pub fn remove(&self, conversation_id: &str) {
+    /// Remove the terminal for `scope`, if present.
+    pub fn remove(&self, scope: &WorkScope) {
         let mut map = self.0.lock().expect("terminal registry poisoned");
-        map.remove(conversation_id);
+        map.remove(scope);
     }
 
     /// Look up an active terminal.
-    pub fn get(&self, conversation_id: &str) -> Option<Arc<TerminalHandle>> {
+    pub fn get(&self, scope: &WorkScope) -> Option<Arc<TerminalHandle>> {
         let map = self.0.lock().expect("terminal registry poisoned");
-        map.get(conversation_id).cloned()
+        map.get(scope).cloned()
     }
 }
