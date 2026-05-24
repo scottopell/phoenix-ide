@@ -2841,6 +2841,8 @@ pre:hover .copy-btn {
   font-weight: 600;
   white-space: nowrap;
   flex-shrink: 0;
+  border: 0;
+  cursor: pointer;
 }
 
 .pr-badge--merged {
@@ -2869,12 +2871,65 @@ pre:hover .copy-btn {
   filter: brightness(1.15);
 }
 
+.pr-control {
+  position: relative;
+  display: inline-flex;
+}
+
+.pr-popover {
+  position: absolute;
+  z-index: 50;
+  left: 0;
+  top: calc(100% + 6px);
+  width: 280px;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-elevated);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+  color: var(--text-primary);
+  font-size: 12px;
+  line-height: 1.4;
+}
+
+.pr-popover-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.pr-popover-muted,
+.pr-popover-list {
+  color: var(--text-muted);
+  font-size: 11px;
+  margin-bottom: 6px;
+}
+
+.pr-popover-list {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pr-autofix-btn {
+  width: 100%;
+  margin-top: 8px;
+  padding: 5px 8px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pr-autofix-btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
 .pr-hint {
   font-size: 10px;
-  color: var(--text-muted);
-  opacity: 0.75;
-  white-space: nowrap;
-}
 
 .statebar-project {
   margin-left: auto;
@@ -5858,7 +5913,8 @@ html * {
     justify-content: center;
     cursor: pointer;
     margin-left: 4px;
-    flex-shrink: 0;
+   border: 0;
+  cursor: pointer;
   }
 
   .statebar-chevron:hover {

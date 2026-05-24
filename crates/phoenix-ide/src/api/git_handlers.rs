@@ -3,8 +3,9 @@
 
 use super::handlers::AppError;
 use super::types::{
-    ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse, PrCheckState,
-    PrDisplayState, PrStatusResponse, PrUnavailableReason,
+    ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
+    PrAutoFixContextResponse, PrCheckDetail, PrCheckState, PrCheckSummary, PrDisplayState,
+    PrFeedbackItem, PrFeedbackSource, PrFeedbackSummary, PrStatusResponse, PrUnavailableReason,
 };
 use super::AppState;
 use crate::db::ConvMode;
@@ -14,8 +15,9 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use serde::Deserialize;
-use std::path::PathBuf;
+use chrono::Utc;
+use serde::{Deserialize, Serialize};
+use std::path::{Path as FsPath, PathBuf};
 use std::time::Duration;
 
 pub(crate) async fn list_git_branches(
@@ -414,11 +416,13 @@ fn get_pr_status_for_branch(cwd: &std::path::Path, branch_name: &str) -> PrStatu
     };
 
     let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
-    // Only an open, non-draft PR has CI state worth a second `gh` call; for
-    // merged/closed/draft the badge is coloured by display_state, so skip the
-    // (potentially slow) `gh pr checks` invocation.
-    let check_state = if matches!(display_state, PrDisplayState::Open) {
-        Some(fetch_pr_checks_state(cwd, pr.number))
+    let checks = if matches!(display_state, PrDisplayState::Open) {
+        Some(fetch_pr_checks(cwd, pr.number))
+    } else {
+        None
+    };
+    let feedback_summary = if matches!(display_state, PrDisplayState::Open) {
+        Some(fetch_pr_feedback(cwd, pr.number).summary)
     } else {
         None
     };
@@ -433,12 +437,163 @@ fn get_pr_status_for_branch(cwd: &std::path::Path, branch_name: &str) -> PrStatu
         draft: Some(pr.is_draft),
         base: Some(pr.base_ref_name),
         head: Some(pr.head_ref_name),
-        check_state,
+        check_state: checks.as_ref().map(|c| c.state.clone()),
+        check_summary: checks.as_ref().map(|c| c.summary.clone()),
+        feedback_summary,
+        updated_at: Some(Utc::now().to_rfc3339()),
         display_state: Some(display_state),
     }
 }
 
-fn fetch_pr_checks_state(cwd: &std::path::Path, number: u64) -> PrCheckState {
+pub(crate) async fn create_pr_auto_fix_context(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PrAutoFixContextResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let (branch_name, worktree_path) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            ..
+        }
+        | ConvMode::Branch {
+            branch_name,
+            worktree_path,
+            ..
+        } => (branch_name.to_string(), worktree_path.to_string()),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work or Branch mode (no associated PR)".to_string(),
+            ));
+        }
+    };
+
+    tokio::task::spawn_blocking(move || {
+        let worktree = PathBuf::from(worktree_path);
+        if !worktree.is_dir()
+            || run_git(&worktree, &["rev-parse", "--is-inside-work-tree"]).is_err()
+        {
+            return Err(AppError::BadRequest(
+                "Conversation worktree is not a git repository".to_string(),
+            ));
+        }
+        capture_pr_auto_fix_context(&worktree, &branch_name)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+    .map(Json)
+}
+
+#[derive(Debug, Serialize)]
+struct PrAutoFixContextArtifact {
+    manifest_version: u32,
+    fetched_at: String,
+    pr: PrArtifactMetadata,
+    checks: PrArtifactChecks,
+    feedback: PrFeedbackSummary,
+    coverage_limitations: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PrArtifactMetadata {
+    number: u64,
+    title: String,
+    url: String,
+    state: String,
+    draft: bool,
+    base: String,
+    head: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PrArtifactChecks {
+    state: PrCheckState,
+    summary: PrCheckSummary,
+    details: Vec<PrCheckDetail>,
+}
+
+fn capture_pr_auto_fix_context(
+    worktree: &FsPath,
+    branch_name: &str,
+) -> Result<PrAutoFixContextResponse, AppError> {
+    let status = get_pr_status_for_branch(worktree, branch_name);
+    if status.unavailable_reason.is_some() {
+        return Err(AppError::BadRequest(format!(
+            "PR context unavailable: {:?}",
+            status.unavailable_reason
+        )));
+    }
+    if !status.found {
+        return Err(AppError::BadRequest(
+            "No pull request found for this branch".to_string(),
+        ));
+    }
+    if status.display_state != Some(PrDisplayState::Open) {
+        return Err(AppError::BadRequest(
+            "Auto-fix is only available for open, non-draft PRs".to_string(),
+        ));
+    }
+
+    let number = status.number.expect("found PR has number");
+    let checks = fetch_pr_checks(worktree, number);
+    let feedback = fetch_pr_feedback(worktree, number);
+    let fetched_at = Utc::now().to_rfc3339();
+    let artifact = PrAutoFixContextArtifact {
+        manifest_version: 1,
+        fetched_at: fetched_at.clone(),
+        pr: PrArtifactMetadata {
+            number,
+            title: status.title.unwrap_or_default(),
+            url: status.url.unwrap_or_default(),
+            state: status.state.unwrap_or_default(),
+            draft: status.draft.unwrap_or(false),
+            base: status.base.unwrap_or_default(),
+            head: status.head.unwrap_or_default(),
+        },
+        checks: PrArtifactChecks {
+            state: checks.state,
+            summary: checks.summary,
+            details: checks.details,
+        },
+        coverage_limitations: feedback.summary.limitations.clone(),
+        feedback: feedback.summary,
+    };
+
+    let dir = worktree.join(".phoenix").join("pr-context");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| AppError::Internal(format!("Failed to create PR context directory: {e}")))?;
+    let safe_ts = fetched_at.replace([':', '.'], "-");
+    let rel_path = format!(".phoenix/pr-context/pr-{number}-{safe_ts}.json");
+    let path = worktree.join(&rel_path);
+    let body = serde_json::to_string_pretty(&artifact)
+        .map_err(|e| AppError::Internal(format!("Failed to encode PR context: {e}")))?;
+    std::fs::write(&path, body)
+        .map_err(|e| AppError::Internal(format!("Failed to write PR context artifact: {e}")))?;
+
+    let message = format!(
+        "Address the PR feedback captured in `{rel_path}`. Use that file as the source of truth for failing CI checks and review comments, fix the issues in this worktree, run targeted tests, commit the changes, and summarize what changed."
+    );
+    Ok(PrAutoFixContextResponse {
+        artifact_path: rel_path,
+        pr_number: number,
+        message,
+    })
+}
+
+#[derive(Debug, Clone)]
+struct CapturedPrChecks {
+    state: PrCheckState,
+    summary: PrCheckSummary,
+    details: Vec<PrCheckDetail>,
+}
+
+fn fetch_pr_checks(cwd: &std::path::Path, number: u64) -> CapturedPrChecks {
     let number = number.to_string();
     let out = match run_gh_raw(
         cwd,
@@ -447,14 +602,14 @@ fn fetch_pr_checks_state(cwd: &std::path::Path, number: u64) -> PrCheckState {
             "checks",
             &number,
             "--json",
-            "name,state,bucket",
+            "name,state,bucket,link,description",
             "--watch=false",
         ],
     ) {
         Ok(out) => out,
         Err(e) => {
             tracing::debug!(pr = %number, error = %e.message, "gh pr checks could not run");
-            return PrCheckState::Unknown;
+            return unknown_checks();
         }
     };
 
@@ -464,17 +619,184 @@ fn fetch_pr_checks_state(cwd: &std::path::Path, number: u64) -> PrCheckState {
     let stdout = out.stdout.trim();
     if stdout.is_empty() {
         tracing::debug!(pr = %number, stderr = %out.stderr.trim(), "gh pr checks produced no output");
-        return PrCheckState::Unknown;
+        return unknown_checks();
     }
     match serde_json::from_str::<Vec<GhPrCheck>>(stdout) {
-        Ok(checks) => normalize_checks(&checks),
+        Ok(checks) => capture_checks(&checks),
         Err(e) => {
             tracing::debug!(pr = %number, output = %stdout, error = %e, "failed to parse gh pr checks JSON");
-            PrCheckState::Unknown
+            unknown_checks()
         }
     }
 }
 
+fn unknown_checks() -> CapturedPrChecks {
+    CapturedPrChecks {
+        state: PrCheckState::Unknown,
+        summary: PrCheckSummary {
+            unknown: 1,
+            ..PrCheckSummary::default()
+        },
+        details: Vec::new(),
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CapturedPrFeedback {
+    summary: PrFeedbackSummary,
+}
+
+fn fetch_pr_feedback(cwd: &FsPath, number: u64) -> CapturedPrFeedback {
+    let mut items = Vec::new();
+    let mut limitations = Vec::new();
+    let coverage = vec![
+        "REST issue comments via gh api repos/{owner}/{repo}/issues/{number}/comments".to_string(),
+        "REST review comments via gh api repos/{owner}/{repo}/pulls/{number}/comments".to_string(),
+        "REST review summaries via gh api repos/{owner}/{repo}/pulls/{number}/reviews".to_string(),
+        "GraphQL review threads when repository owner/name discovery succeeds".to_string(),
+    ];
+
+    let repo = match run_gh(cwd, &["repo", "view", "--json", "owner,name"]) {
+        Ok(raw) => serde_json::from_str::<GhRepoView>(&raw).ok(),
+        Err(e) => {
+            tracing::debug!(pr = %number, error = %e.message, "gh repo view failed during PR feedback discovery");
+            limitations
+                .push("Could not discover repository owner/name; skipped comment APIs".to_string());
+            None
+        }
+    };
+
+    if let Some(repo) = repo {
+        let owner = repo.owner.login;
+        let name = repo.name;
+        let issue_path = format!("repos/{owner}/{name}/issues/{number}/comments");
+        match run_gh(cwd, &["api", &issue_path])
+            .and_then(|raw| parse_gh_json::<Vec<GhIssueComment>>(&raw, "issue comments"))
+        {
+            Ok(comments) => items.extend(comments.into_iter().map(PrFeedbackItem::from)),
+            Err(e) => {
+                tracing::debug!(pr = %number, error = %e.message, "failed to fetch PR issue comments");
+                limitations.push("Issue comments unavailable from gh api".to_string());
+            }
+        }
+
+        let review_comments_path = format!("repos/{owner}/{name}/pulls/{number}/comments");
+        match run_gh(cwd, &["api", &review_comments_path])
+            .and_then(|raw| parse_gh_json::<Vec<GhReviewComment>>(&raw, "review comments"))
+        {
+            Ok(comments) => items.extend(comments.into_iter().map(PrFeedbackItem::from)),
+            Err(e) => {
+                tracing::debug!(pr = %number, error = %e.message, "failed to fetch PR review comments");
+                limitations.push("Review comments unavailable from gh api".to_string());
+            }
+        }
+
+        let reviews_path = format!("repos/{owner}/{name}/pulls/{number}/reviews");
+        match run_gh(cwd, &["api", &reviews_path])
+            .and_then(|raw| parse_gh_json::<Vec<GhReviewSummary>>(&raw, "review summaries"))
+        {
+            Ok(reviews) => items.extend(
+                reviews
+                    .into_iter()
+                    .filter(|r| r.body.as_deref().is_some_and(|b| !b.trim().is_empty()))
+                    .map(PrFeedbackItem::from),
+            ),
+            Err(e) => {
+                tracing::debug!(pr = %number, error = %e.message, "failed to fetch PR review summaries");
+                limitations.push("Review summaries unavailable from gh api".to_string());
+            }
+        }
+
+        match fetch_review_threads(cwd, &owner, &name, number) {
+            Ok(thread_items) => items.extend(thread_items),
+            Err(e) => {
+                tracing::debug!(pr = %number, error = %e.message, "failed to fetch PR review threads");
+                limitations
+                    .push("Review thread resolution unavailable from gh GraphQL".to_string());
+            }
+        }
+    }
+
+    let unresolved = items
+        .iter()
+        .filter(|item| item.resolved != Some(true))
+        .count() as u32;
+    CapturedPrFeedback {
+        summary: PrFeedbackSummary {
+            total: items.len() as u32,
+            unresolved,
+            items,
+            coverage,
+            limitations,
+        },
+    }
+}
+
+fn parse_gh_json<T: for<'de> Deserialize<'de>>(raw: &str, label: &str) -> Result<T, GhError> {
+    serde_json::from_str(raw).map_err(|e| GhError {
+        reason: PrUnavailableReason::CommandFailed,
+        message: format!("failed to parse {label}: {e}"),
+    })
+}
+
+fn fetch_review_threads(
+    cwd: &FsPath,
+    owner: &str,
+    name: &str,
+    number: u64,
+) -> Result<Vec<PrFeedbackItem>, GhError> {
+    let query = r#"query($owner:String!, $name:String!, $number:Int!) {
+      repository(owner:$owner, name:$name) {
+        pullRequest(number:$number) {
+          reviewThreads(first:50) {
+            nodes { isResolved path comments(first:10) { nodes { body url createdAt author { login } } } }
+          }
+        }
+      }
+    }"#;
+    let number_s = number.to_string();
+    let raw = run_gh(
+        cwd,
+        &[
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-F",
+            &format!("owner={owner}"),
+            "-F",
+            &format!("name={name}"),
+            "-F",
+            &format!("number={number_s}"),
+        ],
+    )?;
+    let parsed: GhReviewThreadsResponse = parse_gh_json(&raw, "review threads")?;
+    let mut items = Vec::new();
+    if let Some(nodes) = parsed
+        .data
+        .and_then(|d| d.repository)
+        .and_then(|r| r.pull_request)
+        .map(|pr| pr.review_threads.nodes)
+    {
+        for thread in nodes {
+            for comment in thread.comments.nodes {
+                items.push(PrFeedbackItem {
+                    source: PrFeedbackSource::ReviewThread,
+                    author: comment
+                        .author
+                        .map(|a| a.login)
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    body: comment.body,
+                    path: thread.path.clone(),
+                    url: comment.url,
+                    created_at: comment.created_at,
+                    resolved: Some(thread.is_resolved),
+                });
+            }
+        }
+    }
+    Ok(items)
+}
 #[derive(Debug)]
 struct GhError {
     reason: PrUnavailableReason,
@@ -599,8 +921,163 @@ struct GhPrListItem {
 
 #[derive(Debug, Deserialize)]
 struct GhPrCheck {
+    name: Option<String>,
     state: Option<String>,
     bucket: Option<String>,
+    link: Option<String>,
+    description: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhRepoView {
+    owner: GhRepoOwner,
+    name: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhRepoOwner {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhIssueComment {
+    user: Option<GhUser>,
+    body: Option<String>,
+    #[serde(rename = "html_url")]
+    html_url: Option<String>,
+    #[serde(rename = "created_at")]
+    created_at: Option<String>,
+}
+
+impl From<GhIssueComment> for PrFeedbackItem {
+    fn from(comment: GhIssueComment) -> Self {
+        Self {
+            source: PrFeedbackSource::IssueComment,
+            author: comment
+                .user
+                .map(|u| u.login)
+                .unwrap_or_else(|| "unknown".to_string()),
+            body: comment.body.unwrap_or_default(),
+            path: None,
+            url: comment.html_url,
+            created_at: comment.created_at,
+            resolved: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewComment {
+    user: Option<GhUser>,
+    body: Option<String>,
+    path: Option<String>,
+    #[serde(rename = "html_url")]
+    html_url: Option<String>,
+    #[serde(rename = "created_at")]
+    created_at: Option<String>,
+}
+
+impl From<GhReviewComment> for PrFeedbackItem {
+    fn from(comment: GhReviewComment) -> Self {
+        Self {
+            source: PrFeedbackSource::ReviewComment,
+            author: comment
+                .user
+                .map(|u| u.login)
+                .unwrap_or_else(|| "unknown".to_string()),
+            body: comment.body.unwrap_or_default(),
+            path: comment.path,
+            url: comment.html_url,
+            created_at: comment.created_at,
+            resolved: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewSummary {
+    user: Option<GhUser>,
+    body: Option<String>,
+    #[serde(rename = "html_url")]
+    html_url: Option<String>,
+    #[serde(rename = "submitted_at")]
+    submitted_at: Option<String>,
+}
+
+impl From<GhReviewSummary> for PrFeedbackItem {
+    fn from(review: GhReviewSummary) -> Self {
+        Self {
+            source: PrFeedbackSource::ReviewSummary,
+            author: review
+                .user
+                .map(|u| u.login)
+                .unwrap_or_else(|| "unknown".to_string()),
+            body: review.body.unwrap_or_default(),
+            path: None,
+            url: review.html_url,
+            created_at: review.submitted_at,
+            resolved: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct GhUser {
+    login: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewThreadsResponse {
+    data: Option<GhReviewThreadsData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewThreadsData {
+    repository: Option<GhReviewThreadsRepo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewThreadsRepo {
+    #[serde(rename = "pullRequest")]
+    pull_request: Option<GhReviewThreadsPr>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewThreadsPr {
+    #[serde(rename = "reviewThreads")]
+    review_threads: GhReviewThreadsConnection,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewThreadsConnection {
+    nodes: Vec<GhReviewThread>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewThread {
+    #[serde(rename = "isResolved")]
+    is_resolved: bool,
+    path: Option<String>,
+    comments: GhReviewThreadComments,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewThreadComments {
+    nodes: Vec<GhReviewThreadComment>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhReviewThreadComment {
+    body: String,
+    url: Option<String>,
+    #[serde(rename = "createdAt")]
+    created_at: Option<String>,
+    author: Option<GhGraphqlAuthor>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GhGraphqlAuthor {
+    login: String,
 }
 
 fn normalize_pr_display_state(state: &str, draft: bool) -> PrDisplayState {
@@ -614,41 +1091,93 @@ fn normalize_pr_display_state(state: &str, draft: bool) -> PrDisplayState {
     }
 }
 
-fn normalize_checks(checks: &[GhPrCheck]) -> PrCheckState {
-    if checks.is_empty() {
-        return PrCheckState::Unknown;
-    }
-
-    let mut has_pending = false;
+fn capture_checks(checks: &[GhPrCheck]) -> CapturedPrChecks {
+    let mut summary = PrCheckSummary::default();
+    let mut details = Vec::with_capacity(checks.len());
     for check in checks {
-        let state = check
-            .state
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        let bucket = check
-            .bucket
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        if matches!(
-            state.as_str(),
-            "FAILURE" | "ERROR" | "CANCELLED" | "ACTION_REQUIRED"
-        ) || matches!(bucket.as_str(), "FAIL" | "CANCEL" | "ACTION_REQUIRED")
-        {
-            return PrCheckState::Failing;
+        let name = check
+            .name
+            .clone()
+            .unwrap_or_else(|| "unnamed check".to_string());
+        match classify_check(check) {
+            CheckBucket::Passing => summary.passing += 1,
+            CheckBucket::Pending => {
+                summary.pending += 1;
+                summary.pending_names.push(name.clone());
+            }
+            CheckBucket::Failing => {
+                summary.failing += 1;
+                summary.failing_names.push(name.clone());
+            }
+            CheckBucket::Skipped => summary.skipped += 1,
+            CheckBucket::Unknown => summary.unknown += 1,
         }
-        if !matches!(state.as_str(), "SUCCESS" | "PASS" | "SKIPPED")
-            && !matches!(bucket.as_str(), "PASS" | "SKIP")
-        {
-            has_pending = true;
-        }
+        details.push(PrCheckDetail {
+            name,
+            state: check.state.clone().unwrap_or_default(),
+            bucket: check.bucket.clone().unwrap_or_default(),
+            url: check.link.clone(),
+            description: check.description.clone(),
+        });
     }
+    let state = normalize_check_summary(&summary);
+    CapturedPrChecks {
+        state,
+        summary,
+        details,
+    }
+}
 
-    if has_pending {
+fn normalize_checks(checks: &[GhPrCheck]) -> PrCheckState {
+    normalize_check_summary(&capture_checks(checks).summary)
+}
+
+fn normalize_check_summary(summary: &PrCheckSummary) -> PrCheckState {
+    if summary.failing > 0 {
+        PrCheckState::Failing
+    } else if summary.pending > 0 {
         PrCheckState::Pending
-    } else {
+    } else if summary.passing > 0 || summary.skipped > 0 {
         PrCheckState::Passing
+    } else {
+        PrCheckState::Unknown
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CheckBucket {
+    Passing,
+    Pending,
+    Failing,
+    Skipped,
+    Unknown,
+}
+
+fn classify_check(check: &GhPrCheck) -> CheckBucket {
+    let state = check
+        .state
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    let bucket = check
+        .bucket
+        .as_deref()
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    if matches!(
+        state.as_str(),
+        "FAILURE" | "ERROR" | "CANCELLED" | "ACTION_REQUIRED"
+    ) || matches!(bucket.as_str(), "FAIL" | "CANCEL" | "ACTION_REQUIRED")
+    {
+        CheckBucket::Failing
+    } else if matches!(state.as_str(), "SKIPPED") || matches!(bucket.as_str(), "SKIP") {
+        CheckBucket::Skipped
+    } else if matches!(state.as_str(), "SUCCESS" | "PASS") || matches!(bucket.as_str(), "PASS") {
+        CheckBucket::Passing
+    } else if state.is_empty() && bucket.is_empty() {
+        CheckBucket::Unknown
+    } else {
+        CheckBucket::Pending
     }
 }
 
@@ -798,22 +1327,31 @@ mod tests {
     fn normalize_checks_classifies_pass_pending_and_fail() {
         assert_eq!(
             normalize_checks(&[GhPrCheck {
+                name: None,
                 state: Some("SUCCESS".to_string()),
                 bucket: Some("pass".to_string()),
+                link: None,
+                description: None,
             }]),
             PrCheckState::Passing
         );
         assert_eq!(
             normalize_checks(&[GhPrCheck {
+                name: None,
                 state: Some("PENDING".to_string()),
                 bucket: Some("pending".to_string()),
+                link: None,
+                description: None,
             }]),
             PrCheckState::Pending
         );
         assert_eq!(
             normalize_checks(&[GhPrCheck {
+                name: None,
                 state: Some("FAILURE".to_string()),
                 bucket: Some("fail".to_string()),
+                link: None,
+                description: None,
             }]),
             PrCheckState::Failing
         );

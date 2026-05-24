@@ -1342,6 +1342,8 @@ function ConversationPageContent() {
         onUpgradeModel={handleUpgradeModel}
         toolExecutingStartedAt={atom.toolExecutingStartedAt}
         onOpenFiles={isDesktop ? undefined : () => setShowFileBrowser(true)}
+        onSendMessage={(text) => handleSend(text, [])}
+        showError={showError}
       />
       </div>
 

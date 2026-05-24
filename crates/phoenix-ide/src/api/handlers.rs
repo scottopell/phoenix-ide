@@ -7,7 +7,10 @@ use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, set_chain_name, stream_chain,
     submit_chain_question, unarchive_chain_handler,
 };
-use super::git_handlers::{get_conversation_diff, get_conversation_pr_status, list_git_branches};
+use super::git_handlers::{
+    create_pr_auto_fix_context, get_conversation_diff, get_conversation_pr_status,
+    list_git_branches,
+};
 use super::lifecycle_handlers::{
     abandon_task, approve_task, mark_merged, reject_task, task_feedback,
 };
@@ -193,6 +196,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/pr-status",
             get(get_conversation_pr_status),
+        )
+        .route(
+            "/api/conversations/:id/pr-auto-fix-context",
+            post(create_pr_auto_fix_context),
         )
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
