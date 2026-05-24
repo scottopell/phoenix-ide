@@ -39,11 +39,11 @@ import {
 
 // Conditional overlays / heavy panels — code-split so the default render path
 // (chat view with no overlay open) doesn't pay their bundle cost.
-// - ProseReader, TaskApprovalReader: pull in react-syntax-highlighter
+// - FileViewer/ProseReader, TaskApprovalReader: pull in react-syntax-highlighter
 // - TerminalPanel: pulls in xterm + addon (large)
 // - CredentialHelperPanel, FirstTaskWelcome: rarely mounted
-const ProseReader = lazy(() =>
-  import('../components/ProseReader').then((m) => ({ default: m.ProseReader })),
+const FileViewer = lazy(() =>
+  import('../components/FileViewer').then((m) => ({ default: m.FileViewer })),
 );
 const DiffView = lazy(() =>
   import('../components/viewer/DiffView').then((m) => ({ default: m.DiffView })),
@@ -922,7 +922,7 @@ function ConversationPageContent() {
       return (
         <div id="app">
           <Suspense fallback={null}>
-            <ProseReader
+            <FileViewer
               filePath={prs.path}
               rootDir={prs.rootDir}
               onClose={handleCloseProseReader}
@@ -1423,7 +1423,7 @@ function ConversationPageContent() {
           the exact file the user was viewing. */}
       {!isDesktop && fileExplorer.proseReaderState && (
         <Suspense fallback={null}>
-          <ProseReader
+          <FileViewer
             filePath={fileExplorer.proseReaderState.path}
             rootDir={fileExplorer.proseReaderState.rootDir}
             onClose={handleCloseProseReader}
@@ -1521,7 +1521,7 @@ function ConversationPageContent() {
                   inline
                 />
               ) : splitPanePrs ? (
-                <ProseReader
+                <FileViewer
                   filePath={splitPanePrs.path}
                   rootDir={splitPanePrs.rootDir}
                   onClose={handleCloseProseReader}

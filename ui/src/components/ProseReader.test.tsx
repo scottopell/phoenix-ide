@@ -1,12 +1,12 @@
 import { render, screen, waitFor } from '@testing-library/react';
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { ProseReader } from './ProseReader';
+import { FileViewer } from './FileViewer';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 
 function renderReader(filePath: string) {
   return render(
     <ReviewNotesProvider>
-      <ProseReader
+      <FileViewer
         filePath={filePath}
         rootDir="/tmp/project"
         onClose={() => undefined}
@@ -16,7 +16,7 @@ function renderReader(filePath: string) {
   );
 }
 
-describe('ProseReader typed file responses', () => {
+describe('FileViewer typed file responses', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', vi.fn());
   });
