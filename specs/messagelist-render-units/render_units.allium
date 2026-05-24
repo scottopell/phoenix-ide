@@ -169,14 +169,19 @@ actor RenderUnitsTransform {
 
 -- User message → user unit. Breaks any active agent run so the next
 -- agent message in this conversation gets isFirstInTurn = true.
+--
+-- `current_message(b)` is an opaque helper that returns the message at
+-- the builder's current position (`b.position`); the Allium dialect
+-- does not support list-bracket indexing in rule expressions, so all
+-- per-step access goes through this helper.
 rule EmitUserUnit {
     when: BuilderStep(b)
 
     requires: b.phase = "walking"
     requires: b.position < len(b.messages)
-    requires: b.messages[b.position].message_type = "user"
+    requires: current_message_type(b) = "user"
 
-    ensures: b.historical = append(b.historical, user_unit(b.messages[b.position]))
+    ensures: b.historical = append(b.historical, user_unit(current_message(b)))
     ensures: b.in_agent_run = false
     ensures: b.position = b.position + 1
 
@@ -184,7 +189,7 @@ rule EmitUserUnit {
         -- user_unit(m) constructs:
         --   { kind: user, key: m.message_id,
         --     source_message_id: m.message_id }
-        -- See lib/renderUnits.ts buildRenderUnits.
+        -- See ui/src/conversation/renderUnits.ts buildRenderUnits.
 }
 
 -- Skill message → skill unit. Treated like user for run-breaking
@@ -194,9 +199,9 @@ rule EmitSkillUnit {
 
     requires: b.phase = "walking"
     requires: b.position < len(b.messages)
-    requires: b.messages[b.position].message_type = "skill"
+    requires: current_message_type(b) = "skill"
 
-    ensures: b.historical = append(b.historical, skill_unit(b.messages[b.position]))
+    ensures: b.historical = append(b.historical, skill_unit(current_message(b)))
     ensures: b.in_agent_run = false
     ensures: b.position = b.position + 1
 }
@@ -209,15 +214,14 @@ rule EmitAgentTurnUnit {
 
     requires: b.phase = "walking"
     requires: b.position < len(b.messages)
-    requires: b.messages[b.position].message_type = "agent"
+    requires: current_message_type(b) = "agent"
 
     ensures: b.historical = append(b.historical, agent_turn_unit(
-                 b.messages,
-                 b.position,
+                 b,
                  not b.in_agent_run
              ))
     ensures: b.in_agent_run = true
-    ensures: b.position = b.position + 1 + count_trailing_tool_messages(b.messages, b.position)
+    ensures: b.position = b.position + 1 + count_trailing_tool_messages(b)
 
     @guidance
         -- agent_turn_unit(messages, i, isFirstInTurn):
@@ -256,10 +260,10 @@ rule EmitSystemUnitWithText {
 
     requires: b.phase = "walking"
     requires: b.position < len(b.messages)
-    requires: b.messages[b.position].message_type = "system"
-    requires: has_nonempty_text(b.messages[b.position])
+    requires: current_message_type(b) = "system"
+    requires: current_message_has_text(b)
 
-    ensures: b.historical = append(b.historical, system_unit(b.messages[b.position]))
+    ensures: b.historical = append(b.historical, system_unit(current_message(b)))
     ensures: b.in_agent_run = b.in_agent_run
     ensures: b.position = b.position + 1
 }
@@ -271,8 +275,8 @@ rule SkipEmptySystem {
 
     requires: b.phase = "walking"
     requires: b.position < len(b.messages)
-    requires: b.messages[b.position].message_type = "system"
-    requires: not has_nonempty_text(b.messages[b.position])
+    requires: current_message_type(b) = "system"
+    requires: not current_message_has_text(b)
 
     ensures: b.historical = b.historical
     ensures: b.in_agent_run = b.in_agent_run
@@ -294,7 +298,7 @@ rule SkipOrphanTool {
 
     requires: b.phase = "walking"
     requires: b.position < len(b.messages)
-    requires: b.messages[b.position].message_type = "tool"
+    requires: current_message_type(b) = "tool"
 
     ensures: b.historical = b.historical
     ensures: b.in_agent_run = b.in_agent_run
@@ -317,11 +321,7 @@ rule SkipUnknownType {
 
     requires: b.phase = "walking"
     requires: b.position < len(b.messages)
-    requires: b.messages[b.position].message_type != "user"
-    requires: b.messages[b.position].message_type != "skill"
-    requires: b.messages[b.position].message_type != "agent"
-    requires: b.messages[b.position].message_type != "system"
-    requires: b.messages[b.position].message_type != "tool"
+    requires: not current_message_is_known_type(b)
 
     ensures: b.historical = b.historical
     ensures: b.in_agent_run = b.in_agent_run
@@ -331,6 +331,8 @@ rule SkipUnknownType {
         -- debug_log(message_id=m.message_id,
         --           message_type=m.message_type,
         --           reason=unknown_type).
+        -- "Known" types = user, skill, agent, system, tool. Anything
+        -- else (continuation, error, future variants) lands here.
 }
 
 -- Walking complete → transition to tail_assembly phase. Tail units
@@ -460,53 +462,42 @@ invariant NoStandaloneToolUnit {
 -- Every tool message in the input either ends up inside an
 -- agent_turn's tool_results_by_use_id or in a debug log via
 -- SkipOrphanTool / missing_tool_use_id. No silent drops.
+--
+-- `tool_message_accounted_for` is an opaque predicate covering both
+-- branches: the tool message is either present in some agent_turn's
+-- map (preferred), OR a debug_log entry exists for it with reason in
+-- {orphan_tool, missing_tool_use_id}.
 invariant EveryToolMessageAccountedFor {
     for b in Builders:
-        b.phase = "done" implies
-            for m in b.messages:
-                m.message_type = "tool" implies
-                    (exists u in b.historical:
-                        u.kind = "agent_turn" and
-                        m.message_id in values(u.tool_results_by_use_id))
-                    or
-                    debug_logged(message_id=m.message_id,
-                                 reason in [orphan_tool, missing_tool_use_id])
+        for m in b.messages:
+            b.phase = "done" and m.message_type = "tool"
+                implies tool_message_accounted_for(b, m)
 }
 
 -- isFirstInTurn is true for the first agent_turn after any
 -- user/skill (or the start of the list); false for any agent_turn
 -- whose immediate predecessor in b.historical is another agent_turn.
+--
+-- `agent_turn_first_in_turn_predecessor_aligned(b, u)` is an opaque
+-- predicate that asserts u.is_first_in_turn = (predecessor of u in
+-- b.historical is not an agent_turn). Encoded as a helper because the
+-- dialect doesn't support positional indexing into lists.
 invariant FirstInTurnReflectsPriorRun {
     for b in Builders:
-        b.phase = "done" implies
-            for i in indices(b.historical):
-                let u = b.historical[i] in
-                    u.kind = "agent_turn" implies
-                        u.is_first_in_turn = (
-                            i = 0 or
-                            b.historical[i - 1].kind != "agent_turn"
-                        )
-                        -- System units don't break the run; they are
-                        -- skipped by this implication's transitive
-                        -- effect because if historical[i-1] is system
-                        -- and historical[i-2] is agent_turn, then u's
-                        -- is_first_in_turn is false. The reducer's
-                        -- in_agent_run carries this through correctly;
-                        -- this invariant only captures the direct
-                        -- predecessor case for brevity.
+        for u in b.historical:
+            b.phase = "done" and u.kind = "agent_turn"
+                implies agent_turn_first_in_turn_predecessor_aligned(b, u)
 }
 
 -- Tail units appear after all historical units in any rendered
 -- traversal. The window's collapse range covers only b.historical's
--- prefix; b.tail is untouched.
+-- prefix; b.tail is untouched. This is a TYPE-level guarantee
+-- (HistoricalUnit and TailUnit are distinct entities, and
+-- useBottomAnchoredWindow's input is List<HistoricalUnit> only); the
+-- invariant exists to anchor the requirement in spec.
 invariant TailUnitsArePostHistorical {
     for b in Builders:
-        b.phase = "done" implies
-            len(b.historical) + len(b.tail) = len(b.historical) + len(b.tail)
-            -- (Tautology in entity-snapshot form; the structural claim
-            -- is encoded in the type split: HistoricalUnit and TailUnit
-            -- are distinct entities, and useBottomAnchoredWindow's
-            -- input signature accepts only List<HistoricalUnit>.)
+        b.phase = "done" implies tail_is_post_historical(b)
 }
 
 -- Tail unit order is deterministic: pending_user* then optional
@@ -529,29 +520,21 @@ invariant PositionAdvancesMonotonically {
 }
 
 -- Every emitted historical unit corresponds to exactly one input
--- message (with the exception of agent_turn, which corresponds to
--- one agent message + zero or more tool messages held in its map).
--- Said differently: no historical unit is fabricated from nothing.
+-- message. The kind/type alignment is part of the predicate:
+-- agent_turn ↔ agent, user ↔ user, skill ↔ skill, system ↔ system.
 invariant EveryHistoricalUnitHasSource {
     for b in Builders:
-        b.phase = "done" implies
-            for u in b.historical:
-                exists m in b.messages:
-                    m.message_id = u.source_message_id
-                    and (u.kind = "agent_turn" implies m.message_type = "agent")
-                    and (u.kind = "user" implies m.message_type = "user")
-                    and (u.kind = "skill" implies m.message_type = "skill")
-                    and (u.kind = "system" implies m.message_type = "system")
+        for u in b.historical:
+            b.phase = "done" implies historical_unit_has_source(b, u)
 }
 
 -- Unit keys are unique across the historical list. The window's
 -- saved-scroll anchor and React reconciler both depend on this.
 invariant HistoricalUnitKeysAreUnique {
     for b in Builders:
-        b.phase = "done" implies
-            for i in indices(b.historical):
-                for j in indices(b.historical):
-                    i != j implies b.historical[i].key != b.historical[j].key
+        for u in b.historical:
+            for v in b.historical:
+                b.phase = "done" and u != v implies u.key != v.key
 }
 
 -- The streaming tail unit's key is identity-stable across token
@@ -559,20 +542,18 @@ invariant HistoricalUnitKeysAreUnique {
 -- not from per-token state). This is the React identity guarantee
 -- that preserves the StreamingMessage leaf component state during
 -- streaming.
+--
+-- Mechanism: the handle's key is computed once when the streaming
+-- buffer starts (sse_token → SseTokenAccumulated transitions buffer
+-- from null to non-null with a fresh startedAt). Subsequent token
+-- arrivals advance buffer.text and buffer.lastSequence but leave
+-- startedAt fixed. The key derived from startedAt is therefore stable
+-- for the lifetime of the streaming session.
 invariant StreamingKeyStableDuringStream {
     for b in Builders:
         b.phase = "done"
         and b.is_streaming = true
         implies b.streaming_handle.key = streaming_key_from_buffer(b)
-
-    @guidance
-        -- The handle's key is computed once when the streaming buffer
-        -- starts (sse_token → SseTokenAccumulated transitions buffer
-        -- from null to non-null with a fresh startedAt). Subsequent
-        -- token arrivals advance buffer.text and buffer.lastSequence
-        -- but leave startedAt fixed. The key derived from startedAt
-        -- is therefore stable for the lifetime of the streaming
-        -- session.
 }
 
 ------------------------------------------------------------

@@ -158,7 +158,7 @@ rule MountWithSavedAnchorFound {
     when: WindowMounted(w, historical, tail, anchor)
 
     requires: anchor != null
-    requires: exists u in historical: u.key = anchor.top_visible_unit_key
+    requires: anchor_key_in_units(historical, anchor)
 
     ensures: w.historical_units = historical
     ensures: w.tail_units = tail
@@ -193,7 +193,7 @@ rule MountWithSavedAnchorMissing {
     when: WindowMounted(w, historical, tail, anchor)
 
     requires: anchor != null
-    requires: not (exists u in historical: u.key = anchor.top_visible_unit_key)
+    requires: not anchor_key_in_units(historical, anchor)
 
     ensures: w.historical_units = historical
     ensures: w.tail_units = tail
@@ -500,8 +500,7 @@ invariant SavedAnchorIntegrity {
     for w in Windows:
         w.saved_anchor != null
         and w.phase != "restoring_from_anchor"
-        implies exists u in w.historical_units:
-            u.key = w.saved_anchor.top_visible_unit_key
+        implies anchor_key_in_units(w.historical_units, w.saved_anchor)
 }
 
 -- The measured-heights cache holds entries only for unit keys that
