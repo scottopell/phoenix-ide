@@ -164,6 +164,14 @@ pub fn socket_path_for(socket_dir: &Path, conversation_id: &str) -> PathBuf {
     socket_dir.join(format!("conv-{conversation_id}.sock"))
 }
 
+/// Compute the deterministic socket path for the singleton Global scope
+/// (REQ-TERM-WS-001). Only one global tmux server can exist per Phoenix
+/// process; the filename is a constant so the same server is reused
+/// across process restarts that find the socket already present.
+pub fn socket_path_for_global(socket_dir: &Path) -> PathBuf {
+    socket_dir.join("global.sock")
+}
+
 /// Top-level registry: maps `WorkScope::stable_key()` → per-scope tmux
 /// server. One registry instance per Phoenix process.
 #[derive(Debug)]
@@ -345,6 +353,7 @@ impl TmuxRegistry {
                 socket_path_for_worktree(&self.socket_dir, Path::new(path))
             }
             WorkScope::Conversation(id) => socket_path_for(&self.socket_dir, id),
+            WorkScope::Global => socket_path_for_global(&self.socket_dir),
         };
 
         let server_arc = self.get_or_insert(work_scope, socket_path).await;
@@ -470,6 +479,7 @@ impl TmuxRegistry {
                     socket_path_for_worktree(&self.socket_dir, Path::new(path))
                 }
                 WorkScope::Conversation(id) => socket_path_for(&self.socket_dir, id),
+                WorkScope::Global => socket_path_for_global(&self.socket_dir),
             }
         };
 

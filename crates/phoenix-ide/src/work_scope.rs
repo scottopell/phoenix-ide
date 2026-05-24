@@ -10,16 +10,21 @@ use serde::{Deserialize, Serialize};
 /// any single transcript: managed/branch worktrees survive context-exhaustion
 /// continuations, so the scope must too. Direct-mode conversations have no
 /// durable owner beyond the transcript itself, so they fall back to keying
-/// on the conversation id.
+/// on the conversation id. The `Global` variant is a singleton scope used
+/// by surfaces that want a work-affine resource not bound to any single
+/// conversation — currently the `/new` page's global terminal
+/// (REQ-TERM-WS-001).
 ///
 /// Resources that adopt this primitive should construct it from existing
 /// fields rather than threading both a worktree path and a conversation id
-/// through their callsites. See REQ-PROJ-WS-001, REQ-TMUX-WS-001.
+/// through their callsites. See REQ-PROJ-WS-001, REQ-TMUX-WS-001,
+/// REQ-TERM-WS-001.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value")]
 pub enum WorkScope {
     Worktree(String),
     Conversation(String),
+    Global,
 }
 
 impl WorkScope {
@@ -30,14 +35,14 @@ impl WorkScope {
         }
     }
 
-    /// Stable string form for use as a registry/map key. Worktree and
-    /// conversation namespaces are kept disjoint so a worktree path that
-    /// happens to look like a conversation id (or vice versa) cannot
-    /// collide.
+    /// Stable string form for use as a registry/map key. Worktree,
+    /// conversation, and global namespaces are kept disjoint so values
+    /// that happen to look alike across variants cannot collide.
     pub fn stable_key(&self) -> String {
         match self {
             Self::Worktree(path) => format!("worktree:{path}"),
             Self::Conversation(id) => format!("conversation:{id}"),
+            Self::Global => "global:".to_string(),
         }
     }
 }
@@ -47,6 +52,7 @@ impl fmt::Display for WorkScope {
         match self {
             Self::Worktree(path) => write!(f, "worktree:{path}"),
             Self::Conversation(id) => write!(f, "conversation:{id}"),
+            Self::Global => write!(f, "global:"),
         }
     }
 }
@@ -74,8 +80,11 @@ mod tests {
         let conv = WorkScope::Conversation("/tmp/wt-x".to_string());
         let wt = WorkScope::Worktree("/tmp/wt-x".to_string());
         assert_ne!(conv.stable_key(), wt.stable_key());
+        assert_ne!(conv.stable_key(), WorkScope::Global.stable_key());
+        assert_ne!(wt.stable_key(), WorkScope::Global.stable_key());
         assert_eq!(conv.stable_key(), "conversation:/tmp/wt-x");
         assert_eq!(wt.stable_key(), "worktree:/tmp/wt-x");
+        assert_eq!(WorkScope::Global.stable_key(), "global:");
     }
 
     #[test]
@@ -84,5 +93,6 @@ mod tests {
         let wt = WorkScope::Worktree("/tmp/x".to_string());
         assert_eq!(format!("{conv}"), conv.stable_key());
         assert_eq!(format!("{wt}"), wt.stable_key());
+        assert_eq!(format!("{}", WorkScope::Global), WorkScope::Global.stable_key());
     }
 }
