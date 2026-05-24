@@ -3,21 +3,28 @@
 --
 -- Phoenix Terminal: Behavioural Specification
 --
--- Scope: PTY-backed browser terminal per conversation
+-- Scope: PTY-backed browser terminal per WorkScope (REQ-TERM-WS-001).
+--        A WorkScope is one of: Worktree(path), Conversation(id), or Global.
+--        Continuation conversations that resolve to the same WorkScope share
+--        the terminal, mirroring tmux (REQ-TMUX-WS-001) and browser
+--        (REQ-BROWSER-WS-001) ownership patterns.
 -- Includes: Terminal session lifecycle, PTY spawn, WebSocket I/O relay,
 --           resize handling, command tracker, terminal_last_command,
 --           terminal_command_history, session teardown,
---           conversation-terminal cascade,
+--           per-scope teardown cascade (conversation end, worktree cleanup,
+--           process exit for Global),
 --           authentication identity precondition (session-scoped user)
 -- Excludes:
 --   - UI panel placement (deferred to implementation)
 --   - Scrollback persistence (ephemeral; tmux integration deferred)
 --   - macOS PTY kqueue considerations (Linux target for v1)
---   - Multiple terminals per conversation (exactly one)
+--   - Multiple terminals per WorkScope (exactly one)
 --   - PTY privilege escalation (API runs as same Unix user as shell)
 --   - WebSocket auth mechanism specifics (cookie vs header; see design.md)
 --
--- Requirement traceability: REQ-TERM-001 through REQ-TERM-014, REQ-TERM-021 through REQ-TERM-023
+-- Requirement traceability: REQ-TERM-001 through REQ-TERM-014,
+--                           REQ-TERM-021 through REQ-TERM-023,
+--                           REQ-TERM-WS-001
 -- Dependencies: specs/bedrock/bedrock.allium
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -75,6 +82,20 @@ external entity ShellIntegrationProvider {
 -- Value Types
 ------------------------------------------------------------
 
+-- The durable-owner key for work-affine resources. Defined in
+-- crates/phoenix-ide/src/work_scope.rs. Worktree carries the worktree
+-- path; Conversation carries the conversation id; Global carries no
+-- payload (singleton). stable_key() makes the three namespaces disjoint
+-- via "worktree:", "conversation:", and "global:" prefixes.
+--
+-- Terminal mirrors the WorkScope ownership pattern of tmux
+-- (REQ-TMUX-WS-001) and browser (REQ-BROWSER-WS-001): continuation
+-- conversations resolving to the same scope share the terminal.
+value WorkScope {
+    kind: WorkScopeKind
+    inner: String       -- worktree path, conversation id, or "" for Global
+}
+
 value TerminalDimensions {
     cols: Integer    -- must be > 0
     rows: Integer    -- must be > 0
@@ -101,6 +122,15 @@ value CommandRecord {
 -- Enumerations
 ------------------------------------------------------------
 
+-- Variants of WorkScope. Global is a singleton scope with no underlying
+-- worktree or conversation — used by the /new page and any UI surface
+-- that wants a terminal that outlives every individual conversation.
+enum WorkScopeKind {
+    worktree
+    | conversation
+    | global
+}
+
 -- Shell integration detection state for a terminal session.
 -- Transitions are one-shot: unknown → detected OR unknown → absent.
 -- See ShellIntegrationStatusMonotonic invariant.
@@ -115,8 +145,14 @@ enum ShellIntegrationStatus {
 ------------------------------------------------------------
 
 entity Terminal {
-    -- The conversation this terminal is scoped to.
-    conversation: bedrock/Conversation
+    -- The WorkScope this terminal belongs to (REQ-TERM-WS-001).
+    -- A conversation accesses "its" terminal by resolving its own
+    -- WorkScope (worktree path if managed/branch, conversation id for
+    -- Direct mode) and looking up the matching Terminal. Continuation
+    -- conversations resolving to the same scope share the terminal.
+    -- The Global scope holds a single terminal that is not associated
+    -- with any conversation; see the UserOpensTerminal rule.
+    scope: WorkScope
 
     -- Lifecycle state.
     status: absent | active
@@ -125,8 +161,8 @@ entity Terminal {
         absent -> active
         active -> absent
         -- "absent" is both the initial and terminal state.
-        -- A new WebSocket connection on a conversation with status=absent
-        -- opens a fresh terminal. Closing returns to absent.
+        -- A new WebSocket connection for a scope whose terminal is
+        -- status=absent opens a fresh terminal. Closing returns to absent.
     }
 
     -- Fields present only while active (REQ-TERM-001, REQ-TERM-010).
@@ -197,14 +233,21 @@ config {
 -- Rules
 ------------------------------------------------------------
 
--- REQ-TERM-001, REQ-TERM-002: Terminal opened, PTY spawned
+-- REQ-TERM-001, REQ-TERM-002, REQ-TERM-WS-001: Terminal opened, PTY spawned
 rule TerminalOpened {
-    when: UserOpensTerminal(terminal, conversation)
+    -- A UserOpensTerminal is keyed by WorkScope. For Conversation and
+    -- Worktree scopes the cwd is derived from the scope (conversation
+    -- working_dir or worktree path). For Global, the cwd is $HOME.
+    when: UserOpensTerminal(terminal, scope)
 
-    requires: not conversation.is_terminal
     requires: terminal.status = absent
+    -- For Conversation scope, the underlying conversation must not be
+    -- terminal — same precondition as the pre-WorkScope spec, hoisted
+    -- to the resolution layer.
+    requires: scope.kind = conversation implies not lookup_conversation(scope.inner).is_terminal
 
     ensures: terminal.status = active
+    ensures: terminal.scope = scope
     ensures: PtySpawned(terminal)
 
     @guidance
@@ -216,8 +259,10 @@ rule TerminalOpened {
         --        ioctl(slave_fd, TIOCSCTTY, 0) slave becomes controlling tty
         --        dup2(slave_fd, 0/1/2)         slave is stdin, stdout, stderr
         --        close(slave_fd)               fd already dup'd
-        --        chdir(conversation.working_dir)  conversation working directory
-        --        -- working_dir corresponds to REQ-BED-010; same field used by projects.allium
+        --        chdir(spawn_cwd_for_scope(scope))
+        --        --   WorkScope::Conversation(id) -> conv.working_dir (REQ-BED-010)
+        --        --   WorkScope::Worktree(path)   -> path
+        --        --   WorkScope::Global           -> $HOME
         --        execvp($SHELL, ["-i"])         with explicit env (REQ-TERM-002)
         --      [parent]:
         --        close(slave_fd)               parent must not hold slave open
@@ -262,15 +307,18 @@ rule ShellEnvironmentConstructed {
 -- server-side kill. Reclaim evicts the sitting relay without tearing down
 -- the shell, then attaches the new WebSocket to the same handle.
 rule DuplicateConnectionReclaimsSession {
-    when: UserOpensTerminal(terminal, conversation)
+    when: UserOpensTerminal(terminal, scope)
 
     requires: terminal.status = active
+    requires: terminal.scope = scope
 
     ensures: terminal.status = active
         -- Terminal stays active throughout reclaim — shell, master_fd,
         -- CommandTracker, and ring buffer are preserved.
-    ensures: WebSocketAttached(conversation)
-        -- The new WebSocket becomes the active relay target.
+    ensures: WebSocketAttached(scope)
+        -- The new WebSocket becomes the active relay target. A continuation
+        -- conversation that resolves to the same scope reclaims the
+        -- existing terminal rather than spawning a fresh one.
 
     @guidance
         -- Reclaim sequence (ws.rs handle_socket → acquire_handle → reclaim):
@@ -510,7 +558,12 @@ rule AgentCallsTerminalCommandHistoryEmpty {
     ensures: AgentReceivesError("no commands have completed in this terminal session yet")
 }
 
--- REQ-TERM-012: Terminal torn down when conversation ends
+-- REQ-TERM-012: Terminal torn down when its Conversation-scope conversation ends.
+-- Only fires for Conversation-scoped terminals (Direct-mode conversations
+-- with no worktree). Worktree-scoped terminals survive across conversation
+-- continuations and tear down on worktree cleanup (see
+-- TerminalTornDownWithWorkScopeCleanup). Global-scoped terminals never
+-- tear down via conversation lifecycle.
 rule TerminalAbandonedWithConversation {
     -- Subscribes to bedrock's ConversationBecameTerminal lifecycle announcement,
     -- emitted whenever a conversation's is_terminal derived value becomes true
@@ -524,18 +577,47 @@ rule TerminalAbandonedWithConversation {
     -- event names.
 
     requires: terminal.status = active
+    requires: terminal.scope.kind = conversation
+    requires: terminal.scope.inner = conversation.id
 
     ensures: MasterFdClosed(terminal)
         -- SIGHUP chain fires; shell exits; Task A observes EIO; waitpid() called.
     ensures: terminal.status = absent
 
     @guidance
-        -- Terminal sessions must not outlive their conversation.
-        -- Wire to bedrock's ConversationBecameTerminal event in the runtime executor.
+        -- Conversation-scoped terminal sessions must not outlive their
+        -- conversation. Wire to bedrock's ConversationBecameTerminal event in
+        -- the runtime executor.
         -- Note: this fires for sub-agent conversations too (completed/failed).
-        -- Sub-agent conversations do not have terminals (OneTerminalPerConversation
-        -- only applies to user-facing conversations), so the requires guard
-        -- Terminal(conversation).status = active naturally excludes them.
+        -- Sub-agent conversations do not have terminals (OneTerminalPerWorkScope
+        -- only applies to scopes a user has opened a terminal on), so the
+        -- requires guard naturally excludes them.
+}
+
+-- REQ-TERM-WS-001 / REQ-TERM-012: Worktree-scoped terminal tears down on
+-- the same cleanup events that destroy the worktree-scoped tmux server
+-- (REQ-TMUX-WS-002): archive, abandon, mark-merged, hard-delete. The
+-- preservation rule inherits from tmux — if a continuation conversation
+-- resolves to the same WorkScope, the terminal is preserved.
+rule TerminalTornDownWithWorkScopeCleanup {
+    when: WorkScopeCleaned(scope)
+
+    requires: terminal.status = active
+    requires: terminal.scope = scope
+    requires: scope.kind = worktree
+
+    ensures: MasterFdClosed(terminal)
+    ensures: terminal.status = absent
+
+    @guidance
+        -- WorkScopeCleaned fires from the same project-lifecycle hooks
+        -- that drive REQ-TMUX-WS-002. Conversation end alone does NOT
+        -- fire this — a Worktree-scoped terminal survives every individual
+        -- conversation in that worktree.
+        --
+        -- A Global-scoped terminal has no automatic teardown path; it
+        -- lives for the lifetime of the Phoenix process. UserClosedTerminal
+        -- and explicit process shutdown remain the only teardown triggers.
 }
 
 -- REQ-TERM-015 (revised): OSC 133 detection on first C marker
@@ -700,10 +782,15 @@ rule CwdReportedFromOsc7 {
 -- Invariants
 ------------------------------------------------------------
 
--- REQ-TERM-003
-invariant OneTerminalPerConversation {
-    for c in Conversations:
-        count(Terminal where conversation = c and status = active) <= 1
+-- REQ-TERM-003, REQ-TERM-WS-001: at most one live terminal per WorkScope.
+-- The ActiveTerminals registry HashMap is keyed by WorkScope::stable_key()
+-- and stable_key() is injective across the three variants (disjoint
+-- "worktree:", "conversation:", "global:" prefixes). Two conversations
+-- that resolve to the same WorkScope therefore address the same Terminal
+-- entry — they share rather than collide.
+invariant OneTerminalPerWorkScope {
+    for s in WorkScopes:
+        count(Terminal where scope = s and status = active) <= 1
 }
 
 -- REQ-TERM-010
@@ -778,15 +865,19 @@ surface UserTerminalAccess {
         -- with HTTP 401 before any PTY is created.
 
     context terminal: Terminal
-    context conversation: bedrock/Conversation
+    context scope: WorkScope
+        -- The terminal is addressed by its WorkScope. A conversation-scoped
+        -- WebSocket endpoint resolves the conversation's WorkScope at
+        -- upgrade time; a Global WebSocket endpoint addresses the singleton
+        -- Global scope directly.
 
     exposes:
         terminal.status
+        terminal.scope
 
     provides:
-        UserOpensTerminal(terminal, conversation)
+        UserOpensTerminal(terminal, scope)
             when terminal.status = absent
-            and not conversation.is_terminal
 
         UserClosedTerminal(terminal)
             when terminal.status = active
@@ -803,6 +894,9 @@ surface AgentTerminalAccess {
 
     context conversation: bedrock/Conversation
     context terminal: Terminal
+        -- The terminal is looked up by the conversation's resolved
+        -- WorkScope (REQ-TERM-WS-001). Agents have no access to the
+        -- Global-scoped terminal — Global is a user-only surface.
 
     exposes:
         terminal.status

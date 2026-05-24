@@ -59,18 +59,20 @@ broken arrow keys, and misbehaviour in vim, htop, and similar programs.
 
 ---
 
-### REQ-TERM-003: Exactly One Terminal per Conversation
+### REQ-TERM-003: Exactly One Terminal per WorkScope
 
 WHEN a terminal WebSocket connection is requested
-AND a terminal is already active for that conversation
-THE SYSTEM SHALL return HTTP 409 Conflict
+AND a terminal is already active for the resolved `WorkScope`
+THE SYSTEM SHALL reclaim the existing terminal (REQ-TERM-003 reclaim path, task 24691)
 AND NOT spawn a second PTY
 
-WHEN no terminal is active for the conversation
+WHEN no terminal is active for the resolved `WorkScope`
 THE SYSTEM SHALL accept the WebSocket upgrade and proceed with spawn
 
-**Rationale:** Correct-by-construction. The UI must not offer to open a terminal
-when one is already active, eliminating the 409 path at runtime.
+**Rationale:** Correct-by-construction. The terminal registry is keyed by
+`WorkScope`, so two conversations that resolve to the same scope (e.g. a
+context-exhaustion continuation within the same worktree) address the same
+terminal entry and share rather than collide. See REQ-TERM-WS-001.
 
 ---
 
@@ -248,13 +250,33 @@ result alone is insufficient. Cap of 5 matches the ring buffer capacity.
 
 ---
 
-### REQ-TERM-012: Terminal Torn Down with Conversation
+### REQ-TERM-012: Terminal Torn Down with WorkScope
 
 WHEN a conversation reaches a terminal state (completed, failed, context_exhausted)
-AND a terminal session is active for that conversation
+AND a terminal session is active for the `WorkScope::Conversation(id)` of that
+conversation (i.e. a Direct-mode conversation with no worktree)
 THE SYSTEM SHALL close the master fd
 AND the kernel SHALL deliver SIGHUP to the shell
 AND the terminal session SHALL be torn down
+
+WHEN a worktree is cleaned up via the resource-cleanup cascade
+(archive / abandon / mark-merged / hard-delete; see REQ-TMUX-WS-002)
+AND a terminal session is active for `WorkScope::Worktree(path)` of that worktree
+AND no continuation conversation resolves to the same `WorkScope`
+THE SYSTEM SHALL close the master fd
+AND the terminal session SHALL be torn down
+
+WHEN the active scope is `WorkScope::Global`
+THE SYSTEM SHALL NOT tear the terminal down on any conversation or worktree
+lifecycle event
+AND the terminal SHALL persist for the lifetime of the Phoenix process
+
+**Rationale:** Generalises the original "terminal dies with conversation" rule
+to a per-`WorkScope` lifecycle. Conversation-scoped terminals retain the
+original behaviour; worktree-scoped terminals inherit the tmux preservation
+cascade (REQ-TMUX-WS-002) so continuations keep their REPL state intact;
+global terminals exist outside any conversation and are only torn down by
+explicit user close (REQ-TERM-008) or process exit.
 
 ---
 
@@ -484,3 +506,39 @@ management styles because user setups vary enormously. The spawned
 conversation should investigate, not assume, and should punt gracefully
 on exotic setups (home-manager, nushell, etc.) rather than edit things
 it doesn't understand.
+
+---
+
+## WorkScope Ownership
+
+### REQ-TERM-WS-001: Terminal Sessions Keyed by WorkScope
+
+Phoenix MUST key terminal session ownership by `WorkScope`:
+`WorkScope::Worktree(path)` for managed/branch worktrees,
+`WorkScope::Conversation(conversation_id)` for Direct conversations, and
+`WorkScope::Global` for the singleton scope surfaced on the `/new` page
+(and any other UI surface that wants a terminal not bound to a single
+conversation).
+
+The `ActiveTerminals` registry MUST be a `HashMap<WorkScope, …>` rather
+than a `HashMap<String, …>` keyed by conversation id. Continuation
+conversations that resolve to the same `WorkScope` MUST share the
+existing terminal rather than spawn a new one.
+
+The cleanup cascade MUST decide preservation by `WorkScope` equality
+between the conversation being torn down and its continuation's resolved
+scope: skip the teardown iff `inheritor_scope == Some(work_scope)`. This
+mirrors REQ-TMUX-WS-001 / REQ-TMUX-WS-002 and REQ-BROWSER-WS-001 /
+REQ-BROWSER-WS-003 — the three work-affine resources (tmux server,
+Chrome session, terminal PTY) share a single ownership pattern.
+
+**Rationale:** Pre-existing keying by `conversation_id` created two
+parallel representations of "who owns this resource" — `ActiveTerminals`
+keyed by conv id, `TmuxRegistry` keyed by `WorkScope`. The two
+representations diverged on continuation: tmux state survived
+context-exhaustion continuations within the same worktree, but the
+terminal PTY did not, even though the user's mental model is "the
+shell I was just typing into." Aligning the terminal registry on
+`WorkScope` makes continuation persistence consistent across all
+work-affine resources and makes `WorkScope::Global` representable
+as a first-class value rather than a sentinel string.

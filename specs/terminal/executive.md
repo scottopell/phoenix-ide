@@ -70,7 +70,7 @@ canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 |---|---|---|
 | REQ-TERM-001: PTY-backed terminal per conversation | ✅ Done | src/terminal/spawn.rs |
 | REQ-TERM-002: Explicit shell environment construction | ✅ Done | src/terminal/spawn.rs:build_env() |
-| REQ-TERM-003: Exactly one terminal per conversation | ✅ Done | src/terminal/session.rs:ActiveTerminals |
+| REQ-TERM-003: Exactly one terminal per WorkScope | ✅ Done | src/terminal/session.rs:ActiveTerminals (HashMap<WorkScope, …>) |
 | REQ-TERM-004: Binary WebSocket framing | ✅ Done | src/terminal/ws.rs |
 | REQ-TERM-005: Initial resize before first prompt | ✅ Done | src/terminal/ws.rs:wait_for_resize() |
 | REQ-TERM-006: Resize propagated to PTY and parser | ✅ Done | src/terminal/ws.rs:apply_resize() |
@@ -79,8 +79,9 @@ canonical conceptual reference is https://www.linusakesson.net/programming/tty/.
 | REQ-TERM-009: Child process reaped after shell exit | ✅ Done | src/terminal/ws.rs:waitpid() |
 | REQ-TERM-010: vt100 parser fed every byte in order | ✅ Done | src/terminal/ws.rs:reader_task() |
 | REQ-TERM-011: `read_terminal` agent tool | ✅ Done | src/tools/read_terminal.rs |
-| REQ-TERM-012: Terminal torn down with conversation | ✅ Done | src/terminal/ws.rs:teardown watcher |
+| REQ-TERM-012: Terminal torn down with WorkScope | ✅ Done | src/terminal/ws.rs:teardown watcher (per-scope dispatch) |
 | REQ-TERM-013: WebSocket endpoint authentication | ✅ Done | src/api/auth.rs middleware |
 | REQ-TERM-014: Output channel backpressure | ✅ Done | src/terminal/ws.rs:OUTPUT_BUF bounded reads |
+| REQ-TERM-WS-001: Terminal sessions keyed by WorkScope | ✅ Done | src/terminal/session.rs:ActiveTerminals; src/work_scope.rs |
 
-**Progress:** 14 of 14 complete
+**Progress:** 15 of 15 complete
