@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef } from 'react';
+import { useCallback, useEffect, useMemo, useRef } from 'react';
 import type { UnitHeightCache } from '../conversation/unitHeightCache';
 import type { HistoricalUnit } from '../conversation/renderUnits';
 
@@ -75,5 +75,9 @@ export function useUnitHeightObserver(cache: UnitHeightCache): UnitHeightObserve
     return elementsRef.current.get(key);
   }, []);
 
-  return { observe, getElement };
+  // useMemo the returned object so the wrapper reference is stable
+  // across renders. Otherwise consumers that put `unitObserver` in
+  // useCallback / useEffect deps would see a new identity every render
+  // and re-attach scroll listeners / re-run restore effects.
+  return useMemo(() => ({ observe, getElement }), [observe, getElement]);
 }

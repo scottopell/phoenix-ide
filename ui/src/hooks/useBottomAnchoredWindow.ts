@@ -4,6 +4,7 @@ import {
   useLayoutEffect,
   useEffect,
   useMemo,
+  useCallback,
   useSyncExternalStore,
   type RefObject,
 } from 'react';
@@ -20,17 +21,21 @@ import type { UnitHeightCache } from '../conversation/unitHeightCache';
  * preceded by one spacer div; everything older collapses into that
  * spacer.
  *
- * Spacer height is the sum of per-kind estimates over the collapsed
- * prefix (see KIND_ESTIMATES). A future commit replaces estimates with
- * measured heights from a per-unit ResizeObserver cache; the spacer
- * computation accepts both shapes today by virtue of being a pure
- * function of the units and the index.
- *
  * Boundary expansion uses an `IntersectionObserver` rooted at the scroll
  * container, observing a sentinel placed between the spacer and the
- * rendered slice. Expansion is exact-scroll-compensated: `scrollHeight`
- * is captured before the state update, then `scrollTop` is adjusted by
- * the post-render delta in a layout effect so no visible jump occurs.
+ * rendered slice. The sentinel is attached via a *callback ref* so the
+ * observer is wired the instant the DOM node mounts — even when it
+ * mounts on a later render than the hook's first run (e.g., a
+ * conversation that started empty and grew past the initial window).
+ *
+ * Spacer height is measured-when-cached, kind-estimated otherwise. The
+ * window applies exact scroll compensation in two distinct cases:
+ *   - expansion (firstRenderedUnitIndex decreases): scrollHeight is
+ *     captured before the state mutation, delta is applied after commit
+ *   - spacer-height changes from measured-height writes (cache version
+ *     bump): a separate compensation effect tracks spacerHeight changes
+ *     and adjusts scrollTop by the same delta so the visible content
+ *     stays anchored when ResizeObserver-driven measurements settle
  *
  * See specs/messagelist-render-units/windowing.allium for the window
  * lifecycle state machine; this file is the React-bound implementation.
@@ -51,17 +56,22 @@ export const KIND_ESTIMATES: Record<HistoricalUnit['kind'], number> = {
 /**
  * Saved scroll position keyed by render-unit identity. Restoring by unit
  * key + offset is structurally correct regardless of intervening
- * row-height variation in the prefix. Replaces the prior
- * `savedScrollTop / estimatedRowHeight` heuristic.
+ * row-height variation in the prefix.
  *
- * Written by MessageList on visibility-hidden / unmount; read by this
- * hook on first mount per conversation. Persisted in localStorage at
- * `phoenix:msglist:anchor:{conversationId}` (managed by MessageList,
- * not this hook).
+ * `unitCountAtSave` lets the restore path detect that messages arrived
+ * while the user was away (current historicalUnits.length >
+ * unitCountAtSave) so the "↓ New messages" surface can fire on return —
+ * preserving the REQ-CONV-013 affordance that the prior scrollTop+
+ * msgcount pair provided.
  */
 export interface SavedScrollAnchor {
   topVisibleUnitKey: string;
   offsetWithinUnit: number;
+  /** Optional in this commit; required field landing in the
+   *  anchor-restore commit (see review batch 3). Old anchors written
+   *  without this field still parse, and the restore path treats absent
+   *  as "no msgcount delta information available." */
+  unitCountAtSave?: number;
 }
 
 export interface UseBottomAnchoredWindowArgs {
@@ -85,10 +95,12 @@ export interface UseBottomAnchoredWindowResult {
   /** Pixel height of the top spacer, computed from per-kind estimates
    *  over the collapsed prefix. */
   spacerHeight: number;
-  /** Attach to a `<div aria-hidden />` placed between the spacer and the
-   *  rendered slice; the IntersectionObserver uses it as the structural
-   *  boundary that triggers expansion. */
-  topSentinelRef: RefObject<HTMLDivElement>;
+  /** Callback ref for the sentinel `<div aria-hidden />` placed between
+   *  the spacer and the rendered slice. Using a callback ref (not a
+   *  RefObject) makes the IntersectionObserver wiring re-fire whenever
+   *  the sentinel mounts/unmounts — critical for empty-then-grow
+   *  conversations where the sentinel is conditionally rendered. */
+  topSentinelRef: (node: HTMLDivElement | null) => void;
 }
 
 /** Pure helper: where should `firstRenderedUnitIndex` start on mount?
@@ -145,9 +157,18 @@ export function useBottomAnchoredWindow({
     index: number;
   } | null>(null);
 
+  // Sentinel is stored as state via a callback ref so the
+  // IntersectionObserver effect re-runs whenever the DOM node mounts or
+  // unmounts. A useRef-based sentinel would never trigger the effect
+  // when the node attaches on a later render (e.g., empty conversation
+  // grows past INITIAL_WINDOW within the same session).
+  const [sentinelEl, setSentinelEl] = useState<HTMLDivElement | null>(null);
+  const topSentinelRef = useCallback((node: HTMLDivElement | null) => {
+    setSentinelEl(node);
+  }, []);
+
   const prevScrollHeightRef = useRef<number | null>(null);
   const pendingFirstIndexRef = useRef(0);
-  const topSentinelRef = useRef<HTMLDivElement | null>(null);
   const conversationIdRef = useRef(conversationId);
   conversationIdRef.current = conversationId;
 
@@ -209,14 +230,43 @@ export function useBottomAnchoredWindow({
     pendingFirstIndexRef.current = firstRenderedUnitIndex;
   }, [firstRenderedUnitIndex, scrollRootRef]);
 
+  // Spacer-height compensation: when measured heights land via the
+  // height cache and shift spacerHeight, the content below the spacer
+  // visually shifts by the same delta. Adjust scrollTop to keep the
+  // visible content anchored.
+  //
+  // Skipped while an expansion is in flight (prevScrollHeightRef !==
+  // null) — that path's scrollHeight delta already includes the spacer
+  // change, and applying both compensations would double-correct.
+  const prevSpacerHeightRef = useRef(spacerHeight);
+  useLayoutEffect(() => {
+    if (prevScrollHeightRef.current !== null) {
+      // Expansion-driven compensation is handling this commit.
+      prevSpacerHeightRef.current = spacerHeight;
+      return;
+    }
+    const el = scrollRootRef.current;
+    if (!el) {
+      prevSpacerHeightRef.current = spacerHeight;
+      return;
+    }
+    const delta = spacerHeight - prevSpacerHeightRef.current;
+    if (delta !== 0) {
+      el.scrollTop += delta;
+    }
+    prevSpacerHeightRef.current = spacerHeight;
+  }, [spacerHeight, scrollRootRef]);
+
   // IntersectionObserver on the sentinel. The sentinel sits at the
   // structural boundary between the collapsed spacer and the rendered
   // slice; when it crosses into the buffered viewport the window
-  // expands by EXPAND_BATCH units.
+  // expands by EXPAND_BATCH units. The `sentinelEl` state in the deps
+  // makes this effect re-run when the sentinel mounts on a later
+  // render — without it, an empty-conversation grow-path would never
+  // attach the observer.
   useEffect(() => {
     const root = scrollRootRef.current;
-    const sentinel = topSentinelRef.current;
-    if (!root || !sentinel) return;
+    if (!root || !sentinelEl) return;
     if (typeof IntersectionObserver === 'undefined') return;
 
     const observer = new IntersectionObserver(
@@ -238,9 +288,9 @@ export function useBottomAnchoredWindow({
       },
       { root, rootMargin: SENTINEL_ROOT_MARGIN },
     );
-    observer.observe(sentinel);
+    observer.observe(sentinelEl);
     return () => observer.disconnect();
-  }, [scrollRootRef, conversationId]);
+  }, [scrollRootRef, conversationId, sentinelEl]);
 
   return { firstRenderedUnitIndex, spacerHeight, topSentinelRef };
 }

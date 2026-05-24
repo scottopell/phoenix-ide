@@ -1,4 +1,4 @@
-import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type RefObject } from 'react';
+import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import {
@@ -224,7 +224,7 @@ interface MessageListBodyProps {
   tailUnits: TailUnit[];
   firstRenderedUnitIndex: number;
   spacerHeight: number;
-  topSentinelRef: RefObject<HTMLDivElement>;
+  topSentinelRef: (node: HTMLDivElement | null) => void;
   observeUnit: UnitHeightObserver['observe'];
   slug: string | undefined;
   onRetry: (localId: string) => void;
