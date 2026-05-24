@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import { api, type CodexLoginPreflight, type NotificationSettings } from '../api';
 import { refreshModels } from '../modelsPoller';
-import { useCodexQuota } from '../codexQuota';
+import { clearCodexQuota, useCodexQuota } from '../codexQuota';
 import type { QuotaDetails, RateLimitWindow } from '../sseSchemas';
 import {
   getBrowserNotificationPermission,
@@ -224,6 +224,7 @@ function CodexSection({
     setError(null);
     try {
       await api.codexSignout();
+      clearCodexQuota();
       await refreshModels();
       onPreflightInvalidated();
       onCloseMenu();

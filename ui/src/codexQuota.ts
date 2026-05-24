@@ -19,9 +19,23 @@ import type { QuotaDetails } from './sseSchemas';
 let snapshot: QuotaDetails | null = null;
 const listeners = new Set<() => void>();
 
+function notify(): void {
+  for (const fn of listeners) fn();
+}
+
 export function setCodexQuota(next: QuotaDetails): void {
   snapshot = next;
-  for (const fn of listeners) fn();
+  notify();
+}
+
+/// Drop the stored snapshot. Call on codex sign-out / account switch so
+/// the dropdown stops rendering stale quota for an account that no
+/// longer owns this session. SSE disconnect alone does NOT invalidate
+/// the snapshot — the account is unchanged across reconnects.
+export function clearCodexQuota(): void {
+  if (snapshot === null) return;
+  snapshot = null;
+  notify();
 }
 
 export function getCodexQuotaSnapshot(): QuotaDetails | null {
