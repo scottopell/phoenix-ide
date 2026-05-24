@@ -4561,6 +4561,27 @@ html * {
   cursor: pointer;
 }
 
+.image-preview {
+  min-height: 100%;
+  padding: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-primary);
+}
+
+.image-preview-img {
+  max-width: 100%;
+  max-height: calc(100vh - 160px);
+  object-fit: contain;
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg);
+}
+
+.viewer-shell--inline .image-preview-img {
+  max-height: calc(100vh - 96px);
+}
+
 /* Text/Code display */
 .prose-reader-text {
   font-family: var(--font-mono);

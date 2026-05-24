@@ -65,6 +65,9 @@ export function SkillViewer({ skill, onBack }: SkillViewerProps) {
       })
       .then((data) => {
         if (!cancelled) {
+          if (data.kind && data.kind !== 'text') {
+            throw new Error('Skill prompt is not text');
+          }
           setPromptContent(stripFrontmatter(data.content));
           setLoading(false);
         }

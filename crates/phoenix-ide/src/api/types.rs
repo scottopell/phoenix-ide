@@ -212,9 +212,18 @@ pub struct ListFilesResponse {
 
 /// Response for file reading
 #[derive(Debug, Serialize)]
-pub struct ReadFileResponse {
-    pub content: String,
-    pub encoding: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ReadFileResponse {
+    Text {
+        content: String,
+        encoding: String,
+        file_type: String,
+    },
+    Image {
+        mime_type: String,
+        url: String,
+        file_type: String,
+    },
 }
 
 /// Error response for file operations

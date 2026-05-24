@@ -52,14 +52,31 @@ export interface ProseReaderProps {
 // imported the type from this module.
 export type { ReviewNote } from '../contexts/ReviewNotesContext';
 
-async function readFile(path: string): Promise<string> {
+type ReadFileResult =
+  | { kind: 'text'; content: string; encoding: string; file_type: string }
+  | { kind: 'image'; mime_type: string; url: string; file_type: string };
+
+async function readFile(path: string): Promise<ReadFileResult> {
   const response = await fetch(`/api/files/read?path=${encodeURIComponent(path)}`);
   if (!response.ok) {
     const error = await response.json().catch(() => ({ error: 'Unknown error' }));
     throw new Error(error.error || 'Failed to read file');
   }
   const data = await response.json();
-  return data.content;
+  if (data.kind === 'image') {
+    return {
+      kind: 'image',
+      mime_type: data.mime_type,
+      url: data.url,
+      file_type: data.file_type,
+    };
+  }
+  return {
+    kind: 'text',
+    content: data.content,
+    encoding: data.encoding ?? 'utf-8',
+    file_type: data.file_type ?? 'text',
+  };
 }
 
 function getFileType(path: string): 'markdown' | 'html' | 'code' | 'text' {
@@ -166,7 +183,7 @@ export function ProseReader({
   const syntaxStyle = theme === 'light' ? oneLight : oneDark;
   const reviewNotes = useReviewNotes();
 
-  const [content, setContent] = useState<string | null>(null);
+  const [fileData, setFileData] = useState<ReadFileResult | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [annotating, setAnnotating] = useState<{ lineNumber: number; lineContent: string } | null>(null);
@@ -187,6 +204,8 @@ export function ProseReader({
 
   const fileType = useMemo(() => getFileType(filePath), [filePath]);
   const language = useMemo(() => getLanguage(filePath), [filePath]);
+  const content = fileData?.kind === 'text' ? fileData.content : null;
+  const imageData = fileData?.kind === 'image' ? fileData : null;
 
   // Notes scoped to this file (for panel + per-line indicator).
   // Total pile (across all files + diff) drives the global send count.
@@ -201,9 +220,10 @@ export function ProseReader({
     async function load() {
       setLoading(true);
       setError(null);
+      setFileData(null);
       try {
-        const text = await readFile(absolutePath);
-        if (!cancelled) setContent(text);
+        const result = await readFile(absolutePath);
+        if (!cancelled) setFileData(result);
       } catch (err) {
         if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load file');
       } finally {
@@ -485,7 +505,7 @@ export function ProseReader({
   // for this-file anchors, so cross-viewer entries were no-op clicks.
 
   const copyDisabled = content === null || loading || error !== null;
-  const headerExtras = (
+  const headerExtras = imageData ? null : (
     <>
       <CopyButton
         text={content ?? ''}
@@ -524,7 +544,7 @@ export function ProseReader({
       title={fileName}
       titleTooltip={absolutePath}
       headerExtras={headerExtras}
-      noteCount={fileNotes.length}
+      noteCount={imageData ? 0 : fileNotes.length}
       onToggleNotes={() => setShowPanel((v) => !v)}
       onSend={handleSend}
       banner={
@@ -537,7 +557,7 @@ export function ProseReader({
       }
       onClose={onClose}
       panel={
-        showPanel ? (
+        showPanel && !imageData ? (
           <NotesPanel
             notes={fileNotes}
             onJumpTo={handleJumpTo}
@@ -549,7 +569,7 @@ export function ProseReader({
         ) : null
       }
       dialog={
-        annotating ? (
+        annotating && !imageData ? (
           <AnnotationDialog
             anchorLabel={`Line ${annotating.lineNumber}`}
             lineContent={annotating.lineContent}
@@ -570,6 +590,14 @@ export function ProseReader({
             <AlertCircle size={32} />
             <span>{error}</span>
             <button onClick={onClose}>Close</button>
+          </div>
+        ) : imageData ? (
+          <div className="image-preview">
+            <img
+              src={imageData.url}
+              alt={fileName}
+              className="image-preview-img"
+            />
           </div>
         ) : fileType === 'markdown' ? (
           <div className="prose-reader-markdown">{renderMarkdown}</div>
@@ -622,7 +650,7 @@ export function ProseReader({
         )}
       </div>
       {/* Per-line indicator: dots in the gutter where notes exist (future). */}
-      {fileNotes.length > 0 && null}
+      {!imageData && fileNotes.length > 0 && null}
     </ViewerShell>
   );
 }
