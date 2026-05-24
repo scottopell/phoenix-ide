@@ -49,7 +49,9 @@ if [[ "$CURRENT" != "$VERSION" ]]; then
     info "Bumping crates/phoenix-ide/Cargo.toml: $CURRENT -> $VERSION"
     sed "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" "$CARGO_TOML" > "$CARGO_TOML.tmp" && mv "$CARGO_TOML.tmp" "$CARGO_TOML"
     # Refresh Cargo.lock for the bumped crate.
-    (cd "$ROOT" && cargo update -p phoenix_ide --offline 2>/dev/null)
+    if ! (cd "$ROOT" && cargo update -p phoenix_ide --offline); then
+        die "Failed to refresh Cargo.lock for phoenix_ide"
+    fi
     git -C "$ROOT" add crates/phoenix-ide/Cargo.toml Cargo.lock
     git -C "$ROOT" commit -m "chore: bump version to $VERSION"
     ok "Version bumped"
