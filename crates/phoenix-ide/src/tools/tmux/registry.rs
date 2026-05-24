@@ -104,29 +104,31 @@ pub enum ServerStatus {
     Gone,
 }
 
-/// Per-conversation tmux server entity. One per conversation that has
-/// ever performed a tmux operation; conversations that never use tmux
-/// have no entry.
+/// Per-`WorkScope` tmux server entity. One per scope that has ever
+/// performed a tmux operation; scopes that never use tmux have no entry.
 ///
 /// `socket_path` is computed once at entry creation and is stable for
 /// the entry's lifetime (REQ-TMUX-001 / `SocketPathDeterministic`
-/// invariant). For Work/Branch/Explore conversations the path is keyed
-/// to the worktree path; for Direct conversations it falls back to the
-/// conversation ID (task 03001).
+/// invariant). For `WorkScope::Worktree(path)` the path is keyed to the
+/// worktree; for `WorkScope::Conversation(id)` it falls back to the
+/// conversation id (task 03001 / REQ-TMUX-WS-001).
 #[derive(Debug)]
 pub struct TmuxServer {
-    /// The conversation this server belongs to. Read by the cascade
-    /// orchestrator (task 02696) and by diagnostic surfaces.
+    /// The scope this server belongs to. Read by the cascade orchestrator
+    /// (task 02696) and by diagnostic surfaces. Replaces the prior
+    /// `conversation_id: String` field — for `Worktree`-scoped servers
+    /// "one conversation" is misleading because the chain of continuation
+    /// members all share the entry.
     #[allow(dead_code)]
-    pub conversation_id: String,
+    pub work_scope: WorkScope,
     pub socket_path: PathBuf,
     pub status: ServerStatus,
 }
 
 impl TmuxServer {
-    fn new(conversation_id: &str, socket_path: PathBuf) -> Self {
+    fn new(work_scope: WorkScope, socket_path: PathBuf) -> Self {
         Self {
-            conversation_id: conversation_id.to_string(),
+            work_scope,
             socket_path,
             status: ServerStatus::NotProbed,
         }
@@ -318,11 +320,6 @@ impl TmuxRegistry {
     /// - `WorkScope::Conversation(id)` — Direct mode: registry entry and
     ///   socket keyed to the conversation id.
     ///
-    /// `conversation_id` is recorded on the `TmuxServer` entry for
-    /// diagnostics and logging only — the registry lookup is by
-    /// `work_scope.stable_key()`. Multiple conversations sharing a
-    /// worktree therefore share one entry.
-    ///
     /// On `Live`: no spawn, status=Live.
     /// On `NoSocket`: spawn `main` session in `cwd`, status=Live.
     /// On `DeadSocket`: unlink stale file, spawn `main` session in
@@ -333,7 +330,6 @@ impl TmuxRegistry {
     /// and skips the spawn.
     pub async fn ensure_live(
         &self,
-        conversation_id: &str,
         work_scope: &WorkScope,
         cwd: &Path,
     ) -> Result<Arc<RwLock<TmuxServer>>, TmuxError> {
@@ -349,9 +345,7 @@ impl TmuxRegistry {
             WorkScope::Conversation(id) => socket_path_for(&self.socket_dir, id),
         };
 
-        let server_arc = self
-            .get_or_insert(&work_scope.stable_key(), conversation_id, socket_path)
-            .await;
+        let server_arc = self.get_or_insert(work_scope, socket_path).await;
 
         let mut server = server_arc.write().await;
         // Probe under the per-scope entry write lock — the only
@@ -399,22 +393,25 @@ impl TmuxRegistry {
     /// always go through the probe-and-act sequence.
     async fn get_or_insert(
         &self,
-        registry_key: &str,
-        conversation_id: &str,
+        work_scope: &WorkScope,
         socket_path: PathBuf,
     ) -> Arc<RwLock<TmuxServer>> {
+        let key = work_scope.stable_key();
         {
             let map = self.inner.read().await;
-            if let Some(entry) = map.get(registry_key) {
+            if let Some(entry) = map.get(&key) {
                 return entry.clone();
             }
         }
         let mut map = self.inner.write().await;
-        if let Some(entry) = map.get(registry_key) {
+        if let Some(entry) = map.get(&key) {
             return entry.clone();
         }
-        let entry = Arc::new(RwLock::new(TmuxServer::new(conversation_id, socket_path)));
-        map.insert(registry_key.to_string(), entry.clone());
+        let entry = Arc::new(RwLock::new(TmuxServer::new(
+            work_scope.clone(),
+            socket_path,
+        )));
+        map.insert(key, entry.clone());
         entry
     }
 
@@ -714,7 +711,6 @@ mod tests {
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         assert!(matches!(
             reg.ensure_live(
-                "conv-x",
                 &crate::work_scope::WorkScope::Conversation("conv-x".to_string()),
                 tmp.path()
             )
@@ -834,21 +830,17 @@ mod tests {
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
 
         // Stage entries directly via the internal helper using the same
-        // key derivation `ensure_live` uses. (ensure_live itself returns
+        // scope `ensure_live` uses. (ensure_live itself returns
         // BinaryUnavailable before reaching get_or_insert; this exercises
         // exactly the keying contract Copilot flagged on PR #136.)
         let conv_scope = WorkScope::Conversation("conv-direct".to_string());
         let conv_sock = socket_path_for(tmp.path(), "conv-direct");
-        let _ = reg
-            .get_or_insert(&conv_scope.stable_key(), "conv-direct", conv_sock.clone())
-            .await;
+        let _ = reg.get_or_insert(&conv_scope, conv_sock).await;
 
         let wt_path = std::path::PathBuf::from("/tmp/phoenix-tmux-cascade-regression-wt");
         let wt_scope = WorkScope::Worktree(wt_path.to_string_lossy().into_owned());
         let wt_sock = socket_path_for_worktree(tmp.path(), &wt_path);
-        let _ = reg
-            .get_or_insert(&wt_scope.stable_key(), "conv-wt", wt_sock.clone())
-            .await;
+        let _ = reg.get_or_insert(&wt_scope, wt_sock).await;
 
         assert_eq!(
             reg.conversation_count().await,

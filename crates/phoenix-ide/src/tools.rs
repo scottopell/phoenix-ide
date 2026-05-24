@@ -308,7 +308,7 @@ impl ToolContext {
         // tmux ownership is keyed off the scope rather than re-deciding
         // the worktree-vs-conversation fallback at each callsite.
         self.tmux_registry
-            .ensure_live(&self.conversation_id, &self.work_scope, &self.working_dir)
+            .ensure_live(&self.work_scope, &self.working_dir)
             .await
     }
 
