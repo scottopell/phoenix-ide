@@ -15,9 +15,8 @@ RESTful HTTP API for frontend clients to interact with PhoenixIDE. Designed for 
 | GET | `/api/conversation/{id}/stream` | SSE stream for real-time updates |
 | POST | `/api/conversation/{id}/chat` | Send user message |
 | POST | `/api/conversation/{id}/cancel` | Cancel current operation |
-| POST | `/api/conversation/{id}/archive` | Archive conversation |
-| POST | `/api/conversation/{id}/unarchive` | Unarchive conversation |
-| POST | `/api/conversation/{id}/delete` | Delete conversation |
+| POST | `/api/conversation/{id}/archive` | Archive conversation (terminal; runs cleanup cascade) |
+| POST | `/api/conversation/{id}/delete` | Delete conversation (terminal; runs cleanup cascade, removes row) |
 | POST | `/api/conversation/{id}/rename` | Rename conversation |
 | GET | `/api/conversation-by-slug/{slug}` | Get conversation by slug |
 | GET | `/api/validate-cwd` | Validate directory path |
@@ -236,11 +235,10 @@ Response 200:
 
 Forwards cancel event to state machine. State machine handles cancellation logic (REQ-BED-005).
 
-### Archive/Unarchive/Delete (REQ-API-006)
+### Archive/Delete (REQ-API-006)
 
 ```
 POST /api/conversation/{id}/archive
-POST /api/conversation/{id}/unarchive
 POST /api/conversation/{id}/delete
 
 Response 200:
@@ -248,6 +246,12 @@ Response 200:
   "success": true
 }
 ```
+
+Both are terminal lifecycle transitions and both run the
+resource-cleanup cascade (REQ-BED-032). Archive preserves the DB row
+and message history for retrospection; delete removes them via SQLite
+`ON DELETE CASCADE`. There is no `unarchive` — archive is not
+reversible (see REQ-API-006 / REQ-BED-032 rationale).
 
 ### Rename (REQ-API-006)
 
