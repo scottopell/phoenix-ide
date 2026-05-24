@@ -698,7 +698,7 @@ impl Database {
     ) -> DbResult<()> {
         let now = Utc::now();
         let queue_json = crate::state_machine::event::SteeringQueueEnvelope::to_json(queue)
-            .unwrap_or_else(|_| r#"{"v":"v1","entries":[]}"#.to_string());
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
         let result = sqlx::query(
             "UPDATE conversations SET steering_queue = ?1, updated_at = ?2 WHERE id = ?3",
         )
@@ -737,7 +737,7 @@ impl Database {
             message_ids.iter().map(String::as_str).collect();
         queue.retain(|entry| !to_remove.contains(entry.message_id.as_str()));
         let new_json = crate::state_machine::event::SteeringQueueEnvelope::to_json(&queue)
-            .unwrap_or_else(|_| r#"{"v":"v1","entries":[]}"#.to_string());
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
         sqlx::query("UPDATE conversations SET steering_queue = ?1, updated_at = ?2 WHERE id = ?3")
             .bind(&new_json)
             .bind(now.to_rfc3339())
