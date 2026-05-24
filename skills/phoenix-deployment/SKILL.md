@@ -44,23 +44,10 @@ For full details on each mode (ports, paths, log locations, LLM config), read th
 
 ## Publishing a Release (GitHub)
 
-To publish a new versioned binary to GitHub Releases:
+See [`skills/phoenix-release/SKILL.md`](../phoenix-release/SKILL.md) for the end-to-end flow (version bump, tag, CI build, sub-agent-drafted release notes).
 
-```bash
-./scripts/tag-release.sh v0.2.0
-```
+The stable download URL for the latest published binary:
 
-This script:
-1. Validates the tag is in `vX.Y.Z` format
-2. Checks for a clean working tree
-3. Creates an annotated git tag and pushes it
-
-Pushing the tag triggers `.github/workflows/release.yml`, which:
-- Builds the UI (`pnpm install --frozen-lockfile && pnpm run build`)
-- Compiles a static `x86_64-unknown-linux-musl` binary
-- Creates a GitHub Release with the binary as an asset
-
-The stable download URL:
 ```
 https://github.com/scottopell/phoenix-ide/releases/latest/download/phoenix_ide-x86_64-unknown-linux-musl
 ```
