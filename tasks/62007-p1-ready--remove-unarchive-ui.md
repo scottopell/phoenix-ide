@@ -1,10 +1,3 @@
----
-created: 2026-05-23
-priority: p1
-status: ready
-artifact: ui/src/components/Sidebar.tsx
----
-
 # Remove unarchive UI affordances (archive is now terminal)
 
 ## What

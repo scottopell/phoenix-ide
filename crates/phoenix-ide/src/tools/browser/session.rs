@@ -591,7 +591,6 @@ impl Drop for BrowserSessionGuard<'_> {
 /// kill path automatically.
 ///
 /// REQ-BROWSER-WS-003, REQ-BROWSER-WS-002.
-#[allow(dead_code)] // Wired up in run_resource_cleanup_cascade.
 pub async fn cascade_browser_on_delete(
     manager: &Arc<BrowserSessionManager>,
     work_scope: &WorkScope,

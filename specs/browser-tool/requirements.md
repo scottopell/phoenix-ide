@@ -279,19 +279,19 @@ THE SYSTEM SHALL ensure the file contains all entries in full, without per-entry
 
 ### REQ-BT-010: Implicit Session Model
 
-THE SYSTEM SHALL maintain browser state across tool calls within a conversation
+THE SYSTEM SHALL maintain browser state across tool calls within a `WorkScope`
 
 THE SYSTEM SHALL automatically start the browser on first browser tool call
 
 THE SYSTEM SHALL automatically close the browser after idle timeout (30 minutes)
 
-THE SYSTEM SHALL isolate browser state between different conversations
+THE SYSTEM SHALL isolate browser state between different `WorkScope`s. Continuation members that resolve to the same `WorkScope` deliberately share a session — see REQ-BROWSER-WS-001 / REQ-BROWSER-WS-002.
 
 WHEN browser tools receive `ToolContext`
-THE SYSTEM SHALL use `ctx.browser()` to obtain the session for `ctx.conversation_id`
-AND the mapping from conversation to browser SHALL be enforced by construction
+THE SYSTEM SHALL use `ctx.browser()` to obtain the session for `ctx.work_scope`
+AND the mapping from `WorkScope` to browser SHALL be enforced by construction
 
-**Rationale:** Agents should not need to manage session IDs or browser lifecycle. The `ToolContext.browser()` method provides correct-by-construction session access - tools cannot accidentally use the wrong conversation's browser.
+**Rationale:** Agents should not need to manage session IDs or browser lifecycle. The `ToolContext.browser()` method provides correct-by-construction session access — tools cannot accidentally use the wrong scope's browser. Identity is `WorkScope`, not conversation id, because worktree-backed conversations share resources across continuation members (REQ-BROWSER-WS-001).
 
 **User Stories:** US-1, US-2, US-3
 
@@ -299,14 +299,14 @@ AND the mapping from conversation to browser SHALL be enforced by construction
 
 ### REQ-BT-011: State Persistence
 
-WHILE a conversation is active
-THE SYSTEM SHALL persist browser state (cookies, cache, current page) across tool calls
+WHILE a `WorkScope`'s last-touch is within the idle window
+THE SYSTEM SHALL persist browser state (cookies, cache, current page, open tabs) across tool calls and across continuation members resolving to the same scope
 
 WHEN `ctx.browser()` is called
 THE SYSTEM SHALL update the session's last-activity timestamp
 AND return a guard that provides access to the browser session
 
-**Rationale:** Natural testing flows like "login → navigate → verify" require state to persist between steps.
+**Rationale:** Natural testing flows like "login → navigate → verify" require state to persist between steps. The continuation-inheritance dimension (REQ-BROWSER-WS-002) extends "between steps" to "between continuation members" — the on-disk profile dir is keyed by `WorkScope`, so two members on the same scope see the same cookies/cache/tabs.
 
 **User Stories:** US-2
 
@@ -316,19 +316,19 @@ AND return a guard that provides access to the browser session
 
 WHEN browser tools are invoked
 THE SYSTEM SHALL receive all execution context via a `ToolContext` parameter
-AND derive conversation identity from `ToolContext.conversation_id`
+AND derive scope identity from `ToolContext.work_scope`
 AND access browser session via `ToolContext.browser()` method
 
 WHEN browser tools are constructed
-THE SYSTEM SHALL NOT store per-conversation state
-AND tool instances SHALL be reusable across conversations
+THE SYSTEM SHALL NOT store per-`WorkScope` state
+AND tool instances SHALL be reusable across scopes
 
 THE `ToolContext.browser()` method SHALL:
 - Resolve `ToolContext.work_scope` internally (not exposed to tool)
 - Return a guard that updates activity timestamp on drop
 - Lazily initialize Chrome on first call
 
-**Rationale:** Stateless tools with context injection make invalid states unrepresentable. Tools cannot use wrong conversation's browser because `browser()` derives identity from the context.
+**Rationale:** Stateless tools with context injection make invalid states unrepresentable. Tools cannot use the wrong scope's browser because `browser()` derives identity from the context's `WorkScope`. Direct-mode conversations resolve to `WorkScope::Conversation(<id>)` (per-conversation scoping fallback); worktree-backed conversations resolve to `WorkScope::Worktree(<path>)` (shared across continuations).
 
 **User Stories:** US-1, US-2, US-3
 

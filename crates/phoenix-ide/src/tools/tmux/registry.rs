@@ -88,9 +88,10 @@ pub enum TmuxError {
     },
 }
 
-/// Lifecycle state of a per-conversation tmux server.
+/// Lifecycle state of a per-`WorkScope` tmux server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // Gone is wired up in task 02696's cascade orchestrator.
+#[allow(dead_code)] // `Gone` is the terminal-transition target; cascade
+                    // drops entries rather than setting status=Gone today.
 pub enum ServerStatus {
     /// Initial state — the entry exists but no operation has touched the
     /// server yet. Promoted to `Live` on the first successful
@@ -114,11 +115,12 @@ pub enum ServerStatus {
 /// conversation id (task 03001 / REQ-TMUX-WS-001).
 #[derive(Debug)]
 pub struct TmuxServer {
-    /// The scope this server belongs to. Read by the cascade orchestrator
-    /// (task 02696) and by diagnostic surfaces. Replaces the prior
-    /// `conversation_id: String` field — for `Worktree`-scoped servers
-    /// "one conversation" is misleading because the chain of continuation
-    /// members all share the entry.
+    /// The scope this server belongs to. Diagnostic field — the
+    /// cleanup cascade derives the lookup key from its own `WorkScope`
+    /// arg, not from this field. Replaces the prior `conversation_id:
+    /// String` field; for `Worktree`-scoped servers, "one conversation"
+    /// was misleading because the chain of continuation members all
+    /// share the entry.
     #[allow(dead_code)]
     pub work_scope: WorkScope,
     pub socket_path: PathBuf,
@@ -224,9 +226,9 @@ impl TmuxRegistry {
         self.binary_available
     }
 
-    /// Configured socket directory for this registry. Used by the
-    /// cascade orchestrator (task 02696) to find sockets for entries
-    /// already evicted from memory.
+    /// Configured socket directory for this registry. Available to the
+    /// cleanup cascade for orphan-socket fallback paths and to
+    /// diagnostic surfaces.
     #[allow(dead_code)]
     pub fn socket_dir(&self) -> &Path {
         &self.socket_dir
@@ -416,7 +418,9 @@ impl TmuxRegistry {
     }
 
     /// Best-effort tear-down of a `WorkScope`'s tmux server, called from
-    /// the bedrock hard-delete cascade (task 02696).
+    /// the unified `run_resource_cleanup_cascade` (REQ-BED-032 —
+    /// archive / abandon / mark-merged / hard-delete all share this
+    /// path).
     ///
     /// The registry is keyed by `WorkScope::stable_key()` (same lookup
     /// `ensure_live` uses for insertion). When the registry holds no
@@ -443,7 +447,6 @@ impl TmuxRegistry {
     /// gone) are non-fatal.
     ///
     /// REQ-TMUX-007, REQ-TMUX-WS-001, REQ-TMUX-WS-002.
-    #[allow(dead_code)] // Wired up in task 02696 (bedrock hard-delete cascade).
     pub async fn cascade_on_delete(
         &self,
         work_scope: &WorkScope,
@@ -546,21 +549,20 @@ impl Default for TmuxRegistry {
 }
 
 /// Best-effort cascade outcome (REQ-TMUX-007). Both error fields are
-/// surfaced to the caller (the hard-delete orchestrator in task 02696)
-/// so partial failures can be logged. Neither field is fatal.
+/// surfaced to the caller (the unified `run_resource_cleanup_cascade`
+/// in handlers.rs) so partial failures can be logged. Neither field is
+/// fatal.
 #[derive(Debug, Clone, Default)]
-#[allow(dead_code)] // Consumed by task 02696's cascade orchestrator.
 pub struct CascadeReport {
     pub socket_path: PathBuf,
     pub kill_server_error: Option<String>,
     pub unlink_error: Option<String>,
 }
 
-/// Convenience function for the bedrock cascade orchestrator (task
-/// 02696). Equivalent to `registry.cascade_on_delete(…).await` —
-/// kept as a free function for symmetry with the bash registry's
-/// `remove_conversation` API.
-#[allow(dead_code)] // Wired up in task 02696.
+/// Convenience function for the cleanup-cascade orchestrator. Equivalent
+/// to `registry.cascade_on_delete(…).await` — kept as a free function
+/// for symmetry with the bash registry's `remove_conversation` API and
+/// the new `cascade_browser_on_delete`.
 pub async fn cascade_tmux_on_delete(
     registry: &Arc<TmuxRegistry>,
     work_scope: &WorkScope,

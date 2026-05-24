@@ -2051,8 +2051,13 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
 
 /// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
 /// factored out so hard-delete, archive, abandon, and mark-merged share the
-/// exact same resource teardown. All failures log WARN and continue —
-/// callers own the final DB write and any state-machine transition.
+/// exact same resource teardown. Authoritative failures (worktree-removal,
+/// bash kill, tmux kill-server, browser kill) log WARN with the fields
+/// needed for manual cleanup; best-effort branch deletion inside
+/// `cascade_projects_on_delete` logs at DEBUG and does NOT populate
+/// `project_report.error` — branch cleanup is opportunistic, not
+/// authoritative. Callers own the final DB write and any state-machine
+/// transition.
 ///
 /// The `WorkScope` is resolved once from `conv` and passed to every
 /// scope-keyed cascade (tmux, browser) so the orchestrator owns the single

@@ -1,10 +1,3 @@
----
-created: 2026-05-23
-priority: p1
-status: ready
-artifact: crates/phoenix-ide/src/tools/tmux.rs
----
-
 # Fix flake: `tmux::tests::fresh_session_starts_in_supplied_cwd`
 
 ## What
