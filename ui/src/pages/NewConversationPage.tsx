@@ -63,6 +63,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   // the user isn't tempted to type into a draft that can't be sent.
   const llmReady = conv.models === null || conv.models.llm_configured;
 
+  const inputPlaceholder = conv.startingPoint?.kind === 'task'
+    ? 'Optional notes for this task…'
+    : 'What would you like to work on?';
+
   return (
     <div className="new-conv-page">
       <input
@@ -119,8 +123,8 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
               <textarea
                 ref={textareaRef}
                 className="new-conv-textarea"
-                placeholder="What would you like to work on?"
-                rows={3}
+                placeholder={inputPlaceholder}
+rows={3}
                 value={conv.textareaValue}
                 onChange={(e) => conv.updateDraft(e.target.value)}
                 onKeyDown={handleKeyDown}
