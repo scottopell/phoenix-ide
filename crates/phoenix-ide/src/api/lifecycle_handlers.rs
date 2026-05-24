@@ -362,10 +362,12 @@ pub(crate) async fn abandon_task(
     };
 
     // 2c. Resource cleanup: bash kill, tmux kill, worktree remove, branch
-    // delete (Work mode only). Shared with hard-delete and archive so any
-    // attached terminal/process group is torn down here too. Work mode
-    // task files live on the deleted branch and go with it.
-    run_resource_cleanup_cascade(&state, &conv).await;
+    // delete (Work mode only), browser kill. Shared with hard-delete and
+    // archive so any attached terminal/process group is torn down here
+    // too. Work mode task files live on the deleted branch and go with it.
+    // Only fatal error is a continuation-row lookup failure (returned as
+    // 500 so the user can retry).
+    run_resource_cleanup_cascade(&state, &conv).await?;
 
     // 3. Broadcast diff snapshot (persisted above, before state transition).
     // Reuses the handle obtained during seq pre-allocation at step 2b.
@@ -461,9 +463,10 @@ pub(crate) async fn mark_merged(
     let repo_root_str = repo_root.display().to_string();
 
     // 2. Resource cleanup: bash kill, tmux kill, worktree remove, branch
-    // delete (Work mode only). Shared with hard-delete and archive so any
-    // attached terminal/process group is torn down here too.
-    run_resource_cleanup_cascade(&state, &conv).await;
+    // delete (Work mode only), browser kill. Shared with hard-delete and
+    // archive. Only fatal error is a continuation-row lookup failure
+    // (returned as 500 so the user can retry).
+    run_resource_cleanup_cascade(&state, &conv).await?;
 
     // 3. Route through state machine -> Terminal
     let mode_label = if is_work_mode { "Work" } else { "Branch" };

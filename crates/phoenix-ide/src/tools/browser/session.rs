@@ -548,6 +548,45 @@ impl BrowserSession {
 
         Ok(())
     }
+
+    /// Force-close the underlying Chrome process and abort all background
+    /// tasks. Called by [`BrowserSessionManager::kill_session`] so the
+    /// cleanup cascade is authoritative — Chrome dies even if other
+    /// holders of the session `Arc` (e.g. a live `browser-view`
+    /// WebSocket viewer) keep the `BrowserSession` itself from being
+    /// dropped.
+    ///
+    /// Without this, `kill_session` would only remove the map entry; the
+    /// `Arc` clones held by other components keep `BrowserSession` (and
+    /// therefore `Browser` and the OS chromium process) alive until the
+    /// last clone drops. Cascade then lies: cleanup completed but the
+    /// process is still running.
+    ///
+    /// Falls back to `Browser::kill` (SIGKILL) when `close` errors —
+    /// per chromiumoxide docs `close` is preferred but `kill` is the
+    /// escape hatch for the case where graceful close hangs.
+    async fn terminate(&mut self) {
+        // Abort task handles first so they don't try to talk to a closing
+        // browser. Drop's task-abort logic is now redundant but harmless
+        // (abort on an already-aborted JoinHandle is a no-op).
+        self.handler_task.abort();
+        if let Some(t) = &self.console_task {
+            t.abort();
+        }
+        for t in &self.profiling_tasks {
+            t.abort();
+        }
+
+        match self.browser.close().await {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "browser graceful close failed; falling back to kill");
+                if let Some(Err(io_err)) = self.browser.kill().await {
+                    tracing::warn!(error = %io_err, "browser kill failed; OS process may linger");
+                }
+            }
+        }
+    }
 }
 
 /// RAII guard for browser session access
@@ -803,12 +842,19 @@ impl BrowserSessionManager {
     /// Kill the session belonging to `work_scope` (called from the cleanup
     /// cascade on archive/abandon/mark-merged/delete of the chain leaf).
     ///
-    /// The sessions write lock is released as soon as the entry is removed.
-    /// `remove_dir_all` for the Chrome user data dir runs without holding
-    /// the lock so it doesn't block concurrent `get_session` / `get_existing`
-    /// / `is_active` calls on unrelated scopes for the duration of fs
-    /// deletion. Same goes for the Drop of the removed entry (which closes
-    /// Chrome) — performed after the lock is released.
+    /// Force-closes the underlying Chrome process via
+    /// [`BrowserSession::terminate`] BEFORE dropping the map's `Arc`.
+    /// Other holders of the session `Arc` (notably the `browser-view`
+    /// WebSocket viewer, which keeps an `Arc` for the duration of its
+    /// connection) would otherwise prevent `Drop for BrowserSession`
+    /// from running, leaving the OS chromium process alive after the
+    /// cascade claimed to have killed it.
+    ///
+    /// The sessions write lock is released as soon as the entry is
+    /// removed; `terminate` and the awaited `remove_dir_all` run
+    /// lock-free so concurrent `get_session` / `get_existing` /
+    /// `is_active` calls on unrelated scopes are not blocked for the
+    /// duration of fs deletion + Chrome shutdown.
     pub async fn kill_session(&self, work_scope: &WorkScope) {
         let key = work_scope.stable_key();
         let removed = {
@@ -818,12 +864,19 @@ impl BrowserSessionManager {
         let was_present = removed.is_some();
         if let Some(entry) = removed {
             tracing::info!(work_scope = %work_scope, "Killing browser session");
-            // Drop the entry (which closes the Chrome process) outside the
-            // sessions write lock — Drop work doesn't need exclusion from
-            // other scopes' lookups.
+
+            // Force-close Chrome under a write lock on the session itself
+            // (independent of the sessions map lock). Other `Arc` holders
+            // will observe a dead `Browser`/`Page` on their next CDP call.
+            {
+                let mut session_guard = entry.session.write().await;
+                session_guard.terminate().await;
+            }
+            // Drop our `Arc` clone. If we were the last holder,
+            // `BrowserSession::drop` re-aborts (no-op) and frees memory.
             drop(entry);
 
-            // Clean up user data directory — also lock-free.
+            // Clean up user data directory — lock-free.
             let user_data_dir = user_data_dir_for_key(&key);
             if let Err(e) = tokio::fs::remove_dir_all(&user_data_dir).await {
                 tracing::warn!(path = %user_data_dir, error = %e, "Failed to clean up browser data dir");

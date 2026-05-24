@@ -945,6 +945,15 @@ impl RuntimeManager {
                 // worktree-scoped session is shared across continuation
                 // members, so all of them need the lifecycle edge; a
                 // conversation-scoped session affects only one runtime.
+                //
+                // Cost: O(N) `get_conversation` DB reads per event, N =
+                // count of live runtime handles. Browser-session
+                // lifecycle events are rare (create / kill / idle
+                // cleanup), N is small (active runtimes only), and
+                // `get_conversation` is a single-row indexed read — so
+                // the absolute load is negligible. If this becomes a
+                // hotspot, cache the scope on `ConversationHandle` at
+                // get-or-create time (task 62008).
                 let conv_ids: Vec<String> = {
                     let runtimes = manager.runtimes.read().await;
                     runtimes.keys().cloned().collect()
