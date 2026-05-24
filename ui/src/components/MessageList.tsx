@@ -1,5 +1,5 @@
-import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
-import type { Message, ToolResultContent, ConversationState } from '../api';
+import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type RefObject } from 'react';
+import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import type { StreamingBuffer } from '../conversation/atom';
 import {
@@ -11,10 +11,12 @@ import {
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
 import { MessageContextMenu } from './MessageContextMenu';
+import { useBottomAnchoredWindow } from '../hooks/useBottomAnchoredWindow';
 import {
-  useBottomAnchoredWindow,
-  COLLAPSED_EST_PX,
-} from '../hooks/useBottomAnchoredWindow';
+  buildRenderUnits,
+  type HistoricalUnit,
+  type TailUnit,
+} from '../conversation/renderUnits';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -63,139 +65,129 @@ function extractSkillArgs(trigger: string, name: string): string {
   return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
 }
 
-function isRenderableHistoricalMessage(msg: Message): boolean {
-  const type = msg.message_type || msg.type;
-  if (type === 'tool') return false;
-  if (type === 'system') {
-    return Boolean((msg.content as { text?: string })?.text);
-  }
-  return type === 'user' || type === 'skill' || type === 'agent';
-}
+type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
 
-interface MessageListBodyProps {
-  messages: Message[];
-  pendingMessages: QueuedMessage[];
-  toolResults: Map<string, Message>;
-  convState: ConversationState;
-  onRetry: (localId: string) => void;
-  onCancelSteering?: ((localId: string) => void) | undefined;
-  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
-  /** Number of renderable historical rows collapsed into the top spacer. */
-  collapsedRenderableCount: number;
-  /** Message IDs whose renderable rows are collapsed. Tool rows never render standalone. */
-  collapsedRenderableIds: Set<string>;
-}
-
-/**
- * Memoized subtree holding the .map over historical messages. Wrapping this
- * in React.memo means token updates to `streamingBuffer` (which flow through
- * the parent MessageList shell) DO NOT cause the historical messages to
- * re-render — shallow prop compare skips the subtree entirely because
- * `messages`, `toolResults`, etc. are reference-stable across token arrivals.
- */
-const MessageListBody = memo(function MessageListBody({
-  messages,
-  pendingMessages,
-  toolResults,
-  convState,
-  onRetry,
-  onCancelSteering,
-  onOpenFile,
-  collapsedRenderableCount,
-  collapsedRenderableIds,
-}: MessageListBodyProps) {
-  // Tracks whether the previous rendered message was an agent message, so
-  // we can suppress the "Phoenix HH:MM" header on consecutive agent messages
-  // within the same turn. Any user / skill message resets the run; system
-  // messages and tool messages (which don't render as their own block here)
-  // leave the run intact — they don't represent a new turn.
-  //
-  // inAgentRun is advanced over the FULL message list (before the window
-  // slice) so a row reveals with the SAME header it would have had
-  // non-virtualized — the window boundary must not change turn grouping.
-  let inAgentRun = false;
-  return (
-    <>
-      {collapsedRenderableCount > 0 && (
-        <div
-          className="message-collapsed-spacer"
-          style={{ height: collapsedRenderableCount * COLLAPSED_EST_PX }}
-          aria-hidden="true"
-        />
-      )}
-      {messages.map((msg) => {
-        const type = msg.message_type || msg.type;
-        const rendered = !collapsedRenderableIds.has(msg.message_id);
-        if (type === 'user') {
-          inAgentRun = false;
-          if (!rendered) return null;
-          return <UserMessage key={msg.sequence_id} message={msg} />;
-        } else if (type === 'skill') {
-          inAgentRun = false;
-          if (!rendered) return null;
-          const skillContent = msg.content as { name?: string; trigger?: string };
-          const skillTrigger = skillContent.trigger || '';
-          const triggerArgs = extractSkillArgs(skillTrigger, skillContent.name || '');
-          return (
-            <div key={msg.sequence_id} className="message user" data-sequence-id={msg.sequence_id}>
-              <div className="message-header">
-                <span className="message-sender">You</span>
-                {msg.created_at && (
-                  <span className="message-time" title={new Date(msg.created_at).toLocaleString()}>
-                    {formatMessageTime(msg.created_at)}
-                  </span>
-                )}
-              </div>
-              <div className="message-content">
-                <div className="skill-indicator" title={`Skill invocation: loaded instructions from /${skillContent.name || 'skill'}/SKILL.md and delivered to the agent`}>
-                  <span className="skill-label">skill: /{skillContent.name || 'skill'}</span>
-                  {triggerArgs && (
-                    <span className="skill-trigger">{triggerArgs}</span>
-                  )}
-                </div>
-              </div>
+function renderHistoricalUnit(unit: HistoricalUnit, onOpenFile: OnOpenFile): JSX.Element | null {
+  switch (unit.kind) {
+    case 'user':
+      return <UserMessage key={unit.key} message={unit.message} />;
+    case 'skill': {
+      const c = unit.message.content as { name?: string; trigger?: string };
+      const trigger = c.trigger || '';
+      const args = extractSkillArgs(trigger, c.name || '');
+      return (
+        <div key={unit.key} className="message user" data-sequence-id={unit.message.sequence_id}>
+          <div className="message-header">
+            <span className="message-sender">You</span>
+            {unit.message.created_at && (
+              <span className="message-time" title={new Date(unit.message.created_at).toLocaleString()}>
+                {formatMessageTime(unit.message.created_at)}
+              </span>
+            )}
+          </div>
+          <div className="message-content">
+            <div className="skill-indicator" title={`Skill invocation: loaded instructions from /${c.name || 'skill'}/SKILL.md and delivered to the agent`}>
+              <span className="skill-label">skill: /{c.name || 'skill'}</span>
+              {args && (
+                <span className="skill-trigger">{args}</span>
+              )}
             </div>
-          );
-        } else if (type === 'agent') {
-          const isFirstInTurn = !inAgentRun;
-          inAgentRun = true;
-          if (!rendered) return null;
-          return (
-            <AgentMessage
-              key={msg.sequence_id}
-              message={msg}
-              toolResults={toolResults}
-              onOpenFile={onOpenFile}
-              isFirstInTurn={isFirstInTurn}
-            />
-          );
-        }
-        if (type === 'system') {
-          if (!rendered) return null;
-          const text = (msg.content as { text?: string })?.text;
-          if (text) {
-            return (
-              <div key={msg.sequence_id} className="system-message">
-                <span className="system-message-text">{text}</span>
-              </div>
-            );
-          }
-        }
-        // Skip tool messages - they're rendered inline with their tool_use
-        return null;
-      })}
-      {/* Render pending messages (queued client-side, not yet echoed). */}
-      {pendingMessages.map((msg) => (
+          </div>
+        </div>
+      );
+    }
+    case 'agent_turn':
+      return (
+        <AgentMessage
+          key={unit.key}
+          message={unit.agent}
+          toolResults={unit.toolResultsByUseId}
+          onOpenFile={onOpenFile}
+          isFirstInTurn={unit.isFirstInTurn}
+        />
+      );
+    case 'system': {
+      // buildRenderUnits skips empty-text system messages, so this branch
+      // always has text — but read defensively in case the contract drifts.
+      const text = (unit.message.content as { text?: string })?.text;
+      if (!text) return null;
+      return (
+        <div key={unit.key} className="system-message">
+          <span className="system-message-text">{text}</span>
+        </div>
+      );
+    }
+  }
+}
+
+function renderTailUnit(
+  unit: TailUnit,
+  onRetry: (localId: string) => void,
+  onCancelSteering: ((localId: string) => void) | undefined,
+): JSX.Element | null {
+  switch (unit.kind) {
+    case 'pending_user':
+      return (
         <QueuedUserMessage
-          key={msg.localId}
-          message={msg}
+          key={unit.key}
+          message={unit.message}
           onRetry={onRetry}
           onCancelSteering={onCancelSteering}
         />
-      ))}
-      {convState.type === 'awaiting_sub_agents' && (
-        <SubAgentStatus stateData={convState} />
+      );
+    case 'sub_agent_status':
+      return <SubAgentStatus key={unit.key} stateData={unit.state} />;
+    case 'streaming_agent':
+      // The streaming view is rendered as a sibling of <MessageListBody>
+      // (see <StreamingMessage> below). Step 5 will move the subscription
+      // into the leaf so this case becomes <StreamingMessage key={unit.key} />.
+      return null;
+  }
+}
+
+interface MessageListBodyProps {
+  historicalUnits: HistoricalUnit[];
+  tailUnits: TailUnit[];
+  firstRenderedUnitIndex: number;
+  spacerHeight: number;
+  topSentinelRef: RefObject<HTMLDivElement>;
+  onRetry: (localId: string) => void;
+  onCancelSteering?: ((localId: string) => void) | undefined;
+  onOpenFile: OnOpenFile;
+}
+
+/**
+ * Memoized subtree holding the slice over historical render units.
+ * React.memo's shallow prop compare skips re-render when historicalUnits,
+ * tailUnits, and the window outputs are reference-stable — which they are
+ * across streaming token updates (the parent's streamingBuffer prop
+ * changes, but buildRenderUnits is useMemo'd over messages so the unit
+ * arrays don't reallocate per token).
+ */
+const MessageListBody = memo(function MessageListBody({
+  historicalUnits,
+  tailUnits,
+  firstRenderedUnitIndex,
+  spacerHeight,
+  topSentinelRef,
+  onRetry,
+  onCancelSteering,
+  onOpenFile,
+}: MessageListBodyProps) {
+  return (
+    <>
+      {firstRenderedUnitIndex > 0 && (
+        <div
+          className="message-collapsed-spacer"
+          style={{ height: spacerHeight }}
+          aria-hidden="true"
+        />
       )}
+      <div ref={topSentinelRef} aria-hidden="true" />
+      {historicalUnits
+        .slice(firstRenderedUnitIndex)
+        .map((unit) => renderHistoricalUnit(unit, onOpenFile))}
+      {tailUnits.map((unit) => renderTailUnit(unit, onRetry, onCancelSteering))}
     </>
   );
 });
@@ -262,22 +254,34 @@ export function MessageList({
     savedScrollLookupRef.current = { id: conversationId, pos };
   }
 
-  const renderableMessages = useMemo(
-    () => messages.filter(isRenderableHistoricalMessage),
-    [messages],
+  const { historicalUnits, tailUnits } = useMemo(
+    () => buildRenderUnits({
+      messages,
+      pendingMessages,
+      convState,
+      // Streaming is rendered as a sibling for now; step 5 wires the
+      // streaming-buffer atom into a TailUnit + leaf subscription.
+      streamingHandle: null,
+    }),
+    [messages, pendingMessages, convState],
   );
 
-  const { firstRenderedIndex } = useBottomAnchoredWindow({
-    messageCount: renderableMessages.length,
+  const {
+    firstRenderedUnitIndex,
+    spacerHeight,
+    topSentinelRef,
+  } = useBottomAnchoredWindow({
+    historicalUnits,
     conversationId,
     scrollRootRef: mainRef,
-    savedScrollPos: savedScrollLookupRef.current.pos,
+    // Unit-anchor restore is wired in step 4; for now bottom-pin on mount
+    // and the existing scrollTop-based restore below handles continuity.
+    savedAnchor: null,
   });
-
-  const collapsedRenderableIds = useMemo(
-    () => new Set(renderableMessages.slice(0, firstRenderedIndex).map((msg) => msg.message_id)),
-    [firstRenderedIndex, renderableMessages],
-  );
+  // Suppress unused-variable warning until step 4 wires this through the
+  // unit-anchor save/read. Held in the lookup so step 4 only needs to
+  // change the call site, not re-introduce the read.
+  void savedScrollLookupRef;
 
   if (messages.length > prevMessageCountRef.current) {
     const newMsgs = messages.slice(prevMessageCountRef.current);
@@ -418,22 +422,6 @@ export function MessageList({
 
 
 
-  // Build a map of tool_use_id -> tool result for pairing
-  const toolResults = useMemo(() => {
-    const map = new Map<string, Message>();
-    for (const msg of messages) {
-      const type = msg.message_type || msg.type;
-      if (type === 'tool') {
-        const content = msg.content as ToolResultContent;
-        const toolUseId = content?.tool_use_id;
-        if (toolUseId) {
-          map.set(toolUseId, msg);
-        }
-      }
-    }
-    return map;
-  }, [messages]);
-
   const isEmpty = messages.length === 0 && pendingMessages.length === 0;
 
   return (
@@ -464,15 +452,14 @@ export function MessageList({
             </div>
           ) : (
             <MessageListBody
-              messages={messages}
-              pendingMessages={pendingMessages}
-              toolResults={toolResults}
-              convState={convState}
+              historicalUnits={historicalUnits}
+              tailUnits={tailUnits}
+              firstRenderedUnitIndex={firstRenderedUnitIndex}
+              spacerHeight={spacerHeight}
+              topSentinelRef={topSentinelRef}
               onRetry={onRetry}
               onCancelSteering={onCancelSteering}
               onOpenFile={onOpenFile}
-              collapsedRenderableCount={firstRenderedIndex}
-              collapsedRenderableIds={collapsedRenderableIds}
             />
           )}
           {/* Streaming text — cleared atomically when sse_message arrives (REQ-CONV-019).
