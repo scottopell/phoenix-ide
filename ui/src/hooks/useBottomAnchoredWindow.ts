@@ -4,9 +4,11 @@ import {
   useLayoutEffect,
   useEffect,
   useMemo,
+  useSyncExternalStore,
   type RefObject,
 } from 'react';
 import type { HistoricalUnit } from '../conversation/renderUnits';
+import type { UnitHeightCache } from '../conversation/unitHeightCache';
 
 /**
  * Bottom-anchored render-virtualization window over a typed
@@ -71,6 +73,9 @@ export interface UseBottomAnchoredWindowArgs {
    *  above it are rendered. The actual scrollTop placement is the
    *  caller's responsibility (handled in MessageList's layout effect). */
   savedAnchor?: SavedScrollAnchor | null;
+  /** Per-conversation measured-height cache. Spacer height uses
+   *  measured values when present, per-kind estimates otherwise. */
+  heightCache?: UnitHeightCache | null;
 }
 
 export interface UseBottomAnchoredWindowResult {
@@ -103,26 +108,32 @@ export function computeInitialStart(
   return Math.max(0, units.length - INITIAL_WINDOW);
 }
 
-/** Pure helper: sum the per-kind estimates over the collapsed prefix.
- *  This will be extended in a follow-up commit to consult a measured-height
- *  cache before falling back to KIND_ESTIMATES. */
+/** Pure helper: sum measured-or-estimated heights over the collapsed
+ *  prefix. `getHeight` returns the measured value for a unit key when
+ *  available; missing entries fall back to the per-kind estimate. */
 export function computeSpacerHeight(
   units: HistoricalUnit[],
   firstIdx: number,
+  getHeight: (key: string) => number | undefined = () => undefined,
 ): number {
   let h = 0;
   const limit = Math.min(firstIdx, units.length);
   for (let i = 0; i < limit; i++) {
-    h += KIND_ESTIMATES[units[i]!.kind];
+    const unit = units[i]!;
+    const measured = getHeight(unit.key);
+    h += measured ?? KIND_ESTIMATES[unit.kind];
   }
   return h;
 }
+
+const noopSubscribe = (): (() => void) => () => {};
 
 export function useBottomAnchoredWindow({
   historicalUnits,
   conversationId,
   scrollRootRef,
   savedAnchor,
+  heightCache,
 }: UseBottomAnchoredWindowArgs): UseBottomAnchoredWindowResult {
   // Once the user scrolls up and triggers an expansion, the window is
   // pinned to that index for this conversation. Until then,
@@ -151,9 +162,28 @@ export function useBottomAnchoredWindow({
       ? userExpandedIndex
       : computeInitialStart(historicalUnits, savedAnchor ?? null);
 
+  // Subscribe to the height cache via useSyncExternalStore so spacer
+  // geometry re-renders when ResizeObserver writes land. The version
+  // counter is a primitive — referentially stable across reads when
+  // unchanged, so React skips re-renders for no-op set() calls.
+  const cacheVersion = useSyncExternalStore(
+    heightCache?.subscribe ?? noopSubscribe,
+    () => heightCache?.version ?? 0,
+    () => 0,
+  );
+
   const spacerHeight = useMemo(
-    () => computeSpacerHeight(historicalUnits, firstRenderedUnitIndex),
-    [historicalUnits, firstRenderedUnitIndex],
+    () => computeSpacerHeight(
+      historicalUnits,
+      firstRenderedUnitIndex,
+      heightCache ? (key) => heightCache.get(key) : undefined,
+    ),
+    // cacheVersion is in the deps so a measured-height write triggers
+    // re-computation even though the cache reference is stable. The
+    // exhaustive-deps lint can't see that closure read; the dep is the
+    // signal, not the closure target.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [historicalUnits, firstRenderedUnitIndex, heightCache, cacheVersion],
   );
 
   // Reset compensation bookkeeping on conversation change so a stale

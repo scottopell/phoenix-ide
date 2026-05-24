@@ -180,4 +180,31 @@ describe('computeSpacerHeight', () => {
     // have counted: 1 agent + 20 tools at ~360px each ≈ 7600px. The new
     // model allocates ~400px for that same turn.
   });
+
+  describe('with a getHeight lookup', () => {
+    it('uses the measured value when present', () => {
+      const units: HistoricalUnit[] = [
+        mkUser('u1'),
+        mkAgentTurn('a1'),
+        mkSystem('sys1'),
+      ];
+      const measurements = new Map<string, number>([
+        ['u1', 42],
+        ['a1', 250],
+        // sys1 absent — falls back to estimate
+      ]);
+      const get = (k: string) => measurements.get(k);
+      expect(computeSpacerHeight(units, 3, get)).toBe(
+        42 + 250 + KIND_ESTIMATES.system,
+      );
+    });
+
+    it('falls back to the kind estimate for unmeasured units', () => {
+      const units: HistoricalUnit[] = [mkUser('u1'), mkAgentTurn('a1')];
+      const get = () => undefined;
+      expect(computeSpacerHeight(units, 2, get)).toBe(
+        KIND_ESTIMATES.user + KIND_ESTIMATES.agent_turn,
+      );
+    });
+  });
 });

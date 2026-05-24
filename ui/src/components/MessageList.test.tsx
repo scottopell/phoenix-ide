@@ -93,8 +93,15 @@ describe('MessageList', () => {
   });
 
   it('restores saved scroll when revisiting a cached conversation and does not snap back to bottom', async () => {
-    localStorage.setItem('phoenix:scroll:conv-a', '450');
-    localStorage.setItem('phoenix:msgcount:conv-a', '1');
+    // Unit-anchor restore: with one user message (key=msg-1) whose
+    // wrapper has offsetTop=0 in happy-dom, an offset of 450 produces
+    // scrollTop=450 — matching what the prior pixel-only model
+    // recorded. The second navigation back to conv-a relies on the
+    // save fired during the rerender writing this anchor back fresh.
+    localStorage.setItem(
+      'phoenix:msglist:anchor:conv-a',
+      JSON.stringify({ topVisibleUnitKey: 'msg-1', offsetWithinUnit: 450 }),
+    );
 
     const { container, rerender } = render(
       <MessageList
@@ -129,9 +136,13 @@ describe('MessageList', () => {
     triggerResize(messages, 500);
     expect(main.scrollTop).toBe(1000);
 
+    // Revisit conv-a with its original message present. Unit-anchor
+    // restore looks up by message_id — the saved anchor's
+    // topVisibleUnitKey ('msg-1') matches the rendered unit and the
+    // restore lands the user back at the saved offset.
     rerender(
       <MessageList
-        messages={[makeMessage(3)]}
+        messages={[makeMessage(1)]}
         pendingMessages={[]}
         convState={idleState}
         onRetry={vi.fn()}
