@@ -486,3 +486,5 @@ Phoenix MUST key tmux server ownership by `WorkScope`: `WorkScope::Worktree(path
 ### REQ-TMUX-WS-002: Continuation Sharing Within Worktree Scope
 
 Managed/Branch continuations that share a worktree MUST share the same tmux socket/session. Direct-mode conversations continue to use the conversation fallback scope.
+
+The cleanup cascade MUST decide preservation by `WorkScope` equality between the conversation being torn down and its continuation's resolved scope: skip the kill/unlink iff `inheritor_scope == Some(work_scope)`. Conversation-scope continuations always resolve to a different scope (their own conversation id), so the rule subsumes the "Direct continuations cannot inherit" case structurally without per-kind case-analysis.

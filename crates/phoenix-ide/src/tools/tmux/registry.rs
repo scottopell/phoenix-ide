@@ -415,48 +415,44 @@ impl TmuxRegistry {
         entry
     }
 
-    /// Best-effort tear-down of a conversation's tmux server, called
-    /// from the bedrock hard-delete cascade (task 02696).
+    /// Best-effort tear-down of a `WorkScope`'s tmux server, called from
+    /// the bedrock hard-delete cascade (task 02696).
     ///
-    /// `worktree_path` is used only as a fallback when no registry entry
-    /// exists (same keying logic as `ensure_live`). Pass `None` for
-    /// Direct-mode conversations.
+    /// The registry is keyed by `WorkScope::stable_key()` (same lookup
+    /// `ensure_live` uses for insertion). When the registry holds no
+    /// entry — orphaned socket from a prior process, or a scope whose
+    /// tools never reached `tmux_run` — the deterministic socket path
+    /// is derived from the scope so we still attempt the unlink.
     ///
-    /// `continued_in_conv_id`: if `Some` AND `worktree_path` is also `Some`,
-    /// the conversation's worktree was transferred to a continuation — the
-    /// tmux session keyed off that worktree path is still live for the
-    /// continuation, so we skip the kill and unlink entirely (task 03001).
-    /// The registry entry is still removed.
+    /// `inheritor_scope`: the resolved `WorkScope` of the conversation
+    /// (continuation) that this conversation transfers ownership to, if
+    /// any. Preservation is purely scope equality — when the inheritor
+    /// resolves to the *same* scope, the tmux session is still in active
+    /// use and we skip the kill/unlink. When the inheritor resolves to a
+    /// different scope — Direct conversations always do, since their
+    /// continuations get a fresh `Conversation` scope — we fall through
+    /// to kill+unlink. This makes preservation correct by construction:
+    /// "are my resources still owned by someone live?" rather than
+    /// case-analysis on scope kind plus an implicit invariant about
+    /// continuation inheritance.
     ///
-    /// For Direct conversations (no worktree, socket keyed off `conv-{id}`),
-    /// preservation is a category error: the continuation has its own
-    /// `conversation_id` and cannot reattach to a `conv-{parent_id}.sock`,
-    /// so we tear the server down even when `continued_in_conv_id.is_some()`.
+    /// Postcondition: registry has no entry for `work_scope`. If
+    /// `inheritor_scope` is `None` (or differs from `work_scope`): socket
+    /// file is gone and the tmux server process is gone. Failures of
+    /// `kill-server` (server already dead) and `remove_file` (file already
+    /// gone) are non-fatal.
     ///
-    /// Postcondition: registry has no entry for the conversation's
-    /// `WorkScope`. If `continued_in_conv_id` is None: socket file is
-    /// gone and the tmux server process is gone. Failures of
-    /// `kill-server` (server already dead) and `remove_file` (file
-    /// already gone) are non-fatal.
-    ///
-    /// REQ-TMUX-007, REQ-TMUX-WS-001.
+    /// REQ-TMUX-007, REQ-TMUX-WS-001, REQ-TMUX-WS-002.
     #[allow(dead_code)] // Wired up in task 02696 (bedrock hard-delete cascade).
     pub async fn cascade_on_delete(
         &self,
-        conversation_id: &str,
-        worktree_path: Option<&Path>,
-        continued_in_conv_id: Option<&str>,
+        work_scope: &WorkScope,
+        inheritor_scope: Option<&WorkScope>,
     ) -> CascadeReport {
-        // Derive the same registry key `ensure_live` used at insert time.
-        // Without this, the lookup misses every entry created through the
-        // production path — `ensure_live` inserts by `work_scope.stable_key()`
-        // but a prior version of this function removed by `conversation_id`,
-        // so cascade could never find a real entry and the registry leaked.
-        let work_scope = WorkScope::resolve(conversation_id, worktree_path);
-        let registry_key = work_scope.stable_key();
+        let key = work_scope.stable_key();
         let entry = {
             let mut map = self.inner.write().await;
-            map.remove(&registry_key)
+            map.remove(&key)
         };
 
         let socket_path = if let Some(arc) = entry {
@@ -466,26 +462,25 @@ impl TmuxRegistry {
             // No registry entry — fall back to the deterministic path so
             // we still attempt cleanup of any orphaned socket from a
             // prior process. Path derivation matches `ensure_live`.
-            match worktree_path {
-                Some(wt) => socket_path_for_worktree(&self.socket_dir, wt),
-                None => socket_path_for(&self.socket_dir, conversation_id),
+            match work_scope {
+                WorkScope::Worktree(path) => {
+                    socket_path_for_worktree(&self.socket_dir, Path::new(path))
+                }
+                WorkScope::Conversation(id) => socket_path_for(&self.socket_dir, id),
             }
         };
 
-        // If the worktree was transferred to a continuation, leave the
-        // tmux server running — the continuation owns it now.
-        //
-        // Preservation is only valid when the socket is keyed off a
-        // worktree path the continuation also uses; for Direct conversations
-        // the socket is keyed off the (now-deleted) parent conversation_id
-        // and the continuation cannot reattach, so we fall through to the
-        // normal kill+unlink path.
-        if continued_in_conv_id.is_some() && worktree_path.is_some() {
+        // Preservation by scope equality: the inheritor (continuation) is
+        // still driving the same tmux server iff it resolves to the same
+        // WorkScope. Falls out structurally — Direct continuations
+        // resolve to Conversation(<their own id>), which is never equal
+        // to the parent's Conversation(<parent id>), so they take the
+        // kill+unlink path automatically.
+        if inheritor_scope == Some(work_scope) {
             tracing::debug!(
-                conv_id = %conversation_id,
-                continuation = %continued_in_conv_id.unwrap_or(""),
+                work_scope = %work_scope,
                 socket = %socket_path.display(),
-                "tmux: skipping server kill — worktree transferred to continuation (task 03001)"
+                "tmux: skipping server kill — scope inherited by continuation"
             );
             return CascadeReport {
                 socket_path,
@@ -568,12 +563,11 @@ pub struct CascadeReport {
 #[allow(dead_code)] // Wired up in task 02696.
 pub async fn cascade_tmux_on_delete(
     registry: &Arc<TmuxRegistry>,
-    conversation_id: &str,
-    worktree_path: Option<&Path>,
-    continued_in_conv_id: Option<&str>,
+    work_scope: &WorkScope,
+    inheritor_scope: Option<&WorkScope>,
 ) -> CascadeReport {
     registry
-        .cascade_on_delete(conversation_id, worktree_path, continued_in_conv_id)
+        .cascade_on_delete(work_scope, inheritor_scope)
         .await
 }
 
@@ -810,17 +804,18 @@ mod tests {
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
         // No prior entry, no on-disk socket — cascade should be a no-op
         // that returns without errors.
-        let report = reg.cascade_on_delete("never-existed", None, None).await;
+        let scope = WorkScope::Conversation("never-existed".to_string());
+        let report = reg.cascade_on_delete(&scope, None).await;
         assert!(report.kill_server_error.is_none());
         assert!(report.unlink_error.is_none());
     }
 
-    /// Regression: `ensure_live` inserts the registry entry keyed by
-    /// `work_scope.stable_key()`. The original `cascade_on_delete`
-    /// removed by `conversation_id`, which never matched any production
-    /// entry — leaking the registry on every hard-delete. Insert via the
-    /// production path and assert cascade actually removes the entry,
-    /// for both Worktree and Conversation scopes.
+    /// Regression for the original key-mismatch bug Copilot flagged on
+    /// PR #136: `ensure_live` inserts the registry entry keyed by
+    /// `work_scope.stable_key()`, and the cascade must use the same key
+    /// for removal. The scope-equality refactor now passes the scope
+    /// directly, so the bug is structurally precluded — this test
+    /// pins the contract so it can't regress.
     #[tokio::test]
     async fn cascade_on_delete_removes_entry_inserted_by_ensure_live_paths() {
         let tmp = TempDir::new().unwrap();
@@ -829,10 +824,6 @@ mod tests {
         // removal contract, not the tmux subprocess.
         let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
 
-        // Stage entries directly via the internal helper using the same
-        // scope `ensure_live` uses. (ensure_live itself returns
-        // BinaryUnavailable before reaching get_or_insert; this exercises
-        // exactly the keying contract Copilot flagged on PR #136.)
         let conv_scope = WorkScope::Conversation("conv-direct".to_string());
         let conv_sock = socket_path_for(tmp.path(), "conv-direct");
         let _ = reg.get_or_insert(&conv_scope, conv_sock).await;
@@ -848,16 +839,14 @@ mod tests {
             "precondition: both entries present"
         );
 
-        // Cascade with the corresponding (conv_id, worktree_path) inputs
-        // must remove the matching entry by deriving the same stable_key.
-        let _ = reg.cascade_on_delete("conv-direct", None, None).await;
+        let _ = reg.cascade_on_delete(&conv_scope, None).await;
         assert_eq!(
             reg.conversation_count().await,
             1,
             "Conversation-scope cascade must remove the Conversation-keyed entry"
         );
 
-        let _ = reg.cascade_on_delete("conv-wt", Some(&wt_path), None).await;
+        let _ = reg.cascade_on_delete(&wt_scope, None).await;
         assert_eq!(
             reg.conversation_count().await,
             0,
@@ -865,14 +854,11 @@ mod tests {
         );
     }
 
-    /// Direct-mode (no worktree) continuations cannot inherit the parent's
-    /// `conv-{id}.sock` server — the continuation has its own conversation
-    /// id and would key a different socket. Even when `continued_in_conv_id`
-    /// is set, cascade must tear the orphan server down.
-    ///
-    /// Without the `worktree_path.is_some()` guard, this test would observe
-    /// the lingering socket file (preservation path returning early before
-    /// `remove_file`).
+    /// Direct-mode (no worktree) continuations resolve to their own
+    /// `Conversation(<child id>)` scope, which is never equal to the
+    /// parent's `Conversation(<parent id>)` scope. Cascade must therefore
+    /// tear the orphan server down via the scope-equality preservation
+    /// rule — even when `inheritor_scope` is provided.
     #[tokio::test]
     async fn cascade_on_delete_direct_continuation_does_not_preserve() {
         let tmp = TempDir::new().unwrap();
@@ -882,10 +868,13 @@ mod tests {
         std::fs::write(&socket_path, b"stale").unwrap();
         assert!(socket_path.exists(), "precondition: socket file staged");
 
-        // Direct conv (worktree_path = None) being continued. Preservation
-        // must NOT trigger — socket should be unlinked.
+        // Direct conv (Conversation scope) being continued. The
+        // continuation has a different scope (its own conversation id),
+        // so preservation must NOT trigger — socket should be unlinked.
+        let parent_scope = WorkScope::Conversation("parent-direct".to_string());
+        let child_scope = WorkScope::Conversation("child-conv".to_string());
         let report = reg
-            .cascade_on_delete("parent-direct", None, Some("child-conv"))
+            .cascade_on_delete(&parent_scope, Some(&child_scope))
             .await;
         assert!(report.kill_server_error.is_none());
         assert!(report.unlink_error.is_none());
@@ -896,9 +885,9 @@ mod tests {
         );
     }
 
-    /// Worktree-backed continuations DO inherit the parent's tmux server
-    /// (socket keyed off the worktree path, which the continuation reuses).
-    /// Cascade must skip kill/unlink in this case.
+    /// Worktree-backed continuations resolve to the same `Worktree(<path>)`
+    /// scope as the parent. Cascade must skip kill/unlink in this case
+    /// via the scope-equality preservation rule.
     #[tokio::test]
     async fn cascade_on_delete_worktree_continuation_preserves_socket() {
         let tmp = TempDir::new().unwrap();
@@ -907,8 +896,10 @@ mod tests {
         let socket_path = socket_path_for_worktree(tmp.path(), &worktree);
         std::fs::write(&socket_path, b"live").unwrap();
 
+        let parent_scope = WorkScope::Worktree(worktree.to_string_lossy().into_owned());
+        let child_scope = parent_scope.clone();
         let report = reg
-            .cascade_on_delete("parent-wt", Some(&worktree), Some("child-conv"))
+            .cascade_on_delete(&parent_scope, Some(&child_scope))
             .await;
         assert!(report.kill_server_error.is_none());
         assert!(report.unlink_error.is_none());
