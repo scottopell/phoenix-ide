@@ -152,6 +152,82 @@ describe('WorkActions — continuation gate (REQ-BED-031)', () => {
   });
 });
 
+describe('WorkActions — PR cleanup guidance', () => {
+  beforeEach(async () => {
+    vi.clearAllMocks();
+    const { api } = await import('../api');
+    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ found: false });
+  });
+
+  it('guides closed-unmerged PRs toward Abandon instead of waiting for merge cleanup', async () => {
+    const { api } = await import('../api');
+    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({
+      found: true,
+      number: 133,
+      display_state: 'closed',
+    });
+
+    renderWithProviders(
+      <WorkActions
+        conversationId="conv-closed"
+        convModeLabel="Work"
+        phaseType="idle"
+        branchName="feat/closed-pr"
+        baseBranch="main"
+        continuedInConvId={null}
+      />,
+    );
+
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    const abandon = screen.getByTestId('abandon-button') as HTMLButtonElement;
+
+    await waitFor(() => {
+      expect(screen.getByText(/PR #133 is closed without merge\. Use Abandon/i)).toBeInTheDocument();
+    });
+    expect(screen.queryByText(/cleanup unlocks after GitHub reports merged/i)).not.toBeInTheDocument();
+    expect(mark.disabled).toBe(true);
+    expect(mark.textContent).toMatch(/closed without merge/i);
+    expect(mark.title).toMatch(/Use Abandon/i);
+    expect(abandon.disabled).toBe(false);
+  });
+
+  it.each([
+    ['open', 134],
+    ['draft', 135],
+  ] as const)('keeps %s PRs blocked until GitHub reports merged', async (displayState, number) => {
+    const { api } = await import('../api');
+    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({
+      found: true,
+      number,
+      display_state: displayState,
+    });
+
+    renderWithProviders(
+      <WorkActions
+        conversationId={`conv-${displayState}`}
+        convModeLabel="Work"
+        phaseType="idle"
+        branchName={`feat/${displayState}-pr`}
+        baseBranch="main"
+        continuedInConvId={null}
+      />,
+    );
+
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+
+    await waitFor(() => {
+      expect(
+        screen.getByText(
+          `PR #${number} is ${displayState}; cleanup unlocks after GitHub reports merged.`,
+        ),
+      ).toBeInTheDocument();
+    });
+    expect(mark.disabled).toBe(true);
+    expect(mark.textContent).toMatch(/waiting for PR merge/i);
+    expect(mark.title).toMatch(/merge it before cleanup/i);
+  });
+});
+
 describe('WorkActions — View Diff (task 08641 + 08654 follow-on)', () => {
   beforeEach(async () => {
     vi.clearAllMocks();
