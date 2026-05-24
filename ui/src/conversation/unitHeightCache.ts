@@ -1,4 +1,4 @@
-import { useRef } from 'react';
+import { useEffect, useMemo } from 'react';
 
 // Per-conversation cache of measured render-unit heights, mirrored to
 // sessionStorage so first-paint spacer geometry is exact across remounts
@@ -66,6 +66,18 @@ export class UnitHeightCache {
       this.flushTimer = null;
     }
     this.writePending();
+  }
+
+  /** Release all retained resources: cancel the pending flush timer
+   *  (after one last drain), clear listeners, and clear the in-memory
+   *  heights/pending sets. Call from the host component's unmount or
+   *  conversation-change cleanup; without this, a setTimeout closure
+   *  keeps the cache instance alive until the timer fires. */
+  dispose(): void {
+    this.flush();
+    this.listeners.clear();
+    this.heights.clear();
+    this.pendingWrites.clear();
   }
 
   private writePending(): void {
@@ -138,16 +150,28 @@ export class UnitHeightCache {
 
 /** React hook that creates and manages a `UnitHeightCache` per
  *  conversation. The cache is replaced when conversationId changes;
- *  the prior cache's pending writes are flushed before discard. */
+ *  the prior cache is disposed (flushed, listeners cleared) via a
+ *  useEffect cleanup.
+ *
+ *  useMemo-based construction is concurrent-mode-safe: a discarded
+ *  render simply discards the unused cache instance — no side effects
+ *  ran beyond the constructor's read-only sessionStorage scan. The
+ *  previous useRef-mutation-in-render pattern would prematurely flush
+ *  the committed cache if a render attempt was discarded. */
 export function useUnitHeightCache(conversationId: string | undefined): UnitHeightCache {
-  const cacheRef = useRef<UnitHeightCache | null>(null);
-  const lastConvRef = useRef<string | undefined>(undefined);
+  const cache = useMemo(
+    () => new UnitHeightCache(conversationId),
+    [conversationId],
+  );
 
-  if (cacheRef.current === null || lastConvRef.current !== conversationId) {
-    cacheRef.current?.flush();
-    lastConvRef.current = conversationId;
-    cacheRef.current = new UnitHeightCache(conversationId);
-  }
+  useEffect(() => {
+    // Cleanup runs when conversationId changes (new cache replaces this
+    // one) and when the host unmounts. Either way, drain pending writes
+    // and release the timer.
+    return () => {
+      cache.dispose();
+    };
+  }, [cache]);
 
-  return cacheRef.current;
+  return cache;
 }

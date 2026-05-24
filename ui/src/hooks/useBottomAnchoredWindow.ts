@@ -67,10 +67,15 @@ export const KIND_ESTIMATES: Record<HistoricalUnit['kind'], number> = {
 export interface SavedScrollAnchor {
   topVisibleUnitKey: string;
   offsetWithinUnit: number;
-  /** Optional in this commit; required field landing in the
-   *  anchor-restore commit (see review batch 3). Old anchors written
-   *  without this field still parse, and the restore path treats absent
-   *  as "no msgcount delta information available." */
+  /** Number of historical units present at save time. The restore
+   *  path compares this to current historicalUnits.length to detect
+   *  that messages arrived while the user was away and surface the
+   *  "↓ New messages" affordance.
+   *
+   *  Optional only because the field is forward-compatible: anchors
+   *  written by older app builds (without the field) still parse and
+   *  simply don't surface the new-messages indicator. captureAnchor
+   *  in MessageList always populates it on writes. */
   unitCountAtSave?: number;
 }
 
