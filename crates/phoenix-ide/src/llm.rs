@@ -60,7 +60,6 @@ pub mod codex_login;
 pub mod credential_helper;
 mod discovery;
 mod error;
-mod gateway_profiles;
 mod mock;
 mod models;
 mod openai;

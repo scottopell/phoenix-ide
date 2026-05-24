@@ -3,8 +3,8 @@
 #![allow(dead_code)] // new_empty() used in tests
 
 use super::{
-    all_models, codex_credential, discover_models, gateway_profiles, probe_gateway,
-    CodexCredential, DiscoveryConfig, LlmService, LlmServiceImpl, LoggingService, Provider,
+    all_models, codex_credential, discover_models, probe_gateway, CodexCredential, DiscoveryConfig,
+    LlmService, LlmServiceImpl, LoggingService, Provider,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -480,18 +480,21 @@ impl ModelRegistry {
         reg
     }
 
-    /// Create a registry filtered by a static gateway capability profile.
-    /// Used when the gateway does not implement `/v1/models` but is documented
-    /// in [`super::gateway_profiles::PROFILES`].
-    fn new_with_profile(
-        config: &LlmConfig,
-        profile: &super::gateway_profiles::GatewayProfile,
-    ) -> Self {
+    /// Workaround for the exe.dev built-in gateway: it does not implement
+    /// `/anthropic/v1/models` AND it silently drops requests carrying the
+    /// `context-1m-2025-08-07` anthropic-beta header (returns HTTP 200 with
+    /// an empty SSE stream rather than a 4xx). When this gateway is in use
+    /// and discovery returned nothing, hide the 1M-context model variants
+    /// from the registry so users cannot select a model whose request would
+    /// be silently dropped. See task 24695, conversation 8f82c521.
+    fn hide_models_that_exe_dev_gateway_silently_drops(config: &LlmConfig) -> Self {
         let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
         let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
 
         for spec in all_models() {
-            if !profile.allows_model(&spec.id) {
+            // 1M variants share an api_name with their base model and are
+            // distinguished only by the `-1m` id suffix and the beta header.
+            if spec.id.ends_with("-1m") {
                 continue;
             }
             if let Some(service) = Self::try_create_model(&spec, config) {
@@ -512,6 +515,16 @@ impl ModelRegistry {
             current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
             config: Arc::new(config.clone()),
         }
+    }
+
+    /// True if the configured gateway URL points at the exe.dev built-in
+    /// gateway. Match is a substring check against the link-local IP because
+    /// the URL is well-known and stable.
+    fn gateway_is_exe_dev(config: &LlmConfig) -> bool {
+        config
+            .gateway
+            .as_deref()
+            .is_some_and(|g| g.contains("169.254.169.254"))
     }
 
     /// Pick the default model from available services.
@@ -588,21 +601,17 @@ impl ModelRegistry {
 
         // If discovery returned no models but we're in gateway mode and the probe succeeded,
         // the gateway is reachable but doesn't expose a model-listing endpoint (e.g. exe.dev
-        // gateway only proxies inference). Consult the static gateway-profile table to
-        // filter the hardcoded model list to what this gateway is known to support; fall
-        // back to the full hardcoded list if no profile matches.
+        // gateway only proxies inference). Fall back to hardcoded models with Healthy status,
+        // with one workaround: the exe.dev gateway silently drops 1M-context requests, so
+        // hide those variants from the picker when that gateway is in use.
         if discovered.is_empty() {
             if is_gateway_mode {
-                if let Some(gw) = config.gateway.as_deref() {
-                    if let Some(profile) = gateway_profiles::match_profile(gw) {
-                        tracing::info!(
-                            gateway = %gw,
-                            host_substring = %profile.host_substring,
-                            supported = profile.supported_model_ids.len(),
-                            "Gateway has no /v1/models endpoint; applying static capability profile"
-                        );
-                        return Self::new_with_profile(config, profile);
-                    }
+                if Self::gateway_is_exe_dev(config) {
+                    tracing::info!(
+                        "Gateway is exe.dev; hiding 1M-context model variants from registry \
+                         (gateway silently drops requests with context-1m beta header)"
+                    );
+                    return Self::hide_models_that_exe_dev_gateway_silently_drops(config);
                 }
                 tracing::warn!(
                     "Gateway model discovery returned no models (gateway may not support listing); \
@@ -1195,30 +1204,44 @@ mod tests {
     }
 
     #[test]
-    fn test_gateway_profile_filters_unsupported_models() {
-        // exe.dev gateway profile excludes -1m variants and the context-1m beta.
-        // Simulate the "discovery returned empty" branch by calling new_with_profile
-        // directly; this isolates the filter behavior from the network probe.
+    fn test_exe_dev_gateway_hides_one_million_context_variants() {
+        // Reproduces task 24695: exe.dev silently drops requests with the
+        // context-1m beta header. The registry must hide -1m variants from
+        // the picker so users can't select a model whose request will be
+        // dropped on the wire.
         let config = LlmConfig {
             gateway: Some("http://169.254.169.254/gateway/llm".to_string()),
             ..Default::default()
         };
-        let profile = super::gateway_profiles::match_profile(config.gateway.as_deref().unwrap())
-            .expect("exe.dev profile should match");
-        let registry = ModelRegistry::new_with_profile(&config, profile);
+        assert!(ModelRegistry::gateway_is_exe_dev(&config));
 
-        // Supported variants are registered.
+        let registry = ModelRegistry::hide_models_that_exe_dev_gateway_silently_drops(&config);
+
+        // Base variants remain available.
         assert!(registry.get("claude-sonnet-4-6").is_some());
         assert!(registry.get("claude-opus-4-7").is_some());
         assert!(registry.get("gpt-5.5").is_some());
 
-        // 1M variants — the bug 24695 targets — are NOT registered.
+        // 1M variants are hidden.
         assert!(registry.get("claude-opus-4-7-1m").is_none());
         assert!(registry.get("claude-opus-4-6-1m").is_none());
         assert!(registry.get("claude-sonnet-4-6-1m").is_none());
 
-        // Gateway is healthy from the registry's perspective once the profile applies.
         assert_eq!(registry.gateway_status, GatewayStatus::Healthy);
+    }
+
+    #[test]
+    fn test_gateway_is_exe_dev_matches_only_link_local_ip() {
+        let exe_dev = LlmConfig {
+            gateway: Some("http://169.254.169.254/gateway/llm".to_string()),
+            ..Default::default()
+        };
+        let other = LlmConfig {
+            gateway: Some("https://example.com/v1".to_string()),
+            ..Default::default()
+        };
+        assert!(ModelRegistry::gateway_is_exe_dev(&exe_dev));
+        assert!(!ModelRegistry::gateway_is_exe_dev(&other));
     }
 
     #[test]
