@@ -2728,7 +2728,7 @@ pre:hover .copy-btn {
   align-items: center;
   gap: 3px;
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 /* When task title is shown, demote git flow to secondary */
@@ -2816,10 +2816,6 @@ pre:hover .copy-btn {
 .pr-badge:hover {
   text-decoration: none;
   filter: brightness(1.15);
-}
-
-.git-flow {
-  overflow: visible;
 }
 
 .pr-control {
