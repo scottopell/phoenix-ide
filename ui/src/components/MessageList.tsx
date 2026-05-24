@@ -1,7 +1,6 @@
 import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo, type RefObject } from 'react';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
-import type { StreamingBuffer } from '../conversation/atom';
 import {
   UserMessage,
   QueuedUserMessage,
@@ -55,8 +54,20 @@ interface MessageListProps {
   onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   systemPrompt?: string | undefined;
+  /** Backend conversation UUID (atom.conversationId). Used as the
+   *  localStorage namespace for the anchor and as the parent prop tying
+   *  several pieces of internal state to a single conversation. */
   conversationId?: string | undefined;
-  streamingBuffer?: StreamingBuffer | null;
+  /** URL slug — the key the conversation store is keyed by. Needed by
+   *  the streaming-buffer subscription in `<StreamingMessage>`. May be
+   *  undefined briefly during route transitions; when undefined, the
+   *  streaming tail unit is not emitted. */
+  slug?: string | undefined;
+  /** True while the conversation has an active streaming buffer. Stable
+   *  across token mutations (the boolean stays true through every
+   *  token), so this prop does not propagate per-token re-renders to
+   *  `<MessageList>`. The parent derives this via `useStreamingActive`. */
+  isStreaming?: boolean;
 }
 
 // Threshold in pixels - if user is within this distance of bottom, consider them "pinned"
@@ -183,6 +194,7 @@ function renderHistoricalUnit(unit: HistoricalUnit, onOpenFile: OnOpenFile): JSX
 
 function renderTailUnit(
   unit: TailUnit,
+  slug: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
 ): JSX.Element | null {
@@ -199,10 +211,11 @@ function renderTailUnit(
     case 'sub_agent_status':
       return <SubAgentStatus key={unit.key} stateData={unit.state} />;
     case 'streaming_agent':
-      // The streaming view is rendered as a sibling of <MessageListBody>
-      // (see <StreamingMessage> below). Step 5 will move the subscription
-      // into the leaf so this case becomes <StreamingMessage key={unit.key} />.
-      return null;
+      // The slug-less case should never reach here in practice because
+      // MessageList only emits the streaming_agent unit when slug is
+      // set. Defensive null-return keeps the type narrow.
+      if (!slug) return null;
+      return <StreamingMessage key={unit.key} slug={slug} />;
   }
 }
 
@@ -213,6 +226,7 @@ interface MessageListBodyProps {
   spacerHeight: number;
   topSentinelRef: RefObject<HTMLDivElement>;
   observeUnit: UnitHeightObserver['observe'];
+  slug: string | undefined;
   onRetry: (localId: string) => void;
   onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: OnOpenFile;
@@ -240,6 +254,7 @@ const MessageListBody = memo(function MessageListBody({
   spacerHeight,
   topSentinelRef,
   observeUnit,
+  slug,
   onRetry,
   onCancelSteering,
   onOpenFile,
@@ -265,12 +280,12 @@ const MessageListBody = memo(function MessageListBody({
             {renderHistoricalUnit(unit, onOpenFile)}
           </div>
         ))}
-      {tailUnits.map((unit) => renderTailUnit(unit, onRetry, onCancelSteering))}
+      {tailUnits.map((unit) => renderTailUnit(unit, slug, onRetry, onCancelSteering))}
     </>
   );
 });
 
-export function MessageList({
+function MessageListImpl({
   messages,
   pendingMessages,
   convState,
@@ -279,7 +294,8 @@ export function MessageList({
   onOpenFile,
   systemPrompt,
   conversationId,
-  streamingBuffer,
+  slug,
+  isStreaming = false,
 }: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [jumpToNewestState, setJumpToNewestState] = useState<{
@@ -332,16 +348,25 @@ export function MessageList({
   }
   const savedAnchor = savedAnchorLookupRef.current.anchor;
 
+  // streamingHandle is a tag-only TailUnit driver. The key changes only
+  // on streaming-start / streaming-end transitions; it's reference-
+  // stable across token mutations because `isStreaming` (boolean) is
+  // stable across tokens. This keeps `historicalUnits`/`tailUnits`
+  // reference-stable across tokens too — and the actual buffer text is
+  // subscribed inside <StreamingMessage> via useStreamingBuffer.
+  const streamingHandle = useMemo(
+    () => (isStreaming && slug ? { key: `streaming-${slug}` } : null),
+    [isStreaming, slug],
+  );
+
   const { historicalUnits, tailUnits } = useMemo(
     () => buildRenderUnits({
       messages,
       pendingMessages,
       convState,
-      // Streaming is rendered as a sibling for now; step 5 wires the
-      // streaming-buffer atom into a TailUnit + leaf subscription.
-      streamingHandle: null,
+      streamingHandle,
     }),
-    [messages, pendingMessages, convState],
+    [messages, pendingMessages, convState, streamingHandle],
   );
 
   const heightCache = useUnitHeightCache(conversationId);
@@ -571,15 +596,17 @@ export function MessageList({
               spacerHeight={spacerHeight}
               topSentinelRef={topSentinelRef}
               observeUnit={unitObserver.observe}
+              slug={slug}
               onRetry={onRetry}
               onCancelSteering={onCancelSteering}
               onOpenFile={onOpenFile}
             />
           )}
-          {/* Streaming text — cleared atomically when sse_message arrives (REQ-CONV-019).
-              Lives OUTSIDE <MessageListBody> so token updates only re-render this element,
-              not the historical message list. */}
-          <StreamingMessage buffer={streamingBuffer ?? null} />
+          {/* Streaming text — now rendered via the streaming_agent TailUnit
+              inside <MessageListBody>. <StreamingMessage> subscribes to the
+              buffer via useStreamingBuffer(slug), so per-token mutations
+              re-render only the leaf — MessageList and MessageListBody are
+              untouched by token churn (REQ-MLRU-010). */}
         </div>
       </section>
       {showJumpToNewest && (
@@ -601,3 +628,19 @@ export function MessageList({
     </main>
   );
 }
+
+/**
+ * memo-wrapped export. The parent `<ConversationPage>` re-renders on
+ * every token (it consumes the whole atom via useConversationAtom); this
+ * memo boundary stops that re-render from propagating here, because the
+ * props are reference-stable across token mutations:
+ *   - messages / pendingMessages / convState come from atom slices that
+ *     don't change on tokens
+ *   - isStreaming is a boolean that stays true through every token
+ *   - callbacks are useCallback'd at the parent
+ *   - slug / conversationId are URL/atom-derived strings
+ *
+ * The streaming buffer itself is consumed by <StreamingMessage> via
+ * useStreamingBuffer(slug); only that leaf re-renders per token.
+ */
+export const MessageList = memo(MessageListImpl);

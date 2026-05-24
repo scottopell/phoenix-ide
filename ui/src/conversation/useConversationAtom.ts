@@ -1,5 +1,5 @@
 import { useCallback, useContext, useSyncExternalStore, useRef, type Dispatch } from 'react';
-import type { ConversationAtom, SSEAction } from './atom';
+import type { ConversationAtom, SSEAction, StreamingBuffer } from './atom';
 import type { Conversation } from '../api';
 import { ConversationContext } from './ConversationContext';
 import { conversationListsEqual } from '../utils/conversationDiff';
@@ -144,6 +144,59 @@ export function useConversationsList(): {
     lastRef.current = next;
     return next;
   }, [store]);
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+/**
+ * Returns the streaming buffer for `slug`, or null when no buffer is
+ * active. Reference-stable: the atom's `streamingBuffer` field is the
+ * snapshot; `useSyncExternalStore` skips re-renders when the reference
+ * is unchanged (atom mutations to other fields like `phase` or
+ * `messages` don't cause this hook to re-render — only buffer
+ * mutations do, which is exactly the per-token re-render the consuming
+ * `<StreamingMessage>` leaf needs).
+ *
+ * This is the seam that lets `<MessageList>` stop receiving
+ * `streamingBuffer` as a prop: the leaf subscribes directly, the
+ * historical render tree no longer participates in per-token updates.
+ */
+export function useStreamingBuffer(slug: string): StreamingBuffer | null {
+  const store = useConversationStore();
+
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => store.getSnapshot(slug).streamingBuffer ?? null,
+    [store, slug],
+  );
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+/**
+ * Returns whether `slug` has an active streaming buffer. Re-renders
+ * only on streaming-start and streaming-end transitions (the boolean
+ * stays `true` through every token mutation, and `Object.is(true, true)`
+ * tells React to skip the render).
+ *
+ * Use this in components that need to react to "is streaming happening"
+ * but should NOT re-render per token — typically the parent that
+ * decides whether to render a `<StreamingMessage>` leaf at all.
+ */
+export function useStreamingActive(slug: string): boolean {
+  const store = useConversationStore();
+
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => store.getSnapshot(slug).streamingBuffer != null,
+    [store, slug],
+  );
 
   return useSyncExternalStore(subscribe, getSnapshot);
 }

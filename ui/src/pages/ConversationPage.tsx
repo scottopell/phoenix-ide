@@ -1052,7 +1052,8 @@ function ConversationPageContent() {
         onCancelSteering={handleCancelSteering}
         onOpenFile={handleOpenFileFromPatch}
         conversationId={conversationId}
-        streamingBuffer={atom.streamingBuffer}
+        slug={slug}
+        isStreaming={atom.streamingBuffer != null}
         systemPrompt={atom.systemPrompt ?? undefined}
       />
       {atom.uiError && (

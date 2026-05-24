@@ -111,7 +111,6 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-a"
-        streamingBuffer={null}
       />,
     );
 
@@ -130,7 +129,6 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-b"
-        streamingBuffer={null}
       />,
     );
     triggerResize(messages, 500);
@@ -148,7 +146,6 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-a"
-        streamingBuffer={null}
       />,
     );
 
@@ -172,7 +169,6 @@ describe('MessageList', () => {
         onRetry={vi.fn()}
         onOpenFile={undefined}
         conversationId="conv-a"
-        streamingBuffer={null}
       />,
     );
 
