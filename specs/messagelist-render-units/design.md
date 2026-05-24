@@ -9,11 +9,13 @@ construction) and `windowing.allium` (window lifecycle).
 
 ```
 ui/src/
-├── lib/
+├── conversation/
 │   ├── renderUnits.ts           # NEW. buildRenderUnits + types
 │   ├── renderUnits.test.ts      # NEW. Unit-construction tests
 │   ├── unitHeightCache.ts       # NEW. measured-height map + sessionStorage
 │   └── unitHeightCache.test.ts  # NEW.
+│   (joins existing atom.ts, ConversationStore.ts, etc. as the
+│   projection from atom state to render shape)
 │
 ├── hooks/
 │   ├── useBottomAnchoredWindow.ts   # REWORKED. Takes HistoricalUnit[]
