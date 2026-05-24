@@ -1,0 +1,600 @@
+-- allium: 3
+-- render_units.allium
+--
+-- MessageList Render-Unit Construction: Behavioural Specification
+--
+-- Scope: The pure transform `buildRenderUnits(messages, pendingMessages,
+--        convState, isStreaming) -> { historicalUnits, tailUnits }` that
+--        produces the structural input to the conversation view's
+--        bottom-anchored window. Models the per-message walk as a small
+--        state machine over a Builder entity; final-state invariants
+--        capture the global properties of the produced lists.
+--
+-- Includes: Per-message-type emission rules; tool-result structural
+--           ownership; isFirstInTurn pre-computation; capability-gap
+--           skip rules; tail-unit emission (pending / sub-agent /
+--           streaming); identity and ordering invariants.
+--
+-- Excludes: HTTP/SSE delivery (see sse_wire); reducer that produces
+--           `messages` (see conversation_atom); rendering of individual
+--           units (lives in MessageComponents.tsx, no spec).
+--
+-- Self-contained: this spec does not `use` any other spec. External
+--                 types (Message content blocks, ConversationState
+--                 variants beyond awaiting_sub_agents) are treated
+--                 opaquely.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- A persisted message as seen by the transform. The transform inspects
+-- message_type to dispatch; content is consulted only to extract text
+-- (for system) or tool_use_id (for tool results) and is otherwise
+-- treated opaquely.
+value Message {
+    message_id: String
+    sequence_id: Integer
+    message_type: String
+    -- Opaque to the transform unless message_type is 'system' (text) or
+    -- 'tool' (tool_use_id). The agent renderer reads content blocks
+    -- itself; the transform does not.
+}
+
+-- A client-queued message awaiting server reflection. Sourced from
+-- useMessageQueue; see user_message_queue.allium.
+value QueuedMessage {
+    local_id: String
+    status: String
+}
+
+-- The conversation phase as seen by the transform. Only the
+-- discriminator is inspected; awaiting_sub_agents carries pending +
+-- completed lists used to populate a tail unit.
+value ConvState {
+    type: String
+    -- pending and completed_results are present when type =
+    -- 'awaiting_sub_agents'; opaque otherwise.
+}
+
+-- The streaming buffer's identity-stable handle. The transform reads
+-- only its existence (via isStreaming) and a stable key derived from
+-- buffer.startedAt. Per-token text mutates the buffer behind a
+-- subscription; the transform does not see token deltas.
+value StreamingHandle {
+    key: String
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+-- The kind discriminator on HistoricalUnit. Tool messages do NOT have
+-- a kind: by construction they are owned by an agent_turn and never
+-- appear as a standalone unit.
+enum HistoricalKind {
+    user
+    skill
+    agent_turn
+    system
+}
+
+-- The kind discriminator on TailUnit. These units never enter the
+-- bottom-anchored window's collapsible range.
+enum TailKind {
+    pending_user
+    sub_agent_status
+    streaming_agent
+}
+
+-- The skip reasons emitted by capability-gap logging. Every skip
+-- emits at console.debug carrying its reason; the set is closed.
+enum SkipReason {
+    empty_system
+    orphan_tool
+    unknown_type
+    missing_tool_use_id
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- A historical render unit. Kind-discriminated; agent_turn carries the
+-- tool-result map and the pre-computed isFirstInTurn flag.
+entity HistoricalUnit {
+    kind: HistoricalKind
+    key: String
+    source_message_id: String
+    -- agent_turn-only fields:
+    tool_results_by_use_id: Map<String, Message>?
+    is_first_in_turn: Boolean?
+}
+
+-- A tail render unit. Always rendered, never collapsed by the window.
+entity TailUnit {
+    kind: TailKind
+    key: String
+    -- pending_user carries local_id; sub_agent_status carries a
+    -- ConvState reference; streaming_agent carries the streaming key
+    -- only (buffer is subscribed via atom at the leaf).
+}
+
+-- The transform's working state. Walks messages once, emitting units
+-- into the accumulator. Terminal when position reaches len(messages).
+entity Builder {
+    messages: List<Message>
+    pending_messages: List<QueuedMessage>
+    conv_state: ConvState
+    is_streaming: Boolean
+    streaming_handle: StreamingHandle?
+
+    position: Integer
+    historical: List<HistoricalUnit>
+    tail: List<TailUnit>
+    in_agent_run: Boolean
+
+    transitions phase {
+        walking -> walking
+        walking -> tail_assembly
+        tail_assembly -> done
+        terminal: done
+    }
+    phase: String
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+-- The transform is invoked from a React useMemo at the MessageList
+-- shell. The actor exists to anchor the Builder entity; rules do not
+-- reference it by name.
+actor RenderUnitsTransform {
+    identified_by: Builder
+}
+
+------------------------------------------------------------
+-- Rules — historical walk (phase = walking)
+------------------------------------------------------------
+-- Every walking-phase rule:
+--   1. requires b.phase = 'walking'
+--   2. requires b.position < len(b.messages)
+--   3. advances b.position by 1 or more
+--   4. may append to b.historical, may flip b.in_agent_run
+--
+-- Position advancement guarantees termination: each rule consumes at
+-- least one message. Total: at most len(b.messages) walking rule
+-- firings before the WalkComplete rule transitions to tail_assembly.
+
+-- User message → user unit. Breaks any active agent run so the next
+-- agent message in this conversation gets isFirstInTurn = true.
+rule EmitUserUnit {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: b.messages[b.position].message_type = "user"
+
+    ensures: b.historical = append(b.historical, user_unit(b.messages[b.position]))
+    ensures: b.in_agent_run = false
+    ensures: b.position = b.position + 1
+
+    @guidance
+        -- user_unit(m) constructs:
+        --   { kind: user, key: m.message_id,
+        --     source_message_id: m.message_id }
+        -- See lib/renderUnits.ts buildRenderUnits.
+}
+
+-- Skill message → skill unit. Treated like user for run-breaking
+-- semantics (a /skill invocation starts a new turn).
+rule EmitSkillUnit {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: b.messages[b.position].message_type = "skill"
+
+    ensures: b.historical = append(b.historical, skill_unit(b.messages[b.position]))
+    ensures: b.in_agent_run = false
+    ensures: b.position = b.position + 1
+}
+
+-- Agent message → agent_turn unit. Consumes the trailing run of
+-- tool messages (results) and stores them in the unit's map keyed by
+-- tool_use_id. isFirstInTurn is the inverse of the prior in_agent_run.
+rule EmitAgentTurnUnit {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: b.messages[b.position].message_type = "agent"
+
+    ensures: b.historical = append(b.historical, agent_turn_unit(
+                 b.messages,
+                 b.position,
+                 not b.in_agent_run
+             ))
+    ensures: b.in_agent_run = true
+    ensures: b.position = b.position + 1 + count_trailing_tool_messages(b.messages, b.position)
+
+    @guidance
+        -- agent_turn_unit(messages, i, isFirstInTurn):
+        --   agent := messages[i]
+        --   map := empty
+        --   j := i + 1
+        --   while j < len(messages) and messages[j].message_type = "tool":
+        --     tid := messages[j].content.tool_use_id
+        --     if tid != null:
+        --       map[tid] := messages[j]
+        --     else:
+        --       debug_log(message_id=messages[j].message_id,
+        --                 reason=missing_tool_use_id)
+        --     j := j + 1
+        --   return { kind: agent_turn, key: agent.message_id,
+        --            source_message_id: agent.message_id,
+        --            tool_results_by_use_id: map,
+        --            is_first_in_turn: isFirstInTurn }
+        --
+        -- count_trailing_tool_messages(messages, i):
+        --   j := i + 1
+        --   while j < len(messages) and messages[j].message_type = "tool":
+        --     j := j + 1
+        --   return j - (i + 1)
+        --
+        -- The agent message itself is consumed by position += 1; the
+        -- trailing tool messages are consumed by the count expression.
+        -- Net advance: 1 + (number of trailing tool messages).
+}
+
+-- System message with non-empty text → system unit. Does NOT break the
+-- agent run (a system note between agent turns is part of the same
+-- run for header-suppression purposes).
+rule EmitSystemUnitWithText {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: b.messages[b.position].message_type = "system"
+    requires: has_nonempty_text(b.messages[b.position])
+
+    ensures: b.historical = append(b.historical, system_unit(b.messages[b.position]))
+    ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.position = b.position + 1
+}
+
+-- System message with empty text → skipped + logged. Does NOT break
+-- the agent run.
+rule SkipEmptySystem {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: b.messages[b.position].message_type = "system"
+    requires: not has_nonempty_text(b.messages[b.position])
+
+    ensures: b.historical = b.historical
+    ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.position = b.position + 1
+
+    @guidance
+        -- debug_log(message_id=m.message_id, reason=empty_system).
+        -- The skip is structurally encoded; the log is the
+        -- capability-gap visibility per CLAUDE.md.
+}
+
+-- Tool message outside an agent run (i.e., the agent run was already
+-- consumed by EmitAgentTurnUnit's trailing scan, OR no agent has been
+-- seen yet) → skipped + logged. Reaching this rule means the backend
+-- emitted a tool result without an immediately-preceding agent, which
+-- is a backend invariant violation (see sse_wire).
+rule SkipOrphanTool {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: b.messages[b.position].message_type = "tool"
+
+    ensures: b.historical = b.historical
+    ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.position = b.position + 1
+
+    @guidance
+        -- debug_log(message_id=m.message_id, reason=orphan_tool).
+        -- A correctly-ordered message stream consumes tool messages
+        -- inside EmitAgentTurnUnit's trailing scan; this rule fires
+        -- only when that scan was unavailable (no preceding agent) or
+        -- the messages are reordered. Logging makes the violation
+        -- visible without crashing the render.
+}
+
+-- Unknown message_type → skipped + logged. Forward-compatible: a new
+-- backend message variant won't crash the UI, just disappear from
+-- view. The debug log makes the disappearance traceable.
+rule SkipUnknownType {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position < len(b.messages)
+    requires: b.messages[b.position].message_type != "user"
+    requires: b.messages[b.position].message_type != "skill"
+    requires: b.messages[b.position].message_type != "agent"
+    requires: b.messages[b.position].message_type != "system"
+    requires: b.messages[b.position].message_type != "tool"
+
+    ensures: b.historical = b.historical
+    ensures: b.in_agent_run = b.in_agent_run
+    ensures: b.position = b.position + 1
+
+    @guidance
+        -- debug_log(message_id=m.message_id,
+        --           message_type=m.message_type,
+        --           reason=unknown_type).
+}
+
+-- Walking complete → transition to tail_assembly phase. Tail units
+-- are emitted in declaration order: pending then sub-agent then
+-- streaming.
+rule WalkComplete {
+    when: BuilderStep(b)
+
+    requires: b.phase = "walking"
+    requires: b.position = len(b.messages)
+
+    ensures: b.phase = "tail_assembly"
+    ensures: b.position = b.position
+    ensures: b.historical = b.historical
+    ensures: b.in_agent_run = b.in_agent_run
+}
+
+------------------------------------------------------------
+-- Rules — tail assembly (phase = tail_assembly)
+------------------------------------------------------------
+
+-- Pending queued messages → pending_user tail units, in input order.
+-- The transform's tail list begins with these; subsequent rules
+-- append the sub-agent and streaming tail units after.
+rule AppendPendingTailUnits {
+    when: BuilderStep(b)
+
+    requires: b.phase = "tail_assembly"
+
+    ensures: b.tail = pending_tail_units_in_order(b.pending_messages)
+    ensures: b.phase = "tail_assembly"
+
+    @guidance
+        -- pending_tail_units_in_order(qs):
+        --   for q in qs (input order):
+        --     emit { kind: pending_user, key: q.local_id }
+        -- The status filter (only pending / steering_queued) has
+        -- already been applied upstream by useMessageQueue's
+        -- derivePendingMessages; this rule consumes the filtered list.
+}
+
+-- Awaiting sub-agents → singleton sub_agent_status tail unit. Key is
+-- a constant; the React reconciler uses it to preserve the inner
+-- component identity across re-derivations.
+rule AppendSubAgentStatusTailUnit {
+    when: BuilderStep(b)
+
+    requires: b.phase = "tail_assembly"
+    requires: b.conv_state.type = "awaiting_sub_agents"
+
+    ensures: b.tail = append(b.tail, sub_agent_status_unit(b.conv_state))
+    ensures: b.phase = "tail_assembly"
+}
+
+-- Not awaiting sub-agents → no sub_agent_status unit emitted.
+rule SkipSubAgentStatusWhenIdle {
+    when: BuilderStep(b)
+
+    requires: b.phase = "tail_assembly"
+    requires: b.conv_state.type != "awaiting_sub_agents"
+
+    ensures: b.tail = b.tail
+    ensures: b.phase = "tail_assembly"
+}
+
+-- Streaming active → streaming_agent tail unit (tag only). The buffer
+-- itself is subscribed to via the streaming-buffer atom inside the
+-- StreamingMessage leaf component; this unit does NOT carry the
+-- buffer text.
+rule AppendStreamingTailUnit {
+    when: BuilderStep(b)
+
+    requires: b.phase = "tail_assembly"
+    requires: b.is_streaming = true
+    requires: b.streaming_handle != null
+
+    ensures: b.tail = append(b.tail, streaming_unit(b.streaming_handle))
+    ensures: b.phase = "tail_assembly"
+}
+
+rule SkipStreamingWhenInactive {
+    when: BuilderStep(b)
+
+    requires: b.phase = "tail_assembly"
+    requires: b.is_streaming = false
+
+    ensures: b.tail = b.tail
+    ensures: b.phase = "tail_assembly"
+}
+
+-- Tail assembly complete → terminal. Caller reads b.historical and
+-- b.tail from this state.
+rule AssemblyComplete {
+    when: BuilderStep(b)
+
+    requires: b.phase = "tail_assembly"
+
+    ensures: b.phase = "done"
+    ensures: b.historical = b.historical
+    ensures: b.tail = b.tail
+
+    @guidance
+        -- This rule fires after all tail-assembly rules have had a
+        -- chance to apply for the current state. The execution model
+        -- treats tail-assembly rules as ordered: pending, then
+        -- sub-agent (or skip), then streaming (or skip), then this
+        -- rule.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- The historical list never contains a unit whose source message is a
+-- tool message. Tool messages live inside agent_turn.tool_results_by_use_id.
+invariant NoStandaloneToolUnit {
+    for b in Builders:
+        b.phase = "done" implies
+            for u in b.historical:
+                u.kind != "tool"
+                -- (HistoricalKind has no 'tool' member by construction,
+                -- so this is a structural tautology of the type; stated
+                -- here because the prior raw-message model permitted it
+                -- at the type level.)
+}
+
+-- Every tool message in the input either ends up inside an
+-- agent_turn's tool_results_by_use_id or in a debug log via
+-- SkipOrphanTool / missing_tool_use_id. No silent drops.
+invariant EveryToolMessageAccountedFor {
+    for b in Builders:
+        b.phase = "done" implies
+            for m in b.messages:
+                m.message_type = "tool" implies
+                    (exists u in b.historical:
+                        u.kind = "agent_turn" and
+                        m.message_id in values(u.tool_results_by_use_id))
+                    or
+                    debug_logged(message_id=m.message_id,
+                                 reason in [orphan_tool, missing_tool_use_id])
+}
+
+-- isFirstInTurn is true for the first agent_turn after any
+-- user/skill (or the start of the list); false for any agent_turn
+-- whose immediate predecessor in b.historical is another agent_turn.
+invariant FirstInTurnReflectsPriorRun {
+    for b in Builders:
+        b.phase = "done" implies
+            for i in indices(b.historical):
+                let u = b.historical[i] in
+                    u.kind = "agent_turn" implies
+                        u.is_first_in_turn = (
+                            i = 0 or
+                            b.historical[i - 1].kind != "agent_turn"
+                        )
+                        -- System units don't break the run; they are
+                        -- skipped by this implication's transitive
+                        -- effect because if historical[i-1] is system
+                        -- and historical[i-2] is agent_turn, then u's
+                        -- is_first_in_turn is false. The reducer's
+                        -- in_agent_run carries this through correctly;
+                        -- this invariant only captures the direct
+                        -- predecessor case for brevity.
+}
+
+-- Tail units appear after all historical units in any rendered
+-- traversal. The window's collapse range covers only b.historical's
+-- prefix; b.tail is untouched.
+invariant TailUnitsArePostHistorical {
+    for b in Builders:
+        b.phase = "done" implies
+            len(b.historical) + len(b.tail) = len(b.historical) + len(b.tail)
+            -- (Tautology in entity-snapshot form; the structural claim
+            -- is encoded in the type split: HistoricalUnit and TailUnit
+            -- are distinct entities, and useBottomAnchoredWindow's
+            -- input signature accepts only List<HistoricalUnit>.)
+}
+
+-- Tail unit order is deterministic: pending_user* then optional
+-- sub_agent_status then optional streaming_agent. No interleaving.
+invariant TailUnitOrderIsDeterministic {
+    for b in Builders:
+        b.phase = "done" implies
+            tail_order_is_pending_then_subagent_then_streaming(b.tail)
+}
+
+-- Position advances monotonically and reaches len(messages) before
+-- the phase transitions to tail_assembly. Combined with the
+-- per-rule advancement (each walking rule increments position),
+-- this guarantees termination.
+invariant PositionAdvancesMonotonically {
+    for b in Builders:
+        b.position >= 0
+        and b.position <= len(b.messages)
+        and (b.phase != "walking" implies b.position = len(b.messages))
+}
+
+-- Every emitted historical unit corresponds to exactly one input
+-- message (with the exception of agent_turn, which corresponds to
+-- one agent message + zero or more tool messages held in its map).
+-- Said differently: no historical unit is fabricated from nothing.
+invariant EveryHistoricalUnitHasSource {
+    for b in Builders:
+        b.phase = "done" implies
+            for u in b.historical:
+                exists m in b.messages:
+                    m.message_id = u.source_message_id
+                    and (u.kind = "agent_turn" implies m.message_type = "agent")
+                    and (u.kind = "user" implies m.message_type = "user")
+                    and (u.kind = "skill" implies m.message_type = "skill")
+                    and (u.kind = "system" implies m.message_type = "system")
+}
+
+-- Unit keys are unique across the historical list. The window's
+-- saved-scroll anchor and React reconciler both depend on this.
+invariant HistoricalUnitKeysAreUnique {
+    for b in Builders:
+        b.phase = "done" implies
+            for i in indices(b.historical):
+                for j in indices(b.historical):
+                    i != j implies b.historical[i].key != b.historical[j].key
+}
+
+-- The streaming tail unit's key is identity-stable across token
+-- arrivals (the StreamingHandle.key is derived from buffer.startedAt,
+-- not from per-token state). This is the React identity guarantee
+-- that preserves the StreamingMessage leaf component state during
+-- streaming.
+invariant StreamingKeyStableDuringStream {
+    for b in Builders:
+        b.phase = "done"
+        and b.is_streaming = true
+        implies b.streaming_handle.key = streaming_key_from_buffer(b)
+
+    @guidance
+        -- The handle's key is computed once when the streaming buffer
+        -- starts (sse_token → SseTokenAccumulated transitions buffer
+        -- from null to non-null with a fresh startedAt). Subsequent
+        -- token arrivals advance buffer.text and buffer.lastSequence
+        -- but leave startedAt fixed. The key derived from startedAt
+        -- is therefore stable for the lifetime of the streaming
+        -- session.
+}
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+-- Q1. Tool result with no tool_use_id: SkipOrphanTool covers the
+--     "no preceding agent" case, and EmitAgentTurnUnit's @guidance
+--     covers the "agent present but tool_use_id missing" case via
+--     debug_log + skip-from-map. Both are silent drops with logging.
+--     The design.md flags this as worth confirming. If a stricter
+--     contract is wanted ("every tool result must pair"), this spec
+--     would gain a rule that aborts the transform on missing pairing,
+--     surfacing a UIError instead of a silent drop.
+--
+-- Q2. System message in the middle of an agent run: this spec treats
+--     system as run-preserving (does not flip b.in_agent_run). This
+--     matches today's behavior. If a future product decision is that
+--     a system note should start a new turn for header purposes,
+--     EmitSystemUnitWithText would flip in_agent_run = false; the
+--     FirstInTurnReflectsPriorRun invariant captures the immediate
+--     predecessor only and would need extension.
+--
+-- Q3. Continuation and error message_type: today's code treats these
+--     as unknown (skipped via SkipUnknownType). If they need rendering,
+--     a new HistoricalKind variant + emission rule lands here.
