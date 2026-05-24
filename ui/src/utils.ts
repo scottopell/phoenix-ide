@@ -185,8 +185,14 @@ export function parseConversationState(raw: unknown): ConversationState {
       }
       return { type: 'handed_off', successor_conv_id: successor };
     }
-    case 'error':
-      return { type: 'error', message: (obj['message'] as string) ?? 'Unknown error' };
+    case 'error': {
+      const errorKind = obj['error_kind'];
+      return {
+        type: 'error',
+        message: (obj['message'] as string) ?? 'Unknown error',
+        ...(typeof errorKind === 'string' && errorKind.length > 0 ? { error_kind: errorKind } : {}),
+      };
+    }
     case 'awaiting_recovery':
       return {
         type: 'awaiting_recovery',

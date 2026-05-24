@@ -180,7 +180,7 @@ export type ConversationState =
   | { type: 'awaiting_user_response'; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'handed_off'; successor_conv_id: string }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string; error_kind?: string }
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
   | { type: 'terminal' };
 

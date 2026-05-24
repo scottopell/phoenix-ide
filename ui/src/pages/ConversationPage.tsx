@@ -1267,6 +1267,7 @@ function ConversationPageContent() {
       ) : convStateForChildren.type === 'error' ? (
         <ErrorBanner
           message={convStateForChildren.message}
+          errorKind={convStateForChildren.error_kind}
           onRetry={() => handleSend('continue', [])}
           onDismiss={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />

@@ -1,8 +1,9 @@
 import { AlertCircle } from 'lucide-react';
+import type { ReactNode } from 'react';
 
 interface ErrorBannerProps {
   message: string;
-  errorKind?: string;
+  errorKind?: string | undefined;
   onRetry: () => void;
   onDismiss: () => void;
 }
@@ -10,8 +11,21 @@ interface ErrorBannerProps {
 /**
  * Parse and humanize an error message from the backend.
  * The backend often returns JSON-formatted error strings.
+ *
+ * For `usage_limit_reached` the backend already supplies a plan-aware
+ * string that mirrors codex CLI's `UsageLimitReachedError::fmt`
+ * verbatim — including the upgrade / usage-page URLs and the reset
+ * time. We pass it through unmodified and let `linkify` turn the URLs
+ * into anchors at render time.
  */
-function humanizeError(message: string): { title: string; details: string | null } {
+function humanizeError(
+  message: string,
+  errorKind?: string,
+): { title: string; details: string | null } {
+  if (errorKind === 'usage_limit_reached') {
+    return { title: 'Usage limit reached', details: message };
+  }
+
   // Try to parse as JSON (backend often wraps errors)
   try {
     const parsed = JSON.parse(message);
@@ -69,13 +83,42 @@ function humanizeError(message: string): { title: string; details: string | null
   };
 }
 
-export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBannerProps) {
-  const { title, details } = humanizeError(message);
+// Split a string on http/https URLs and return an array of strings and
+// anchor elements. Keeps trailing punctuation outside the link — codex
+// CLI's strings end sentences with URLs ("…purchase more credits.") and
+// a greedy match would swallow the period into the href.
+const URL_RE = /(https?:\/\/[^\s)\]<>]+[^\s)\].,;:!?<>])/g;
 
+function linkify(text: string): ReactNode[] {
+  const out: ReactNode[] = [];
+  let last = 0;
+  for (const match of text.matchAll(URL_RE)) {
+    const start = match.index ?? 0;
+    if (start > last) out.push(text.slice(last, start));
+    const url = match[0];
+    out.push(
+      <a key={`${start}-${url}`} href={url} target="_blank" rel="noopener noreferrer">
+        {url}
+      </a>,
+    );
+    last = start + url.length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
+
+export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBannerProps) {
+  const { title, details } = humanizeError(message, errorKind);
+
+  // `usage_limit_reached` is terminal — retry will hit the same wall.
+  // The actionable next step is switching models or waiting until the
+  // window resets, not re-sending the same prompt.
+  const isUsageLimit = errorKind === 'usage_limit_reached';
   const isRetryable =
-    !errorKind ||
-    errorKind === 'unknown' ||
-    ['rate_limit', 'overloaded', 'network', 'timeout'].includes(errorKind);
+    !isUsageLimit &&
+    (!errorKind ||
+      errorKind === 'unknown' ||
+      ['rate_limit', 'overloaded', 'network', 'timeout'].includes(errorKind));
 
   return (
     <div className="error-input-area">
@@ -86,7 +129,7 @@ export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBan
         </div>
         <div className="error-body-content">
           <div className="error-body-title">{title}</div>
-          {details && <div className="error-body-details">{details}</div>}
+          {details && <div className="error-body-details">{linkify(details)}</div>}
         </div>
       </div>
 
@@ -97,7 +140,11 @@ export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBan
             ↺ Retry — sends &ldquo;continue&rdquo;
           </button>
         ) : (
-          <span className="error-action-hint">Start a new conversation to continue.</span>
+          <span className="error-action-hint">
+            {isUsageLimit
+              ? 'Switch to a different model in the picker, or wait for the window to reset.'
+              : 'Start a new conversation to continue.'}
+          </span>
         )}
         <button className="error-dismiss-btn" onClick={onDismiss} title="Dismiss error">
           Dismiss
