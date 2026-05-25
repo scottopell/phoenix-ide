@@ -45,18 +45,18 @@ export type AwaitingSubAgentsState = Extract<
 
 /** Units that live in the virtualized historical list. */
 export type HistoricalUnit =
-  | { kind: 'user';   key: string; message: Message }
-  | { kind: 'skill';  key: string; message: Message }
+  | { kind: 'user';         key: string; message: Message }
+  | { kind: 'skill';        key: string; message: Message }
   | { kind: 'agent_turn';
       key: string;
       agent: Message;
       toolResultsByUseId: ReadonlyMap<string, Message>;
       isFirstInTurn: boolean }
-  | { kind: 'system'; key: string; message: Message };
+  | { kind: 'system';       key: string; message: Message }
+  | { kind: 'pending_user'; key: string; message: QueuedMessage };
 
 /** Units pinned to the tail; never collapsed by the window. */
 export type TailUnit =
-  | { kind: 'pending_user';     key: string; message: QueuedMessage }
   | { kind: 'sub_agent_status'; key: string; state: AwaitingSubAgentsState }
   | { kind: 'streaming_agent';  key: string };
 
@@ -83,7 +83,12 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits;
 ### Key naming convention
 
 - `user` / `agent_turn` / `system` / `skill` units: `key = message.message_id`
-- `pending_user`: `key = queuedMessage.localId`
+- `pending_user`: `key = queuedMessage.localId` — by convention the server
+  echoes the message back with `message_id = localId`, so the same render-
+  unit key persists through the pending → sent transition (the unit's
+  *kind* changes from `pending_user` to `user`, but React's reconciler
+  treats it as an in-place update on a single keyed node — no
+  cross-region promotion, no scroll compensation needed).
 - `sub_agent_status`: `key = 'sub-agent-status'` (singleton)
 - `streaming_agent`: `key = 'streaming-${conversationId}-${startedAt}'` —
   the `startedAt` from `StreamingBuffer` makes the key stable across token
@@ -145,11 +150,15 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
     }
   }
 
-  const tailUnits: TailUnit[] = [];
-
+  // Pending user messages append to the END of historicalUnits, sharing
+  // the eventual `user` unit's key (localId == message_id at ack time).
+  // This keeps the pending → sent transition an in-place keyed update
+  // rather than a cross-region promotion from tailUnits to historicalUnits.
   for (const q of pendingMessages) {
-    tailUnits.push({ kind: 'pending_user', key: q.localId, message: q });
+    historicalUnits.push({ kind: 'pending_user', key: q.localId, message: q });
   }
+
+  const tailUnits: TailUnit[] = [];
 
   if (convState.type === 'awaiting_sub_agents') {
     tailUnits.push({
@@ -216,21 +225,10 @@ unique per session), which MessageList wraps into
 ```ts
 // ui/src/hooks/useBottomAnchoredWindow.ts
 
-export interface SavedScrollAnchor {
-  topVisibleUnitKey: string;
-  offsetWithinUnit: number;
-  /** Number of historical units at save time. Restore compares this
-   *  to current `historicalUnits.length` to detect "messages arrived
-   *  while away" and surface the ↓ New messages button. Optional for
-   *  forward-compat with anchors written by older app builds. */
-  unitCountAtSave?: number;
-}
-
 export interface UseWindowInputs {
   historicalUnits: HistoricalUnit[];
   conversationId: string | undefined;
   scrollRootRef: React.RefObject<HTMLElement | null>;
-  savedAnchor?: SavedScrollAnchor | null;
   heightCache?: UnitHeightCache | null;
 }
 
@@ -255,20 +253,21 @@ Constants:
 export const INITIAL_WINDOW = 12;
 export const EXPAND_BATCH = 12;
 export const SENTINEL_ROOT_MARGIN = '600px 0px 0px 0px';
-export const RESTORE_OVERSCAN = 4;
 
 export const KIND_ESTIMATES: Record<HistoricalUnit['kind'], number> = {
   user: 100,
   skill: 80,
   agent_turn: 400,
   system: 100,
+  pending_user: 100,
 };
 ```
 
 Internal mechanics:
 
 1. `firstRenderedUnitIndex` is React state. Initial value is computed once
-   per conversation from `(historicalUnits.length, savedAnchor)`.
+   per conversation as `max(0, historicalUnits.length - INITIAL_WINDOW)`
+   (always bottom-pinned; no saved-anchor branch).
 2. A `useEffect` attaches an `IntersectionObserver` to `topSentinelRef`
    with `root: scrollRootRef.current` and `rootMargin: SENTINEL_ROOT_MARGIN`.
    When the sentinel intersects, the effect decreases
@@ -296,32 +295,29 @@ correctly in the DOM:
 ```ts
 // ui/src/conversation/unitHeightCache.ts
 
-const STORAGE_PREFIX = 'phoenix:hcache:';
-
 export class UnitHeightCache {
   constructor(private readonly conversationId: string | undefined) {
     this.heights = new Map();
     this.listeners = new Set();
-    this.hydrateFromStorage();
   }
 
   set(key: string, height: number): void;
   get(key: string): number | undefined;
   subscribe(listener: () => void): () => void;
   clear(): void;
-
-  /** Called by conversation-delete cascade. */
-  static clearConversation(conversationId: string): void;
 }
 
 export function useUnitHeightCache(conversationId: string | undefined): UnitHeightCache;
 ```
 
-Reads are O(1) from the Map; the `sessionStorage` mirror is write-through
-and hydrated synchronously on construction. Writes are debounced (16ms
-trailing) to coalesce ResizeObserver bursts during scroll. Subscribers are
-notified after each successful write — the window hook subscribes so that
-spacer height updates land in a re-render.
+In-memory only. REQ-MLRU-013's `sessionStorage` mirror was removed
+alongside REQ-CONV-013/REQ-MLRU-009: persistence existed solely to
+make the saved-scroll restore land precisely on first paint, and with
+that restore gone there is no first-paint geometry contract to
+support. The cache is reconstructed per mount; the initial spacer
+uses per-kind estimates and converges as `ResizeObserver` callbacks
+fire. Subscribers are notified after each write — the window hook
+subscribes so spacer-height updates land in a re-render.
 
 ## Unit Height Observer
 
@@ -357,53 +353,14 @@ return (
 The ref callback caches per-unit-key observer instances to avoid
 re-creating observers on every render.
 
-## Saved-Scroll Anchor
+## Saved-Scroll Anchor (REMOVED)
 
-```ts
-// inside MessageList.tsx
-
-interface SavedAnchorStorage {
-  read(conversationId: string): SavedScrollAnchor | null;
-  write(conversationId: string, anchor: SavedScrollAnchor): void;
-}
-
-const STORAGE_PREFIX = 'phoenix:msglist:anchor:';
-```
-
-**Write path:** on `document.visibilitychange === 'hidden'` and on
-component unmount:
-
-1. Walk the rendered unit DOM nodes (via a ref-map keyed by `unit.key`)
-2. Find the first node whose `offsetTop >= scrollRoot.scrollTop`
-3. Compute `offsetWithinUnit = scrollRoot.scrollTop - node.offsetTop`
-4. Persist `{ topVisibleUnitKey: unit.key, offsetWithinUnit }`
-
-**Read path:** on first render with a non-empty `historicalUnits[]`:
-
-1. Look up the saved anchor for the conversation id
-2. Find `foundIndex = historicalUnits.findIndex(u => u.key === anchor.topVisibleUnitKey)`
-3. If `foundIndex < 0`: fall back to bottom-pin
-4. Otherwise: set `firstRenderedUnitIndex = max(0, foundIndex - RESTORE_OVERSCAN)`
-5. In a layout effect after first paint: locate the DOM node for that
-   unit (via the ref-map), set
-   `scrollRoot.scrollTop = node.offsetTop + anchor.offsetWithinUnit`
-
-If `sessionStorage` height cache (REQ-MLRU-013) has measured heights, the
-spacer height for the prefix is exact, so the unit's `offsetTop` is
-correct on first paint without an extra layout pass.
-
-## Migration
-
-The existing `localStorage` key `${SCROLL_KEY_PREFIX}{conversationId}`
-stores a number (scrollTop). The new anchor key is
-`phoenix:msglist:anchor:{conversationId}` storing a JSON
-`SavedScrollAnchor`. The old key is **not** migrated — one visit's worth of
-restore-to-bottom regression is acceptable, and conflating old/new shapes
-behind a single key invites parsing ambiguity. The old key is deleted on
-the first successful anchor write per conversation.
-
-The `${MSGCOUNT_KEY_PREFIX}` companion key is no longer needed and can be
-deleted in the same write.
+REQ-MLRU-009 was deprecated and the anchor-capture / restore /
+ack-DOM-snapshot machinery removed. No localStorage key is read or
+written. Mount lands pinned to the bottom (REQ-MLRU-005); per
+REQ-MLRU-001, pending → sent acknowledgement is a keyed in-place
+update on a single render unit, so no ack-time scroll compensation
+is needed.
 
 ## Streaming Subscription
 
@@ -478,23 +435,22 @@ notice their messages disappearing.
 
 **Window-hook tests** (mocked DOM):
 
-1. Initial mount with no anchor → `firstRenderedUnitIndex = max(0, len - 12)`
-2. Initial mount with anchor found → index = `foundIndex - 4`, clamped at 0
-3. Initial mount with anchor not found → falls back to default
-4. Sentinel intersection → `firstRenderedUnitIndex` decreases by 12
-5. Sentinel intersection at index 0 → no-op
-6. Scroll compensation: scrollHeight increases by Δ → scrollTop increases
+1. Initial mount → `firstRenderedUnitIndex = max(0, len - 12)`
+2. Sentinel intersection → `firstRenderedUnitIndex` decreases by 12
+3. Sentinel intersection at index 0 → no-op
+4. Scroll compensation: scrollHeight increases by Δ → scrollTop increases
    by Δ
 
 **Integration tests** (`MessageList.test.tsx`):
 
 1. **REQ-MLRU-012 regression:** 1 user + 1 agent (20 tool_use blocks) +
    20 tool messages → `agent_turn` is in initial rendered DOM
-2. Saved anchor restore: write anchor, remount → scrollTop matches saved
-3. Saved anchor with missing key → bottom-pinned mount
-4. Streaming start → `<StreamingMessage />` renders below tail; parent
+2. Pending → sent acknowledgement: render with a `pending_user` unit,
+   rerender with the same `localId` echoed as a `user` message →
+   render-unit key persists; no viewport jump; no extra layout effect
+3. Streaming start → `<StreamingMessage />` renders below tail; parent
    `MessageList` does not re-render on simulated token bursts
-5. Streaming complete → `streaming_agent` disappears, `agent_turn`
+4. Streaming complete → `streaming_agent` disappears, `agent_turn`
    appears, single commit
 
 ## Performance Validation
@@ -524,10 +480,12 @@ streaming.
 
 ## Open Questions Resolved by This Spec
 
-- **Pending and sub-agent ambiguity:** REQ-MLRU-004 makes them
-  `TailUnit`s, structurally distinct from historical units.
-- **Saved-scroll estimate fragility:** REQ-MLRU-009 anchors by unit key,
-  not by pixel division.
+- **Pending/sent split (PR #152 hotfix):** REQ-MLRU-001 puts
+  `pending_user` in `HistoricalUnit` sharing its eventual `user` unit's
+  key (localId == message_id at ack), so pending → sent is an in-place
+  keyed update — no cross-region promotion, no ack scroll compensation.
+- **Sub-agent and streaming positioning:** REQ-MLRU-004 keeps them as
+  `TailUnit`s (ephemeral, no ack lifecycle).
 - **Spacer over/under-allocation:** REQ-MLRU-008 measures per unit with
   per-kind fallback.
 - **Streaming and unified-list tension:** REQ-MLRU-010 typifies streaming

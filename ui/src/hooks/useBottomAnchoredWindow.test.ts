@@ -2,18 +2,16 @@
 //
 // The hook itself integrates these with React + IntersectionObserver +
 // DOM; that integration is exercised by MessageList.test.tsx. This file
-// covers the structural decisions: initial-window placement under
-// saved-anchor variants, and spacer-height summation across the
-// per-kind estimates.
+// covers the structural decisions: initial-window placement (always
+// bottom-pinned) and spacer-height summation across the per-kind
+// estimates.
 
 import { describe, it, expect } from 'vitest';
 import {
   computeInitialStart,
   computeSpacerHeight,
   INITIAL_WINDOW,
-  RESTORE_OVERSCAN,
   KIND_ESTIMATES,
-  type SavedScrollAnchor,
 } from './useBottomAnchoredWindow';
 import type { Message } from '../api';
 import type { HistoricalUnit } from '../conversation/renderUnits';
@@ -75,58 +73,16 @@ function mkSkill(key: string): HistoricalUnit {
 describe('computeInitialStart', () => {
   it('returns 0 when there are fewer units than INITIAL_WINDOW', () => {
     const units = Array.from({ length: 5 }, (_, i) => mkUser(`u${i}`));
-    expect(computeInitialStart(units, null)).toBe(0);
+    expect(computeInitialStart(units)).toBe(0);
   });
 
-  it('bottom-pins to the last INITIAL_WINDOW units when no anchor is provided', () => {
+  it('bottom-pins to the last INITIAL_WINDOW units', () => {
     const units = Array.from({ length: 50 }, (_, i) => mkUser(`u${i}`));
-    expect(computeInitialStart(units, null)).toBe(50 - INITIAL_WINDOW);
+    expect(computeInitialStart(units)).toBe(50 - INITIAL_WINDOW);
   });
 
-  it('returns 0 when units array is empty (regardless of anchor)', () => {
-    expect(computeInitialStart([], null)).toBe(0);
-    expect(
-      computeInitialStart([], { topVisibleUnitKey: 'missing', offsetWithinUnit: 0 }),
-    ).toBe(0);
-  });
-
-  it('widens the window so the anchored unit + RESTORE_OVERSCAN above is rendered', () => {
-    const units = Array.from({ length: 100 }, (_, i) => mkUser(`u${i}`));
-    const anchor: SavedScrollAnchor = {
-      topVisibleUnitKey: 'u50',
-      offsetWithinUnit: 12,
-    };
-    expect(computeInitialStart(units, anchor)).toBe(50 - RESTORE_OVERSCAN);
-  });
-
-  it('clamps the anchor start to 0 when the anchored unit is within RESTORE_OVERSCAN of the top', () => {
-    const units = Array.from({ length: 100 }, (_, i) => mkUser(`u${i}`));
-    const anchor: SavedScrollAnchor = {
-      topVisibleUnitKey: 'u2',
-      offsetWithinUnit: 0,
-    };
-    expect(computeInitialStart(units, anchor)).toBe(0);
-  });
-
-  it('falls back to bottom-pin when the anchor key is not present in units', () => {
-    const units = Array.from({ length: 50 }, (_, i) => mkUser(`u${i}`));
-    const anchor: SavedScrollAnchor = {
-      topVisibleUnitKey: 'gone',
-      offsetWithinUnit: 100,
-    };
-    expect(computeInitialStart(units, anchor)).toBe(50 - INITIAL_WINDOW);
-  });
-
-  it('anchor that points to a unit near the bottom still uses the anchor, not bottom-pin', () => {
-    // Bottom-pin would be 100 - 12 = 88. Anchor at u92 - 4 = 88. Both
-    // produce the same result here, but the path is anchor-driven —
-    // verify by anchoring slightly higher.
-    const units = Array.from({ length: 100 }, (_, i) => mkUser(`u${i}`));
-    const anchor: SavedScrollAnchor = {
-      topVisibleUnitKey: 'u80',
-      offsetWithinUnit: 0,
-    };
-    expect(computeInitialStart(units, anchor)).toBe(80 - RESTORE_OVERSCAN);
+  it('returns 0 when units array is empty', () => {
+    expect(computeInitialStart([])).toBe(0);
   });
 });
 
@@ -176,9 +132,6 @@ describe('computeSpacerHeight', () => {
     // units.
     const units: HistoricalUnit[] = [mkAgentTurn('a1')];
     expect(computeSpacerHeight(units, 1)).toBe(KIND_ESTIMATES.agent_turn);
-    // Compare against the (incorrect) old model where every tool would
-    // have counted: 1 agent + 20 tools at ~360px each ≈ 7600px. The new
-    // model allocates ~400px for that same turn.
   });
 
   describe('with a getHeight lookup', () => {

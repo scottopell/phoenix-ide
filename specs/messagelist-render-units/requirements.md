@@ -4,13 +4,17 @@
 
 This spec governs the structural model of the conversation message list:
 the render-unit type layer, the bottom-anchored window over that layer,
-boundary expansion, measured spacer geometry, saved-scroll restore by
-unit anchor, and the streaming-view subscription path that preserves
-historical-list render isolation.
+boundary expansion, measured spacer geometry, and the streaming-view
+subscription path that preserves historical-list render isolation.
 
 It supersedes the raw-message virtualization model that the
 `isRenderableHistoricalMessage` patch in `MessageList.tsx` mitigated but
 did not structurally replace.
+
+**No saved-scroll restore:** REQ-CONV-013 (per-conversation scroll
+memory) was deprecated. This spec accordingly does not specify, and
+implementations do not provide, any unit-anchor capture, restore, or
+DOM-snapshot machinery. Mount always lands pinned to the bottom.
 
 ## Transparency Contract (carried from conversation-ui)
 
@@ -22,12 +26,13 @@ preserve these answers:
 
 1. The newest activity is visible without the user having to scroll.
 2. Every tool result is paired with the tool call that produced it.
-3. Restoring to a previously-saved scroll position lands on the same content
-   the user was reading.
-4. Revealing older messages on scroll-up does not change the appearance of
+3. Revealing older messages on scroll-up does not change the appearance of
    already-visible messages (no header re-numbering, no scroll jump).
-5. Token-streaming updates do not cause the conversation history to re-render
+4. Token-streaming updates do not cause the conversation history to re-render
    or change identity.
+5. Acknowledgement of a pending user message (server echo) does not
+   move the viewport away from what the user is reading; the pending
+   bubble and its acknowledged form share a single timeline identity.
 
 This contract is the acceptance test for completeness. If a question cannot
 be answered confidently from the rendered UI, the requirement is incomplete.
@@ -38,14 +43,28 @@ be answered confidently from the rendered UI, the requirement is incomplete.
 
 ### REQ-MLRU-001: Render Unit Layer
 
-WHEN the message list renders historical, pending, sub-agent-status, and
-streaming content
+WHEN the message list renders historical (incl. pending user), sub-agent-
+status, and streaming content
 THE SYSTEM SHALL derive a single ordered pair of typed lists
 `(historicalUnits: HistoricalUnit[], tailUnits: TailUnit[])` from
 `messages`, `pendingMessages`, `convState`, and the streaming-active flag
 AND render exactly the bounded slice
 `historicalUnits.slice(firstRenderedUnitIndex, lastRenderedUnitIndex)`
 followed by all `tailUnits`, with no filtering inside the render loop
+
+WHEN a pending user message exists in `pendingMessages`
+THE SYSTEM SHALL emit it as a `HistoricalUnit` of kind `pending_user`
+appended at the tail of `historicalUnits`, keyed by `localId`
+AND share that key with the acknowledged `user` HistoricalUnit that
+replaces it on server echo (the server populates `message_id = localId`,
+so the same render-unit key persists through the pending → sent
+transition)
+
+THE SYSTEM SHALL NOT emit pending user messages as `TailUnit`. The
+type-level membership in `HistoricalUnit` guarantees that the
+pending → sent transition is an in-place payload swap on a single
+render unit, not a cross-region promotion that would require scroll
+compensation.
 
 WHEN a `tool`-type message is encountered during render-unit construction
 THE SYSTEM SHALL NOT emit a standalone unit for it
@@ -107,7 +126,8 @@ THE SYSTEM SHALL set each unit's `isFirstInTurn: boolean` field based on
 whether the immediately-preceding rendered unit (regardless of window
 position) is also an `agent_turn` from the same turn-run
 
-WHEN a `user`, `skill`, or `pending_user` unit precedes an `agent_turn`
+WHEN a `user`, `skill`, or `pending_user` historical unit precedes an
+`agent_turn`
 THE SYSTEM SHALL set `isFirstInTurn = true` on that `agent_turn`
 
 WHEN another `agent_turn` precedes an `agent_turn` with no intervening
@@ -128,8 +148,8 @@ impossible for the window to affect header rendering.
 
 ### REQ-MLRU-004: Tail-Pinned Unit Typing
 
-THE SYSTEM SHALL type `pending_user`, `sub_agent_status`, and
-`streaming_agent` units as `TailUnit`, distinct from `HistoricalUnit`
+THE SYSTEM SHALL type `sub_agent_status` and `streaming_agent` units as
+`TailUnit`, distinct from `HistoricalUnit`
 
 THE SYSTEM SHALL accept only `HistoricalUnit[]` (not `RenderUnit[]`) as
 input to the virtualized-window hook
@@ -137,22 +157,24 @@ SO THAT a `TailUnit` cannot be collapsed into the spacer by the window
 
 WHEN tail units exist
 THE SYSTEM SHALL render them in declaration order
-(`pending_user` → `sub_agent_status` → `streaming_agent`)
-after the entire historical slice
+(`sub_agent_status` → `streaming_agent`) after the entire historical
+slice
 AND ensure they are always present in the rendered DOM, never represented
 by spacer height
 
-**Rationale:** Task 01004's acceptance criterion: "Pending queued messages
-and sub-agent status are represented as render units or explicitly
-documented as non-virtualized tail units; there must be no ambiguity about
-whether they count toward the window." Typing them as `TailUnit` makes the
-non-virtualization a compile-time property rather than a comment.
+**Rationale:** Sub-agent status and streaming-agent are ephemeral
+display-only views with no acknowledgement lifecycle — they appear,
+update, and disappear in response to phase changes rather than message
+arrival. Keeping them as `TailUnit` reflects that. Pending user
+messages, by contrast, are ackable and must share render-unit identity
+with their acknowledged form; they live in `HistoricalUnit` per
+REQ-MLRU-001.
 
 ---
 
 ### REQ-MLRU-005: Bottom-Anchored Initial Window
 
-WHEN the message list mounts with no saved scroll anchor
+WHEN the message list mounts
 THE SYSTEM SHALL set `firstRenderedUnitIndex = max(0, historicalUnits.length - INITIAL_WINDOW)`
 WITH `INITIAL_WINDOW = 12`
 AND scroll the container to its bottom such that the last historical unit
@@ -170,9 +192,10 @@ and SHALL NOT auto-anchor to the bottom on new message arrival
 (the existing jump-to-newest button handles that case)
 
 **Rationale:** Task 65002 established that bottom-pinned-on-mount is the
-only correct landing for a conversation switch. The window must be expressed
-in unit indexes so that tool-result-heavy turns cannot push the latest agent
-turn out of the initial window.
+only correct landing for a conversation switch. With REQ-CONV-013
+removed, this is the *sole* mount landing strategy. The window must be
+expressed in unit indexes so that tool-result-heavy turns cannot push
+the latest agent turn out of the initial window.
 
 ---
 
@@ -264,37 +287,20 @@ universal row estimate.
 
 ### REQ-MLRU-009: Unit-Anchor Saved-Scroll Restore
 
-WHEN the message list saves its scroll state (on visibility-hidden and
-on unmount, as per REQ-CONV-013)
-THE SYSTEM SHALL identify the first rendered `HistoricalUnit` whose
-`element.offsetTop >= scrollRoot.scrollTop`
-AND persist `{ topVisibleUnitKey: string; offsetWithinUnit: number }` to
-localStorage keyed by conversation id
-WHERE `offsetWithinUnit = scrollTop - element.offsetTop`
+**DEPRECATED:** Removed alongside REQ-CONV-013. The implementation
+(saved anchor capture on visibilitychange/unmount, restore on first
+paint, RESTORE_OVERSCAN window widening, ack-time DOM snapshot) was
+deleted. There is no saved-scroll restore; mount always lands pinned
+to the bottom per REQ-MLRU-005.
 
-WHEN the message list mounts with a saved unit anchor
-THE SYSTEM SHALL look up the anchor's `topVisibleUnitKey` in the current
-`historicalUnits` array
-AND if found, set `firstRenderedUnitIndex = max(0, foundIndex - RESTORE_OVERSCAN)`
-AND after layout commit, scroll the container to
-`foundUnitElement.offsetTop + offsetWithinUnit`
-WHERE `RESTORE_OVERSCAN = 4`
-
-WHEN the anchor's `topVisibleUnitKey` is not present in the current units
-(e.g., the message has been deleted or the conversation rebuilt)
-THE SYSTEM SHALL fall back to bottom-pin per REQ-MLRU-005
-
-THE SYSTEM SHALL NOT use `savedScrollTop / estimatedRowHeight` to decide
-the initial window
-(this branch is removed entirely)
-
-**Rationale:** The current restore divides the saved scrollTop by the
-360px estimate to widen the window so the saved offset lands in real
-content. This works when row heights are uniform but lands in wrong content
-when they vary. Anchoring to a unit by key is structurally correct
-regardless of intervening row heights. The "near-top saves disable
-virtualization" branch is no longer necessary because anchoring is the
-mechanism for all restore positions.
+**Deprecation Reason:** Unit-anchor restore is structurally correct
+*in isolation*, but it interacted poorly with pending → sent
+acknowledgement: the unit whose key was anchored could change shape
+during the pending → sent swap, and the ack-time DOM-snapshot
+compensation introduced by PR #152 was a band-aid for that
+interaction. The decision was to remove the entire feature rather
+than continue patching. The pending → sent transition is now handled
+correctly-by-construction (REQ-MLRU-001 single-key invariant).
 
 ---
 
@@ -373,30 +379,18 @@ regression of the unit model.
 
 ### REQ-MLRU-013: SessionStorage Height Cache
 
-WHEN a unit's measured height is written to the cache (REQ-MLRU-008)
-THE SYSTEM SHALL also write it to `sessionStorage` keyed by
-`phoenix:hcache:{conversationId}:{unitKey}`
-(write may be debounced or coalesced; the API surface is per-key)
+**DEPRECATED:** Removed alongside REQ-CONV-013. Persisting measured
+heights to `sessionStorage` existed solely to make the first paint
+after navigation produce exact spacer geometry so that the
+unit-anchor restore (REQ-MLRU-009) landed precisely without a
+reflow. With saved-scroll restore gone, persistence is dead weight.
 
-WHEN the message list mounts with a non-empty `historicalUnits[]`
-THE SYSTEM SHALL hydrate the measured-height cache from `sessionStorage`
-entries matching `phoenix:hcache:{conversationId}:*`
-BEFORE the first paint
-SO THAT the initial spacer height uses exact measured values, not
-kind-estimate fallbacks
-
-WHEN `sessionStorage` writes fail (quota exceeded)
-THE SYSTEM SHALL silently fall back to memory-only
-(no user-visible error; the in-memory cache still works for the session)
-
-WHEN a conversation is deleted (per the cascade in task 02696)
-THE SYSTEM SHALL clear all `phoenix:hcache:{conversationId}:*` entries
-
-**Rationale:** Without persistence, the first paint after navigation falls
-back to kind estimates until `ResizeObserver` fires. With persistence, the
-initial spacer geometry matches the user's prior session. Saved-scroll
-restore by unit anchor (REQ-MLRU-009) is correct without the cache, but the
-cache eliminates the brief visual settle on first paint.
+The measured-height cache (REQ-MLRU-008) remains as an *in-memory*
+per-conversation Map for the lifetime of the conversation's mount;
+it is rebuilt on each mount as `ResizeObserver` callbacks fire. The
+first paint uses per-kind estimates; subsequent renders use measured
+values as they accumulate. The brief visual settle on first paint
+is acceptable.
 
 ---
 
@@ -431,16 +425,15 @@ map to requirements above:
 | Task criterion | Requirement |
 |----------------|-------------|
 | `MessageList` builds deterministic `RenderUnit[]` | REQ-MLRU-001 |
+| Pending and sent user messages share one render-unit key | REQ-MLRU-001 |
 | Virtualization hook accepts `renderUnitCount` | REQ-MLRU-005 |
 | `MessageListBody` renders units, not raw rows | REQ-MLRU-001 |
 | Tool-result-heavy tail regression test | REQ-MLRU-012 |
 | Boundary expansion via IntersectionObserver sentinel | REQ-MLRU-006 |
 | No `scrollTop - spacerHeight` trigger remains | REQ-MLRU-006 |
-| Saved scroll restore to top renders real content | REQ-MLRU-009 |
-| Saved bottom-pinned revisit keeps virtualization active | REQ-MLRU-009, REQ-MLRU-005 |
-| Saved mid-conversation restore uses measured geometry | REQ-MLRU-008, REQ-MLRU-009 |
 | Switch into large conversation lands pinned to bottom | REQ-MLRU-005 |
 | No visible scroll jump when expanding older units | REQ-MLRU-007 |
+| No visible scroll jump on pending → sent acknowledgement | REQ-MLRU-001 (single-key timeline) |
 | Streaming token updates don't re-render historical list | REQ-MLRU-010 |
 | System prompt, pending, sub-agent, tool inline, jump-to-newest, context menu preserved | REQ-MLRU-004, REQ-MLRU-002, REQ-MLRU-014; menu carried unchanged |
 | Validate with `browser_profile conversation-load` | Implementation step; see design.md |

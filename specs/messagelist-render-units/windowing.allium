@@ -6,23 +6,22 @@
 -- Scope: The lifecycle of the virtualized window that the message list
 --        maintains over the historicalUnits list produced by the
 --        render_units transform. Models the window's mount, expansion,
---        scroll-restore, and pinned-to-bottom states; the
---        IntersectionObserver-driven boundary expansion; the exact
---        scroll-compensation pattern that prevents visible jumps; and
---        the saved-scroll anchor by unit key.
+--        and pinned-to-bottom states; the IntersectionObserver-driven
+--        boundary expansion; and the exact scroll-compensation pattern
+--        that prevents visible jumps.
 --
--- Includes: Initial-mount window placement; bottom-pinned auto-anchor
---           on async message arrival; user scroll-up detection;
---           sentinel-intersection expansion; scroll-compensation
---           layout effect; saved-anchor save (on hide/unmount);
---           saved-anchor restore (on first paint); measured-height
---           cache reads for spacer geometry; pin-to-bottom on new
---           message arrival when the user is at the bottom.
+-- Includes: Initial-mount window placement (always bottom-pinned);
+--           bottom-pinned auto-anchor on async message arrival; user
+--           scroll-up detection; sentinel-intersection expansion;
+--           scroll-compensation layout effect; measured-height cache
+--           reads for spacer geometry; pin-to-bottom on new message
+--           arrival when the user is at the bottom.
 --
 -- Excludes: render_units transform (see render_units.allium);
 --           individual unit rendering (MessageComponents.tsx, no spec);
---           localStorage / sessionStorage serialization format details
---           (see design.md).
+--           saved-scroll restoration — REQ-CONV-013 and REQ-MLRU-009
+--           were deprecated and the entire save/restore/ack-snapshot
+--           path was removed.
 --
 -- Uses: render_units (HistoricalUnit, TailUnit types).
 use "./render_units.allium" as ru
@@ -30,23 +29,6 @@ use "./render_units.allium" as ru
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
-
--- A saved-scroll anchor written on visibility-hidden / unmount and
--- read on first mount with a non-empty historicalUnits list. The
--- anchor identifies a unit by key (structural) and the per-pixel
--- offset from that unit's top to the viewport top (positional within
--- the unit). Together, key and offset restore the viewport to the same
--- content the user was looking at, independent of intervening row-height
--- variation in the prefix. `unit_count_at_save` is optional
--- compatibility metadata: anchors written before that field existed
--- still restore by key+offset, while newer anchors preserve the prior
--- REQ-CONV-013 new-message affordance by comparing save-time historical
--- unit count with the current count on restore.
-value SavedScrollAnchor {
-    top_visible_unit_key: String
-    offset_within_unit: Integer
-    unit_count_at_save: Integer?
-}
 
 -- The measured height of a rendered historical unit, written by a
 -- ResizeObserver callback. Lookups are O(1) by key; absence is
@@ -71,12 +53,11 @@ value KindEstimate {
 -- The window's lifecycle phase. Models what the window is doing right
 -- now from the user's perspective: pinned to bottom watching for new
 -- content; scrolled up and holding position; actively expanding the
--- visible range on the user's behalf; restoring from a saved anchor.
+-- visible range on the user's behalf.
 enum WindowPhase {
     pinned_to_bottom
     user_scrolled_up
     expanding
-    restoring_from_anchor
 }
 
 ------------------------------------------------------------
@@ -97,15 +78,11 @@ entity Window {
     phase: WindowPhase
 
     measured_heights: Map<String, Integer>
-    saved_anchor: SavedScrollAnchor?
 
     -- Captured pre-update scrollHeight for exact scroll compensation.
     -- Non-null only between the expand trigger and the post-render
     -- layout effect that consumes the delta. Otherwise null.
     pre_expand_scroll_height: Integer?
-
-    -- The Builder's transitions field is the closest analog from
-    -- render_units; here phase is set explicitly by rules.
 }
 
 ------------------------------------------------------------
@@ -114,10 +91,10 @@ entity Window {
 -- INITIAL_WINDOW = 12 (units rendered on default mount)
 -- EXPAND_BATCH = 12 (units revealed per sentinel intersection)
 -- MAX_RENDERED_UNITS = 48 (historical units retained in DOM after expansion)
--- RESTORE_OVERSCAN = 4 (extra units rendered above an anchor target)
 -- SENTINEL_ROOT_MARGIN = "600px 0px 0px 0px"
 -- BOTTOM_SENTINEL_ROOT_MARGIN = "0px 0px 600px 0px"
--- KIND_ESTIMATES = { user: 100, skill: 80, agent_turn: 400, system: 100 }
+-- KIND_ESTIMATES = { user: 100, skill: 80, agent_turn: 400, system: 100,
+--                    pending_user: 100 }
 
 ------------------------------------------------------------
 -- Actor Declarations
@@ -133,14 +110,13 @@ actor BottomAnchoredWindow {
 -- Rules — initial mount
 ------------------------------------------------------------
 
--- Fresh mount with NO saved anchor → bottom-pinned. The window starts
--- showing the last INITIAL_WINDOW units; the scroll container is
--- scrolled to its bottom such that the last historical unit and all
--- tail units are visible.
-rule MountWithoutSavedAnchor {
-    when: WindowMounted(w, historical, tail, anchor)
-
-    requires: anchor = null
+-- Fresh mount → bottom-pinned. The window starts showing the last
+-- INITIAL_WINDOW units; the scroll container is scrolled to its bottom
+-- such that the last historical unit and all tail units are visible.
+-- This is the SOLE mount strategy; saved-scroll restoration was removed
+-- alongside REQ-CONV-013.
+rule MountBottomPinned {
+    when: WindowMounted(w, historical, tail)
 
     ensures: w.historical_units = historical
     ensures: w.tail_units = tail
@@ -150,7 +126,6 @@ rule MountWithoutSavedAnchor {
     ensures: w.phase = "pinned_to_bottom"
     ensures: w.pre_expand_scroll_height = null
     ensures: w.measured_heights = empty_map()
-    ensures: w.saved_anchor = null
 
     @guidance
         -- The scroll-to-bottom side effect happens in a useLayoutEffect
@@ -159,99 +134,28 @@ rule MountWithoutSavedAnchor {
         -- arrival via the AutoAnchorOnNewMessages rule below.
 }
 
--- Fresh mount WITH saved anchor whose key is in the historical list →
--- restore. The window opens wide enough to render the target unit
--- with RESTORE_OVERSCAN units above it; phase is restoring_from_anchor
--- until a post-paint scroll completes the restore.
-rule MountWithSavedAnchorFound {
-    when: WindowMounted(w, historical, tail, anchor)
-
-    requires: anchor != null
-    requires: anchor_key_in_units(historical, anchor)
-
-    ensures: w.historical_units = historical
-    ensures: w.tail_units = tail
-    ensures: w.first_rendered_unit_index = max_int(
-                 0,
-                 index_of_unit_by_key(historical, anchor.top_visible_unit_key) - 4
-             )
-    ensures: w.last_rendered_unit_index = min_int(
-                 len(historical),
-                 max_int(
-                     index_of_unit_by_key(historical, anchor.top_visible_unit_key) + 5,
-                     w.first_rendered_unit_index + 12
-                 )
-             )
-    ensures: w.is_pinned_to_bottom = false
-    ensures: w.phase = "restoring_from_anchor"
-    ensures: w.pre_expand_scroll_height = null
-    ensures: w.saved_anchor = anchor
-
-    @guidance
-        -- After the first paint, a useLayoutEffect locates the unit's
-        -- DOM node via the ref-map and sets scrollRoot.scrollTop to
-        -- (node.offsetTop + anchor.offset_within_unit). The
-        -- AnchorRestoreCompleted rule then transitions phase out of
-        -- restoring_from_anchor.
-        --
-        -- offsetTop accuracy on first paint depends on the prefix
-        -- spacer height being exact: that is what REQ-MLRU-013's
-        -- sessionStorage height cache provides. With the cache,
-        -- the restore lands precisely; without it, a single
-        -- post-measurement reflow corrects the position.
-}
-
--- Fresh mount WITH saved anchor whose key is NOT in the historical
--- list (message deleted, conversation rebuilt) → fall back to
--- bottom-pin. The stale anchor is cleared so subsequent saves do not
--- re-attempt the missing target.
-rule MountWithSavedAnchorMissing {
-    when: WindowMounted(w, historical, tail, anchor)
-
-    requires: anchor != null
-    requires: not anchor_key_in_units(historical, anchor)
-
-    ensures: w.historical_units = historical
-    ensures: w.tail_units = tail
-    ensures: w.first_rendered_unit_index = max_int(0, len(historical) - 12)
-    ensures: w.last_rendered_unit_index = len(historical)
-    ensures: w.is_pinned_to_bottom = true
-    ensures: w.phase = "pinned_to_bottom"
-    ensures: w.pre_expand_scroll_height = null
-    ensures: w.saved_anchor = null
-
-    @guidance
-        -- The fall-back to bottom-pin is identical to
-        -- MountWithoutSavedAnchor. Clearing saved_anchor (rather than
-        -- preserving it) prevents repeated stale-lookup work on
-        -- subsequent visibility-hidden saves.
-}
-
--- Anchor restore complete → phase transitions out of
--- restoring_from_anchor. Subsequent user interaction routes through
--- the scroll-driven rules below.
-rule AnchorRestoreCompleted {
-    when: AnchorRestorePainted(w)
-
-    requires: w.phase = "restoring_from_anchor"
-
-    ensures: w.phase = "user_scrolled_up"
-    ensures: w.is_pinned_to_bottom = false
-}
-
 ------------------------------------------------------------
 -- Rules — async message arrival
 ------------------------------------------------------------
 
 -- The historical_units list grows (a new agent_turn or user unit
--- arrived via the reducer). If the user is pinned to the bottom, the
--- window auto-anchors to the new tail. If the user is scrolled up,
--- the window preserves first_rendered_unit_index (the JumpToNewest
--- button handles surfacing the new content).
+-- arrived via the reducer, or a pending_user unit was appended). If
+-- the user is pinned to the bottom, the window auto-anchors to the new
+-- tail. If the user is scrolled up, the window preserves
+-- first_rendered_unit_index (the JumpToNewest button handles surfacing
+-- the new content).
+--
+-- Pending → sent acknowledgement is NOT a new historical unit: it is
+-- an in-place keyed replacement of an existing `pending_user` unit by
+-- a `user` unit with the same key (localId == message_id at ack). The
+-- list length and indexes are unchanged; the unit's kind/payload
+-- differs. No special handling is required — React's reconciler
+-- updates the keyed node and the window state is invariant.
 rule AutoAnchorOnNewMessages {
     when: HistoricalUnitsUpdated(w, new_historical)
 
     requires: w.is_pinned_to_bottom = true
+    requires: len(new_historical) > len(w.historical_units)
 
     ensures: w.historical_units = new_historical
     ensures: w.first_rendered_unit_index = max_int(0, len(new_historical) - 12)
@@ -271,6 +175,7 @@ rule PreserveWindowWhenScrolledUp {
     when: HistoricalUnitsUpdated(w, new_historical)
 
     requires: w.is_pinned_to_bottom = false
+    requires: len(new_historical) > len(w.historical_units)
 
     ensures: w.historical_units = new_historical
     ensures: w.first_rendered_unit_index = w.first_rendered_unit_index
@@ -282,6 +187,28 @@ rule PreserveWindowWhenScrolledUp {
         -- visible separately. Clicking it sets scrollTop = scrollHeight
         -- and flips is_pinned_to_bottom back to true; the next
         -- HistoricalUnitsUpdated then anchors to bottom.
+}
+
+-- Length-preserving update (e.g., pending → sent in-place keyed
+-- replacement): historical_units payload changes but len is the same.
+-- Window indexes and pin state are invariant.
+rule InPlaceUnitUpdate {
+    when: HistoricalUnitsUpdated(w, new_historical)
+
+    requires: len(new_historical) = len(w.historical_units)
+
+    ensures: w.historical_units = new_historical
+    ensures: w.first_rendered_unit_index = w.first_rendered_unit_index
+    ensures: w.last_rendered_unit_index = w.last_rendered_unit_index
+    ensures: w.is_pinned_to_bottom = w.is_pinned_to_bottom
+    ensures: w.phase = w.phase
+
+    @guidance
+        -- This rule covers the pending → sent transition. Because the
+        -- pending_user unit and the eventual user unit share a key
+        -- (localId == message_id at ack), React's reconciler treats
+        -- this as a keyed update on a single DOM node, not a
+        -- remove/insert pair. No scroll compensation is required.
 }
 
 ------------------------------------------------------------
@@ -436,7 +363,9 @@ rule ExpansionCompensationSkipped {
 -- A ResizeObserver callback fired for a unit at index i in the
 -- historical list → write the measured height into the cache keyed by
 -- unit.key. The spacer-height computation reads the cache; a write
--- triggers a re-render of the spacer's host.
+-- triggers a re-render of the spacer's host. The cache is in-memory
+-- only — REQ-MLRU-013's sessionStorage mirror was deprecated alongside
+-- the saved-scroll restore it served.
 rule ResizeObserverMeasuredHeight {
     when: UnitResized(w, unit_key, measured_px)
 
@@ -453,45 +382,6 @@ rule ResizeObserverMeasuredHeight {
         --     sum over i in [w.last_rendered_unit_index, len(w.historical_units)): measured_or_estimated(i)
         -- where measured_or_estimated(i) reads w.measured_heights by unit key
         -- when present and otherwise falls back to KIND_ESTIMATES by kind.
-        --
-        -- The cache write is mirrored to sessionStorage by the
-        -- UnitHeightCache implementation; that mirror is not part of
-        -- the window's state machine (it is a side effect of the
-        -- cache layer, modeled in design.md).
-}
-
-------------------------------------------------------------
--- Rules — saved-scroll anchor write
-------------------------------------------------------------
-
--- Visibility-hidden or unmount → capture the current top-visible unit
--- and offset, persist as the saved anchor. Walks the rendered units
--- (via the actor's ref-map, not part of the entity state) to find the
--- first whose offsetTop >= scrollTop.
-rule SaveAnchorOnHideOrUnmount {
-    when: SaveAnchorTriggered(w, scroll_top, top_unit_key, top_unit_offset_top)
-
-    requires: w.historical_units != empty_list()
-
-    ensures: w.saved_anchor = SavedScrollAnchor {
-                 top_visible_unit_key: top_unit_key,
-                 offset_within_unit: scroll_top - top_unit_offset_top
-             }
-    ensures: w.first_rendered_unit_index = w.first_rendered_unit_index
-    ensures: w.last_rendered_unit_index = w.last_rendered_unit_index
-
-    @guidance
-        -- The actor identifies top_unit_key and top_unit_offset_top by
-        -- walking the ref-map of rendered units and picking the first
-        -- whose offsetTop >= scrollTop. If no such unit exists (the
-        -- user is below the last unit's top), use the last rendered
-        -- unit; offset_within_unit may be larger than that unit's
-        -- height, which is fine — restore will scroll past the unit's
-        -- top by that amount, landing at the same content.
-        --
-        -- Persistence: localStorage at
-        -- phoenix:msglist:anchor:{conversation_id}. The old
-        -- scrollTop-only key is deleted in the same write.
 }
 
 ------------------------------------------------------------
@@ -544,18 +434,6 @@ invariant PinnedToBottomCoupledToPhase {
         w.is_pinned_to_bottom = (w.phase = "pinned_to_bottom")
 }
 
--- The saved anchor's key, when set, refers either to a unit currently
--- in the historical list OR to a unit that was in the list at the
--- time of save (the latter is a transient case during restore). The
--- spec captures the steady-state claim; the restore rules handle the
--- missing-key case explicitly.
-invariant SavedAnchorIntegrity {
-    for w in Windows:
-        w.saved_anchor != null
-        and w.phase != "restoring_from_anchor"
-        implies anchor_key_in_units(w.historical_units, w.saved_anchor)
-}
-
 -- The measured-heights cache holds entries only for unit keys that
 -- appear (or appeared) in the historical list. Stale entries persist
 -- in the in-memory map for the session but do not violate this
@@ -567,7 +445,7 @@ invariant MeasuredHeightsBelongToUnits {
         for key in keys(w.measured_heights):
             -- Stated as "permitted to be stale" rather than an absolute
             -- presence requirement; the cache layer's eviction policy
-            -- is best-effort (clears on conversation delete).
+            -- is best-effort (clears on conversation mount).
             true
 }
 
@@ -600,9 +478,3 @@ invariant MeasuredHeightsBelongToUnits {
 --     single-render commit. If React 18's automatic batching coalesces
 --     several HistoricalUnitsUpdated events, only the final state
 --     matters; this is fine. Worth re-verifying after this lands.
---
--- Q4. The SavedAnchorIntegrity invariant uses the entity-snapshot
---     quantifier and so cannot capture "the anchor referenced a unit
---     that was in the list at save time." A temporal extension to the
---     Allium dialect would capture this; for now, the
---     MountWithSavedAnchorMissing rule covers the operational case.

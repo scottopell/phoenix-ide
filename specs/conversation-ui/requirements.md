@@ -264,18 +264,25 @@ THE SYSTEM SHALL enable at-a-glance identification of which conversations need a
 
 ### REQ-CONV-013: Per-Conversation Scroll Position Memory
 
-WHEN user navigates away from a conversation
-THE SYSTEM SHALL persist the current scroll position for that conversation
+**DEPRECATED:** Removed wholesale. The feature accumulated bugs at the
+boundary between the virtualized window, ack-time promotion of pending
+messages, and DOM-anchor capture; the recurring user-visible symptom was
+that acknowledgement of a sent message produced a viewport jump away
+from the content the user was reading. Rather than keep patching, the
+requirement and its supporting machinery (saved unit anchor, ack-time
+DOM snapshot, sessionStorage height-cache persistence) were removed in
+a single pass.
 
-WHEN user returns to a previously viewed conversation
-THE SYSTEM SHALL restore the scroll position to where they left off
-AND NOT auto-scroll to the bottom (unless they were already at the bottom)
-
-WHEN conversation receives new messages while user is away
-THE SYSTEM SHALL still restore to saved position
-AND provide affordance to jump to newest content
-
-**Rationale:** Users reading through long conversations lose their place when switching contexts. Preserving scroll position respects user attention and reduces re-orientation friction.
+**Deprecation Reason:** The implementation surface for "remember where
+the user was scrolled when they last looked" was structurally entangled
+with virtualization geometry and pending→sent transitions. Each bugfix
+introduced a new edge case. The product cost of dropping the feature is
+that returning to a conversation lands the user pinned to the bottom
+(per REQ-CONV-002 auto-scroll-to-newest), which is acceptable and
+predictable. If the feature is re-introduced, the design must be
+correct-by-construction — likely by keying restore to a single
+canonical timeline unit identity that does not change shape on
+acknowledgement.
 
 ---
 

@@ -1,17 +1,7 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { UnitHeightCache } from './unitHeightCache';
 
 describe('UnitHeightCache', () => {
-  beforeEach(() => {
-    sessionStorage.clear();
-    vi.useFakeTimers();
-  });
-
-  afterEach(() => {
-    vi.useRealTimers();
-    sessionStorage.clear();
-  });
-
   describe('in-memory operations', () => {
     it('stores and retrieves heights by key', () => {
       const cache = new UnitHeightCache('conv-1');
@@ -45,6 +35,12 @@ describe('UnitHeightCache', () => {
       expect(cache.version).toBeGreaterThan(v0);
       expect(cache.version).toBe(v0 + 2);
     });
+
+    it('works with an undefined conversationId', () => {
+      const cache = new UnitHeightCache(undefined);
+      cache.set('u1', 100);
+      expect(cache.get('u1')).toBe(100);
+    });
   });
 
   describe('subscribers', () => {
@@ -70,73 +66,16 @@ describe('UnitHeightCache', () => {
     });
   });
 
-  describe('sessionStorage mirror', () => {
-    it('persists writes to sessionStorage after the flush timer', () => {
-      const cache = new UnitHeightCache('conv-1');
-      cache.set('u1', 120);
-      // Pending — not yet flushed
-      expect(sessionStorage.getItem('phoenix:hcache:conv-1:u1')).toBeNull();
-      vi.advanceTimersByTime(20);
-      expect(sessionStorage.getItem('phoenix:hcache:conv-1:u1')).toBe('120');
-    });
-
-    it('coalesces multiple writes within the flush window', () => {
+  describe('dispose', () => {
+    it('clears the in-memory map and listeners', () => {
       const cache = new UnitHeightCache('conv-1');
       cache.set('u1', 100);
-      cache.set('u2', 200);
-      cache.set('u1', 150); // overwrites pending
-      vi.advanceTimersByTime(20);
-      expect(sessionStorage.getItem('phoenix:hcache:conv-1:u1')).toBe('150');
-      expect(sessionStorage.getItem('phoenix:hcache:conv-1:u2')).toBe('200');
-    });
-
-    it('flush() writes synchronously without waiting for the timer', () => {
-      const cache = new UnitHeightCache('conv-1');
-      cache.set('u1', 99);
-      cache.flush();
-      expect(sessionStorage.getItem('phoenix:hcache:conv-1:u1')).toBe('99');
-    });
-
-    it('hydrates existing sessionStorage entries for the conversation on construct', () => {
-      sessionStorage.setItem('phoenix:hcache:conv-1:u1', '111');
-      sessionStorage.setItem('phoenix:hcache:conv-1:u2', '222');
-      sessionStorage.setItem('phoenix:hcache:other:u1', '999');
-      const cache = new UnitHeightCache('conv-1');
-      expect(cache.get('u1')).toBe(111);
-      expect(cache.get('u2')).toBe(222);
-      // Entries from a different conversation are not visible.
-      expect(cache.get('u3')).toBeUndefined();
-    });
-
-    it('skips malformed entries during hydration', () => {
-      sessionStorage.setItem('phoenix:hcache:conv-1:u1', 'not-a-number');
-      sessionStorage.setItem('phoenix:hcache:conv-1:u2', '50');
-      const cache = new UnitHeightCache('conv-1');
+      const listener = vi.fn();
+      cache.subscribe(listener);
+      cache.dispose();
       expect(cache.get('u1')).toBeUndefined();
-      expect(cache.get('u2')).toBe(50);
-    });
-
-    it('does not touch sessionStorage when conversationId is undefined', () => {
-      const cache = new UnitHeightCache(undefined);
-      cache.set('u1', 100);
-      vi.advanceTimersByTime(20);
-      expect(sessionStorage.length).toBe(0);
-      // In-memory cache still works.
-      expect(cache.get('u1')).toBe(100);
-    });
-  });
-
-  describe('clearConversation', () => {
-    it('removes only the matching conversation entries', () => {
-      sessionStorage.setItem('phoenix:hcache:conv-1:u1', '100');
-      sessionStorage.setItem('phoenix:hcache:conv-1:u2', '200');
-      sessionStorage.setItem('phoenix:hcache:conv-2:u1', '300');
-      sessionStorage.setItem('unrelated', 'keep');
-      UnitHeightCache.clearConversation('conv-1');
-      expect(sessionStorage.getItem('phoenix:hcache:conv-1:u1')).toBeNull();
-      expect(sessionStorage.getItem('phoenix:hcache:conv-1:u2')).toBeNull();
-      expect(sessionStorage.getItem('phoenix:hcache:conv-2:u1')).toBe('300');
-      expect(sessionStorage.getItem('unrelated')).toBe('keep');
+      cache.set('u1', 200);
+      expect(listener).not.toHaveBeenCalled();
     });
   });
 });

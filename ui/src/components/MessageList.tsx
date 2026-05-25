@@ -1,4 +1,4 @@
-import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
+import { memo, useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { flushSync } from 'react-dom';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
@@ -11,10 +11,7 @@ import {
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
 import { MessageContextMenu } from './MessageContextMenu';
-import {
-  useBottomAnchoredWindow,
-  type SavedScrollAnchor,
-} from '../hooks/useBottomAnchoredWindow';
+import { useBottomAnchoredWindow } from '../hooks/useBottomAnchoredWindow';
 import { useUnitHeightCache } from '../conversation/unitHeightCache';
 import { useStreamingStartedAt } from '../conversation/useConversationAtom';
 import { useUnitHeightObserver, type UnitHeightObserver } from '../hooks/useUnitHeightObserver';
@@ -56,9 +53,9 @@ interface MessageListProps {
   onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   systemPrompt?: string | undefined;
-  /** Backend conversation UUID (atom.conversationId). Used as the
-   *  localStorage namespace for the anchor and as the parent prop tying
-   *  several pieces of internal state to a single conversation. */
+  /** Backend conversation UUID (atom.conversationId). Used as the parent
+   *  prop tying several pieces of internal state to a single
+   *  conversation. */
   conversationId?: string | undefined;
   /** URL slug — the key the conversation store is keyed by. Needed for
    *  both the streaming-active subscription (via useStreamingStartedAt)
@@ -71,138 +68,6 @@ interface MessageListProps {
 // Threshold in pixels - if user is within this distance of bottom, consider them "pinned"
 const SCROLL_THRESHOLD = 100;
 
-const ANCHOR_KEY_PREFIX = 'phoenix:msglist:anchor:';
-// Legacy keys from the pre-render-unit scroll-restore model. We delete
-// these whenever we write a fresh anchor so they don't accumulate, but
-// we do not read them — one visit's worth of restore-to-bottom is the
-// acceptable regression per design.md.
-const LEGACY_SCROLL_KEY_PREFIX = 'phoenix:scroll:';
-const LEGACY_MSGCOUNT_KEY_PREFIX = 'phoenix:msgcount:';
-
-function parseSavedAnchor(raw: string | null): SavedScrollAnchor | null {
-  if (!raw) return null;
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed === null || typeof parsed !== 'object') return null;
-    const obj = parsed as Record<string, unknown>;
-    if (typeof obj['topVisibleUnitKey'] !== 'string') return null;
-    // typeof NaN === 'number' so the typeof check alone admits NaN
-    // (localStorage is user-mutable). Number.isFinite tightens to real
-    // finite numbers so a corrupted offsetWithinUnit can't coerce
-    // scrollTop to NaN at restore time.
-    const offset = obj['offsetWithinUnit'];
-    if (typeof offset !== 'number' || !Number.isFinite(offset)) return null;
-    const unitCountAtSave = obj['unitCountAtSave'];
-    const validCount = typeof unitCountAtSave === 'number'
-      && Number.isFinite(unitCountAtSave)
-      && unitCountAtSave >= 0
-      ? unitCountAtSave
-      : undefined;
-    return {
-      topVisibleUnitKey: obj['topVisibleUnitKey'],
-      offsetWithinUnit: offset,
-      ...(validCount !== undefined ? { unitCountAtSave: validCount } : {}),
-    };
-  } catch {
-    return null;
-  }
-}
-
-/** Distance from the scroll root's content top to an element's top —
- *  the correct generalization of `el.offsetTop` when the scroll root
- *  is not the offsetParent. Uses `getBoundingClientRect` (viewport
- *  coordinates) then converts to content coordinates by adding
- *  `root.scrollTop` and subtracting the root's own viewport offset. */
-function unitTopInScrollRoot(el: HTMLElement, root: HTMLElement): number {
-  return el.getBoundingClientRect().top
-    - root.getBoundingClientRect().top
-    + root.scrollTop;
-}
-
-function captureDomAnchor(root: HTMLElement): SavedScrollAnchor | null {
-  const nodes = Array.from(
-    root.querySelectorAll<HTMLElement>('[data-render-unit-key]'),
-  );
-  let visibleTop: { key: string; unitTop: number } | null = null;
-  for (const el of nodes) {
-    const key = el.dataset['renderUnitKey'];
-    if (!key) continue;
-    const unitTop = unitTopInScrollRoot(el, root);
-    if (unitTop <= root.scrollTop) {
-      visibleTop = { key, unitTop };
-    } else {
-      break;
-    }
-  }
-  if (!visibleTop) {
-    const first = nodes[0];
-    const key = first?.dataset['renderUnitKey'];
-    if (!first || !key) return null;
-    return {
-      topVisibleUnitKey: key,
-      offsetWithinUnit: root.scrollTop - unitTopInScrollRoot(first, root),
-    };
-  }
-  return {
-    topVisibleUnitKey: visibleTop.key,
-    offsetWithinUnit: root.scrollTop - visibleTop.unitTop,
-  };
-}
-
-function captureAnchor(
-  scrollTop: number,
-  historicalUnits: HistoricalUnit[],
-  firstRenderedUnitIndex: number,
-  lastRenderedUnitIndex: number,
-  root: HTMLElement,
-  getElement: UnitHeightObserver['getElement'],
-): SavedScrollAnchor | null {
-  // Walk rendered units in DOM order; the LAST unit whose top is at or
-  // above scrollTop is the unit the viewport-top intersects (the unit
-  // the user is reading). offsetWithinUnit = positive distance from
-  // the unit's top to the viewport top.
-  //
-  // If no rendered unit's top is <= scrollTop (user is above all
-  // rendered units, i.e. inside the spacer), fall through to the
-  // fallback below.
-  let visibleTopUnit: { unit: HistoricalUnit; unitTop: number } | null = null;
-  for (let i = firstRenderedUnitIndex; i < lastRenderedUnitIndex; i++) {
-    const unit = historicalUnits[i]!;
-    const el = getElement(unit.key);
-    if (!el) continue;
-    const unitTop = unitTopInScrollRoot(el, root);
-    if (unitTop <= scrollTop) {
-      visibleTopUnit = { unit, unitTop };
-    } else {
-      // Once we pass scrollTop, subsequent units are also below — done.
-      break;
-    }
-  }
-  if (visibleTopUnit) {
-    return {
-      topVisibleUnitKey: visibleTopUnit.unit.key,
-      offsetWithinUnit: scrollTop - visibleTopUnit.unitTop,
-      unitCountAtSave: historicalUnits.length,
-    };
-  }
-  // Fallback: user is above all rendered units (inside the spacer) —
-  // anchor to the first rendered unit. offsetWithinUnit is negative
-  // here, restore lands at unitTop + negativeOffset = the same spacer
-  // position. Restore math handles either sign.
-  for (let i = firstRenderedUnitIndex; i < lastRenderedUnitIndex; i++) {
-    const unit = historicalUnits[i]!;
-    const el = getElement(unit.key);
-    if (el) {
-      return {
-        topVisibleUnitKey: unit.key,
-        offsetWithinUnit: scrollTop - unitTopInScrollRoot(el, root),
-        unitCountAtSave: historicalUnits.length,
-      };
-    }
-  }
-  return null;
-}
-
 // Extracts the arguments portion of a skill trigger string, stripping the leading skill name.
 function extractSkillArgs(trigger: string, name: string): string {
   return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
@@ -210,10 +75,24 @@ function extractSkillArgs(trigger: string, name: string): string {
 
 type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
 
-function renderHistoricalUnit(unit: HistoricalUnit, onOpenFile: OnOpenFile): JSX.Element | null {
+function renderHistoricalUnit(
+  unit: HistoricalUnit,
+  onOpenFile: OnOpenFile,
+  onRetry: (localId: string) => void,
+  onCancelSteering: ((localId: string) => void) | undefined,
+): JSX.Element | null {
   switch (unit.kind) {
     case 'user':
       return <UserMessage key={unit.key} message={unit.message} />;
+    case 'pending_user':
+      return (
+        <QueuedUserMessage
+          key={unit.key}
+          message={unit.message}
+          onRetry={onRetry}
+          onCancelSteering={onCancelSteering}
+        />
+      );
     case 'skill': {
       const c = unit.message.content as { name?: string; trigger?: string };
       const trigger = c.trigger || '';
@@ -266,19 +145,8 @@ function renderHistoricalUnit(unit: HistoricalUnit, onOpenFile: OnOpenFile): JSX
 function renderTailUnit(
   unit: TailUnit,
   slug: string | undefined,
-  onRetry: (localId: string) => void,
-  onCancelSteering: ((localId: string) => void) | undefined,
 ): JSX.Element | null {
   switch (unit.kind) {
-    case 'pending_user':
-      return (
-        <QueuedUserMessage
-          key={unit.key}
-          message={unit.message}
-          onRetry={onRetry}
-          onCancelSteering={onCancelSteering}
-        />
-      );
     case 'sub_agent_status':
       return <SubAgentStatus key={unit.key} stateData={unit.state} />;
     case 'streaming_agent':
@@ -314,11 +182,7 @@ interface MessageListBodyProps {
  * props (e.g. callbacks) churn at the parent.
  *
  * Each rendered unit is wrapped in a `<div>` that owns the
- * ResizeObserver-attaching ref callback. The wrapper is a flex item of
- * the same parent (#messages) and visually transparent — it doesn't
- * change the layout previously produced by direct-child message
- * components, but it provides the structural DOM hook that both the
- * height cache and the saved-scroll anchor write rely on.
+ * ResizeObserver-attaching ref callback.
  */
 const MessageListBody = memo(function MessageListBody({
   historicalUnits,
@@ -353,7 +217,7 @@ const MessageListBody = memo(function MessageListBody({
             ref={observeUnit(unit)}
             data-render-unit-key={unit.key}
           >
-            {renderHistoricalUnit(unit, onOpenFile)}
+            {renderHistoricalUnit(unit, onOpenFile, onRetry, onCancelSteering)}
           </div>
         ))}
       {lastRenderedUnitIndex < historicalUnits.length && (
@@ -368,7 +232,7 @@ const MessageListBody = memo(function MessageListBody({
       )}
       {tailUnits.map((unit) => (
         <div key={unit.key} data-render-unit-key={unit.key}>
-          {renderTailUnit(unit, slug, onRetry, onCancelSteering)}
+          {renderTailUnit(unit, slug)}
         </div>
       ))}
     </>
@@ -394,7 +258,6 @@ function MessageListImpl({
   const mainRef = useRef<HTMLElement>(null);
   const messagesRef = useRef<HTMLDivElement>(null);
   const isPinnedToBottom = useRef(true); // Start pinned to bottom
-  const lastRestoredConversationId = useRef<string | undefined>(undefined);
   const lastScrollTop = useRef(0);
   const prevMessagesHeight = useRef(0);
   // Tracks message count between renders so the ResizeObserver knows whether a
@@ -406,13 +269,6 @@ function MessageListImpl({
   // 'none'  = no new message this render.
   const scrollTriggerRef = useRef<'none' | 'soft' | 'force'>('none');
   const lastConversationIdRef = useRef<string | undefined>(conversationId);
-  const ackSnapshotRef = useRef<{
-    anchor: SavedScrollAnchor | null;
-    scrollTop: number;
-    scrollHeight: number;
-    wasPinned: boolean;
-  } | null>(null);
-  const previousPendingIdsRef = useRef<Set<string>>(new Set(pendingMessages.map((m) => m.localId)));
 
   if (lastConversationIdRef.current !== conversationId) {
     lastConversationIdRef.current = conversationId;
@@ -420,31 +276,8 @@ function MessageListImpl({
     prevMessageCountRef.current = messages.length;
     scrollTriggerRef.current = 'none';
     lastScrollTop.current = mainRef.current?.scrollTop ?? 0;
-    ackSnapshotRef.current = null;
-    previousPendingIdsRef.current = new Set(pendingMessages.map((m) => m.localId));
     isPinnedToBottom.current = true;
   }
-
-  // Saved unit-anchor for REQ-CONV-013, read synchronously and memoized
-  // per conversation. The hook uses it to widen the initial window so the
-  // anchored unit is rendered before first paint; the layout effect below
-  // applies the actual scrollTop placement once the DOM is committed.
-  const savedAnchorLookupRef = useRef<{ id: string | undefined; anchor: SavedScrollAnchor | null }>({
-    id: undefined,
-    anchor: null,
-  });
-  if (savedAnchorLookupRef.current.id !== conversationId) {
-    let anchor: SavedScrollAnchor | null = null;
-    if (conversationId) {
-      try {
-        anchor = parseSavedAnchor(localStorage.getItem(`${ANCHOR_KEY_PREFIX}${conversationId}`));
-      } catch {
-        anchor = null;
-      }
-    }
-    savedAnchorLookupRef.current = { id: conversationId, anchor };
-  }
-  const savedAnchor = savedAnchorLookupRef.current.anchor;
 
   // Streaming session identity: useStreamingStartedAt subscribes to
   // `streamingBuffer?.startedAt` for this slug and re-renders only when
@@ -476,17 +309,6 @@ function MessageListImpl({
     [messages, pendingMessages, convState, streamingHandle],
   );
 
-  const currentPendingIds = useMemo(
-    () => new Set(pendingMessages.map((m) => m.localId)),
-    [pendingMessages],
-  );
-  const acknowledgedPendingIds = useMemo(() => {
-    const historicalKeys = new Set(historicalUnits.map((u) => u.key));
-    return Array.from(previousPendingIdsRef.current).filter(
-      (id) => !currentPendingIds.has(id) && historicalKeys.has(id),
-    );
-  }, [currentPendingIds, historicalUnits]);
-
   const heightCache = useUnitHeightCache(conversationId);
   const unitObserver = useUnitHeightObserver(heightCache);
 
@@ -502,7 +324,6 @@ function MessageListImpl({
     historicalUnits,
     conversationId,
     scrollRootRef: mainRef,
-    savedAnchor,
     heightCache,
   });
 
@@ -525,35 +346,13 @@ function MessageListImpl({
     return distanceFromBottom <= SCROLL_THRESHOLD;
   }, []);
 
-  // Handle scroll events to track if user is pinned to bottom and to
-  // capture the current unit anchor so a later save persists the
-  // up-to-date position. Fires for both user scrolls and programmatic
-  // scrolls (ResizeObserver auto-anchor, restore, jump-to-newest).
+  // Track pin-to-bottom on scroll, and clear the jump-to-newest button
+  // when the user returns to the bottom.
   const handleScroll = useCallback(() => {
     isPinnedToBottom.current = checkIfPinnedToBottom();
     const el = mainRef.current;
     if (el) {
       lastScrollTop.current = el.scrollTop;
-      ackSnapshotRef.current = {
-        anchor: captureDomAnchor(el),
-        scrollTop: el.scrollTop,
-        scrollHeight: el.scrollHeight,
-        wasPinned: checkIfPinnedToBottom(),
-      };
-      if (conversationId) {
-        const { historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex } = captureStateRef.current;
-        const anchor = captureAnchor(
-          el.scrollTop,
-          historicalUnits,
-          firstRenderedUnitIndex,
-          lastRenderedUnitIndex,
-          el,
-          unitObserver.getElement,
-        );
-        if (anchor) {
-          latestAnchorRef.current = { conversationId, anchor };
-        }
-      }
     }
     if (isPinnedToBottom.current) {
       setJumpToNewestState((prev) => (
@@ -562,7 +361,7 @@ function MessageListImpl({
           : { conversationId, visible: false }
       ));
     }
-  }, [checkIfPinnedToBottom, conversationId, unitObserver]);
+  }, [checkIfPinnedToBottom, conversationId]);
 
   // Scroll to bottom helper
   const scrollToBottom = useCallback(() => {
@@ -612,225 +411,10 @@ function MessageListImpl({
     return () => observer.disconnect();
   }, [conversationId]);
 
-  // Latest captured anchor, refreshed on every scroll event (user
-  // scrolls and programmatic scrolls both fire `scroll`, including the
-  // ResizeObserver's auto-anchor-to-bottom). The save effect persists
-  // the ref's value at visibilitychange / cleanup time; reading from
-  // a ref is necessary because by the time the cleanup fires on
-  // conversation switch, the OLD unit DOM nodes have already
-  // unmounted and `unitObserver.getElement` returns nothing for them.
-  const latestAnchorRef = useRef<{ conversationId: string; anchor: SavedScrollAnchor } | null>(null);
-
-  // Latest historicalUnits + firstRenderedUnitIndex captured for the
-  // scroll handler. Refs keep handleScroll's identity stable across
-  // unit-content updates.
-  const captureStateRef = useRef({ historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex });
-  captureStateRef.current = { historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex };
-
-  // Save unit anchor on visibility-hidden and unmount (REQ-MLRU-009 +
-  // REQ-CONV-013). Replaces the prior scrollTop+messageCount save.
-  useEffect(() => {
-    if (!conversationId) return;
-    const save = (recomputeCurrent: boolean) => {
-      let anchorToSave: SavedScrollAnchor | null = null;
-      const root = mainRef.current;
-      if (recomputeCurrent && root) {
-        const { historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex } = captureStateRef.current;
-        anchorToSave = captureAnchor(
-          root.scrollTop,
-          historicalUnits,
-          firstRenderedUnitIndex,
-          lastRenderedUnitIndex,
-          root,
-          unitObserver.getElement,
-        );
-        if (anchorToSave) {
-          latestAnchorRef.current = { conversationId, anchor: anchorToSave };
-        }
-      }
-
-      if (!anchorToSave) {
-        const last = latestAnchorRef.current;
-        if (last && last.conversationId === conversationId) {
-          anchorToSave = last.anchor;
-        }
-      }
-
-      if (anchorToSave) {
-        try {
-          localStorage.setItem(
-            `${ANCHOR_KEY_PREFIX}${conversationId}`,
-            JSON.stringify(anchorToSave),
-          );
-        } catch {
-          // Quota exceeded; the in-memory state is still correct.
-        }
-      }
-      // Prune legacy keys whether or not the new write succeeded so a
-      // future visit doesn't read both shapes.
-      try {
-        localStorage.removeItem(`${LEGACY_SCROLL_KEY_PREFIX}${conversationId}`);
-        localStorage.removeItem(`${LEGACY_MSGCOUNT_KEY_PREFIX}${conversationId}`);
-      } catch {
-        // ignored
-      }
-      // Persist any measured heights so a remount's first paint uses
-      // exact spacer geometry.
-      heightCache.flush();
-    };
-    const onVisChange = () => {
-      if (document.visibilityState === 'hidden') save(true);
-    };
-    document.addEventListener('visibilitychange', onVisChange);
-    return () => {
-      document.removeEventListener('visibilitychange', onVisChange);
-      save(false);
-    };
-  }, [conversationId, heightCache, unitObserver]);
-
-  // Restore by unit anchor on first paint per conversation. Runs in
-  // useLayoutEffect so it lands before the ResizeObserver's first
-  // observation has a chance to interfere.
-  //
-  // Three things have to land together here (REQ-MLRU-009, REQ-CONV-013):
-  //   1. scrollTop placement at the saved anchor (when anchor + unit
-  //      both exist), using unitTopInScrollRoot so the math is
-  //      correct regardless of whether #main-area is the offsetParent.
-  //   2. prevMessagesHeight seeded from the current content height so
-  //      the first ResizeObserver tick (which compares against this
-  //      ref) does not see a bogus heightGrew=true and either snap to
-  //      bottom (clobbering the restore) or pop the "↓ New messages"
-  //      button on a fresh visit.
-  //   3. latestAnchorRef seeded so a quick visibility-hidden after
-  //      restore (user opens conversation and tab-switches) persists
-  //      the restored position rather than nothing — and so the saved
-  //      unitCountAtSave is preserved across save/restore cycles.
-  //
-  // The "new messages while away" surface is the saved
-  // unitCountAtSave vs current historicalUnits.length comparison: if
-  // the count grew and the restored position is not at bottom, show
-  // the jump-to-newest button.
-  useLayoutEffect(() => {
-    if (!conversationId) return;
-    if (lastRestoredConversationId.current === conversationId) return;
-    if (historicalUnits.length === 0) return;
-    const root = mainRef.current;
-    const messagesEl = messagesRef.current;
-    if (!root || !messagesEl) return;
-
-    const savedAnchorIndex = savedAnchor
-      ? historicalUnits.findIndex((u) => u.key === savedAnchor.topVisibleUnitKey)
-      : -1;
-    const canRestoreSavedAnchor = savedAnchor !== null && savedAnchorIndex >= 0;
-
-    if (canRestoreSavedAnchor && savedAnchor) {
-      const anchorEl = unitObserver.getElement(savedAnchor.topVisibleUnitKey);
-      if (!anchorEl) return;
-    }
-
-    lastRestoredConversationId.current = conversationId;
-
-    // (2) Seed prevMessagesHeight so the first ResizeObserver tick
-    //     after this restore doesn't observe a spurious "height grew".
-    prevMessagesHeight.current = messagesEl.getBoundingClientRect().height;
-
-    if (canRestoreSavedAnchor && savedAnchor) {
-      const el = unitObserver.getElement(savedAnchor.topVisibleUnitKey);
-      // Guarded above; keep the branch defensive for future refactors.
-      if (!el) return;
-      // (1) Restore with correct content-coordinate math.
-      const unitTop = unitTopInScrollRoot(el, root);
-      root.scrollTop = unitTop + savedAnchor.offsetWithinUnit;
-      lastScrollTop.current = root.scrollTop;
-      isPinnedToBottom.current = checkIfPinnedToBottom();
-    } else if (savedAnchor && conversationId) {
-      try {
-        localStorage.removeItem(`${ANCHOR_KEY_PREFIX}${conversationId}`);
-      } catch {
-        // ignored
-      }
-    }
-
-    // (3) Seed latestAnchorRef with the current position (or, if the
-    //     anchor is missing, with whatever bottom-pin we landed on)
-    //     so a save before the first scroll persists meaningful state.
-    const initialAnchor = captureAnchor(
-      root.scrollTop,
-      historicalUnits,
-      firstRenderedUnitIndex,
-      lastRenderedUnitIndex,
-      root,
-      unitObserver.getElement,
-    );
-    if (initialAnchor) {
-      latestAnchorRef.current = { conversationId, anchor: initialAnchor };
-    }
-
-    // jumpToNewest surface for "new messages arrived while away":
-    // the saved anchor's unitCountAtSave (if present) tells us how
-    // many units existed at save time. If the count grew AND we're
-    // not currently pinned to bottom, surface the button.
-    if (
-      savedAnchor?.unitCountAtSave !== undefined
-      && historicalUnits.length > savedAnchor.unitCountAtSave
-      && !isPinnedToBottom.current
-    ) {
-      setJumpToNewestState((prev) => (
-        prev.conversationId === conversationId && prev.visible
-          ? prev
-          : { conversationId, visible: true }
-      ));
-    }
-  }, [
-    conversationId,
-    historicalUnits,
-    savedAnchor,
-    firstRenderedUnitIndex,
-    lastRenderedUnitIndex,
-    unitObserver,
-    checkIfPinnedToBottom,
-  ]);
-
-  useLayoutEffect(() => {
-    const root = mainRef.current;
-    if (!root) return;
-    if (acknowledgedPendingIds.length > 0) {
-      const snapshot = ackSnapshotRef.current;
-      if (snapshot?.wasPinned) {
-        root.scrollTop = root.scrollHeight;
-        lastScrollTop.current = root.scrollTop;
-        isPinnedToBottom.current = true;
-      } else if (snapshot) {
-        const anchor = snapshot.anchor;
-        const promotedAnchor = anchor && acknowledgedPendingIds.includes(anchor.topVisibleUnitKey)
-          ? Array.from(root.querySelectorAll<HTMLElement>('[data-render-unit-key]')).find(
-            (el) => el.dataset['renderUnitKey'] === anchor.topVisibleUnitKey,
-          ) ?? null
-          : null;
-        if (promotedAnchor && anchor) {
-          root.scrollTop = unitTopInScrollRoot(promotedAnchor, root) + anchor.offsetWithinUnit;
-        } else {
-          root.scrollTop = snapshot.scrollTop + (root.scrollHeight - snapshot.scrollHeight);
-        }
-        lastScrollTop.current = root.scrollTop;
-        isPinnedToBottom.current = checkIfPinnedToBottom();
-      }
-    }
-    ackSnapshotRef.current = {
-      anchor: captureDomAnchor(root),
-      scrollTop: root.scrollTop,
-      scrollHeight: root.scrollHeight,
-      wasPinned: checkIfPinnedToBottom(),
-    };
-    previousPendingIdsRef.current = currentPendingIds;
-  }, [acknowledgedPendingIds, checkIfPinnedToBottom, currentPendingIds]);
-
   // isEmpty reflects "nothing for MessageListBody to render". Includes
-  // tail units (pending_user, sub_agent_status, streaming_agent) so the
-  // sub-agent status block when historical messages are still empty
-  // (e.g., sub-agent flow that begins streaming before the user message
-  // persists, or a reconnect race where pending events outpace the
-  // initial snapshot).
+  // tail units (sub_agent_status, streaming_agent) so the empty-state
+  // placeholder doesn't hide an active streaming buffer or sub-agent
+  // status block when historical messages are still empty.
   const isEmpty = historicalUnits.length === 0 && tailUnits.length === 0;
 
   return (

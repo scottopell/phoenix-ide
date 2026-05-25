@@ -39,7 +39,6 @@ vi.mock('./MessageContextMenu', () => ({
   MessageContextMenu: () => null,
 }));
 
-let resizeCallback: ResizeObserverCallback | null = null;
 let scrollHeightDescriptor: PropertyDescriptor | undefined;
 let clientHeightDescriptor: PropertyDescriptor | undefined;
 let originalGetBCR: typeof HTMLElement.prototype.getBoundingClientRect | undefined;
@@ -67,21 +66,8 @@ class MockIntersectionObserver {
 }
 
 class MockResizeObserver {
-  constructor(callback: ResizeObserverCallback) {
-    resizeCallback = callback;
-  }
-
   observe() {}
   disconnect() {}
-}
-
-function triggerResize(target: Element, height: number) {
-  act(() => {
-    resizeCallback?.(
-      [{ target, contentRect: { height } as DOMRectReadOnly } as ResizeObserverEntry],
-      {} as ResizeObserver,
-    );
-  });
 }
 
 function makeMessage(sequence_id: number, message_type: Message['message_type'] = 'user'): Message {
@@ -103,7 +89,6 @@ const idleState: ConversationState = { type: 'idle' };
 describe('MessageList', () => {
   beforeEach(() => {
     localStorage.clear();
-    resizeCallback = null;
     intersectionObservers = [];
     scrollHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollHeight');
     clientHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
@@ -156,106 +141,14 @@ describe('MessageList', () => {
     }
   });
 
-  it('restores saved scroll when revisiting a cached conversation and does not snap back to bottom', async () => {
-    // Unit-anchor restore: with one user message (key=msg-1) whose
-    // wrapper has offsetTop=0 in happy-dom, an offset of 450 produces
-    // scrollTop=450 — matching what the prior pixel-only model
-    // recorded. The second navigation back to conv-a relies on the
-    // save fired during the rerender writing this anchor back fresh.
-    localStorage.setItem(
-      'phoenix:msglist:anchor:conv-a',
-      JSON.stringify({ topVisibleUnitKey: 'msg-1', offsetWithinUnit: 450 }),
-    );
-
-    const { container, rerender } = render(
-      withConvContext(
-        <MessageList
-          messages={[makeMessage(1)]}
-          pendingMessages={[]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-a"
-        />,
-      ),
-    );
-
-    const main = container.querySelector('#main-area') as HTMLElement;
-    const messages = container.querySelector('#messages') as HTMLElement;
-
-    await waitFor(() => expect(main.scrollTop).toBe(450));
-    triggerResize(messages, 500);
-    expect(main.scrollTop).toBe(450);
-
-    rerender(
-      withConvContext(
-        <MessageList
-          messages={[makeMessage(2)]}
-          pendingMessages={[]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-b"
-        />,
-      ),
-    );
-    triggerResize(messages, 500);
-    expect(main.scrollTop).toBe(1000);
-
-    // Revisit conv-a with its original message present. Unit-anchor
-    // restore looks up by message_id — the saved anchor's
-    // topVisibleUnitKey ('msg-1') matches the rendered unit and the
-    // restore lands the user back at the saved offset.
-    rerender(
-      withConvContext(
-        <MessageList
-          messages={[makeMessage(1)]}
-          pendingMessages={[]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-a"
-        />,
-      ),
-    );
-
-    await waitFor(() => expect(main.scrollTop).toBe(450));
-    triggerResize(messages, 500);
-    expect(main.scrollTop).toBe(450);
-  });
-
-  it('recomputes the current unit anchor on visibility-hidden even without a scroll event', () => {
-    const { container } = render(
-      withConvContext(
-        <MessageList
-          messages={[makeMessage(1), makeMessage(2), makeMessage(3)]}
-          pendingMessages={[]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-a"
-        />,
-      ),
-    );
-
-    const main = container.querySelector('#main-area') as HTMLElement;
-    main.scrollTop = 250;
-
-    Object.defineProperty(document, 'visibilityState', {
-      configurable: true,
-      get: () => 'hidden',
-    });
-    document.dispatchEvent(new Event('visibilitychange'));
-
-    const saved = JSON.parse(localStorage.getItem('phoenix:msglist:anchor:conv-a') ?? 'null');
-    expect(saved).toMatchObject({
-      topVisibleUnitKey: 'msg-3',
-      offsetWithinUnit: 50,
-      unitCountAtSave: 3,
-    });
-  });
-
-  it('keeps viewport stable when a visible pending message is acknowledged', async () => {
+  it('pending → sent acknowledgement keeps a single keyed render unit (REQ-MLRU-001)', async () => {
+    // The previous bug class: a pending_user TailUnit was promoted to a
+    // user HistoricalUnit on ack, which required scroll compensation
+    // (PR #152 hotfix). The new model emits pending_user as a
+    // HistoricalUnit appended at the tail of historicalUnits, sharing
+    // the eventual user unit's key (localId == message_id at ack). The
+    // pending → sent transition is therefore a keyed in-place update
+    // on a single DOM node — no cross-region promotion.
     const pending = {
       localId: 'msg-21',
       text: 'pending acknowledgement',
@@ -265,11 +158,6 @@ describe('MessageList', () => {
     };
     const historical = Array.from({ length: 20 }, (_, i) => makeMessage(i + 1, 'user'));
 
-    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
-      configurable: true,
-      get: () => 3000,
-    });
-
     const { container, rerender } = render(
       withConvContext(
         <MessageList
@@ -283,12 +171,7 @@ describe('MessageList', () => {
       ),
     );
 
-    const main = container.querySelector('#main-area') as HTMLElement;
     await waitFor(() => expect(container.querySelector('[data-render-unit-key="msg-21"]')).not.toBeNull());
-    act(() => {
-      main.scrollTop = 2025;
-      main.dispatchEvent(new Event('scroll', { bubbles: true }));
-    });
 
     rerender(
       withConvContext(
@@ -310,67 +193,13 @@ describe('MessageList', () => {
       ),
     );
 
-    await waitFor(() => expect(container.querySelector('[data-render-unit-key="msg-21"]')).not.toBeNull());
-    expect(main.scrollTop).toBe(2025);
-  });
-
-  it('stays pinned to bottom when acknowledging a pending tail message', async () => {
-    const pending = {
-      localId: 'msg-21',
-      text: 'pending bottom acknowledgement',
-      images: [],
-      timestamp: 1,
-      status: 'pending' as const,
-    };
-    const historical = Array.from({ length: 20 }, (_, i) => makeMessage(i + 1, 'user'));
-
-    const { container, rerender } = render(
-      withConvContext(
-        <MessageList
-          messages={historical}
-          pendingMessages={[pending]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-ack-bottom"
-        />,
-      ),
-    );
-
-    const main = container.querySelector('#main-area') as HTMLElement;
-    await waitFor(() => expect(container.querySelector('[data-render-unit-key="msg-21"]')).not.toBeNull());
-    act(() => {
-      main.scrollTop = 600;
-      main.dispatchEvent(new Event('scroll', { bubbles: true }));
+    // The render-unit-key wrapper for `msg-21` survives the ack — the
+    // same keyed node hosts the QueuedUserMessage before and the
+    // UserMessage after. There is exactly one wrapper with that key.
+    await waitFor(() => {
+      const nodes = container.querySelectorAll('[data-render-unit-key="msg-21"]');
+      expect(nodes).toHaveLength(1);
     });
-
-    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
-      configurable: true,
-      get: () => 1200,
-    });
-
-    rerender(
-      withConvContext(
-        <MessageList
-          messages={[
-            ...historical,
-            {
-              ...makeMessage(21, 'user'),
-              message_id: 'msg-21',
-              content: { text: pending.text },
-            },
-          ]}
-          pendingMessages={[]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-ack-bottom"
-        />,
-      ),
-    );
-
-    await waitFor(() => expect(main.scrollHeight - main.scrollTop - main.clientHeight).toBeLessThanOrEqual(100));
-    expect(container.querySelector('.jump-to-newest')).toBeNull();
   });
 
   it('bounds retained historical DOM while expanding upward', async () => {

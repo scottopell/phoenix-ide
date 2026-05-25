@@ -485,16 +485,22 @@ describe('buildRenderUnits', () => {
   // -------------------------------------------------------------------
 
   describe('tail units', () => {
-    it('appends pending_user tail units in input order', () => {
+    it('appends pending_user units at the tail of historicalUnits in input order', () => {
+      // Pending user messages live in historicalUnits (REQ-MLRU-001) so
+      // that pending → sent acknowledgement is an in-place keyed update
+      // on a single render unit. The eventual user unit's key (the
+      // server-echoed message_id) equals the localId by server
+      // convention.
       const out = buildRenderUnits({
         messages: [],
         pendingMessages: [queued('q1'), queued('q2')],
         convState: IDLE,
         streamingHandle: null,
       });
-      expect(out.tailUnits).toHaveLength(2);
-      expect(out.tailUnits[0]).toMatchObject({ kind: 'pending_user', key: 'q1' });
-      expect(out.tailUnits[1]).toMatchObject({ kind: 'pending_user', key: 'q2' });
+      expect(out.historicalUnits).toHaveLength(2);
+      expect(out.historicalUnits[0]).toMatchObject({ kind: 'pending_user', key: 'q1' });
+      expect(out.historicalUnits[1]).toMatchObject({ kind: 'pending_user', key: 'q2' });
+      expect(out.tailUnits.filter((u) => u.kind !== 'sub_agent_status' && u.kind !== 'streaming_agent')).toEqual([]);
     });
 
     it('appends a singleton sub_agent_status tail unit when awaiting_sub_agents', () => {
@@ -550,7 +556,7 @@ describe('buildRenderUnits', () => {
       expect(out.tailUnits.filter((u) => u.kind === 'streaming_agent')).toEqual([]);
     });
 
-    it('emits tail units in deterministic order: pending_user, then sub_agent_status, then streaming_agent', () => {
+    it('emits pending_user at the tail of historicalUnits; sub_agent_status before streaming_agent in tailUnits', () => {
       const state: ConversationState = {
         type: 'awaiting_sub_agents',
         pending: [],
@@ -562,9 +568,11 @@ describe('buildRenderUnits', () => {
         convState: state,
         streamingHandle: { key: 'stream-1' },
       });
+      expect(out.historicalUnits.map((u) => u.kind)).toEqual([
+        'pending_user',
+        'pending_user',
+      ]);
       expect(out.tailUnits.map((u) => u.kind)).toEqual([
-        'pending_user',
-        'pending_user',
         'sub_agent_status',
         'streaming_agent',
       ]);

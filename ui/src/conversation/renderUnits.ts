@@ -34,10 +34,10 @@ export type HistoricalUnit =
       toolResultsByUseId: ReadonlyMap<string, Message>;
       isFirstInTurn: boolean;
     }
-  | { kind: 'system'; key: string; message: Message };
+  | { kind: 'system'; key: string; message: Message }
+  | { kind: 'pending_user'; key: string; message: QueuedMessage };
 
 export type TailUnit =
-  | { kind: 'pending_user'; key: string; message: QueuedMessage }
   | { kind: 'sub_agent_status'; key: string; state: AwaitingSubAgentsState }
   | { kind: 'streaming_agent'; key: string };
 
@@ -176,11 +176,16 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
     }
   }
 
-  const tailUnits: TailUnit[] = [];
-
+  // Pending user messages append to historicalUnits at the tail, sharing
+  // the eventual `user` unit's key (server populates message_id = localId
+  // at ack). This keeps pending → sent transitions a keyed in-place
+  // update on a single render unit — no cross-region promotion, no scroll
+  // compensation (REQ-MLRU-001).
   for (const q of pendingMessages) {
-    tailUnits.push({ kind: 'pending_user', key: q.localId, message: q });
+    historicalUnits.push({ kind: 'pending_user', key: q.localId, message: q });
   }
+
+  const tailUnits: TailUnit[] = [];
 
   if (convState.type === 'awaiting_sub_agents') {
     tailUnits.push({

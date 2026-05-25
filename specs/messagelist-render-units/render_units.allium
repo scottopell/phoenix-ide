@@ -71,18 +71,22 @@ value StreamingHandle {
 
 -- The kind discriminator on HistoricalUnit. Tool messages do NOT have
 -- a kind: by construction they are owned by an agent_turn and never
--- appear as a standalone unit.
+-- appear as a standalone unit. `pending_user` is a HistoricalKind so
+-- that the pending → sent transition is a keyed in-place update on a
+-- single render unit (the unit's kind changes from pending_user to
+-- user, but the key — `localId == message_id` at ack — persists).
 enum HistoricalKind {
     user
     skill
     agent_turn
     system
+    pending_user
 }
 
 -- The kind discriminator on TailUnit. These units never enter the
--- bottom-anchored window's collapsible range.
+-- bottom-anchored window's collapsible range. They are ephemeral
+-- display-only views with no acknowledgement lifecycle.
 enum TailKind {
-    pending_user
     sub_agent_status
     streaming_agent
 }
@@ -136,7 +140,8 @@ entity Builder {
 
     transitions phase {
         walking -> walking
-        walking -> tail_assembly
+        walking -> pending_append
+        pending_append -> tail_assembly
         tail_assembly -> done
         terminal: done
     }
@@ -335,44 +340,57 @@ rule SkipUnknownType {
         -- else (continuation, error, future variants) lands here.
 }
 
--- Walking complete → transition to tail_assembly phase. Tail units
--- are emitted in declaration order: pending then sub-agent then
--- streaming.
+-- Walking complete → transition to pending_append phase. Pending
+-- user messages are appended to the historical list (REQ-MLRU-001);
+-- tail-assembly emits sub-agent and streaming units after.
 rule WalkComplete {
     when: BuilderStep(b)
 
     requires: b.phase = "walking"
     requires: b.position = len(b.messages)
 
-    ensures: b.phase = "tail_assembly"
+    ensures: b.phase = "pending_append"
     ensures: b.position = b.position
     ensures: b.historical = b.historical
     ensures: b.in_agent_run = b.in_agent_run
 }
 
 ------------------------------------------------------------
--- Rules — tail assembly (phase = tail_assembly)
+-- Rules — pending append (phase = pending_append)
 ------------------------------------------------------------
 
--- Pending queued messages → pending_user tail units, in input order.
--- The transform's tail list begins with these; subsequent rules
--- append the sub-agent and streaming tail units after.
-rule AppendPendingTailUnits {
+-- Pending queued messages → pending_user HISTORICAL units, in input
+-- order, appended at the END of b.historical. Each unit's key is
+-- q.local_id, which equals the eventual server-echoed message_id at
+-- ack time (the server populates message_id := localId on the user
+-- send). The pending → sent transition is therefore an in-place keyed
+-- replacement of a pending_user historical unit by a user historical
+-- unit with the same key — no cross-region promotion, no tail/historical
+-- boundary, no scroll compensation.
+rule AppendPendingHistoricalUnits {
     when: BuilderStep(b)
 
-    requires: b.phase = "tail_assembly"
+    requires: b.phase = "pending_append"
 
-    ensures: b.tail = pending_tail_units_in_order(b.pending_messages)
+    ensures: b.historical = concat(b.historical, pending_historical_units_in_order(b.pending_messages))
     ensures: b.phase = "tail_assembly"
 
     @guidance
-        -- pending_tail_units_in_order(qs):
+        -- pending_historical_units_in_order(qs):
         --   for q in qs (input order):
-        --     emit { kind: pending_user, key: q.local_id }
+        --     emit { kind: pending_user, key: q.local_id,
+        --            source_message_id: q.local_id }
         -- The status filter (only pending / steering_queued) has
         -- already been applied upstream by useMessageQueue's
         -- derivePendingMessages; this rule consumes the filtered list.
+        --
+        -- The pending_user unit does NOT flip in_agent_run; that field
+        -- is no longer consulted after walking completes.
 }
+
+------------------------------------------------------------
+-- Rules — tail assembly (phase = tail_assembly)
+------------------------------------------------------------
 
 -- Awaiting sub-agents → singleton sub_agent_status tail unit. Key is
 -- a constant; the React reconciler uses it to preserve the inner
@@ -528,8 +546,11 @@ invariant EveryHistoricalUnitHasSource {
             b.phase = "done" implies historical_unit_has_source(b, u)
 }
 
--- Unit keys are unique across the historical list. The window's
--- saved-scroll anchor and React reconciler both depend on this.
+-- Unit keys are unique across the historical list. React's reconciler
+-- depends on this for stable in-place updates — particularly for the
+-- pending → sent transition (a pending_user unit and the user unit
+-- that replaces it share a key, but only one of the two appears in
+-- b.historical at a time).
 invariant HistoricalUnitKeysAreUnique {
     for b in Builders:
         for u in b.historical:

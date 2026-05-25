@@ -21,6 +21,10 @@ import type { UnitHeightCache } from '../conversation/unitHeightCache';
  * preceded by one spacer div; everything older collapses into that
  * spacer.
  *
+ * Mount lands pinned to the bottom (REQ-MLRU-005). Saved-scroll
+ * restoration was removed alongside REQ-CONV-013; the previous
+ * `savedAnchor` argument and `RESTORE_OVERSCAN` constant are gone.
+ *
  * Boundary expansion uses an `IntersectionObserver` rooted at the scroll
  * container, observing a sentinel placed between the spacer and the
  * rendered slice. The sentinel is attached via a *callback ref* so the
@@ -46,50 +50,19 @@ export const EXPAND_BATCH = 12;
 export const MAX_RENDERED_UNITS = 48;
 export const SENTINEL_ROOT_MARGIN = '600px 0px 0px 0px';
 export const BOTTOM_SENTINEL_ROOT_MARGIN = '0px 0px 600px 0px';
-export const RESTORE_OVERSCAN = 4;
 
 export const KIND_ESTIMATES: Record<HistoricalUnit['kind'], number> = {
   user: 100,
   skill: 80,
   agent_turn: 400,
   system: 100,
+  pending_user: 100,
 };
-
-/**
- * Saved scroll position keyed by render-unit identity. Restoring by unit
- * key + offset is structurally correct regardless of intervening
- * row-height variation in the prefix.
- *
- * `unitCountAtSave` lets the restore path detect that messages arrived
- * while the user was away (current historicalUnits.length >
- * unitCountAtSave) so the "↓ New messages" surface can fire on return —
- * preserving the REQ-CONV-013 affordance that the prior scrollTop+
- * msgcount pair provided.
- */
-export interface SavedScrollAnchor {
-  topVisibleUnitKey: string;
-  offsetWithinUnit: number;
-  /** Number of historical units present at save time. The restore
-   *  path compares this to current historicalUnits.length to detect
-   *  that messages arrived while the user was away and surface the
-   *  "↓ New messages" affordance.
-   *
-   *  Optional only because the field is forward-compatible: anchors
-   *  written by older app builds (without the field) still parse and
-   *  simply don't surface the new-messages indicator. captureAnchor
-   *  in MessageList always populates it on writes. */
-  unitCountAtSave?: number;
-}
 
 export interface UseBottomAnchoredWindowArgs {
   historicalUnits: HistoricalUnit[];
   conversationId: string | undefined;
   scrollRootRef: RefObject<HTMLElement | null>;
-  /** When set and the key exists in `historicalUnits`, the initial
-   *  window widens so the anchored unit and `RESTORE_OVERSCAN` units
-   *  above it are rendered. The actual scrollTop placement is the
-   *  caller's responsibility (handled in MessageList's layout effect). */
-  savedAnchor?: SavedScrollAnchor | null;
   /** Per-conversation measured-height cache. Spacer height uses
    *  measured values when present, per-kind estimates otherwise. */
   heightCache?: UnitHeightCache | null;
@@ -119,19 +92,8 @@ export interface UseBottomAnchoredWindowResult {
 }
 
 /** Pure helper: where should `firstRenderedUnitIndex` start on mount?
- *  If a savedAnchor is provided and its key exists in `units`, widen the
- *  window so the anchored unit (plus `RESTORE_OVERSCAN` units above) is
- *  rendered. Otherwise default to bottom-pin (last `INITIAL_WINDOW`). */
-export function computeInitialStart(
-  units: HistoricalUnit[],
-  savedAnchor: SavedScrollAnchor | null | undefined,
-): number {
-  if (savedAnchor) {
-    const idx = units.findIndex((u) => u.key === savedAnchor.topVisibleUnitKey);
-    if (idx >= 0) {
-      return Math.max(0, idx - RESTORE_OVERSCAN);
-    }
-  }
+ *  Always bottom-pinned to the last `INITIAL_WINDOW` units. */
+export function computeInitialStart(units: HistoricalUnit[]): number {
   return Math.max(0, units.length - INITIAL_WINDOW);
 }
 
@@ -163,30 +125,12 @@ export function computeRangeHeight(
   return h;
 }
 
-function computeInitialEnd(
-  units: HistoricalUnit[],
-  firstIdx: number,
-  savedAnchor: SavedScrollAnchor | null | undefined,
-): number {
-  if (savedAnchor) {
-    const idx = units.findIndex((u) => u.key === savedAnchor.topVisibleUnitKey);
-    if (idx >= 0) {
-      return Math.min(
-        units.length,
-        Math.max(idx + 1 + RESTORE_OVERSCAN, firstIdx + INITIAL_WINDOW),
-      );
-    }
-  }
-  return units.length;
-}
-
 const noopSubscribe = (): (() => void) => () => {};
 
 export function useBottomAnchoredWindow({
   historicalUnits,
   conversationId,
   scrollRootRef,
-  savedAnchor,
   heightCache,
 }: UseBottomAnchoredWindowArgs): UseBottomAnchoredWindowResult {
   const [windowRange, setWindowRange] = useState<{
@@ -215,8 +159,8 @@ export function useBottomAnchoredWindow({
       ? windowRange
       : null;
 
-  const initialFirst = computeInitialStart(historicalUnits, savedAnchor ?? null);
-  const initialLast = computeInitialEnd(historicalUnits, initialFirst, savedAnchor ?? null);
+  const initialFirst = computeInitialStart(historicalUnits);
+  const initialLast = historicalUnits.length;
   const firstRenderedUnitIndex = Math.max(
     0,
     Math.min(activeRange?.first ?? initialFirst, historicalUnits.length),
