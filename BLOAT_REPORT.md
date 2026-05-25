@@ -296,7 +296,7 @@ each individual fix is small.
 | # | Hypothesis | Test | Threshold for "win" | Result |
 |---|-----------|------|---------------------|--------|
 | **E1** | Moving `monitor` to its own crate cuts cold dev build ≥ 5 s wall-clock. | `cargo clean && cargo build --timings` before vs after. | ≥ 5 s wall-clock + p<0.05 across runs. | **PASS (single run): −23.7 s wall (−17%), −42.0 s CPU (−12%). See "E1 results" below.** |
-| E2 | Dropping `compression-full` → `compression-gzip` shaves ≥ 8 s CPU. | Edit Cargo.toml, rebuild fresh; compare timings. | ≥ 8 s CPU (zstd-sys gone). | pending |
+| **E2** | Dropping `compression-full` → `compression-br,compression-gzip` shaves ≥ 8 s CPU. | Edit Cargo.toml, rebuild fresh; compare timings. | ≥ 8 s CPU (zstd-sys gone). | **PASS: −24.4 s CPU (−8%), −8 units. See "E2 results" below.** |
 | E3 | Bumping tower/tower-http/thiserror/rand to current majors cuts dup-link cost ≥ 3 s CPU. | Coordinated bump branch, rebuild fresh. | ≥ 3 s CPU + no behavioural regressions. | pending |
 | E4 | Replacing chromiumoxide with `headless_chrome` (or trimmed CDP) drops cold wall-clock ≥ 40 s. | Spike branch with browser_profile reimplemented; benchmark. | ≥ 40 s wall-clock. | pending |
 
@@ -354,3 +354,59 @@ delta is contention noise, not the refactor. Robust deltas: unit count
 - `crates/phoenix-ide/Cargo.toml` — removed `[[bin]]` + 4 deps (ratatui, crossterm, rusqlite, ureq)
 - `crates/phoenix-monitor/Cargo.toml` — new
 - `crates/phoenix-monitor/src/main.rs` — moved verbatim from `crates/phoenix-ide/src/bin/monitor.rs`
+
+---
+
+## E2 results (executed 2026-05-25)
+
+Refactor: pruned `tower-http` `compression-full` feature down to
+`compression-br,compression-gzip`. Updated `CompressionLayer` builder
+to enable only `gzip(true)` + `br(true)` (dropped `deflate` and `zstd`).
+
+Rationale: phoenix-ide is single-server and accessed both locally and
+over public HTTPS. Brotli wins on the embedded `ui/dist/` React bundle
+(10–15 % smaller than gzip) and is supported by every browser since
+Chrome 50 / Firefox 44. Zstd over HTTP is Chrome 123+ / Firefox 126+
+only (March/May 2024) — narrow browser-support window for a marginal
+ratio improvement, and `zstd-sys` is a 10 s C build script on every
+cold compile.
+
+HTTP/HTTPS unification verified correct: `main.rs` builds one router
+with one `CompressionLayer` before the `if let Some(tls_source)` branch
+that picks the listener type. Both code paths layer compression
+identically — single source of truth at `main.rs:233-234`.
+
+Procedure (single cold workspace build, idle-ish system):
+
+```bash
+cargo clean
+rm -rf target/cargo-timings
+cargo build --timings
+```
+
+| Metric | Before E2 (= after E1) | After E2 | Δ |
+|--------|----:|----:|----:|
+| Compile units | 422 | 414 | **−8** |
+| Total CPU | 317.6 s | 293.2 s | **−24.4 s (−8%)** |
+| Wall-clock | 113.5 s | 112.4 s | −1.1 s |
+| Critical path | 96.6 s | 97.6 s | ~0 |
+
+**Removed:** `zstd-sys` (10 s C build script), `zstd`, `zstd-safe`,
+and 5 other transitives.
+
+**Kept:** `brotli` (2.02 s), `brotli-decompressor`, `flate2`,
+`compression-codecs`, `async-compression` — all the codec machinery
+brotli + gzip need.
+
+**Wall-clock unchanged** because zstd-sys built in parallel off the
+critical path (which is still `chromiumoxide_cdp → chromiumoxide →
+phoenix_ide`). The CPU saving lowers thermal/contention pressure on
+shared-core machines, which improves cold builds elsewhere indirectly.
+
+**Validation:**
+- `cargo check --workspace` ✓
+- `cargo clippy --workspace -- -D warnings` ✓
+
+**Files changed:**
+- `crates/phoenix-ide/Cargo.toml` — `compression-full` → `compression-br,compression-gzip`
+- `crates/phoenix-ide/src/main.rs` — dropped `.deflate(true).zstd(true)` from `CompressionLayer`
