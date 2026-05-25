@@ -132,6 +132,14 @@ Each git worktree gets unique ports and database automatically.
 
 ⚠️ Do NOT use `cargo run` directly—server needs LLM gateway config from `./dev.py`.
 
+If you're in a Claude Code remote sandbox (`IS_SANDBOX=yes`) and need to drive the UI in a real browser, `npx agent-browser` works once pointed at the pre-installed Playwright Chrome and given cert/sandbox args:
+
+```bash
+export AGENT_BROWSER_EXECUTABLE_PATH=/opt/pw-browsers/chromium-1194/chrome-linux/chrome
+export AGENT_BROWSER_ARGS="--ignore-certificate-errors,--disable-dev-shm-usage,--no-sandbox"
+npx agent-browser open http://localhost:8042
+```
+
 ### Node + pnpm
 
 The UI uses pnpm via Corepack, pinned in `ui/package.json#packageManager`.
