@@ -182,7 +182,7 @@ rows={3}
           <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
           <textarea
             className="new-conv-textarea-mobile"
-            placeholder="What would you like to work on?"
+            placeholder={inputPlaceholder}
             rows={2}
             value={conv.textareaValue}
             onChange={(e) => conv.updateDraft(e.target.value)}
