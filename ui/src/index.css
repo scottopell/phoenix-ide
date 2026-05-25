@@ -6056,9 +6056,12 @@ html * {
   display: flex;
   flex-direction: column;
   align-items: center;
-  justify-content: center;
+  justify-content: flex-start;
   overflow: auto;
-  padding: 20px;
+  padding-inline: 20px;
+  padding-block-start: clamp(72px, 14vh, 140px);
+  padding-block-end: 48px;
+  box-sizing: border-box;
 }
 
 .new-conv-content {
