@@ -232,9 +232,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let compression = CompressionLayer::new()
         .gzip(true)
-        .br(true)
-        .deflate(true)
-        .zstd(true);
+        .br(true);
 
     // HTTP access log: one line per request with method, path, status, latency.
     // Health check endpoint (/version) is suppressed from normal INFO logging.
