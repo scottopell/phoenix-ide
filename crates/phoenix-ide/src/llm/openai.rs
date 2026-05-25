@@ -210,14 +210,10 @@ struct ResponsesStreamAccumulator {
     /// otherwise opaque — capturing one example per stream is enough to
     /// classify the wire shape next time the success path stops working.
     logged_empty_dispatch: bool,
-    /// True when the request targets the `ChatGPT` codex backend. Gates parsing
-    /// of codex-specific SSE events (`codex.rate_limits`) so platform-API
-    /// streams aren't accidentally interpreted against the codex schema.
-    use_codex_backend: bool,
 }
 
 impl ResponsesStreamAccumulator {
-    fn new(use_codex_backend: bool) -> Self {
+    fn new() -> Self {
         Self {
             input_tokens: 0,
             output_tokens: 0,
@@ -225,7 +221,6 @@ impl ResponsesStreamAccumulator {
             output_items: Vec::new(),
             done: false,
             logged_empty_dispatch: false,
-            use_codex_backend,
         }
     }
 
@@ -258,20 +253,6 @@ impl ResponsesStreamAccumulator {
                     if !delta.is_empty() {
                         let _ = chunk_tx.send(super::TokenChunk::Text(delta.to_string()));
                     }
-                }
-            }
-            // Codex backend emits this mid-stream on every turn with the
-            // current quota snapshot. Gate on `use_codex_backend` so the
-            // platform-OpenAI path can't accidentally match a same-named
-            // event (it never sends one — defense-in-depth).
-            "codex.rate_limits" if self.use_codex_backend => {
-                if let Some(snapshot) = super::rate_limit::parse_rate_limit_event(data) {
-                    let _ = chunk_tx.send(super::TokenChunk::RateLimitSnapshot(snapshot));
-                } else {
-                    tracing::debug!(
-                        data = %data,
-                        "codex.rate_limits payload failed to parse — dropping"
-                    );
                 }
             }
             "response.output_item.done" => {
@@ -527,7 +508,23 @@ pub async fn complete_streaming(
         return Err(LlmError::from_http_status(status.as_u16(), &body));
     }
 
-    let mut acc = ResponsesStreamAccumulator::new(use_codex_backend);
+    // Codex bridge emits a fresh quota snapshot in response headers on
+    // every successful turn (`x-codex-{plan-type,active-limit,primary-*,
+    // secondary-*,credits-*}`). Read them once here and broadcast a single
+    // `RateLimitSnapshot` chunk per turn — the WebSocket variant of this
+    // backend delivers an equivalent `codex.rate_limits` SSE frame mid-
+    // stream, but the HTTP transport Phoenix uses does not. Phoenix's UI
+    // (`ui/src/codexQuota.ts`) only cares about the latest value, so a
+    // single emission per turn is sufficient.
+    if use_codex_backend {
+        if let Some(snapshot) =
+            super::rate_limit::quota_from_codex_response_headers(response.headers())
+        {
+            let _ = chunk_tx.send(super::TokenChunk::RateLimitSnapshot(snapshot));
+        }
+    }
+
+    let mut acc = ResponsesStreamAccumulator::new();
     let mut sse = super::sse::SseParser::new();
     let mut stream = response.bytes_stream();
 
@@ -1435,7 +1432,7 @@ mod tests {
     fn process_event_returns_err_on_top_level_error() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(false);
+        let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{"type":"error","code":"rate_limit_exceeded","message":"slow down"}"#;
         let err = acc.process_event("error", data, &tx).unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::RateLimit);
@@ -1445,7 +1442,7 @@ mod tests {
     fn process_event_handles_codex_nested_error_shape() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(false);
+        let mut acc = ResponsesStreamAccumulator::new();
         // Real codex/ChatGPT-backend payload captured 2026-05-11 via WARN log.
         let data = r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","param":"input"},"sequence_number":2}"#;
         let err = acc.process_event("error", data, &tx).unwrap_err();
@@ -1459,7 +1456,7 @@ mod tests {
     fn process_event_returns_err_on_response_failed() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(false);
+        let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{"type":"response.failed","response":{"status":"failed","error":{"code":"server_error","message":"upstream"}}}"#;
         let err = acc.process_event("response.failed", data, &tx).unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::ServerError);
@@ -1469,7 +1466,7 @@ mod tests {
     fn process_event_returns_err_on_response_incomplete_max_tokens() {
         use super::super::LlmErrorKind;
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(false);
+        let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{"type":"response.incomplete","response":{"incomplete_details":{"reason":"max_output_tokens"}}}"#;
         let err = acc
             .process_event("response.incomplete", data, &tx)
@@ -1486,7 +1483,7 @@ mod tests {
     #[test]
     fn process_event_recovers_output_from_response_completed_when_no_item_done() {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(false);
+        let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{
             "type":"response.completed",
             "response":{
@@ -1518,7 +1515,7 @@ mod tests {
     #[test]
     fn responses_api_cached_tokens_are_threaded_without_double_counting() {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(false);
+        let mut acc = ResponsesStreamAccumulator::new();
         let data = r#"{
             "type":"response.completed",
             "response":{
@@ -1638,7 +1635,7 @@ mod tests {
     #[test]
     fn process_event_fallback_skips_when_output_items_already_captured() {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(false);
+        let mut acc = ResponsesStreamAccumulator::new();
         let item_done = r#"{
             "type":"response.output_item.done",
             "item":{"type":"message","role":"assistant","content":[
@@ -1664,45 +1661,6 @@ mod tests {
             acc.output_items.len(),
             1,
             "fallback must not duplicate items already captured via item.done"
-        );
-    }
-
-    #[test]
-    fn process_event_emits_rate_limit_snapshot_on_codex_backend() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(true);
-        let data = r#"{
-            "type": "codex.rate_limits",
-            "plan_type": "plus",
-            "rate_limits": {
-                "primary": { "used_percent": 87.4, "window_minutes": 10080, "reset_at": 1704672000 }
-            }
-        }"#;
-        acc.process_event("codex.rate_limits", data, &tx).unwrap();
-        match rx.try_recv().expect("snapshot chunk") {
-            super::super::TokenChunk::RateLimitSnapshot(q) => {
-                assert_eq!(q.plan_type.as_deref(), Some("plus"));
-                assert_eq!(q.primary.unwrap().used_percent, 87.4);
-            }
-            other => panic!("expected RateLimitSnapshot, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn process_event_ignores_rate_limits_on_platform_backend() {
-        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
-        let mut acc = ResponsesStreamAccumulator::new(false);
-        let data = r#"{
-            "type": "codex.rate_limits",
-            "rate_limits": { "primary": { "used_percent": 50.0 } }
-        }"#;
-        acc.process_event("codex.rate_limits", data, &tx).unwrap();
-        assert!(
-            matches!(
-                rx.try_recv(),
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-            ),
-            "platform backend must not emit codex-specific chunks"
         );
     }
 }
