@@ -119,6 +119,36 @@ function unitTopInScrollRoot(el: HTMLElement, root: HTMLElement): number {
     + root.scrollTop;
 }
 
+function captureDomAnchor(root: HTMLElement): SavedScrollAnchor | null {
+  const nodes = Array.from(
+    root.querySelectorAll<HTMLElement>('[data-render-unit-key]'),
+  );
+  let visibleTop: { key: string; unitTop: number } | null = null;
+  for (const el of nodes) {
+    const key = el.dataset['renderUnitKey'];
+    if (!key) continue;
+    const unitTop = unitTopInScrollRoot(el, root);
+    if (unitTop <= root.scrollTop) {
+      visibleTop = { key, unitTop };
+    } else {
+      break;
+    }
+  }
+  if (!visibleTop) {
+    const first = nodes[0];
+    const key = first?.dataset['renderUnitKey'];
+    if (!first || !key) return null;
+    return {
+      topVisibleUnitKey: key,
+      offsetWithinUnit: root.scrollTop - unitTopInScrollRoot(first, root),
+    };
+  }
+  return {
+    topVisibleUnitKey: visibleTop.key,
+    offsetWithinUnit: root.scrollTop - visibleTop.unitTop,
+  };
+}
+
 function captureAnchor(
   scrollTop: number,
   historicalUnits: HistoricalUnit[],
@@ -336,7 +366,11 @@ const MessageListBody = memo(function MessageListBody({
           aria-hidden="true"
         />
       )}
-      {tailUnits.map((unit) => renderTailUnit(unit, slug, onRetry, onCancelSteering))}
+      {tailUnits.map((unit) => (
+        <div key={unit.key} data-render-unit-key={unit.key}>
+          {renderTailUnit(unit, slug, onRetry, onCancelSteering)}
+        </div>
+      ))}
     </>
   );
 });
@@ -372,6 +406,13 @@ function MessageListImpl({
   // 'none'  = no new message this render.
   const scrollTriggerRef = useRef<'none' | 'soft' | 'force'>('none');
   const lastConversationIdRef = useRef<string | undefined>(conversationId);
+  const ackSnapshotRef = useRef<{
+    anchor: SavedScrollAnchor | null;
+    scrollTop: number;
+    scrollHeight: number;
+    wasPinned: boolean;
+  } | null>(null);
+  const previousPendingIdsRef = useRef<Set<string>>(new Set(pendingMessages.map((m) => m.localId)));
 
   if (lastConversationIdRef.current !== conversationId) {
     lastConversationIdRef.current = conversationId;
@@ -379,6 +420,8 @@ function MessageListImpl({
     prevMessageCountRef.current = messages.length;
     scrollTriggerRef.current = 'none';
     lastScrollTop.current = mainRef.current?.scrollTop ?? 0;
+    ackSnapshotRef.current = null;
+    previousPendingIdsRef.current = new Set(pendingMessages.map((m) => m.localId));
     isPinnedToBottom.current = true;
   }
 
@@ -433,6 +476,17 @@ function MessageListImpl({
     [messages, pendingMessages, convState, streamingHandle],
   );
 
+  const currentPendingIds = useMemo(
+    () => new Set(pendingMessages.map((m) => m.localId)),
+    [pendingMessages],
+  );
+  const acknowledgedPendingIds = useMemo(() => {
+    const historicalKeys = new Set(historicalUnits.map((u) => u.key));
+    return Array.from(previousPendingIdsRef.current).filter(
+      (id) => !currentPendingIds.has(id) && historicalKeys.has(id),
+    );
+  }, [currentPendingIds, historicalUnits]);
+
   const heightCache = useUnitHeightCache(conversationId);
   const unitObserver = useUnitHeightObserver(heightCache);
 
@@ -480,6 +534,12 @@ function MessageListImpl({
     const el = mainRef.current;
     if (el) {
       lastScrollTop.current = el.scrollTop;
+      ackSnapshotRef.current = {
+        anchor: captureDomAnchor(el),
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        wasPinned: checkIfPinnedToBottom(),
+      };
       if (conversationId) {
         const { historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex } = captureStateRef.current;
         const anchor = captureAnchor(
@@ -731,11 +791,42 @@ function MessageListImpl({
     checkIfPinnedToBottom,
   ]);
 
-
+  useLayoutEffect(() => {
+    const root = mainRef.current;
+    if (!root) return;
+    if (acknowledgedPendingIds.length > 0) {
+      const snapshot = ackSnapshotRef.current;
+      if (snapshot?.wasPinned) {
+        root.scrollTop = root.scrollHeight;
+        lastScrollTop.current = root.scrollTop;
+        isPinnedToBottom.current = true;
+      } else if (snapshot) {
+        const anchor = snapshot.anchor;
+        const promotedAnchor = anchor && acknowledgedPendingIds.includes(anchor.topVisibleUnitKey)
+          ? Array.from(root.querySelectorAll<HTMLElement>('[data-render-unit-key]')).find(
+            (el) => el.dataset['renderUnitKey'] === anchor.topVisibleUnitKey,
+          ) ?? null
+          : null;
+        if (promotedAnchor && anchor) {
+          root.scrollTop = unitTopInScrollRoot(promotedAnchor, root) + anchor.offsetWithinUnit;
+        } else {
+          root.scrollTop = snapshot.scrollTop + (root.scrollHeight - snapshot.scrollHeight);
+        }
+        lastScrollTop.current = root.scrollTop;
+        isPinnedToBottom.current = checkIfPinnedToBottom();
+      }
+    }
+    ackSnapshotRef.current = {
+      anchor: captureDomAnchor(root),
+      scrollTop: root.scrollTop,
+      scrollHeight: root.scrollHeight,
+      wasPinned: checkIfPinnedToBottom(),
+    };
+    previousPendingIdsRef.current = currentPendingIds;
+  }, [acknowledgedPendingIds, checkIfPinnedToBottom, currentPendingIds]);
 
   // isEmpty reflects "nothing for MessageListBody to render". Includes
   // tail units (pending_user, sub_agent_status, streaming_agent) so the
-  // empty-state placeholder doesn't hide an active streaming buffer or
   // sub-agent status block when historical messages are still empty
   // (e.g., sub-agent flow that begins streaming before the user message
   // persists, or a reconnect race where pending events outpace the
@@ -833,3 +924,4 @@ function MessageListImpl({
  * re-renders per token.
  */
 export const MessageList = memo(MessageListImpl);
+

@@ -255,6 +255,123 @@ describe('MessageList', () => {
     });
   });
 
+  it('keeps viewport stable when a visible pending message is acknowledged', async () => {
+    const pending = {
+      localId: 'local-ack-1',
+      text: 'pending acknowledgement',
+      images: [],
+      timestamp: 1,
+      status: 'pending' as const,
+    };
+    const historical = Array.from({ length: 20 }, (_, i) => makeMessage(i + 1, 'user'));
+
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => 3000,
+    });
+
+    const { container, rerender } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[pending]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-ack"
+        />,
+      ),
+    );
+
+    const main = container.querySelector('#main-area') as HTMLElement;
+    await waitFor(() => expect(container.querySelector('[data-render-unit-key="local-ack-1"]')).not.toBeNull());
+    act(() => {
+      main.scrollTop = 2025;
+      main.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    rerender(
+      withConvContext(
+        <MessageList
+          messages={[
+            ...historical,
+            {
+              ...makeMessage(21, 'user'),
+              message_id: 'local-ack-1',
+              content: { text: pending.text },
+            },
+          ]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-ack"
+        />,
+      ),
+    );
+
+    await waitFor(() => expect(container.querySelector('[data-render-unit-key="local-ack-1"]')).not.toBeNull());
+    expect(main.scrollTop).toBe(2025);
+  });
+
+  it('stays pinned to bottom when acknowledging a pending tail message', async () => {
+    const pending = {
+      localId: 'local-ack-bottom',
+      text: 'pending bottom acknowledgement',
+      images: [],
+      timestamp: 1,
+      status: 'pending' as const,
+    };
+    const historical = Array.from({ length: 20 }, (_, i) => makeMessage(i + 1, 'user'));
+
+    const { container, rerender } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[pending]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-ack-bottom"
+        />,
+      ),
+    );
+
+    const main = container.querySelector('#main-area') as HTMLElement;
+    await waitFor(() => expect(container.querySelector('[data-render-unit-key="local-ack-bottom"]')).not.toBeNull());
+    act(() => {
+      main.scrollTop = 600;
+      main.dispatchEvent(new Event('scroll', { bubbles: true }));
+    });
+
+    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
+      configurable: true,
+      get: () => 1200,
+    });
+
+    rerender(
+      withConvContext(
+        <MessageList
+          messages={[
+            ...historical,
+            {
+              ...makeMessage(21, 'user'),
+              message_id: 'local-ack-bottom',
+              content: { text: pending.text },
+            },
+          ]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-ack-bottom"
+        />,
+      ),
+    );
+
+    await waitFor(() => expect(main.scrollTop).toBe(1200));
+  });
+
   it('bounds retained historical DOM while expanding upward', async () => {
     const historical = Array.from({ length: 100 }, (_, i) => makeMessage(i + 1, 'user'));
 
