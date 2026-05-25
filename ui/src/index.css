@@ -10440,6 +10440,356 @@ html * {
 }
 
 
+/* ── browser_profile structured response (REQ-BT-019) ──────────────────── */
+
+.profile-response {
+  padding: 8px 12px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  background: var(--bg-primary);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.profile-response-header {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.profile-action-chip {
+  padding: 2px 8px;
+  border-radius: 3px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.profile-outcome-completed {
+  background: color-mix(in srgb, var(--accent-green) 18%, var(--bg-secondary));
+  color: var(--accent-green);
+}
+
+.profile-outcome-blocked {
+  background: color-mix(in srgb, var(--accent-red) 20%, var(--bg-secondary));
+  color: var(--accent-red);
+}
+
+.profile-meta {
+  color: var(--text-muted);
+}
+
+.profile-meta-warn {
+  color: var(--accent-yellow, #d69e2e);
+}
+
+.profile-warnings-count {
+  color: var(--accent-yellow, #d69e2e);
+  font-weight: 600;
+}
+
+.profile-blocked-reason {
+  padding: 6px 8px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent-red) 8%, var(--bg-secondary));
+  border-left: 3px solid var(--accent-red);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.profile-path {
+  font-family: var(--font-mono);
+  cursor: help;
+}
+
+.profile-toggle {
+  background: transparent;
+  border: none;
+  padding: 2px 0;
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.profile-toggle:hover {
+  color: var(--text-primary);
+}
+
+.profile-toggle-raw {
+  margin-top: 4px;
+  color: var(--text-muted);
+}
+
+.profile-raw-json {
+  margin: 4px 0;
+  padding: 6px 8px;
+  background: var(--code-bg);
+  border-radius: 3px;
+  max-height: 280px;
+  overflow: auto;
+  font-size: 11px;
+  white-space: pre;
+}
+
+/* ── scenario sparkline grid ──────────────────────────────────────────── */
+
+.profile-sparkline-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.profile-metric-row {
+  display: grid;
+  grid-template-columns: 110px 96px 1fr;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-primary);
+}
+
+.profile-metric-label {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
+.profile-metric-stats {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.profile-sparkline {
+  color: var(--accent-blue, #4299e1);
+  display: block;
+}
+
+/* ── per-run table ────────────────────────────────────────────────────── */
+
+.profile-per-run-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+  margin-top: 4px;
+}
+
+.profile-per-run-table th,
+.profile-per-run-table td {
+  padding: 3px 8px;
+  text-align: right;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.profile-per-run-table th {
+  color: var(--text-secondary);
+  font-weight: 600;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.profile-th-unit {
+  color: var(--text-muted);
+  font-weight: 400;
+  text-transform: none;
+}
+
+.profile-cell-null {
+  color: var(--text-muted);
+  cursor: help;
+}
+
+/* ── warnings ─────────────────────────────────────────────────────────── */
+
+.profile-warnings {
+  padding: 6px 8px;
+  border-radius: 3px;
+  background: color-mix(in srgb, var(--accent-yellow, #d69e2e) 8%, var(--bg-secondary));
+  border-left: 3px solid var(--accent-yellow, #d69e2e);
+}
+
+.profile-warnings-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--accent-yellow, #d69e2e);
+  margin-bottom: 4px;
+}
+
+.profile-warnings ul {
+  margin: 0;
+  padding-left: 18px;
+  font-size: 11px;
+  color: var(--text-primary);
+}
+
+/* ── heap diff ────────────────────────────────────────────────────────── */
+
+.profile-heap-table,
+.profile-metrics-table {
+  border-collapse: collapse;
+  font-size: 12px;
+}
+
+.profile-heap-table td,
+.profile-metrics-table td {
+  padding: 3px 12px 3px 0;
+  vertical-align: top;
+}
+
+.profile-metrics-table .profile-metric-name {
+  color: var(--text-secondary);
+}
+
+.profile-metrics-table .profile-metric-value {
+  font-variant-numeric: tabular-nums;
+  text-align: right;
+  color: var(--text-primary);
+}
+
+.profile-delta {
+  font-variant-numeric: tabular-nums;
+}
+
+.profile-delta-zero {
+  color: var(--text-muted);
+}
+
+.profile-delta-up {
+  color: var(--accent-yellow, #d69e2e);
+}
+
+.profile-delta-down {
+  color: var(--accent-green);
+}
+
+.profile-delta-bad {
+  color: var(--accent-red);
+  font-weight: 600;
+}
+
+.profile-footnote {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-style: italic;
+}
+
+.profile-response .profile-footnote code {
+  font-style: normal;
+  background: var(--code-bg);
+  padding: 0 4px;
+  border-radius: 2px;
+}
+
+/* ── CPU hot-function tables ──────────────────────────────────────────── */
+
+.profile-hot-block {
+  margin-top: 4px;
+}
+
+.profile-hot-title {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.profile-hot-subtitle {
+  font-size: 10px;
+  color: var(--text-muted);
+  margin-bottom: 4px;
+}
+
+.profile-hot-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 11px;
+}
+
+.profile-hot-table td {
+  padding: 2px 6px;
+  vertical-align: middle;
+}
+
+.profile-hot-bar {
+  width: 60px;
+  min-width: 60px;
+}
+
+.profile-hot-bar-fill {
+  height: 8px;
+  background: color-mix(in srgb, var(--accent-blue, #4299e1) 75%, transparent);
+  border-radius: 1px;
+}
+
+.profile-hot-bar-fill-warn {
+  background: color-mix(in srgb, var(--accent-yellow, #d69e2e) 75%, transparent);
+}
+
+.profile-hot-value {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+  width: 70px;
+}
+
+.profile-hot-percent {
+  text-align: right;
+  color: var(--text-muted);
+  width: 50px;
+  font-variant-numeric: tabular-nums;
+}
+
+.profile-hot-label {
+  font-family: var(--font-mono);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+/* ── trace summary ────────────────────────────────────────────────────── */
+
+.profile-long-tasks {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+/* ── status-line fallback ─────────────────────────────────────────────── */
+
+.profile-status-line {
+  padding: 8px 12px;
+}
+
+.profile-status-text {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.profile-status-error .profile-action-chip {
+  background: color-mix(in srgb, var(--accent-red) 20%, var(--bg-secondary));
+  color: var(--accent-red);
+}
+
+/* :first-child overrides placed at the end so descending-specificity is preserved. */
+
+.profile-per-run-table th:first-child,
+.profile-per-run-table td:first-child {
+  text-align: left;
+  color: var(--text-muted);
+}
+
+.profile-heap-table td:first-child {
+  color: var(--text-secondary);
+}
+
+
 /* ── Browser view panel (REQ-BT-018) ───────────────────────────────────── */
 
 /* Live mirror of the conversation's headless Chromium. View-only — the

@@ -28,6 +28,7 @@ import { useConversationInlineStream } from '../hooks/useConversationInlineStrea
 import { linkifyText } from '../utils/linkify';
 import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
+import { BrowserProfileResponseView } from './BrowserProfileResponseView';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -1068,6 +1069,13 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
             <BashResponseView response={bashResponse} />
           ) : tmuxResponse ? (
             <TmuxResponseView response={tmuxResponse} />
+          ) : name === 'browser_profile' ? (
+            <BrowserProfileResponseView
+              action={String((input as Record<string, unknown>)?.['action'] ?? '')}
+              displayData={result?.display_data as Record<string, unknown> | undefined}
+              fallbackText={resultText}
+              isError={isError}
+            />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">
