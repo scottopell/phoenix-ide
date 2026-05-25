@@ -2,7 +2,7 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { SubAgentStatus, AgentMessage } from './MessageComponents';
-import { StreamingMessage } from './StreamingMessage';
+import { StreamingMessageView } from './StreamingMessage';
 import { api, type ConversationState, type Message } from '../api';
 
 vi.mock('../api', async (importOriginal) => {
@@ -179,7 +179,7 @@ describe('markdown table rendering', () => {
   it('wraps streaming message tables in a local horizontal scroll container', async () => {
     render(
       <MemoryRouter>
-        <StreamingMessage buffer={{ text: wideTableMarkdown, lastSequence: 1, startedAt: Date.now() }} />
+        <StreamingMessageView buffer={{ text: wideTableMarkdown, lastSequence: 1, startedAt: Date.now() }} />
       </MemoryRouter>,
     );
 

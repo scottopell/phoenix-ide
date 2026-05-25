@@ -4,6 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import { SyntaxHighlighter, oneDark, oneLight } from '../utils/syntaxHighlighter';
 import type { StreamingBuffer } from '../conversation/atom';
+import { useStreamingBuffer } from '../conversation/useConversationAtom';
 import { parseStreamingBlocks, type StreamingBlock } from '../utils/parseStreamingBlocks';
 
 // Stable markdown configuration — avoids creating new references on every render
@@ -24,12 +25,26 @@ const MARKDOWN_COMPONENTS = {
   table: MarkdownTable,
 };
 
-interface StreamingMessageProps {
+/**
+ * Subscribes to the streaming buffer for the given slug and renders it.
+ * The subscription happens at this leaf so per-token atom mutations
+ * re-render only this component — `<MessageList>` and its
+ * `<MessageListBody>` are untouched by token churn (REQ-MLRU-010).
+ */
+export function StreamingMessage({ slug }: { slug: string }) {
+  const buffer = useStreamingBuffer(slug);
+  return <StreamingMessageView buffer={buffer} />;
+}
+
+interface StreamingMessageViewProps {
   buffer: StreamingBuffer | null;
 }
 
 /**
- * Displays in-progress streaming text below the message list (REQ-CONV-019, REQ-BED-025).
+ * Renders a streaming buffer. Pure: takes the buffer as a prop. Use
+ * `<StreamingMessage slug={...} />` for the subscribing wrapper;
+ * `<StreamingMessageView />` is exported for tests that exercise the
+ * rendering pipeline directly.
  *
  * Renders while the LLM is generating. When the final `sse_message` event arrives,
  * the reducer clears this buffer and appends the finalized message atomically — one
@@ -44,7 +59,7 @@ interface StreamingMessageProps {
  * - Open code fence → <pre><code className="streaming-code"> with matching
  *   dimensions so the swap to SyntaxHighlighter causes no layout shift.
  */
-export function StreamingMessage({ buffer }: StreamingMessageProps) {
+export function StreamingMessageView({ buffer }: StreamingMessageViewProps) {
   const { theme } = useTheme();
   const syntaxStyle = theme === 'light' ? oneLight : oneDark;
   // rAF-gated display buffer: accumulates incoming text and flushes once per frame.
@@ -54,23 +69,32 @@ export function StreamingMessage({ buffer }: StreamingMessageProps) {
 
   const incomingText = buffer?.text ?? '';
 
+  // Update the pending text and schedule a single rAF flush per frame.
+  // The previous cleanup-on-every-dep-change pattern cancelled in-flight
+  // frames on every token, defeating the coalescing intent — display
+  // would freeze during a burst and only catch up on idle. The
+  // scheduled rAF below is allowed to fire; subsequent token effects
+  // only update pendingText and skip re-scheduling because rafHandle
+  // is non-null.
   useEffect(() => {
     pendingText.current = incomingText;
-
     if (rafHandle.current === null) {
       rafHandle.current = requestAnimationFrame(() => {
         setDisplayText(pendingText.current);
         rafHandle.current = null;
       });
     }
+  }, [incomingText]);
 
+  // Cancel any pending frame on unmount only — not on every token.
+  useEffect(() => {
     return () => {
       if (rafHandle.current !== null) {
         cancelAnimationFrame(rafHandle.current);
         rafHandle.current = null;
       }
     };
-  }, [incomingText]);
+  }, []);
 
   if (!buffer) return null;
 

@@ -61,6 +61,9 @@ export function TaskViewer({ task, tasksDir, activeSlug, onBack }: TaskViewerPro
       })
       .then((data) => {
         if (!cancelled) {
+          if (data.kind && data.kind !== 'text') {
+            throw new Error('Task file is not text');
+          }
           setRawContent(data.content);
           setContent(stripFrontmatter(data.content));
           setLoading(false);

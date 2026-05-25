@@ -5,9 +5,12 @@
 use super::assets::{get_index_html, serve_favicon, serve_service_worker, serve_static};
 use super::chains::{
     archive_chain_handler, delete_chain_handler, get_chain, set_chain_name, stream_chain,
-    submit_chain_question, unarchive_chain_handler,
+    submit_chain_question,
 };
-use super::git_handlers::{get_conversation_diff, get_conversation_pr_status, list_git_branches};
+use super::git_handlers::{
+    create_pr_auto_fix_context, get_conversation_diff, get_conversation_pr_status,
+    list_git_branches,
+};
 use super::lifecycle_handlers::{
     abandon_task, approve_task, mark_merged, reject_task, task_feedback,
 };
@@ -33,7 +36,7 @@ use crate::git_ops::{
 use crate::llm::{ContentBlock, GatewayStatus};
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
-use crate::terminal::terminal_ws_handler;
+use crate::terminal::{terminal_ws_global_handler, terminal_ws_handler};
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -87,6 +90,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/stream", get(stream_conversation))
         // Terminal WebSocket (REQ-TERM-001 through REQ-TERM-014)
         .route("/api/conversations/:id/terminal", get(terminal_ws_handler))
+        // Global terminal WebSocket — singleton scope, unbound to any
+        // conversation (REQ-TERM-WS-001). Surfaced on /new.
+        .route("/api/terminal/global", get(terminal_ws_global_handler))
         // Live browser view WebSocket (REQ-BT-018)
         .route(
             "/api/conversations/:id/browser-view",
@@ -119,12 +125,11 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/abandon-task", post(abandon_task))
         // Mark as merged (REQ-PROJ-026)
         .route("/api/conversations/:id/mark-merged", post(mark_merged))
-        // Lifecycle (REQ-API-006)
+        // Lifecycle (REQ-API-006). Archive and delete are both terminal
+        // transitions that run the resource-cleanup cascade (REQ-BED-032);
+        // archive preserves the row, delete removes it. There is no
+        // unarchive — archive is not reversible.
         .route("/api/conversations/:id/archive", post(archive_conversation))
-        .route(
-            "/api/conversations/:id/unarchive",
-            post(unarchive_conversation),
-        )
         .route("/api/conversations/:id/delete", post(delete_conversation))
         .route("/api/conversations/:id/rename", post(rename_conversation))
         // Token usage (Phase 4)
@@ -148,10 +153,6 @@ pub fn create_router(state: AppState) -> Router {
         )
         .route("/api/chains/:rootId/stream", get(stream_chain))
         .route("/api/chains/:rootId/archive", post(archive_chain_handler))
-        .route(
-            "/api/chains/:rootId/unarchive",
-            post(unarchive_chain_handler),
-        )
         .route(
             "/api/chains/:rootId",
             axum::routing::delete(delete_chain_handler),
@@ -193,6 +194,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/pr-status",
             get(get_conversation_pr_status),
+        )
+        .route(
+            "/api/conversations/:id/pr-auto-fix-context",
+            post(create_pr_auto_fix_context),
         )
         // Project task files available before a conversation exists
         .route("/api/tasks", get(list_project_tasks))
@@ -357,7 +362,18 @@ async fn enrich_conversation_with_seed(
     // Reflect current `BrowserSessionManager` state at hydration. The single
     // source of truth is the manager's `HashMap`; the SSE
     // `BrowserSessionState` event keeps the client in sync after this point.
-    enriched.browser_session_active = state.runtime.browser_sessions().is_active(&conv.id).await;
+    // Sessions are keyed by `WorkScope` (REQ-BROWSER-WS-001), so a
+    // continuation of a worktree-backed conversation sees `true` here as
+    // soon as its predecessor's session is live.
+    let work_scope = crate::work_scope::WorkScope::resolve(
+        &conv.id,
+        conv.conv_mode.worktree_path().map(std::path::Path::new),
+    );
+    enriched.browser_session_active = state
+        .runtime
+        .browser_sessions()
+        .is_active(&work_scope)
+        .await;
     enriched
 }
 
@@ -2004,31 +2020,188 @@ async fn archive_conversation(
     Path(id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     refuse_if_chain_member(&state, &id, "archive").await?;
-
-    state
-        .runtime
-        .db()
-        .archive_conversation(&id)
-        .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
-
+    run_archive_cascade(&state, &id).await?;
     Ok(Json(SuccessResponse { success: true }))
 }
 
-async fn unarchive_conversation(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> Result<Json<SuccessResponse>, AppError> {
-    refuse_if_chain_member(&state, &id, "unarchive").await?;
+/// Archive cascade: same resource cleanup as hard-delete (bash kill, tmux
+/// kill, worktree/branch removal) but flips `archived = 1` instead of
+/// deleting the row. "Done-but-keep-history": the conversation, its
+/// messages, and tool calls remain queryable; live resources are gone.
+///
+/// Rejects busy conversations with the same `cancel_first` 409 as
+/// hard-delete — cleanup would race in-flight tool execution otherwise.
+/// Resource cleanup failures (bash / tmux / worktree) log WARN and
+/// continue; only the final `archived = 1` write is fatal.
+pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<(), AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if conv.state.is_busy() {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Cannot archive a busy conversation. Cancel the in-flight \
+             operation first, then retry.",
+            "cancel_first",
+        ))));
+    }
+
+    run_resource_cleanup_cascade(state, &conv).await?;
 
     state
         .runtime
         .db()
-        .unarchive_conversation(&id)
+        .archive_conversation(id)
         .await
-        .map_err(|e| AppError::NotFound(e.to_string()))?;
+        .map_err(|e| AppError::Internal(format!("Failed to set archived flag: {e}")))?;
 
-    Ok(Json(SuccessResponse { success: true }))
+    Ok(())
+}
+
+/// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
+/// factored out so hard-delete, archive, abandon, and mark-merged share the
+/// exact same resource teardown. Authoritative failures (worktree-removal,
+/// bash kill, tmux kill-server, browser kill) log WARN with the fields
+/// needed for manual cleanup; best-effort branch deletion inside
+/// `cascade_projects_on_delete` logs at DEBUG and does NOT populate
+/// `project_report.error` — branch cleanup is opportunistic, not
+/// authoritative. Callers own the final DB write and any state-machine
+/// transition.
+///
+/// Returns `Err` only when the continuation `WorkScope` cannot be
+/// resolved (DB error on `get_conversation`) and `continued_in_conv_id`
+/// was set. Without a known inheritor scope, the cascade cannot make
+/// the preservation decision: treating the missing inheritor as "no
+/// inheritor" would tear down resources the continuation may still
+/// need; treating it as "same scope" would over-preserve and leak. The
+/// only defensible response is to refuse the cascade entirely so the
+/// caller can retry once the DB is healthy. All cleanup side effects
+/// (kill, unlink, fs remove) run AFTER this lookup, so an early return
+/// here leaves no partial state.
+///
+/// The `WorkScope` is resolved once from `conv` and passed to every
+/// scope-keyed cascade (tmux, browser) so the orchestrator owns the single
+/// derivation point. Bash and projects retain conv-shaped APIs: bash keys
+/// per-conversation handles by conv id (no scope inheritance), and projects
+/// inspects `conv.conv_mode` for the branch/worktree mode discriminant.
+pub(super) async fn run_resource_cleanup_cascade(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+) -> Result<(), AppError> {
+    let id = conv.id.as_str();
+    let work_scope = crate::work_scope::WorkScope::resolve(
+        &conv.id,
+        conv.conv_mode.worktree_path().map(std::path::Path::new),
+    );
+
+    // Resolve the continuation's `WorkScope` (if any) so the scope-keyed
+    // cascades can check inheritance via scope equality. Resolve BEFORE
+    // any cleanup side effect runs — if the DB lookup fails we refuse
+    // the whole cascade rather than guess wrong about whether the
+    // inheritor still owns the resources we're about to release.
+    let inheritor_scope: Option<crate::work_scope::WorkScope> =
+        if let Some(cont_id) = conv.continued_in_conv_id.as_deref() {
+            match state.runtime.db().get_conversation(cont_id).await {
+                Ok(continuation) => Some(crate::work_scope::WorkScope::resolve(
+                    &continuation.id,
+                    continuation
+                        .conv_mode
+                        .worktree_path()
+                        .map(std::path::Path::new),
+                )),
+                Err(e) => {
+                    return Err(AppError::Internal(format!(
+                        "cleanup cascade refused: continuation lookup failed for \
+                         conv={id} continuation={cont_id}: {e} \
+                         (preservation decision requires the inheritor's scope; \
+                         retry once the DB is healthy)"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+
+    // Step 2: bash handles.
+    let bash_report =
+        crate::tools::bash::registry::cascade_bash_on_delete(state.runtime.bash_handles(), id)
+            .await;
+    let had_live_handles = !bash_report.live_handle_pgids.is_empty();
+    let had_kill_failures = !bash_report.kill_failures.is_empty();
+    if had_kill_failures {
+        tracing::warn!(
+            conv_id = %id,
+            live_handle_pids = ?bash_report.live_handle_pids,
+            live_handle_pgids = ?bash_report.live_handle_pgids,
+            kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
+            kill_failures = ?bash_report.kill_failures,
+            "bash cleanup had kill failures; orphan process groups may remain"
+        );
+    } else if had_live_handles {
+        tracing::debug!(
+            conv_id = %id,
+            live_handle_pids = ?bash_report.live_handle_pids,
+            live_handle_pgids = ?bash_report.live_handle_pgids,
+            kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
+            "bash cascade: SIGKILL'd live process groups"
+        );
+    }
+
+    // Step 3: tmux server. Scope-equality preservation: skip kill iff the
+    // continuation inherited the same scope (REQ-TMUX-WS-002).
+    let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
+        state.runtime.tmux_registry(),
+        &work_scope,
+        inheritor_scope.as_ref(),
+    )
+    .await;
+    if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
+        let kill_status = tmux_report.kill_server_error.as_deref().unwrap_or("ok");
+        tracing::warn!(
+            conv_id = %id,
+            socket_path = %tmux_report.socket_path.display(),
+            kill_server_status = %kill_status,
+            unlink_error = ?tmux_report.unlink_error,
+            "tmux cleanup partial failure; orphan socket/server may remain"
+        );
+    }
+
+    // Step 4: terminal PTY. Same scope-equality preservation rule
+    // (REQ-TERM-WS-001, REQ-TERM-012). Sub-agent / no-terminal scopes
+    // hit the no-op fast path inside the cascade — registry miss is the
+    // common case during conversation cleanup.
+    crate::terminal::cascade_terminal_on_delete(
+        &state.terminals,
+        &work_scope,
+        inheritor_scope.as_ref(),
+    )
+    .await;
+
+    // Step 5: project worktree.
+    let project_report = cascade_projects_on_delete(state, conv).await;
+    if let Some(err) = &project_report.error {
+        tracing::warn!(
+            conv_id = %id,
+            worktree_path = ?project_report.worktree_path,
+            branch_name = ?project_report.branch_name,
+            error = %err,
+            "project cleanup failed; orphan worktree/branch may remain"
+        );
+    }
+
+    // Step 6: browser session. Same scope-equality rule as tmux
+    // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
+    crate::tools::browser::session::cascade_browser_on_delete(
+        state.runtime.browser_sessions(),
+        &work_scope,
+        inheritor_scope.as_ref(),
+    )
+    .await;
+
+    Ok(())
 }
 
 /// REQ-BED-032: Hard-delete cascade orchestrator.
@@ -2093,73 +2266,13 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         ))));
     }
 
-    // Step 2: bash handles.
-    let bash_report =
-        crate::tools::bash::registry::cascade_bash_on_delete(state.runtime.bash_handles(), id)
-            .await;
-    let had_live_handles = !bash_report.live_handle_pgids.is_empty();
-    let had_kill_failures = !bash_report.kill_failures.is_empty();
-    if had_kill_failures {
-        tracing::warn!(
-            conv_id = %id,
-            live_handle_pids = ?bash_report.live_handle_pids,
-            live_handle_pgids = ?bash_report.live_handle_pgids,
-            kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
-            kill_failures = ?bash_report.kill_failures,
-            "bash cleanup had kill failures; orphan process groups may remain"
-        );
-    } else if had_live_handles {
-        // We killed handles cleanly — log at debug so an operator
-        // chasing leaks can correlate. Skipping the log entirely on the
-        // pure no-op path keeps test output and prod logs quiet.
-        tracing::debug!(
-            conv_id = %id,
-            live_handle_pids = ?bash_report.live_handle_pids,
-            live_handle_pgids = ?bash_report.live_handle_pgids,
-            kill_pending_kernel_pids = ?bash_report.kill_pending_kernel_pids,
-            "bash cascade: SIGKILL'd live process groups"
-        );
-    }
-
-    // Step 3: tmux server.
-    //
-    // worktree_path for socket keying (task 03001): use the typed worktree
-    // field for Work/Branch, cwd for Explore (REQ-PROJ-028 guarantees cwd IS
-    // the worktree for Explore), None for Direct. Mirrors the Explore
-    // fallback in src/terminal/ws.rs — without it, the cascade looks up the
-    // wrong (conv-{id}.sock) deterministic socket and the actual
-    // wt-{hash}.sock tmux server is orphaned.
-    let tmux_worktree_buf: Option<std::path::PathBuf> =
-        conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
-    let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
-        state.runtime.tmux_registry(),
-        id,
-        tmux_worktree_buf.as_deref(),
-        conv.continued_in_conv_id.as_deref(),
-    )
-    .await;
-    if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
-        let kill_status = tmux_report.kill_server_error.as_deref().unwrap_or("ok");
-        tracing::warn!(
-            conv_id = %id,
-            socket_path = %tmux_report.socket_path.display(),
-            kill_server_status = %kill_status,
-            unlink_error = ?tmux_report.unlink_error,
-            "tmux cleanup partial failure; orphan socket/server may remain"
-        );
-    }
-
-    // Step 4: project worktree.
-    let project_report = cascade_projects_on_delete(state, &conv).await;
-    if let Some(err) = &project_report.error {
-        tracing::warn!(
-            conv_id = %id,
-            worktree_path = ?project_report.worktree_path,
-            branch_name = ?project_report.branch_name,
-            error = %err,
-            "project cleanup failed; orphan worktree/branch may remain"
-        );
-    }
+    // Steps 2-5: bash handles, tmux server, project worktree, browser
+    // session. Cleanup-step failures log WARN and continue; the only
+    // fatal error from this call is a continuation-row DB lookup failure
+    // (returned as 500 so the user can retry). Shared with archive /
+    // abandon / mark-merged so the resource teardown is byte-for-byte
+    // identical.
+    run_resource_cleanup_cascade(state, &conv).await?;
 
     // Step 5: row deletion. SQLite ON DELETE CASCADE removes dependent
     // rows. This is the only step whose failure is fatal to the request
@@ -2248,6 +2361,28 @@ async fn cascade_projects_on_delete(
     state: &AppState,
     conv: &crate::db::Conversation,
 ) -> CascadeProjectsReport {
+    // Chain-member preservation: if this conversation has a successor in
+    // a continuation chain, the worktree + branch are shared with that
+    // successor -- only the leaf (continued_in_conv_id = None) actually
+    // owns them. Skip cleanup here; the leaf's cascade will handle it.
+    // Mirrors the tmux preservation logic at tools/tmux/registry.rs:456,
+    // making chain delete/archive correct by construction: no redundant
+    // worktree-remove or branch-D calls walking the chain, and no race
+    // window where root's cascade tears down resources the leaf is using.
+    //
+    // Per-conv archive/delete/unarchive are gated by `refuse_if_chain_member`
+    // so for those callers `continued_in_conv_id` is None and this check
+    // is a no-op. Abandon and mark-merged are gated by `reject_if_continued`
+    // (leaf-only), so this is also a no-op there.
+    if conv.continued_in_conv_id.is_some() {
+        tracing::debug!(
+            conv_id = %conv.id,
+            continuation = %conv.continued_in_conv_id.as_deref().unwrap_or(""),
+            "skipping worktree/branch cleanup -- transferred to continuation"
+        );
+        return CascadeProjectsReport::default();
+    }
+
     let (branch_name, worktree_path, is_work_mode) = match &conv.conv_mode {
         ConvMode::Work {
             branch_name,
@@ -2605,13 +2740,30 @@ fn detect_file_type(path: &std::path::Path) -> (String, bool) {
 
 /// Check if file content appears to be valid text
 fn is_valid_text(content: &[u8]) -> bool {
-    // Check for null bytes (common in binary files)
     if content.contains(&0) {
         return false;
     }
 
-    // Try to parse as UTF-8
     std::str::from_utf8(content).is_ok()
+}
+
+fn preview_url_for_path(path: &std::path::Path) -> String {
+    format!("/preview{}", percent_encode_path(path))
+}
+
+fn percent_encode_path(path: &std::path::Path) -> String {
+    use std::fmt::Write;
+
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    let mut out = String::with_capacity(path_str.len());
+    for &b in path_str.as_bytes() {
+        if b == b'/' || b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 /// List files in a directory with metadata (REQ-PF-001, REQ-PF-002)
@@ -2702,7 +2854,7 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
     Ok(Json(ListFilesResponse { items }))
 }
 
-/// Read file contents with text encoding validation (REQ-PF-005)
+/// Read file contents with an explicit text/image contract (REQ-PF-005).
 async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileResponse>, AppError> {
     let path = PathBuf::from(&query.path);
 
@@ -2713,7 +2865,6 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
         return Err(AppError::BadRequest("Path is a directory".to_string()));
     }
 
-    // Check file size (limit to 10MB for safety)
     let metadata = fs::metadata(&path)
         .map_err(|e| AppError::BadRequest(format!("Cannot read file metadata: {e}")))?;
     if metadata.len() > 10 * 1024 * 1024 {
@@ -2722,24 +2873,34 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
         ));
     }
 
-    // Read file content
+    let (file_type, _is_text_file) = detect_file_type(&path);
+    if file_type == "image" {
+        let mime_type = mime_guess::from_path(&path)
+            .first_or_octet_stream()
+            .to_string();
+        return Ok(Json(ReadFileResponse::Image {
+            mime_type,
+            url: preview_url_for_path(&path),
+            file_type,
+        }));
+    }
+
     let content =
         fs::read(&path).map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
 
-    // Validate text encoding
     if !is_valid_text(&content) {
         return Err(AppError::BadRequest(
             "File appears to be binary or has invalid encoding".to_string(),
         ));
     }
 
-    // Convert to string (we know it's valid UTF-8 from is_valid_text check)
     let text = String::from_utf8(content)
         .map_err(|_| AppError::BadRequest("Invalid UTF-8 encoding".to_string()))?;
 
-    Ok(Json(ReadFileResponse {
+    Ok(Json(ReadFileResponse::Text {
         content: text,
         encoding: "utf-8".to_string(),
+        file_type,
     }))
 }
 
@@ -2755,7 +2916,6 @@ async fn serve_preview_file(
 ) -> Result<axum::response::Response, AppError> {
     use axum::response::IntoResponse;
 
-    // filepath comes without leading slash from the wildcard capture
     let path = PathBuf::from(format!("/{filepath}"));
 
     if !path.exists() {
@@ -4132,6 +4292,367 @@ mod hard_delete_cascade_tests {
         assert!(state.db.get_conversation("cb-a").await.is_ok());
         assert!(state.db.get_conversation("cb-b").await.is_ok());
     }
+
+    /// Archive cascade rejects a busy conversation with the same
+    /// `cancel_first` 409 as hard-delete, leaves the row unarchived,
+    /// then succeeds once the conversation settles to idle.
+    #[tokio::test]
+    async fn archive_rejects_busy_with_409_then_succeeds() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-arc-1", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+
+        state
+            .db
+            .update_conversation_state("c-arc-1", &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .expect("set busy");
+
+        let err = run_archive_cascade(&state, "c-arc-1")
+            .await
+            .expect_err("must reject while busy");
+        match err {
+            AppError::Conflict(detail) => {
+                assert_eq!(detail.error_type, "cancel_first");
+                assert!(detail.error.contains("Cancel"));
+            }
+            other => panic!("expected 409 Conflict, got {other:?}"),
+        }
+
+        let conv = state
+            .db
+            .get_conversation("c-arc-1")
+            .await
+            .expect("row still present");
+        assert!(
+            !conv.archived,
+            "archived flag must NOT be set after refused archive"
+        );
+
+        state
+            .db
+            .update_conversation_state("c-arc-1", &ConvState::Idle)
+            .await
+            .expect("settle");
+
+        run_archive_cascade(&state, "c-arc-1")
+            .await
+            .expect("archive");
+
+        let conv = state
+            .db
+            .get_conversation("c-arc-1")
+            .await
+            .expect("row preserved");
+        assert!(conv.archived, "archived flag must be set after archive");
+    }
+
+    /// Archive cascade preserves the conversation row + messages (done-but-
+    /// keep-history) while running the same resource cleanup as hard-delete
+    /// — verified here via the bash registry, which the cascade must drop.
+    #[tokio::test]
+    async fn archive_sets_flag_and_drops_bash_registry() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-arc-2", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        let _ = state.runtime.bash_handles().get_or_create("c-arc-2").await;
+
+        run_archive_cascade(&state, "c-arc-2")
+            .await
+            .expect("archive");
+
+        let conv = state
+            .db
+            .get_conversation("c-arc-2")
+            .await
+            .expect("row preserved");
+        assert!(conv.archived, "archived flag must be set");
+
+        assert!(
+            state
+                .runtime
+                .bash_handles()
+                .remove_conversation("c-arc-2")
+                .await
+                .is_none(),
+            "bash registry entry must be dropped by archive cascade"
+        );
+    }
+
+    /// `archive_chain_handler` runs the cascade against every member and
+    /// flips `archived = 1` on each — symmetrical with chain delete.
+    #[tokio::test]
+    async fn archive_chain_handler_archives_every_member() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["ca-a", "ca-b", "ca-c"]).await;
+        for id in ["ca-a", "ca-b", "ca-c"] {
+            let _ = state.runtime.bash_handles().get_or_create(id).await;
+        }
+
+        let _ = crate::api::chains::archive_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("ca-a".to_string()),
+        )
+        .await
+        .expect("chain archive");
+
+        for id in ["ca-a", "ca-b", "ca-c"] {
+            let conv = state
+                .db
+                .get_conversation(id)
+                .await
+                .unwrap_or_else(|_| panic!("{id} row preserved"));
+            assert!(conv.archived, "{id} must be archived");
+            assert!(
+                state
+                    .runtime
+                    .bash_handles()
+                    .remove_conversation(id)
+                    .await
+                    .is_none(),
+                "bash registry leaked entry for {id}"
+            );
+        }
+    }
+
+    /// If any member of a chain is busy, `archive_chain_handler` refuses
+    /// the whole operation up-front — no flags flipped, no cleanup.
+    #[tokio::test]
+    async fn archive_chain_refuses_if_any_member_busy() {
+        let state = make_test_state().await;
+        build_chain_for_test(&state, &["cab-a", "cab-b"]).await;
+        state
+            .db
+            .update_conversation_state("cab-b", &ConvState::LlmRequesting { attempt: 0 })
+            .await
+            .expect("set busy");
+
+        let err = crate::api::chains::archive_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("cab-a".to_string()),
+        )
+        .await
+        .expect_err("must refuse while busy");
+        match err {
+            AppError::Conflict(detail) => assert_eq!(detail.error_type, "cancel_first"),
+            other => panic!("expected 409, got {other:?}"),
+        }
+
+        for id in ["cab-a", "cab-b"] {
+            let conv = state.db.get_conversation(id).await.expect("row preserved");
+            assert!(
+                !conv.archived,
+                "{id} must NOT be archived after refused chain archive"
+            );
+        }
+    }
+
+    /// Build a 3-member Work-mode chain (A -> A2 -> A3) sharing a real git
+    /// worktree + branch on disk. Returns the tempdir guard (kept alive by
+    /// caller), the repo path, the worktree path, and the branch name so
+    /// the test can assert against the filesystem after a chain operation.
+    async fn build_workmode_chain_with_shared_worktree(
+        state: &AppState,
+        ids: &[&str; 3],
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+
+        // Initial commit so `git worktree add <path> <branch>` has a
+        // commit to base the new branch on.
+        crate::git_ops::run_git(&repo, &["init", "--initial-branch=main"]).expect("git init");
+        crate::git_ops::run_git(&repo, &["config", "user.email", "test@phoenix"])
+            .expect("git config email");
+        crate::git_ops::run_git(&repo, &["config", "user.name", "phoenix-test"])
+            .expect("git config name");
+        crate::git_ops::run_git(&repo, &["commit", "--allow-empty", "-m", "init"])
+            .expect("initial commit");
+
+        let branch = format!("task-{}", ids[0]);
+        let worktree = tmp.path().join("worktree");
+        crate::git_ops::run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                worktree.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .expect("worktree add");
+
+        let project = state
+            .db
+            .find_or_create_project(repo.to_str().unwrap())
+            .await
+            .expect("project");
+        let mode = crate::db::ConvMode::Work {
+            branch_name: crate::db::NonEmptyString::new(branch.clone()).unwrap(),
+            worktree_path: crate::db::NonEmptyString::new(worktree.to_string_lossy().to_string())
+                .unwrap(),
+            base_branch: crate::db::NonEmptyString::new("main").unwrap(),
+            task_id: crate::db::NonEmptyString::new("00001").unwrap(),
+            task_title: crate::db::NonEmptyString::new("test chain").unwrap(),
+        };
+
+        for id in ids {
+            state
+                .db
+                .create_conversation_with_project(
+                    id,
+                    &format!("slug-{id}"),
+                    worktree.to_str().unwrap(),
+                    true,
+                    None,
+                    None,
+                    Some(&project.id),
+                    &mode,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("create conv");
+        }
+        for pair in ids.windows(2) {
+            sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+                .bind(pair[1])
+                .bind(pair[0])
+                .execute(state.db.pool())
+                .await
+                .expect("link");
+        }
+
+        (tmp, repo, worktree, branch)
+    }
+
+    /// Chain archive must tear down the chain's shared worktree + branch
+    /// exactly once (from the leaf's cascade) and flip `archived = 1` on
+    /// every member. Verifies the correct-by-construction continuation
+    /// preservation: root + mid skip worktree cleanup, leaf actually
+    /// removes it. End state: shared resources gone, all rows archived.
+    #[tokio::test]
+    async fn archive_chain_cleans_shared_worktree_and_branch_once() {
+        let state = make_test_state().await;
+        let ids = ["sc-a", "sc-a2", "sc-a3"];
+        let (_tmp, repo, worktree, branch) =
+            build_workmode_chain_with_shared_worktree(&state, &ids).await;
+
+        assert!(worktree.exists(), "precondition: worktree must exist");
+        assert!(
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
+            "precondition: branch must exist"
+        );
+
+        let _ = crate::api::chains::archive_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("sc-a".to_string()),
+        )
+        .await
+        .expect("chain archive");
+
+        assert!(
+            !worktree.exists(),
+            "shared worktree must be removed after chain archive"
+        );
+        assert!(
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
+            "shared task branch must be deleted after chain archive (Work mode)"
+        );
+        for id in ids {
+            let conv = state
+                .db
+                .get_conversation(id)
+                .await
+                .unwrap_or_else(|_| panic!("{id} row preserved"));
+            assert!(conv.archived, "{id} must be archived");
+        }
+    }
+
+    /// Chain hard-delete must tear down the chain's shared worktree +
+    /// branch exactly once and remove every row. Root-first iteration
+    /// (FK on `continued_in_conv_id` requires it) plus the in-cascade
+    /// continuation-preservation check together ensure the worktree is
+    /// only touched at the leaf -- no race where root's cascade pulls
+    /// the worktree out from under the leaf's row before the leaf row
+    /// is even deleted.
+    #[tokio::test]
+    async fn delete_chain_cleans_shared_worktree_and_branch_once() {
+        let state = make_test_state().await;
+        let ids = ["dc-a", "dc-a2", "dc-a3"];
+        let (_tmp, repo, worktree, branch) =
+            build_workmode_chain_with_shared_worktree(&state, &ids).await;
+
+        assert!(worktree.exists(), "precondition: worktree must exist");
+
+        let _ = crate::api::chains::delete_chain_handler(
+            axum::extract::State(state.clone()),
+            axum::extract::Path("dc-a".to_string()),
+        )
+        .await
+        .expect("chain delete");
+
+        assert!(
+            !worktree.exists(),
+            "shared worktree must be removed after chain delete"
+        );
+        assert!(
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
+            "shared task branch must be deleted after chain delete (Work mode)"
+        );
+        for id in ids {
+            assert!(
+                state.db.get_conversation(id).await.is_err(),
+                "{id} row must be gone after chain delete"
+            );
+        }
+    }
+
+    /// Per-conversation cascade on a chain root must NOT touch the worktree
+    /// -- it belongs to the leaf. Pure invariant test for the new
+    /// `continued_in_conv_id` guard in `cascade_projects_on_delete`. Drives
+    /// the cascade directly (bypassing the chain-member API gate) so the
+    /// preservation logic is exercised in isolation.
+    #[tokio::test]
+    async fn cascade_skips_worktree_when_continuation_exists() {
+        let state = make_test_state().await;
+        let ids = ["pc-a", "pc-a2"];
+        let (_tmp, _repo, worktree, _branch) =
+            build_workmode_chain_with_shared_worktree(&state, &[ids[0], ids[1], "pc-a3"]).await;
+
+        let root_conv = state.db.get_conversation("pc-a").await.expect("root");
+        let report = cascade_projects_on_delete(&state, &root_conv).await;
+        assert!(
+            report.worktree_path.is_none(),
+            "cascade on chain root must report no worktree work (continuation owns it), got {report:?}"
+        );
+        assert!(
+            report.branch_name.is_none(),
+            "cascade on chain root must not name branch for deletion"
+        );
+        assert!(
+            report.error.is_none(),
+            "skip path must not surface an error"
+        );
+        assert!(
+            worktree.exists(),
+            "worktree must remain intact after non-leaf cascade"
+        );
+    }
 }
 
 /// Task 02713: `upgrade_conversation_model` must accept the change from
@@ -4295,5 +4816,71 @@ mod upgrade_model_state_guard_tests {
         // Model must be unchanged.
         let conv = state.db.get_conversation("c-busy").await.expect("reload");
         assert_eq!(conv.model.as_deref(), Some("claude-opus-4-7"));
+    }
+}
+
+#[cfg(test)]
+mod file_read_tests {
+    use super::*;
+
+    #[test]
+    fn preview_url_percent_encodes_reserved_path_characters() {
+        let path = std::path::Path::new("/tmp/screens/a #1?raw%.png");
+        assert_eq!(
+            preview_url_for_path(path),
+            "/preview/tmp/screens/a%20%231%3Fraw%25.png"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_image_preview_for_png_without_utf8_validation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("screenshot.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).expect("png bytes");
+
+        let Json(response) = read_file(Query(PathQuery {
+            path: path.to_string_lossy().to_string(),
+        }))
+        .await
+        .expect("image response");
+
+        match response {
+            ReadFileResponse::Image {
+                mime_type,
+                url,
+                file_type,
+            } => {
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(file_type, "image");
+                assert_eq!(url, preview_url_for_path(&path));
+            }
+            other => panic!("expected image response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_keeps_text_response_for_utf8_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "hello\n").expect("text");
+
+        let Json(response) = read_file(Query(PathQuery {
+            path: path.to_string_lossy().to_string(),
+        }))
+        .await
+        .expect("text response");
+
+        match response {
+            ReadFileResponse::Text {
+                content,
+                encoding,
+                file_type,
+            } => {
+                assert_eq!(content, "hello\n");
+                assert_eq!(encoding, "utf-8");
+                assert_eq!(file_type, "text");
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
     }
 }

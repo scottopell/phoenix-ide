@@ -114,6 +114,50 @@ export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_
 export type PrCheckState = 'passing' | 'pending' | 'failing' | 'unknown';
 export type PrDisplayState = 'open' | 'draft' | 'merged' | 'closed';
 
+export interface PrCheckSummary {
+  passing: number;
+  pending: number;
+  failing: number;
+  skipped: number;
+  unknown: number;
+  failing_names: string[];
+  pending_names: string[];
+}
+
+export type PrFeedbackSource = 'issue_comment' | 'review_comment' | 'review_summary' | 'review_thread';
+export type PrFeedbackCoverageSurface = 'issue_comments' | 'review_comments' | 'review_summaries' | 'review_threads';
+export type PrFeedbackCoverageStatus = 'fetched' | 'unavailable' | 'auth_failed';
+
+export interface PrFeedbackCoverage {
+  surface: PrFeedbackCoverageSurface;
+  status: PrFeedbackCoverageStatus;
+  detail?: string;
+}
+
+export interface PrFeedbackItem {
+  id?: string;
+  source: PrFeedbackSource;
+  author: string;
+  body: string;
+  path?: string;
+  url?: string;
+  created_at?: string;
+  resolved?: boolean;
+}
+
+export interface PrFeedbackSummary {
+  total: number;
+  unresolved: number;
+  items: PrFeedbackItem[];
+  coverage: PrFeedbackCoverage[];
+}
+
+export interface PrAutoFixContextResponse {
+  artifact_path: string;
+  pr_number: number;
+  message: string;
+}
+
 export interface PrStatusResponse {
   found: boolean;
   unavailable_reason?: PrUnavailableReason;
@@ -125,6 +169,9 @@ export interface PrStatusResponse {
   base?: string;
   head?: string;
   check_state?: PrCheckState;
+  check_summary?: PrCheckSummary;
+  feedback_summary?: PrFeedbackSummary;
+  updated_at?: string;
   display_state?: PrDisplayState;
 }
 
@@ -180,7 +227,7 @@ export type ConversationState =
   | { type: 'awaiting_user_response'; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'handed_off'; successor_conv_id: string }
-  | { type: 'error'; message: string }
+  | { type: 'error'; message: string; error_kind?: string }
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
   | { type: 'terminal' };
 
@@ -887,6 +934,12 @@ export const api = {
   async getPrStatus(conversationId: string): Promise<PrStatusResponse> {
     const resp = await fetch(`/api/conversations/${conversationId}/pr-status`);
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to fetch PR status'); }
+    return resp.json();
+  },
+
+  async createPrAutoFixContext(conversationId: string): Promise<PrAutoFixContextResponse> {
+    const resp = await fetch(`/api/conversations/${conversationId}/pr-auto-fix-context`, { method: 'POST' });
+    if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || 'Failed to capture PR context'); }
     return resp.json();
   },
 

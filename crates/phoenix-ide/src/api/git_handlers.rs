@@ -3,8 +3,8 @@
 
 use super::handlers::AppError;
 use super::types::{
-    ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse, PrCheckState,
-    PrDisplayState, PrStatusResponse, PrUnavailableReason,
+    ConversationDiffResponse, GitBranchEntry, GitBranchesQuery, GitBranchesResponse,
+    PrAutoFixContextResponse, PrStatusResponse, PrUnavailableReason,
 };
 use super::AppState;
 use crate::db::ConvMode;
@@ -14,9 +14,7 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use serde::Deserialize;
 use std::path::PathBuf;
-use std::time::Duration;
 
 pub(crate) async fn list_git_branches(
     State(state): State<AppState>,
@@ -368,288 +366,59 @@ pub(crate) async fn get_conversation_pr_status(
         )));
     }
 
-    tokio::task::spawn_blocking(move || get_pr_status_for_branch(&cwd, &branch_name))
-        .await
-        .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))
-        .map(Json)
-}
-
-fn get_pr_status_for_branch(cwd: &std::path::Path, branch_name: &str) -> PrStatusResponse {
-    if run_git(cwd, &["rev-parse", "--is-inside-work-tree"]).is_err() {
-        return PrStatusResponse::unavailable(PrUnavailableReason::NotGitRepo);
-    }
-
-    let list_output = match run_gh(
-        cwd,
-        &[
-            "pr",
-            "list",
-            "--head",
-            branch_name,
-            "--state",
-            "all",
-            "--limit",
-            "1",
-            "--json",
-            "number,title,url,state,isDraft,baseRefName,headRefName",
-        ],
-    ) {
-        Ok(output) => output,
-        Err(e) => {
-            tracing::debug!(branch = %branch_name, error = %e.message, "gh pr list failed");
-            return PrStatusResponse::unavailable(e.reason);
-        }
-    };
-
-    let mut prs: Vec<GhPrListItem> = match serde_json::from_str(&list_output) {
-        Ok(prs) => prs,
-        Err(e) => {
-            tracing::debug!(branch = %branch_name, output = %list_output, error = %e, "failed to parse gh pr list JSON");
-            return PrStatusResponse::unavailable(PrUnavailableReason::CommandFailed);
-        }
-    };
-
-    let Some(pr) = prs.pop() else {
-        return PrStatusResponse::not_found();
-    };
-
-    let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
-    // Only an open, non-draft PR has CI state worth a second `gh` call; for
-    // merged/closed/draft the badge is coloured by display_state, so skip the
-    // (potentially slow) `gh pr checks` invocation.
-    let check_state = if matches!(display_state, PrDisplayState::Open) {
-        Some(fetch_pr_checks_state(cwd, pr.number))
-    } else {
-        None
-    };
-
-    PrStatusResponse {
-        found: true,
-        unavailable_reason: None,
-        number: Some(pr.number),
-        title: Some(pr.title),
-        url: Some(pr.url),
-        state: Some(pr.state),
-        draft: Some(pr.is_draft),
-        base: Some(pr.base_ref_name),
-        head: Some(pr.head_ref_name),
-        check_state,
-        display_state: Some(display_state),
-    }
-}
-
-fn fetch_pr_checks_state(cwd: &std::path::Path, number: u64) -> PrCheckState {
-    let number = number.to_string();
-    let out = match run_gh_raw(
-        cwd,
-        &[
-            "pr",
-            "checks",
-            &number,
-            "--json",
-            "name,state,bucket",
-            "--watch=false",
-        ],
-    ) {
-        Ok(out) => out,
-        Err(e) => {
-            tracing::debug!(pr = %number, error = %e.message, "gh pr checks could not run");
-            return PrCheckState::Unknown;
-        }
-    };
-
-    // `gh pr checks` exits non-zero when checks are failing (1) or pending (8) but still
-    // emits the JSON we need to classify them — so we key off the parsed output, not the
-    // exit code. Only a usage/auth error (empty or non-JSON stdout) yields `Unknown`.
-    let stdout = out.stdout.trim();
-    if stdout.is_empty() {
-        tracing::debug!(pr = %number, stderr = %out.stderr.trim(), "gh pr checks produced no output");
-        return PrCheckState::Unknown;
-    }
-    match serde_json::from_str::<Vec<GhPrCheck>>(stdout) {
-        Ok(checks) => normalize_checks(&checks),
-        Err(e) => {
-            tracing::debug!(pr = %number, output = %stdout, error = %e, "failed to parse gh pr checks JSON");
-            PrCheckState::Unknown
-        }
-    }
-}
-
-#[derive(Debug)]
-struct GhError {
-    reason: PrUnavailableReason,
-    message: String,
-}
-
-struct GhOutput {
-    status: std::process::ExitStatus,
-    stdout: String,
-    stderr: String,
-}
-
-/// Run `gh` with an 8s timeout, returning the exit status and captured output.
-/// `Err` only on spawn failure or timeout — a non-zero exit is still `Ok` so the
-/// caller can decide (some `gh` subcommands exit non-zero but still emit useful JSON).
-fn run_gh_raw(cwd: &std::path::Path, args: &[&str]) -> Result<GhOutput, GhError> {
-    use std::io::Read;
-    use std::process::{Command, Stdio};
-    use std::time::Instant;
-
-    let mut child = Command::new("gh")
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| GhError {
-            reason: if e.kind() == std::io::ErrorKind::NotFound {
-                PrUnavailableReason::GhMissing
-            } else {
-                PrUnavailableReason::CommandFailed
-            },
-            message: format!("Failed to run gh {}: {e}", args.join(" ")),
-        })?;
-
-    // Drain stdout/stderr in background threads so a large `gh` response (e.g.
-    // a PR with many checks) can't fill the OS pipe buffer and wedge the child
-    // while we poll for exit. The threads finish on EOF — which arrives when
-    // the child exits or is killed — so they always join cleanly.
-    let mut stdout_pipe = child.stdout.take().expect("gh stdout is piped");
-    let mut stderr_pipe = child.stderr.take().expect("gh stderr is piped");
-    let stdout_h = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout_pipe.read_to_end(&mut buf);
-        buf
-    });
-    let stderr_h = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stderr_pipe.read_to_end(&mut buf);
-        buf
-    });
-
-    let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(|e| GhError {
-            reason: PrUnavailableReason::CommandFailed,
-            message: format!("gh {} wait failed: {e}", args.join(" ")),
-        })? {
-            break status;
-        }
-        if started.elapsed() > Duration::from_secs(8) {
-            let _ = child.kill();
-            let _ = child.wait();
-            let _ = stdout_h.join();
-            let _ = stderr_h.join();
-            return Err(GhError {
-                reason: PrUnavailableReason::CommandFailed,
-                message: format!("gh {} timed out", args.join(" ")),
-            });
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-
-    Ok(GhOutput {
-        status,
-        stdout: String::from_utf8_lossy(&stdout_h.join().unwrap_or_default())
-            .trim()
-            .to_string(),
-        stderr: String::from_utf8_lossy(&stderr_h.join().unwrap_or_default())
-            .trim()
-            .to_string(),
+    tokio::task::spawn_blocking(move || {
+        crate::api::pr_monitoring::get_pr_status_for_branch(&cwd, &branch_name)
     })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))
+    .map(Json)
 }
 
-/// Run `gh` expecting success; maps a non-zero exit to a typed `GhError`
-/// (auth vs generic failure) and returns trimmed stdout on success.
-fn run_gh(cwd: &std::path::Path, args: &[&str]) -> Result<String, GhError> {
-    let out = run_gh_raw(cwd, args)?;
-    if out.status.success() {
-        Ok(out.stdout)
-    } else {
-        let lower = out.stderr.to_lowercase();
-        let reason = if lower.contains("not logged")
-            || lower.contains("not authenticated")
-            || lower.contains("authentication")
-            || lower.contains("gh auth login")
-        {
-            PrUnavailableReason::NotAuthenticated
-        } else {
-            PrUnavailableReason::CommandFailed
-        };
-        Err(GhError {
-            reason,
-            message: format!("gh {} failed: {}", args.join(" "), out.stderr),
-        })
-    }
-}
+pub(crate) async fn create_pr_auto_fix_context(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<PrAutoFixContextResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-#[derive(Debug, Deserialize)]
-struct GhPrListItem {
-    number: u64,
-    title: String,
-    url: String,
-    state: String,
-    #[serde(rename = "isDraft")]
-    is_draft: bool,
-    #[serde(rename = "baseRefName")]
-    base_ref_name: String,
-    #[serde(rename = "headRefName")]
-    head_ref_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct GhPrCheck {
-    state: Option<String>,
-    bucket: Option<String>,
-}
-
-fn normalize_pr_display_state(state: &str, draft: bool) -> PrDisplayState {
-    if draft {
-        return PrDisplayState::Draft;
-    }
-    match state.to_ascii_uppercase().as_str() {
-        "MERGED" => PrDisplayState::Merged,
-        "CLOSED" => PrDisplayState::Closed,
-        _ => PrDisplayState::Open,
-    }
-}
-
-fn normalize_checks(checks: &[GhPrCheck]) -> PrCheckState {
-    if checks.is_empty() {
-        return PrCheckState::Unknown;
-    }
-
-    let mut has_pending = false;
-    for check in checks {
-        let state = check
-            .state
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        let bucket = check
-            .bucket
-            .as_deref()
-            .unwrap_or_default()
-            .to_ascii_uppercase();
-        if matches!(
-            state.as_str(),
-            "FAILURE" | "ERROR" | "CANCELLED" | "ACTION_REQUIRED"
-        ) || matches!(bucket.as_str(), "FAIL" | "CANCEL" | "ACTION_REQUIRED")
-        {
-            return PrCheckState::Failing;
+    let (branch_name, worktree_path) = match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            ..
         }
-        if !matches!(state.as_str(), "SUCCESS" | "PASS" | "SKIPPED")
-            && !matches!(bucket.as_str(), "PASS" | "SKIP")
-        {
-            has_pending = true;
+        | ConvMode::Branch {
+            branch_name,
+            worktree_path,
+            ..
+        } => (branch_name.to_string(), worktree_path.to_string()),
+        _ => {
+            return Err(AppError::BadRequest(
+                "Conversation is not in Work or Branch mode (no associated PR)".to_string(),
+            ));
         }
-    }
+    };
 
-    if has_pending {
-        PrCheckState::Pending
-    } else {
-        PrCheckState::Passing
-    }
+    tokio::task::spawn_blocking(move || {
+        let worktree = PathBuf::from(worktree_path);
+        crate::api::pr_monitoring::capture_pr_auto_fix_context(&worktree, &branch_name).map_err(
+            |e| match e {
+                crate::api::pr_monitoring::PrMonitorError::BadRequest(message) => {
+                    AppError::BadRequest(message)
+                }
+                crate::api::pr_monitoring::PrMonitorError::Internal(message) => {
+                    AppError::Internal(message)
+                }
+            },
+        )
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?
+    .map(Json)
 }
 
 /// `GET /api/conversations/:id/diff` — committed and uncommitted changes
@@ -767,55 +536,5 @@ mod tests {
         // Saturated always reports the (lower-bound) total even if it
         // happens to equal stdout.len() — caller must show "≥X KiB" UI.
         assert_eq!(truncated_kib("x", 8 * 1024, true), Some(8));
-    }
-
-    #[test]
-    fn normalize_pr_display_state_prefers_draft() {
-        assert_eq!(
-            normalize_pr_display_state("OPEN", true),
-            PrDisplayState::Draft
-        );
-        assert_eq!(
-            normalize_pr_display_state("MERGED", false),
-            PrDisplayState::Merged
-        );
-        assert_eq!(
-            normalize_pr_display_state("CLOSED", false),
-            PrDisplayState::Closed
-        );
-        assert_eq!(
-            normalize_pr_display_state("OPEN", false),
-            PrDisplayState::Open
-        );
-    }
-
-    #[test]
-    fn normalize_checks_classifies_empty_as_unknown() {
-        assert_eq!(normalize_checks(&[]), PrCheckState::Unknown);
-    }
-
-    #[test]
-    fn normalize_checks_classifies_pass_pending_and_fail() {
-        assert_eq!(
-            normalize_checks(&[GhPrCheck {
-                state: Some("SUCCESS".to_string()),
-                bucket: Some("pass".to_string()),
-            }]),
-            PrCheckState::Passing
-        );
-        assert_eq!(
-            normalize_checks(&[GhPrCheck {
-                state: Some("PENDING".to_string()),
-                bucket: Some("pending".to_string()),
-            }]),
-            PrCheckState::Pending
-        );
-        assert_eq!(
-            normalize_checks(&[GhPrCheck {
-                state: Some("FAILURE".to_string()),
-                bucket: Some("fail".to_string()),
-            }]),
-            PrCheckState::Failing
-        );
     }
 }

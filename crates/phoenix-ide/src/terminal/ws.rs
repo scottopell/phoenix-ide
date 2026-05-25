@@ -13,6 +13,7 @@ use super::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
 use super::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
 use crate::api::AppState;
 use crate::runtime::{RuntimeManager, SseEvent};
+use crate::work_scope::WorkScope;
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{Path, State, WebSocketUpgrade},
@@ -47,31 +48,66 @@ pub async fn terminal_ws_handler(
     let terminals = state.terminals.clone();
     let db = state.db.clone();
     let runtime = Arc::clone(&state.runtime);
-    ws.on_upgrade(move |socket| handle_socket(socket, conversation_id, terminals, db, runtime))
+    ws.on_upgrade(move |socket| async move {
+        let (cwd, scope) = match db.get_conversation(&conversation_id).await {
+            Ok(conv) => {
+                // worktree_path drives WorkScope keying (task 03001 / Phase 2):
+                // typed on `ConvMode` for Work, Branch, and managed Explore.
+                // Sub-agent Explore returns None and never reaches this code
+                // (no user PTY), so no fallback is needed. Direct returns None
+                // (resolves to WorkScope::Conversation).
+                let wt = conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
+                let scope = WorkScope::resolve(&conversation_id, wt.as_deref());
+                (std::path::PathBuf::from(&conv.cwd), scope)
+            }
+            Err(e) => {
+                tracing::warn!(conv_id = %conversation_id, error = %e, "Terminal: conversation not found");
+                return;
+            }
+        };
+        handle_socket(socket, scope, cwd, conversation_id, terminals, runtime).await;
+    })
+}
+
+/// Axum handler: `GET /api/terminal/global` (WebSocket upgrade).
+///
+/// Singleton global terminal (REQ-TERM-WS-001). Not bound to any
+/// conversation; survives every individual conversation; lives for the
+/// lifetime of the Phoenix process. Used by `/new` (and any other surface
+/// that wants a terminal unbound from a single transcript).
+pub async fn terminal_ws_global_handler(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let terminals = state.terminals.clone();
+    let runtime = Arc::clone(&state.runtime);
+    // Global terminal spawns in $HOME — the only stable cwd that doesn't
+    // depend on any conversation or worktree. Falls back to "/" if $HOME
+    // is unset, matching the safety net the shell would apply.
+    let cwd = std::env::var_os("HOME")
+        .map_or_else(|| std::path::PathBuf::from("/"), std::path::PathBuf::from);
+    ws.on_upgrade(move |socket| {
+        handle_socket(
+            socket,
+            WorkScope::Global,
+            cwd,
+            "global".to_string(),
+            terminals,
+            runtime,
+        )
+    })
 }
 
 #[allow(clippy::too_many_lines)] // inherently dense PTY lifecycle; see relay.rs for the testable core
 async fn handle_socket(
     socket: WebSocket,
-    conversation_id: String,
+    scope: WorkScope,
+    cwd: std::path::PathBuf,
+    id_label: String,
     terminals: ActiveTerminals,
-    db: crate::db::Database,
     runtime: Arc<RuntimeManager>,
 ) {
-    let (cwd, worktree_path) = match db.get_conversation(&conversation_id).await {
-        Ok(conv) => {
-            // worktree_path for socket keying (task 03001 / Phase 2): typed
-            // on `ConvMode` for Work, Branch, and managed Explore. Sub-agent
-            // Explore returns None and never reaches this code (no user PTY),
-            // so no fallback is needed. Direct returns None (per-conv socket).
-            let wt = conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
-            (std::path::PathBuf::from(&conv.cwd), wt)
-        }
-        Err(e) => {
-            tracing::warn!(conv_id = %conversation_id, error = %e, "Terminal: conversation not found");
-            return;
-        }
-    };
+    let conversation_id = id_label;
 
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
@@ -90,9 +126,9 @@ async fn handle_socket(
     // branch (full_teardown / detach_only).
     let Some((arc_handle, attach_permit)) = acquire_handle(
         &conversation_id,
+        &scope,
         &terminals,
         &cwd,
-        worktree_path.as_deref(),
         initial_dims,
         &mut ws_sender,
         &runtime,
@@ -125,7 +161,7 @@ async fn handle_socket(
         Err(reason) => {
             tracing::error!(conv_id = %conversation_id, error = %reason, "Terminal: fd setup failed");
             // Full teardown — we failed before the relay started.
-            full_teardown(&terminals, &conversation_id, arc_handle, child_pid).await;
+            full_teardown(&terminals, &conversation_id, &scope, arc_handle, child_pid).await;
             return;
         }
     };
@@ -137,23 +173,29 @@ async fn handle_socket(
     let _ = arc_handle.stop_tx.send(StopReason::Running);
     let stop_rx = arc_handle.stop_tx.subscribe();
 
-    // REQ-TERM-012: tear down terminal when conversation reaches a terminal state.
-    let teardown_stop = arc_handle.stop_tx.clone();
-    let teardown_conv_id = conversation_id.clone();
-    if let Ok(mut bcast_rx) = runtime.subscribe(&conversation_id).await {
-        tokio::spawn(async move {
-            loop {
-                match bcast_rx.recv().await {
-                    Ok(SseEvent::ConversationBecameTerminal { .. }) => {
-                        tracing::debug!(conv_id = %teardown_conv_id, "Terminal: conversation ended, tearing down PTY");
-                        let _ = teardown_stop.send(StopReason::TearDown);
-                        break;
+    // REQ-TERM-012 (per-scope): the conversation-end teardown only applies
+    // to Conversation-scoped terminals. Worktree-scoped terminals survive
+    // across conversation continuations and tear down only via the
+    // worktree cleanup cascade (REQ-TERM-WS-001, REQ-TMUX-WS-002). Global
+    // terminals never tear down on conversation lifecycle.
+    if matches!(scope, WorkScope::Conversation(_)) {
+        let teardown_stop = arc_handle.stop_tx.clone();
+        let teardown_conv_id = conversation_id.clone();
+        if let Ok(mut bcast_rx) = runtime.subscribe(&conversation_id).await {
+            tokio::spawn(async move {
+                loop {
+                    match bcast_rx.recv().await {
+                        Ok(SseEvent::ConversationBecameTerminal { .. }) => {
+                            tracing::debug!(conv_id = %teardown_conv_id, "Terminal: conversation ended, tearing down PTY");
+                            let _ = teardown_stop.send(StopReason::TearDown);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(_) => break,
                     }
-                    Ok(_) => {}
-                    Err(_) => break,
                 }
-            }
-        });
+            });
+        }
     }
 
     // Adapt WS sender: Sink<Message> → Sink<Vec<u8>> by wrapping in Message::Binary.
@@ -207,7 +249,7 @@ async fn handle_socket(
     //                             can recover the session.
     match exit {
         RelayExit::PtyEof | RelayExit::Stopped(StopReason::TearDown) => {
-            full_teardown(&terminals, &conversation_id, arc_handle, child_pid).await;
+            full_teardown(&terminals, &conversation_id, &scope, arc_handle, child_pid).await;
         }
         RelayExit::Stopped(StopReason::Detach | StopReason::Running) | RelayExit::WsClosed => {
             detach_only(&conversation_id, arc_handle);
@@ -246,18 +288,18 @@ async fn handle_socket(
 ///      handle is fresh and nobody holds it yet.
 async fn acquire_handle(
     conversation_id: &str,
+    scope: &WorkScope,
     terminals: &ActiveTerminals,
     cwd: &std::path::Path,
-    worktree_path: Option<&std::path::Path>,
     initial_dims: Dims,
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     runtime: &Arc<RuntimeManager>,
 ) -> Option<(Arc<TerminalHandle>, OwnedSemaphorePermit)> {
-    // Fast path: reclaim if a handle already exists. The reclaim path
-    // does not consult the tmux registry because the existing PTY is
-    // already running whatever it was originally given (tmux attach or
-    // $SHELL); switching mid-session would require killing the child.
-    if let Some(existing) = terminals.get(conversation_id) {
+    // Fast path: reclaim if a handle already exists for this scope. The
+    // reclaim path does not consult the tmux registry because the existing
+    // PTY is already running whatever it was originally given (tmux attach
+    // or $SHELL); switching mid-session would require killing the child.
+    if let Some(existing) = terminals.get(scope) {
         return reclaim(conversation_id, existing).await;
     }
 
@@ -265,7 +307,7 @@ async fn acquire_handle(
     // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
     // forwarded so a fresh tmux server starts its pane in the
     // conversation's project directory rather than Phoenix's own CWD.
-    let plan = resolve_exec_plan(conversation_id, worktree_path, cwd, runtime).await;
+    let plan = resolve_exec_plan(conversation_id, scope, cwd, runtime).await;
 
     let cwd_owned = cwd.to_path_buf();
     let handle = match tokio::task::spawn_blocking(move || {
@@ -289,12 +331,12 @@ async fn acquire_handle(
     // Atomic check-and-insert. If we lose the race, the handle we just spawned
     // is dropped (closing master_fd → SIGHUP), and we fall back to reclaiming
     // the winner so the caller still gets an attached session.
-    if let Some(arc_handle) = terminals.try_insert(conversation_id.to_string(), handle) {
+    if let Some(arc_handle) = terminals.try_insert(scope.clone(), handle) {
         // Fresh handle — permit is available immediately (initialized with 1).
         return acquire_permit(conversation_id, arc_handle).await;
     }
 
-    tracing::warn!(conv_id = %conversation_id, "Terminal: post-spawn race lost, reclaiming winner");
+    tracing::warn!(conv_id = %conversation_id, scope = %scope, "Terminal: post-spawn race lost, reclaiming winner");
     // Reap the child from the losing spawn to avoid a zombie. The handle was
     // consumed by try_insert (on loss it was dropped), so master_fd is closed
     // and the child will receive SIGHUP.
@@ -303,7 +345,7 @@ async fn acquire_handle(
     })
     .await;
 
-    let Some(existing) = terminals.get(conversation_id) else {
+    let Some(existing) = terminals.get(scope) else {
         // Winner removed itself between try_insert and get. Report back to
         // the client and bail — retrying again could loop on edge-case timing.
         let _ = ws_sender
@@ -315,19 +357,21 @@ async fn acquire_handle(
 }
 
 /// Decide whether the freshly-spawned PTY should run `tmux attach`
-/// against the conversation's dedicated socket or fall back to
-/// `$SHELL -i` (REQ-TMUX-004). Lazy-spawns the conversation's tmux
-/// server on first call (REQ-TMUX-002), reuses it after Phoenix
-/// restart (REQ-TMUX-005), and recreates over a stale socket
-/// (REQ-TMUX-006).
+/// against the scope's dedicated socket or fall back to `$SHELL -i`
+/// (REQ-TMUX-004). Lazy-spawns the scope's tmux server on first call
+/// (REQ-TMUX-002), reuses it after Phoenix restart (REQ-TMUX-005), and
+/// recreates over a stale socket (REQ-TMUX-006).
 ///
-/// `worktree_path` controls socket keying: `Some` for Work/Branch and
-/// top-level managed Explore (socket tied to the worktree so continuations
-/// share the session), `None` for Direct and sub-agent Explore (per-conv
-/// socket, or pass-through to parent server respectively). See task 03001.
+/// The caller's already-resolved `scope` is passed in directly so the
+/// tmux socket selection matches the terminal's ownership scope
+/// (REQ-TERM-WS-001). Re-resolving here from `(conversation_id,
+/// worktree_path)` would silently downgrade `WorkScope::Global` to
+/// `Conversation("global")`, breaking the singleton tmux session — and
+/// would also drop the disjointness between Worktree and Conversation
+/// scopes that share an inner string.
 async fn resolve_exec_plan(
     conversation_id: &str,
-    worktree_path: Option<&std::path::Path>,
+    scope: &WorkScope,
     cwd: &std::path::Path,
     runtime: &Arc<RuntimeManager>,
 ) -> PtyExecPlan {
@@ -335,10 +379,7 @@ async fn resolve_exec_plan(
     if !registry.binary_available() {
         return PtyExecPlan::Shell;
     }
-    match registry
-        .ensure_live(conversation_id, worktree_path, cwd)
-        .await
-    {
+    match registry.ensure_live(scope, cwd).await {
         Ok(server_arc) => {
             let server = server_arc.read().await;
             PtyExecPlan::Tmux {
@@ -409,17 +450,18 @@ async fn acquire_permit(
 async fn full_teardown(
     terminals: &ActiveTerminals,
     conversation_id: &str,
+    scope: &WorkScope,
     arc_handle: Arc<TerminalHandle>,
     child_pid: nix::unistd::Pid,
 ) {
-    terminals.remove(conversation_id);
+    terminals.remove(scope);
     // When this and any other Arc clones drop, master_fd closes → SIGHUP → shell exits.
     drop(arc_handle);
     let _ = tokio::task::spawn_blocking(move || {
         let _ = waitpid(child_pid, None);
     })
     .await;
-    tracing::info!(conv_id = %conversation_id, "Terminal session ended");
+    tracing::info!(conv_id = %conversation_id, scope = %scope, "Terminal session ended");
 }
 
 /// Detach only: release our Arc clone but leave the registry entry intact so

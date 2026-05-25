@@ -233,17 +233,37 @@ is logged.
 
 ---
 
-### REQ-TMUX-008: Conversation Soft-State (Archive, Close) Does Not Affect Server
+### REQ-TMUX-008: Conversation UI-State (Close, Blur) Does Not Affect Server
 
-WHEN a conversation transitions to a non-active soft state (archived,
-closed-but-not-deleted, conversation tab closed in the UI)
+WHEN a conversation transitions to a UI-only state (conversation tab
+closed in the UI, conversation tab blurred, parent window closed)
 THE SYSTEM SHALL NOT terminate the conversation's tmux server
 AND the server's windows / panes / scrollback SHALL remain available
 upon the conversation's next active touch
 
-**Rationale:** "Comes back tomorrow, dev server still running" is the
-explicit pitch of using tmux. Archive is a UI/organisational signal, not
-a resource-management signal.
+WHEN a conversation transitions to `archived` (a terminal lifecycle
+state — see REQ-BED-032)
+THE SYSTEM SHALL invoke `cascade_tmux_on_delete` with the same
+scope-equality preservation rule as hard-delete (REQ-TMUX-WS-002),
+killing the tmux server and unlinking the socket unless a continuation
+inherits the same `WorkScope`
+
+**Rationale:** "Comes back tomorrow, dev server still running" remains
+the pitch of using tmux — but only across UI noise (closing a tab,
+blurring it, restarting Phoenix). Archive is the user's signal that
+the work is over; preserving live resources after that point is a
+leak, not a feature. The earlier "archive is purely organisational"
+framing predates the unified-cleanup-cascade work in REQ-BED-032; this
+requirement is the spec catching up to that decision.
+
+History: prior text treated archive as a soft-state signal that left
+the tmux server alive indefinitely. This was identified as a leak
+during the WorkScope stack review on PR #135 — Copilot flagged that
+the orchestrator was reclaiming resources but the unarchive surface
+still implied the conversation could be resumed. The fix is to treat
+archive as terminal across the board (drop unarchive, run the cascade);
+see REQ-API-006 and REQ-BED-032 for the matching API and orchestrator
+changes.
 
 ---
 
@@ -456,3 +476,15 @@ remains available for detailed tmux operations.
 | `TMUX_TRUNCATION_KEEP_BYTES` | 4096 | Bytes preserved from each end on truncation |
 | `TMUX_SOCKET_DIR` | `~/.phoenix-ide/tmux-sockets/` | Socket directory; permissions 0700 |
 | `TMUX_DEFAULT_SESSION` | `main` | Session name created on lazy spawn |
+
+## WorkScope Ownership
+
+### REQ-TMUX-WS-001: Tmux Server Keyed by WorkScope
+
+Phoenix MUST key tmux server ownership by `WorkScope`: `WorkScope::Worktree(path)` for managed/branch worktrees and `WorkScope::Conversation(conversation_id)` for Direct conversations.
+
+### REQ-TMUX-WS-002: Continuation Sharing Within Worktree Scope
+
+Managed/Branch continuations that share a worktree MUST share the same tmux socket/session. Direct-mode conversations continue to use the conversation fallback scope.
+
+The cleanup cascade MUST decide preservation by `WorkScope` equality between the conversation being torn down and its continuation's resolved scope: skip the kill/unlink iff `inheritor_scope == Some(work_scope)`. Conversation-scope continuations always resolve to a different scope (their own conversation id), so the rule subsumes the "Direct continuations cannot inherit" case structurally without per-kind case-analysis.

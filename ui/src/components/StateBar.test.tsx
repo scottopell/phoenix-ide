@@ -12,6 +12,7 @@ vi.mock('../api', async (importOriginal) => {
     api: {
       ...actual.api,
       getPrStatus: vi.fn(),
+      createPrAutoFixContext: vi.fn(),
       getConversationUsage: vi.fn(),
     },
   };
@@ -38,6 +39,11 @@ beforeAll(() => {
 beforeEach(() => {
   vi.clearAllMocks();
   (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ found: false });
+  (api.createPrAutoFixContext as ReturnType<typeof vi.fn>).mockResolvedValue({
+    artifact_path: '.phoenix/pr-context/pr-12.json',
+    pr_number: 12,
+    message: 'Address `.phoenix/pr-context/pr-12.json`',
+  });
   (api.getConversationUsage as ReturnType<typeof vi.fn>).mockResolvedValue({
     own: { input_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, output_tokens: 0, turns: 0 },
     total: { input_tokens: 0, cache_creation_tokens: 0, cache_read_tokens: 0, output_tokens: 0, turns: 0 },
@@ -71,12 +77,14 @@ function renderStateBar({
   contextWindowUsed = 0,
   modelContextWindow = 200_000,
   continuation,
+  onSendMessage,
 }: {
   conversation?: Conversation;
   convState?: ComponentProps<typeof StateBar>['convState'];
   contextWindowUsed?: number;
   modelContextWindow?: number;
   continuation?: ComponentProps<typeof StateBar>['continuation'];
+  onSendMessage?: ComponentProps<typeof StateBar>['onSendMessage'];
 } = {}) {
   const props: ComponentProps<typeof StateBar> = {
     conversation,
@@ -89,6 +97,9 @@ function renderStateBar({
   };
   if (continuation) {
     props.continuation = continuation;
+  }
+  if (onSendMessage) {
+    props.onSendMessage = onSendMessage;
   }
   return render(
     <MemoryRouter>
@@ -126,11 +137,8 @@ describe('StateBar PR badge', () => {
 
     renderStateBar();
 
-    const badge = await screen.findByRole('link', { name: label });
+    const badge = await screen.findByRole('button', { name: label });
     expect(badge).toHaveClass('pr-badge', className);
-    expect(badge).toHaveAttribute('href', 'https://github.com/scottopell/phoenix-ide/pull/12');
-    expect(badge).toHaveAttribute('target', '_blank');
-    expect(badge).toHaveAttribute('rel', 'noreferrer');
     expect(badge.getAttribute('title')).toContain('Add PR tracking');
   });
 
@@ -149,7 +157,7 @@ describe('StateBar PR badge', () => {
     renderStateBar();
 
     expect(await screen.findByText('gh auth')).toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: /^#\d+/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /^#\d+/ })).not.toBeInTheDocument();
   });
 
   it('does not fetch PR status for conversations without a branch', async () => {
@@ -157,6 +165,40 @@ describe('StateBar PR badge', () => {
 
     await waitFor(() => expect(screen.getByText('track-pr-status')).toBeInTheDocument());
     expect(api.getPrStatus).not.toHaveBeenCalled();
+  });
+
+  it('opens CI popover and sends auto-fix message from captured context', async () => {
+    const onSendMessage = vi.fn();
+    mockPrStatus({
+      found: true,
+      number: 12,
+      title: 'Fix CI',
+      url: 'https://github.com/scottopell/phoenix-ide/pull/12',
+      state: 'OPEN',
+      draft: false,
+      base: 'main',
+      head: 'task-123-pr-status',
+      display_state: 'open',
+      check_state: 'failing',
+      check_summary: {
+        passing: 1,
+        pending: 0,
+        failing: 1,
+        skipped: 0,
+        unknown: 0,
+        failing_names: ['test'],
+        pending_names: [],
+      },
+      feedback_summary: { total: 2, unresolved: 2, items: [], coverage: [] },
+    });
+
+    renderStateBar({ onSendMessage });
+    fireEvent.click(await screen.findByRole('button', { name: /#12 checks ✗/i }));
+    expect(await screen.findByRole('dialog', { name: /PR CI monitoring/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /Auto-fix CI & address comments/i }));
+
+    await waitFor(() => expect(api.createPrAutoFixContext).toHaveBeenCalledWith('conv-1'));
+    await waitFor(() => expect(onSendMessage).toHaveBeenCalledWith('Address `.phoenix/pr-context/pr-12.json`'));
   });
 });
 

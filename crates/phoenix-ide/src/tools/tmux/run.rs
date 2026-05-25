@@ -248,11 +248,7 @@ async fn resolve_tmux_paths(
     ctx: &ToolContext,
     cwd: &Path,
 ) -> Result<(PathBuf, PathBuf), ToolOutput> {
-    let server_arc = match ctx
-        .tmux_registry()
-        .ensure_live(&ctx.conversation_id, ctx.worktree_path.as_deref(), cwd)
-        .await
-    {
+    let server_arc = match ctx.tmux_registry().ensure_live(&ctx.work_scope, cwd).await {
         Ok(arc) => arc,
         Err(TmuxError::BinaryUnavailable) => {
             return Err(error_envelope(
@@ -976,11 +972,7 @@ mod tests {
 
         let server = ctx
             .tmux_registry()
-            .ensure_live(
-                &ctx.conversation_id,
-                ctx.worktree_path.as_deref(),
-                &ctx.working_dir,
-            )
+            .ensure_live(&ctx.work_scope, &ctx.working_dir)
             .await
             .unwrap();
         let socket_path = server.read().await.socket_path.clone();

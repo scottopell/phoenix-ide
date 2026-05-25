@@ -350,7 +350,7 @@ fn arb_user_question_response_event() -> impl Strategy<Value = Event> {
 }
 
 fn arb_task_approval_event() -> impl Strategy<Value = Event> {
-    arb_task_approval_outcome().prop_map(|outcome| Event::TaskApprovalResponse { outcome })
+    arb_task_approval_outcome().prop_map(|outcome| Event::TaskApprovalDecided { outcome })
 }
 
 fn arb_grace_turn_exhausted_event() -> impl Strategy<Value = Event> {

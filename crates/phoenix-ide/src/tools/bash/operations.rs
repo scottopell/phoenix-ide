@@ -977,8 +977,9 @@ async fn shape_handle_response(
                         kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
                         kill_attempted_at: kill_attempted_str
                             .unwrap_or_else(|| format_systime(SystemTime::now())),
-                        display,
-                        signal_sent: signal_sent_top.unwrap_or_else(|| "TERM".into()),
+                        display: Some(display),
+                        signal_sent: Some(signal_sent_top.unwrap_or_else(|| "TERM".into())),
+                        waited_ms: None,
                     })
                 }
                 // Kill resolved (pending=false) but state is still Live —
@@ -1005,20 +1006,12 @@ async fn shape_handle_response(
                         kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
                         kill_attempted_at: kill_attempted_str
                             .unwrap_or_else(|| format_systime(SystemTime::now())),
-                        display,
-                        // No `signal_sent` echo on peek.
-                        signal_sent: String::new(),
+                        display: Some(display),
+                        signal_sent: None,
+                        waited_ms: None,
                     })
                 }
                 ResponseKind::Wait if is_kill_pending_kernel => {
-                    // The legacy code emitted status="kill_pending_kernel"
-                    // here (no display field with the typed kill payload).
-                    // To preserve the prior JSON shape — which carried the
-                    // full Running shape (with display) — we use the
-                    // KillPendingKernel typed payload but *without* an
-                    // embedded `signal_sent` field by emitting an empty
-                    // string. The downstream consumers branch on `status`,
-                    // which is the reliable discriminator.
                     BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
                         handle: handle.handle_id.to_string(),
                         cmd,
@@ -1027,8 +1020,9 @@ async fn shape_handle_response(
                         kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
                         kill_attempted_at: kill_attempted_str
                             .unwrap_or_else(|| format_systime(SystemTime::now())),
-                        display,
-                        signal_sent: String::new(),
+                        display: Some(display),
+                        signal_sent: None,
+                        waited_ms: None,
                     })
                 }
                 ResponseKind::Peek => BashResponse::Running(BashRunningPayload {
@@ -1055,6 +1049,10 @@ async fn shape_handle_response(
         HandleState::Tombstoned(t) => {
             let view = read_window_from_tombstone(t, read_args);
             let window = window_to_typed(&view);
+            let display_field = match kind {
+                ResponseKind::Kill { .. } => Some(display),
+                ResponseKind::Peek | ResponseKind::Wait => None,
+            };
             BashResponse::Tombstoned(BashTombstonedPayload {
                 handle: handle.handle_id.to_string(),
                 cmd,
@@ -1067,24 +1065,13 @@ async fn shape_handle_response(
                 kill_signal_sent: t.kill_signal_sent.map(|s| s.as_str().to_string()),
                 kill_attempted_at: t.kill_attempted_at.map(format_systime),
                 window,
-                display,
+                display: display_field,
                 signal_sent: signal_sent_top,
             })
         }
     };
 
-    let mut value = serde_json::to_value(&typed).unwrap_or(Value::Null);
-    // The `peek (kill_pending_kernel)` and `wait (kill_pending_kernel)`
-    // branches above produce a typed payload with `signal_sent: ""` —
-    // strip the empty echo to match the legacy wire shape (peek/wait do
-    // not echo a signal_sent on the response).
-    if let Value::Object(obj) = &mut value {
-        if let Some(Value::String(s)) = obj.get("signal_sent") {
-            if s.is_empty() {
-                obj.remove("signal_sent");
-            }
-        }
-    }
+    let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
     let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
     ToolOutput::success(serialized).with_display(value)
 }
@@ -1123,6 +1110,11 @@ async fn still_running_response(
         .map(|a| format_systime(a.attempted_at));
 
     // If a kill is in flight, surface as kill_pending_kernel (REQ-BASH-003).
+    // This is the passive-wait branch: no `display` label (only kill / peek /
+    // wait shape one), no `signal_sent` echo (this caller did not issue the
+    // kill), and `waited_ms` carries the elapsed wait window. The
+    // `BashKillPendingKernelPayload` fields are `Option`s precisely so this
+    // shape is constructible directly — no post-serialization scrubbing.
     let typed = if kill_attempt.is_some() {
         BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
             handle: handle.handle_id.to_string(),
@@ -1132,10 +1124,9 @@ async fn still_running_response(
             kill_signal_sent: kill_signal_str.unwrap_or_else(|| "TERM".into()),
             kill_attempted_at: kill_attempted_str
                 .unwrap_or_else(|| format_systime(SystemTime::now())),
-            // No display label on run/wait still_running paths.
-            display: String::new(),
-            // No signal_sent echo: this is a passive wait, not a kill call.
-            signal_sent: String::new(),
+            display: None,
+            signal_sent: None,
+            waited_ms: Some(waited_ms),
         })
     } else {
         BashResponse::StillRunning(BashStillRunningPayload {
@@ -1149,32 +1140,7 @@ async fn still_running_response(
         })
     };
 
-    let mut value = serde_json::to_value(&typed).unwrap_or(Value::Null);
-    if let Value::Object(obj) = &mut value {
-        // Strip the empty `display` and `signal_sent` placeholders we set
-        // for the kill_pending_kernel path here so the wire shape matches
-        // the legacy still_running JSON (no display, no signal_sent on the
-        // passive-wait code path).
-        if let Some(Value::String(s)) = obj.get("display") {
-            if s.is_empty() {
-                obj.remove("display");
-            }
-        }
-        if let Some(Value::String(s)) = obj.get("signal_sent") {
-            if s.is_empty() {
-                obj.remove("signal_sent");
-            }
-        }
-        // Add waited_ms for the kill_pending_kernel still-running variant
-        // emitted from this code path; the typed payload omits it because
-        // KillPendingKernel doesn't carry it as a structural field, but
-        // the legacy wire kept it for parity with still_running shape.
-        if obj.get("status").and_then(Value::as_str) == Some("kill_pending_kernel")
-            && !obj.contains_key("waited_ms")
-        {
-            obj.insert("waited_ms".into(), Value::Number(waited_ms.into()));
-        }
-    }
+    let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
     let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
     ToolOutput::success(serialized).with_display(value)
 }
@@ -1230,19 +1196,12 @@ async fn terminal_or_panic_response(
                     // wait/peek path: no synthesized display label here
                     // (callers that want the label go through
                     // `shape_handle_response`).
-                    display: String::new(),
+                    display: None,
                     signal_sent: None,
                 })
             };
 
-            let mut value = serde_json::to_value(&typed).unwrap_or(Value::Null);
-            if let Value::Object(obj) = &mut value {
-                if let Some(Value::String(s)) = obj.get("display") {
-                    if s.is_empty() {
-                        obj.remove("display");
-                    }
-                }
-            }
+            let value = serde_json::to_value(&typed).unwrap_or(Value::Null);
             let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
             ToolOutput::success(serialized).with_display(value)
         }

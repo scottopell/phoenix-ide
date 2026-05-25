@@ -31,7 +31,7 @@ import { NotesPanel } from './viewer/NotesPanel';
 import { CopyButton } from './CopyButton';
 import { AnnotationDialog } from './viewer/AnnotationDialog';
 import { formatNotesForSend } from './viewer/formatNotes';
-import { Loader2, AlertCircle, MessageSquarePlus } from 'lucide-react';
+import { MessageSquarePlus } from 'lucide-react';
 
 interface PatchContext {
   modifiedLines: Set<number>;
@@ -41,6 +41,7 @@ interface PatchContext {
 export interface ProseReaderProps {
   filePath: string;
   rootDir: string;
+  content: string;
   onClose: () => void;
   onSendNotes: (notes: string) => void;
   patchContext?: PatchContext | undefined;
@@ -51,16 +52,6 @@ export interface ProseReaderProps {
 // Re-exported for backward compatibility with external callers that
 // imported the type from this module.
 export type { ReviewNote } from '../contexts/ReviewNotesContext';
-
-async function readFile(path: string): Promise<string> {
-  const response = await fetch(`/api/files/read?path=${encodeURIComponent(path)}`);
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ error: 'Unknown error' }));
-    throw new Error(error.error || 'Failed to read file');
-  }
-  const data = await response.json();
-  return data.content;
-}
 
 function getFileType(path: string): 'markdown' | 'html' | 'code' | 'text' {
   const ext = path.split('.').pop()?.toLowerCase();
@@ -156,6 +147,7 @@ function AnnotatableBlock({
 export function ProseReader({
   filePath,
   rootDir,
+  content,
   onClose,
   onSendNotes,
   patchContext,
@@ -166,9 +158,6 @@ export function ProseReader({
   const syntaxStyle = theme === 'light' ? oneLight : oneDark;
   const reviewNotes = useReviewNotes();
 
-  const [content, setContent] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [annotating, setAnnotating] = useState<{ lineNumber: number; lineContent: string } | null>(null);
   const [showPanel, setShowPanel] = useState(false);
   const [highlightedLine, setHighlightedLine] = useState<number | null>(null);
@@ -194,25 +183,6 @@ export function ProseReader({
     () => reviewNotes.notesForFile(absolutePath),
     [reviewNotes, absolutePath],
   );
-
-  // Load file
-  useEffect(() => {
-    let cancelled = false;
-    async function load() {
-      setLoading(true);
-      setError(null);
-      try {
-        const text = await readFile(absolutePath);
-        if (!cancelled) setContent(text);
-      } catch (err) {
-        if (!cancelled) setError(err instanceof Error ? err.message : 'Failed to load file');
-      } finally {
-        if (!cancelled) setLoading(false);
-      }
-    }
-    load();
-    return () => { cancelled = true; };
-  }, [absolutePath]);
 
   // Reset scroll-restored flag when the file (or its scroll key) changes —
   // a new file means a new restoration target.
@@ -484,14 +454,12 @@ export function ProseReader({
   // the panel previously showed all notes but `handleJumpTo` only worked
   // for this-file anchors, so cross-viewer entries were no-op clicks.
 
-  const copyDisabled = content === null || loading || error !== null;
   const headerExtras = (
     <>
       <CopyButton
         text={content ?? ''}
         className="viewer-shell-copy-btn"
         title="Copy file contents"
-        disabled={copyDisabled}
       />
       {fileType === 'html' && (
         <>
@@ -560,18 +528,7 @@ export function ProseReader({
       }
     >
       <div className="prose-reader-content" ref={contentRef}>
-        {loading ? (
-          <div className="prose-reader-loading">
-            <Loader2 size={32} className="spinning" />
-            <span>Loading file...</span>
-          </div>
-        ) : error ? (
-          <div className="prose-reader-error">
-            <AlertCircle size={32} />
-            <span>{error}</span>
-            <button onClick={onClose}>Close</button>
-          </div>
-        ) : fileType === 'markdown' ? (
+        {fileType === 'markdown' ? (
           <div className="prose-reader-markdown">{renderMarkdown}</div>
         ) : fileType === 'html' && htmlViewMode === 'preview' ? (
           <div className="prose-reader-html-preview">

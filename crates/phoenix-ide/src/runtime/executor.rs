@@ -1868,6 +1868,19 @@ where
                 Err(e) => llm_error_to_outcome(e),
             };
 
+            // Task 67004: a terminal UsageLimitReached carries the
+            // structured QuotaDetails parsed from the 429 response
+            // headers. Replay it through the chunk channel as a
+            // `RateLimitSnapshot` so the codex quota store sees the
+            // limit-hit state — same channel the 200 path uses to push
+            // per-turn snapshots (see `llm/openai.rs`
+            // `complete_streaming`). The ErrorBanner reads from the
+            // same store to render reset/credits/promo alongside the
+            // plan-aware message.
+            if let LlmOutcome::UsageLimitReached { ref details, .. } = llm_outcome {
+                let _ = chunk_tx.send(crate::llm::TokenChunk::RateLimitSnapshot(details.clone()));
+            }
+
             // Happens-before barrier for task 24683: close the chunk
             // broadcast and wait for the forwarder to drain any
             // trailing tokens before the outcome (and therefore the

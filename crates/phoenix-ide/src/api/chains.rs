@@ -32,7 +32,7 @@ use tokio_stream::wrappers::BroadcastStream;
 use tokio_stream::StreamExt;
 use ts_rs::TS;
 
-use super::handlers::{run_hard_delete_cascade, AppError};
+use super::handlers::{run_archive_cascade, run_hard_delete_cascade, AppError};
 use super::types::{ConflictErrorResponse, SuccessResponse};
 use super::wire::ChainSseWireEvent;
 use super::AppState;
@@ -211,29 +211,57 @@ pub async fn set_chain_name(
     Ok(Json(view))
 }
 
-/// `POST /api/chains/:rootId/archive` — archive every member of the chain
-/// atomically. Single-member roots are not chains; the per-conversation
-/// `/archive` endpoint owns those.
+/// `POST /api/chains/:rootId/archive` — archive every member of the chain.
+/// Single-member roots are not chains; the per-conversation `/archive`
+/// endpoint owns those.
+///
+/// Performs the same resource cleanup (bash kill, tmux kill, worktree /
+/// branch removal) per member as the per-conversation archive cascade,
+/// then sets `archived = 1` on each member row via `archive_conversation`.
+/// Pre-checks every member's busy state up front and refuses the whole
+/// operation if any member is busy (no partial cleanup).
+///
+/// **Not atomic.** Side effects + DB writes happen per member. If a later
+/// member errors (e.g. TOCTOU-races into busy after the precheck), earlier
+/// members may already be cleaned up + archived while later members are
+/// untouched. The cascade itself can't be atomic (worktree/tmux kills are
+/// non-transactional), and we don't wrap the per-row `archived = 1` writes
+/// in a transaction either — keeping cleanup and the flag flip in lockstep
+/// per member is more useful than rolling back the flag while the resources
+/// are gone. Same shape as `delete_chain_handler`.
 pub async fn archive_chain_handler(
     State(state): State<AppState>,
     Path(root_id): Path<String>,
 ) -> Result<Json<SuccessResponse>, AppError> {
     validate_chain_root(&state, &root_id).await?;
-    state.db.archive_chain(&root_id).await.map_err(db_to_app)?;
-    Ok(Json(SuccessResponse { success: true }))
-}
 
-/// `POST /api/chains/:rootId/unarchive`
-pub async fn unarchive_chain_handler(
-    State(state): State<AppState>,
-    Path(root_id): Path<String>,
-) -> Result<Json<SuccessResponse>, AppError> {
-    validate_chain_root(&state, &root_id).await?;
-    state
+    let member_ids = state
         .db
-        .unarchive_chain(&root_id)
+        .chain_members_forward(&root_id)
         .await
         .map_err(db_to_app)?;
+
+    for id in &member_ids {
+        let conv = state.db.get_conversation(id).await.map_err(db_to_app)?;
+        if conv.state.is_busy() {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                format!(
+                    "Cannot archive chain: member {id} is busy. Cancel the in-flight \
+                     operation first, then retry.",
+                ),
+                "cancel_first",
+            ))));
+        }
+    }
+
+    // TOCTOU note: the busy precheck is best-effort. Same shape as the
+    // delete-chain handler — a member can transition to busy after the
+    // loop and before its cascade runs, in which case `run_archive_cascade`
+    // returns 409 mid-iteration with earlier members already cleaned up.
+    for id in &member_ids {
+        run_archive_cascade(&state, id).await?;
+    }
+
     Ok(Json(SuccessResponse { success: true }))
 }
 

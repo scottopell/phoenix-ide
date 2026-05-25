@@ -4,7 +4,8 @@ use crate::db::{ErrorKind, ImageData, ToolResult};
 use serde::{Deserialize, Serialize};
 
 /// A steering message that has been queued for delivery when the conversation
-/// next reaches `Idle`. Stored as JSON in `conversations.steering_queue`.
+/// next reaches `Idle`. Persisted as JSON inside a [`SteeringQueueEnvelope`]
+/// in `conversations.steering_queue`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SteerEntry {
     pub text: String,
@@ -13,6 +14,83 @@ pub struct SteerEntry {
     pub message_id: String,
     pub user_agent: Option<String>,
     pub skill_invocation: Option<crate::skills::SkillInvocation>,
+}
+
+/// Versioned on-disk envelope around the FIFO steering queue.
+///
+/// `conversations.steering_queue` is a JSON-in-TEXT column. A future
+/// schema evolution (renamed field, removed field, semantically-changed
+/// field) cannot use `#[serde(default)]` on a flat struct because that
+/// silently drops fields old rows do not carry — the read path then
+/// loses the user's pending queue with no log trace. The versioned
+/// envelope makes evolution structural: a `V2` variant added later
+/// forces a new match arm in [`SteeringQueueEnvelope::into_entries`],
+/// so existing rows tagged `V1` cannot be silently misinterpreted.
+///
+/// Wire form (V1):
+///   `{"v": "v1", "entries": [SteerEntry, …]}`
+///
+/// Back-compat: pre-envelope rows persisted a bare JSON array
+/// (`[]` or `[SteerEntry, …]`). [`SteeringQueueEnvelope::from_json`]
+/// accepts both shapes; every write goes out as the envelope, so a
+/// touched row is upgraded irreversibly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "v", rename_all = "snake_case")]
+pub enum SteeringQueueEnvelope {
+    V1 { entries: Vec<SteerEntry> },
+}
+
+impl SteeringQueueEnvelope {
+    /// Extract the in-memory queue, regardless of which persisted version
+    /// produced it. New envelope variants added here will fail to compile
+    /// at every reader site until they handle the new case — preventing
+    /// the silent-loss bug class.
+    pub fn into_entries(self) -> Vec<SteerEntry> {
+        match self {
+            Self::V1 { entries } => entries,
+        }
+    }
+
+    /// Parse the persisted column value. Accepts both the versioned
+    /// envelope and a pre-envelope bare JSON array (which is treated as
+    /// V1). Failure is propagated rather than swallowed; callers decide
+    /// whether to default to empty after logging.
+    pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
+        let value: serde_json::Value = serde_json::from_str(s)?;
+        if value.is_array() {
+            // Pre-envelope (bare array) — adopt as V1.
+            let entries: Vec<SteerEntry> = serde_json::from_value(value)?;
+            return Ok(Self::V1 { entries });
+        }
+        serde_json::from_value(value)
+    }
+
+    /// Serialise the queue in the current envelope variant.
+    pub fn to_json(entries: &[SteerEntry]) -> Result<String, serde_json::Error> {
+        let env = Self::V1 {
+            entries: entries.to_vec(),
+        };
+        serde_json::to_string(&env)
+    }
+}
+
+/// Decode a steering-queue column value, logging a `warn!` and
+/// returning an empty queue on parse failure rather than silently
+/// dropping the user's pending steers. The conversation-id is included
+/// in the log line so the failure is diagnosable from a single grep.
+pub fn decode_steering_queue(conversation_id: &str, raw: &str) -> Vec<SteerEntry> {
+    match SteeringQueueEnvelope::from_json(raw) {
+        Ok(env) => env.into_entries(),
+        Err(e) => {
+            tracing::warn!(
+                conversation_id = %conversation_id,
+                error = %e,
+                raw_len = raw.len(),
+                "failed to decode conversations.steering_queue; treating as empty (the user's pending steers for this conversation are dropped)"
+            );
+            Vec::new()
+        }
+    }
 }
 use crate::llm::{ContentBlock, Usage};
 use crate::state_machine::state::{
@@ -105,8 +183,16 @@ pub enum Event {
     UserTriggerContinuation,
 
     // Task approval events (REQ-BED-028)
-    /// User responded to a proposed task plan
-    TaskApprovalResponse {
+    /// User responded to a proposed task plan.
+    ///
+    /// Matches the `TaskApprovalDecided(conversation, decision)` trigger in
+    /// `specs/bedrock/bedrock.allium` (the surface's `provides:` block plus
+    /// the four `UserApprovesTaskCurrentConversation` /
+    /// `UserApprovesTaskFreshWorkConversation` / `UserProvidesFeedback` /
+    /// `UserRejectsTask` rules). The HTTP wire type `TaskApprovalResponse`
+    /// in `api/types.rs` is unrelated — it's the response body, not the
+    /// lifecycle event.
+    TaskApprovalDecided {
         outcome: TaskApprovalOutcome,
     },
     /// Internal completion event emitted after fresh task approval creates the
@@ -208,7 +294,7 @@ impl Event {
             Event::ContinuationResponse { .. } => "ContinuationResponse",
             Event::ContinuationFailed { .. } => "ContinuationFailed",
             Event::UserTriggerContinuation => "UserTriggerContinuation",
-            Event::TaskApprovalResponse { .. } => "TaskApprovalResponse",
+            Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
@@ -294,7 +380,7 @@ pub enum CoreEvent {
 #[derive(Debug, Clone)]
 #[allow(dead_code)] // Variants used by split transition functions
 pub enum ParentOnlyEvent {
-    TaskApprovalResponse {
+    TaskApprovalDecided {
         outcome: TaskApprovalOutcome,
     },
     TaskHandoffComplete {
@@ -451,8 +537,8 @@ impl TryFrom<Event> for ParentEvent {
                 }))
             }
             // Parent-only events
-            Event::TaskApprovalResponse { outcome } => {
-                Ok(ParentEvent::Parent(ParentOnlyEvent::TaskApprovalResponse {
+            Event::TaskApprovalDecided { outcome } => {
+                Ok(ParentEvent::Parent(ParentOnlyEvent::TaskApprovalDecided {
                     outcome,
                 }))
             }
@@ -591,7 +677,7 @@ impl TryFrom<Event> for SubAgentEvent {
             // SteerDrainedUserMessages is parent-only: steering is a parent-
             // conversation feature, and the executor's drain detector guards
             // against firing for sub-agents.
-            Event::TaskApprovalResponse { .. }
+            Event::TaskApprovalDecided { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
             | Event::CredentialBecameAvailable
@@ -635,7 +721,7 @@ impl ParentEvent {
         match self {
             ParentEvent::Core(e) => e.variant_name(),
             ParentEvent::Parent(e) => match e {
-                ParentOnlyEvent::TaskApprovalResponse { .. } => "TaskApprovalResponse",
+                ParentOnlyEvent::TaskApprovalDecided { .. } => "TaskApprovalDecided",
                 ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
                 ParentOnlyEvent::CredentialBecameAvailable => "CredentialBecameAvailable",
@@ -656,5 +742,112 @@ impl SubAgentEvent {
                 SubAgentOnlyEvent::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod spec_runtime_name_alignment_tests {
+    use super::*;
+    use crate::state_machine::state::TaskApprovalOutcome;
+
+    /// Lock the event variant name to the spec trigger name. The four
+    /// `UserApprovesTaskCurrentConversation` / `UserApprovesTaskFreshWorkConversation`
+    /// / `UserProvidesFeedback` / `UserRejectsTask` rules in
+    /// `specs/bedrock/bedrock.allium` subscribe to
+    /// `TaskApprovalDecided(conversation, decision)`; the bedrock + auth
+    /// surfaces declare it under `provides:`. The Rust event name and that
+    /// spec name must match, or the audit-class drift task 02684 caught
+    /// returns. Renaming one without the other regresses; this test fails
+    /// at compile time (variant) and runtime (string) if so.
+    #[test]
+    fn task_approval_event_name_matches_spec_trigger() {
+        let event = Event::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Rejected,
+        };
+        assert_eq!(event.variant_name(), "TaskApprovalDecided");
+
+        let parent_only = ParentOnlyEvent::TaskApprovalDecided {
+            outcome: TaskApprovalOutcome::Rejected,
+        };
+        let parent_event = ParentEvent::Parent(parent_only);
+        assert_eq!(parent_event.variant_name(), "TaskApprovalDecided");
+    }
+}
+
+#[cfg(test)]
+mod steering_queue_envelope_tests {
+    use super::{decode_steering_queue, SteerEntry, SteeringQueueEnvelope};
+
+    fn fixture() -> SteerEntry {
+        SteerEntry {
+            text: "do the thing".into(),
+            llm_text: None,
+            images: vec![],
+            message_id: "m-1".into(),
+            user_agent: None,
+            skill_invocation: None,
+        }
+    }
+
+    #[test]
+    fn round_trips_through_v1_envelope() {
+        let entries = vec![fixture()];
+        let json = SteeringQueueEnvelope::to_json(&entries).unwrap();
+        assert!(
+            json.contains(r#""v":"v1""#),
+            "writes must tag with v=v1: {json}"
+        );
+        let decoded = decode_steering_queue("conv-1", &json);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].message_id, "m-1");
+    }
+
+    /// Pre-envelope rows persisted a bare JSON array. Readers must
+    /// accept it so the rollout does not drop existing queues.
+    #[test]
+    fn accepts_pre_envelope_bare_array() {
+        let entries = vec![fixture()];
+        let bare = serde_json::to_string(&entries).unwrap();
+        assert!(bare.starts_with('['));
+        let decoded = decode_steering_queue("conv-2", &bare);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].message_id, "m-1");
+    }
+
+    /// The default column value `[]` parses as an empty queue.
+    #[test]
+    fn empty_bare_array_decodes_as_empty() {
+        assert!(decode_steering_queue("conv-3", "[]").is_empty());
+    }
+
+    /// The empty envelope encoding likewise parses to an empty queue.
+    #[test]
+    fn empty_v1_envelope_decodes_as_empty() {
+        assert!(decode_steering_queue("conv-4", r#"{"v":"v1","entries":[]}"#).is_empty());
+    }
+
+    /// Malformed JSON in the column is the bug-class regression guard:
+    /// the previous code did `serde_json::from_str(...).ok().unwrap_or_default()`,
+    /// silently substituting an empty queue with no trace. The new
+    /// path surfaces a `warn!` and still returns an empty queue so the
+    /// runtime stays alive; the warn line is the diagnostic.
+    #[test]
+    fn corrupt_input_returns_empty_without_panicking() {
+        assert!(decode_steering_queue("conv-5", "not json").is_empty());
+        assert!(decode_steering_queue("conv-6", r#"{"v":"v999","entries":[]}"#).is_empty());
+    }
+
+    /// The total-match invariant: extracting entries from the envelope
+    /// is a `match` over the persisted versions. Adding a new variant
+    /// in `SteeringQueueEnvelope` forces an arm here at compile time;
+    /// this test exists to lock the property in (the body always
+    /// succeeds — the static type checker is the actual assertion).
+    #[test]
+    fn into_entries_match_is_exhaustive() {
+        let env = SteeringQueueEnvelope::V1 {
+            entries: vec![fixture()],
+        };
+        let entries = env.into_entries();
+        assert_eq!(entries.len(), 1);
     }
 }

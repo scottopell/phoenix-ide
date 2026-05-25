@@ -207,7 +207,6 @@ export function SharePage() {
           onRetry={() => {}}
           onOpenFile={undefined}
           conversationId={conversation.id}
-          streamingBuffer={null}
         />
         <BreadcrumbBar breadcrumbs={breadcrumbs} visible={breadcrumbs.length > 0} />
       </main>

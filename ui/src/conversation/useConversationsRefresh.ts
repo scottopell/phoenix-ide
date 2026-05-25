@@ -6,6 +6,7 @@ import { api } from '../api';
 import { cacheDB } from '../cache';
 import { clearLastViewer } from '../storage/lastViewerStorage';
 import { clearDraftStorage } from '../hooks/useDraft';
+import { UnitHeightCache } from './unitHeightCache';
 
 const POLL_INTERVAL_MS = 5000;
 
@@ -190,6 +191,10 @@ export function useConversationsRefreshDriver(): void {
       // localStorage drafts are keyed by conversationId, not slug — clear
       // by id regardless of whether we still hold an atom for the slug.
       clearDraftStorage(detail.conversationId);
+      // sessionStorage unit-height cache is also keyed by conversationId —
+      // without this clear, hard-deleted conversations leak per-unit
+      // entries for the rest of the browser session.
+      UnitHeightCache.clearConversation(detail.conversationId);
       // Always re-poll — the deleted row may have been part of a chain
       // whose other members' counts are now stale.
       void refreshRef.current();

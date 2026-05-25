@@ -22,6 +22,8 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { render, screen, act } from '@testing-library/react';
 import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import { SharePage } from './SharePage';
+import { ConversationContext } from '../conversation/ConversationContext';
+import { ConversationStore } from '../conversation/ConversationStore';
 
 type Listener = (event: MessageEvent) => void;
 
@@ -74,12 +76,18 @@ function inProdMode<T>(fn: () => T): T {
 }
 
 function renderSharePage() {
+  // SharePage renders <MessageList>, which now subscribes to the
+  // conversation store via useStreamingStartedAt. Provide an empty
+  // store for the selector to short-circuit cleanly.
+  const store = new ConversationStore();
   return render(
-    <MemoryRouter initialEntries={['/share/tok-1']}>
-      <Routes>
-        <Route path="/share/:token" element={<SharePage />} />
-      </Routes>
-    </MemoryRouter>
+    <ConversationContext.Provider value={store}>
+      <MemoryRouter initialEntries={['/share/tok-1']}>
+        <Routes>
+          <Route path="/share/:token" element={<SharePage />} />
+        </Routes>
+      </MemoryRouter>
+    </ConversationContext.Provider>
   );
 }
 

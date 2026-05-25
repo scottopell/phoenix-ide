@@ -1,9 +1,18 @@
 //! Structured quota and rate-limit state extracted from the codex backend.
 //!
 //! The codex backend (`chatgpt.com/backend-api/codex`) returns plan and quota
-//! state in both the 429 response body (`plan_type`, `resets_at`) and the
-//! `x-codex-*` response headers (window snapshots, credits, promo). Phoenix
-//! parses both to render plan-aware terminal errors.
+//! state in `x-codex-*` response headers on every Responses call — both 200
+//! and 429. The full set lives in headers: window snapshots
+//! (`primary`/`secondary` used-percent / window-minutes / reset-at), plan
+//! type (`x-codex-plan-type`), active limit (`x-codex-active-limit`),
+//! credits (`x-codex-credits-*`), promo message (`x-codex-promo-message`).
+//! The 429 JSON body additionally provides `resets_at` (no header
+//! equivalent) and historically also `plan_type` (now also in a header).
+//!
+//! Phoenix uses the HTTP/SSE transport against this backend. The WebSocket
+//! variant of the same endpoint emits a richer mid-stream `codex.rate_limits`
+//! frame (consumed by codex CLI) — the HTTP path never sees that frame, so
+//! the response headers are the single source of truth here.
 //!
 //! These types intentionally mirror the codex CLI's `RateLimitSnapshot` shape
 //! (`codex-rs/protocol/src/protocol.rs`) without depending on the
@@ -50,6 +59,51 @@ pub struct CreditsSnapshot {
 
 const ACTIVE_LIMIT_HEADER: &str = "x-codex-active-limit";
 const PROMO_MESSAGE_HEADER: &str = "x-codex-promo-message";
+const PLAN_TYPE_HEADER: &str = "x-codex-plan-type";
+
+/// Build a complete `QuotaDetails` snapshot from a successful codex-bridge
+/// response's headers. Returns `None` only when the response carries no
+/// recognized `x-codex-*` quota data at all (e.g. an account on a plan that
+/// doesn't surface quota state).
+pub fn quota_from_codex_response_headers(headers: &HeaderMap) -> Option<QuotaDetails> {
+    // `x-codex-active-limit` is informational about the currently binding
+    // tier name (e.g. "premium") — it does NOT control the prefix of the
+    // window-bucket headers, which always live under `x-codex-*`. So we
+    // always parse with the default prefix and use active-limit only as
+    // metadata. (The named-family `parse_rate_limit_for_limit(_, Some(id))`
+    // form is still used by the 429 path where the body carries an explicit
+    // `limit_name` that does change the prefix.)
+    let limit_id = parse_active_limit(headers);
+    let (primary, secondary, limit_name) = parse_rate_limit_for_limit(headers, None);
+    let credits = parse_credits_snapshot(headers);
+    let plan_type = parse_header_str(headers, PLAN_TYPE_HEADER)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let promo_message = parse_promo_message(headers);
+
+    let any_data = primary.is_some()
+        || secondary.is_some()
+        || credits.is_some()
+        || plan_type.is_some()
+        || limit_id.is_some()
+        || limit_name.is_some()
+        || promo_message.is_some();
+    if !any_data {
+        return None;
+    }
+
+    Some(QuotaDetails {
+        plan_type,
+        resets_at: None,
+        limit_id,
+        limit_name,
+        primary,
+        secondary,
+        credits,
+        promo_message,
+    })
+}
 
 /// Parses the `x-codex-*` rate-limit headers for the active limit id into a
 /// `(primary, secondary, limit_name)` triple. `limit_id` should match the
@@ -88,86 +142,6 @@ pub fn parse_rate_limit_for_limit(
         .map(str::to_string);
 
     (primary, secondary, limit_name)
-}
-
-/// Parses a `codex.rate_limits` mid-stream SSE event payload into a
-/// `QuotaDetails` snapshot. Returns `None` if the payload is not a
-/// `codex.rate_limits` event or fails to deserialize.
-///
-/// Mirrors codex CLI's `parse_rate_limit_event` in
-/// `codex-rs/codex-api/src/rate_limits.rs:131-162`. The header path (429)
-/// populates `promo_message`, `resets_at`, and `limit_name`; the SSE path
-/// does not — those fields stay `None`.
-pub fn parse_rate_limit_event(payload: &str) -> Option<QuotaDetails> {
-    #[derive(Deserialize)]
-    struct EventWindow {
-        used_percent: f64,
-        window_minutes: Option<i64>,
-        reset_at: Option<i64>,
-    }
-
-    #[derive(Deserialize)]
-    struct EventDetails {
-        primary: Option<EventWindow>,
-        secondary: Option<EventWindow>,
-    }
-
-    #[derive(Deserialize)]
-    struct EventCredits {
-        has_credits: bool,
-        unlimited: bool,
-        balance: Option<String>,
-    }
-
-    #[derive(Deserialize)]
-    struct Event {
-        #[serde(rename = "type")]
-        kind: String,
-        plan_type: Option<String>,
-        rate_limits: Option<EventDetails>,
-        credits: Option<EventCredits>,
-        metered_limit_name: Option<String>,
-        limit_name: Option<String>,
-    }
-
-    let event: Event = serde_json::from_str(payload).ok()?;
-    if event.kind != "codex.rate_limits" {
-        return None;
-    }
-
-    let map_window = |w: EventWindow| RateLimitWindow {
-        used_percent: w.used_percent,
-        window_minutes: w.window_minutes,
-        resets_at: w.reset_at,
-    };
-
-    let (primary, secondary) = event.rate_limits.map_or((None, None), |d| {
-        (d.primary.map(map_window), d.secondary.map(map_window))
-    });
-
-    let credits = event.credits.map(|c| CreditsSnapshot {
-        has_credits: c.has_credits,
-        unlimited: c.unlimited,
-        balance: c.balance,
-    });
-
-    let limit_id = event
-        .metered_limit_name
-        .or(event.limit_name)
-        .map(|n| n.trim().to_ascii_lowercase().replace('-', "_"))
-        .filter(|n| !n.is_empty())
-        .or_else(|| Some("codex".to_string()));
-
-    Some(QuotaDetails {
-        plan_type: event.plan_type,
-        resets_at: None,
-        limit_id,
-        limit_name: None,
-        primary,
-        secondary,
-        credits,
-        promo_message: None,
-    })
 }
 
 pub fn parse_active_limit(headers: &HeaderMap) -> Option<String> {
@@ -324,80 +298,66 @@ mod tests {
     }
 
     #[test]
-    fn parse_rate_limit_event_full_payload() {
-        let payload = r#"{
-            "type": "codex.rate_limits",
-            "plan_type": "plus",
-            "rate_limits": {
-                "primary":   { "used_percent": 12.5, "window_minutes": 60,   "reset_at": 1704069000 },
-                "secondary": { "used_percent": 87.4, "window_minutes": 10080,"reset_at": 1704672000 }
-            },
-            "credits": { "has_credits": true, "unlimited": false, "balance": "$3.42" },
-            "metered_limit_name": "codex"
-        }"#;
-        let q = parse_rate_limit_event(payload).expect("parses");
+    fn quota_from_response_headers_full() {
+        let mut headers = HeaderMap::new();
+        headers.insert(PLAN_TYPE_HEADER, HeaderValue::from_static("plus"));
+        headers.insert(ACTIVE_LIMIT_HEADER, HeaderValue::from_static("premium"));
+        headers.insert(
+            "x-codex-primary-used-percent",
+            HeaderValue::from_static("12.5"),
+        );
+        headers.insert(
+            "x-codex-primary-window-minutes",
+            HeaderValue::from_static("300"),
+        );
+        headers.insert(
+            "x-codex-primary-reset-at",
+            HeaderValue::from_static("1779756466"),
+        );
+        headers.insert(
+            "x-codex-secondary-used-percent",
+            HeaderValue::from_static("48"),
+        );
+        headers.insert(
+            "x-codex-secondary-window-minutes",
+            HeaderValue::from_static("10080"),
+        );
+        headers.insert(
+            "x-codex-credits-has-credits",
+            HeaderValue::from_static("false"),
+        );
+        headers.insert(
+            "x-codex-credits-unlimited",
+            HeaderValue::from_static("false"),
+        );
+
+        let q = quota_from_codex_response_headers(&headers).expect("snapshot");
         assert_eq!(q.plan_type.as_deref(), Some("plus"));
+        assert_eq!(q.limit_id.as_deref(), Some("premium"));
         let p = q.primary.expect("primary");
         assert_eq!(p.used_percent, 12.5);
-        assert_eq!(p.window_minutes, Some(60));
-        assert_eq!(p.resets_at, Some(1704069000));
+        assert_eq!(p.window_minutes, Some(300));
+        assert_eq!(p.resets_at, Some(1779756466));
         let s = q.secondary.expect("secondary");
-        assert_eq!(s.used_percent, 87.4);
+        assert_eq!(s.used_percent, 48.0);
+        assert_eq!(s.window_minutes, Some(10080));
         let c = q.credits.expect("credits");
-        assert!(c.has_credits);
+        assert!(!c.has_credits);
         assert!(!c.unlimited);
-        assert_eq!(c.balance.as_deref(), Some("$3.42"));
-        assert_eq!(q.limit_id.as_deref(), Some("codex"));
-        assert!(q.limit_name.is_none());
-        assert!(q.promo_message.is_none());
-        assert!(q.resets_at.is_none());
     }
 
     #[test]
-    fn parse_rate_limit_event_minimal_primary_only() {
-        let payload = r#"{
-            "type": "codex.rate_limits",
-            "rate_limits": { "primary": { "used_percent": 50.0 } }
-        }"#;
-        let q = parse_rate_limit_event(payload).expect("parses");
-        let p = q.primary.expect("primary");
-        assert_eq!(p.used_percent, 50.0);
-        assert!(p.window_minutes.is_none());
-        assert!(p.resets_at.is_none());
-        assert!(q.secondary.is_none());
-        assert!(q.credits.is_none());
-        assert!(q.plan_type.is_none());
-        assert_eq!(q.limit_id.as_deref(), Some("codex"));
+    fn quota_from_response_headers_empty_returns_none() {
+        let headers = HeaderMap::new();
+        assert!(quota_from_codex_response_headers(&headers).is_none());
     }
 
     #[test]
-    fn parse_rate_limit_event_rejects_wrong_type() {
-        let payload = r#"{ "type": "response.completed" }"#;
-        assert!(parse_rate_limit_event(payload).is_none());
-    }
-
-    #[test]
-    fn parse_rate_limit_event_rejects_invalid_json() {
-        assert!(parse_rate_limit_event("not-json").is_none());
-    }
-
-    #[test]
-    fn parse_rate_limit_event_falls_back_to_limit_name_field() {
-        let payload = r#"{
-            "type": "codex.rate_limits",
-            "limit_name": "Codex-Other"
-        }"#;
-        let q = parse_rate_limit_event(payload).expect("parses");
-        assert_eq!(q.limit_id.as_deref(), Some("codex_other"));
-    }
-
-    #[test]
-    fn parse_rate_limit_event_no_rate_limits_field() {
-        let payload = r#"{ "type": "codex.rate_limits", "plan_type": "free" }"#;
-        let q = parse_rate_limit_event(payload).expect("parses");
+    fn quota_from_response_headers_plan_type_alone_returns_some() {
+        let mut headers = HeaderMap::new();
+        headers.insert(PLAN_TYPE_HEADER, HeaderValue::from_static("free"));
+        let q = quota_from_codex_response_headers(&headers).expect("snapshot");
         assert_eq!(q.plan_type.as_deref(), Some("free"));
         assert!(q.primary.is_none());
-        assert!(q.secondary.is_none());
-        assert_eq!(q.limit_id.as_deref(), Some("codex"));
     }
 }

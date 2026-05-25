@@ -723,20 +723,20 @@ mod random_walk {
             },
 
             ConvState::AwaitingTaskApproval { .. } => match rng.gen_range(0..5) {
-                0 => Event::TaskApprovalResponse {
+                0 => Event::TaskApprovalDecided {
                     outcome: TaskApprovalOutcome::Approved {
                         handoff: crate::state_machine::state::TaskApprovalHandoff::ContinueInCurrentConversation,
                     },
                 },
-                1 => Event::TaskApprovalResponse {
+                1 => Event::TaskApprovalDecided {
                     outcome: TaskApprovalOutcome::Approved {
                         handoff: crate::state_machine::state::TaskApprovalHandoff::StartFreshWorkConversation,
                     },
                 },
-                2 => Event::TaskApprovalResponse {
+                2 => Event::TaskApprovalDecided {
                     outcome: TaskApprovalOutcome::Rejected,
                 },
-                3 => Event::TaskApprovalResponse {
+                3 => Event::TaskApprovalDecided {
                     outcome: TaskApprovalOutcome::FeedbackProvided {
                         annotations: random_string(rng, 20),
                     },

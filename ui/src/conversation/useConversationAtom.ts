@@ -1,5 +1,5 @@
 import { useCallback, useContext, useSyncExternalStore, useRef, type Dispatch } from 'react';
-import type { ConversationAtom, SSEAction } from './atom';
+import type { ConversationAtom, SSEAction, StreamingBuffer } from './atom';
 import type { Conversation } from '../api';
 import { ConversationContext } from './ConversationContext';
 import { conversationListsEqual } from '../utils/conversationDiff';
@@ -144,6 +144,61 @@ export function useConversationsList(): {
     lastRef.current = next;
     return next;
   }, [store]);
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+/**
+ * Returns the streaming buffer for `slug`, or null when no buffer is
+ * active. Reference-stable: the atom's `streamingBuffer` field is the
+ * snapshot; `useSyncExternalStore` skips re-renders when the reference
+ * is unchanged (atom mutations to other fields like `phase` or
+ * `messages` don't cause this hook to re-render — only buffer
+ * mutations do, which is exactly the per-token re-render the consuming
+ * `<StreamingMessage>` leaf needs).
+ *
+ * This is the seam that lets `<MessageList>` stop receiving
+ * `streamingBuffer` as a prop: the leaf subscribes directly, the
+ * historical render tree no longer participates in per-token updates.
+ */
+export function useStreamingBuffer(slug: string): StreamingBuffer | null {
+  const store = useConversationStore();
+
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => store.getSnapshot(slug).streamingBuffer ?? null,
+    [store, slug],
+  );
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+/**
+ * Returns the streaming buffer's `startedAt` for `slug`, or null when
+ * no buffer is active. Re-renders the consumer on streaming-start,
+ * streaming-end, AND streaming-restart (a new buffer started with a
+ * fresh `startedAt`), because `Object.is` comparison on the returned
+ * number distinguishes those transitions.
+ *
+ * Use this to derive a session-stable identity for a streaming view
+ * (e.g., a React `key` that forces a fresh component instance on each
+ * new streaming session). The boolean "is streaming active right now"
+ * is just `useStreamingStartedAt(slug) !== null`.
+ */
+export function useStreamingStartedAt(slug: string | undefined): number | null {
+  const store = useConversationStore();
+
+  const subscribe = useCallback(
+    (listener: () => void) => (slug ? store.subscribe(slug, listener) : () => {}),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => (slug ? store.getSnapshot(slug).streamingBuffer?.startedAt ?? null : null),
+    [store, slug],
+  );
 
   return useSyncExternalStore(subscribe, getSnapshot);
 }

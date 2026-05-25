@@ -1,110 +1,280 @@
-import { useState, useRef, useLayoutEffect, useEffect, type RefObject } from 'react';
+import {
+  useState,
+  useRef,
+  useLayoutEffect,
+  useEffect,
+  useMemo,
+  useCallback,
+  useSyncExternalStore,
+  type RefObject,
+} from 'react';
+import type { HistoricalUnit } from '../conversation/renderUnits';
+import type { UnitHeightCache } from '../conversation/unitHeightCache';
 
 /**
- * Bottom-anchored render-virtualization window.
+ * Bottom-anchored render-virtualization window over a typed
+ * `HistoricalUnit[]`.
  *
- * Only the last `INITIAL_WINDOW` messages render as real subtrees on mount;
- * everything older collapses into ONE estimated-height top spacer. Because the
- * user is pinned to the bottom on a conversation switch, that spacer is always
- * OFFSCREEN above the viewport — its rough `COLLAPSED_EST_PX` height only
- * affects the scrollbar thumb, never viewport content. This is what structurally
- * prevents the two rejected-v1 regressions:
- *   1. "switch not pinned to bottom" — the newest message is always inside the
- *      initial window (indices [count-INITIAL_WINDOW, count)), so it is a REAL
- *      row the ResizeObserver scroll-to-bottom can land on.
- *   2. "estimate -> measured scroll jump" — only REAL measured rows ever enter
- *      the viewport. Revealing older rows on scroll-up prepends REAL rows and
- *      shrinks the spacer; the net height delta is applied to scrollTop in a
- *      layout effect (exact compensation, the revealed rows are not estimated).
- *      The only estimated geometry is the offscreen top spacer.
+ * The window operates on render units, not raw messages — tool messages
+ * are owned by their `agent_turn` unit and never appear here. The
+ * rendered DOM is exactly `historicalUnits.slice(firstRenderedUnitIndex)`
+ * preceded by one spacer div; everything older collapses into that
+ * spacer.
+ *
+ * Boundary expansion uses an `IntersectionObserver` rooted at the scroll
+ * container, observing a sentinel placed between the spacer and the
+ * rendered slice. The sentinel is attached via a *callback ref* so the
+ * observer is wired the instant the DOM node mounts — even when it
+ * mounts on a later render than the hook's first run (e.g., a
+ * conversation that started empty and grew past the initial window).
+ *
+ * Spacer height is measured-when-cached, kind-estimated otherwise. The
+ * window applies exact scroll compensation in two distinct cases:
+ *   - expansion (firstRenderedUnitIndex decreases): scrollHeight is
+ *     captured before the state mutation, delta is applied after commit
+ *   - spacer-height changes from measured-height writes (cache version
+ *     bump): a separate compensation effect tracks spacerHeight changes
+ *     and adjusts scrollTop by the same delta so the visible content
+ *     stays anchored when ResizeObserver-driven measurements settle
+ *
+ * See specs/messagelist-render-units/windowing.allium for the window
+ * lifecycle state machine; this file is the React-bound implementation.
  */
 
 export const INITIAL_WINDOW = 12;
 export const EXPAND_BATCH = 12;
-export const EXPAND_TRIGGER_PX = 600;
-export const COLLAPSED_EST_PX = 360;
+export const MAX_RENDERED_UNITS = 48;
+export const SENTINEL_ROOT_MARGIN = '600px 0px 0px 0px';
+export const BOTTOM_SENTINEL_ROOT_MARGIN = '0px 0px 600px 0px';
 export const RESTORE_OVERSCAN = 4;
 
-interface UseBottomAnchoredWindowArgs {
-  messageCount: number;
-  conversationId: string | undefined;
-  scrollRootRef: RefObject<HTMLElement | null>;
-  /**
-   * Saved scroll pixel offset for REQ-CONV-013 restore, read synchronously on
-   * the restoring mount. The initial window widens so the estimated spacer ends
-   * before the saved offset, with extra real rows above the viewport as a buffer.
-   * This preserves bottom-window virtualization for common bottom-pinned revisits
-   * while avoiding a restored viewport that lands wholly inside the spacer. The
-   * render-units follow-up will replace this estimate-bound compromise with
-   * measured render-unit geometry.
-   */
-  savedScrollPos?: number | null;
-}
-
-interface UseBottomAnchoredWindowResult {
-  /** Messages at index >= this render REAL; [0, firstRenderedIndex) collapse to one spacer. */
-  firstRenderedIndex: number;
-  /** Per-collapsed-message estimated height for the top spacer only. */
-  collapsedEstPx: number;
-}
-
-function computeDefaultStart(messageCount: number): number {
-  return Math.max(0, messageCount - INITIAL_WINDOW);
-}
+export const KIND_ESTIMATES: Record<HistoricalUnit['kind'], number> = {
+  user: 100,
+  skill: 80,
+  agent_turn: 400,
+  system: 100,
+};
 
 /**
- * Returns the initial `firstRenderedIndex` for a given mount, widening the
- * window when a saved scroll position must land in real content.
+ * Saved scroll position keyed by render-unit identity. Restoring by unit
+ * key + offset is structurally correct regardless of intervening
+ * row-height variation in the prefix.
+ *
+ * `unitCountAtSave` lets the restore path detect that messages arrived
+ * while the user was away (current historicalUnits.length >
+ * unitCountAtSave) so the "↓ New messages" surface can fire on return —
+ * preserving the REQ-CONV-013 affordance that the prior scrollTop+
+ * msgcount pair provided.
  */
-function computeInitialStart(
-  messageCount: number,
-  savedScrollPos: number | null | undefined,
-): number {
-  const defaultStart = computeDefaultStart(messageCount);
-  if (savedScrollPos != null) {
-    const rowsBeforeRestore = Math.floor(savedScrollPos / COLLAPSED_EST_PX);
-    return Math.max(0, Math.min(defaultStart, rowsBeforeRestore - RESTORE_OVERSCAN));
-  }
-  return defaultStart;
+export interface SavedScrollAnchor {
+  topVisibleUnitKey: string;
+  offsetWithinUnit: number;
+  /** Number of historical units present at save time. The restore
+   *  path compares this to current historicalUnits.length to detect
+   *  that messages arrived while the user was away and surface the
+   *  "↓ New messages" affordance.
+   *
+   *  Optional only because the field is forward-compatible: anchors
+   *  written by older app builds (without the field) still parse and
+   *  simply don't surface the new-messages indicator. captureAnchor
+   *  in MessageList always populates it on writes. */
+  unitCountAtSave?: number;
 }
 
+export interface UseBottomAnchoredWindowArgs {
+  historicalUnits: HistoricalUnit[];
+  conversationId: string | undefined;
+  scrollRootRef: RefObject<HTMLElement | null>;
+  /** When set and the key exists in `historicalUnits`, the initial
+   *  window widens so the anchored unit and `RESTORE_OVERSCAN` units
+   *  above it are rendered. The actual scrollTop placement is the
+   *  caller's responsibility (handled in MessageList's layout effect). */
+  savedAnchor?: SavedScrollAnchor | null;
+  /** Per-conversation measured-height cache. Spacer height uses
+   *  measured values when present, per-kind estimates otherwise. */
+  heightCache?: UnitHeightCache | null;
+}
+
+export interface UseBottomAnchoredWindowResult {
+  /** Units at index >= this render real; [0, firstRenderedUnitIndex)
+   *  collapse into the top spacer. */
+  firstRenderedUnitIndex: number;
+  /** Units at index < this render real; [lastRenderedUnitIndex, length)
+   *  collapse into the bottom spacer. */
+  lastRenderedUnitIndex: number;
+  /** Pixel height of the top spacer, computed from measured heights or
+   *  per-kind estimates over the collapsed prefix. */
+  spacerHeight: number;
+  /** Pixel height of the bottom spacer, computed from measured heights or
+   *  per-kind estimates over the collapsed suffix. */
+  bottomSpacerHeight: number;
+  /** Callback ref for the sentinel `<div aria-hidden />` placed between
+   *  the top spacer and the rendered slice. */
+  topSentinelRef: (node: HTMLDivElement | null) => void;
+  /** Callback ref for the sentinel placed between the rendered slice and
+   *  the bottom spacer. */
+  bottomSentinelRef: (node: HTMLDivElement | null) => void;
+  /** Reset the bounded range to the bottom-pinned tail window. */
+  resetToBottom: () => void;
+}
+
+/** Pure helper: where should `firstRenderedUnitIndex` start on mount?
+ *  If a savedAnchor is provided and its key exists in `units`, widen the
+ *  window so the anchored unit (plus `RESTORE_OVERSCAN` units above) is
+ *  rendered. Otherwise default to bottom-pin (last `INITIAL_WINDOW`). */
+export function computeInitialStart(
+  units: HistoricalUnit[],
+  savedAnchor: SavedScrollAnchor | null | undefined,
+): number {
+  if (savedAnchor) {
+    const idx = units.findIndex((u) => u.key === savedAnchor.topVisibleUnitKey);
+    if (idx >= 0) {
+      return Math.max(0, idx - RESTORE_OVERSCAN);
+    }
+  }
+  return Math.max(0, units.length - INITIAL_WINDOW);
+}
+
+/** Pure helper: sum measured-or-estimated heights over the collapsed
+ *  prefix. `getHeight` returns the measured value for a unit key when
+ *  available; missing entries fall back to the per-kind estimate. */
+export function computeSpacerHeight(
+  units: HistoricalUnit[],
+  firstIdx: number,
+  getHeight: (key: string) => number | undefined = () => undefined,
+): number {
+  return computeRangeHeight(units, 0, firstIdx, getHeight);
+}
+
+export function computeRangeHeight(
+  units: HistoricalUnit[],
+  startIdx: number,
+  endIdx: number,
+  getHeight: (key: string) => number | undefined = () => undefined,
+): number {
+  let h = 0;
+  const start = Math.max(0, Math.min(startIdx, units.length));
+  const end = Math.max(start, Math.min(endIdx, units.length));
+  for (let i = start; i < end; i++) {
+    const unit = units[i]!;
+    const measured = getHeight(unit.key);
+    h += measured ?? KIND_ESTIMATES[unit.kind];
+  }
+  return h;
+}
+
+function computeInitialEnd(
+  units: HistoricalUnit[],
+  firstIdx: number,
+  savedAnchor: SavedScrollAnchor | null | undefined,
+): number {
+  if (savedAnchor) {
+    const idx = units.findIndex((u) => u.key === savedAnchor.topVisibleUnitKey);
+    if (idx >= 0) {
+      return Math.min(
+        units.length,
+        Math.max(idx + 1 + RESTORE_OVERSCAN, firstIdx + INITIAL_WINDOW),
+      );
+    }
+  }
+  return units.length;
+}
+
+const noopSubscribe = (): (() => void) => () => {};
+
 export function useBottomAnchoredWindow({
-  messageCount,
+  historicalUnits,
   conversationId,
   scrollRootRef,
-  savedScrollPos,
+  savedAnchor,
+  heightCache,
 }: UseBottomAnchoredWindowArgs): UseBottomAnchoredWindowResult {
-  // The DEFAULT window is DERIVED from messageCount every render (messages
-  // load async AFTER mount: messageCount goes 0 -> N, and a one-shot useState
-  // init would freeze firstRenderedIndex at computeInitialStart(0)=0 and
-  // never virtualize — the v2 init-timing bug). Only an explicit user
-  // scroll-up "pins" the window to a lower index; until then it tracks the
-  // bottom reactively.
-  const [userExpandedWindow, setUserExpandedWindow] = useState<{
+  const [windowRange, setWindowRange] = useState<{
     conversationId: string | undefined;
-    index: number;
+    first: number;
+    last: number;
   } | null>(null);
+
+  const [topSentinelEl, setTopSentinelEl] = useState<HTMLDivElement | null>(null);
+  const topSentinelRef = useCallback((node: HTMLDivElement | null) => {
+    setTopSentinelEl(node);
+  }, []);
+  const [bottomSentinelEl, setBottomSentinelEl] = useState<HTMLDivElement | null>(null);
+  const bottomSentinelRef = useCallback((node: HTMLDivElement | null) => {
+    setBottomSentinelEl(node);
+  }, []);
+
   const prevScrollHeightRef = useRef<number | null>(null);
+  const pendingFirstIndexRef = useRef(0);
+  const pendingLastIndexRef = useRef(0);
+  const conversationIdRef = useRef(conversationId);
+  conversationIdRef.current = conversationId;
 
-  const userExpandedIndex = userExpandedWindow !== null
-    && userExpandedWindow.conversationId === conversationId
-    ? userExpandedWindow.index
-    : null;
+  const activeRange =
+    windowRange !== null && windowRange.conversationId === conversationId
+      ? windowRange
+      : null;
 
-  const firstRenderedIndex =
-    userExpandedIndex !== null
-      ? userExpandedIndex
-      : computeInitialStart(messageCount, savedScrollPos);
+  const initialFirst = computeInitialStart(historicalUnits, savedAnchor ?? null);
+  const initialLast = computeInitialEnd(historicalUnits, initialFirst, savedAnchor ?? null);
+  const firstRenderedUnitIndex = Math.max(
+    0,
+    Math.min(activeRange?.first ?? initialFirst, historicalUnits.length),
+  );
+  const lastRenderedUnitIndex = Math.max(
+    firstRenderedUnitIndex,
+    Math.min(activeRange?.last ?? initialLast, historicalUnits.length),
+  );
 
+  const resetToBottom = useCallback(() => {
+    setWindowRange({
+      conversationId: conversationIdRef.current,
+      first: Math.max(0, historicalUnits.length - INITIAL_WINDOW),
+      last: historicalUnits.length,
+    });
+  }, [historicalUnits.length]);
+
+  // Subscribe to the height cache via useSyncExternalStore so spacer
+  // geometry re-renders when ResizeObserver writes land. The version
+  // counter is a primitive — referentially stable across reads when
+  // unchanged, so React skips re-renders for no-op set() calls.
+  const cacheVersion = useSyncExternalStore(
+    heightCache?.subscribe ?? noopSubscribe,
+    () => heightCache?.version ?? 0,
+    () => 0,
+  );
+
+  const getCachedHeight = heightCache ? (key: string) => heightCache.get(key) : undefined;
+  const spacerHeight = useMemo(
+    () => computeSpacerHeight(
+      historicalUnits,
+      firstRenderedUnitIndex,
+      getCachedHeight,
+    ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [historicalUnits, firstRenderedUnitIndex, heightCache, cacheVersion],
+  );
+  const bottomSpacerHeight = useMemo(
+    () => computeRangeHeight(
+      historicalUnits,
+      lastRenderedUnitIndex,
+      historicalUnits.length,
+      getCachedHeight,
+    ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [historicalUnits, lastRenderedUnitIndex, heightCache, cacheVersion],
+  );
+
+  // Reset compensation bookkeeping on conversation change so a stale
+  // pre-expand scrollHeight from a prior conversation doesn't apply to
+  // the new one.
   useLayoutEffect(() => {
     prevScrollHeightRef.current = null;
   }, [conversationId]);
 
-  // Scroll-compensation bookkeeping: capture scrollHeight BEFORE the state
-  // update that shrinks firstRenderedIndex, then in a layout effect add the
-  // net growth back to scrollTop so viewport content stays visually fixed.
-  const pendingFirstIndexRef = useRef(firstRenderedIndex);
-
+  // Exact scroll compensation for both prepend and bounded-window range
+  // shifts: capture scrollHeight before the state mutation and apply the
+  // committed delta before paint so the viewport's content anchor holds.
   useLayoutEffect(() => {
     const el = scrollRootRef.current;
     if (el && prevScrollHeightRef.current !== null) {
@@ -114,30 +284,98 @@ export function useBottomAnchoredWindow({
       }
       prevScrollHeightRef.current = null;
     }
-    pendingFirstIndexRef.current = firstRenderedIndex;
-  }, [firstRenderedIndex, scrollRootRef]);
+    pendingFirstIndexRef.current = firstRenderedUnitIndex;
+    pendingLastIndexRef.current = lastRenderedUnitIndex;
+  }, [firstRenderedUnitIndex, lastRenderedUnitIndex, scrollRootRef]);
 
-  // Hook's OWN scroll listener — does NOT touch the existing handleScroll.
-  useEffect(() => {
+  const prevSpacerHeightRef = useRef(spacerHeight);
+  useLayoutEffect(() => {
+    if (prevScrollHeightRef.current !== null) {
+      prevSpacerHeightRef.current = spacerHeight;
+      return;
+    }
     const el = scrollRootRef.current;
-    if (!el) return;
+    if (!el) {
+      prevSpacerHeightRef.current = spacerHeight;
+      return;
+    }
+    const delta = spacerHeight - prevSpacerHeightRef.current;
+    if (delta !== 0) {
+      el.scrollTop += delta;
+    }
+    prevSpacerHeightRef.current = spacerHeight;
+  }, [spacerHeight, scrollRootRef]);
 
-    const onScroll = () => {
-      if (pendingFirstIndexRef.current <= 0) return;
-      const spacerHeight = pendingFirstIndexRef.current * COLLAPSED_EST_PX;
-      if (el.scrollTop - spacerHeight > EXPAND_TRIGGER_PX) return;
-      // Capture pre-update geometry for exact scroll compensation.
-      prevScrollHeightRef.current = el.scrollHeight;
-      const next = Math.max(0, pendingFirstIndexRef.current - EXPAND_BATCH);
-      pendingFirstIndexRef.current = next;
-      setUserExpandedWindow({ conversationId, index: next });
-    };
+  useEffect(() => {
+    const root = scrollRootRef.current;
+    if (!root || !topSentinelEl) return;
+    if (typeof IntersectionObserver === 'undefined') return;
 
-    el.addEventListener('scroll', onScroll, { passive: true });
-    return () => el.removeEventListener('scroll', onScroll);
-    // Re-attach when conversation changes so the listener observes the
-    // (possibly remounted) scroll root and resets its expansion gate.
-  }, [scrollRootRef, conversationId]);
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (!entry || !entry.isIntersecting) return;
+        if (pendingFirstIndexRef.current <= 0) return;
 
-  return { firstRenderedIndex, collapsedEstPx: COLLAPSED_EST_PX };
+        prevScrollHeightRef.current = root.scrollHeight;
+        const nextFirst = Math.max(0, pendingFirstIndexRef.current - EXPAND_BATCH);
+        const candidateLast = pendingLastIndexRef.current;
+        const nextLast = Math.min(
+          candidateLast,
+          nextFirst + MAX_RENDERED_UNITS,
+        );
+        pendingFirstIndexRef.current = nextFirst;
+        pendingLastIndexRef.current = nextLast;
+        setWindowRange({
+          conversationId: conversationIdRef.current,
+          first: nextFirst,
+          last: nextLast,
+        });
+      },
+      { root, rootMargin: SENTINEL_ROOT_MARGIN },
+    );
+    observer.observe(topSentinelEl);
+    return () => observer.disconnect();
+  }, [scrollRootRef, conversationId, topSentinelEl]);
+
+  useEffect(() => {
+    const root = scrollRootRef.current;
+    if (!root || !bottomSentinelEl) return;
+    if (typeof IntersectionObserver === 'undefined') return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (!entry || !entry.isIntersecting) return;
+        if (pendingLastIndexRef.current >= historicalUnits.length) return;
+
+        prevScrollHeightRef.current = root.scrollHeight;
+        const nextLast = Math.min(historicalUnits.length, pendingLastIndexRef.current + EXPAND_BATCH);
+        const nextFirst = Math.max(
+          0,
+          Math.min(pendingFirstIndexRef.current + EXPAND_BATCH, nextLast - MAX_RENDERED_UNITS),
+        );
+        pendingFirstIndexRef.current = nextFirst;
+        pendingLastIndexRef.current = nextLast;
+        setWindowRange({
+          conversationId: conversationIdRef.current,
+          first: nextFirst,
+          last: nextLast,
+        });
+      },
+      { root, rootMargin: BOTTOM_SENTINEL_ROOT_MARGIN },
+    );
+    observer.observe(bottomSentinelEl);
+    return () => observer.disconnect();
+  }, [scrollRootRef, conversationId, bottomSentinelEl, historicalUnits.length]);
+
+  return {
+    firstRenderedUnitIndex,
+    lastRenderedUnitIndex,
+    spacerHeight,
+    bottomSpacerHeight,
+    topSentinelRef,
+    bottomSentinelRef,
+    resetToBottom,
+  };
 }

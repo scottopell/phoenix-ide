@@ -32,8 +32,8 @@ impl Tool for TerminalLastCommandTool {
     }
 
     async fn run(&self, _input: Value, ctx: ToolContext) -> ToolOutput {
-        let Some(handle) = ctx.terminals.get(&ctx.conversation_id) else {
-            return ToolOutput::error("no terminal is open for this conversation");
+        let Some(handle) = ctx.terminals.get(&ctx.work_scope) else {
+            return ToolOutput::error("no terminal is open for this work scope");
         };
 
         let status = *handle

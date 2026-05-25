@@ -26,6 +26,36 @@ use tokio_rustls::TlsAcceptor;
 /// single such client pins the process alive past a deploy indefinitely.
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
 
+/// Bound the post-shutdown drain by [`SHUTDOWN_GRACE`]. Both server paths
+/// (HTTP `axum::serve` task + HTTPS `hyper_util` graceful shutdown) route
+/// through here so the deadline lives in exactly one place — re-introducing
+/// the shutdown-clock divergence from task 02708 + PR #117 now requires
+/// editing this function (or its only constant) rather than two unrelated
+/// `tokio::time::timeout` / `tokio::select! { … sleep(…) }` sites.
+///
+/// Returns `Some(drain_result)` if the drain completed within the bound;
+/// `None` if the deadline elapsed first. Callers that need to *force-close*
+/// remaining work on timeout (e.g. aborting an `axum::serve` `JoinHandle`) do
+/// that themselves on `None`; this helper does not own task ownership.
+pub(crate) async fn bounded_post_shutdown_drain<F>(
+    drain: F,
+    label: &'static str,
+) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    match tokio::time::timeout(SHUTDOWN_GRACE, drain).await {
+        Ok(v) => Some(v),
+        Err(_elapsed) => {
+            tracing::warn!(
+                timeout_seconds = SHUTDOWN_GRACE.as_secs(),
+                "Timed out waiting for {label} connections to drain"
+            );
+            None
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) enum ConfigSource {
     Manual(Paths),
@@ -192,15 +222,7 @@ pub async fn serve_https(
         }
     }
 
-    tokio::select! {
-        () = graceful.shutdown() => {}
-        () = tokio::time::sleep(SHUTDOWN_GRACE) => {
-            tracing::warn!(
-                timeout_seconds = SHUTDOWN_GRACE.as_secs(),
-                "Timed out waiting for HTTPS connections to drain"
-            );
-        }
-    }
+    let _ = bounded_post_shutdown_drain(graceful.shutdown(), "HTTPS").await;
 
     Ok(())
 }
@@ -260,4 +282,48 @@ fn ensure_managed_cert(dir: &Path, hosts: &[String]) -> Result<Paths, Box<dyn Er
         cert_path: issued.cert_path,
         key_path: issued.key_path,
     })
+}
+
+#[cfg(test)]
+mod bounded_drain_tests {
+    use super::bounded_post_shutdown_drain;
+
+    /// A drain future that completes before the deadline forwards its
+    /// inner value verbatim. The contract `Some(F::Output) iff fast
+    /// enough` is what both server paths rely on to decide whether to
+    /// force-abort: HTTP aborts the `axum::serve` JoinHandle when the
+    /// result is `None`; HTTPS discards `None`.
+    #[tokio::test]
+    async fn fast_drain_returns_some_with_inner_value() {
+        let result = bounded_post_shutdown_drain(async { "drained" }, "test").await;
+        assert_eq!(result, Some("drained"));
+    }
+
+    /// A drain future that never completes returns `None` once the
+    /// deadline elapses. We can't wait the full `SHUTDOWN_GRACE` in a
+    /// unit test, so this exercises the timeout path with a pending
+    /// future under `tokio::time::pause()` and an explicit
+    /// `advance()` past the grace period.
+    ///
+    /// The bug class this guards: the regression caught on PR #117 was
+    /// that the timeout had been started at *server startup* rather
+    /// than at the shutdown signal, causing the non-stuck server to be
+    /// aborted every `SHUTDOWN_GRACE` seconds. Routing the bound
+    /// through this helper makes that bug structurally unreachable —
+    /// `bounded_post_shutdown_drain` *takes* the future, so the clock
+    /// cannot start before the function is called.
+    #[tokio::test(start_paused = true)]
+    async fn slow_drain_returns_none_after_grace_period() {
+        let drain = std::future::pending::<()>();
+        let join = tokio::spawn(async move { bounded_post_shutdown_drain(drain, "test").await });
+        // Yield so the spawned task is polled at least once and the
+        // inner `timeout()` registers its sleep before we advance the
+        // clock; otherwise the advance fires before the timer exists
+        // and the join hangs.
+        tokio::task::yield_now().await;
+        // Advance just past SHUTDOWN_GRACE so the inner timeout fires.
+        tokio::time::advance(super::SHUTDOWN_GRACE + std::time::Duration::from_secs(1)).await;
+        let result = join.await.unwrap();
+        assert!(result.is_none());
+    }
 }

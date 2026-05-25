@@ -761,6 +761,15 @@ pub struct BashStillRunningPayload {
 /// `kill_pending_kernel` response payload (REQ-BASH-003). The kill
 /// response timer expired before the kernel delivered the exit; the
 /// process is still alive and the handle stays subscribable.
+///
+/// Carries the active-kill fields (`display`, `signal_sent`) and the
+/// passive-wait fields (`waited_ms`) as `Option`s with
+/// `skip_serializing_if`: the same `status="kill_pending_kernel"` envelope
+/// is emitted from four distinct producer sites (active kill, peek on
+/// kill-in-flight, wait on kill-in-flight, run/wait observing kill-in-
+/// flight) whose wire shapes differ in which of these are present. The
+/// `Option` encoding makes "absent" structurally distinct from "empty
+/// placeholder" so no post-serialization scrubbing is needed.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashKillPendingKernelPayload {
@@ -773,9 +782,18 @@ pub struct BashKillPendingKernelPayload {
     pub window: BashRingWindow,
     pub kill_signal_sent: String,
     pub kill_attempted_at: String,
-    pub display: String,
-    /// Echoes the signal sent on this kill call (`TERM` / `KILL`).
-    pub signal_sent: String,
+    /// Display label (REQ-BASH-015) — present on kill / peek / wait paths
+    /// that synthesise a label; absent on the run/wait passive-wait path.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub display: Option<String>,
+    /// Echoes the signal sent on a kill call (`TERM` / `KILL`); absent on
+    /// peek/wait/passive paths which observe but did not issue the kill.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub signal_sent: Option<String>,
+    /// Wait window elapsed (run/wait passive-wait path only); absent on
+    /// kill / peek paths.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub waited_ms: Option<u64>,
 }
 
 /// `tombstoned` response payload (REQ-BASH-006). Served on peek/wait/kill
@@ -800,7 +818,11 @@ pub struct BashTombstonedPayload {
     pub kill_attempted_at: Option<String>,
     #[serde(flatten)]
     pub window: BashRingWindow,
-    pub display: String,
+    /// Display label (REQ-BASH-015) — present on the kill path; absent on
+    /// peek/wait of an already-terminal handle (run-path uses the
+    /// separate [`BashRunTombstonePayload`]).
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub display: Option<String>,
     /// Echo of the kill signal on the `kill` operation (None on peek/wait
     /// of an already-terminal handle).
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -1019,7 +1041,7 @@ mod bash_tmux_wire_tests {
                 truncated_before: false,
                 lines: vec![],
             },
-            display: "kill b-2 (TERM)".into(),
+            display: Some("kill b-2 (TERM)".into()),
             signal_sent: Some("TERM".into()),
         });
         let v = serde_json::to_value(&resp).unwrap();
@@ -1027,6 +1049,7 @@ mod bash_tmux_wire_tests {
         assert_eq!(v["final_cause"], "killed");
         assert_eq!(v["signal_number"], 15);
         assert_eq!(v["signal_sent"], "TERM");
+        assert_eq!(v["display"], "kill b-2 (TERM)");
     }
 
     #[test]
@@ -1057,6 +1080,130 @@ mod bash_tmux_wire_tests {
         assert_eq!(v["status"], "exited");
         // No display field on the run-tombstone shape.
         assert!(v.get("display").is_none());
+    }
+
+    /// Helper: produce a typical [`BashRingWindow`] for the
+    /// kill-pending-kernel shape tests below.
+    fn kpk_test_window() -> BashRingWindow {
+        BashRingWindow {
+            start_offset: 0,
+            end_offset: 0,
+            truncated_before: false,
+            lines: vec![],
+        }
+    }
+
+    /// `kill` operation that timed out before the kernel delivered the exit:
+    /// `display` is the synthesised label, `signal_sent` echoes the issued
+    /// signal, `waited_ms` is absent (this is not a passive wait).
+    #[test]
+    fn bash_kill_pending_active_kill_shape() {
+        let resp = BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
+            handle: "b-1".into(),
+            cmd: "trap '' TERM; sleep 9".into(),
+            label: None,
+            window: kpk_test_window(),
+            kill_signal_sent: "TERM".into(),
+            kill_attempted_at: "1700000000".into(),
+            display: Some("kill b-1 (TERM, pending)".into()),
+            signal_sent: Some("TERM".into()),
+            waited_ms: None,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "kill_pending_kernel");
+        assert_eq!(v["display"], "kill b-1 (TERM, pending)");
+        assert_eq!(v["signal_sent"], "TERM");
+        assert!(
+            v.get("waited_ms").is_none(),
+            "active-kill path must not emit waited_ms"
+        );
+    }
+
+    /// `peek` / `wait` on a handle already in kill_pending_kernel: `display`
+    /// carries the peek/wait label, but `signal_sent` is absent (this caller
+    /// did not issue the kill) and `waited_ms` is absent (not a passive run).
+    #[test]
+    fn bash_kill_pending_peek_or_wait_shape() {
+        let resp = BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
+            handle: "b-2".into(),
+            cmd: "trap '' TERM; sleep 9".into(),
+            label: None,
+            window: kpk_test_window(),
+            kill_signal_sent: "TERM".into(),
+            kill_attempted_at: "1700000000".into(),
+            display: Some("peek b-2".into()),
+            signal_sent: None,
+            waited_ms: None,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "kill_pending_kernel");
+        assert_eq!(v["display"], "peek b-2");
+        assert!(
+            v.get("signal_sent").is_none(),
+            "peek/wait must not echo signal_sent"
+        );
+        assert!(v.get("waited_ms").is_none());
+    }
+
+    /// Passive `run` / `wait` observing an in-flight kill: no `display`
+    /// label (only the kill / peek / wait paths synthesise one) and no
+    /// `signal_sent` echo, but `waited_ms` carries the elapsed wait.
+    /// This is the path the previous code reached by emitting
+    /// `display: ""` + `signal_sent: ""` placeholders and scrubbing them
+    /// after the fact.
+    #[test]
+    fn bash_kill_pending_passive_wait_shape() {
+        let resp = BashResponse::KillPendingKernel(BashKillPendingKernelPayload {
+            handle: "b-3".into(),
+            cmd: "trap '' TERM; sleep 9".into(),
+            label: None,
+            window: kpk_test_window(),
+            kill_signal_sent: "TERM".into(),
+            kill_attempted_at: "1700000000".into(),
+            display: None,
+            signal_sent: None,
+            waited_ms: Some(30_000),
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "kill_pending_kernel");
+        assert!(
+            v.get("display").is_none(),
+            "passive-wait must not emit a display label"
+        );
+        assert!(
+            v.get("signal_sent").is_none(),
+            "passive-wait must not echo signal_sent"
+        );
+        assert_eq!(v["waited_ms"], 30_000);
+    }
+
+    /// `peek` / `wait` of an already-terminal handle: tombstoned with no
+    /// synthesised `display` label and no `signal_sent` echo. Previously
+    /// emitted `display: ""` and scrubbed it.
+    #[test]
+    fn bash_tombstoned_passive_observe_shape() {
+        let resp = BashResponse::Tombstoned(BashTombstonedPayload {
+            handle: "b-4".into(),
+            cmd: "true".into(),
+            label: None,
+            final_cause: "exited".into(),
+            exit_code: Some(0),
+            signal_number: None,
+            duration_ms: 1,
+            finished_at: "1700000000".into(),
+            kill_signal_sent: None,
+            kill_attempted_at: None,
+            window: kpk_test_window(),
+            display: None,
+            signal_sent: None,
+        });
+        let v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["status"], "tombstoned");
+        assert!(
+            v.get("display").is_none(),
+            "passive-observe of tombstoned must not emit a display label"
+        );
+        assert!(v.get("signal_sent").is_none());
     }
 
     #[test]

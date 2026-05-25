@@ -2,16 +2,18 @@
 //!
 //! REQ-BT-010: Implicit Session Model
 //! REQ-BT-011: State Persistence
+//! REQ-BROWSER-WS-001: Sessions keyed by `WorkScope` so continuations share Chrome.
 
 #![allow(dead_code)] // Work in progress - browser tools being integrated
 
 use chromiumoxide::{
     browser::{Browser, BrowserConfig},
-    cdp::js_protocol::runtime::{EventConsoleApiCalled, RemoteObject},
+    cdp::js_protocol::runtime::{ConsoleApiCalledType, EventConsoleApiCalled, RemoteObject},
     fetcher::{BrowserFetcher, BrowserFetcherOptions, BrowserKind},
     Page,
 };
 use futures::StreamExt;
+use serde::{Serialize, Serializer};
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
@@ -19,6 +21,33 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+
+use crate::work_scope::WorkScope;
+
+/// Derive a Chrome user data dir from a `WorkScope::stable_key()`.
+///
+/// The `stable_key` embeds the worktree path for `Worktree` scopes, which can
+/// easily exceed Chrome's per-component path length limit (and the `SUN_PATH`
+/// max for any unix-domain socket Chrome opens beneath the profile dir) on
+/// deep checkouts. Hash the key to a bounded 16-hex-char prefix instead —
+/// same trick `socket_path_for_worktree` uses for tmux sockets — so the
+/// resulting path is filesystem-safe and bounded regardless of input length.
+///
+/// SHA-256 is used (rather than `DefaultHasher`) so the derivation is
+/// stable across Rust/Phoenix releases — a toolchain upgrade must not
+/// orphan an existing on-disk Chrome profile by re-keying.
+fn user_data_dir_for_key(scope_key: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(scope_key.as_bytes());
+    let digest = h.finalize();
+    let prefix = u64::from_be_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 digest is 32 bytes; first 8 always fits a u64"),
+    );
+    format!("/tmp/phoenix-chrome-{prefix:016x}")
+}
 
 /// Maximum console log entries to keep per session
 const MAX_CONSOLE_LOGS: usize = 1000;
@@ -54,10 +83,104 @@ impl From<chromiumoxide::error::CdpError> for BrowserError {
     }
 }
 
+/// Browser console message level.
+///
+/// Phoenix-owned enum mirroring the CDP `Runtime.consoleAPICalled.type` value
+/// set (see chromiumoxide's `ConsoleApiCalledType`). Stored on
+/// [`ConsoleEntry`] as a typed value rather than a string so a level the LLM
+/// or UI filters on (e.g. `"error"`) cannot drift onto an arbitrary string.
+/// The [`From<ConsoleApiCalledType>`] impl is a total match: if chromiumoxide
+/// adds a CDP variant, conversion stops compiling rather than silently
+/// flattening to an unknown level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConsoleLevel {
+    Log,
+    Debug,
+    Info,
+    Warning,
+    Error,
+    Dir,
+    Dirxml,
+    Table,
+    Trace,
+    Clear,
+    StartGroup,
+    StartGroupCollapsed,
+    EndGroup,
+    Assert,
+    Profile,
+    ProfileEnd,
+    Count,
+    TimeEnd,
+}
+
+impl ConsoleLevel {
+    /// Canonical CDP wire identifier (`"log"`, `"warning"`, `"startGroup"`, …).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Log => "log",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+            Self::Dir => "dir",
+            Self::Dirxml => "dirxml",
+            Self::Table => "table",
+            Self::Trace => "trace",
+            Self::Clear => "clear",
+            Self::StartGroup => "startGroup",
+            Self::StartGroupCollapsed => "startGroupCollapsed",
+            Self::EndGroup => "endGroup",
+            Self::Assert => "assert",
+            Self::Profile => "profile",
+            Self::ProfileEnd => "profileEnd",
+            Self::Count => "count",
+            Self::TimeEnd => "timeEnd",
+        }
+    }
+}
+
+impl std::fmt::Display for ConsoleLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for ConsoleLevel {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl From<ConsoleApiCalledType> for ConsoleLevel {
+    fn from(t: ConsoleApiCalledType) -> Self {
+        match t {
+            ConsoleApiCalledType::Log => Self::Log,
+            ConsoleApiCalledType::Debug => Self::Debug,
+            ConsoleApiCalledType::Info => Self::Info,
+            ConsoleApiCalledType::Warning => Self::Warning,
+            ConsoleApiCalledType::Error => Self::Error,
+            ConsoleApiCalledType::Dir => Self::Dir,
+            ConsoleApiCalledType::Dirxml => Self::Dirxml,
+            ConsoleApiCalledType::Table => Self::Table,
+            ConsoleApiCalledType::Trace => Self::Trace,
+            ConsoleApiCalledType::Clear => Self::Clear,
+            ConsoleApiCalledType::StartGroup => Self::StartGroup,
+            ConsoleApiCalledType::StartGroupCollapsed => Self::StartGroupCollapsed,
+            ConsoleApiCalledType::EndGroup => Self::EndGroup,
+            ConsoleApiCalledType::Assert => Self::Assert,
+            ConsoleApiCalledType::Profile => Self::Profile,
+            ConsoleApiCalledType::ProfileEnd => Self::ProfileEnd,
+            ConsoleApiCalledType::Count => Self::Count,
+            ConsoleApiCalledType::TimeEnd => Self::TimeEnd,
+        }
+    }
+}
+
 /// Console log entry captured from the browser
 #[derive(Debug, Clone)]
 pub struct ConsoleEntry {
-    pub level: String,
+    pub level: ConsoleLevel,
     pub text: String,
     pub timestamp: Instant,
 }
@@ -219,12 +342,16 @@ impl BrowserSession {
         base.join(".cache/phoenix-ide/chromium")
     }
 
-    /// Build a `BrowserConfig` with optional explicit Chrome executable path
+    /// Build a `BrowserConfig` with optional explicit Chrome executable path.
+    /// `scope_key` is a `WorkScope::stable_key()` value — a string that
+    /// uniquely identifies the durable owner of this session. The Chrome
+    /// user data dir is derived from it so a continuation that resolves to
+    /// the same scope reuses the same on-disk profile.
     fn browser_config(
-        conversation_id: &str,
+        scope_key: &str,
         executable: Option<&Path>,
     ) -> Result<BrowserConfig, BrowserError> {
-        let user_data_dir = format!("/tmp/phoenix-chrome-{conversation_id}");
+        let user_data_dir = user_data_dir_for_key(scope_key);
 
         // Remove stale user data directory to avoid Chrome SingletonLock conflicts
         // (e.g. from a previous crash or test run that didn't clean up)
@@ -256,10 +383,10 @@ impl BrowserSession {
 
     /// Launch browser and create a session
     async fn launch_and_init(
-        conversation_id: &str,
+        scope_key: &str,
         executable: Option<&Path>,
     ) -> Result<Self, BrowserError> {
-        let config = Self::browser_config(conversation_id, executable)?;
+        let config = Self::browser_config(scope_key, executable)?;
 
         let (browser, mut handler) = Browser::launch(config)
             .await
@@ -315,7 +442,7 @@ impl BrowserSession {
     ///   2. System Chrome via chromiumoxide's lookup (PATH + standard
     ///      install paths).
     ///   3. `BrowserFetcher` downloads a compatible Chromium and caches it.
-    async fn new(conversation_id: &str) -> Result<Self, BrowserError> {
+    async fn new(scope_key: &str) -> Result<Self, BrowserError> {
         // 1. Explicit env-var override — used by the test harness in
         //    sandboxes where Chrome lives at a non-standard path that
         //    chromiumoxide's lookup doesn't probe.
@@ -326,7 +453,7 @@ impl BrowserSession {
                     "Using PHOENIX_CHROME_EXECUTABLE={}",
                     explicit_path.display()
                 );
-                match Self::launch_and_init(conversation_id, Some(&explicit_path)).await {
+                match Self::launch_and_init(scope_key, Some(&explicit_path)).await {
                     Ok(session) => return Ok(session),
                     Err(e) => {
                         tracing::warn!(
@@ -343,7 +470,7 @@ impl BrowserSession {
         }
 
         // 2. System Chrome (no explicit executable — chromiumoxide finds it)
-        match Self::launch_and_init(conversation_id, None).await {
+        match Self::launch_and_init(scope_key, None).await {
             Ok(session) => return Ok(session),
             Err(e) => {
                 tracing::info!("System Chrome not available ({e}), trying fetcher...");
@@ -375,7 +502,7 @@ impl BrowserSession {
 
         tracing::info!("Using Chrome at {:?}", info.executable_path);
 
-        Self::launch_and_init(conversation_id, Some(&info.executable_path)).await
+        Self::launch_and_init(scope_key, Some(&info.executable_path)).await
     }
 
     /// Attach a new live-view viewer (REQ-BT-018).
@@ -421,8 +548,10 @@ impl BrowserSession {
         // Spawn task to capture console events (uses separate lock, no contention)
         let task = tokio::spawn(async move {
             while let Some(event) = console_events.next().await {
-                // Extract log level and message
-                let level = format!("{:?}", event.r#type).to_lowercase();
+                // Convert the chromiumoxide CDP enum into Phoenix's owned
+                // `ConsoleLevel` via a total `From` match; downgrading to a
+                // free-form string here would lose the closed-set invariant.
+                let level: ConsoleLevel = event.r#type.clone().into();
                 let text = event
                     .args
                     .iter()
@@ -516,6 +645,45 @@ impl BrowserSession {
 
         Ok(())
     }
+
+    /// Force-close the underlying Chrome process and abort all background
+    /// tasks. Called by [`BrowserSessionManager::kill_session`] so the
+    /// cleanup cascade is authoritative — Chrome dies even if other
+    /// holders of the session `Arc` (e.g. a live `browser-view`
+    /// WebSocket viewer) keep the `BrowserSession` itself from being
+    /// dropped.
+    ///
+    /// Without this, `kill_session` would only remove the map entry; the
+    /// `Arc` clones held by other components keep `BrowserSession` (and
+    /// therefore `Browser` and the OS chromium process) alive until the
+    /// last clone drops. Cascade then lies: cleanup completed but the
+    /// process is still running.
+    ///
+    /// Falls back to `Browser::kill` (SIGKILL) when `close` errors —
+    /// per chromiumoxide docs `close` is preferred but `kill` is the
+    /// escape hatch for the case where graceful close hangs.
+    async fn terminate(&mut self) {
+        // Abort task handles first so they don't try to talk to a closing
+        // browser. Drop's task-abort logic is now redundant but harmless
+        // (abort on an already-aborted JoinHandle is a no-op).
+        self.handler_task.abort();
+        if let Some(t) = &self.console_task {
+            t.abort();
+        }
+        for t in &self.profiling_tasks {
+            t.abort();
+        }
+
+        match self.browser.close().await {
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(error = %e, "browser graceful close failed; falling back to kill");
+                if let Some(Err(io_err)) = self.browser.kill().await {
+                    tracing::warn!(error = %io_err, "browser kill failed; OS process may linger");
+                }
+            }
+        }
+    }
 }
 
 /// RAII guard for browser session access
@@ -544,13 +712,48 @@ impl Drop for BrowserSessionGuard<'_> {
     }
 }
 
+/// Best-effort tear-down of the browser session belonging to `work_scope`,
+/// mirroring [`crate::tools::tmux::registry::cascade_tmux_on_delete`] so
+/// archive / abandon / mark-merged / delete drop the Chrome process the same
+/// way they drop bash and tmux (REQ-BROWSER-WS-003).
+///
+/// `inheritor_scope`: the resolved `WorkScope` of the continuation, if any.
+/// Preservation is scope equality — when the inheritor resolves to the
+/// *same* scope, the Chrome window is still in use and we skip the kill.
+/// Different-scope or no inheritor falls through to teardown. The
+/// equality rule subsumes the per-kind case-analysis (Worktree vs
+/// Conversation): Direct continuations resolve to their own
+/// `Conversation` scope, never equal to the parent's, so they take the
+/// kill path automatically.
+///
+/// REQ-BROWSER-WS-003, REQ-BROWSER-WS-002.
+pub async fn cascade_browser_on_delete(
+    manager: &Arc<BrowserSessionManager>,
+    work_scope: &WorkScope,
+    inheritor_scope: Option<&WorkScope>,
+) {
+    if inheritor_scope == Some(work_scope) {
+        tracing::debug!(
+            work_scope = %work_scope,
+            "browser: skipping session kill — scope inherited by continuation"
+        );
+        return;
+    }
+    manager.kill_session(work_scope).await;
+}
+
 /// Lifecycle event published by [`BrowserSessionManager`] when a session is
 /// created or destroyed. The runtime bridges these into per-conversation SSE
 /// streams so the UI can show "browser session live" state without inferring
 /// it from message history.
+///
+/// Carries the `WorkScope` rather than a single `conversation_id` because a
+/// `Worktree`-scoped session may be shared across continuation members; the
+/// bridge fans out to every live runtime handle whose conversation resolves
+/// to this scope (REQ-BROWSER-WS-002).
 #[derive(Debug, Clone)]
 pub struct BrowserSessionLifecycleEvent {
-    pub conversation_id: String,
+    pub work_scope: WorkScope,
     /// `true` on session creation, `false` on session removal (kill or
     /// idle cleanup).
     pub active: bool,
@@ -562,9 +765,19 @@ pub struct BrowserSessionLifecycleEvent {
 pub type BrowserSessionLifecycleSink =
     tokio::sync::mpsc::UnboundedSender<BrowserSessionLifecycleEvent>;
 
+/// Map entry: the `WorkScope` (carried for idle-cleanup lifecycle emission)
+/// plus the live session arc.
+struct ScopedSession {
+    scope: WorkScope,
+    session: Arc<RwLock<BrowserSession>>,
+}
+
 /// Global manager for all browser sessions
 pub struct BrowserSessionManager {
-    sessions: RwLock<HashMap<String, Arc<RwLock<BrowserSession>>>>,
+    /// Keyed by `WorkScope::stable_key()`. Storing the `WorkScope` alongside
+    /// the session lets idle cleanup emit lifecycle events with the original
+    /// scope rather than parsing the string key back into a `WorkScope`.
+    sessions: RwLock<HashMap<String, ScopedSession>>,
     cleanup_task: Option<JoinHandle<()>>,
     /// Optional lifecycle event sink. Populated by [`RuntimeManager::new`]
     /// so session create/destroy edges flow into per-conversation SSE
@@ -607,27 +820,30 @@ impl BrowserSessionManager {
         manager
     }
 
-    /// Whether a live session currently exists for `conversation_id`.
+    /// Whether a live session currently exists for `work_scope`.
     /// The `HashMap` is the single source of truth for session liveness —
     /// callers must not maintain a parallel bool.
-    pub async fn is_active(&self, conversation_id: &str) -> bool {
-        self.sessions.read().await.contains_key(conversation_id)
+    pub async fn is_active(&self, work_scope: &WorkScope) -> bool {
+        self.sessions
+            .read()
+            .await
+            .contains_key(&work_scope.stable_key())
     }
 
     /// Publish a lifecycle edge if a sink is wired. Best-effort: dropped
     /// receivers / closed channels are logged at `debug` (capability gap)
     /// and do not affect session correctness.
-    fn emit_lifecycle(&self, conversation_id: &str, active: bool) {
+    fn emit_lifecycle(&self, work_scope: &WorkScope, active: bool) {
         let Some(sink) = self.lifecycle_sink.as_ref() else {
             return;
         };
         let event = BrowserSessionLifecycleEvent {
-            conversation_id: conversation_id.to_string(),
+            work_scope: work_scope.clone(),
             active,
         };
         if let Err(e) = sink.send(event) {
             tracing::debug!(
-                conversation_id,
+                work_scope = %work_scope,
                 active,
                 error = %e,
                 "dropping browser session lifecycle event — sink closed"
@@ -635,57 +851,25 @@ impl BrowserSessionManager {
         }
     }
 
-    /// Get or create a browser session for a conversation
-    pub async fn get_or_create(
-        &self,
-        conversation_id: &str,
-    ) -> Result<BrowserSessionGuard<'_>, BrowserError> {
-        // Check if session exists
-        {
-            let sessions = self.sessions.read().await;
-            if let Some(session) = sessions.get(conversation_id) {
-                let _guard = session.write().await;
-                // We need to return a guard that holds the lock
-                // This is tricky with the current design - let's simplify
-            }
-        }
-
-        // Create new session if needed
-        let mut sessions = self.sessions.write().await;
-
-        if !sessions.contains_key(conversation_id) {
-            tracing::info!(conversation_id, "Creating new browser session");
-            let session = BrowserSession::new(conversation_id).await?;
-            sessions.insert(conversation_id.to_string(), Arc::new(RwLock::new(session)));
-        }
-
-        // Get the session and return guard
-        let _session = sessions
-            .get(conversation_id)
-            .ok_or_else(|| BrowserError::SessionNotFound(conversation_id.to_string()))?
-            .clone();
-
-        drop(sessions); // Release the sessions lock
-
-        // Now acquire the session lock
-        // Note: This creates a lifetime issue - we need a different approach
-        // For now, let's use a simpler API
-        Err(BrowserError::OperationFailed(
-            "Session guard API needs redesign - use get_session instead".to_string(),
-        ))
-    }
-
-    /// Get a session for a conversation (creates if needed)
-    /// Returns Arc to the session - caller manages locking
+    /// Get a session for a `work_scope` (creates if needed).
+    /// Returns Arc to the session - caller manages locking.
+    ///
+    /// Sessions are keyed by `WorkScope::stable_key()`: continuations of a
+    /// worktree-backed conversation resolve to the same scope and therefore
+    /// inherit the same Chrome window (REQ-BROWSER-WS-001), while Direct
+    /// conversations fall back to per-conversation scoping (no shared owner
+    /// exists for them to inherit).
     pub async fn get_session(
         &self,
-        conversation_id: &str,
+        work_scope: &WorkScope,
     ) -> Result<Arc<RwLock<BrowserSession>>, BrowserError> {
+        let key = work_scope.stable_key();
+
         // Check if session exists
         {
             let sessions = self.sessions.read().await;
-            if let Some(session) = sessions.get(conversation_id) {
-                return Ok(session.clone());
+            if let Some(entry) = sessions.get(&key) {
+                return Ok(entry.session.clone());
             }
         }
 
@@ -693,12 +877,12 @@ impl BrowserSessionManager {
         let mut sessions = self.sessions.write().await;
 
         // Double-check after acquiring write lock
-        if let Some(session) = sessions.get(conversation_id) {
-            return Ok(session.clone());
+        if let Some(entry) = sessions.get(&key) {
+            return Ok(entry.session.clone());
         }
 
-        tracing::info!(conversation_id, "Creating new browser session");
-        let session = BrowserSession::new(conversation_id).await?;
+        tracing::info!(work_scope = %work_scope, "Creating new browser session");
+        let session = BrowserSession::new(&key).await?;
         let session_arc = Arc::new(RwLock::new(session));
 
         // Set up console log listener
@@ -711,48 +895,95 @@ impl BrowserSessionManager {
             tracing::warn!(error = %e, "Failed to set up profiling listener");
         }
 
-        sessions.insert(conversation_id.to_string(), session_arc.clone());
+        sessions.insert(
+            key,
+            ScopedSession {
+                scope: work_scope.clone(),
+                session: session_arc.clone(),
+            },
+        );
         // Drop the write lock before emitting — the receiver may grab the
         // sessions read lock to confirm state, and we don't want to hold
         // the write lock across that.
         drop(sessions);
-        self.emit_lifecycle(conversation_id, true);
+        self.emit_lifecycle(work_scope, true);
 
         Ok(session_arc)
     }
 
-    /// Get the session for a conversation **without creating one**.
+    /// Get the session for a `work_scope` **without creating one**.
     ///
     /// Used by the live-view WS endpoint, which deliberately must not spawn
     /// a chromium just because someone opened the panel — the panel reflects
     /// the agent's existing browser, not a new one.
-    pub async fn get_existing(&self, conversation_id: &str) -> Option<Arc<RwLock<BrowserSession>>> {
+    ///
+    /// Logs at `debug` when the lookup misses so a "viewer opened but no
+    /// session existed" silent failure becomes auditable (capability-gap
+    /// logging per REQ-BROWSER-WS-004).
+    pub async fn get_existing(
+        &self,
+        work_scope: &WorkScope,
+    ) -> Option<Arc<RwLock<BrowserSession>>> {
+        let key = work_scope.stable_key();
         let sessions = self.sessions.read().await;
-        sessions.get(conversation_id).cloned()
+        let hit = sessions.get(&key).map(|e| e.session.clone());
+        if hit.is_none() {
+            tracing::debug!(
+                work_scope = %work_scope,
+                "browser session lookup miss — no session for scope"
+            );
+        }
+        hit
     }
 
-    /// Kill a specific session (called on conversation delete)
-    pub async fn kill_session(&self, conversation_id: &str) {
-        let mut sessions = self.sessions.write().await;
-        let removed = sessions.remove(conversation_id);
+    /// Kill the session belonging to `work_scope` (called from the cleanup
+    /// cascade on archive/abandon/mark-merged/delete of the chain leaf).
+    ///
+    /// Force-closes the underlying Chrome process via
+    /// [`BrowserSession::terminate`] BEFORE dropping the map's `Arc`.
+    /// Other holders of the session `Arc` (notably the `browser-view`
+    /// WebSocket viewer, which keeps an `Arc` for the duration of its
+    /// connection) would otherwise prevent `Drop for BrowserSession`
+    /// from running, leaving the OS chromium process alive after the
+    /// cascade claimed to have killed it.
+    ///
+    /// The sessions write lock is released as soon as the entry is
+    /// removed; `terminate` and the awaited `remove_dir_all` run
+    /// lock-free so concurrent `get_session` / `get_existing` /
+    /// `is_active` calls on unrelated scopes are not blocked for the
+    /// duration of fs deletion + Chrome shutdown.
+    pub async fn kill_session(&self, work_scope: &WorkScope) {
+        let key = work_scope.stable_key();
+        let removed = {
+            let mut sessions = self.sessions.write().await;
+            sessions.remove(&key)
+        };
         let was_present = removed.is_some();
-        if let Some(session) = removed {
-            tracing::info!(conversation_id, "Killing browser session");
-            // Session will be dropped, which closes the browser
-            drop(session);
+        if let Some(entry) = removed {
+            tracing::info!(work_scope = %work_scope, "Killing browser session");
 
-            // Clean up user data directory
-            let user_data_dir = format!("/tmp/phoenix-chrome-{conversation_id}");
+            // Force-close Chrome under a write lock on the session itself
+            // (independent of the sessions map lock). Other `Arc` holders
+            // will observe a dead `Browser`/`Page` on their next CDP call.
+            {
+                let mut session_guard = entry.session.write().await;
+                session_guard.terminate().await;
+            }
+            // Drop our `Arc` clone. If we were the last holder,
+            // `BrowserSession::drop` re-aborts (no-op) and frees memory.
+            drop(entry);
+
+            // Clean up user data directory — lock-free.
+            let user_data_dir = user_data_dir_for_key(&key);
             if let Err(e) = tokio::fs::remove_dir_all(&user_data_dir).await {
                 tracing::warn!(path = %user_data_dir, error = %e, "Failed to clean up browser data dir");
             }
         }
-        drop(sessions);
         // Lifecycle edge is "session was present and is now gone". A no-op
         // kill (no session existed) must NOT emit — that would falsely
         // signal a transition the UI hasn't seen the up-edge of.
         if was_present {
-            self.emit_lifecycle(conversation_id, false);
+            self.emit_lifecycle(work_scope, false);
         }
     }
 
@@ -774,10 +1005,10 @@ impl BrowserSessionManager {
         // Find idle sessions
         {
             let sessions = self.sessions.read().await;
-            for (conv_id, session) in sessions.iter() {
-                if let Ok(guard) = session.try_read() {
+            for (key, entry) in sessions.iter() {
+                if let Ok(guard) = entry.session.try_read() {
                     if now.duration_since(guard.last_activity) > IDLE_TIMEOUT {
-                        to_remove.push(conv_id.clone());
+                        to_remove.push(key.clone());
                     }
                 }
             }
@@ -785,20 +1016,20 @@ impl BrowserSessionManager {
 
         // Remove idle sessions
         if !to_remove.is_empty() {
-            let mut removed = Vec::new();
+            let mut removed_scopes = Vec::new();
             {
                 let mut sessions = self.sessions.write().await;
-                for conv_id in to_remove {
-                    tracing::info!(conversation_id = %conv_id, "Cleaning up idle browser session");
-                    if sessions.remove(&conv_id).is_some() {
-                        removed.push(conv_id);
+                for key in to_remove {
+                    tracing::info!(scope_key = %key, "Cleaning up idle browser session");
+                    if let Some(entry) = sessions.remove(&key) {
+                        removed_scopes.push(entry.scope);
                     }
                 }
             }
             // Emit outside the write lock so receivers don't deadlock if
             // they re-enter the manager.
-            for conv_id in &removed {
-                self.emit_lifecycle(conv_id, false);
+            for scope in &removed_scopes {
+                self.emit_lifecycle(scope, false);
             }
         }
     }
@@ -850,6 +1081,7 @@ mod lifecycle_hook_tests {
         BrowserSession, BrowserSessionLifecycleEvent, BrowserSessionLifecycleSink,
         BrowserSessionManager,
     };
+    use crate::work_scope::WorkScope;
     use std::sync::Arc;
     use std::time::Instant;
     use tokio::sync::RwLock;
@@ -865,36 +1097,52 @@ mod lifecycle_hook_tests {
         (BrowserSessionManager::with_lifecycle_sink(Some(tx)), rx)
     }
 
-    /// `kill_session` on a manager that never had a session for `conv_id`
+    fn scope_conv(id: &str) -> WorkScope {
+        WorkScope::Conversation(id.to_string())
+    }
+
+    fn scope_wt(path: &str) -> WorkScope {
+        WorkScope::Worktree(path.to_string())
+    }
+
+    /// `kill_session` on a manager that never had a session for this scope
     /// must not emit a lifecycle edge — the UI never saw the up-edge, so
     /// emitting a down-edge would falsely signal a transition.
     #[tokio::test]
     async fn kill_session_no_op_does_not_emit() {
         let (manager, mut rx) = install_sink();
-        manager.kill_session("conv-never-existed").await;
+        let scope = scope_conv("conv-never-existed");
+        manager.kill_session(&scope).await;
         assert!(
             rx.try_recv().is_err(),
-            "kill_session on absent conv must not emit a lifecycle event"
+            "kill_session on absent scope must not emit a lifecycle event"
         );
-        assert!(!manager.is_active("conv-never-existed").await);
+        assert!(!manager.is_active(&scope).await);
     }
 
     /// `is_active` must reflect the underlying `HashMap`. We can't create a
-    /// real `BrowserSession` without chrome, so insert a sentinel session
-    /// arc by hand to exercise the contains-key path.
+    /// real `BrowserSession` without chrome, so this just exercises the
+    /// "absent" branch for both scope variants.
     #[tokio::test]
     async fn is_active_reflects_hashmap_membership() {
         let (manager, _rx) = install_sink();
-        assert!(!manager.is_active("conv-1").await);
+        assert!(!manager.is_active(&scope_conv("conv-1")).await);
+        assert!(!manager.is_active(&scope_wt("/tmp/wt-1")).await);
+    }
 
-        // Synthesize a session arc by reusing an existing session arc only
-        // available through the test-internal API. We can't construct a
-        // real `BrowserSession` here without launching chrome, so this
-        // test exercises only the post-conditions that don't depend on
-        // session internals.
-        let _ = manager;
-        // Falls back to the broader `kill_session_no_op_does_not_emit` for
-        // the false case; chrome-gated `tests.rs` covers the true case.
+    /// Worktree and Conversation scopes with the same inner string occupy
+    /// disjoint namespaces; a present worktree session must not satisfy an
+    /// `is_active` query for the same-string conversation scope.
+    #[tokio::test]
+    async fn is_active_disjoint_namespaces() {
+        let (manager, _rx) = install_sink();
+        let conv = scope_conv("/tmp/x");
+        let wt = scope_wt("/tmp/x");
+        assert!(!manager.is_active(&conv).await);
+        assert!(!manager.is_active(&wt).await);
+        // Same string, different scope kinds: their stable_key values must
+        // differ so a hit on one cannot satisfy the other.
+        assert_ne!(conv.stable_key(), wt.stable_key());
     }
 
     /// Test the full create-emit + kill-emit pair end-to-end using a
@@ -905,18 +1153,20 @@ mod lifecycle_hook_tests {
     #[tokio::test]
     async fn emit_lifecycle_round_trips_through_sink() {
         let (manager, mut rx) = install_sink();
-        manager.emit_lifecycle("conv-A", true);
-        manager.emit_lifecycle("conv-A", false);
-        manager.emit_lifecycle("conv-B", true);
+        let a = scope_conv("conv-A");
+        let b = scope_conv("conv-B");
+        manager.emit_lifecycle(&a, true);
+        manager.emit_lifecycle(&a, false);
+        manager.emit_lifecycle(&b, true);
 
         let e1 = rx.try_recv().expect("first event missing");
-        assert_eq!(e1.conversation_id, "conv-A");
+        assert_eq!(e1.work_scope, a);
         assert!(e1.active);
         let e2 = rx.try_recv().expect("second event missing");
-        assert_eq!(e2.conversation_id, "conv-A");
+        assert_eq!(e2.work_scope, a);
         assert!(!e2.active);
         let e3 = rx.try_recv().expect("third event missing");
-        assert_eq!(e3.conversation_id, "conv-B");
+        assert_eq!(e3.work_scope, b);
         assert!(e3.active);
         assert!(rx.try_recv().is_err(), "no more events expected");
     }
@@ -926,8 +1176,9 @@ mod lifecycle_hook_tests {
     #[tokio::test]
     async fn emit_lifecycle_without_sink_is_no_op() {
         let manager = BrowserSessionManager::default();
-        manager.emit_lifecycle("conv-X", true);
-        assert!(!manager.is_active("conv-X").await);
+        let scope = scope_conv("conv-X");
+        manager.emit_lifecycle(&scope, true);
+        assert!(!manager.is_active(&scope).await);
     }
 
     /// Belt-and-braces: keep the unused-import lints quiet. `BrowserSession`
@@ -935,6 +1186,59 @@ mod lifecycle_hook_tests {
     /// chrome-gated tests.
     #[allow(dead_code)]
     fn _phantom_uses(_b: Option<BrowserSession>, _r: Option<RwLock<()>>, _i: Option<Instant>) {}
+}
+
+#[cfg(test)]
+mod console_level_tests {
+    use super::ConsoleLevel;
+    use chromiumoxide::cdp::js_protocol::runtime::ConsoleApiCalledType;
+
+    /// All 18 CDP variants round-trip through the typed conversion to the
+    /// canonical CDP wire identifier. If chromiumoxide adds a variant, the
+    /// `From<ConsoleApiCalledType>` impl stops compiling — guaranteeing the
+    /// "stringly-typed level" bug class cannot regress.
+    #[test]
+    fn from_cdp_total_and_canonical() {
+        let cases = [
+            (ConsoleApiCalledType::Log, "log"),
+            (ConsoleApiCalledType::Debug, "debug"),
+            (ConsoleApiCalledType::Info, "info"),
+            (ConsoleApiCalledType::Warning, "warning"),
+            (ConsoleApiCalledType::Error, "error"),
+            (ConsoleApiCalledType::Dir, "dir"),
+            (ConsoleApiCalledType::Dirxml, "dirxml"),
+            (ConsoleApiCalledType::Table, "table"),
+            (ConsoleApiCalledType::Trace, "trace"),
+            (ConsoleApiCalledType::Clear, "clear"),
+            (ConsoleApiCalledType::StartGroup, "startGroup"),
+            (
+                ConsoleApiCalledType::StartGroupCollapsed,
+                "startGroupCollapsed",
+            ),
+            (ConsoleApiCalledType::EndGroup, "endGroup"),
+            (ConsoleApiCalledType::Assert, "assert"),
+            (ConsoleApiCalledType::Profile, "profile"),
+            (ConsoleApiCalledType::ProfileEnd, "profileEnd"),
+            (ConsoleApiCalledType::Count, "count"),
+            (ConsoleApiCalledType::TimeEnd, "timeEnd"),
+        ];
+        for (cdp, expected) in cases {
+            let level: ConsoleLevel = cdp.into();
+            assert_eq!(level.as_str(), expected, "wrong wire form for {expected}");
+        }
+    }
+
+    /// Wire serialization matches `as_str` so consumers downstream of
+    /// `json!({"level": entry.level})` see the canonical identifier and not
+    /// the `Debug` spelling the previous `format!("{:?}", …).to_lowercase()`
+    /// produced (e.g. `"startgroup"` rather than CDP's `"startGroup"`).
+    #[test]
+    fn serializes_as_canonical_string() {
+        let value = serde_json::to_value(ConsoleLevel::StartGroup).unwrap();
+        assert_eq!(value, serde_json::Value::String("startGroup".into()));
+        let value = serde_json::to_value(ConsoleLevel::Error).unwrap();
+        assert_eq!(value, serde_json::Value::String("error".into()));
+    }
 }
 
 #[cfg(test)]

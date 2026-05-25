@@ -87,8 +87,27 @@ function readXtermTheme(): ITheme {
   };
 }
 
+/**
+ * Identity of the terminal session this panel attaches to. The backend
+ * keys terminals by `WorkScope` (REQ-TERM-WS-001); the frontend mirrors
+ * that with a discriminated union so each variant carries exactly the
+ * fields it needs.
+ *
+ * - `conversation`: a per-conversation terminal (the default UX on the
+ *   conversation page). Continuation conversations that resolve to the
+ *   same worktree share the backend terminal automatically — the panel
+ *   doesn't know about that, it just connects to its conversation's
+ *   endpoint and gets reclaimed onto the shared session.
+ * - `global`: the singleton terminal surfaced on `/new`. Not bound to
+ *   any conversation; survives every individual conversation; lives for
+ *   the lifetime of the Phoenix process.
+ */
+export type TerminalScope =
+  | { kind: 'conversation'; conversationId: string }
+  | { kind: 'global' };
+
 interface TerminalPanelProps {
-  conversationId: string;
+  scope: TerminalScope;
   /** Total height in px (including header strip) */
   height: number;
   /** When true, only the header strip renders — no xterm */
@@ -140,10 +159,22 @@ interface CommandExecution {
 /** REQ-TERM-015. Frontend mirrors `config.shell_integration_detection_window`. */
 const DETECTION_WINDOW_MS = 5000;
 
-/** Build the WebSocket URL for a conversation's terminal endpoint. */
-function terminalWsUrl(conversationId: string): string {
+/** Build the WebSocket URL for a terminal scope. */
+function terminalWsUrl(scope: TerminalScope): string {
   const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-  return `${proto}//${window.location.host}/api/conversations/${conversationId}/terminal`;
+  if (scope.kind === 'global') {
+    return `${proto}//${window.location.host}/api/terminal/global`;
+  }
+  return `${proto}//${window.location.host}/api/conversations/${scope.conversationId}/terminal`;
+}
+
+/** Stable React-key / dependency string for a scope. Prefixes mirror the
+ *  backend's `WorkScope::stable_key()` so namespaces stay disjoint —
+ *  `conversation:global` and `global:` are distinct keys, so a future
+ *  conversation id that happens to equal a reserved variant name can't
+ *  collide and suppress a reconnect on scope change. */
+function scopeKey(scope: TerminalScope): string {
+  return scope.kind === 'global' ? 'global:' : `conversation:${scope.conversationId}`;
 }
 
 /** Encode a resize frame: 0x01 + u16be cols + u16be rows */
@@ -244,7 +275,7 @@ ${snippet.snippet}
 }
 
 export function TerminalPanel({
-  conversationId,
+  scope,
   height,
   collapsed,
   onExpand,
@@ -256,6 +287,7 @@ export function TerminalPanel({
   showError,
   onSendSelectionToDraft,
 }: TerminalPanelProps) {
+  const scopeId = scopeKey(scope);
   const containerRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
@@ -528,7 +560,7 @@ export function TerminalPanel({
     }, DETECTION_WINDOW_MS);
 
     // --- WebSocket connection ---
-    const ws = new WebSocket(terminalWsUrl(conversationId));
+    const ws = new WebSocket(terminalWsUrl(scope));
     ws.binaryType = 'arraybuffer';
     wsRef.current = ws;
     setStatus('Connecting…');
@@ -663,7 +695,8 @@ export function TerminalPanel({
       window.clearTimeout(initTimer);
       if (cleanupReal) cleanupReal();
     };
-  }, [conversationId, setStatus, reconnectNonce]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scopeId, setStatus, reconnectNonce]);
 
   const reconnect = useCallback(() => {
     setReconnectNonce((n) => n + 1);

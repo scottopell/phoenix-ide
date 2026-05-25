@@ -1,7 +1,7 @@
 import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
-import type { Message, ToolResultContent, ConversationState } from '../api';
+import { flushSync } from 'react-dom';
+import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
-import type { StreamingBuffer } from '../conversation/atom';
 import {
   UserMessage,
   QueuedUserMessage,
@@ -13,8 +13,16 @@ import { StreamingMessage } from './StreamingMessage';
 import { MessageContextMenu } from './MessageContextMenu';
 import {
   useBottomAnchoredWindow,
-  COLLAPSED_EST_PX,
+  type SavedScrollAnchor,
 } from '../hooks/useBottomAnchoredWindow';
+import { useUnitHeightCache } from '../conversation/unitHeightCache';
+import { useStreamingStartedAt } from '../conversation/useConversationAtom';
+import { useUnitHeightObserver, type UnitHeightObserver } from '../hooks/useUnitHeightObserver';
+import {
+  buildRenderUnits,
+  type HistoricalUnit,
+  type TailUnit,
+} from '../conversation/renderUnits';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -48,159 +56,326 @@ interface MessageListProps {
   onCancelSteering?: ((localId: string) => void) | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   systemPrompt?: string | undefined;
+  /** Backend conversation UUID (atom.conversationId). Used as the
+   *  localStorage namespace for the anchor and as the parent prop tying
+   *  several pieces of internal state to a single conversation. */
   conversationId?: string | undefined;
-  streamingBuffer?: StreamingBuffer | null;
+  /** URL slug — the key the conversation store is keyed by. Needed for
+   *  both the streaming-active subscription (via useStreamingStartedAt)
+   *  and the streaming-buffer subscription inside <StreamingMessage>.
+   *  May be undefined briefly during route transitions; when undefined,
+   *  no streaming tail unit is emitted. */
+  slug?: string | undefined;
 }
 
 // Threshold in pixels - if user is within this distance of bottom, consider them "pinned"
 const SCROLL_THRESHOLD = 100;
 
-const SCROLL_KEY_PREFIX = 'phoenix:scroll:';
-const MSGCOUNT_KEY_PREFIX = 'phoenix:msgcount:';
+const ANCHOR_KEY_PREFIX = 'phoenix:msglist:anchor:';
+// Legacy keys from the pre-render-unit scroll-restore model. We delete
+// these whenever we write a fresh anchor so they don't accumulate, but
+// we do not read them — one visit's worth of restore-to-bottom is the
+// acceptable regression per design.md.
+const LEGACY_SCROLL_KEY_PREFIX = 'phoenix:scroll:';
+const LEGACY_MSGCOUNT_KEY_PREFIX = 'phoenix:msgcount:';
+
+function parseSavedAnchor(raw: string | null): SavedScrollAnchor | null {
+  if (!raw) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (parsed === null || typeof parsed !== 'object') return null;
+    const obj = parsed as Record<string, unknown>;
+    if (typeof obj['topVisibleUnitKey'] !== 'string') return null;
+    // typeof NaN === 'number' so the typeof check alone admits NaN
+    // (localStorage is user-mutable). Number.isFinite tightens to real
+    // finite numbers so a corrupted offsetWithinUnit can't coerce
+    // scrollTop to NaN at restore time.
+    const offset = obj['offsetWithinUnit'];
+    if (typeof offset !== 'number' || !Number.isFinite(offset)) return null;
+    const unitCountAtSave = obj['unitCountAtSave'];
+    const validCount = typeof unitCountAtSave === 'number'
+      && Number.isFinite(unitCountAtSave)
+      && unitCountAtSave >= 0
+      ? unitCountAtSave
+      : undefined;
+    return {
+      topVisibleUnitKey: obj['topVisibleUnitKey'],
+      offsetWithinUnit: offset,
+      ...(validCount !== undefined ? { unitCountAtSave: validCount } : {}),
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Distance from the scroll root's content top to an element's top —
+ *  the correct generalization of `el.offsetTop` when the scroll root
+ *  is not the offsetParent. Uses `getBoundingClientRect` (viewport
+ *  coordinates) then converts to content coordinates by adding
+ *  `root.scrollTop` and subtracting the root's own viewport offset. */
+function unitTopInScrollRoot(el: HTMLElement, root: HTMLElement): number {
+  return el.getBoundingClientRect().top
+    - root.getBoundingClientRect().top
+    + root.scrollTop;
+}
+
+function captureDomAnchor(root: HTMLElement): SavedScrollAnchor | null {
+  const nodes = Array.from(
+    root.querySelectorAll<HTMLElement>('[data-render-unit-key]'),
+  );
+  let visibleTop: { key: string; unitTop: number } | null = null;
+  for (const el of nodes) {
+    const key = el.dataset['renderUnitKey'];
+    if (!key) continue;
+    const unitTop = unitTopInScrollRoot(el, root);
+    if (unitTop <= root.scrollTop) {
+      visibleTop = { key, unitTop };
+    } else {
+      break;
+    }
+  }
+  if (!visibleTop) {
+    const first = nodes[0];
+    const key = first?.dataset['renderUnitKey'];
+    if (!first || !key) return null;
+    return {
+      topVisibleUnitKey: key,
+      offsetWithinUnit: root.scrollTop - unitTopInScrollRoot(first, root),
+    };
+  }
+  return {
+    topVisibleUnitKey: visibleTop.key,
+    offsetWithinUnit: root.scrollTop - visibleTop.unitTop,
+  };
+}
+
+function captureAnchor(
+  scrollTop: number,
+  historicalUnits: HistoricalUnit[],
+  firstRenderedUnitIndex: number,
+  lastRenderedUnitIndex: number,
+  root: HTMLElement,
+  getElement: UnitHeightObserver['getElement'],
+): SavedScrollAnchor | null {
+  // Walk rendered units in DOM order; the LAST unit whose top is at or
+  // above scrollTop is the unit the viewport-top intersects (the unit
+  // the user is reading). offsetWithinUnit = positive distance from
+  // the unit's top to the viewport top.
+  //
+  // If no rendered unit's top is <= scrollTop (user is above all
+  // rendered units, i.e. inside the spacer), fall through to the
+  // fallback below.
+  let visibleTopUnit: { unit: HistoricalUnit; unitTop: number } | null = null;
+  for (let i = firstRenderedUnitIndex; i < lastRenderedUnitIndex; i++) {
+    const unit = historicalUnits[i]!;
+    const el = getElement(unit.key);
+    if (!el) continue;
+    const unitTop = unitTopInScrollRoot(el, root);
+    if (unitTop <= scrollTop) {
+      visibleTopUnit = { unit, unitTop };
+    } else {
+      // Once we pass scrollTop, subsequent units are also below — done.
+      break;
+    }
+  }
+  if (visibleTopUnit) {
+    return {
+      topVisibleUnitKey: visibleTopUnit.unit.key,
+      offsetWithinUnit: scrollTop - visibleTopUnit.unitTop,
+      unitCountAtSave: historicalUnits.length,
+    };
+  }
+  // Fallback: user is above all rendered units (inside the spacer) —
+  // anchor to the first rendered unit. offsetWithinUnit is negative
+  // here, restore lands at unitTop + negativeOffset = the same spacer
+  // position. Restore math handles either sign.
+  for (let i = firstRenderedUnitIndex; i < lastRenderedUnitIndex; i++) {
+    const unit = historicalUnits[i]!;
+    const el = getElement(unit.key);
+    if (el) {
+      return {
+        topVisibleUnitKey: unit.key,
+        offsetWithinUnit: scrollTop - unitTopInScrollRoot(el, root),
+        unitCountAtSave: historicalUnits.length,
+      };
+    }
+  }
+  return null;
+}
 
 // Extracts the arguments portion of a skill trigger string, stripping the leading skill name.
 function extractSkillArgs(trigger: string, name: string): string {
   return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
 }
 
-function isRenderableHistoricalMessage(msg: Message): boolean {
-  const type = msg.message_type || msg.type;
-  if (type === 'tool') return false;
-  if (type === 'system') {
-    return Boolean((msg.content as { text?: string })?.text);
-  }
-  return type === 'user' || type === 'skill' || type === 'agent';
-}
+type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
 
-interface MessageListBodyProps {
-  messages: Message[];
-  pendingMessages: QueuedMessage[];
-  toolResults: Map<string, Message>;
-  convState: ConversationState;
-  onRetry: (localId: string) => void;
-  onCancelSteering?: ((localId: string) => void) | undefined;
-  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
-  /** Number of renderable historical rows collapsed into the top spacer. */
-  collapsedRenderableCount: number;
-  /** Message IDs whose renderable rows are collapsed. Tool rows never render standalone. */
-  collapsedRenderableIds: Set<string>;
-}
-
-/**
- * Memoized subtree holding the .map over historical messages. Wrapping this
- * in React.memo means token updates to `streamingBuffer` (which flow through
- * the parent MessageList shell) DO NOT cause the historical messages to
- * re-render — shallow prop compare skips the subtree entirely because
- * `messages`, `toolResults`, etc. are reference-stable across token arrivals.
- */
-const MessageListBody = memo(function MessageListBody({
-  messages,
-  pendingMessages,
-  toolResults,
-  convState,
-  onRetry,
-  onCancelSteering,
-  onOpenFile,
-  collapsedRenderableCount,
-  collapsedRenderableIds,
-}: MessageListBodyProps) {
-  // Tracks whether the previous rendered message was an agent message, so
-  // we can suppress the "Phoenix HH:MM" header on consecutive agent messages
-  // within the same turn. Any user / skill message resets the run; system
-  // messages and tool messages (which don't render as their own block here)
-  // leave the run intact — they don't represent a new turn.
-  //
-  // inAgentRun is advanced over the FULL message list (before the window
-  // slice) so a row reveals with the SAME header it would have had
-  // non-virtualized — the window boundary must not change turn grouping.
-  let inAgentRun = false;
-  return (
-    <>
-      {collapsedRenderableCount > 0 && (
-        <div
-          className="message-collapsed-spacer"
-          style={{ height: collapsedRenderableCount * COLLAPSED_EST_PX }}
-          aria-hidden="true"
-        />
-      )}
-      {messages.map((msg) => {
-        const type = msg.message_type || msg.type;
-        const rendered = !collapsedRenderableIds.has(msg.message_id);
-        if (type === 'user') {
-          inAgentRun = false;
-          if (!rendered) return null;
-          return <UserMessage key={msg.sequence_id} message={msg} />;
-        } else if (type === 'skill') {
-          inAgentRun = false;
-          if (!rendered) return null;
-          const skillContent = msg.content as { name?: string; trigger?: string };
-          const skillTrigger = skillContent.trigger || '';
-          const triggerArgs = extractSkillArgs(skillTrigger, skillContent.name || '');
-          return (
-            <div key={msg.sequence_id} className="message user" data-sequence-id={msg.sequence_id}>
-              <div className="message-header">
-                <span className="message-sender">You</span>
-                {msg.created_at && (
-                  <span className="message-time" title={new Date(msg.created_at).toLocaleString()}>
-                    {formatMessageTime(msg.created_at)}
-                  </span>
-                )}
-              </div>
-              <div className="message-content">
-                <div className="skill-indicator" title={`Skill invocation: loaded instructions from /${skillContent.name || 'skill'}/SKILL.md and delivered to the agent`}>
-                  <span className="skill-label">skill: /{skillContent.name || 'skill'}</span>
-                  {triggerArgs && (
-                    <span className="skill-trigger">{triggerArgs}</span>
-                  )}
-                </div>
-              </div>
+function renderHistoricalUnit(unit: HistoricalUnit, onOpenFile: OnOpenFile): JSX.Element | null {
+  switch (unit.kind) {
+    case 'user':
+      return <UserMessage key={unit.key} message={unit.message} />;
+    case 'skill': {
+      const c = unit.message.content as { name?: string; trigger?: string };
+      const trigger = c.trigger || '';
+      const args = extractSkillArgs(trigger, c.name || '');
+      return (
+        <div key={unit.key} className="message user" data-sequence-id={unit.message.sequence_id}>
+          <div className="message-header">
+            <span className="message-sender">You</span>
+            {unit.message.created_at && (
+              <span className="message-time" title={new Date(unit.message.created_at).toLocaleString()}>
+                {formatMessageTime(unit.message.created_at)}
+              </span>
+            )}
+          </div>
+          <div className="message-content">
+            <div className="skill-indicator" title={`Skill invocation: loaded instructions from /${c.name || 'skill'}/SKILL.md and delivered to the agent`}>
+              <span className="skill-label">skill: /{c.name || 'skill'}</span>
+              {args && (
+                <span className="skill-trigger">{args}</span>
+              )}
             </div>
-          );
-        } else if (type === 'agent') {
-          const isFirstInTurn = !inAgentRun;
-          inAgentRun = true;
-          if (!rendered) return null;
-          return (
-            <AgentMessage
-              key={msg.sequence_id}
-              message={msg}
-              toolResults={toolResults}
-              onOpenFile={onOpenFile}
-              isFirstInTurn={isFirstInTurn}
-            />
-          );
-        }
-        if (type === 'system') {
-          if (!rendered) return null;
-          const text = (msg.content as { text?: string })?.text;
-          if (text) {
-            return (
-              <div key={msg.sequence_id} className="system-message">
-                <span className="system-message-text">{text}</span>
-              </div>
-            );
-          }
-        }
-        // Skip tool messages - they're rendered inline with their tool_use
-        return null;
-      })}
-      {/* Render pending messages (queued client-side, not yet echoed). */}
-      {pendingMessages.map((msg) => (
+          </div>
+        </div>
+      );
+    }
+    case 'agent_turn':
+      return (
+        <AgentMessage
+          key={unit.key}
+          message={unit.agent}
+          toolResults={unit.toolResultsByUseId}
+          onOpenFile={onOpenFile}
+          isFirstInTurn={unit.isFirstInTurn}
+        />
+      );
+    case 'system': {
+      // buildRenderUnits skips empty-text system messages, so this branch
+      // always has text — but read defensively in case the contract drifts.
+      const text = (unit.message.content as { text?: string })?.text;
+      if (!text) return null;
+      return (
+        <div key={unit.key} className="system-message">
+          <span className="system-message-text">{text}</span>
+        </div>
+      );
+    }
+  }
+}
+
+function renderTailUnit(
+  unit: TailUnit,
+  slug: string | undefined,
+  onRetry: (localId: string) => void,
+  onCancelSteering: ((localId: string) => void) | undefined,
+): JSX.Element | null {
+  switch (unit.kind) {
+    case 'pending_user':
+      return (
         <QueuedUserMessage
-          key={msg.localId}
-          message={msg}
+          key={unit.key}
+          message={unit.message}
           onRetry={onRetry}
           onCancelSteering={onCancelSteering}
         />
-      ))}
-      {convState.type === 'awaiting_sub_agents' && (
-        <SubAgentStatus stateData={convState} />
+      );
+    case 'sub_agent_status':
+      return <SubAgentStatus key={unit.key} stateData={unit.state} />;
+    case 'streaming_agent':
+      // The slug-less case should never reach here in practice because
+      // MessageList only emits the streaming_agent unit when slug is
+      // set. Defensive null-return keeps the type narrow.
+      if (!slug) return null;
+      return <StreamingMessage key={unit.key} slug={slug} />;
+  }
+}
+
+interface MessageListBodyProps {
+  historicalUnits: HistoricalUnit[];
+  tailUnits: TailUnit[];
+  firstRenderedUnitIndex: number;
+  lastRenderedUnitIndex: number;
+  spacerHeight: number;
+  bottomSpacerHeight: number;
+  topSentinelRef: (node: HTMLDivElement | null) => void;
+  bottomSentinelRef: (node: HTMLDivElement | null) => void;
+  observeUnit: UnitHeightObserver['observe'];
+  slug: string | undefined;
+  onRetry: (localId: string) => void;
+  onCancelSteering?: ((localId: string) => void) | undefined;
+  onOpenFile: OnOpenFile;
+}
+
+/**
+ * Memoized subtree holding the slice over historical render units.
+ * The parent <MessageList> is itself memo'd so token churn doesn't
+ * even reach this layer; this memo is the inner belt-and-suspenders
+ * boundary that keeps the historical render path stable when other
+ * props (e.g. callbacks) churn at the parent.
+ *
+ * Each rendered unit is wrapped in a `<div>` that owns the
+ * ResizeObserver-attaching ref callback. The wrapper is a flex item of
+ * the same parent (#messages) and visually transparent — it doesn't
+ * change the layout previously produced by direct-child message
+ * components, but it provides the structural DOM hook that both the
+ * height cache and the saved-scroll anchor write rely on.
+ */
+const MessageListBody = memo(function MessageListBody({
+  historicalUnits,
+  tailUnits,
+  firstRenderedUnitIndex,
+  lastRenderedUnitIndex,
+  spacerHeight,
+  bottomSpacerHeight,
+  topSentinelRef,
+  bottomSentinelRef,
+  observeUnit,
+  slug,
+  onRetry,
+  onCancelSteering,
+  onOpenFile,
+}: MessageListBodyProps) {
+  return (
+    <>
+      {firstRenderedUnitIndex > 0 && (
+        <div
+          className="message-collapsed-spacer"
+          style={{ height: spacerHeight }}
+          aria-hidden="true"
+        />
       )}
+      <div ref={topSentinelRef} aria-hidden="true" />
+      {historicalUnits
+        .slice(firstRenderedUnitIndex, lastRenderedUnitIndex)
+        .map((unit) => (
+          <div
+            key={unit.key}
+            ref={observeUnit(unit)}
+            data-render-unit-key={unit.key}
+          >
+            {renderHistoricalUnit(unit, onOpenFile)}
+          </div>
+        ))}
+      {lastRenderedUnitIndex < historicalUnits.length && (
+        <div ref={bottomSentinelRef} aria-hidden="true" />
+      )}
+      {lastRenderedUnitIndex < historicalUnits.length && (
+        <div
+          className="message-collapsed-spacer"
+          style={{ height: bottomSpacerHeight }}
+          aria-hidden="true"
+        />
+      )}
+      {tailUnits.map((unit) => (
+        <div key={unit.key} data-render-unit-key={unit.key}>
+          {renderTailUnit(unit, slug, onRetry, onCancelSteering)}
+        </div>
+      ))}
     </>
   );
 });
 
-export function MessageList({
+function MessageListImpl({
   messages,
   pendingMessages,
   convState,
@@ -209,7 +384,7 @@ export function MessageList({
   onOpenFile,
   systemPrompt,
   conversationId,
-  streamingBuffer,
+  slug,
 }: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [jumpToNewestState, setJumpToNewestState] = useState<{
@@ -231,6 +406,13 @@ export function MessageList({
   // 'none'  = no new message this render.
   const scrollTriggerRef = useRef<'none' | 'soft' | 'force'>('none');
   const lastConversationIdRef = useRef<string | undefined>(conversationId);
+  const ackSnapshotRef = useRef<{
+    anchor: SavedScrollAnchor | null;
+    scrollTop: number;
+    scrollHeight: number;
+    wasPinned: boolean;
+  } | null>(null);
+  const previousPendingIdsRef = useRef<Set<string>>(new Set(pendingMessages.map((m) => m.localId)));
 
   if (lastConversationIdRef.current !== conversationId) {
     lastConversationIdRef.current = conversationId;
@@ -238,46 +420,91 @@ export function MessageList({
     prevMessageCountRef.current = messages.length;
     scrollTriggerRef.current = 'none';
     lastScrollTop.current = mainRef.current?.scrollTop ?? 0;
+    ackSnapshotRef.current = null;
+    previousPendingIdsRef.current = new Set(pendingMessages.map((m) => m.localId));
     isPinnedToBottom.current = true;
   }
 
-  // Saved scroll pixel for REQ-CONV-013, read synchronously and memoized per
-  // conversation so the bottom-anchored window can widen far enough that the
-  // restored scrollTop lands inside REAL rendered content (not the estimated
-  // spacer). Recomputed on conversationId change, same render-time pattern as
-  // the rest of this component.
-  const savedScrollLookupRef = useRef<{ id: string | undefined; pos: number | null }>({
+  // Saved unit-anchor for REQ-CONV-013, read synchronously and memoized
+  // per conversation. The hook uses it to widen the initial window so the
+  // anchored unit is rendered before first paint; the layout effect below
+  // applies the actual scrollTop placement once the DOM is committed.
+  const savedAnchorLookupRef = useRef<{ id: string | undefined; anchor: SavedScrollAnchor | null }>({
     id: undefined,
-    pos: null,
+    anchor: null,
   });
-  if (savedScrollLookupRef.current.id !== conversationId) {
-    let pos: number | null = null;
+  if (savedAnchorLookupRef.current.id !== conversationId) {
+    let anchor: SavedScrollAnchor | null = null;
     if (conversationId) {
       try {
-        const raw = localStorage.getItem(`${SCROLL_KEY_PREFIX}${conversationId}`);
-        pos = raw !== null ? parseInt(raw, 10) : null;
-        if (pos !== null && Number.isNaN(pos)) pos = null;
-      } catch { pos = null; }
+        anchor = parseSavedAnchor(localStorage.getItem(`${ANCHOR_KEY_PREFIX}${conversationId}`));
+      } catch {
+        anchor = null;
+      }
     }
-    savedScrollLookupRef.current = { id: conversationId, pos };
+    savedAnchorLookupRef.current = { id: conversationId, anchor };
   }
+  const savedAnchor = savedAnchorLookupRef.current.anchor;
 
-  const renderableMessages = useMemo(
-    () => messages.filter(isRenderableHistoricalMessage),
-    [messages],
+  // Streaming session identity: useStreamingStartedAt subscribes to
+  // `streamingBuffer?.startedAt` for this slug and re-renders only when
+  // a session starts / ends / restarts (not per-token). The actual
+  // buffer text is subscribed inside <StreamingMessage> via
+  // useStreamingBuffer.
+  //
+  // Including startedAt in the key forces React to remount
+  // <StreamingMessage> across back-to-back sessions (e.g., when
+  // sse_message and sse_token land in the same React batch and the
+  // streaming-active boolean never observes false between sessions).
+  // Without it, the leaf's pendingText / displayText state from
+  // session N would briefly bleed into session N+1's first frame.
+  const streamingStartedAt = useStreamingStartedAt(slug);
+  const streamingHandle = useMemo(
+    () => (streamingStartedAt !== null && slug
+      ? { key: `streaming-${slug}-${streamingStartedAt}` }
+      : null),
+    [streamingStartedAt, slug],
   );
 
-  const { firstRenderedIndex } = useBottomAnchoredWindow({
-    messageCount: renderableMessages.length,
+  const { historicalUnits, tailUnits } = useMemo(
+    () => buildRenderUnits({
+      messages,
+      pendingMessages,
+      convState,
+      streamingHandle,
+    }),
+    [messages, pendingMessages, convState, streamingHandle],
+  );
+
+  const currentPendingIds = useMemo(
+    () => new Set(pendingMessages.map((m) => m.localId)),
+    [pendingMessages],
+  );
+  const acknowledgedPendingIds = useMemo(() => {
+    const historicalKeys = new Set(historicalUnits.map((u) => u.key));
+    return Array.from(previousPendingIdsRef.current).filter(
+      (id) => !currentPendingIds.has(id) && historicalKeys.has(id),
+    );
+  }, [currentPendingIds, historicalUnits]);
+
+  const heightCache = useUnitHeightCache(conversationId);
+  const unitObserver = useUnitHeightObserver(heightCache);
+
+  const {
+    firstRenderedUnitIndex,
+    lastRenderedUnitIndex,
+    spacerHeight,
+    bottomSpacerHeight,
+    topSentinelRef,
+    bottomSentinelRef,
+    resetToBottom,
+  } = useBottomAnchoredWindow({
+    historicalUnits,
     conversationId,
     scrollRootRef: mainRef,
-    savedScrollPos: savedScrollLookupRef.current.pos,
+    savedAnchor,
+    heightCache,
   });
-
-  const collapsedRenderableIds = useMemo(
-    () => new Set(renderableMessages.slice(0, firstRenderedIndex).map((msg) => msg.message_id)),
-    [firstRenderedIndex, renderableMessages],
-  );
 
   if (messages.length > prevMessageCountRef.current) {
     const newMsgs = messages.slice(prevMessageCountRef.current);
@@ -298,11 +525,36 @@ export function MessageList({
     return distanceFromBottom <= SCROLL_THRESHOLD;
   }, []);
 
-  // Handle scroll events to track if user is pinned to bottom
+  // Handle scroll events to track if user is pinned to bottom and to
+  // capture the current unit anchor so a later save persists the
+  // up-to-date position. Fires for both user scrolls and programmatic
+  // scrolls (ResizeObserver auto-anchor, restore, jump-to-newest).
   const handleScroll = useCallback(() => {
     isPinnedToBottom.current = checkIfPinnedToBottom();
     const el = mainRef.current;
-    if (el) lastScrollTop.current = el.scrollTop;
+    if (el) {
+      lastScrollTop.current = el.scrollTop;
+      ackSnapshotRef.current = {
+        anchor: captureDomAnchor(el),
+        scrollTop: el.scrollTop,
+        scrollHeight: el.scrollHeight,
+        wasPinned: checkIfPinnedToBottom(),
+      };
+      if (conversationId) {
+        const { historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex } = captureStateRef.current;
+        const anchor = captureAnchor(
+          el.scrollTop,
+          historicalUnits,
+          firstRenderedUnitIndex,
+          lastRenderedUnitIndex,
+          el,
+          unitObserver.getElement,
+        );
+        if (anchor) {
+          latestAnchorRef.current = { conversationId, anchor };
+        }
+      }
+    }
     if (isPinnedToBottom.current) {
       setJumpToNewestState((prev) => (
         prev.conversationId === conversationId && !prev.visible
@@ -310,7 +562,7 @@ export function MessageList({
           : { conversationId, visible: false }
       ));
     }
-  }, [checkIfPinnedToBottom, conversationId]);
+  }, [checkIfPinnedToBottom, conversationId, unitObserver]);
 
   // Scroll to bottom helper
   const scrollToBottom = useCallback(() => {
@@ -360,81 +612,226 @@ export function MessageList({
     return () => observer.disconnect();
   }, [conversationId]);
 
-  // Save scroll position on unmount / visibility change (REQ-CONV-013)
+  // Latest captured anchor, refreshed on every scroll event (user
+  // scrolls and programmatic scrolls both fire `scroll`, including the
+  // ResizeObserver's auto-anchor-to-bottom). The save effect persists
+  // the ref's value at visibilitychange / cleanup time; reading from
+  // a ref is necessary because by the time the cleanup fires on
+  // conversation switch, the OLD unit DOM nodes have already
+  // unmounted and `unitObserver.getElement` returns nothing for them.
+  const latestAnchorRef = useRef<{ conversationId: string; anchor: SavedScrollAnchor } | null>(null);
+
+  // Latest historicalUnits + firstRenderedUnitIndex captured for the
+  // scroll handler. Refs keep handleScroll's identity stable across
+  // unit-content updates.
+  const captureStateRef = useRef({ historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex });
+  captureStateRef.current = { historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex };
+
+  // Save unit anchor on visibility-hidden and unmount (REQ-MLRU-009 +
+  // REQ-CONV-013). Replaces the prior scrollTop+messageCount save.
   useEffect(() => {
     if (!conversationId) return;
-    const saveScroll = () => {
+    const save = (recomputeCurrent: boolean) => {
+      let anchorToSave: SavedScrollAnchor | null = null;
+      const root = mainRef.current;
+      if (recomputeCurrent && root) {
+        const { historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex } = captureStateRef.current;
+        anchorToSave = captureAnchor(
+          root.scrollTop,
+          historicalUnits,
+          firstRenderedUnitIndex,
+          lastRenderedUnitIndex,
+          root,
+          unitObserver.getElement,
+        );
+        if (anchorToSave) {
+          latestAnchorRef.current = { conversationId, anchor: anchorToSave };
+        }
+      }
+
+      if (!anchorToSave) {
+        const last = latestAnchorRef.current;
+        if (last && last.conversationId === conversationId) {
+          anchorToSave = last.anchor;
+        }
+      }
+
+      if (anchorToSave) {
+        try {
+          localStorage.setItem(
+            `${ANCHOR_KEY_PREFIX}${conversationId}`,
+            JSON.stringify(anchorToSave),
+          );
+        } catch {
+          // Quota exceeded; the in-memory state is still correct.
+        }
+      }
+      // Prune legacy keys whether or not the new write succeeded so a
+      // future visit doesn't read both shapes.
       try {
-        // Use ref for scroll position — DOM element may be detached on unmount
-        localStorage.setItem(`${SCROLL_KEY_PREFIX}${conversationId}`, String(lastScrollTop.current));
-        localStorage.setItem(`${MSGCOUNT_KEY_PREFIX}${conversationId}`, String(messages.length));
-      } catch { /* storage full - degrade gracefully */ }
+        localStorage.removeItem(`${LEGACY_SCROLL_KEY_PREFIX}${conversationId}`);
+        localStorage.removeItem(`${LEGACY_MSGCOUNT_KEY_PREFIX}${conversationId}`);
+      } catch {
+        // ignored
+      }
+      // Persist any measured heights so a remount's first paint uses
+      // exact spacer geometry.
+      heightCache.flush();
     };
     const onVisChange = () => {
-      if (document.visibilityState === 'hidden') saveScroll();
+      if (document.visibilityState === 'hidden') save(true);
     };
     document.addEventListener('visibilitychange', onVisChange);
     return () => {
       document.removeEventListener('visibilitychange', onVisChange);
-      saveScroll(); // save on unmount (route change)
+      save(false);
     };
-  }, [conversationId, messages.length]);
+  }, [conversationId, heightCache, unitObserver]);
 
-  // Restore scroll position on mount after messages render (REQ-CONV-013).
-  // useLayoutEffect runs synchronously after DOM commit and before the browser
-  // fires ResizeObserver, so isPinnedToBottom is correctly set before the
-  // observer decides whether to auto-scroll — no rAF, no flash to bottom first.
+  // Restore by unit anchor on first paint per conversation. Runs in
+  // useLayoutEffect so it lands before the ResizeObserver's first
+  // observation has a chance to interfere.
+  //
+  // Three things have to land together here (REQ-MLRU-009, REQ-CONV-013):
+  //   1. scrollTop placement at the saved anchor (when anchor + unit
+  //      both exist), using unitTopInScrollRoot so the math is
+  //      correct regardless of whether #main-area is the offsetParent.
+  //   2. prevMessagesHeight seeded from the current content height so
+  //      the first ResizeObserver tick (which compares against this
+  //      ref) does not see a bogus heightGrew=true and either snap to
+  //      bottom (clobbering the restore) or pop the "↓ New messages"
+  //      button on a fresh visit.
+  //   3. latestAnchorRef seeded so a quick visibility-hidden after
+  //      restore (user opens conversation and tab-switches) persists
+  //      the restored position rather than nothing — and so the saved
+  //      unitCountAtSave is preserved across save/restore cycles.
+  //
+  // The "new messages while away" surface is the saved
+  // unitCountAtSave vs current historicalUnits.length comparison: if
+  // the count grew and the restored position is not at bottom, show
+  // the jump-to-newest button.
   useLayoutEffect(() => {
-    if (!conversationId || messages.length === 0 || lastRestoredConversationId.current === conversationId) return;
+    if (!conversationId) return;
+    if (lastRestoredConversationId.current === conversationId) return;
+    if (historicalUnits.length === 0) return;
+    const root = mainRef.current;
+    const messagesEl = messagesRef.current;
+    if (!root || !messagesEl) return;
+
+    const savedAnchorIndex = savedAnchor
+      ? historicalUnits.findIndex((u) => u.key === savedAnchor.topVisibleUnitKey)
+      : -1;
+    const canRestoreSavedAnchor = savedAnchor !== null && savedAnchorIndex >= 0;
+
+    if (canRestoreSavedAnchor && savedAnchor) {
+      const anchorEl = unitObserver.getElement(savedAnchor.topVisibleUnitKey);
+      if (!anchorEl) return;
+    }
+
     lastRestoredConversationId.current = conversationId;
-    let savedPos: string | null = null;
-    let savedCount: string | null = null;
-    try {
-      savedPos = localStorage.getItem(`${SCROLL_KEY_PREFIX}${conversationId}`);
-      savedCount = localStorage.getItem(`${MSGCOUNT_KEY_PREFIX}${conversationId}`);
-    } catch {
-      return;
+
+    // (2) Seed prevMessagesHeight so the first ResizeObserver tick
+    //     after this restore doesn't observe a spurious "height grew".
+    prevMessagesHeight.current = messagesEl.getBoundingClientRect().height;
+
+    if (canRestoreSavedAnchor && savedAnchor) {
+      const el = unitObserver.getElement(savedAnchor.topVisibleUnitKey);
+      // Guarded above; keep the branch defensive for future refactors.
+      if (!el) return;
+      // (1) Restore with correct content-coordinate math.
+      const unitTop = unitTopInScrollRoot(el, root);
+      root.scrollTop = unitTop + savedAnchor.offsetWithinUnit;
+      lastScrollTop.current = root.scrollTop;
+      isPinnedToBottom.current = checkIfPinnedToBottom();
+    } else if (savedAnchor && conversationId) {
+      try {
+        localStorage.removeItem(`${ANCHOR_KEY_PREFIX}${conversationId}`);
+      } catch {
+        // ignored
+      }
     }
-    if (savedPos !== null) {
-      const pos = parseInt(savedPos, 10);
-      if (Number.isNaN(pos)) return;
-      const parsedCount = savedCount ? parseInt(savedCount, 10) : messages.length;
-      const prevCount = Number.isNaN(parsedCount) ? messages.length : parsedCount;
-      const el = mainRef.current;
-      if (el) {
-        el.scrollTop = pos;
-        lastScrollTop.current = pos;
+
+    // (3) Seed latestAnchorRef with the current position (or, if the
+    //     anchor is missing, with whatever bottom-pin we landed on)
+    //     so a save before the first scroll persists meaningful state.
+    const initialAnchor = captureAnchor(
+      root.scrollTop,
+      historicalUnits,
+      firstRenderedUnitIndex,
+      lastRenderedUnitIndex,
+      root,
+      unitObserver.getElement,
+    );
+    if (initialAnchor) {
+      latestAnchorRef.current = { conversationId, anchor: initialAnchor };
+    }
+
+    // jumpToNewest surface for "new messages arrived while away":
+    // the saved anchor's unitCountAtSave (if present) tells us how
+    // many units existed at save time. If the count grew AND we're
+    // not currently pinned to bottom, surface the button.
+    if (
+      savedAnchor?.unitCountAtSave !== undefined
+      && historicalUnits.length > savedAnchor.unitCountAtSave
+      && !isPinnedToBottom.current
+    ) {
+      setJumpToNewestState((prev) => (
+        prev.conversationId === conversationId && prev.visible
+          ? prev
+          : { conversationId, visible: true }
+      ));
+    }
+  }, [
+    conversationId,
+    historicalUnits,
+    savedAnchor,
+    firstRenderedUnitIndex,
+    lastRenderedUnitIndex,
+    unitObserver,
+    checkIfPinnedToBottom,
+  ]);
+
+  useLayoutEffect(() => {
+    const root = mainRef.current;
+    if (!root) return;
+    if (acknowledgedPendingIds.length > 0) {
+      const snapshot = ackSnapshotRef.current;
+      if (snapshot?.wasPinned) {
+        root.scrollTop = root.scrollHeight;
+        lastScrollTop.current = root.scrollTop;
+        isPinnedToBottom.current = true;
+      } else if (snapshot) {
+        const anchor = snapshot.anchor;
+        const promotedAnchor = anchor && acknowledgedPendingIds.includes(anchor.topVisibleUnitKey)
+          ? Array.from(root.querySelectorAll<HTMLElement>('[data-render-unit-key]')).find(
+            (el) => el.dataset['renderUnitKey'] === anchor.topVisibleUnitKey,
+          ) ?? null
+          : null;
+        if (promotedAnchor && anchor) {
+          root.scrollTop = unitTopInScrollRoot(promotedAnchor, root) + anchor.offsetWithinUnit;
+        } else {
+          root.scrollTop = snapshot.scrollTop + (root.scrollHeight - snapshot.scrollHeight);
+        }
+        lastScrollTop.current = root.scrollTop;
         isPinnedToBottom.current = checkIfPinnedToBottom();
-        if (messages.length > prevCount && !isPinnedToBottom.current) {
-          setJumpToNewestState((prev) => (
-            prev.conversationId === conversationId && prev.visible
-              ? prev
-              : { conversationId, visible: true }
-          ));
-        }
       }
     }
-  }, [conversationId, messages.length, checkIfPinnedToBottom]);
+    ackSnapshotRef.current = {
+      anchor: captureDomAnchor(root),
+      scrollTop: root.scrollTop,
+      scrollHeight: root.scrollHeight,
+      wasPinned: checkIfPinnedToBottom(),
+    };
+    previousPendingIdsRef.current = currentPendingIds;
+  }, [acknowledgedPendingIds, checkIfPinnedToBottom, currentPendingIds]);
 
-
-
-  // Build a map of tool_use_id -> tool result for pairing
-  const toolResults = useMemo(() => {
-    const map = new Map<string, Message>();
-    for (const msg of messages) {
-      const type = msg.message_type || msg.type;
-      if (type === 'tool') {
-        const content = msg.content as ToolResultContent;
-        const toolUseId = content?.tool_use_id;
-        if (toolUseId) {
-          map.set(toolUseId, msg);
-        }
-      }
-    }
-    return map;
-  }, [messages]);
-
-  const isEmpty = messages.length === 0 && pendingMessages.length === 0;
+  // isEmpty reflects "nothing for MessageListBody to render". Includes
+  // tail units (pending_user, sub_agent_status, streaming_agent) so the
+  // sub-agent status block when historical messages are still empty
+  // (e.g., sub-agent flow that begins streaming before the user message
+  // persists, or a reconnect race where pending events outpace the
+  // initial snapshot).
+  const isEmpty = historicalUnits.length === 0 && tailUnits.length === 0;
 
   return (
     <main id="main-area" ref={mainRef} onScroll={handleScroll}>
@@ -464,27 +861,33 @@ export function MessageList({
             </div>
           ) : (
             <MessageListBody
-              messages={messages}
-              pendingMessages={pendingMessages}
-              toolResults={toolResults}
-              convState={convState}
+              historicalUnits={historicalUnits}
+              tailUnits={tailUnits}
+              firstRenderedUnitIndex={firstRenderedUnitIndex}
+              lastRenderedUnitIndex={lastRenderedUnitIndex}
+              spacerHeight={spacerHeight}
+              bottomSpacerHeight={bottomSpacerHeight}
+              topSentinelRef={topSentinelRef}
+              bottomSentinelRef={bottomSentinelRef}
+              observeUnit={unitObserver.observe}
+              slug={slug}
               onRetry={onRetry}
               onCancelSteering={onCancelSteering}
               onOpenFile={onOpenFile}
-              collapsedRenderableCount={firstRenderedIndex}
-              collapsedRenderableIds={collapsedRenderableIds}
             />
           )}
-          {/* Streaming text — cleared atomically when sse_message arrives (REQ-CONV-019).
-              Lives OUTSIDE <MessageListBody> so token updates only re-render this element,
-              not the historical message list. */}
-          <StreamingMessage buffer={streamingBuffer ?? null} />
+          {/* Streaming text — now rendered via the streaming_agent TailUnit
+              inside <MessageListBody>. <StreamingMessage> subscribes to the
+              buffer via useStreamingBuffer(slug), so per-token mutations
+              re-render only the leaf — MessageList and MessageListBody are
+              untouched by token churn (REQ-MLRU-010). */}
         </div>
       </section>
       {showJumpToNewest && (
         <button
           className="jump-to-newest"
           onClick={() => {
+            flushSync(resetToBottom);
             scrollToBottom();
             setJumpToNewestState((prev) => (
               prev.conversationId === conversationId && !prev.visible
@@ -500,3 +903,25 @@ export function MessageList({
     </main>
   );
 }
+
+/**
+ * memo-wrapped export. The parent `<ConversationPage>` re-renders on
+ * every token (it consumes the whole atom via useConversationAtom); this
+ * memo boundary stops that re-render from propagating here, because the
+ * props are reference-stable across token mutations:
+ *   - messages / pendingMessages / convState come from atom slices that
+ *     don't change on tokens
+ *   - callbacks (onRetry / onCancelSteering / onOpenFile) are
+ *     useCallback'd at the parent
+ *   - slug / conversationId are URL/atom-derived strings
+ *   - systemPrompt is a string from the atom that doesn't mutate per token
+ *
+ * Internally, MessageList subscribes to `useStreamingStartedAt(slug)` —
+ * a primitive (number | null) that stays Object.is-stable through every
+ * token within a session, so the subscription notification on each token
+ * does not trigger a re-render. The buffer text itself is consumed by
+ * <StreamingMessage> via useStreamingBuffer(slug); only that leaf
+ * re-renders per token.
+ */
+export const MessageList = memo(MessageListImpl);
+

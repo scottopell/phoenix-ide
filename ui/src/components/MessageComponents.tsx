@@ -534,7 +534,7 @@ function QueuedUserMessageImpl({
 
 interface AgentMessageProps {
   message: Message;
-  toolResults: Map<string, Message>;
+  toolResults: ReadonlyMap<string, Message>;
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
   /**
    * When false, suppresses the "Phoenix HH:MM" header row. Used by the list

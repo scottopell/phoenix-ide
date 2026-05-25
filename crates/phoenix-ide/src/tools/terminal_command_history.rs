@@ -59,8 +59,8 @@ impl Tool for TerminalCommandHistoryTool {
         // Clamp count to [1, 5].
         let count = parsed.count.clamp(1, 5);
 
-        let Some(handle) = ctx.terminals.get(&ctx.conversation_id) else {
-            return ToolOutput::error("no terminal is open for this conversation");
+        let Some(handle) = ctx.terminals.get(&ctx.work_scope) else {
+            return ToolOutput::error("no terminal is open for this work scope");
         };
 
         let status = *handle

@@ -5,13 +5,33 @@ import type { BashRingLine } from "./BashRingLine";
  * `kill_pending_kernel` response payload (REQ-BASH-003). The kill
  * response timer expired before the kernel delivered the exit; the
  * process is still alive and the handle stays subscribable.
+ *
+ * Carries the active-kill fields (`display`, `signal_sent`) and the
+ * passive-wait fields (`waited_ms`) as `Option`s with
+ * `skip_serializing_if`: the same `status="kill_pending_kernel"` envelope
+ * is emitted from four distinct producer sites (active kill, peek on
+ * kill-in-flight, wait on kill-in-flight, run/wait observing kill-in-
+ * flight) whose wire shapes differ in which of these are present. The
+ * `Option` encoding makes "absent" structurally distinct from "empty
+ * placeholder" so no post-serialization scrubbing is needed.
  */
 export type BashKillPendingKernelPayload = { handle: string, cmd: string, 
 /**
  * Optional handle label set on the run call (REQ-BASH-002).
  */
-label?: string | null, kill_signal_sent: string, kill_attempted_at: string, display: string, 
+label?: string | null, kill_signal_sent: string, kill_attempted_at: string, 
 /**
- * Echoes the signal sent on this kill call (`TERM` / `KILL`).
+ * Display label (REQ-BASH-015) — present on kill / peek / wait paths
+ * that synthesise a label; absent on the run/wait passive-wait path.
  */
-signal_sent: string, start_offset: number, end_offset: number, truncated_before: boolean, lines: Array<BashRingLine>, };
+display?: string | null, 
+/**
+ * Echoes the signal sent on a kill call (`TERM` / `KILL`); absent on
+ * peek/wait/passive paths which observe but did not issue the kill.
+ */
+signal_sent?: string | null, 
+/**
+ * Wait window elapsed (run/wait passive-wait path only); absent on
+ * kill / peek paths.
+ */
+waited_ms?: number | null, start_offset: number, end_offset: number, truncated_before: boolean, lines: Array<BashRingLine>, };

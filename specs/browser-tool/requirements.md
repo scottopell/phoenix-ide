@@ -279,19 +279,19 @@ THE SYSTEM SHALL ensure the file contains all entries in full, without per-entry
 
 ### REQ-BT-010: Implicit Session Model
 
-THE SYSTEM SHALL maintain browser state across tool calls within a conversation
+THE SYSTEM SHALL maintain browser state across tool calls within a `WorkScope`
 
 THE SYSTEM SHALL automatically start the browser on first browser tool call
 
 THE SYSTEM SHALL automatically close the browser after idle timeout (30 minutes)
 
-THE SYSTEM SHALL isolate browser state between different conversations
+THE SYSTEM SHALL isolate browser state between different `WorkScope`s. Continuation members that resolve to the same `WorkScope` deliberately share a session — see REQ-BROWSER-WS-001 / REQ-BROWSER-WS-002.
 
 WHEN browser tools receive `ToolContext`
-THE SYSTEM SHALL use `ctx.browser()` to obtain the session for `ctx.conversation_id`
-AND the mapping from conversation to browser SHALL be enforced by construction
+THE SYSTEM SHALL use `ctx.browser()` to obtain the session for `ctx.work_scope`
+AND the mapping from `WorkScope` to browser SHALL be enforced by construction
 
-**Rationale:** Agents should not need to manage session IDs or browser lifecycle. The `ToolContext.browser()` method provides correct-by-construction session access - tools cannot accidentally use the wrong conversation's browser.
+**Rationale:** Agents should not need to manage session IDs or browser lifecycle. The `ToolContext.browser()` method provides correct-by-construction session access — tools cannot accidentally use the wrong scope's browser. Identity is `WorkScope`, not conversation id, because worktree-backed conversations share resources across continuation members (REQ-BROWSER-WS-001).
 
 **User Stories:** US-1, US-2, US-3
 
@@ -299,14 +299,14 @@ AND the mapping from conversation to browser SHALL be enforced by construction
 
 ### REQ-BT-011: State Persistence
 
-WHILE a conversation is active
-THE SYSTEM SHALL persist browser state (cookies, cache, current page) across tool calls
+WHILE a `WorkScope`'s last-touch is within the idle window
+THE SYSTEM SHALL persist browser state (cookies, cache, current page, open tabs) across tool calls and across continuation members resolving to the same scope
 
 WHEN `ctx.browser()` is called
 THE SYSTEM SHALL update the session's last-activity timestamp
 AND return a guard that provides access to the browser session
 
-**Rationale:** Natural testing flows like "login → navigate → verify" require state to persist between steps.
+**Rationale:** Natural testing flows like "login → navigate → verify" require state to persist between steps. The continuation-inheritance dimension (REQ-BROWSER-WS-002) extends "between steps" to "between continuation members" — the on-disk profile dir is keyed by `WorkScope`, so two members on the same scope see the same cookies/cache/tabs.
 
 **User Stories:** US-2
 
@@ -316,21 +316,106 @@ AND return a guard that provides access to the browser session
 
 WHEN browser tools are invoked
 THE SYSTEM SHALL receive all execution context via a `ToolContext` parameter
-AND derive conversation identity from `ToolContext.conversation_id`
+AND derive scope identity from `ToolContext.work_scope`
 AND access browser session via `ToolContext.browser()` method
 
 WHEN browser tools are constructed
-THE SYSTEM SHALL NOT store per-conversation state
-AND tool instances SHALL be reusable across conversations
+THE SYSTEM SHALL NOT store per-`WorkScope` state
+AND tool instances SHALL be reusable across scopes
 
 THE `ToolContext.browser()` method SHALL:
-- Use `conversation_id` internally (not exposed to tool)
+- Resolve `ToolContext.work_scope` internally (not exposed to tool)
 - Return a guard that updates activity timestamp on drop
 - Lazily initialize Chrome on first call
 
-**Rationale:** Stateless tools with context injection make invalid states unrepresentable. Tools cannot use wrong conversation's browser because `browser()` derives identity from the context.
+**Rationale:** Stateless tools with context injection make invalid states unrepresentable. Tools cannot use the wrong scope's browser because `browser()` derives identity from the context's `WorkScope`. Direct-mode conversations resolve to `WorkScope::Conversation(<id>)` (per-conversation scoping fallback); worktree-backed conversations resolve to `WorkScope::Worktree(<path>)` (shared across continuations).
 
 **User Stories:** US-1, US-2, US-3
+
+---
+
+## WorkScope Ownership
+
+These requirements migrate browser sessions from per-conversation ownership to `WorkScope` ownership, the same primitive tmux integration adopted in REQ-TMUX-WS-001. Worktree-backed conversations share a single Chrome window across continuation members; Direct conversations fall back to per-conversation scoping because no durable owner exists for them to inherit.
+
+### REQ-BROWSER-WS-001: Sessions Keyed by WorkScope
+
+WHEN `BrowserSessionManager::get_session` resolves a session
+THE SYSTEM SHALL key the lookup by `WorkScope::stable_key()`
+
+WHEN a conversation is worktree-backed (Work, Branch, top-level managed Explore)
+THE SYSTEM SHALL resolve `WorkScope::Worktree(<path>)` for the lookup
+
+WHEN a conversation is Direct (no durable owner)
+THE SYSTEM SHALL resolve `WorkScope::Conversation(<id>)` for the lookup
+
+WHEN `BrowserSession::new` constructs a Chrome instance
+THE SYSTEM SHALL derive the user data directory from the same scope key
+AND two sessions resolving to the same scope SHALL share the same on-disk profile
+
+**Rationale:** A Work/Branch conversation and any context-exhaustion continuation that inherits its worktree are the same unit of work. Their tools should drive the same Chrome window — including open tabs, cookies, and dev-tools state — without the continuation observing a silent re-login.
+
+**User Stories:** US-1, US-2, US-3
+
+---
+
+### REQ-BROWSER-WS-002: Continuation Inheritance and Lifecycle Fan-Out
+
+WHILE a worktree-scoped browser session is live
+WHEN a continuation conversation resolves to the same `WorkScope`
+THE SYSTEM SHALL return the existing `Arc<RwLock<BrowserSession>>` on `get_session`
+AND SHALL NOT spawn a fresh Chrome instance
+
+WHEN `BrowserSessionLifecycleEvent` is published
+THE SYSTEM SHALL carry the `WorkScope` of the affected session
+AND the SSE bridge SHALL fan out `BrowserSessionState` to every live runtime
+    handle whose conversation resolves to that scope
+
+WHEN a continuation member's enriched view is hydrated
+THE SYSTEM SHALL derive `browser_session_active` from `is_active(&WorkScope)` of the member's resolved scope
+
+**Rationale:** Inheritance is structural — the agent does not opt in. The SSE fan-out keeps every continuation member's UI synchronized with the underlying Chrome process, so a kill triggered by the leaf is reflected in every member's "browser session live" indicator.
+
+**User Stories:** US-2
+
+---
+
+### REQ-BROWSER-WS-003: Cascade Integration
+
+WHEN the resource-cleanup cascade runs (archive / abandon / mark-merged / hard-delete)
+THE SYSTEM SHALL invoke `cascade_browser_on_delete(manager, &WorkScope, inheritor_scope)`
+AND `inheritor_scope` SHALL be the continuation's resolved `WorkScope`, or `None` if there is no continuation
+AND failures SHALL log WARN and continue
+    (consistent with the bash / tmux / projects cascade error policy)
+
+WHEN `inheritor_scope == Some(work_scope)` (scope equality holds)
+THE SYSTEM SHALL skip the session kill
+    (the inheritor is still driving the same Chrome window)
+
+WHEN `inheritor_scope` is `None` OR differs from `work_scope`
+THE SYSTEM SHALL tear the session down
+    (Direct continuations always fall here — their `Conversation(<child_id>)` scope is never equal to the parent's `Conversation(<parent_id>)` scope, so the equality rule subsumes the per-kind case-analysis)
+
+**Rationale:** Before this requirement, archive/abandon killed bash + tmux but leaked Chrome until Phoenix restart. Scope-equality preservation is correct by construction — it asks "are my resources still owned by someone live?" rather than relying on the implicit invariant "Worktree continuations always inherit the same worktree." The same shape applies to tmux (REQ-TMUX-WS-002).
+
+**User Stories:** US-2, US-3
+
+---
+
+### REQ-BROWSER-WS-004: Capability-Gap Logging
+
+WHEN `BrowserSessionManager::get_existing` returns `None`
+THE SYSTEM SHALL log at `debug` level with the queried `WorkScope`
+
+WHEN `cascade_browser_on_delete` skips a kill because the worktree is shared with a continuation
+THE SYSTEM SHALL log at `debug` level with the work scope and the continuation id
+
+WHEN `BrowserSessionLifecycleEvent` cannot be delivered (sink closed)
+THE SYSTEM SHALL log at `debug` level
+
+**Rationale:** The absence of a session — viewer attached but agent never opened anything; cascade asked to kill a session that already died — is the failure mode that hides hardest. Audit-trail logging makes these silent paths observable without changing the user-facing surface.
+
+**User Stories:** US-3
 
 ---
 

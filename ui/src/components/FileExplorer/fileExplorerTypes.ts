@@ -12,11 +12,11 @@ export interface ProseReaderState {
 }
 
 export interface FileExplorerContextValue {
-  /** Open a file in the prose reader */
+  /** Open a file in the viewer */
   openFile: (path: string, rootDir: string, patchContext?: PatchContext) => void;
   /** Currently open file, or null */
   activeFile: string | null;
-  /** Close the prose reader */
+  /** Close the file viewer */
   closeFile: () => void;
   /** Full prose reader state (path + rootDir + patchContext) */
   proseReaderState: ProseReaderState | null;

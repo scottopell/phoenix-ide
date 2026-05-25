@@ -1,10 +1,23 @@
-import { useEffect, useRef, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ImageAttachments } from '../components/ImageAttachments';
 import { ConversationSettings } from '../components/ConversationSettings';
 import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
+import { PaneDivider } from '../components/PaneDivider';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
 import { useCreateConversation } from '../hooks/useCreateConversation';
+import { useResizablePane } from '../hooks/useResizablePane';
+import { useIsDesktop } from '../hooks/useMediaQuery';
+
+// Lazy: xterm + addon are a non-trivial bundle slice. Deferred behind the
+// `everExpanded` gate below — the dynamic import only fires once the user
+// expands the global terminal pane, at which point we keep TerminalPanel
+// mounted so the WebSocket and shell state survive subsequent collapse/expand.
+const TerminalPanel = lazy(() =>
+  import('../components/TerminalPanel').then((m) => ({ default: m.TerminalPanel })),
+);
+
+const GLOBAL_TERMINAL_COLLAPSED_PX = 32;
 
 interface NewConversationPageProps {
   desktopMode?: boolean;
@@ -15,6 +28,31 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const conv = useCreateConversation(navigate);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Real-breakpoint gate for the global terminal. CSS `display:none` would
+  // hide it on mobile but React effects (lazy import, WebSocket open,
+  // xterm allocation) still run — pulling the singleton tmux/PTY into
+  // existence even on devices where the user can't see or use it.
+  const isDesktop = useIsDesktop();
+
+  // Global terminal split-pane. Persistence key is distinct from the
+  // per-conversation terminal so the two heights don't fight. Default
+  // collapsed: opt-in surface, mirrors ConversationPage's default.
+  const terminalPane = useResizablePane({
+    key: 'global-terminal-height',
+    min: GLOBAL_TERMINAL_COLLAPSED_PX,
+    max: () => Math.min(800, Math.floor(window.innerHeight * 0.75)),
+    defaultSize: 300,
+    collapseThreshold: 60,
+    defaultCollapsed: true,
+  });
+
+  // Defer mounting TerminalPanel until first expand. The lazy chunk import,
+  // WebSocket open, and xterm allocation all happen inside TerminalPanel's
+  // mount effect; without this gate, a user who never expands the pane
+  // still pays for all of it on every visit to /new. Once mounted, the
+  // panel stays mounted so collapse/expand preserves shell state.
+  const [everExpanded, setEverExpanded] = useState(!terminalPane.collapsed);
 
   // Auto-resize textarea
   useEffect(() => {
@@ -175,6 +213,47 @@ rows={3}
           />
         </div>
       </main>
+
+      {/* Global terminal — singleton WorkScope::Global session,
+          survives navigation and conversation lifecycles. The divider is
+          always rendered on desktop so the user has an affordance to
+          expand; TerminalPanel itself only mounts on first expand
+          (see `everExpanded` above). Mobile renders nothing — no PTY,
+          no WebSocket, no xterm bundle fetch. */}
+      {isDesktop && (
+        <>
+          <PaneDivider
+            orientation="horizontal"
+            title="Drag to resize • Double-click to collapse/expand"
+            onPointerDown={(e) => {
+              setEverExpanded(true);
+              terminalPane.startDrag(e, 'y', true);
+            }}
+            onDoubleClick={() => {
+              if (terminalPane.collapsed) {
+                setEverExpanded(true);
+                terminalPane.expandFromCollapsed();
+              } else {
+                terminalPane.setCollapsed(true);
+              }
+            }}
+          />
+          {everExpanded && (
+            <Suspense fallback={null}>
+              <TerminalPanel
+                scope={{ kind: 'global' }}
+                height={terminalPane.collapsed ? GLOBAL_TERMINAL_COLLAPSED_PX : terminalPane.size}
+                collapsed={terminalPane.collapsed}
+                onExpand={() => {
+                  setEverExpanded(true);
+                  terminalPane.expandFromCollapsed();
+                }}
+                onCollapse={() => terminalPane.setCollapsed(true)}
+              />
+            </Suspense>
+          )}
+        </>
+      )}
 
       {/* Mobile: bottom-anchored input — hidden until an LLM is configured */}
       {llmReady && (

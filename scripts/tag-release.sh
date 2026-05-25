@@ -36,17 +36,27 @@ VERSION="${TAG#v}"
 
 git -C "$ROOT" tag | grep -qx "$TAG" && die "Tag $TAG already exists locally."
 
-# Bump Cargo.toml version
-CARGO_TOML="$ROOT/Cargo.toml"
+# Bump version in crates/phoenix-ide/Cargo.toml.
+# The root Cargo.toml is workspace-only (no [package]) since the crates/
+# restructure — the version lives on the phoenix_ide crate.
+CARGO_TOML="$ROOT/crates/phoenix-ide/Cargo.toml"
+[[ -f "$CARGO_TOML" ]] || die "Expected $CARGO_TOML to exist."
+
 CURRENT=$(grep -m1 '^version' "$CARGO_TOML" | sed 's/version = "\(.*\)"/\1/')
+[[ -n "$CURRENT" ]] || die "Could not read current version from $CARGO_TOML"
+
 if [[ "$CURRENT" != "$VERSION" ]]; then
-    info "Bumping Cargo.toml: $CURRENT -> $VERSION"
+    info "Bumping crates/phoenix-ide/Cargo.toml: $CURRENT -> $VERSION"
     sed "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" "$CARGO_TOML" > "$CARGO_TOML.tmp" && mv "$CARGO_TOML.tmp" "$CARGO_TOML"
-    # Update Cargo.lock
-    cargo generate-lockfile --manifest-path "$CARGO_TOML" 2>/dev/null
-    git -C "$ROOT" add Cargo.toml Cargo.lock
+    # Refresh Cargo.lock for the bumped crate.
+    if ! (cd "$ROOT" && cargo update -p phoenix_ide --offline); then
+        die "Failed to refresh Cargo.lock for phoenix_ide"
+    fi
+    git -C "$ROOT" add crates/phoenix-ide/Cargo.toml Cargo.lock
     git -C "$ROOT" commit -m "chore: bump version to $VERSION"
     ok "Version bumped"
+else
+    info "Version already $VERSION — no bump needed"
 fi
 
 SHA=$(git -C "$ROOT" rev-parse --short HEAD)
