@@ -189,8 +189,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
     : null;
   const selectedConflictSlug = selectedTaskConflict ?? selectedBranchConflict;
   const hasStartingPoint = intent === 'direct' || Boolean(startingPoint);
+  const hasMessageContent = draft.trim().length > 0 || images.length > 0 || startingPoint?.kind === 'task';
 
-  const canSend = (draft.trim().length > 0 || images.length > 0) && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking' && hasStartingPoint && !selectedConflictSlug;
+  const canSend = hasMessageContent && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking' && hasStartingPoint && !selectedConflictSlug;
 
   const addImages = async (files: File[]) => {
     try {
@@ -234,7 +235,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   const handleSend = async () => {
     const trimmed = draft.trim();
-    if (!trimmed && images.length === 0) return;
+    const taskStartProvidesContent = startingPoint?.kind === 'task';
+    if (!trimmed && images.length === 0 && !taskStartProvidesContent) return;
     if (creating || dirStatus === 'invalid' || dirStatus === 'checking') return;
 
     setError(null);

@@ -163,7 +163,10 @@ export function ConversationSettings({
   const activeTasks = tasks.filter(t => !['done', 'wont-do'].includes(t.status));
   const importantTasks = activeTasks
     .toSorted((a, b) => {
-      const priorityRank = (p: string) => Number(p.replace(/^p/, '')) || 9;
+      const priorityRank = (p: string) => {
+        const rank = Number(p.replace(/^p/, ''));
+        return Number.isNaN(rank) ? 9 : rank;
+      };
       return priorityRank(a.priority) - priorityRank(b.priority) || a.id.localeCompare(b.id);
     })
     .slice(0, 8);
@@ -384,7 +387,9 @@ export function ConversationSettings({
       )}
 
       {(() => {
-        const selectedBranch = displayBranches.find(b => b.name === selectedName);
+        const selectedBranch = startingPoint?.kind === 'checkoutBranch'
+          ? displayBranches.find(b => b.name === selectedName)
+          : undefined;
         const conflictSlug = selectedTask?.conversation_slug ?? selectedBranch?.conflict_slug;
         if (!conflictSlug || intent === 'direct') return null;
         return (
