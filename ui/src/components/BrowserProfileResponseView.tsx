@@ -176,6 +176,16 @@ interface MetricDef {
   nullWhen: (s: RunSample) => boolean;
 }
 
+/** Type-safe numeric read from an untrusted sample. `displayData` is
+ *  `Record<string, unknown>`; a missing key, `undefined`, or a non-numeric
+ *  value all collapse to `null` so downstream `.toFixed()` never sees
+ *  garbage. */
+function numericValue(s: RunSample, m: MetricDef): number | null {
+  if (m.nullWhen(s)) return null;
+  const v: unknown = s[m.key];
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
 const SCENARIO_METRICS: MetricDef[] = [
   { key: 'script_ms', label: 'script', unit: 'ms', nullWhen: () => false },
   { key: 'wall_ms', label: 'wall', unit: 'ms', nullWhen: (s) => s.wall_ms === null },
@@ -201,7 +211,7 @@ function SparklineGrid({ samples }: { samples: RunSample[] }) {
   // a metric that's null across the board (no React, no GC) clutters more
   // than it informs.
   const visible = SCENARIO_METRICS.filter((m) =>
-    samples.some((s) => !m.nullWhen(s) && (s[m.key] as number | null) !== null),
+    samples.some((s) => numericValue(s, m) !== null),
   );
   if (visible.length === 0) return null;
   return (
@@ -214,11 +224,7 @@ function SparklineGrid({ samples }: { samples: RunSample[] }) {
 }
 
 function MetricRow({ metric, samples }: { metric: MetricDef; samples: RunSample[] }) {
-  const values: (number | null)[] = samples.map((s) => {
-    if (metric.nullWhen(s)) return null;
-    const v = s[metric.key];
-    return typeof v === 'number' ? v : null;
-  });
+  const values: (number | null)[] = samples.map((s) => numericValue(s, metric));
   const real = values.filter((v): v is number => v !== null);
   if (real.length === 0) return null;
   const min = Math.min(...real);
@@ -288,7 +294,7 @@ function Sparkline({ values }: { values: (number | null)[] }) {
 
 function PerRunTable({ samples }: { samples: RunSample[] }) {
   const visible = SCENARIO_METRICS.filter((m) =>
-    samples.some((s) => !m.nullWhen(s) && (s[m.key] as number | null) !== null),
+    samples.some((s) => numericValue(s, m) !== null),
   );
   return (
     <table className="profile-per-run-table">
@@ -308,10 +314,9 @@ function PerRunTable({ samples }: { samples: RunSample[] }) {
           <tr key={s.run_index}>
             <td>{s.run_index}</td>
             {visible.map((m) => {
-              const isNull = m.nullWhen(s) || (s[m.key] as number | null) === null;
-              const v = isNull ? null : (s[m.key] as number);
+              const v = numericValue(s, m);
               return (
-                <td key={String(m.key)} className={isNull ? 'profile-cell-null' : ''}>
+                <td key={String(m.key)} className={v === null ? 'profile-cell-null' : ''}>
                   {v === null ? (
                     <span title={nullReason(m, s)}>—</span>
                   ) : (

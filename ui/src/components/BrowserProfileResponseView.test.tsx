@@ -296,6 +296,51 @@ describe('BrowserProfileResponseView', () => {
       expect(multiPointSegments.length).toBeGreaterThanOrEqual(1);
     });
 
+    it('renders a malformed payload without throwing (undefined / non-numeric metric values)', () => {
+      // displayData is typed as Record<string, unknown> — an upstream
+      // schema drift or a hand-crafted payload could deliver `undefined`
+      // or a string where a number is expected. The renderer must not
+      // call .toFixed() on those values — it should treat them as null
+      // and render "—".
+      const malformed = {
+        outcome: 'completed',
+        requested_runs: 1,
+        warmup: 0,
+        methodology_warnings: [],
+        raw_samples: [
+          {
+            run_index: 0,
+            // script_ms intentionally MISSING (undefined)
+            long_tasks: 'oops', // wrong type
+            wall_ms: 100,
+            // dom_nodes intentionally MISSING
+            gc_ran: true,
+            js_heap_used: null,
+            react_status: 'absent',
+            react_commits: null,
+            react_actual_ms: null,
+          },
+        ],
+      };
+      // Should not throw, and should render the table with "—" for the
+      // non-numeric / undefined cells.
+      const { container } = render(
+        <BrowserProfileResponseView
+          action="run_scenario"
+          displayData={malformed}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      // Open the per-run table.
+      fireEvent.click(screen.getByText(/Per-run table/));
+      const tbody = container.querySelector('.profile-per-run-table tbody');
+      expect(tbody).not.toBeNull();
+      // No `undefined` text leaked. No NaN. (And no throw, implicit by
+      // reaching this line.)
+      expect(tbody!.textContent ?? '').not.toMatch(/undefined|NaN/);
+    });
+
     it('renders blocked outcome with the failing step', () => {
       render(
         <BrowserProfileResponseView
