@@ -266,7 +266,7 @@ export function ConversationSettings({
               <div className="git-workflow-panel" ref={comboRef}>
                 <button
                   type="button"
-                  className={`git-workflow-option ${(!startingPoint || startingPoint.kind === 'branch') ? 'git-workflow-option--active' : ''}`}
+                  className={`git-workflow-option ${startingPoint?.kind === 'branch' ? 'git-workflow-option--active' : ''}`}
                   onClick={() => {
                     selectBranch(defaultBranch ?? currentBranch ?? selectedName);
                     setTaskPickerOpen(false);
@@ -279,15 +279,17 @@ export function ConversationSettings({
 
                 <button
                   type="button"
-                  className={`git-workflow-option ${selectedTask ? 'git-workflow-option--active' : ''}`}
-                  onClick={() => {
-                    setTaskPickerOpen(open => !open);
-                    setBranchPickerOpen(false);
-                  }}
+            className={`git-workflow-option ${taskPickerOpen || selectedTask ? 'git-workflow-option--active' : ''}`}
+            onClick={() => {
+              setStartingPoint?.(null);
+              setTaskPickerOpen(open => !open);
+              setBranchPickerOpen(false);
+            }}
+
                 >
                   <span className="git-workflow-title">Pick a task</span>
                   <span className="git-workflow-desc">
-                    {selectedTask ? `${selectedTask.priority} ${selectedTask.id}: ${selectedTask.slug}` : `${importantTasks.length} active tasks`}
+                    {selectedTask ? `${selectedTask.priority} ${selectedTask.id}: ${selectedTask.slug}` : taskPickerOpen ? 'Select a task below' : `${importantTasks.length} active tasks`}
                   </span>
                 </button>
                 {taskPickerOpen && (
