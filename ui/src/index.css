@@ -5263,10 +5263,19 @@ html * {
   flex-shrink: 0;
 }
 
+.new-conv-workflow-layout {
+  display: grid;
+  grid-template-columns: minmax(160px, 0.42fr) minmax(0, 1fr);
+  gap: 12px;
+  margin-top: 8px;
+  align-items: stretch;
+}
+
 .new-conv-workflows {
   display: grid;
   gap: 8px;
-  margin-top: 8px;
+  align-content: start;
+  margin-top: 0;
 }
 
 .workflow-card {
@@ -5276,6 +5285,7 @@ html * {
   border: 1px solid var(--border);
   border-radius: 6px;
   cursor: pointer;
+  min-width: 0;
 }
 
 .workflow-card--active {
@@ -5304,8 +5314,33 @@ html * {
   line-height: 1.4;
 }
 
+.new-conv-workflow-detail {
+  min-width: 0;
+}
+
+.workflow-detail-empty {
+  height: 100%;
+  min-height: 92px;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--bg-secondary);
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.workflow-detail-empty strong {
+  font-size: 12px;
+}
+
+.workflow-detail-empty span {
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--text-muted);
+}
+
 .git-workflow-panel {
-  margin-top: 10px;
   display: grid;
   gap: 6px;
 }
@@ -5465,6 +5500,12 @@ html * {
 .task-start-detail-markdown code {
   font-family: var(--font-mono, monospace);
   font-size: 10px;
+}
+
+@media (width <= 760px) {
+  .new-conv-workflow-layout {
+    grid-template-columns: 1fr;
+  }
 }
 
 .new-conv-mode-selector {
