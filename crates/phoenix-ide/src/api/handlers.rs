@@ -2732,8 +2732,22 @@ fn is_valid_text(content: &[u8]) -> bool {
 }
 
 fn preview_url_for_path(path: &std::path::Path) -> String {
-    let absolute = path.to_string_lossy();
-    format!("/preview{absolute}")
+    format!("/preview{}", percent_encode_path(path))
+}
+
+fn percent_encode_path(path: &std::path::Path) -> String {
+    use std::fmt::Write;
+
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    let mut out = String::with_capacity(path_str.len());
+    for &b in path_str.as_bytes() {
+        if b == b'/' || b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 /// List files in a directory with metadata (REQ-PF-001, REQ-PF-002)
@@ -2874,6 +2888,40 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
     }))
 }
 
+fn percent_decode_path(path: &str) -> Result<String, AppError> {
+    let mut out = Vec::with_capacity(path.len());
+    let mut bytes = path.bytes();
+    while let Some(b) = bytes.next() {
+        if b == b'%' {
+            let Some(hi) = bytes.next() else {
+                return Err(AppError::BadRequest(
+                    "Invalid percent-encoded path".to_string(),
+                ));
+            };
+            let Some(lo) = bytes.next() else {
+                return Err(AppError::BadRequest(
+                    "Invalid percent-encoded path".to_string(),
+                ));
+            };
+            let Some(hi) = char::from(hi).to_digit(16) else {
+                return Err(AppError::BadRequest(
+                    "Invalid percent-encoded path".to_string(),
+                ));
+            };
+            let Some(lo) = char::from(lo).to_digit(16) else {
+                return Err(AppError::BadRequest(
+                    "Invalid percent-encoded path".to_string(),
+                ));
+            };
+            out.push(u8::try_from((hi << 4) | lo).expect("hex nibbles fit in u8"));
+        } else {
+            out.push(b);
+        }
+    }
+    String::from_utf8(out)
+        .map_err(|_| AppError::BadRequest("Invalid UTF-8 in percent-encoded path".to_string()))
+}
+
 /// Serve a file from an absolute path with native Content-Type.
 /// Used by "Open in browser" for HTML preview -- the path-based URL means
 /// relative references (CSS, JS, images) resolve correctly against the
@@ -2886,8 +2934,7 @@ async fn serve_preview_file(
 ) -> Result<axum::response::Response, AppError> {
     use axum::response::IntoResponse;
 
-    // filepath comes without leading slash from the wildcard capture
-    let path = PathBuf::from(format!("/{filepath}"));
+    let path = PathBuf::from(format!("/{}", percent_decode_path(&filepath)?));
 
     if !path.exists() {
         return Err(AppError::NotFound("File does not exist".to_string()));
@@ -4776,6 +4823,23 @@ mod upgrade_model_state_guard_tests {
 #[cfg(test)]
 mod file_read_tests {
     use super::*;
+
+    #[test]
+    fn preview_url_percent_encodes_reserved_path_characters() {
+        let path = std::path::Path::new("/tmp/screens/a #1?raw%.png");
+        assert_eq!(
+            preview_url_for_path(path),
+            "/preview/tmp/screens/a%20%231%3Fraw%25.png"
+        );
+    }
+
+    #[test]
+    fn percent_decode_path_reverses_preview_url_path_encoding() {
+        assert_eq!(
+            percent_decode_path("tmp/screens/a%20%231%3Fraw%25.png").expect("decode"),
+            "tmp/screens/a #1?raw%.png"
+        );
+    }
 
     #[tokio::test]
     async fn read_file_returns_image_preview_for_png_without_utf8_validation() {
