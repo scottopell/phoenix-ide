@@ -1575,7 +1575,11 @@ def cmd_check():
     results_lock = threading.Lock()
     t_start = time.monotonic()
 
-    CHECK_TIMEOUT = 300  # 5 minutes per step -- kill and fail if exceeded
+    # Per-step kill-and-fail budget. 600s covers cold `cargo test compile`
+    # on a 4-vCPU GitHub Actions runner without sccache (observed ~5min);
+    # local M-class hardware finishes in ~90s. Bump only if a single step
+    # legitimately takes longer — never to mask flakes.
+    CHECK_TIMEOUT = 600
 
     def run_step(name, cmd, cwd=ROOT):
         # Stream stdout+stderr line-by-line into a bounded buffer so that on
@@ -1645,7 +1649,13 @@ def cmd_check():
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
-        """Rust lane: clippy → musl smoke check → test compile → test run → codegen staleness check.
+        """Rust lane: clippy → [musl smoke check] → test compile → test run → codegen staleness check.
+
+        The musl smoke check is **macOS-only and conditional** on the
+        `x86_64-linux-musl-gcc` cross toolchain being on PATH; it never
+        runs on Linux (clippy already covers the same surface there).
+        Expect the timing breakdown to be missing the musl line on Linux
+        and on macOS hosts without the cross toolchain installed.
 
         vite build is intentionally NOT run here. `#[derive(Embed)]` in
         crates/phoenix-ide/src/api/assets.rs reads ui/dist/ during proc-macro
@@ -2037,32 +2047,44 @@ def cmd_check():
 
     print("Running checks in parallel...\n")
 
+    # Threads carry the lane name so a hung-thread report names the lane.
     threads = [
-        threading.Thread(target=lane_rust),
+        threading.Thread(target=lane_rust, name="rust"),
         # Use the `typecheck` script so contributors running `pnpm typecheck`
         # locally exercise the same `tsc -b --noEmit` invocation this lane
         # uses. Project references + exactOptionalPropertyTypes only fire
         # under `-b`; bare `pnpm exec tsc --noEmit` silently misses them.
-        threading.Thread(target=run_step, args=("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR)),
-        threading.Thread(target=lane_ui_lint),
-        threading.Thread(target=run_step, args=("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR)),
-        threading.Thread(target=lane_fast),
-        threading.Thread(target=check_ast_grep),
-        threading.Thread(target=check_allium),
-        threading.Thread(target=check_spec_anchors),
-        threading.Thread(target=check_package_lock_clean),
-        threading.Thread(target=lane_e2e),
+        threading.Thread(target=run_step, args=("tsc typecheck", ["pnpm", "run", "typecheck"], UI_DIR), name="tsc"),
+        threading.Thread(target=lane_ui_lint, name="ui-lint"),
+        threading.Thread(target=run_step, args=("vitest", ["pnpm", "exec", "vitest", "run"], UI_DIR), name="vitest"),
+        threading.Thread(target=lane_fast, name="fast"),
+        threading.Thread(target=check_ast_grep, name="ast-grep"),
+        threading.Thread(target=check_allium, name="allium"),
+        threading.Thread(target=check_spec_anchors, name="spec-anchors"),
+        threading.Thread(target=check_package_lock_clean, name="pkglock"),
+        threading.Thread(target=lane_e2e, name="e2e"),
     ]
     for t in threads:
         t.start()
     # Per-thread join budget must cover the longest *lane*, not a single step.
     # lane_rust runs ~6 sequential steps each with their own CHECK_TIMEOUT,
-    # so we cap join at 6×CHECK_TIMEOUT + 30s. Without this, a slow cold
-    # build of lane_rust returns from join early and the loop below reports
-    # "All N passed" before lane_rust has reported its tail steps.
+    # so we cap join at 6×CHECK_TIMEOUT + 30s. After joining we still verify
+    # the thread actually finished — Thread.join() returning after a timeout
+    # does not imply the thread is done, so a still-alive lane is recorded
+    # as an explicit failure rather than silently dropped from results.
     LANE_JOIN_TIMEOUT = (CHECK_TIMEOUT * 6) + 30
     for t in threads:
         t.join(timeout=LANE_JOIN_TIMEOUT)
+    stuck = [t for t in threads if t.is_alive()]
+    for t in stuck:
+        with results_lock:
+            label = f"hung: {t.name}"
+            results.append((
+                label, 1, LANE_JOIN_TIMEOUT,
+                f"lane did not finish within {LANE_JOIN_TIMEOUT}s — "
+                "a subprocess may be orphaned; investigate before retrying",
+            ))
+            print(f"  ✗ {label:<18s} ({LANE_JOIN_TIMEOUT}s)")
 
     total_elapsed = time.monotonic() - t_start
     failures = [(n, out) for n, rc, _, out in results if rc != 0]
