@@ -130,14 +130,16 @@ lastSseEventAt: number  // unix ms, client clock — for the watchdog
 `phaseEnteredAt` is updated on every `StateChange` event and on `Init`.
 `toolStartedAt` is updated when a `MessageUpdated` arrives with
 `display_data.started_at` set on a tool-use block. `lastSseEventAt` is
-updated on every event of any kind, including server keep-alive comments
-(the EventSource API surfaces these as `onmessage` with empty data — see
-client implementation note below).
+updated on every event observable to the client `EventSource` — including
+the typed `ping` keep-alive once the server-side switch described in the
+next section ships. Standard `EventSource` does NOT surface SSE comment
+lines, so the current `: ping\n\n` keep-alive is invisible to the
+watchdog until that switch lands.
 
 ### Server keep-alive observation
 
 The SSE keep-alive sent by axum's `KeepAlive` API is an SSE comment line
-(`: ping\n\n`). Standard `EventSource` does NOT fire `onmessage` for
+(`: ping\n\n`). Standard `EventSource` does NOT fire any handler for
 comments. To observe them for the watchdog, two options:
 
 **Option A (preferred):** Switch the SSE keep-alive to a typed event with

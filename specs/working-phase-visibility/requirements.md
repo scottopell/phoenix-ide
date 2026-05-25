@@ -109,21 +109,30 @@ secondary answer that the modifier addresses.
 
 GIVEN the SSE connection state is `connected` AND the conversation phase is
 any working phase
-WHEN no SSE event of any kind (including server keep-alive comments) has
-arrived for `HEARTBEAT_WATCHDOG_SECONDS` (default 35)
+WHEN no SSE event observable to the client `EventSource` has arrived for
+`HEARTBEAT_WATCHDOG_SECONDS` (default 35)
 THE SYSTEM SHALL surface a degraded-signal indicator in the StateBar:
 "no signal from server for Ns"
 
 WHEN any SSE event subsequently arrives
 THE SYSTEM SHALL clear the degraded-signal indicator immediately
 
+**Prerequisite:** The server keep-alive is currently emitted as an SSE
+comment line (`: ping\n\n`, see `api/sse.rs:71` / `handlers.rs:3279`), and
+standard `EventSource` does NOT fire any handler for comments. For this
+requirement to be implementable as written, the keep-alive MUST be switched
+to a typed event (`event: ping\ndata:\n\n`) so the client `EventSource`
+observes it via an explicit `ping` listener. This switch is owned by
+design.md ("Server keep-alive observation") and is forward-compatible:
+clients that don't listen for `ping` simply ignore it.
+
 **Rationale:** TCP-level connection health is not the same as application-
 level liveness; a wedged server can hold the SSE socket open indefinitely.
-The keep-alive interval is 15s (`api/sse.rs:71`, `handlers.rs:3279`);
-`HEARTBEAT_WATCHDOG_SECONDS = 35` gives ~2.3x headroom so a single missed
-keep-alive does not trigger a false positive. The threshold is for "no event
-*of any kind*" — a long LLM stream that is in fact sending tokens does not
-trigger it.
+The keep-alive interval is 15s; `HEARTBEAT_WATCHDOG_SECONDS = 35` gives
+~2.3x headroom so a single missed keep-alive does not trigger a false
+positive. The threshold is for "no client-observable event of any kind"
+(typed `ping` events count) — a long LLM stream that is in fact sending
+tokens does not trigger it.
 
 ---
 

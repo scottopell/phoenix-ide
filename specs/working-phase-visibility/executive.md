@@ -78,10 +78,13 @@ greenfield additions on existing infrastructure.
 
 ## Cross-Spec Dependencies
 
-- **`specs/llm-retry-visibility/`** — produces the retry-modifier context
-  that REQ-WPV-003 composes onto the base reason. The Allium spec for
-  working-phase-visibility imports `llm-retry-visibility.allium` for the
-  `RetryContext` type.
+- **`specs/llm-retry-visibility/`** — sibling spec, drafted in a follow-up
+  commit (not yet present in this branch). Will produce the retry-modifier
+  context that REQ-WPV-003 composes onto the base reason. Until that spec
+  lands, the `RetryContext` value type is inlined in this spec's Allium
+  file as a `PLACEHOLDER` block; on landing, the `use
+  "../llm-retry-visibility/llm-retry-visibility.allium" as llm_retry`
+  import is restored and the placeholder is deleted.
 
 - **`specs/sse_wire/`** — wire-format authority; new variants (`LlmFirstByte`,
   `entered_at` on `StateChange`) and the keep-alive typed-event switch are

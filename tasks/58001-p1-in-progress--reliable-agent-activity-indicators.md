@@ -60,10 +60,13 @@ Each stage stands alone and ships value independently.
   have arrived; show elapsed time on the running tool widget header
   (not only StateBar).
 - Client-side heartbeat watchdog: if `connectionState === 'connected'`
-  and `convState` is a working phase and no SSE event of any kind
-  (including SSE comments / keep-alives) has arrived for >N seconds
-  (suggest N=20), downgrade indicator to
-  `"no signal from server for Ns"`.
+  and `convState` is a working phase and no SSE event observable to
+  `EventSource` has arrived for >35s, downgrade indicator to
+  `"no signal from server for Ns"`. Prerequisite: switch the server
+  keep-alive from an SSE comment (`: ping\n\n`, invisible to standard
+  `EventSource`) to a typed `event: ping` so the client can observe it
+  via an explicit listener. See `specs/working-phase-visibility/`
+  REQ-WPV-004 + design.md "Server keep-alive observation."
 - Stop letting connection state mask agent state: when reconnecting,
   show both — `"reconnecting (2) — agent was thinking 12s ago"`.
 
