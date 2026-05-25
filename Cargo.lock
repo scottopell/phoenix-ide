@@ -1971,6 +1971,19 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "phoenix-monitor"
+version = "0.7.0"
+dependencies = [
+ "chrono",
+ "crossterm",
+ "ratatui",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "ureq",
+]
+
+[[package]]
 name = "phoenix-tls"
 version = "0.1.0"
 dependencies = [
@@ -1989,7 +2002,6 @@ dependencies = [
  "brush-parser",
  "chromiumoxide",
  "chrono",
- "crossterm",
  "futures",
  "globset",
  "hyper",
@@ -2005,10 +2017,8 @@ dependencies = [
  "proptest",
  "pulldown-cmark",
  "rand 0.8.5",
- "ratatui",
  "regex",
  "reqwest",
- "rusqlite",
  "rust-embed",
  "rustls",
  "rustls-pki-types",
@@ -2031,7 +2041,6 @@ dependencies = [
  "tracing-subscriber",
  "ts-rs",
  "unicode-security",
- "ureq",
  "uuid",
  "vte",
  "which",
