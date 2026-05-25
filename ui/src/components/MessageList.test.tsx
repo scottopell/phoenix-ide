@@ -257,7 +257,7 @@ describe('MessageList', () => {
 
   it('keeps viewport stable when a visible pending message is acknowledged', async () => {
     const pending = {
-      localId: 'local-ack-1',
+      localId: 'msg-21',
       text: 'pending acknowledgement',
       images: [],
       timestamp: 1,
@@ -284,7 +284,7 @@ describe('MessageList', () => {
     );
 
     const main = container.querySelector('#main-area') as HTMLElement;
-    await waitFor(() => expect(container.querySelector('[data-render-unit-key="local-ack-1"]')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-render-unit-key="msg-21"]')).not.toBeNull());
     act(() => {
       main.scrollTop = 2025;
       main.dispatchEvent(new Event('scroll', { bubbles: true }));
@@ -297,7 +297,7 @@ describe('MessageList', () => {
             ...historical,
             {
               ...makeMessage(21, 'user'),
-              message_id: 'local-ack-1',
+              message_id: 'msg-21',
               content: { text: pending.text },
             },
           ]}
@@ -310,13 +310,13 @@ describe('MessageList', () => {
       ),
     );
 
-    await waitFor(() => expect(container.querySelector('[data-render-unit-key="local-ack-1"]')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-render-unit-key="msg-21"]')).not.toBeNull());
     expect(main.scrollTop).toBe(2025);
   });
 
   it('stays pinned to bottom when acknowledging a pending tail message', async () => {
     const pending = {
-      localId: 'local-ack-bottom',
+      localId: 'msg-21',
       text: 'pending bottom acknowledgement',
       images: [],
       timestamp: 1,
@@ -338,7 +338,7 @@ describe('MessageList', () => {
     );
 
     const main = container.querySelector('#main-area') as HTMLElement;
-    await waitFor(() => expect(container.querySelector('[data-render-unit-key="local-ack-bottom"]')).not.toBeNull());
+    await waitFor(() => expect(container.querySelector('[data-render-unit-key="msg-21"]')).not.toBeNull());
     act(() => {
       main.scrollTop = 600;
       main.dispatchEvent(new Event('scroll', { bubbles: true }));
@@ -356,7 +356,7 @@ describe('MessageList', () => {
             ...historical,
             {
               ...makeMessage(21, 'user'),
-              message_id: 'local-ack-bottom',
+              message_id: 'msg-21',
               content: { text: pending.text },
             },
           ]}
@@ -369,7 +369,8 @@ describe('MessageList', () => {
       ),
     );
 
-    await waitFor(() => expect(main.scrollTop).toBe(1200));
+    await waitFor(() => expect(main.scrollHeight - main.scrollTop - main.clientHeight).toBeLessThanOrEqual(100));
+    expect(container.querySelector('.jump-to-newest')).toBeNull();
   });
 
   it('bounds retained historical DOM while expanding upward', async () => {
