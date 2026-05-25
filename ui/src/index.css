@@ -2728,7 +2728,7 @@ pre:hover .copy-btn {
   align-items: center;
   gap: 3px;
   min-width: 0;
-  overflow: hidden;
+  overflow: visible;
 }
 
 /* When task title is shown, demote git flow to secondary */
@@ -2816,11 +2816,6 @@ pre:hover .copy-btn {
 .pr-badge:hover {
   text-decoration: none;
   filter: brightness(1.15);
-}
-
-/* stylelint-disable-next-line no-duplicate-selectors -- upstream duplicate introduced in #140; first selector at line ~2726 sets overflow: hidden, this overrides to visible for the PR-popover surface. Fold these together in a follow-up. */
-.git-flow {
-  overflow: visible;
 }
 
 .pr-control {
@@ -4560,6 +4555,27 @@ html * {
   border: none;
   border-radius: 6px;
   cursor: pointer;
+}
+
+.image-preview {
+  min-height: 100%;
+  padding: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg-primary);
+}
+
+.image-preview-img {
+  max-width: 100%;
+  max-height: calc(100vh - 160px);
+  object-fit: contain;
+  border-radius: 8px;
+  box-shadow: var(--shadow-lg);
+}
+
+.viewer-shell--inline .image-preview-img {
+  max-height: calc(100vh - 96px);
 }
 
 /* Text/Code display */
@@ -10640,3 +10656,4 @@ html * {
   color: var(--text-primary);
   background: var(--bg-tertiary);
 }
+

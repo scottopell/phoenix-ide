@@ -2724,13 +2724,30 @@ fn detect_file_type(path: &std::path::Path) -> (String, bool) {
 
 /// Check if file content appears to be valid text
 fn is_valid_text(content: &[u8]) -> bool {
-    // Check for null bytes (common in binary files)
     if content.contains(&0) {
         return false;
     }
 
-    // Try to parse as UTF-8
     std::str::from_utf8(content).is_ok()
+}
+
+fn preview_url_for_path(path: &std::path::Path) -> String {
+    format!("/preview{}", percent_encode_path(path))
+}
+
+fn percent_encode_path(path: &std::path::Path) -> String {
+    use std::fmt::Write;
+
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    let mut out = String::with_capacity(path_str.len());
+    for &b in path_str.as_bytes() {
+        if b == b'/' || b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
 }
 
 /// List files in a directory with metadata (REQ-PF-001, REQ-PF-002)
@@ -2821,7 +2838,7 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
     Ok(Json(ListFilesResponse { items }))
 }
 
-/// Read file contents with text encoding validation (REQ-PF-005)
+/// Read file contents with an explicit text/image contract (REQ-PF-005).
 async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileResponse>, AppError> {
     let path = PathBuf::from(&query.path);
 
@@ -2832,7 +2849,6 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
         return Err(AppError::BadRequest("Path is a directory".to_string()));
     }
 
-    // Check file size (limit to 10MB for safety)
     let metadata = fs::metadata(&path)
         .map_err(|e| AppError::BadRequest(format!("Cannot read file metadata: {e}")))?;
     if metadata.len() > 10 * 1024 * 1024 {
@@ -2841,24 +2857,34 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
         ));
     }
 
-    // Read file content
+    let (file_type, _is_text_file) = detect_file_type(&path);
+    if file_type == "image" {
+        let mime_type = mime_guess::from_path(&path)
+            .first_or_octet_stream()
+            .to_string();
+        return Ok(Json(ReadFileResponse::Image {
+            mime_type,
+            url: preview_url_for_path(&path),
+            file_type,
+        }));
+    }
+
     let content =
         fs::read(&path).map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
 
-    // Validate text encoding
     if !is_valid_text(&content) {
         return Err(AppError::BadRequest(
             "File appears to be binary or has invalid encoding".to_string(),
         ));
     }
 
-    // Convert to string (we know it's valid UTF-8 from is_valid_text check)
     let text = String::from_utf8(content)
         .map_err(|_| AppError::BadRequest("Invalid UTF-8 encoding".to_string()))?;
 
-    Ok(Json(ReadFileResponse {
+    Ok(Json(ReadFileResponse::Text {
         content: text,
         encoding: "utf-8".to_string(),
+        file_type,
     }))
 }
 
@@ -2874,7 +2900,6 @@ async fn serve_preview_file(
 ) -> Result<axum::response::Response, AppError> {
     use axum::response::IntoResponse;
 
-    // filepath comes without leading slash from the wildcard capture
     let path = PathBuf::from(format!("/{filepath}"));
 
     if !path.exists() {
@@ -4758,5 +4783,71 @@ mod upgrade_model_state_guard_tests {
         // Model must be unchanged.
         let conv = state.db.get_conversation("c-busy").await.expect("reload");
         assert_eq!(conv.model.as_deref(), Some("claude-opus-4-7"));
+    }
+}
+
+#[cfg(test)]
+mod file_read_tests {
+    use super::*;
+
+    #[test]
+    fn preview_url_percent_encodes_reserved_path_characters() {
+        let path = std::path::Path::new("/tmp/screens/a #1?raw%.png");
+        assert_eq!(
+            preview_url_for_path(path),
+            "/preview/tmp/screens/a%20%231%3Fraw%25.png"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_returns_image_preview_for_png_without_utf8_validation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("screenshot.png");
+        std::fs::write(&path, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).expect("png bytes");
+
+        let Json(response) = read_file(Query(PathQuery {
+            path: path.to_string_lossy().to_string(),
+        }))
+        .await
+        .expect("image response");
+
+        match response {
+            ReadFileResponse::Image {
+                mime_type,
+                url,
+                file_type,
+            } => {
+                assert_eq!(mime_type, "image/png");
+                assert_eq!(file_type, "image");
+                assert_eq!(url, preview_url_for_path(&path));
+            }
+            other => panic!("expected image response, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn read_file_keeps_text_response_for_utf8_files() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("notes.txt");
+        std::fs::write(&path, "hello\n").expect("text");
+
+        let Json(response) = read_file(Query(PathQuery {
+            path: path.to_string_lossy().to_string(),
+        }))
+        .await
+        .expect("text response");
+
+        match response {
+            ReadFileResponse::Text {
+                content,
+                encoding,
+                file_type,
+            } => {
+                assert_eq!(content, "hello\n");
+                assert_eq!(encoding, "utf-8");
+                assert_eq!(file_type, "text");
+            }
+            other => panic!("expected text response, got {other:?}"),
+        }
     }
 }

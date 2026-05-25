@@ -99,30 +99,36 @@ export function WorkActions({
   // fast click could mark-merged a conversation whose PR is still open.
   const prChecking = prStatus === null;
   const prMerged = prStatus?.found && prStatus.display_state === 'merged';
+  const prClosedUnmerged = prStatus?.found && prStatus.display_state === 'closed';
   const prUnavailable = !!prStatus?.unavailable_reason;
   const prBlocksCleanup = prStatus?.found && !prMerged;
   const completeDisabled =
     isLoading || hasContinuation || prChecking || (!!prBlocksCleanup && !manualFallback);
   const completeLabel = prChecking
     ? 'Checking PR…'
-    : prMerged
-      ? 'Clean up merged PR'
-      : prBlocksCleanup
-        ? 'Waiting for PR merge'
-        : prUnavailable && !manualFallback
-          ? 'Use manual fallback'
-          : 'Mark as Merged';
+      : prMerged
+        ? 'Clean up merged PR'
+        : prClosedUnmerged
+          ? 'PR closed without merge'
+          : prBlocksCleanup
+            ? 'Waiting for PR merge'
+            : prUnavailable && !manualFallback
+              ? 'Use manual fallback'
+              : 'Mark as Merged';
+
   const completeTitle = hasContinuation
     ? 'This conversation has been continued. Abandon the continuation instead.'
     : prChecking
       ? 'Checking PR status…'
       : prMerged
         ? 'GitHub reports this PR is merged. Clean up Phoenix local state.'
-        : prBlocksCleanup
-          ? `GitHub reports PR #${prStatus?.number} is ${prStatus?.display_state}; merge it before cleanup.`
-          : prUnavailable && !manualFallback
-            ? 'GitHub CLI status is unavailable. Click to enable the explicit manual cleanup fallback.'
-            : 'Manual fallback: assert the PR was merged outside Phoenix and clean up local state.';
+        : prClosedUnmerged
+          ? `GitHub reports PR #${prStatus?.number} is closed without merge. Use Abandon to clean up Phoenix local state.`
+          : prBlocksCleanup
+            ? `GitHub reports PR #${prStatus?.number} is ${prStatus?.display_state}; merge it before cleanup.`
+            : prUnavailable && !manualFallback
+              ? 'GitHub CLI status is unavailable. Click to enable the explicit manual cleanup fallback.'
+              : 'Manual fallback: assert the PR was merged outside Phoenix and clean up local state.';
   const continuationTooltip = hasContinuation
     ? 'This conversation has been continued. Abandon the continuation instead.'
     : undefined;
@@ -222,7 +228,9 @@ export function WorkActions({
       </button>
       {prBlocksCleanup && !manualFallback && (
         <span className="work-actions-pr-note">
-          PR #{prStatus.number} is {prStatus.display_state}; cleanup unlocks after GitHub reports merged.
+          {prClosedUnmerged
+            ? `PR #${prStatus.number} is closed without merge. Use Abandon to clean up local Phoenix state.`
+            : `PR #${prStatus.number} is ${prStatus.display_state}; cleanup unlocks after GitHub reports merged.`}
         </span>
       )}
       {prUnavailable && manualFallback && (
