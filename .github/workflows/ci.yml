@@ -42,6 +42,16 @@ jobs:
         with:
           # Keep ~/.cargo/bin (cargo-nextest, allium) across runs.
           cache-bin: true
+          # rust-cache's default key hashes Cargo.lock + rustc only, not
+          # Cargo.toml. Profile edits (e.g. `debug = "line-tables-only"`)
+          # then produce stale-hit caches: target/ restores but cargo
+          # detects the fingerprint mismatch and rebuilds everything from
+          # scratch, while the post-step skips save ("Cache up-to-date")
+          # because the key already exists. Net: every PR pays a full
+          # cold compile on every run, persistently. Hashing Cargo.toml
+          # into the key gives profile changes their own cache bucket
+          # that fills cleanly on first run and warms thereafter.
+          key: profile-${{ hashFiles('Cargo.toml') }}
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
