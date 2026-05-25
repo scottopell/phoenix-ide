@@ -43,7 +43,9 @@ import type { UnitHeightCache } from '../conversation/unitHeightCache';
 
 export const INITIAL_WINDOW = 12;
 export const EXPAND_BATCH = 12;
+export const MAX_RENDERED_UNITS = 48;
 export const SENTINEL_ROOT_MARGIN = '600px 0px 0px 0px';
+export const BOTTOM_SENTINEL_ROOT_MARGIN = '0px 0px 600px 0px';
 export const RESTORE_OVERSCAN = 4;
 
 export const KIND_ESTIMATES: Record<HistoricalUnit['kind'], number> = {
@@ -95,17 +97,25 @@ export interface UseBottomAnchoredWindowArgs {
 
 export interface UseBottomAnchoredWindowResult {
   /** Units at index >= this render real; [0, firstRenderedUnitIndex)
-   *  collapse into the spacer. */
+   *  collapse into the top spacer. */
   firstRenderedUnitIndex: number;
-  /** Pixel height of the top spacer, computed from per-kind estimates
-   *  over the collapsed prefix. */
+  /** Units at index < this render real; [lastRenderedUnitIndex, length)
+   *  collapse into the bottom spacer. */
+  lastRenderedUnitIndex: number;
+  /** Pixel height of the top spacer, computed from measured heights or
+   *  per-kind estimates over the collapsed prefix. */
   spacerHeight: number;
+  /** Pixel height of the bottom spacer, computed from measured heights or
+   *  per-kind estimates over the collapsed suffix. */
+  bottomSpacerHeight: number;
   /** Callback ref for the sentinel `<div aria-hidden />` placed between
-   *  the spacer and the rendered slice. Using a callback ref (not a
-   *  RefObject) makes the IntersectionObserver wiring re-fire whenever
-   *  the sentinel mounts/unmounts — critical for empty-then-grow
-   *  conversations where the sentinel is conditionally rendered. */
+   *  the top spacer and the rendered slice. */
   topSentinelRef: (node: HTMLDivElement | null) => void;
+  /** Callback ref for the sentinel placed between the rendered slice and
+   *  the bottom spacer. */
+  bottomSentinelRef: (node: HTMLDivElement | null) => void;
+  /** Reset the bounded range to the bottom-pinned tail window. */
+  resetToBottom: () => void;
 }
 
 /** Pure helper: where should `firstRenderedUnitIndex` start on mount?
@@ -133,14 +143,41 @@ export function computeSpacerHeight(
   firstIdx: number,
   getHeight: (key: string) => number | undefined = () => undefined,
 ): number {
+  return computeRangeHeight(units, 0, firstIdx, getHeight);
+}
+
+export function computeRangeHeight(
+  units: HistoricalUnit[],
+  startIdx: number,
+  endIdx: number,
+  getHeight: (key: string) => number | undefined = () => undefined,
+): number {
   let h = 0;
-  const limit = Math.min(firstIdx, units.length);
-  for (let i = 0; i < limit; i++) {
+  const start = Math.max(0, Math.min(startIdx, units.length));
+  const end = Math.max(start, Math.min(endIdx, units.length));
+  for (let i = start; i < end; i++) {
     const unit = units[i]!;
     const measured = getHeight(unit.key);
     h += measured ?? KIND_ESTIMATES[unit.kind];
   }
   return h;
+}
+
+function computeInitialEnd(
+  units: HistoricalUnit[],
+  firstIdx: number,
+  savedAnchor: SavedScrollAnchor | null | undefined,
+): number {
+  if (savedAnchor) {
+    const idx = units.findIndex((u) => u.key === savedAnchor.topVisibleUnitKey);
+    if (idx >= 0) {
+      return Math.min(
+        units.length,
+        Math.max(idx + 1 + RESTORE_OVERSCAN, firstIdx + INITIAL_WINDOW),
+      );
+    }
+  }
+  return units.length;
 }
 
 const noopSubscribe = (): (() => void) => () => {};
@@ -152,41 +189,50 @@ export function useBottomAnchoredWindow({
   savedAnchor,
   heightCache,
 }: UseBottomAnchoredWindowArgs): UseBottomAnchoredWindowResult {
-  // Once the user scrolls up and triggers an expansion, the window is
-  // pinned to that index for this conversation. Until then,
-  // firstRenderedUnitIndex is derived reactively from
-  // (historicalUnits, savedAnchor) so async unit arrivals keep the
-  // tail visible.
-  const [userExpandedWindow, setUserExpandedWindow] = useState<{
+  const [windowRange, setWindowRange] = useState<{
     conversationId: string | undefined;
-    index: number;
+    first: number;
+    last: number;
   } | null>(null);
 
-  // Sentinel is stored as state via a callback ref so the
-  // IntersectionObserver effect re-runs whenever the DOM node mounts or
-  // unmounts. A useRef-based sentinel would never trigger the effect
-  // when the node attaches on a later render (e.g., empty conversation
-  // grows past INITIAL_WINDOW within the same session).
-  const [sentinelEl, setSentinelEl] = useState<HTMLDivElement | null>(null);
+  const [topSentinelEl, setTopSentinelEl] = useState<HTMLDivElement | null>(null);
   const topSentinelRef = useCallback((node: HTMLDivElement | null) => {
-    setSentinelEl(node);
+    setTopSentinelEl(node);
+  }, []);
+  const [bottomSentinelEl, setBottomSentinelEl] = useState<HTMLDivElement | null>(null);
+  const bottomSentinelRef = useCallback((node: HTMLDivElement | null) => {
+    setBottomSentinelEl(node);
   }, []);
 
   const prevScrollHeightRef = useRef<number | null>(null);
   const pendingFirstIndexRef = useRef(0);
+  const pendingLastIndexRef = useRef(0);
   const conversationIdRef = useRef(conversationId);
   conversationIdRef.current = conversationId;
 
-  const userExpandedIndex =
-    userExpandedWindow !== null
-    && userExpandedWindow.conversationId === conversationId
-      ? userExpandedWindow.index
+  const activeRange =
+    windowRange !== null && windowRange.conversationId === conversationId
+      ? windowRange
       : null;
 
-  const firstRenderedUnitIndex =
-    userExpandedIndex !== null
-      ? userExpandedIndex
-      : computeInitialStart(historicalUnits, savedAnchor ?? null);
+  const initialFirst = computeInitialStart(historicalUnits, savedAnchor ?? null);
+  const initialLast = computeInitialEnd(historicalUnits, initialFirst, savedAnchor ?? null);
+  const firstRenderedUnitIndex = Math.max(
+    0,
+    Math.min(activeRange?.first ?? initialFirst, historicalUnits.length),
+  );
+  const lastRenderedUnitIndex = Math.max(
+    firstRenderedUnitIndex,
+    Math.min(activeRange?.last ?? initialLast, historicalUnits.length),
+  );
+
+  const resetToBottom = useCallback(() => {
+    setWindowRange({
+      conversationId: conversationIdRef.current,
+      first: Math.max(0, historicalUnits.length - INITIAL_WINDOW),
+      last: historicalUnits.length,
+    });
+  }, [historicalUnits.length]);
 
   // Subscribe to the height cache via useSyncExternalStore so spacer
   // geometry re-renders when ResizeObserver writes land. The version
@@ -198,18 +244,25 @@ export function useBottomAnchoredWindow({
     () => 0,
   );
 
+  const getCachedHeight = heightCache ? (key: string) => heightCache.get(key) : undefined;
   const spacerHeight = useMemo(
     () => computeSpacerHeight(
       historicalUnits,
       firstRenderedUnitIndex,
-      heightCache ? (key) => heightCache.get(key) : undefined,
+      getCachedHeight,
     ),
-    // cacheVersion is in the deps so a measured-height write triggers
-    // re-computation even though the cache reference is stable. The
-    // exhaustive-deps lint can't see that closure read; the dep is the
-    // signal, not the closure target.
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [historicalUnits, firstRenderedUnitIndex, heightCache, cacheVersion],
+  );
+  const bottomSpacerHeight = useMemo(
+    () => computeRangeHeight(
+      historicalUnits,
+      lastRenderedUnitIndex,
+      historicalUnits.length,
+      getCachedHeight,
+    ),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [historicalUnits, lastRenderedUnitIndex, heightCache, cacheVersion],
   );
 
   // Reset compensation bookkeeping on conversation change so a stale
@@ -219,10 +272,9 @@ export function useBottomAnchoredWindow({
     prevScrollHeightRef.current = null;
   }, [conversationId]);
 
-  // Exact scroll compensation: capture scrollHeight BEFORE the state
-  // update (in the observer callback), apply the delta to scrollTop
-  // AFTER the render commit. Net: viewport content appears visually
-  // fixed while new units appear in the spacer's prior region.
+  // Exact scroll compensation for both prepend and bounded-window range
+  // shifts: capture scrollHeight before the state mutation and apply the
+  // committed delta before paint so the viewport's content anchor holds.
   useLayoutEffect(() => {
     const el = scrollRootRef.current;
     if (el && prevScrollHeightRef.current !== null) {
@@ -233,20 +285,12 @@ export function useBottomAnchoredWindow({
       prevScrollHeightRef.current = null;
     }
     pendingFirstIndexRef.current = firstRenderedUnitIndex;
-  }, [firstRenderedUnitIndex, scrollRootRef]);
+    pendingLastIndexRef.current = lastRenderedUnitIndex;
+  }, [firstRenderedUnitIndex, lastRenderedUnitIndex, scrollRootRef]);
 
-  // Spacer-height compensation: when measured heights land via the
-  // height cache and shift spacerHeight, the content below the spacer
-  // visually shifts by the same delta. Adjust scrollTop to keep the
-  // visible content anchored.
-  //
-  // Skipped while an expansion is in flight (prevScrollHeightRef !==
-  // null) — that path's scrollHeight delta already includes the spacer
-  // change, and applying both compensations would double-correct.
   const prevSpacerHeightRef = useRef(spacerHeight);
   useLayoutEffect(() => {
     if (prevScrollHeightRef.current !== null) {
-      // Expansion-driven compensation is handling this commit.
       prevSpacerHeightRef.current = spacerHeight;
       return;
     }
@@ -262,16 +306,9 @@ export function useBottomAnchoredWindow({
     prevSpacerHeightRef.current = spacerHeight;
   }, [spacerHeight, scrollRootRef]);
 
-  // IntersectionObserver on the sentinel. The sentinel sits at the
-  // structural boundary between the collapsed spacer and the rendered
-  // slice; when it crosses into the buffered viewport the window
-  // expands by EXPAND_BATCH units. The `sentinelEl` state in the deps
-  // makes this effect re-run when the sentinel mounts on a later
-  // render — without it, an empty-conversation grow-path would never
-  // attach the observer.
   useEffect(() => {
     const root = scrollRootRef.current;
-    if (!root || !sentinelEl) return;
+    if (!root || !topSentinelEl) return;
     if (typeof IntersectionObserver === 'undefined') return;
 
     const observer = new IntersectionObserver(
@@ -281,21 +318,64 @@ export function useBottomAnchoredWindow({
         if (pendingFirstIndexRef.current <= 0) return;
 
         prevScrollHeightRef.current = root.scrollHeight;
-        const next = Math.max(
-          0,
-          pendingFirstIndexRef.current - EXPAND_BATCH,
+        const nextFirst = Math.max(0, pendingFirstIndexRef.current - EXPAND_BATCH);
+        const candidateLast = pendingLastIndexRef.current;
+        const nextLast = Math.min(
+          candidateLast,
+          nextFirst + MAX_RENDERED_UNITS,
         );
-        pendingFirstIndexRef.current = next;
-        setUserExpandedWindow({
+        pendingFirstIndexRef.current = nextFirst;
+        pendingLastIndexRef.current = nextLast;
+        setWindowRange({
           conversationId: conversationIdRef.current,
-          index: next,
+          first: nextFirst,
+          last: nextLast,
         });
       },
       { root, rootMargin: SENTINEL_ROOT_MARGIN },
     );
-    observer.observe(sentinelEl);
+    observer.observe(topSentinelEl);
     return () => observer.disconnect();
-  }, [scrollRootRef, conversationId, sentinelEl]);
+  }, [scrollRootRef, conversationId, topSentinelEl]);
 
-  return { firstRenderedUnitIndex, spacerHeight, topSentinelRef };
+  useEffect(() => {
+    const root = scrollRootRef.current;
+    if (!root || !bottomSentinelEl) return;
+    if (typeof IntersectionObserver === 'undefined') return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        const entry = entries[0];
+        if (!entry || !entry.isIntersecting) return;
+        if (pendingLastIndexRef.current >= historicalUnits.length) return;
+
+        prevScrollHeightRef.current = root.scrollHeight;
+        const nextLast = Math.min(historicalUnits.length, pendingLastIndexRef.current + EXPAND_BATCH);
+        const nextFirst = Math.max(
+          0,
+          Math.min(pendingFirstIndexRef.current + EXPAND_BATCH, nextLast - MAX_RENDERED_UNITS),
+        );
+        pendingFirstIndexRef.current = nextFirst;
+        pendingLastIndexRef.current = nextLast;
+        setWindowRange({
+          conversationId: conversationIdRef.current,
+          first: nextFirst,
+          last: nextLast,
+        });
+      },
+      { root, rootMargin: BOTTOM_SENTINEL_ROOT_MARGIN },
+    );
+    observer.observe(bottomSentinelEl);
+    return () => observer.disconnect();
+  }, [scrollRootRef, conversationId, bottomSentinelEl, historicalUnits.length]);
+
+  return {
+    firstRenderedUnitIndex,
+    lastRenderedUnitIndex,
+    spacerHeight,
+    bottomSpacerHeight,
+    topSentinelRef,
+    bottomSentinelRef,
+    resetToBottom,
+  };
 }

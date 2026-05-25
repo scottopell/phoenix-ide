@@ -92,6 +92,7 @@ entity Window {
     tail_units: List<ru.TailUnit>
 
     first_rendered_unit_index: Integer
+    last_rendered_unit_index: Integer
     is_pinned_to_bottom: Boolean
     phase: WindowPhase
 
@@ -112,8 +113,10 @@ entity Window {
 ------------------------------------------------------------
 -- INITIAL_WINDOW = 12 (units rendered on default mount)
 -- EXPAND_BATCH = 12 (units revealed per sentinel intersection)
+-- MAX_RENDERED_UNITS = 48 (historical units retained in DOM after expansion)
 -- RESTORE_OVERSCAN = 4 (extra units rendered above an anchor target)
 -- SENTINEL_ROOT_MARGIN = "600px 0px 0px 0px"
+-- BOTTOM_SENTINEL_ROOT_MARGIN = "0px 0px 600px 0px"
 -- KIND_ESTIMATES = { user: 100, skill: 80, agent_turn: 400, system: 100 }
 
 ------------------------------------------------------------
@@ -142,6 +145,7 @@ rule MountWithoutSavedAnchor {
     ensures: w.historical_units = historical
     ensures: w.tail_units = tail
     ensures: w.first_rendered_unit_index = max_int(0, len(historical) - 12)
+    ensures: w.last_rendered_unit_index = len(historical)
     ensures: w.is_pinned_to_bottom = true
     ensures: w.phase = "pinned_to_bottom"
     ensures: w.pre_expand_scroll_height = null
@@ -170,6 +174,13 @@ rule MountWithSavedAnchorFound {
     ensures: w.first_rendered_unit_index = max_int(
                  0,
                  index_of_unit_by_key(historical, anchor.top_visible_unit_key) - 4
+             )
+    ensures: w.last_rendered_unit_index = min_int(
+                 len(historical),
+                 max_int(
+                     index_of_unit_by_key(historical, anchor.top_visible_unit_key) + 5,
+                     w.first_rendered_unit_index + 12
+                 )
              )
     ensures: w.is_pinned_to_bottom = false
     ensures: w.phase = "restoring_from_anchor"
@@ -203,6 +214,7 @@ rule MountWithSavedAnchorMissing {
     ensures: w.historical_units = historical
     ensures: w.tail_units = tail
     ensures: w.first_rendered_unit_index = max_int(0, len(historical) - 12)
+    ensures: w.last_rendered_unit_index = len(historical)
     ensures: w.is_pinned_to_bottom = true
     ensures: w.phase = "pinned_to_bottom"
     ensures: w.pre_expand_scroll_height = null
@@ -243,6 +255,7 @@ rule AutoAnchorOnNewMessages {
 
     ensures: w.historical_units = new_historical
     ensures: w.first_rendered_unit_index = max_int(0, len(new_historical) - 12)
+    ensures: w.last_rendered_unit_index = len(new_historical)
     ensures: w.phase = "pinned_to_bottom"
 
     @guidance
@@ -261,6 +274,7 @@ rule PreserveWindowWhenScrolledUp {
 
     ensures: w.historical_units = new_historical
     ensures: w.first_rendered_unit_index = w.first_rendered_unit_index
+    ensures: w.last_rendered_unit_index = w.last_rendered_unit_index
     ensures: w.phase = w.phase
 
     @guidance
@@ -309,6 +323,9 @@ rule UserReturnedToBottom {
 -- 600px-buffered region above the visible viewport) → trigger
 -- expansion. Capture scrollHeight before the state mutation, then
 -- decrement first_rendered_unit_index by EXPAND_BATCH (clamped to 0).
+-- If the resulting rendered range exceeds MAX_RENDERED_UNITS, move the
+-- newer overflow into the bottom spacer by decreasing
+-- last_rendered_unit_index.
 --
 -- Phase transitions to expanding for the duration of the
 -- render-commit; the post-commit layout effect transitions it back.
@@ -319,6 +336,10 @@ rule SentinelIntersectedExpand {
 
     ensures: w.pre_expand_scroll_height = scroll_height_now
     ensures: w.first_rendered_unit_index = max_int(0, w.first_rendered_unit_index - 12)
+    ensures: w.last_rendered_unit_index = min_int(
+                 w.last_rendered_unit_index,
+                 w.first_rendered_unit_index + 48
+             )
     ensures: w.phase = "expanding"
     ensures: w.is_pinned_to_bottom = w.is_pinned_to_bottom
 
@@ -330,6 +351,23 @@ rule SentinelIntersectedExpand {
         -- value when it runs after the render commit. Implementations
         -- that split these into separate setState calls reintroduce
         -- the visible-jump bug.
+}
+
+-- Bottom sentinel intersected while newer historical units are collapsed
+-- below the rendered range → shift the bounded window toward the tail.
+rule BottomSentinelIntersectedExpand {
+    when: BottomSentinelIntersected(w, scroll_height_now)
+
+    requires: w.last_rendered_unit_index < len(w.historical_units)
+
+    ensures: w.pre_expand_scroll_height = scroll_height_now
+    ensures: w.last_rendered_unit_index = min_int(len(w.historical_units), w.last_rendered_unit_index + 12)
+    ensures: w.first_rendered_unit_index = max_int(
+                 0,
+                 min_int(w.first_rendered_unit_index + 12, w.last_rendered_unit_index - 48)
+             )
+    ensures: w.phase = "expanding"
+    ensures: w.is_pinned_to_bottom = w.is_pinned_to_bottom
 }
 
 -- Sentinel intersected at the top of the historical list → no-op.
@@ -404,15 +442,17 @@ rule ResizeObserverMeasuredHeight {
 
     ensures: w.measured_heights = set_map(w.measured_heights, unit_key, measured_px)
     ensures: w.first_rendered_unit_index = w.first_rendered_unit_index
+    ensures: w.last_rendered_unit_index = w.last_rendered_unit_index
     ensures: w.is_pinned_to_bottom = w.is_pinned_to_bottom
 
     @guidance
-        -- Spacer height is derived (not stored):
-        --   spacer_height(w) =
-        --     sum over i in [0, w.first_rendered_unit_index):
-        --       w.measured_heights[w.historical_units[i].key]
-        --         if present
-        --       else KIND_ESTIMATES[w.historical_units[i].kind]
+        -- Top spacer and bottom spacer heights are derived (not stored):
+        --   top_spacer_height(w) =
+        --     sum over i in [0, w.first_rendered_unit_index): measured_or_estimated(i)
+        --   bottom_spacer_height(w) =
+        --     sum over i in [w.last_rendered_unit_index, len(w.historical_units)): measured_or_estimated(i)
+        -- where measured_or_estimated(i) reads w.measured_heights by unit key
+        -- when present and otherwise falls back to KIND_ESTIMATES by kind.
         --
         -- The cache write is mirrored to sessionStorage by the
         -- UnitHeightCache implementation; that mirror is not part of
@@ -438,6 +478,7 @@ rule SaveAnchorOnHideOrUnmount {
                  offset_within_unit: scroll_top - top_unit_offset_top
              }
     ensures: w.first_rendered_unit_index = w.first_rendered_unit_index
+    ensures: w.last_rendered_unit_index = w.last_rendered_unit_index
 
     @guidance
         -- The actor identifies top_unit_key and top_unit_offset_top by
@@ -457,13 +498,20 @@ rule SaveAnchorOnHideOrUnmount {
 -- Invariants
 ------------------------------------------------------------
 
--- first_rendered_unit_index is always a valid offset into
--- historical_units. The window never points beyond the available
--- range.
-invariant FirstRenderedUnitIndexInBounds {
+-- first_rendered_unit_index and last_rendered_unit_index are always a
+-- valid half-open range into historical_units.
+invariant RenderedUnitRangeInBounds {
     for w in Windows:
         w.first_rendered_unit_index >= 0
-        and w.first_rendered_unit_index <= len(w.historical_units)
+        and w.first_rendered_unit_index <= w.last_rendered_unit_index
+        and w.last_rendered_unit_index <= len(w.historical_units)
+}
+
+-- After expansion, the historical DOM window remains bounded.
+invariant RenderedUnitRangeBounded {
+    for w in Windows:
+        len(w.historical_units) <= 48
+        or (w.last_rendered_unit_index - w.first_rendered_unit_index) <= 48
 }
 
 -- Tail units are not addressable by first_rendered_unit_index.

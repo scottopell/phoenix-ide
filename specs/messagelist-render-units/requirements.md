@@ -43,7 +43,8 @@ streaming content
 THE SYSTEM SHALL derive a single ordered pair of typed lists
 `(historicalUnits: HistoricalUnit[], tailUnits: TailUnit[])` from
 `messages`, `pendingMessages`, `convState`, and the streaming-active flag
-AND render exactly the slice `historicalUnits.slice(firstRenderedUnitIndex)`
+AND render exactly the bounded slice
+`historicalUnits.slice(firstRenderedUnitIndex, lastRenderedUnitIndex)`
 followed by all `tailUnits`, with no filtering inside the render loop
 
 WHEN a `tool`-type message is encountered during render-unit construction
@@ -61,7 +62,7 @@ THE SYSTEM SHALL skip it
 AND log a `console.debug` recording the unrecognized type and `message_id`
 
 **Rationale:** The rendered DOM list cardinality must equal the unit-list
-cardinality minus the collapsed prefix. Filtering at render time
+cardinality minus the collapsed prefix and suffix. Filtering at render time
 (`collapsedRenderableIds`, `if type === 'tool' return null`) creates parallel
 representations of "what renders" and is the structural drift this spec
 eliminates.
@@ -185,9 +186,16 @@ container with `rootMargin: '600px 0px 0px 0px'`
 
 WHEN the sentinel intersects the expanded root (i.e., enters the
 600-pixel-buffered viewport)
-THE SYSTEM SHALL expand the window by `EXPAND_BATCH = 12` (decrement
+THE SYSTEM SHALL expand the window upward by `EXPAND_BATCH = 12` (decrement
 `firstRenderedUnitIndex`)
+AND SHALL keep at most `MAX_RENDERED_UNITS = 48` historical units in the DOM
+by moving the newer overflow into a measured bottom spacer
 USING the exact-scroll-compensation pattern from REQ-MLRU-007
+
+WHEN newer historical units are collapsed behind the bottom spacer
+THE SYSTEM SHALL render a bottom sentinel above that spacer
+AND when it intersects the lower buffered viewport, expand the window
+downward by `EXPAND_BATCH = 12`, again preserving the max rendered-unit cap
 
 THE SYSTEM SHALL NOT use any heuristic based on
 `scrollTop - estimatedSpacerHeight` to trigger expansion
@@ -228,11 +236,13 @@ THE SYSTEM SHALL observe it via `ResizeObserver`
 AND write its current `offsetHeight` into a measured-height cache keyed
 by `unit.key`
 
-WHEN computing the spacer height
-THE SYSTEM SHALL sum, for each collapsed unit in
-`historicalUnits.slice(0, firstRenderedUnitIndex)`:
-- the measured height if present in the cache, otherwise
-- the per-kind estimate from `KIND_ESTIMATES`
+WHEN computing spacer height
+THE SYSTEM SHALL sum the measured or estimated heights for every collapsed
+historical unit in either spacer range:
+- top spacer: `historicalUnits.slice(0, firstRenderedUnitIndex)`
+- bottom spacer: `historicalUnits.slice(lastRenderedUnitIndex)`
+using the measured height if present in the cache, otherwise the per-kind
+estimate from `KIND_ESTIMATES`
 
 THE SYSTEM SHALL provide initial `KIND_ESTIMATES`:
 - `user`: 100px

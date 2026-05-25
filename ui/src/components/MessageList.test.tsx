@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { act, render, waitFor } from '@testing-library/react';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
+import { MAX_RENDERED_UNITS, SENTINEL_ROOT_MARGIN } from '../hooks/useBottomAnchoredWindow';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 
@@ -42,6 +43,28 @@ let resizeCallback: ResizeObserverCallback | null = null;
 let scrollHeightDescriptor: PropertyDescriptor | undefined;
 let clientHeightDescriptor: PropertyDescriptor | undefined;
 let originalGetBCR: typeof HTMLElement.prototype.getBoundingClientRect | undefined;
+let intersectionObservers: MockIntersectionObserver[] = [];
+
+class MockIntersectionObserver {
+  readonly rootMargin: string;
+  private readonly callback: IntersectionObserverCallback;
+
+  constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {
+    this.callback = callback;
+    this.rootMargin = options?.rootMargin ?? '';
+    intersectionObservers.push(this);
+  }
+
+  observe() {}
+  disconnect() {}
+
+  intersect() {
+    this.callback(
+      [{ isIntersecting: true } as IntersectionObserverEntry],
+      this as unknown as IntersectionObserver,
+    );
+  }
+}
 
 class MockResizeObserver {
   constructor(callback: ResizeObserverCallback) {
@@ -81,9 +104,11 @@ describe('MessageList', () => {
   beforeEach(() => {
     localStorage.clear();
     resizeCallback = null;
+    intersectionObservers = [];
     scrollHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollHeight');
     clientHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
     vi.stubGlobal('ResizeObserver', MockResizeObserver);
+    vi.stubGlobal('IntersectionObserver', MockIntersectionObserver);
     Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
       configurable: true,
       get: () => 1000,
@@ -228,6 +253,38 @@ describe('MessageList', () => {
       offsetWithinUnit: 50,
       unitCountAtSave: 3,
     });
+  });
+
+  it('bounds retained historical DOM while expanding upward', async () => {
+    const historical = Array.from({ length: 100 }, (_, i) => makeMessage(i + 1, 'user'));
+
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-a"
+        />,
+      ),
+    );
+
+    await waitFor(() => {
+      expect(intersectionObservers.some((o) => o.rootMargin === SENTINEL_ROOT_MARGIN)).toBe(true);
+    });
+
+    for (let i = 0; i < 5; i++) {
+      act(() => {
+        intersectionObservers.find((o) => o.rootMargin === SENTINEL_ROOT_MARGIN)?.intersect();
+      });
+    }
+
+    const renderedUnits = container.querySelectorAll('[data-render-unit-key]');
+    expect(renderedUnits).toHaveLength(MAX_RENDERED_UNITS);
+    expect(container.querySelector('[data-sequence-id="100"]')).toBeNull();
+    expect(container.querySelectorAll('.message-collapsed-spacer')).toHaveLength(2);
   });
 
   it('windows renderable rows so recent tool results do not hide their owning agent row', () => {

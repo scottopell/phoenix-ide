@@ -1,4 +1,5 @@
 import { memo, useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
+import { flushSync } from 'react-dom';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import {
@@ -122,6 +123,7 @@ function captureAnchor(
   scrollTop: number,
   historicalUnits: HistoricalUnit[],
   firstRenderedUnitIndex: number,
+  lastRenderedUnitIndex: number,
   root: HTMLElement,
   getElement: UnitHeightObserver['getElement'],
 ): SavedScrollAnchor | null {
@@ -134,7 +136,7 @@ function captureAnchor(
   // rendered units, i.e. inside the spacer), fall through to the
   // fallback below.
   let visibleTopUnit: { unit: HistoricalUnit; unitTop: number } | null = null;
-  for (let i = firstRenderedUnitIndex; i < historicalUnits.length; i++) {
+  for (let i = firstRenderedUnitIndex; i < lastRenderedUnitIndex; i++) {
     const unit = historicalUnits[i]!;
     const el = getElement(unit.key);
     if (!el) continue;
@@ -157,7 +159,7 @@ function captureAnchor(
   // anchor to the first rendered unit. offsetWithinUnit is negative
   // here, restore lands at unitTop + negativeOffset = the same spacer
   // position. Restore math handles either sign.
-  for (let i = firstRenderedUnitIndex; i < historicalUnits.length; i++) {
+  for (let i = firstRenderedUnitIndex; i < lastRenderedUnitIndex; i++) {
     const unit = historicalUnits[i]!;
     const el = getElement(unit.key);
     if (el) {
@@ -262,8 +264,11 @@ interface MessageListBodyProps {
   historicalUnits: HistoricalUnit[];
   tailUnits: TailUnit[];
   firstRenderedUnitIndex: number;
+  lastRenderedUnitIndex: number;
   spacerHeight: number;
+  bottomSpacerHeight: number;
   topSentinelRef: (node: HTMLDivElement | null) => void;
+  bottomSentinelRef: (node: HTMLDivElement | null) => void;
   observeUnit: UnitHeightObserver['observe'];
   slug: string | undefined;
   onRetry: (localId: string) => void;
@@ -289,8 +294,11 @@ const MessageListBody = memo(function MessageListBody({
   historicalUnits,
   tailUnits,
   firstRenderedUnitIndex,
+  lastRenderedUnitIndex,
   spacerHeight,
+  bottomSpacerHeight,
   topSentinelRef,
+  bottomSentinelRef,
   observeUnit,
   slug,
   onRetry,
@@ -308,7 +316,7 @@ const MessageListBody = memo(function MessageListBody({
       )}
       <div ref={topSentinelRef} aria-hidden="true" />
       {historicalUnits
-        .slice(firstRenderedUnitIndex)
+        .slice(firstRenderedUnitIndex, lastRenderedUnitIndex)
         .map((unit) => (
           <div
             key={unit.key}
@@ -318,6 +326,16 @@ const MessageListBody = memo(function MessageListBody({
             {renderHistoricalUnit(unit, onOpenFile)}
           </div>
         ))}
+      {lastRenderedUnitIndex < historicalUnits.length && (
+        <div ref={bottomSentinelRef} aria-hidden="true" />
+      )}
+      {lastRenderedUnitIndex < historicalUnits.length && (
+        <div
+          className="message-collapsed-spacer"
+          style={{ height: bottomSpacerHeight }}
+          aria-hidden="true"
+        />
+      )}
       {tailUnits.map((unit) => renderTailUnit(unit, slug, onRetry, onCancelSteering))}
     </>
   );
@@ -420,8 +438,12 @@ function MessageListImpl({
 
   const {
     firstRenderedUnitIndex,
+    lastRenderedUnitIndex,
     spacerHeight,
+    bottomSpacerHeight,
     topSentinelRef,
+    bottomSentinelRef,
+    resetToBottom,
   } = useBottomAnchoredWindow({
     historicalUnits,
     conversationId,
@@ -459,11 +481,12 @@ function MessageListImpl({
     if (el) {
       lastScrollTop.current = el.scrollTop;
       if (conversationId) {
-        const { historicalUnits, firstRenderedUnitIndex } = captureStateRef.current;
+        const { historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex } = captureStateRef.current;
         const anchor = captureAnchor(
           el.scrollTop,
           historicalUnits,
           firstRenderedUnitIndex,
+          lastRenderedUnitIndex,
           el,
           unitObserver.getElement,
         );
@@ -541,8 +564,8 @@ function MessageListImpl({
   // Latest historicalUnits + firstRenderedUnitIndex captured for the
   // scroll handler. Refs keep handleScroll's identity stable across
   // unit-content updates.
-  const captureStateRef = useRef({ historicalUnits, firstRenderedUnitIndex });
-  captureStateRef.current = { historicalUnits, firstRenderedUnitIndex };
+  const captureStateRef = useRef({ historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex });
+  captureStateRef.current = { historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex };
 
   // Save unit anchor on visibility-hidden and unmount (REQ-MLRU-009 +
   // REQ-CONV-013). Replaces the prior scrollTop+messageCount save.
@@ -552,11 +575,12 @@ function MessageListImpl({
       let anchorToSave: SavedScrollAnchor | null = null;
       const root = mainRef.current;
       if (recomputeCurrent && root) {
-        const { historicalUnits, firstRenderedUnitIndex } = captureStateRef.current;
+        const { historicalUnits, firstRenderedUnitIndex, lastRenderedUnitIndex } = captureStateRef.current;
         anchorToSave = captureAnchor(
           root.scrollTop,
           historicalUnits,
           firstRenderedUnitIndex,
+          lastRenderedUnitIndex,
           root,
           unitObserver.getElement,
         );
@@ -674,6 +698,7 @@ function MessageListImpl({
       root.scrollTop,
       historicalUnits,
       firstRenderedUnitIndex,
+      lastRenderedUnitIndex,
       root,
       unitObserver.getElement,
     );
@@ -701,6 +726,7 @@ function MessageListImpl({
     historicalUnits,
     savedAnchor,
     firstRenderedUnitIndex,
+    lastRenderedUnitIndex,
     unitObserver,
     checkIfPinnedToBottom,
   ]);
@@ -747,8 +773,11 @@ function MessageListImpl({
               historicalUnits={historicalUnits}
               tailUnits={tailUnits}
               firstRenderedUnitIndex={firstRenderedUnitIndex}
+              lastRenderedUnitIndex={lastRenderedUnitIndex}
               spacerHeight={spacerHeight}
+              bottomSpacerHeight={bottomSpacerHeight}
               topSentinelRef={topSentinelRef}
+              bottomSentinelRef={bottomSentinelRef}
               observeUnit={unitObserver.observe}
               slug={slug}
               onRetry={onRetry}
@@ -767,6 +796,7 @@ function MessageListImpl({
         <button
           className="jump-to-newest"
           onClick={() => {
+            flushSync(resetToBottom);
             scrollToBottom();
             setJumpToNewestState((prev) => (
               prev.conversationId === conversationId && !prev.visible
