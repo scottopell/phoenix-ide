@@ -113,6 +113,16 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => { if (isGitDir === false) setIntent('direct'); }, [isGitDir]);
 
   useEffect(() => {
+    setBranches([]);
+    setTasks([]);
+    setCurrentBranch(null);
+    setBaseBranch(null);
+    setDefaultBranch(null);
+    setStartingPoint(null);
+    setBranchSearch('');
+  }, [cwd]);
+
+  useEffect(() => {
     if (!isGitDir || intent !== 'fromExistingWork') {
       setBranches([]);
       setTasks([]);
