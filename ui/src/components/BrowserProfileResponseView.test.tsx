@@ -427,6 +427,53 @@ describe('BrowserProfileResponseView', () => {
       expect(screen.getByText(/CPU profile is empty/)).toBeInTheDocument();
     });
 
+    it('survives malformed hot-function entries (drops the bad rows, clamps negative percent)', () => {
+      // Schema drift / hand-rolled payload: bad value type, missing
+      // percent, non-string label, negative percent. These must not
+      // crash render or leak invalid CSS — `displayData` is untyped at
+      // runtime so the renderer has to be defensive.
+      const badPayload = {
+        cpu_summary: {
+          path: '/tmp/x.json',
+          hitcount_fallback: false,
+          total: 100,
+          top_by_self: [
+            { label: 'good fn', value: 50.0, percent: 50.0 },
+            { label: 'bad value', value: 'oops', percent: 10.0 },
+            { label: 'missing percent', value: 5.0 /* no percent */ },
+            { label: 12345, value: 3.0, percent: 3.0 }, // wrong label type
+            { label: 'negative pct', value: 1.0, percent: -5 },
+            { label: 'huge pct', value: 1.0, percent: 999 },
+          ],
+          top_by_total: [],
+        },
+      };
+      const { container } = render(
+        <BrowserProfileResponseView
+          action="cpu_stop"
+          displayData={badPayload}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      // No NaN/undefined leaked into the table.
+      const cpuBlock = container.querySelector('.profile-cpu');
+      expect(cpuBlock).not.toBeNull();
+      expect(cpuBlock!.textContent ?? '').not.toMatch(/NaN|undefined/);
+      // Good row still renders.
+      expect(screen.getByText('good fn')).toBeInTheDocument();
+      // Every bar-fill width is a valid percentage in [0, 100].
+      const bars = cpuBlock!.querySelectorAll('.profile-hot-bar-fill');
+      for (const bar of bars) {
+        const w = (bar as HTMLElement).style.width;
+        const m = w.match(/^([\d.]+)%$/);
+        expect(m).not.toBeNull();
+        const pct = parseFloat(m![1]!);
+        expect(pct).toBeGreaterThanOrEqual(0);
+        expect(pct).toBeLessThanOrEqual(100);
+      }
+    });
+
     it('fallback status chip preserves the actual action name', () => {
       const { rerender } = render(
         <BrowserProfileResponseView
@@ -477,6 +524,40 @@ describe('BrowserProfileResponseView', () => {
       expect(screen.getByText('RunTask')).toBeInTheDocument();
       expect(screen.getByText('ParseHTML')).toBeInTheDocument();
       expect(screen.getByText(/chrome:\/\/tracing/)).toBeInTheDocument();
+    });
+
+    it('drops malformed long-task entries without crashing', () => {
+      const tasks: unknown[] = [
+        { name: 'good', ms: 75 },
+        { name: 'missing ms' /* no ms */ },
+        { name: 42, ms: 50 }, // wrong name type
+        { name: 'string ms', ms: 'oops' },
+        { name: 'NaN ms', ms: NaN },
+        { name: 'good 2', ms: 60 },
+      ];
+      const { container } = render(
+        <BrowserProfileResponseView
+          action="trace_stop"
+          displayData={{
+            trace: {
+              path: '/tmp/x.json',
+              event_count: 10,
+              long_task_count: tasks.length,
+              long_task_total_ms: 185,
+              long_tasks: tasks,
+              timed_out: false,
+            },
+          }}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      const traceBlock = container.querySelector('.profile-trace');
+      expect(traceBlock).not.toBeNull();
+      // Good rows kept; bad rows dropped; no NaN/undefined leaked.
+      expect(screen.getByText('good')).toBeInTheDocument();
+      expect(screen.getByText('good 2')).toBeInTheDocument();
+      expect(traceBlock!.textContent ?? '').not.toMatch(/NaN|undefined/);
     });
 
     it('omits the chrome://tracing footnote when path is absent', () => {

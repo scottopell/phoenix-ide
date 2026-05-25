@@ -455,6 +455,24 @@ interface CpuHotEntry {
   percent: number;
 }
 
+/** Drop entries that don't conform to the typed shape — `displayData` is
+ *  `Record<string, unknown>` at runtime, so a schema-drift / hand-rolled
+ *  payload could carry strings or undefined where numbers are expected.
+ *  Filtering at the boundary keeps the renderer's body assumption-free. */
+function sanitizeCpuEntries(entries: unknown): CpuHotEntry[] {
+  if (!Array.isArray(entries)) return [];
+  return entries.flatMap((e): CpuHotEntry[] => {
+    if (!e || typeof e !== 'object') return [];
+    const o = e as Record<string, unknown>;
+    const label = typeof o['label'] === 'string' ? o['label'] : null;
+    const value = typeof o['value'] === 'number' && Number.isFinite(o['value']) ? o['value'] : null;
+    const percent =
+      typeof o['percent'] === 'number' && Number.isFinite(o['percent']) ? o['percent'] : null;
+    if (label === null || value === null || percent === null) return [];
+    return [{ label, value, percent }];
+  });
+}
+
 function CpuSummaryView({
   action,
   data,
@@ -469,13 +487,15 @@ function CpuSummaryView({
         path?: string;
         hitcount_fallback?: boolean;
         total?: number;
-        top_by_self?: CpuHotEntry[];
-        top_by_total?: CpuHotEntry[];
+        top_by_self?: unknown;
+        top_by_total?: unknown;
       }
     | undefined;
   if (!summary || !Array.isArray(summary.top_by_self)) {
     return <StatusLine action={action} text={fallbackText} variant="success" />;
   }
+  const topBySelf = sanitizeCpuEntries(summary.top_by_self);
+  const topByTotal = sanitizeCpuEntries(summary.top_by_total);
   const unit = summary.hitcount_fallback ? 'hits' : 'ms';
   const path = summary.path;
   return (
@@ -500,14 +520,14 @@ function CpuSummaryView({
       <HotFunctionTable
         title="Top by SELF time"
         subtitle="aggregated per function — where CPU is actually spent"
-        entries={summary.top_by_self}
+        entries={topBySelf}
         unit={unit}
       />
-      {summary.top_by_total && summary.top_by_total.length > 0 && (
+      {topByTotal.length > 0 && (
         <HotFunctionTable
           title="Top call-tree nodes by TOTAL time"
           subtitle="self + descendants — may double-count recursion"
-          entries={summary.top_by_total}
+          entries={topByTotal}
           unit={unit}
         />
       )}
@@ -535,7 +555,10 @@ function HotFunctionTable({
           {entries.map((e, i) => (
             <tr key={i}>
               <td className="profile-hot-bar">
-                <div className="profile-hot-bar-fill" style={{ width: `${Math.min(100, e.percent)}%` }} />
+                <div
+                  className="profile-hot-bar-fill"
+                  style={{ width: `${clampPercent(e.percent)}%` }}
+                />
               </td>
               <td className="profile-hot-value">
                 {e.value.toFixed(1)}
@@ -560,6 +583,18 @@ interface LongTask {
   ms: number;
 }
 
+function sanitizeLongTasks(entries: unknown): LongTask[] {
+  if (!Array.isArray(entries)) return [];
+  return entries.flatMap((e): LongTask[] => {
+    if (!e || typeof e !== 'object') return [];
+    const o = e as Record<string, unknown>;
+    const name = typeof o['name'] === 'string' ? o['name'] : null;
+    const ms = typeof o['ms'] === 'number' && Number.isFinite(o['ms']) ? o['ms'] : null;
+    if (name === null || ms === null) return [];
+    return [{ name, ms }];
+  });
+}
+
 function TraceSummaryView({
   data,
   fallbackText,
@@ -573,14 +608,14 @@ function TraceSummaryView({
         event_count?: number;
         long_task_count?: number;
         long_task_total_ms?: number;
-        long_tasks?: LongTask[];
+        long_tasks?: unknown;
         timed_out?: boolean;
       }
     | undefined;
   if (!trace) {
     return <StatusLine action="trace_stop" text={fallbackText} variant="success" />;
   }
-  const longTasks = Array.isArray(trace.long_tasks) ? trace.long_tasks : [];
+  const longTasks = sanitizeLongTasks(trace.long_tasks);
   return (
     <div className="profile-response profile-trace">
       <div className="profile-response-header">
@@ -709,6 +744,13 @@ function deltaClass(n: number, detached = false): string {
   if (detached && n > 0) return 'profile-delta-bad';
   if (n > 0) return 'profile-delta-up';
   return 'profile-delta-down';
+}
+
+function clampPercent(n: number): number {
+  if (!Number.isFinite(n)) return 0;
+  if (n < 0) return 0;
+  if (n > 100) return 100;
+  return n;
 }
 
 function shortPath(p: string): string {
