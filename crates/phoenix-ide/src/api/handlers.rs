@@ -3163,8 +3163,21 @@ async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<Ta
         .list_conversations()
         .await
         .unwrap_or_default();
+    let target_project_id = state
+        .runtime
+        .db()
+        .list_projects()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| std::path::Path::new(&p.canonical_path) == cwd)
+        .map(|p| p.id);
     let task_to_slug: std::collections::HashMap<String, String> = all_convs
         .iter()
+        .filter(|c| match target_project_id.as_deref() {
+            Some(project_id) => c.project_id.as_deref() == Some(project_id),
+            None => std::path::Path::new(&c.cwd) == cwd,
+        })
         .filter_map(|c| {
             let task_id = c.conv_mode.task_id()?;
             let slug = c.slug.as_deref()?;

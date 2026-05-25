@@ -178,18 +178,19 @@ export function useCreateConversation(navigate: (path: string) => void) {
     return () => { clearTimeout(timer); setBranchSearchLoading(false); };
   }, [isGitDir, intent, cwd, branchSearch]);
 
-  const effectiveBranch = intent === 'fromExistingWork'
-    ? (startingPoint?.kind === 'branch' || startingPoint?.kind === 'checkoutBranch' ? startingPoint.name : (baseBranch ?? currentBranch ?? defaultBranch))
+  const activeStartingPoint = intent === 'fromExistingWork' ? startingPoint : null;
+  const effectiveBranch = activeStartingPoint
+    ? (activeStartingPoint.kind === 'branch' || activeStartingPoint.kind === 'checkoutBranch' ? activeStartingPoint.name : (baseBranch ?? currentBranch ?? defaultBranch))
     : null;
-  const selectedBranchConflict = startingPoint?.kind === 'checkoutBranch' && effectiveBranch
+  const selectedBranchConflict = activeStartingPoint?.kind === 'checkoutBranch' && effectiveBranch
     ? branches.find(b => b.name === effectiveBranch)?.conflict_slug ?? null
     : null;
-  const selectedTaskConflict = startingPoint?.kind === 'task'
-    ? startingPoint.task.conversation_slug ?? null
+  const selectedTaskConflict = activeStartingPoint?.kind === 'task'
+    ? activeStartingPoint.task.conversation_slug ?? null
     : null;
   const selectedConflictSlug = selectedTaskConflict ?? selectedBranchConflict;
-  const hasStartingPoint = intent === 'direct' || Boolean(startingPoint);
-  const hasMessageContent = draft.trim().length > 0 || images.length > 0 || startingPoint?.kind === 'task';
+  const hasStartingPoint = intent === 'direct' || Boolean(activeStartingPoint);
+  const hasMessageContent = draft.trim().length > 0 || images.length > 0 || activeStartingPoint?.kind === 'task';
 
   const canSend = hasMessageContent && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking' && hasStartingPoint && !selectedConflictSlug;
 
@@ -235,7 +236,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   const handleSend = async () => {
     const trimmed = draft.trim();
-    const taskStartProvidesContent = startingPoint?.kind === 'task';
+    const taskStartProvidesContent = activeStartingPoint?.kind === 'task';
     if (!trimmed && images.length === 0 && !taskStartProvidesContent) return;
     if (creating || dirStatus === 'invalid' || dirStatus === 'checking') return;
 
@@ -254,7 +255,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
       const messageId = generateUUID();
       const trimmedCwd = cwd.trim();
-      if (intent === 'fromExistingWork' && !startingPoint) {
+      if (intent === 'fromExistingWork' && !activeStartingPoint) {
         setError('Pick a branch or task to start from.');
         setCreating(false);
         return;
@@ -266,19 +267,19 @@ export function useCreateConversation(navigate: (path: string) => void) {
       }
       const backendMode = intent === 'direct'
         ? 'direct'
-        : startingPoint?.kind === 'checkoutBranch'
+        : activeStartingPoint?.kind === 'checkoutBranch'
           ? 'branch'
           : 'managed';
       const submitBranch = intent === 'fromExistingWork'
-        ? (startingPoint?.kind === 'branch' || startingPoint?.kind === 'checkoutBranch' ? startingPoint.name : (baseBranch ?? currentBranch ?? defaultBranch))
+        ? (activeStartingPoint?.kind === 'branch' || activeStartingPoint?.kind === 'checkoutBranch' ? activeStartingPoint.name : (baseBranch ?? currentBranch ?? defaultBranch))
         : null;
       if (intent === 'fromExistingWork' && !submitBranch) {
         setError('Pick a Git starting point.');
         setCreating(false);
         return;
       }
-      const submitText = startingPoint?.kind === 'task'
-        ? buildTaskStartPrompt(trimmedCwd, startingPoint.task, trimmed)
+      const submitText = activeStartingPoint?.kind === 'task'
+        ? buildTaskStartPrompt(trimmedCwd, activeStartingPoint.task, trimmed)
         : trimmed;
       const conv = await createConversationWithStore(
         trimmedCwd, submitText, messageId, selectedModel || undefined, images, backendMode,
