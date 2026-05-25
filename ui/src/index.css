@@ -5564,21 +5564,21 @@ html * {
   margin-bottom: 0;
 }
 
-.task-start-detail-markdown h1,
-.task-start-detail-markdown h2,
-.task-start-detail-markdown h3 {
+.new-conv-page .task-start-detail .task-start-detail-markdown h1,
+.new-conv-page .task-start-detail .task-start-detail-markdown h2,
+.new-conv-page .task-start-detail .task-start-detail-markdown h3 {
   margin: 8px 0 4px;
   color: var(--text-primary);
   font-size: 12px;
 }
 
-.task-start-detail-markdown p,
-.task-start-detail-markdown ul,
-.task-start-detail-markdown ol {
+.new-conv-page .task-start-detail .task-start-detail-markdown p,
+.new-conv-page .task-start-detail .task-start-detail-markdown ul,
+.new-conv-page .task-start-detail .task-start-detail-markdown ol {
   margin: 4px 0;
 }
 
-.task-start-detail-markdown code {
+.new-conv-page .task-start-detail .task-start-detail-markdown code {
   font-family: var(--font-mono, monospace);
   font-size: 10px;
 }
@@ -6140,8 +6140,7 @@ html * {
   justify-content: flex-start;
   overflow: auto;
   padding-inline: 20px;
-  padding-block-start: clamp(72px, 14vh, 140px);
-  padding-block-end: 48px;
+  padding-block: clamp(72px, 14vh, 140px) 48px;
   box-sizing: border-box;
 }
 
