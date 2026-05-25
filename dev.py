@@ -446,6 +446,10 @@ def ensure_ui_deps():
     if not (UI_DIR / "node_modules" / ".modules.yaml").exists():
         print("Installing UI dependencies...")
         subprocess.run(["pnpm", "install"], cwd=UI_DIR, check=True, env=node_env())
+    # rust-embed in crates/phoenix-ide/src/api/assets.rs reads ui/dist/ at
+    # proc-macro expansion. The folder must exist for cargo to build, even
+    # if empty — runtime serve_static() falls back to filesystem reads.
+    (UI_DIR / "dist").mkdir(exist_ok=True)
 
 
 def build_rust(release: bool = True):
@@ -1641,13 +1645,16 @@ def cmd_check():
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
-        """Rust lane: vite build → clippy → musl smoke check → test compile → test run → codegen staleness check.
+        """Rust lane: clippy → musl smoke check → test compile → test run → codegen staleness check.
 
-        vite build is sequenced here (rather than as its own parallel thread)
-        because `#[derive(Embed)]` in crates/phoenix-ide/src/api/assets.rs reads
-        ui/dist/ during proc-macro expansion. Running vite build in parallel
-        with cargo races: clippy can expand the macro before (or during) vite's
-        output write and panic with "File should be readable: NotFound".
+        vite build is intentionally NOT run here. `#[derive(Embed)]` in
+        crates/phoenix-ide/src/api/assets.rs reads ui/dist/ during proc-macro
+        expansion, and that read tolerates an empty (or just `.gitkeep`)
+        directory: rust-embed enumerates whatever files are there. The
+        runtime fallback in serve_static() reads from the filesystem when
+        Assets::get() returns None, so an empty embed table is correct for
+        check. Build-time bundling of UI assets belongs to `prod_build`,
+        which runs vite in its own worktree.
 
         Test compile and run are split into two steps so each gets its own
         CHECK_TIMEOUT budget. Cold test-binary compiles on this codebase can
@@ -1660,7 +1667,6 @@ def cmd_check():
         overwrite the generated .ts files; if those differ from what's
         committed to git, the developer forgot to regenerate.
         """
-        run_step("vite build", ["pnpm", "exec", "vite", "build"], UI_DIR)
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
         if sys.platform == "darwin":
             # macOS prod deploy uses native target (launchd_prod_deploy → prod_build target=None),
@@ -1672,8 +1678,10 @@ def cmd_check():
                 ])
             else:
                 print("  i  cargo check musl: skipped (x86_64-linux-musl-gcc not on PATH; see task 60001)")
-        else:
-            run_step("cargo check musl", ["cargo", "check"])
+        # Linux hosts: the prior fallback was a plain `cargo check`, which is
+        # strictly redundant with `cargo clippy` above (clippy implies check).
+        # Drop it — musl validation belongs on the CI/macOS path that has the
+        # cross toolchain installed.
         has_nextest = subprocess.run(
             ["cargo", "nextest", "--version"],
             capture_output=True,
@@ -1972,6 +1980,17 @@ def cmd_check():
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
     ensure_ui_deps()
 
+    # Enable sccache (if installed) as the rustc wrapper so deps' object files
+    # are shared across worktrees / `cargo clean` cycles. Honored by every
+    # cargo invocation below because the env is inherited by run_step's
+    # subprocesses. Skip cleanly if sccache isn't on PATH or the user has
+    # explicitly set RUSTC_WRAPPER already.
+    if shutil.which("sccache") and "RUSTC_WRAPPER" not in os.environ:
+        os.environ["RUSTC_WRAPPER"] = "sccache"
+        # Default cache dir + 20G cap. Devs can override via SCCACHE_DIR /
+        # SCCACHE_CACHE_SIZE before invoking dev.py.
+        os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
+
     # Classify the environment up front so the Rust suite skips the
     # classes of tests that would otherwise produce env-noise failures.
     #
@@ -2036,11 +2055,14 @@ def cmd_check():
     ]
     for t in threads:
         t.start()
+    # Per-thread join budget must cover the longest *lane*, not a single step.
+    # lane_rust runs ~6 sequential steps each with their own CHECK_TIMEOUT,
+    # so we cap join at 6×CHECK_TIMEOUT + 30s. Without this, a slow cold
+    # build of lane_rust returns from join early and the loop below reports
+    # "All N passed" before lane_rust has reported its tail steps.
+    LANE_JOIN_TIMEOUT = (CHECK_TIMEOUT * 6) + 30
     for t in threads:
-        # Timeout on join so Ctrl+C is responsive (subprocess.run timeout
-        # handles the actual deadline; this just prevents infinite wait
-        # if a thread somehow survives)
-        t.join(timeout=CHECK_TIMEOUT + 30)
+        t.join(timeout=LANE_JOIN_TIMEOUT)
 
     total_elapsed = time.monotonic() - t_start
     failures = [(n, out) for n, rc, _, out in results if rc != 0]
