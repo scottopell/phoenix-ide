@@ -22,6 +22,20 @@ unused_comparisons = "deny"
 [profile.release]
 debug = true  # Include debug symbols for production debugging
 
+# Cold-compile + link-time reductions for `./dev.py check` and dev builds.
+# `line-tables-only` keeps file:line info (so panics + backtraces still
+# resolve) but drops full DWARF type info, which is the bulk of what slows
+# the linker on debug builds. `codegen-units = 256` gives rustc more
+# parallelism on cold builds; dev is already opt-level=0 so monomorphized
+# inlining loss is moot.
+[profile.dev]
+debug = "line-tables-only"
+codegen-units = 256
+
+[profile.test]
+debug = "line-tables-only"
+codegen-units = 256
+
 # Optimize heavy dependencies even in debug builds to reduce:
 # - Incremental build time
 # - Binary size (prevents debug build linker hangs)
