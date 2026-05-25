@@ -1074,6 +1074,208 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             )
         return True
 
+    def _ensure_heavy_prod_shape_fixture(
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+        conv_mode: dict,
+        cwd: str,
+    ) -> bool:
+        """Ensure a sanitized 484-message fixture matching a real prod shape.
+
+        Shape derived from read-only aggregate inspection of prod conversation
+        `check-open-pr-development` (no raw prod text copied):
+        18 user messages, 233 agent messages, 233 tool messages; mostly
+        agent→tool pairs with a few zero/multi-tool agents and large user/tool
+        payload outliers. Used for MessageList virtualization profiling.
+        """
+        slug = "fixture-heavy-prod-shape"
+        expected_count = 484
+        existing = conn.execute(
+            "SELECT id, archived FROM conversations WHERE slug = ?",
+            (slug,),
+        ).fetchone()
+        if existing is not None:
+            conv_id, archived = existing
+            message_count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+                (conv_id,),
+            ).fetchone()[0]
+            if archived == 0 and message_count == expected_count:
+                return False
+            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+            conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+
+        conv_id = str(_uuid.uuid4())
+        state_json = json.dumps({"type": "idle"})
+        mode_json = json.dumps(conv_mode)
+        conn.execute(
+            "INSERT INTO conversations ("
+            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
+            " state, state_updated_at, created_at, updated_at, archived,"
+            " model, project_id, conv_mode, desired_base_branch,"
+            " seed_parent_id, seed_label"
+            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, ?)",
+            (
+                conv_id,
+                slug,
+                "Fixture Heavy Prod Shape",
+                cwd,
+                state_json,
+                now,
+                now,
+                now,
+                project_id,
+                mode_json,
+                "perf:message-list-heavy-prod-shape",
+            ),
+        )
+
+        zero_tool_agents = {5, 17, 41, 68, 93, 119, 151, 188, 229}
+        two_tool_agents = {12, 37, 74, 106, 143, 177, 214}
+        three_tool_agents = {201}
+
+        def _tool_count(agent_idx: int) -> int:
+            if agent_idx in zero_tool_agents:
+                return 0
+            if agent_idx in two_tool_agents:
+                return 2
+            if agent_idx in three_tool_agents:
+                return 3
+            return 1
+
+        def _markdown_table(rows: int) -> str:
+            lines = ["| metric | value | note |", "| --- | ---: | --- |"]
+            for i in range(rows):
+                lines.append(f"| sample-{i} | {i * 17} | deterministic fixture row |")
+            return "\n".join(lines)
+
+        def _insert_message(
+            seq: int,
+            message_type: str,
+            content: object,
+            display_data: object | None = None,
+            usage_data: object | None = None,
+        ) -> None:
+            conn.execute(
+                "INSERT INTO messages ("
+                " message_id, conversation_id, sequence_id, message_type,"
+                " content, display_data, usage_data, created_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    str(_uuid.uuid4()),
+                    conv_id,
+                    seq,
+                    message_type,
+                    json.dumps(content),
+                    json.dumps(display_data) if display_data is not None else None,
+                    json.dumps(usage_data) if usage_data is not None else None,
+                    now,
+                ),
+            )
+
+        seq = 0
+        agent_idx = 0
+        tool_idx = 0
+        for turn in range(18):
+            if turn == 0:
+                user_words = 12000
+            elif turn == 8:
+                user_words = 6000
+            elif turn == 15:
+                user_words = 2500
+            else:
+                user_words = 420
+            _insert_message(
+                seq,
+                "user",
+                {
+                    "text": (
+                        f"Heavy fixture user turn {turn + 1}.\n\n"
+                        f"{_perf_text(user_words)}"
+                    ),
+                    "images": [],
+                },
+            )
+            seq += 1
+
+            agents_this_turn = 13 if turn < 17 else 12
+            for _ in range(agents_this_turn):
+                count = _tool_count(agent_idx)
+                tool_blocks = []
+                for local_tool in range(count):
+                    tool_blocks.append({
+                        "type": "tool_use",
+                        "id": f"heavy-tool-{agent_idx}-{local_tool}",
+                        "name": "bash" if (agent_idx + local_tool) % 3 else "read_file",
+                        "input": {
+                            "cmd": f"echo heavy-fixture-{agent_idx}-{local_tool}",
+                            "path": f"/tmp/heavy-fixture-{agent_idx}-{local_tool}.txt",
+                        },
+                        "display": f"heavy fixture tool {agent_idx}.{local_tool}",
+                    })
+
+                text_words = 620 if agent_idx in {22, 88, 166, 220} else 64
+                blocks = [
+                    {
+                        "type": "text",
+                        "text": (
+                            f"Heavy fixture agent step {agent_idx}.\n\n"
+                            f"{_perf_text(text_words)}\n\n"
+                            f"{_markdown_table(4 if agent_idx % 11 == 0 else 1)}\n\n"
+                            "```ts\n"
+                            "export function heavyFixture(value: string): string {\n"
+                            "  return value.trim().toUpperCase();\n"
+                            "}\n"
+                            "```"
+                        ),
+                    },
+                    *tool_blocks,
+                ]
+                _insert_message(
+                    seq,
+                    "agent",
+                    blocks,
+                    usage_data={
+                        "input_tokens": 200 + agent_idx,
+                        "output_tokens": 80 + (agent_idx % 40),
+                    },
+                )
+                seq += 1
+
+                for local_tool in range(count):
+                    if tool_idx in {7, 101, 180}:
+                        result_words = 3200
+                    elif tool_idx % 17 == 0:
+                        result_words = 900
+                    else:
+                        result_words = 90
+                    tool_use_id = f"heavy-tool-{agent_idx}-{local_tool}"
+                    _insert_message(
+                        seq,
+                        "tool",
+                        {
+                            "tool_use_id": tool_use_id,
+                            "content": (
+                                f"Sanitized heavy fixture tool result {tool_idx}.\n"
+                                f"{_perf_text(result_words)}"
+                            ),
+                            "is_error": False,
+                        },
+                        display_data={"duration_ms": 125 + (tool_idx % 5000)},
+                    )
+                    seq += 1
+                    tool_idx += 1
+
+                agent_idx += 1
+
+        if seq != expected_count or agent_idx != 233 or tool_idx != 233:
+            raise RuntimeError(
+                "heavy prod-shape fixture generated unexpected counts: "
+                f"messages={seq}, agents={agent_idx}, tools={tool_idx}"
+            )
+        return True
+
     # ----------------------------------------------------- the seed
 
     direct_mode = {"mode": "Direct"}
@@ -1092,10 +1294,21 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
                 conv_mode=direct_mode,
                 cwd=str(ROOT),
             )
+            created_heavy_fixture = _ensure_heavy_prod_shape_fixture(
+                conn,
+                project_id=project_id,
+                conv_mode=direct_mode,
+                cwd=str(ROOT),
+            )
             conn.commit()
             if not quiet_if_populated:
                 count = _existing_active_count(conn)
-                suffix = " + repaired perf fixture" if created_fixture else ""
+                suffixes = []
+                if created_fixture:
+                    suffixes.append("repaired perf fixture")
+                if created_heavy_fixture:
+                    suffixes.append("repaired heavy fixture")
+                suffix = f" + {', '.join(suffixes)}" if suffixes else ""
                 print(f"✓ Dev DB already populated ({count} conversations) — skipping seed{suffix}.")
             return
 
@@ -1152,6 +1365,12 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
         )
 
         _ensure_conversation_load_fixture(
+            conn,
+            project_id=project_id,
+            conv_mode=direct_mode,
+            cwd=str(ROOT),
+        )
+        _ensure_heavy_prod_shape_fixture(
             conn,
             project_id=project_id,
             conv_mode=direct_mode,
