@@ -2888,40 +2888,6 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
     }))
 }
 
-fn percent_decode_path(path: &str) -> Result<String, AppError> {
-    let mut out = Vec::with_capacity(path.len());
-    let mut bytes = path.bytes();
-    while let Some(b) = bytes.next() {
-        if b == b'%' {
-            let Some(hi) = bytes.next() else {
-                return Err(AppError::BadRequest(
-                    "Invalid percent-encoded path".to_string(),
-                ));
-            };
-            let Some(lo) = bytes.next() else {
-                return Err(AppError::BadRequest(
-                    "Invalid percent-encoded path".to_string(),
-                ));
-            };
-            let Some(hi) = char::from(hi).to_digit(16) else {
-                return Err(AppError::BadRequest(
-                    "Invalid percent-encoded path".to_string(),
-                ));
-            };
-            let Some(lo) = char::from(lo).to_digit(16) else {
-                return Err(AppError::BadRequest(
-                    "Invalid percent-encoded path".to_string(),
-                ));
-            };
-            out.push(u8::try_from((hi << 4) | lo).expect("hex nibbles fit in u8"));
-        } else {
-            out.push(b);
-        }
-    }
-    String::from_utf8(out)
-        .map_err(|_| AppError::BadRequest("Invalid UTF-8 in percent-encoded path".to_string()))
-}
-
 /// Serve a file from an absolute path with native Content-Type.
 /// Used by "Open in browser" for HTML preview -- the path-based URL means
 /// relative references (CSS, JS, images) resolve correctly against the
@@ -2934,7 +2900,7 @@ async fn serve_preview_file(
 ) -> Result<axum::response::Response, AppError> {
     use axum::response::IntoResponse;
 
-    let path = PathBuf::from(format!("/{}", percent_decode_path(&filepath)?));
+    let path = PathBuf::from(format!("/{filepath}"));
 
     if !path.exists() {
         return Err(AppError::NotFound("File does not exist".to_string()));
@@ -4830,14 +4796,6 @@ mod file_read_tests {
         assert_eq!(
             preview_url_for_path(path),
             "/preview/tmp/screens/a%20%231%3Fraw%25.png"
-        );
-    }
-
-    #[test]
-    fn percent_decode_path_reverses_preview_url_path_encoding() {
-        assert_eq!(
-            percent_decode_path("tmp/screens/a%20%231%3Fraw%25.png").expect("decode"),
-            "tmp/screens/a #1?raw%.png"
         );
     }
 
