@@ -82,7 +82,11 @@ function ScenarioView({
     return <StatusLine action="run_scenario" text={fallbackText} variant={isError ? 'error' : 'success'} />;
   }
 
-  const outcome = typeof data['outcome'] === 'string' ? data['outcome'] : 'unknown';
+  const rawOutcome = typeof data['outcome'] === 'string' ? data['outcome'] : 'unknown';
+  // `outcome` flows into a className; map to a known set so an unexpected
+  // backend string can't inject spaces / punctuation into the class list.
+  const outcome: 'completed' | 'blocked' | 'unknown' =
+    rawOutcome === 'completed' || rawOutcome === 'blocked' ? rawOutcome : 'unknown';
   const requestedRuns = typeof data['requested_runs'] === 'number' ? data['requested_runs'] : null;
   const warmup = typeof data['warmup'] === 'number' ? data['warmup'] : null;
   const blockedStep = typeof data['blocked_step'] === 'string' ? data['blocked_step'] : null;
@@ -99,7 +103,7 @@ function ScenarioView({
     <div className="profile-response profile-scenario">
       <div className="profile-response-header">
         <span className={`profile-action-chip profile-outcome-${outcome}`}>
-          {outcome === 'completed' ? '✓ completed' : outcome === 'blocked' ? '✗ blocked' : outcome}
+          {outcome === 'completed' ? '✓ completed' : outcome === 'blocked' ? '✗ blocked' : rawOutcome}
         </span>
         {requestedRuns !== null && (
           <span className="profile-meta">
@@ -129,6 +133,7 @@ function ScenarioView({
           <button
             type="button"
             className="profile-toggle"
+            aria-expanded={tableExpanded}
             onClick={() => setTableExpanded((v) => !v)}
           >
             {tableExpanded ? '▾' : '▸'} Per-run table ({rawSamples.length} run
@@ -152,6 +157,7 @@ function ScenarioView({
       <button
         type="button"
         className="profile-toggle profile-toggle-raw"
+        aria-expanded={showRawJson}
         onClick={() => setShowRawJson((v) => !v)}
       >
         {showRawJson ? '▾' : '▸'} Raw payload
@@ -242,24 +248,40 @@ function Sparkline({ values }: { values: (number | null)[] }) {
   const max = Math.max(...real);
   const range = max - min || 1;
   const stepX = values.length > 1 ? w / (values.length - 1) : 0;
-  const points = values
-    .map((v, i) => {
-      if (v === null) return null;
-      const x = i * stepX;
-      const y = h - ((v - min) / range) * (h - 2) - 1;
-      return `${x.toFixed(1)},${y.toFixed(1)}`;
-    })
-    .filter((p): p is string => p !== null)
-    .join(' ');
+  // Split into contiguous non-null segments so a null gap doesn't get
+  // visually interpolated by a straight connecting line (the absence of
+  // a measurement is information, not noise).
+  const segments: Array<Array<{ x: number; y: number }>> = [];
+  let current: Array<{ x: number; y: number }> = [];
+  values.forEach((v, i) => {
+    if (v === null) {
+      if (current.length > 0) {
+        segments.push(current);
+        current = [];
+      }
+      return;
+    }
+    const x = i * stepX;
+    const y = h - ((v - min) / range) * (h - 2) - 1;
+    current.push({ x, y });
+  });
+  if (current.length > 0) segments.push(current);
   return (
     <svg width={w} height={h} className="profile-sparkline">
-      <polyline points={points} fill="none" stroke="currentColor" strokeWidth="1.2" />
-      {values.map((v, i) => {
-        if (v === null) return null;
-        const x = i * stepX;
-        const y = h - ((v - min) / range) * (h - 2) - 1;
-        return <circle key={i} cx={x} cy={y} r="1.5" fill="currentColor" />;
-      })}
+      {segments.map((seg, si) => (
+        <polyline
+          key={si}
+          points={seg.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(' ')}
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.2"
+        />
+      ))}
+      {segments.flatMap((seg, si) =>
+        seg.map((p, pi) => (
+          <circle key={`${si}-${pi}`} cx={p.x} cy={p.y} r="1.5" fill="currentColor" />
+        )),
+      )}
     </svg>
   );
 }
@@ -563,11 +585,9 @@ function TraceSummaryView({
         )}
         {typeof trace.long_task_count === 'number' && (
           <span className="profile-meta">
-            {trace.long_task_count} long task{trace.long_task_count !== 1 ? 's' : ''} (
-            {typeof trace.long_task_total_ms === 'number'
-              ? `${trace.long_task_total_ms.toFixed(1)} ms total`
-              : ''}
-            )
+            {trace.long_task_count} long task{trace.long_task_count !== 1 ? 's' : ''}
+            {typeof trace.long_task_total_ms === 'number' &&
+              ` (${trace.long_task_total_ms.toFixed(1)} ms total)`}
           </span>
         )}
         {trace.timed_out && (
@@ -619,6 +639,7 @@ function LongTaskTable({ tasks }: { tasks: LongTask[] }) {
         <button
           type="button"
           className="profile-toggle"
+          aria-expanded={expanded}
           onClick={() => setExpanded((v) => !v)}
         >
           {expanded ? `▾ Show top 5` : `▸ Show all ${tasks.length} long tasks`}

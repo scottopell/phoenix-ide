@@ -152,6 +152,150 @@ describe('BrowserProfileResponseView', () => {
       expect(heapRow!.textContent).toMatch(/last —/);
     });
 
+    it('clamps unknown outcome strings to a safe CSS-class suffix', () => {
+      // Defensive: outcome flows into className. An unexpected string
+      // (spaces, punctuation, future variants) must not become part of
+      // the class selector.
+      const { container } = render(
+        <BrowserProfileResponseView
+          action="run_scenario"
+          displayData={{
+            outcome: 'weird value; .injected',
+            requested_runs: 1,
+            warmup: 0,
+            methodology_warnings: [],
+            raw_samples: [],
+          }}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      const chip = container.querySelector('.profile-action-chip');
+      expect(chip).not.toBeNull();
+      // Class list contains only profile-outcome-{completed|blocked|unknown}.
+      const classes = chip!.className.split(/\s+/);
+      const outcomeClasses = classes.filter((c) => c.startsWith('profile-outcome-'));
+      expect(outcomeClasses).toHaveLength(1);
+      expect(outcomeClasses[0]).toMatch(/^profile-outcome-(completed|blocked|unknown)$/);
+    });
+
+    it('exposes aria-expanded on the per-run table and raw-payload toggles', () => {
+      render(
+        <BrowserProfileResponseView
+          action="run_scenario"
+          displayData={sampleData}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      const perRunBtn = screen.getByRole('button', { name: /Per-run table/ });
+      expect(perRunBtn).toHaveAttribute('aria-expanded', 'false');
+      fireEvent.click(perRunBtn);
+      expect(perRunBtn).toHaveAttribute('aria-expanded', 'true');
+
+      const rawBtn = screen.getByRole('button', { name: /Raw payload/ });
+      expect(rawBtn).toHaveAttribute('aria-expanded', 'false');
+      fireEvent.click(rawBtn);
+      expect(rawBtn).toHaveAttribute('aria-expanded', 'true');
+    });
+
+    it('breaks the sparkline polyline at null gaps so non-measured runs do not visually interpolate', () => {
+      // Runs 0 and 2 measure heap (gc_ran=true); run 1 does NOT (gc_ran=false).
+      // A single polyline through points 0 and 2 would draw a straight line
+      // implying continuous heap growth across run 1 — a quiet lie. The fix
+      // must split the polyline at the null gap so the absence is visible.
+      const data = {
+        outcome: 'completed',
+        requested_runs: 3,
+        warmup: 0,
+        methodology_warnings: [],
+        raw_samples: [
+          {
+            run_index: 0,
+            script_ms: 10,
+            long_tasks: 0,
+            wall_ms: 100,
+            dom_nodes: 1000,
+            gc_ran: true,
+            js_heap_used: 1_000_000,
+            react_status: 'absent',
+            react_commits: null,
+            react_actual_ms: null,
+          },
+          {
+            run_index: 1,
+            script_ms: 11,
+            long_tasks: 0,
+            wall_ms: 105,
+            dom_nodes: 1000,
+            gc_ran: false,
+            js_heap_used: null,
+            react_status: 'absent',
+            react_commits: null,
+            react_actual_ms: null,
+          },
+          {
+            run_index: 2,
+            script_ms: 12,
+            long_tasks: 0,
+            wall_ms: 110,
+            dom_nodes: 1000,
+            gc_ran: true,
+            js_heap_used: 3_000_000,
+            react_status: 'absent',
+            react_commits: null,
+            react_actual_ms: null,
+          },
+        ],
+      };
+      const { container } = render(
+        <BrowserProfileResponseView
+          action="run_scenario"
+          displayData={data}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      const heapRow = Array.from(container.querySelectorAll('.profile-metric-row')).find(
+        (row) => row.textContent?.includes('JS heap'),
+      );
+      expect(heapRow).toBeTruthy();
+      // No <polyline> in the heap row connects two points across a null gap.
+      // Equivalent: no single polyline has both non-null endpoints — they
+      // must be in separate polyline elements (each with ≤1 point) or a
+      // path with M (move) breaks. We enforce: no polyline contains 2+ points.
+      const polylines = heapRow!.querySelectorAll('polyline');
+      for (const pl of polylines) {
+        const points = (pl.getAttribute('points') ?? '').trim();
+        const count = points === '' ? 0 : points.split(/\s+/).length;
+        expect(count).toBeLessThanOrEqual(1);
+      }
+    });
+
+    it('still draws a connected polyline when all points are contiguous', () => {
+      // Sanity-check the fix doesn't over-restrict: an all-non-null metric
+      // (script_ms) MUST still render one polyline that spans the runs.
+      const { container } = render(
+        <BrowserProfileResponseView
+          action="run_scenario"
+          displayData={sampleData}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      const scriptRow = Array.from(container.querySelectorAll('.profile-metric-row')).find(
+        (row) => row.textContent?.startsWith('script'),
+      );
+      expect(scriptRow).toBeTruthy();
+      const polylines = scriptRow!.querySelectorAll('polyline');
+      // At least one polyline with ≥2 points (the line connecting runs).
+      const multiPointSegments = Array.from(polylines).filter((pl) => {
+        const pts = (pl.getAttribute('points') ?? '').trim();
+        return pts !== '' && pts.split(/\s+/).length >= 2;
+      });
+      expect(multiPointSegments.length).toBeGreaterThanOrEqual(1);
+    });
+
     it('renders blocked outcome with the failing step', () => {
       render(
         <BrowserProfileResponseView
@@ -362,6 +506,54 @@ describe('BrowserProfileResponseView', () => {
       expect(screen.queryByText('Task5')).toBeNull();
       fireEvent.click(screen.getByText(/Show all 8 long tasks/));
       expect(screen.getByText('Task7')).toBeInTheDocument();
+    });
+
+    it('omits the empty parens when long_task_total_ms is missing', () => {
+      render(
+        <BrowserProfileResponseView
+          action="trace_stop"
+          displayData={{
+            trace: {
+              path: '/tmp/x.json',
+              event_count: 1,
+              long_task_count: 3,
+              // long_task_total_ms intentionally omitted
+              long_tasks: [],
+              timed_out: false,
+            },
+          }}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      // No empty "( )" or "()" group floating after the long-task count.
+      const content = document.body.textContent ?? '';
+      expect(content).not.toMatch(/\(\s*\)/);
+    });
+
+    it('exposes aria-expanded on the long-task disclosure toggle', () => {
+      const tasks = Array.from({ length: 8 }, (_, i) => ({ name: `T${i}`, ms: 100 - i }));
+      render(
+        <BrowserProfileResponseView
+          action="trace_stop"
+          displayData={{
+            trace: {
+              path: '/tmp/x.json',
+              event_count: 1,
+              long_task_count: 8,
+              long_task_total_ms: 800,
+              long_tasks: tasks,
+              timed_out: false,
+            },
+          }}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      const toggle = screen.getByRole('button', { name: /Show all 8 long tasks/ });
+      expect(toggle).toHaveAttribute('aria-expanded', 'false');
+      fireEvent.click(toggle);
+      expect(toggle).toHaveAttribute('aria-expanded', 'true');
     });
   });
 
