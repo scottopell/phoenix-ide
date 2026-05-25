@@ -2,8 +2,12 @@
 //!
 //! The codex backend (`chatgpt.com/backend-api/codex`) returns plan and quota
 //! state in `x-codex-*` response headers on every Responses call — both 200
-//! and 429. The 429 body adds `plan_type` and `resets_at`; everything else
-//! (window snapshots, credits, plan type, active limit, promo) is in headers.
+//! and 429. The full set lives in headers: window snapshots
+//! (`primary`/`secondary` used-percent / window-minutes / reset-at), plan
+//! type (`x-codex-plan-type`), active limit (`x-codex-active-limit`),
+//! credits (`x-codex-credits-*`), promo message (`x-codex-promo-message`).
+//! The 429 JSON body additionally provides `resets_at` (no header
+//! equivalent) and historically also `plan_type` (now also in a header).
 //!
 //! Phoenix uses the HTTP/SSE transport against this backend. The WebSocket
 //! variant of the same endpoint emits a richer mid-stream `codex.rate_limits`
@@ -83,6 +87,7 @@ pub fn quota_from_codex_response_headers(headers: &HeaderMap) -> Option<QuotaDet
         || credits.is_some()
         || plan_type.is_some()
         || limit_id.is_some()
+        || limit_name.is_some()
         || promo_message.is_some();
     if !any_data {
         return None;
