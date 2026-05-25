@@ -21,9 +21,11 @@ function withConvContext(ui: React.ReactElement): React.ReactElement {
 
 vi.mock('./MessageComponents', () => ({
   UserMessage: ({ message }: { message: { sequence_id: number } }) => (
-    <div className="message user" data-sequence-id={message.sequence_id}>user</div>
+    <div className="message user" data-sequence-id={message.sequence_id} data-payload-kind="user">user</div>
   ),
-  QueuedUserMessage: () => null,
+  QueuedUserMessage: () => (
+    <div className="message queued" data-payload-kind="pending">pending</div>
+  ),
   AgentMessage: ({ message }: { message: { sequence_id: number } }) => (
     <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>
   ),
@@ -173,6 +175,13 @@ describe('MessageList', () => {
 
     await waitFor(() => expect(container.querySelector('[data-render-unit-key="msg-21"]')).not.toBeNull());
 
+    // Capture the wrapper DOM node + its initial payload kind before
+    // the ack rerender. Same key + same node identity post-rerender is
+    // what proves React reconciled in-place rather than unmount/remount.
+    const wrapperBefore = container.querySelector('[data-render-unit-key="msg-21"]');
+    expect(wrapperBefore).not.toBeNull();
+    expect(wrapperBefore!.querySelector('[data-payload-kind]')?.getAttribute('data-payload-kind')).toBe('pending');
+
     rerender(
       withConvContext(
         <MessageList
@@ -193,13 +202,15 @@ describe('MessageList', () => {
       ),
     );
 
-    // The render-unit-key wrapper for `msg-21` survives the ack — the
-    // same keyed node hosts the QueuedUserMessage before and the
-    // UserMessage after. There is exactly one wrapper with that key.
+    // The render-unit-key wrapper for `msg-21` survives the ack — same
+    // node identity, payload kind swaps pending → user.
     await waitFor(() => {
       const nodes = container.querySelectorAll('[data-render-unit-key="msg-21"]');
       expect(nodes).toHaveLength(1);
+      expect(nodes[0]!.querySelector('[data-payload-kind]')?.getAttribute('data-payload-kind')).toBe('user');
     });
+    const wrapperAfter = container.querySelector('[data-render-unit-key="msg-21"]');
+    expect(wrapperAfter).toBe(wrapperBefore);
   });
 
   it('bounds retained historical DOM while expanding upward', async () => {

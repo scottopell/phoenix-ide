@@ -119,9 +119,9 @@ entity HistoricalUnit {
 entity TailUnit {
     kind: TailKind
     key: String
-    -- pending_user carries local_id; sub_agent_status carries a
-    -- ConvState reference; streaming_agent carries the streaming key
-    -- only (buffer is subscribed via atom at the leaf).
+    -- sub_agent_status carries a ConvState reference; streaming_agent
+    -- carries the streaming key only (buffer is subscribed via atom
+    -- at the leaf).
 }
 
 -- The transform's working state. Walks messages once, emitting units
@@ -378,8 +378,16 @@ rule AppendPendingHistoricalUnits {
     @guidance
         -- pending_historical_units_in_order(qs):
         --   for q in qs (input order):
-        --     emit { kind: pending_user, key: q.local_id,
-        --            source_message_id: q.local_id }
+        --     emit { kind: pending_user, key: q.local_id, message: q }
+        -- The TS HistoricalUnit shape for pending_user is
+        --   { kind: 'pending_user'; key: string; message: QueuedMessage }
+        -- The unit's source identity is q.local_id, carried in the
+        -- `key` field (per HistoricalUnitKeysAreUnique). At ack time
+        -- the server populates message_id := local_id and the same
+        -- key surfaces as a `user` HistoricalUnit with its
+        -- `message: Message`, so React's reconciler treats the
+        -- transition as a keyed in-place update on a single node.
+        --
         -- The status filter (only pending / steering_queued) has
         -- already been applied upstream by useMessageQueue's
         -- derivePendingMessages; this rule consumes the filtered list.
@@ -518,12 +526,15 @@ invariant TailUnitsArePostHistorical {
         b.phase = "done" implies tail_is_post_historical(b)
 }
 
--- Tail unit order is deterministic: pending_user* then optional
--- sub_agent_status then optional streaming_agent. No interleaving.
+-- Tail unit order is deterministic: optional sub_agent_status then
+-- optional streaming_agent. No interleaving. pending_user is NOT a
+-- TailKind — it lives in b.historical (see REQ-MLRU-001 + the
+-- AppendPendingHistoricalUnits rule) so that pending → sent is a
+-- keyed in-place update on a single render unit.
 invariant TailUnitOrderIsDeterministic {
     for b in Builders:
         b.phase = "done" implies
-            tail_order_is_pending_then_subagent_then_streaming(b.tail)
+            tail_order_is_subagent_then_streaming(b.tail)
 }
 
 -- Position advances monotonically and reaches len(messages) before
