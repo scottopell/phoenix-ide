@@ -23,41 +23,74 @@ The earlier draft of "watch" conflated these axes. Splitting them is
 why WorkScope shipped first as scope-equality and wake is a separate
 spec rather than another condition on the same edge.
 
+## Why No AwaitingWake State
+
+The earliest draft of this spec introduced an `AwaitingWake` conv
+state by analogy with `AwaitingTaskApproval` / `AwaitingContinuation`.
+Resolved against: the existing `Awaiting*` family is exclusively
+"waiting on the user." Wake is "waiting on the runtime," which is a
+different category by every relevant property:
+
+| Property | `Awaiting*` (today) | Wake |
+|----------|---------------------|------|
+| Who unblocks the wait? | The user | The runtime / external event |
+| Does the user need to take an action? | Yes | No |
+| Should user input be disabled? | Implicitly yes (the conv is asking the user something) | No (the conv is doing background work) |
+| Is there a single "answer" expected? | Yes (approve, continue) | No (the answer is "the event happened") |
+
+Modelling wake as `AwaitingWake` would have created a state with
+exactly the wrong semantics: a conv that *can* accept user input but
+that the state name suggests *cannot*. The pit-of-success direction
+is to keep the conv in `Idle`, persist the contract row as the single
+source of truth for "is this conv waiting on something," and augment
+`is_busy()` to read from the contract table (REQ-WAKE-004).
+
+Concretely, this avoids:
+- Two representations of the same semantic value (conv state AND
+  contract row), which Voss panel identified as a recurring
+  correctness anti-pattern in this codebase
+- A state-machine special case for "user message during
+  AwaitingWake" — with the conv in `Idle`, user messages are normal
+  Idle conv messages and need no special policy
+- UI confusion about whether the conv is "waiting on you" or "waiting
+  on something else" — `Idle + wake indicator` is unambiguous; the
+  user knows they can still type
+
 ## Design Decisions
 
 ### Persisted contract, not in-memory wake handle
 
-A pure in-memory wake (router holds Vec\<Contract\> in process, fires
+A pure in-memory wake (router holds Vec<Contract> in process, fires
 SSE on condition) would be simpler to build but inherits every silent-
 loss path that the bash module already pays for. Phoenix restarts
 during a long wait would orphan the LLM, exactly the failure mode the
 spec exists to eliminate. SQLite persistence is the cost of being
 honest about "this is a real commitment to fire the LLM."
 
-### First-fire-wins for multi-contract
+### Independent multi-contract semantics
 
-Considered: `wait_all`, `wait_any`, `wait_first_then_cancel_others`.
-The first two are useful and absent. The third is what v1 ships
-(REQ-WAKE-010) because it's the only one that maps cleanly onto a
-single tool result delivery — the conversation gets one tool result on
-fire, transitions out of `AwaitingWake`, and continues. Adding
-`wait_all` would require either a result-aggregation phase (delay
-fire-delivery until last contract resolves) or a multi-tool-result
-delivery model (deliver each as it fires, conversation stays in
-`AwaitingWake` until all resolved). Both are real designs; neither is
-load-bearing for v1.
+Earlier draft was "first-fire-wins, cancel siblings." Reconsidered
+when removing AwaitingWake: that semantics only made sense in a
+model where the conv was in a single-contract-bound `AwaitingWake`
+state and needed to "leave" that state on fire. With contracts as
+free-standing rows decoupled from conv state, the more honest
+semantics is "each contract fires independently into the conv's
+message log." If the LLM wants supersede behaviour, it can register
+a single contract over a `wait_any { handle_a, handle_b }` condition
+in v2; conflating supersede into v1's single-condition shape was
+premature.
 
 ### Synthetic tool result vs new conversation event kind
 
 REQ-WAKE-006 chose "synthetic tool result that looks identical to the
 synchronous-wait response." Alternative was a new `WakeFired`
 conversation event kind that the LLM would have to learn to recognize
-distinctly. The synthetic-tool-result approach makes the wake primitive
-a drop-in replacement for `op=wait` from the LLM's vantage point — the
-only difference is that wake consumes zero turns until fire. Marin
-panel review specifically argued for this shape: "the LLM should not
-have to learn a parallel taxonomy for 'I waited synchronously' vs 'I
-registered a contract.'"
+distinctly. The synthetic-tool-result approach makes the wake
+primitive a drop-in replacement for `op=wait` from the LLM's vantage
+point — the only difference is that wake consumes zero turns until
+fire. Marin panel review specifically argued for this shape: "the
+LLM should not have to learn a parallel taxonomy for 'I waited
+synchronously' vs 'I registered a contract.'"
 
 ### Why HandleTerminal first
 
@@ -67,121 +100,126 @@ Three condition kinds were considered for v1:
 - `FileChanged` — fires on file mtime advance
 
 `HandleTerminal` is the only one whose evaluator is a pure read of
-existing state (`HandleState` is already there). The other two require
-new poller infrastructure (tmux capture-pane scheduling, file-watcher).
-Shipping `HandleTerminal` first validates the persistence + delivery +
-state-machine pieces in isolation; condition-kind growth becomes a
-matter of adding evaluators against the same edge.
+existing state (`HandleState` is already there). The other two
+require new poller infrastructure (tmux capture-pane scheduling,
+file-watcher). Shipping `HandleTerminal` first validates the
+persistence + delivery + state-machine pieces in isolation;
+condition-kind growth becomes a matter of adding evaluators against
+the same edge.
 
 ### Why no WebhookFired in v1
 
 Webhook wake (Phoenix exposes an endpoint that fires a contract on
 HTTP POST) opens a security surface: who is authorized to wake a
 conversation, what payload format, what rate-limiting, how does the
-auth model interact with the existing browser-tool auth surface. Not a
-v1 question. Will be a separate spec when it lands.
+auth model interact with the existing browser-tool auth surface. Not
+a v1 question. Will be a separate spec when it lands.
 
 ### Polling cadence, not push-from-handle
 
 The wake-router polls. An alternative would be the handle code
-(bash/tmux/subagent) pushing terminal events directly into the router.
-Push is more efficient (no idle ticks) but requires each spawn substrate
-to know about the wake router — a coupling that today does not exist.
-Poll-pull keeps the router as the single point of contract knowledge
-and lets each handle substrate stay unaware. v2 may convert
-`HandleTerminal` specifically to push (it's a one-line change in the
-bash waiter-task) once the abstraction is proven.
+(bash/tmux/subagent) pushing terminal events directly into the
+router. Push is more efficient (no idle ticks) but requires each
+spawn substrate to know about the wake router — a coupling that
+today does not exist. Poll-pull keeps the router as the single point
+of contract knowledge and lets each handle substrate stay unaware.
+v2 may convert `HandleTerminal` specifically to push (it's a one-line
+change in the bash waiter-task) once the abstraction is proven.
 
-## Open Questions (Must Resolve Before Implementation)
+### Unified `wait_until` tool, not per-substrate
 
-### Continuation inheritance (REQ-WAKE-012)
+Resolved per asking-questions Q3 (2026-05-24). Trade-off:
+- **Per-substrate** (rejected): three tools (`bash_wait_until`,
+  `tmux_wait_until`, `subagent_wait_until`), each tightly typed to
+  its handle namespace. Lower upfront design cost. Higher
+  description tax in context (~3x).
+- **Unified** (chosen): one tool with tagged-enum handle
+  discriminator. Higher upfront design cost (one shared tool surface
+  to spec). Lower context cost. Forward-aligned with the eventual
+  `WorkHandle` trait Voss + Marin both recommended.
 
-When a conversation A continues into conversation B, and A had
-registered wake contracts:
+Implementation must use a `#[serde(tag = "kind")]` enum on the
+`handle` parameter so that `{ kind: Bash, id: "x" }` paired with a
+non-existent bash handle id fails at validation rather than as a
+runtime error. This is the Voss panel's correct-by-construction
+principle applied at the tool surface.
 
-- (a) Contracts transfer to B; B is now in `AwaitingWake` from the
-  moment of continuation; the LLM in B sees the wake fire when it
-  happens.
-- (b) Contracts fire `Forgotten` on continuation; A's transcript
-  records the forgotten event; B starts in `Idle`.
-- (c) Contracts depend on whether the underlying handle is inherited
-  by B — if yes, contract transfers; if no, contract fires
-  `Forgotten`.
+### `is_busy()` augmentation, not state mutation
 
-(c) is the most coherent but is blocked on [[bash-cascade-skips-
-inheritor-scope]] resolution. Until bash handle inheritance is
-decided, (b) is the safe fallback for v1.
+REQ-WAKE-004 makes `is_busy()` consult `wake_contracts` rather than
+introducing an `AwaitingWake` state. The cost is one SQLite count
+query per `is_busy()` evaluation. Lifecycle endpoints already do at
+least one SQLite read; the additional count is negligible. The
+correctness payoff is that the contract row remains the single
+source of truth — there is no "the state says I'm AwaitingWake but
+the contract table says I have zero contracts" failure mode.
 
-### User-interrupt semantics (REQ-WAKE-013)
+## Resolved Questions
 
-Three positions, each defensible:
+### REQ-WAKE-012 — continuation inheritance: RESOLVED
 
-- **Queue:** user message accumulates; on fire, both deliver together.
-  Honors user intent without losing the wait. Complicates the state
-  machine (where does the queued message live?).
-- **Cancel:** user message cancels all contracts. Honors the principle
-  "user attention overrides background work." Loses the wait result.
-- **Reject:** explicit "the conversation is busy; cancel the wake or
-  wait." Honors no-implicit-state-change but is the worst UX (user
-  sees an error).
+Per [[bash-cascade-skips-inheritor-scope]] task 62009 direction (B):
+bash is per-conv-ephemeral by design; the cascade kills bash handles
+on the parent boundary and notifies the child with a synthetic
+message listing killed handles. Wake contracts on bash handles
+therefore cannot survive the boundary — they fire `Forgotten` with
+reason `"continuation_boundary"`. Wake contracts on tmux / browser /
+subagent handles transfer (re-key `conv_id` to the child) because
+the underlying handle itself transfers.
 
-Cancel is the simplest correct behavior. Queue is the best UX but
-requires a `pending_user_message` field on `AwaitingWake`. Reject is
-not acceptable as a default.
+### REQ-WAKE-013 — user-interrupt semantics: RESOLVED (N/A)
 
-### Tool surface — one tool or many?
+Because the conv stays in `Idle` while waiting (no `AwaitingWake`
+state), user messages and wake fires are both just events that
+append to the conv message log. Ordering is by arrival; the next
+LLM turn includes whatever has accumulated. The race "both arrive
+in the same millisecond" is serialized by the existing per-conv
+lock around message-log appends. No new policy needed.
 
-Two viable shapes:
+### Tool surface — one tool or many: RESOLVED
 
-- **Per-substrate registration:** `bash_wait_until { handle, condition }`,
-  `tmux_wait_until { handle, condition }`, `subagent_wait_until {
-  handle, condition }`. Each is a thin wrapper that knows how to
-  resolve its handle type to a contract row.
-- **Unified registration:** a single `wait_until { handle, condition }`
-  tool that takes a `handle` discriminator carrying both kind and id.
-
-The per-substrate shape has more tool-description tax (Henrik panel
-concern) but keeps each tool's docs short and its handle-id format
-obvious. The unified shape is consistent with the eventual `WorkHandle`
-trait Voss panel recommended. Decision should defer to whether the
-`WorkHandle` trait gets built before or after this spec ships. If
-`WorkHandle` first, build the unified tool. If wake-contracts first,
-build per-substrate and converge later.
+Unified `wait_until` (REQ-WAKE-016). See "Unified `wait_until`
+tool" decision above.
 
 ## Out of Scope (v1)
 
 - Cross-conversation wake (one conversation wakes another)
 - Webhook-triggered wake
-- Conditional wake (`wake_when_A_or_B`)
+- Compound conditions (`wake_when_A_or_B`, `wait_any`, `wait_all`)
 - Wake with retry (`fire_on_condition_for_max_N_times`)
 - Wake against external systems (GitHub API, Slack)
 - File-watcher conditions
 - Regex/content-match conditions
 
-Each of these is a future condition-kind or future contract-shape
-against the same `AwaitingWake` edge. v1 ships the edge + one condition
-kind; v2+ adds kinds without touching the edge.
+Each of these is a future condition-kind or future contract-shape.
+v1 ships the foundation; v2+ adds kinds without revisiting the
+foundation.
 
 ## Observability Plan
 
 - New SSE events: `WakeContractRegistered`, `WakeContractFired`,
-  `WakeContractCancelled`, `WakeContractExpired`, `WakeContractForgotten`
-- New conv state visible in UI: `AwaitingWake` chip with `expires_at`
-  countdown
+  `WakeContractCancelled`, `WakeContractExpired`,
+  `WakeContractForgotten`
+- New UI: wake indicator on Idle convs with pending contracts;
+  per-contract cancel affordance
 - Metrics (REQ-WAKE-015): registration rate, fire latency,
-  expired/forgotten ratios
-- `phoenix-client.py` gets a `wake-status <conv-id>` verb for CLI debug
+  expired/forgotten ratios with reason breakdown
+- `phoenix-client.py` gets a `wake-status <conv-id>` verb for CLI
+  debug
 
 ## Migration / Rollout
 
-- Phase 0: ship the spec; resolve open questions
-- Phase 1: types, DB migration, `AwaitingWake` state machine variant,
-  router service (no LLM-facing tools yet, exercised by tests only)
-- Phase 2: ship `bash_wait_until` (HandleTerminal only) as the first
-  LLM-facing surface; validate against real conversations
-- Phase 3: `tmux_wait_until` + `subagent_wait_until` (still
-  HandleTerminal only)
+- Phase 0: ship the spec (this PR)
+- Phase 1: types, DB migration, wake-router service, `is_busy()`
+  augmentation, restart resync (no LLM-facing tool yet; exercised
+  by tests only)
+- Phase 2: ship `wait_until` tool with HandleTerminal/Bash only;
+  validate against real conversations; metrics + observability
+  surface
+- Phase 3: HandleTerminal/TmuxPane + HandleTerminal/SubAgent
+  (still single condition kind)
 - Phase 4 (separate spec revision): additional condition kinds
+  (regex, file, port)
 
-Each phase is independently shippable. Phase 1 has no LLM surface so
-ships dark; phases 2-4 are progressive LLM capability rollout.
+Each phase is independently shippable. Phase 1 has no LLM surface
+so ships dark; phases 2-4 are progressive LLM capability rollout.
