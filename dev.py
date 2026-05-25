@@ -2064,7 +2064,14 @@ def cmd_check():
         threading.Thread(target=check_package_lock_clean, name="pkglock"),
         threading.Thread(target=lane_e2e, name="e2e"),
     ]
+    # daemon=True so a hung lane does not block interpreter shutdown after
+    # we report it as failed and call sys.exit(1). Non-daemon threads cause
+    # Python to wait at exit, defeating the hung-lane detection below.
+    # run_step's subprocess.run already enforces CHECK_TIMEOUT per step via
+    # SIGKILL on the child; daemon=True covers the case where a lane is
+    # wedged in Python (not in a subprocess) past LANE_JOIN_TIMEOUT.
     for t in threads:
+        t.daemon = True
         t.start()
     # Per-thread join budget must cover the longest *lane*, not a single step.
     # lane_rust runs ~6 sequential steps each with their own CHECK_TIMEOUT,
