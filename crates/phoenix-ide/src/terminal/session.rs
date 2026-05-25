@@ -171,4 +171,88 @@ impl ActiveTerminals {
         let map = self.0.lock().expect("terminal registry poisoned");
         map.get(scope).cloned()
     }
+
+    /// Cascade-cleanup entry for `run_resource_cleanup_cascade`
+    /// (REQ-TERM-WS-001, REQ-TERM-012). Mirrors `TmuxRegistry::cascade_on_delete`
+    /// and `BrowserSessionManager::cascade_on_delete`:
+    ///
+    ///   - If `inheritor_scope == Some(work_scope)`, the continuation
+    ///     conversation resolves to the same scope and still owns the
+    ///     terminal. Skip teardown.
+    ///   - Otherwise, remove the registry entry, signal any attached relay
+    ///     to tear down via `StopReason::TearDown`, and reap the shell
+    ///     when no relay is attached (when a relay is attached, its own
+    ///     teardown branch calls `waitpid`).
+    ///
+    /// Best-effort. Returns silently if no terminal is registered for the
+    /// scope — that is the common case during cascade for scopes that
+    /// never spawned a user terminal (sub-agent conversations, etc.).
+    pub async fn cascade_on_delete(
+        &self,
+        work_scope: &WorkScope,
+        inheritor_scope: Option<&WorkScope>,
+    ) {
+        if inheritor_scope == Some(work_scope) {
+            tracing::debug!(
+                work_scope = %work_scope,
+                "terminal: skipping teardown — scope inherited by continuation"
+            );
+            return;
+        }
+
+        let handle = {
+            let mut map = self.0.lock().expect("terminal registry poisoned");
+            map.remove(work_scope)
+        };
+        let Some(handle) = handle else {
+            return;
+        };
+
+        let child_pid = handle.child_pid;
+        // attach_permit starts with 1 permit; an attached relay holds it
+        // for its lifetime, so `available_permits() == 0` means a relay is
+        // currently attached.
+        let relay_attached = handle.attach_permit.available_permits() == 0;
+
+        // Signal an attached relay to tear down. The relay's exit branch
+        // runs `full_teardown` which closes the master_fd, reaps the
+        // child, and exits. `send` returns Err if no receivers are alive
+        // (no relay attached) — we ignore.
+        let _ = handle.stop_tx.send(StopReason::TearDown);
+
+        // Drop our registry-owned Arc clone. If a relay is attached, it
+        // still has its own clone + master_fd dup, so master_fd stays
+        // open until the relay's clean-up. If no relay is attached, our
+        // clone was the last reference: Drop fires now, master_fd closes,
+        // SIGHUP delivers to the shell's process group.
+        drop(handle);
+
+        if !relay_attached {
+            // No relay to reap the child for us. Do it here.
+            // spawn_blocking because waitpid is sync; ignore errors —
+            // ECHILD just means someone else already reaped it.
+            let _ = tokio::task::spawn_blocking(move || {
+                let _ = nix::sys::wait::waitpid(child_pid, None);
+            })
+            .await;
+        }
+
+        tracing::info!(
+            work_scope = %work_scope,
+            relay_attached,
+            "terminal: cascade teardown complete"
+        );
+    }
+}
+
+/// Convenience function for the cleanup-cascade orchestrator. Mirrors
+/// `cascade_tmux_on_delete` and `cascade_browser_on_delete`.
+pub async fn cascade_terminal_on_delete(
+    terminals: &ActiveTerminals,
+    work_scope: &WorkScope,
+    inheritor_scope: Option<&WorkScope>,
+) {
+    terminals
+        .cascade_on_delete(work_scope, inheritor_scope)
+        .await;
 }

@@ -172,6 +172,81 @@ fn global_scope_is_disjoint_and_singleton() {
     );
 }
 
+// ── Unit: cascade_on_delete (REQ-TERM-WS-001, REQ-TERM-012) ──────────────────
+
+/// REQ-TERM-012: cascade removes the registry entry for the torn-down scope.
+/// Mirrors the tmux/browser cascade pattern.
+#[tokio::test]
+async fn cascade_on_delete_removes_entry_for_scope() {
+    let registry = ActiveTerminals::new();
+    let dims = Dims { cols: 80, rows: 24 };
+    let scope = WorkScope::Worktree("/tmp/wt-cascade-remove".to_string());
+
+    registry
+        .try_insert(scope.clone(), dummy_handle(dims))
+        .unwrap();
+    assert!(registry.get(&scope).is_some());
+
+    registry.cascade_on_delete(&scope, None).await;
+    assert!(
+        registry.get(&scope).is_none(),
+        "cascade with no inheritor must remove the entry"
+    );
+}
+
+/// REQ-TERM-WS-001: scope-equality preservation. A continuation conversation
+/// that resolves to the same Worktree scope inherits the terminal; cascade
+/// must skip teardown rather than kill a session the inheritor still uses.
+#[tokio::test]
+async fn cascade_on_delete_preserves_when_continuation_inherits_scope() {
+    let registry = ActiveTerminals::new();
+    let dims = Dims { cols: 80, rows: 24 };
+    let scope = WorkScope::Worktree("/tmp/wt-cascade-preserve".to_string());
+    let inheritor = scope.clone();
+
+    registry
+        .try_insert(scope.clone(), dummy_handle(dims))
+        .unwrap();
+    registry.cascade_on_delete(&scope, Some(&inheritor)).await;
+
+    assert!(
+        registry.get(&scope).is_some(),
+        "cascade must preserve the terminal when inheritor_scope == work_scope"
+    );
+}
+
+/// Direct-mode (`Conversation` scope) continuation resolves to a different
+/// scope (`Conversation(<their own id>)`), so the cascade must tear down.
+/// Falls out structurally from scope inequality.
+#[tokio::test]
+async fn cascade_on_delete_direct_continuation_does_not_preserve() {
+    let registry = ActiveTerminals::new();
+    let dims = Dims { cols: 80, rows: 24 };
+    let parent = WorkScope::Conversation("parent-direct".to_string());
+    let child = WorkScope::Conversation("child-direct".to_string());
+
+    registry
+        .try_insert(parent.clone(), dummy_handle(dims))
+        .unwrap();
+    registry.cascade_on_delete(&parent, Some(&child)).await;
+
+    assert!(
+        registry.get(&parent).is_none(),
+        "Direct-mode continuation resolves to its own Conversation scope, \
+         which is never equal to the parent's — cascade must tear down"
+    );
+}
+
+/// Cascade against a scope with no registry entry is a no-op (the common
+/// case during conversation cleanup for sub-agent / no-terminal scopes).
+#[tokio::test]
+async fn cascade_on_delete_no_entry_is_noop() {
+    let registry = ActiveTerminals::new();
+    let scope = WorkScope::Conversation("never-existed".to_string());
+    registry.cascade_on_delete(&scope, None).await;
+    assert!(registry.get(&scope).is_none());
+}
+
 // ── Property: OneTerminalPerWorkScope ─────────────────────────────────────────
 
 proptest! {

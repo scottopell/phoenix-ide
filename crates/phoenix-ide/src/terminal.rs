@@ -18,6 +18,7 @@ mod spawn;
 pub(crate) mod test_helpers;
 mod ws;
 
+pub use session::cascade_terminal_on_delete;
 pub use session::ActiveTerminals;
 pub use session::ShellIntegrationStatus;
 pub use ws::{terminal_ws_global_handler, terminal_ws_handler};

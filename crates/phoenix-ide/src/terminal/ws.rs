@@ -49,31 +49,23 @@ pub async fn terminal_ws_handler(
     let db = state.db.clone();
     let runtime = Arc::clone(&state.runtime);
     ws.on_upgrade(move |socket| async move {
-        let (cwd, worktree_path) = match db.get_conversation(&conversation_id).await {
+        let (cwd, scope) = match db.get_conversation(&conversation_id).await {
             Ok(conv) => {
-                // worktree_path for socket keying (task 03001 / Phase 2): typed
-                // on `ConvMode` for Work, Branch, and managed Explore. Sub-agent
-                // Explore returns None and never reaches this code (no user PTY),
-                // so no fallback is needed. Direct returns None (per-conv socket).
+                // worktree_path drives WorkScope keying (task 03001 / Phase 2):
+                // typed on `ConvMode` for Work, Branch, and managed Explore.
+                // Sub-agent Explore returns None and never reaches this code
+                // (no user PTY), so no fallback is needed. Direct returns None
+                // (resolves to WorkScope::Conversation).
                 let wt = conv.conv_mode.worktree_path().map(std::path::PathBuf::from);
-                (std::path::PathBuf::from(&conv.cwd), wt)
+                let scope = WorkScope::resolve(&conversation_id, wt.as_deref());
+                (std::path::PathBuf::from(&conv.cwd), scope)
             }
             Err(e) => {
                 tracing::warn!(conv_id = %conversation_id, error = %e, "Terminal: conversation not found");
                 return;
             }
         };
-        let scope = WorkScope::resolve(&conversation_id, worktree_path.as_deref());
-        handle_socket(
-            socket,
-            scope,
-            cwd,
-            worktree_path,
-            conversation_id,
-            terminals,
-            runtime,
-        )
-        .await;
+        handle_socket(socket, scope, cwd, conversation_id, terminals, runtime).await;
     })
 }
 
@@ -99,7 +91,6 @@ pub async fn terminal_ws_global_handler(
             socket,
             WorkScope::Global,
             cwd,
-            None,
             "global".to_string(),
             terminals,
             runtime,
@@ -107,12 +98,11 @@ pub async fn terminal_ws_global_handler(
     })
 }
 
-#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // inherently dense PTY lifecycle; see relay.rs for the testable core
+#[allow(clippy::too_many_lines)] // inherently dense PTY lifecycle; see relay.rs for the testable core
 async fn handle_socket(
     socket: WebSocket,
     scope: WorkScope,
     cwd: std::path::PathBuf,
-    worktree_path: Option<std::path::PathBuf>,
     id_label: String,
     terminals: ActiveTerminals,
     runtime: Arc<RuntimeManager>,
@@ -139,7 +129,6 @@ async fn handle_socket(
         &scope,
         &terminals,
         &cwd,
-        worktree_path.as_deref(),
         initial_dims,
         &mut ws_sender,
         &runtime,
@@ -297,13 +286,11 @@ async fn handle_socket(
 ///      winner so the caller still gets an attached session.
 ///   3. `acquire_owned()` the permit — available immediately since the
 ///      handle is fresh and nobody holds it yet.
-#[allow(clippy::too_many_arguments)]
 async fn acquire_handle(
     conversation_id: &str,
     scope: &WorkScope,
     terminals: &ActiveTerminals,
     cwd: &std::path::Path,
-    worktree_path: Option<&std::path::Path>,
     initial_dims: Dims,
     ws_sender: &mut futures::stream::SplitSink<WebSocket, Message>,
     runtime: &Arc<RuntimeManager>,
@@ -320,7 +307,7 @@ async fn acquire_handle(
     // (REQ-TMUX-004 / design.md §"Terminal Attach Path"). `cwd` is
     // forwarded so a fresh tmux server starts its pane in the
     // conversation's project directory rather than Phoenix's own CWD.
-    let plan = resolve_exec_plan(conversation_id, worktree_path, cwd, runtime).await;
+    let plan = resolve_exec_plan(conversation_id, scope, cwd, runtime).await;
 
     let cwd_owned = cwd.to_path_buf();
     let handle = match tokio::task::spawn_blocking(move || {
@@ -370,19 +357,21 @@ async fn acquire_handle(
 }
 
 /// Decide whether the freshly-spawned PTY should run `tmux attach`
-/// against the conversation's dedicated socket or fall back to
-/// `$SHELL -i` (REQ-TMUX-004). Lazy-spawns the conversation's tmux
-/// server on first call (REQ-TMUX-002), reuses it after Phoenix
-/// restart (REQ-TMUX-005), and recreates over a stale socket
-/// (REQ-TMUX-006).
+/// against the scope's dedicated socket or fall back to `$SHELL -i`
+/// (REQ-TMUX-004). Lazy-spawns the scope's tmux server on first call
+/// (REQ-TMUX-002), reuses it after Phoenix restart (REQ-TMUX-005), and
+/// recreates over a stale socket (REQ-TMUX-006).
 ///
-/// `worktree_path` controls socket keying: `Some` for Work/Branch and
-/// top-level managed Explore (socket tied to the worktree so continuations
-/// share the session), `None` for Direct and sub-agent Explore (per-conv
-/// socket, or pass-through to parent server respectively). See task 03001.
+/// The caller's already-resolved `scope` is passed in directly so the
+/// tmux socket selection matches the terminal's ownership scope
+/// (REQ-TERM-WS-001). Re-resolving here from `(conversation_id,
+/// worktree_path)` would silently downgrade `WorkScope::Global` to
+/// `Conversation("global")`, breaking the singleton tmux session — and
+/// would also drop the disjointness between Worktree and Conversation
+/// scopes that share an inner string.
 async fn resolve_exec_plan(
     conversation_id: &str,
-    worktree_path: Option<&std::path::Path>,
+    scope: &WorkScope,
     cwd: &std::path::Path,
     runtime: &Arc<RuntimeManager>,
 ) -> PtyExecPlan {
@@ -390,8 +379,7 @@ async fn resolve_exec_plan(
     if !registry.binary_available() {
         return PtyExecPlan::Shell;
     }
-    let work_scope = crate::work_scope::WorkScope::resolve(conversation_id, worktree_path);
-    match registry.ensure_live(&work_scope, cwd).await {
+    match registry.ensure_live(scope, cwd).await {
         Ok(server_arc) => {
             let server = server_arc.read().await;
             PtyExecPlan::Tmux {
