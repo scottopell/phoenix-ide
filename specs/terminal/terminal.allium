@@ -599,8 +599,17 @@ rule TerminalAbandonedWithConversation {
 -- (REQ-TMUX-WS-002): archive, abandon, mark-merged, hard-delete. The
 -- preservation rule inherits from tmux — if a continuation conversation
 -- resolves to the same WorkScope, the terminal is preserved.
+--
+-- Trigger params: `terminal` is the affected entity; `scope` is the
+-- WorkScope whose lifecycle hook fired. Mirrors
+-- `TerminalAbandonedWithConversation` above, which carries
+-- (terminal, conversation) as a local event subscribed to bedrock's
+-- announcement. `WorkScopeCleaned` is similarly a local-event name the
+-- implementation wires to the unified `run_resource_cleanup_cascade`
+-- in `api/handlers.rs` (Step 4) so the cross-spec contract stays
+-- explicit and navigable.
 rule TerminalTornDownWithWorkScopeCleanup {
-    when: WorkScopeCleaned(scope)
+    when: WorkScopeCleaned(terminal, scope)
 
     requires: terminal.status = active
     requires: terminal.scope = scope
