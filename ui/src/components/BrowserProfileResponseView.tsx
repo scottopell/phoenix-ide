@@ -41,7 +41,7 @@ export function BrowserProfileResponseView({ action, displayData, fallbackText, 
       return <MetricsView data={displayData} fallbackText={fallbackText} />;
     case 'cpu_stop':
     case 'cpu_summary':
-      return <CpuSummaryView data={displayData} fallbackText={fallbackText} />;
+      return <CpuSummaryView action={action} data={displayData} fallbackText={fallbackText} />;
     case 'trace_stop':
       return <TraceSummaryView data={displayData} fallbackText={fallbackText} />;
     default:
@@ -217,14 +217,17 @@ function MetricRow({ metric, samples }: { metric: MetricDef; samples: RunSample[
   if (real.length === 0) return null;
   const min = Math.min(...real);
   const max = Math.max(...real);
-  const last = real[real.length - 1];
+  // `last` is the LITERAL final-run value (which may be null when that run
+  // didn't measure this metric — e.g. React absent, GC disabled). Showing
+  // an earlier non-null value as "last" would be a quiet lie.
+  const last: number | null = values.length > 0 ? (values[values.length - 1] ?? null) : null;
   return (
     <div className="profile-metric-row">
       <span className="profile-metric-label">{metric.label}</span>
       <Sparkline values={values} />
       <span className="profile-metric-stats">
         min {fmtVal(min, metric.unit)} · max {fmtVal(max, metric.unit)} · last{' '}
-        {fmtVal(last ?? min, metric.unit)}
+        {last === null ? '—' : fmtVal(last, metric.unit)}
       </span>
     </div>
   );
@@ -426,9 +429,11 @@ interface CpuHotEntry {
 }
 
 function CpuSummaryView({
+  action,
   data,
   fallbackText,
 }: {
+  action: string;
   data: Record<string, unknown> | undefined;
   fallbackText: string;
 }) {
@@ -442,7 +447,7 @@ function CpuSummaryView({
       }
     | undefined;
   if (!summary || !Array.isArray(summary.top_by_self)) {
-    return <StatusLine action="cpu" text={fallbackText} variant="success" />;
+    return <StatusLine action={action} text={fallbackText} variant="success" />;
   }
   const unit = summary.hitcount_fallback ? 'hits' : 'ms';
   const path = summary.path;
@@ -578,10 +583,12 @@ function TraceSummaryView({
       {longTasks.length === 0 && (
         <div className="profile-footnote">No long tasks (&gt;50ms) recorded.</div>
       )}
-      <div className="profile-footnote">
-        Load <code>{trace.path}</code> into <code>chrome://tracing</code> or DevTools Performance
-        for the full event timeline.
-      </div>
+      {trace.path && (
+        <div className="profile-footnote">
+          Load <code>{trace.path}</code> into <code>chrome://tracing</code> or DevTools Performance
+          for the full event timeline.
+        </div>
+      )}
     </div>
   );
 }

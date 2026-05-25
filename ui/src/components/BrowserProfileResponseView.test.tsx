@@ -102,6 +102,56 @@ describe('BrowserProfileResponseView', () => {
       expect(table!.querySelectorAll('tbody tr')).toHaveLength(3);
     });
 
+    it('shows "last —" when the final run has no value for a metric', () => {
+      // Final run has gc_ran=false → js_heap_used is null. "last" must be
+      // the literal final value (rendered as —), NOT a previous run's value.
+      const data = {
+        outcome: 'completed',
+        requested_runs: 2,
+        warmup: 0,
+        methodology_warnings: [],
+        raw_samples: [
+          {
+            run_index: 0,
+            script_ms: 10,
+            long_tasks: 0,
+            wall_ms: 100,
+            dom_nodes: 1000,
+            gc_ran: true,
+            js_heap_used: 2_000_000,
+            react_status: 'absent',
+            react_commits: null,
+            react_actual_ms: null,
+          },
+          {
+            run_index: 1,
+            script_ms: 11,
+            long_tasks: 0,
+            wall_ms: 105,
+            dom_nodes: 1000,
+            gc_ran: false,
+            js_heap_used: null,
+            react_status: 'absent',
+            react_commits: null,
+            react_actual_ms: null,
+          },
+        ],
+      };
+      const { container } = render(
+        <BrowserProfileResponseView
+          action="run_scenario"
+          displayData={data}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      const heapRow = Array.from(
+        container.querySelectorAll('.profile-metric-row'),
+      ).find((row) => row.textContent?.includes('JS heap'));
+      expect(heapRow).toBeTruthy();
+      expect(heapRow!.textContent).toMatch(/last —/);
+    });
+
     it('renders blocked outcome with the failing step', () => {
       render(
         <BrowserProfileResponseView
@@ -187,6 +237,27 @@ describe('BrowserProfileResponseView', () => {
       );
       expect(screen.getByText(/CPU profile is empty/)).toBeInTheDocument();
     });
+
+    it('fallback status chip preserves the actual action name', () => {
+      const { rerender } = render(
+        <BrowserProfileResponseView
+          action="cpu_stop"
+          displayData={undefined}
+          fallbackText="empty"
+          isError={false}
+        />,
+      );
+      expect(screen.getByText(/profile · cpu_stop/)).toBeInTheDocument();
+      rerender(
+        <BrowserProfileResponseView
+          action="cpu_summary"
+          displayData={undefined}
+          fallbackText="empty"
+          isError={false}
+        />,
+      );
+      expect(screen.getByText(/profile · cpu_summary/)).toBeInTheDocument();
+    });
   });
 
   describe('trace_stop', () => {
@@ -217,6 +288,28 @@ describe('BrowserProfileResponseView', () => {
       expect(screen.getByText('RunTask')).toBeInTheDocument();
       expect(screen.getByText('ParseHTML')).toBeInTheDocument();
       expect(screen.getByText(/chrome:\/\/tracing/)).toBeInTheDocument();
+    });
+
+    it('omits the chrome://tracing footnote when path is absent', () => {
+      render(
+        <BrowserProfileResponseView
+          action="trace_stop"
+          displayData={{
+            trace: {
+              event_count: 10,
+              long_task_count: 0,
+              long_task_total_ms: 0,
+              long_tasks: [],
+              timed_out: false,
+            },
+          }}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      // No "undefined" string anywhere; no chrome://tracing hint.
+      expect(screen.queryByText(/undefined/)).toBeNull();
+      expect(screen.queryByText(/chrome:\/\/tracing/)).toBeNull();
     });
 
     it('shows partial-trace banner when tracingComplete timed out', () => {
