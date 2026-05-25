@@ -3,6 +3,7 @@ import { useNavigate } from 'react-router-dom';
 import { ImageAttachments } from '../components/ImageAttachments';
 import { ConversationSettings } from '../components/ConversationSettings';
 import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
+import { PaneDivider } from '../components/PaneDivider';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
 import { useCreateConversation } from '../hooks/useCreateConversation';
 import { useResizablePane } from '../hooks/useResizablePane';
@@ -189,8 +190,23 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
 
       {/* Global terminal — singleton WorkScope::Global session,
           survives navigation and conversation lifecycles. Always rendered;
-          default collapsed. Desktop only — mobile real-estate is tight. */}
+          default collapsed. Desktop only — mobile real-estate is tight.
+          PaneDivider mirrors ConversationPage's terminal divider so the
+          height persistence wired through `useResizablePane` actually has
+          a user-visible drag/double-click affordance. */}
       <div className="desktop-only">
+        <PaneDivider
+          orientation="horizontal"
+          title="Drag to resize • Double-click to collapse/expand"
+          onPointerDown={(e) => terminalPane.startDrag(e, 'y', true)}
+          onDoubleClick={() => {
+            if (terminalPane.collapsed) {
+              terminalPane.expandFromCollapsed();
+            } else {
+              terminalPane.setCollapsed(true);
+            }
+          }}
+        />
         <Suspense fallback={null}>
           <TerminalPanel
             scope={{ kind: 'global' }}

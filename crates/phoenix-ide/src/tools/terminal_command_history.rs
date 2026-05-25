@@ -60,7 +60,7 @@ impl Tool for TerminalCommandHistoryTool {
         let count = parsed.count.clamp(1, 5);
 
         let Some(handle) = ctx.terminals.get(&ctx.work_scope) else {
-            return ToolOutput::error("no terminal is open for this conversation");
+            return ToolOutput::error("no terminal is open for this work scope");
         };
 
         let status = *handle

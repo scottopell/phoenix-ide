@@ -168,9 +168,13 @@ function terminalWsUrl(scope: TerminalScope): string {
   return `${proto}//${window.location.host}/api/conversations/${scope.conversationId}/terminal`;
 }
 
-/** Stable React-key / dependency string for a scope. */
+/** Stable React-key / dependency string for a scope. Prefixes mirror the
+ *  backend's `WorkScope::stable_key()` so namespaces stay disjoint —
+ *  `conversation:global` and `global:` are distinct keys, so a future
+ *  conversation id that happens to equal a reserved variant name can't
+ *  collide and suppress a reconnect on scope change. */
 function scopeKey(scope: TerminalScope): string {
-  return scope.kind === 'global' ? 'global' : scope.conversationId;
+  return scope.kind === 'global' ? 'global:' : `conversation:${scope.conversationId}`;
 }
 
 /** Encode a resize frame: 0x01 + u16be cols + u16be rows */
