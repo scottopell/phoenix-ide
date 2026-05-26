@@ -1812,6 +1812,7 @@ where
         let tasks_dir_name = self.context.tasks_dir_name.clone();
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
+        let llm_language = self.context.llm_language;
 
         // Token streaming channel (REQ-BED-025).
         //
@@ -1910,12 +1911,13 @@ where
                 &tasks_dir_name,
                 is_sub_agent,
                 mode_context.as_ref(),
+                llm_language,
             );
 
             // Build request — normalize messages against current tool set
             // to remove tool_use/tool_result blocks for tools no longer
             // available (e.g., propose_task after Explore→Work transition).
-            let tools = tool_executor.definitions().await;
+            let tools = tool_executor.definitions_for_language(llm_language).await;
             let tool_names: std::collections::HashSet<&str> =
                 tools.iter().map(|t| t.name.as_str()).collect();
             let messages = strip_unavailable_tool_blocks(messages, &tool_names);

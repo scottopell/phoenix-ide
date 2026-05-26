@@ -9,6 +9,7 @@ mod chain_runtime;
 mod db;
 pub(crate) mod git_ops;
 mod llm;
+mod llm_language;
 mod message_expander;
 mod platform;
 mod runtime;
@@ -582,6 +583,7 @@ mod reconcile_worktrees_tests {
             None,
             None,
             None,
+            llm_language::LlmLanguage::default(),
         )
         .await
         .unwrap();

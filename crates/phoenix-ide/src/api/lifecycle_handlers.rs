@@ -552,6 +552,7 @@ mod tests {
             continued_in_conv_id,
             chain_name: None,
             steering_queue: vec![],
+            llm_language: crate::llm_language::LlmLanguage::default(),
         }
     }
 

@@ -1167,6 +1167,7 @@ impl RuntimeManager {
                 None, // desired_base_branch
                 None, // seed_parent_id (sub-agents use `parent_conversation_id` above)
                 None, // seed_label
+                parent_conv.llm_language, // inherit language from parent
             )
             .await
         {
@@ -1232,6 +1233,8 @@ impl RuntimeManager {
             taskmd_core::discover::discover_or_default(&conv_context.working_dir)
                 .to_string_lossy()
                 .into_owned();
+        // Sub-agents inherit their parent's LLM language.
+        conv_context.llm_language = conv.llm_language;
 
         // 4. Create channels for the sub-agent runtime. The broadcaster
         // seeds its counter from the message we just inserted (sequence_id=1)
@@ -1440,6 +1443,10 @@ impl RuntimeManager {
         context.tasks_dir_name = taskmd_core::discover::discover_or_default(&context.working_dir)
             .to_string_lossy()
             .into_owned();
+        // Pin the LLM-facing language for the lifetime of this runtime so
+        // the system prompt and tool descriptions stay consistent across all
+        // turns even if the global default changes mid-conversation.
+        context.llm_language = conv.llm_language;
 
         let (event_tx, event_rx) = mpsc::channel(32);
         // Inherit the broadcaster from an eviction if available (e.g. model

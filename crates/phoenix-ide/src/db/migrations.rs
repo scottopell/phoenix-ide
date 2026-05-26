@@ -64,6 +64,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "rewrite_opus_4_5_to_4_6",
         sql: MIGRATION_010,
     },
+    Migration {
+        version: 11,
+        name: "add_llm_language_and_app_settings",
+        sql: MIGRATION_011,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -283,6 +288,19 @@ UPDATE turn_usage   SET model = 'claude-opus-4-6' WHERE model = 'claude-opus-4-5
 UPDATE chain_qa     SET model = 'claude-opus-4-6' WHERE model = 'claude-opus-4-5';
 ";
 
+/// Add per-conversation `llm_language` column and a generic `app_settings`
+/// key/value table for global preferences. `llm_language` defaults to
+/// `phoenix-native` for both fresh installs and backfilled old rows.
+const MIGRATION_011: &str = r"
+ALTER TABLE conversations
+    ADD COLUMN llm_language TEXT NOT NULL DEFAULT 'phoenix-native';
+
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -384,7 +402,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 10);
+        assert_eq!(first, 11);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

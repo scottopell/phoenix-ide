@@ -40,23 +40,11 @@ pub const LEAF_DIRECT_MESSAGE_LIMIT: usize = 20;
 /// in-process and discarded after the request.
 pub const LEAF_DIRECT_TOKEN_BUDGET: usize = 4000;
 
-/// System prompt for the chain Q&A answer invocation (REQ-CHN-001).
-const ANSWER_SYSTEM_PROMPT: &str = "You are answering a question about a Phoenix continuation chain — \
-a sequence of conversations that were continued one into the next as the original conversation \
-exhausted its context. The user's question is below the bundled context.
-
-Each chain member is delimited by a structural tag (e.g. [main:#abc123] or [leaf-summary:#def456]). \
-Answer ONLY from the bundled chain content. If the context does not support a confident answer, \
-say so explicitly and indicate what would be needed to answer. Do not speculate beyond the \
-provided content.";
-
-/// System prompt for the in-process leaf-summary pre-step.
-const LEAF_SUMMARY_SYSTEM_PROMPT: &str =
-    "Summarize the work done in the conversation transcript below. \
-Focus on what was attempted, what was decided, what was completed, and any open questions. \
-Aim for a concise summary (a few short paragraphs) that another LLM could use to answer \
-recall questions about this conversation. Do not include greetings, sign-offs, or commentary \
-about the summary itself — just the summary.";
+// Chain Q&A system prompts are language-aware; the per-language text lives
+// in `crate::llm_language::chain_answer_system_prompt` /
+// `crate::llm_language::chain_leaf_summary_system_prompt`. Pinned cache
+// keys in `build_answer_request` / `summarize_leaf_in_process` include the
+// language so phoenix-native and caveman prompts don't share a cache slot.
 
 /// Maximum tokens cap for the in-process leaf summary.
 const LEAF_SUMMARY_MAX_TOKENS: u32 = 1024;
@@ -351,7 +339,15 @@ impl ChainQa {
             .get_mid_tier_model()
             .ok_or(ChainQaError::NoModelAvailable)?;
 
-        let bundled = bundle_chain_context(&self.db, &members, service.as_ref()).await?;
+        // The chain root pins the language for all members (chain continuations
+        // inherit it at creation time). Default-fallback covers an empty member
+        // list, but that branch was already rejected above.
+        let language = members
+            .first()
+            .map(|c| c.llm_language)
+            .unwrap_or_default();
+        let bundled =
+            bundle_chain_context(&self.db, &members, service.as_ref(), language).await?;
 
         let qa_id = uuid::Uuid::new_v4().to_string();
         let created_at = Utc::now();
@@ -373,6 +369,7 @@ impl ChainQa {
             bundled,
             service,
             model_id,
+            language,
         })
     }
 
@@ -395,7 +392,7 @@ impl ChainQa {
         prep: &PreparedInvocation,
         runtime: &Arc<ChainRuntime>,
     ) -> Result<String, RunInvocationError> {
-        let request = build_answer_request(&prep.bundled, &prep.question);
+        let request = build_answer_request(&prep.bundled, &prep.question, prep.language);
 
         // Channel between the LLM provider and the chain broadcaster. The
         // provider sends `TokenChunk::Text` deltas; we forward each one to
@@ -536,6 +533,9 @@ struct PreparedInvocation {
     service: Arc<dyn LlmService>,
     #[allow(dead_code)] // Persisted into chain_qa.model via insert_chain_qa
     model_id: String,
+    /// Language inherited from the chain's root conversation. Switches both
+    /// the answer-time system prompt and any leaf-summary pre-step.
+    language: crate::llm_language::LlmLanguage,
 }
 
 /// Internal error wrapper that pairs a [`ChainQaError`] with whatever
@@ -547,23 +547,29 @@ struct RunInvocationError {
 }
 
 /// Build the answer-time `LlmRequest` from a bundled context and a question.
-fn build_answer_request(bundled: &BundledContext, question: &str) -> LlmRequest {
+fn build_answer_request(
+    bundled: &BundledContext,
+    question: &str,
+    language: crate::llm_language::LlmLanguage,
+) -> LlmRequest {
     let prompt = format!(
         "{context}\n---\nQuestion: {question}\n",
         context = bundled.render_for_prompt(),
         question = question,
     );
     LlmRequest {
-        system: vec![SystemContent::new(ANSWER_SYSTEM_PROMPT)],
+        system: vec![SystemContent::new(
+            crate::llm_language::chain_answer_system_prompt(language),
+        )],
         messages: vec![LlmMessage {
             role: MessageRole::User,
             content: vec![ContentBlock::text(prompt)],
         }],
         tools: vec![],
         max_tokens: Some(ANSWER_MAX_TOKENS),
-        // Shared by every chain answer call across all chains, so the
-        // ANSWER_SYSTEM_PROMPT prefix caches once.
-        cache_key: PromptCacheKey::stable("chain-qa-answer"),
+        // One cache key per language so phoenix-native and caveman prompts
+        // don't collide on a shared cache slot.
+        cache_key: PromptCacheKey::stable(format!("chain-qa-answer/{}", language.as_str())),
     }
 }
 
@@ -578,6 +584,7 @@ pub async fn bundle_chain_context(
     db: &Database,
     members: &[Conversation],
     service: &dyn LlmService,
+    language: crate::llm_language::LlmLanguage,
 ) -> Result<BundledContext, ChainQaError> {
     if members.is_empty() {
         return Ok(BundledContext {
@@ -611,7 +618,7 @@ pub async fn bundle_chain_context(
                     approx_tokens,
                     "Chain leaf exceeds direct budget; summarizing in-process",
                 );
-                let summary = summarize_leaf_in_process(service, &direct_text).await?;
+                let summary = summarize_leaf_in_process(service, &direct_text, language).await?;
                 leaf_summary_model = Some(service.model_id().to_string());
                 blocks.push(MemberContextBlock {
                     conv_id: conv.id.clone(),
@@ -712,17 +719,23 @@ fn trailing_continuation_summary(messages: &[Message]) -> Option<String> {
 async fn summarize_leaf_in_process(
     service: &dyn LlmService,
     transcript_text: &str,
+    language: crate::llm_language::LlmLanguage,
 ) -> Result<String, ChainQaError> {
     let request = LlmRequest {
-        system: vec![SystemContent::new(LEAF_SUMMARY_SYSTEM_PROMPT)],
+        system: vec![SystemContent::new(
+            crate::llm_language::chain_leaf_summary_system_prompt(language),
+        )],
         messages: vec![LlmMessage {
             role: MessageRole::User,
             content: vec![ContentBlock::text(transcript_text.to_string())],
         }],
         tools: vec![],
         max_tokens: Some(LEAF_SUMMARY_MAX_TOKENS),
-        // Shared by every leaf-summary call so the boilerplate prompt caches.
-        cache_key: PromptCacheKey::stable("chain-qa-leaf-summary"),
+        // Per-language cache key so different prompts don't collide.
+        cache_key: PromptCacheKey::stable(format!(
+            "chain-qa-leaf-summary/{}",
+            language.as_str()
+        )),
     };
     let response = service.complete(&request).await?;
     Ok(response.text())

@@ -329,8 +329,21 @@ pub trait Tool: Send + Sync {
     /// Tool name
     fn name(&self) -> &str;
 
-    /// Tool description for LLM
+    /// Tool description for LLM (phoenix-native).
     fn description(&self) -> String;
+
+    /// Tool description in a non-default language. The default impl falls
+    /// back to `description()` (phoenix-native). Tools that have curated
+    /// shorter prose for an alternate language override this to switch on
+    /// `language`. See `crate::llm_language::tool_description_override` for
+    /// the centralized override table.
+    fn description_for_language(
+        &self,
+        language: crate::llm_language::LlmLanguage,
+    ) -> String {
+        crate::llm_language::tool_description_override(self.name(), language)
+            .map_or_else(|| self.description(), str::to_string)
+    }
 
     /// JSON schema for tool input
     fn input_schema(&self) -> Value;
@@ -545,13 +558,23 @@ impl ToolRegistry {
         Self { tools }
     }
 
-    /// Get all tool definitions for LLM
+    /// Get all tool definitions for LLM (phoenix-native).
+    #[allow(dead_code)] // Convenience over `definitions_for_language(..::default())`.
     pub fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
+        self.definitions_for_language(crate::llm_language::LlmLanguage::default())
+    }
+
+    /// Get all tool definitions for LLM in the requested language.
+    /// Tools without a translated description fall back to phoenix-native.
+    pub fn definitions_for_language(
+        &self,
+        language: crate::llm_language::LlmLanguage,
+    ) -> Vec<crate::llm::ToolDefinition> {
         self.tools
             .iter()
             .map(|t| crate::llm::ToolDefinition {
                 name: t.name().to_string(),
-                description: t.description(),
+                description: t.description_for_language(language),
                 input_schema: t.input_schema(),
                 defer_loading: t.defer_loading(),
             })

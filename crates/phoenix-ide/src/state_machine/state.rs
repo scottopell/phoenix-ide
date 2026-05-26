@@ -1797,6 +1797,9 @@ pub struct ConvContext {
     /// all agree on the same name without re-walking the worktree on every
     /// reference.
     pub tasks_dir_name: String,
+    /// LLM-facing prose language for this conversation. Drives the system
+    /// prompt builder and tool description selection.
+    pub llm_language: crate::llm_language::LlmLanguage,
 }
 
 /// Default context window for unknown models (conservative)
@@ -1823,6 +1826,7 @@ impl ConvContext {
             desired_base_branch: None,
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
+            llm_language: crate::llm_language::LlmLanguage::default(),
         }
     }
 
@@ -1847,6 +1851,7 @@ impl ConvContext {
             desired_base_branch: None,
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
+            llm_language: crate::llm_language::LlmLanguage::default(),
         }
     }
 }

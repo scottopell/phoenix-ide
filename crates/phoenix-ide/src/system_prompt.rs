@@ -10,18 +10,10 @@ use std::fmt::Write;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 
+use crate::llm_language::{self, LlmLanguage};
+
 /// Names of guidance files to look for, in order of preference
 const GUIDANCE_FILE_NAMES: &[&str] = &["AGENTS.md", "AGENT.md"];
-
-/// Base system prompt establishing the agent's role
-const BASE_PROMPT: &str = r"You are a helpful AI assistant with access to tools for executing code, editing files, and searching codebases. Use tools when appropriate to accomplish tasks.
-
-Be concise in your responses. When using tools, explain what you're doing briefly.";
-
-/// Suffix added for sub-agent conversations
-const SUB_AGENT_SUFFIX: &str = r"
-
-You are a sub-agent working on a specific task. When you complete your task, call submit_result with your findings. If you encounter an unrecoverable error, call submit_error. Your conversation will end after calling either tool.";
 
 /// Conversation mode context for system prompt injection.
 /// Carries only the stable, display-oriented fields the prompt needs.
@@ -514,6 +506,7 @@ pub fn build_system_prompt(
     tasks_dir_name: &str,
     is_sub_agent: bool,
     mode: Option<&ModeContext>,
+    language: LlmLanguage,
 ) -> String {
     let builtin_dir = crate::skills::builtin::default_extract_dir();
     build_system_prompt_with_options(
@@ -523,6 +516,7 @@ pub fn build_system_prompt(
         mode,
         None,
         builtin_dir.as_deref(),
+        language,
     )
 }
 
@@ -530,7 +524,7 @@ pub fn build_system_prompt(
 /// built-in extract directory. Tests pass `None` for `builtin_dir` to assert
 /// filesystem-only behavior; production callers go through
 /// [`build_system_prompt`] which uses the live extract location.
-#[allow(clippy::too_many_lines)] // One match arm per ModeContext variant; splitting hurts readability
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)] // One match arm per ModeContext variant; splitting hurts readability
 pub fn build_system_prompt_with_options(
     working_dir: &Path,
     tasks_dir_name: &str,
@@ -538,8 +532,9 @@ pub fn build_system_prompt_with_options(
     mode: Option<&ModeContext>,
     home_override: Option<&Path>,
     builtin_dir: Option<&Path>,
+    language: LlmLanguage,
 ) -> String {
-    let mut prompt = String::from(BASE_PROMPT);
+    let mut prompt = String::from(llm_language::base_prompt(language));
 
     // Add guidance from discovered files
     let guidance_files = discover_guidance_files(working_dir);
@@ -602,47 +597,13 @@ pub fn build_system_prompt_with_options(
     if let Some(mode) = mode {
         match mode {
             ModeContext::Explore => {
-                let _ = write!(
-                    prompt,
-                    "\n\nYou are in Explore mode. This conversation is read-only \
-                     for source files -- you can read files, search, analyze, and \
-                     discuss the codebase, but you cannot modify code.\n\n\
-                     Workflow for proposing work:\n\
-                     1. Draft (or reuse) a task file. The body is free-form \
-                        markdown -- start with an `# H1` title, then the plan.\n   \
-                        Use the taskmd convention: name the file \
-                        `NNNNN-pX-status--slug.md` (status one of `ready`, \
-                        `in-progress`, or `brainstorming`) under `{tasks_dir_name}/`. \
-                        It's just a filename -- no tooling needed -- and it gives \
-                        the task a stable id/priority/status/slug plus an automatic \
-                        `ready` -> `in-progress` rename on approval, so prefer it. \
-                        To draft one, use `patch` with operation `overwrite` (the \
-                        Explore-mode `patch` allowlist is scoped to \
-                        `{tasks_dir_name}/`).\n   \
-                        If you genuinely can't follow that convention, any other \
-                        `.md` file is still accepted as a plain brief -- but it \
-                        carries no metadata and gets no status rename, so it's \
-                        strictly less useful; reach for it only as a fallback. A \
-                        taskmd-pattern filename is accepted ONLY under \
-                        `{tasks_dir_name}/`; a plain `.md` file may live anywhere \
-                        in the worktree (e.g. point `propose_task` at an existing \
-                        `docs/plan.md`).\n\
-                     2. Call `propose_task` with `task_file` set to the path \
-                        (e.g. `{tasks_dir_name}/12345-p2-ready--my-slug.md`). The \
-                        user will review and can approve, request revisions, or \
-                        reject. On approval, an isolated worktree is created and \
-                        you gain full write access.\n\n\
-                     The `patch` tool is restricted to `{tasks_dir_name}/` in this \
-                     mode. `bash` is unavailable. If the user asks you to change \
-                     code directly, explain that you must propose a task first."
-                );
+                prompt.push_str(&llm_language::mode_explore(language, tasks_dir_name));
                 if let Some(next_id) = next_taskmd_id(working_dir, tasks_dir_name) {
-                    let _ = write!(
-                        prompt,
-                        "\n\nThe next available taskmd ID for this worktree is \
-                         `{next_id}` -- use it when drafting a new task file \
-                         (e.g. `{tasks_dir_name}/{next_id}-p2-ready--my-slug.md`)."
-                    );
+                    prompt.push_str(&llm_language::next_taskmd_id_hint(
+                        language,
+                        tasks_dir_name,
+                        &next_id,
+                    ));
                 }
             }
             ModeContext::Work {
@@ -650,56 +611,34 @@ pub fn build_system_prompt_with_options(
                 base_branch,
                 worktree_path,
             } => {
-                let _ = write!(
-                    prompt,
-                    "\n\nYou are in Work mode on branch {branch_name}, targeting \
-                     {base_branch}.\n\
-                     Your working directory is {worktree_path}. All file edits and \
-                     bash commands MUST stay inside this worktree. Do NOT modify \
-                     files in the main checkout or repo root.\n\
-                     Use bash and the patch tool to make changes.\n\n\
-                     When the task is complete, let the user know it's ready; they \
-                     review and merge the branch into {base_branch} via a pull \
-                     request -- Phoenix does not perform the merge. If your task \
-                     file follows the taskmd convention (`NNNNN-pX-status--slug.md`), \
-                     also mark it done yourself before handing off: rename the file \
-                     from `...-{{status}}--{{slug}}.md` to `...-done--{{slug}}.md` \
-                     (the filename is the sole source of truth for task status -- \
-                     nothing renames it for you) and commit that rename on this \
-                     branch alongside your work."
-                );
+                prompt.push_str(&llm_language::mode_work(
+                    language,
+                    branch_name,
+                    base_branch,
+                    worktree_path,
+                ));
             }
             ModeContext::Direct => {
-                prompt.push_str(
-                    "\n\nYou have full tool access. You are working directly in this directory \
-                     with no plan/approve workflow or branch isolation. Changes happen on the \
-                     current branch.",
-                );
+                prompt.push_str(llm_language::mode_direct(language));
             }
             ModeContext::Branch {
                 branch_name,
                 base_branch,
                 worktree_path,
             } => {
-                let _ = write!(
-                    prompt,
-                    "\n\nYou are in Branch mode on existing branch {branch_name}, \
-                     targeting {base_branch}.\n\
-                     Your working directory is {worktree_path}. All file edits and \
-                     bash commands MUST stay inside this worktree. Do NOT modify \
-                     files in the main checkout or repo root.\n\
-                     You are working directly on an existing branch -- there is no \
-                     task file. Commit your changes directly to {branch_name}.\n\n\
-                     When the work is complete, let the user know. They will handle \
-                     merging or pushing when ready."
-                );
+                prompt.push_str(&llm_language::mode_branch(
+                    language,
+                    branch_name,
+                    base_branch,
+                    worktree_path,
+                ));
             }
         }
     }
 
     // Add sub-agent suffix if applicable
     if is_sub_agent {
-        prompt.push_str(SUB_AGENT_SUFFIX);
+        prompt.push_str(llm_language::sub_agent_suffix(language));
     }
 
     prompt
@@ -768,11 +707,63 @@ mod tests {
             None,
             Some(temp.path()),
             None,
+            crate::llm_language::LlmLanguage::default(),
         );
 
         assert!(prompt.contains("helpful AI assistant"));
         assert!(!prompt.contains("<project_guidance>"));
         assert!(!prompt.contains("sub-agent"));
+    }
+
+    #[test]
+    fn caveman_language_swaps_the_base_prompt() {
+        let temp = TempDir::new().unwrap();
+        let native = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            None,
+            Some(temp.path()),
+            None,
+            crate::llm_language::LlmLanguage::PhoenixNative,
+        );
+        let caveman = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            None,
+            Some(temp.path()),
+            None,
+            crate::llm_language::LlmLanguage::Caveman,
+        );
+        assert!(native.contains("helpful AI assistant"));
+        assert!(caveman.contains("smart caveman"));
+        assert!(
+            !caveman.contains("helpful AI assistant"),
+            "caveman should not retain the phoenix-native opener"
+        );
+    }
+
+    #[test]
+    fn caveman_language_swaps_mode_blocks() {
+        let temp = TempDir::new().unwrap();
+        let mode = ModeContext::Work {
+            branch_name: "task-1".into(),
+            base_branch: "main".into(),
+            worktree_path: "/wt".into(),
+        };
+        let caveman = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&mode),
+            Some(temp.path()),
+            None,
+            crate::llm_language::LlmLanguage::Caveman,
+        );
+        assert!(caveman.contains("work cave"));
+        // Phoenix-native phrasing must not bleed through.
+        assert!(!caveman.contains("You are in Work mode"));
     }
 
     #[test]
@@ -787,6 +778,7 @@ mod tests {
             None,
             Some(temp.path()),
             None,
+            crate::llm_language::LlmLanguage::default(),
         );
 
         assert!(prompt.contains("<project_guidance>"));
@@ -805,6 +797,7 @@ mod tests {
             None,
             Some(temp.path()),
             None,
+            crate::llm_language::LlmLanguage::default(),
         );
 
         assert!(prompt.contains("sub-agent"));
@@ -1081,6 +1074,7 @@ mod tests {
             None,
             Some(temp.path()),
             None,
+            crate::llm_language::LlmLanguage::default(),
         );
 
         assert!(prompt.contains("<available_skills>"));
@@ -1100,6 +1094,7 @@ mod tests {
             None,
             Some(temp.path()),
             None,
+            crate::llm_language::LlmLanguage::default(),
         );
 
         assert!(!prompt.contains("<available_skills>"));
@@ -1224,6 +1219,7 @@ mod tests {
             Some(&ModeContext::Explore),
             Some(temp.path()),
             None,
+            crate::llm_language::LlmLanguage::default(),
         );
 
         assert!(prompt.contains("Explore mode"));
@@ -1253,6 +1249,7 @@ mod tests {
             Some(&ModeContext::Explore),
             Some(temp.path()),
             None,
+            crate::llm_language::LlmLanguage::default(),
         );
 
         assert!(prompt.contains("Explore mode"));
@@ -1273,6 +1270,7 @@ mod tests {
             Some(&ModeContext::Explore),
             Some(temp.path()),
             None,
+            crate::llm_language::LlmLanguage::default(),
         );
         assert!(!prompt.contains("next available taskmd ID"));
     }
@@ -1295,6 +1293,7 @@ mod tests {
             Some(&ModeContext::Explore),
             Some(temp.path()),
             None,
+            crate::llm_language::LlmLanguage::default(),
         );
 
         let expected_id = taskmd_core::ids::next_id(&tasks_dir);
@@ -1317,6 +1316,7 @@ mod tests {
             Some(&mode),
             Some(temp.path()),
             None,
+            crate::llm_language::LlmLanguage::default(),
         );
 
         assert!(prompt.contains("Work mode"));
@@ -1437,6 +1437,7 @@ mod tests {
             None,
             Some(temp.path()),
             Some(&extract_dir),
+            crate::llm_language::LlmLanguage::default(),
         );
         assert!(prompt.contains("**spears**"));
         // Built-ins use the (built-in) marker rather than exposing the extract path

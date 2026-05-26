@@ -193,8 +193,18 @@ pub trait ToolExecutor: Send + Sync {
     /// Execute a tool by name with context
     async fn execute(&self, name: &str, input: Value, ctx: ToolContext) -> Option<ToolOutput>;
 
-    /// Get tool definitions for LLM
+    /// Get tool definitions for LLM (phoenix-native).
     async fn definitions(&self) -> Vec<crate::llm::ToolDefinition>;
+
+    /// Get tool definitions in the requested LLM language. Default impl
+    /// delegates to `definitions()` (phoenix-native); production overrides
+    /// translate tool descriptions per-language.
+    async fn definitions_for_language(
+        &self,
+        _language: crate::llm_language::LlmLanguage,
+    ) -> Vec<crate::llm::ToolDefinition> {
+        self.definitions().await
+    }
 
     /// Replace the tool set (e.g., Explore -> Work mode transition).
     /// Default is a no-op for test doubles that don't need dynamic swapping.
@@ -395,6 +405,13 @@ impl<T: ToolExecutor + ?Sized> ToolExecutor for Arc<T> {
 
     async fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
         (**self).definitions().await
+    }
+
+    async fn definitions_for_language(
+        &self,
+        language: crate::llm_language::LlmLanguage,
+    ) -> Vec<crate::llm::ToolDefinition> {
+        (**self).definitions_for_language(language).await
     }
 
     fn upgrade_to_work_mode(&self) {
@@ -738,12 +755,20 @@ impl ToolExecutor for ToolRegistryExecutor {
     }
 
     async fn definitions(&self) -> Vec<crate::llm::ToolDefinition> {
+        self.definitions_for_language(crate::llm_language::LlmLanguage::default())
+            .await
+    }
+
+    async fn definitions_for_language(
+        &self,
+        language: crate::llm_language::LlmLanguage,
+    ) -> Vec<crate::llm::ToolDefinition> {
         let mut defs = {
             let registry = self
                 .registry
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            registry.definitions()
+            registry.definitions_for_language(language)
         };
 
         // Merge live MCP tool definitions (respects current disabled state).
