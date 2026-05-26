@@ -209,9 +209,13 @@ export function useBottomAnchoredWindow({
     [historicalUnits, lastRenderedUnitIndex, heightCache, cacheVersion],
   );
 
-  // Reset compensation bookkeeping on conversation change so a stale
-  // pre-expand scrollHeight from a prior conversation doesn't apply to
-  // the new one.
+  // Reset compensation bookkeeping on conversation change so stale
+  // values from a prior conversation don't apply to the new one. Both
+  // `prevScrollHeightRef` (expansion delta) and `prevSpacerHeightRef`
+  // (spacer-height delta) are baselines from the previous conversation
+  // and would produce nonsensical deltas after the swap — leaving them
+  // dirty caused random landing positions on conversation switch.
+  const prevConversationIdRef = useRef(conversationId);
   useLayoutEffect(() => {
     prevScrollHeightRef.current = null;
   }, [conversationId]);
@@ -234,6 +238,14 @@ export function useBottomAnchoredWindow({
 
   const prevSpacerHeightRef = useRef(spacerHeight);
   useLayoutEffect(() => {
+    // Conversation switch: reseat the baseline without applying a delta.
+    // The old baseline references the previous conversation's geometry
+    // and would yield a meaningless scrollTop adjustment.
+    if (prevConversationIdRef.current !== conversationId) {
+      prevConversationIdRef.current = conversationId;
+      prevSpacerHeightRef.current = spacerHeight;
+      return;
+    }
     if (prevScrollHeightRef.current !== null) {
       prevSpacerHeightRef.current = spacerHeight;
       return;
@@ -248,7 +260,7 @@ export function useBottomAnchoredWindow({
       el.scrollTop += delta;
     }
     prevSpacerHeightRef.current = spacerHeight;
-  }, [spacerHeight, scrollRootRef]);
+  }, [spacerHeight, scrollRootRef, conversationId]);
 
   useEffect(() => {
     const root = scrollRootRef.current;
