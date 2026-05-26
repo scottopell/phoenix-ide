@@ -742,13 +742,21 @@ impl Default for AssistantMessage {
 }
 
 impl AssistantMessage {
+    /// Construct with an explicit `message_id`. Production code threads the
+    /// LLM dispatch's `request_id` through so the streaming `Token` events
+    /// (which already carry it) share identity with this finalized message —
+    /// the UI keys its in-flight streaming render unit by `request_id`, the
+    /// eventual `agent_turn` render unit by `message_id`, and the two match
+    /// exactly because they're the same string. Tests can pass a fresh
+    /// `Uuid::new_v4().to_string()` if they don't care about the wire trace.
     pub fn new(
+        message_id: String,
         content: Vec<ContentBlock>,
         usage: Option<UsageData>,
         display_data: Option<Value>,
     ) -> Self {
         Self {
-            message_id: uuid::Uuid::new_v4().to_string(),
+            message_id,
             content,
             usage,
             display_data,

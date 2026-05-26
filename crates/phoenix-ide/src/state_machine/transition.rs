@@ -691,6 +691,7 @@ fn handle_core_llm_response(
         tool_calls,
         end_turn: _,
         usage: usage_data,
+        request_id,
     } = event
     else {
         unreachable!("handle_core_llm_response called with non-LlmResponse event");
@@ -712,6 +713,7 @@ fn handle_core_llm_response(
                 content,
                 Some(usage_data),
                 &context.working_dir,
+                request_id,
             ))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_agent_done()));
@@ -721,7 +723,8 @@ fn handle_core_llm_response(
     let first = tool_calls[0].clone();
     let rest = tool_calls[1..].to_vec();
     let display_data = compute_bash_display_data(&content, &context.working_dir);
-    let assistant_message = AssistantMessage::new(content, Some(usage_data), display_data);
+    let assistant_message =
+        AssistantMessage::new(request_id, content, Some(usage_data), display_data);
     // Broadcast (not persist) the assistant message now so the UI's main
     // message list renders the in-flight `tool_use` blocks during execution.
     // Atomic DB persistence still happens later via `PersistCheckpoint`; the
@@ -1658,6 +1661,7 @@ pub fn transition_parent(
                 content,
                 tool_calls,
                 usage: usage_data,
+                request_id,
                 ..
             }),
         ) => {
@@ -1693,7 +1697,7 @@ pub fn transition_parent(
                     let msg = "propose_task must be the only tool in response".to_string();
                     let display_data = compute_bash_display_data(&content, &context.working_dir);
                     let assistant_message =
-                        AssistantMessage::new(content, Some(usage_data), display_data);
+                        AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
                     let error_results: Vec<ToolResult> = tool_calls
                         .iter()
                         .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
@@ -1726,7 +1730,7 @@ pub fn transition_parent(
                         let display_data =
                             compute_bash_display_data(&content, &context.working_dir);
                         let assistant_message =
-                            AssistantMessage::new(content, Some(usage_data), display_data);
+                            AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
                         let tool_result = ToolResult::error(tool.id.clone(), err_msg);
                         let checkpoint =
                             CheckpointData::tool_round(assistant_message, vec![tool_result])
@@ -1756,7 +1760,7 @@ pub fn transition_parent(
                         let display_data =
                             compute_bash_display_data(&content, &context.working_dir);
                         let assistant_message =
-                            AssistantMessage::new(content, Some(usage_data), display_data);
+                            AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
                         let tool_result = ToolResult::error(tool.id.clone(), err_msg);
                         let checkpoint =
                             CheckpointData::tool_round(assistant_message, vec![tool_result])
@@ -1777,7 +1781,7 @@ pub fn transition_parent(
                     ToolResult::success(tool.id.clone(), "Plan submitted for review".to_string());
                 let display_data = compute_bash_display_data(&content, &context.working_dir);
                 let assistant_message =
-                    AssistantMessage::new(content, Some(usage_data), display_data);
+                    AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
                 let checkpoint =
                     CheckpointData::tool_round(assistant_message, vec![tool_result])
                         .expect("propose_task produces exactly one tool_use and one result");
@@ -1811,7 +1815,7 @@ pub fn transition_parent(
                     let msg = "ask_user_question must be the only tool in response".to_string();
                     let display_data = compute_bash_display_data(&content, &context.working_dir);
                     let assistant_message =
-                        AssistantMessage::new(content, Some(usage_data), display_data);
+                        AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
                     let error_results: Vec<ToolResult> = tool_calls
                         .iter()
                         .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
@@ -1838,7 +1842,7 @@ pub fn transition_parent(
                         let display_data =
                             compute_bash_display_data(&content, &context.working_dir);
                         let assistant_message =
-                            AssistantMessage::new(content, Some(usage_data), display_data);
+                            AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
                         let tool_result = ToolResult::error(tool.id.clone(), err_msg);
                         let checkpoint =
                             CheckpointData::tool_round(assistant_message, vec![tool_result])
@@ -1861,7 +1865,7 @@ pub fn transition_parent(
                 );
                 let display_data = compute_bash_display_data(&content, &context.working_dir);
                 let assistant_message =
-                    AssistantMessage::new(content, Some(usage_data), display_data);
+                    AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
                 let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])
                     .expect("ask_user_question produces exactly one tool_use and one result");
 
@@ -1878,7 +1882,7 @@ pub fn transition_parent(
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
             if should_trigger_continuation(&usage_data, context.context_window) {
-                let tr = handle_context_exhaustion(context, content, tool_calls, usage_data);
+                let tr = handle_context_exhaustion(context, content, tool_calls, usage_data, request_id);
                 return Ok(ParentTransitionResult {
                     new_state: ParentState::try_from(tr.new_state)
                         .expect("handle_context_exhaustion returns parent-valid state"),
@@ -1892,6 +1896,7 @@ pub fn transition_parent(
                 tool_calls,
                 end_turn: false,
                 usage: usage_data,
+                request_id,
             };
             let ParentState::Core(core_state) = state else {
                 unreachable!()
@@ -2160,12 +2165,14 @@ pub fn transition_sub_agent(
                 content,
                 tool_calls,
                 usage: usage_data,
+                request_id,
                 ..
             }),
         ) => {
             // Context exhaustion check first (sub-agent fails immediately)
             if should_trigger_continuation(&usage_data, context.context_window) {
-                let tr = handle_context_exhaustion(context, content, tool_calls, usage_data);
+                let tr =
+                    handle_context_exhaustion(context, content, tool_calls, usage_data, request_id);
                 return Ok(SubAgentTransitionResult {
                     new_state: SubAgentState::try_from(tr.new_state)
                         .expect("sub-agent context exhaustion returns Failed"),
@@ -2184,6 +2191,7 @@ pub fn transition_sub_agent(
                         content,
                         Some(usage_data),
                         &context.working_dir,
+                        request_id,
                     ));
                 }
                 return Ok(tr.with_effect(Effect::PersistState).with_effect(
@@ -2201,8 +2209,12 @@ pub fn transition_sub_agent(
                     let msg =
                         "submit_result/submit_error must be the only tool in response".to_string();
                     let display_data = compute_bash_display_data(&content, &context.working_dir);
-                    let assistant_message =
-                        AssistantMessage::new(content, Some(usage_data), display_data);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
                     let error_results: Vec<ToolResult> = tool_calls
                         .iter()
                         .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
@@ -2227,6 +2239,7 @@ pub fn transition_sub_agent(
                             content,
                             Some(usage_data),
                             &context.working_dir,
+                            request_id,
                         ))
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::NotifyParent {
@@ -2244,6 +2257,7 @@ pub fn transition_sub_agent(
                             content,
                             Some(usage_data),
                             &context.working_dir,
+                            request_id,
                         ))
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::NotifyParent {
@@ -2263,6 +2277,7 @@ pub fn transition_sub_agent(
                 tool_calls,
                 end_turn: false,
                 usage: usage_data,
+                request_id,
             };
             let SubAgentState::Core(core_state) = state else {
                 unreachable!()
@@ -2315,6 +2330,7 @@ pub fn handle_outcome(
 }
 
 /// Convert `LlmOutcome` to the equivalent `Event` for delegation to `transition()`.
+#[allow(clippy::too_many_lines)] // Pure-data dispatch over a wide LlmOutcome enum
 fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
     match outcome {
         LlmOutcome::Response {
@@ -2322,11 +2338,13 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
             tool_calls,
             end_turn,
             usage,
+            request_id,
         } => Event::LlmResponse {
             content,
             tool_calls,
             end_turn,
             usage,
+            request_id,
         },
         LlmOutcome::RateLimited { retry_after: _ } => {
             let attempt = current_attempt(state);
@@ -2483,6 +2501,7 @@ fn handle_context_exhaustion(
     blocks: Vec<crate::llm::ContentBlock>,
     tool_calls: Vec<ToolCall>,
     usage_data: UsageData,
+    request_id: String,
 ) -> TransitionResult {
     use crate::state_machine::state::SubAgentOutcome;
 
@@ -2497,6 +2516,7 @@ fn handle_context_exhaustion(
                 blocks,
                 Some(usage_data),
                 &ctx.working_dir,
+                request_id,
             ))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
@@ -2514,6 +2534,7 @@ fn handle_context_exhaustion(
                 blocks,
                 Some(usage_data),
                 &ctx.working_dir,
+                request_id,
             ))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::NotifyParent {
@@ -2730,6 +2751,7 @@ mod tests {
 
         // Build an AssistantMessage with 3 tool_use blocks matching the 3 tools
         let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
             vec![
                 ContentBlock::tool_use(
                     "tool-1",
@@ -2904,6 +2926,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
             },
+            "test-req-id".to_string(),
         );
 
         // Sub-agent should go to Failed, not AwaitingContinuation
@@ -2960,6 +2983,7 @@ mod tests {
                 cache_read_tokens: 0,
                 cache_creation_tokens: 0,
             },
+            "test-req-id".to_string(),
         );
 
         // Parent should go to AwaitingContinuation
@@ -3021,6 +3045,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
                 },
+                request_id: "test-req-id".to_string(),
             },
         )
         .unwrap();
@@ -3070,6 +3095,7 @@ mod tests {
                     cache_creation_tokens: 0,
                     cache_read_tokens: 0,
                 },
+                request_id: "test-req-id".to_string(),
             },
         )
         .unwrap();
@@ -3277,6 +3303,7 @@ mod tests {
                 tool_calls: vec![tool],
                 end_turn: false,
                 usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
             },
         )
         .unwrap();
@@ -3335,6 +3362,7 @@ mod tests {
                 tool_calls: vec![auq_tool, bash_tool],
                 end_turn: false,
                 usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
             },
         );
 
@@ -3403,6 +3431,7 @@ mod tests {
                 tool_calls: vec![propose_tool, bash_tool],
                 end_turn: false,
                 usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
             },
         );
 
@@ -3463,6 +3492,7 @@ mod tests {
                 tool_calls: vec![propose_tool],
                 end_turn: false,
                 usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
             },
         )
         .expect("transition must succeed");
@@ -3527,6 +3557,7 @@ mod tests {
                 tool_calls: vec![auq_tool],
                 end_turn: false,
                 usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
             },
         )
         .expect("transition must succeed");

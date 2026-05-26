@@ -179,7 +179,7 @@ describe('markdown table rendering', () => {
   it('wraps streaming message tables in a local horizontal scroll container', async () => {
     render(
       <MemoryRouter>
-        <StreamingMessageView buffer={{ text: wideTableMarkdown, lastSequence: 1, startedAt: Date.now() }} />
+        <StreamingMessageView buffer={{ text: wideTableMarkdown, lastSequence: 1, startedAt: Date.now(), requestId: 'test-req-id' }} />
       </MemoryRouter>,
     );
 

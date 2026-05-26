@@ -207,6 +207,7 @@ describe('MessageList streaming-isolation perf invariant', () => {
           type: 'sse_token',
           sequenceId: i + 1,
           delta: `t${i} `,
+          requestId: 'test-req-id',
         });
       }
     });
@@ -284,6 +285,7 @@ describe('MessageList streaming-isolation perf invariant', () => {
         type: 'sse_token',
         sequenceId: 2,
         delta: 'hello',
+        requestId: 'test-req-id',
       });
     });
 

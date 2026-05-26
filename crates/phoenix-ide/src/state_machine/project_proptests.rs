@@ -579,6 +579,7 @@ mod random_walk {
                             tool_calls,
                             end_turn: true,
                             usage: Usage::default(),
+                            request_id: "test-req-id".to_string(),
                         }
                     }
                     1 => {
@@ -978,6 +979,7 @@ mod random_walk {
                         tool_calls: vec![tc],
                         end_turn: true,
                         usage: Usage::default(),
+                        request_id: "test-req-id".to_string(),
                     }
                 } else {
                     generate_valid_event(&state, &mut rng)

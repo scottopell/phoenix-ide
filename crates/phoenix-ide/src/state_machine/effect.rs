@@ -248,13 +248,14 @@ impl Effect {
         blocks: Vec<ContentBlock>,
         usage: Option<UsageData>,
         cwd: &Path,
+        message_id: String,
     ) -> Self {
         let display_data = compute_bash_display_data(&blocks, cwd);
         Effect::PersistMessage {
             content: MessageContent::agent(blocks),
             display_data,
             usage_data: usage,
-            message_id: uuid::Uuid::new_v4().to_string(),
+            message_id,
             idempotent: false,
         }
     }

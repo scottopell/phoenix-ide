@@ -1310,6 +1310,7 @@ mod tests {
 
         // Build AssistantMessage with tool_use blocks for all 3 tools
         let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
             vec![
                 ContentBlock::ToolUse {
                     id: "t1".to_string(),
@@ -1436,6 +1437,7 @@ mod tests {
             tool_calls: vec![submit_result_call],
             end_turn: true,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         };
 
         let result = transition(&state, &context, event).unwrap();
@@ -1489,6 +1491,7 @@ mod tests {
             tool_calls: vec![submit_error_call],
             end_turn: true,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         };
 
         let result = transition(&state, &context, event).unwrap();
@@ -1595,6 +1598,7 @@ mod tests {
             tool_calls: vec![bash_call, submit_call],
             end_turn: true,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         };
 
         let result = transition(&state, &context, event);
@@ -1651,6 +1655,7 @@ mod tests {
             tool_calls: vec![submit_call],
             end_turn: true,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         };
 
         let result = transition(&state, &context, event).unwrap();

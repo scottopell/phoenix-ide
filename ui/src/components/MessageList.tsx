@@ -11,7 +11,7 @@ import {
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
 import { MessageContextMenu } from './MessageContextMenu';
-import { useStreamingStartedAt } from '../conversation/useConversationAtom';
+import { useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
   buildRenderUnits,
   type HistoricalUnit,
@@ -186,12 +186,17 @@ function MessageListImpl({
   const [isAtBottom, setIsAtBottom] = useState(true);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
 
-  const streamingStartedAt = useStreamingStartedAt(slug);
+  // The streaming buffer's `requestId` IS the eventual agent message_id
+  // (server uses the same uuid for both — see `AssistantMessage::new` in
+  // crates/phoenix-ide/src/state_machine/state.rs). Keying the streaming
+  // unit by this value means the finalized `agent_turn` HistoricalUnit
+  // arrives under the same render-unit key, and the transition is an
+  // in-place keyed update — virtuoso doesn't observe a key swap, the
+  // viewport doesn't drift. Symmetric to pending_user → user.
+  const streamingRequestId = useStreamingRequestId(slug);
   const streamingHandle = useMemo(
-    () => (streamingStartedAt !== null && slug
-      ? { key: `streaming-${slug}-${streamingStartedAt}` }
-      : null),
-    [streamingStartedAt, slug],
+    () => (streamingRequestId !== null ? { key: streamingRequestId } : null),
+    [streamingRequestId],
   );
 
   const { historicalUnits, tailUnits } = useMemo(
@@ -271,7 +276,7 @@ function MessageListImpl({
             followOutput="auto"
             atBottomThreshold={PIN_TO_BOTTOM_THRESHOLD}
             atBottomStateChange={handleAtBottomStateChange}
-            initialTopMostItemIndex={allUnits.length > 0 ? allUnits.length - 1 : 0}
+            initialTopMostItemIndex={{ index: 'LAST', align: 'end' }}
             alignToBottom
             increaseViewportBy={{ top: 600, bottom: 600 }}
             {...(SystemPromptHeaderSlot ? { components: { Header: SystemPromptHeaderSlot } } : {})}

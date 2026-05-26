@@ -1863,6 +1863,7 @@ where
                         tool_calls,
                         end_turn: response.end_turn,
                         usage: response.usage,
+                        request_id: request_id.clone(),
                     }
                 }
                 Err(e) => llm_error_to_outcome(e),
@@ -4945,6 +4946,7 @@ mod steer_drain_detector_tests {
         );
 
         let assistant = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
             vec![ContentBlock::ToolUse {
                 id: "tool-img-1".to_string(),
                 name: "read_image".to_string(),

@@ -130,6 +130,9 @@ pub enum Event {
         #[allow(dead_code)] // Reserved for conversation flow control
         end_turn: bool,
         usage: Usage,
+        /// Server-generated request id, threaded through from `LlmOutcome::Response`.
+        /// Used as the eventual `AssistantMessage.message_id`.
+        request_id: String,
     },
     LlmError {
         message: String,
@@ -333,6 +336,7 @@ pub enum CoreEvent {
         tool_calls: Vec<ToolCall>,
         end_turn: bool,
         usage: Usage,
+        request_id: String,
     },
     LlmError {
         message: String,
@@ -475,11 +479,13 @@ impl TryFrom<Event> for ParentEvent {
                 tool_calls,
                 end_turn,
                 usage,
+                request_id,
             } => Ok(ParentEvent::Core(CoreEvent::LlmResponse {
                 content,
                 tool_calls,
                 end_turn,
                 usage,
+                request_id,
             })),
             Event::LlmError {
                 message,
@@ -611,11 +617,13 @@ impl TryFrom<Event> for SubAgentEvent {
                 tool_calls,
                 end_turn,
                 usage,
+                request_id,
             } => Ok(SubAgentEvent::Core(CoreEvent::LlmResponse {
                 content,
                 tool_calls,
                 end_turn,
                 usage,
+                request_id,
             })),
             Event::LlmError {
                 message,
