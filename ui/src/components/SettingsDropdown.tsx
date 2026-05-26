@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
-import { api, type CodexLoginPreflight, type NotificationSettings } from '../api';
+import { api, type CodexLoginPreflight, type LlmLanguageSetting, type NotificationSettings } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { clearCodexQuota, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
@@ -167,6 +167,7 @@ export function SettingsDropdown({
             />
           )}
           <NotificationsSection />
+          <LlmLanguageSection />
           <VersionFooter />
         </div>
       )}
@@ -376,6 +377,79 @@ function NotificationsSection() {
           Long task finished
         </label>
       </div>
+      {saving && <div className="settings-section__hint">Saving…</div>}
+      {error && <div className="settings-section__error">{error}</div>}
+    </section>
+  );
+}
+
+/**
+ * Global default LLM language. Applied only to NEW conversations; existing
+ * conversations stay in whatever language they were created with, and chain
+ * continuations / sub-agents inherit from their parent.
+ */
+function LlmLanguageSection() {
+  const [setting, setSetting] = useState<LlmLanguageSetting | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => { mountedRef.current = false; };
+  }, []);
+
+  useEffect(() => {
+    api.getLlmLanguageSetting()
+      .then((loaded) => { if (mountedRef.current) setSetting(loaded); })
+      .catch((err) => {
+        if (!mountedRef.current) return;
+        setError(err instanceof Error ? err.message : 'Failed to load LLM language');
+      });
+  }, []);
+
+  const select = useCallback((next: string) => {
+    if (!setting || setting.language === next) return;
+    setSetting({ ...setting, language: next });
+    setSaving(true);
+    setError(null);
+    api.updateLlmLanguageSetting(next)
+      .then((saved) => {
+        if (!mountedRef.current) return;
+        setSetting(saved);
+        setSaving(false);
+      })
+      .catch((err: unknown) => {
+        if (!mountedRef.current) return;
+        setError(err instanceof Error ? err.message : 'Failed to save LLM language');
+        setSaving(false);
+      });
+  }, [setting]);
+
+  if (!setting && !error) return null;
+
+  return (
+    <section className="settings-section">
+      <h3 className="settings-section__title">LLM Language</h3>
+      <div className="settings-section__hint">
+        Sets the voice Phoenix uses with the model (system prompt, tool
+        descriptions). Applies to new conversations only.
+      </div>
+      {setting && (
+        <div className="settings-theme-row">
+          {setting.available.map((lang) => (
+            <button
+              key={lang}
+              type="button"
+              className={`settings-theme-btn${setting.language === lang ? ' active' : ''}`}
+              onClick={() => select(lang)}
+              title={lang === 'caveman' ? 'Ugg. Why use many word.' : 'Default Phoenix prose'}
+            >
+              {lang === 'phoenix-native' ? 'Phoenix' : lang === 'caveman' ? 'Caveman' : lang}
+            </button>
+          ))}
+        </div>
+      )}
       {saving && <div className="settings-section__hint">Saving…</div>}
       {error && <div className="settings-section__error">{error}</div>}
     </section>

@@ -488,6 +488,15 @@ export interface NotificationSettings {
   notify_idle: boolean;
 }
 
+/** Global default LLM language for new conversations. The selected
+ * language is pinned to each conversation at creation time; chain
+ * continuations and sub-agents inherit from their parent rather than
+ * re-reading this default. */
+export interface LlmLanguageSetting {
+  language: string;
+  available: string[];
+}
+
 export interface UsageTotals {
   input_tokens: number;
   output_tokens: number;
@@ -572,6 +581,22 @@ export const api = {
       body: JSON.stringify(settings),
     });
     if (!resp.ok) throw new Error('Failed to save notification settings');
+    return resp.json();
+  },
+
+  async getLlmLanguageSetting(): Promise<LlmLanguageSetting> {
+    const resp = await fetch('/api/settings/llm-language');
+    if (!resp.ok) throw new Error('Failed to load LLM language setting');
+    return resp.json();
+  },
+
+  async updateLlmLanguageSetting(language: string): Promise<LlmLanguageSetting> {
+    const resp = await fetch('/api/settings/llm-language', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ language }),
+    });
+    if (!resp.ok) throw new Error('Failed to save LLM language setting');
     return resp.json();
   },
 
