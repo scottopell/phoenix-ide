@@ -88,24 +88,18 @@ pub fn all_models() -> Vec<ModelSpec> {
     vec![
         // Anthropic models
         // Note: 4.6+ models use stable (non-dated) API IDs; id matches api_name for correct lookup.
+        // Anthropic 4.6+ models have 1M-token context windows natively as of
+        // their 2026-03-13 GA. The `context-1m-2025-08-07` beta header was
+        // retired April 30, 2026 and is no longer required (or accepted on
+        // older models). See migration 009 for legacy `-1m` id rewrite.
         ModelSpec {
             id: "claude-opus-4-7".into(),
             api_name: "claude-opus-4-7".into(),
             provider: Provider::Anthropic,
             api_format: ApiFormat::Anthropic,
             description: "Claude Opus 4.7 (most capable, slower)".into(),
-            context_window: 200_000,
-            recommended: true,
-            supports_tool_search: true,
-        },
-        ModelSpec {
-            id: "claude-opus-4-7-1m".into(),
-            api_name: "claude-opus-4-7".into(),
-            provider: Provider::Anthropic,
-            api_format: ApiFormat::Anthropic,
-            description: "Claude Opus 4.7 (1M context)".into(),
             context_window: 1_000_000,
-            recommended: false,
+            recommended: true,
             supports_tool_search: true,
         },
         ModelSpec {
@@ -114,7 +108,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             provider: Provider::Anthropic,
             api_format: ApiFormat::Anthropic,
             description: "Claude Opus 4.6 (legacy)".into(),
-            context_window: 200_000,
+            context_window: 1_000_000,
             recommended: false,
             supports_tool_search: true,
         },
@@ -124,7 +118,7 @@ pub fn all_models() -> Vec<ModelSpec> {
             provider: Provider::Anthropic,
             api_format: ApiFormat::Anthropic,
             description: "Claude Sonnet 4.6 (balanced performance)".into(),
-            context_window: 200_000,
+            context_window: 1_000_000,
             recommended: true,
             supports_tool_search: true,
         },
@@ -137,26 +131,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 200_000,
             recommended: true,
             supports_tool_search: false,
-        },
-        ModelSpec {
-            id: "claude-opus-4-6-1m".into(),
-            api_name: "claude-opus-4-6".into(),
-            provider: Provider::Anthropic,
-            api_format: ApiFormat::Anthropic,
-            description: "Claude Opus 4.6 (1M context, legacy)".into(),
-            context_window: 1_000_000,
-            recommended: false,
-            supports_tool_search: true,
-        },
-        ModelSpec {
-            id: "claude-sonnet-4-6-1m".into(),
-            api_name: "claude-sonnet-4-6".into(),
-            provider: Provider::Anthropic,
-            api_format: ApiFormat::Anthropic,
-            description: "Claude Sonnet 4.6 (1M context)".into(),
-            context_window: 1_000_000,
-            recommended: false,
-            supports_tool_search: true,
         },
         ModelSpec {
             id: "claude-opus-4-5".into(),

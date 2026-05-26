@@ -480,53 +480,6 @@ impl ModelRegistry {
         reg
     }
 
-    /// Workaround for the exe.dev built-in gateway: it does not implement
-    /// `/anthropic/v1/models` AND it silently drops requests carrying the
-    /// `context-1m-2025-08-07` anthropic-beta header (returns HTTP 200 with
-    /// an empty SSE stream rather than a 4xx). When this gateway is in use
-    /// and discovery returned nothing, hide the 1M-context model variants
-    /// from the registry so users cannot select a model whose request would
-    /// be silently dropped. See task 24695, conversation 8f82c521.
-    fn hide_models_that_exe_dev_gateway_silently_drops(config: &LlmConfig) -> Self {
-        let mut services: HashMap<String, Arc<dyn LlmService>> = HashMap::new();
-        let mut specs: HashMap<String, super::ModelSpec> = HashMap::new();
-
-        for spec in all_models() {
-            // 1M variants share an api_name with their base model and are
-            // distinguished only by the `-1m` id suffix and the beta header.
-            if spec.id.ends_with("-1m") {
-                continue;
-            }
-            if let Some(service) = Self::try_create_model(&spec, config) {
-                services.insert(spec.id.clone(), service);
-                specs.insert(spec.id.clone(), spec);
-            }
-        }
-
-        let default_model = Self::pick_default_model(&services, config);
-
-        Self {
-            services: std::sync::RwLock::new(services),
-            specs: std::sync::RwLock::new(specs),
-            default_model,
-            gateway_status: GatewayStatus::Healthy,
-            codex_bridge_loaded_at_startup: config.codex_credential.is_some(),
-            codex_loaded_path_at_startup: config.codex_credential_path.clone(),
-            current_codex_loaded_path: std::sync::RwLock::new(config.codex_credential_path.clone()),
-            config: Arc::new(config.clone()),
-        }
-    }
-
-    /// True if the configured gateway URL points at the exe.dev built-in
-    /// gateway. Match is a substring check against the link-local IP because
-    /// the URL is well-known and stable.
-    fn gateway_is_exe_dev(config: &LlmConfig) -> bool {
-        config
-            .gateway
-            .as_deref()
-            .is_some_and(|g| g.contains("169.254.169.254"))
-    }
-
     /// Pick the default model from available services.
     /// Prefers claude-sonnet-4-6 > claude-sonnet-4-5 > any available > hardcoded fallback.
     fn pick_default_model(
@@ -601,18 +554,9 @@ impl ModelRegistry {
 
         // If discovery returned no models but we're in gateway mode and the probe succeeded,
         // the gateway is reachable but doesn't expose a model-listing endpoint (e.g. exe.dev
-        // gateway only proxies inference). Fall back to hardcoded models with Healthy status,
-        // with one workaround: the exe.dev gateway silently drops 1M-context requests, so
-        // hide those variants from the picker when that gateway is in use.
+        // gateway only proxies inference). Fall back to hardcoded models with Healthy status.
         if discovered.is_empty() {
             if is_gateway_mode {
-                if Self::gateway_is_exe_dev(config) {
-                    tracing::info!(
-                        "Gateway is exe.dev; hiding 1M-context model variants from registry \
-                         (gateway silently drops requests with context-1m beta header)"
-                    );
-                    return Self::hide_models_that_exe_dev_gateway_silently_drops(config);
-                }
                 tracing::warn!(
                     "Gateway model discovery returned no models (gateway may not support listing); \
                      using hardcoded model list with Healthy status"
@@ -911,11 +855,10 @@ impl ModelRegistry {
     /// don't drift. Returns the (`model_id`, service) pair so the caller
     /// can persist the identifier into `chain_qa.model`.
     ///
-    /// Preference order: claude-sonnet-4-6 → claude-sonnet-4-6-1m →
-    /// gpt-5.5 → registry default. Returns None only when the registry has
-    /// no models at all.
+    /// Preference order: claude-sonnet-4-6 → gpt-5.5 → registry default.
+    /// Returns None only when the registry has no models at all.
     pub fn get_mid_tier_model(&self) -> Option<(String, Arc<dyn LlmService>)> {
-        const PREFERRED: &[&str] = &["claude-sonnet-4-6", "claude-sonnet-4-6-1m", "gpt-5.5"];
+        const PREFERRED: &[&str] = &["claude-sonnet-4-6", "gpt-5.5"];
         for id in PREFERRED {
             if let Some(service) = self.get(id) {
                 return Some(((*id).to_string(), service));
@@ -1201,47 +1144,6 @@ mod tests {
         // Should have models from multiple providers
         assert!(registry.get("claude-sonnet-4-6").is_some());
         assert!(registry.get("gpt-5.5").is_some());
-    }
-
-    #[test]
-    fn test_exe_dev_gateway_hides_one_million_context_variants() {
-        // Reproduces task 24695: exe.dev silently drops requests with the
-        // context-1m beta header. The registry must hide -1m variants from
-        // the picker so users can't select a model whose request will be
-        // dropped on the wire.
-        let config = LlmConfig {
-            gateway: Some("http://169.254.169.254/gateway/llm".to_string()),
-            ..Default::default()
-        };
-        assert!(ModelRegistry::gateway_is_exe_dev(&config));
-
-        let registry = ModelRegistry::hide_models_that_exe_dev_gateway_silently_drops(&config);
-
-        // Base variants remain available.
-        assert!(registry.get("claude-sonnet-4-6").is_some());
-        assert!(registry.get("claude-opus-4-7").is_some());
-        assert!(registry.get("gpt-5.5").is_some());
-
-        // 1M variants are hidden.
-        assert!(registry.get("claude-opus-4-7-1m").is_none());
-        assert!(registry.get("claude-opus-4-6-1m").is_none());
-        assert!(registry.get("claude-sonnet-4-6-1m").is_none());
-
-        assert_eq!(registry.gateway_status, GatewayStatus::Healthy);
-    }
-
-    #[test]
-    fn test_gateway_is_exe_dev_matches_only_link_local_ip() {
-        let exe_dev = LlmConfig {
-            gateway: Some("http://169.254.169.254/gateway/llm".to_string()),
-            ..Default::default()
-        };
-        let other = LlmConfig {
-            gateway: Some("https://example.com/v1".to_string()),
-            ..Default::default()
-        };
-        assert!(ModelRegistry::gateway_is_exe_dev(&exe_dev));
-        assert!(!ModelRegistry::gateway_is_exe_dev(&other));
     }
 
     #[test]
@@ -1587,7 +1489,7 @@ mod tests {
             .unwrap();
         assert_eq!(opus.provider, "Anthropic");
         assert!(opus.description.contains("most capable"));
-        assert_eq!(opus.context_window, 200_000);
+        assert_eq!(opus.context_window, 1_000_000);
     }
 
     #[test]

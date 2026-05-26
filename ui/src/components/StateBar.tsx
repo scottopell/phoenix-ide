@@ -334,7 +334,13 @@ export function StateBar({
   // and we have models and a callback. Error-state switch lets the user
   // recover from overload/quota by picking another model, then retrying.
   const currentModel = conversation?.model ?? '';
-  const is1m = currentModel.endsWith('-1m');
+  // Anthropic made 1M context GA on 2026-03-13: Opus 4.7, Opus 4.6, and
+  // Sonnet 4.6 carry 1M natively under their base id (no `-1m` suffix, no
+  // beta header). Detect 1M-capable models by inspecting the registry's
+  // declared context window so the badge keeps working without relying on
+  // the obsolete id suffix.
+  const is1m =
+    availableModels?.find(m => m.id === currentModel)?.context_window === 1_000_000;
   const canPickModel = !!(
     onUpgradeModel &&
     availableModels &&

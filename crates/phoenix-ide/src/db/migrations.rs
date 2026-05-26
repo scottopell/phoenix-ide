@@ -54,6 +54,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_notification_settings",
         sql: MIGRATION_008,
     },
+    Migration {
+        version: 9,
+        name: "rewrite_one_million_context_model_ids_to_base",
+        sql: MIGRATION_009,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -239,6 +244,28 @@ CREATE TABLE IF NOT EXISTS notification_settings (
 );
 ";
 
+/// Rewrite `claude-*-1m` model ids back to their base ids across persisted
+/// state. As of Anthropic's 2026-03-13 GA announcement, the 1M context
+/// window is native on Opus 4.6, Sonnet 4.6, and Opus 4.7 at standard
+/// pricing — no beta header, no separate `api_name`. The `-1m` variants in
+/// `all_models()` are being removed in the same commit; without this
+/// migration, conversations and chain Q&A rows that pinned a `-1m` id
+/// would fail to resolve a service after upgrade. Rewriting is loss-less:
+/// the old `-1m` rows shared `api_name` and pricing with their base.
+const MIGRATION_009: &str = r"
+UPDATE conversations SET model = 'claude-opus-4-7'   WHERE model = 'claude-opus-4-7-1m';
+UPDATE conversations SET model = 'claude-opus-4-6'   WHERE model = 'claude-opus-4-6-1m';
+UPDATE conversations SET model = 'claude-sonnet-4-6' WHERE model = 'claude-sonnet-4-6-1m';
+
+UPDATE turn_usage SET model = 'claude-opus-4-7'   WHERE model = 'claude-opus-4-7-1m';
+UPDATE turn_usage SET model = 'claude-opus-4-6'   WHERE model = 'claude-opus-4-6-1m';
+UPDATE turn_usage SET model = 'claude-sonnet-4-6' WHERE model = 'claude-sonnet-4-6-1m';
+
+UPDATE chain_qa SET model = 'claude-opus-4-7'   WHERE model = 'claude-opus-4-7-1m';
+UPDATE chain_qa SET model = 'claude-opus-4-6'   WHERE model = 'claude-opus-4-6-1m';
+UPDATE chain_qa SET model = 'claude-sonnet-4-6' WHERE model = 'claude-sonnet-4-6-1m';
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -323,6 +350,7 @@ mod tests {
                 parent_conversation_id TEXT, \
                 user_initiated BOOLEAN NOT NULL DEFAULT 1, \
                 archived BOOLEAN NOT NULL DEFAULT 0, \
+                model TEXT, \
                 state_updated_at TEXT NOT NULL DEFAULT '2025-01-01', \
                 created_at TEXT NOT NULL DEFAULT '2025-01-01', \
                 updated_at TEXT NOT NULL DEFAULT '2025-01-01'\
@@ -339,7 +367,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 8);
+        assert_eq!(first, 9);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -844,5 +872,73 @@ mod tests {
             top2["worktree_path"],
             "/repo/.phoenix/worktrees/top-explore"
         );
+    }
+
+    #[tokio::test]
+    async fn migration_009_rewrites_one_million_context_model_ids_to_base() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        // Seed three convs pinned to legacy `-1m` ids and one on a base id.
+        // The migration must rewrite the three `-1m` rows and leave the
+        // already-base row untouched.
+        let seeds = [
+            ("c-opus-7-1m", "claude-opus-4-7-1m"),
+            ("c-opus-6-1m", "claude-opus-4-6-1m"),
+            ("c-sonnet-6-1m", "claude-sonnet-4-6-1m"),
+            ("c-base", "claude-sonnet-4-6"),
+        ];
+        for (id, model) in seeds {
+            sqlx::query(
+                "INSERT INTO conversations (id, model, conv_mode, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+                 VALUES (?, ?, '{\"mode\":\"Direct\"}', '{\"type\":\"idle\"}', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(id)
+            .bind(model)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        async fn model_for(pool: &SqlitePool, id: &str) -> Option<String> {
+            sqlx::query("SELECT model FROM conversations WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+                .get::<Option<String>, _>("model")
+        }
+
+        assert_eq!(
+            model_for(&pool, "c-opus-7-1m").await.as_deref(),
+            Some("claude-opus-4-7")
+        );
+        assert_eq!(
+            model_for(&pool, "c-opus-6-1m").await.as_deref(),
+            Some("claude-opus-4-6")
+        );
+        assert_eq!(
+            model_for(&pool, "c-sonnet-6-1m").await.as_deref(),
+            Some("claude-sonnet-4-6")
+        );
+        assert_eq!(
+            model_for(&pool, "c-base").await.as_deref(),
+            Some("claude-sonnet-4-6"),
+            "Non -1m rows must not be touched"
+        );
+
+        // turn_usage and chain_qa are created by earlier migrations (004, 005);
+        // confirm migration 009's UPDATE statements against them did not error
+        // by checking the tables are queryable.
+        sqlx::query("SELECT COUNT(*) FROM turn_usage")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query("SELECT COUNT(*) FROM chain_qa")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     }
 }
