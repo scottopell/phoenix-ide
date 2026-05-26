@@ -11,7 +11,8 @@ This task establishes the final internal viewer API shape so the follow-up Pierr
 - Priority: P1.
 - This task is strictly sequenced before `pierre-diff-replacement`.
 - Visible UX change is allowed only as small cleanup required by the refactor: normalize header actions, loading/error/image states, renderer naming, and shell behavior where it reduces future integration risk.
-- `MetaViewer` renders already-resolved payloads. It does **not** own `/api/files/read` or diff fetching in this task.
+- `MetaViewer` renders already-resolved payloads. It does **not** own `/api/files/read` or diff fetching in this task, but this task **does** define the typed boundary between viewer open requests and resolved render payloads.
+- Establish the canonical viewer slot/state contract in this task: file, diff, image, HTML, and future viewer kinds should flow through one mutually exclusive viewer model, including `ViewerStateContext` and viewer restoration behavior where applicable.
 - Retire the `ProseReader` component/name internally. Do not keep it as a long-term compatibility wrapper.
 - Do not add `@pierre/diffs` in this task. Define the final diff payload/API shape using current DiffView underneath.
 - Review-note behavior should move toward shared hooks, not one giant MetaViewer god-component and not fully duplicated renderer-owned logic.
@@ -29,6 +30,9 @@ This task establishes the final internal viewer API shape so the follow-up Pierr
 3. Preserve existing review-note semantics for files and diffs.
 4. Preserve current FileViewer, DiffViewer, NotesPanel, and WorkActions user behavior while cleaning internal component boundaries.
 5. Make the follow-up Pierre diff migration a renderer swap behind the final MetaViewer/diff body contract, not another architectural refactor.
+6. Define the viewer open-state contract: canonical open request types, resolved payload types, one mutually exclusive viewer slot, and restoration behavior for file/diff/image/HTML viewer kinds.
+7. Extract file type and language classification out of `ProseReader` into a tested typed utility.
+8. Audit `TaskApprovalReader` for reusable Markdown/annotation primitives and either reuse the extracted pieces or document why approval-plan rendering remains separate.
 
 ## Non-goals
 
@@ -39,6 +43,7 @@ This task establishes the final internal viewer API shape so the follow-up Pierr
 - Do not remove existing HTML preview/open-in-browser functionality.
 - Do not change review-note formatted output semantics.
 - Do not change message rendering (`MessageComponents`, `StreamingMessage`) except if a tiny shared utility extraction is clearly required and low-risk.
+- Do not design a fully generic cross-renderer annotation/scroll capability framework in this task. Standardize practical shared hooks for today's file-review lifecycle; Pierre-specific typed `scrollTo`/annotation integration belongs in the follow-up diff replacement task.
 
 ## Current responsibilities to split
 
@@ -72,6 +77,11 @@ Current files/components to inspect and preserve:
 - `ui/src/components/viewer/formatNotes.ts`
 - `ui/src/contexts/ReviewNotesContext.tsx`
 - `ui/src/contexts/ViewerStateContext.tsx`
+- `ui/src/storage/lastViewerStorage.ts`
+- `ui/src/components/TaskApprovalReader.tsx`
+  - rendered Markdown approval-plan body
+  - annotatable Markdown blocks
+  - candidate for shared Markdown/annotation primitives, or explicit documented separation
 
 ## Proposed target shape
 
@@ -88,6 +98,20 @@ type MetaViewerPayload =
 ```
 
 The payload is **resolved/renderable**. For files, `FileViewer` remains the loader and normalizes `/api/files/read` results into a `MetaViewerPayload`.
+
+Also define the request/payload boundary explicitly:
+
+```ts
+type ViewerOpenRequest =
+  | FileViewerOpenRequest
+  | DiffViewerOpenRequest
+  | ImageViewerOpenRequest
+  | HtmlViewerOpenRequest;
+```
+
+`ViewerOpenRequest` represents intent such as "open this file path" or "open this conversation diff". Loader/adapters resolve those requests into `MetaViewerPayload`. `MetaViewer` itself renders only resolved payloads.
+
+The viewer state model should expose a single mutually exclusive viewer slot. File, diff, image, HTML preview/source, and future viewer kinds should not be modeled as parallel independent slots. Update `ViewerStateContext`, restoration behavior, and `lastViewerStorage` as needed to make this contract explicit.
 
 Suggested payload properties:
 
@@ -136,6 +160,10 @@ Suggested components/hooks:
 - `useReviewableViewer` / `useFileReviewNotes` / `useDiffReviewNotes`
   - shared hook(s) for add-note, jump, highlight, send, clear, note count, and formatted output
   - avoid copying the same review-note lifecycle into every renderer
+  - focus on today's practical file-review lifecycle; do not invent a broad generic renderer capability framework before the Pierre diff task needs one
+- `viewerFileTypes` / `viewerLanguage` utility or similar
+  - owns file type and syntax language classification that currently lives in `ProseReader`
+  - has focused tests so routing and syntax highlighting do not drift
 
 ## Behavioral requirements
 
@@ -146,6 +174,7 @@ Suggested components/hooks:
   - Plain text still renders line-by-line with line numbers.
   - HTML keeps both source and preview mode.
   - HTML preview remains sandboxed and still supports opening in a browser.
+  - HTML preview security semantics remain equivalent: sandbox attributes, script behavior, preview URL behavior, and explicit open-in-browser behavior must not loosen accidentally.
   - Images still render in the viewer shell.
   - Loading and error states remain clear and consistent.
 - Review notes remain equivalent:
@@ -162,16 +191,27 @@ Suggested components/hooks:
   - close/Escape behavior still works.
   - header actions remain available in the relevant renderer.
   - file viewer and diff viewer remain mutually exclusive where they are today.
+  - viewer restoration/back-to-conversation behavior remains equivalent, but is represented through the new single viewer slot contract.
+- Naming/CSS behavior is cleaned up with the refactor:
+  - production component/type/file names should no longer imply `ProseReader` owns all viewer modes.
+  - stale production CSS class names such as `prose-reader-*` should be renamed to renderer-neutral names as part of the move, except for explicitly bounded temporary migration shims.
 
 ## Acceptance criteria
 
-- `ProseReader` is removed as an internal public component/import path, or reduced only to a temporary test-only alias that is not used by production code. Production code uses `MetaViewer` plus specialized viewer bodies.
+- `ProseReader` is removed as an internal public component/import path, or reduced only to a temporary test-only alias that is not used by production code. Production code uses `MetaViewer` plus specialized viewer bodies. Review checklist: verify production code no longer imports `ProseReader`.
 - `FileViewer` still owns file loading but delegates all ready rendering to `MetaViewer` using typed resolved payloads.
+- A typed `ViewerOpenRequest` vs `MetaViewerPayload` boundary exists. Open requests represent user/app intent; resolved payloads represent renderable content. MetaViewer renders only the latter.
+- `ViewerStateContext` and viewer restoration/storage use one canonical mutually exclusive viewer slot rather than parallel file/diff/image state models. Update `lastViewerStorage` or its successor as needed.
 - HTML source/preview/open-browser behavior lives in a dedicated HTML renderer path, not mixed into Markdown/code/text rendering.
+- HTML preview sandbox/security behavior is preserved and validated by automated test where practical or explicit manual validation notes where browser security behavior is difficult to assert in unit tests.
+- File type and syntax-language classification is extracted from `ProseReader` into a typed utility with focused tests.
 - Image rendering is represented as a first-class MetaViewer payload/body, not as an unrelated special case outside the viewer model.
 - Diff viewing is represented in the MetaViewer payload/API shape, but still uses the current homegrown diff renderer internally. No Pierre dependency is added.
 - Shared review-note hook(s) exist and are used by at least the file-oriented renderers where practical; duplicated note/jump/send code is reduced and the remaining ownership is intentional.
 - Existing file-note and diff-note anchors remain compatible with `ReviewNotesContext`.
+- Shared file-review hooks standardize current add-note, jump, highlight, send, clear, and note-count behavior where practical. A fully generic cross-renderer annotation/scroll capability framework is not required in this task.
+- `TaskApprovalReader` is audited for overlap with the extracted Markdown/annotation primitives. It either reuses appropriate shared pieces or documents why approval-plan rendering remains separate.
+- Production CSS/classes and component names are updated away from misleading `prose-reader-*` ownership naming, except for explicitly bounded temporary shims.
 - Existing tests are updated or replaced to assert behavior at the new component boundaries.
 - Add focused tests for payload routing and at least one behavior-preservation path per renderer kind:
   - markdown
@@ -179,6 +219,9 @@ Suggested components/hooks:
   - HTML source/preview
   - image
   - current diff adapter
+  - viewer open request -> resolved payload adapter boundary
+  - single-slot viewer state/restoration behavior
+  - file type/language classification
 - `./dev.py check` passes.
 
 ## Implementation notes
@@ -188,6 +231,7 @@ Suggested components/hooks:
 - The final diff payload shape should make the Pierre replacement straightforward, but task 1 must not depend on Pierre types.
 - Watch for comments in moved code that describe stale `ProseReader` responsibilities; update or delete them rather than carrying misleading names forward.
 - If the split exposes ambiguous ownership between MetaViewer and renderer bodies, prefer typed payloads and renderer-local body state over boolean prop soup.
+- MetaViewer should route and compose; it should not simply become a renamed ProseReader that accumulates all renderer-specific state. Pragmatic exceptions are acceptable when the resulting type boundaries and tests remain clear.
 
 ## Follow-up dependency
 
