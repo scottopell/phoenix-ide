@@ -36,18 +36,25 @@ entirely during reconnects. This spec adds:
 
 Wire format changes are additive:
 
-- `SseWireEvent::StateChange` gains `state_updated_at: i64` (unix
-  milliseconds, server clock) — sourced from the existing
-  `Conversation.state_updated_at`.
+- `SseWireEvent::StateChange` gains `state_updated_at: DateTime<Utc>`,
+  serialised as RFC3339 on the wire — the same shape as the existing
+  Init carrier so both arrive in the same form. Client converts to ms
+  once at the SSE-handler boundary.
 - No new field on `Init.conversation`: the existing flattened
   `Conversation.state_updated_at` is already at the top level of the
   Init payload.
 - New `SseWireEvent::LlmFirstByte { request_id, sequence_id }` emitted from
   the token forwarder in `executor.rs:1740-1764`, exactly once per LLM
   request, immediately before the first `Token` event for that request.
-- Tool-use block `display_data` gains `started_at: i64`, set by
-  `dispatch_tool_execution` and propagated via `MessageUpdated` (reuses the
-  same convention as `duration_ms`, no new wire variant).
+- The assistant message's `display_data` gains a typed
+  `tool_starts: BTreeMap<String, i64>` map (keyed by `tool_use_id`,
+  unix-ms values), populated by `dispatch_tool_execution` and propagated
+  via `MessageUpdated` — message-level rather than tool-use-block-level
+  because `ContentBlock::ToolUse` is `{id, name, input}` with no
+  display_data field and is persisted/cross-provider (a typed field
+  there would require schema migration for a UI-side value). Mirrors the
+  duration_ms-on-tool-result-display_data convention; no new wire
+  variant.
 - SSE keep-alive switches from a comment line to a typed `event: ping`
   payload (small change in `api/sse.rs:69-73` and `handlers.rs:3277-3281`)
   so the client `EventSource` observes it for the watchdog. Forward-
@@ -69,7 +76,7 @@ in the sibling spec `specs/llm-retry-visibility/`.
 | Requirement | Status | Notes |
 |-------------|--------|-------|
 | **REQ-WPV-001:** Server-authoritative state-entry timestamp | ❌ New | Adds `state_updated_at` to `StateChange` (sourced from existing `Conversation.state_updated_at`); Init already exposes it via flatten. ts-rs regen + `parity_*` test update required |
-| **REQ-WPV-002:** Inline elapsed-time on in-flight artifacts | ❌ New | Tool widget timer via `display_data.started_at`; pending assistant bubble retains empty agent message during `llm_requesting` |
+| **REQ-WPV-002:** Inline elapsed-time on in-flight artifacts | ❌ New | Tool widget timer via the assistant message's `display_data.tool_starts[tool_use_id]` map (typed `BTreeMap<String, i64>`); pending assistant bubble retains empty agent message during `llm_requesting` |
 | **REQ-WPV-003:** StateBar derivation rule | 🔄 Extend | Existing `StateBar.tsx:341-422` composition gains retry-modifier and degraded-signal precedence; existing `tool_executing` timer path becomes a special case of the generalised rule |
 | **REQ-WPV-004:** Heartbeat watchdog | ❌ New | Threshold 35s; depends on keep-alive switch from SSE comment to typed `ping` event |
 | **REQ-WPV-005:** Connection state does not mask agent state | 🔄 Rewrite | `StateBar.tsx:349-373` currently short-circuits; replace with composition that retains last-known activity with frozen elapsed |
@@ -120,10 +127,14 @@ The corresponding Allium spec is
   `fresh` on any event. Invariant: `stale` is reachable only from
   `connected` (a reconnecting/offline socket already conveys the same
   information).
-- `PendingAssistantBubble` lifecycle: `not_present → placeholder`
-  (entering `llm_requesting`, no tokens) → `streaming` (first token
-  received) → `complete` (response finalised) | `removed` (phase exited
-  without tokens).
+- `PendingAssistantBubble` lifecycle (reusable across turns; idle
+  ground state is `not_present`): `not_present → placeholder` (entering
+  `llm_requesting`, no tokens) → `streaming` (first token received) →
+  `not_present` on the next assistant `Message` event (turn complete).
+  The "phase exited llm_requesting without any token" path also returns
+  the bubble to `not_present`. The state enum has three values —
+  `not_present | placeholder | streaming` — no terminal states, so the
+  bubble can re-arm on every subsequent turn.
 - Invariants: exactly one live timer in the StateBar at a time; the
   inline-artifact timer (on a tool or pending bubble) is independent and
   may coexist; `LastKnownActivity` is set iff `connectionState !=

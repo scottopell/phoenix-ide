@@ -31,15 +31,24 @@ on the displayed activity (REQ-WPV-003).
 ### REQ-WPV-001: Server-Authoritative Phase Entry Timestamp
 
 WHEN the conversation transitions to a new state
-THE SYSTEM SHALL include `state_updated_at` (unix milliseconds, server
-clock) in the `StateChange` SSE event — sourced from the existing
-`Conversation.state_updated_at: DateTime<Utc>` field the runtime already
-bumps on every transition
+THE SYSTEM SHALL include `state_updated_at` in the `StateChange` SSE
+event — sourced from the existing `Conversation.state_updated_at:
+DateTime<Utc>` field the runtime already bumps on every transition
 
 WHEN an SSE stream is opened (or reconnects)
 THE SYSTEM SHALL include `state_updated_at` in the `Init` snapshot,
 already carried at the top level of `init.conversation` via the
 `#[serde(flatten)]` on `EnrichedConversation`
+
+**Wire format:** Both carriers serialise the field as the default
+`DateTime<Utc>` shape (RFC3339 string, e.g.
+`"2026-05-25T20:24:36.123Z"`), NOT as a unix-ms integer. The client
+converts to ms-since-epoch once at the SSE-handler boundary (a single
+`Date.parse(s)` call) and stores the integer form in the conversation
+atom; every downstream consumer reads an integer. The wire is uniform
+across Init and StateChange because both fields come from the same
+serde-flattened `Conversation.state_updated_at` — there is no parallel
+integer-typed representation.
 
 **Rationale:** Elapsed-time displays must survive reconnect, page reload,
 and multi-tab observation. A client-derived timestamp at event-arrival

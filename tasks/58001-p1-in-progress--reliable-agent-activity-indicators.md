@@ -111,6 +111,8 @@ Each stage stands alone and ships value independently.
   known.
 - LLM retries are visible (not buried inside a 45s "thinking..."
   silence).
-- A wedged server is detected within ~20s and surfaced.
+- A wedged server is detected within ~35s and surfaced (the spec sets
+  HEARTBEAT_WATCHDOG_SECONDS=35; ~2.3x the 15s server keep-alive
+  interval, so a single missed keep-alive doesn't false-positive).
 - A reconnect during a working phase preserves the user's
   understanding of what was happening.

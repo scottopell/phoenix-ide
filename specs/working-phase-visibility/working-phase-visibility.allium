@@ -40,18 +40,35 @@
 --   specs/connection_machine/connection_machine.allium — ConnectionState
 --       enum imported; transitions consumed by REQ-WPV-005.
 --   specs/llm-retry-visibility/ — sibling spec, drafted in a follow-up
---       commit. Will own the canonical RetryContext value and the
---       producer of LlmAttempt SSE events. For now this spec inlines a
---       minimal RetryContext + render_retry_modifier helper marked
---       PLACEHOLDER below; when the sibling spec lands, the import
---       `use "../llm-retry-visibility/llm-retry-visibility.allium" as llm_retry`
---       is restored and the placeholders are deleted.
+--       commit (NOT yet present in this branch — so there is intentionally
+--       no allium import for it). Will own the canonical RetryContext
+--       value and the producer of LlmAttempt SSE events. Until the
+--       sibling lands, this spec inlines a minimal RetryContext and a
+--       render_retry_modifier_for helper marked PLACEHOLDER below; on
+--       landing, the placeholders are deleted and an import for the
+--       sibling spec is added to the imports block.
 --   specs/sse_wire/sse_wire.allium — wire envelope contract; this spec's
 --       new variants (LlmFirstByte) and field (StateChange.state_updated_at)
 --       extend it.
 --
--- Requirement traceability: REQ-WPV-001 through REQ-WPV-008
+-- Requirement traceability: REQ-WPV-001 through REQ-WPV-007 are modelled
+-- here. REQ-WPV-008 (display continuity across reload) is a property of
+-- the Init handling path and the sse_wire pending_truncated branch; it
+-- is intentionally NOT modelled as a rule in this spec because it is
+-- emergent from REQ-WPV-001's server-authoritative timestamps + the
+-- pending_truncated degraded-display branch documented in
+-- requirements.md. See `deferred Req008ReloadContinuity` below.
 
+-- Spec-vs-code name mapping (consumed by every `conn/ClientConnection
+-- ...state = live` use site below):
+--   spec name      <->  UI code name (ui/src/hooks/connectionMachine.ts)
+--   live           <->  'connected'
+--   reconnected_display <->  'reconnected'
+--   connecting | reconnecting | offline | disconnected  <->  same
+-- The "healthy enough that absence of events is suspicious" set used
+-- by REQ-WPV-004 is { live } (spec) == { 'connected' } (code). The
+-- brief grace state `reconnected_display` / 'reconnected' is excluded
+-- so the watchdog doesn't duplicate the connection chip's messaging.
 use "../connection_machine/connection_machine.allium" as conn
 
 ------------------------------------------------------------
@@ -461,7 +478,7 @@ rule WatchdogTick {
     when: ElapsedTickerFired(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI code: 'connected'; see ObservedPhase comment above
     requires: ObservedPhase{view}.working = true
     requires: now() - HeartbeatWatchdog{view}.last_event_at
               >= config.heartbeat_watchdog_seconds * 1000
@@ -490,7 +507,7 @@ rule WatchdogDisarmsOnConnectionDegrade {
 rule LastKnownActivityCapturedOnDegrade {
     when: ConnectionStateChanged(view, new_state)
 
-    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- prior state
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI: 'connected', prior state
     requires: new_state in { reconnecting, offline }
     requires: ObservedPhase{view}.working = true
 
@@ -775,7 +792,7 @@ rule DisplayWhenStreaming {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI code: 'connected'; see ObservedPhase comment above
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase = llm_requesting
     requires: PendingAssistantBubble{view}.state = streaming
@@ -794,7 +811,7 @@ rule DisplayWhenThinking {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI code: 'connected'; see ObservedPhase comment above
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase = llm_requesting
     requires: PendingAssistantBubble{view}.state in { not_present, placeholder }
@@ -817,7 +834,7 @@ rule DisplayWhenToolExecuting {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI code: 'connected'; see ObservedPhase comment above
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase = tool_executing
 
@@ -840,7 +857,7 @@ rule DisplayWhenOtherWorking {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI code: 'connected'; see ObservedPhase comment above
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase not in { llm_requesting, tool_executing }
 
@@ -861,7 +878,7 @@ rule DisplayWhenNotWorking {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI code: 'connected'; see ObservedPhase comment above
     requires: ObservedPhase{view}.working = false
 
     ensures: StateBarDisplay{view} = non_working_display(ObservedPhase{view})
@@ -874,7 +891,7 @@ rule DisplayWhenNotWorking {
 -- REQ-WPV-003: exactly one live elapsed counter in the StateBar.
 invariant SingleLiveTimerInStateBar {
     for v in ClientView:
-        live_timer_count_in(StateBarDisplay{view: v}.text) <= 1
+        live_timer_count_in(StateBarDisplay{view: v}.activity.text) <= 1
 }
 
 -- REQ-WPV-001: elapsed time is ALWAYS derived from a server-authoritative
@@ -900,7 +917,9 @@ invariant LastKnownActivityWellGated {
         implies conn/ClientConnection{conversation_id: v.conversation_id}.state in { reconnecting, offline }
 }
 
--- REQ-WPV-008: a fresh Init wipes any stale frozen activity.
+-- REQ-WPV-005: a fresh Init wipes any stale frozen activity (the
+-- captured last-known activity is for display-during-disconnect; when
+-- the next Init lands, the live phase is authoritative again).
 invariant InitClearsCapturedActivity {
     for v in ClientView:
         most_recent_event_was_init(v)
@@ -996,6 +1015,25 @@ deferred PerArtifactRetryBadge
     -- retry events to specific tool blocks; defer.
     -- Location: ui/src/components/MessageComponents.tsx
 
+deferred Req008ReloadContinuity
+    -- REQ-WPV-008 ("display continuity across reload, within 1s of
+    -- continuous-connect") is an emergent property of:
+    --   (a) REQ-WPV-001's server-authoritative state_updated_at being
+    --       carried on Init and StateChange (ObservedPhaseSeededFromInit
+    --       + ObservedPhaseUpdatedByStateChange rules above), and
+    --   (b) the pending_truncated=true degraded-display branch
+    --       documented in requirements.md, which reads from sse_wire's
+    --       InitSnapshot.pending_truncated flag.
+    -- The acceptance-criterion expression of REQ-WPV-008 lives in
+    -- requirements.md (the WHEN/THEN pair with the pending_truncated
+    -- branch); modelling it as an Allium rule here would duplicate
+    -- existing entity assignments without adding new behavioural
+    -- structure. The integration test that proves REQ-WPV-008 will
+    -- exercise the entity-assignment rules above plus the
+    -- ConversationActivityFeed surface guarantees.
+    -- Location: ui/src/conversation/atom.ts (Init reducer path),
+    -- and sse_wire.allium's InitSnapshot.pending_truncated.
+
 ------------------------------------------------------------
 -- Open questions
 ------------------------------------------------------------
@@ -1052,4 +1090,6 @@ deferred PerArtifactRetryBadge
 --     parallel `entered_at` field. On Init the value is already at the
 --     top of `init.conversation` via the `#[serde(flatten)]` on
 --     `EnrichedConversation`; on StateChange we add a typed
---     `state_updated_at: i64` field carrying the same value.
+--     `state_updated_at: DateTime<Utc>` field carrying the same value
+--     (RFC3339 on the wire to match the Init flatten; client converts
+--     to ms once at the SSE-handler boundary).

@@ -5,11 +5,12 @@
 Three surfaces, one wire change, one client state-machine extension.
 
 1. **Wire** (`crates/phoenix-ide/src/api/wire.rs`): `StateChange` gains
-   a `state_updated_at: i64` field (unix ms, sourced from the existing
-   `Conversation.state_updated_at`). New SSE event `LlmFirstByte` marks
-   the boundary inside `llm_requesting`. No new field on `Init` — the
-   existing flattened `Conversation.state_updated_at` is already at the
-   top level of the Init payload.
+   a `state_updated_at: DateTime<Utc>` field (RFC3339 on the wire,
+   matching the existing flattened Init carrier; sourced from the
+   existing `Conversation.state_updated_at` row field). New SSE event
+   `LlmFirstByte` marks the boundary inside `llm_requesting`. No new
+   field on `Init` — the existing flattened `Conversation.state_updated_at`
+   is already at the top level of the Init payload.
 2. **Runtime** (`crates/phoenix-ide/src/runtime/executor.rs`): emit
    `LlmFirstByte` from the token forwarder when the first token of an
    LLM request arrives; inject `started_at` into the assistant message's
@@ -24,7 +25,7 @@ Three surfaces, one wire change, one client state-machine extension.
 
 ## Wire Format Changes
 
-### `StateChange.state_updated_at: i64` (new field)
+### `StateChange.state_updated_at: DateTime<Utc>` (new field)
 
 ```rust
 StateChange {
@@ -32,27 +33,44 @@ StateChange {
     #[ts(type = "unknown")]
     state: Value,
     presentation_mode: String,
-    /// Unix milliseconds (server clock) at which the conversation entered
-    /// this state. Sourced from `Conversation.state_updated_at` — the same
-    /// `DateTime<Utc>` field the runtime already bumps on every state
-    /// transition (`db.rs:676`). Carrying it on the wire event makes
-    /// elapsed-time deterministic across reconnect / reload / multi-tab.
-    state_updated_at: i64,
+    /// The server clock at which the conversation entered this state —
+    /// the same `Conversation.state_updated_at: DateTime<Utc>` value the
+    /// runtime already bumps on every state transition (`db.rs:676`),
+    /// re-emitted on every StateChange for parity with the Init carrier.
+    /// Serialises as RFC3339 on the wire (matching the Init flatten);
+    /// the client converts to ms once at the SSE-handler boundary.
+    state_updated_at: DateTime<Utc>,
 }
 ```
 
-### `Init.conversation.state_updated_at: i64` (already present)
+### `Init.conversation.state_updated_at: string` (already present, RFC3339)
 
 `EnrichedConversation` flattens `Conversation` via `#[serde(flatten)]`
 (`runtime.rs:618-620`), so the existing `Conversation.state_updated_at:
 DateTime<Utc>` field is ALREADY at the top level of the Init payload's
-`conversation` object. No new struct is required; a fresh client reads
-`init.conversation.state_updated_at` and converts to unix ms.
+`conversation` object. No new struct is required.
 
-This satisfies "no parallel representations": one canonical
-`state_updated_at` on the conversation row, exposed verbatim on Init via
-the flatten, and re-emitted as `StateChange.state_updated_at` on every
-transition. There is no separately-tracked `entered_at` field.
+**Wire-format note:** `DateTime<Utc>` serialises to an RFC3339 string by
+default (e.g. `"2026-05-25T20:24:36.123456789Z"`), not an integer. So
+the wire shapes are asymmetric:
+
+| Carrier | Wire type | Source field |
+|---|---|---|
+| `Init.conversation.state_updated_at` | RFC3339 string | `Conversation.state_updated_at: DateTime<Utc>` (flatten, unchanged) |
+| `StateChange.state_updated_at` | RFC3339 string | same `DateTime<Utc>`, serialised the same way for parity |
+
+Both arrive on the wire as strings. The client converts to a unix-ms
+number once, at the SSE handler boundary (immediately when the event is
+parsed, before reaching the conversation atom), and stores the
+converted value in `phaseStateUpdatedAt: number | null`. From there
+every consumer reads an integer — the conversion happens in exactly one
+place. `Date.parse(rfc3339)` returns ms-since-epoch directly in JS, so
+the converter is one line.
+
+(Earlier drafts of this design typed `StateChange.state_updated_at` as
+`i64`. Replaced with the string form so Init and StateChange have the
+same wire type for the same value, avoiding two parallel
+representations of the same field.)
 
 (The original draft of this design proposed adding a new
 `Init.conversation.phase.entered_at` nested field. That would have
@@ -353,7 +371,8 @@ None. Decisions resolved during elicitation (session of 2026-05-25):
   `Conversation.state_updated_at` (already bumped on every transition)
   rather than introducing a parallel `entered_at` field. On Init the
   field is already at the top of `init.conversation` via flatten; on
-  StateChange it's added as `state_updated_at: i64`.
+  StateChange it's added as `state_updated_at: DateTime<Utc>` (RFC3339
+  on the wire to match the Init flatten; client converts to ms once).
 - Per-tool `started_at` carrier: a typed `tool_starts: BTreeMap<String,
   i64>` field on the assistant message's display_data — NOT a new field
   on `ContentBlock::ToolUse` (which would require schema migration and
