@@ -392,6 +392,13 @@ function LlmLanguageSection() {
   const [setting, setSetting] = useState<LlmLanguageSetting | null>(null);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Monotonic save id (mirrors NotificationsSection): rapid clicks issue
+  // multiple PUTs and we apply only the latest response to setting, so
+  // out-of-order completions don't overwrite the user's current selection.
+  const latestSaveRef = useRef(0);
+  // Last server-confirmed value — used to roll back the optimistic
+  // selection if the latest PUT fails.
+  const confirmedRef = useRef<LlmLanguageSetting | null>(null);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -401,7 +408,11 @@ function LlmLanguageSection() {
 
   useEffect(() => {
     api.getLlmLanguageSetting()
-      .then((loaded) => { if (mountedRef.current) setSetting(loaded); })
+      .then((loaded) => {
+        if (!mountedRef.current) return;
+        confirmedRef.current = loaded;
+        setSetting(loaded);
+      })
       .catch((err) => {
         if (!mountedRef.current) return;
         setError(err instanceof Error ? err.message : 'Failed to load LLM language');
@@ -410,17 +421,24 @@ function LlmLanguageSection() {
 
   const select = useCallback((next: string) => {
     if (!setting || setting.language === next) return;
+    const saveId = latestSaveRef.current + 1;
+    latestSaveRef.current = saveId;
     setSetting({ ...setting, language: next });
     setSaving(true);
     setError(null);
     api.updateLlmLanguageSetting(next)
       .then((saved) => {
-        if (!mountedRef.current) return;
+        // Only the latest save's response is allowed to mutate state.
+        // Earlier PUTs that arrive out of order are dropped on the floor.
+        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
+        confirmedRef.current = saved;
         setSetting(saved);
         setSaving(false);
       })
       .catch((err: unknown) => {
-        if (!mountedRef.current) return;
+        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
+        // Roll back the optimistic selection so the UI matches the server.
+        if (confirmedRef.current) setSetting(confirmedRef.current);
         setError(err instanceof Error ? err.message : 'Failed to save LLM language');
         setSaving(false);
       });
@@ -443,6 +461,7 @@ function LlmLanguageSection() {
               type="button"
               className={`settings-theme-btn${setting.language === lang ? ' active' : ''}`}
               onClick={() => select(lang)}
+              disabled={saving}
               title={lang === 'caveman' ? 'Ugg. Why use many word.' : 'Default Phoenix prose'}
             >
               {lang === 'phoenix-native' ? 'Phoenix' : lang === 'caveman' ? 'Caveman' : lang}

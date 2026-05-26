@@ -591,7 +591,10 @@ fn llm_language_setting_response(
 ) -> LlmLanguageSettingResponse {
     LlmLanguageSettingResponse {
         language: lang.as_str().to_string(),
-        available: vec!["phoenix-native".to_string(), "caveman".to_string()],
+        available: crate::llm_language::LlmLanguage::ALL
+            .iter()
+            .map(|l| l.as_str().to_string())
+            .collect(),
     }
 }
 

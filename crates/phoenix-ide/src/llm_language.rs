@@ -26,6 +26,12 @@ pub enum LlmLanguage {
 }
 
 impl LlmLanguage {
+    /// All known languages in display order. Single source of truth — the
+    /// settings API response, the migration's `DEFAULT 'phoenix-native'`,
+    /// and any future UI dropdown all key off this list. Adding a variant
+    /// here is the only edit required to expose a new language.
+    pub const ALL: &'static [Self] = &[Self::PhoenixNative, Self::Caveman];
+
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PhoenixNative => "phoenix-native",
@@ -34,11 +40,7 @@ impl LlmLanguage {
     }
 
     pub fn parse(s: &str) -> Option<Self> {
-        match s {
-            "phoenix-native" => Some(Self::PhoenixNative),
-            "caveman" => Some(Self::Caveman),
-            _ => None,
-        }
+        Self::ALL.iter().copied().find(|lang| lang.as_str() == s)
     }
 
     /// Parse with fallback to default for unknown / NULL values from old DB rows.

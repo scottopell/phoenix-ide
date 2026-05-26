@@ -161,7 +161,8 @@ CREATE TABLE IF NOT EXISTS conversations (
     updated_at TEXT NOT NULL,
     archived BOOLEAN NOT NULL DEFAULT 0,
     model TEXT,
-    llm_language TEXT NOT NULL DEFAULT 'phoenix-native',
+    -- llm_language column added by migration 010; not in SCHEMA so that
+    -- migration 010's ALTER TABLE doesn't collide on a fresh DB.
 
     FOREIGN KEY (parent_conversation_id)
         REFERENCES conversations(id) ON DELETE CASCADE
