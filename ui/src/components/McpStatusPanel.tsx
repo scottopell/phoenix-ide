@@ -82,7 +82,13 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
       if (result.restarted.length > 0) parts.push(`↻${result.restarted.length} restarted`);
       if (result.failed.length > 0) parts.push(`!${result.failed.length} failed`);
       if (result.unchanged.length > 0) parts.push(`${result.unchanged.length} unchanged`);
-      showToast(`MCP reload: ${parts.join(', ') || 'no servers'}`, 3000);
+      const message = `MCP reload: ${parts.join(', ') || 'no servers'}`;
+      if (result.failed.length > 0) {
+        const firstFailure = result.failed[0];
+        showError(`${message} (${firstFailure.server} ${firstFailure.action} failed)`, 5000);
+      } else {
+        showToast(message, 3000);
+      }
       // Keep reloading=true until the next poll shows fresh OAuth content
       // (effect below) or the safety timeout fires.
     } catch {

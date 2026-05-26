@@ -1500,14 +1500,21 @@ for line in sys.stdin:
             .await;
 
         assert_eq!(result.added, vec!["fixture"]);
-        for _ in 0..50 {
+        let mut connected = false;
+        let mut timed_out = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
             if !manager.status().await.is_empty() {
-                manager.shutdown().await;
-                return;
+                connected = true;
+                break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        panic!("fixture did not connect in background");
+        if !connected {
+            timed_out = true;
+        }
+        manager.shutdown().await;
+        assert!(!timed_out, "fixture did not connect in background");
     }
 
     #[tokio::test]
