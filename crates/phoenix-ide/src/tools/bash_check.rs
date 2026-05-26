@@ -7,7 +7,7 @@ use brush_parser::ast::{
     AndOr, AndOrList, Command, CommandPrefixOrSuffixItem, CompoundCommand, CompoundList, Pipeline,
     SimpleCommand,
 };
-use brush_parser::{Parser, ParserOptions, SourceInfo};
+use brush_parser::{Parser, ParserOptions};
 use std::io::Cursor;
 
 /// Error returned when a command is blocked
@@ -28,7 +28,7 @@ impl std::error::Error for CheckError {}
 /// Returns Ok(()) if safe to run, Err with helpful message if blocked.
 pub fn check(script: &str) -> Result<(), CheckError> {
     let cursor = Cursor::new(script);
-    let mut parser = Parser::new(cursor, &ParserOptions::default(), &SourceInfo::default());
+    let mut parser = Parser::new(cursor, &ParserOptions::default());
     let program = parser.parse_program().map_err(|_| CheckError {
         message: "Failed to parse script".into(),
     })?;
@@ -74,7 +74,7 @@ fn simplify_with_brush(script: &str, cwd: &str) -> Option<String> {
     use brush_parser::ast::SeparatorOperator;
 
     let cursor = Cursor::new(script);
-    let mut parser = Parser::new(cursor, &ParserOptions::default(), &SourceInfo::default());
+    let mut parser = Parser::new(cursor, &ParserOptions::default());
     let program = parser.parse_program().ok()?;
 
     // Process each complete command list
@@ -324,7 +324,7 @@ fn check_command(cmd: &Command) -> Result<(), CheckError> {
         Command::Simple(simple) => check_simple_command(simple),
         Command::Compound(compound, _redirects) => check_compound_command(compound),
         Command::Function(func) => check_compound_command(&func.body.0),
-        Command::ExtendedTest(_) => Ok(()), // [[ ... ]] doesn't execute commands
+        Command::ExtendedTest(_, _) => Ok(()), // [[ ... ]] doesn't execute commands
     }
 }
 
@@ -360,6 +360,9 @@ fn check_compound_command(cmd: &CompoundCommand) -> Result<(), CheckError> {
             Ok(())
         }
         CompoundCommand::Arithmetic(_) | CompoundCommand::ArithmeticForClause(_) => Ok(()),
+        // Coprocess runs a single command asynchronously in a subshell.
+        // Check that command's body the same as a simple subshell.
+        CompoundCommand::Coprocess(coproc) => check_command(&coproc.body),
     }
 }
 

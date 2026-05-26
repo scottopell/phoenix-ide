@@ -82,7 +82,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 
 # Browser automation
 chromiumoxide = { version = "0.9", default-features = false, features = ["fetcher", "rustls", "zip0"] }
-brush-parser = "0.3.0"
+brush-parser = "0.4"
 taskmd-core = ">=1.1,<2"
 listenfd = "1.0.2"
 nucleo-matcher = "0.3.1"
