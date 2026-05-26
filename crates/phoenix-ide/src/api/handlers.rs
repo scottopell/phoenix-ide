@@ -3387,6 +3387,8 @@ async fn reload_mcp(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!(
         added = ?result.added,
         removed = ?result.removed,
+        restarted = ?result.restarted,
+        failed = ?result.failed,
         unchanged = result.unchanged.len(),
         "MCP config reloaded"
     );

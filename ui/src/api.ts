@@ -436,10 +436,18 @@ export interface McpServerStatus {
   pending_oauth_url?: string;
 }
 
+export interface McpReloadFailure {
+  server: string;
+  action: string;
+  error: string;
+}
+
 export interface McpReloadResult {
   added: string[];
   removed: string[];
+  restarted: string[];
   unchanged: string[];
+  failed: McpReloadFailure[];
 }
 
 export interface GitBranchEntry {
