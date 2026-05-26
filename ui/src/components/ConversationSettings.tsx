@@ -97,6 +97,7 @@ export function ConversationSettings({
   const [branchPickerOpen, setBranchPickerOpen] = useState(false);
   const [taskDetail, setTaskDetail] = useState<{ path: string; content: string } | null>(null);
   const [taskDetailLoading, setTaskDetailLoading] = useState(false);
+  const [taskPage, setTaskPage] = useState(0);
   const comboRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -161,15 +162,23 @@ export function ConversationSettings({
     return () => { cancelled = true; };
   }, [selectedTask]);
   const activeTasks = tasks.filter(t => !['done', 'wont-do'].includes(t.status));
-  const importantTasks = activeTasks
-    .toSorted((a, b) => {
-      const priorityRank = (p: string) => {
-        const rank = Number(p.replace(/^p/, ''));
-        return Number.isNaN(rank) ? 9 : rank;
-      };
-      return priorityRank(a.priority) - priorityRank(b.priority) || a.id.localeCompare(b.id);
-    })
-    .slice(0, 8);
+  const sortedActiveTasks = activeTasks.toSorted((a, b) => {
+    const priorityRank = (p: string) => {
+      const rank = Number(p.replace(/^p/, ''));
+      return Number.isNaN(rank) ? 9 : rank;
+    };
+    return priorityRank(a.priority) - priorityRank(b.priority) || a.id.localeCompare(b.id);
+  });
+  const taskPageSize = 8;
+  const taskPageCount = Math.max(1, Math.ceil(sortedActiveTasks.length / taskPageSize));
+  const clampedTaskPage = Math.min(taskPage, taskPageCount - 1);
+  const pagedTasks = sortedActiveTasks.slice(
+    clampedTaskPage * taskPageSize,
+    clampedTaskPage * taskPageSize + taskPageSize,
+  );
+  useEffect(() => {
+    setTaskPage(0);
+  }, [tasks]);
 
   // Build display list: current branch first, then the rest in order received
   // (already sorted by recency from backend for local, or relevance for search).
@@ -292,13 +301,13 @@ export function ConversationSettings({
                 >
                   <span className="git-workflow-title">Pick a task</span>
                   <span className="git-workflow-desc">
-                    {selectedTask ? `${selectedTask.priority} ${selectedTask.id}: ${selectedTask.slug}` : taskPickerOpen ? 'Select a task below' : `${importantTasks.length} active tasks`}
+                    {selectedTask ? `${selectedTask.priority} ${selectedTask.id}: ${selectedTask.slug}` : taskPickerOpen ? 'Select a task below' : `${activeTasks.length} active tasks`}
                   </span>
                 </button>
                 {taskPickerOpen && (
                   <div className="task-start-list">
-                    {importantTasks.length === 0 && <div className="task-start-empty">No active tasks found.</div>}
-                    {importantTasks.map(t => (
+                    {activeTasks.length === 0 && <div className="task-start-empty">No active tasks found.</div>}
+                    {pagedTasks.map(t => (
                       <button
                         key={t.path}
                         type="button"
@@ -312,6 +321,31 @@ export function ConversationSettings({
                         </span>
                       </button>
                     ))}
+                    {taskPageCount > 1 && (
+                      <div className="task-start-pagination">
+                        <span>
+                          Showing {clampedTaskPage * taskPageSize + 1}-{Math.min((clampedTaskPage + 1) * taskPageSize, sortedActiveTasks.length)} of {sortedActiveTasks.length}
+                        </span>
+                        <span className="task-start-pagination-controls">
+                          <button
+                            type="button"
+                            className="task-start-page-button"
+                            disabled={clampedTaskPage === 0}
+                            onClick={() => setTaskPage(page => Math.max(0, page - 1))}
+                          >
+                            Prev
+                          </button>
+                          <button
+                            type="button"
+                            className="task-start-page-button"
+                            disabled={clampedTaskPage >= taskPageCount - 1}
+                            onClick={() => setTaskPage(page => Math.min(taskPageCount - 1, page + 1))}
+                          >
+                            Next
+                          </button>
+                        </span>
+                      </div>
+                    )}
                   </div>
                 )}
                 {selectedTask && (
