@@ -2941,6 +2941,27 @@ pre:hover .copy-btn {
   color: var(--text-muted);
 }
 
+.usage-panel-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.usage-panel-header-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.usage-panel-header-value {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
 .usage-stats-section {
   padding: 8px 12px;
 }
