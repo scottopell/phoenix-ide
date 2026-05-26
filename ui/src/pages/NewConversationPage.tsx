@@ -101,7 +101,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   // the user isn't tempted to type into a draft that can't be sent.
   const llmReady = conv.models === null || conv.models.llm_configured;
 
-  const inputPlaceholder = conv.startingPoint?.kind === 'task'
+  const inputPlaceholder = conv.workflow.kind === 'planFromTask'
     ? 'Optional notes for this task…'
     : 'What would you like to work on?';
 
@@ -139,16 +139,13 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             recentDirs={conv.recentDirs}
             isGitDir={conv.isGitDir}
             error={conv.error}
-            intent={conv.intent}
-            setIntent={conv.setIntent}
-            startingPoint={conv.startingPoint}
-            setStartingPoint={conv.setStartingPoint}
+            workflow={conv.workflow}
+            setWorkflow={conv.setWorkflow}
             tasks={conv.tasks}
             branches={conv.branches}
             currentBranch={conv.currentBranch}
-            baseBranch={conv.baseBranch}
-            setBaseBranch={conv.setBaseBranch}
             defaultBranch={conv.defaultBranch}
+            gitMetadataLoading={conv.gitMetadataLoading}
             branchSearch={conv.branchSearch}
             setBranchSearch={conv.setBranchSearch}
             branchSearchLoading={conv.branchSearchLoading}
@@ -197,16 +194,13 @@ rows={3}
             setShowAllModels={conv.setShowAllModels}
             isGitDir={conv.isGitDir}
             error={conv.error}
-            intent={conv.intent}
-            setIntent={conv.setIntent}
-            startingPoint={conv.startingPoint}
-            setStartingPoint={conv.setStartingPoint}
+            workflow={conv.workflow}
+            setWorkflow={conv.setWorkflow}
             tasks={conv.tasks}
             branches={conv.branches}
             currentBranch={conv.currentBranch}
-            baseBranch={conv.baseBranch}
-            setBaseBranch={conv.setBaseBranch}
             defaultBranch={conv.defaultBranch}
+            gitMetadataLoading={conv.gitMetadataLoading}
             branchSearch={conv.branchSearch}
             setBranchSearch={conv.setBranchSearch}
             branchSearchLoading={conv.branchSearchLoading}

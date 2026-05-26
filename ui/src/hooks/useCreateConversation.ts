@@ -29,11 +29,44 @@ function buildTaskStartPrompt(cwd: string, task: TaskEntry, extraInstructions: s
   ].filter(Boolean).join('\n');
 }
 
-export type ConversationIntent = 'direct' | 'fromExistingWork';
-export type StartingPoint =
-  | { kind: 'branch'; name: string }
-  | { kind: 'checkoutBranch'; name: string }
-  | { kind: 'task'; task: TaskEntry };
+export type NewConversationWorkflow =
+  | { kind: 'direct' }
+  | { kind: 'planFromBranch'; baseBranch: string | null }
+  | { kind: 'planFromTask'; task: TaskEntry | null; baseBranch: string | null }
+  | { kind: 'continueBranch'; branch: string | null };
+
+function workflowNeedsGit(workflow: NewConversationWorkflow): boolean {
+  return workflow.kind !== 'direct';
+}
+
+function workflowTask(workflow: NewConversationWorkflow): TaskEntry | null {
+  return workflow.kind === 'planFromTask' ? workflow.task : null;
+}
+
+function workflowBranch(workflow: NewConversationWorkflow): string | null {
+  switch (workflow.kind) {
+    case 'planFromBranch':
+      return workflow.baseBranch;
+    case 'planFromTask':
+      return workflow.baseBranch;
+    case 'continueBranch':
+      return workflow.branch;
+    case 'direct':
+      return null;
+  }
+}
+
+function deriveSubmission(workflow: NewConversationWorkflow): { mode: 'direct' | 'managed' | 'branch'; baseBranch: string | null } {
+  switch (workflow.kind) {
+    case 'direct':
+      return { mode: 'direct', baseBranch: null };
+    case 'planFromBranch':
+    case 'planFromTask':
+      return { mode: 'managed', baseBranch: workflowBranch(workflow) };
+    case 'continueBranch':
+      return { mode: 'branch', baseBranch: workflow.branch };
+  }
+}
 
 function getRecentDirs(): string[] {
   try {
@@ -64,19 +97,20 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [creating, setCreating] = useState(false);
 
   const [recentDirs, setRecentDirs] = useState<string[]>(() => getRecentDirs());
-  const [intent, setIntent] = useState<ConversationIntent>('direct');
-  const [startingPoint, setStartingPoint] = useState<StartingPoint | null>(null);
+  const [workflow, setWorkflow] = useState<NewConversationWorkflow>({ kind: 'direct' });
   const [tasks, setTasks] = useState<TaskEntry[]>([]);
   const [branches, setBranches] = useState<GitBranchEntry[]>([]);
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
-  const [baseBranch, setBaseBranch] = useState<string | null>(null);
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
+  const [gitMetadataLoading, setGitMetadataLoading] = useState(false);
   const [branchSearch, setBranchSearch] = useState('');
   const [branchSearchLoading, setBranchSearchLoading] = useState(false);
 
   const voiceSupported = isWebSpeechSupported();
   const [interimText, setInterimText] = useState('');
   const draftBeforeVoiceRef = useRef<string>('');
+  const metadataRequestSeqRef = useRef(0);
+  const workflowTouchedCwdRef = useRef<string | null>(null);
 
   // Subscribe to the shared models poller so credential transitions
   // (Codex sign-in/sign-out, gateway flips) reach this page without a
@@ -110,63 +144,79 @@ export function useCreateConversation(navigate: (path: string) => void) {
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
 
-  useEffect(() => { if (isGitDir === false) setIntent('direct'); }, [isGitDir]);
+  useEffect(() => {
+    if (isGitDir === false && workflowNeedsGit(workflow)) setWorkflow({ kind: 'direct' });
+  }, [isGitDir, workflow]);
 
   useEffect(() => {
     setBranches([]);
     setTasks([]);
     setCurrentBranch(null);
-    setBaseBranch(null);
     setDefaultBranch(null);
-    setStartingPoint(null);
+    setGitMetadataLoading(false);
+    setWorkflow(prev => workflowNeedsGit(prev) ? { kind: 'direct' } : prev);
     setBranchSearch('');
   }, [cwd]);
 
   useEffect(() => {
-    if (!isGitDir || intent !== 'fromExistingWork') {
+    if (!isGitDir) {
       setBranches([]);
       setTasks([]);
       setCurrentBranch(null);
-      setBaseBranch(null);
       setDefaultBranch(null);
-      setStartingPoint(null);
+      setGitMetadataLoading(false);
       setBranchSearch('');
       return;
     }
     const trimmedCwd = cwd.trim();
     if (!trimmedCwd) return;
 
+    const requestSeq = ++metadataRequestSeqRef.current;
     let cancelled = false;
-    api.listGitBranches(trimmedCwd).then(resp => {
-      if (cancelled) return;
-      setBranches(resp.branches);
-      setCurrentBranch(resp.current);
-      setDefaultBranch(resp.default_branch ?? null);
-      const initialBranch = resp.default_branch ?? resp.current;
-      setBaseBranch(initialBranch);
-      setStartingPoint(prev => prev ?? (initialBranch ? { kind: 'branch', name: initialBranch } : null));
-    }).catch(err => {
-      if (cancelled) return;
-      console.warn('Failed to fetch git branches:', err);
-      setBranches([]);
-      setCurrentBranch(null);
-      setDefaultBranch(null);
-      setBaseBranch(null);
-    });
-    api.listProjectTasks(trimmedCwd).then(resp => {
-      if (cancelled) return;
-      setTasks(resp.tasks);
-    }).catch(err => {
-      if (cancelled) return;
-      console.warn('Failed to fetch tasks:', err);
-      setTasks([]);
+    setGitMetadataLoading(true);
+    Promise.allSettled([
+      api.listGitBranches(trimmedCwd),
+      api.listProjectTasks(trimmedCwd),
+    ]).then(([branchesResult, tasksResult]) => {
+      if (cancelled || requestSeq !== metadataRequestSeqRef.current || cwd.trim() !== trimmedCwd) return;
+
+      if (branchesResult.status === 'fulfilled') {
+        const resp = branchesResult.value;
+        setBranches(resp.branches);
+        setCurrentBranch(resp.current);
+        setDefaultBranch(resp.default_branch ?? null);
+        const initialBranch = resp.default_branch ?? resp.current;
+        setWorkflow(prev => {
+          if (!initialBranch) return prev;
+          if (prev.kind === 'direct') return workflowTouchedCwdRef.current === trimmedCwd ? prev : { kind: 'planFromBranch', baseBranch: initialBranch };
+          if (workflowBranch(prev)) return prev;
+          if (prev.kind === 'planFromBranch') return { ...prev, baseBranch: initialBranch };
+          if (prev.kind === 'planFromTask') return { ...prev, baseBranch: initialBranch };
+          if (prev.kind === 'continueBranch') return { ...prev, branch: initialBranch };
+          return prev;
+        });
+      } else {
+        console.warn('Failed to fetch git branches:', branchesResult.reason);
+        setBranches([]);
+        setCurrentBranch(null);
+        setDefaultBranch(null);
+      }
+
+      if (tasksResult.status === 'fulfilled') {
+        setTasks(tasksResult.value.tasks);
+      } else {
+        console.warn('Failed to fetch tasks:', tasksResult.reason);
+        setTasks([]);
+      }
+    }).finally(() => {
+      if (!cancelled && requestSeq === metadataRequestSeqRef.current) setGitMetadataLoading(false);
     });
 
     return () => { cancelled = true; };
-  }, [isGitDir, intent, cwd]);
+  }, [isGitDir, cwd]);
 
   useEffect(() => {
-    if (!isGitDir || intent !== 'fromExistingWork' || !branchSearch.trim()) return;
+    if (!isGitDir || !branchSearch.trim()) return;
     const trimmedCwd = cwd.trim();
     if (!trimmedCwd) return;
 
@@ -186,23 +236,26 @@ export function useCreateConversation(navigate: (path: string) => void) {
     }, 300);
 
     return () => { clearTimeout(timer); setBranchSearchLoading(false); };
-  }, [isGitDir, intent, cwd, branchSearch]);
+  }, [isGitDir, cwd, branchSearch]);
 
-  const activeStartingPoint = intent === 'fromExistingWork' ? startingPoint : null;
-  const effectiveBranch = activeStartingPoint
-    ? (activeStartingPoint.kind === 'branch' || activeStartingPoint.kind === 'checkoutBranch' ? activeStartingPoint.name : (baseBranch ?? currentBranch ?? defaultBranch))
+  const selectedTask = workflowTask(workflow);
+  const selectedBranchConflict = workflow.kind === 'continueBranch' && workflow.branch
+    ? branches.find(b => b.name === workflow.branch)?.conflict_slug ?? null
     : null;
-  const selectedBranchConflict = activeStartingPoint?.kind === 'checkoutBranch' && effectiveBranch
-    ? branches.find(b => b.name === effectiveBranch)?.conflict_slug ?? null
-    : null;
-  const selectedTaskConflict = activeStartingPoint?.kind === 'task'
-    ? activeStartingPoint.task.conversation_slug ?? null
-    : null;
+  const selectedTaskConflict = selectedTask?.conversation_slug ?? null;
   const selectedConflictSlug = selectedTaskConflict ?? selectedBranchConflict;
-  const hasStartingPoint = intent === 'direct' || Boolean(activeStartingPoint);
-  const hasMessageContent = draft.trim().length > 0 || images.length > 0 || activeStartingPoint?.kind === 'task';
+  const hasWorkflowStartingPoint = workflow.kind === 'direct' || Boolean(workflowBranch(workflow));
+  const hasMessageContent = draft.trim().length > 0 || images.length > 0 || Boolean(selectedTask);
+  const taskWorkflowReady = workflow.kind !== 'planFromTask' || Boolean(selectedTask);
+  const gitWorkflowReady = !workflowNeedsGit(workflow)
+    || (isGitDir === true && !gitMetadataLoading && !branchSearchLoading && hasWorkflowStartingPoint && taskWorkflowReady);
 
-  const canSend = hasMessageContent && !creating && dirStatus !== 'invalid' && dirStatus !== 'checking' && hasStartingPoint && !selectedConflictSlug;
+  const canSend = hasMessageContent
+    && !creating
+    && dirStatus !== 'invalid'
+    && dirStatus !== 'checking'
+    && gitWorkflowReady
+    && !selectedConflictSlug;
 
   const addImages = async (files: File[]) => {
     try {
@@ -246,7 +299,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   const handleSend = async () => {
     const trimmed = draft.trim();
-    const taskStartProvidesContent = activeStartingPoint?.kind === 'task';
+    const taskStartProvidesContent = Boolean(selectedTask);
     if (!trimmed && images.length === 0 && !taskStartProvidesContent) return;
     if (creating || dirStatus === 'invalid' || dirStatus === 'checking') return;
 
@@ -265,35 +318,38 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
       const messageId = generateUUID();
       const trimmedCwd = cwd.trim();
-      if (intent === 'fromExistingWork' && !activeStartingPoint) {
-        setError('Pick a branch or task to start from.');
+      if (workflowNeedsGit(workflow) && isGitDir !== true) {
+        setError('Choose a Git repository before starting an isolated workflow.');
         setCreating(false);
         return;
       }
-      if (intent === 'fromExistingWork' && selectedConflictSlug) {
+      if (workflowNeedsGit(workflow) && (gitMetadataLoading || branchSearchLoading)) {
+        setError('Still loading Git branches. Try again in a moment.');
+        setCreating(false);
+        return;
+      }
+      const submission = deriveSubmission(workflow);
+      if (workflowNeedsGit(workflow) && !submission.baseBranch) {
+        setError('Pick a Git branch to start from.');
+        setCreating(false);
+        return;
+      }
+      if (workflow.kind === 'planFromTask' && !selectedTask) {
+        setError('Pick a task file before starting from a task.');
+        setCreating(false);
+        return;
+      }
+      if (selectedConflictSlug) {
         setError('That starting point already has an active conversation.');
         setCreating(false);
         return;
       }
-      const backendMode = intent === 'direct'
-        ? 'direct'
-        : activeStartingPoint?.kind === 'checkoutBranch'
-          ? 'branch'
-          : 'managed';
-      const submitBranch = intent === 'fromExistingWork'
-        ? (activeStartingPoint?.kind === 'branch' || activeStartingPoint?.kind === 'checkoutBranch' ? activeStartingPoint.name : (baseBranch ?? currentBranch ?? defaultBranch))
-        : null;
-      if (intent === 'fromExistingWork' && !submitBranch) {
-        setError('Pick a Git starting point.');
-        setCreating(false);
-        return;
-      }
-      const submitText = activeStartingPoint?.kind === 'task'
-        ? buildTaskStartPrompt(trimmedCwd, activeStartingPoint.task, trimmed)
+      const submitText = selectedTask
+        ? buildTaskStartPrompt(trimmedCwd, selectedTask, trimmed)
         : trimmed;
       const conv = await createConversationWithStore(
-        trimmedCwd, submitText, messageId, selectedModel || undefined, images, backendMode,
-        submitBranch,
+        trimmedCwd, submitText, messageId, selectedModel || undefined, images, submission.mode,
+        submission.baseBranch,
       );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
@@ -302,6 +358,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setError(err instanceof Error ? err.message : 'Failed to create conversation');
       setCreating(false);
     }
+  };
+
+  const setWorkflowFromUser = (next: NewConversationWorkflow) => {
+    workflowTouchedCwdRef.current = cwd.trim();
+    setWorkflow(next);
   };
 
   return {
@@ -323,16 +384,13 @@ export function useCreateConversation(navigate: (path: string) => void) {
     error,
     creating,
     canSend,
-    intent,
-    setIntent,
-    startingPoint,
-    setStartingPoint,
+    workflow,
+    setWorkflow: setWorkflowFromUser,
     tasks,
     branches,
     currentBranch,
-    baseBranch,
-    setBaseBranch,
     defaultBranch,
+    gitMetadataLoading,
     branchSearch,
     setBranchSearch,
     branchSearchLoading,

@@ -5348,47 +5348,113 @@ html * {
 
 .new-conv-workflow-layout {
   display: grid;
-  grid-template-columns: minmax(160px, 0.42fr) minmax(0, 1fr);
-  gap: 12px;
-  margin-top: 8px;
-  align-items: stretch;
+  gap: 8px;
+  margin-top: 10px;
 }
 
-.new-conv-workflows {
+.new-conv-workflow-heading {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.new-conv-workflow-heading > .new-conv-workflow-hint {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.new-conv-workflows,
+.new-conv-workflow-alternates {
   display: grid;
   gap: 8px;
   align-content: start;
   margin-top: 0;
 }
 
+.new-conv-workflow-alternates--three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
+.new-conv-workflow-alternates--two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
 .workflow-card {
+  position: relative;
   display: flex;
   gap: 8px;
-  padding: 10px;
-  border: 1px solid var(--border);
+  padding: 10px 9px;
+  border: 1px solid var(--border-color);
   border-radius: 6px;
   cursor: pointer;
   min-width: 0;
 }
 
+.workflow-card--hero {
+  justify-content: center;
+  padding: 12px 10px;
+  border-color: color-mix(in srgb, var(--accent-blue) 45%, var(--border-color));
+  text-align: center;
+}
+
+.workflow-card--hero input[type="radio"] {
+  margin-top: 1px;
+}
+
+.workflow-card--hero.workflow-card--active::after {
+  top: 10px;
+  right: 11px;
+}
+
+.workflow-card--discouraged:not(.workflow-card--active) {
+  opacity: 0.72;
+}
+
+.workflow-card--discouraged:not(.workflow-card--active):hover {
+  opacity: 0.9;
+}
+
 .workflow-card--active {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 8%, transparent);
+}
+
+.workflow-card--active::after {
+  content: '✓';
+  position: absolute;
+  top: 8px;
+  right: 9px;
+  color: var(--accent-blue);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.workflow-card-radio {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
 }
 
 .workflow-card input[type="radio"] {
   margin-top: 3px;
-  accent-color: var(--accent);
+  accent-color: var(--accent-blue);
 }
 
 .workflow-card-content {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 3px;
+  min-width: 0;
+}
+
+.workflow-card--hero .workflow-card-content {
+  align-items: center;
 }
 
 .workflow-card-content strong {
   font-size: 12px;
+  line-height: 1.25;
 }
 
 .workflow-card-content span {
@@ -5398,7 +5464,11 @@ html * {
 }
 
 .new-conv-workflow-detail {
-  min-width: 0;
+  margin-top: 2px;
+  padding: 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
 }
 
 .workflow-detail-empty {
@@ -5428,6 +5498,12 @@ html * {
   gap: 6px;
 }
 
+.git-workflow-summary {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .git-workflow-option {
   text-align: left;
   padding: 8px 10px;
@@ -5442,8 +5518,8 @@ html * {
 }
 
 .git-workflow-option--active {
-  border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: var(--accent-blue);
+  background: color-mix(in srgb, var(--accent-blue) 8%, transparent);
 }
 
 .git-workflow-title {
@@ -5476,7 +5552,7 @@ html * {
 }
 
 .task-start-item--active {
-  border-color: var(--accent);
+  border-color: var(--accent-blue);
 }
 
 .task-start-priority {
@@ -5612,7 +5688,7 @@ html * {
 }
 
 @media (width <= 760px) {
-  .new-conv-workflow-layout {
+  .new-conv-workflow-alternates {
     grid-template-columns: 1fr;
   }
 }
