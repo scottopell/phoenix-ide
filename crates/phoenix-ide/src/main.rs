@@ -56,21 +56,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    // Install the rustls crypto provider explicitly. rustls 0.23 refuses
+    // Install a rustls crypto provider explicitly. rustls 0.23 refuses
     // to auto-pick when both `ring` and `aws-lc-rs` end up in the dep
     // tree — which happens here via reqwest (aws-lc-rs) + our direct
     // rustls = { features = ["ring"] } and several transitive consumers
     // (chromiumoxide, hyper-rustls). Without this call the first
-    // `ServerConfig::builder()` call panics on startup. ring is our
-    // chosen provider (matches the feature flag on the direct rustls
-    // dep and stays consistent with our existing TLS code paths).
+    // `ServerConfig::builder()` call panics on startup.
+    //
+    // Preference: install `ring` when no provider is already set. ring
+    // matches the feature flag on our direct rustls dep and stays
+    // consistent with our existing TLS code paths.
     //
     // `install_default()` returns `Err(existing)` if a provider was
-    // already installed earlier in the process — benign on its own
-    // (some libraries may install one as a side effect of import).
-    // Log and continue rather than crashing the binary on a benign
-    // race; the panic we're trying to prevent only occurs when no
-    // provider is installed at all.
+    // already installed earlier in the process — typically benign
+    // (an upstream library may set one as an import side effect). We
+    // accept whichever provider is in place rather than crashing on
+    // that race; the panic we're trying to prevent only occurs when
+    // NO provider is installed at all.
     if rustls::crypto::ring::default_provider()
         .install_default()
         .is_err()
