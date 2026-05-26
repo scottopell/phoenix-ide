@@ -74,8 +74,11 @@ export interface BuildInputs {
   pendingMessages: QueuedMessage[];
   convState: ConversationState;
   /** Tag for the active streaming session (null when no buffer). Built
-   *  by the caller from `useStreamingStartedAt(slug)`; the key
-   *  embeds startedAt so back-to-back sessions remount cleanly. */
+   *  by the caller from `useStreamingRequestId(slug)`; the key is the
+   *  server-allocated `request_id` for the in-flight LLM dispatch and
+   *  also becomes the finalized agent message's `message_id`, so the
+   *  streaming `TailUnit` and the eventual `agent_turn` `HistoricalUnit`
+   *  share a key by construction — symmetric to pending_user → user. */
   streamingHandle: { key: string } | null;
 }
 
@@ -92,11 +95,15 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits;
   treats it as an in-place update on a single keyed node — no
   cross-region promotion, no scroll compensation needed).
 - `sub_agent_status`: `key = 'sub-agent-status'` (singleton)
-- `streaming_agent`: `key = 'streaming-${conversationId}-${startedAt}'` —
-  the `startedAt` from `StreamingBuffer` makes the key stable across token
-  arrivals but unique per streaming session. The atom owns the buffer; the
-  unit just needs to be identity-stable so React preserves the leaf state
-  across re-derivations.
+- `streaming_agent`: `key = streamingBuffer.requestId` — the server-allocated
+  `request_id` for the active LLM dispatch. Stable across all tokens in
+  the session (every Token SSE event carries it) AND becomes the
+  finalized agent message's `message_id` on persistence, so the
+  streaming `TailUnit` and the eventual `agent_turn` `HistoricalUnit`
+  share a render-unit key. The streaming → sent transition is therefore
+  an in-place keyed update on a single render unit — symmetric to
+  pending_user → user (REQ-MLRU-001). No cross-region key swap, no
+  imperative scroll compensation needed for the transition.
 
 ## Construction Algorithm
 
@@ -217,10 +224,12 @@ function buildAgentTurn(
 
 The function is pure, takes only data, has no DOM dependencies, and is
 fully unit-testable. `streamingHandle` is derived at the call site
-via `useStreamingStartedAt(slug)`: when streaming is active the hook
-returns the buffer's `startedAt` (a number stable across tokens but
-unique per session), which MessageList wraps into
-`{ key: \`streaming-${slug}-${startedAt}\` }`.
+via `useStreamingRequestId(slug)`: when streaming is active the hook
+returns the buffer's `requestId` (the server-allocated `request_id`
+stable across all tokens in the session AND identical to the eventual
+finalized `AssistantMessage.message_id`), which MessageList wraps into
+`{ key: requestId }`. The streaming → sent transition therefore
+preserves render-unit identity by construction.
 
 ## Virtualization (REQ-MLRU-015)
 

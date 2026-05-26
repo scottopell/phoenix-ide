@@ -274,14 +274,28 @@ function MessageListImpl({
   const prevStreamingRequestIdRef = useRef(streamingRequestId);
   const prevPendingLengthRef = useRef(pendingMessages.length);
   const prevConversationIdRef = useRef(conversationId);
-  // Stable ref read by handleTotalListHeightChanged (which is bound once
-  // via useCallback([]) and cannot see the live prop directly). Used to
-  // gate the height-driven unread path on streaming activity so that
-  // unrelated height changes — system prompt header toggle, image load
-  // in an older message, late-arriving syntax highlighter on a scrolled-
-  // past code block — don't spuriously raise "↓ New messages".
+  // Refs read by handleTotalListHeightChanged (bound via useCallback and
+  // cannot see live props directly):
+  //   - streamingRequestIdRef: gate height-driven unread on streaming
+  //     activity so unrelated height changes (header toggle, image load
+  //     in old message, late-arriving syntax highlighter) don't raise
+  //     "↓ New messages".
+  //   - convStateRef: also let `awaiting_sub_agents` count as active tail
+  //     activity. `persist_sub_agent_results` updates the existing
+  //     spawn_agents tool message via MessageUpdated rather than
+  //     appending — messages.length stays the same, no stream is active,
+  //     but the rendered tail genuinely grew.
+  //   - lastSeenConvIdRef: tracks the conversationId at the last
+  //     totalListHeightChanged callback. When it diverges from the live
+  //     prop, virtuoso just re-keyed to a new conversation and emitted
+  //     its first measurement for it; discard the stale baseline. Doing
+  //     this inside the callback (rather than a passive useEffect) is
+  //     synchronous with virtuoso's measurement timing.
   const streamingRequestIdRef = useRef(streamingRequestId);
+  const convStateRef = useRef(convState);
+  const lastSeenConvIdRef = useRef(conversationId);
   streamingRequestIdRef.current = streamingRequestId;
+  convStateRef.current = convState;
 
   useEffect(() => {
     const conversationChanged = prevConversationIdRef.current !== conversationId;
@@ -333,6 +347,18 @@ function MessageListImpl({
   //   - past PIN threshold AND height shrank → unrelated render churn
   //     (e.g. an item collapsed); leave alone.
   const handleTotalListHeightChanged = useCallback((newHeight: number) => {
+    // Detect conversation switch synchronously. virtuoso re-keys to the
+    // new conversation on `key={conversationId}` change and emits its
+    // first totalListHeightChanged for the new conversation during
+    // mount/measurement — which can happen before any passive useEffect
+    // runs. If the lastSeenConvIdRef baseline diverges from the live
+    // prop, treat this as the first measurement of the new conversation
+    // and reseat the prevTotalHeightRef baseline without acting on it.
+    if (lastSeenConvIdRef.current !== conversationId) {
+      lastSeenConvIdRef.current = conversationId;
+      prevTotalHeightRef.current = newHeight;
+      return;
+    }
     const prevHeight = prevTotalHeightRef.current;
     prevTotalHeightRef.current = newHeight;
     if (allUnitsLengthRef.current === 0) return;
@@ -351,16 +377,27 @@ function MessageListImpl({
         align: 'end',
         behavior: 'auto',
       });
-    } else if (newHeight > prevHeight && streamingRequestIdRef.current !== null) {
-      // Only treat height growth as "unread tail content" when streaming
-      // is actually active. Otherwise unrelated growth (header toggle,
-      // image load in an older message, late syntax-highlighter mount
-      // on a scrolled-past code block) would spuriously raise the
-      // "↓ New messages" button. Length-grew append cases are covered
-      // by the separate useEffect on messages.length / pending.
-      setHasUnreadTailContent(true);
+    } else if (newHeight > prevHeight) {
+      // Only treat height growth as "unread tail content" when there's
+      // genuine server-driven activity at the tail. Otherwise unrelated
+      // growth — header toggle, image load in older message, late
+      // syntax-highlighter mount on scrolled-past code block — would
+      // spuriously raise the "↓ New messages" button.
+      //
+      // Two coarse signals indicate genuine tail activity:
+      //   - active stream (token text growing inside the tail unit)
+      //   - awaiting_sub_agents phase (persist_sub_agent_results updates
+      //     the existing spawn_agents message via MessageUpdated;
+      //     same-length but the rendered tail grows)
+      // Length-grew append cases are covered by the separate
+      // useEffect on messages.length / pending.
+      const streamingActive = streamingRequestIdRef.current !== null;
+      const subAgentsActive = convStateRef.current.type === 'awaiting_sub_agents';
+      if (streamingActive || subAgentsActive) {
+        setHasUnreadTailContent(true);
+      }
     }
-  }, []);
+  }, [conversationId]);
 
   const scrollToNewest = useCallback(() => {
     if (allUnitsLengthRef.current === 0) return;
