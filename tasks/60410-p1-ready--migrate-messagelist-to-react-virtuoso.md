@@ -1,10 +1,3 @@
----
-created: 2026-05-25
-priority: p1
-status: ready
-artifact: ui/src/components/MessageList.tsx
----
-
 # Migrate MessageList virtualization from spacer-based progressive rendering to react-virtuoso
 
 ## Why now

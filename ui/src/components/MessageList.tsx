@@ -243,7 +243,15 @@ function MessageListImpl({
   // mount growth doesn't kick us out), imperatively re-snap. Past the
   // threshold means the user has intentionally scrolled up — respect
   // that and let the jump-to-newest button do its job.
+  // Read latest length without re-binding the callback per render.
+  // `data.length === 0` is reachable when systemPrompt is present but no
+  // messages have arrived; calling `scrollToIndex({ index: 'LAST' })` on
+  // an empty list is library-undefined.
+  const allUnitsLengthRef = useRef(allUnits.length);
+  allUnitsLengthRef.current = allUnits.length;
+
   const handleTotalListHeightChanged = useCallback(() => {
+    if (allUnitsLengthRef.current === 0) return;
     const s = scrollerRef.current;
     if (!s) return;
     const fromBottom = s.scrollHeight - s.scrollTop - s.clientHeight;
@@ -257,6 +265,7 @@ function MessageListImpl({
   }, []);
 
   const scrollToNewest = useCallback(() => {
+    if (allUnitsLengthRef.current === 0) return;
     virtuosoRef.current?.scrollToIndex({
       index: 'LAST',
       align: 'end',
@@ -314,7 +323,11 @@ function MessageListImpl({
             atBottomThreshold={PIN_TO_BOTTOM_THRESHOLD}
             atBottomStateChange={handleAtBottomStateChange}
             totalListHeightChanged={handleTotalListHeightChanged}
-            initialTopMostItemIndex={{ index: 'LAST', align: 'end' }}
+            // `'LAST'` is library-defined only when `data` has at least one
+            // item. With a system prompt and no messages, allUnits is empty;
+            // fall back to index 0 (the Header) so the prop is structurally
+            // valid in every state.
+            initialTopMostItemIndex={allUnits.length > 0 ? { index: 'LAST', align: 'end' } : 0}
             alignToBottom
             increaseViewportBy={{ top: 600, bottom: 600 }}
             {...(SystemPromptHeaderSlot ? { components: { Header: SystemPromptHeaderSlot } } : {})}

@@ -1475,6 +1475,9 @@ pre:hover .copy-btn {
   display: flex;
   flex-direction: column;
   gap: 16px;
+  max-width: 800px;
+  margin: 0 auto;
+  width: 100%;
 }
 
 /* Fade in animation for content after skeleton — shares @keyframes fade-in defined below */
