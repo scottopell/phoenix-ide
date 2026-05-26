@@ -342,12 +342,8 @@ impl ChainQa {
         // The chain root pins the language for all members (chain continuations
         // inherit it at creation time). Default-fallback covers an empty member
         // list, but that branch was already rejected above.
-        let language = members
-            .first()
-            .map(|c| c.llm_language)
-            .unwrap_or_default();
-        let bundled =
-            bundle_chain_context(&self.db, &members, service.as_ref(), language).await?;
+        let language = members.first().map(|c| c.llm_language).unwrap_or_default();
+        let bundled = bundle_chain_context(&self.db, &members, service.as_ref(), language).await?;
 
         let qa_id = uuid::Uuid::new_v4().to_string();
         let created_at = Utc::now();
@@ -732,10 +728,7 @@ async fn summarize_leaf_in_process(
         tools: vec![],
         max_tokens: Some(LEAF_SUMMARY_MAX_TOKENS),
         // Per-language cache key so different prompts don't collide.
-        cache_key: PromptCacheKey::stable(format!(
-            "chain-qa-leaf-summary/{}",
-            language.as_str()
-        )),
+        cache_key: PromptCacheKey::stable(format!("chain-qa-leaf-summary/{}", language.as_str())),
     };
     let response = service.complete(&request).await?;
     Ok(response.text())

@@ -1164,7 +1164,7 @@ impl RuntimeManager {
                 Some(&spec.model_id), // inherit parent's model
                 None,                 // project_id
                 &sub_conv_mode,
-                None, // desired_base_branch
+                None,                     // desired_base_branch
                 None, // seed_parent_id (sub-agents use `parent_conversation_id` above)
                 None, // seed_label
                 parent_conv.llm_language, // inherit language from parent

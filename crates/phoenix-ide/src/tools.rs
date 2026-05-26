@@ -337,10 +337,7 @@ pub trait Tool: Send + Sync {
     /// shorter prose for an alternate language override this to switch on
     /// `language`. See `crate::llm_language::tool_description_override` for
     /// the centralized override table.
-    fn description_for_language(
-        &self,
-        language: crate::llm_language::LlmLanguage,
-    ) -> String {
+    fn description_for_language(&self, language: crate::llm_language::LlmLanguage) -> String {
         crate::llm_language::tool_description_override(self.name(), language)
             .map_or_else(|| self.description(), str::to_string)
     }

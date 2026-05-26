@@ -134,9 +134,14 @@ async fn bundle_chain_context_three_member_with_short_leaf() {
     for id in ["m1", "m2", "m3"] {
         members.push(db.get_conversation(id).await.unwrap());
     }
-    let bundled = bundle_chain_context(&db, &members, llm.as_ref(), crate::llm_language::LlmLanguage::default())
-        .await
-        .unwrap();
+    let bundled = bundle_chain_context(
+        &db,
+        &members,
+        llm.as_ref(),
+        crate::llm_language::LlmLanguage::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(bundled.blocks.len(), 3);
     assert_eq!(bundled.blocks[0].kind, MemberBlockKind::ContinuationSummary);
@@ -182,9 +187,14 @@ async fn bundle_chain_context_long_leaf_summarizes_via_llm() {
     for id in ["L1", "L2"] {
         members.push(db.get_conversation(id).await.unwrap());
     }
-    let bundled = bundle_chain_context(&db, &members, llm.as_ref(), crate::llm_language::LlmLanguage::default())
-        .await
-        .unwrap();
+    let bundled = bundle_chain_context(
+        &db,
+        &members,
+        llm.as_ref(),
+        crate::llm_language::LlmLanguage::default(),
+    )
+    .await
+    .unwrap();
 
     assert_eq!(bundled.blocks.len(), 2);
     assert_eq!(bundled.blocks[1].kind, MemberBlockKind::LeafSummary);
@@ -209,9 +219,14 @@ async fn bundle_chain_context_marks_missing_continuation_summary() {
     for id in ["mc-a", "mc-b"] {
         members.push(db.get_conversation(id).await.unwrap());
     }
-    let bundled = bundle_chain_context(&db, &members, llm.as_ref(), crate::llm_language::LlmLanguage::default())
-        .await
-        .unwrap();
+    let bundled = bundle_chain_context(
+        &db,
+        &members,
+        llm.as_ref(),
+        crate::llm_language::LlmLanguage::default(),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         bundled.blocks[0].kind,
         MemberBlockKind::ContinuationSummaryMissing,

@@ -301,10 +301,11 @@ impl Database {
 
     /// Read a single global app setting by key, returning `None` if unset.
     pub async fn get_app_setting(&self, key: &str) -> DbResult<Option<String>> {
-        let row: Option<(String,)> = sqlx::query_as("SELECT value FROM app_settings WHERE key = ?1")
-            .bind(key)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT value FROM app_settings WHERE key = ?1")
+                .bind(key)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|(v,)| v))
     }
 
@@ -337,7 +338,8 @@ impl Database {
         &self,
         lang: crate::llm_language::LlmLanguage,
     ) -> DbResult<()> {
-        self.set_app_setting("default_llm_language", lang.as_str()).await
+        self.set_app_setting("default_llm_language", lang.as_str())
+            .await
     }
 
     // ==================== MCP Disabled Servers ====================
