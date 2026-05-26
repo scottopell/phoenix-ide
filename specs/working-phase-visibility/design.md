@@ -323,13 +323,41 @@ header. Tick via the same one-second interval pattern used for the
 StateBar's `toolElapsedSeconds` (StateBar.tsx:283-297) — extract to a
 shared `useElapsedSeconds(startedAt)` hook.
 
-**Pending assistant bubble:** `MessageComponents.tsx:635-638` filters out
-empty agent messages. Change the filter to *retain* an empty agent message
-when it is the live in-flight target (identified by being the most recent
-agent message whose enclosing conversation is in `llm_requesting` AND no
-tokens have arrived for the current request_id). The bubble renders the
-elapsed counter where the streamed text will appear; on the first token,
-the streaming text replaces the counter in-place.
+**Pending assistant bubble:** there is no persisted empty assistant
+message to retain — text-only LLM responses are committed to the
+messages table only after the `LlmResponse` transition (the
+`Effect::persist_agent_message` path in
+`crates/phoenix-ide/src/state_machine/transition.rs` ~L711), so during
+the pre-first-byte `llm_requesting` window the message list literally
+contains no row for the in-flight turn. The live streaming bubble after the first byte is
+already materialised by the `renderUnits` machinery as a synthetic
+`streaming_agent` tail unit driven by `streamingBuffer`
+(`ui/src/conversation/renderUnits.ts:193-197`).
+
+Add a new synthetic tail unit (`pending_agent` or similar) emitted by
+`renderUnits.ts` immediately before the existing `streaming_agent` tail
+unit's slot. Discriminator (when to emit):
+
+- `convState.phase === 'llm_requesting'` (or the awaiting variants)
+- `streamingBuffer` is empty (no tokens for the current request yet)
+- `PendingAssistantBubble` (the spec-level entity defined in
+  `working-phase-visibility.allium`) is in `placeholder` state — the
+  reducer mirrors this from the same triggers the spec's rules consume
+
+The unit's payload carries `placeholder_since` (sourced from the atom's
+`phaseStateUpdatedAt`); the React component renders the elapsed counter
+where the streamed text would appear. On the first token, the reducer
+clears `placeholder` (per the bubble lifecycle in the Allium spec), the
+`pending_agent` tail unit drops out of `renderUnits`, and the existing
+`streaming_agent` tail unit takes over the same screen slot — same
+visual position, contents transition from counter to streamed text. On
+the final assistant `Message` arrival, the streaming unit retires and
+the persisted message renders in its place.
+
+The empty-message filter at `MessageComponents.tsx:635-638` is NOT
+changed — it correctly hides genuinely empty historical agent rows. The
+placeholder is a derived/synthetic unit, not a row in the messages
+list.
 
 ## Connection-State Composition
 

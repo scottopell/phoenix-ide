@@ -417,9 +417,15 @@ rule ObservedPhaseUpdatedByStateChange {
 -- carrier on the wire is the existing `Conversation.state_updated_at`
 -- field flattened into `EnrichedConversation` at the top level of the
 -- Init payload — no new struct, no parallel representation.
--- Event shape: SseInitReceived(view, raw_state, state_updated_at).
+-- Event shape: SseInitReceived(view, raw_state, state_updated_at,
+-- pending_truncated). `pending_truncated` is unused here (this rule
+-- only cares about the current state + entry time, which are
+-- authoritative regardless of ring-overflow status), but the event
+-- shape is shared with PendingBubbleSeededFromInit below which DOES
+-- consume it; declaring the full positional signature keeps all
+-- consumers aligned.
 rule ObservedPhaseSeededFromInit {
-    when: SseInitReceived(view, raw_state, state_updated_at)
+    when: SseInitReceived(view, raw_state, state_updated_at, pending_truncated)
 
     ensures: ObservedPhase{view}.working    = is_working_phase(raw_state)
     ensures: ObservedPhase{view}.phase      = working_phase_of(raw_state)
@@ -549,7 +555,7 @@ rule LastKnownActivityCapturedOnDegrade {
 -- current state. Reuses the SseInitReceived trigger; the rule body
 -- does not read the payload, only the fact of arrival.
 rule LastKnownActivityClearedOnInit {
-    when: SseInitReceived(view, raw_state, state_updated_at)
+    when: SseInitReceived(view, raw_state, state_updated_at, pending_truncated)
 
     ensures: LastKnownActivityCapture{view}.captured = null
 }
@@ -600,13 +606,22 @@ rule PendingBubblePlaceholderCreated {
 -- Init carrier seeds `placeholder_since` so the elapsed counter
 -- continues from the phase entry (not from reload time).
 --
--- Event shape: SseInitReceived(view, raw_state, state_updated_at).
+-- Gated on `pending_truncated = false`: when the SSE replay ring
+-- overflowed, REQ-WPV-008's truncated-branch requires showing a
+-- degraded notice in place of inline indicators (the in-flight detail
+-- cannot be reliably reconstructed until the next checkpoint).
+-- Seeding a fresh-looking placeholder here would conflict with that.
+--
+-- Event shape: SseInitReceived(view, raw_state, state_updated_at,
+-- pending_truncated). `pending_truncated` is the existing
+-- `Init.pending_truncated` flag defined in sse_wire.allium.
 rule PendingBubbleSeededFromInit {
-    when: SseInitReceived(view, raw_state, state_updated_at)
+    when: SseInitReceived(view, raw_state, state_updated_at, pending_truncated)
 
     requires: is_working_phase(raw_state)
     requires: working_phase_of(raw_state) = llm_requesting
     requires: PendingAssistantBubble{view}.state = not_present
+    requires: pending_truncated = false
 
     ensures: PendingAssistantBubble{view}.state             = placeholder
     ensures: PendingAssistantBubble{view}.placeholder_since = state_updated_at
@@ -646,6 +661,29 @@ rule PendingBubbleResetOnEmptyPhaseExit {
     when: ObservedPhaseUpdatedFromWorking(view, llm_requesting, new_phase)
 
     requires: PendingAssistantBubble{view}.state = placeholder
+
+    ensures: PendingAssistantBubble{view}.state             = not_present
+    ensures: PendingAssistantBubble{view}.request_id        = null
+    ensures: PendingAssistantBubble{view}.placeholder_since = null
+    ensures: PendingAssistantBubble{view}.first_token_seq   = null
+}
+
+-- REQ-WPV-006: phase left llm_requesting WHILE the bubble was in
+-- `streaming` (some tokens arrived, then the turn errored or was
+-- cancelled before the assistant Message was persisted). Without this
+-- rule the bubble would stay stuck in `streaming` showing partial
+-- text into the error/cancel/retry state, and the next
+-- llm_requesting entry would fail the `state = not_present`
+-- precondition on PendingBubblePlaceholderCreated.
+--
+-- The implementation discards the buffered streaming text from the UI
+-- on this transition (the partial response is not the canonical
+-- output of the turn); a recovery/retry attempt arms a fresh
+-- placeholder via the normal phase-transition path.
+rule PendingBubbleResetOnStreamingPhaseExit {
+    when: ObservedPhaseUpdatedFromWorking(view, llm_requesting, new_phase)
+
+    requires: PendingAssistantBubble{view}.state = streaming
 
     ensures: PendingAssistantBubble{view}.state             = not_present
     ensures: PendingAssistantBubble{view}.request_id        = null
@@ -793,13 +831,22 @@ rule DisplayWhenReconnectingWithCapturedActivity {
     requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = reconnecting
     requires: LastKnownActivityCapture{view}.captured != null
 
-    let snap     = LastKnownActivityCapture{view}.captured
-    let elapsed  = snap.elapsed_at_disconnect / 1000
-    let attempts = conn/ClientConnection{conversation_id: view.conversation_id}.attempt
+    let snap        = LastKnownActivityCapture{view}.captured
+    let elapsed     = snap.elapsed_at_disconnect / 1000
+    let attempts    = conn/ClientConnection{conversation_id: view.conversation_id}.attempt
+    -- `render_frozen_retry_modifier(snap.retry)` is the helper that
+    -- formats the captured RetryContext as " (retry K/N <reason>)" when
+    -- snap.retry is non-null, and returns "" otherwise. Mirrors the
+    -- live `render_retry_modifier_for(view)` helper but reads from the
+    -- frozen snapshot rather than the live TurnRetryContext, so the
+    -- "most specific known activity" survives the disconnect intact
+    -- (REQ-WPV-003/005).
+    let retry_suffix = render_frozen_retry_modifier(snap.retry)
 
     ensures: StateBarDisplay{view}.activity = DisplayedActivity{
         text:      "reconnecting (" + str(attempts) + ") — last: "
-                   + snap.base_reason_text + " " + str(elapsed) + "s",
+                   + snap.base_reason_text + " " + str(elapsed) + "s"
+                   + retry_suffix,
         dot_class: reconnecting,
         has_timer: false
     }
@@ -812,12 +859,14 @@ rule DisplayWhenOfflineWithCapturedActivity {
     requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = offline
     requires: LastKnownActivityCapture{view}.captured != null
 
-    let snap    = LastKnownActivityCapture{view}.captured
-    let elapsed = snap.elapsed_at_disconnect / 1000
+    let snap         = LastKnownActivityCapture{view}.captured
+    let elapsed      = snap.elapsed_at_disconnect / 1000
+    let retry_suffix = render_frozen_retry_modifier(snap.retry)
 
     ensures: StateBarDisplay{view}.activity = DisplayedActivity{
         text:      "offline — last: " + snap.base_reason_text
-                   + " " + str(elapsed) + "s",
+                   + " " + str(elapsed) + "s"
+                   + retry_suffix,
         dot_class: offline,
         has_timer: false
     }
