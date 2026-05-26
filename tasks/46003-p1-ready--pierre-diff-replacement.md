@@ -53,6 +53,7 @@ The spike conclusion: Phoenix can retain per-line diff comments without brittle 
 - Do not redesign the full viewer shell; this task should plug into the MetaViewer shape from the prerequisite task.
 - Do not migrate `ReviewNotesContext` to a new anchor schema unless a small compatibility adapter is unavoidable. If a new schema is needed, file a follow-up task instead of expanding this one.
 - Do not depend on DOM scraping for annotations, note indicators, line identity, or jump behavior.
+- Do not keep the old homegrown diff renderer as a production fallback. If old code remains, it must be explicitly compatibility-only.
 
 ## Current behavior to preserve
 
@@ -68,9 +69,14 @@ The spike conclusion: Phoenix can retain per-line diff comments without brittle 
   - `oldLine`
   - `newLine`
   - `diffPos`
-- Users can add notes on add/delete/context lines.
-- Users can add file-level notes from file headers or an equivalent explicit file-level affordance.
+- Users can add notes on add/delete/context lines; context lines remain annotatable, displayable in note indicators, and jumpable.
+- Pending diff notes created under the current viewer remain visible and jumpable where their existing anchor data is sufficient.
+- Users can add file-level notes from file headers or an equivalent explicit file-level affordance, including header-only entries such as binary diffs.
 - Existing note indicators remain visible or are replaced with an equivalent Pierre-rendered indicator.
+- Added, deleted, renamed, and binary files produce stable, readable file identities for headers and notes.
+- Empty, malformed, and partially parseable diff sections do not crash the conversation UI; they show an appropriate empty/error/fallback state scoped to the viewer.
+- Truncated diffs render best-effort partial content and preserve truncation indicators.
+- Existing comparator, commit-log, and diff header information remains available in the viewer.
 - NotesPanel can jump back to annotated diff lines.
 - Sending notes into chat preserves current `formatNotesForSend` output semantics.
 - File/prose viewer and diff viewer remain mutually exclusive as they are after the MetaViewer refactor.
@@ -146,19 +152,28 @@ Use the project's existing browser profiling approach where possible. Do not rel
 - Do not assume current `.diff-*` CSS classes apply to Pierre-rendered content.
 - Preserve keyboard and pointer affordances for adding notes.
 - Preserve touch/long-press behavior if it exists after the MetaViewer refactor.
+- Preserve accessible note affordances and diff navigation where currently available, including labels, focus behavior, and keyboard reachability.
 - Validate screen-reader labels and focus behavior for note actions, headers, and the viewer shell.
 
 ## Acceptance criteria
 
 - `@pierre/diffs` is added as a UI dependency and used by the diff viewer path.
 - The homegrown diff row rendering path is removed or fully bypassed for production diff viewing.
+- Any retained homegrown diff code is explicitly compatibility-only; the old parser/renderer must not remain in the production render path or as a parallel authoritative implementation.
 - `diffParse.ts` is deleted, retired, or reduced to a compatibility adapter with a clear reason. It should not remain as a parallel authoritative parser.
 - No annotation, note indicator, line identity, or jump behavior depends on querying/scraping Pierre's DOM.
 - Existing Phoenix diff note anchors continue to work with `ReviewNotesContext`.
 - Users can add notes to diff lines and file headers/equivalent file-level targets.
+- Context lines remain annotatable, receive note indicators, and can be jumped to from NotesPanel.
+- Header-level/file-level notes work for normal file entries and header-only entries such as binary diffs.
+- Pending notes created with the previous diff viewer remain visible and jumpable when their existing anchor data is sufficient.
 - NotesPanel jump uses Pierre's supported scroll target API or an equivalent typed handle, not DOM scraping.
 - Existing note formatting sent to chat remains compatible.
 - Committed and uncommitted sections cannot collide in annotation identity.
+- Empty, malformed, truncated, or partially parseable diff sections do not crash the conversation page and preserve useful viewer-local empty/error/fallback UI.
+- Added, deleted, renamed, and binary files have stable readable identities in headers and notes.
+- Existing comparator, commit-log, and header information is preserved.
+- Pierre styling is intentionally integrated with Phoenix light/dark themes without accidental reliance on old `.diff-*` CSS classes.
 - Edge cases listed above are covered by automated tests where reasonable and manual/browser validation notes where automation is impractical.
 - Large-diff behavior is measured and documented in the PR/task notes.
 - `./dev.py check` passes.
@@ -173,7 +188,10 @@ Use the project's existing browser profiling approach where possible. Do not rel
   - note indicator rendering
   - NotesPanel jump invoking typed scroll target
   - file-level note action
+  - context-line note action and jump behavior
+  - pending-note compatibility where existing anchors contain enough data
   - truncation banners/metadata
+  - empty/error/fallback rendering for malformed or partially parseable diffs
 - Regression tests for rename/delete/binary/no-newline cases where feasible.
 
 ## Follow-ups explicitly out of scope
