@@ -60,7 +60,7 @@ similar = "2"  # For generating diffs
 
 # Process management
 # Process management and PTY
-nix = { version = "0.29", features = ["signal", "process", "term", "fs"] }
+nix = { version = "0.31", features = ["signal", "process", "term", "fs"] }
 libc = "0.2"
 
 # OSC 133 parsing for CommandTracker (REQ-TERM-021)

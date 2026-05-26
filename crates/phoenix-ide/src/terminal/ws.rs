@@ -480,9 +480,13 @@ fn detach_only(conversation_id: &str, arc_handle: Arc<TerminalHandle>) {
 /// the registry's master fd.
 fn build_pty_io(master_fd_raw: std::os::unix::io::RawFd) -> Result<PtyMasterIo, String> {
     set_nonblocking(master_fd_raw).map_err(|e| format!("set_nonblocking: {e}"))?;
-    let pty_fd = nix::unistd::dup(master_fd_raw)
-        .map(|raw| unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw) })
-        .map_err(|e| format!("dup: {e}"))?;
+    // SAFETY: master_fd_raw is owned by the registry for the lifetime of
+    // the relay; the dup'd fd is owned by the returned OwnedFd.
+    let raw = unsafe { libc::dup(master_fd_raw) };
+    if raw < 0 {
+        return Err(format!("dup: {}", std::io::Error::last_os_error()));
+    }
+    let pty_fd = unsafe { std::os::unix::io::OwnedFd::from_raw_fd(raw) };
     PtyMasterIo::new(pty_fd).map_err(|e| format!("AsyncFd: {e}"))
 }
 
