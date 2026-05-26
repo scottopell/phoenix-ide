@@ -46,6 +46,8 @@ by Slack, Discord, Linear, and Notion for the same problem.
 - The MessageList ResizeObserver-driven "pinned + new content → snap
   to bottom" logic — virtuoso's `followOutput="auto"` is the
   replacement.
+- The `scrollTriggerRef = 'force'` force-scroll-on-system-message path
+  (see "Behavioral change" below for the rationale).
 
 ### Stays unchanged
 
@@ -97,6 +99,47 @@ by Slack, Discord, Linear, and Notion for the same problem.
 4. Delete the spacer + sentinel DOM in `MessageListBody`. The body
    collapses to a single virtuoso instance.
 5. Delete the `.message-collapsed-spacer` CSS rule.
+6. Delete the `scrollTriggerRef` ref + the "hasSystem → 'force'"
+   branch in the new-message detection block in `MessageList.tsx`.
+
+## Behavioral change: relax REQ-MLRU-014 (drop force-scroll override)
+
+The current code yanks the viewport to the bottom — and re-pins the
+user — whenever a new `system`-type message arrives, regardless of
+where the user was scrolled. The trigger comes from
+`scrollTriggerRef.current = hasSystem ? 'force' : 'soft'` followed by
+the ResizeObserver branch `if (isPinnedToBottom.current || trigger ===
+'force')`. System messages in Phoenix include approval prompts, mode
+transitions, and runtime errors — typically actionable, hence the
+yank.
+
+**This migration drops force-scroll.** Reasons:
+
+1. Force-scroll is a hostile UX pattern. Slack / Discord / Linear /
+   Notion never yank the viewport on incoming messages, however
+   urgent; they use unread badges or inline indicators.
+2. The current trigger is over-broad — it fires on any system message,
+   including non-urgent transitions (cancellation, mode change).
+3. Virtuoso's `followOutput="auto"` cleanly expresses "follow if
+   pinned, leave alone otherwise." Force-scroll would require an
+   imperative `<Virtuoso ref>` + `useEffect` watching for new system
+   messages + manual `scrollToIndex({ index: 'LAST' })` — a special
+   case bolted onto virtuoso's declarative model.
+
+**Replacement (also in scope for this task):** the jump-to-newest
+button already exists for unread content. When the unread set
+contains a system message, the button should render with a visually
+distinct urgency style (e.g. yellow background or `↓ Action required`
+label) so users scrolled up can tell the new content is high-priority
+without being forcibly moved.
+
+**Spec impact:** REQ-MLRU-014 ("Pinned-to-Bottom Preservation") was
+already simple — "pinned users stay pinned through new content, non-
+pinned users see the jump-to-newest button." It will be reworded to
+make explicit that no auto-scroll override exists for system messages.
+The transparency-contract bullet "newest activity is visible without
+having to scroll" is unchanged — it's satisfied for pinned users
+naturally; non-pinned users get the visual cue.
 
 ## Spec changes
 
@@ -112,9 +155,14 @@ substantive rewrite. Plan:
     listing the configuration knobs that satisfy the transparency
     contract (followOutput, initialTopMostItemIndex, etc.).
   - REQ-MLRU-009 + REQ-MLRU-013 remain deprecated (already done).
-  - REQ-MLRU-001 / 002 / 003 / 004 / 010 / 011 / 012 / 014 stay — they
-    govern the render-unit transform and rendering, which virtuoso
-    consumes but doesn't replace.
+  - REQ-MLRU-001 / 002 / 003 / 004 / 010 / 011 / 012 stay unchanged.
+  - REQ-MLRU-014: reworded to drop the force-scroll-on-system-message
+    override. New text: "pinned-to-bottom users stay pinned through
+    new content arrival (virtuoso's `followOutput="auto"`); non-
+    pinned users see the jump-to-newest button. The button SHALL
+    render with a distinct urgency style when the unread set contains
+    a `system`-type message. The SYSTEM SHALL NOT force-scroll the
+    viewport for any message type."
 - `specs/messagelist-render-units/windowing.allium`: delete entirely.
   Window lifecycle is now an internal concern of virtuoso, not Phoenix
   user code. The bottom-pin contract is restated in requirements.md.
@@ -145,19 +193,18 @@ substantive rewrite. Plan:
 7. Streaming while scrolled up — viewport does not yank user down.
    Jump-to-newest button appears.
 8. Clicking jump-to-newest snaps to bottom and clears the button.
-9. Performance: cold-load of `fixture-heavy-prod-shape` is no worse
-   than the current spacer-based approach (measure via
-   `browser_profile conversation-load` if available, else manual
-   eyeball).
-10. Net LOC reduction: the deleted hooks + spacer machinery should
+9. System message arrives while user is scrolled up — viewport does
+   NOT jump (force-scroll relaxation per REQ-MLRU-014 rewording);
+   jump-to-newest button is rendered with urgency styling.
+10. Performance: cold-load of `fixture-heavy-prod-shape` is no worse
+    than the current spacer-based approach (measure via
+    `browser_profile conversation-load` if available, else manual
+    eyeball).
+11. Net LOC reduction: the deleted hooks + spacer machinery should
     outweigh the virtuoso config code. Expect ~-300 to -500 LOC.
 
 ## Risks
 
-- **Virtuoso's `followOutput="auto"` behavior may not match our exact
-  "force-scroll on system message" semantic** (REQ-MLRU-014 +
-  `scrollTriggerRef = 'force'` path). Mitigation: use virtuoso's
-  imperative `scrollToIndex` from a ref when system messages arrive.
 - **Tool-result-heavy turns** (REQ-MLRU-012 regression test) need to
   render correctly under virtuoso's height measurement. Virtuoso
   measures items on first render and remembers; should be fine but
