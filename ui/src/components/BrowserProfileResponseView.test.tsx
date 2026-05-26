@@ -474,6 +474,32 @@ describe('BrowserProfileResponseView', () => {
       expect(screen.getByText(/CPU profile is empty/)).toBeInTheDocument();
     });
 
+    it('falls back to the text summary when every hot-function entry was malformed', () => {
+      // If sanitizeCpuEntries strips ALL rows, an empty table is less
+      // informative than the original text summary (which explains the
+      // shape of the absence). Use the status-line fallback in that case.
+      render(
+        <BrowserProfileResponseView
+          action="cpu_stop"
+          displayData={{
+            cpu_summary: {
+              path: '/tmp/x.json',
+              hitcount_fallback: false,
+              total: 100,
+              top_by_self: [
+                { label: 12345, value: 'oops' /* bad */ },
+                { label: 'missing percent', value: 5 /* no percent */ },
+              ],
+              top_by_total: [],
+            },
+          }}
+          fallbackText="CPU profile is empty (no nodes — was the session too short?)."
+          isError={false}
+        />,
+      );
+      expect(screen.getByText(/CPU profile is empty/)).toBeInTheDocument();
+    });
+
     it('survives malformed hot-function entries (drops the bad rows, clamps negative percent)', () => {
       // Schema drift / hand-rolled payload: bad value type, missing
       // percent, non-string label, negative percent. These must not
@@ -800,6 +826,34 @@ describe('BrowserProfileResponseView', () => {
       expect(screen.getByText(/2\.4 MB/)).toBeInTheDocument();
       expect(screen.getByText('Nodes')).toBeInTheDocument();
       expect(screen.getByText('1,234')).toBeInTheDocument();
+    });
+
+    it('filters out NaN / Infinity metric values', () => {
+      // `typeof === 'number'` admits NaN and Infinity; the renderer must
+      // gate on Number.isFinite to keep them out of the UI.
+      render(
+        <BrowserProfileResponseView
+          action="metrics"
+          displayData={{
+            metrics: {
+              GoodOne: 42,
+              NotANumber: Number.NaN,
+              PosInfinity: Number.POSITIVE_INFINITY,
+              NegInfinity: Number.NEGATIVE_INFINITY,
+              AnotherGood: 7,
+            },
+          }}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      expect(screen.getByText('GoodOne')).toBeInTheDocument();
+      expect(screen.getByText('AnotherGood')).toBeInTheDocument();
+      expect(screen.queryByText('NotANumber')).toBeNull();
+      expect(screen.queryByText('PosInfinity')).toBeNull();
+      expect(screen.queryByText('NegInfinity')).toBeNull();
+      // Sanity: nothing renders the literal NaN / Infinity strings.
+      expect(document.body.textContent ?? '').not.toMatch(/NaN|Infinity/);
     });
   });
 

@@ -449,7 +449,7 @@ function MetricsView({
     return <StatusLine action="metrics" text={fallbackText} variant="success" />;
   }
   const rows = Object.entries(metrics)
-    .filter(([, v]) => typeof v === 'number')
+    .filter(([, v]) => typeof v === 'number' && Number.isFinite(v))
     .map(([k, v]) => ({ name: k, value: v as number }));
   return (
     <div className="profile-response profile-metrics">
@@ -522,6 +522,11 @@ function CpuSummaryView({
   }
   const topBySelf = sanitizeCpuEntries(summary.top_by_self);
   const topByTotal = sanitizeCpuEntries(summary.top_by_total);
+  // Every entry sanitized away — the text summary (which explains the
+  // shape of the absence) is more useful than an empty table.
+  if (topBySelf.length === 0) {
+    return <StatusLine action={action} text={fallbackText} variant="success" />;
+  }
   const unit = summary.hitcount_fallback ? 'hits' : 'ms';
   const path = summary.path;
   return (

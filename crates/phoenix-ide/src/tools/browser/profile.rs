@@ -1342,11 +1342,18 @@ async fn action_cpu_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
     // REQ-BT-019.7: return the summary INLINE, not just a file path. A
     // file an agent cannot read is an artifact, not an answer; the file
     // is still kept for a human / DevTools deep-dive.
-    let summary = summarize_cpu_profile(&profile, CPU_SUMMARY_TOP_N);
+    //
+    // Compute rankings ONCE and use them to render both the text summary
+    // and the structured display_data — re-running build_cpu_rankings on
+    // a large profile is wasteful and a future-divergence risk.
+    let rankings = build_cpu_rankings(&profile, CPU_SUMMARY_TOP_N);
+    let summary_text = rankings
+        .as_ref()
+        .map_or_else(|| cpu_empty_text(&profile), render_cpu_summary_text);
     let out = ToolOutput::success(format!(
-        "CPU profile saved to {path} (load in Chrome DevTools → Performance for the full tree).\n\n{summary}"
+        "CPU profile saved to {path} (load in Chrome DevTools → Performance for the full tree).\n\n{summary_text}"
     ));
-    match cpu_summary_display_data(&profile, CPU_SUMMARY_TOP_N, &path) {
+    match rankings.as_ref().and_then(|s| cpu_summary_json(s, &path)) {
         Some(display) => out.with_display(display),
         None => out,
     }
@@ -1371,11 +1378,13 @@ async fn action_cpu_summary(path: Option<&str>) -> ToolOutput {
             ))
         }
     };
-    let out = ToolOutput::success(format!(
-        "CPU profile {path}\n\n{}",
-        summarize_cpu_profile(&profile, CPU_SUMMARY_TOP_N)
-    ));
-    match cpu_summary_display_data(&profile, CPU_SUMMARY_TOP_N, path) {
+    // Same once-per-request ranking computation as action_cpu_stop.
+    let rankings = build_cpu_rankings(&profile, CPU_SUMMARY_TOP_N);
+    let summary_text = rankings
+        .as_ref()
+        .map_or_else(|| cpu_empty_text(&profile), render_cpu_summary_text);
+    let out = ToolOutput::success(format!("CPU profile {path}\n\n{summary_text}"));
+    match rankings.as_ref().and_then(|s| cpu_summary_json(s, path)) {
         Some(display) => out.with_display(display),
         None => out,
     }
@@ -1616,32 +1625,46 @@ fn render_cpu_summary_text(summary: &CpuProfileSummary) -> String {
     out
 }
 
-/// Render a `Profiler.Profile` as a human/agent-readable hot-function
-/// ranking (REQ-BT-019.7). Thin shim over [`build_cpu_rankings`] +
-/// [`render_cpu_summary_text`] that preserves the empty/no-samples
-/// text fallbacks.
-fn summarize_cpu_profile(p: &CpuProfile, top_n: usize) -> String {
+/// Text fallback when the profile carries no rankable data — the
+/// empty/no-samples cases that [`build_cpu_rankings`] returns `None` for.
+fn cpu_empty_text(p: &CpuProfile) -> String {
     if p.nodes.is_empty() {
-        return "CPU profile is empty (no nodes — was the session too short?).".to_string();
-    }
-    match build_cpu_rankings(p, top_n) {
-        Some(summary) => render_cpu_summary_text(&summary),
-        None => "CPU profile carries no samples or hit counts (session too short to sample)."
-            .to_string(),
+        "CPU profile is empty (no nodes — was the session too short?).".to_string()
+    } else {
+        "CPU profile carries no samples or hit counts (session too short to sample).".to_string()
     }
 }
 
-/// Build the `display_data` payload fragment for a CPU profile. The
-/// returned value is the `cpu_summary` object (path + structured
-/// rankings), or `None` when the profile is empty/has no samples — the
-/// text output already explains the absence in that case.
-fn cpu_summary_display_data(p: &CpuProfile, top_n: usize, path: &str) -> Option<Value> {
-    let summary = build_cpu_rankings(p, top_n)?;
-    let mut value = serde_json::to_value(&summary).ok()?;
+/// Wrap a pre-computed [`CpuProfileSummary`] as the `display_data`
+/// payload fragment (`cpu_summary` object containing path + rankings).
+/// Callers that already have a `CpuProfileSummary` use this to avoid
+/// recomputing rankings via [`cpu_summary_display_data`].
+fn cpu_summary_json(summary: &CpuProfileSummary, path: &str) -> Option<Value> {
+    let mut value = serde_json::to_value(summary).ok()?;
     if let Value::Object(ref mut map) = value {
         map.insert("path".to_string(), Value::String(path.to_string()));
     }
     Some(json!({ "cpu_summary": value }))
+}
+
+/// Render a `Profiler.Profile` as a human/agent-readable hot-function
+/// ranking (REQ-BT-019.7). Thin test shim — production callers compute
+/// rankings once and route through [`render_cpu_summary_text`] +
+/// [`cpu_summary_json`] directly.
+#[cfg(test)]
+fn summarize_cpu_profile(p: &CpuProfile, top_n: usize) -> String {
+    build_cpu_rankings(p, top_n)
+        .as_ref()
+        .map_or_else(|| cpu_empty_text(p), render_cpu_summary_text)
+}
+
+/// Build the `display_data` payload fragment for a CPU profile. Thin
+/// test shim — production callers compute rankings once and call
+/// [`cpu_summary_json`] with the pre-computed summary.
+#[cfg(test)]
+fn cpu_summary_display_data(p: &CpuProfile, top_n: usize, path: &str) -> Option<Value> {
+    let summary = build_cpu_rankings(p, top_n)?;
+    cpu_summary_json(&summary, path)
 }
 
 // ============================================================================
