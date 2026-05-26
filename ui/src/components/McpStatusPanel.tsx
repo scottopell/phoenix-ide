@@ -84,8 +84,11 @@ export function McpStatusPanel({ showToast, showError }: McpStatusPanelProps) {
       if (result.unchanged.length > 0) parts.push(`${result.unchanged.length} unchanged`);
       const message = `MCP reload: ${parts.join(', ') || 'no servers'}`;
       if (result.failed.length > 0) {
-        const firstFailure = result.failed[0];
-        showError(`${message} (${firstFailure.server} ${firstFailure.action} failed)`, 5000);
+        const [firstFailure] = result.failed;
+        const suffix = firstFailure
+          ? ` (${firstFailure.server} ${firstFailure.action} failed)`
+          : '';
+        showError(`${message}${suffix}`, 5000);
       } else {
         showToast(message, 3000);
       }
