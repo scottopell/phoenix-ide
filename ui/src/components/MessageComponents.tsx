@@ -914,6 +914,328 @@ function TmuxResponseView({ response }: { response: Record<string, unknown> }) {
   );
 }
 
+// Console logs come as a JSON array `[{level, text}, ...]` newest-first, or — when
+// the encoded form would blow past the 4KB result cap — a `"Logs written to /tmp/..."`
+// pointer string. Render by level so error/warning entries don't disappear in a wall
+// of debug logs.
+type ConsoleLogEntry = { level: string; text: string };
+
+const CONSOLE_LEVEL_ORDER = ['error', 'warning', 'info', 'log', 'debug'] as const;
+
+function parseConsoleLogs(text: string): ConsoleLogEntry[] | null {
+  try {
+    const parsed = JSON.parse(text);
+    if (!Array.isArray(parsed)) return null;
+    const entries: ConsoleLogEntry[] = [];
+    for (const e of parsed) {
+      if (e && typeof e === 'object' && typeof (e as { level?: unknown }).level === 'string' && typeof (e as { text?: unknown }).text === 'string') {
+        entries.push({ level: (e as ConsoleLogEntry).level, text: (e as ConsoleLogEntry).text });
+      }
+    }
+    return entries;
+  } catch {
+    return null;
+  }
+}
+
+export function BrowserConsoleLogsView({ rawText }: { rawText: string }) {
+  const trimmed = rawText.trim();
+  // File escape-hatch path (REQ-BT-015): output exceeds 4KB, full logs dumped to disk.
+  if (trimmed.startsWith('Logs written to ')) {
+    return (
+      <div className="console-logs-response">
+        <div className="console-logs-pointer">{trimmed}</div>
+      </div>
+    );
+  }
+
+  const entries = parseConsoleLogs(rawText);
+  if (entries === null) {
+    return <pre className="console-logs-fallback">{rawText}</pre>;
+  }
+  if (entries.length === 0) {
+    return <div className="console-logs-response"><div className="console-logs-empty">(no console entries)</div></div>;
+  }
+
+  const counts: Record<string, number> = {};
+  for (const e of entries) counts[e.level] = (counts[e.level] ?? 0) + 1;
+
+  return (
+    <div className="console-logs-response">
+      <div className="console-logs-header">
+        <span className="console-logs-count">
+          {entries.length} entr{entries.length === 1 ? 'y' : 'ies'}
+        </span>
+        {CONSOLE_LEVEL_ORDER.map((lvl) =>
+          counts[lvl] ? (
+            <span key={lvl} className={`console-logs-tally console-level-${lvl}`}>
+              {counts[lvl]} {lvl}
+            </span>
+          ) : null
+        )}
+      </div>
+      <div className="console-logs-list">
+        {entries.map((entry, i) => (
+          <div key={i} className={`console-log-entry console-level-${entry.level}`}>
+            <span className="console-log-level">{entry.level}</span>
+            <pre className="console-log-text">{entry.text}</pre>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Search tool output is plain text shaped as `relative/path:NN: content` lines,
+// optionally followed by bracketed notes like `[Results limited to 50 ...]` or
+// `[Walk truncated ...]`. Group hits by file so a multi-hit file shows once with
+// its line numbers underneath.
+type SearchHit = { path: string; lineNumber: number; content: string };
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function parseSearchOutput(text: string): {
+  hits: SearchHit[];
+  notes: string[];
+  noMatches: boolean;
+} {
+  const notes: string[] = [];
+  const hits: SearchHit[] = [];
+
+  if (text.trim() === 'No matches found.') {
+    return { hits, notes, noMatches: true };
+  }
+
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    if (line.startsWith('[') && line.trimEnd().endsWith(']')) {
+      notes.push(line.trim().slice(1, -1));
+      continue;
+    }
+    // Non-greedy path, then :digits:, then optional space, then content.
+    // Path can contain colons in unusual cases; backtracking will find the
+    // rightmost path/digits boundary that satisfies the digit run.
+    const m = /^(.+?):(\d+):\s?(.*)$/.exec(line);
+    if (m && m[1] !== undefined && m[2] !== undefined) {
+      hits.push({ path: m[1], lineNumber: parseInt(m[2], 10), content: m[3] ?? '' });
+    } else {
+      notes.push(line);
+    }
+  }
+  return { hits, notes, noMatches: false };
+}
+
+export function SearchResultsView({
+  rawText,
+  onOpenFile,
+}: {
+  rawText: string;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+}) {
+  const { hits, notes, noMatches } = useMemo(() => parseSearchOutput(rawText), [rawText]);
+
+  if (noMatches) {
+    return (
+      <div className="search-results">
+        <div className="search-results-empty">No matches found.</div>
+      </div>
+    );
+  }
+
+  if (hits.length === 0 && notes.length === 0) {
+    return <pre className="search-results-fallback">{rawText}</pre>;
+  }
+
+  const groups: Array<{ path: string; hits: SearchHit[] }> = [];
+  const seen = new Map<string, number>();
+  for (const hit of hits) {
+    const idx = seen.get(hit.path);
+    if (idx === undefined) {
+      seen.set(hit.path, groups.length);
+      groups.push({ path: hit.path, hits: [hit] });
+    } else {
+      groups[idx]!.hits.push(hit);
+    }
+  }
+
+  return (
+    <div className="search-results">
+      {hits.length > 0 && (
+        <div className="search-results-header">
+          <span className="search-results-count">
+            {hits.length} match{hits.length === 1 ? '' : 'es'} in {groups.length} file
+            {groups.length === 1 ? '' : 's'}
+          </span>
+        </div>
+      )}
+      <div className="search-results-list">
+        {groups.map((group) => (
+          <div key={group.path} className="search-results-file">
+            {onOpenFile ? (
+              <button
+                type="button"
+                className="search-results-filepath"
+                onClick={() =>
+                  onOpenFile(
+                    group.path,
+                    new Set([group.hits[0]!.lineNumber]),
+                    group.hits[0]!.lineNumber
+                  )
+                }
+                title="Open file"
+              >
+                {group.path}
+                <span className="search-results-filehit-count">
+                  {group.hits.length} hit{group.hits.length === 1 ? '' : 's'}
+                </span>
+              </button>
+            ) : (
+              <span className="search-results-filepath search-results-filepath-static">
+                {group.path}
+                <span className="search-results-filehit-count">
+                  {group.hits.length} hit{group.hits.length === 1 ? '' : 's'}
+                </span>
+              </span>
+            )}
+            <div className="search-results-hits">
+              {group.hits.map((hit, i) => {
+                const lineProps = onOpenFile
+                  ? {
+                      onClick: () =>
+                        onOpenFile(group.path, new Set([hit.lineNumber]), hit.lineNumber),
+                    }
+                  : {};
+                return (
+                  <div
+                    key={i}
+                    className={`search-result-line ${onOpenFile ? 'search-result-line-clickable' : ''}`}
+                    {...lineProps}
+                  >
+                    <span className="search-result-lineno">{hit.lineNumber}</span>
+                    <span className="search-result-content">{hit.content || ' '}</span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+      {notes.length > 0 && (
+        <div className="search-results-notes">
+          {notes.map((n, i) => (
+            <div key={i} className="search-results-note">{n}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// keyword_search returns LLM-filtered text shaped as `path: explanation` per line,
+// or — when the filter LLM is unavailable — raw ripgrep output (with line numbers
+// and context separators). Detect which and render accordingly.
+type KeywordHit = { path: string; explanation: string };
+
+// eslint-disable-next-line react-refresh/only-export-components
+export function parseKeywordSearchOutput(text: string): {
+  hits: KeywordHit[];
+  rawFallback: boolean;
+  empty: boolean;
+} {
+  const trimmed = text.trim();
+  if (
+    trimmed === '' ||
+    trimmed === 'No matches found for the given search terms.' ||
+    trimmed.startsWith('No relevant files found')
+  ) {
+    return { hits: [], rawFallback: false, empty: true };
+  }
+
+  const lines = text.split('\n').filter((l) => l.trim());
+  // Raw ripgrep -C output has `path:NN:` or `path-NN-` per line plus `--` separators.
+  // If a meaningful fraction of lines look like that, treat as fallback.
+  const ripgrepShaped = lines.filter((l) => /^[^\s].*?[-:]\d+[-:]/.test(l) || l === '--').length;
+  if (lines.length >= 4 && ripgrepShaped / lines.length > 0.25) {
+    return { hits: [], rawFallback: true, empty: false };
+  }
+
+  const hits: KeywordHit[] = [];
+  for (const line of lines) {
+    // path is everything up to the first `: ` (with a trailing space), and must
+    // not itself contain a colon — the LLM-filter prompt's output uses absolute
+    // POSIX paths with `: ` as the separator before the explanation.
+    const m = /^([^:\s][^:]*?):\s+(.+)$/.exec(line);
+    if (m && m[1] !== undefined && m[2] !== undefined) {
+      hits.push({ path: m[1].trim(), explanation: m[2].trim() });
+    }
+  }
+
+  // If very few lines parsed cleanly, the output likely isn't the LLM-filtered
+  // shape — bail to plain rendering rather than show a tiny misleading list.
+  if (hits.length === 0 || hits.length * 3 < lines.length) {
+    return { hits: [], rawFallback: true, empty: false };
+  }
+  return { hits, rawFallback: false, empty: false };
+}
+
+export function KeywordSearchView({
+  rawText,
+  onOpenFile,
+}: {
+  rawText: string;
+  onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+}) {
+  const parsed = useMemo(() => parseKeywordSearchOutput(rawText), [rawText]);
+
+  if (parsed.empty) {
+    return (
+      <div className="keyword-search-results">
+        <div className="search-results-empty">No relevant files found.</div>
+      </div>
+    );
+  }
+
+  if (parsed.rawFallback) {
+    return (
+      <div className="keyword-search-results keyword-search-raw">
+        <div className="keyword-search-fallback-note">
+          Raw ripgrep results — LLM filter unavailable
+        </div>
+        <pre className="keyword-search-raw-text">{rawText}</pre>
+      </div>
+    );
+  }
+
+  return (
+    <div className="keyword-search-results">
+      <div className="search-results-header">
+        <span className="search-results-count">
+          {parsed.hits.length} relevant file{parsed.hits.length === 1 ? '' : 's'}
+        </span>
+      </div>
+      <div className="keyword-search-list">
+        {parsed.hits.map((hit, i) => (
+          <div key={i} className="keyword-search-hit">
+            {onOpenFile ? (
+              <button
+                type="button"
+                className="keyword-search-filepath"
+                onClick={() => onOpenFile(hit.path, new Set(), 0)}
+              >
+                {hit.path}
+              </button>
+            ) : (
+              <span className="keyword-search-filepath keyword-search-filepath-static">
+                {hit.path}
+              </span>
+            )}
+            <div className="keyword-search-explanation">{hit.explanation}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
 function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
@@ -1079,6 +1401,12 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
               fallbackText={resultText}
               isError={isError}
             />
+          ) : name === 'browser_recent_console_logs' && !isError ? (
+            <BrowserConsoleLogsView rawText={resultText} />
+          ) : name === 'search' && !isError ? (
+            <SearchResultsView rawText={resultText} onOpenFile={onOpenFile} />
+          ) : name === 'keyword_search' && !isError ? (
+            <KeywordSearchView rawText={resultText} onOpenFile={onOpenFile} />
           ) : isShortOutput ? (
             // Short output: show inline, no collapse
             <div className="tool-block-output-content">
