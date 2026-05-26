@@ -72,15 +72,10 @@ function formatContextWindow(n: number): string {
   return n.toString();
 }
 
-/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-5.5" -> "gpt-5.5"
- *  For 1M variants, strip the "-1m" suffix (the 1M badge handles display). */
+/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-5.5" -> "gpt-5.5" */
 function abbreviateModel(model: string): string {
-  // Claude models: strip "claude-" prefix, strip "-1m" suffix, convert trailing version hyphen to dot
   if (!model.startsWith('claude-')) return model;
-  let inner = model.slice(7); // strip "claude-"
-  if (inner.endsWith('-1m')) {
-    inner = inner.slice(0, -3);
-  }
+  const inner = model.slice(7); // strip "claude-"
   const lastHyphen = inner.lastIndexOf('-');
   if (lastHyphen > 0 && /^\d+$/.test(inner.slice(lastHyphen + 1))) {
     return inner.slice(0, lastHyphen) + '.' + inner.slice(lastHyphen + 1);
@@ -334,11 +329,6 @@ export function StateBar({
   // and we have models and a callback. Error-state switch lets the user
   // recover from overload/quota by picking another model, then retrying.
   const currentModel = conversation?.model ?? '';
-  // Anthropic made 1M context GA on 2026-03-13: Opus 4.7, Opus 4.6, and
-  // Sonnet 4.6 carry 1M natively under their base id (no `-1m` suffix, no
-  // beta header). Detect 1M-capable models by inspecting the registry's
-  // declared context window so the badge keeps working without relying on
-  // the obsolete id suffix.
   const is1m =
     availableModels?.find(m => m.id === currentModel)?.context_window === 1_000_000;
   const canPickModel = !!(
