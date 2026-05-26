@@ -17,10 +17,12 @@
 --   ui/src/conversation/atom.ts — phaseEnteredAt / toolStartedAt /
 --       lastSseEventAt fields
 --   ui/src/components/MessageComponents.tsx — inline tool/bubble timers
---   crates/phoenix-ide/src/api/wire.rs — StateChange.entered_at,
+--   crates/phoenix-ide/src/api/wire.rs — StateChange.state_updated_at,
 --       LlmFirstByte event
---   crates/phoenix-ide/src/runtime/executor.rs — entered_at stamping,
---       LlmFirstByte emission, per-tool started_at
+--   crates/phoenix-ide/src/db/schema.rs — Conversation.state_updated_at
+--       (already exists; this spec reuses it as the entry timestamp)
+--   crates/phoenix-ide/src/runtime/executor.rs — LlmFirstByte emission,
+--       per-tool started_at injection into message display_data
 --
 -- Includes: DisplayedActivity composition; LastKnownActivity capture
 --           on connected→reconnecting; HeartbeatWatchdog fresh/stale;
@@ -45,7 +47,7 @@
 --       `use "../llm-retry-visibility/llm-retry-visibility.allium" as llm_retry`
 --       is restored and the placeholders are deleted.
 --   specs/sse_wire/sse_wire.allium — wire envelope contract; this spec's
---       new variants (LlmFirstByte) and field (StateChange.entered_at)
+--       new variants (LlmFirstByte) and field (StateChange.state_updated_at)
 --       extend it.
 --
 -- Requirement traceability: REQ-WPV-001 through REQ-WPV-008
@@ -60,8 +62,14 @@ use "../connection_machine/connection_machine.allium" as conn
 -- is "one tab"; multiple tabs viewing the same conversation each have
 -- their own ClientView instance and derive the same DisplayedActivity
 -- independently from the shared server-authoritative timestamps.
+--
+-- `conversation_id` is carried so cross-spec entity lookups into the
+-- connection_machine spec (whose ClientConnection entity is keyed by
+-- `conversation_id`, not by view) are well-formed: e.g.
+-- `conn/ClientConnection{conversation_id: view.conversation_id}`.
 actor ClientView {
-    identified_by: Integer  -- tab-local id, opaque
+    identified_by: Integer
+    conversation_id: String
 }
 
 ------------------------------------------------------------
@@ -160,23 +168,28 @@ enum HeartbeatFreshness {
 }
 
 -- Lifecycle of the placeholder assistant bubble that appears during
--- llm_requesting with no tokens yet.
+-- llm_requesting with no tokens yet. The bubble is a reusable
+-- singleton: it returns to `not_present` after each turn so the next
+-- turn can re-arm it. `not_present` is the idle ground state; the
+-- "complete" outcome (assistant message persisted) and the "removed"
+-- outcome (phase exited without tokens) both route back to
+-- `not_present` rather than terminal states.
 enum PendingBubbleState {
-    not_present        -- no live LLM request in flight
-    | placeholder      -- llm_requesting active, no tokens yet
-    | streaming        -- LlmFirstByte received; bubble now hosts streaming text
-    | complete         -- assistant message fully persisted (Message event)
-    | removed          -- llm_requesting exited without any token
+    not_present
+    | placeholder
+    | streaming
 }
 
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
 
--- The conversation phase as observed by this client. `entered_at` is
--- server-authoritative (REQ-WPV-001); on Init it comes from
--- conversation.phase.entered_at; on each StateChange it is the
--- StateChange.entered_at field. The entity has no field-level
+-- The conversation phase as observed by this client.
+-- `state_updated_at` is server-authoritative (REQ-WPV-001); on Init it
+-- comes from `EnrichedConversation.state_updated_at` (the existing
+-- top-level field, flattened from `Conversation`); on each StateChange
+-- it is carried on the new `StateChange.state_updated_at` field. The
+-- entity has no field-level
 -- transitions because each StateChange / Init replaces the snapshot
 -- wholesale — there is no meaningful intermediate state to model.
 entity ObservedPhase {
@@ -190,20 +203,21 @@ entity ObservedPhase {
     -- The specific working phase, when working.
     phase: WorkingPhase?
 
-    -- Server-authoritative entry time. The single source for elapsed-time
-    -- displays. NEVER set client-side from event arrival time.
-    entered_at: Timestamp
-
-    -- The most-recent unresolved retry context for the in-flight turn,
-    -- when one exists. Cleared on phase exit. Populated by rules in
-    -- llm-retry-visibility (sibling spec).
-    retry: RetryContext?
+    -- Server-authoritative entry time. Sourced from the existing
+    -- `Conversation.state_updated_at: DateTime<Utc>` field (which the
+    -- runtime already bumps on every state transition, see db.rs:676);
+    -- this entity uses the same value, just normalised to unix ms. The
+    -- single source for elapsed-time displays. NEVER set client-side
+    -- from event arrival time.
+    state_updated_at: Timestamp
 }
 
--- The pending placeholder bubble. Exists in DOM iff state in
--- { placeholder, streaming } (the streaming state still holds the same
--- bubble; only its contents change from elapsed-counter to streamed
--- text per REQ-WPV-002).
+-- The pending placeholder bubble. Singleton per ClientView. DOM presence
+-- is gated on state in { placeholder, streaming } (the streaming state
+-- still holds the same bubble; only its contents change from elapsed-
+-- counter to streamed text per REQ-WPV-002). After a turn completes the
+-- bubble returns to `not_present` so the next turn can re-arm it — the
+-- state machine is reusable across turns, not single-shot.
 entity PendingAssistantBubble {
     view: ClientView
 
@@ -211,30 +225,29 @@ entity PendingAssistantBubble {
 
     -- The request_id of the LLM request this bubble is bound to. Used
     -- to correlate LlmFirstByte and Token events to the bubble. Set
-    -- when the placeholder is created; cleared on complete/removed.
-    request_id: String? when state in { placeholder, streaming }
+    -- when the placeholder is created; cleared on return to not_present.
+    request_id: String?
 
-    -- Server-authoritative; matches ObservedPhase.entered_at when the
-    -- bubble is in `placeholder` state. Used for the inline elapsed
+    -- Server-authoritative; matches ObservedPhase.state_updated_at when
+    -- the bubble is in `placeholder` state. Used for the inline elapsed
     -- counter inside the bubble.
-    placeholder_since: Timestamp? when state = placeholder
+    placeholder_since: Timestamp?
+
+    -- The SSE sequence_id of the first Token observed for this request
+    -- (the same sequence_id carried on the LlmFirstByte event). Stored
+    -- here so PendingBubbleCompletedOnMessage can correlate the
+    -- persisted assistant Message to this bubble (a Message with seq >
+    -- first_token_seq is THIS bubble's completion). The wire-level
+    -- request_id is unsuitable because SseWireEvent::Message does not
+    -- carry it; sequence_id is monotonic and on every event by
+    -- construction (see sse_wire.allium).
+    first_token_seq: Integer?
 
     transitions state {
         not_present -> placeholder
-            -- ObservedPhase transitions to working=true,
-            -- phase=llm_requesting; no Token has yet arrived for the
-            -- current request_id.
         placeholder -> streaming
-            -- LlmFirstByte received for this bubble's request_id.
-        placeholder -> removed
-            -- ObservedPhase left llm_requesting without any Token
-            -- arriving (error / cancellation path).
-        streaming -> complete
-            -- Persisted Message event arrives carrying the full
-            -- assistant message that hosted this bubble. The DOM node
-            -- transitions from the live streaming buffer to the
-            -- canonical persisted message; no remount.
-        terminal: complete, removed
+        placeholder -> not_present
+        streaming -> not_present
     }
 }
 
@@ -249,10 +262,35 @@ entity InflightToolTimer {
     -- unique by construction (same as elsewhere in the runtime).
     tool_use_id: String
 
-    -- Server-authoritative start time from the tool-use block's
-    -- display_data.started_at. Set when the executor begins dispatch
-    -- (REQ-WPV-002).
+    -- Server-authoritative start time. Carrier: the parent assistant
+    -- message's `display_data.tool_starts` map (a HashMap<ToolUseId,
+    -- unix_ms>) populated by the runtime when `dispatch_tool_execution`
+    -- begins and propagated via `MessageUpdated`. This avoids amending
+    -- the persisted `ContentBlock::ToolUse` schema (which has only
+    -- {id, name, input}); see design.md "Per-tool started_at carrier."
     started_at: Timestamp
+}
+
+-- Per-turn retry context. Lives across phase transitions within a
+-- single turn (REQ-WPV-003 requires `executing bash 12s (retry 2/5)`
+-- when the LLM retried earlier in the same turn before reaching the
+-- tool call). Cleared on AgentDone (turn boundary), NOT on per-phase
+-- exit — that would discard the retry context the moment the phase
+-- transitions from llm_requesting to tool_executing, contradicting the
+-- required display. Populated by rules owned by the
+-- llm-retry-visibility sibling spec; left empty (entity absent) when
+-- the turn has no unresolved retry.
+entity TurnRetryContext {
+    view: ClientView
+    retry: RetryContext
+}
+
+-- The StateBar's derived activity output. One per ClientView. Updated
+-- in-place by the DisplayWhen* derivation rules each time
+-- DerivationTriggered(view) fires.
+entity StateBarDisplay {
+    view: ClientView
+    activity: DisplayedActivity
 }
 
 -- Watchdog freshness state. Single instance per ClientView.
@@ -280,7 +318,7 @@ entity HeartbeatWatchdog {
 
 -- The captured snapshot at the moment we left `live`. Cleared the
 -- moment a fresh Init lands (which carries the authoritative current
--- phase + entered_at).
+-- phase + state_updated_at).
 entity LastKnownActivityCapture {
     view: ClientView
 
@@ -309,15 +347,19 @@ config {
 
 -- REQ-WPV-001: a StateChange replaces the ObservedPhase wholesale.
 -- Event shape (positional): SseStateChangeReceived(view, raw_state,
--- entered_at). `raw_state` is the opaque ConvState the server emits;
--- the helpers `is_working_phase` and `working_phase_of` (described in
--- @guidance) project it onto our WorkingPhase enum.
+-- state_updated_at). `raw_state` is the opaque ConvState the server
+-- emits; the helpers `is_working_phase` and `working_phase_of`
+-- (described in @guidance) project it onto our WorkingPhase enum.
+-- `state_updated_at` is the value of `Conversation.state_updated_at`
+-- at the moment the new state took effect — the runtime already
+-- bumps this on every transition (db.rs:676), this rule just
+-- propagates it onto the client snapshot.
 rule ObservedPhaseUpdatedByStateChange {
-    when: SseStateChangeReceived(view, raw_state, entered_at)
+    when: SseStateChangeReceived(view, raw_state, state_updated_at)
 
     ensures: ObservedPhase{view}.working    = is_working_phase(raw_state)
     ensures: ObservedPhase{view}.phase      = working_phase_of(raw_state)
-    ensures: ObservedPhase{view}.entered_at = entered_at
+    ensures: ObservedPhase{view}.state_updated_at = state_updated_at
 
     @guidance
         -- is_working_phase / working_phase_of map the runtime ConvState
@@ -336,18 +378,18 @@ rule ObservedPhaseUpdatedByStateChange {
         -- implementation; consumers must check `working` before reading.
 }
 
--- REQ-WPV-001: Init's phase carries the same entered_at field; on
--- (re-)connect, the ObservedPhase is reconstructed from this.
--- Event shape: SseInitReceived(view, phase_raw_state, phase_entered_at).
--- The Init payload's full shape is broader than this; we destructure to
--- the fields this rule consumes (positional, since Allium when:
--- patterns are positional-named).
+-- REQ-WPV-001: Init's phase carries the same state_updated_at field;
+-- on (re-)connect, the ObservedPhase is reconstructed from it. The
+-- carrier on the wire is the existing `Conversation.state_updated_at`
+-- field flattened into `EnrichedConversation` at the top level of the
+-- Init payload — no new struct, no parallel representation.
+-- Event shape: SseInitReceived(view, raw_state, state_updated_at).
 rule ObservedPhaseSeededFromInit {
-    when: SseInitReceived(view, phase_raw_state, phase_entered_at)
+    when: SseInitReceived(view, raw_state, state_updated_at)
 
-    ensures: ObservedPhase{view}.working    = is_working_phase(phase_raw_state)
-    ensures: ObservedPhase{view}.phase      = working_phase_of(phase_raw_state)
-    ensures: ObservedPhase{view}.entered_at = phase_entered_at
+    ensures: ObservedPhase{view}.working    = is_working_phase(raw_state)
+    ensures: ObservedPhase{view}.phase      = working_phase_of(raw_state)
+    ensures: ObservedPhase{view}.state_updated_at = state_updated_at
 }
 
 ------------------------------------------------------------
@@ -356,16 +398,48 @@ rule ObservedPhaseSeededFromInit {
 
 -- Any SSE event (including the typed `ping` keep-alive) updates
 -- last_event_at and resets freshness to fresh.
--- Event shape: SseAnyEventReceived(view) — emitted by the EventSource
--- listener regardless of event type. The implementation registers a
--- catch-all listener at the EventSource boundary and dispatches this
--- trigger before per-event-type processing, so the watchdog never
--- misses an event just because its type lacks a dedicated handler.
+-- Event shape: SseAnyEventReceived(view) — fanned in from per-event
+-- listeners (see @guidance below).
 rule WatchdogResetOnAnyEvent {
     when: SseAnyEventReceived(view)
 
     ensures: HeartbeatWatchdog{view}.last_event_at = now()
     ensures: HeartbeatWatchdog{view}.freshness     = fresh
+
+    @guidance
+        -- Native `EventSource` does NOT have a catch-all for named SSE
+        -- events; named events only fire listeners registered for that
+        -- specific event name (see MDN, "Using server-sent events":
+        -- https://developer.mozilla.org/en-US/docs/Web/API/Server-sent_events/Using_server-sent_events).
+        -- The default `onmessage` only fires for events with no event
+        -- name (the unnamed "message" event).
+        --
+        -- The implementation MUST therefore register an explicit
+        -- listener for every named event the server emits, AND each
+        -- listener must bump `lastSseEventAt` (this rule's effect)
+        -- before delegating to per-event-type processing. The current
+        -- event set, sourced from `SseWireEvent::event_type()` in
+        -- `crates/phoenix-ide/src/api/wire.rs`:
+        --
+        --   init, message, message_updated, state_change, token,
+        --   agent_done, conversation_became_terminal,
+        --   conversation_update, error, browser_session_state,
+        --   steer_message_queued, rate_limit_snapshot,
+        --   conversation_hard_deleted
+        --
+        -- Plus the new variants this spec introduces:
+        --
+        --   llm_first_byte (working-phase-visibility)
+        --   llm_attempt    (llm-retry-visibility, sibling spec)
+        --   ping           (server keep-alive, see design.md
+        --                   "Server keep-alive observation")
+        --
+        -- A small wrapper helper in the SSE-client layer (one place,
+        -- not duplicated per listener) avoids per-listener drift. New
+        -- event variants added to `SseWireEvent` MUST add a matching
+        -- listener registration in the same change; the lack of a
+        -- catch-all means a forgotten registration silently degrades
+        -- the watchdog rather than producing a compile error.
 }
 
 -- REQ-WPV-004: tick check. Fires on a 1-second interval driven by the
@@ -387,7 +461,7 @@ rule WatchdogTick {
     when: ElapsedTickerFired(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{view}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
     requires: ObservedPhase{view}.working = true
     requires: now() - HeartbeatWatchdog{view}.last_event_at
               >= config.heartbeat_watchdog_seconds * 1000
@@ -416,14 +490,14 @@ rule WatchdogDisarmsOnConnectionDegrade {
 rule LastKnownActivityCapturedOnDegrade {
     when: ConnectionStateChanged(view, new_state)
 
-    requires: conn/ClientConnection{view}.state = live  -- prior state
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- prior state
     requires: new_state in { reconnecting, offline }
     requires: ObservedPhase{view}.working = true
 
     let snap = LastKnownActivity{
         phase:                 ObservedPhase{view}.phase,
         base_reason_text:      base_reason_text_for(ObservedPhase{view}),
-        elapsed_at_disconnect: now() - ObservedPhase{view}.entered_at,
+        elapsed_at_disconnect: now() - ObservedPhase{view}.state_updated_at,
         captured_at:           now()
     }
 
@@ -434,7 +508,7 @@ rule LastKnownActivityCapturedOnDegrade {
 -- current state. Reuses the SseInitReceived trigger; the rule body
 -- does not read the payload, only the fact of arrival.
 rule LastKnownActivityClearedOnInit {
-    when: SseInitReceived(view, phase_raw_state, phase_entered_at)
+    when: SseInitReceived(view, raw_state, state_updated_at)
 
     ensures: LastKnownActivityCapture{view}.captured = null
 }
@@ -455,75 +529,99 @@ rule LastKnownActivityClearedOnReconnect {
 -- Rules — PendingAssistantBubble
 ------------------------------------------------------------
 
--- REQ-WPV-006: enter llm_requesting with no tokens → create placeholder.
+-- REQ-WPV-006: enter llm_requesting with no tokens → arm placeholder.
+-- The bubble is a reusable singleton, so the precondition admits any
+-- non-active state (not_present after the previous turn cleaned up).
+-- The placeholder_since stamp is taken from the just-set
+-- ObservedPhase.state_updated_at so the inline elapsed counter ticks
+-- from phase entry, not from this rule's firing time.
 rule PendingBubblePlaceholderCreated {
     when: ObservedPhaseUpdatedToWorking(view, llm_requesting)
 
     requires: PendingAssistantBubble{view}.state = not_present
 
-    ensures: PendingAssistantBubble{view}.state            = placeholder
-    ensures: PendingAssistantBubble{view}.placeholder_since = ObservedPhase{view}.entered_at
-    -- request_id is set when the next Token / LlmFirstByte arrives and
-    -- the client correlates it; until then it is null.
+    ensures: PendingAssistantBubble{view}.state             = placeholder
+    ensures: PendingAssistantBubble{view}.placeholder_since = ObservedPhase{view}.state_updated_at
+    ensures: PendingAssistantBubble{view}.first_token_seq   = null
+    -- request_id is set when LlmFirstByte arrives; null while placeholder.
 }
 
 -- REQ-WPV-007: LlmFirstByte arrives → transition to streaming. Same DOM
--- node, contents swap from elapsed counter to streamed text.
--- Event shape: SseLlmFirstByteReceived(view, request_id).
+-- node, contents swap from elapsed counter to streamed text. The event
+-- carries both `request_id` (correlator the runtime uses internally)
+-- and `sequence_id` (the wire-envelope seq, monotonic per stream); we
+-- store the seq on the bubble so PendingBubbleCompletedOnMessage can
+-- correlate the persisted assistant Message back to this bubble (a
+-- Message with role=assistant and seq > first_token_seq is THIS
+-- bubble's completion). request_id alone is unsuitable because
+-- SseWireEvent::Message does not carry it.
+-- Event shape: SseLlmFirstByteReceived(view, request_id, sequence_id).
 rule PendingBubbleTransitionsToStreaming {
-    when: SseLlmFirstByteReceived(view, request_id)
+    when: SseLlmFirstByteReceived(view, request_id, sequence_id)
 
     requires: PendingAssistantBubble{view}.state = placeholder
 
-    ensures: PendingAssistantBubble{view}.state      = streaming
-    ensures: PendingAssistantBubble{view}.request_id = request_id
+    ensures: PendingAssistantBubble{view}.state           = streaming
+    ensures: PendingAssistantBubble{view}.request_id      = request_id
+    ensures: PendingAssistantBubble{view}.first_token_seq = sequence_id
 }
 
--- REQ-WPV-006: phase left llm_requesting without any Token → remove.
-rule PendingBubbleRemovedOnPhaseExit {
-    when: ObservedPhaseUpdatedFromWorking(view, llm_requesting, _new_phase)
+-- REQ-WPV-006: phase left llm_requesting without any Token. The bubble
+-- returns to `not_present` (NOT a terminal state) so the next
+-- llm_requesting entry can re-arm it. Clears the per-bubble fields.
+rule PendingBubbleResetOnEmptyPhaseExit {
+    when: ObservedPhaseUpdatedFromWorking(view, llm_requesting, new_phase)
 
     requires: PendingAssistantBubble{view}.state = placeholder
 
-    ensures: PendingAssistantBubble{view}.state = removed
+    ensures: PendingAssistantBubble{view}.state             = not_present
+    ensures: PendingAssistantBubble{view}.request_id        = null
+    ensures: PendingAssistantBubble{view}.placeholder_since = null
+    ensures: PendingAssistantBubble{view}.first_token_seq   = null
 }
 
 -- The streaming bubble becomes the canonical persisted message on the
--- next assistant Message event arrival.
+-- next assistant Message event arrival, then returns to `not_present`
+-- so the next turn can re-arm. The DOM transition from the live
+-- streaming buffer to the canonical persisted message is handled by
+-- the implementation; the bubble entity itself just resets.
 --
--- Correlation note: SseWireEvent::Message payloads do NOT carry the
--- LLM request_id (only Token events do), so we cannot correlate
--- bubble→message by request_id directly. Instead the correlation is
--- sequential: a streaming bubble exists only while a single LLM
--- request is in flight (PendingAssistantBubble is per-view-singleton);
--- the next assistant Message after the bubble entered `streaming`
--- IS the completion of that request. The implementation enforces this
--- ordering via the SSE sequence_id (a Message event with role=assistant
--- and sequence_id strictly greater than the bubble's first Token
--- sequence_id is the completion).
--- Event shape: SseMessageReceived(view, message_role, message_seq,
--- bubble_first_token_seq).
+-- Correlation: SseWireEvent::Message payloads do NOT carry request_id
+-- (only Token events do). We compare the inbound message's seq to the
+-- bubble's stored first_token_seq (set when the bubble transitioned
+-- to streaming). A Message with role=assistant and seq >
+-- first_token_seq is the completion of THIS bubble's request — by
+-- SSE sequence_id monotonicity (sse_wire.allium) and the singleton
+-- nature of in-flight LLM requests per conversation.
+-- Event shape: SseMessageReceived(view, message_role, message_seq).
 rule PendingBubbleCompletedOnMessage {
-    when: SseMessageReceived(view, message_role, message_seq, bubble_first_token_seq)
+    when: SseMessageReceived(view, message_role, message_seq)
 
     requires: PendingAssistantBubble{view}.state = streaming
     requires: message_role = assistant
-    requires: message_seq > bubble_first_token_seq
+    requires: message_seq > PendingAssistantBubble{view}.first_token_seq
 
-    ensures: PendingAssistantBubble{view}.state = complete
+    ensures: PendingAssistantBubble{view}.state             = not_present
+    ensures: PendingAssistantBubble{view}.request_id        = null
+    ensures: PendingAssistantBubble{view}.placeholder_since = null
+    ensures: PendingAssistantBubble{view}.first_token_seq   = null
 }
 
 ------------------------------------------------------------
 -- Rules — InflightToolTimer
 ------------------------------------------------------------
 
--- REQ-WPV-002: tool-use block gains a started_at via MessageUpdated.
--- This is the structural trigger for the inline timer's existence.
+-- REQ-WPV-002: a per-tool start time appears in a message_updated
+-- event. The carrier is the parent assistant message's
+-- `display_data.tool_starts` map (HashMap<ToolUseId, unix_ms>): the
+-- runtime adds an entry to that map and emits MessageUpdated with the
+-- updated display_data when `dispatch_tool_execution` begins. This
+-- approach is preferred over amending `ContentBlock::ToolUse` (which is
+-- {id, name, input} on disk and crosses all LLM providers); the
+-- assistant-message display_data already exists as a structured per-
+-- message side-channel for UI metadata (e.g. duration_ms on
+-- tool-result messages). See design.md "Per-tool started_at carrier."
 -- Event shape: SseToolUseStartedAtUpdated(view, tool_use_id, started_at).
--- The implementation projects this from a generic SseMessageUpdatedReceived
--- by matching `message_updated` events whose display_data carries a
--- new `started_at` field on a tool-use block; views that fail the
--- match no-op.
 rule InflightToolTimerCreated {
     when: SseToolUseStartedAtUpdated(view, tool_use_id, started_at)
 
@@ -548,6 +646,42 @@ rule InflightToolTimerRemovedOnResult {
 }
 
 ------------------------------------------------------------
+-- Rules — TurnRetryContext lifecycle
+------------------------------------------------------------
+
+-- REQ-WPV-003 illustrates `executing bash 12s (retry 2/5)` — the
+-- retry-modifier must persist across an intra-turn phase transition
+-- (llm_requesting → tool_executing). Therefore the retry context is
+-- NOT scoped to a single phase. It is cleared at the turn boundary
+-- only: AgentDone signals the turn has reached a terminal outcome and
+-- any unresolved retry context is no longer relevant.
+--
+-- Population (creation/update on LlmAttempt events) is owned by the
+-- llm-retry-visibility sibling spec; this spec only defines the
+-- clear-on-AgentDone rule because clearance is observable to the
+-- display layer and must outlive a single phase.
+-- Event shape: SseAgentDoneReceived(view).
+rule TurnRetryContextClearedOnAgentDone {
+    when: SseAgentDoneReceived(view)
+
+    requires: exists TurnRetryContext{view: view}
+
+    ensures: not exists TurnRetryContext{view: view}
+}
+
+-- A turn-terminal error event (UserFacingError) also concludes the
+-- retry visibility; surfacing a retry suffix on a finalised error is
+-- confusing ("retry 2/5" with no further attempt). Cleared on receipt.
+-- Event shape: SseErrorReceived(view).
+rule TurnRetryContextClearedOnTerminalError {
+    when: SseErrorReceived(view)
+
+    requires: exists TurnRetryContext{view: view}
+
+    ensures: not exists TurnRetryContext{view: view}
+}
+
+------------------------------------------------------------
 -- Rules — DisplayedActivity derivation
 ------------------------------------------------------------
 
@@ -568,7 +702,7 @@ rule DisplayWhenWatchdogStale {
 
     let secs = (now() - HeartbeatWatchdog{view}.last_event_at) / 1000
 
-    ensures: StateBarDisplay{view} = DisplayedActivity{
+    ensures: StateBarDisplay{view}.activity = DisplayedActivity{
         text:      "no signal from server for " + str(secs) + "s",
         dot_class: degraded,
         has_timer: true
@@ -583,14 +717,14 @@ rule DisplayWhenReconnectingWithCapturedActivity {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{view}.state = reconnecting
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = reconnecting
     requires: LastKnownActivityCapture{view}.captured != null
 
     let snap     = LastKnownActivityCapture{view}.captured
     let elapsed  = snap.elapsed_at_disconnect / 1000
-    let attempts = conn/ClientConnection{view}.attempt
+    let attempts = conn/ClientConnection{conversation_id: view.conversation_id}.attempt
 
-    ensures: StateBarDisplay{view} = DisplayedActivity{
+    ensures: StateBarDisplay{view}.activity = DisplayedActivity{
         text:      "reconnecting (" + str(attempts) + ") — last: "
                    + snap.base_reason_text + " " + str(elapsed) + "s",
         dot_class: reconnecting,
@@ -602,13 +736,13 @@ rule DisplayWhenOfflineWithCapturedActivity {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{view}.state = offline
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = offline
     requires: LastKnownActivityCapture{view}.captured != null
 
     let snap    = LastKnownActivityCapture{view}.captured
     let elapsed = snap.elapsed_at_disconnect / 1000
 
-    ensures: StateBarDisplay{view} = DisplayedActivity{
+    ensures: StateBarDisplay{view}.activity = DisplayedActivity{
         text:      "offline — last: " + snap.base_reason_text
                    + " " + str(elapsed) + "s",
         dot_class: offline,
@@ -627,11 +761,11 @@ rule DisplayWhenReconnectingWithoutCapturedActivity {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{view}.state in { reconnecting, offline }
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state in { reconnecting, offline }
     requires: LastKnownActivityCapture{view}.captured = null
 
-    let conn_state = conn/ClientConnection{view}.state
-    let attempts   = conn/ClientConnection{view}.attempt
+    let conn_state = conn/ClientConnection{conversation_id: view.conversation_id}.state
+    let attempts   = conn/ClientConnection{conversation_id: view.conversation_id}.attempt
 
     ensures: StateBarDisplay{view} = connection_only_display(conn_state, attempts)
 }
@@ -641,14 +775,14 @@ rule DisplayWhenStreaming {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{view}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase = llm_requesting
     requires: PendingAssistantBubble{view}.state = streaming
 
-    let retry_suffix = render_retry_modifier(ObservedPhase{view}.retry)
+    let retry_suffix = render_retry_modifier_for(view)
 
-    ensures: StateBarDisplay{view} = DisplayedActivity{
+    ensures: StateBarDisplay{view}.activity = DisplayedActivity{
         text:      "streaming" + retry_suffix,
         dot_class: working,
         has_timer: false
@@ -660,15 +794,15 @@ rule DisplayWhenThinking {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{view}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase = llm_requesting
     requires: PendingAssistantBubble{view}.state in { not_present, placeholder }
 
-    let secs         = (now() - ObservedPhase{view}.entered_at) / 1000
-    let retry_suffix = render_retry_modifier(ObservedPhase{view}.retry)
+    let secs         = (now() - ObservedPhase{view}.state_updated_at) / 1000
+    let retry_suffix = render_retry_modifier_for(view)
 
-    ensures: StateBarDisplay{view} = DisplayedActivity{
+    ensures: StateBarDisplay{view}.activity = DisplayedActivity{
         text:      "thinking " + str(secs) + "s" + retry_suffix,
         dot_class: working,
         has_timer: true
@@ -683,15 +817,15 @@ rule DisplayWhenToolExecuting {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{view}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase = tool_executing
 
-    let secs         = (now() - ObservedPhase{view}.entered_at) / 1000
+    let secs         = (now() - ObservedPhase{view}.state_updated_at) / 1000
     let tool_name    = current_tool_name(view)
-    let retry_suffix = render_retry_modifier(ObservedPhase{view}.retry)
+    let retry_suffix = render_retry_modifier_for(view)
 
-    ensures: StateBarDisplay{view} = DisplayedActivity{
+    ensures: StateBarDisplay{view}.activity = DisplayedActivity{
         text:      "executing " + tool_name + " " + str(secs) + "s" + retry_suffix,
         dot_class: working,
         has_timer: true
@@ -706,15 +840,15 @@ rule DisplayWhenOtherWorking {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{view}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase not in { llm_requesting, tool_executing }
 
-    let secs         = (now() - ObservedPhase{view}.entered_at) / 1000
+    let secs         = (now() - ObservedPhase{view}.state_updated_at) / 1000
     let prose        = phase_prose(ObservedPhase{view}.phase)
-    let retry_suffix = render_retry_modifier(ObservedPhase{view}.retry)
+    let retry_suffix = render_retry_modifier_for(view)
 
-    ensures: StateBarDisplay{view} = DisplayedActivity{
+    ensures: StateBarDisplay{view}.activity = DisplayedActivity{
         text:      prose + " " + str(secs) + "s" + retry_suffix,
         dot_class: working,
         has_timer: true
@@ -727,7 +861,7 @@ rule DisplayWhenNotWorking {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
-    requires: conn/ClientConnection{view}.state = live
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
     requires: ObservedPhase{view}.working = false
 
     ensures: StateBarDisplay{view} = non_working_display(ObservedPhase{view})
@@ -745,14 +879,14 @@ invariant SingleLiveTimerInStateBar {
 
 -- REQ-WPV-001: elapsed time is ALWAYS derived from a server-authoritative
 -- timestamp. If a UI elapsed value exists, it must trace to either
--- ObservedPhase.entered_at, InflightToolTimer.started_at, or
+-- ObservedPhase.state_updated_at, InflightToolTimer.started_at, or
 -- HeartbeatWatchdog.last_event_at (the watchdog is client-side by
 -- construction — it measures local silence).
 invariant ElapsedTracesToServerTimestamp {
     for v in ClientView:
         for elapsed in elapsed_values_in(StateBarDisplay{view: v}):
             elapsed.source in {
-                ObservedPhase{view: v}.entered_at,
+                ObservedPhase{view: v}.state_updated_at,
                 any InflightToolTimer{view: v}.started_at,
                 HeartbeatWatchdog{view: v}.last_event_at
             }
@@ -763,7 +897,7 @@ invariant ElapsedTracesToServerTimestamp {
 invariant LastKnownActivityWellGated {
     for v in ClientView:
         LastKnownActivityCapture{view: v}.captured != null
-        implies conn/ClientConnection{view: v}.state in { reconnecting, offline }
+        implies conn/ClientConnection{conversation_id: v.conversation_id}.state in { reconnecting, offline }
 }
 
 -- REQ-WPV-008: a fresh Init wipes any stale frozen activity.
@@ -786,7 +920,7 @@ invariant PlaceholderBubbleImpliesLlmRequesting {
 -- this; the invariant makes it structural.
 invariant WatchdogStaleOnlyWhenWorkingAndLive {
     for v in ClientView where HeartbeatWatchdog{view: v}.freshness = stale:
-        conn/ClientConnection{view: v}.state = live
+        conn/ClientConnection{conversation_id: v.conversation_id}.state = live
         and ObservedPhase{view: v}.working = true
 }
 
@@ -812,7 +946,7 @@ surface ConversationActivityFeed {
 
     @guarantee SingleSourceOfElapsedTime
         -- Every elapsed value visible to the user traces back to a
-        -- server-authoritative timestamp (entered_at, started_at) OR to
+        -- server-authoritative timestamp (state_updated_at, started_at) OR to
         -- the watchdog's local silence measurement. No elapsed value is
         -- computed from event-arrival time.
 
@@ -869,7 +1003,7 @@ deferred PerArtifactRetryBadge
 -- No open questions remain. Decisions resolved during elicitation
 -- session dated 2026-05-25:
 --
---   - entered_at: server-authoritative on both StateChange and Init's
+--   - state_updated_at: server-authoritative on both StateChange and Init's
 --     phase. Client-side timestamps explicitly rejected because they
 --     reset on reconnect/reload and diverge across tabs.
 --
@@ -902,7 +1036,20 @@ deferred PerArtifactRetryBadge
 --     MessageComponents.tsx:635-638 is amended to retain the live
 --     in-flight target.
 --
---   - Per-tool started_at carrier: tool-use block display_data,
---     mirroring the duration_ms convention. New ToolExecutionStarted
---     SSE variant explicitly rejected — would be a parallel
---     representation of the same value.
+--   - Per-tool started_at carrier: a typed `tool_starts: BTreeMap<
+--     String, i64>` field on the assistant message's display_data,
+--     populated by the runtime when `dispatch_tool_execution` begins
+--     and propagated via `MessageUpdated`. Mirrors the duration_ms
+--     convention (typed metadata on message display_data). A new field
+--     on `ContentBlock::ToolUse` was rejected because that struct is
+--     persisted/cross-provider and adding a UI-side field there
+--     requires a migration. A new ToolExecutionStarted SSE variant was
+--     rejected as a parallel representation of the same value.
+--
+--   - State-entry timestamp: reuse the existing
+--     `Conversation.state_updated_at: DateTime<Utc>` (already bumped on
+--     every state transition via db.rs:676) rather than introducing a
+--     parallel `entered_at` field. On Init the value is already at the
+--     top of `init.conversation` via the `#[serde(flatten)]` on
+--     `EnrichedConversation`; on StateChange we add a typed
+--     `state_updated_at: i64` field carrying the same value.

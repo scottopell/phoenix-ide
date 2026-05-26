@@ -4,14 +4,18 @@
 
 Three surfaces, one wire change, one client state-machine extension.
 
-1. **Wire** (`crates/phoenix-ide/src/api/wire.rs`): `StateChange` and the
-   phase carried in `Init` gain a server-authoritative `entered_at` (unix
-   ms). New optional SSE event `LlmFirstByte` marks the boundary inside
-   `llm_requesting`.
-2. **Runtime** (`crates/phoenix-ide/src/runtime/executor.rs`): stamp
-   `entered_at` whenever a phase is entered; emit `LlmFirstByte` from the
-   token forwarder when the first token of an LLM request arrives. Stamp
-   per-tool `started_at` when `dispatch_tool_execution` begins.
+1. **Wire** (`crates/phoenix-ide/src/api/wire.rs`): `StateChange` gains
+   a `state_updated_at: i64` field (unix ms, sourced from the existing
+   `Conversation.state_updated_at`). New SSE event `LlmFirstByte` marks
+   the boundary inside `llm_requesting`. No new field on `Init` — the
+   existing flattened `Conversation.state_updated_at` is already at the
+   top level of the Init payload.
+2. **Runtime** (`crates/phoenix-ide/src/runtime/executor.rs`): emit
+   `LlmFirstByte` from the token forwarder when the first token of an
+   LLM request arrives; inject `started_at` into the assistant message's
+   `display_data.tool_starts` map when `dispatch_tool_execution` begins.
+   No new server-side tracking for state entry — the existing
+   `Conversation.state_updated_at` row update is reused.
 3. **Client** (`ui/src/conversation/atom.ts`, `ui/src/components/StateBar.tsx`,
    `ui/src/components/MessageComponents.tsx`): derive elapsed times from
    server timestamps; render inline indicators on in-flight artifacts;
@@ -20,7 +24,7 @@ Three surfaces, one wire change, one client state-machine extension.
 
 ## Wire Format Changes
 
-### `StateChange.entered_at: i64` (new field)
+### `StateChange.state_updated_at: i64` (new field)
 
 ```rust
 StateChange {
@@ -29,20 +33,32 @@ StateChange {
     state: Value,
     presentation_mode: String,
     /// Unix milliseconds (server clock) at which the conversation entered
-    /// this phase. Lets clients display elapsed time deterministically
-    /// across reconnect / reload and across multiple tabs viewing the
-    /// same conversation.
-    entered_at: i64,
+    /// this state. Sourced from `Conversation.state_updated_at` — the same
+    /// `DateTime<Utc>` field the runtime already bumps on every state
+    /// transition (`db.rs:676`). Carrying it on the wire event makes
+    /// elapsed-time deterministic across reconnect / reload / multi-tab.
+    state_updated_at: i64,
 }
 ```
 
-### `Init.conversation.phase.entered_at: i64` (new nested field)
+### `Init.conversation.state_updated_at: i64` (already present)
 
-The `EnrichedConversation` struct embedded in `Init.conversation` already
-carries the current phase. Add `entered_at` to that phase struct so a fresh
-client reconstructs the same elapsed time. Per the project's "no parallel
-representations" principle, the field name and semantics MUST match the one
-on `StateChange`.
+`EnrichedConversation` flattens `Conversation` via `#[serde(flatten)]`
+(`runtime.rs:618-620`), so the existing `Conversation.state_updated_at:
+DateTime<Utc>` field is ALREADY at the top level of the Init payload's
+`conversation` object. No new struct is required; a fresh client reads
+`init.conversation.state_updated_at` and converts to unix ms.
+
+This satisfies "no parallel representations": one canonical
+`state_updated_at` on the conversation row, exposed verbatim on Init via
+the flatten, and re-emitted as `StateChange.state_updated_at` on every
+transition. There is no separately-tracked `entered_at` field.
+
+(The original draft of this design proposed adding a new
+`Init.conversation.phase.entered_at` nested field. That would have
+required adding a new `phase` object alongside `state` — a parallel
+representation of the same data. Replaced with the flattened
+`state_updated_at` reuse described above.)
 
 ### `LlmFirstByte { request_id, sequence_id }` (new variant)
 
@@ -63,36 +79,62 @@ client can observe a `Token` for a request without first observing the
 `LlmFirstByte`). When an LLM request completes with zero tokens (an error
 or early termination), `LlmFirstByte` is NOT emitted.
 
-### Per-tool `started_at` on the tool-use block
+### Per-tool `started_at` carrier
 
 Tool execution start time is server-authoritative for the same reasons as
-phase entry. Two viable carriers; the implementation chooses one:
+phase entry. The challenge: `ContentBlock::ToolUse` is shaped `{id, name,
+input}` only (`llm/types.rs:117-121`), it's persisted as JSON in
+`messages.content`, and it crosses every LLM provider. Adding a new field
+to it would require schema migration and provider-wide changes for a
+purely UI-side metadata value. Three carriers considered:
 
-**Option A (preferred):** Add `started_at: Option<i64>` to the tool-use
-block's `display_data` JSON, set when `dispatch_tool_execution` begins, and
-propagate via `MessageUpdated`. This piggybacks on an existing event type
-and reuses the display_data convention already used for `duration_ms`.
+**Option A — message-level `display_data.tool_starts` map (chosen).**
+The parent assistant message's `display_data` (already mutable via the
+`MessageUpdated` event path) gains an entry like:
 
-**Option B:** New `ToolExecutionStarted { sequence_id, tool_use_id,
-started_at }` SSE event. More explicit but adds wire surface for a value
-the client only needs as an input to a derived display.
+```json
+{
+  "tool_starts": { "<tool_use_id>": 1716663041234, ... }
+}
+```
 
-Decision: Option A. The tool-use block's `display_data` is already the
-home for execution metadata (cf. `duration_ms` injection in
-`schema.rs:649-655`); a parallel mechanism would violate the
-"no-parallel-representations" rule.
+The runtime mutates this map when `dispatch_tool_execution` begins and
+emits `MessageUpdated{display_data}` with the updated map. The client
+reads `display_data.tool_starts[tool_use_id]` for the inline widget timer.
+This is the same display_data side-channel pattern that
+`ToolResult.duration_ms` rides on (cf. `schema.rs:649-655`, `wire.rs:259-264`)
+— a mutable per-message blob for UI metadata that does not belong on the
+LLM content block.
+
+**Option B — typed field on `ContentBlock::ToolUse`.** Cleaner type story
+but expensive: requires migrating `messages.content` JSON, threading
+the field through all LLM provider response parsing, and reasoning about
+its meaning at the LLM-provider boundary (where it has none). Rejected
+for a UI-side metadata value.
+
+**Option C — new `ToolExecutionStarted` SSE variant.** Rejected for the
+same reason `duration_ms` doesn't have its own variant: parallel
+representation with an existing carrier.
+
+Decision: Option A. The new map key (`display_data.tool_starts`) is a
+typed addition to the runtime's existing `MessageDisplayData` struct (or
+equivalent) — implemented as a typed field on the Rust side, with
+ts-rs codegen mirroring it to the client. The `display_data` JSON blob
+remains the carrier, but the map itself is typed at compile time, not
+free-form.
 
 ## Runtime Changes
 
 ### Phase entry timestamping
 
-`executor.rs` already calls a single helper to transition to a new phase
-(broadcasting `StateChange`). Extend that helper to capture
-`SystemTime::now()` as unix milliseconds and include it on the wire event.
-Persist nothing: a reconnect after the next phase transition gets the new
-phase's `entered_at` in the next `StateChange`; a reconnect during the
-current phase gets it in `Init` (the executor already knows the current
-phase's entry time because it's the one who set it).
+The runtime already updates `Conversation.state_updated_at` on every
+state transition (`db.rs:676`, `db.rs:1491`). The only change is to
+include that field on the new `StateChange.state_updated_at` wire field
+when the executor broadcasts the event. No new client-side tracking, no
+new server-side tracking: the value is read from the row that was just
+updated, and propagated verbatim. On Init, the existing
+`#[serde(flatten)]` on `EnrichedConversation` already exposes
+`state_updated_at` at the top level.
 
 ### First-byte emission
 
@@ -102,12 +144,16 @@ loop with a "first chunk seen for this request_id" flag; on the first
 chunk, emit `LlmFirstByte` immediately before the `Token`. The flag is
 per-request and lives only in the forwarder task's stack.
 
-### Per-tool started_at
+### Per-tool started_at injection
 
-`dispatch_tool_execution` (in `executor.rs`) is the single point at which a
-tool transitions from "block exists" to "actually running." Capture
-`SystemTime::now()` there, write it into the tool-use block's `display_data`
-via the existing `MessageUpdated` path. No new wire variant.
+`dispatch_tool_execution` (in `executor.rs`) is the single point at which
+a tool transitions from "block exists" to "actually running." When it
+begins, the runtime mutates the parent assistant message's display_data
+to set `tool_starts[tool_use_id] = now_unix_ms` and emits
+`MessageUpdated{display_data}` with the updated map. The
+`MessageDisplayData` struct (or its equivalent) gains a typed
+`tool_starts: BTreeMap<String, i64>` field; ts-rs codegen mirrors the
+shape to the client.
 
 ## Client Changes
 
@@ -118,23 +164,26 @@ via the existing `MessageUpdated` path. No new wire variant.
 
 ```ts
 // On the phase atom (or alongside convState):
-phaseEnteredAt: number | null  // unix ms, from server
+phaseStateUpdatedAt: number | null  // unix ms, from server
 
 // On the inline-artifact atoms (tool-use blocks, pending assistant bubble):
-toolStartedAt: Record<ToolUseId, number>  // from display_data.started_at
+toolStartedAt: Record<ToolUseId, number>  // from display_data.tool_starts
 
 // On the connection observer:
 lastSseEventAt: number  // unix ms, client clock — for the watchdog
 ```
 
-`phaseEnteredAt` is updated on every `StateChange` event and on `Init`.
-`toolStartedAt` is updated when a `MessageUpdated` arrives with
-`display_data.started_at` set on a tool-use block. `lastSseEventAt` is
-updated on every event observable to the client `EventSource` — including
-the typed `ping` keep-alive once the server-side switch described in the
-next section ships. Standard `EventSource` does NOT surface SSE comment
-lines, so the current `: ping\n\n` keep-alive is invisible to the
-watchdog until that switch lands.
+`phaseStateUpdatedAt` is updated on every `StateChange` event (from
+`state_updated_at`) and on `Init` (from `conversation.state_updated_at`).
+`toolStartedAt` is updated when a `MessageUpdated` arrives carrying a
+`display_data.tool_starts` map; the reducer merges the map's entries
+into the atom's per-tool-id record. `lastSseEventAt` is updated on every
+event observable to the client `EventSource` (each per-event listener
+bumps it before delegating; see the EventSource listener notes below) —
+including the typed `ping` keep-alive once the server-side switch
+described in the next section ships. Standard `EventSource` does NOT
+surface SSE comment lines, so the current `: ping\n\n` keep-alive is
+invisible to the watchdog until that switch lands.
 
 ### Server keep-alive observation
 
@@ -144,10 +193,23 @@ comments. To observe them for the watchdog, two options:
 
 **Option A (preferred):** Switch the SSE keep-alive to a typed event with
 `event: ping` and `data: ""`. EventSource fires the `ping` event handler;
-the client listens and bumps `lastSseEventAt`. Minimal Rust change
-(`api/sse.rs:69-73`, `handlers.rs:3277-3281`): replace
-`.text("ping")` with `.event("ping").text("")`. Forward-compatible:
-clients that don't listen for `ping` simply ignore it.
+the client listens and bumps `lastSseEventAt`. The axum 0.7 API for
+KeepAlive carries an `Event`, not a raw string (cf.
+<https://docs.rs/axum/latest/axum/response/sse/struct.KeepAlive.html>):
+
+```rust
+// Before (api/sse.rs:69-73, handlers.rs:3277-3281):
+KeepAlive::new()
+    .interval(Duration::from_secs(15))
+    .text("ping")
+
+// After:
+KeepAlive::new()
+    .interval(Duration::from_secs(15))
+    .event(Event::default().event("ping").data(""))
+```
+
+Forward-compatible: clients that don't listen for `ping` simply ignore it.
 
 **Option B:** Use a polyfilled EventSource implementation that surfaces
 comments. Larger client dependency for a small need.
@@ -162,6 +224,42 @@ shared hook) compares `Date.now() - lastSseEventAt` every second; when it
 exceeds 35 000 ms AND `connectionState === 'connected'` AND `convState` is
 a working phase, set a `degradedSignal: true` flag on the StateBar's input.
 Cleared the moment any SSE event arrives.
+
+#### EventSource listener wiring (required)
+
+Native `EventSource` has no wildcard for named SSE events — named events
+only fire listeners registered for their specific event name (the default
+`onmessage` only fires for unnamed events). To make
+`lastSseEventAt` track *every* server-emitted event, the SSE client
+layer (`ui/src/hooks/useConnection.ts` or its delegate) MUST register
+an explicit listener for every event type the server emits, each
+bumping `lastSseEventAt` before delegating to per-event reducer
+handling. The current set, sourced from `SseWireEvent::event_type()`
+(`crates/phoenix-ide/src/api/wire.rs`):
+
+```
+init, message, message_updated, state_change, token, agent_done,
+conversation_became_terminal, conversation_update, error,
+browser_session_state, steer_message_queued, rate_limit_snapshot,
+conversation_hard_deleted
+```
+
+Plus the new variants introduced here and in the sibling spec:
+
+```
+llm_first_byte   (working-phase-visibility)
+llm_attempt      (llm-retry-visibility, sibling spec)
+ping             (server keep-alive, see "Server keep-alive observation")
+```
+
+A small `wrapHandler(eventName, fn)` helper in the SSE-client layer
+(one place, not duplicated per listener) is the recommended shape so
+the bump-then-delegate sequence cannot drift listener-by-listener. The
+listener registration list is the authoritative enumeration of
+event types the client observes — any new `SseWireEvent` variant MUST
+add a matching registration in the same change, since without a catch-
+all a forgotten registration silently degrades the watchdog (it will
+go stale during a turn that only emits the un-registered event type).
 
 ### StateBar derivation
 
@@ -233,12 +331,15 @@ None. All new fields are on wire events; no DB columns affected.
 
 ## ts-rs Codegen
 
-The `StateChange.entered_at` and `LlmFirstByte` additions both require
-`./dev.py codegen` to regenerate `ui/src/generated/SseWireEvent.ts`. The
-`parity_*` tests in `crates/phoenix-ide/src/api/sse.rs` must be updated to
-include the new field in expected JSON output. The valibot schemas in
-`ui/src/sseSchemas.ts` need a `LlmFirstByteSchema` and an extension of
-`StateChangeSchema` to include `entered_at`.
+The `StateChange.state_updated_at` and `LlmFirstByte` additions both
+require `./dev.py codegen` to regenerate `ui/src/generated/SseWireEvent.ts`.
+The `parity_*` tests in `crates/phoenix-ide/src/api/sse.rs` must be
+updated to include the new field in expected JSON output. The valibot
+schemas in `ui/src/sseSchemas.ts` need a `LlmFirstByteSchema` and an
+extension of `StateChangeSchema` to include `state_updated_at`. The
+typed `tool_starts: BTreeMap<String, i64>` field on the message
+display_data struct also needs codegen if that struct is ts-rs-exported
+(or its TS shape updated by hand if hand-typed).
 
 ## Open Questions
 
@@ -248,9 +349,15 @@ None. Decisions resolved during elicitation (session of 2026-05-25):
   itself is the progress signal (REQ-WPV-007).
 - Server keep-alive observability: switched from SSE comment to typed
   `event: ping` so the client watchdog observes it.
-- `entered_at` on `Init`'s phase: required; without it, a fresh client
-  cannot reconstruct the displayed elapsed time and REQ-WPV-008 fails.
-- Per-tool `started_at` carrier: `display_data` on the tool-use block,
-  reusing the `duration_ms` convention.
+- State-entry timestamp on the wire: reuse the existing
+  `Conversation.state_updated_at` (already bumped on every transition)
+  rather than introducing a parallel `entered_at` field. On Init the
+  field is already at the top of `init.conversation` via flatten; on
+  StateChange it's added as `state_updated_at: i64`.
+- Per-tool `started_at` carrier: a typed `tool_starts: BTreeMap<String,
+  i64>` field on the assistant message's display_data — NOT a new field
+  on `ContentBlock::ToolUse` (which would require schema migration and
+  cross-provider work for a UI-side value) and NOT a new SSE variant
+  (parallel representation).
 - Frozen-elapsed during reconnect: counter does not advance through the
   disconnect (honest about what we know).

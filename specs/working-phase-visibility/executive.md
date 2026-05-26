@@ -9,9 +9,12 @@ generic spinner with a phase-name label; only `tool_executing` has an
 elapsed-time counter, and connection-state messaging masks agent state
 entirely during reconnects. This spec adds:
 
-- A **server-authoritative phase entry timestamp** (`entered_at`) on every
-  `StateChange` and on the phase carried in `Init`, so elapsed times survive
-  reconnect, page reload, and multi-tab observation.
+- A **server-authoritative state-entry timestamp** — the existing
+  `Conversation.state_updated_at: DateTime<Utc>` (already bumped on every
+  transition, `db.rs:676`) is added to the `StateChange` wire event and
+  already exposed on `Init.conversation` via `#[serde(flatten)]`, so
+  elapsed times survive reconnect, page reload, and multi-tab observation
+  with no new field on the conversation row.
 - **Inline elapsed-time indicators on in-flight artifacts** (tool widgets;
   a placeholder assistant bubble during `llm_requesting`), so the activity
   signal is at the point of expectation rather than only in a header.
@@ -33,10 +36,12 @@ entirely during reconnects. This spec adds:
 
 Wire format changes are additive:
 
-- `SseWireEvent::StateChange` gains `entered_at: i64` (unix milliseconds,
-  server clock).
-- The phase carried in `Init.conversation` gains `entered_at: i64` so a
-  fresh client matches the live-connected display.
+- `SseWireEvent::StateChange` gains `state_updated_at: i64` (unix
+  milliseconds, server clock) — sourced from the existing
+  `Conversation.state_updated_at`.
+- No new field on `Init.conversation`: the existing flattened
+  `Conversation.state_updated_at` is already at the top level of the
+  Init payload.
 - New `SseWireEvent::LlmFirstByte { request_id, sequence_id }` emitted from
   the token forwarder in `executor.rs:1740-1764`, exactly once per LLM
   request, immediately before the first `Token` event for that request.
@@ -63,7 +68,7 @@ in the sibling spec `specs/llm-retry-visibility/`.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-WPV-001:** Server-authoritative phase entry timestamp | ❌ New | Adds `entered_at` to `StateChange` and to `Init.conversation.phase`; ts-rs regen + `parity_*` test update required |
+| **REQ-WPV-001:** Server-authoritative state-entry timestamp | ❌ New | Adds `state_updated_at` to `StateChange` (sourced from existing `Conversation.state_updated_at`); Init already exposes it via flatten. ts-rs regen + `parity_*` test update required |
 | **REQ-WPV-002:** Inline elapsed-time on in-flight artifacts | ❌ New | Tool widget timer via `display_data.started_at`; pending assistant bubble retains empty agent message during `llm_requesting` |
 | **REQ-WPV-003:** StateBar derivation rule | 🔄 Extend | Existing `StateBar.tsx:341-422` composition gains retry-modifier and degraded-signal precedence; existing `tool_executing` timer path becomes a special case of the generalised rule |
 | **REQ-WPV-004:** Heartbeat watchdog | ❌ New | Threshold 35s; depends on keep-alive switch from SSE comment to typed `ping` event |
@@ -87,7 +92,7 @@ greenfield additions on existing infrastructure.
   import is restored and the placeholder is deleted.
 
 - **`specs/sse_wire/`** — wire-format authority; new variants (`LlmFirstByte`,
-  `entered_at` on `StateChange`) and the keep-alive typed-event switch are
+  `state_updated_at` on `StateChange`) and the keep-alive typed-event switch are
   changes that the sse_wire invariants must continue to hold (replay ring
   semantics, sequence_id monotonicity, etc.). The `parity_*` tests in
   `api/sse.rs` enforce byte-for-byte parity.

@@ -35,7 +35,9 @@ specific reason and surface that.
 - `ui/src/components/StateBar.tsx:349-373` — connection state currently
   short-circuits and *masks* agent state during reconnect
 - `crates/phoenix-ide/src/api/wire.rs` — SseWireEvent variants;
-  `StateChange` has no `entered_at` timestamp
+  `StateChange` doesn't carry `state_updated_at` on the wire even though
+  `Conversation.state_updated_at` already exists on the row
+  (`db/schema.rs:476`, bumped on every transition via `db.rs:676`)
 - `crates/phoenix-ide/src/llm/error.rs:81-105` — retry classification
 - `crates/phoenix-ide/src/llm/anthropic.rs` — retry loop lives inside
   `complete_streaming`; no event emitted on retry
@@ -48,13 +50,15 @@ Each stage stands alone and ships value independently.
 
 ### Stage A — foundation (no retry visibility yet)
 
-- Add `entered_at: i64` to `StateChange` wire event and to the phase
-  carried in `Init` (so timers survive reconnect / page reload).
+- Add `state_updated_at: i64` to `StateChange` wire event (sourced from
+  the already-bumped `Conversation.state_updated_at`). Init already
+  exposes this field at `init.conversation.state_updated_at` via the
+  `#[serde(flatten)]` on `EnrichedConversation` — no Init payload change.
   Regenerate `ui/src/generated/`.
 - Frontend: replicate the `toolExecutingStartedAt` pattern for every
   working phase (`llm_requesting`, `awaiting_llm`,
   `seeded_llm_requesting`, `awaiting_sub_agents`,
-  `awaiting_continuation`, etc.) keyed off the new `entered_at`.
+  `awaiting_continuation`, etc.) keyed off `state_updated_at`.
 - Inline status on in-flight artifacts: render a placeholder assistant
   bubble with `"thinking 4s..."` while `llm_requesting` and no tokens
   have arrived; show elapsed time on the running tool widget header

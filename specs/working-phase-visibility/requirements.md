@@ -30,20 +30,26 @@ on the displayed activity (REQ-WPV-003).
 
 ### REQ-WPV-001: Server-Authoritative Phase Entry Timestamp
 
-WHEN the conversation transitions to a new phase
-THE SYSTEM SHALL include the entry timestamp (`entered_at`, unix milliseconds,
-server clock) in the `StateChange` SSE event
+WHEN the conversation transitions to a new state
+THE SYSTEM SHALL include `state_updated_at` (unix milliseconds, server
+clock) in the `StateChange` SSE event — sourced from the existing
+`Conversation.state_updated_at: DateTime<Utc>` field the runtime already
+bumps on every transition
 
 WHEN an SSE stream is opened (or reconnects)
-THE SYSTEM SHALL include the current phase's `entered_at` in the `Init`
-snapshot
+THE SYSTEM SHALL include `state_updated_at` in the `Init` snapshot,
+already carried at the top level of `init.conversation` via the
+`#[serde(flatten)]` on `EnrichedConversation`
 
-**Rationale:** Elapsed-time displays must survive reconnect, page reload, and
-multi-tab observation. A client-derived timestamp at event-arrival time fails
-all three (timer resets on reconnect, drifts under network jitter, and
-diverges across tabs viewing the same conversation). Server-authoritative
-`entered_at` makes the elapsed time a pure function of `now() - entered_at`,
-deterministic and consistent.
+**Rationale:** Elapsed-time displays must survive reconnect, page reload,
+and multi-tab observation. A client-derived timestamp at event-arrival
+time fails all three (timer resets on reconnect, drifts under network
+jitter, and diverges across tabs viewing the same conversation).
+Server-authoritative `state_updated_at` makes the elapsed time a pure
+function of `now() - state_updated_at`, deterministic and consistent.
+Reusing the existing `Conversation.state_updated_at` (rather than
+introducing a parallel `entered_at` field) avoids parallel representation
+of the same semantic value.
 
 ---
 
@@ -82,7 +88,7 @@ unresolved `LlmAttempt` event for this turn; see
 WHEN multiple potential live timers exist for a single phase
 THE SYSTEM SHALL display exactly one elapsed-time counter in the StateBar,
 selected by the precedence:
-1. The base reason's own timer (`now() - phase.entered_at`)
+1. The base reason's own timer (`now() - phase.state_updated_at`)
 2. NOT layered with any other timer (the inline-artifact timer in REQ-WPV-002
    covers per-artifact granularity)
 
@@ -204,13 +210,32 @@ window in which "thinking..." can hide a real problem.
 
 ### REQ-WPV-008: Display Continuity Across Reload
 
-WHEN a user reloads the page mid-working-phase
+GIVEN a user reloads the page mid-working-phase
+AND the `Init` payload carries `pending_truncated = false` (the SSE
+replay ring did not overflow since the last anchor — see
+`specs/sse_wire/sse_wire.allium`)
 THE SYSTEM SHALL reconstruct the inline and StateBar indicators from `Init`
-such that elapsed times match (within one second) what they would have shown
-on a continuously-connected client
+such that elapsed times match (within one second) what they would have
+shown on a continuously-connected client
+
+GIVEN a user reloads the page mid-working-phase
+AND the `Init` payload carries `pending_truncated = true`
+THE SYSTEM SHALL display the phase-level StateBar indicator (which
+reconstructs cleanly from the always-present `conversation.state` +
+`conversation.state_updated_at` fields) AND a degraded notice in place
+of the per-artifact inline indicators: "reload truncated — in-flight
+detail will reappear at the next checkpoint"
 
 **Rationale:** Acceptance-criterion expression of REQ-WPV-001 + REQ-WPV-005.
-Listed separately because it is the integration-test target.
+The truncated-replay exception is necessary because pending_truncated=true
+means Phoenix intentionally sent an empty pending-event list and the DB
+snapshot lacks the eager assistant/tool-use blocks until the tool round
+checkpoint completes (see `specs/sse_wire/sse_wire.allium`'s
+`pending_truncated` semantics). Reconstructing the inline indicators
+within one second is not possible in that case; the spec is explicit
+about the degradation so implementers don't silently render stale data
+or empty timers. Listed separately because it is the integration-test
+target.
 
 ---
 
