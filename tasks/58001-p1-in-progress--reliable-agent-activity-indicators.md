@@ -21,12 +21,19 @@ of what is going on, and no failure mode should be silent.
 
 One inline timer per in-flight artifact (active tool widget, pending
 assistant message) + one global StateBar summary. The StateBar shows
-the *most specific known reason*, with precedence:
+a **base reason** derived from the phase, plus an optional **retry
+modifier** when a retry is unresolved (see REQ-WPV-003). Examples:
 
-    retry > rate-limit > tool name > "thinking"
+    thinking 4s                          (llm_requesting, pre-first-byte, no retry)
+    executing bash 12s                   (tool_executing, no retry)
+    executing bash 12s (retry 2/5)       (tool_executing, retry from earlier in turn)
+    thinking 4s (retry 2/5 after 429)    (llm_requesting, retry from current attempt)
 
-Do not layer multiple live timers in the StateBar — pick the most
-specific reason and surface that.
+Retry is a **modifier on the base reason**, NOT a replacement for it —
+the phase is always the primary signal of "what is the agent doing
+right now?"; retry answers the secondary "why is it taking this
+long?". Do not layer multiple live timers in the StateBar — exactly
+one elapsed counter, derived from the phase's state_updated_at.
 
 ## Current state (pointers)
 
@@ -50,10 +57,12 @@ Each stage stands alone and ships value independently.
 
 ### Stage A — foundation (no retry visibility yet)
 
-- Add `state_updated_at: i64` to `StateChange` wire event (sourced from
-  the already-bumped `Conversation.state_updated_at`). Init already
-  exposes this field at `init.conversation.state_updated_at` via the
-  `#[serde(flatten)]` on `EnrichedConversation` — no Init payload change.
+- Add `state_updated_at: DateTime<Utc>` to `StateChange` wire event
+  (sourced from the already-bumped `Conversation.state_updated_at`).
+  Serialise as RFC3339 to match the existing Init carrier (which is
+  the same `DateTime<Utc>` flattened from `Conversation` and already
+  on the wire as an RFC3339 string). Init payload unchanged. Client
+  converts to ms once at the SSE-handler boundary via `Date.parse(s)`.
   Regenerate `ui/src/generated/`.
 - Frontend: replicate the `toolExecutingStartedAt` pattern for every
   working phase (`llm_requesting`, `awaiting_llm`,

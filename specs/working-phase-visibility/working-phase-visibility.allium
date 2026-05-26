@@ -105,11 +105,20 @@ value EventClock {
 -- capture time so the display shows a stable number through the
 -- reconnect, rather than continuing to count forward through a period
 -- where we have no signal from the server.
+--
+-- `retry` carries any unresolved retry context that was visible at the
+-- moment we degraded (REQ-WPV-003: the retry modifier is part of the
+-- most-specific known activity). Without it the reconnect display
+-- would silently drop `(retry 2/5)` from a frozen "last: thinking 12s"
+-- even though that was the most specific signal we had — which is
+-- exactly the "connection state masking agent state" failure REQ-WPV-005
+-- forbids.
 value LastKnownActivity {
     phase:                 WorkingPhase
     base_reason_text:      String
     elapsed_at_disconnect: Integer
     captured_at:           Timestamp
+    retry:                 RetryContext?
 }
 
 -- PLACEHOLDER: this value will move to specs/llm-retry-visibility/ when
@@ -240,9 +249,12 @@ entity PendingAssistantBubble {
 
     state: PendingBubbleState
 
-    -- The request_id of the LLM request this bubble is bound to. Used
-    -- to correlate LlmFirstByte and Token events to the bubble. Set
-    -- when the placeholder is created; cleared on return to not_present.
+    -- The request_id of the LLM request this bubble is bound to. The
+    -- placeholder bubble is created BEFORE we know which request_id the
+    -- forwarder will assign — the value is set when LlmFirstByte
+    -- arrives carrying that id (PendingBubbleTransitionsToStreaming
+    -- rule below) and cleared on return to not_present. Null during
+    -- the `placeholder` phase; non-null during `streaming`.
     request_id: String?
 
     -- Server-authoritative; matches ObservedPhase.state_updated_at when
@@ -250,14 +262,19 @@ entity PendingAssistantBubble {
     -- counter inside the bubble.
     placeholder_since: Timestamp?
 
-    -- The SSE sequence_id of the first Token observed for this request
-    -- (the same sequence_id carried on the LlmFirstByte event). Stored
-    -- here so PendingBubbleCompletedOnMessage can correlate the
-    -- persisted assistant Message to this bubble (a Message with seq >
-    -- first_token_seq is THIS bubble's completion). The wire-level
-    -- request_id is unsuitable because SseWireEvent::Message does not
-    -- carry it; sequence_id is monotonic and on every event by
-    -- construction (see sse_wire.allium).
+    -- The SSE sequence_id stored on the bubble to correlate the
+    -- persisted assistant Message back to this bubble's request. Set
+    -- to the LlmFirstByte event's own sequence_id on the streaming
+    -- transition. Per sse_wire.allium, each SSE event carries its own
+    -- monotonic sequence_id from SseBroadcaster.next_seq, so LlmFirstByte
+    -- and the first Token that follows it have DIFFERENT consecutive
+    -- sequence_ids (LlmFirstByte is emitted immediately before the
+    -- first Token, taking one seq; the Token takes the next). Both are
+    -- strictly greater than any prior event for this conversation, so
+    -- a Message event with seq > first_token_seq is unambiguously this
+    -- bubble's completion. SseWireEvent::Message does NOT carry the
+    -- request_id, so wire-level request_id correlation is unavailable
+    -- and this seq-based form is the only reliable correlator.
     first_token_seq: Integer?
 
     transitions state {
@@ -510,12 +527,19 @@ rule LastKnownActivityCapturedOnDegrade {
     requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI: 'connected', prior state
     requires: new_state in { reconnecting, offline }
     requires: ObservedPhase{view}.working = true
+    requires: ObservedPhase{view}.phase != null  -- type-narrowing: implied by working=true, but Allium's optional-typing needs an explicit guard
 
+    -- `current_retry_for(view)` is a helper that returns
+    -- `TurnRetryContext{view: view}.retry` when that entity exists, or
+    -- `null` otherwise. Inlined as a helper (rather than an if-then-else
+    -- expression, which the v3 grammar doesn't have) so the snapshot
+    -- gets both fields in one value-literal construction.
     let snap = LastKnownActivity{
         phase:                 ObservedPhase{view}.phase,
         base_reason_text:      base_reason_text_for(ObservedPhase{view}),
         elapsed_at_disconnect: now() - ObservedPhase{view}.state_updated_at,
-        captured_at:           now()
+        captured_at:           now(),
+        retry:                 current_retry_for(view)
     }
 
     ensures: LastKnownActivityCapture{view}.captured = snap
@@ -560,7 +584,39 @@ rule PendingBubblePlaceholderCreated {
     ensures: PendingAssistantBubble{view}.state             = placeholder
     ensures: PendingAssistantBubble{view}.placeholder_since = ObservedPhase{view}.state_updated_at
     ensures: PendingAssistantBubble{view}.first_token_seq   = null
-    -- request_id is set when LlmFirstByte arrives; null while placeholder.
+    -- request_id stays null until LlmFirstByte arrives; the placeholder
+    -- bubble doesn't need it for rendering, only the streaming bubble
+    -- does (to correlate the persisted Message back to itself).
+}
+
+-- REQ-WPV-006 + REQ-WPV-008: a fresh Init that lands while the
+-- conversation is in `llm_requesting` and no streaming tokens have
+-- arrived yet needs to re-arm the placeholder bubble. The phase-
+-- transition trigger `ObservedPhaseUpdatedToWorking` does NOT fire on
+-- Init (Init replaces the snapshot wholesale; there is no edge), so
+-- without this rule a page reload or reconnect mid-`llm_requesting`
+-- would leave the StateBar showing the right phase but the message
+-- area missing its in-flight placeholder. The state_updated_at on the
+-- Init carrier seeds `placeholder_since` so the elapsed counter
+-- continues from the phase entry (not from reload time).
+--
+-- Event shape: SseInitReceived(view, raw_state, state_updated_at).
+rule PendingBubbleSeededFromInit {
+    when: SseInitReceived(view, raw_state, state_updated_at)
+
+    requires: is_working_phase(raw_state)
+    requires: working_phase_of(raw_state) = llm_requesting
+    requires: PendingAssistantBubble{view}.state = not_present
+
+    ensures: PendingAssistantBubble{view}.state             = placeholder
+    ensures: PendingAssistantBubble{view}.placeholder_since = state_updated_at
+    ensures: PendingAssistantBubble{view}.first_token_seq   = null
+    ensures: PendingAssistantBubble{view}.request_id        = null
+    -- If the server-side turn had already passed first-byte before
+    -- reload, the next Token event (replayed from the SSE ring) will
+    -- carry the request_id and the regular streaming-transition path
+    -- catches up; the bubble is only stuck in `placeholder` for the
+    -- pre-first-byte case.
 }
 
 -- REQ-WPV-007: LlmFirstByte arrives → transition to streaming. Same DOM
@@ -784,7 +840,30 @@ rule DisplayWhenReconnectingWithoutCapturedActivity {
     let conn_state = conn/ClientConnection{conversation_id: view.conversation_id}.state
     let attempts   = conn/ClientConnection{conversation_id: view.conversation_id}.attempt
 
-    ensures: StateBarDisplay{view} = connection_only_display(conn_state, attempts)
+    ensures: StateBarDisplay{view}.activity = connection_only_display(conn_state, attempts)
+}
+
+-- Transient connection states: `connecting` (first SSE open),
+-- `reconnected_display` (the brief grace state right after a successful
+-- reconnect — the user is seeing the "Reconnected" badge), and
+-- `disconnected` (between unmount and the next mount). These are
+-- excluded from `state = live` and so would otherwise fall through
+-- every DisplayWhen* branch, leaving StateBarDisplay stale or
+-- undefined. Defer to `connection_only_display(state, attempts)` for
+-- the StateBar text — the connection chip already conveys the state
+-- itself and the rule below ensures every connection-state value has
+-- exactly one matching DisplayWhen* branch by construction.
+rule DisplayWhenConnectionTransient {
+    when: DerivationTriggered(view)
+
+    requires: HeartbeatWatchdog{view}.freshness = fresh
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state
+              in { connecting, reconnected_display, disconnected }
+
+    let conn_state = conn/ClientConnection{conversation_id: view.conversation_id}.state
+    let attempts   = conn/ClientConnection{conversation_id: view.conversation_id}.attempt
+
+    ensures: StateBarDisplay{view}.activity = connection_only_display(conn_state, attempts)
 }
 
 -- REQ-WPV-007: streaming sub-phase — no elapsed counter.
@@ -881,7 +960,7 @@ rule DisplayWhenNotWorking {
     requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI code: 'connected'; see ObservedPhase comment above
     requires: ObservedPhase{view}.working = false
 
-    ensures: StateBarDisplay{view} = non_working_display(ObservedPhase{view})
+    ensures: StateBarDisplay{view}.activity = non_working_display(ObservedPhase{view})
 }
 
 ------------------------------------------------------------

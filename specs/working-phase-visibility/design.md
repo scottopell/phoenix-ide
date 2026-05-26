@@ -314,11 +314,14 @@ formal derivation):
 ### Inline indicators
 
 **Tool widget timer:** `MessageComponents.tsx` `ToolUseBlock` renders the
-tool header (lines 1037-1046). When the block has `display_data.started_at`
-and no `result` yet, render the elapsed counter inline in the header. Tick
-via the same one-second interval pattern used for the StateBar's
-`toolElapsedSeconds` (StateBar.tsx:283-297) — extract to a shared
-`useElapsedSeconds(startedAt)` hook.
+tool header (lines 1037-1046). Look up the start time in the parent
+assistant message's `display_data.tool_starts[tool_use_id]` map (typed
+`BTreeMap<String, i64>` on the Rust side, see the "Per-tool started_at
+carrier" decision above). When that entry is present and no `result`
+has landed for the tool yet, render the elapsed counter inline in the
+header. Tick via the same one-second interval pattern used for the
+StateBar's `toolElapsedSeconds` (StateBar.tsx:283-297) — extract to a
+shared `useElapsedSeconds(startedAt)` hook.
 
 **Pending assistant bubble:** `MessageComponents.tsx:635-638` filters out
 empty agent messages. Change the filter to *retain* an empty agent message
