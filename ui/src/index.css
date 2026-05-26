@@ -380,7 +380,10 @@ body {
 #main-area {
   flex: 1 1 auto;
   min-height: 0;
-  overflow: hidden auto;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  position: relative;
 }
 
 /* Views */
@@ -526,18 +529,34 @@ body {
 }
 
 /* Chat View */
-#chat-view {
+#chat-view.view.active {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
   padding: 12px;
 }
 
-/* Jump to newest messages button (REQ-CONV-013) */
+.message-virtuoso {
+  flex: 1 1 auto;
+  min-height: 0;
+  width: 100%;
+}
+
+.virtuoso-row {
+  max-width: 800px;
+  margin: 0 auto;
+  padding-bottom: 8px;
+  width: 100%;
+}
+
+/* Jump to newest messages button */
 .jump-to-newest {
-  position: sticky;
+  position: absolute;
   bottom: 12px;
   left: 50%;
   transform: translateX(-50%);
   display: block;
-  margin: 0 auto;
   padding: 6px 16px;
   background: var(--accent-blue, #3b82f6);
   color: #fff;
@@ -565,15 +584,6 @@ body {
     opacity: 1;
     transform: translateX(-50%) translateY(0);
   }
-}
-
-#messages {
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-  max-width: 800px;
-  margin: 0 auto;
-  width: 100%;
 }
 
 /* System Prompt Block */

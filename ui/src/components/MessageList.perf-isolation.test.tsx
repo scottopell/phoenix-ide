@@ -36,6 +36,34 @@ vi.mock('./MessageComponents', () => ({
   formatMessageTime: () => '12:00',
 }));
 vi.mock('./MessageContextMenu', () => ({ MessageContextMenu: () => null }));
+
+// Mock react-virtuoso as a passthrough. This test measures React commit
+// counts for the MessageListImpl boundary; virtuoso's internal scheduling
+// is irrelevant to the streaming-isolation invariant being verified.
+vi.mock('react-virtuoso', () => ({
+  Virtuoso: <T,>({
+    data,
+    itemContent,
+    components,
+    computeItemKey,
+  }: {
+    data: T[];
+    itemContent: (index: number, data: T) => React.ReactNode;
+    components?: { Header?: React.ComponentType };
+    computeItemKey?: (index: number, data: T) => React.Key;
+  }) => {
+    const Header = components?.Header;
+    return (
+      <div data-testid="mock-virtuoso">
+        {Header && <Header />}
+        {data.map((item, i) => {
+          const key = computeItemKey ? computeItemKey(i, item) : i;
+          return <div key={key}>{itemContent(i, item)}</div>;
+        })}
+      </div>
+    );
+  },
+}));
 // Keep the markdown / syntax-highlighter cheap so per-token commits of
 // the real <StreamingMessage> are fast and don't dominate the test
 // budget. The commit COUNT is the assertion target, not timing.
