@@ -1,5 +1,5 @@
 import { memo, useState, useRef, useCallback, useMemo, useEffect } from 'react';
-import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
+import { Virtuoso, type VirtuosoHandle, type VirtuosoProps } from 'react-virtuoso';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import {
@@ -302,14 +302,22 @@ function MessageListImpl({
   // loading). That leaves the user a few hundred pixels above true bottom
   // — visually "not at the bottom" despite virtuoso's internal pin.
   //
-  // Bridge the gap by comparing the user's pre-growth scroll position to
-  // the pre-growth bottom: if they were within the PIN threshold of where
-  // the bottom used to be, treat it as render-drift (content grew under
-  // them) and re-snap. Past the PIN threshold means the user has
-  // intentionally scrolled up — leave them where they are and let the
-  // jump-to-newest button do its job. Aligning with the same 100px
-  // threshold as the at-bottom-state detection keeps these two concepts
-  // consistent.
+  // `totalListHeightChanged` fires on EVERY height delta, including:
+  //   - new items appended
+  //   - existing items resizing (markdown render, code highlighter mount,
+  //     streaming token text growth, MessageUpdated mutating existing
+  //     content like spawn_agents → sub-agent results)
+  //
+  // Use the user's pre-growth scroll position vs the pre-growth bottom
+  // (captured via `prevTotalHeightRef`) to fork:
+  //   - within PIN threshold of old bottom → render-drift, re-snap
+  //   - past PIN threshold AND height grew → user intentionally
+  //     scrolled up while tail content kept arriving → mark unread
+  //     content so the jump-to-newest button appears. This is the
+  //     streaming-in-flight path that `messages.length` cannot catch
+  //     (token growth doesn't change the array).
+  //   - past PIN threshold AND height shrank → unrelated render churn
+  //     (e.g. an item collapsed); leave alone.
   const handleTotalListHeightChanged = useCallback((newHeight: number) => {
     const prevHeight = prevTotalHeightRef.current;
     prevTotalHeightRef.current = newHeight;
@@ -329,6 +337,8 @@ function MessageListImpl({
         align: 'end',
         behavior: 'auto',
       });
+    } else if (newHeight > prevHeight) {
+      setHasUnreadTailContent(true);
     }
   }, []);
 
@@ -372,41 +382,61 @@ function MessageListImpl({
     [],
   );
 
+  // Empty-state UI lives in virtuoso's `EmptyPlaceholder` slot rather than
+  // a parallel branch, so that systemPrompt (rendered as virtuoso's
+  // Header) stays visible alongside the "Start a conversation" affordance
+  // for a freshly-opened conversation with a system prompt and no
+  // messages yet. The previous parallel-branch approach hid the empty
+  // state once a system prompt loaded, which surprised users opening a
+  // new conversation.
+  const EmptyPlaceholder = useMemo(() => {
+    const Component = () => (
+      <div className="empty-state">
+        <div className="empty-state-icon"><MessageSquareIcon /></div>
+        <p>Start a conversation</p>
+      </div>
+    );
+    return Component;
+  }, []);
+
+  const virtuosoComponents = useMemo<NonNullable<VirtuosoProps<RenderUnit, unknown>['components']>>(() => {
+    const components: NonNullable<VirtuosoProps<RenderUnit, unknown>['components']> = {
+      EmptyPlaceholder,
+    };
+    if (SystemPromptHeaderSlot) {
+      components.Header = SystemPromptHeaderSlot;
+    }
+    return components;
+  }, [EmptyPlaceholder, SystemPromptHeaderSlot]);
+
   return (
     <main id="main-area">
       <section id="chat-view" className="view active">
-        {isEmpty && !systemPrompt ? (
-          <div className="empty-state">
-            <div className="empty-state-icon"><MessageSquareIcon /></div>
-            <p>Start a conversation</p>
-          </div>
-        ) : (
-          <Virtuoso
-            key={conversationId ?? '__empty__'}
-            ref={virtuosoRef}
-            scrollerRef={handleScrollerRef}
-            data={allUnits}
-            itemContent={itemContent}
-            computeItemKey={computeItemKey}
-            followOutput="auto"
-            atBottomThreshold={PIN_TO_BOTTOM_THRESHOLD}
-            atBottomStateChange={handleAtBottomStateChange}
-            totalListHeightChanged={handleTotalListHeightChanged}
-            // `'LAST'` is library-defined only when `data` has at least
-            // one item. When systemPrompt-only renders with empty data,
-            // omit this prop entirely — virtuoso's default (no initial
-            // index) is correct for that case. Index 0 would target a
-            // data item that doesn't exist (the Header slot is not a
-            // data item).
-            {...(allUnits.length > 0
-              ? { initialTopMostItemIndex: { index: 'LAST' as const, align: 'end' as const } }
-              : {})}
-            alignToBottom
-            increaseViewportBy={{ top: 600, bottom: 600 }}
-            {...(SystemPromptHeaderSlot ? { components: { Header: SystemPromptHeaderSlot } } : {})}
-            className="message-virtuoso"
-          />
-        )}
+        <Virtuoso
+          key={conversationId ?? '__empty__'}
+          ref={virtuosoRef}
+          scrollerRef={handleScrollerRef}
+          data={allUnits}
+          itemContent={itemContent}
+          computeItemKey={computeItemKey}
+          followOutput="auto"
+          atBottomThreshold={PIN_TO_BOTTOM_THRESHOLD}
+          atBottomStateChange={handleAtBottomStateChange}
+          totalListHeightChanged={handleTotalListHeightChanged}
+          // `'LAST'` is library-defined only when `data` has at least
+          // one item. When systemPrompt-only renders with empty data,
+          // omit this prop entirely — virtuoso's default (no initial
+          // index) is correct for that case. Index 0 would target a
+          // data item that doesn't exist (the Header slot is not a
+          // data item).
+          {...(allUnits.length > 0
+            ? { initialTopMostItemIndex: { index: 'LAST' as const, align: 'end' as const } }
+            : {})}
+          alignToBottom
+          increaseViewportBy={{ top: 600, bottom: 600 }}
+          components={virtuosoComponents}
+          className="message-virtuoso"
+        />
       </section>
       {!isEmpty && !isAtBottom && hasUnreadTailContent && (
         <button className="jump-to-newest" onClick={scrollToNewest}>
