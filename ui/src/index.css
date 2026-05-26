@@ -380,7 +380,14 @@ body {
 #main-area {
   flex: 1 1 auto;
   min-height: 0;
-  overflow: hidden;
+
+  /* `overflow: hidden auto` preserves scroll behavior for the
+     ConversationListPage (mobile) which renders its list directly into
+     this element and wires touch handlers to it. The chat view's
+     Virtuoso owns its own internal scroller, so this outer overflow
+     is benign there — content fits the flex bounds, no outer scroll
+     engages. */
+  overflow: hidden auto;
   display: flex;
   flex-direction: column;
   position: relative;

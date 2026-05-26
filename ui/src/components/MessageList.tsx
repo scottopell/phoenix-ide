@@ -237,6 +237,14 @@ function MessageListImpl({
 
   const handleScrollerRef = useCallback((ref: HTMLElement | Window | null) => {
     scrollerRef.current = ref instanceof HTMLElement ? ref : null;
+    // Preserve the `#messages` selector that <MessageContextMenu> binds
+    // its `contextmenu` listener to. Before the virtuoso migration the
+    // outer wrapper carried this id; virtuoso owns its own scroller now
+    // and we re-stamp the id on it so the right-click affordance keeps
+    // working without restructuring the menu component.
+    if (ref instanceof HTMLElement) {
+      ref.id = 'messages';
+    }
   }, []);
 
   // Read latest length without re-binding the callback per render.
@@ -246,18 +254,47 @@ function MessageListImpl({
   const allUnitsLengthRef = useRef(allUnits.length);
   allUnitsLengthRef.current = allUnits.length;
 
-  // Mark unread tail content when the count grows while the user is not
-  // pinned at bottom. The "↓ New messages" affordance only shows after
-  // new tail content actually arrived during a non-pinned state, not on
-  // every scroll-up of a static conversation.
-  const prevLengthForUnreadRef = useRef(allUnits.length);
+  // Mark unread tail content when ANY tail signal fires while the user
+  // is not pinned at bottom. Three independent signals cover the cases:
+  //   1. `messages.length` grows — covers user/agent/system arrivals AND
+  //      tool messages (which collapse into an existing agent_turn unit
+  //      so `allUnits.length` would NOT change, but the visible tail
+  //      content does).
+  //   2. `streamingRequestId` transitions null → string — a new streaming
+  //      session started; subsequent token-by-token growth is implicit
+  //      while it stays non-null. We don't subscribe to per-token text
+  //      changes (would break REQ-MLRU-010 streaming isolation); the
+  //      session-start signal is the actionable trigger.
+  //   3. `pendingMessages.length` grows — local queue gained a queued
+  //      bubble (e.g. a steered message during agent activity).
+  // Reset on conversation switch so unread state cannot leak across
+  // navigation (MessageList stays mounted by ConversationPage and only
+  // sees a prop change for `conversationId`).
+  const prevMessagesLengthRef = useRef(messages.length);
+  const prevStreamingRequestIdRef = useRef(streamingRequestId);
+  const prevPendingLengthRef = useRef(pendingMessages.length);
+  const prevConversationIdRef = useRef(conversationId);
   useEffect(() => {
-    const prev = prevLengthForUnreadRef.current;
-    prevLengthForUnreadRef.current = allUnits.length;
-    if (allUnits.length > prev && !isAtBottom) {
+    const conversationChanged = prevConversationIdRef.current !== conversationId;
+    const prevMsgs = prevMessagesLengthRef.current;
+    const prevStreamId = prevStreamingRequestIdRef.current;
+    const prevPending = prevPendingLengthRef.current;
+    prevConversationIdRef.current = conversationId;
+    prevMessagesLengthRef.current = messages.length;
+    prevStreamingRequestIdRef.current = streamingRequestId;
+    prevPendingLengthRef.current = pendingMessages.length;
+    if (conversationChanged) {
+      setHasUnreadTailContent(false);
+      return;
+    }
+    if (isAtBottom) return;
+    const messagesGrew = messages.length > prevMsgs;
+    const streamingStarted = prevStreamId === null && streamingRequestId !== null;
+    const pendingGrew = pendingMessages.length > prevPending;
+    if (messagesGrew || streamingStarted || pendingGrew) {
       setHasUnreadTailContent(true);
     }
-  }, [allUnits.length, isAtBottom]);
+  }, [conversationId, messages.length, pendingMessages.length, streamingRequestId, isAtBottom]);
 
   // virtuoso's `followOutput="auto"` only fires when `data.length` grows;
   // it doesn't re-snap when the LAST item's height changes async after
