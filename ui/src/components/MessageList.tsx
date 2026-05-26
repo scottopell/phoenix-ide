@@ -48,6 +48,12 @@ interface MessageListProps {
 }
 
 const PIN_TO_BOTTOM_THRESHOLD = 100;
+// Wider tolerance for the re-snap-on-content-growth path than for the
+// pin-detection threshold above. The streaming agent's item grows
+// asynchronously as markdown / code blocks mount; that growth pushes
+// the user beyond the 100px pin threshold without any user input. Treat
+// "within 300px of bottom" as "drifted by render lag, snap back."
+const FOLLOW_OUTPUT_DRIFT_TOLERANCE = 300;
 
 function extractSkillArgs(trigger: string, name: string): string {
   return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
@@ -185,6 +191,7 @@ function MessageListImpl({
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
+  const scrollerRef = useRef<HTMLElement | null>(null);
 
   // The streaming buffer's `requestId` IS the eventual agent message_id
   // (server uses the same uuid for both — see `AssistantMessage::new` in
@@ -218,6 +225,35 @@ function MessageListImpl({
 
   const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
     setIsAtBottom(atBottom);
+  }, []);
+
+  const handleScrollerRef = useCallback((ref: HTMLElement | Window | null) => {
+    scrollerRef.current = ref instanceof HTMLElement ? ref : null;
+  }, []);
+
+  // virtuoso's `followOutput="auto"` only fires when `data.length` grows;
+  // it doesn't re-snap when the LAST item's height changes async after
+  // mount (markdown render, react-syntax-highlighter mounting, image
+  // loading). That leaves the user a few hundred pixels above true bottom
+  // — visually "not at the bottom" despite virtuoso's internal pin.
+  //
+  // Bridge the gap: when virtuoso reports the total list height changed,
+  // check the live scroller's distance to bottom. If within a generous
+  // drift-tolerant threshold (wider than `atBottomThreshold=100` so post-
+  // mount growth doesn't kick us out), imperatively re-snap. Past the
+  // threshold means the user has intentionally scrolled up — respect
+  // that and let the jump-to-newest button do its job.
+  const handleTotalListHeightChanged = useCallback(() => {
+    const s = scrollerRef.current;
+    if (!s) return;
+    const fromBottom = s.scrollHeight - s.scrollTop - s.clientHeight;
+    if (fromBottom < FOLLOW_OUTPUT_DRIFT_TOLERANCE) {
+      virtuosoRef.current?.scrollToIndex({
+        index: 'LAST',
+        align: 'end',
+        behavior: 'auto',
+      });
+    }
   }, []);
 
   const scrollToNewest = useCallback(() => {
@@ -270,12 +306,14 @@ function MessageListImpl({
           <Virtuoso
             key={conversationId ?? '__empty__'}
             ref={virtuosoRef}
+            scrollerRef={handleScrollerRef}
             data={allUnits}
             itemContent={itemContent}
             computeItemKey={computeItemKey}
             followOutput="auto"
             atBottomThreshold={PIN_TO_BOTTOM_THRESHOLD}
             atBottomStateChange={handleAtBottomStateChange}
+            totalListHeightChanged={handleTotalListHeightChanged}
             initialTopMostItemIndex={{ index: 'LAST', align: 'end' }}
             alignToBottom
             increaseViewportBy={{ top: 600, bottom: 600 }}
