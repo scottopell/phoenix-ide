@@ -16,8 +16,8 @@ hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "s
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "fs", "compression-br", "compression-gzip", "trace"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "compression-br", "compression-gzip", "trace"] }
 
 # Local TLS CA + leaf-cert issuance (separate workspace member to keep
 # `phoenix-tls`'s cold-compile cost off `phoenix-tls` itself).
