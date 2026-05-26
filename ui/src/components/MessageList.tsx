@@ -274,6 +274,15 @@ function MessageListImpl({
   const prevStreamingRequestIdRef = useRef(streamingRequestId);
   const prevPendingLengthRef = useRef(pendingMessages.length);
   const prevConversationIdRef = useRef(conversationId);
+  // Stable ref read by handleTotalListHeightChanged (which is bound once
+  // via useCallback([]) and cannot see the live prop directly). Used to
+  // gate the height-driven unread path on streaming activity so that
+  // unrelated height changes — system prompt header toggle, image load
+  // in an older message, late-arriving syntax highlighter on a scrolled-
+  // past code block — don't spuriously raise "↓ New messages".
+  const streamingRequestIdRef = useRef(streamingRequestId);
+  streamingRequestIdRef.current = streamingRequestId;
+
   useEffect(() => {
     const conversationChanged = prevConversationIdRef.current !== conversationId;
     const prevMsgs = prevMessagesLengthRef.current;
@@ -285,6 +294,11 @@ function MessageListImpl({
     prevPendingLengthRef.current = pendingMessages.length;
     if (conversationChanged) {
       setHasUnreadTailContent(false);
+      // The handleTotalListHeightChanged baseline must reset alongside
+      // the rest of the per-conversation state. Otherwise the first
+      // callback in conversation B compares against conversation A's
+      // total list height and can spuriously fire re-snap or unread.
+      prevTotalHeightRef.current = 0;
       return;
     }
     if (isAtBottom) return;
@@ -337,7 +351,13 @@ function MessageListImpl({
         align: 'end',
         behavior: 'auto',
       });
-    } else if (newHeight > prevHeight) {
+    } else if (newHeight > prevHeight && streamingRequestIdRef.current !== null) {
+      // Only treat height growth as "unread tail content" when streaming
+      // is actually active. Otherwise unrelated growth (header toggle,
+      // image load in an older message, late syntax-highlighter mount
+      // on a scrolled-past code block) would spuriously raise the
+      // "↓ New messages" button. Length-grew append cases are covered
+      // by the separate useEffect on messages.length / pending.
       setHasUnreadTailContent(true);
     }
   }, []);

@@ -195,8 +195,8 @@ describe('MessageList streaming-isolation perf invariant', () => {
     // Dispatch a 100-token burst directly into the store. Each
     // dispatch triggers useSyncExternalStore notify → React schedules
     // an update for subscribers whose getSnapshot returned a different
-    // value. useStreamingStartedAt returns the same number (the
-    // session's startedAt) for every token, so MessageList should NOT
+    // value. useStreamingRequestId returns the same string (the
+    // session's request_id) for every token, so MessageList should NOT
     // re-commit. useStreamingBuffer returns a fresh buffer ref on
     // every token, so StreamingMessage SHOULD re-commit (the rAF
     // coalescing inside the leaf is a separate concern from the
@@ -218,11 +218,11 @@ describe('MessageList streaming-isolation perf invariant', () => {
 
     // The hard claim: per-token streaming triggers AT MOST ONE
     // <MessageListImpl> commit — the streaming-start transition where
-    // useStreamingStartedAt returns its first non-null value and the
+    // useStreamingRequestId returns its first non-null value and the
     // streamingHandle key materialises (adding the streaming_agent
-    // TailUnit). Tokens 2..N keep startedAt stable; their dispatches
-    // notify subscribers, but useStreamingStartedAt's getSnapshot
-    // returns the same number, so MessageList stays memo'd.
+    // TailUnit). Tokens 2..N keep request_id stable; their dispatches
+    // notify subscribers, but useStreamingRequestId's getSnapshot
+    // returns the same string, so MessageList stays memo'd.
     //
     // Without this isolation, the delta would be ~100 (one commit per
     // token). With it, the delta is 1, regardless of burst size.
@@ -272,8 +272,8 @@ describe('MessageList streaming-isolation perf invariant', () => {
     const baseline = counter.count.total;
 
     // Transition phase to llm_requesting AND emit a first token —
-    // streamingBuffer goes from null to non-null, useStreamingStartedAt
-    // returns a number where it previously returned null. MessageList
+    // streamingBuffer goes from null to non-null, useStreamingRequestId
+    // returns a string where it previously returned null. MessageList
     // memo breaks; one commit expected.
     act(() => {
       store.dispatch(slug, {
