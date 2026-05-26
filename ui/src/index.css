@@ -11014,19 +11014,19 @@ html * {
  * ============================================================================ */
 
 .console-logs-response {
-  padding: 8px 12px;
+  padding: 6px 10px;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 11.5px;
   background: var(--bg-primary);
 }
 
 .console-logs-header {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: 6px;
   align-items: center;
-  margin-bottom: 6px;
-  font-size: 11px;
+  margin-bottom: 4px;
+  font-size: 10.5px;
   color: var(--text-secondary);
 }
 
@@ -11036,72 +11036,58 @@ html * {
 }
 
 .console-logs-tally {
-  padding: 1px 6px;
-  border-radius: 3px;
+  padding: 0 4px;
   font-weight: 600;
-  background: var(--bg-tertiary);
-  color: var(--text-primary);
+  color: var(--text-muted);
 }
 
 .console-logs-tally.console-level-error {
-  background: color-mix(in srgb, var(--accent-red) 20%, var(--bg-secondary));
   color: var(--accent-red);
 }
 
 .console-logs-tally.console-level-warning {
-  background: color-mix(in srgb, var(--accent-yellow, #d69e2e) 22%, var(--bg-secondary));
   color: var(--accent-yellow, #d69e2e);
 }
 
 .console-logs-tally.console-level-info {
-  background: color-mix(in srgb, var(--accent-blue, #4299e1) 18%, var(--bg-secondary));
   color: var(--accent-blue, #4299e1);
 }
 
 .console-logs-list {
   display: flex;
   flex-direction: column;
-  gap: 2px;
   max-height: 360px;
   overflow-y: auto;
 }
 
 .console-log-entry {
   display: flex;
-  align-items: flex-start;
+  align-items: baseline;
   gap: 8px;
-  padding: 3px 6px;
-  border-radius: 3px;
-  background: var(--code-bg);
-  border-left: 3px solid transparent;
+  padding: 1px 6px;
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  line-height: 1.45;
+  border-bottom: 1px solid color-mix(in srgb, var(--border-color) 40%, transparent);
 }
 
-.console-log-entry.console-level-error {
-  border-left-color: var(--accent-red);
-  background: color-mix(in srgb, var(--accent-red) 6%, var(--code-bg));
-}
-
-.console-log-entry.console-level-warning {
-  border-left-color: var(--accent-yellow, #d69e2e);
-  background: color-mix(in srgb, var(--accent-yellow, #d69e2e) 6%, var(--code-bg));
-}
-
-.console-log-entry.console-level-info {
-  border-left-color: var(--accent-blue, #4299e1);
+.console-log-entry:last-child {
+  border-bottom: none;
 }
 
 .console-log-entry.console-level-debug {
-  opacity: 0.75;
+  opacity: 0.65;
 }
 
 .console-log-level {
   flex-shrink: 0;
-  width: 56px;
+  width: 46px;
   font-size: 10px;
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-muted);
-  padding-top: 2px;
+  font-weight: 600;
+  text-align: right;
 }
 
 .console-level-error .console-log-level {
@@ -11124,7 +11110,7 @@ html * {
   overflow-wrap: anywhere;
   flex: 1;
   font-family: var(--font-mono);
-  font-size: 12px;
+  font-size: 11.5px;
   color: var(--text-primary);
 }
 

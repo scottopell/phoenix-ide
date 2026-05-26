@@ -978,7 +978,7 @@ export function BrowserConsoleLogsView({ rawText }: { rawText: string }) {
         {entries.map((entry, i) => (
           <div key={i} className={`console-log-entry console-level-${entry.level}`}>
             <span className="console-log-level">{entry.level}</span>
-            <pre className="console-log-text">{entry.text}</pre>
+            <div className="console-log-text">{entry.text}</div>
           </div>
         ))}
       </div>
