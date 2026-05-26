@@ -560,13 +560,21 @@ rule LastKnownActivityClearedOnInit {
     ensures: LastKnownActivityCapture{view}.captured = null
 }
 
--- Cleared when the connection re-establishes without a fresh Init
--- (defensive; in practice Init always lands on reconnect — see
--- conn/RECONNECTED_DISPLAY_DONE flow). This rule guarantees that
--- LastKnownActivity is never displayed alongside a healthy connection.
+-- Cleared when the connection enters a "healthy enough" state. The
+-- connection_machine transitions reconnecting → reconnected_display
+-- (the grace state, where the "Reconnected" badge shows) BEFORE
+-- transitioning to live (after RECONNECTED_DISPLAY_DONE fires). Both
+-- states represent a successful re-establishment of the SSE stream
+-- from the user's POV, so the frozen last-known activity must be
+-- cleared on EITHER edge to prevent the "stale captured activity on
+-- a healthy connection" failure that LastKnownActivityWellGated forbids.
+-- This rule covers the no-Init-yet path: in practice Init always lands
+-- on reconnect (LastKnownActivityClearedOnInit handles that), but the
+-- reconnect-without-Init defensive clear keeps the invariant tight.
 rule LastKnownActivityClearedOnReconnect {
-    when: ConnectionStateChanged(view, live)
+    when: ConnectionStateChanged(view, new_state)
 
+    requires: new_state in { live, reconnected_display }
     requires: LastKnownActivityCapture{view}.captured != null
 
     ensures: LastKnownActivityCapture{view}.captured = null

@@ -86,9 +86,10 @@ value InitSnapshot {
 -- `event_type` matches the SseWireEvent's `type` discriminator
 -- ("token", "state_change", "message", "message_updated",
 -- "agent_done", "conversation_update", "conversation_became_terminal",
--- "error", "browser_session_state", "steer_message_queued"). Init
--- itself is never in the ring (init is per-subscriber, never
--- broadcast). ConversationHardDeleted is excluded by construction (a
+-- "error", "browser_session_state", "steer_message_queued",
+-- "llm_first_byte"). Init itself is never in the ring (init is
+-- per-subscriber, never broadcast). ConversationHardDeleted is
+-- excluded by construction (a
 -- deleted conversation cannot subsequently receive a subscribe).
 --
 -- `payload` is opaque at this level — it is whatever the wire-format
@@ -457,9 +458,18 @@ rule PersistedMessageClearsReplayRing {
 -- Every non-Message broadcast appends to the ring. Includes:
 -- token, state_change, message_updated, agent_done, conversation_update,
 -- conversation_became_terminal, error, browser_session_state,
--- steer_message_queued. Excludes Init (per-stream, never broadcast)
--- and ConversationHardDeleted (terminal action; no subsequent init
--- can fire for this conversation, so replay is moot).
+-- steer_message_queued, llm_first_byte. Excludes Init (per-stream,
+-- never broadcast) and ConversationHardDeleted (terminal action; no
+-- subsequent init can fire for this conversation, so replay is moot).
+--
+-- `llm_first_byte` (introduced by specs/working-phase-visibility/)
+-- MUST replay alongside the `token` events it precedes — if a client
+-- reloads after first-byte but before the assistant Message is
+-- persisted, replaying tokens without the preceding first-byte marker
+-- leaves the pending bubble stuck in `placeholder` while text streams,
+-- violating REQ-WPV-007/008. The boundary marker shares the ring's
+-- ordering guarantees so the bubble's first_token_seq correlation
+-- holds across replay.
 --
 -- Append happens atomically with broadcast: the entry's seq IS the
 -- envelope seq the live subscribers receive.
@@ -469,7 +479,7 @@ rule EphemeralEventAppendedToReplayRing {
     requires: entry.event_type in {
         "token", "state_change", "message_updated", "agent_done",
         "conversation_update", "conversation_became_terminal", "error",
-        "browser_session_state", "steer_message_queued"
+        "browser_session_state", "steer_message_queued", "llm_first_byte"
     }
 
     let ring = ReplayRing{conversation_id: conv_id}

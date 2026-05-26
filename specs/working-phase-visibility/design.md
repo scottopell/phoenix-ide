@@ -224,8 +224,17 @@ KeepAlive::new()
 // After:
 KeepAlive::new()
     .interval(Duration::from_secs(15))
-    .event(Event::default().event("ping").data(""))
+    .event(Event::default().event("ping").data("ping"))
 ```
+
+The `data("ping")` payload is intentional and non-empty: per axum's
+`Event::data` documentation
+(<https://docs.rs/axum/latest/axum/response/sse/struct.Event.html#method.data>)
+events with an empty `data` field are ignored by the browser, so
+`data("")` would produce a wire frame the client never observes —
+defeating the entire watchdog. The exact payload string is irrelevant
+to the client (the listener just bumps `lastSseEventAt` on the named
+`ping` event and discards the body), but it MUST be non-empty.
 
 Forward-compatible: clients that don't listen for `ping` simply ignore it.
 
@@ -339,14 +348,25 @@ Add a new synthetic tail unit (`pending_agent` or similar) emitted by
 unit's slot. Discriminator (when to emit):
 
 - The atom's `phase: ConversationState` discriminant equals
-  `'llm_requesting'` (or the `awaiting_llm` / `seeded_llm_requesting`
-  variants), checked via `atom.phase.type === 'llm_requesting'` etc.
-  ConversationState is the discriminated union defined in
-  `ui/src/api.ts:215`; its discriminator field is `type`, not `phase`.
+  `'llm_requesting'` or `'seeded_llm_requesting'`, checked via
+  `atom.phase.type === 'llm_requesting'` etc. ConversationState is the
+  discriminated union defined in `ui/src/api.ts:215`; its discriminator
+  field is `type`, not `phase`.
 - `streamingBuffer` is empty (no tokens for the current request yet).
 - `PendingAssistantBubble` (the spec-level entity defined in
   `working-phase-visibility.allium`) is in `placeholder` state — the
   reducer mirrors this from the same triggers the spec's rules consume.
+
+**Why not `awaiting_llm`?** That variant is set client-side via
+`local_phase_change` (`ConversationPage.tsx:577`) the moment the user
+presses send, before any server StateChange has landed; its
+`state_updated_at` would be stale (the previous phase's timestamp) or
+absent, so the elapsed counter would start from the wrong time. The
+spec deliberately gates the timer on server-authoritative timestamps
+only, so the `awaiting_llm` window stays uncounted. If a "sending..."
+affordance is needed during that brief gap, render it separately
+without an elapsed counter (it's not the same artifact as the pending
+bubble).
 
 The unit's payload carries `placeholder_since` (sourced from the atom's
 `phaseStateUpdatedAt`); the React component renders the elapsed counter
