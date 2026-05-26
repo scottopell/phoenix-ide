@@ -103,11 +103,12 @@ fn http_get(path: &str) -> Result<String, String> {
     let url = format!("{BASE_URL}{path}");
     let mut req = ureq::get(&url);
     if let Some(cookie) = auth_cookie() {
-        req = req.set("Cookie", &cookie);
+        req = req.header("Cookie", &cookie);
     }
     req.call()
         .map_err(|e| format!("HTTP error: {e}"))?
-        .into_string()
+        .into_body()
+        .read_to_string()
         .map_err(|e| format!("Read error: {e}"))
 }
 
