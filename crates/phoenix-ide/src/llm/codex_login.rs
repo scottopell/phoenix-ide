@@ -41,7 +41,7 @@
 //!   step. Tokens written here are interchangeable with Codex CLI's.
 
 use base64::Engine;
-use rand::RngCore;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -113,7 +113,7 @@ pub struct PkceCodes {
 
 pub fn generate_pkce() -> PkceCodes {
     let mut bytes = [0u8; 64];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     let code_verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
     let digest = Sha256::digest(code_verifier.as_bytes());
     let code_challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest);
@@ -125,7 +125,7 @@ pub fn generate_pkce() -> PkceCodes {
 
 pub fn generate_state() -> String {
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 

@@ -154,10 +154,10 @@ impl CodexLoginManager {
 }
 
 fn new_session_id() -> String {
-    use rand::RngCore;
+    use rand::Rng;
     use std::fmt::Write;
     let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
+    rand::rng().fill_bytes(&mut bytes);
     bytes.iter().fold(String::with_capacity(32), |mut acc, b| {
         let _ = write!(acc, "{b:02x}");
         acc

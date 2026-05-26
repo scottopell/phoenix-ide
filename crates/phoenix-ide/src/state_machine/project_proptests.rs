@@ -498,6 +498,7 @@ mod random_walk {
     use proptest::prelude::*;
     use rand::rngs::StdRng;
     use rand::Rng;
+    use rand::RngExt;
     use rand::SeedableRng;
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -508,7 +509,7 @@ mod random_walk {
 
     fn random_string(rng: &mut impl Rng, len: usize) -> String {
         (0..len)
-            .map(|_| (b'a' + rng.gen_range(0..26)) as char)
+            .map(|_| (b'a' + rng.random_range(0..26)) as char)
             .collect()
     }
 
@@ -527,7 +528,7 @@ mod random_walk {
     }
 
     fn random_error_kind(rng: &mut impl Rng) -> ErrorKind {
-        match rng.gen_range(0..6) {
+        match rng.random_range(0..6) {
             0 => ErrorKind::Network,
             1 => ErrorKind::RateLimit,
             2 => ErrorKind::ServerError,
@@ -542,7 +543,7 @@ mod random_walk {
     #[allow(clippy::too_many_lines)]
     fn generate_valid_event(state: &ConvState, rng: &mut impl Rng) -> Event {
         match state {
-            ConvState::Idle => match rng.gen_range(0..3) {
+            ConvState::Idle => match rng.random_range(0..3) {
                 0 => Event::UserMessage {
                     text: random_string(rng, 10),
                     llm_text: None,
@@ -559,10 +560,10 @@ mod random_walk {
             },
 
             ConvState::LlmRequesting { attempt } | ConvState::SeededLlmRequesting { attempt, .. } => {
-                match rng.gen_range(0..4) {
+                match rng.random_range(0..4) {
                     0 => {
                         // LlmResponse: text-only or with tool calls
-                        let num_tools = rng.gen_range(0..3);
+                        let num_tools = rng.random_range(0..3);
                         let mut tool_calls: Vec<ToolCall> = Vec::new();
                         let mut content = vec![ContentBlock::text("response")];
                         for _ in 0..num_tools {
@@ -584,7 +585,7 @@ mod random_walk {
                     1 => {
                         // LlmError with random retryable/non-retryable
                         let error_kind = random_error_kind(rng);
-                        let recovery = rng.gen_bool(0.2) && matches!(error_kind, ErrorKind::Auth);
+                        let recovery = rng.random_bool(0.2) && matches!(error_kind, ErrorKind::Auth);
                         Event::LlmError {
                             message: random_string(rng, 15),
                             error_kind,
@@ -601,7 +602,7 @@ mod random_walk {
             }
 
             ConvState::ToolExecuting { current_tool, .. } => {
-                match rng.gen_range(0..2) {
+                match rng.random_range(0..2) {
                     0 => {
                         // ToolComplete with matching ID
                         Event::ToolComplete {
@@ -623,7 +624,7 @@ mod random_walk {
             } => {
                 // Also consider SubAgentResult if there are pending sub-agents
                 let options = if pending_sub_agents.is_empty() { 2 } else { 3 };
-                match rng.gen_range(0..options) {
+                match rng.random_range(0..options) {
                     0 => Event::ToolAborted {
                         tool_use_id: tool_use_id.clone(),
                     },
@@ -633,7 +634,7 @@ mod random_walk {
                     },
                     _ => {
                         // SubAgentResult for a pending agent
-                        let agent = &pending_sub_agents[rng.gen_range(0..pending_sub_agents.len())];
+                        let agent = &pending_sub_agents[rng.random_range(0..pending_sub_agents.len())];
                         Event::SubAgentResult {
                             agent_id: agent.agent_id.clone(),
                             outcome: SubAgentOutcome::Success {
@@ -649,10 +650,10 @@ mod random_walk {
                     // Shouldn't happen, but be defensive
                     return Event::UserCancel { reason: None };
                 }
-                match rng.gen_range(0..2) {
+                match rng.random_range(0..2) {
                     0 => {
-                        let agent = &pending[rng.gen_range(0..pending.len())];
-                        let outcome = if rng.gen_bool(0.7) {
+                        let agent = &pending[rng.random_range(0..pending.len())];
+                        let outcome = if rng.random_bool(0.7) {
                             SubAgentOutcome::Success {
                                 result: random_string(rng, 15),
                             }
@@ -676,7 +677,7 @@ mod random_walk {
                     // Shouldn't happen, but defensive
                     return Event::UserCancel { reason: None };
                 }
-                let agent = &pending[rng.gen_range(0..pending.len())];
+                let agent = &pending[rng.random_range(0..pending.len())];
                 Event::SubAgentResult {
                     agent_id: agent.agent_id.clone(),
                     outcome: SubAgentOutcome::Failure {
@@ -695,7 +696,7 @@ mod random_walk {
                 skill_invocation: None,
             },
 
-            ConvState::AwaitingRecovery { .. } => match rng.gen_range(0..3) {
+            ConvState::AwaitingRecovery { .. } => match rng.random_range(0..3) {
                 0 => Event::CredentialBecameAvailable,
                 1 => Event::CredentialHelperFailed {
                     message: random_string(rng, 15),
@@ -703,7 +704,7 @@ mod random_walk {
                 _ => Event::UserCancel { reason: None },
             },
 
-            ConvState::AwaitingContinuation { attempt, .. } => match rng.gen_range(0..4) {
+            ConvState::AwaitingContinuation { attempt, .. } => match rng.random_range(0..4) {
                 0 => Event::ContinuationResponse {
                     summary: random_string(rng, 30),
                 },
@@ -722,7 +723,7 @@ mod random_walk {
                 _ => Event::UserCancel { reason: None },
             },
 
-            ConvState::AwaitingTaskApproval { .. } => match rng.gen_range(0..5) {
+            ConvState::AwaitingTaskApproval { .. } => match rng.random_range(0..5) {
                 0 => Event::TaskApprovalDecided {
                     outcome: TaskApprovalOutcome::Approved {
                         handoff: crate::state_machine::state::TaskApprovalHandoff::ContinueInCurrentConversation,
@@ -745,7 +746,7 @@ mod random_walk {
             },
 
             ConvState::AwaitingUserResponse { questions, .. } => {
-                match rng.gen_range(0..2) {
+                match rng.random_range(0..2) {
                     0 => {
                         // Build answers matching the questions
                         let answers: HashMap<String, String> = questions
@@ -754,7 +755,7 @@ mod random_walk {
                                 let answer = if q.options.is_empty() {
                                     random_string(rng, 5)
                                 } else {
-                                    q.options[rng.gen_range(0..q.options.len())].label.clone()
+                                    q.options[rng.random_range(0..q.options.len())].label.clone()
                                 };
                                 (q.question.clone(), answer)
                             })
@@ -961,7 +962,7 @@ mod random_walk {
                 }
 
                 // When in LlmRequesting, sometimes inject a propose_task response
-                let event = if matches!(state, ConvState::LlmRequesting { .. }) && rng.gen_bool(0.3) {
+                let event = if matches!(state, ConvState::LlmRequesting { .. }) && rng.random_bool(0.3) {
                     let tool_id = random_id(&mut rng);
                     let tc = ToolCall::new(
                         tool_id.clone(),

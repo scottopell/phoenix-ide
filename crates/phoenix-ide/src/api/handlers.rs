@@ -50,7 +50,7 @@ use axum::{
 };
 use chrono::Datelike;
 use chrono::{Local, Timelike};
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
@@ -3486,7 +3486,7 @@ fn generate_slug() -> String {
         "star",
     ];
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let adjective = words.choose(&mut rng).unwrap_or(&"blue");
     let noun = words.choose(&mut rng).unwrap_or(&"sky");
 
