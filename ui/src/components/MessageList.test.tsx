@@ -158,7 +158,7 @@ describe('MessageList', () => {
     expect(wrapperAfter).toBe(wrapperBefore);
   });
 
-  it('windows renderable rows so recent tool results do not hide their owning agent row', () => {
+  it('folds trailing tool messages into the owning agent_turn unit (REQ-MLRU-002)', () => {
     const historical = [
       ...Array.from({ length: 20 }, (_, i) => makeMessage(i + 1, 'user')),
       makeMessage(21, 'agent'),
