@@ -10,8 +10,8 @@ name = "phoenix-monitor"
 path = "src/main.rs"
 
 [dependencies]
-ratatui = "0.29"
-crossterm = "0.28"
+ratatui = "0.30"
+crossterm = "0.29"
 rusqlite = "0.32"
 ureq = { version = "2", features = ["json"] }
 serde = { version = "1", features = ["derive"] }
