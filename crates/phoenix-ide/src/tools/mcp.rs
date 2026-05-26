@@ -21,6 +21,9 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Five minutes gives OAuth flows (mcp-remote prompts, browser redirect) time to complete.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Upper bound for an HTTP reload request applying changed existing configs.
+const RELOAD_RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 // ---------------------------------------------------------------------------
 // McpToolDef
 // ---------------------------------------------------------------------------
@@ -1009,6 +1012,9 @@ impl McpClientManager {
         let mut restarted = Vec::new();
         let mut unchanged = Vec::new();
         let mut failed = Vec::new();
+        let mut restart_pending = std::collections::HashSet::new();
+        let mut restart_futures: futures::stream::FuturesUnordered<McpRestartFuture> =
+            futures::stream::FuturesUnordered::new();
 
         let mut removed_servers = Vec::new();
         {
@@ -1024,6 +1030,7 @@ impl McpClientManager {
             }
         }
         for (name, mut server) in removed_servers {
+            self.pending_oauth_urls.write().await.remove(&name);
             server.terminate().await;
             tracing::info!(server = %name, "MCP server removed during reload");
         }
@@ -1080,13 +1087,56 @@ impl McpClientManager {
                     self.pending_oauth_urls.write().await.remove(&name);
                     old_server.terminate().await;
 
-                    match Self::connect_one(&name, &entry, Arc::clone(&self.pending_oauth_urls))
-                        .await
-                    {
-                        Ok(server) => {
-                            self.pending_oauth_urls.write().await.remove(&name);
-                            let tool_count = server.tools.len();
-                            self.servers.write().await.insert(name.clone(), server);
+                    let oauth = Arc::clone(&self.pending_oauth_urls);
+                    let servers = Arc::clone(&self.servers);
+                    restart_pending.insert(name.clone());
+                    restart_futures.push(Box::pin(async move {
+                        let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
+                        match result {
+                            Ok(server) => {
+                                oauth.write().await.remove(&name);
+                                let tool_count = server.tools.len();
+                                servers.write().await.insert(name.clone(), server);
+                                (name, Ok(tool_count))
+                            }
+                            Err(error) => (name, Err(error)),
+                        }
+                    }));
+                }
+            }
+        }
+
+        let restart_deadline = tokio::time::Instant::now() + RELOAD_RESTART_TIMEOUT;
+        while !restart_pending.is_empty() {
+            let timeout = tokio::time::sleep_until(restart_deadline);
+            tokio::pin!(timeout);
+            tokio::select! {
+                () = &mut timeout => {
+                    for name in restart_pending.drain() {
+                        self.pending_oauth_urls.write().await.remove(&name);
+                        tracing::warn!(
+                            server = %name,
+                            timeout_seconds = RELOAD_RESTART_TIMEOUT.as_secs(),
+                            "Timed out restarting MCP server during reload after config change"
+                        );
+                        failed.push(McpReloadFailure {
+                            server: name,
+                            action: "restart".to_string(),
+                            error: format!(
+                                "timed out after {}s restarting changed MCP server",
+                                RELOAD_RESTART_TIMEOUT.as_secs()
+                            ),
+                        });
+                    }
+                    break;
+                }
+                outcome = futures::StreamExt::next(&mut restart_futures) => {
+                    let Some((name, result)) = outcome else {
+                        break;
+                    };
+                    restart_pending.remove(&name);
+                    match result {
+                        Ok(tool_count) => {
                             tracing::info!(
                                 server = %name,
                                 tools = tool_count,
@@ -1134,6 +1184,10 @@ impl McpClientManager {
         servers.clear();
     }
 }
+
+type McpRestartResult = (String, Result<usize, String>);
+type McpRestartFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = McpRestartResult> + Send>>;
 
 /// Result of an MCP config reload.
 #[derive(Debug, Clone, serde::Serialize)]
