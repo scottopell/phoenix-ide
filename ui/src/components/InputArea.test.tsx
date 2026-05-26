@@ -11,22 +11,26 @@ const idleState: ConversationState = { type: 'idle' };
 
 interface InputAreaTestProps {
   conversationId: string | undefined;
+  convState?: ConversationState;
   draft?: string;
   onDraftChange?: (text: string) => void;
+  onCancel?: () => void;
   focusToken?: number;
 }
 
 function renderInput({
   conversationId,
+  convState = idleState,
   draft = '',
   onDraftChange = () => {},
+  onCancel = () => {},
   focusToken,
 }: InputAreaTestProps) {
   const focusProps = focusToken === undefined ? {} : { focusToken };
   return render(
     <InputArea
       conversationId={conversationId}
-      convState={idleState}
+      convState={convState}
       images={[]}
       setImages={() => {}}
       isOffline={false}
@@ -35,7 +39,7 @@ function renderInput({
       onDraftChange={onDraftChange}
       {...focusProps}
       onSend={() => {}}
-      onCancel={() => {}}
+      onCancel={onCancel}
       onRetry={() => {}}
     />,
   );
@@ -217,6 +221,70 @@ describe('InputArea focusToken contract', () => {
 
     fireEvent.click(screen.getByText('do-focus'));
     expect(document.activeElement).toBe(textarea);
+  });
+});
+
+describe('InputArea cancellation affordance', () => {
+  it('shows Stop and calls onCancel for cancellable working states', () => {
+    const onCancel = vi.fn();
+    renderInput({
+      conversationId: 'conv-cancel',
+      convState: { type: 'llm_requesting', attempt: 1 },
+      onCancel,
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Stop' }));
+    expect(onCancel).toHaveBeenCalledOnce();
+  });
+
+  it('renders continuation progress without a Stop button', () => {
+    const onCancel = vi.fn();
+    renderInput({
+      conversationId: 'conv-continuation',
+      convState: { type: 'awaiting_continuation', attempt: 1 },
+      onCancel,
+    });
+
+    expect(screen.getByRole('status')).toHaveTextContent('Compacting conversation...');
+    expect(screen.getByText(/preserve context for a new conversation/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /stop/i })).not.toBeInTheDocument();
+  });
+
+  it('does not send from click or Enter while awaiting continuation', () => {
+    const onSend = vi.fn();
+    render(
+      <InputArea
+        conversationId="conv-continuation"
+        convState={{ type: 'awaiting_continuation', attempt: 1 }}
+        images={[]}
+        setImages={() => {}}
+        isOffline={false}
+        failedMessages={[]}
+        draft="queued follow-up"
+        onDraftChange={() => {}}
+        onSend={onSend}
+        onCancel={() => {}}
+        onRetry={() => {}}
+      />,
+    );
+
+    const send = screen.getByRole('button', { name: 'Send' });
+    expect(send).toBeDisabled();
+    fireEvent.click(send);
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it('does not call onCancel for Escape while awaiting continuation', () => {
+    const onCancel = vi.fn();
+    renderInput({
+      conversationId: 'conv-continuation',
+      convState: { type: 'awaiting_continuation', attempt: 1 },
+      onCancel,
+    });
+
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Escape' });
+    expect(onCancel).not.toHaveBeenCalled();
   });
 });
 

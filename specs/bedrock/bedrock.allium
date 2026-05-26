@@ -761,12 +761,12 @@ rule ContinuationFailed {
         "Continuation summary unavailable. Context was exhausted."
 }
 
-rule CancelDuringContinuation {
+rule RejectCancelDuringContinuation {
     when: UserCancels(conversation)
     requires: conversation.core_status = awaiting_continuation
-    ensures: conversation.parent_status = context_exhausted
-    ensures: conversation.continuation_summary =
-        "Conversation ended by user during context continuation."
+    ensures: InvalidCancellationState(conversation)
+    ensures: conversation.core_status = awaiting_continuation
+    ensures: not LlmAborted(conversation)
 }
 
 rule ContinuationRetryableError {

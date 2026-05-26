@@ -15,7 +15,7 @@ import type { QueuedMessage } from '../hooks';
 import { useDraftActions, useDraftValue, useScopedState } from '../hooks';
 import type { ConversationState, ImageData, SkillEntry } from '../api';
 import { api, ExpansionError } from '../api';
-import { isAgentWorking, isCancellingState } from '../utils';
+import { canCancelConversationState, isAgentWorking, isCancellingState } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
@@ -87,6 +87,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   onDismissError,
 }, ref) {
   const agentWorking = isAgentWorking(convState);
+  const canCancel = canCancelConversationState(convState);
   const isCancelling = isCancellingState(convState);
   const setDraft = onDraftChange;
   const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
@@ -476,6 +477,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     }
 
     if (!text && images.length === 0) return;
+    if (convState.type === 'awaiting_continuation') return;
     // Allow send while agent is working — the server will queue it as a
     // steering message and deliver it when the conversation reaches Idle.
 
@@ -580,7 +582,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const displayedText = voiceBase !== null ? voiceBase : draft;
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
-  const sendEnabled = hasContent && !expansionError;
+  const isContinuationProgress = convState.type === 'awaiting_continuation';
+  const canSend = !isContinuationProgress;
+  const sendEnabled = canSend && hasContent && !expansionError;
 
   // Cycle placeholder hint each time the input clears (e.g., after send).
   // Advances only when draft goes empty, not on a timer.
@@ -605,9 +609,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     : 'Type a message...';
   const placeholder = isOffline
     ? 'Type a message (will send when back online)...'
-    : agentWorking
-      ? 'Agent working... send to queue a follow-up'
-      : hint ? `${baseText} (${hint})` : baseText;
+    : isContinuationProgress
+      ? 'Compacting conversation...'
+      : agentWorking
+        ? 'Agent working... send to queue a follow-up'
+        : hint ? `${baseText} (${hint})` : baseText;
 
   // =========================================================================
   // Render
@@ -640,6 +646,19 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {convState.type === 'awaiting_continuation' && (
+        <div className="continuation-progress" role="status" aria-live="polite">
+          <div className="continuation-progress-header">
+            <span>Compacting conversation...</span>
+            <span className="continuation-progress-caption">Preparing a continuation</span>
+          </div>
+          <div className="continuation-progress-bar" aria-hidden="true">
+            <div className="continuation-progress-bar-fill" />
+          </div>
+          <p className="continuation-progress-text">Phoenix is generating a continuation summary to preserve context for a new conversation.</p>
         </div>
       )}
 
@@ -716,7 +735,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               disabled={agentWorking}
             />
           )}
-          {agentWorking ? (
+          {canCancel ? (
             <button
               className="input-stop-btn"
               onClick={onCancel}

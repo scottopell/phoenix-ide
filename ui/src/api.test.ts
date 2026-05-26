@@ -7,6 +7,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { api, canChangeModelInState, ConflictError, type ConversationState } from './api';
+import { canCancelConversationState } from './utils';
 
 describe('api.continueConversation', () => {
   beforeEach(() => {
@@ -83,6 +84,32 @@ describe('api.continueConversation', () => {
     await expect(api.continueConversation('parent-id')).rejects.toThrow(
       /Conversation not found/,
     );
+  });
+});
+
+describe('canCancelConversationState', () => {
+  const cases: ReadonlyArray<readonly [ConversationState, boolean]> = [
+    [{ type: 'idle' }, false],
+    [{ type: 'error', message: 'overloaded', error_kind: 'server_overloaded' }, false],
+    [{ type: 'awaiting_llm' }, false],
+    [{ type: 'llm_requesting', attempt: 1 }, true],
+    [{ type: 'tool_executing', current_tool: { id: 't', name: 'bash', input: {} }, remaining_tools: [] }, true],
+    [{ type: 'awaiting_sub_agents', pending: [], completed_results: [] }, true],
+    [{ type: 'awaiting_continuation', attempt: 1 }, false],
+    [{ type: 'cancelling' }, false],
+    [{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }, false],
+    [{ type: 'cancelling_sub_agents', pending: [] }, false],
+    [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, true],
+    [{ type: 'awaiting_user_response', questions: [] }, true],
+    [{ type: 'context_exhausted', summary: 's' }, false],
+    [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential' }, true],
+    [{ type: 'terminal' }, false],
+    [{ type: 'handed_off', successor_conv_id: 'next' }, false],
+    [{ type: 'seeded_llm_requesting', seed_message_id: 'seed', attempt: 1 }, true],
+  ];
+
+  it.each(cases)('%o -> %s', (state, expected) => {
+    expect(canCancelConversationState(state)).toBe(expected);
   });
 });
 

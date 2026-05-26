@@ -2113,21 +2113,6 @@ pub fn transition_parent(
             .with_effect(Effect::NotifyContextExhausted { summary: fallback }))
         }
 
-        (
-            ParentState::Core(CoreState::AwaitingContinuation { .. }),
-            ParentEvent::Core(CoreEvent::UserCancel { .. }),
-        ) => {
-            let cancelled =
-                "Continuation cancelled by user. Please start a new conversation.".to_string();
-            Ok(ParentTransitionResult::new(ParentState::ContextExhausted {
-                summary: cancelled.clone(),
-            })
-            .with_effect(Effect::persist_continuation_message(&cancelled))
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::AbortLlm)
-            .with_effect(Effect::NotifyContextExhausted { summary: cancelled }))
-        }
-
         // LlmError during continuation - retries exhausted -> ContextExhausted
         (
             ParentState::Core(CoreState::AwaitingContinuation { .. }),
@@ -2745,6 +2730,25 @@ mod tests {
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+    }
+
+    #[test]
+    fn parent_cancel_during_continuation_is_invalid_and_does_not_abort_llm() {
+        let state = ConvState::AwaitingContinuation {
+            rejected_tool_calls: vec![],
+            attempt: 1,
+        };
+
+        let err = transition(&state, &test_context(), Event::UserCancel { reason: None })
+            .expect_err("continuation generation is not user-cancellable");
+
+        assert!(matches!(
+            err,
+            TransitionError::InvalidTransition {
+                state: "AwaitingContinuation",
+                event: "UserCancel"
+            }
+        ));
     }
 
     // Bug class (task 60008): a parent that exhausts context must never

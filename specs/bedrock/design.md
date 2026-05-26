@@ -1285,17 +1285,13 @@ fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
     .with_effect(Effect::NotifyContextExhausted { summary: fallback }))
 }
 
-// User cancels during continuation
-(ConvState::AwaitingContinuation { trigger_usage, .. }, Event::UserCancel) => {
-    let cancelled = "Continuation cancelled by user.".to_string();
-    
-    Ok(TransitionResult::new(ConvState::ContextExhausted {
-        summary: cancelled.clone(),
-        final_usage: trigger_usage,
+// User cancellation during continuation is rejected by the cancel endpoint/state machine.
+// The in-flight summary request remains active so compaction can complete.
+(ConvState::AwaitingContinuation { .. }, Event::UserCancel) => {
+    Err(TransitionError::InvalidTransition {
+        state: "AwaitingContinuation",
+        event: "UserCancel",
     })
-    .with_effect(Effect::persist_continuation_message(cancelled.clone()))
-    .with_effect(Effect::PersistState)
-    .with_effect(Effect::NotifyContextExhausted { summary: cancelled }))
 }
 
 // Context exhausted rejects user messages
@@ -1367,7 +1363,7 @@ enum ErrorKind {
 | LlmRequesting | LlmResponse (>= 90%, Unhandled) | Failed | NotifyParent |
 | AwaitingContinuation | ContinuationResponse | ContextExhausted | PersistMessage, PersistState, NotifyContextExhausted |
 | AwaitingContinuation | ContinuationFailed | ContextExhausted | PersistMessage (fallback), PersistState, NotifyContextExhausted |
-| AwaitingContinuation | UserCancel | ContextExhausted | PersistMessage (cancelled), PersistState, NotifyContextExhausted |
+| AwaitingContinuation | UserCancel | **REJECT** | No abort; continuation remains in flight |
 | ContextExhausted | UserMessage | **REJECT** | Return error "context exhausted" |
 | ContextExhausted | * | ContextExhausted | No-op |
 | Idle | UserTriggerContinuation | AwaitingContinuation | PersistState, RequestContinuation |

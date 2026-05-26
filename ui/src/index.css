@@ -1556,6 +1556,58 @@ pre:hover .copy-btn {
   --pulse-color: var(--accent-purple, #a371f7);
 }
 
+.continuation-progress {
+  margin-bottom: 6px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent-purple, #a371f7) 35%, var(--border-color));
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--bg-primary) 88%, var(--accent-purple, #a371f7));
+}
+
+.continuation-progress-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--text-primary);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.continuation-progress-caption {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+.continuation-progress-text {
+  margin: 6px 0 0;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.continuation-progress-bar {
+  height: 3px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--bg-tertiary) 70%, transparent);
+}
+
+.continuation-progress-bar-fill {
+  width: 35%;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent-purple, #a371f7);
+  animation: continuation-progress-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes continuation-progress-slide {
+  0% { transform: translateX(-110%); }
+  100% { transform: translateX(310%); }
+}
+
 #message-input {
   width: 100%;
   padding: 10px 80px 10px 12px; /* right padding reserves space for inline buttons */

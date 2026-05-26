@@ -66,6 +66,20 @@ export function isAgentWorking(state: ConversationState): boolean {
   }
 }
 
+export function canCancelConversationState(state: ConversationState): boolean {
+  switch (state.type) {
+    case 'llm_requesting': case 'seeded_llm_requesting': case 'tool_executing':
+    case 'awaiting_sub_agents': case 'awaiting_task_approval': case 'awaiting_user_response':
+    case 'awaiting_recovery':
+      return true;
+    case 'idle': case 'error': case 'terminal': case 'handed_off': case 'context_exhausted':
+    case 'awaiting_llm': case 'awaiting_continuation':
+    case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
+      return false;
+    default: state satisfies never; return false;
+  }
+}
+
 export function isCancellingState(state: ConversationState): boolean {
   switch (state.type) {
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
@@ -118,7 +132,7 @@ export function getStateDescription(state: ConversationState): string {
       return `waiting for ${pending} sub-agent${pending !== 1 ? 's' : ''}`;
     }
     case 'awaiting_continuation':
-      return 'summarizing...';
+      return 'Compacting conversation...';
     case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
       return 'cancelling...';
     case 'idle': case 'terminal':

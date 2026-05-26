@@ -373,6 +373,11 @@ WHEN continuation request fails after standard retries
 THE SYSTEM SHALL transition to context exhausted state
 AND use a fallback summary indicating the failure
 
+WHEN user requests cancellation during continuation summary generation
+THE SYSTEM SHALL reject the request as an invalid cancellation state
+AND SHALL NOT abort the in-flight continuation request
+AND SHALL remain awaiting the continuation summary
+
 **Rationale:** The summary preserves session context for users to seed a new conversation. Mentioning rejected tools acknowledges what the agent intended. Failures shouldn't block users from moving on.
 
 ---

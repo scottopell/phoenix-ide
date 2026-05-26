@@ -1805,6 +1805,16 @@ async fn cancel_conversation(
         }));
     }
 
+    if !conversation.state.allows_user_cancel() {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            format!(
+                "Conversation cannot be cancelled while in {} state",
+                conversation.state.variant_name()
+            ),
+            "cannot_cancel_state",
+        ))));
+    }
+
     state
         .runtime
         .send_event(&id, Event::UserCancel { reason: None })
@@ -4004,6 +4014,46 @@ mod hard_delete_cascade_tests {
             SseEvent::Message { message } => assert_eq!(message.message_id, msg.message_id),
             other => panic!("expected live message event, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn cancel_rejects_awaiting_continuation_without_changing_state() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-continuation", "continuation", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        state
+            .db
+            .update_conversation_state(
+                "c-continuation",
+                &ConvState::AwaitingContinuation {
+                    rejected_tool_calls: vec![],
+                    attempt: 1,
+                },
+            )
+            .await
+            .expect("update state");
+
+        let err = cancel_conversation(State(state.clone()), Path("c-continuation".to_string()))
+            .await
+            .expect_err("awaiting continuation cancel should be rejected");
+
+        match err {
+            AppError::Conflict(detail) => assert_eq!(detail.error_type, "cannot_cancel_state"),
+            other => panic!("expected conflict, got {other:?}"),
+        }
+
+        let conv = state
+            .db
+            .get_conversation("c-continuation")
+            .await
+            .expect("conversation still exists");
+        assert!(matches!(
+            conv.state,
+            ConvState::AwaitingContinuation { attempt: 1, .. }
+        ));
     }
 
     #[tokio::test]

@@ -1560,6 +1560,20 @@ impl ConvState {
         )
     }
 
+    /// True when `UserCancel` is a supported user action for this state.
+    pub fn allows_user_cancel(&self) -> bool {
+        matches!(
+            self,
+            ConvState::LlmRequesting { .. }
+                | ConvState::SeededLlmRequesting { .. }
+                | ConvState::ToolExecuting { .. }
+                | ConvState::AwaitingSubAgents { .. }
+                | ConvState::AwaitingTaskApproval { .. }
+                | ConvState::AwaitingUserResponse { .. }
+                | ConvState::AwaitingRecovery { .. }
+        )
+    }
+
     /// True only for `Idle` and `Error` — the states with nothing in
     /// flight that a model swap would race. Error-state recovery
     /// ("pick another model") is specified by REQ-LLM-006.

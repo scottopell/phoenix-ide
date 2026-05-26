@@ -2,7 +2,7 @@ import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, canChangeModelInState, ExpansionError, type Conversation, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
-import { isAgentWorking, isCancellingState, parseConversationState } from '../utils';
+import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
 import { cacheDB } from '../cache';
 import { MessageList } from '../components/MessageList';
@@ -585,7 +585,7 @@ function ConversationPageContent() {
   }, [queuedMessages, dismiss, appendDraftCb, requestComposerFocus]);
 
   const handleCancel = async () => {
-    if (!conversationId || !isAgentWorking(atom.phase)) return;
+    if (!conversationId || !canCancelConversationState(atom.phase)) return;
     if (isCancellingState(atom.phase)) return;
 
     try {
