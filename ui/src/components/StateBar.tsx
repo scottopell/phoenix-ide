@@ -329,8 +329,6 @@ export function StateBar({
   // and we have models and a callback. Error-state switch lets the user
   // recover from overload/quota by picking another model, then retrying.
   const currentModel = conversation?.model ?? '';
-  const is1m =
-    availableModels?.find(m => m.id === currentModel)?.context_window === 1_000_000;
   const canPickModel = !!(
     onUpgradeModel &&
     availableModels &&
@@ -471,13 +469,11 @@ export function StateBar({
                       aria-expanded={pickerOpen}
                     >
                       {modelAbbrev}
-                      {is1m && <span className="model-1m-badge">1M</span>}
                       <span className="conv-model-caret" aria-hidden="true">&#9662;</span>
                     </button>
                   ) : (
                     <span className="conv-model" title={`Model: ${conversation.model ?? 'default'}`}>
                       {modelAbbrev}
-                      {is1m && <span className="model-1m-badge">1M</span>}
                     </span>
                   )}
                   {pickerOpen && canPickModel && (
