@@ -236,20 +236,48 @@ export function useBottomAnchoredWindow({
     pendingLastIndexRef.current = lastRenderedUnitIndex;
   }, [firstRenderedUnitIndex, lastRenderedUnitIndex, scrollRootRef]);
 
+  // Spacer-height compensation for ResizeObserver-driven measurement
+  // settle: as kind-estimate fallbacks get replaced by measured values
+  // the spacer height changes, and scrollTop needs an equal-and-opposite
+  // bump to keep the visible content anchored.
+  //
+  // The effect must ONLY fire on measurement settle, not on structural
+  // changes (historicalUnits length grew, firstRenderedUnitIndex moved,
+  // conversation switched). Structural changes have their own paths:
+  //   - sentinel expansion → exact scroll comp via prevScrollHeightRef
+  //   - conversation switch → reseat without delta (mount lands bottom-pinned)
+  //   - units hydration on initial mount → reseat without delta (the
+  //     ResizeObserver in MessageList scrolls to bottom once content arrives)
+  //
+  // Earlier this effect fired on any spacerHeight change, which produced
+  // a phantom delta on first message hydration and landed users at
+  // arbitrary mid-conversation scroll positions.
   const prevSpacerHeightRef = useRef(spacerHeight);
+  const prevStructureRef = useRef({
+    length: historicalUnits.length,
+    first: firstRenderedUnitIndex,
+    last: lastRenderedUnitIndex,
+  });
   useLayoutEffect(() => {
-    // Conversation switch: reseat the baseline without applying a delta.
-    // The old baseline references the previous conversation's geometry
-    // and would yield a meaningless scrollTop adjustment.
-    if (prevConversationIdRef.current !== conversationId) {
+    const structureChanged =
+      prevStructureRef.current.length !== historicalUnits.length
+      || prevStructureRef.current.first !== firstRenderedUnitIndex
+      || prevStructureRef.current.last !== lastRenderedUnitIndex;
+    const conversationChanged = prevConversationIdRef.current !== conversationId;
+
+    if (conversationChanged || structureChanged || prevScrollHeightRef.current !== null) {
+      // Reseat baseline without applying delta — caller paths above
+      // own the scroll positioning for these transitions.
       prevConversationIdRef.current = conversationId;
       prevSpacerHeightRef.current = spacerHeight;
+      prevStructureRef.current = {
+        length: historicalUnits.length,
+        first: firstRenderedUnitIndex,
+        last: lastRenderedUnitIndex,
+      };
       return;
     }
-    if (prevScrollHeightRef.current !== null) {
-      prevSpacerHeightRef.current = spacerHeight;
-      return;
-    }
+
     const el = scrollRootRef.current;
     if (!el) {
       prevSpacerHeightRef.current = spacerHeight;
@@ -260,7 +288,14 @@ export function useBottomAnchoredWindow({
       el.scrollTop += delta;
     }
     prevSpacerHeightRef.current = spacerHeight;
-  }, [spacerHeight, scrollRootRef, conversationId]);
+  }, [
+    spacerHeight,
+    scrollRootRef,
+    conversationId,
+    historicalUnits.length,
+    firstRenderedUnitIndex,
+    lastRenderedUnitIndex,
+  ]);
 
   useEffect(() => {
     const root = scrollRootRef.current;
