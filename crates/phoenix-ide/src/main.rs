@@ -42,18 +42,6 @@ mod hot_restart;
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // Startup sequence is inherently sequential; splitting would obscure the flow.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Install the rustls crypto provider explicitly. rustls 0.23 refuses
-    // to auto-pick when both `ring` and `aws-lc-rs` end up in the dep
-    // tree — which happens here via reqwest (aws-lc-rs) + our direct
-    // rustls = { features = ["ring"] } and several transitive consumers
-    // (chromiumoxide, hyper-rustls). Without this call the first
-    // ServerConfig::builder() call panics on startup. ring is our
-    // chosen provider (matches the feature flag on the direct rustls
-    // dep and stays consistent with our existing TLS code paths).
-    rustls::crypto::ring::default_provider()
-        .install_default()
-        .expect("failed to install rustls ring crypto provider");
-
     // Initialize logging
     tracing_subscriber::registry()
         .with(
@@ -67,6 +55,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .with_span_list(false),
         )
         .init();
+
+    // Install the rustls crypto provider explicitly. rustls 0.23 refuses
+    // to auto-pick when both `ring` and `aws-lc-rs` end up in the dep
+    // tree — which happens here via reqwest (aws-lc-rs) + our direct
+    // rustls = { features = ["ring"] } and several transitive consumers
+    // (chromiumoxide, hyper-rustls). Without this call the first
+    // `ServerConfig::builder()` call panics on startup. ring is our
+    // chosen provider (matches the feature flag on the direct rustls
+    // dep and stays consistent with our existing TLS code paths).
+    //
+    // `install_default()` returns `Err(existing)` if a provider was
+    // already installed earlier in the process — benign on its own
+    // (some libraries may install one as a side effect of import).
+    // Log and continue rather than crashing the binary on a benign
+    // race; the panic we're trying to prevent only occurs when no
+    // provider is installed at all.
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        tracing::debug!(
+            "rustls default crypto provider was already installed by another component; \
+             keeping the existing provider"
+        );
+    }
 
     hot_restart::record_start_time();
 
