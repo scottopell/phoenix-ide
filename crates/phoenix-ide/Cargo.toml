@@ -56,7 +56,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 base64 = "0.22"
 sha2 = "0.11"
 rand = "0.10"
-similar = "2"  # For generating diffs
+similar = "3"  # For generating diffs
 
 # Process management
 # Process management and PTY
