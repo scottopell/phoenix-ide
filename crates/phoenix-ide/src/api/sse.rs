@@ -179,12 +179,22 @@ mod tests {
                 sequence_id,
                 state,
                 presentation_mode,
-            } => json!({
-                "type": "state_change",
-                "sequence_id": sequence_id,
-                "state": serde_json::to_value(state).unwrap_or(Value::Null),
-                "presentation_mode": presentation_mode,
-            }),
+            } => {
+                let mut obj = json!({
+                    "type": "state_change",
+                    "sequence_id": sequence_id,
+                    "state": serde_json::to_value(state).unwrap_or(Value::Null),
+                    "presentation_mode": presentation_mode,
+                });
+                if let Some(error_kind) = state.error_kind() {
+                    obj["error"] = json!({
+                        "kind": error_kind,
+                        "can_auto_retry": error_kind.is_auto_retryable(),
+                        "can_user_resume": error_kind.is_user_resumable(),
+                    });
+                }
+                obj
+            }
             SseEvent::Token {
                 sequence_id,
                 text,

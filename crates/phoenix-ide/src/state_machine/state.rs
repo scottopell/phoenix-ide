@@ -1552,6 +1552,15 @@ impl ConvState {
         matches!(self, ConvState::Idle | ConvState::Error { .. })
     }
 
+    pub fn error_kind(&self) -> Option<&ErrorKind> {
+        match self {
+            Self::Error { error_kind, .. }
+            | Self::Failed { error_kind, .. }
+            | Self::AwaitingRecovery { error_kind, .. } => Some(error_kind),
+            _ => None,
+        }
+    }
+
     /// Stable, payload-free name of this variant. Used by structured
     /// error types (e.g. `TransitionError::InvalidTransition`) and
     /// tracing so they can carry a state discriminator without the

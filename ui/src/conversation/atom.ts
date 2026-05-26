@@ -1,5 +1,6 @@
 import * as v from 'valibot';
 import type { ConversationState, Message, Conversation, ToolResultContent } from '../api';
+import type { ErrorPresentation } from '../errorPresentation';
 import type { Breadcrumb } from '../types';
 import {
   SseTokenDataSchema,
@@ -122,7 +123,7 @@ export type SSEAction =
       durationMs?: number;
       epoch?: number;
     }
-  | { type: 'sse_state_change'; sequenceId: number; phase: ConversationState; epoch?: number }
+  | { type: 'sse_state_change'; sequenceId: number; phase: ConversationState; error?: ErrorPresentation; epoch?: number }
   | { type: 'sse_agent_done'; sequenceId: number; epoch?: number }
   | { type: 'sse_token'; sequenceId: number; delta: string; requestId: string; epoch?: number }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
@@ -406,6 +407,7 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_state_change',
         sequenceId: res.output.sequence_id,
         phase: parseConversationState(res.output.state),
+        ...(res.output.error ? { error: res.output.error } : {}),
       });
     }
     case 'message': {
@@ -715,7 +717,11 @@ export function conversationReducer(
 
     case 'sse_state_change': {
       return applyIfNewer(atom, 'sse_state_change', action.sequenceId, (a) => {
-        const newCrumb = breadcrumbFromPhase(action.phase, action.sequenceId);
+        const phase =
+          action.phase.type === 'error' && action.error
+            ? { ...action.phase, error: action.error }
+            : action.phase;
+        const newCrumb = breadcrumbFromPhase(phase, action.sequenceId);
         const { breadcrumbs, breadcrumbSequenceIds } = applyBreadcrumb(
           a.breadcrumbs,
           a.breadcrumbSequenceIds,
@@ -728,7 +734,7 @@ export function conversationReducer(
           action.phase.type === 'tool_executing' ? Date.now() : null;
         return {
           ...a,
-          phase: action.phase,
+          phase,
           breadcrumbs,
           breadcrumbSequenceIds,
           toolExecutingStartedAt,

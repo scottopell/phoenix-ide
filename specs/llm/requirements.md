@@ -110,8 +110,12 @@ WHEN LLM request fails
 THE SYSTEM SHALL classify error into an explicit, named category
 AND SHALL NOT use a catch-all or unknown classification
 
-WHEN error is retryable (network timeout, transient rate-limit throttle, server error)
+WHEN error is retryable for automatic runtime retry (network timeout, transient rate-limit throttle, server error)
 THE SYSTEM SHALL include retry-after hint when available
+
+WHEN error is not retryable for automatic runtime retry but may be recovered by user action (authentication failure, selected model overload)
+THE SYSTEM SHALL classify automatic retry policy separately from user-resume policy
+AND SHALL NOT use automatic retry classification to hide a persisted conversation resume affordance
 
 WHEN error is a quota/usage-limit exhaustion (distinct from a transient throttle)
 THE SYSTEM SHALL classify it as a terminal, non-retryable error category
@@ -124,7 +128,7 @@ AND SHALL surface a message suggesting the user try a different model
 WHEN a new error condition is encountered
 THE SYSTEM SHALL require an explicit classification decision before it can be handled
 
-**Rationale:** Error classification enables the state machine to implement appropriate retry logic. Exhaustive classification prevents accidental behavioral contracts where unknown errors silently become non-retryable, causing transient failures to be treated as permanent. Quota exhaustion and overloaded-model errors are distinct from transient throttles — retrying them is wasted work and the user-facing recovery differs (wait for window reset / upgrade plan / pick another model).
+**Rationale:** Error classification enables the state machine to implement appropriate automatic retry logic. Exhaustive classification prevents accidental behavioral contracts where unknown errors silently become non-retryable, causing transient failures to be treated as permanent. Quota exhaustion and overloaded-model errors are distinct from transient throttles — automatic retrying them is wasted work and the user-facing recovery differs (wait for window reset / upgrade plan / pick another model). Automatic retry safety is not the same capability as user-triggered resume after external action; auth failures are non-auto-retryable but resumable after credentials are refreshed.
 
 ---
 

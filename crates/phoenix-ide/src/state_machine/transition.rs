@@ -1231,7 +1231,7 @@ fn handle_core_error_retry(
     match (state, event) {
         // Retryable LlmError below max -> retry (shared)
         (CoreState::LlmRequesting { attempt }, CoreEvent::LlmError { error_kind, .. })
-            if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS =>
+            if error_kind.is_auto_retryable() && *attempt < MAX_RETRY_ATTEMPTS =>
         {
             let new_attempt = attempt + 1;
             let delay = retry_delay(new_attempt);
@@ -1256,7 +1256,7 @@ fn handle_core_error_retry(
                 ..
             },
         ) => {
-            let error_message = if error_kind.is_retryable() {
+            let error_message = if error_kind.is_auto_retryable() {
                 format!("Failed after {attempt} attempts: {message}")
             } else {
                 message
@@ -1304,7 +1304,7 @@ fn handle_core_continuation(
                 attempt,
             },
             CoreEvent::LlmError { error_kind, .. },
-        ) if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
+        ) if error_kind.is_auto_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
             let new_attempt = attempt + 1;
             let delay = retry_delay(new_attempt);
 
@@ -2006,7 +2006,7 @@ pub fn transition_parent(
                 ref error_kind,
                 ..
             }),
-        ) if !error_kind.is_retryable() || {
+        ) if !error_kind.is_auto_retryable() || {
             // Check if we're at/past max retries
             match state {
                 ParentState::Core(CoreState::AwaitingContinuation { attempt, .. }) => {
@@ -2136,8 +2136,8 @@ pub fn transition_sub_agent(
                 error_kind,
                 ..
             }),
-        ) if !error_kind.is_retryable() || *attempt >= MAX_RETRY_ATTEMPTS => {
-            let error_message = if error_kind.is_retryable() {
+        ) if !error_kind.is_auto_retryable() || *attempt >= MAX_RETRY_ATTEMPTS => {
+            let error_message = if error_kind.is_auto_retryable() {
                 format!("Failed after {attempt} attempts: {message}")
             } else {
                 message
@@ -2580,7 +2580,7 @@ pub fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> ErrorKind {
     }
 }
 
-// ErrorKind::is_retryable() is now defined in db/schema.rs
+// ErrorKind::is_auto_retryable() is now defined in db/schema.rs
 
 #[cfg(test)]
 mod tests {

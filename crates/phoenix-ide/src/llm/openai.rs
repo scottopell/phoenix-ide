@@ -1377,16 +1377,16 @@ mod tests {
         // All four terminal — not retryable
         assert!(!classify_responses_error("usage_limit_reached", "x")
             .kind
-            .is_retryable());
+            .is_auto_retryable());
         assert!(!classify_responses_error("usage_not_included", "x")
             .kind
-            .is_retryable());
+            .is_auto_retryable());
         assert!(!classify_responses_error("server_is_overloaded", "x")
             .kind
-            .is_retryable());
+            .is_auto_retryable());
         assert!(!classify_responses_error("slow_down", "x")
             .kind
-            .is_retryable());
+            .is_auto_retryable());
     }
 
     #[test]
@@ -1447,7 +1447,7 @@ mod tests {
         let data = r#"{"type":"error","error":{"type":"invalid_request_error","code":"context_length_exceeded","message":"Your input exceeds the context window of this model. Please adjust your input and try again.","param":"input"},"sequence_number":2}"#;
         let err = acc.process_event("error", data, &tx).unwrap_err();
         assert_eq!(err.kind, LlmErrorKind::ContextWindowExceeded);
-        assert!(!err.kind.is_retryable());
+        assert!(!err.kind.is_auto_retryable());
         assert!(err.message.contains("context_length_exceeded"));
         assert!(err.message.contains("Your input exceeds"));
     }
@@ -1591,7 +1591,7 @@ mod tests {
         .expect_err("empty content with billed output tokens must fail");
         assert_eq!(err.kind, crate::llm::LlmErrorKind::ServerError);
         assert!(
-            err.kind.is_retryable(),
+            err.kind.is_auto_retryable(),
             "a lost-message response must be retryable so the executor retries"
         );
     }

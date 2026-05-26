@@ -1,3 +1,5 @@
+import type { ErrorPresentation } from './errorPresentation';
+import type { ErrorKind } from './generated/ErrorKind';
 // Phoenix API Client
 
 // SSE event types come from the runtime schemas in `./sseSchemas`, which
@@ -227,7 +229,7 @@ export type ConversationState =
   | { type: 'awaiting_user_response'; questions: UserQuestion[] }
   | { type: 'context_exhausted'; summary: string }
   | { type: 'handed_off'; successor_conv_id: string }
-  | { type: 'error'; message: string; error_kind?: string }
+  | { type: 'error'; message: string; error_kind: ErrorKind; error?: ErrorPresentation }
   | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
   | { type: 'terminal' };
 
