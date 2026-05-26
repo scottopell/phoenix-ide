@@ -210,6 +210,8 @@ pub enum Event {
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
+    /// User dismissed the structured question UI without answering it.
+    UserQuestionDismissed,
 
     /// Grace turn exhausted -- sub-agent used its extra turn without calling `submit_result`.
     /// The executor extracted the last assistant text (if any) before sending this event.
@@ -300,6 +302,7 @@ impl Event {
             Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
+            Event::UserQuestionDismissed => "UserQuestionDismissed",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             Event::CredentialBecameAvailable => "CredentialBecameAvailable",
             Event::CredentialHelperFailed { .. } => "CredentialHelperFailed",
@@ -394,6 +397,7 @@ pub enum ParentOnlyEvent {
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
+    UserQuestionDismissed,
     CredentialBecameAvailable,
     CredentialHelperFailed {
         message: String,
@@ -560,6 +564,9 @@ impl TryFrom<Event> for ParentEvent {
                 answers,
                 annotations,
             })),
+            Event::UserQuestionDismissed => {
+                Ok(ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed))
+            }
             Event::CredentialBecameAvailable => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::CredentialBecameAvailable,
             )),
@@ -688,6 +695,7 @@ impl TryFrom<Event> for SubAgentEvent {
             Event::TaskApprovalDecided { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
+            | Event::UserQuestionDismissed
             | Event::CredentialBecameAvailable
             | Event::CredentialHelperFailed { .. }
             | Event::TaskResolved { .. }
@@ -732,6 +740,7 @@ impl ParentEvent {
                 ParentOnlyEvent::TaskApprovalDecided { .. } => "TaskApprovalDecided",
                 ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
+                ParentOnlyEvent::UserQuestionDismissed => "UserQuestionDismissed",
                 ParentOnlyEvent::CredentialBecameAvailable => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",
                 ParentOnlyEvent::TaskResolved { .. } => "TaskResolved",

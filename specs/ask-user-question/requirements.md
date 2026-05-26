@@ -87,14 +87,16 @@ AND provide answers as a formatted tool result that maps each question text to
 the selected label, including any preview content of the selected option and
 any user-added notes
 
-WHEN user declines to answer
-THE SYSTEM SHALL indicate the refusal to the agent
-AND allow the agent to proceed using its own judgment
+WHEN user dismisses the structured question panel
+THE SYSTEM SHALL close the panel without recording an answer
+AND SHALL NOT indicate any refusal to the agent
+AND SHALL NOT authorize the agent to proceed autonomously
+AND SHALL NOT resume agent execution until the user sends an explicit message
 
 **Rationale:** The agent needs structured response data to continue the task.
 Including preview content and notes in the result gives the agent full context
-about what the user chose and why. The decline path prevents users from being
-stuck if they don't want to answer.
+about what the user chose and why. Dismissal is an escape hatch from the
+structured UI, not an answer; users can reframe or answer in normal chat prose.
 
 ---
 
@@ -138,7 +140,7 @@ WHEN agent is waiting for user response
 THE SYSTEM SHALL indicate the waiting state to connected clients
 AND include the questions being asked in the state data
 
-WHEN user responds or declines
+WHEN user responds or dismisses
 THE SYSTEM SHALL transition state and notify all connected clients
 
 **Rationale:** Users need immediate visual feedback that the agent is waiting

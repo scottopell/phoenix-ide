@@ -766,7 +766,7 @@ mod random_walk {
                             annotations: None,
                         }
                     }
-                    _ => Event::UserCancel { reason: None },
+                    _ => Event::UserQuestionDismissed,
                 }
             }
 

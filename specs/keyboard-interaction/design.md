@@ -137,7 +137,7 @@ Buttons with keyboard shortcuts include the shortcut in their `title`
 attribute:
 
 - `Submit (Ctrl+Enter)`
-- `Decline (Escape)`
+- `Dismiss (Escape)`
 - `Next question (Tab)`
 
 Format shortcuts using the platform: `Cmd` on macOS, `Ctrl` elsewhere. Detect
@@ -156,7 +156,7 @@ via `navigator.platform` or `navigator.userAgent`.
 | Shift+Tab | Go to previous question | Go to previous question |
 | n | Open notes (preview questions only) | -- |
 | Ctrl+Enter | Submit all answers | Submit all answers |
-| Escape | Confirm decline dialog | Confirm decline dialog |
+| Escape | Confirm dismiss dialog | Confirm dismiss dialog |
 
 ### Sidebar Navigation (cross-references specs/conversation-ui)
 

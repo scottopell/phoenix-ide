@@ -1418,18 +1418,20 @@ pub fn transition_parent(
                         handoff: TaskApprovalHandoff::StartFreshWorkConversation,
                     },
             }),
-        ) => Ok(ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
-            task_file: task_file.clone(),
-            title: title.clone(),
-            priority: *priority,
-            plan: plan.clone(),
-        })
-        .with_effect(Effect::ApproveTaskFreshHandoff {
-            task_file: task_file.clone(),
-            title: title.clone(),
-            priority: *priority,
-            plan: plan.clone(),
-        })),
+        ) => Ok(
+            ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
+                task_file: task_file.clone(),
+                title: title.clone(),
+                priority: *priority,
+                plan: plan.clone(),
+            })
+            .with_effect(Effect::ApproveTaskFreshHandoff {
+                task_file: task_file.clone(),
+                title: title.clone(),
+                priority: *priority,
+                plan: plan.clone(),
+            }),
+        ),
 
         (
             ParentState::AwaitingTaskApproval { .. },
@@ -1499,6 +1501,15 @@ pub fn transition_parent(
         ) => Err(TransitionError::AwaitingUserResponse),
 
         (
+            ParentState::AwaitingUserResponse { .. },
+            ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed),
+        ) => Ok(
+            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change()),
+        ),
+
+        (
             ParentState::AwaitingUserResponse { questions, .. },
             ParentEvent::Parent(ParentOnlyEvent::UserQuestionResponse {
                 answers,
@@ -1552,28 +1563,6 @@ pub fn transition_parent(
                 .with_effect(Effect::RequestLlm),
             )
         }
-
-        (
-            ParentState::AwaitingUserResponse { .. },
-            ParentEvent::Core(CoreEvent::UserCancel { .. }),
-        ) => Ok(
-            ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting {
-                attempt: 1,
-            }))
-            .with_effect(Effect::PersistMessage {
-                content: crate::db::MessageContent::user(
-                    "I declined to answer those questions. Please proceed using your own judgment."
-                        .to_string(),
-                ),
-                display_data: None,
-                usage_data: None,
-                message_id: uuid::Uuid::new_v4().to_string(),
-                idempotent: false,
-            })
-            .with_effect(Effect::PersistState)
-            .with_effect(Effect::notify_state_change())
-            .with_effect(Effect::RequestLlm),
-        ),
 
         // ============================================================
         // Parent-only state: AwaitingRecovery (REQ-BED-030)
@@ -1696,15 +1685,18 @@ pub fn transition_parent(
                 if tool_calls.len() > 1 {
                     let msg = "propose_task must be the only tool in response".to_string();
                     let display_data = compute_bash_display_data(&content, &context.working_dir);
-                    let assistant_message =
-                        AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
                     let error_results: Vec<ToolResult> = tool_calls
                         .iter()
                         .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
                         .collect();
-                    let checkpoint =
-                        CheckpointData::tool_round(assistant_message, error_results)
-                            .expect("error_results.len() == tool_calls.len()");
+                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)
+                        .expect("error_results.len() == tool_calls.len()");
                     return Ok(ParentTransitionResult::new(ParentState::Core(
                         CoreState::LlmRequesting { attempt: 1 },
                     ))
@@ -1729,8 +1721,12 @@ pub fn transition_parent(
                         );
                         let display_data =
                             compute_bash_display_data(&content, &context.working_dir);
-                        let assistant_message =
-                            AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
+                        let assistant_message = AssistantMessage::new(
+                            request_id.clone(),
+                            content,
+                            Some(usage_data),
+                            display_data,
+                        );
                         let tool_result = ToolResult::error(tool.id.clone(), err_msg);
                         let checkpoint =
                             CheckpointData::tool_round(assistant_message, vec![tool_result])
@@ -1759,8 +1755,12 @@ pub fn transition_parent(
                         // and retry.
                         let display_data =
                             compute_bash_display_data(&content, &context.working_dir);
-                        let assistant_message =
-                            AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
+                        let assistant_message = AssistantMessage::new(
+                            request_id.clone(),
+                            content,
+                            Some(usage_data),
+                            display_data,
+                        );
                         let tool_result = ToolResult::error(tool.id.clone(), err_msg);
                         let checkpoint =
                             CheckpointData::tool_round(assistant_message, vec![tool_result])
@@ -1780,11 +1780,14 @@ pub fn transition_parent(
                 let tool_result =
                     ToolResult::success(tool.id.clone(), "Plan submitted for review".to_string());
                 let display_data = compute_bash_display_data(&content, &context.working_dir);
-                let assistant_message =
-                    AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
-                let checkpoint =
-                    CheckpointData::tool_round(assistant_message, vec![tool_result])
-                        .expect("propose_task produces exactly one tool_use and one result");
+                let assistant_message = AssistantMessage::new(
+                    request_id.clone(),
+                    content,
+                    Some(usage_data),
+                    display_data,
+                );
+                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])
+                    .expect("propose_task produces exactly one tool_use and one result");
 
                 return Ok(
                     ParentTransitionResult::new(ParentState::AwaitingTaskApproval {
@@ -1814,15 +1817,18 @@ pub fn transition_parent(
                 if tool_calls.len() > 1 {
                     let msg = "ask_user_question must be the only tool in response".to_string();
                     let display_data = compute_bash_display_data(&content, &context.working_dir);
-                    let assistant_message =
-                        AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
+                    let assistant_message = AssistantMessage::new(
+                        request_id.clone(),
+                        content,
+                        Some(usage_data),
+                        display_data,
+                    );
                     let error_results: Vec<ToolResult> = tool_calls
                         .iter()
                         .map(|t| ToolResult::error(t.id.clone(), msg.clone()))
                         .collect();
-                    let checkpoint =
-                        CheckpointData::tool_round(assistant_message, error_results)
-                            .expect("error_results.len() == tool_calls.len()");
+                    let checkpoint = CheckpointData::tool_round(assistant_message, error_results)
+                        .expect("error_results.len() == tool_calls.len()");
                     return Ok(ParentTransitionResult::new(ParentState::Core(
                         CoreState::LlmRequesting { attempt: 1 },
                     ))
@@ -1841,14 +1847,18 @@ pub fn transition_parent(
                         );
                         let display_data =
                             compute_bash_display_data(&content, &context.working_dir);
-                        let assistant_message =
-                            AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
+                        let assistant_message = AssistantMessage::new(
+                            request_id.clone(),
+                            content,
+                            Some(usage_data),
+                            display_data,
+                        );
                         let tool_result = ToolResult::error(tool.id.clone(), err_msg);
                         let checkpoint =
                             CheckpointData::tool_round(assistant_message, vec![tool_result])
                                 .expect(
-                                    "ask_user_question produces exactly one tool_use and one result",
-                                );
+                                "ask_user_question produces exactly one tool_use and one result",
+                            );
                         return Ok(ParentTransitionResult::new(ParentState::Core(
                             CoreState::LlmRequesting { attempt: 1 },
                         ))
@@ -1864,8 +1874,12 @@ pub fn transition_parent(
                     "Awaiting user response. See following message for answers.".to_string(),
                 );
                 let display_data = compute_bash_display_data(&content, &context.working_dir);
-                let assistant_message =
-                    AssistantMessage::new(request_id.clone(), content, Some(usage_data), display_data);
+                let assistant_message = AssistantMessage::new(
+                    request_id.clone(),
+                    content,
+                    Some(usage_data),
+                    display_data,
+                );
                 let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])
                     .expect("ask_user_question produces exactly one tool_use and one result");
 
@@ -1882,7 +1896,8 @@ pub fn transition_parent(
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
             if should_trigger_continuation(&usage_data, context.context_window) {
-                let tr = handle_context_exhaustion(context, content, tool_calls, usage_data, request_id);
+                let tr =
+                    handle_context_exhaustion(context, content, tool_calls, usage_data, request_id);
                 return Ok(ParentTransitionResult {
                     new_state: ParentState::try_from(tr.new_state)
                         .expect("handle_context_exhaustion returns parent-valid state"),
@@ -3643,8 +3658,7 @@ mod tests {
     }
 
     #[test]
-    fn test_awaiting_user_response_cancel_resumes_llm() {
-        use crate::db::MessageContent;
+    fn test_awaiting_user_response_dismisses_without_resuming_llm() {
         use crate::state_machine::state::UserQuestion;
 
         let state = ConvState::AwaitingUserResponse {
@@ -3657,47 +3671,36 @@ mod tests {
             tool_use_id: "tool-auq-1".to_string(),
         };
 
-        let result =
-            transition(&state, &test_context(), Event::UserCancel { reason: None }).unwrap();
+        let result = transition(&state, &test_context(), Event::UserQuestionDismissed).unwrap();
 
         assert!(
-            matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
-            "Decline should re-enter LlmRequesting so the agent proceeds (REQ-AUQ-004), got {:?}",
+            matches!(result.new_state, ConvState::Idle),
+            "Dismiss should return to Idle so the user can type a message, got {:?}",
             result.new_state
-        );
-
-        let decline_message = result.effects.iter().find_map(|e| {
-            if let Effect::PersistMessage {
-                content: MessageContent::User(user),
-                ..
-            } = e
-            {
-                Some(user.text.clone())
-            } else {
-                None
-            }
-        });
-        assert!(
-            decline_message
-                .as_deref()
-                .is_some_and(|t| t.contains("declined")),
-            "Decline must persist a user-role message telling the agent to proceed, got {decline_message:?}"
-        );
-
-        assert!(
-            result
-                .effects
-                .iter()
-                .any(|e| matches!(e, Effect::RequestLlm)),
-            "Should dispatch a new LLM request so the agent resumes"
         );
 
         assert!(
             !result
                 .effects
                 .iter()
-                .any(|e| matches!(e, Effect::NotifyAgentDone)),
-            "Decline must not notify agent_done — the agent is resuming, not stopping"
+                .any(|e| matches!(e, Effect::PersistMessage { .. })),
+            "Dismiss must not persist an implicit answer or proceed instruction"
+        );
+
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Dismiss must not request the LLM on its own"
+        );
+
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistState)),
+            "Dismiss should persist the Idle state"
         );
     }
 
@@ -3731,6 +3734,57 @@ mod tests {
         assert!(
             matches!(result, Err(TransitionError::AwaitingUserResponse)),
             "Should reject user messages with AwaitingUserResponse error, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_user_message_after_question_dismissal_resumes_agent() {
+        use crate::state_machine::state::UserQuestion;
+
+        let state = ConvState::AwaitingUserResponse {
+            questions: vec![UserQuestion {
+                question: "Which library?".to_string(),
+                header: "Dependencies".to_string(),
+                options: vec![],
+                multi_select: false,
+            }],
+            tool_use_id: "tool-auq-1".to_string(),
+        };
+
+        let dismissed = transition(&state, &test_context(), Event::UserQuestionDismissed).unwrap();
+
+        let result = transition(
+            &dismissed.new_state,
+            &test_context(),
+            Event::UserMessage {
+                text: "Use lodash.".to_string(),
+                llm_text: None,
+                images: vec![],
+                message_id: "msg-1".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { attempt: 1 }),
+            "Free-form user message after dismiss should resume the agent, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistMessage { .. })),
+            "Free-form message should be persisted explicitly"
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "Free-form message should request LLM"
         );
     }
 

@@ -5,7 +5,7 @@
  * Step-by-step wizard showing one question at a time with full keyboard
  * navigation (arrow keys, space, enter, tab, escape).
  *
- * Submit calls api.respondToQuestion; Decline calls api.cancelConversation.
+ * Submit calls api.respondToQuestion; Dismiss calls api.dismissQuestion.
  */
 
 import { useState, useCallback, useEffect, useRef } from 'react';
@@ -28,13 +28,14 @@ export interface QuestionPanelProps {
   questions: UserQuestion[];
   conversationId: string;
   showToast: (message: string, duration?: number) => void;
-  /** Called after a successful respond/cancel POST. The parent uses this to
+  /** Called after a successful respond/dismiss POST. The parent uses this to
    *  optimistically advance the local phase out of awaiting_user_response so
    *  the wizard dismisses immediately, instead of waiting for the SSE state
    *  echo (which can lag or be missed entirely on a flaky connection). The
    *  authoritative server-side phase change arrives via sse_state_change and
    *  reconciles. Mirrors handleSend in ConversationPage.tsx. */
-  onSubmitted: () => void;
+  onAnswered: () => void;
+  onDismissed: () => void;
 }
 
 const OTHER_SENTINEL = '__other__';
@@ -52,7 +53,8 @@ export function QuestionPanel({
   questions,
   conversationId,
   showToast,
-  onSubmitted,
+  onAnswered,
+  onDismissed,
 }: QuestionPanelProps) {
   useRegisterFocusScope('question-panel');
 
@@ -86,7 +88,7 @@ export function QuestionPanel({
     message: string;
     isError: boolean;
   } | null>(null);
-  const [showConfirmDecline, setShowConfirmDecline] = useState(false);
+  const [showConfirmDismiss, setShowConfirmDismiss] = useState(false);
   const [multiSelections, setMultiSelections] = useState<
     Record<string, Set<string>>
   >({});
@@ -227,7 +229,7 @@ export function QuestionPanel({
     return hasAny ? result : undefined;
   }, [questions, answers, annotations]);
 
-  // --- Submit / Decline ---
+  // --- Submit / Dismiss ---
   const handleSubmit = useCallback(async () => {
     if (!allAnswered || submitting) return;
     setSubmitting(true);
@@ -238,7 +240,7 @@ export function QuestionPanel({
         buildAnswerMap(),
         buildAnnotations()
       );
-      onSubmitted();
+      onAnswered();
       showToast('Response sent', 3000);
     } catch (err) {
       const msg =
@@ -253,31 +255,31 @@ export function QuestionPanel({
     conversationId,
     buildAnswerMap,
     buildAnnotations,
-    onSubmitted,
+    onAnswered,
     showToast,
   ]);
 
-  const handleDeclineClick = useCallback(() => {
+  const handleDismissClick = useCallback(() => {
     if (submitting) return;
-    setShowConfirmDecline(true);
+    setShowConfirmDismiss(true);
   }, [submitting]);
 
-  const handleConfirmDecline = useCallback(async () => {
-    setShowConfirmDecline(false);
+  const handleConfirmDismiss = useCallback(async () => {
+    setShowConfirmDismiss(false);
     if (submitting) return;
     setSubmitting(true);
     setFeedback(null);
     try {
-      await api.cancelConversation(conversationId);
-      onSubmitted();
-      showToast('Declined to answer', 3000);
+      await api.dismissQuestion(conversationId);
+      onDismissed();
+      showToast('Question dismissed. Type a message to continue.', 3000);
     } catch (err) {
-      const msg = err instanceof Error ? err.message : 'Failed to decline';
+      const msg = err instanceof Error ? err.message : 'Failed to dismiss';
       setFeedback({ message: msg, isError: true });
     } finally {
       setSubmitting(false);
     }
-  }, [submitting, conversationId, onSubmitted, showToast]);
+  }, [submitting, conversationId, onDismissed, showToast]);
 
   // --- Navigation ---
   const goToStep = useCallback(
@@ -409,7 +411,7 @@ export function QuestionPanel({
       if (!currentQuestion) return;
 
       // If confirm dialog is open, don't handle
-      if (showConfirmDecline) return;
+      if (showConfirmDismiss) return;
 
       const isInInput =
         e.target instanceof HTMLInputElement ||
@@ -433,7 +435,7 @@ export function QuestionPanel({
           // Re-focus the panel so keyboard nav continues
           panelRef.current?.focus();
         } else {
-          setShowConfirmDecline(true);
+          setShowConfirmDismiss(true);
         }
         return;
       }
@@ -584,7 +586,7 @@ export function QuestionPanel({
       currentQuestion,
       currentStep,
       focusedIndex,
-      showConfirmDecline,
+      showConfirmDismiss,
       isLastStep,
       enterPressedOnLast,
       expandedNotes,
@@ -673,23 +675,23 @@ export function QuestionPanel({
 
       <div className="question-actions">
         <button
-          className="question-btn question-btn--decline-small"
-          onClick={handleDeclineClick}
+          className="question-btn question-btn--dismiss-small"
+          onClick={handleDismissClick}
           disabled={submitting}
-          title="Escape to decline"
+          title="Escape to dismiss"
         >
-          Decline
+          Dismiss
         </button>
 
         <ConfirmDialog
-          visible={showConfirmDecline}
-          title="Decline to answer?"
-          message="The agent will proceed using its own judgment."
-          confirmText="Decline"
+          visible={showConfirmDismiss}
+          title="Dismiss structured questions?"
+          message="The question panel will close. No answer will be sent, and the agent will not continue until you type a message."
+          confirmText="Dismiss"
           cancelText="Cancel"
           danger
-          onConfirm={handleConfirmDecline}
-          onCancel={() => setShowConfirmDecline(false)}
+          onConfirm={handleConfirmDismiss}
+          onCancel={() => setShowConfirmDismiss(false)}
         />
 
         <div className="question-actions-right">

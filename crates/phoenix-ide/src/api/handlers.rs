@@ -121,6 +121,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/task-feedback", post(task_feedback))
         // User question response (REQ-AUQ-003)
         .route("/api/conversations/:id/respond", post(respond_to_question))
+        .route(
+            "/api/conversations/:id/dismiss-question",
+            post(dismiss_question),
+        )
         // Task abandon (REQ-PROJ-010)
         .route("/api/conversations/:id/abandon-task", post(abandon_task))
         // Mark as merged (REQ-PROJ-026)
@@ -1974,6 +1978,33 @@ async fn respond_to_question(
                 annotations: req.annotations,
             },
         )
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+async fn dismiss_question(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Conversation is not awaiting a user response",
+            "wrong_state",
+        ))));
+    }
+
+    state
+        .runtime
+        .send_event(&id, Event::UserQuestionDismissed)
         .await
         .map_err(AppError::BadRequest)?;
 

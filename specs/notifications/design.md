@@ -92,7 +92,7 @@ Today's call sites (verified by grep `showInfo|showWarning|showError|showSuccess
 
 - `McpStatusPanel.tsx:77,107` — MCP server reload + toggle outcomes (success-coloured)
 - `McpStatusPanel.tsx:81,109` — MCP failures (currently routed through the `showToast` prop, which is wired from `showSuccess` — see Phase 1 gap noted in REQ-NOTIF-002 status)
-- `QuestionPanel.tsx:242,273` — "Response sent" / "Declined to answer"
+- `QuestionPanel.tsx` — "Response sent" / dismissal confirmation
 - `QuestionPanel.tsx:467,533` — "Press Enter again to submit" (Enter-key hint)
 - `ConversationListPage.tsx:98` — `showWarning` for storage-usage threshold
 - `ConversationListPage.tsx:102,274,295,305,317` — `showError` for storage quota exceeded + chain operation failures (the only red-styled toasts in the UI today)

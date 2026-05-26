@@ -31,7 +31,7 @@ keys and are never blocked by panel-level handlers.
 | **REQ-KB-004:** Auto-Focus on Panel Appearance | ✅ Complete | QuestionPanel auto-focuses first option on mount and step change |
 | **REQ-KB-005:** Escape Key Behavior | ✅ Complete | QuestionPanel, ShortcutHelpPanel, ProseReader, TaskApprovalReader all register as focus scopes. Escape hierarchy: sub-context -> confirm if unsaved -> dismiss -> navigate |
 | **REQ-KB-006:** Shortcut Help Panel | ✅ Complete | `?` key opens `ShortcutHelpPanel` |
-| **REQ-KB-007:** Tooltip Shortcut Hints | ✅ Complete | Submit, Decline, Send buttons show shortcuts |
+| **REQ-KB-007:** Tooltip Shortcut Hints | ✅ Complete | Submit, Dismiss, Send buttons show shortcuts |
 | **REQ-KB-008:** Prevent Key Leak to Inactive Scopes | ✅ Complete | `useKeyboardNav` gated by `hasActiveScope` |
 
 **Progress:** 8 of 8 complete

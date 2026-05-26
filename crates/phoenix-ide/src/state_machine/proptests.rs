@@ -379,6 +379,7 @@ pub(crate) fn arb_event() -> impl Strategy<Value = Event> {
         Just(Event::UserCancel { reason: None }),
         arb_task_approval_event(),
         arb_user_question_response_event(),
+        Just(Event::UserQuestionDismissed),
         arb_grace_turn_exhausted_event(),
     ]
 }
