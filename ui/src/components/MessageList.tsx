@@ -107,6 +107,10 @@ function renderHistoricalUnit(
         />
       );
     case 'system': {
+      const displayData = unit.message.display_data as
+        | { hidden?: boolean }
+        | null;
+      if (displayData?.hidden) return null;
       const text = (unit.message.content as { text?: string })?.text;
       if (!text) return null;
       return (

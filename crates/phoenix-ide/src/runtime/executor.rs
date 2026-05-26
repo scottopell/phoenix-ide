@@ -1555,6 +1555,26 @@ where
                 Ok(None)
             }
 
+            Effect::PersistHiddenSystemMarker { marker, message_id } => {
+                let seq = self.broadcast_tx.next_seq();
+                let content = MessageContent::system(marker);
+                let display_data = Some(serde_json::json!({ "hidden": true }));
+                let msg = self
+                    .storage
+                    .add_message_with_seq(
+                        &message_id,
+                        &self.context.conversation_id,
+                        seq,
+                        &content,
+                        display_data.as_ref(),
+                        None,
+                    )
+                    .await?;
+
+                let _ = self.broadcast_tx.send_message(msg);
+                Ok(None)
+            }
+
             Effect::PersistSubAgentResults {
                 results,
                 spawn_tool_id,

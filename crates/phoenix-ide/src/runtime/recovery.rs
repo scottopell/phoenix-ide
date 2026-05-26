@@ -28,6 +28,8 @@ pub enum RecoveryReason {
     NoAgentMessage,
     /// Last agent message contains text (normal completion)
     AgentHasTextResponse,
+    /// Last message marks a deliberate `ask_user_question` dismissal
+    UserQuestionDismissed,
     /// Last agent message is `tool_use` only, needs continuation
     InterruptedMidTurn,
     /// Too many consecutive auto-continue restarts (liveness bound)
@@ -77,6 +79,10 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
 
     // Last message must be a tool result
     let last_msg = messages.last().unwrap();
+    if is_user_question_dismissed_marker(last_msg) {
+        return RecoveryDecision::idle(RecoveryReason::UserQuestionDismissed);
+    }
+
     if !matches!(last_msg.message_type, MessageType::Tool) {
         return RecoveryDecision::idle(RecoveryReason::LastMessageNotTool);
     }
@@ -117,6 +123,14 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
     }
 }
 
+fn is_user_question_dismissed_marker(message: &Message) -> bool {
+    matches!(
+        &message.content,
+        MessageContent::System(sys)
+            if sys.text.contains(crate::state_machine::transition::USER_QUESTION_DISMISSED_MARKER)
+    )
+}
+
 /// Count restart system messages since the last user message.
 /// A user message starts a new turn, so restart markers from before
 /// that point are historical and don't count toward the loop threshold.
@@ -139,7 +153,7 @@ fn count_restart_messages_since_last_user_msg(messages: &[Message]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{ToolContent, UserContent};
+    use crate::db::{SystemContent, ToolContent, UserContent};
     use chrono::Utc;
     use serde_json::json;
 
@@ -476,12 +490,41 @@ mod tests {
         assert_eq!(decision.reason, RecoveryReason::AgentHasTextResponse);
     }
 
+    fn system_question_dismissed_msg(seq: i64) -> Message {
+        Message {
+            message_id: format!("sys-auq-dismissed-{seq}"),
+            conversation_id: "test-conv".to_string(),
+            sequence_id: seq,
+            message_type: MessageType::System,
+            content: MessageContent::System(SystemContent {
+                text: crate::state_machine::transition::USER_QUESTION_DISMISSED_MARKER.to_string(),
+            }),
+            display_data: Some(json!({ "hidden": true })),
+            usage_data: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_user_question_dismissal_marker_prevents_auto_continue() {
+        let messages = vec![
+            user_msg(1, "Which option should I use?"),
+            agent_tool_use_only(2, &["ask_user_question"]),
+            tool_result(3, "tool-2-0", "Awaiting user response."),
+            system_question_dismissed_msg(4),
+        ];
+
+        let decision = should_auto_continue(&messages);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::UserQuestionDismissed);
+        assert!(matches!(decision.state, ConvState::Idle));
+    }
+
     // =========================================================================
     // Restart loop detection
     // =========================================================================
 
     fn system_restart_msg(seq: i64) -> Message {
-        use crate::db::SystemContent;
         Message {
             message_id: format!("sys-{seq}"),
             conversation_id: "test-conv".to_string(),
@@ -835,6 +878,9 @@ mod proptests {
                             prop_assert!(has_text, "Agent should have text for AgentHasTextResponse");
                         }
                     }
+                }
+                RecoveryReason::UserQuestionDismissed => {
+                    prop_assert!(!decision.needs_auto_continue);
                 }
                 RecoveryReason::InterruptedMidTurn => {
                     prop_assert!(decision.needs_auto_continue);

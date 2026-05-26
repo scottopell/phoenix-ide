@@ -24,6 +24,11 @@ use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
 
+/// Stable marker persisted as a hidden system message when the user dismisses
+/// an `ask_user_question` panel without answering. Recovery uses this to
+/// distinguish deliberate dismissal from an interrupted tool turn.
+pub const USER_QUESTION_DISMISSED_MARKER: &str = "[ask-user-question-dismissed]";
+
 /// Statuses a task file may be in for `propose_task` to accept it.
 const ACCEPTABLE_PROPOSE_STATUSES: &[taskmd_core::constants::Status] = &[
     taskmd_core::constants::Status::Ready,
@@ -1505,6 +1510,10 @@ pub fn transition_parent(
             ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed),
         ) => Ok(
             ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
+                .with_effect(Effect::PersistHiddenSystemMarker {
+                    marker: USER_QUESTION_DISMISSED_MARKER,
+                    message_id: uuid::Uuid::new_v4().to_string(),
+                })
                 .with_effect(Effect::PersistState)
                 .with_effect(Effect::notify_state_change()),
         ),
