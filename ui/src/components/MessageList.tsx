@@ -1,4 +1,4 @@
-import { memo, useState, useRef, useCallback, useMemo } from 'react';
+import { memo, useState, useRef, useCallback, useMemo, useEffect } from 'react';
 import { Virtuoso, type VirtuosoHandle } from 'react-virtuoso';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
@@ -48,12 +48,6 @@ interface MessageListProps {
 }
 
 const PIN_TO_BOTTOM_THRESHOLD = 100;
-// Wider tolerance for the re-snap-on-content-growth path than for the
-// pin-detection threshold above. The streaming agent's item grows
-// asynchronously as markdown / code blocks mount; that growth pushes
-// the user beyond the 100px pin threshold without any user input. Treat
-// "within 300px of bottom" as "drifted by render lag, snap back."
-const FOLLOW_OUTPUT_DRIFT_TOLERANCE = 300;
 
 function extractSkillArgs(trigger: string, name: string): string {
   return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
@@ -190,8 +184,19 @@ function MessageListImpl({
 }: MessageListProps) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
+  // Tail-content unread tracking: bumped when the visible-unit count grows
+  // while the user is NOT pinned at bottom. Cleared when isAtBottom flips
+  // true or the jump-to-newest button is clicked. This keeps the
+  // "↓ New messages" affordance honest: it only shows after new tail
+  // content arrived while the user was scrolled up, not on every
+  // scroll-up of a static conversation.
+  const [hasUnreadTailContent, setHasUnreadTailContent] = useState(false);
   const virtuosoRef = useRef<VirtuosoHandle>(null);
   const scrollerRef = useRef<HTMLElement | null>(null);
+  // Most recent `totalListHeightChanged` value virtuoso has reported. Used
+  // to detect "user was pinned to the previous bottom" — see the
+  // handleTotalListHeightChanged comment.
+  const prevTotalHeightRef = useRef(0);
 
   // The streaming buffer's `requestId` IS the eventual agent message_id
   // (server uses the same uuid for both — see `AssistantMessage::new` in
@@ -225,24 +230,15 @@ function MessageListImpl({
 
   const handleAtBottomStateChange = useCallback((atBottom: boolean) => {
     setIsAtBottom(atBottom);
+    // Returning to bottom clears the unread badge regardless of whether
+    // the user got there via scroll, click, or virtuoso's followOutput.
+    if (atBottom) setHasUnreadTailContent(false);
   }, []);
 
   const handleScrollerRef = useCallback((ref: HTMLElement | Window | null) => {
     scrollerRef.current = ref instanceof HTMLElement ? ref : null;
   }, []);
 
-  // virtuoso's `followOutput="auto"` only fires when `data.length` grows;
-  // it doesn't re-snap when the LAST item's height changes async after
-  // mount (markdown render, react-syntax-highlighter mounting, image
-  // loading). That leaves the user a few hundred pixels above true bottom
-  // — visually "not at the bottom" despite virtuoso's internal pin.
-  //
-  // Bridge the gap: when virtuoso reports the total list height changed,
-  // check the live scroller's distance to bottom. If within a generous
-  // drift-tolerant threshold (wider than `atBottomThreshold=100` so post-
-  // mount growth doesn't kick us out), imperatively re-snap. Past the
-  // threshold means the user has intentionally scrolled up — respect
-  // that and let the jump-to-newest button do its job.
   // Read latest length without re-binding the callback per render.
   // `data.length === 0` is reachable when systemPrompt is present but no
   // messages have arrived; calling `scrollToIndex({ index: 'LAST' })` on
@@ -250,12 +246,47 @@ function MessageListImpl({
   const allUnitsLengthRef = useRef(allUnits.length);
   allUnitsLengthRef.current = allUnits.length;
 
-  const handleTotalListHeightChanged = useCallback(() => {
+  // Mark unread tail content when the count grows while the user is not
+  // pinned at bottom. The "↓ New messages" affordance only shows after
+  // new tail content actually arrived during a non-pinned state, not on
+  // every scroll-up of a static conversation.
+  const prevLengthForUnreadRef = useRef(allUnits.length);
+  useEffect(() => {
+    const prev = prevLengthForUnreadRef.current;
+    prevLengthForUnreadRef.current = allUnits.length;
+    if (allUnits.length > prev && !isAtBottom) {
+      setHasUnreadTailContent(true);
+    }
+  }, [allUnits.length, isAtBottom]);
+
+  // virtuoso's `followOutput="auto"` only fires when `data.length` grows;
+  // it doesn't re-snap when the LAST item's height changes async after
+  // mount (markdown render, react-syntax-highlighter mounting, image
+  // loading). That leaves the user a few hundred pixels above true bottom
+  // — visually "not at the bottom" despite virtuoso's internal pin.
+  //
+  // Bridge the gap by comparing the user's pre-growth scroll position to
+  // the pre-growth bottom: if they were within the PIN threshold of where
+  // the bottom used to be, treat it as render-drift (content grew under
+  // them) and re-snap. Past the PIN threshold means the user has
+  // intentionally scrolled up — leave them where they are and let the
+  // jump-to-newest button do its job. Aligning with the same 100px
+  // threshold as the at-bottom-state detection keeps these two concepts
+  // consistent.
+  const handleTotalListHeightChanged = useCallback((newHeight: number) => {
+    const prevHeight = prevTotalHeightRef.current;
+    prevTotalHeightRef.current = newHeight;
     if (allUnitsLengthRef.current === 0) return;
+    // First non-empty render: initialTopMostItemIndex handles placement.
+    if (prevHeight === 0) return;
     const s = scrollerRef.current;
     if (!s) return;
-    const fromBottom = s.scrollHeight - s.scrollTop - s.clientHeight;
-    if (fromBottom < FOLLOW_OUTPUT_DRIFT_TOLERANCE) {
+    // virtuoso calls this synchronously when its internal height model
+    // recomputes, before any compensatory scrollTop adjustment for the
+    // new content — so scrollTop here still reflects the user's
+    // pre-growth scroll position.
+    const oldFromBottom = prevHeight - s.scrollTop - s.clientHeight;
+    if (oldFromBottom <= PIN_TO_BOTTOM_THRESHOLD) {
       virtuosoRef.current?.scrollToIndex({
         index: 'LAST',
         align: 'end',
@@ -266,6 +297,7 @@ function MessageListImpl({
 
   const scrollToNewest = useCallback(() => {
     if (allUnitsLengthRef.current === 0) return;
+    setHasUnreadTailContent(false);
     virtuosoRef.current?.scrollToIndex({
       index: 'LAST',
       align: 'end',
@@ -323,11 +355,15 @@ function MessageListImpl({
             atBottomThreshold={PIN_TO_BOTTOM_THRESHOLD}
             atBottomStateChange={handleAtBottomStateChange}
             totalListHeightChanged={handleTotalListHeightChanged}
-            // `'LAST'` is library-defined only when `data` has at least one
-            // item. With a system prompt and no messages, allUnits is empty;
-            // fall back to index 0 (the Header) so the prop is structurally
-            // valid in every state.
-            initialTopMostItemIndex={allUnits.length > 0 ? { index: 'LAST', align: 'end' } : 0}
+            // `'LAST'` is library-defined only when `data` has at least
+            // one item. When systemPrompt-only renders with empty data,
+            // omit this prop entirely — virtuoso's default (no initial
+            // index) is correct for that case. Index 0 would target a
+            // data item that doesn't exist (the Header slot is not a
+            // data item).
+            {...(allUnits.length > 0
+              ? { initialTopMostItemIndex: { index: 'LAST' as const, align: 'end' as const } }
+              : {})}
             alignToBottom
             increaseViewportBy={{ top: 600, bottom: 600 }}
             {...(SystemPromptHeaderSlot ? { components: { Header: SystemPromptHeaderSlot } } : {})}
@@ -335,7 +371,7 @@ function MessageListImpl({
           />
         )}
       </section>
-      {!isEmpty && !isAtBottom && (
+      {!isEmpty && !isAtBottom && hasUnreadTailContent && (
         <button className="jump-to-newest" onClick={scrollToNewest}>
           ↓ New messages
         </button>
