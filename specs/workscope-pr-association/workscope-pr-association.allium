@@ -1,0 +1,504 @@
+-- allium: 3
+-- workscope-pr-association.allium
+--
+-- Phoenix WorkScope-owned PR Association: Behavioural Specification
+--
+-- Scope: Durable association between a WorkScope and observed GitHub pull
+--        requests; primary PR derivation; freshness-aware PR status; PR
+--        auto-fix target selection; and abandon-time best-effort refresh.
+--
+-- Includes:
+--   - WorkScope-keyed PR observation history.
+--   - Read-only versus write observation behaviour.
+--   - Primary PR ranking and stale/fresh response semantics.
+--   - Alignment between StateBar PR identity and auto-fix target.
+--   - Bounded, non-fatal abandon refresh before worktree cleanup.
+--
+-- Excludes:
+--   - GitHub CLI internals and GraphQL/REST wire formats.
+--   - Check-run and review-thread parsing details.
+--   - Manual PR attach/switch UI.
+--   - Background scanners, webhooks, or scheduled refresh.
+--
+-- Source of truth:
+--   tasks/67006-p1-done--workscope-pr-association.md
+--   PR #148 review decisions.
+--
+-- Dependencies: specs/bedrock/bedrock.allium
+
+use "../bedrock/bedrock.allium" as bedrock
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- The durable-owner key for work-affine resources. The runtime resolves a
+-- conversation to either a worktree scope or a conversation scope; continuations
+-- that inherit a worktree resolve to the same WorkScope as their predecessor.
+value WorkScope {
+    kind: WorkScopeKind
+    inner: String
+}
+
+value PrIdentity {
+    repo_owner: String
+    repo_name: String
+    number: Integer
+    title: String
+    url: String
+    state: PullRequestState
+    draft: Boolean
+    display_state: PullRequestDisplayState
+    base: String
+    head: String
+    github_updated_at: Timestamp?
+}
+
+value PrRefreshMetadata {
+    state: PrRefreshState
+    reason: PrUnavailableReason?
+    last_attempted_at: Timestamp
+    last_refreshed_at: Timestamp?
+    stale: Boolean
+}
+
+value PrStatusView {
+    pr: PrIdentity?
+    refresh: PrRefreshMetadata
+}
+
+value PrAutoFixContext {
+    target: PrIdentity
+}
+
+------------------------------------------------------------
+-- Contracts
+------------------------------------------------------------
+
+contract WorkScopePrStatusContract {
+    resolve_status: (conversation: bedrock/Conversation) -> PrStatusView
+
+    @invariant FreshnessIsExplicit
+        -- Every status view carries refresh metadata. A caller never infers
+        -- freshness from the presence or absence of a PR identity alone.
+
+    @invariant StaleReasonIsStateful
+        -- Stale persisted PR data distinguishes not_found from unavailable.
+        -- Unavailable responses carry a reason; not_found responses do not
+        -- masquerade as unavailable.
+}
+
+contract WorkScopePrAutoFixContract {
+    create_context: (conversation: bedrock/Conversation) -> PrAutoFixContext
+
+
+    @invariant StatusAndActionUseSamePrimary
+        -- The StateBar-rendered PR and the auto-fix target are both derived
+        -- from the same WorkScope primary. If a response contains stale
+        -- not_found metadata with a persisted primary, number-based auto-fix
+        -- may remain available for that primary; if the provider is
+        -- unavailable, auto-fix is disabled until the provider issue is fixed.
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum WorkScopeKind {
+    worktree
+    | conversation
+}
+
+enum PullRequestState {
+    open
+    | merged
+    | closed
+}
+
+enum PullRequestDisplayState {
+    open
+    | draft
+    | merged
+    | closed
+}
+
+enum PrRefreshState {
+    fresh
+    | not_found
+    | unavailable
+}
+
+enum PrUnavailableReason {
+    gh_missing
+    | not_authenticated
+    | not_git_repo
+    | command_failed
+}
+
+enum PrimaryRank {
+    open_non_draft
+    | draft
+    | merged
+    | closed
+}
+
+------------------------------------------------------------
+-- Entities and Variants
+------------------------------------------------------------
+
+-- Durable row representing a WorkScope that has actually learned PR facts.
+-- Read-only lookups do not create this entity.
+entity WorkScopeRecord {
+    scope: WorkScope
+    created_at: Timestamp
+    updated_at: Timestamp
+
+    associations: WorkScopePrAssociation with work_scope = this
+    primary: associations where is_primary = true
+}
+
+-- Durable PR history for one WorkScope. Re-observing the same PR updates the
+-- mutable PR facts plus last_seen_at, while first_seen_at remains stable.
+entity WorkScopePrAssociation {
+    work_scope: WorkScopeRecord
+    repo_owner: String
+    repo_name: String
+    pr_number: Integer
+    identity: PrIdentity
+    first_seen_at: Timestamp
+    last_seen_at: Timestamp
+    rank: PrimaryRank
+    is_primary: Boolean
+}
+
+-- Observable result of /pr-status. Modelled as an entity so rules can name the
+-- response produced by a request without binding to HTTP/JSON implementation.
+entity PrStatusResult {
+    conversation: bedrock/Conversation
+    scope: WorkScope
+    pr: PrIdentity?
+    refresh: PrRefreshMetadata
+}
+
+-- Observable result of /pr-auto-fix-context.
+entity PrAutoFixContextResult {
+    conversation: bedrock/Conversation
+    scope: WorkScope
+    target: PrIdentity
+}
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    abandon_refresh_deadline_ms: Integer = 10000
+}
+
+------------------------------------------------------------
+-- Rules
+------------------------------------------------------------
+
+rule ObservationCreatesScopeRecord {
+    when: PrFactsObserved(scope, facts)
+
+    requires: facts.count > 0
+    requires: not exists WorkScopeRecord{scope: scope}
+
+    ensures: WorkScopeRecord.created(
+        scope: scope,
+        created_at: now,
+        updated_at: now
+    )
+}
+
+rule ReadOnlyLookupDoesNotCreateScopeRecord {
+    when: PrimaryPrLookup(scope)
+
+    requires: not exists WorkScopeRecord{scope: scope}
+
+    ensures: not WorkScopeRecord.created
+}
+
+rule NewObservationCreatesAssociation {
+    when: PrFactsObserved(scope, fact)
+
+    requires: exists WorkScopeRecord{scope: scope}
+    requires: not exists WorkScopePrAssociation{
+        work_scope: WorkScopeRecord{scope: scope},
+        repo_owner: fact.repo_owner,
+        repo_name: fact.repo_name,
+        pr_number: fact.number
+    }
+
+    ensures: WorkScopePrAssociation.created(
+        work_scope: WorkScopeRecord{scope: scope},
+        repo_owner: fact.repo_owner,
+        repo_name: fact.repo_name,
+        pr_number: fact.number,
+        identity: identity_from_fact(fact),
+        first_seen_at: now,
+        last_seen_at: now,
+        rank: rank_for_identity(identity_from_fact(fact)),
+        is_primary: false
+    )
+}
+
+rule RepeatedObservationPreservesFirstSeen {
+    when: PrFactsObserved(scope, fact)
+
+    requires: exists WorkScopePrAssociation{
+        work_scope: WorkScopeRecord{scope: scope},
+        repo_owner: fact.repo_owner,
+        repo_name: fact.repo_name,
+        pr_number: fact.number
+    }
+
+    ensures: WorkScopePrAssociation.updated(
+        identity: identity_from_fact(fact),
+        last_seen_at: now,
+        rank: rank_for_identity(identity_from_fact(fact))
+    )
+
+    @guidance
+        -- The existing first_seen_at value is preserved. Only mutable PR facts,
+        -- rank, and last_seen_at are updated on repeat observations.
+}
+
+rule PrimaryPrDerivedAfterObservation {
+    when: PrFactsObserved(scope, fact)
+
+    requires: exists WorkScopeRecord{scope: scope}
+
+    ensures: DerivePrimaryPr(scope)
+
+    @guidance
+        -- Primary derivation happens after observation persistence, so fresh
+        -- branch discoveries and existing number-refreshed associations are
+        -- compared in one WorkScope history before the response is selected.
+}
+
+rule PrStatusFreshResponseUsesDerivedPrimary {
+    when: PrStatusRequested(conversation)
+
+    let scope = resolve_work_scope(conversation)
+    let refresh = refresh_branch_prs(conversation)
+
+    requires: refresh.state = fresh
+
+    ensures: PrFactsObserved(scope, refresh.facts)
+    ensures: PrStatusResult.created(
+        conversation: conversation,
+        scope: scope,
+        pr: primary_pr(scope),
+        refresh: fresh_metadata(refresh.attempted_at)
+    )
+}
+
+rule PrStatusStalePersistedPrimaryOnNotFound {
+    when: PrStatusRequested(conversation)
+
+    let scope = resolve_work_scope(conversation)
+    let refresh = refresh_branch_prs(conversation)
+
+    requires: refresh.state = not_found
+    requires: exists primary_pr(scope)
+
+    ensures: PrStatusResult.created(
+        conversation: conversation,
+        scope: scope,
+        pr: primary_pr(scope),
+        refresh: stale_not_found_metadata(refresh.attempted_at)
+    )
+}
+
+rule PrStatusUnavailableWithPersistedPrimary {
+    when: PrStatusRequested(conversation)
+
+    let scope = resolve_work_scope(conversation)
+    let refresh = refresh_branch_prs(conversation)
+
+    requires: refresh.state = unavailable
+    requires: exists primary_pr(scope)
+
+    ensures: PrStatusResult.created(
+        conversation: conversation,
+        scope: scope,
+        pr: primary_pr(scope),
+        refresh: stale_unavailable_metadata(refresh.attempted_at, refresh.reason)
+    )
+}
+
+rule PrStatusUnavailableWithoutPrimary {
+    when: PrStatusRequested(conversation)
+
+    let scope = resolve_work_scope(conversation)
+    let refresh = refresh_branch_prs(conversation)
+
+    requires: refresh.state = unavailable
+    requires: not exists primary_pr(scope)
+
+    ensures: PrStatusResult.created(
+        conversation: conversation,
+        scope: scope,
+        pr: null,
+        refresh: unavailable_metadata(refresh.attempted_at, refresh.reason)
+    )
+}
+
+rule AssociatedAutoFixTargetsPrimaryByNumber {
+    when: PrAutoFixContextRequested(conversation)
+
+    let scope = resolve_work_scope(conversation)
+    let target = primary_pr(scope)
+    let refresh = provider_refresh_by_number(target)
+
+    requires: exists target
+    requires: target.display_state = open
+    requires: refresh.state != unavailable
+
+    ensures: PrAutoFixContextResult.created(
+        conversation: conversation,
+        scope: scope,
+        target: target
+    )
+    ensures: PrFactsObserved(scope, refresh.facts)
+
+    @guidance
+        -- A branch refresh returning not_found does not disable this path.
+        -- Once a WorkScope has a primary PR, auto-fix refreshes that PR by
+        -- number so branch/HEAD drift does not strand the user.
+}
+
+rule AutoFixUnavailableWhenProviderUnavailable {
+    when: PrAutoFixContextRequested(conversation)
+
+    let scope = resolve_work_scope(conversation)
+    let target = primary_pr(scope)
+    let refresh = provider_refresh_by_number(target)
+
+    requires: exists target
+    requires: refresh.state = unavailable
+
+    ensures: not PrAutoFixContextResult.created
+    ensures: UserInformedAutoFixUnavailable(refresh.reason)
+}
+
+rule BranchAutoFixFallbackWithoutAssociation {
+    when: PrAutoFixContextRequested(conversation)
+
+    let scope = resolve_work_scope(conversation)
+    let refresh = refresh_branch_prs(conversation)
+    let target = branch_primary(refresh.facts)
+
+    requires: not exists primary_pr(scope)
+    requires: refresh.state = fresh
+    requires: target.display_state = open
+
+    ensures: PrFactsObserved(scope, refresh.facts)
+    ensures: PrAutoFixContextResult.created(
+        conversation: conversation,
+        scope: scope,
+        target: target
+    )
+}
+
+rule AbandonBestEffortRefreshIsBoundedAndNonFatal {
+    when: ConversationAbandoned(conversation)
+
+    let scope = resolve_work_scope(conversation)
+
+    requires: conversation.mode in { work, branch }
+
+    ensures: BestEffortPrRefreshAttempted(scope, config.abandon_refresh_deadline_ms)
+    ensures: CleanupContinues(conversation)
+
+    @guidance
+        -- The refresh happens while the worktree still exists. Any failure,
+        -- unavailable provider, not_found result, or deadline expiry is logged
+        -- and cannot prevent worktree/branch cleanup from completing.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+invariant OneWorkScopeRecordPerScope {
+    for a in WorkScopeRecords:
+        for b in WorkScopeRecords:
+            a != b implies a.scope != b.scope
+}
+
+invariant OneAssociationPerPrPerScope {
+    for a in WorkScopePrAssociations:
+        for b in WorkScopePrAssociations:
+            a != b implies not (
+                a.work_scope = b.work_scope
+                and a.identity.repo_owner = b.identity.repo_owner
+                and a.identity.repo_name = b.identity.repo_name
+                and a.identity.number = b.identity.number
+            )
+}
+
+invariant AtMostOnePrimaryPerScope {
+    for scope_record in WorkScopeRecords:
+        count(WorkScopePrAssociation{work_scope: scope_record, is_primary: true}) <= 1
+}
+
+------------------------------------------------------------
+-- Actor Declarations
+------------------------------------------------------------
+
+actor ConversationUser {
+    identified_by: bedrock/Conversation
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+surface PrStatusApi {
+    facing user: ConversationUser
+
+    context conversation: bedrock/Conversation
+
+    exposes:
+        PrStatusView
+
+    provides:
+        PrStatusRequested(conversation)
+            when conversation.mode in { work, branch }
+
+    contracts:
+        fulfils WorkScopePrStatusContract
+}
+
+surface PrAutoFixApi {
+    facing user: ConversationUser
+
+    context conversation: bedrock/Conversation
+
+    exposes:
+        PrAutoFixContext
+
+    provides:
+        PrAutoFixContextRequested(conversation)
+            when conversation.mode in { work, branch }
+
+    contracts:
+        fulfils WorkScopePrAutoFixContract
+}
+
+surface AbandonCleanup {
+    facing user: ConversationUser
+
+    context conversation: bedrock/Conversation
+
+    provides:
+        ConversationAbandoned(conversation)
+            when conversation.mode in { work, branch }
+
+    @guarantee PrRefreshNeverBlocksCleanup
+        -- Abandon may attempt to enrich PR association history before cleanup,
+        -- but cleanup completion does not depend on PR provider success.
+}
