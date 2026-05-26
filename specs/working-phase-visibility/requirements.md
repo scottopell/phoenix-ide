@@ -190,11 +190,17 @@ WHEN the phase exits `llm_requesting` without any tokens having arrived (an
 error or cancellation path)
 THE SYSTEM SHALL remove the placeholder bubble
 
-**Rationale:** Today the empty-message filter at `MessageComponents.tsx:635-638`
-hides agent messages with no content. That is correct for genuinely empty
-historical messages but wrong for the live in-flight case where the absence
-*is* the information ("we're waiting"). The placeholder is anchored to the
-spot where the text will appear, giving the user spatial continuity.
+**Rationale:** During the pre-first-byte window the conversation has no
+assistant row in the messages table to render — text-only LLM responses
+are persisted only after the `LlmResponse` transition completes (see
+design.md). The absence *is* the information the user needs ("we're
+waiting"), so the spec mandates a placeholder anchored to the spot
+where the text will appear, giving the user spatial continuity. The
+placeholder is implemented as a derived/synthetic render unit (see
+design.md "Pending assistant bubble") rather than a row in the
+messages list; the existing empty-message filter at
+`MessageComponents.tsx:635-638` continues to correctly hide genuinely
+empty historical agent rows.
 
 ---
 

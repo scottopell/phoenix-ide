@@ -101,7 +101,7 @@ value EventClock {
 }
 
 -- A frozen capture of the agent's activity at the moment we lost
--- connection. The `elapsed_at_disconnect` field is computed once at
+-- connection. The `elapsed_ms_at_disconnect` field is computed once at
 -- capture time so the display shows a stable number through the
 -- reconnect, rather than continuing to count forward through a period
 -- where we have no signal from the server.
@@ -116,7 +116,7 @@ value EventClock {
 value LastKnownActivity {
     phase:                 WorkingPhase
     base_reason_text:      String
-    elapsed_at_disconnect: Integer
+    elapsed_ms_at_disconnect: Integer
     captured_at:           Timestamp
     retry:                 RetryContext?
 }
@@ -543,7 +543,7 @@ rule LastKnownActivityCapturedOnDegrade {
     let snap = LastKnownActivity{
         phase:                 ObservedPhase{view}.phase,
         base_reason_text:      base_reason_text_for(ObservedPhase{view}),
-        elapsed_at_disconnect: now() - ObservedPhase{view}.state_updated_at,
+        elapsed_ms_at_disconnect: now() - ObservedPhase{view}.state_updated_at,
         captured_at:           now(),
         retry:                 current_retry_for(view)
     }
@@ -832,7 +832,7 @@ rule DisplayWhenReconnectingWithCapturedActivity {
     requires: LastKnownActivityCapture{view}.captured != null
 
     let snap        = LastKnownActivityCapture{view}.captured
-    let elapsed     = snap.elapsed_at_disconnect / 1000
+    let elapsed     = snap.elapsed_ms_at_disconnect / 1000
     let attempts    = conn/ClientConnection{conversation_id: view.conversation_id}.attempt
     -- `render_frozen_retry_modifier(snap.retry)` is the helper that
     -- formats the captured RetryContext as " (retry K/N <reason>)" when
@@ -860,7 +860,7 @@ rule DisplayWhenOfflineWithCapturedActivity {
     requires: LastKnownActivityCapture{view}.captured != null
 
     let snap         = LastKnownActivityCapture{view}.captured
-    let elapsed      = snap.elapsed_at_disconnect / 1000
+    let elapsed      = snap.elapsed_ms_at_disconnect / 1000
     let retry_suffix = render_frozen_retry_modifier(snap.retry)
 
     ensures: StateBarDisplay{view}.activity = DisplayedActivity{

@@ -338,11 +338,15 @@ Add a new synthetic tail unit (`pending_agent` or similar) emitted by
 `renderUnits.ts` immediately before the existing `streaming_agent` tail
 unit's slot. Discriminator (when to emit):
 
-- `convState.phase === 'llm_requesting'` (or the awaiting variants)
-- `streamingBuffer` is empty (no tokens for the current request yet)
+- The atom's `phase: ConversationState` discriminant equals
+  `'llm_requesting'` (or the `awaiting_llm` / `seeded_llm_requesting`
+  variants), checked via `atom.phase.type === 'llm_requesting'` etc.
+  ConversationState is the discriminated union defined in
+  `ui/src/api.ts:215`; its discriminator field is `type`, not `phase`.
+- `streamingBuffer` is empty (no tokens for the current request yet).
 - `PendingAssistantBubble` (the spec-level entity defined in
   `working-phase-visibility.allium`) is in `placeholder` state — the
-  reducer mirrors this from the same triggers the spec's rules consume
+  reducer mirrors this from the same triggers the spec's rules consume.
 
 The unit's payload carries `placeholder_since` (sourced from the atom's
 `phaseStateUpdatedAt`); the React component renders the elapsed counter
