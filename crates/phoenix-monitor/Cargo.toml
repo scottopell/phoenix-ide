@@ -1,6 +1,6 @@
 [package]
 name = "phoenix-monitor"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.94"
 description = "Phoenix IDE production monitor — TUI dashboard + headless CLI."
