@@ -381,6 +381,23 @@ body {
   flex: 1 1 auto;
   min-height: 0;
   overflow: hidden auto;
+
+  /* Browser-native scroll anchoring: when content above the visible
+     viewport reflows (virtualization window expanding, measured
+     heights replacing kind-estimate fallbacks in the spacer, etc.)
+     the browser keeps the topmost in-viewport element fixed by
+     adjusting scrollTop equal-and-opposite. Replaces the hand-rolled
+     scrollTop-delta compensation that previously lived in
+     useBottomAnchoredWindow. See specs/messagelist-render-units/. */
+  overflow-anchor: auto;
+}
+
+/* Spacers must NOT be eligible as the browser's anchor node — their
+   height *is* the thing changing, so anchoring on them defeats the
+   compensation. Render-unit wrappers stay at the default
+   `overflow-anchor: auto` so the browser picks one of them. */
+.message-collapsed-spacer {
+  overflow-anchor: none;
 }
 
 /* Views */

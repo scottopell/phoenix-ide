@@ -213,7 +213,7 @@ THE SYSTEM SHALL expand the window upward by `EXPAND_BATCH = 12` (decrement
 `firstRenderedUnitIndex`)
 AND SHALL keep at most `MAX_RENDERED_UNITS = 48` historical units in the DOM
 by moving the newer overflow into a measured bottom spacer
-USING the exact-scroll-compensation pattern from REQ-MLRU-007
+RELYING on the browser's CSS scroll-anchoring per REQ-MLRU-007
 
 WHEN newer historical units are collapsed behind the bottom spacer
 THE SYSTEM SHALL render a bottom sentinel above that spacer
@@ -230,25 +230,42 @@ between collapsed and rendered content. The sentinel is that boundary.
 
 ---
 
-### REQ-MLRU-007: Exact Scroll Compensation
+### REQ-MLRU-007: Browser-Native Scroll Anchoring
 
-WHEN `firstRenderedUnitIndex` decreases (the window expands to reveal
-older units)
-THE SYSTEM SHALL capture `scrollRoot.scrollHeight` synchronously before
-the React state update that triggers the new render
-AND in a `useLayoutEffect` that runs after the render commit, increase
-`scrollRoot.scrollTop` by `(newScrollHeight - capturedScrollHeight)`
+WHEN the virtualization window expands (revealing older or newer units
+into the DOM) or when measured heights replace kind-estimate fallbacks
+in the spacer
+THE SYSTEM SHALL preserve the topmost in-viewport render-unit's
+viewport position by relying on the browser's CSS scroll-anchoring
+algorithm (`overflow-anchor`)
 
-WHEN the layout effect runs without a captured pre-render scrollHeight
-(i.e., the window decrease did not come from the expansion path)
-THE SYSTEM SHALL leave `scrollTop` unchanged
+THE SYSTEM SHALL set `overflow-anchor: auto` (or default) on
+`#main-area` (the scroll root) and on every render-unit wrapper
 
-THE SYSTEM SHALL ensure no React paint occurs between the capture and
-the compensation
-SO THAT the user observes no visible scroll jump when older units appear
+THE SYSTEM SHALL set `overflow-anchor: none` on
+`.message-collapsed-spacer` divs so the browser never selects a
+spacer as the anchor node (the spacer's height is the thing changing,
+so anchoring on it would defeat the compensation)
 
-**Rationale:** Carried verbatim from the prior virtualization pass; the
-pattern is correct. The redesign keeps it.
+THE SYSTEM SHALL NOT maintain a hand-rolled scroll-compensation layout
+effect that captures `scrollHeight` pre-render and applies a delta
+post-commit. This pattern was removed: it required guarding every
+spacer/window mutation by its trigger (expansion vs. measurement
+settle vs. structural change), and missing a guard produced
+arbitrary-position scroll jumps.
+
+**Rationale:** Browser scroll-anchoring is the correct-by-construction
+mechanism for "preserve visible content during reflow above it." The
+browser handles every case uniformly — window expansion, measured-
+height settle, font-loading-driven height changes, image dimensions
+landing late — without per-case guards. CSS scroll-anchoring is
+universally supported in modern Chrome/Firefox and in Safari 18+
+(2024); Phoenix targets latest browsers.
+
+**Out of scope:** auto-scroll-to-bottom on new messages when the user
+is pinned — that is a different concern (pulling the user forward,
+not preserving an anchor) and lives in `MessageList`'s
+`ResizeObserver` effect, not in this requirement.
 
 ---
 

@@ -7,21 +7,29 @@
 --        maintains over the historicalUnits list produced by the
 --        render_units transform. Models the window's mount, expansion,
 --        and pinned-to-bottom states; the IntersectionObserver-driven
---        boundary expansion; and the exact scroll-compensation pattern
---        that prevents visible jumps.
+--        boundary expansion. Visible-content position preservation
+--        during reflow is delegated to the browser via CSS
+--        `overflow-anchor` rather than a hand-rolled layout-effect
+--        scroll compensation.
 --
 -- Includes: Initial-mount window placement (always bottom-pinned);
 --           bottom-pinned auto-anchor on async message arrival; user
 --           scroll-up detection; sentinel-intersection expansion;
---           scroll-compensation layout effect; measured-height cache
---           reads for spacer geometry; pin-to-bottom on new message
---           arrival when the user is at the bottom.
+--           measured-height cache reads for spacer geometry;
+--           pin-to-bottom on new message arrival when the user is at
+--           the bottom.
 --
 -- Excludes: render_units transform (see render_units.allium);
 --           individual unit rendering (MessageComponents.tsx, no spec);
 --           saved-scroll restoration — REQ-CONV-013 and REQ-MLRU-009
 --           were deprecated and the entire save/restore/ack-snapshot
 --           path was removed.
+--           Scroll-jump prevention during prefix reflow is delegated
+--           to the browser's CSS scroll-anchoring (overflow-anchor:
+--           auto on #main-area, overflow-anchor: none on the spacer
+--           divs). This spec models the windowing state machine but
+--           not the compensation mechanism, because the mechanism
+--           lives in the browser, not in user code.
 --
 -- Uses: render_units (HistoricalUnit, TailUnit types).
 use "./render_units.allium" as ru
@@ -52,12 +60,16 @@ value KindEstimate {
 
 -- The window's lifecycle phase. Models what the window is doing right
 -- now from the user's perspective: pinned to bottom watching for new
--- content; scrolled up and holding position; actively expanding the
--- visible range on the user's behalf.
+-- content; scrolled up and holding position.
+--
+-- The previous `expanding` phase was an internal bookkeeping state
+-- used by the hand-rolled scroll-compensation layout effect. With CSS
+-- `overflow-anchor` doing the compensation, expansion is no longer a
+-- multi-step state machine — the window range mutates in a single
+-- render commit and the browser handles the visible-anchor preservation.
 enum WindowPhase {
     pinned_to_bottom
     user_scrolled_up
-    expanding
 }
 
 ------------------------------------------------------------
@@ -78,11 +90,6 @@ entity Window {
     phase: WindowPhase
 
     measured_heights: Map<String, Integer>
-
-    -- Captured pre-update scrollHeight for exact scroll compensation.
-    -- Non-null only between the expand trigger and the post-render
-    -- layout effect that consumes the delta. Otherwise null.
-    pre_expand_scroll_height: Integer?
 }
 
 ------------------------------------------------------------
@@ -124,7 +131,6 @@ rule MountBottomPinned {
     ensures: w.last_rendered_unit_index = len(historical)
     ensures: w.is_pinned_to_bottom = true
     ensures: w.phase = "pinned_to_bottom"
-    ensures: w.pre_expand_scroll_height = null
     ensures: w.measured_heights = empty_map()
 
     @guidance
@@ -248,112 +254,62 @@ rule UserReturnedToBottom {
 
 -- Sentinel intersected the expanded scroll-root viewport (the
 -- 600px-buffered region above the visible viewport) → trigger
--- expansion. Capture scrollHeight before the state mutation, then
--- decrement first_rendered_unit_index by EXPAND_BATCH (clamped to 0).
--- If the resulting rendered range exceeds MAX_RENDERED_UNITS, move the
--- newer overflow into the bottom spacer by decreasing
--- last_rendered_unit_index.
+-- expansion. Decrement first_rendered_unit_index by EXPAND_BATCH
+-- (clamped to 0). If the resulting rendered range exceeds
+-- MAX_RENDERED_UNITS, move the newer overflow into the bottom spacer
+-- by decreasing last_rendered_unit_index.
 --
--- Phase transitions to expanding for the duration of the
--- render-commit; the post-commit layout effect transitions it back.
+-- No scrollHeight capture, no post-render compensation rule. The
+-- browser's CSS `overflow-anchor` keeps the topmost in-viewport
+-- render-unit element fixed as the prepended units expand the
+-- document upward. The spacer divs are opted out via
+-- `overflow-anchor: none` so the browser doesn't anchor on them.
 rule SentinelIntersectedExpand {
-    when: SentinelIntersected(w, scroll_height_now)
+    when: SentinelIntersected(w)
 
     requires: w.first_rendered_unit_index > 0
 
-    ensures: w.pre_expand_scroll_height = scroll_height_now
     ensures: w.first_rendered_unit_index = max_int(0, w.first_rendered_unit_index - 12)
     ensures: w.last_rendered_unit_index = min_int(
                  w.last_rendered_unit_index,
                  w.first_rendered_unit_index + 48
              )
-    ensures: w.phase = "expanding"
     ensures: w.is_pinned_to_bottom = w.is_pinned_to_bottom
+    ensures: w.phase = w.phase
 
     @guidance
-        -- The exact-scroll-compensation pattern requires this rule's
-        -- TWO mutations to be observable to React as a single update:
-        -- pre_expand_scroll_height and first_rendered_unit_index must
-        -- land together so the layout effect can read the captured
-        -- value when it runs after the render commit. Implementations
-        -- that split these into separate setState calls reintroduce
-        -- the visible-jump bug.
+        -- The visible-content-stable invariant is enforced by the
+        -- browser via overflow-anchor, not by user code. The window
+        -- state mutates in a single setState; the next render commit
+        -- includes the new units and the browser silently increments
+        -- scrollTop to keep the anchor's viewport position fixed.
 }
 
 -- Bottom sentinel intersected while newer historical units are collapsed
 -- below the rendered range → shift the bounded window toward the tail.
 rule BottomSentinelIntersectedExpand {
-    when: BottomSentinelIntersected(w, scroll_height_now)
+    when: BottomSentinelIntersected(w)
 
     requires: w.last_rendered_unit_index < len(w.historical_units)
 
-    ensures: w.pre_expand_scroll_height = scroll_height_now
     ensures: w.last_rendered_unit_index = min_int(len(w.historical_units), w.last_rendered_unit_index + 12)
     ensures: w.first_rendered_unit_index = max_int(
                  0,
                  min_int(w.first_rendered_unit_index + 12, w.last_rendered_unit_index - 48)
              )
-    ensures: w.phase = "expanding"
     ensures: w.is_pinned_to_bottom = w.is_pinned_to_bottom
+    ensures: w.phase = w.phase
 }
 
 -- Sentinel intersected at the top of the historical list → no-op.
 -- Cannot expand further; the user has reached the conversation's
 -- start.
 rule SentinelIntersectedAtTop {
-    when: SentinelIntersected(w, scroll_height_now)
+    when: SentinelIntersected(w)
 
     requires: w.first_rendered_unit_index = 0
 
     ensures: w = w
-}
-
--- Post-render layout effect → apply scroll compensation. The delta
--- between current scrollHeight and the captured value equals the
--- pixel height of the newly-prepended units; adding it to scrollTop
--- keeps the previously-visible content visually fixed.
-rule ExpansionCompensationApplied {
-    when: PostExpandLayoutEffect(w, current_scroll_height, current_scroll_top)
-
-    requires: w.phase = "expanding"
-    requires: w.pre_expand_scroll_height != null
-
-    ensures: w.phase = post_expansion_phase(w)
-    ensures: w.pre_expand_scroll_height = null
-    -- Side effect (not on the entity but performed by the actor):
-    -- scrollRoot.scrollTop = current_scroll_top + (current_scroll_height - w.pre_expand_scroll_height)
-
-    @guidance
-        -- post_expansion_phase(w):
-        --   if w.is_pinned_to_bottom then "pinned_to_bottom"
-        --   else "user_scrolled_up"
-        --
-        -- The compensation is applied within useLayoutEffect, before
-        -- the browser paints. The user observes the new units appear
-        -- above the spacer's prior region with no visible scroll jump
-        -- of the originally-visible content.
-        --
-        -- If a stale layout effect runs (e.g., due to React fast-refresh
-        -- in development) with pre_expand_scroll_height = null, the
-        -- ExpansionCompensationSkipped rule fires instead.
-}
-
-rule ExpansionCompensationSkipped {
-    when: PostExpandLayoutEffect(w, current_scroll_height, current_scroll_top)
-
-    requires: w.pre_expand_scroll_height = null
-
-    ensures: w = w
-
-    @guidance
-        -- The layout effect was scheduled but no expansion was in
-        -- flight. Could happen on re-render due to measured-height
-        -- updates that change spacer height but do not change
-        -- first_rendered_unit_index. Leaving scrollTop alone is
-        -- correct: the spacer-height change is the geometry change,
-        -- and any visual settle is bounded by the difference between
-        -- measured and prior estimated heights (per-kind estimates
-        -- bound this difference at construction).
 }
 
 ------------------------------------------------------------
@@ -415,15 +371,6 @@ invariant TailUnitsAreNotCollapsible {
         -- exists to anchor the requirement (REQ-MLRU-004) in spec.
 }
 
--- pre_expand_scroll_height is non-null exactly when phase = expanding.
--- A non-null value outside the expanding phase indicates a stale
--- captured value that must not be consumed by a subsequent layout
--- effect (ExpansionCompensationSkipped guards this).
-invariant PreExpandHeightCoupledToPhase {
-    for w in Windows:
-        (w.pre_expand_scroll_height != null) = (w.phase = "expanding")
-}
-
 -- is_pinned_to_bottom is true exactly when phase is pinned_to_bottom.
 -- The two fields are redundant but kept together for legibility:
 -- phase describes what the window is "doing right now"; the boolean
@@ -433,6 +380,17 @@ invariant PinnedToBottomCoupledToPhase {
     for w in Windows:
         w.is_pinned_to_bottom = (w.phase = "pinned_to_bottom")
 }
+
+-- Visible-content stability during expansion is delegated to the
+-- browser's CSS scroll-anchoring. There is no entity-level invariant
+-- to assert because the compensation is not modeled here — the
+-- `overflow-anchor: auto` on the scroll root + `overflow-anchor:
+-- none` on the spacer divs is the mechanism, and the browser's
+-- scroll-anchoring algorithm is its specification. Spec sees:
+-- first_rendered_unit_index decreases by EXPAND_BATCH; the user does
+-- not perceive a visible jump. The "does not jump" property is
+-- empirical (verified in browser smoke tests) rather than a derivable
+-- invariant of this state machine.
 
 -- The measured-heights cache holds entries only for unit keys that
 -- appear (or appeared) in the historical list. Stale entries persist

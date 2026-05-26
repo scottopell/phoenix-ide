@@ -272,13 +272,17 @@ Internal mechanics:
    with `root: scrollRootRef.current` and `rootMargin: SENTINEL_ROOT_MARGIN`.
    When the sentinel intersects, the effect decreases
    `firstRenderedUnitIndex` by `EXPAND_BATCH` (clamped at 0).
-3. Before the state decrement, the effect captures
-   `scrollRootRef.current.scrollHeight` into `prevScrollHeightRef`.
-4. A `useLayoutEffect` keyed on `firstRenderedUnitIndex` consumes
-   `prevScrollHeightRef` and adjusts `scrollTop` by the delta.
-5. `spacerHeight` is computed via `useMemo` over the prefix slice and the
+3. **No scroll compensation in user code.** The browser's CSS
+   scroll-anchoring (`overflow-anchor: auto` on the scroll root,
+   `overflow-anchor: none` on the spacer divs) preserves the topmost
+   in-viewport render-unit's viewport position as the prepended units
+   expand the document upward. There is no `prevScrollHeightRef`
+   capture and no post-commit `scrollTop += delta` layout effect.
+4. `spacerHeight` is computed via `useMemo` over the prefix slice and the
    `heightCache`. When the cache emits a change event, the memo
-   reconciles and the spacer re-renders.
+   reconciles and the spacer re-renders. The browser absorbs the
+   spacer-height delta into `scrollTop` via the same overflow-anchor
+   mechanism — no compensation effect needed for measurement settle.
 
 The hook returns `topSentinelRef` so the component places the sentinel
 correctly in the DOM:
@@ -438,8 +442,10 @@ notice their messages disappearing.
 1. Initial mount → `firstRenderedUnitIndex = max(0, len - 12)`
 2. Sentinel intersection → `firstRenderedUnitIndex` decreases by 12
 3. Sentinel intersection at index 0 → no-op
-4. Scroll compensation: scrollHeight increases by Δ → scrollTop increases
-   by Δ
+4. Scroll compensation is not a user-code concern (browser-native via
+   `overflow-anchor`); not testable in happy-dom. Verified empirically
+   in browser smoke (window expansion, measurement settle, conv switch
+   all produce zero visible scroll jumps).
 
 **Integration tests** (`MessageList.test.tsx`):
 

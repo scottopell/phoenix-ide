@@ -11,7 +11,7 @@ It is the structural follow-up to the bottom-anchored window introduced in task 
 - Render-unit construction from `messages`, `pendingMessages`, and `convState` (pure transform)
 - Pending user messages typed as `HistoricalUnit` sharing the eventual `user` unit's key, so pending → sent is an in-place keyed update
 - Bottom-anchored window over `HistoricalUnit[]`
-- Boundary-expansion sentinel and exact-scroll-compensation
+- Boundary-expansion sentinel; visible-content preservation via browser-native CSS `overflow-anchor`
 - Measured per-unit heights (in-memory) with kind-estimate fallback
 - Streaming view as a `TailUnit` kind with leaf-level buffer subscription
 - Capability-gap logging on skipped messages
@@ -51,7 +51,7 @@ A correct-by-construction rewrite of the message-list virtualization so the virt
 | **REQ-MLRU-004:** Tail-Pinned Unit Typing | Complete | `TailUnit` covers only `sub_agent_status` and `streaming_agent` |
 | **REQ-MLRU-005:** Bottom-Anchored Initial Window | Complete | Window expressed in unit indexes; always bottom-pinned on mount |
 | **REQ-MLRU-006:** IntersectionObserver Boundary Expansion | Complete | Sentinel callback ref; no scrollTop math |
-| **REQ-MLRU-007:** Exact Scroll Compensation | Complete | Pattern preserved; spacer-height delta path added |
+| **REQ-MLRU-007:** Browser-Native Scroll Anchoring | Complete | CSS `overflow-anchor` on the scroll root + `none` on spacers; hand-rolled scrollTop-delta layout effect deleted |
 | **REQ-MLRU-008:** Measured Spacer with Kind Fallback | Complete | Per-unit `ResizeObserver` writes cache; spacer reads measured-when-present |
 | **REQ-MLRU-009:** Unit-Anchor Saved-Scroll Restore | **Deprecated** | Removed alongside REQ-CONV-013; mount always lands pinned to bottom |
 | **REQ-MLRU-010:** Streaming Subscription Isolation | Complete | `TailUnit` tag + `useStreamingBuffer` in leaf; commit-count regression test |

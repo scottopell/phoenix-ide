@@ -148,7 +148,6 @@ export function useBottomAnchoredWindow({
     setBottomSentinelEl(node);
   }, []);
 
-  const prevScrollHeightRef = useRef<number | null>(null);
   const pendingFirstIndexRef = useRef(0);
   const pendingLastIndexRef = useRef(0);
   const conversationIdRef = useRef(conversationId);
@@ -209,93 +208,23 @@ export function useBottomAnchoredWindow({
     [historicalUnits, lastRenderedUnitIndex, heightCache, cacheVersion],
   );
 
-  // Reset compensation bookkeeping on conversation change so stale
-  // values from a prior conversation don't apply to the new one. Both
-  // `prevScrollHeightRef` (expansion delta) and `prevSpacerHeightRef`
-  // (spacer-height delta) are baselines from the previous conversation
-  // and would produce nonsensical deltas after the swap — leaving them
-  // dirty caused random landing positions on conversation switch.
-  const prevConversationIdRef = useRef(conversationId);
+  // Track the rendered window range in refs so the IntersectionObserver
+  // callbacks can read it without re-subscribing on every render.
   useLayoutEffect(() => {
-    prevScrollHeightRef.current = null;
-  }, [conversationId]);
-
-  // Exact scroll compensation for both prepend and bounded-window range
-  // shifts: capture scrollHeight before the state mutation and apply the
-  // committed delta before paint so the viewport's content anchor holds.
-  useLayoutEffect(() => {
-    const el = scrollRootRef.current;
-    if (el && prevScrollHeightRef.current !== null) {
-      const delta = el.scrollHeight - prevScrollHeightRef.current;
-      if (delta !== 0) {
-        el.scrollTop += delta;
-      }
-      prevScrollHeightRef.current = null;
-    }
     pendingFirstIndexRef.current = firstRenderedUnitIndex;
     pendingLastIndexRef.current = lastRenderedUnitIndex;
-  }, [firstRenderedUnitIndex, lastRenderedUnitIndex, scrollRootRef]);
+  }, [firstRenderedUnitIndex, lastRenderedUnitIndex]);
 
-  // Spacer-height compensation for ResizeObserver-driven measurement
-  // settle: as kind-estimate fallbacks get replaced by measured values
-  // the spacer height changes, and scrollTop needs an equal-and-opposite
-  // bump to keep the visible content anchored.
-  //
-  // The effect must ONLY fire on measurement settle, not on structural
-  // changes (historicalUnits length grew, firstRenderedUnitIndex moved,
-  // conversation switched). Structural changes have their own paths:
-  //   - sentinel expansion → exact scroll comp via prevScrollHeightRef
-  //   - conversation switch → reseat without delta (mount lands bottom-pinned)
-  //   - units hydration on initial mount → reseat without delta (the
-  //     ResizeObserver in MessageList scrolls to bottom once content arrives)
-  //
-  // Earlier this effect fired on any spacerHeight change, which produced
-  // a phantom delta on first message hydration and landed users at
-  // arbitrary mid-conversation scroll positions.
-  const prevSpacerHeightRef = useRef(spacerHeight);
-  const prevStructureRef = useRef({
-    length: historicalUnits.length,
-    first: firstRenderedUnitIndex,
-    last: lastRenderedUnitIndex,
-  });
-  useLayoutEffect(() => {
-    const structureChanged =
-      prevStructureRef.current.length !== historicalUnits.length
-      || prevStructureRef.current.first !== firstRenderedUnitIndex
-      || prevStructureRef.current.last !== lastRenderedUnitIndex;
-    const conversationChanged = prevConversationIdRef.current !== conversationId;
-
-    if (conversationChanged || structureChanged || prevScrollHeightRef.current !== null) {
-      // Reseat baseline without applying delta — caller paths above
-      // own the scroll positioning for these transitions.
-      prevConversationIdRef.current = conversationId;
-      prevSpacerHeightRef.current = spacerHeight;
-      prevStructureRef.current = {
-        length: historicalUnits.length,
-        first: firstRenderedUnitIndex,
-        last: lastRenderedUnitIndex,
-      };
-      return;
-    }
-
-    const el = scrollRootRef.current;
-    if (!el) {
-      prevSpacerHeightRef.current = spacerHeight;
-      return;
-    }
-    const delta = spacerHeight - prevSpacerHeightRef.current;
-    if (delta !== 0) {
-      el.scrollTop += delta;
-    }
-    prevSpacerHeightRef.current = spacerHeight;
-  }, [
-    spacerHeight,
-    scrollRootRef,
-    conversationId,
-    historicalUnits.length,
-    firstRenderedUnitIndex,
-    lastRenderedUnitIndex,
-  ]);
+  // Note: no scroll-compensation layout effects. The browser's
+  // overflow-anchor CSS preserves the visible content's viewport
+  // position whenever content above it reflows — window expansion
+  // revealing older units, measured heights replacing kind-estimate
+  // fallbacks in the spacer, etc. See `#main-area { overflow-anchor:
+  // auto }` and `.message-collapsed-spacer { overflow-anchor: none }`
+  // in index.css. The spacer divs are explicitly opted out so they
+  // can't be chosen as the browser's anchor node — their height is the
+  // thing changing, so anchoring on them would defeat the
+  // compensation.
 
   useEffect(() => {
     const root = scrollRootRef.current;
@@ -308,7 +237,9 @@ export function useBottomAnchoredWindow({
         if (!entry || !entry.isIntersecting) return;
         if (pendingFirstIndexRef.current <= 0) return;
 
-        prevScrollHeightRef.current = root.scrollHeight;
+        // No scrollHeight capture — browser overflow-anchor preserves
+        // the visible content's viewport position as the prepended
+        // units expand the document upward.
         const nextFirst = Math.max(0, pendingFirstIndexRef.current - EXPAND_BATCH);
         const candidateLast = pendingLastIndexRef.current;
         const nextLast = Math.min(
@@ -340,7 +271,6 @@ export function useBottomAnchoredWindow({
         if (!entry || !entry.isIntersecting) return;
         if (pendingLastIndexRef.current >= historicalUnits.length) return;
 
-        prevScrollHeightRef.current = root.scrollHeight;
         const nextLast = Math.min(historicalUnits.length, pendingLastIndexRef.current + EXPAND_BATCH);
         const nextFirst = Math.max(
           0,
