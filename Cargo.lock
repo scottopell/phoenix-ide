@@ -2514,7 +2514,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix-monitor"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "chrono",
  "crossterm",
@@ -2535,7 +2535,7 @@ dependencies = [
 
 [[package]]
 name = "phoenix_ide"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "async-trait",
  "axum",
