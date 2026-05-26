@@ -11008,9 +11008,9 @@ html * {
 }
 
 /* ============================================================================
- * Browser console-logs structured response. Per-entry level pill so error/
- * warning entries are visible against a wall of debug output. The header tally
- * lets the reader scan a 100-entry result at a glance.
+ * Browser console-logs structured response. Dense color-coded table:
+ * right-aligned colored level column + text, 1px row dividers. The header
+ * tally lets the reader scan a 100-entry result at a glance.
  * ============================================================================ */
 
 .console-logs-response {
@@ -11194,7 +11194,7 @@ html * {
   cursor: pointer;
 }
 
-.search-results-filepath:hover {
+button.search-results-filepath:hover {
   background: var(--bg-hover, var(--bg-secondary));
 }
 
@@ -11222,14 +11222,24 @@ html * {
   font-family: var(--font-mono);
   font-size: 12px;
   color: var(--text-primary);
+  text-align: left;
+  width: 100%;
+}
+
+button.search-result-line {
+  background: none;
+  border: none;
+  border-radius: 0;
 }
 
 .search-result-line-clickable {
   cursor: pointer;
 }
 
-.search-result-line-clickable:hover {
+.search-result-line-clickable:hover,
+.search-result-line-clickable:focus-visible {
   background: color-mix(in srgb, var(--accent-blue, #4299e1) 8%, transparent);
+  outline: none;
 }
 
 .search-result-lineno {
@@ -11307,7 +11317,7 @@ html * {
   word-break: break-all;
 }
 
-.keyword-search-filepath:hover {
+button.keyword-search-filepath:hover {
   text-decoration: underline;
 }
 

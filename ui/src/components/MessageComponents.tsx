@@ -1097,24 +1097,26 @@ export function SearchResultsView({
               </span>
             )}
             <div className="search-results-hits">
-              {group.hits.map((hit, i) => {
-                const lineProps = onOpenFile
-                  ? {
-                      onClick: () =>
-                        onOpenFile(group.path, new Set([hit.lineNumber]), hit.lineNumber),
-                    }
-                  : {};
-                return (
-                  <div
+              {group.hits.map((hit, i) =>
+                onOpenFile ? (
+                  <button
                     key={i}
-                    className={`search-result-line ${onOpenFile ? 'search-result-line-clickable' : ''}`}
-                    {...lineProps}
+                    type="button"
+                    className="search-result-line search-result-line-clickable"
+                    onClick={() =>
+                      onOpenFile(group.path, new Set([hit.lineNumber]), hit.lineNumber)
+                    }
                   >
                     <span className="search-result-lineno">{hit.lineNumber}</span>
                     <span className="search-result-content">{hit.content || ' '}</span>
+                  </button>
+                ) : (
+                  <div key={i} className="search-result-line">
+                    <span className="search-result-lineno">{hit.lineNumber}</span>
+                    <span className="search-result-content">{hit.content || ' '}</span>
                   </div>
-                );
-              })}
+                )
+              )}
             </div>
           </div>
         ))}
