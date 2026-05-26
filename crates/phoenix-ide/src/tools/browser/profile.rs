@@ -936,11 +936,18 @@ async fn scenario_success_output(
         if let Err(e) = tokio::fs::write(&path, &pretty).await {
             return ToolOutput::error(format!("Failed to write scenario output: {e}"));
         }
+        // Surface the saved-samples path on the structured payload too, so
+        // the UI renderer can show a visible/copyable footnote — the text
+        // body's path reference is the only one rendered without it.
+        let mut escaped_payload = payload;
+        if let Value::Object(ref mut map) = escaped_payload {
+            map.insert("samples_path".to_string(), Value::String(path.clone()));
+        }
         ToolOutput::success(format!(
             "run_scenario completed: {runs} raw per-run samples (warmup {warmup} discarded). \
              Full raw samples written to {path} (use `cat`). NOT reduced — compute stats yourself."
         ))
-        .with_display(payload)
+        .with_display(escaped_payload)
     } else {
         ToolOutput::success(pretty).with_display(payload)
     }

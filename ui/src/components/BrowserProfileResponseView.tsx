@@ -15,6 +15,19 @@
 
 import { useState, useMemo } from 'react';
 
+/** Actions that have a dedicated structured renderer. Other browser_profile
+ *  actions (e.g. why_render, throttle, gc_heap) should fall through to the
+ *  parent's generic short-vs-long text rendering so long outputs keep their
+ *  collapse / copy controls. */
+export const STRUCTURED_PROFILE_ACTIONS = new Set([
+  'run_scenario',
+  'heap_snapshot',
+  'metrics',
+  'cpu_stop',
+  'cpu_summary',
+  'trace_stop',
+]);
+
 interface Props {
   action: string;
   displayData: Record<string, unknown> | undefined;
@@ -98,6 +111,7 @@ function ScenarioView({
         (s): s is RunSample => !!s && typeof s === 'object',
       )
     : [];
+  const samplesPath = typeof data['samples_path'] === 'string' ? data['samples_path'] : null;
 
   return (
     <div className="profile-response profile-scenario">
@@ -151,6 +165,13 @@ function ScenarioView({
               <li key={i}>{w}</li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {samplesPath && (
+        <div className="profile-footnote">
+          Raw samples written to <code>{samplesPath}</code> — exceeded inline output limit, use{' '}
+          <code>cat</code> to read the full JSON.
         </div>
       )}
 
@@ -400,6 +421,11 @@ function HeapDiffView({
           retained-size approximated by self_size delta; true retained needs dominator-tree walk.
         </div>
       )}
+      <div className="profile-footnote">
+        baseline: <code>{baseline}</code>
+        <br />
+        post: <code>{post}</code>
+      </div>
     </div>
   );
 }
@@ -530,6 +556,12 @@ function CpuSummaryView({
           entries={topByTotal}
           unit={unit}
         />
+      )}
+      {path && (
+        <div className="profile-footnote">
+          Saved to <code>{path}</code> — pass to <code>cpu_summary</code> or load in DevTools →
+          Performance.
+        </div>
       )}
     </div>
   );

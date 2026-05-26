@@ -341,6 +341,28 @@ describe('BrowserProfileResponseView', () => {
       expect(tbody!.textContent ?? '').not.toMatch(/undefined|NaN/);
     });
 
+    it('renders the saved samples path footnote when the scenario output was escaped to disk', () => {
+      // Large scenarios get raw samples written to /tmp/...; the structured
+      // payload carries `samples_path` so the UI surfaces a copyable path
+      // (otherwise users can't `cat` the full output that the text refers to).
+      const { container } = render(
+        <BrowserProfileResponseView
+          action="run_scenario"
+          displayData={{
+            outcome: 'completed',
+            requested_runs: 100,
+            warmup: 1,
+            methodology_warnings: [],
+            raw_samples: [],
+            samples_path: '/tmp/phoenix-scenario-xyz.json',
+          }}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      expect(container.textContent ?? '').toContain('/tmp/phoenix-scenario-xyz.json');
+    });
+
     it('renders blocked outcome with the failing step', () => {
       render(
         <BrowserProfileResponseView
@@ -392,6 +414,31 @@ describe('BrowserProfileResponseView', () => {
       expect(screen.getAllByText(/busyLoop\s+app\.js:42/).length).toBeGreaterThanOrEqual(2);
       expect(screen.getByText('Top by SELF time')).toBeInTheDocument();
       expect(screen.getByText('Top call-tree nodes by TOTAL time')).toBeInTheDocument();
+    });
+
+    it('renders the full CPU profile path as visible / copyable text (REQ-BT-019.7)', () => {
+      // Realistic UUID path > 40 chars triggers shortPath() truncation in
+      // the header chip. The path must ALSO appear in full visible text
+      // somewhere so users can copy it into `cpu_summary` or DevTools.
+      const longPath =
+        '/tmp/phoenix-cpu-profile-9f3e4f76-8ac4-4be1-9c1d-5a8c3a6b7d12.json';
+      const { container } = render(
+        <BrowserProfileResponseView
+          action="cpu_stop"
+          displayData={{
+            cpu_summary: {
+              path: longPath,
+              hitcount_fallback: false,
+              total: 100,
+              top_by_self: [{ label: 'f', value: 100, percent: 100 }],
+              top_by_total: [],
+            },
+          }}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      expect(container.textContent ?? '').toContain(longPath);
     });
 
     it('flags hitcount fallback when samples absent', () => {
@@ -705,6 +752,30 @@ describe('BrowserProfileResponseView', () => {
       expect(screen.getByText(/\+614\.0 KB/)).toBeInTheDocument();
       expect(screen.getByText(/12 → 47/)).toBeInTheDocument();
       expect(screen.getByText(/retained-size approximated/)).toBeInTheDocument();
+    });
+
+    it('renders both heap snapshot paths visibly so users can open them in DevTools', () => {
+      // Realistic UUID paths > 40 chars trigger shortPath() truncation.
+      const baseline = '/tmp/phoenix-heap-9f3e4f76-8ac4-4be1-baseline.heapsnapshot';
+      const post = '/tmp/phoenix-heap-5a8c3a6b-7d12-4f3e-aftercheckpoint.heapsnapshot';
+      const { container } = render(
+        <BrowserProfileResponseView
+          action="heap_snapshot"
+          displayData={{
+            baseline,
+            post,
+            node_count_delta: 0,
+            self_size_delta_bytes: 0,
+            retained_size_approximate: true,
+            detached_dom_nodes: { baseline: 0, post: 0 },
+          }}
+          fallbackText=""
+          isError={false}
+        />,
+      );
+      const textContent = container.textContent ?? '';
+      expect(textContent).toContain(baseline);
+      expect(textContent).toContain(post);
     });
   });
 
