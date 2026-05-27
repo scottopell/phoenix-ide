@@ -252,6 +252,8 @@ Enumerate Allium specs with `ls specs/*/*.allium`. Cross-spec dependencies are d
 
 **Both formats are authoritative.** If the code disagrees with either spEARS or Allium, one of them is wrong. spEARS requirements (REQ-* IDs) define what must be built; Allium's transition graph, preconditions, and invariants define exact behaviour. `@guidance` blocks in Allium describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right.
 
+**Before pushing a spec change**, run the pre-flight checklist in [`specs/AUTHORING.md`](specs/AUTHORING.md). The checklist captures the failure modes that drove 8 rounds of review iteration on PR #155 (wire-shape mismatches, Allium grammar bugs, undeclared helpers, cross-file drift, stale citations, cross-spec whitelist gaps) so future spec authors don't repay them.
+
 ---
 
 ## Production
