@@ -48,9 +48,9 @@ one elapsed counter, derived from the phase's state_updated_at.
 
 ## Current state (pointers)
 
-- `ui/src/components/StateBar.tsx:283-297, 408-409` — existing
+- `ui/src/components/the `toolElapsedSeconds` pattern in StateBar.tsx, 408-409` — existing
   `toolExecutingStartedAt` elapsed-seconds pattern (template to copy)
-- `ui/src/components/StateBar.tsx:349-373` — connection state currently
+- `ui/src/components/the connection short-circuit in StateBar.tsx` — connection state currently
   short-circuits and *masks* agent state during reconnect
 - `crates/phoenix-ide/src/api/wire.rs` — SseWireEvent variants;
   `StateChange` doesn't carry `state_updated_at` on the wire even though
@@ -108,7 +108,7 @@ Each stage stands alone and ships value independently.
 ### Stage C — sub-phase split for the LLM call
 
 - Emit `LlmFirstByte` (or set a flag on the first `Token` event) from
-  the forwarder task in `executor.rs:1740-1764`.
+  the forwarder task in `executor.rs`.
 - StateBar transitions
   `"thinking 4.1s"` → `"streaming"` once first byte arrives.
 - Optionally: post-hoc TTFT shown on the assistant message bubble

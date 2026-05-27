@@ -15,7 +15,7 @@ The conversation runtime exposes "phases" via `SseWireEvent::StateChange`:
 `llm_requesting`, `tool_executing`, `awaiting_sub_agents`, and others. Today
 the UI's `StateBar` collapses every working phase into a generic spinner with
 a phase-name label. There is no elapsed-time indicator on most phases (only
-`tool_executing` has one, added ad-hoc in `StateBar.tsx:283-297`), no
+`tool_executing` has one, added ad-hoc in the `toolElapsedSeconds` pattern in `StateBar.tsx`), no
 indication when streaming has begun versus when we're still waiting for the
 first byte, no indication when the SSE stream has gone silent, and the
 StateBar masks the agent's last-known activity entirely whenever the
@@ -133,7 +133,7 @@ WHEN any SSE event subsequently arrives
 THE SYSTEM SHALL clear the degraded-signal indicator immediately
 
 **Prerequisite:** The server keep-alive is currently emitted as an SSE
-comment line (`: ping\n\n`, see `api/sse.rs:71` / `handlers.rs:3279`), and
+comment line (`: ping\n\n`, see `api/sse.rs:71` / `handlers.rs`), and
 standard `EventSource` does NOT fire any handler for comments. For this
 requirement to be implementable as written, the keep-alive MUST be switched
 to a typed event with a **non-empty** `data` field
@@ -202,7 +202,7 @@ where the text will appear, giving the user spatial continuity. The
 placeholder is implemented as a derived/synthetic render unit (see
 design.md "Pending assistant bubble") rather than a row in the
 messages list; the existing empty-message filter at
-`MessageComponents.tsx:635-638` continues to correctly hide genuinely
+the empty-message filter (`hasRenderableContent` guard in `MessageComponents.tsx`) continues to correctly hide genuinely
 empty historical agent rows.
 
 ---

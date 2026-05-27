@@ -38,14 +38,14 @@ The retry is driven by the **executor + state machine**:
 1. `LlmRequesting { attempt: N }` is the active state.
 2. LLM client returns `Err(LlmError)`.
 3. Executor maps `LlmErrorKind` → `LlmOutcome`
-   (`executor.rs:3549-3578`):
+   (``llm_error_to_llm_outcome` in executor.rs`):
    - `RateLimit` → `LlmOutcome::RateLimited { retry_after }`
    - `ServerError` / `ServerOverloaded` → `LlmOutcome::ServerError { ... }`
    - `Network` → retryable
    - Others (`Auth`, `UsageLimitReached`, `ContentFilter`,
      `ContextWindowExceeded`, `InvalidRequest`) → non-retryable
 4. State machine handles retryable error in `handle_core_llm_error`
-   (`transition.rs:1223-1278`):
+   (``handle_core_error_retry` in transition.rs`):
    ```rust
    CoreState::AwaitingContinuation {
        rejected_tool_calls: ...,
@@ -70,7 +70,7 @@ The retry is driven by the **executor + state machine**:
    }
    ```
 6. State machine transitions `AwaitingContinuation → LlmRequesting`
-   on `RetryTimeout` (`transition.rs:1273-1278`).
+   on `RetryTimeout` (`the `RetryTimeout` case in `handle_core_error_retry``).
 
 ### What's already on the wire
 
@@ -92,7 +92,7 @@ currently lost between executor and client:
 2. **Backoff delay** (`delay: Duration` in `Effect::ScheduleRetry`) —
    only known to the executor's spawned tokio task.
 3. **resets_at quota timestamp** — already formatted into user-facing
-   error message strings (`llm/error.rs:206-222`), but only surfaced
+   error message strings (`the `retry_suffix` / `retry_suffix_after_or` helpers in llm/error.rs`), but only surfaced
    when the conversation terminates with `UserFacingError`, NOT
    during the retry loop.
 4. **Max attempts** — implicit somewhere in the state machine. Need
@@ -117,7 +117,7 @@ must decide:
 ### Sub-agent retries
 
 Sub-agents have their own state machine instance
-(`state.rs:1345`); each runs `AwaitingContinuation { attempt }`
+(`the `SubAgentState::Core` conversions in state.rs`); each runs `AwaitingContinuation { attempt }`
 independently.
 
 **Spec decision needed**: if a sub-agent retries, does the parent's
@@ -132,7 +132,7 @@ JoinHandle is tracked. If the user clicks Cancel during the sleep,
 the spawned task keeps sleeping and eventually sends `RetryTimeout`
 to a state machine that has transitioned to `Cancelling` or `Idle`.
 The state machine filters stale `RetryTimeout` events
-(`transition.rs:588`).
+(`the `Idle`+`LlmResponse` stale absorber in transition.rs`).
 
 **For the spec**: cancellation IS already correctly modelled at the
 state machine level. The display-side answer is "during backoff,
@@ -218,16 +218,16 @@ Plus updates to `specs/sse_wire/sse_wire.allium`:
 ## Code paths to verify when drafting
 
 - `executor.rs:1408-1418` — `Effect::ScheduleRetry` handler
-- `executor.rs:1819` — `complete_streaming` call site
-- `executor.rs:3549-3578` — `LlmError` → `LlmOutcome` mapping
-- `transition.rs:1223-1278` — `handle_core_llm_error` retry transition
-- `transition.rs:1290-1322` — continuation retry handler
-- `state.rs:885-891` — `AwaitingContinuation { rejected_tool_calls,
+- `the `complete_streaming` call site in executor.rs` — `complete_streaming` call site
+- ``llm_error_to_llm_outcome` in executor.rs` — `LlmError` → `LlmOutcome` mapping
+- ``handle_core_error_retry` in transition.rs` — `handle_core_llm_error` retry transition
+- ``handle_core_continuation` in transition.rs` — continuation retry handler
+- ``ConvState::AwaitingContinuation` in state.rs` — `AwaitingContinuation { rejected_tool_calls,
   attempt }`
 - `llm/error.rs:81-115` — `LlmErrorKind` + `is_retryable`
 - `wire.rs:328-331` — `RateLimitSnapshot` for overlap analysis
 - `llm/anthropic.rs:343-` — `complete_streaming` (single attempt)
-- `llm/openai.rs:471-` — same shape
+- ``complete_streaming` in llm/openai.rs (~L452-)` — same shape
 - `llm/service.rs:138-158` — dispatch layer
 
 ## Pre-flight checklist

@@ -168,7 +168,7 @@ enum WorkingPhase {
 
 -- The visual treatment class applied to the StateBar's status dot.
 -- Mirrors the dot-class CSS conventions already in use at
--- StateBar.tsx:341-422.
+-- the `stateText` composition block in StateBar.tsx.
 enum DotClass {
     idle
     | working
@@ -366,7 +366,7 @@ entity LastKnownActivityCapture {
 config {
     heartbeat_watchdog_seconds: Integer = 35
     -- ~2.3x the server's SSE keep-alive interval (15s; api/sse.rs:71,
-    -- handlers.rs:3279). One missed keep-alive must not trigger the
+    -- handlers.rs). One missed keep-alive must not trigger the
     -- watchdog.
 
     watchdog_tick_interval_ms: Integer = 1000

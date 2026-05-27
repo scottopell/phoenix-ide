@@ -91,7 +91,7 @@ LlmFirstByte {
 ```
 
 Emitted exactly once per LLM request, from the token forwarder in
-`executor.rs:1740-1764`, immediately before the first `Token` event for
+the forwarder task in `executor.rs`, immediately before the first `Token` event for
 that request is forwarded. The two events are emitted atomically (no
 client can observe a `Token` for a request without first observing the
 `LlmFirstByte`). When an LLM request completes with zero tokens (an error
@@ -156,7 +156,7 @@ updated, and propagated verbatim. On Init, the existing
 
 ### First-byte emission
 
-The forwarder task at `executor.rs:1740-1764` subscribes to the LLM client's
+The forwarder task in `executor.rs` subscribes to the LLM client's
 chunk channel and emits `SseEvent::Token` for each text chunk. Wrap that
 loop with a "first chunk seen for this request_id" flag; on the first
 chunk, emit `LlmFirstByte` immediately before the `Token`. The flag is
@@ -218,7 +218,7 @@ bumps `lastSseEventAt`. The axum 0.7 API for KeepAlive carries an
 <https://docs.rs/axum/latest/axum/response/sse/struct.KeepAlive.html>):
 
 ```rust
-// Before (api/sse.rs:69-73, handlers.rs:3277-3281):
+// Before (api/sse.rs:69-73, handlers.rs:3355-3359):
 KeepAlive::new()
     .interval(Duration::from_secs(15))
     .text("ping")
@@ -292,7 +292,7 @@ go stale during a turn that only emits the un-registered event type).
 
 ### StateBar derivation
 
-`StateBar.tsx:341-422` already composes its `stateText` from
+the `stateText` composition block in `StateBar.tsx` already composes its `stateText` from
 `(connectionState, convState)`. Extend the composition:
 
 ```ts
@@ -331,7 +331,7 @@ assistant message's `display_data.tool_starts[tool_use_id]` map (typed
 carrier" decision above). When that entry is present and no `result`
 has landed for the tool yet, render the elapsed counter inline in the
 header. Tick via the same one-second interval pattern used for the
-StateBar's `toolElapsedSeconds` (StateBar.tsx:283-297) — extract to a
+StateBar's `toolElapsedSeconds` (the `toolElapsedSeconds` pattern in StateBar.tsx) — extract to a
 shared `useElapsedSeconds(startedAt)` hook.
 
 **Pending assistant bubble:** there is no persisted empty assistant
@@ -343,7 +343,7 @@ the pre-first-byte `llm_requesting` window the message list literally
 contains no row for the in-flight turn. The live streaming bubble after the first byte is
 already materialised by the `renderUnits` machinery as a synthetic
 `streaming_agent` tail unit driven by `streamingBuffer`
-(`ui/src/conversation/renderUnits.ts:193-197`).
+(`ui/src/conversation/`renderUnits.ts` (the `streaming_agent` tail unit)`).
 
 Add a new synthetic tail unit (`pending_agent` or similar) emitted by
 `renderUnits.ts` immediately before the existing `streaming_agent` tail
@@ -380,7 +380,7 @@ visual position, contents transition from counter to streamed text. On
 the final assistant `Message` arrival, the streaming unit retires and
 the persisted message renders in its place.
 
-The empty-message filter at `MessageComponents.tsx:635-638` is NOT
+The empty-message filter (`hasRenderableContent` guard in `MessageComponents.tsx`) is NOT
 changed — it correctly hides genuinely empty historical agent rows. The
 placeholder is a derived/synthetic unit, not a row in the messages
 list.
