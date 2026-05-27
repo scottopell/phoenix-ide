@@ -90,13 +90,14 @@ additions on existing infrastructure.
 
 ## Cross-Spec Dependencies
 
-- **`specs/llm-retry-visibility/`** — sibling spec, drafted in a follow-up
-  commit (not yet present in this branch). Will produce the retry-modifier
-  context that REQ-WPV-003 composes onto the base reason. Until that spec
-  lands, the `RetryContext` value type is inlined in this spec's Allium
-  file as a `PLACEHOLDER` block; on landing, the `use
+- **`specs/llm-retry-visibility/`** — sibling spec. Owns the canonical
+  `value RetryContext` and the `entity TurnRetryContext` (keyed by
+  `conversation_id`). This spec imports it via `use
   "../llm-retry-visibility/llm-retry-visibility.allium" as llm_retry`
-  import is restored and the placeholder is deleted.
+  and references `llm_retry/TurnRetryContext{conversation_id:
+  view.conversation_id}` in the helpers backing REQ-WPV-003's retry-
+  modifier composition. The producer-side `LlmAttempt` SSE event and
+  its replay-ring eligibility are also owned there.
 
 - **`specs/sse_wire/`** — wire-format authority; new variants (`LlmFirstByte`,
   `state_updated_at` on `StateChange`) and the keep-alive typed-event switch are

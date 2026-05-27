@@ -39,14 +39,14 @@
 -- Cross-references:
 --   specs/connection_machine/connection_machine.allium — ConnectionState
 --       enum imported; transitions consumed by REQ-WPV-005.
---   specs/llm-retry-visibility/ — sibling spec, drafted in a follow-up
---       commit (NOT yet present in this branch — so there is intentionally
---       no allium import for it). Will own the canonical RetryContext
---       value and the producer of LlmAttempt SSE events. Until the
---       sibling lands, this spec inlines a minimal RetryContext and a
---       render_retry_modifier_for helper marked PLACEHOLDER below; on
---       landing, the placeholders are deleted and an import for the
---       sibling spec is added to the imports block.
+--   specs/llm-retry-visibility/llm-retry-visibility.allium — sibling
+--       spec; owns the canonical RetryContext value type and the
+--       TurnRetryContext entity (keyed by conversation_id). This spec
+--       imports it and references llm_retry/TurnRetryContext via
+--       conversation_id lookups (same pattern as the conn/ClientConnection
+--       cross-reference); the consumer's render_retry_modifier_for /
+--       render_frozen_retry_modifier helpers compose the rendered suffix
+--       from the imported value.
 --   specs/sse_wire/sse_wire.allium — wire envelope contract; this spec's
 --       new variants (LlmFirstByte) and field (StateChange.state_updated_at)
 --       extend it.
@@ -70,6 +70,7 @@
 -- brief grace state `reconnected_display` / 'reconnected' is excluded
 -- so the watchdog doesn't duplicate the connection chip's messaging.
 use "../connection_machine/connection_machine.allium" as conn
+use "../llm-retry-visibility/llm-retry-visibility.allium" as llm_retry
 
 ------------------------------------------------------------
 -- Actor Declarations
@@ -118,21 +119,7 @@ value LastKnownActivity {
     base_reason_text:      String
     elapsed_ms_at_disconnect: Integer
     captured_at:           Timestamp
-    retry:                 RetryContext?
-}
-
--- PLACEHOLDER: this value will move to specs/llm-retry-visibility/ when
--- that spec lands. It is inlined here so this spec parses standalone.
--- A RetryContext represents the most-recent unresolved LLM retry
--- attempt for the current turn, derived from `LlmAttempt` SSE events
--- that the llm-retry-visibility spec will own. `null` semantics ("no
--- retry") are represented by the absence of a RetryContext on the
--- ObservedPhase entity, not by a null instance.
-value RetryContext {
-    attempt:        Integer
-    max_attempts:   Integer
-    reason_text:    String
-    backing_off:    Boolean
+    retry:                 llm_retry/RetryContext?
 }
 
 -- The fully-composed text + visual treatment shown in the StateBar.
@@ -305,20 +292,6 @@ entity InflightToolTimer {
     started_at: Timestamp
 }
 
--- Per-turn retry context. Lives across phase transitions within a
--- single turn (REQ-WPV-003 requires `executing bash 12s (retry 2/5)`
--- when the LLM retried earlier in the same turn before reaching the
--- tool call). Cleared on AgentDone (turn boundary), NOT on per-phase
--- exit — that would discard the retry context the moment the phase
--- transitions from llm_requesting to tool_executing, contradicting the
--- required display. Populated by rules owned by the
--- llm-retry-visibility sibling spec; left empty (entity absent) when
--- the turn has no unresolved retry.
-entity TurnRetryContext {
-    view: ClientView
-    retry: RetryContext
-}
-
 -- The StateBar's derived activity output. One per ClientView. Updated
 -- in-place by the DisplayWhen* derivation rules each time
 -- DerivationTriggered(view) fires.
@@ -426,13 +399,17 @@ config {
 --       dot_class is the per-phase visual treatment; has_timer=false.
 --
 --   render_retry_modifier_for(view: ClientView) -> String
---       "" when no TurnRetryContext{view: view} exists;
---       " (retry K/N <reason>)" when one does. Leading space so the
---       suffix concatenates cleanly onto a base reason text. K is
---       retry.attempt, N is retry.max_attempts, <reason> comes from
---       retry.reason_text.
+--       "" when no llm_retry/TurnRetryContext{conversation_id:
+--       view.conversation_id} exists; " (retry K/N <reason>)" when
+--       one does. Leading space so the suffix concatenates cleanly
+--       onto a base reason text. K is retry.attempt, N is
+--       retry.max_attempts, <reason> comes from retry.reason_text.
+--       The TurnRetryContext entity itself is owned by the
+--       llm-retry-visibility sibling spec (keyed by conversation_id);
+--       this helper does the lookup via view.conversation_id, the
+--       same cross-spec pattern used for conn/ClientConnection.
 --
---   render_frozen_retry_modifier(retry: RetryContext?) -> String
+--   render_frozen_retry_modifier(retry: llm_retry/RetryContext?) -> String
 --       "" when retry is null; same " (retry K/N <reason>)" format
 --       as render_retry_modifier_for otherwise. Reads from a frozen
 --       LastKnownActivity.retry snapshot rather than the live
@@ -458,11 +435,12 @@ config {
 --       which implies a running tool). Parallel-tool policy is
 --       deferred (see `deferred MultipleParallelToolsInOneAssistantMessage`).
 --
---   current_retry_for(view: ClientView) -> RetryContext?
---       TurnRetryContext{view: view}.retry when the entity exists;
---       null otherwise. The LastKnownActivity capture rule uses this
---       to snapshot retry alongside the base activity at the moment
---       of degrade.
+--   current_retry_for(view: ClientView) -> llm_retry/RetryContext?
+--       llm_retry/TurnRetryContext{conversation_id:
+--       view.conversation_id}.retry when the entity exists; null
+--       otherwise. The LastKnownActivity capture rule uses this to
+--       snapshot retry alongside the base activity at the moment of
+--       degrade.
 --
 -- Invariant predicates (used only inside `invariant` blocks):
 --
@@ -649,8 +627,9 @@ rule LastKnownActivityCapturedOnDegrade {
     requires: ObservedPhase{view}.phase != null  -- type-narrowing: implied by working=true, but Allium's optional-typing needs an explicit guard
 
     -- `current_retry_for(view)` is a helper that returns
-    -- `TurnRetryContext{view: view}.retry` when that entity exists, or
-    -- `null` otherwise. Inlined as a helper (rather than an if-then-else
+    -- `llm_retry/TurnRetryContext{conversation_id:
+    -- view.conversation_id}.retry` when that entity exists, or `null`
+    -- otherwise. Inlined as a helper (rather than an if-then-else
     -- expression, which the v3 grammar doesn't have) so the snapshot
     -- gets both fields in one value-literal construction.
     let snap = LastKnownActivity{
@@ -928,42 +907,6 @@ rule InflightToolTimerRemovedOnConversationDelete {
 }
 
 ------------------------------------------------------------
--- Rules — TurnRetryContext lifecycle
-------------------------------------------------------------
-
--- REQ-WPV-003 illustrates `executing bash 12s (retry 2/5)` — the
--- retry-modifier must persist across an intra-turn phase transition
--- (llm_requesting → tool_executing). Therefore the retry context is
--- NOT scoped to a single phase. It is cleared at the turn boundary
--- only: AgentDone signals the turn has reached a terminal outcome and
--- any unresolved retry context is no longer relevant.
---
--- Population (creation/update on LlmAttempt events) is owned by the
--- llm-retry-visibility sibling spec; this spec only defines the
--- clear-on-AgentDone rule because clearance is observable to the
--- display layer and must outlive a single phase.
--- Event shape: SseAgentDoneReceived(view).
-rule TurnRetryContextClearedOnAgentDone {
-    when: SseAgentDoneReceived(view)
-
-    requires: exists TurnRetryContext{view: view}
-
-    ensures: not exists TurnRetryContext{view: view}
-}
-
--- A turn-terminal error event (UserFacingError) also concludes the
--- retry visibility; surfacing a retry suffix on a finalised error is
--- confusing ("retry 2/5" with no further attempt). Cleared on receipt.
--- Event shape: SseErrorReceived(view).
-rule TurnRetryContextClearedOnTerminalError {
-    when: SseErrorReceived(view)
-
-    requires: exists TurnRetryContext{view: view}
-
-    ensures: not exists TurnRetryContext{view: view}
-}
-
-------------------------------------------------------------
 -- Rules — DisplayedActivity derivation
 ------------------------------------------------------------
 
@@ -1006,12 +949,12 @@ rule DisplayWhenReconnectingWithCapturedActivity {
     let elapsed     = snap.elapsed_ms_at_disconnect / 1000
     let attempts    = conn/ClientConnection{conversation_id: view.conversation_id}.attempt
     -- `render_frozen_retry_modifier(snap.retry)` is the helper that
-    -- formats the captured RetryContext as " (retry K/N <reason>)" when
-    -- snap.retry is non-null, and returns "" otherwise. Mirrors the
-    -- live `render_retry_modifier_for(view)` helper but reads from the
-    -- frozen snapshot rather than the live TurnRetryContext, so the
-    -- "most specific known activity" survives the disconnect intact
-    -- (REQ-WPV-003/005).
+    -- formats the captured llm_retry/RetryContext as " (retry K/N
+    -- <reason>)" when snap.retry is non-null, and returns ""
+    -- otherwise. Mirrors the live `render_retry_modifier_for(view)`
+    -- helper but reads from the frozen snapshot rather than the live
+    -- llm_retry/TurnRetryContext, so the "most specific known
+    -- activity" survives the disconnect intact (REQ-WPV-003/005).
     let retry_suffix = render_frozen_retry_modifier(snap.retry)
 
     ensures: StateBarDisplay{view}.activity = DisplayedActivity{

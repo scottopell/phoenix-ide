@@ -1,0 +1,641 @@
+-- allium: 3
+-- llm-retry-visibility.allium
+--
+-- LLM Retry Visibility: Behavioural Specification
+--
+-- Scope: The producer side of LLM-retry visibility — the SSE wire event
+--        (LlmAttempt) emitted from the executor's Effect::ScheduleRetry
+--        handler, the typed retry context that flows through the
+--        envelope, the per-conversation TurnRetryContext entity (read
+--        by specs/working-phase-visibility/ to compose the StateBar's
+--        retry modifier), and the post-hoc retry_count persisted on the
+--        assistant message's display_data.
+--
+-- Source of truth:
+--   crates/phoenix-ide/src/api/wire.rs — SseWireEvent::LlmAttempt
+--       variant + event_type() tag
+--   crates/phoenix-ide/src/runtime.rs — SseEvent::LlmAttempt
+--       and From<SseEvent> conversion
+--   crates/phoenix-ide/src/runtime/executor.rs — Effect::ScheduleRetry
+--       handler (`executor.rs:1408-1418`); emission site
+--   crates/phoenix-ide/src/state_machine/transition.rs — retry
+--       transitions (handle_core_error_retry, handle_core_continuation);
+--       MAX_RETRY_ATTEMPTS constant
+--   crates/phoenix-ide/src/llm/error.rs — LlmErrorKind classification
+--       (is_retryable)
+--
+-- Includes: LlmAttemptReason enumeration; the RetryContext value type
+--           moved here from working-phase-visibility's PLACEHOLDER block;
+--           the TurnRetryContext entity (keyed by conversation_id, like
+--           sse_wire's other per-conversation entities); the populator
+--           rule (TurnRetryContextUpdatedOnLlmAttempt) and the clear
+--           rules (on AgentDone and terminal Error); the post-hoc
+--           retry_count persist rule on assistant-message persist.
+-- Excludes:
+--   - The StateBar rendering of "(retry K/N <reason>)" itself — owned by
+--     specs/working-phase-visibility/'s render_retry_modifier_for helper.
+--   - The cancellation transitions; modelled in specs/conversation_atom/
+--     (the underlying state machine transitions).
+--   - The SSE replay-ring eligibility; modelled in specs/sse_wire/'s
+--     EphemeralEventAppendedToReplayRing rule whose whitelist this spec
+--     extends.
+--
+-- Cross-references:
+--   specs/working-phase-visibility/working-phase-visibility.allium — the
+--       consumer. Imports this spec via `use ".../llm-retry-visibility/
+--       llm-retry-visibility.allium" as llm_retry`. Reads
+--       llm_retry/TurnRetryContext{conversation_id} via its
+--       render_retry_modifier_for helper.
+--   specs/sse_wire/sse_wire.allium — wire envelope contract. The
+--       `llm_attempt` event_type is added to
+--       EphemeralEventAppendedToReplayRing's whitelist in the same
+--       change that lands this spec, per the cross-spec checklist at
+--       the top of that rule.
+--   specs/conversation_atom/conversation_atom.allium — no atom impact
+--       for the wire event itself (it populates a TurnRetryContext
+--       entity owned here). The retry_count field on
+--       display_data is set at persist time on the existing assistant-
+--       message persist path.
+--
+-- Requirement traceability: REQ-LRV-001 through REQ-LRV-007 are modelled
+-- here. REQ-LRV-002 (reason classification) is structurally enforced by
+-- the exhaustive match between LlmErrorKind's retryable subset and
+-- LlmAttemptReason; modelled via the LlmAttemptReasonClassification rule.
+-- REQ-LRV-005 (cancellation routes through Cancelling) is a property of
+-- the state machine transitions and the StaleRetryTimeoutAbsorbed
+-- behaviour already modelled in specs/conversation_atom/; this spec
+-- documents it as a `deferred Req005CancellationDuringBackoff` entry
+-- with the rationale.
+-- REQ-LRV-007 (LlmAttempt vs RateLimitSnapshot distinct) is a wire-level
+-- contract enforced by the sse_wire replay-ring whitelist; modelled
+-- here as the LlmAttemptReplayEligible invariant cross-referencing
+-- sse_wire.
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
+
+-- Why a retry attempt is being scheduled. Mirrors the retryable subset
+-- of LlmErrorKind exactly (`llm/error.rs:111` — Network, RateLimit,
+-- ServerError). Non-retryable LlmErrorKind variants terminate the turn
+-- without scheduling a retry, so they never reach this enum.
+value LlmAttemptReason {
+    -- one of: rate_limit, server_error, network
+    -- (declared as an enum in the implementation; Allium v3 grammar
+    -- represents the three-value distinction via the equality
+    -- predicates in the rules below)
+    kind: String
+}
+
+-- The retry context surfaced to the client for one in-flight retry.
+-- Moved here from working-phase-visibility's PLACEHOLDER block on
+-- this spec's landing. Carries everything the consumer's
+-- render_retry_modifier_for(view) helper needs to compose the
+-- "(retry K/N <reason>)" suffix, plus informational fields
+-- (backing_off_ms, resets_at) for future displays.
+--
+-- Field semantics:
+--   attempt:        The attempt number this retry is scheduled FOR.
+--                   1-indexed; matches the state's `attempt` after
+--                   the bump.
+--   max_attempts:   The retry-budget ceiling
+--                   (MAX_RETRY_ATTEMPTS = 3 in
+--                   `state_machine/transition.rs:183`). Carried
+--                   per-event so a future per-provider policy is
+--                   wire-compatible.
+--   reason:         Classified per LlmAttemptReasonClassification.
+--   reason_text:    Human-rendered form of `reason` ("rate limit",
+--                   "server error", "network error"). Set by
+--                   the populator rule from a shared helper
+--                   reason_to_text(reason).
+--   backing_off_ms: The retry-delay value from
+--                   Effect::ScheduleRetry, in milliseconds.
+--                   Informational at v1 — no rule depends on it.
+--   resets_at:      Quota reset timestamp from LlmError.quota when
+--                   the error was a RateLimit with quota details;
+--                   null otherwise.
+value RetryContext {
+    attempt:        Integer
+    max_attempts:   Integer
+    reason:         LlmAttemptReason
+    reason_text:    String
+    backing_off_ms: Integer
+    resets_at:      Timestamp?
+}
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- Per-conversation retry context for the current turn. Keyed by
+-- conversation_id (the same pattern sse_wire, conn, and
+-- conversation_atom use for per-conversation state); a single tab
+-- maps a conversation_id to its ClientView via the working-phase-
+-- visibility's helpers when rendering. Cleared on turn-terminal
+-- events (AgentDone, terminal Error) by the rules below.
+--
+-- Population is the producer-side observation of a server-emitted
+-- LlmAttempt event; the entity's lifecycle is bounded by the turn,
+-- not by the SSE connection (a reconnect mid-turn replays the
+-- LlmAttempt via the ephemeral ring and re-populates the entity —
+-- see LlmAttemptReplayEligible invariant).
+entity TurnRetryContext {
+    conversation_id: String
+    retry:           RetryContext
+}
+
+------------------------------------------------------------
+-- Helpers (pure functions referenced by the rules below)
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; the rules below
+-- call these by bare identifier. This block is the single source of
+-- truth for their signatures and semantics. Any rule that uses a name
+-- not in this block is using an undeclared helper — call that out in
+-- review.
+--
+--   classify_retry_reason(error_kind: LlmErrorKind) -> LlmAttemptReason
+--       Maps the retryable subset of LlmErrorKind to LlmAttemptReason:
+--           Network     -> LlmAttemptReason{kind: "network"}
+--           RateLimit   -> LlmAttemptReason{kind: "rate_limit"}
+--           ServerError -> LlmAttemptReason{kind: "server_error"}
+--       Undefined on non-retryable variants (which never reach
+--       Effect::ScheduleRetry per is_retryable() in llm/error.rs:111).
+--
+--   reason_to_text(reason: LlmAttemptReason) -> String
+--       Maps reason.kind to its human-rendered form:
+--           "rate_limit"   -> "rate limit"
+--           "server_error" -> "server error"
+--           "network"      -> "network error"
+--       The strings are not normative wire syntax; they are the
+--       implementation's single source of truth and are referenced by
+--       working-phase-visibility's render_retry_modifier_for helper
+--       to compose " (retry K/N <reason_text>)".
+--
+--   state_attempt(conv_id: String) -> Integer
+--       The attempt counter from the conversation's current
+--       ConvState (LlmRequesting or AwaitingContinuation). The
+--       runtime guarantees state.attempt == LlmAttempt.attempt on
+--       every retry-scheduled emission (the state is bumped in the
+--       same transition that schedules the retry — see
+--       handle_core_error_retry / handle_core_continuation in
+--       transition.rs).
+--
+--   max_retry_attempts() -> Integer
+--       The global retry-budget ceiling. Sourced from
+--       `state_machine/transition.rs::MAX_RETRY_ATTEMPTS`. Returned
+--       as a value so any future per-provider policy can switch the
+--       implementation without changing the wire shape.
+--
+------------------------------------------------------------
+
+------------------------------------------------------------
+-- Rules — LlmAttempt classification + emission
+------------------------------------------------------------
+
+-- REQ-LRV-002: the runtime-side classification of LlmErrorKind to
+-- LlmAttemptReason. Documents the contract that the wire emission
+-- (RuntimeEmitsLlmAttemptOnScheduleRetry below) honors. Modelling this
+-- as a rule (rather than @guidance) makes the three-way mapping
+-- structural: if a future LlmErrorKind variant becomes retryable, the
+-- match here must be extended or the rule is incomplete.
+--
+-- Event shape: RuntimeClassifiesRetryError(conv_id, error_kind).
+-- Fires inside handle_core_error_retry / handle_core_continuation at
+-- the moment the rule's `if error_kind.is_retryable() && *attempt <
+-- MAX_RETRY_ATTEMPTS` guard passes.
+rule LlmAttemptReasonClassification {
+    when: RuntimeClassifiesRetryError(conv_id, error_kind)
+
+    -- The three retryable variants in LlmErrorKind. The runtime
+    -- guarantees this rule fires only inside the retryable guard, so
+    -- the four non-retryable variants (UsageLimitReached,
+    -- ServerOverloaded, Auth, InvalidRequest, ContentFilter,
+    -- ContextWindowExceeded) never trigger.
+    requires: error_kind in { "network", "rate_limit", "server_error" }
+
+    let reason = classify_retry_reason(error_kind)
+
+    ensures: ClassifiedRetryReason{conv_id}.reason = reason
+}
+
+-- REQ-LRV-001: the SSE wire emission. Fires from the executor's
+-- Effect::ScheduleRetry handler (`executor.rs:1408-1418`),
+-- immediately before the spawned tokio sleep that drives the
+-- backoff. The emission and the sleep happen in the same effect
+-- arm, so there is no ordering window in which the sleep
+-- completes (and a RetryTimeout outcome lands) before the
+-- LlmAttempt event has been queued for broadcast.
+--
+-- Event shape: EffectScheduleRetryEmitted(conv_id, attempt, delay_ms,
+--                                          reason, resets_at).
+rule RuntimeEmitsLlmAttemptOnScheduleRetry {
+    when: EffectScheduleRetryEmitted(conv_id, attempt, delay_ms, reason, resets_at)
+
+    requires: attempt >= 1
+    requires: attempt <= max_retry_attempts()
+    requires: reason.kind in { "network", "rate_limit", "server_error" }
+    requires: delay_ms >= 0
+
+    -- The LlmAttempt event is constructed here. The actual SSE
+    -- envelope (sequence_id assignment, broadcast) is the sse_wire
+    -- responsibility; this rule constructs the payload value.
+    let payload = RetryContext{
+        attempt:        attempt,
+        max_attempts:   max_retry_attempts(),
+        reason:         reason,
+        reason_text:    reason_to_text(reason),
+        backing_off_ms: delay_ms,
+        resets_at:      resets_at
+    }
+
+    ensures: LlmAttemptBroadcast{conv_id}.payload = payload
+
+    @guidance
+        -- Implementation: inside the Effect::ScheduleRetry arm of
+        -- ConversationRuntime::handle_effect, prior to the
+        -- tokio::spawn that schedules the backoff sleep:
+        --
+        --   let _ = self.broadcast_tx.send_seq(|seq| SseEvent::LlmAttempt {
+        --       sequence_id: seq,
+        --       attempt,
+        --       max_attempts: MAX_RETRY_ATTEMPTS,
+        --       reason,
+        --       backing_off_ms: delay.as_millis() as u64,
+        --       resets_at,
+        --   });
+        --
+        -- The `reason` and `resets_at` arguments to Effect::ScheduleRetry
+        -- are added in the same change. handle_core_error_retry and
+        -- handle_core_continuation in transition.rs build them from the
+        -- inbound Event::LlmError's error_kind + (newly-added) resets_at
+        -- fields. resets_at is non-null only for RateLimit errors whose
+        -- LlmError.quota carries a resets_at value.
+        --
+        -- Replay eligibility: the LlmAttempt event IS appended to the
+        -- ephemeral replay ring (sse_wire's EphemeralEventAppendedToReplayRing
+        -- whitelist includes "llm_attempt"). Without this, a client
+        -- reconnecting mid-backoff would lose the retry context
+        -- (REQ-LRV-001 rationale).
+}
+
+------------------------------------------------------------
+-- Rules — TurnRetryContext lifecycle
+------------------------------------------------------------
+
+-- REQ-LRV-001 / REQ-LRV-003: the client-side population. When the
+-- client receives an LlmAttempt event, the TurnRetryContext for the
+-- conversation is created or replaced. Replaced (not merged) because
+-- each attempt's context fully supersedes the previous one —
+-- "(retry 2/3 after 429)" is replaced by "(retry 3/3 after server
+-- error)" if the second retry hits a different error class.
+--
+-- Event shape: SseLlmAttemptReceived(conv_id, attempt, max_attempts,
+--                                     reason, backing_off_ms, resets_at).
+rule TurnRetryContextUpdatedOnLlmAttempt {
+    when: SseLlmAttemptReceived(conv_id, attempt, max_attempts, reason, backing_off_ms, resets_at)
+
+    let payload = RetryContext{
+        attempt:        attempt,
+        max_attempts:   max_attempts,
+        reason:         reason,
+        reason_text:    reason_to_text(reason),
+        backing_off_ms: backing_off_ms,
+        resets_at:      resets_at
+    }
+
+    ensures: TurnRetryContext{conv_id}.retry = payload
+}
+
+-- REQ-LRV-003 (cross-spec) / REQ-WPV-003 (per the consumer): the
+-- retry context lives across intra-turn phase transitions
+-- (llm_requesting -> tool_executing carries the retry suffix
+-- forward; see working-phase-visibility's REQ-WPV-003 example
+-- "executing bash 12s (retry 2/5)"). It is cleared only at the
+-- turn boundary. AgentDone is the success-path boundary.
+--
+-- Event shape: SseAgentDoneReceived(conv_id).
+-- (Moved here from working-phase-visibility on this spec's landing;
+-- the consumer no longer owns the entity.)
+rule TurnRetryContextClearedOnAgentDone {
+    when: SseAgentDoneReceived(conv_id)
+
+    requires: exists TurnRetryContext{conversation_id: conv_id}
+
+    ensures: not exists TurnRetryContext{conversation_id: conv_id}
+}
+
+-- The error-path boundary. A terminal UserFacingError (mapped from a
+-- non-retryable LlmErrorKind, or from a retryable kind that hit
+-- MAX_RETRY_ATTEMPTS, or from a tool failure that aborts the turn)
+-- concludes the retry visibility. Surfacing "(retry 2/3)" alongside a
+-- finalised error message is confusing — the user reads it as "still
+-- retrying" when in fact the turn has given up.
+--
+-- Event shape: SseErrorReceived(conv_id).
+rule TurnRetryContextClearedOnTerminalError {
+    when: SseErrorReceived(conv_id)
+
+    requires: exists TurnRetryContext{conversation_id: conv_id}
+
+    ensures: not exists TurnRetryContext{conversation_id: conv_id}
+}
+
+------------------------------------------------------------
+-- Rules — post-hoc retry_count persistence
+------------------------------------------------------------
+
+-- REQ-LRV-006: when an assistant message is persisted for a turn
+-- that retried at least once, the final retry count is captured on
+-- the message's display_data.retry_count field. The badge
+-- "(retried Nx)" is rendered by the UI when retry_count > 0.
+--
+-- The runtime captures the final attempt count from the state being
+-- transitioned out of (LlmRequesting{attempt: N} or
+-- AwaitingContinuation{attempt: N}) at the moment LlmResponse fires.
+-- retry_count = max(0, final_attempt - 1): a turn that succeeded on
+-- the first try has final_attempt = 1 and retry_count = 0 (badge
+-- hidden); a turn that succeeded on the third try has final_attempt
+-- = 3 and retry_count = 2 (badge reads "(retried 2x)").
+--
+-- Event shape: AssistantMessagePersisted(conv_id, message_id,
+--                                         final_attempt).
+rule RetryCountPersistedAtTurnEnd {
+    when: AssistantMessagePersisted(conv_id, message_id, final_attempt)
+
+    requires: final_attempt >= 1
+
+    -- max(0, final_attempt - 1). Allium v3 has no built-in max; the
+    -- helper is left as a runtime-side detail (retry_count is
+    -- floor-clamped to 0 — final_attempt is always >= 1 in
+    -- practice because the state machine bumps it on every retry,
+    -- starting from 1 on the first request, so the subtraction never
+    -- underflows).
+    let count = final_attempt - 1
+
+    ensures: PersistedAssistantMessage{message_id}.display_data_retry_count = count
+
+    @guidance
+        -- Implementation: inside the Effect::persist_agent_message
+        -- handler (`state_machine/transition.rs` -- search for the
+        -- persist path), or the Effect::PersistCheckpoint path for
+        -- turns ending in a tool round, capture
+        --   final_attempt = current_attempt(&state)
+        -- at the moment of the LlmResponse transition. Write
+        --   message.display_data.retry_count = final_attempt - 1
+        -- on the assistant message. retry_count is a typed
+        -- field on the MessageDisplayData struct (Rust-side); ts-rs
+        -- codegen exports the field to TypeScript.
+        --
+        -- For rollout, the field is gated by `#[serde(default)]` so
+        -- existing assistant message rows (which predate the field)
+        -- read as retry_count = 0. The UI's badge-display rule
+        -- (retry_count > 0) hides the badge for those rows, which
+        -- is correct: we have no record of retries on legacy rows.
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- REQ-LRV-001 + REQ-WPV-008: the LlmAttempt event must replay on
+-- reconnect so the StateBar's retry suffix is preserved across the
+-- disconnect. This is enforced cross-spec by sse_wire's
+-- EphemeralEventAppendedToReplayRing rule (whose event_type
+-- whitelist includes "llm_attempt"). The invariant here is the
+-- consumer-side property: if the producer emitted LlmAttempt and
+-- the conversation has not yet hit a turn-boundary clear,
+-- TurnRetryContext exists for the conversation.
+invariant TurnRetryContextPresentBetweenAttemptAndTurnBoundary {
+    -- "If an LlmAttempt was the most recent retry-relevant event for
+    -- a conversation and no turn-boundary clear has fired since,
+    -- TurnRetryContext exists for that conversation."
+    -- Modelled as a property of the rule fan-in: the populator rule
+    -- sets it; the two clear rules unset it; no other rule touches
+    -- it. The implementation guarantees this by construction.
+    for conv_id in TurnRetryContext:
+        TurnRetryContext{conversation_id: conv_id}.retry.attempt >= 1
+        and TurnRetryContext{conversation_id: conv_id}.retry.attempt
+              <= TurnRetryContext{conversation_id: conv_id}.retry.max_attempts
+}
+
+-- REQ-LRV-002: the wire emission only carries reason values from the
+-- retryable subset. Structurally enforced by the
+-- RuntimeEmitsLlmAttemptOnScheduleRetry rule's reason.kind precondition.
+invariant LlmAttemptReasonInRetryableSet {
+    for conv_id in LlmAttemptBroadcast:
+        LlmAttemptBroadcast{conv_id}.payload.reason.kind
+            in { "network", "rate_limit", "server_error" }
+}
+
+-- REQ-LRV-004: LlmAttempt is emitted on the conversation whose
+-- state machine scheduled the retry. Sub-agents have their own
+-- conversation_id and their own SSE stream; the runtime guarantees
+-- broadcast scope (broadcast_tx is per-conversation). The invariant
+-- documents the contract:
+invariant LlmAttemptDoesNotEscapeConversationBoundary {
+    -- "An LlmAttempt for conversation X is delivered only on
+    -- conversation X's SSE stream."
+    -- Modelled as a sse_wire-level property; this spec asserts the
+    -- non-leak by construction of broadcast_tx scope.
+    for conv_id in LlmAttemptBroadcast:
+        LlmAttemptBroadcast{conv_id}.delivered_on_conversation = conv_id
+}
+
+-- REQ-LRV-007: LlmAttempt is replay-eligible; RateLimitSnapshot is
+-- not. The invariant restates the wire-level contract from
+-- sse_wire.allium's EphemeralEventAppendedToReplayRing whitelist
+-- (which includes "llm_attempt" and excludes "rate_limit_snapshot").
+-- Modelled here as a cross-spec assertion so a future change to
+-- either spec that breaks the invariant surfaces in this spec's
+-- check rather than only in sse_wire's.
+invariant LlmAttemptReplayEligible {
+    -- "Every LlmAttempt event appended to a conversation's replay
+    -- ring is later observable to a reconnecting client via the
+    -- ring's pending_events on the next InitSnapshot."
+    -- This is the contract; the realisation is in sse_wire's
+    -- EphemeralEventAppendedToReplayRing rule (whose whitelist
+    -- includes "llm_attempt"). Stated here so a future change that
+    -- drops "llm_attempt" from the whitelist breaks an invariant
+    -- visibly attributed to this spec.
+    -- (Truly structural assertion would require a cross-spec entity
+    -- reference; the prose form is the load-bearing reminder for
+    -- now — see `deferred ReplayRingMembershipStructural` below.)
+    true
+}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The two surfaces this spec exposes:
+--
+--   RetryContextProducer — read by working-phase-visibility's
+--       render_retry_modifier_for(view) helper. Exposes the
+--       TurnRetryContext entity (keyed by conversation_id) and
+--       the RetryContext value type.
+--
+--   RetryCountPersistedSurface — read by the UI's
+--       AssistantMessage component to render the post-hoc badge.
+--       Exposes the display_data.retry_count field on a persisted
+--       assistant message.
+surface RetryContextProducer {
+    facing consumer_conversation: String
+
+    exposes:
+        TurnRetryContext{conversation_id}
+        RetryContext
+
+    @guarantee TurnBoundaryClears
+        -- TurnRetryContext is removed on every turn-terminal event
+        -- (AgentDone, terminal Error). The consumer is guaranteed
+        -- not to render a stale "(retry K/N)" suffix on a turn that
+        -- has finished or aborted.
+
+    @guarantee RetryablesOnly
+        -- The reason field is always one of the three retryable
+        -- classifications (Network, RateLimit, ServerError). Non-
+        -- retryable LlmErrorKind variants never produce an
+        -- LlmAttempt because the state machine terminates the turn
+        -- without scheduling a retry.
+
+    @guarantee ReplaySurvivable
+        -- A client reconnecting mid-backoff observes the LlmAttempt
+        -- via the SSE replay ring and reconstructs TurnRetryContext
+        -- identical to a continuously-connected client's. The
+        -- guarantee is rooted in sse_wire's
+        -- EphemeralEventAppendedToReplayRing whitelist; this surface
+        -- asserts the consumer-visible consequence.
+}
+
+surface RetryCountPersistedSurface {
+    facing message_consumer: String  -- message_id
+
+    exposes:
+        PersistedAssistantMessage{message_id}.display_data_retry_count
+
+    @guarantee NonNegativeRetryCount
+        -- retry_count is always >= 0. Zero means "did not retry" and
+        -- the UI's badge-display rule hides the badge in that case.
+
+    @guarantee CountIsFinalAttemptMinusOne
+        -- retry_count = final_attempt - 1 for the LlmResponse that
+        -- produced the persisted message. The runtime captures
+        -- final_attempt at the moment of state transition out of
+        -- LlmRequesting/AwaitingContinuation.
+}
+
+------------------------------------------------------------
+-- Deferred
+------------------------------------------------------------
+
+deferred PerProviderRetryPolicies
+    -- All retryable LlmErrorKind variants share the global
+    -- MAX_RETRY_ATTEMPTS = 3 ceiling (`state_machine/transition.rs:183`)
+    -- and the exponential backoff 1s/2s/4s. Per-provider customisation
+    -- (e.g. longer backoff for Anthropic 429, faster for OpenAI 5xx)
+    -- is wire-compatible — the LlmAttempt event carries max_attempts
+    -- per-event, so the runtime can switch policies without a spec
+    -- change. Defer until a use case materialises.
+    -- Location: crates/phoenix-ide/src/state_machine/transition.rs
+
+deferred LiveBackoffCountdown
+    -- A live "backing off Ns" sub-display would compose
+    -- (now() - llm_attempt.event_arrived_at) against
+    -- llm_attempt.backing_off_ms to show the remaining backoff.
+    -- The wire field is already present; the consumer-side rule
+    -- would live in specs/working-phase-visibility/ as a new
+    -- DisplayWhen* rule gated on "currently backing off." V1 omits
+    -- this; the static "(retry K/N <reason>)" suffix is sufficient.
+    -- Location: ui/src/components/StateBar.tsx
+
+deferred CrossConversationRetryRollup
+    -- A parent-view aggregation ("this parent's sub-agents are
+    -- collectively retrying") is potentially useful for the
+    -- aggregate-dashboard feature but out of scope for v1. The
+    -- per-conversation TurnRetryContext entity is the precondition
+    -- for any such rollup.
+    -- Location: would live in ui/src/pages/
+
+deferred PerToolRetryBadge
+    -- An inline badge on a tool widget ("this tool call's underlying
+    -- LLM turn retried 2x") would require correlating LlmAttempt
+    -- events to specific tool blocks. The retry_count on the
+    -- assistant-message persist (REQ-LRV-006) covers the post-hoc
+    -- message-level surface; per-tool granularity is deferred.
+    -- See working-phase-visibility's PerArtifactRetryBadge deferred
+    -- entry — the two are linked.
+    -- Location: ui/src/components/MessageComponents.tsx
+
+deferred Req005CancellationDuringBackoff
+    -- REQ-LRV-005 is satisfied by the existing state machine: a
+    -- user-triggered cancel during backoff transitions the
+    -- conversation to a Cancelling* variant (handled by
+    -- handle_core_cancel paths); the spawned Effect::ScheduleRetry
+    -- task continues sleeping but its eventual RetryTimeout event is
+    -- absorbed by the state machine's idle-LlmResponse stale-event
+    -- absorber (the `Idle`+`LlmResponse` stale absorber in
+    -- transition.rs). The display side naturally tracks the
+    -- transition via the same TurnRetryContext entity (cleared on
+    -- the turn-terminal event that follows the cancellation, per
+    -- TurnRetryContextClearedOn{AgentDone,TerminalError} rules
+    -- above). No new event or rule needed; the requirement is the
+    -- explicit documentation of this behaviour.
+    -- Location: specs/conversation_atom/ (state machine transitions)
+
+deferred ReplayRingMembershipStructural
+    -- The LlmAttemptReplayEligible invariant above is asserted as
+    -- prose because cross-spec entity membership is awkward to
+    -- express structurally in Allium v3. A future extension could
+    -- model sse_wire/ReplayRing.entries explicitly across specs and
+    -- assert that every LlmAttemptBroadcast{conv_id} appears in the
+    -- corresponding ring. For v1 the cross-spec checklist at the
+    -- top of EphemeralEventAppendedToReplayRing is the operational
+    -- safeguard.
+    -- Location: specs/sse_wire/sse_wire.allium
+
+------------------------------------------------------------
+-- Open questions
+------------------------------------------------------------
+
+-- No open questions remain. Decisions resolved during drafting
+-- (session of 2026-05-27):
+--
+--   - LlmAttempt vs RateLimitSnapshot: kept distinct (REQ-LRV-007).
+--     LlmAttempt IS replay-eligible; RateLimitSnapshot is NOT.
+--     Different lifecycles, different staleness properties.
+--
+--   - max_attempts source: global MAX_RETRY_ATTEMPTS = 3
+--     (`transition.rs:183`). Per-event field on the wire keeps the
+--     contract per-provider-compatible for the future.
+--
+--   - resets_at threading: widen Event::LlmError to carry
+--     resets_at: Option<DateTime<Utc>> (sourced from
+--     LlmError.quota.resets_at on the inbound error). The retry
+--     scheduler forwards it onto Effect::ScheduleRetry and from
+--     there onto the LlmAttempt wire event. Alternative
+--     (side-channel quota-store lookup at emit time) rejected for
+--     coupling the executor to codex-specific quota state.
+--
+--   - retry_count carrier on the persisted message: typed
+--     `retry_count: u32` field on MessageDisplayData. Mirrors
+--     working-phase-visibility's tool_starts and the existing
+--     duration_ms-on-tool-result convention. Rejected: a new SSE
+--     variant (parallel representation), a free-form JSON key
+--     (loss of compile-time shape).
+--
+--   - Sub-agent retries: parent stays mute (REQ-LRV-004). Each
+--     conversation's SSE stream carries only its own retries.
+--     Cross-conversation rollups deferred.
+--
+--   - Cancellation during backoff: no new event needed — the
+--     existing Cancelling* transitions are the abort signal, stale
+--     RetryTimeouts are filtered by the state machine's idle
+--     absorber. The display naturally tracks the transition
+--     through the same TurnRetryContext lifecycle. Documented
+--     explicitly as Req005CancellationDuringBackoff deferred.
+--
+--   - Backing-off countdown: deferred (LiveBackoffCountdown). V1
+--     renders only the static "(retry K/N <reason>)" suffix; the
+--     backing_off_ms wire field exists for the future countdown
+--     and for log/debug visibility.
