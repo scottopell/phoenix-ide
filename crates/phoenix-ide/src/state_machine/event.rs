@@ -130,6 +130,9 @@ pub enum Event {
         #[allow(dead_code)] // Reserved for conversation flow control
         end_turn: bool,
         usage: Usage,
+        /// Server-generated request id, threaded through from `LlmOutcome::Response`.
+        /// Used as the eventual `AssistantMessage.message_id`.
+        request_id: String,
     },
     LlmError {
         message: String,
@@ -207,6 +210,8 @@ pub enum Event {
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
+    /// User dismissed the structured question UI without answering it.
+    UserQuestionDismissed,
 
     /// Grace turn exhausted -- sub-agent used its extra turn without calling `submit_result`.
     /// The executor extracted the last assistant text (if any) before sending this event.
@@ -297,6 +302,7 @@ impl Event {
             Event::TaskApprovalDecided { .. } => "TaskApprovalDecided",
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
+            Event::UserQuestionDismissed => "UserQuestionDismissed",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             Event::CredentialBecameAvailable => "CredentialBecameAvailable",
             Event::CredentialHelperFailed { .. } => "CredentialHelperFailed",
@@ -333,6 +339,7 @@ pub enum CoreEvent {
         tool_calls: Vec<ToolCall>,
         end_turn: bool,
         usage: Usage,
+        request_id: String,
     },
     LlmError {
         message: String,
@@ -390,6 +397,7 @@ pub enum ParentOnlyEvent {
         answers: HashMap<String, String>,
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
+    UserQuestionDismissed,
     CredentialBecameAvailable,
     CredentialHelperFailed {
         message: String,
@@ -475,11 +483,13 @@ impl TryFrom<Event> for ParentEvent {
                 tool_calls,
                 end_turn,
                 usage,
+                request_id,
             } => Ok(ParentEvent::Core(CoreEvent::LlmResponse {
                 content,
                 tool_calls,
                 end_turn,
                 usage,
+                request_id,
             })),
             Event::LlmError {
                 message,
@@ -554,6 +564,9 @@ impl TryFrom<Event> for ParentEvent {
                 answers,
                 annotations,
             })),
+            Event::UserQuestionDismissed => {
+                Ok(ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed))
+            }
             Event::CredentialBecameAvailable => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::CredentialBecameAvailable,
             )),
@@ -611,11 +624,13 @@ impl TryFrom<Event> for SubAgentEvent {
                 tool_calls,
                 end_turn,
                 usage,
+                request_id,
             } => Ok(SubAgentEvent::Core(CoreEvent::LlmResponse {
                 content,
                 tool_calls,
                 end_turn,
                 usage,
+                request_id,
             })),
             Event::LlmError {
                 message,
@@ -680,6 +695,7 @@ impl TryFrom<Event> for SubAgentEvent {
             Event::TaskApprovalDecided { .. }
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
+            | Event::UserQuestionDismissed
             | Event::CredentialBecameAvailable
             | Event::CredentialHelperFailed { .. }
             | Event::TaskResolved { .. }
@@ -724,6 +740,7 @@ impl ParentEvent {
                 ParentOnlyEvent::TaskApprovalDecided { .. } => "TaskApprovalDecided",
                 ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
+                ParentOnlyEvent::UserQuestionDismissed => "UserQuestionDismissed",
                 ParentOnlyEvent::CredentialBecameAvailable => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",
                 ParentOnlyEvent::TaskResolved { .. } => "TaskResolved",

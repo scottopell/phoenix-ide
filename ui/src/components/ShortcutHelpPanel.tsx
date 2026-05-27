@@ -37,7 +37,7 @@ const SHORTCUT_GROUPS: ShortcutGroup[] = [
       { key: 'Shift+Tab', description: 'Previous question' },
       { key: 'n', description: 'Add notes (preview questions)' },
       { key: 'Ctrl+Enter', description: 'Submit answers' },
-      { key: 'Escape', description: 'Decline (with confirmation)' },
+      { key: 'Escape', description: 'Dismiss structured question (with confirmation)' },
     ],
   },
   {

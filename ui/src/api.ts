@@ -436,10 +436,18 @@ export interface McpServerStatus {
   pending_oauth_url?: string;
 }
 
+export interface McpReloadFailure {
+  server: string;
+  action: string;
+  error: string;
+}
+
 export interface McpReloadResult {
   added: string[];
   removed: string[];
+  restarted: string[];
   unchanged: string[];
+  failed: McpReloadFailure[];
 }
 
 export interface GitBranchEntry {
@@ -880,6 +888,16 @@ export const api = {
     return resp.json();
   },
 
+  /** List tasks from a project tasks/ directory before a conversation exists */
+  async listProjectTasks(cwd: string, signal?: AbortSignal): Promise<{ tasks: TaskEntry[] }> {
+    const resp = await fetch(
+      `/api/tasks?cwd=${encodeURIComponent(cwd)}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to list tasks');
+    return resp.json();
+  },
+
   /** List tasks from the conversation's project tasks/ directory */
   async listConversationTasks(
     convId: string,
@@ -1028,6 +1046,14 @@ export const api = {
       body: JSON.stringify({ answers, annotations }),
     });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to respond to question'); }
+    return resp.json();
+  },
+
+  async dismissQuestion(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/dismiss-question`, {
+      method: 'POST',
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to dismiss question'); }
     return resp.json();
   },
 

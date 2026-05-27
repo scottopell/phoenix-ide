@@ -56,6 +56,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // Install a rustls crypto provider explicitly. rustls 0.23 refuses
+    // to auto-pick when both `ring` and `aws-lc-rs` end up in the dep
+    // tree — which happens here via reqwest (aws-lc-rs) + our direct
+    // rustls = { features = ["ring"] } and several transitive consumers
+    // (chromiumoxide, hyper-rustls). Without this call the first
+    // `ServerConfig::builder()` call panics on startup.
+    //
+    // Preference: install `ring` when no provider is already set. ring
+    // matches the feature flag on our direct rustls dep and stays
+    // consistent with our existing TLS code paths.
+    //
+    // `install_default()` returns `Err(existing)` if a provider was
+    // already installed earlier in the process — typically benign
+    // (an upstream library may set one as an import side effect). We
+    // accept whichever provider is in place rather than crashing on
+    // that race; the panic we're trying to prevent only occurs when
+    // NO provider is installed at all.
+    if rustls::crypto::ring::default_provider()
+        .install_default()
+        .is_err()
+    {
+        tracing::debug!(
+            "rustls default crypto provider was already installed by another component; \
+             keeping the existing provider"
+        );
+    }
+
     hot_restart::record_start_time();
 
     // REQ-BASH-007: install the child subreaper so descendants whose
@@ -230,11 +257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let compression = CompressionLayer::new()
-        .gzip(true)
-        .br(true)
-        .deflate(true)
-        .zstd(true);
+    let compression = CompressionLayer::new().gzip(true).br(true);
 
     // HTTP access log: one line per request with method, path, status, latency.
     // Health check endpoint (/version) is suppressed from normal INFO logging.

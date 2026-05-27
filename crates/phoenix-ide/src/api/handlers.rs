@@ -21,9 +21,9 @@ use super::types::{
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse,
-    SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest,
-    ValidateCwdResponse,
+    NotificationSettingsRequest, ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry,
+    SkillsResponse, SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse,
+    UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::db::{
@@ -36,7 +36,7 @@ use crate::git_ops::{
 use crate::llm::{ContentBlock, GatewayStatus};
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
-use crate::terminal::terminal_ws_handler;
+use crate::terminal::{terminal_ws_global_handler, terminal_ws_handler};
 
 use super::browser_view::browser_view_ws_handler;
 
@@ -50,7 +50,7 @@ use axum::{
 };
 use chrono::Datelike;
 use chrono::{Local, Timelike};
-use rand::seq::SliceRandom;
+use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
@@ -90,6 +90,9 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/stream", get(stream_conversation))
         // Terminal WebSocket (REQ-TERM-001 through REQ-TERM-014)
         .route("/api/conversations/:id/terminal", get(terminal_ws_handler))
+        // Global terminal WebSocket — singleton scope, unbound to any
+        // conversation (REQ-TERM-WS-001). Surfaced on /new.
+        .route("/api/terminal/global", get(terminal_ws_global_handler))
         // Live browser view WebSocket (REQ-BT-018)
         .route(
             "/api/conversations/:id/browser-view",
@@ -118,6 +121,10 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/task-feedback", post(task_feedback))
         // User question response (REQ-AUQ-003)
         .route("/api/conversations/:id/respond", post(respond_to_question))
+        .route(
+            "/api/conversations/:id/dismiss-question",
+            post(dismiss_question),
+        )
         // Task abandon (REQ-PROJ-010)
         .route("/api/conversations/:id/abandon-task", post(abandon_task))
         // Mark as merged (REQ-PROJ-026)
@@ -196,6 +203,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/pr-auto-fix-context",
             post(create_pr_auto_fix_context),
         )
+        // Project task files available before a conversation exists
+        .route("/api/tasks", get(list_project_tasks))
         // Git utilities
         .route("/api/git/branches", get(list_git_branches))
         // Environment info
@@ -1975,6 +1984,33 @@ async fn respond_to_question(
     Ok(Json(SuccessResponse { success: true }))
 }
 
+async fn dismiss_question(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::AwaitingUserResponse { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Conversation is not awaiting a user response",
+            "wrong_state",
+        ))));
+    }
+
+    state
+        .runtime
+        .send_event(&id, Event::UserQuestionDismissed)
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
 // ============================================================
 // Lifecycle (REQ-API-006)
 // ============================================================
@@ -2164,7 +2200,18 @@ pub(super) async fn run_resource_cleanup_cascade(
         );
     }
 
-    // Step 4: project worktree.
+    // Step 4: terminal PTY. Same scope-equality preservation rule
+    // (REQ-TERM-WS-001, REQ-TERM-012). Sub-agent / no-terminal scopes
+    // hit the no-op fast path inside the cascade — registry miss is the
+    // common case during conversation cleanup.
+    crate::terminal::cascade_terminal_on_delete(
+        &state.terminals,
+        &work_scope,
+        inheritor_scope.as_ref(),
+    )
+    .await;
+
+    // Step 5: project worktree.
     let project_report = cascade_projects_on_delete(state, conv).await;
     if let Some(err) = &project_report.error {
         tracing::warn!(
@@ -2176,7 +2223,7 @@ pub(super) async fn run_resource_cleanup_cascade(
         );
     }
 
-    // Step 5: browser session. Same scope-equality rule as tmux
+    // Step 6: browser session. Same scope-equality rule as tmux
     // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
     crate::tools::browser::session::cascade_browser_on_delete(
         state.runtime.browser_sessions(),
@@ -3135,6 +3182,70 @@ async fn list_conversation_skills(
 // Tasks
 // ============================================================
 
+async fn task_entries_for_cwd(state: &AppState, cwd: &std::path::Path) -> Vec<TaskEntry> {
+    let tasks_dir_name = taskmd_core::discover::discover_or_default(cwd)
+        .to_string_lossy()
+        .into_owned();
+    let tasks_dir = cwd.join(&tasks_dir_name);
+
+    let all_convs = state
+        .runtime
+        .db()
+        .list_conversations()
+        .await
+        .unwrap_or_default();
+    let target_project_id = state
+        .runtime
+        .db()
+        .list_projects()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .find(|p| std::path::Path::new(&p.canonical_path) == cwd)
+        .map(|p| p.id);
+    let task_to_slug: std::collections::HashMap<String, String> = all_convs
+        .iter()
+        .filter(|c| match target_project_id.as_deref() {
+            Some(project_id) => c.project_id.as_deref() == Some(project_id),
+            None => std::path::Path::new(&c.cwd) == cwd,
+        })
+        .filter_map(|c| {
+            let task_id = c.conv_mode.task_id()?;
+            let slug = c.slug.as_deref()?;
+            Some((task_id.to_string(), slug.to_string()))
+        })
+        .collect();
+
+    taskmd_core::tasks::list_tasks(&tasks_dir)
+        .into_iter()
+        .map(|t| {
+            let conversation_slug = task_to_slug.get(&t.id).cloned();
+            TaskEntry {
+                id: t.id,
+                priority: t.priority.to_string(),
+                status: t.status.to_string(),
+                slug: t.slug,
+                path: t.path.to_string_lossy().into_owned(),
+                conversation_slug,
+            }
+        })
+        .collect()
+}
+
+/// List task files from a project's tasks/ directory before a conversation exists.
+async fn list_project_tasks(
+    State(state): State<AppState>,
+    Query(query): Query<ProjectTasksQuery>,
+) -> Result<Json<TasksResponse>, AppError> {
+    let cwd = std::path::PathBuf::from(&query.cwd);
+    if !cwd.exists() || !cwd.is_dir() {
+        return Err(AppError::BadRequest("Directory does not exist".to_string()));
+    }
+    Ok(Json(TasksResponse {
+        tasks: task_entries_for_cwd(&state, &cwd).await,
+    }))
+}
+
 /// List task files from the conversation's project tasks/ directory.
 async fn list_conversation_tasks(
     State(state): State<AppState>,
@@ -3148,43 +3259,9 @@ async fn list_conversation_tasks(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
-    let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
-        .to_string_lossy()
-        .into_owned();
-    let tasks_dir = cwd.join(&tasks_dir_name);
-
-    // Build task_id -> conversation_slug map from active Work conversations
-    let all_convs = state
-        .runtime
-        .db()
-        .list_conversations()
-        .await
-        .unwrap_or_default();
-    let task_to_slug: std::collections::HashMap<String, String> = all_convs
-        .iter()
-        .filter_map(|c| {
-            let task_id = c.conv_mode.task_id()?;
-            let slug = c.slug.as_deref()?;
-            Some((task_id.to_string(), slug.to_string()))
-        })
-        .collect();
-
-    let tasks = taskmd_core::tasks::list_tasks(&tasks_dir)
-        .into_iter()
-        .map(|t| {
-            let conversation_slug = task_to_slug.get(&t.id).cloned();
-            TaskEntry {
-                id: t.id,
-                priority: t.priority.to_string(),
-                status: t.status.to_string(),
-                slug: t.slug,
-                path: t.path.to_string_lossy().into_owned(),
-                conversation_slug,
-            }
-        })
-        .collect();
-
-    Ok(Json(TasksResponse { tasks }))
+    Ok(Json(TasksResponse {
+        tasks: task_entries_for_cwd(&state, &cwd).await,
+    }))
 }
 
 /// Token usage totals for a conversation (own turns + root rollup including sub-agents).
@@ -3341,6 +3418,8 @@ async fn reload_mcp(State(state): State<AppState>) -> impl IntoResponse {
     tracing::info!(
         added = ?result.added,
         removed = ?result.removed,
+        restarted = ?result.restarted,
+        failed = ?result.failed,
         unchanged = result.unchanged.len(),
         "MCP config reloaded"
     );
@@ -3472,7 +3551,7 @@ fn generate_slug() -> String {
         "star",
     ];
 
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let adjective = words.choose(&mut rng).unwrap_or(&"blue");
     let noun = words.choose(&mut rng).unwrap_or(&"sky");
 

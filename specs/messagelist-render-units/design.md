@@ -2,34 +2,36 @@
 
 This document describes the technical architecture implementing the
 requirements in `specs/messagelist-render-units/requirements.md`. The
-behavioural specifications live in `render_units.allium` (unit
-construction) and `windowing.allium` (window lifecycle).
+behavioural specification for unit construction lives in
+`render_units.allium`. The windowing/scroll-anchor behavioural layer is
+no longer Phoenix code; it is delegated to `react-virtuoso` (see
+REQ-MLRU-015), so the corresponding `windowing.allium` was removed in
+task 60410.
 
 ## File Layout
 
 ```
 ui/src/
 ├── conversation/
-│   ├── renderUnits.ts           # NEW. buildRenderUnits + types
-│   ├── renderUnits.test.ts      # NEW. Unit-construction tests
-│   ├── unitHeightCache.ts       # NEW. measured-height map + sessionStorage
-│   └── unitHeightCache.test.ts  # NEW.
-│   (joins existing atom.ts, ConversationStore.ts, etc. as the
-│   projection from atom state to render shape)
-│
-├── hooks/
-│   ├── useBottomAnchoredWindow.ts   # REWORKED. Takes HistoricalUnit[]
-│   └── useUnitHeightObserver.ts     # NEW. ResizeObserver-per-unit wiring
+│   └── renderUnits.ts           # buildRenderUnits + types
+│      (joins existing atom.ts, ConversationStore.ts, etc. as the
+│       projection from atom state to render shape)
 │
 ├── components/
-│   ├── MessageList.tsx          # REWORKED. Derives units, slices, dispatches
-│   ├── MessageListBody.tsx      # SPLIT OUT. Pure (HistoricalUnit[], TailUnit[]) -> JSX
-│   ├── StreamingMessage.tsx     # REWORKED. Subscribes to buffer atom internally
-│   └── MessageList.test.tsx     # EXTENDED. Adds tool-result-heavy-tail regression
+│   ├── MessageList.tsx          # Builds units, renders single <Virtuoso>
+│   ├── StreamingMessage.tsx     # Subscribes to buffer atom internally
+│   └── MessageList.test.tsx     # Unit + dispatch + ack-identity tests
 │
 └── generated/
     └── (no changes — render units are a UI-only concept; no wire types)
 ```
+
+The following files existed in earlier iterations and were removed in
+task 60410 when virtuoso took over windowing:
+
+- `ui/src/hooks/useBottomAnchoredWindow.ts` (+ test)
+- `ui/src/hooks/useUnitHeightObserver.ts`
+- `ui/src/conversation/unitHeightCache.ts` (+ test)
 
 ## Type Shapes
 
@@ -45,18 +47,18 @@ export type AwaitingSubAgentsState = Extract<
 
 /** Units that live in the virtualized historical list. */
 export type HistoricalUnit =
-  | { kind: 'user';   key: string; message: Message }
-  | { kind: 'skill';  key: string; message: Message }
+  | { kind: 'user';         key: string; message: Message }
+  | { kind: 'skill';        key: string; message: Message }
   | { kind: 'agent_turn';
       key: string;
       agent: Message;
       toolResultsByUseId: ReadonlyMap<string, Message>;
       isFirstInTurn: boolean }
-  | { kind: 'system'; key: string; message: Message };
+  | { kind: 'system';       key: string; message: Message }
+  | { kind: 'pending_user'; key: string; message: QueuedMessage };
 
 /** Units pinned to the tail; never collapsed by the window. */
 export type TailUnit =
-  | { kind: 'pending_user';     key: string; message: QueuedMessage }
   | { kind: 'sub_agent_status'; key: string; state: AwaitingSubAgentsState }
   | { kind: 'streaming_agent';  key: string };
 
@@ -72,8 +74,11 @@ export interface BuildInputs {
   pendingMessages: QueuedMessage[];
   convState: ConversationState;
   /** Tag for the active streaming session (null when no buffer). Built
-   *  by the caller from `useStreamingStartedAt(slug)`; the key
-   *  embeds startedAt so back-to-back sessions remount cleanly. */
+   *  by the caller from `useStreamingRequestId(slug)`; the key is the
+   *  server-allocated `request_id` for the in-flight LLM dispatch and
+   *  also becomes the finalized agent message's `message_id`, so the
+   *  streaming `TailUnit` and the eventual `agent_turn` `HistoricalUnit`
+   *  share a key by construction — symmetric to pending_user → user. */
   streamingHandle: { key: string } | null;
 }
 
@@ -83,13 +88,22 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits;
 ### Key naming convention
 
 - `user` / `agent_turn` / `system` / `skill` units: `key = message.message_id`
-- `pending_user`: `key = queuedMessage.localId`
+- `pending_user`: `key = queuedMessage.localId` — by convention the server
+  echoes the message back with `message_id = localId`, so the same render-
+  unit key persists through the pending → sent transition (the unit's
+  *kind* changes from `pending_user` to `user`, but React's reconciler
+  treats it as an in-place update on a single keyed node — no
+  cross-region promotion, no scroll compensation needed).
 - `sub_agent_status`: `key = 'sub-agent-status'` (singleton)
-- `streaming_agent`: `key = 'streaming-${conversationId}-${startedAt}'` —
-  the `startedAt` from `StreamingBuffer` makes the key stable across token
-  arrivals but unique per streaming session. The atom owns the buffer; the
-  unit just needs to be identity-stable so React preserves the leaf state
-  across re-derivations.
+- `streaming_agent`: `key = streamingBuffer.requestId` — the server-allocated
+  `request_id` for the active LLM dispatch. Stable across all tokens in
+  the session (every Token SSE event carries it) AND becomes the
+  finalized agent message's `message_id` on persistence, so the
+  streaming `TailUnit` and the eventual `agent_turn` `HistoricalUnit`
+  share a render-unit key. The streaming → sent transition is therefore
+  an in-place keyed update on a single render unit — symmetric to
+  pending_user → user (REQ-MLRU-001). No cross-region key swap, no
+  imperative scroll compensation needed for the transition.
 
 ## Construction Algorithm
 
@@ -145,11 +159,15 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
     }
   }
 
-  const tailUnits: TailUnit[] = [];
-
+  // Pending user messages append to the END of historicalUnits, sharing
+  // the eventual `user` unit's key (localId == message_id at ack time).
+  // This keeps the pending → sent transition an in-place keyed update
+  // rather than a cross-region promotion from tailUnits to historicalUnits.
   for (const q of pendingMessages) {
-    tailUnits.push({ kind: 'pending_user', key: q.localId, message: q });
+    historicalUnits.push({ kind: 'pending_user', key: q.localId, message: q });
   }
+
+  const tailUnits: TailUnit[] = [];
 
   if (convState.type === 'awaiting_sub_agents') {
     tailUnits.push({
@@ -206,204 +224,139 @@ function buildAgentTurn(
 
 The function is pure, takes only data, has no DOM dependencies, and is
 fully unit-testable. `streamingHandle` is derived at the call site
-via `useStreamingStartedAt(slug)`: when streaming is active the hook
-returns the buffer's `startedAt` (a number stable across tokens but
-unique per session), which MessageList wraps into
-`{ key: \`streaming-${slug}-${startedAt}\` }`.
+via `useStreamingRequestId(slug)`: when streaming is active the hook
+returns the buffer's `requestId` (the server-allocated `request_id`
+stable across all tokens in the session AND identical to the eventual
+finalized `AssistantMessage.message_id`), which MessageList wraps into
+`{ key: requestId }`. The streaming → sent transition therefore
+preserves render-unit identity by construction.
 
-## Window Hook
+## Virtualization (REQ-MLRU-015)
 
-```ts
-// ui/src/hooks/useBottomAnchoredWindow.ts
+MessageList renders a single `<Virtuoso>` instance from `react-virtuoso`
+with the concatenation `[...historicalUnits, ...tailUnits]` as its
+`data` prop. Virtuoso owns: windowing (which items are in DOM at any
+time), scroll-anchor compensation (preserving viewport when items mount
+above the viewport), item-height measurement, and follow-output (pin-
+to-bottom behavior).
 
-export interface SavedScrollAnchor {
-  topVisibleUnitKey: string;
-  offsetWithinUnit: number;
-  /** Number of historical units at save time. Restore compares this
-   *  to current `historicalUnits.length` to detect "messages arrived
-   *  while away" and surface the ↓ New messages button. Optional for
-   *  forward-compat with anchors written by older app builds. */
-  unitCountAtSave?: number;
-}
-
-export interface UseWindowInputs {
-  historicalUnits: HistoricalUnit[];
-  conversationId: string | undefined;
-  scrollRootRef: React.RefObject<HTMLElement | null>;
-  savedAnchor?: SavedScrollAnchor | null;
-  heightCache?: UnitHeightCache | null;
-}
-
-export interface UseWindowOutputs {
-  firstRenderedUnitIndex: number;
-  spacerHeight: number;
-  /** Callback ref — when the sentinel DOM node mounts (which may
-   *  happen on a later render than the first, e.g. an empty
-   *  conversation that grows past INITIAL_WINDOW), this triggers the
-   *  IntersectionObserver setup effect via a state-backed ref. A
-   *  RefObject would not, because ref-mutation doesn't trigger
-   *  re-runs of useEffect. */
-  topSentinelRef: (node: HTMLDivElement | null) => void;
-}
-
-export function useBottomAnchoredWindow(inputs: UseWindowInputs): UseWindowOutputs;
-```
-
-Constants:
-
-```ts
-export const INITIAL_WINDOW = 12;
-export const EXPAND_BATCH = 12;
-export const SENTINEL_ROOT_MARGIN = '600px 0px 0px 0px';
-export const RESTORE_OVERSCAN = 4;
-
-export const KIND_ESTIMATES: Record<HistoricalUnit['kind'], number> = {
-  user: 100,
-  skill: 80,
-  agent_turn: 400,
-  system: 100,
-};
-```
-
-Internal mechanics:
-
-1. `firstRenderedUnitIndex` is React state. Initial value is computed once
-   per conversation from `(historicalUnits.length, savedAnchor)`.
-2. A `useEffect` attaches an `IntersectionObserver` to `topSentinelRef`
-   with `root: scrollRootRef.current` and `rootMargin: SENTINEL_ROOT_MARGIN`.
-   When the sentinel intersects, the effect decreases
-   `firstRenderedUnitIndex` by `EXPAND_BATCH` (clamped at 0).
-3. Before the state decrement, the effect captures
-   `scrollRootRef.current.scrollHeight` into `prevScrollHeightRef`.
-4. A `useLayoutEffect` keyed on `firstRenderedUnitIndex` consumes
-   `prevScrollHeightRef` and adjusts `scrollTop` by the delta.
-5. `spacerHeight` is computed via `useMemo` over the prefix slice and the
-   `heightCache`. When the cache emits a change event, the memo
-   reconciles and the spacer re-renders.
-
-The hook returns `topSentinelRef` so the component places the sentinel
-correctly in the DOM:
+Key configuration:
 
 ```tsx
-<div className="message-collapsed-spacer" style={{ height: spacerHeight }} />
-<div ref={topSentinelRef} aria-hidden />
-{historicalUnits.slice(firstRenderedUnitIndex).map(renderUnit)}
-{tailUnits.map(renderTailUnit)}
+<Virtuoso
+  key={conversationId ?? '__empty__'}
+  ref={virtuosoRef}
+  data={allUnits}
+  itemContent={(_, unit) => (
+    <div className="virtuoso-row" data-render-unit-key={unit.key}>
+      {renderUnit(unit, slug, onOpenFile, onRetry, onCancelSteering)}
+    </div>
+  )}
+  computeItemKey={(_, unit) => unit.key}
+  followOutput="auto"
+  atBottomThreshold={100}
+  atBottomStateChange={(atBottom) => setIsAtBottom(atBottom)}
+  initialTopMostItemIndex={allUnits.length > 0 ? allUnits.length - 1 : 0}
+  alignToBottom
+  increaseViewportBy={{ top: 600, bottom: 600 }}
+  {...(SystemPromptHeaderSlot ? { components: { Header: SystemPromptHeaderSlot } } : {})}
+  className="message-virtuoso"
+/>
 ```
 
-## Height Cache
+Rationale for each non-default knob:
 
-```ts
-// ui/src/conversation/unitHeightCache.ts
+- `key={conversationId}` — forces a fresh Virtuoso instance per
+  conversation. Virtuoso's measurement cache and pin state are owned
+  per-instance; remount guarantees a clean bottom-pinned landing on
+  every switch without leakage from the prior conversation. Cost: a
+  re-measure on return visits, acceptable given the sub-second visit
+  cadence and small typical conversation size.
+- `followOutput="auto"` — when the user is already pinned to the bottom
+  and a new item arrives (or the streaming agent's item grows), Virtuoso
+  re-snaps. When the user has scrolled up, Virtuoso leaves the viewport
+  alone. This is the entire pin/no-pin policy (REQ-MLRU-014); no force-
+  scroll override exists.
+- `atBottomThreshold={100}` — matches the prior hand-rolled
+  `scrollHeight - scrollTop - clientHeight <= 100` threshold so the
+  pin/no-pin classification stays identical to user expectations
+  established by the previous implementation.
+- `initialTopMostItemIndex={allUnits.length - 1}` + `alignToBottom` —
+  bottom-pinned mount (replaces REQ-MLRU-005). For empty data, index 0
+  is a no-op default.
+- `increaseViewportBy={{ top: 600, bottom: 600 }}` — overscan distance
+  matching the prior 600-pixel sentinel rootMargin so the perceived
+  smoothness during scrollback is the same.
 
-const STORAGE_PREFIX = 'phoenix:hcache:';
+The `data-render-unit-key` attribute on each item wrapper is preserved
+for selectors used by tests and dev tools (it is also a guarantee in
+REQ-MLRU-001 that one DOM node per key persists through pending → sent
+acknowledgement).
 
-export class UnitHeightCache {
-  constructor(private readonly conversationId: string | undefined) {
-    this.heights = new Map();
-    this.listeners = new Set();
-    this.hydrateFromStorage();
-  }
+## Jump-to-Newest Button
 
-  set(key: string, height: number): void;
-  get(key: string): number | undefined;
-  subscribe(listener: () => void): () => void;
-  clear(): void;
-
-  /** Called by conversation-delete cascade. */
-  static clearConversation(conversationId: string): void;
-}
-
-export function useUnitHeightCache(conversationId: string | undefined): UnitHeightCache;
-```
-
-Reads are O(1) from the Map; the `sessionStorage` mirror is write-through
-and hydrated synchronously on construction. Writes are debounced (16ms
-trailing) to coalesce ResizeObserver bursts during scroll. Subscribers are
-notified after each successful write — the window hook subscribes so that
-spacer height updates land in a re-render.
-
-## Unit Height Observer
-
-```ts
-// ui/src/hooks/useUnitHeightObserver.ts
-
-/**
- * Returns a callback ref for each unit element. The callback attaches a
- * ResizeObserver and writes measured heights into the cache keyed by
- * unit.key.
- */
-export function useUnitHeightObserver(cache: UnitHeightCache): (
-  unit: HistoricalUnit,
-) => (el: HTMLElement | null) => void;
-```
-
-Used in `MessageListBody`:
+Visibility is driven by Virtuoso's `atBottomStateChange` callback:
 
 ```tsx
-const observe = useUnitHeightObserver(heightCache);
-
-return (
-  <>
-    {renderedUnits.map((unit) => (
-      <div key={unit.key} ref={observe(unit)}>
-        {renderUnit(unit)}
-      </div>
-    ))}
-  </>
-);
+{!isEmpty && !isAtBottom && (
+  <button className="jump-to-newest" onClick={scrollToNewest}>
+    ↓ New messages
+  </button>
+)}
 ```
 
-The ref callback caches per-unit-key observer instances to avoid
-re-creating observers on every render.
+Click calls the imperative Virtuoso ref:
 
-## Saved-Scroll Anchor
-
-```ts
-// inside MessageList.tsx
-
-interface SavedAnchorStorage {
-  read(conversationId: string): SavedScrollAnchor | null;
-  write(conversationId: string, anchor: SavedScrollAnchor): void;
-}
-
-const STORAGE_PREFIX = 'phoenix:msglist:anchor:';
+```tsx
+virtuosoRef.current?.scrollToIndex({
+  index: 'LAST',
+  align: 'end',
+  behavior: 'auto',
+});
 ```
 
-**Write path:** on `document.visibilitychange === 'hidden'` and on
-component unmount:
+`behavior: 'auto'` is an instant snap (no animated scroll), matching
+the prior `scrollTop = scrollHeight` pattern. After the scroll settles,
+Virtuoso fires `atBottomStateChange(true)` and the button is removed
+by the conditional render.
 
-1. Walk the rendered unit DOM nodes (via a ref-map keyed by `unit.key`)
-2. Find the first node whose `offsetTop >= scrollRoot.scrollTop`
-3. Compute `offsetWithinUnit = scrollRoot.scrollTop - node.offsetTop`
-4. Persist `{ topVisibleUnitKey: unit.key, offsetWithinUnit }`
+## System Prompt as Virtuoso Header
 
-**Read path:** on first render with a non-empty `historicalUnits[]`:
+When `systemPrompt` is non-empty, MessageList provides a Header slot to
+Virtuoso:
 
-1. Look up the saved anchor for the conversation id
-2. Find `foundIndex = historicalUnits.findIndex(u => u.key === anchor.topVisibleUnitKey)`
-3. If `foundIndex < 0`: fall back to bottom-pin
-4. Otherwise: set `firstRenderedUnitIndex = max(0, foundIndex - RESTORE_OVERSCAN)`
-5. In a layout effect after first paint: locate the DOM node for that
-   unit (via the ref-map), set
-   `scrollRoot.scrollTop = node.offsetTop + anchor.offsetWithinUnit`
+```tsx
+const SystemPromptHeaderSlot = useMemo(() => {
+  if (!systemPrompt) return undefined;
+  const Header = () => (
+    <SystemPromptHeader
+      systemPrompt={systemPrompt}
+      expanded={systemPromptExpanded}
+      onToggle={toggleSystemPrompt}
+    />
+  );
+  return Header;
+}, [systemPrompt, systemPromptExpanded, toggleSystemPrompt]);
+```
 
-If `sessionStorage` height cache (REQ-MLRU-013) has measured heights, the
-spacer height for the prefix is exact, so the unit's `offsetTop` is
-correct on first paint without an extra layout pass.
+Virtuoso treats the Header as item 0; it scrolls with content and is
+measured like any item. This means the system prompt scrolls off-screen
+when the user reads down through the conversation, matching the prior
+behavior where the prompt lived inside the same scrolling container.
 
-## Migration
+The Header prop is omitted (rather than passed `undefined`) when there
+is no prompt — `exactOptionalPropertyTypes: true` in tsconfig rejects
+explicit-undefined component prop values, so MessageList spreads
+conditionally via `{...(SystemPromptHeaderSlot ? { components: { Header: SystemPromptHeaderSlot } } : {})}`.
 
-The existing `localStorage` key `${SCROLL_KEY_PREFIX}{conversationId}`
-stores a number (scrollTop). The new anchor key is
-`phoenix:msglist:anchor:{conversationId}` storing a JSON
-`SavedScrollAnchor`. The old key is **not** migrated — one visit's worth of
-restore-to-bottom regression is acceptable, and conflating old/new shapes
-behind a single key invites parsing ambiguity. The old key is deleted on
-the first successful anchor write per conversation.
+## Saved-Scroll Anchor (REMOVED)
 
-The `${MSGCOUNT_KEY_PREFIX}` companion key is no longer needed and can be
-deleted in the same write.
+REQ-MLRU-009 was deprecated and the anchor-capture / restore /
+ack-DOM-snapshot machinery removed. No localStorage key is read or
+written. Mount lands pinned to the bottom (REQ-MLRU-015); per
+REQ-MLRU-001, pending → sent acknowledgement is a keyed in-place
+update on a single render unit, so no ack-time scroll compensation
+is needed.
 
 ## Streaming Subscription
 
@@ -476,62 +429,53 @@ notice their messages disappearing.
     that state
 15. `isStreaming = true` → `streaming_agent` tail unit emitted
 
-**Window-hook tests** (mocked DOM):
-
-1. Initial mount with no anchor → `firstRenderedUnitIndex = max(0, len - 12)`
-2. Initial mount with anchor found → index = `foundIndex - 4`, clamped at 0
-3. Initial mount with anchor not found → falls back to default
-4. Sentinel intersection → `firstRenderedUnitIndex` decreases by 12
-5. Sentinel intersection at index 0 → no-op
-6. Scroll compensation: scrollHeight increases by Δ → scrollTop increases
-   by Δ
+**Virtuoso behavioral tests** are out of scope for unit-test coverage:
+react-virtuoso requires real DOM measurement that happy-dom does not
+provide. The unit test file mocks `react-virtuoso` as a passthrough
+(renders the Header + all items) so React reconciler behavior is
+testable in isolation; real windowing and scroll-anchor behavior is
+verified by an in-browser smoke pass (see task 60410 acceptance
+criteria).
 
 **Integration tests** (`MessageList.test.tsx`):
 
 1. **REQ-MLRU-012 regression:** 1 user + 1 agent (20 tool_use blocks) +
-   20 tool messages → `agent_turn` is in initial rendered DOM
-2. Saved anchor restore: write anchor, remount → scrollTop matches saved
-3. Saved anchor with missing key → bottom-pinned mount
-4. Streaming start → `<StreamingMessage />` renders below tail; parent
-   `MessageList` does not re-render on simulated token bursts
-5. Streaming complete → `streaming_agent` disappears, `agent_turn`
-   appears, single commit
+   20 tool messages → `agent_turn` is in rendered DOM
+2. Pending → sent acknowledgement: render with a `pending_user` unit,
+   rerender with the same `localId` echoed as a `user` message →
+   render-unit key persists, same DOM node identity; no extra commits
+3. 100-message render smoke — MessageList builds + dispatches units
+   without throwing
+
+The streaming-isolation perf invariant (REQ-MLRU-010) is verified by
+`MessageList.perf-isolation.test.tsx` against the same passthrough
+virtuoso mock — virtuoso's internal scheduling is irrelevant to the
+streaming-isolation commit-count assertion.
 
 ## Performance Validation
 
-After implementation, validate with `browser_profile conversation-load`:
-
-1. Baseline: current main branch with bottom-anchored window
-2. Refactor branch: render-units + sentinel + measured spacer + atom-leaf
-   streaming
-3. Compare: `react_commit_ms`, `long_task_count`, `script_ms`,
-   `total_blocking_time`
-
-Expected: equal or better commit time (the slice-only render path removes
-the Set lookup and the inline filter); script_ms should improve in the
-streaming case (parent no longer re-renders).
-
-If `script_ms` regresses materially, the most likely culprits are:
-- ResizeObserver too noisy (mitigate: debounce writes further)
-- Cache subscriber re-rendering parent (mitigate: scope subscription to
-  the spacer component only via `useSyncExternalStore`)
-- IntersectionObserver firing repeatedly during fast scroll (mitigate:
-  disconnect during in-flight expansion, re-attach after commit)
-
-Re-evaluate task 65003 against the new model after this work lands; some
-of its tuning targets may be obsoleted by the sentinel + atom-leaf
-streaming.
+Verified empirically by exercising the in-browser smoke (conversation
+switch, scroll-back through a 500-message fixture, streaming token
+arrival pinned and scrolled-up). Quantitative profiling (`browser_profile
+conversation-load`) is available if a regression is suspected. Virtuoso
+is the same library shipped by Slack, Discord, Linear, and Notion for
+the same use case; defaults are tuned for chat-style payloads.
 
 ## Open Questions Resolved by This Spec
 
-- **Pending and sub-agent ambiguity:** REQ-MLRU-004 makes them
-  `TailUnit`s, structurally distinct from historical units.
-- **Saved-scroll estimate fragility:** REQ-MLRU-009 anchors by unit key,
-  not by pixel division.
-- **Spacer over/under-allocation:** REQ-MLRU-008 measures per unit with
-  per-kind fallback.
+- **Pending/sent split (PR #152 hotfix):** REQ-MLRU-001 puts
+  `pending_user` in `HistoricalUnit` sharing its eventual `user` unit's
+  key (localId == message_id at ack), so pending → sent is an in-place
+  keyed update — no cross-region promotion, no ack scroll compensation.
+- **Sub-agent and streaming positioning:** REQ-MLRU-004 keeps them as
+  `TailUnit`s (ephemeral, no ack lifecycle).
+- **Spacer over/under-allocation:** Resolved structurally by REQ-MLRU-015
+  — Virtuoso owns measurement; Phoenix has no spacer DOM elements.
 - **Streaming and unified-list tension:** REQ-MLRU-010 typifies streaming
   as a tail unit whose leaf component owns the subscription.
+- **Hand-rolled scroll-anchor compensation drift (PR #161/162/163):**
+  Resolved structurally by REQ-MLRU-015 — Virtuoso owns the anchor
+  contract.
 
 ## Open Question Carried Forward
 

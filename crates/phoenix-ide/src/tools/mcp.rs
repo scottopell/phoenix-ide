@@ -21,6 +21,9 @@ const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// Five minutes gives OAuth flows (mcp-remote prompts, browser redirect) time to complete.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Upper bound for an HTTP reload request applying changed existing configs.
+const RELOAD_RESTART_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 // ---------------------------------------------------------------------------
 // McpToolDef
 // ---------------------------------------------------------------------------
@@ -500,20 +503,36 @@ impl McpServer {
             .map_err(|e| format!("MCP server '{}': notification flush failed: {e}", self.name))
     }
 
+    fn spawn_config(&self) -> McpServerConfig {
+        McpServerConfig {
+            command: self.spawn_command.clone(),
+            args: self.spawn_args.clone(),
+            env: self.spawn_env.clone(),
+        }
+    }
+
+    async fn terminate(&mut self) {
+        if let Some(handle) = self.stderr_task.take() {
+            handle.abort();
+        }
+        let _ = self.child.kill().await;
+    }
+
     /// Check whether the child process is still running.
     pub fn is_alive(&mut self) -> bool {
         // try_wait returns Ok(Some(status)) if exited, Ok(None) if still running.
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    fn is_crash_like_error(error: &str) -> bool {
+        error.contains("stdout closed")
+            || error.contains("stdin write failed")
+            || error.contains("stdin flush failed")
+    }
+
     /// Attempt to respawn and reinitialize after a crash.
     async fn respawn(&mut self) -> Result<(), String> {
-        // Abort the old stderr drain task.
-        if let Some(handle) = self.stderr_task.take() {
-            handle.abort();
-        }
-        // Kill old process if still somehow alive.
-        let _ = self.child.kill().await;
+        self.terminate().await;
 
         // Re-spawn with the same config.
         let mut new_server = McpServer::spawn(
@@ -798,7 +817,7 @@ impl McpClientManager {
 
                     // If alive, the error is a tool-level failure (not a crash).
                     // Also covers the case where another task already respawned.
-                    if server.is_alive() {
+                    if server.is_alive() && !McpServer::is_crash_like_error(e) {
                         return Err(e.clone());
                     }
 
@@ -969,7 +988,7 @@ impl McpClientManager {
     }
 
     /// Re-scan config files and reconcile servers: connect new ones,
-    /// disconnect removed ones, leave unchanged ones alone.
+    /// disconnect removed ones, restart changed ones, leave unchanged ones alone.
     ///
     /// Changes take effect immediately: MCP tools are resolved live from
     /// the manager on each LLM request, so all conversations (new and
@@ -977,71 +996,177 @@ impl McpClientManager {
     ///
     /// Returns a summary of what changed.
     pub async fn reload(&self) -> McpReloadResult {
-        let configs = Self::read_all_configs();
+        self.reload_from_configs(Self::read_all_configs()).await
+    }
+
+    #[allow(clippy::too_many_lines)] // Reload reconciliation is a single ordered lifecycle: remove, add, restart, summarize.
+    async fn reload_from_configs(
+        &self,
+        configs: Vec<(String, McpServerConfig)>,
+    ) -> McpReloadResult {
         let config_names: std::collections::HashSet<String> =
             configs.iter().map(|(n, _)| n.clone()).collect();
 
         let mut added = Vec::new();
         let mut removed = Vec::new();
+        let mut restarted = Vec::new();
         let mut unchanged = Vec::new();
+        let mut failed = Vec::new();
+        let mut restart_pending = std::collections::HashSet::new();
+        let mut restart_futures: futures::stream::FuturesUnordered<McpRestartFuture> =
+            futures::stream::FuturesUnordered::new();
 
-        // Remove servers no longer in config.
+        let mut removed_servers = Vec::new();
         {
             let mut servers = self.servers.write().await;
             let existing_names: Vec<String> = servers.keys().cloned().collect();
             for name in existing_names {
                 if !config_names.contains(&name) {
-                    if let Some(mut server) = servers.remove(&name) {
-                        if let Some(handle) = server.stderr_task.take() {
-                            handle.abort();
-                        }
-                        let _ = server.child.kill().await;
-                        tracing::info!(server = %name, "MCP server removed during reload");
+                    if let Some(server) = servers.remove(&name) {
+                        removed_servers.push((name.clone(), server));
                     }
                     removed.push(name);
                 }
             }
         }
+        for (name, mut server) in removed_servers {
+            self.pending_oauth_urls.write().await.remove(&name);
+            server.terminate().await;
+            tracing::info!(server = %name, "MCP server removed during reload");
+        }
 
-        // Spawn background connections for new servers (same pattern as
-        // start_background_discovery — returns immediately so the HTTP
-        // response isn't held open for the full connect timeout).
         for (name, entry) in configs {
-            let already_exists = self.servers.read().await.contains_key(&name);
-            if already_exists {
-                unchanged.push(name);
-                continue;
+            let existing_config = {
+                let servers = self.servers.read().await;
+                servers.get(&name).map(McpServer::spawn_config)
+            };
+
+            match existing_config {
+                None => {
+                    let oauth = Arc::clone(&self.pending_oauth_urls);
+                    oauth.write().await.remove(&name);
+                    added.push(name.clone());
+
+                    let servers = Arc::clone(&self.servers);
+                    tokio::spawn(async move {
+                        let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
+                        match result {
+                            Ok(server) => {
+                                oauth.write().await.remove(&name);
+                                let tool_count = server.tools.len();
+                                servers.write().await.insert(name.clone(), server);
+                                tracing::info!(
+                                    server = %name,
+                                    tools = tool_count,
+                                    "MCP server connected during reload"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(server = %name, "Failed to connect during reload: {e}");
+                            }
+                        }
+                    });
+                }
+                Some(current) if current == entry => {
+                    unchanged.push(name);
+                }
+                Some(_) => {
+                    let old_server = {
+                        let mut servers = self.servers.write().await;
+                        match servers.get(&name) {
+                            Some(server) if server.spawn_config() != entry => servers.remove(&name),
+                            Some(_) | None => None,
+                        }
+                    };
+
+                    let Some(mut old_server) = old_server else {
+                        unchanged.push(name);
+                        continue;
+                    };
+
+                    self.pending_oauth_urls.write().await.remove(&name);
+                    old_server.terminate().await;
+
+                    let oauth = Arc::clone(&self.pending_oauth_urls);
+                    let servers = Arc::clone(&self.servers);
+                    restart_pending.insert(name.clone());
+                    restart_futures.push(Box::pin(async move {
+                        let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
+                        match result {
+                            Ok(server) => {
+                                oauth.write().await.remove(&name);
+                                let tool_count = server.tools.len();
+                                servers.write().await.insert(name.clone(), server);
+                                (name, Ok(tool_count))
+                            }
+                            Err(error) => (name, Err(error)),
+                        }
+                    }));
+                }
             }
+        }
 
-            let oauth = Arc::clone(&self.pending_oauth_urls);
-            // Clear stale OAuth URL before retrying so the UI gets a fresh one.
-            oauth.write().await.remove(&name);
-            added.push(name.clone());
-
-            let servers = Arc::clone(&self.servers);
-            tokio::spawn(async move {
-                let result = Self::connect_one(&name, &entry, Arc::clone(&oauth)).await;
-                match result {
-                    Ok(server) => {
-                        oauth.write().await.remove(&name);
-                        let tool_count = server.tools.len();
-                        servers.write().await.insert(name.clone(), server);
-                        tracing::info!(
+        let restart_deadline = tokio::time::Instant::now() + RELOAD_RESTART_TIMEOUT;
+        while !restart_pending.is_empty() {
+            let timeout = tokio::time::sleep_until(restart_deadline);
+            tokio::pin!(timeout);
+            tokio::select! {
+                () = &mut timeout => {
+                    for name in restart_pending.drain() {
+                        self.pending_oauth_urls.write().await.remove(&name);
+                        tracing::warn!(
                             server = %name,
-                            tools = tool_count,
-                            "MCP server connected during reload"
+                            timeout_seconds = RELOAD_RESTART_TIMEOUT.as_secs(),
+                            "Timed out restarting MCP server during reload after config change"
                         );
+                        failed.push(McpReloadFailure {
+                            server: name,
+                            action: "restart".to_string(),
+                            error: format!(
+                                "timed out after {}s restarting changed MCP server",
+                                RELOAD_RESTART_TIMEOUT.as_secs()
+                            ),
+                        });
                     }
-                    Err(e) => {
-                        tracing::warn!(server = %name, "Failed to connect during reload: {e}");
+                    break;
+                }
+                outcome = futures::StreamExt::next(&mut restart_futures) => {
+                    let Some((name, result)) = outcome else {
+                        break;
+                    };
+                    restart_pending.remove(&name);
+                    match result {
+                        Ok(tool_count) => {
+                            tracing::info!(
+                                server = %name,
+                                tools = tool_count,
+                                "MCP server restarted during reload after config change"
+                            );
+                            restarted.push(name);
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                server = %name,
+                                error = %error,
+                                "Failed to restart MCP server during reload after config change"
+                            );
+                            failed.push(McpReloadFailure {
+                                server: name,
+                                action: "restart".to_string(),
+                                error,
+                            });
+                        }
                     }
                 }
-            });
+            }
         }
+
         McpReloadResult {
             added,
             removed,
+            restarted,
             unchanged,
+            failed,
         }
     }
 
@@ -1060,15 +1185,29 @@ impl McpClientManager {
     }
 }
 
+type McpRestartResult = (String, Result<usize, String>);
+type McpRestartFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = McpRestartResult> + Send>>;
+
 /// Result of an MCP config reload.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct McpReloadResult {
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    pub restarted: Vec<String>,
     pub unchanged: Vec<String>,
+    pub failed: Vec<McpReloadFailure>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct McpReloadFailure {
+    pub server: String,
+    pub action: String,
+    pub error: String,
 }
 
 /// Parsed MCP server configuration from a config file.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct McpServerConfig {
     command: String,
     args: Vec<String>,
@@ -1202,5 +1341,264 @@ mod tests {
         // We can't assert anything about count since the dev machine may have configs,
         // but the call should not panic.
         let _ = configs;
+    }
+
+    fn write_fixture_server(dir: &tempfile::TempDir) -> std::path::PathBuf {
+        let script = dir.path().join("mcp_fixture.py");
+        std::fs::write(
+            &script,
+            r#"
+import json
+import os
+import sys
+
+marker = sys.argv[1]
+label = sys.argv[2] if len(sys.argv) > 2 else ""
+
+def append_marker(event):
+    with open(marker, "a", encoding="utf-8") as f:
+        f.write(f"{event}|pid={os.getpid()}|label={label}|env={os.environ.get('MCP_TEST_VALUE', '')}\n")
+        f.flush()
+
+def send(req_id, result):
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}) + "\n")
+    sys.stdout.flush()
+
+append_marker("start")
+for line in sys.stdin:
+    if not line.strip():
+        continue
+    req = json.loads(line)
+    req_id = req.get("id")
+    method = req.get("method")
+    if method == "initialize":
+        send(req_id, {"protocolVersion": "2024-11-05", "capabilities": {}, "serverInfo": {"name": "fixture", "version": "1"}})
+    elif method == "tools/list":
+        send(req_id, {"tools": [{"name": "report", "description": "Report config", "inputSchema": {"type": "object"}}]})
+    elif method == "tools/call":
+        crash_file = os.environ.get("MCP_CRASH_ONCE_FILE")
+        if crash_file and os.path.exists(crash_file):
+            os.remove(crash_file)
+            os._exit(2)
+        send(req_id, {"content": [{"type": "text", "text": f"label={label};env={os.environ.get('MCP_TEST_VALUE', '')}"}]})
+    elif req_id is not None:
+        send(req_id, {})
+"#,
+        )
+        .expect("write fixture server");
+        script
+    }
+
+    fn fixture_config(
+        script: &std::path::Path,
+        marker: &std::path::Path,
+        label: &str,
+        env_value: &str,
+    ) -> McpServerConfig {
+        McpServerConfig {
+            command: std::env::var("PYTHON").unwrap_or_else(|_| "python3".to_string()),
+            args: vec![
+                script.display().to_string(),
+                marker.display().to_string(),
+                label.to_string(),
+            ],
+            env: HashMap::from([("MCP_TEST_VALUE".to_string(), env_value.to_string())]),
+        }
+    }
+
+    async fn connect_fixture(manager: &McpClientManager, config: &McpServerConfig) {
+        let server = McpClientManager::connect_one(
+            "fixture",
+            config,
+            Arc::clone(&manager.pending_oauth_urls),
+        )
+        .await
+        .expect("connect fixture");
+        manager
+            .servers
+            .write()
+            .await
+            .insert("fixture".to_string(), server);
+    }
+
+    fn marker_lines(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn reload_same_config_is_unchanged_without_respawn() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let manager = McpClientManager::new();
+        let config = fixture_config(&script, &marker, "v1", "env1");
+        connect_fixture(&manager, &config).await;
+
+        let result = manager
+            .reload_from_configs(vec![("fixture".to_string(), config)])
+            .await;
+
+        assert_eq!(result.unchanged, vec!["fixture"]);
+        assert!(result.restarted.is_empty());
+        assert!(result.failed.is_empty());
+        assert_eq!(marker_lines(&marker).len(), 1);
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reload_changed_args_restarts_and_uses_new_args() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let manager = McpClientManager::new();
+        let initial = fixture_config(&script, &marker, "v1", "env1");
+        connect_fixture(&manager, &initial).await;
+
+        let changed = fixture_config(&script, &marker, "v2", "env1");
+        let result = manager
+            .reload_from_configs(vec![("fixture".to_string(), changed)])
+            .await;
+
+        assert_eq!(result.restarted, vec!["fixture"]);
+        assert!(result.unchanged.is_empty());
+        assert!(result.failed.is_empty());
+        assert_eq!(marker_lines(&marker).len(), 2);
+        let output = manager
+            .call_tool("fixture", "report", serde_json::json!({}))
+            .await
+            .expect("call report");
+        assert_eq!(output, "label=v2;env=env1");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reload_changed_command_reports_failure_not_unchanged() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let manager = McpClientManager::new();
+        let initial = fixture_config(&script, &marker, "v1", "env1");
+        connect_fixture(&manager, &initial).await;
+
+        let mut changed = fixture_config(&script, &marker, "v1", "env1");
+        changed.command = tmp.path().join("missing-command").display().to_string();
+        let result = manager
+            .reload_from_configs(vec![("fixture".to_string(), changed)])
+            .await;
+
+        assert!(result.unchanged.is_empty());
+        assert!(result.restarted.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].server, "fixture");
+        assert_eq!(result.failed[0].action, "restart");
+        assert!(manager.status().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_changed_env_restarts_and_uses_new_env() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let manager = McpClientManager::new();
+        let initial = fixture_config(&script, &marker, "v1", "env1");
+        connect_fixture(&manager, &initial).await;
+
+        let changed = fixture_config(&script, &marker, "v1", "env2");
+        let result = manager
+            .reload_from_configs(vec![("fixture".to_string(), changed)])
+            .await;
+
+        assert_eq!(result.restarted, vec!["fixture"]);
+        assert!(result.failed.is_empty());
+        let output = manager
+            .call_tool("fixture", "report", serde_json::json!({}))
+            .await
+            .expect("call report");
+        assert_eq!(output, "label=v1;env=env2");
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reload_removes_missing_server() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let manager = McpClientManager::new();
+        let config = fixture_config(&script, &marker, "v1", "env1");
+        connect_fixture(&manager, &config).await;
+
+        let result = manager.reload_from_configs(Vec::new()).await;
+
+        assert_eq!(result.removed, vec!["fixture"]);
+        assert!(manager.status().await.is_empty());
+        assert!(manager
+            .call_tool("fixture", "report", serde_json::json!({}))
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn reload_added_server_reports_added_and_connects_in_background() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let manager = McpClientManager::new();
+        let config = fixture_config(&script, &marker, "v1", "env1");
+
+        let result = manager
+            .reload_from_configs(vec![("fixture".to_string(), config)])
+            .await;
+
+        assert_eq!(result.added, vec!["fixture"]);
+        let mut connected = false;
+        let mut timed_out = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if !manager.status().await.is_empty() {
+                connected = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        if !connected {
+            timed_out = true;
+        }
+        manager.shutdown().await;
+        assert!(!timed_out, "fixture did not connect in background");
+    }
+
+    #[tokio::test]
+    async fn respawn_after_changed_config_reload_uses_new_config() {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let script = write_fixture_server(&tmp);
+        let marker = tmp.path().join("marker.log");
+        let crash_once = tmp.path().join("crash-once");
+        std::fs::write(&crash_once, "crash").expect("write crash marker");
+        let manager = McpClientManager::new();
+        let initial = fixture_config(&script, &marker, "v1", "env1");
+        connect_fixture(&manager, &initial).await;
+
+        let mut changed = fixture_config(&script, &marker, "v2", "env2");
+        changed.env.insert(
+            "MCP_CRASH_ONCE_FILE".to_string(),
+            crash_once.display().to_string(),
+        );
+        let result = manager
+            .reload_from_configs(vec![("fixture".to_string(), changed)])
+            .await;
+        assert_eq!(result.restarted, vec!["fixture"]);
+
+        let output = manager
+            .call_tool("fixture", "report", serde_json::json!({}))
+            .await
+            .expect("respawn and retry report");
+
+        assert_eq!(output, "label=v2;env=env2");
+        assert_eq!(marker_lines(&marker).len(), 3);
+        manager.shutdown().await;
     }
 }

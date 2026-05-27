@@ -36,6 +36,34 @@ vi.mock('./MessageComponents', () => ({
   formatMessageTime: () => '12:00',
 }));
 vi.mock('./MessageContextMenu', () => ({ MessageContextMenu: () => null }));
+
+// Mock react-virtuoso as a passthrough. This test measures React commit
+// counts for the MessageListImpl boundary; virtuoso's internal scheduling
+// is irrelevant to the streaming-isolation invariant being verified.
+vi.mock('react-virtuoso', () => ({
+  Virtuoso: <T,>({
+    data,
+    itemContent,
+    components,
+    computeItemKey,
+  }: {
+    data: T[];
+    itemContent: (index: number, data: T) => React.ReactNode;
+    components?: { Header?: React.ComponentType };
+    computeItemKey?: (index: number, data: T) => React.Key;
+  }) => {
+    const Header = components?.Header;
+    return (
+      <div data-testid="mock-virtuoso">
+        {Header && <Header />}
+        {data.map((item, i) => {
+          const key = computeItemKey ? computeItemKey(i, item) : i;
+          return <div key={key}>{itemContent(i, item)}</div>;
+        })}
+      </div>
+    );
+  },
+}));
 // Keep the markdown / syntax-highlighter cheap so per-token commits of
 // the real <StreamingMessage> are fast and don't dominate the test
 // budget. The commit COUNT is the assertion target, not timing.
@@ -167,8 +195,8 @@ describe('MessageList streaming-isolation perf invariant', () => {
     // Dispatch a 100-token burst directly into the store. Each
     // dispatch triggers useSyncExternalStore notify → React schedules
     // an update for subscribers whose getSnapshot returned a different
-    // value. useStreamingStartedAt returns the same number (the
-    // session's startedAt) for every token, so MessageList should NOT
+    // value. useStreamingRequestId returns the same string (the
+    // session's request_id) for every token, so MessageList should NOT
     // re-commit. useStreamingBuffer returns a fresh buffer ref on
     // every token, so StreamingMessage SHOULD re-commit (the rAF
     // coalescing inside the leaf is a separate concern from the
@@ -179,6 +207,7 @@ describe('MessageList streaming-isolation perf invariant', () => {
           type: 'sse_token',
           sequenceId: i + 1,
           delta: `t${i} `,
+          requestId: 'test-req-id',
         });
       }
     });
@@ -189,11 +218,11 @@ describe('MessageList streaming-isolation perf invariant', () => {
 
     // The hard claim: per-token streaming triggers AT MOST ONE
     // <MessageListImpl> commit — the streaming-start transition where
-    // useStreamingStartedAt returns its first non-null value and the
+    // useStreamingRequestId returns its first non-null value and the
     // streamingHandle key materialises (adding the streaming_agent
-    // TailUnit). Tokens 2..N keep startedAt stable; their dispatches
-    // notify subscribers, but useStreamingStartedAt's getSnapshot
-    // returns the same number, so MessageList stays memo'd.
+    // TailUnit). Tokens 2..N keep request_id stable; their dispatches
+    // notify subscribers, but useStreamingRequestId's getSnapshot
+    // returns the same string, so MessageList stays memo'd.
     //
     // Without this isolation, the delta would be ~100 (one commit per
     // token). With it, the delta is 1, regardless of burst size.
@@ -243,8 +272,8 @@ describe('MessageList streaming-isolation perf invariant', () => {
     const baseline = counter.count.total;
 
     // Transition phase to llm_requesting AND emit a first token —
-    // streamingBuffer goes from null to non-null, useStreamingStartedAt
-    // returns a number where it previously returned null. MessageList
+    // streamingBuffer goes from null to non-null, useStreamingRequestId
+    // returns a string where it previously returned null. MessageList
     // memo breaks; one commit expected.
     act(() => {
       store.dispatch(slug, {
@@ -256,6 +285,7 @@ describe('MessageList streaming-isolation perf invariant', () => {
         type: 'sse_token',
         sequenceId: 2,
         delta: 'hello',
+        requestId: 'test-req-id',
       });
     });
 

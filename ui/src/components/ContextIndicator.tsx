@@ -15,6 +15,10 @@ interface ContextIndicatorProps {
 }
 
 const formatTokens = (n: number): string => {
+  if (n >= 1_000_000) {
+    const m = n / 1_000_000;
+    return `${Number.isInteger(m) ? m : m.toFixed(1)}M`;
+  }
   if (n >= 1000) {
     return `${(n / 1000).toFixed(0)}k`;
   }
@@ -109,6 +113,12 @@ export function ContextIndicator({ used, max, conversationId, onTriggerContinuat
       </div>
       {panelOpen && (
         <div className="context-menu usage-panel">
+          <div className="usage-panel-header">
+            <span className="usage-panel-header-label">Context window</span>
+            <span className="usage-panel-header-value">
+              {formatTokens(used)} / {formatTokens(max)} tokens ({percent.toFixed(1)}%)
+            </span>
+          </div>
           <div className="usage-panel-stats">
             {usageLoading ? (
               <div className="usage-panel-loading">Loading...</div>

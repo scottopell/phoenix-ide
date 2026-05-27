@@ -74,15 +74,10 @@ function formatContextWindow(n: number): string {
   return n.toString();
 }
 
-/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-5.5" -> "gpt-5.5"
- *  For 1M variants, strip the "-1m" suffix (the 1M badge handles display). */
+/** Abbreviate model ID: "claude-sonnet-4-6" -> "sonnet-4.6", "gpt-5.5" -> "gpt-5.5" */
 function abbreviateModel(model: string): string {
-  // Claude models: strip "claude-" prefix, strip "-1m" suffix, convert trailing version hyphen to dot
   if (!model.startsWith('claude-')) return model;
-  let inner = model.slice(7); // strip "claude-"
-  if (inner.endsWith('-1m')) {
-    inner = inner.slice(0, -3);
-  }
+  const inner = model.slice(7); // strip "claude-"
   const lastHyphen = inner.lastIndexOf('-');
   if (lastHyphen > 0 && /^\d+$/.test(inner.slice(lastHyphen + 1))) {
     return inner.slice(0, lastHyphen) + '.' + inner.slice(lastHyphen + 1);
@@ -448,29 +443,12 @@ export function StateBar({
   // and we have models and a callback. Error-state switch lets the user
   // recover from overload/quota by picking another model, then retrying.
   const currentModel = conversation?.model ?? '';
-  const is1m = currentModel.endsWith('-1m');
   const canPickModel = !!(
     onUpgradeModel &&
     availableModels &&
     availableModels.length > 0 &&
     canChangeModelInState(convState)
   );
-
-  // Shortcut: one-click upgrade to the 1M variant of the current model, if it
-  // exists. The general picker also exposes 1M variants under "Show all", but
-  // context-window upgrades are frequent enough to deserve a visible button.
-  const upgradeTo1mId = is1m ? null : currentModel + '-1m';
-  const canUpgradeTo1m = !!(
-    upgradeTo1mId &&
-    availableModels?.some(m => m.id === upgradeTo1mId) &&
-    canChangeModelInState(convState) &&
-    onUpgradeModel
-  );
-
-  const handleUpgradeTo1m = () => {
-    if (!canUpgradeTo1m || !upgradeTo1mId || !onUpgradeModel) return;
-    onUpgradeModel(upgradeTo1mId);
-  };
 
   // Default list: recommended models plus the currently selected one (if not recommended).
   // "Show all" expands to the full list. Always deduplicate by id.
@@ -605,23 +583,12 @@ export function StateBar({
                       aria-expanded={pickerOpen}
                     >
                       {modelAbbrev}
-                      {is1m && <span className="model-1m-badge">1M</span>}
                       <span className="conv-model-caret" aria-hidden="true">&#9662;</span>
                     </button>
                   ) : (
                     <span className="conv-model" title={`Model: ${conversation.model ?? 'default'}`}>
                       {modelAbbrev}
-                      {is1m && <span className="model-1m-badge">1M</span>}
                     </span>
-                  )}
-                  {canUpgradeTo1m && (
-                    <button
-                      className="model-upgrade-btn"
-                      onClick={handleUpgradeTo1m}
-                      title={`Upgrade to 1M context (${upgradeTo1mId})`}
-                    >
-                      1M
-                    </button>
                   )}
                   {pickerOpen && canPickModel && (
                     <div className="model-picker" role="listbox" aria-label="Select model">

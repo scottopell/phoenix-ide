@@ -237,6 +237,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             type: 'sse_token',
             sequenceId: res.output.sequence_id,
             delta: res.output.text,
+            requestId: res.output.request_id,
           },
         });
       });

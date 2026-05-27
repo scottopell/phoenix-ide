@@ -1276,7 +1276,8 @@ function ConversationPageContent() {
           questions={convStateForChildren.questions}
           conversationId={conversation.id}
           showToast={showInfo}
-          onSubmitted={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
+          onAnswered={() => dispatch({ type: 'local_phase_change', phase: { type: 'llm_requesting', attempt: 1 }, expectedConversationId: conversation.id })}
+          onDismissed={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
         />
       ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
         <>
@@ -1366,7 +1367,7 @@ function ConversationPageContent() {
           />
           <Suspense fallback={null}>
             <TerminalPanel
-              conversationId={conversationId!}
+              scope={{ kind: 'conversation', conversationId: conversationId! }}
               height={terminalPane.collapsed ? TERMINAL_COLLAPSED_PX : terminalPane.size}
               collapsed={terminalPane.collapsed}
               onExpand={terminalPane.expandFromCollapsed}

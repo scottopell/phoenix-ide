@@ -10,7 +10,7 @@ use super::command_tracker::CommandTracker;
 use super::session::{Dims, ShellIntegrationStatus, StopReason, TerminalHandle};
 use nix::{
     pty::openpty,
-    unistd::{close, dup2, execve, fork, setsid, ForkResult},
+    unistd::{close, execve, fork, setsid, ForkResult},
 };
 use std::{
     ffi::CString,
@@ -90,10 +90,16 @@ pub fn spawn_pty(
 
             // Wire slave to std{in,out,err}.
             for std_fd in [0, 1, 2] {
-                dup2(slave_raw, std_fd).unwrap_or_else(|e| {
-                    eprintln!("dup2({slave_raw}, {std_fd}): {e}");
+                // SAFETY: post-fork child; raw libc avoids the AsFd/OwnedFd
+                // RAII overhead nix 0.31's dup2 would add right before exec.
+                let ret = unsafe { libc::dup2(slave_raw, std_fd) };
+                if ret < 0 {
+                    eprintln!(
+                        "dup2({slave_raw}, {std_fd}): {}",
+                        std::io::Error::last_os_error()
+                    );
                     unsafe { libc::_exit(1) };
-                });
+                }
             }
 
             // Close the original slave fd now that it's been dup'd.

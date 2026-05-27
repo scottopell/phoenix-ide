@@ -1,12 +1,8 @@
 [package]
 name = "phoenix_ide"
-version = "0.7.0"
+version = "0.8.1"
 edition = "2021"
 rust-version = "1.94"
-
-[[bin]]
-name = "phoenix-monitor"
-path = "src/bin/monitor.rs"
 
 [dependencies]
 # Async runtime
@@ -20,8 +16,8 @@ hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "s
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pki-types = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
-tower = "0.4"
-tower-http = { version = "0.5", features = ["cors", "fs", "compression-full", "trace"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs", "compression-br", "compression-gzip", "trace"] }
 
 # Local TLS CA + leaf-cert issuance (separate workspace member to keep
 # `phoenix-tls`'s cold-compile cost off `phoenix-tls` itself).
@@ -32,9 +28,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Database
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
-libsqlite3-sys = { version = "0.30", features = ["bundled"] }
-rusqlite = "0.32"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "sqlite"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
@@ -55,17 +50,17 @@ mime_guess = "2"
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
-thiserror = "1"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 base64 = "0.22"
-sha2 = "0.10"
-rand = "0.8"
-similar = "2"  # For generating diffs
+sha2 = "0.11"
+rand = "0.10"
+similar = "3"  # For generating diffs
 
 # Process management
 # Process management and PTY
-nix = { version = "0.29", features = ["signal", "process", "term", "fs"] }
+nix = { version = "0.31", features = ["signal", "process", "term", "fs"] }
 libc = "0.2"
 
 # OSC 133 parsing for CommandTracker (REQ-TERM-021)
@@ -86,16 +81,12 @@ regex = "1"
 pulldown-cmark = { version = "0.13", default-features = false }
 
 # Browser automation
-chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime", "_fetcher-rustls-tokio"] }
-brush-parser = "0.3.0"
+chromiumoxide = { version = "0.9", default-features = false, features = ["fetcher", "rustls", "zip0"] }
+brush-parser = "0.4"
 taskmd-core = ">=1.1,<2"
 listenfd = "1.0.2"
 nucleo-matcher = "0.3.1"
 
-# TUI monitor
-ratatui = "0.29"
-crossterm = "0.28"
-ureq = { version = "2", features = ["json"] }
 unicode-security = "0.1.2"
 
 # Locating tmux on PATH at registry init (specs/tmux-integration/REQ-TMUX-003).

@@ -855,11 +855,10 @@ impl ModelRegistry {
     /// don't drift. Returns the (`model_id`, service) pair so the caller
     /// can persist the identifier into `chain_qa.model`.
     ///
-    /// Preference order: claude-sonnet-4-6 → claude-sonnet-4-6-1m →
-    /// gpt-5.5 → registry default. Returns None only when the registry has
-    /// no models at all.
+    /// Preference order: claude-sonnet-4-6 → gpt-5.5 → registry default.
+    /// Returns None only when the registry has no models at all.
     pub fn get_mid_tier_model(&self) -> Option<(String, Arc<dyn LlmService>)> {
-        const PREFERRED: &[&str] = &["claude-sonnet-4-6", "claude-sonnet-4-6-1m", "gpt-5.5"];
+        const PREFERRED: &[&str] = &["claude-sonnet-4-6", "gpt-5.5"];
         for id in PREFERRED {
             if let Some(service) = self.get(id) {
                 return Some(((*id).to_string(), service));
@@ -1490,7 +1489,7 @@ mod tests {
             .unwrap();
         assert_eq!(opus.provider, "Anthropic");
         assert!(opus.description.contains("most capable"));
-        assert_eq!(opus.context_window, 200_000);
+        assert_eq!(opus.context_window, 1_000_000);
     }
 
     #[test]

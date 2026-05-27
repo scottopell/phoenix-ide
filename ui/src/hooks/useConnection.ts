@@ -412,6 +412,7 @@ export function useConnection({
               type: 'sse_token',
               sequenceId: res.data.sequence_id,
               delta: res.data.text,
+              requestId: res.data.request_id,
             });
           });
 

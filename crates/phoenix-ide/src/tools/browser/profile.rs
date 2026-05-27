@@ -936,11 +936,18 @@ async fn scenario_success_output(
         if let Err(e) = tokio::fs::write(&path, &pretty).await {
             return ToolOutput::error(format!("Failed to write scenario output: {e}"));
         }
+        // Surface the saved-samples path on the structured payload too, so
+        // the UI renderer can show a visible/copyable footnote — the text
+        // body's path reference is the only one rendered without it.
+        let mut escaped_payload = payload;
+        if let Value::Object(ref mut map) = escaped_payload {
+            map.insert("samples_path".to_string(), Value::String(path.clone()));
+        }
         ToolOutput::success(format!(
             "run_scenario completed: {runs} raw per-run samples (warmup {warmup} discarded). \
              Full raw samples written to {path} (use `cat`). NOT reduced — compute stats yourself."
         ))
-        .with_display(payload)
+        .with_display(escaped_payload)
     } else {
         ToolOutput::success(pretty).with_display(payload)
     }
@@ -1335,10 +1342,21 @@ async fn action_cpu_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput {
     // REQ-BT-019.7: return the summary INLINE, not just a file path. A
     // file an agent cannot read is an artifact, not an answer; the file
     // is still kept for a human / DevTools deep-dive.
-    let summary = summarize_cpu_profile(&profile, CPU_SUMMARY_TOP_N);
-    ToolOutput::success(format!(
-        "CPU profile saved to {path} (load in Chrome DevTools → Performance for the full tree).\n\n{summary}"
-    ))
+    //
+    // Compute rankings ONCE and use them to render both the text summary
+    // and the structured display_data — re-running build_cpu_rankings on
+    // a large profile is wasteful and a future-divergence risk.
+    let rankings = build_cpu_rankings(&profile, CPU_SUMMARY_TOP_N);
+    let summary_text = rankings
+        .as_ref()
+        .map_or_else(|| cpu_empty_text(&profile), render_cpu_summary_text);
+    let out = ToolOutput::success(format!(
+        "CPU profile saved to {path} (load in Chrome DevTools → Performance for the full tree).\n\n{summary_text}"
+    ));
+    match rankings.as_ref().and_then(|s| cpu_summary_json(s, &path)) {
+        Some(display) => out.with_display(display),
+        None => out,
+    }
 }
 
 /// `cpu_summary`: re-summarise a saved CPU profile JSON without a
@@ -1360,10 +1378,16 @@ async fn action_cpu_summary(path: Option<&str>) -> ToolOutput {
             ))
         }
     };
-    ToolOutput::success(format!(
-        "CPU profile {path}\n\n{}",
-        summarize_cpu_profile(&profile, CPU_SUMMARY_TOP_N)
-    ))
+    // Same once-per-request ranking computation as action_cpu_stop.
+    let rankings = build_cpu_rankings(&profile, CPU_SUMMARY_TOP_N);
+    let summary_text = rankings
+        .as_ref()
+        .map_or_else(|| cpu_empty_text(&profile), render_cpu_summary_text);
+    let out = ToolOutput::success(format!("CPU profile {path}\n\n{summary_text}"));
+    match rankings.as_ref().and_then(|s| cpu_summary_json(s, path)) {
+        Some(display) => out.with_display(display),
+        None => out,
+    }
 }
 
 /// How many hot functions to show in a CPU summary.
@@ -1458,32 +1482,67 @@ fn cpu_node_label(nodes: &CpuNodeMap, id: i64) -> String {
     }
 }
 
-/// Render a `Profiler.Profile` as a human/agent-readable hot-function
-/// ranking (REQ-BT-019.7). Self is aggregated per function (the robust
-/// "where is CPU spent" metric, no double-count); total (self +
-/// descendants) is per node and labelled as possibly double-counting
-/// recursion — deliberately not summed across nodes.
-fn summarize_cpu_profile(p: &CpuProfile, top_n: usize) -> String {
+/// One hot-function row in the structured CPU summary payload. `value`
+/// is wall-time milliseconds when sampled, hit counts when the profile
+/// only carries `hitCount` (discriminated by `hitcount_fallback` on the
+/// parent struct — units are inseparable from that flag).
+#[derive(Debug, Clone, serde::Serialize)]
+struct CpuHotEntry {
+    label: String,
+    value: f64,
+    percent: f64,
+}
+
+/// Structured form of a CPU profile summary. Produced once from a
+/// `Profiler.Profile`; both the text summary and the `display_data`
+/// payload are rendered from this. `None` from [`build_cpu_rankings`]
+/// signals "no nodes" or "no samples" — the text fallback handles those.
+#[derive(Debug, Clone, serde::Serialize)]
+struct CpuProfileSummary {
+    hitcount_fallback: bool,
+    total: f64,
+    top_by_self: Vec<CpuHotEntry>,
+    top_by_total: Vec<CpuHotEntry>,
+}
+
+/// Compute hot-function rankings from a `Profiler.Profile`. Returns
+/// `None` when the profile is empty or carries no attributable
+/// samples/hits — callers use a text-only "empty" / "no samples" branch.
+fn build_cpu_rankings(p: &CpuProfile, top_n: usize) -> Option<CpuProfileSummary> {
     use std::collections::HashMap;
-    use std::fmt::Write as _;
 
     if p.nodes.is_empty() {
-        return "CPU profile is empty (no nodes — was the session too short?).".to_string();
+        return None;
     }
     let nodes: CpuNodeMap = p.nodes.iter().map(|n| (n.id, n)).collect();
-    let (self_us, total_us, hitcount) = cpu_self_times(p);
+    let (self_us, total_us, hitcount_fallback) = cpu_self_times(p);
     if total_us <= 0.0 {
-        return "CPU profile carries no samples or hit counts (session too short to sample)."
-            .to_string();
+        return None;
     }
 
-    // Aggregate self by function identity (label collapses name+url+line).
+    let conv = |us: f64| {
+        if hitcount_fallback {
+            us
+        } else {
+            us / 1000.0
+        }
+    };
+
     let mut agg: HashMap<String, f64> = HashMap::new();
     for (&id, &us) in &self_us {
         *agg.entry(cpu_node_label(&nodes, id)).or_default() += us;
     }
-    let mut by_self: Vec<(&String, &f64)> = agg.iter().collect();
-    by_self.sort_by(|a, b| b.1.partial_cmp(a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let mut by_self: Vec<(String, f64)> = agg.into_iter().collect();
+    by_self.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top_by_self: Vec<CpuHotEntry> = by_self
+        .into_iter()
+        .take(top_n)
+        .map(|(label, us)| CpuHotEntry {
+            label,
+            value: conv(us),
+            percent: us / total_us * 100.0,
+        })
+        .collect();
 
     let mut memo = HashMap::new();
     let mut by_total: Vec<(i64, f64)> = p
@@ -1498,50 +1557,114 @@ fn summarize_cpu_profile(p: &CpuProfile, top_n: usize) -> String {
         })
         .collect();
     by_total.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top_by_total: Vec<CpuHotEntry> = by_total
+        .into_iter()
+        .take_while(|(_, us)| *us > 0.0)
+        .take(top_n)
+        .map(|(id, us)| CpuHotEntry {
+            label: cpu_node_label(&nodes, id),
+            value: conv(us),
+            percent: us / total_us * 100.0,
+        })
+        .collect();
 
-    let unit = if hitcount { "hits" } else { "ms" };
-    let conv = |us: f64| if hitcount { us } else { us / 1000.0 };
+    Some(CpuProfileSummary {
+        hitcount_fallback,
+        total: conv(total_us),
+        top_by_self,
+        top_by_total,
+    })
+}
+
+/// Render the structured summary as the human/agent-readable text block
+/// (REQ-BT-019.7). Self is aggregated per function (the robust "where is
+/// CPU spent" metric, no double-count); total (self + descendants) is
+/// per node and labelled as possibly double-counting recursion.
+fn render_cpu_summary_text(summary: &CpuProfileSummary) -> String {
+    use std::fmt::Write as _;
+
+    let unit = if summary.hitcount_fallback {
+        "hits"
+    } else {
+        "ms"
+    };
     let mut out = String::new();
-    if hitcount {
+    if summary.hitcount_fallback {
         out.push_str(
             "NOTE: profile has no samples/timeDeltas — ranking by hitCount \
              (relative weight, NOT absolute time).\n\n",
         );
     } else {
-        let _ = writeln!(out, "Sampled wall time: {:.1}ms.\n", total_us / 1000.0);
+        let _ = writeln!(out, "Sampled wall time: {:.1}ms.\n", summary.total);
     }
     let _ = writeln!(
         out,
         "Top {} by SELF time (aggregated per function — where CPU is actually spent):",
-        top_n.min(by_self.len())
+        summary.top_by_self.len()
     );
-    for (lbl, us) in by_self.into_iter().take(top_n) {
+    for entry in &summary.top_by_self {
         let _ = writeln!(
             out,
-            "  {:>9.1}{unit}  {:>5.1}%  {lbl}",
-            conv(*us),
-            us / total_us * 100.0
+            "  {:>9.1}{unit}  {:>5.1}%  {}",
+            entry.value, entry.percent, entry.label
         );
     }
     let _ = writeln!(
         out,
         "\nTop {} call-tree nodes by TOTAL time (self + descendants; \
          per node — may double-count recursion):",
-        top_n.min(by_total.len())
+        summary.top_by_total.len()
     );
-    for (id, us) in by_total.into_iter().take(top_n) {
-        if us <= 0.0 {
-            break;
-        }
+    for entry in &summary.top_by_total {
         let _ = writeln!(
             out,
             "  {:>9.1}{unit}  {:>5.1}%  {}",
-            conv(us),
-            us / total_us * 100.0,
-            cpu_node_label(&nodes, id)
+            entry.value, entry.percent, entry.label
         );
     }
     out
+}
+
+/// Text fallback when the profile carries no rankable data — the
+/// empty/no-samples cases that [`build_cpu_rankings`] returns `None` for.
+fn cpu_empty_text(p: &CpuProfile) -> String {
+    if p.nodes.is_empty() {
+        "CPU profile is empty (no nodes — was the session too short?).".to_string()
+    } else {
+        "CPU profile carries no samples or hit counts (session too short to sample).".to_string()
+    }
+}
+
+/// Wrap a pre-computed [`CpuProfileSummary`] as the `display_data`
+/// payload fragment (`cpu_summary` object containing path + rankings).
+/// Callers that already have a `CpuProfileSummary` use this to avoid
+/// recomputing rankings via [`cpu_summary_display_data`].
+fn cpu_summary_json(summary: &CpuProfileSummary, path: &str) -> Option<Value> {
+    let mut value = serde_json::to_value(summary).ok()?;
+    if let Value::Object(ref mut map) = value {
+        map.insert("path".to_string(), Value::String(path.to_string()));
+    }
+    Some(json!({ "cpu_summary": value }))
+}
+
+/// Render a `Profiler.Profile` as a human/agent-readable hot-function
+/// ranking (REQ-BT-019.7). Thin test shim — production callers compute
+/// rankings once and route through [`render_cpu_summary_text`] +
+/// [`cpu_summary_json`] directly.
+#[cfg(test)]
+fn summarize_cpu_profile(p: &CpuProfile, top_n: usize) -> String {
+    build_cpu_rankings(p, top_n)
+        .as_ref()
+        .map_or_else(|| cpu_empty_text(p), render_cpu_summary_text)
+}
+
+/// Build the `display_data` payload fragment for a CPU profile. Thin
+/// test shim — production callers compute rankings once and call
+/// [`cpu_summary_json`] with the pre-computed summary.
+#[cfg(test)]
+fn cpu_summary_display_data(p: &CpuProfile, top_n: usize, path: &str) -> Option<Value> {
+    let summary = build_cpu_rankings(p, top_n)?;
+    cpu_summary_json(&summary, path)
 }
 
 // ============================================================================
@@ -1681,10 +1804,10 @@ async fn action_trace_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput 
         return ToolOutput::error(format!("Failed to write trace: {e}"));
     }
 
+    let event_count = events.len();
     let mut summary = format!(
-        "Trace saved to {path} ({} events). Long tasks (>50ms): {long_count}, \
-         total {long_total_ms:.1}ms.",
-        events.len()
+        "Trace saved to {path} ({event_count} events). Long tasks (>50ms): {long_count}, \
+         total {long_total_ms:.1}ms."
     );
     if !top.is_empty() {
         summary.push_str("\n  Top long tasks:\n");
@@ -1693,7 +1816,30 @@ async fn action_trace_stop(session: &Arc<RwLock<BrowserSession>>) -> ToolOutput 
     if timed_out {
         summary.push_str("\n  (note: tracingComplete timed out; trace may be partial)");
     }
-    ToolOutput::success(summary)
+
+    // Structured payload for the UI renderer. `long_tasks` carries the
+    // full sorted list (text shows only top 5); `ms` is wall-time
+    // milliseconds, derived from the CDP `dur` field (microseconds).
+    let long_tasks_payload: Vec<Value> = long_tasks
+        .iter()
+        .map(|(name, dur_us)| {
+            json!({
+                "name": name,
+                "ms": dur_us / 1000.0,
+            })
+        })
+        .collect();
+    let display = json!({
+        "trace": {
+            "path": &path,
+            "event_count": event_count,
+            "long_task_count": long_count,
+            "long_task_total_ms": long_total_ms,
+            "long_tasks": long_tasks_payload,
+            "timed_out": timed_out,
+        }
+    });
+    ToolOutput::success(summary).with_display(display)
 }
 
 // ============================================================================
@@ -2212,5 +2358,89 @@ mod tests {
         }))
         .expect("valid empty Profile");
         assert!(summarize_cpu_profile(&p, 5).contains("empty"));
+    }
+
+    /// Structured display_data: cpu_summary payload carries path + ms-typed
+    /// hot-function rankings in the order they're rendered in text.
+    #[test]
+    fn cpu_summary_display_data_carries_structured_rankings() {
+        let profile = json!({
+            "nodes": [
+                { "id": 1, "callFrame": { "functionName": "(root)", "scriptId": "0",
+                    "url": "", "lineNumber": -1, "columnNumber": -1 }, "children": [2, 3] },
+                { "id": 2, "callFrame": { "functionName": "hot", "scriptId": "1",
+                    "url": "app.js", "lineNumber": 41, "columnNumber": 2 } },
+                { "id": 3, "callFrame": { "functionName": "cold", "scriptId": "1",
+                    "url": "app.js", "lineNumber": 99, "columnNumber": 4 } }
+            ],
+            "startTime": 0, "endTime": 10000,
+            "samples":    [2, 2, 2, 3],
+            "timeDeltas": [3000, 3000, 3000, 1000]
+        });
+        let p: CpuProfile = serde_json::from_value(profile).expect("valid Profile");
+        let display = cpu_summary_display_data(&p, 15, "/tmp/some-profile.json")
+            .expect("structured payload should be produced");
+
+        let cs = &display["cpu_summary"];
+        assert_eq!(cs["path"], "/tmp/some-profile.json");
+        assert_eq!(cs["hitcount_fallback"], false);
+        // total wall time = 10ms.
+        let total = cs["total"].as_f64().expect("total ms");
+        assert!((total - 10.0).abs() < 0.01, "total should be 10ms: {total}");
+
+        let by_self = cs["top_by_self"].as_array().expect("top_by_self array");
+        assert!(!by_self.is_empty(), "rankings non-empty");
+        // hot ranks first (9ms self), cold second (1ms).
+        assert!(by_self[0]["label"]
+            .as_str()
+            .unwrap()
+            .contains("hot  app.js:42"));
+        let hot_val = by_self[0]["value"].as_f64().expect("hot value");
+        assert!((hot_val - 9.0).abs() < 0.01, "hot value should be 9ms");
+        let hot_pct = by_self[0]["percent"].as_f64().expect("hot percent");
+        assert!((hot_pct - 90.0).abs() < 0.01, "hot is 90% of total");
+    }
+
+    /// hitCount fallback surfaces in display_data with the flag set; `value`
+    /// carries raw hit counts (units inseparable from the flag).
+    #[test]
+    fn cpu_summary_display_data_hitcount_fallback_flag() {
+        let profile = json!({
+            "nodes": [
+                { "id": 1, "callFrame": { "functionName": "f", "scriptId": "1",
+                    "url": "a.js", "lineNumber": 0, "columnNumber": 0 }, "hitCount": 7 }
+            ],
+            "startTime": 0, "endTime": 1
+        });
+        let p: CpuProfile = serde_json::from_value(profile).expect("valid Profile");
+        let display = cpu_summary_display_data(&p, 5, "/tmp/x.json")
+            .expect("non-empty profile yields payload");
+        assert_eq!(display["cpu_summary"]["hitcount_fallback"], true);
+        let by_self = display["cpu_summary"]["top_by_self"]
+            .as_array()
+            .expect("rankings");
+        assert!((by_self[0]["value"].as_f64().unwrap() - 7.0).abs() < 0.01);
+    }
+
+    /// Empty / no-sample profiles yield no display_data — the text output
+    /// already explains the absence, and a payload with empty arrays
+    /// would invite the UI to render a confusing empty table.
+    #[test]
+    fn cpu_summary_display_data_returns_none_on_empty() {
+        let empty: CpuProfile = serde_json::from_value(json!({
+            "nodes": [], "startTime": 0, "endTime": 0
+        }))
+        .expect("empty Profile");
+        assert!(cpu_summary_display_data(&empty, 5, "/tmp/x.json").is_none());
+
+        let no_samples: CpuProfile = serde_json::from_value(json!({
+            "nodes": [
+                { "id": 1, "callFrame": { "functionName": "f", "scriptId": "1",
+                    "url": "a.js", "lineNumber": 0, "columnNumber": 0 } }
+            ],
+            "startTime": 0, "endTime": 0
+        }))
+        .expect("Profile");
+        assert!(cpu_summary_display_data(&no_samples, 5, "/tmp/x.json").is_none());
     }
 }

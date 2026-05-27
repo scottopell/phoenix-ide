@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/phoenix-ide", "crates/phoenix-tls"]
+members = ["crates/phoenix-ide", "crates/phoenix-monitor", "crates/phoenix-tls"]
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }
@@ -21,6 +21,22 @@ unused_comparisons = "deny"
 
 [profile.release]
 debug = true  # Include debug symbols for production debugging
+
+# Cold-compile + link-time reduction for `./dev.py check` and dev builds.
+# `line-tables-only` keeps file:line info (so panics + backtraces still
+# resolve) but drops full DWARF type info, which is the bulk of what slows
+# the linker on debug builds.
+#
+# NOTE: do NOT bump `codegen-units` here. A previous iteration set it to
+# 256 (matching dev's opt-0 default) but profile inheritance pushed that
+# onto the opt-3 package overrides below, regressing cold-compile by ~30%
+# on low-core CI runners. Defaults (256 dev opt-0, 16 dev-opt-3 inherited)
+# are the right trade.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
 
 # Optimize heavy dependencies even in debug builds to reduce:
 # - Incremental build time

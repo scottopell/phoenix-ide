@@ -33,7 +33,7 @@ pub(crate) fn assistant_message_for_tools(tool_ids: &[&str]) -> AssistantMessage
             input: serde_json::json!({}),
         })
         .collect();
-    AssistantMessage::new(content_blocks, None, None)
+    AssistantMessage::new(uuid::Uuid::new_v4().to_string(), content_blocks, None, None)
 }
 
 // ============================================================================
@@ -117,7 +117,12 @@ fn arb_tool_executing_state() -> impl Strategy<Value = ConvState> {
                 remaining_tools,
                 completed_results: vec![],
                 pending_sub_agents: vec![],
-                assistant_message: AssistantMessage::new(content_blocks, None, None),
+                assistant_message: AssistantMessage::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    content_blocks,
+                    None,
+                    None,
+                ),
             }
         })
 }
@@ -149,7 +154,12 @@ fn arb_cancelling_tool_state() -> impl Strategy<Value = ConvState> {
                 tool_use_id,
                 skipped_tools,
                 completed_results: vec![],
-                assistant_message: AssistantMessage::new(content_blocks, None, None),
+                assistant_message: AssistantMessage::new(
+                    uuid::Uuid::new_v4().to_string(),
+                    content_blocks,
+                    None,
+                    None,
+                ),
                 pending_sub_agents: vec![],
             }
         },
@@ -296,6 +306,7 @@ fn arb_llm_response_event() -> impl Strategy<Value = Event> {
             tool_calls,
             end_turn: true,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         }
     })
 }
@@ -368,6 +379,7 @@ pub(crate) fn arb_event() -> impl Strategy<Value = Event> {
         Just(Event::UserCancel { reason: None }),
         arb_task_approval_event(),
         arb_user_question_response_event(),
+        Just(Event::UserQuestionDismissed),
         arb_grace_turn_exhausted_event(),
     ]
 }
@@ -680,6 +692,7 @@ proptest! {
             tool_calls: vec![],
             end_turn: true,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         };
 
         let result = transition(&state, &test_context(), event);
@@ -708,6 +721,7 @@ proptest! {
             tool_calls: tool_calls.clone(),
             end_turn: false,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         };
 
         let result = transition(&state, &test_context(), event);
@@ -895,7 +909,7 @@ proptest! {
                 input: serde_json::json!({}),
             });
         }
-        let assistant_message = AssistantMessage::new(content_blocks, None, None);
+        let assistant_message = AssistantMessage::new(uuid::Uuid::new_v4().to_string(), content_blocks, None, None);
 
         let state = ConvState::CancellingTool {
             tool_use_id: tool_use_id.clone(),
@@ -950,7 +964,7 @@ proptest! {
                 input: serde_json::json!({}),
             });
         }
-        let assistant_message = AssistantMessage::new(content_blocks, None, None);
+        let assistant_message = AssistantMessage::new(uuid::Uuid::new_v4().to_string(), content_blocks, None, None);
 
         let state = ConvState::CancellingTool {
             tool_use_id: tool_use_id.clone(),
@@ -1067,6 +1081,7 @@ fn test_complete_tool_cycle() {
             tool_calls: vec![tool.clone()],
             end_turn: false,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         },
     )
     .unwrap();
@@ -1103,6 +1118,7 @@ fn test_complete_tool_cycle() {
             tool_calls: vec![],
             end_turn: true,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         },
     )
     .unwrap();
@@ -1153,6 +1169,7 @@ fn test_retry_cycle() {
             tool_calls: vec![],
             end_turn: true,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         },
     )
     .unwrap();
@@ -1204,6 +1221,7 @@ fn test_multi_tool_chain() {
             tool_calls: vec![tool1.clone(), tool2.clone(), tool3.clone()],
             end_turn: false,
             usage: Usage::default(),
+            request_id: "test-req-id".to_string(),
         },
     )
     .unwrap();
@@ -1305,6 +1323,7 @@ fn test_cancel_mid_tool_chain() {
 
     // Build AssistantMessage with tool_use blocks for all 4 tools
     let assistant_message = AssistantMessage::new(
+        uuid::Uuid::new_v4().to_string(),
         vec![
             ContentBlock::ToolUse {
                 id: "t1".to_string(),
@@ -1872,6 +1891,7 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                     tool_calls,
                     end_turn: true,
                     usage: Usage::default(),
+                    request_id: "test-req-id".to_string(),
                 }
             }
             1 => LlmOutcome::RateLimited { retry_after: None },
@@ -2099,7 +2119,7 @@ proptest! {
             tool_use_id: tool_use_id.clone(),
             skipped_tools: vec![],
             completed_results: vec![],
-            assistant_message: AssistantMessage::new(content_blocks, None, None),
+            assistant_message: AssistantMessage::new(uuid::Uuid::new_v4().to_string(), content_blocks, None, None),
             pending_sub_agents: vec![],
         };
         let outcome = EffectOutcome::Tool(ToolExecOutcome::Aborted {

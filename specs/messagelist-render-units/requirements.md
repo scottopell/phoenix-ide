@@ -3,14 +3,26 @@
 ## Scope
 
 This spec governs the structural model of the conversation message list:
-the render-unit type layer, the bottom-anchored window over that layer,
-boundary expansion, measured spacer geometry, saved-scroll restore by
-unit anchor, and the streaming-view subscription path that preserves
+the render-unit type layer, the virtualized rendering boundary over that
+layer, and the streaming-view subscription path that preserves
 historical-list render isolation.
 
 It supersedes the raw-message virtualization model that the
 `isRenderableHistoricalMessage` patch in `MessageList.tsx` mitigated but
 did not structurally replace.
+
+**Virtualization vendor:** As of task 60410, virtualization is delegated
+to `react-virtuoso` (REQ-MLRU-015). The hand-rolled bottom-anchored
+window, IntersectionObserver-driven boundary expansion, exact-scroll
+compensation, and measured-spacer-with-kind-fallback geometry layer
+(formerly REQ-MLRU-005, REQ-MLRU-006, REQ-MLRU-007, REQ-MLRU-008) are
+all deprecated. The library is now authoritative for windowing,
+scroll anchoring, and item-height measurement.
+
+**No saved-scroll restore:** REQ-CONV-013 (per-conversation scroll
+memory) was deprecated. This spec accordingly does not specify, and
+implementations do not provide, any unit-anchor capture, restore, or
+DOM-snapshot machinery. Mount always lands pinned to the bottom.
 
 ## Transparency Contract (carried from conversation-ui)
 
@@ -22,12 +34,13 @@ preserve these answers:
 
 1. The newest activity is visible without the user having to scroll.
 2. Every tool result is paired with the tool call that produced it.
-3. Restoring to a previously-saved scroll position lands on the same content
-   the user was reading.
-4. Revealing older messages on scroll-up does not change the appearance of
+3. Revealing older messages on scroll-up does not change the appearance of
    already-visible messages (no header re-numbering, no scroll jump).
-5. Token-streaming updates do not cause the conversation history to re-render
+4. Token-streaming updates do not cause the conversation history to re-render
    or change identity.
+5. Acknowledgement of a pending user message (server echo) does not
+   move the viewport away from what the user is reading; the pending
+   bubble and its acknowledged form share a single timeline identity.
 
 This contract is the acceptance test for completeness. If a question cannot
 be answered confidently from the rendered UI, the requirement is incomplete.
@@ -38,14 +51,28 @@ be answered confidently from the rendered UI, the requirement is incomplete.
 
 ### REQ-MLRU-001: Render Unit Layer
 
-WHEN the message list renders historical, pending, sub-agent-status, and
-streaming content
+WHEN the message list renders historical (incl. pending user), sub-agent-
+status, and streaming content
 THE SYSTEM SHALL derive a single ordered pair of typed lists
 `(historicalUnits: HistoricalUnit[], tailUnits: TailUnit[])` from
 `messages`, `pendingMessages`, `convState`, and the streaming-active flag
 AND render exactly the bounded slice
 `historicalUnits.slice(firstRenderedUnitIndex, lastRenderedUnitIndex)`
 followed by all `tailUnits`, with no filtering inside the render loop
+
+WHEN a pending user message exists in `pendingMessages`
+THE SYSTEM SHALL emit it as a `HistoricalUnit` of kind `pending_user`
+appended at the tail of `historicalUnits`, keyed by `localId`
+AND share that key with the acknowledged `user` HistoricalUnit that
+replaces it on server echo (the server populates `message_id = localId`,
+so the same render-unit key persists through the pending → sent
+transition)
+
+THE SYSTEM SHALL NOT emit pending user messages as `TailUnit`. The
+type-level membership in `HistoricalUnit` guarantees that the
+pending → sent transition is an in-place payload swap on a single
+render unit, not a cross-region promotion that would require scroll
+compensation.
 
 WHEN a `tool`-type message is encountered during render-unit construction
 THE SYSTEM SHALL NOT emit a standalone unit for it
@@ -107,7 +134,8 @@ THE SYSTEM SHALL set each unit's `isFirstInTurn: boolean` field based on
 whether the immediately-preceding rendered unit (regardless of window
 position) is also an `agent_turn` from the same turn-run
 
-WHEN a `user`, `skill`, or `pending_user` unit precedes an `agent_turn`
+WHEN a `user`, `skill`, or `pending_user` historical unit precedes an
+`agent_turn`
 THE SYSTEM SHALL set `isFirstInTurn = true` on that `agent_turn`
 
 WHEN another `agent_turn` precedes an `agent_turn` with no intervening
@@ -128,8 +156,8 @@ impossible for the window to affect header rendering.
 
 ### REQ-MLRU-004: Tail-Pinned Unit Typing
 
-THE SYSTEM SHALL type `pending_user`, `sub_agent_status`, and
-`streaming_agent` units as `TailUnit`, distinct from `HistoricalUnit`
+THE SYSTEM SHALL type `sub_agent_status` and `streaming_agent` units as
+`TailUnit`, distinct from `HistoricalUnit`
 
 THE SYSTEM SHALL accept only `HistoricalUnit[]` (not `RenderUnit[]`) as
 input to the virtualized-window hook
@@ -137,164 +165,73 @@ SO THAT a `TailUnit` cannot be collapsed into the spacer by the window
 
 WHEN tail units exist
 THE SYSTEM SHALL render them in declaration order
-(`pending_user` → `sub_agent_status` → `streaming_agent`)
-after the entire historical slice
+(`sub_agent_status` → `streaming_agent`) after the entire historical
+slice
 AND ensure they are always present in the rendered DOM, never represented
 by spacer height
 
-**Rationale:** Task 01004's acceptance criterion: "Pending queued messages
-and sub-agent status are represented as render units or explicitly
-documented as non-virtualized tail units; there must be no ambiguity about
-whether they count toward the window." Typing them as `TailUnit` makes the
-non-virtualization a compile-time property rather than a comment.
+**Rationale:** Sub-agent status and streaming-agent are ephemeral
+display-only views with no acknowledgement lifecycle — they appear,
+update, and disappear in response to phase changes rather than message
+arrival. Keeping them as `TailUnit` reflects that. Pending user
+messages, by contrast, are ackable and must share render-unit identity
+with their acknowledged form; they live in `HistoricalUnit` per
+REQ-MLRU-001.
 
 ---
 
 ### REQ-MLRU-005: Bottom-Anchored Initial Window
 
-WHEN the message list mounts with no saved scroll anchor
-THE SYSTEM SHALL set `firstRenderedUnitIndex = max(0, historicalUnits.length - INITIAL_WINDOW)`
-WITH `INITIAL_WINDOW = 12`
-AND scroll the container to its bottom such that the last historical unit
-and all tail units are visible
-
-WHEN `historicalUnits.length` grows due to async message arrival while the
-user has not scrolled up
-THE SYSTEM SHALL recompute `firstRenderedUnitIndex` reactively to keep the
-tail of the list bottom-pinned
-
-WHEN the user has scrolled up such that the topmost rendered unit is
-not at the bottom of the list
-THE SYSTEM SHALL preserve the user's expanded `firstRenderedUnitIndex`
-and SHALL NOT auto-anchor to the bottom on new message arrival
-(the existing jump-to-newest button handles that case)
-
-**Rationale:** Task 65002 established that bottom-pinned-on-mount is the
-only correct landing for a conversation switch. The window must be expressed
-in unit indexes so that tool-result-heavy turns cannot push the latest agent
-turn out of the initial window.
+**DEPRECATED:** Replaced by REQ-MLRU-015. Virtuoso's
+`initialTopMostItemIndex` (set to `allUnits.length - 1`) plus
+`alignToBottom` provide bottom-pinned-on-mount; no per-conversation
+window-index state is computed by Phoenix code.
 
 ---
 
 ### REQ-MLRU-006: IntersectionObserver Boundary Expansion
 
-WHEN historical units are collapsed behind the spacer
-THE SYSTEM SHALL render a sentinel `<div aria-hidden />` immediately
-below the spacer and above the first rendered unit
-AND observe that sentinel via `IntersectionObserver` rooted at the scroll
-container with `rootMargin: '600px 0px 0px 0px'`
-
-WHEN the sentinel intersects the expanded root (i.e., enters the
-600-pixel-buffered viewport)
-THE SYSTEM SHALL expand the window upward by `EXPAND_BATCH = 12` (decrement
-`firstRenderedUnitIndex`)
-AND SHALL keep at most `MAX_RENDERED_UNITS = 48` historical units in the DOM
-by moving the newer overflow into a measured bottom spacer
-USING the exact-scroll-compensation pattern from REQ-MLRU-007
-
-WHEN newer historical units are collapsed behind the bottom spacer
-THE SYSTEM SHALL render a bottom sentinel above that spacer
-AND when it intersects the lower buffered viewport, expand the window
-downward by `EXPAND_BATCH = 12`, again preserving the max rendered-unit cap
-
-THE SYSTEM SHALL NOT use any heuristic based on
-`scrollTop - estimatedSpacerHeight` to trigger expansion
-
-**Rationale:** The current `scrollTop - spacerHeight > 600px` trigger
-depends on spacer-estimate accuracy. Per-unit-kind estimates (REQ-MLRU-008)
-improve this, but the only correct trigger is the actual DOM boundary
-between collapsed and rendered content. The sentinel is that boundary.
+**DEPRECATED:** Replaced by REQ-MLRU-015. Virtuoso owns boundary
+expansion internally via its own viewport-overscan logic. No sentinel
+DOM nodes or `IntersectionObserver` instances exist in MessageList.
 
 ---
 
 ### REQ-MLRU-007: Exact Scroll Compensation
 
-WHEN `firstRenderedUnitIndex` decreases (the window expands to reveal
-older units)
-THE SYSTEM SHALL capture `scrollRoot.scrollHeight` synchronously before
-the React state update that triggers the new render
-AND in a `useLayoutEffect` that runs after the render commit, increase
-`scrollRoot.scrollTop` by `(newScrollHeight - capturedScrollHeight)`
-
-WHEN the layout effect runs without a captured pre-render scrollHeight
-(i.e., the window decrease did not come from the expansion path)
-THE SYSTEM SHALL leave `scrollTop` unchanged
-
-THE SYSTEM SHALL ensure no React paint occurs between the capture and
-the compensation
-SO THAT the user observes no visible scroll jump when older units appear
-
-**Rationale:** Carried verbatim from the prior virtualization pass; the
-pattern is correct. The redesign keeps it.
+**DEPRECATED:** Replaced by REQ-MLRU-015. Virtuoso applies its own
+scroll-anchor compensation in a `useLayoutEffect` between commit and
+paint when items above the viewport mount or unmount. Phoenix code
+does not capture `scrollHeight` or adjust `scrollTop`.
 
 ---
 
 ### REQ-MLRU-008: Measured Spacer Height with Kind-Estimate Fallback
 
-WHEN a `HistoricalUnit` is rendered in the DOM
-THE SYSTEM SHALL observe it via `ResizeObserver`
-AND write its current `offsetHeight` into a measured-height cache keyed
-by `unit.key`
-
-WHEN computing spacer height
-THE SYSTEM SHALL sum the measured or estimated heights for every collapsed
-historical unit in either spacer range:
-- top spacer: `historicalUnits.slice(0, firstRenderedUnitIndex)`
-- bottom spacer: `historicalUnits.slice(lastRenderedUnitIndex)`
-using the measured height if present in the cache, otherwise the per-kind
-estimate from `KIND_ESTIMATES`
-
-THE SYSTEM SHALL provide initial `KIND_ESTIMATES`:
-- `user`: 100px
-- `skill`: 80px
-- `agent_turn`: 400px
-- `system`: 100px
-
-THE SYSTEM SHALL apply measured heights immediately on each
-`ResizeObserver` callback, without waiting for the next state update
-(the cache write triggers a re-render of the spacer only)
-
-**Rationale:** A single `360px * count` spacer over-allocates for
-tool-message-heavy tails and under-allocates for long agent turns. Measured
-geometry corrects both. Per-kind estimates are the right fallback because
-they reflect the actual structural diversity of unit kinds rather than a
-universal row estimate.
+**DEPRECATED:** Replaced by REQ-MLRU-015. Virtuoso measures items via
+its own internal `ResizeObserver` and maintains an in-memory height
+cache for the lifetime of the Virtuoso instance. No `KIND_ESTIMATES`
+table, no per-conversation height-cache Map, no spacer DOM elements
+exist in MessageList.
 
 ---
 
 ### REQ-MLRU-009: Unit-Anchor Saved-Scroll Restore
 
-WHEN the message list saves its scroll state (on visibility-hidden and
-on unmount, as per REQ-CONV-013)
-THE SYSTEM SHALL identify the first rendered `HistoricalUnit` whose
-`element.offsetTop >= scrollRoot.scrollTop`
-AND persist `{ topVisibleUnitKey: string; offsetWithinUnit: number }` to
-localStorage keyed by conversation id
-WHERE `offsetWithinUnit = scrollTop - element.offsetTop`
+**DEPRECATED:** Removed alongside REQ-CONV-013. The implementation
+(saved anchor capture on visibilitychange/unmount, restore on first
+paint, RESTORE_OVERSCAN window widening, ack-time DOM snapshot) was
+deleted. There is no saved-scroll restore; mount always lands pinned
+to the bottom per REQ-MLRU-005.
 
-WHEN the message list mounts with a saved unit anchor
-THE SYSTEM SHALL look up the anchor's `topVisibleUnitKey` in the current
-`historicalUnits` array
-AND if found, set `firstRenderedUnitIndex = max(0, foundIndex - RESTORE_OVERSCAN)`
-AND after layout commit, scroll the container to
-`foundUnitElement.offsetTop + offsetWithinUnit`
-WHERE `RESTORE_OVERSCAN = 4`
-
-WHEN the anchor's `topVisibleUnitKey` is not present in the current units
-(e.g., the message has been deleted or the conversation rebuilt)
-THE SYSTEM SHALL fall back to bottom-pin per REQ-MLRU-005
-
-THE SYSTEM SHALL NOT use `savedScrollTop / estimatedRowHeight` to decide
-the initial window
-(this branch is removed entirely)
-
-**Rationale:** The current restore divides the saved scrollTop by the
-360px estimate to widen the window so the saved offset lands in real
-content. This works when row heights are uniform but lands in wrong content
-when they vary. Anchoring to a unit by key is structurally correct
-regardless of intervening row heights. The "near-top saves disable
-virtualization" branch is no longer necessary because anchoring is the
-mechanism for all restore positions.
+**Deprecation Reason:** Unit-anchor restore is structurally correct
+*in isolation*, but it interacted poorly with pending → sent
+acknowledgement: the unit whose key was anchored could change shape
+during the pending → sent swap, and the ack-time DOM-snapshot
+compensation introduced by PR #152 was a band-aid for that
+interaction. The decision was to remove the entire feature rather
+than continue patching. The pending → sent transition is now handled
+correctly-by-construction (REQ-MLRU-001 single-key invariant).
 
 ---
 
@@ -373,74 +310,119 @@ regression of the unit model.
 
 ### REQ-MLRU-013: SessionStorage Height Cache
 
-WHEN a unit's measured height is written to the cache (REQ-MLRU-008)
-THE SYSTEM SHALL also write it to `sessionStorage` keyed by
-`phoenix:hcache:{conversationId}:{unitKey}`
-(write may be debounced or coalesced; the API surface is per-key)
+**DEPRECATED:** Removed alongside REQ-CONV-013. Persisting measured
+heights to `sessionStorage` existed solely to make the first paint
+after navigation produce exact spacer geometry so that the
+unit-anchor restore (REQ-MLRU-009) landed precisely without a
+reflow. With saved-scroll restore gone, persistence is dead weight.
 
-WHEN the message list mounts with a non-empty `historicalUnits[]`
-THE SYSTEM SHALL hydrate the measured-height cache from `sessionStorage`
-entries matching `phoenix:hcache:{conversationId}:*`
-BEFORE the first paint
-SO THAT the initial spacer height uses exact measured values, not
-kind-estimate fallbacks
-
-WHEN `sessionStorage` writes fail (quota exceeded)
-THE SYSTEM SHALL silently fall back to memory-only
-(no user-visible error; the in-memory cache still works for the session)
-
-WHEN a conversation is deleted (per the cascade in task 02696)
-THE SYSTEM SHALL clear all `phoenix:hcache:{conversationId}:*` entries
-
-**Rationale:** Without persistence, the first paint after navigation falls
-back to kind estimates until `ResizeObserver` fires. With persistence, the
-initial spacer geometry matches the user's prior session. Saved-scroll
-restore by unit anchor (REQ-MLRU-009) is correct without the cache, but the
-cache eliminates the brief visual settle on first paint.
+The measured-height cache (REQ-MLRU-008) remains as an *in-memory*
+per-conversation Map for the lifetime of the conversation's mount;
+it is rebuilt on each mount as `ResizeObserver` callbacks fire. The
+first paint uses per-kind estimates; subsequent renders use measured
+values as they accumulate. The brief visual settle on first paint
+is acceptable.
 
 ---
 
 ### REQ-MLRU-014: Pinned-to-Bottom Preservation
 
-WHEN a new message arrives via SSE and the user is currently pinned to
-the bottom of the list (`isPinnedToBottom === true`)
-THE SYSTEM SHALL keep the bottom of the list visible after the new unit
-is appended
-(carries forward the existing ResizeObserver-driven scroll-to-bottom)
+WHEN a new render unit appears at the tail and the user is currently
+pinned to the bottom of the list
+THE SYSTEM SHALL keep the bottom of the list visible after the unit is
+appended
+(delegated to Virtuoso's `followOutput="auto"`)
 
-WHEN a new message arrives and the user is NOT pinned to the bottom
+WHEN a new render unit appears and the user is NOT pinned to the bottom
 (scrolled up)
-THE SYSTEM SHALL show the "jump-to-newest" button (existing behavior)
+THE SYSTEM SHALL show the "jump-to-newest" button
 AND SHALL NOT auto-scroll the viewport
 
-THE SYSTEM SHALL determine "pinned to bottom" using the same
-`scrollTop + clientHeight >= scrollHeight - threshold` check as the
-prior implementation
+THE SYSTEM SHALL NOT force-scroll the viewport for any message type.
+No "force" override exists for system messages, approval prompts, or
+any other unit kind: a user who has scrolled up retains their scroll
+position regardless of incoming content type, and the jump-to-newest
+button is the sole mechanism for returning to the tail on demand.
 
-**Rationale:** Non-regression of existing REQ-CONV-002 behavior. The
-render-unit refactor changes the windowing model; it must not change the
-auto-scroll-on-arrival semantics.
+THE SYSTEM SHALL determine "pinned to bottom" using Virtuoso's
+`atBottomStateChange` callback with `atBottomThreshold` configured to
+match the prior 100-pixel threshold.
+
+**Rationale:** Force-scroll-on-system-message (the prior implementation
+of this requirement) was an over-broad trigger that yanked the viewport
+on routine system messages (mode transitions, cancellations) as well as
+actionable ones (approval prompts). It is a hostile UX pattern not used
+by comparable chat-style products. Pinned-vs-scrolled-up is the only
+state that drives auto-scroll; the jump-to-newest button is the only
+escape hatch.
+
+---
+
+### REQ-MLRU-015: Virtuoso-Owned Virtualization
+
+WHEN the message list renders
+THE SYSTEM SHALL pass the concatenation `[...historicalUnits, ...tailUnits]`
+as the `data` prop to a single `<Virtuoso>` instance from
+`react-virtuoso`
+AND render each item via `itemContent={(_, unit) => renderUnit(unit, ...)}`
+AND key each item via `computeItemKey={(_, unit) => unit.key}`
+
+THE SYSTEM SHALL configure the Virtuoso instance with:
+- `followOutput="auto"` — pin to bottom only when the user is already
+  at the bottom (per REQ-MLRU-014); do not yank when scrolled up
+- `initialTopMostItemIndex={allUnits.length - 1}` (or `0` when empty) —
+  bottom-pinned mount (replaces REQ-MLRU-005)
+- `alignToBottom` — when total content height is less than viewport
+  height, items pin to the bottom of the viewport rather than the top
+- `atBottomThreshold={100}` — match the prior pin-detection threshold
+- `atBottomStateChange={isAtBottom => …}` — wired to the
+  jump-to-newest button visibility state
+- `increaseViewportBy={{ top: 600, bottom: 600 }}` — overscan distance
+  matching the prior 600-pixel sentinel rootMargin
+- `key={conversationId}` on the React element — force a fresh Virtuoso
+  instance per conversation, so no stale scroll/measurement state can
+  leak between conversations
+
+WHEN the user is scrolled up and clicks the jump-to-newest button
+THE SYSTEM SHALL call the imperative
+`virtuosoRef.current.scrollToIndex({ index: 'LAST', align: 'end', behavior: 'auto' })`
+AND clear the button visibility (via `atBottomStateChange` firing
+`true` after the scroll completes)
+
+WHEN a `systemPrompt` is provided
+THE SYSTEM SHALL render it via Virtuoso's `components={{ Header }}` slot
+so it scrolls with the message content and Virtuoso measures it as part
+of the scrollable region
+
+THE SYSTEM SHALL NOT capture, persist, or restore any per-conversation
+scroll position, height cache, or measurement state outside Virtuoso's
+own internal cache. Cross-conversation visits are first-render-fresh by
+design (REQ-CONV-013 stays deprecated).
+
+**Rationale:** The hand-rolled spacer + IntersectionObserver-sentinel
++ scroll-compensation stack (PR #161, #162, #163 hotfixes) repeatedly
+introduced new scroll-jump regressions because each layer made
+assumptions the others had to compensate for. Virtuoso encapsulates
+the entire windowing + anchor-compensation contract behind a stable,
+library-tested API, replacing four Phoenix requirements (REQ-MLRU-005,
+006, 007, 008) with one declarative configuration.
 
 ---
 
 ## Acceptance Criteria Mapping
 
-The acceptance criteria in `tasks/01004-p1-ready--messagelist-render-units-virtualization.md`
+The acceptance criteria in `tasks/60410-p1-ready--migrate-messagelist-to-react-virtuoso.md`
 map to requirements above:
 
 | Task criterion | Requirement |
 |----------------|-------------|
 | `MessageList` builds deterministic `RenderUnit[]` | REQ-MLRU-001 |
-| Virtualization hook accepts `renderUnitCount` | REQ-MLRU-005 |
-| `MessageListBody` renders units, not raw rows | REQ-MLRU-001 |
+| Pending and sent user messages share one render-unit key | REQ-MLRU-001 |
+| Single `<Virtuoso>` instance renders units | REQ-MLRU-015 |
 | Tool-result-heavy tail regression test | REQ-MLRU-012 |
-| Boundary expansion via IntersectionObserver sentinel | REQ-MLRU-006 |
-| No `scrollTop - spacerHeight` trigger remains | REQ-MLRU-006 |
-| Saved scroll restore to top renders real content | REQ-MLRU-009 |
-| Saved bottom-pinned revisit keeps virtualization active | REQ-MLRU-009, REQ-MLRU-005 |
-| Saved mid-conversation restore uses measured geometry | REQ-MLRU-008, REQ-MLRU-009 |
-| Switch into large conversation lands pinned to bottom | REQ-MLRU-005 |
-| No visible scroll jump when expanding older units | REQ-MLRU-007 |
+| Switch into large conversation lands pinned to bottom | REQ-MLRU-015 |
+| No visible scroll jump as older units come into view | REQ-MLRU-015 (Virtuoso-owned) |
+| No visible scroll jump on pending → sent acknowledgement | REQ-MLRU-001 (single-key timeline) |
 | Streaming token updates don't re-render historical list | REQ-MLRU-010 |
-| System prompt, pending, sub-agent, tool inline, jump-to-newest, context menu preserved | REQ-MLRU-004, REQ-MLRU-002, REQ-MLRU-014; menu carried unchanged |
-| Validate with `browser_profile conversation-load` | Implementation step; see design.md |
+| System message arrives while scrolled up — no force-scroll | REQ-MLRU-014 |
+| System prompt, pending, sub-agent, tool inline, jump-to-newest, context menu preserved | REQ-MLRU-004, REQ-MLRU-002, REQ-MLRU-014, REQ-MLRU-015 |

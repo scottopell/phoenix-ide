@@ -495,56 +495,16 @@ function useConversationListPolling(intervalMs = 5000) {
 }
 ```
 
-## Scroll Position Memory (REQ-CONV-013)
+## Scroll Position Memory (REMOVED)
 
-Per-conversation scroll position is preserved across navigation. The
-implementation lives inline in `MessageList.tsx` (see the save effect
-around `:261` and the restore effect around `:281`) rather than in a
-dedicated `useScrollMemory` hook — earlier drafts of this design
-proposed extracting one, but the inline approach handles
-visibility-change and unmount in the same effect tree as the message
-rendering it depends on. Storage key: `phoenix:scroll:{conversationId}`.
-
-The behavioural contract is unchanged from earlier drafts:
-
-- On mount of a conversation: read the saved scroll offset (if any)
-  and apply it after the first render that produces messages.
-- On unmount, route change, or `visibilitychange` to hidden: write the
-  current `scrollTop` to `phoenix:scroll:{conversationId}`.
-- A conversation's scroll memory is independent of every other
-  conversation's; switching back-and-forth always lands the user where
-  they left off.
-
-### New Messages While Away
-
-When returning to a conversation with new messages:
-
-```typescript
-function MessageList({ conversationId, messages }) {
-  const [savedPosition, setSavedPosition] = useState<number | null>(null);
-  const [hasNewMessages, setHasNewMessages] = useState(false);
-  
-  // Detect new messages since last visit
-  useEffect(() => {
-    const lastSeen = localStorage.getItem(`phoenix:lastSeen:${conversationId}`);
-    const newestMsg = messages[messages.length - 1];
-    if (lastSeen && newestMsg && newestMsg.sequence_id > parseInt(lastSeen)) {
-      setHasNewMessages(true);
-    }
-  }, [messages]);
-  
-  return (
-    <div ref={containerRef}>
-      {messages.map(m => <Message key={m.id} ... />)}
-      {hasNewMessages && savedPosition !== null && (
-        <button className="jump-to-new" onClick={scrollToBottom}>
-          ↓ Jump to newest
-        </button>
-      )}
-    </div>
-  );
-}
-```
+REQ-CONV-013 was deprecated and the implementation removed. There is no
+per-conversation saved scroll offset, no unit-anchor restore, and no
+sessionStorage height-cache hydration. Returning to a conversation
+lands the user pinned to the bottom (REQ-CONV-002 auto-scroll-to-
+newest). The legacy localStorage keys (`phoenix:scroll:*`,
+`phoenix:msgcount:*`, `phoenix:msglist:anchor:*`) are no longer read or
+written; they will simply expire from localStorage as the browser
+prunes them.
 
 ## Message Delivery State Machine (REQ-CONV-004)
 

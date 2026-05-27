@@ -1555,6 +1555,26 @@ where
                 Ok(None)
             }
 
+            Effect::PersistHiddenSystemMarker { marker, message_id } => {
+                let seq = self.broadcast_tx.next_seq();
+                let content = MessageContent::system(marker);
+                let display_data = Some(serde_json::json!({ "hidden": true }));
+                let msg = self
+                    .storage
+                    .add_message_with_seq(
+                        &message_id,
+                        &self.context.conversation_id,
+                        seq,
+                        &content,
+                        display_data.as_ref(),
+                        None,
+                    )
+                    .await?;
+
+                let _ = self.broadcast_tx.send_message(msg);
+                Ok(None)
+            }
+
             Effect::PersistSubAgentResults {
                 results,
                 spawn_tool_id,
@@ -1863,6 +1883,7 @@ where
                         tool_calls,
                         end_turn: response.end_turn,
                         usage: response.usage,
+                        request_id: request_id.clone(),
                     }
                 }
                 Err(e) => llm_error_to_outcome(e),
@@ -1871,11 +1892,12 @@ where
             // Task 67004: a terminal UsageLimitReached carries the
             // structured QuotaDetails parsed from the 429 response
             // headers. Replay it through the chunk channel as a
-            // `RateLimitSnapshot` so the codex quota store (driven by
-            // mid-stream snapshots in task 67003) sees the limit-hit
-            // state — the ErrorBanner reads from the same store to
-            // render reset/credits/promo alongside the plan-aware
-            // message.
+            // `RateLimitSnapshot` so the codex quota store sees the
+            // limit-hit state — same channel the 200 path uses to push
+            // per-turn snapshots (see `llm/openai.rs`
+            // `complete_streaming`). The ErrorBanner reads from the
+            // same store to render reset/credits/promo alongside the
+            // plan-aware message.
             if let LlmOutcome::UsageLimitReached { ref details, .. } = llm_outcome {
                 let _ = chunk_tx.send(crate::llm::TokenChunk::RateLimitSnapshot(details.clone()));
             }
@@ -4944,6 +4966,7 @@ mod steer_drain_detector_tests {
         );
 
         let assistant = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
             vec![ContentBlock::ToolUse {
                 id: "tool-img-1".to_string(),
                 name: "read_image".to_string(),

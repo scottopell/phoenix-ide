@@ -2,7 +2,7 @@
 //!
 //! Spec: `specs/terminal/terminal.allium`
 //! Obligations covered:
-//!   - `OneTerminalPerConversation` invariant (REQ-TERM-003)
+//!   - `OneTerminalPerWorkScope` invariant (REQ-TERM-003, REQ-TERM-WS-001)
 //!   - `is_terminal()` correctness (REQ-TERM-012 precondition)
 //!   - Dims validity (`ResizeFrameRejected` precondition)
 //!   - `try_insert` atomic semantics (used on the fresh-session path; the
@@ -17,12 +17,16 @@ use proptest::prelude::*;
 
 use super::session::{ActiveTerminals, Dims};
 use crate::state_machine::state::ConvState;
+use crate::work_scope::WorkScope;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-/// Generate arbitrary conversation IDs (non-empty strings).
-fn arb_conv_id() -> impl Strategy<Value = String> {
-    "[a-z0-9]{8}-[a-z0-9]{4}".prop_map(|s| s)
+/// Generate arbitrary conversation IDs, wrapped in `WorkScope::Conversation`
+/// — the variant under test for the registry's race-guard semantics. The
+/// other variants are exercised via the namespace-disjointness tests in
+/// `work_scope.rs`.
+fn arb_conv_scope() -> impl Strategy<Value = WorkScope> {
+    "[a-z0-9]{8}-[a-z0-9]{4}".prop_map(WorkScope::Conversation)
 }
 
 /// Build a minimal `TerminalHandle` for registry tests.
@@ -59,104 +63,234 @@ fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
     }
 }
 
-// ── Unit: OneTerminalPerConversation (registry semantics) ─────────────────────
+// ── Unit: OneTerminalPerWorkScope (registry semantics) ────────────────────────
 
-/// REQ-TERM-003 atomicity: `try_insert` on an already-active conversation
-/// returns `None`. The higher-level handler (see `ws.rs::acquire_handle`)
+/// REQ-TERM-003 / REQ-TERM-WS-001 atomicity: `try_insert` on an already-active
+/// scope returns `None`. The higher-level handler (see `ws.rs::acquire_handle`)
 /// treats that as a signal to reclaim the winner rather than reject —
 /// see task 24691 and `DuplicateConnectionReclaimsSession` in terminal.allium.
 /// This test covers only the registry-level atomicity used as the race guard.
 #[test]
 fn try_insert_rejects_duplicate() {
     let registry = ActiveTerminals::new();
-    let conv_id = "conv-001".to_string();
+    let scope = WorkScope::Conversation("conv-001".to_string());
     let dims = Dims { cols: 80, rows: 24 };
 
     // First insert succeeds.
-    let first = registry.try_insert(conv_id.clone(), dummy_handle(dims));
+    let first = registry.try_insert(scope.clone(), dummy_handle(dims));
     assert!(first.is_some(), "first insert should succeed");
 
-    // Second insert is rejected (409).
-    let second = registry.try_insert(conv_id.clone(), dummy_handle(dims));
-    assert!(second.is_none(), "duplicate insert must return None (409)");
+    // Second insert is rejected.
+    let second = registry.try_insert(scope.clone(), dummy_handle(dims));
+    assert!(
+        second.is_none(),
+        "duplicate insert must return None for the same scope"
+    );
 }
 
 /// After `remove`, a new insert succeeds (absent → active → absent → active cycle).
 #[test]
 fn remove_allows_reinsertion() {
     let registry = ActiveTerminals::new();
-    let conv_id = "conv-002".to_string();
+    let scope = WorkScope::Conversation("conv-002".to_string());
     let dims = Dims { cols: 80, rows: 24 };
 
     registry
-        .try_insert(conv_id.clone(), dummy_handle(dims))
+        .try_insert(scope.clone(), dummy_handle(dims))
         .unwrap();
-    registry.remove(&conv_id);
+    registry.remove(&scope);
 
-    let third = registry.try_insert(conv_id.clone(), dummy_handle(dims));
+    let third = registry.try_insert(scope.clone(), dummy_handle(dims));
     assert!(third.is_some(), "insert after remove must succeed");
 }
 
-/// `get` returns `Some` for registered conversations, `None` otherwise.
+/// `get` returns `Some` for registered scopes, `None` otherwise.
 #[test]
 fn get_returns_correct_presence() {
     let registry = ActiveTerminals::new();
     let dims = Dims { cols: 80, rows: 24 };
+    let absent = WorkScope::Conversation("nonexistent".to_string());
+    let present = WorkScope::Conversation("present".to_string());
 
-    assert!(registry.get("nonexistent").is_none());
+    assert!(registry.get(&absent).is_none());
 
     registry
-        .try_insert("present".to_string(), dummy_handle(dims))
+        .try_insert(present.clone(), dummy_handle(dims))
         .unwrap();
-    assert!(registry.get("present").is_some());
-    assert!(registry.get("nonexistent").is_none());
+    assert!(registry.get(&present).is_some());
+    assert!(registry.get(&absent).is_none());
 }
 
-// ── Property: OneTerminalPerConversation ──────────────────────────────────────
+/// REQ-TERM-WS-001: Worktree and Conversation scopes with the same inner
+/// string do NOT collide — the registry is keyed by the full WorkScope, not
+/// the inner string. Two terminals can coexist for `Worktree("/tmp/x")` and
+/// `Conversation("/tmp/x")` without conflict.
+#[test]
+fn worktree_and_conversation_scopes_are_disjoint() {
+    let registry = ActiveTerminals::new();
+    let dims = Dims { cols: 80, rows: 24 };
+    let conv = WorkScope::Conversation("shared-string".to_string());
+    let wt = WorkScope::Worktree("shared-string".to_string());
+
+    assert!(registry
+        .try_insert(conv.clone(), dummy_handle(dims))
+        .is_some());
+    assert!(
+        registry
+            .try_insert(wt.clone(), dummy_handle(dims))
+            .is_some(),
+        "Worktree scope must not collide with Conversation scope on the same inner string"
+    );
+    assert!(registry.get(&conv).is_some());
+    assert!(registry.get(&wt).is_some());
+}
+
+/// REQ-TERM-WS-001: the singleton Global scope holds exactly one terminal at
+/// a time and is disjoint from any Conversation or Worktree scope.
+#[test]
+fn global_scope_is_disjoint_and_singleton() {
+    let registry = ActiveTerminals::new();
+    let dims = Dims { cols: 80, rows: 24 };
+
+    assert!(registry
+        .try_insert(WorkScope::Global, dummy_handle(dims))
+        .is_some());
+    assert!(
+        registry
+            .try_insert(WorkScope::Global, dummy_handle(dims))
+            .is_none(),
+        "Global is singleton: a second insert must return None"
+    );
+
+    // Disjoint from Conversation / Worktree with "global:" string.
+    let conv_lookalike = WorkScope::Conversation("global:".to_string());
+    assert!(
+        registry
+            .try_insert(conv_lookalike.clone(), dummy_handle(dims))
+            .is_some(),
+        "Conversation(\"global:\") must not collide with WorkScope::Global"
+    );
+}
+
+// ── Unit: cascade_on_delete (REQ-TERM-WS-001, REQ-TERM-012) ──────────────────
+
+/// REQ-TERM-012: cascade removes the registry entry for the torn-down scope.
+/// Mirrors the tmux/browser cascade pattern.
+#[tokio::test]
+async fn cascade_on_delete_removes_entry_for_scope() {
+    let registry = ActiveTerminals::new();
+    let dims = Dims { cols: 80, rows: 24 };
+    let scope = WorkScope::Worktree("/tmp/wt-cascade-remove".to_string());
+
+    registry
+        .try_insert(scope.clone(), dummy_handle(dims))
+        .unwrap();
+    assert!(registry.get(&scope).is_some());
+
+    registry.cascade_on_delete(&scope, None).await;
+    assert!(
+        registry.get(&scope).is_none(),
+        "cascade with no inheritor must remove the entry"
+    );
+}
+
+/// REQ-TERM-WS-001: scope-equality preservation. A continuation conversation
+/// that resolves to the same Worktree scope inherits the terminal; cascade
+/// must skip teardown rather than kill a session the inheritor still uses.
+#[tokio::test]
+async fn cascade_on_delete_preserves_when_continuation_inherits_scope() {
+    let registry = ActiveTerminals::new();
+    let dims = Dims { cols: 80, rows: 24 };
+    let scope = WorkScope::Worktree("/tmp/wt-cascade-preserve".to_string());
+    let inheritor = scope.clone();
+
+    registry
+        .try_insert(scope.clone(), dummy_handle(dims))
+        .unwrap();
+    registry.cascade_on_delete(&scope, Some(&inheritor)).await;
+
+    assert!(
+        registry.get(&scope).is_some(),
+        "cascade must preserve the terminal when inheritor_scope == work_scope"
+    );
+}
+
+/// Direct-mode (`Conversation` scope) continuation resolves to a different
+/// scope (`Conversation(<their own id>)`), so the cascade must tear down.
+/// Falls out structurally from scope inequality.
+#[tokio::test]
+async fn cascade_on_delete_direct_continuation_does_not_preserve() {
+    let registry = ActiveTerminals::new();
+    let dims = Dims { cols: 80, rows: 24 };
+    let parent = WorkScope::Conversation("parent-direct".to_string());
+    let child = WorkScope::Conversation("child-direct".to_string());
+
+    registry
+        .try_insert(parent.clone(), dummy_handle(dims))
+        .unwrap();
+    registry.cascade_on_delete(&parent, Some(&child)).await;
+
+    assert!(
+        registry.get(&parent).is_none(),
+        "Direct-mode continuation resolves to its own Conversation scope, \
+         which is never equal to the parent's — cascade must tear down"
+    );
+}
+
+/// Cascade against a scope with no registry entry is a no-op (the common
+/// case during conversation cleanup for sub-agent / no-terminal scopes).
+#[tokio::test]
+async fn cascade_on_delete_no_entry_is_noop() {
+    let registry = ActiveTerminals::new();
+    let scope = WorkScope::Conversation("never-existed".to_string());
+    registry.cascade_on_delete(&scope, None).await;
+    assert!(registry.get(&scope).is_none());
+}
+
+// ── Property: OneTerminalPerWorkScope ─────────────────────────────────────────
 
 proptest! {
     /// Invariant: for any sequence of try_insert / remove operations across
-    /// distinct conversation IDs, the count of active terminals per conversation
-    /// never exceeds 1.
+    /// distinct scopes, the count of active terminals per scope never exceeds 1.
     ///
-    /// Maps to: `OneTerminalPerConversation` in terminal.allium.
+    /// Maps to: `OneTerminalPerWorkScope` in terminal.allium.
     #[test]
-    fn prop_one_terminal_per_conversation(
+    fn prop_one_terminal_per_workscope(
         ops in proptest::collection::vec(
-            (arb_conv_id(), proptest::bool::ANY),  // (conv_id, insert=true / remove=false)
+            (arb_conv_scope(), proptest::bool::ANY),  // (scope, insert=true / remove=false)
             1..50
         )
     ) {
         let registry = ActiveTerminals::new();
         let dims = Dims { cols: 80, rows: 24 };
 
-        for (conv_id, do_insert) in ops {
+        for (scope, do_insert) in ops {
             if do_insert {
                 // try_insert either succeeds or returns None — never panics.
-                let _ = registry.try_insert(conv_id.clone(), dummy_handle(dims));
+                let _ = registry.try_insert(scope.clone(), dummy_handle(dims));
             } else {
-                registry.remove(&conv_id);
+                registry.remove(&scope);
             }
 
-            // Invariant: count per conversation must be 0 or 1.
+            // Invariant: count per scope must be 0 or 1.
             let map = registry.0.lock().unwrap();
-            let count = map.iter().filter(|(k, _)| **k == conv_id).count();
+            let count = map.iter().filter(|(k, _)| **k == scope).count();
             prop_assert!(count <= 1,
-                "OneTerminalPerConversation violated: {} active for {}",
-                count, conv_id);
+                "OneTerminalPerWorkScope violated: {} active for {:?}",
+                count, scope);
         }
     }
 
-    /// Concurrent-simulation: two inserts racing on the same conversation ID
-    /// must result in at most one active terminal. We simulate this serially
+    /// Concurrent-simulation: two inserts racing on the same scope must
+    /// result in at most one active terminal. We simulate this serially
     /// (Rust Mutex guarantees atomicity; the spec requires it).
     #[test]
-    fn prop_concurrent_insert_one_wins(conv_id in arb_conv_id()) {
+    fn prop_concurrent_insert_one_wins(scope in arb_conv_scope()) {
         let registry = ActiveTerminals::new();
         let dims = Dims { cols: 80, rows: 24 };
 
-        let r1 = registry.try_insert(conv_id.clone(), dummy_handle(dims));
-        let r2 = registry.try_insert(conv_id.clone(), dummy_handle(dims));
+        let r1 = registry.try_insert(scope.clone(), dummy_handle(dims));
+        let r2 = registry.try_insert(scope.clone(), dummy_handle(dims));
 
         // Exactly one succeeds.
         let successes = [r1.is_some(), r2.is_some()].iter().filter(|&&b| b).count();

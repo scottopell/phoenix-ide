@@ -18,6 +18,14 @@ export interface StreamingBuffer {
   text: string;
   lastSequence: number;
   startedAt: number;
+  /** The server-allocated `request_id` from the inbound `Token` SSE events.
+   *  When the LLM request finalizes, the server uses this same id as the
+   *  resulting `AssistantMessage.message_id`. The UI keys its streaming
+   *  render unit by `request_id` and its eventual `agent_turn` render unit
+   *  by `message_id` — they match, so the streaming → sent transition is
+   *  an in-place keyed update on a single render unit, symmetric to
+   *  REQ-MLRU-001's pending_user → user pattern. */
+  requestId: string;
 }
 
 export type UIError =
@@ -116,7 +124,7 @@ export type SSEAction =
     }
   | { type: 'sse_state_change'; sequenceId: number; phase: ConversationState; epoch?: number }
   | { type: 'sse_agent_done'; sequenceId: number; epoch?: number }
-  | { type: 'sse_token'; sequenceId: number; delta: string; epoch?: number }
+  | { type: 'sse_token'; sequenceId: number; delta: string; requestId: string; epoch?: number }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
   | { type: 'sse_browser_session_state'; sequenceId: number; active: boolean; epoch?: number }
   // `sequenceId` is present when the error originated on the wire (server's
@@ -383,6 +391,7 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_token',
         sequenceId: res.output.sequence_id,
         delta: res.output.text,
+        requestId: res.output.request_id,
       });
     }
     case 'state_change': {
@@ -758,6 +767,12 @@ export function conversationReducer(
           text: (a.streamingBuffer?.text ?? '') + action.delta,
           lastSequence: action.sequenceId,
           startedAt: a.streamingBuffer?.startedAt ?? Date.now(),
+          // The server's `request_id` is stable across every token of a
+          // streaming session and matches the eventual `AssistantMessage.
+          // message_id`. We capture it on every token (cheap; same value
+          // throughout) so the render unit's key is available immediately
+          // and survives a reconnect-replay that starts mid-stream.
+          requestId: action.requestId,
         },
       }));
     }

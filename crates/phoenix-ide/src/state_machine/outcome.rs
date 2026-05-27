@@ -25,6 +25,14 @@ pub enum LlmOutcome {
         tool_calls: Vec<ToolCall>,
         end_turn: bool,
         usage: Usage,
+        /// Server-generated request id from the LLM dispatch. Becomes the
+        /// `AssistantMessage.message_id` on persistence so that the streaming
+        /// `Token` events (which already carry this id) share identity with
+        /// the eventual finalized message. Lets the UI key the in-flight
+        /// streaming view by the same value as the eventual `agent_turn`
+        /// render unit — a same-key in-place transition rather than a
+        /// cross-region key swap.
+        request_id: String,
     },
     /// Transient rate-limit throttle (429) — retryable
     RateLimited {

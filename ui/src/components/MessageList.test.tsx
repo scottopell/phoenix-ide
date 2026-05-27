@@ -1,8 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { act, render, waitFor } from '@testing-library/react';
+import { describe, expect, it, vi } from 'vitest';
+import { render, waitFor } from '@testing-library/react';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
-import { MAX_RENDERED_UNITS, SENTINEL_ROOT_MARGIN } from '../hooks/useBottomAnchoredWindow';
 import { ConversationContext } from '../conversation/ConversationContext';
 import { ConversationStore } from '../conversation/ConversationStore';
 
@@ -21,9 +20,11 @@ function withConvContext(ui: React.ReactElement): React.ReactElement {
 
 vi.mock('./MessageComponents', () => ({
   UserMessage: ({ message }: { message: { sequence_id: number } }) => (
-    <div className="message user" data-sequence-id={message.sequence_id}>user</div>
+    <div className="message user" data-sequence-id={message.sequence_id} data-payload-kind="user">user</div>
   ),
-  QueuedUserMessage: () => null,
+  QueuedUserMessage: () => (
+    <div className="message queued" data-payload-kind="pending">pending</div>
+  ),
   AgentMessage: ({ message }: { message: { sequence_id: number } }) => (
     <div className="message agent" data-sequence-id={message.sequence_id}>agent</div>
   ),
@@ -39,50 +40,36 @@ vi.mock('./MessageContextMenu', () => ({
   MessageContextMenu: () => null,
 }));
 
-let resizeCallback: ResizeObserverCallback | null = null;
-let scrollHeightDescriptor: PropertyDescriptor | undefined;
-let clientHeightDescriptor: PropertyDescriptor | undefined;
-let originalGetBCR: typeof HTMLElement.prototype.getBoundingClientRect | undefined;
-let intersectionObservers: MockIntersectionObserver[] = [];
-
-class MockIntersectionObserver {
-  readonly rootMargin: string;
-  private readonly callback: IntersectionObserverCallback;
-
-  constructor(callback: IntersectionObserverCallback, options?: IntersectionObserverInit) {
-    this.callback = callback;
-    this.rootMargin = options?.rootMargin ?? '';
-    intersectionObservers.push(this);
-  }
-
-  observe() {}
-  disconnect() {}
-
-  intersect() {
-    this.callback(
-      [{ isIntersecting: true } as IntersectionObserverEntry],
-      this as unknown as IntersectionObserver,
+// Mock react-virtuoso as a passthrough that renders all items plus the
+// Header slot. Real virtualization is tested in-browser via agent-browser
+// smoke (acceptance criteria in tasks/60410). Unit tests focus on:
+//   - render-unit construction (buildRenderUnits)
+//   - per-unit component dispatch
+//   - keyed in-place reconciliation across the pending → sent transition
+vi.mock('react-virtuoso', () => ({
+  Virtuoso: <T,>({
+    data,
+    itemContent,
+    components,
+    computeItemKey,
+  }: {
+    data: T[];
+    itemContent: (index: number, data: T) => React.ReactNode;
+    components?: { Header?: React.ComponentType };
+    computeItemKey?: (index: number, data: T) => React.Key;
+  }) => {
+    const Header = components?.Header;
+    return (
+      <div data-testid="mock-virtuoso">
+        {Header && <Header />}
+        {data.map((item, i) => {
+          const key = computeItemKey ? computeItemKey(i, item) : i;
+          return <div key={key}>{itemContent(i, item)}</div>;
+        })}
+      </div>
     );
-  }
-}
-
-class MockResizeObserver {
-  constructor(callback: ResizeObserverCallback) {
-    resizeCallback = callback;
-  }
-
-  observe() {}
-  disconnect() {}
-}
-
-function triggerResize(target: Element, height: number) {
-  act(() => {
-    resizeCallback?.(
-      [{ target, contentRect: { height } as DOMRectReadOnly } as ResizeObserverEntry],
-      {} as ResizeObserver,
-    );
-  });
-}
+  },
+}));
 
 function makeMessage(sequence_id: number, message_type: Message['message_type'] = 'user'): Message {
   const content = message_type === 'tool'
@@ -101,193 +88,77 @@ function makeMessage(sequence_id: number, message_type: Message['message_type'] 
 const idleState: ConversationState = { type: 'idle' };
 
 describe('MessageList', () => {
-  beforeEach(() => {
-    localStorage.clear();
-    resizeCallback = null;
-    intersectionObservers = [];
-    scrollHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'scrollHeight');
-    clientHeightDescriptor = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
-    vi.stubGlobal('ResizeObserver', MockResizeObserver);
-    vi.stubGlobal('IntersectionObserver', MockIntersectionObserver);
-    Object.defineProperty(HTMLElement.prototype, 'scrollHeight', {
-      configurable: true,
-      get: () => 1000,
-    });
-    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
-      configurable: true,
-      get: () => 400,
-    });
-    // Mock getBoundingClientRect so the unit-anchor scroll math (which
-    // uses bounding rects to compute content-relative positions) works
-    // in happy-dom. Default happy-dom returns zeros for everything and
-    // doesn't relayout when scrollTop changes, so the math otherwise
-    // produces stale results on subsequent visits. The simulation:
-    // every element's top in viewport = -scrollTop of the scroll root
-    // (i.e., element is at content position 0, viewport-shifted by the
-    // current scroll). #main-area itself stays at viewport top=0.
-    originalGetBCR = HTMLElement.prototype.getBoundingClientRect;
-    HTMLElement.prototype.getBoundingClientRect = function (this: HTMLElement) {
-      if (this.id === 'main-area') {
-        return new DOMRect(0, 0, 0, 400);
-      }
-      const root = this.ownerDocument.getElementById('main-area');
-      const st = root?.scrollTop ?? 0;
-      const key = this.dataset?.['renderUnitKey'];
-      const seq = key?.startsWith('msg-') ? Number(key.slice(4)) : 0;
-      const contentTop = Number.isFinite(seq) && seq > 0 ? (seq - 1) * 100 : 0;
-      return new DOMRect(0, contentTop - st, 0, 80);
+  it('pending → sent acknowledgement keeps a single keyed render unit (REQ-MLRU-001)', async () => {
+    // The previous bug class: a pending_user TailUnit was promoted to a
+    // user HistoricalUnit on ack, which required scroll compensation
+    // (PR #152 hotfix). The new model emits pending_user as a
+    // HistoricalUnit appended at the tail of historicalUnits, sharing
+    // the eventual user unit's key (localId == message_id at ack). The
+    // pending → sent transition is therefore a keyed in-place update
+    // on a single DOM node — no cross-region promotion.
+    const pending = {
+      localId: 'msg-21',
+      text: 'pending acknowledgement',
+      images: [],
+      timestamp: 1,
+      status: 'pending' as const,
     };
-  });
-
-  afterEach(() => {
-    vi.unstubAllGlobals();
-    if (originalGetBCR) {
-      HTMLElement.prototype.getBoundingClientRect = originalGetBCR;
-    }
-    if (scrollHeightDescriptor) {
-      Object.defineProperty(HTMLElement.prototype, 'scrollHeight', scrollHeightDescriptor);
-    } else {
-      delete (HTMLElement.prototype as unknown as { scrollHeight?: unknown }).scrollHeight;
-    }
-    if (clientHeightDescriptor) {
-      Object.defineProperty(HTMLElement.prototype, 'clientHeight', clientHeightDescriptor);
-    } else {
-      delete (HTMLElement.prototype as unknown as { clientHeight?: unknown }).clientHeight;
-    }
-  });
-
-  it('restores saved scroll when revisiting a cached conversation and does not snap back to bottom', async () => {
-    // Unit-anchor restore: with one user message (key=msg-1) whose
-    // wrapper has offsetTop=0 in happy-dom, an offset of 450 produces
-    // scrollTop=450 — matching what the prior pixel-only model
-    // recorded. The second navigation back to conv-a relies on the
-    // save fired during the rerender writing this anchor back fresh.
-    localStorage.setItem(
-      'phoenix:msglist:anchor:conv-a',
-      JSON.stringify({ topVisibleUnitKey: 'msg-1', offsetWithinUnit: 450 }),
-    );
+    const historical = Array.from({ length: 20 }, (_, i) => makeMessage(i + 1, 'user'));
 
     const { container, rerender } = render(
       withConvContext(
         <MessageList
-          messages={[makeMessage(1)]}
-          pendingMessages={[]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-a"
-        />,
-      ),
-    );
-
-    const main = container.querySelector('#main-area') as HTMLElement;
-    const messages = container.querySelector('#messages') as HTMLElement;
-
-    await waitFor(() => expect(main.scrollTop).toBe(450));
-    triggerResize(messages, 500);
-    expect(main.scrollTop).toBe(450);
-
-    rerender(
-      withConvContext(
-        <MessageList
-          messages={[makeMessage(2)]}
-          pendingMessages={[]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-b"
-        />,
-      ),
-    );
-    triggerResize(messages, 500);
-    expect(main.scrollTop).toBe(1000);
-
-    // Revisit conv-a with its original message present. Unit-anchor
-    // restore looks up by message_id — the saved anchor's
-    // topVisibleUnitKey ('msg-1') matches the rendered unit and the
-    // restore lands the user back at the saved offset.
-    rerender(
-      withConvContext(
-        <MessageList
-          messages={[makeMessage(1)]}
-          pendingMessages={[]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-a"
-        />,
-      ),
-    );
-
-    await waitFor(() => expect(main.scrollTop).toBe(450));
-    triggerResize(messages, 500);
-    expect(main.scrollTop).toBe(450);
-  });
-
-  it('recomputes the current unit anchor on visibility-hidden even without a scroll event', () => {
-    const { container } = render(
-      withConvContext(
-        <MessageList
-          messages={[makeMessage(1), makeMessage(2), makeMessage(3)]}
-          pendingMessages={[]}
-          convState={idleState}
-          onRetry={vi.fn()}
-          onOpenFile={undefined}
-          conversationId="conv-a"
-        />,
-      ),
-    );
-
-    const main = container.querySelector('#main-area') as HTMLElement;
-    main.scrollTop = 250;
-
-    Object.defineProperty(document, 'visibilityState', {
-      configurable: true,
-      get: () => 'hidden',
-    });
-    document.dispatchEvent(new Event('visibilitychange'));
-
-    const saved = JSON.parse(localStorage.getItem('phoenix:msglist:anchor:conv-a') ?? 'null');
-    expect(saved).toMatchObject({
-      topVisibleUnitKey: 'msg-3',
-      offsetWithinUnit: 50,
-      unitCountAtSave: 3,
-    });
-  });
-
-  it('bounds retained historical DOM while expanding upward', async () => {
-    const historical = Array.from({ length: 100 }, (_, i) => makeMessage(i + 1, 'user'));
-
-    const { container } = render(
-      withConvContext(
-        <MessageList
           messages={historical}
-          pendingMessages={[]}
+          pendingMessages={[pending]}
           convState={idleState}
           onRetry={vi.fn()}
           onOpenFile={undefined}
-          conversationId="conv-a"
+          conversationId="conv-ack"
         />,
       ),
     );
 
+    await waitFor(() => expect(container.querySelector('[data-render-unit-key="msg-21"]')).not.toBeNull());
+
+    // Capture the wrapper DOM node + its initial payload kind before
+    // the ack rerender. Same key + same node identity post-rerender is
+    // what proves React reconciled in-place rather than unmount/remount.
+    const wrapperBefore = container.querySelector('[data-render-unit-key="msg-21"]');
+    expect(wrapperBefore).not.toBeNull();
+    expect(wrapperBefore!.querySelector('[data-payload-kind]')?.getAttribute('data-payload-kind')).toBe('pending');
+
+    rerender(
+      withConvContext(
+        <MessageList
+          messages={[
+            ...historical,
+            {
+              ...makeMessage(21, 'user'),
+              message_id: 'msg-21',
+              content: { text: pending.text },
+            },
+          ]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-ack"
+        />,
+      ),
+    );
+
+    // The render-unit-key wrapper for `msg-21` survives the ack — same
+    // node identity, payload kind swaps pending → user.
     await waitFor(() => {
-      expect(intersectionObservers.some((o) => o.rootMargin === SENTINEL_ROOT_MARGIN)).toBe(true);
+      const nodes = container.querySelectorAll('[data-render-unit-key="msg-21"]');
+      expect(nodes).toHaveLength(1);
+      expect(nodes[0]!.querySelector('[data-payload-kind]')?.getAttribute('data-payload-kind')).toBe('user');
     });
-
-    for (let i = 0; i < 5; i++) {
-      act(() => {
-        intersectionObservers.find((o) => o.rootMargin === SENTINEL_ROOT_MARGIN)?.intersect();
-      });
-    }
-
-    const renderedUnits = container.querySelectorAll('[data-render-unit-key]');
-    expect(renderedUnits).toHaveLength(MAX_RENDERED_UNITS);
-    expect(container.querySelector('[data-sequence-id="100"]')).toBeNull();
-    expect(container.querySelectorAll('.message-collapsed-spacer')).toHaveLength(2);
+    const wrapperAfter = container.querySelector('[data-render-unit-key="msg-21"]');
+    expect(wrapperAfter).toBe(wrapperBefore);
   });
 
-  it('windows renderable rows so recent tool results do not hide their owning agent row', () => {
+  it('folds trailing tool messages into the owning agent_turn unit (REQ-MLRU-002)', () => {
     const historical = [
       ...Array.from({ length: 20 }, (_, i) => makeMessage(i + 1, 'user')),
       makeMessage(21, 'agent'),
@@ -307,7 +178,35 @@ describe('MessageList', () => {
       ),
     );
 
+    // buildRenderUnits consumes trailing tool messages into the owning
+    // agent_turn's toolResultsByUseId map; there is exactly one agent
+    // row, never standalone tool rows (REQ-MLRU-002).
     expect(container.querySelector('[data-sequence-id="21"]')).not.toBeNull();
     expect(container.querySelectorAll('.message.agent')).toHaveLength(1);
+  });
+
+  it('renders a 100-message conversation without throwing', () => {
+    // The deleted spacer-based windowing layer had a separate test that
+    // asserted a bounded number of rendered units + presence of spacers.
+    // With virtuoso owning virtualization, that's a library concern;
+    // here we only assert MessageList builds + dispatches render units
+    // for a representative payload size. Real windowing behavior is
+    // verified by agent-browser smoke against running Phoenix.
+    const historical = Array.from({ length: 100 }, (_, i) => makeMessage(i + 1, 'user'));
+
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-100"
+        />,
+      ),
+    );
+
+    expect(container.querySelectorAll('[data-render-unit-key]').length).toBe(100);
   });
 });

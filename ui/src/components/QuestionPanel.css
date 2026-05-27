@@ -492,8 +492,8 @@
   background: var(--bg-hover, var(--bg-secondary));
 }
 
-/* Small decline button (footer-left, unobtrusive) */
-.question-btn--decline-small {
+/* Small dismiss button (footer-left, unobtrusive) */
+.question-btn--dismiss-small {
   background: transparent;
   color: var(--text-muted);
   border: none;
@@ -502,8 +502,8 @@
   font-weight: 400;
 }
 
-.question-btn--decline-small:hover:not(:disabled) {
-  color: var(--accent-red);
+.question-btn--dismiss-small:hover:not(:disabled) {
+  color: var(--text-secondary, var(--text-primary));
 }
 
 /* Inline feedback */

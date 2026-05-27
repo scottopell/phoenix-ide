@@ -103,7 +103,7 @@ describe('conversationReducer', () => {
     it('clears streaming buffer on init', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        streamingBuffer: { text: 'partial', lastSequence: 3, startedAt: Date.now() },
+        streamingBuffer: { text: 'partial', lastSequence: 3, startedAt: Date.now(), requestId: 'test-req-id' },
       };
 
       const next = dispatch(atom, { type: 'sse_init', payload: makeInitPayload() });
@@ -504,7 +504,7 @@ describe('conversationReducer', () => {
         ...createInitialAtom(),
         lastSequenceId: 7,
         phase: { type: 'llm_requesting', attempt: 1 },
-        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000 },
+        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
         conversationId: 'conv-1',
       };
       const payload = makeInitPayload({
@@ -533,7 +533,7 @@ describe('conversationReducer', () => {
         ...createInitialAtom(),
         lastSequenceId: 7,
         phase: { type: 'llm_requesting', attempt: 1 },
-        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000 },
+        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
         conversationId: 'conv-1',
       };
       const payload = makeInitPayload({
@@ -566,7 +566,7 @@ describe('conversationReducer', () => {
         ...createInitialAtom(),
         lastSequenceId: 7,
         phase: { type: 'llm_requesting', attempt: 1 },
-        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000 },
+        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
         conversationId: 'conv-1',
       };
       const payload = makeInitPayload({
@@ -591,7 +591,7 @@ describe('conversationReducer', () => {
         ...createInitialAtom(),
         lastSequenceId: 7,
         phase: { type: 'llm_requesting', attempt: 1 },
-        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000 },
+        streamingBuffer: { text: 'Hello ', lastSequence: 7, startedAt: 1000, requestId: 'test-req-id' },
         conversationId: 'conv-1',
       };
       const payload = makeInitPayload({
@@ -675,7 +675,7 @@ describe('conversationReducer', () => {
     it('clears streamingBuffer atomically on message arrival', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        streamingBuffer: { text: 'partial text', lastSequence: 8, startedAt: Date.now() },
+        streamingBuffer: { text: 'partial text', lastSequence: 8, startedAt: Date.now(), requestId: 'test-req-id' },
       };
 
       const next = dispatch(atom, {
@@ -1118,7 +1118,7 @@ describe('conversationReducer', () => {
     it('clears streaming buffer', () => {
       const atom: ConversationAtom = {
         ...createInitialAtom(),
-        streamingBuffer: { text: 'incomplete', lastSequence: 15, startedAt: Date.now() },
+        streamingBuffer: { text: 'incomplete', lastSequence: 15, startedAt: Date.now(), requestId: 'test-req-id' },
       };
 
       const next = dispatch(atom, { type: 'sse_agent_done', sequenceId: 16 });
@@ -1151,8 +1151,8 @@ describe('conversationReducer', () => {
     it('accumulates tokens in streaming buffer', () => {
       const atom = llmRequestingAtom();
 
-      const s1 = dispatch(atom, { type: 'sse_token', sequenceId: 1, delta: 'Hello' });
-      const s2 = dispatch(s1, { type: 'sse_token', sequenceId: 2, delta: ' world' });
+      const s1 = dispatch(atom, { type: 'sse_token', sequenceId: 1, delta: 'Hello', requestId: 'test-req-id' });
+      const s2 = dispatch(s1, { type: 'sse_token', sequenceId: 2, delta: ' world', requestId: 'test-req-id' });
 
       expect(s2.streamingBuffer?.text).toBe('Hello world');
       expect(s2.lastSequenceId).toBe(2);
@@ -1162,10 +1162,10 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...llmRequestingAtom(),
         lastSequenceId: 5,
-        streamingBuffer: { text: 'Hello', lastSequence: 5, startedAt: Date.now() },
+        streamingBuffer: { text: 'Hello', lastSequence: 5, startedAt: Date.now(), requestId: 'test-req-id' },
       };
 
-      const next = dispatch(atom, { type: 'sse_token', sequenceId: 3, delta: ' stale' });
+      const next = dispatch(atom, { type: 'sse_token', sequenceId: 3, delta: ' stale', requestId: 'test-req-id' });
 
       expect(next).toBe(atom);
     });
@@ -1175,10 +1175,10 @@ describe('conversationReducer', () => {
       const atom: ConversationAtom = {
         ...llmRequestingAtom(),
         lastSequenceId: 1,
-        streamingBuffer: { text: 'Hello', lastSequence: 1, startedAt },
+        streamingBuffer: { text: 'Hello', lastSequence: 1, startedAt, requestId: 'test-req-id' },
       };
 
-      const next = dispatch(atom, { type: 'sse_token', sequenceId: 2, delta: '!' });
+      const next = dispatch(atom, { type: 'sse_token', sequenceId: 2, delta: '!', requestId: 'test-req-id' });
 
       expect(next.streamingBuffer?.startedAt).toBe(startedAt);
     });
@@ -1193,6 +1193,7 @@ describe('conversationReducer', () => {
         type: 'sse_token',
         sequenceId: 1,
         delta: 'ghost',
+        requestId: 'test-req-id',
       });
       expect(next).toBe(atom);
       expect(next.streamingBuffer).toBeNull();
@@ -1211,6 +1212,7 @@ describe('conversationReducer', () => {
         type: 'sse_token',
         sequenceId: 1,
         delta: 'ghost',
+        requestId: 'test-req-id',
       });
       expect(next).toBe(atom);
     });
@@ -1232,13 +1234,13 @@ describe('conversationReducer', () => {
         ...createInitialAtom(),
         phase: { type: 'llm_requesting', attempt: 1 },
         lastSequenceId: 50,
-        streamingBuffer: { text: 'Before ', lastSequence: 50, startedAt: Date.now() },
+        streamingBuffer: { text: 'Before ', lastSequence: 50, startedAt: Date.now(), requestId: 'test-req-id' },
       };
 
       // Server keeps streaming across the reconnect with ids 51, 52, 53.
-      const a1 = dispatch(preReconnect, { type: 'sse_token', sequenceId: 51, delta: 'reconnect ' });
-      const a2 = dispatch(a1, { type: 'sse_token', sequenceId: 52, delta: 'works ' });
-      const a3 = dispatch(a2, { type: 'sse_token', sequenceId: 53, delta: 'correctly' });
+      const a1 = dispatch(preReconnect, { type: 'sse_token', sequenceId: 51, delta: 'reconnect ', requestId: 'test-req-id' });
+      const a2 = dispatch(a1, { type: 'sse_token', sequenceId: 52, delta: 'works ', requestId: 'test-req-id' });
+      const a3 = dispatch(a2, { type: 'sse_token', sequenceId: 53, delta: 'correctly', requestId: 'test-req-id' });
 
       expect(a3.streamingBuffer?.text).toBe('Before reconnect works correctly');
       expect(a3.lastSequenceId).toBe(53);

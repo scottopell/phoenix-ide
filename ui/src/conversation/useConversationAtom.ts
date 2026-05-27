@@ -177,18 +177,25 @@ export function useStreamingBuffer(slug: string): StreamingBuffer | null {
 }
 
 /**
- * Returns the streaming buffer's `startedAt` for `slug`, or null when
+ * Returns the streaming buffer's `requestId` for `slug`, or null when
  * no buffer is active. Re-renders the consumer on streaming-start,
- * streaming-end, AND streaming-restart (a new buffer started with a
- * fresh `startedAt`), because `Object.is` comparison on the returned
- * number distinguishes those transitions.
+ * streaming-end, AND streaming-restart (a new buffer with a fresh
+ * `requestId`), because `Object.is` comparison on the returned string
+ * distinguishes those transitions.
  *
- * Use this to derive a session-stable identity for a streaming view
- * (e.g., a React `key` that forces a fresh component instance on each
- * new streaming session). The boolean "is streaming active right now"
- * is just `useStreamingStartedAt(slug) !== null`.
+ * `requestId` is the server-generated id stamped on every `Token` SSE
+ * event AND on the eventual `AssistantMessage.message_id`. Using it as
+ * the streaming render unit's key means the streaming → sent transition
+ * preserves key identity — the streaming `TailUnit` and the finalized
+ * `agent_turn` `HistoricalUnit` share a key, so virtuoso (and the
+ * React reconciler in general) sees an in-place keyed update rather
+ * than a cross-region key swap. Symmetric to REQ-MLRU-001's
+ * pending_user → user pattern.
+ *
+ * The boolean "is streaming active right now" is just
+ * `useStreamingRequestId(slug) !== null`.
  */
-export function useStreamingStartedAt(slug: string | undefined): number | null {
+export function useStreamingRequestId(slug: string | undefined): string | null {
   const store = useConversationStore();
 
   const subscribe = useCallback(
@@ -196,7 +203,7 @@ export function useStreamingStartedAt(slug: string | undefined): number | null {
     [store, slug],
   );
   const getSnapshot = useCallback(
-    () => (slug ? store.getSnapshot(slug).streamingBuffer?.startedAt ?? null : null),
+    () => (slug ? store.getSnapshot(slug).streamingBuffer?.requestId ?? null : null),
     [store, slug],
   );
 

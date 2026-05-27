@@ -51,7 +51,7 @@ impl From<NotificationSettingsRequest> for crate::db::NotificationSettings {
 /// Request to upgrade a conversation's model
 #[derive(Debug, Deserialize)]
 pub struct UpgradeModelRequest {
-    /// Target model ID (e.g., "claude-sonnet-4-6-1m")
+    /// Target model ID (e.g., "claude-opus-4-7").
     pub model: String,
 }
 
@@ -359,6 +359,12 @@ pub struct TaskEntry {
 #[derive(Debug, Serialize)]
 pub struct TasksResponse {
     pub tasks: Vec<TaskEntry>,
+}
+
+/// Query parameters for listing project task files before a conversation exists.
+#[derive(Debug, Deserialize)]
+pub struct ProjectTasksQuery {
+    pub cwd: String,
 }
 
 /// Expansion error detail returned to the frontend (REQ-IR-007)

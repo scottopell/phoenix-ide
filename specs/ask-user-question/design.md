@@ -11,10 +11,15 @@ The execution flow is:
 4. The state machine transitions from `ToolExecuting` to `AwaitingUserResponse`,
    persisting the questions and remaining tool state
 5. An SSE state_change event notifies the UI to display the question interface
-6. The user selects options and submits via `POST /api/conversations/{id}/respond`
-7. The API handler sends a `UserQuestionResponse` event to the state machine
+6. The user selects options and submits via `POST /api/conversations/{id}/respond`,
+   or dismisses the structured panel via `POST /api/conversations/{id}/dismiss-question`
+7. For submitted answers, the API handler sends a `UserQuestionResponse` event
+   to the state machine
 8. The state machine constructs a tool result from the answers and resumes:
    either executing remaining tools or requesting the next LLM turn
+9. For dismissal, the state machine returns to `Idle` without persisting a
+   message or requesting the LLM; the user may type a normal chat message to
+   continue explicitly
 
 The tool struct exists for schema and description purposes. Execution is
 intercepted by the executor before reaching `Tool::run()`.
@@ -102,6 +107,8 @@ UserQuestionResponse {
     answers: HashMap<String, String>,
     annotations: Option<HashMap<String, QuestionAnnotation>>,
 },
+
+UserQuestionDismissed,
 ```
 
 ### State Transitions
@@ -113,8 +120,9 @@ UserQuestionResponse {
 resumes execution: if remaining tools exist, transitions to `ToolExecuting`
 for the next tool; otherwise transitions to `LlmRequesting`.
 
-`AwaitingUserResponse` + `UserCancel` constructs an error tool result ("User
-declined to answer") and transitions to `Idle`.
+`AwaitingUserResponse` + `UserQuestionDismissed` transitions to `Idle`,
+persisting the state change and notifying clients. It does not persist a user
+message, create a tool result, or request the LLM.
 
 ## Executor Integration (REQ-AUQ-001, REQ-AUQ-005, REQ-AUQ-006)
 
@@ -181,7 +189,7 @@ Work). It is NOT registered in `ToolRegistry::for_subagent()`.
 The tool uses `defer_loading: true` via the existing MCP tool search mechanism.
 On models without tool search support, it appears in the standard tool list.
 
-## API Endpoint (REQ-AUQ-003, REQ-AUQ-004)
+## API Endpoints (REQ-AUQ-003, REQ-AUQ-004)
 
 ```
 POST /api/conversations/{id}/respond
@@ -203,6 +211,15 @@ The handler sends a `UserQuestionResponse` event to the state machine.
 If the conversation is not in `AwaitingUserResponse` state, returns 409
 Conflict.
 
+```
+POST /api/conversations/{id}/dismiss-question
+```
+
+The handler sends a `UserQuestionDismissed` event to the state machine.
+If the conversation is not in `AwaitingUserResponse` state, returns 409
+Conflict. Dismissal only closes the structured question panel; it is not an
+answer and does not authorize autonomous continuation.
+
 ## UI Components (REQ-AUQ-001, REQ-AUQ-002, REQ-AUQ-003, REQ-AUQ-007)
 
 When SSE `state_change` event arrives with `type: "awaiting_user_response"`:
@@ -215,7 +232,7 @@ When SSE `state_change` event arrives with `type: "awaiting_user_response"`:
 5. Each question shows an "Other" text input as the last option
 6. Optional notes field per question for user annotations
 7. Submit button sends POST to `/api/conversations/{id}/respond`
-8. Decline button sends POST to `/api/conversations/{id}/cancel`
+8. Dismiss button sends POST to `/api/conversations/{id}/dismiss-question`
 
 ## Testing Strategy
 
