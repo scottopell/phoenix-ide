@@ -455,6 +455,53 @@ rule PersistedMessageClearsReplayRing {
         -- client's pending replay path).
 }
 
+-- ============================================================
+-- Cross-spec checklist — when adding a new SseWireEvent variant
+-- ============================================================
+-- The wire envelope is consumed by multiple specs and code paths.
+-- A new variant landed in only some of them silently degrades the
+-- guarantees the others depend on. When adding a variant, update
+-- ALL of the following in the same change:
+--
+-- 1. crates/phoenix-ide/src/api/wire.rs
+--    - Add the variant to enum SseWireEvent
+--    - Add its event-type discriminator to event_type()
+--    - Add a parity test entry under parity_*
+-- 2. crates/phoenix-ide/src/runtime.rs (SseEvent)
+--    - Add the matching runtime-side variant and From<SseEvent>
+--      conversion to SseWireEvent
+-- 3. ui/src/sseSchemas.ts
+--    - Add a valibot schema for the new variant
+--    - Wire it through the SSE-event reducer dispatch
+-- 4. ui/src/hooks/useConnection.ts (or wherever the EventSource
+--    listeners are registered)
+--    - Register an explicit listener for the new event name; the
+--      native EventSource has no wildcard for named events, so a
+--      missing listener silently drops the event on the client
+--      AND breaks the heartbeat-watchdog's lastSseEventAt bump
+--      (see specs/working-phase-visibility/, "EventSource listener
+--      wiring (required)" in design.md)
+-- 5. THIS spec (sse_wire.allium)
+--    - EphemeralEventAppendedToReplayRing.event_type whitelist below
+--    - PendingEventEntry's event_type comment block (~L87)
+--    - The replay-ordering invariants if the variant has ordering
+--      semantics that interact with token/Message
+-- 6. specs/conversation_atom/conversation_atom.allium
+--    - Add a reducer rule for the new event's effect on the atom,
+--      OR document it as ephemeral with no atom impact
+-- 7. specs/sse_wire/sse_wire.allium and any consumer spec that
+--    enumerates event types — search with: grep -rn "'token'" specs/
+--
+-- Audit pattern:
+--   grep -rn "'<new_event_name>'\\|\"<new_event_name>\"" specs/ crates/ ui/
+--
+-- Missing any step is a structural bug, not a polish item. A
+-- forgotten replay-ring whitelist entry (item 5) means the new event
+-- replays on reconnect for some clients but not others; a forgotten
+-- listener registration (item 4) means the watchdog goes stale during
+-- a turn that only emits the un-registered event type.
+-- ============================================================
+
 -- Every non-Message broadcast appends to the ring. Includes:
 -- token, state_change, message_updated, agent_done, conversation_update,
 -- conversation_became_terminal, error, browser_session_state,

@@ -376,6 +376,115 @@ config {
 }
 
 ------------------------------------------------------------
+-- Helpers (pure functions referenced by the rules below)
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; the rules below
+-- call these by bare identifier. This block is the single source of
+-- truth for their signatures and semantics. Any rule that uses a name
+-- not in this block is using an undeclared helper — call that out in
+-- review rather than inventing semantics ad-hoc.
+--
+-- Phase mapping (ConvState → WorkingPhase enum):
+--
+--   is_working_phase(raw_state: ConvState) -> Boolean
+--       True iff raw_state is one of the runtime ConvState variants
+--       that maps to our WorkingPhase enum (llm_requesting variants,
+--       tool_executing, awaiting_sub_agents, awaiting_continuation,
+--       cancelling variants, awaiting_recovery). False for idle,
+--       terminal, error, context_exhausted, handed_off, etc.
+--
+--   working_phase_of(raw_state: ConvState) -> WorkingPhase?
+--       The mapped WorkingPhase value when is_working_phase(raw_state)
+--       holds; null otherwise. Mapping detailed in the
+--       ObservedPhaseUpdatedByStateChange rule's @guidance.
+--
+-- Display-text formatters (return DisplayedActivity or String):
+--
+--   base_reason_text_for(phase: ObservedPhase) -> String
+--       The leading prose for the base reason, e.g. "thinking",
+--       "executing bash", "awaiting sub-agents". Does NOT include the
+--       elapsed counter; just the verb-phrase.
+--
+--   phase_prose(p: WorkingPhase) -> String
+--       Map from a specific WorkingPhase value to its display prose
+--       for the "other working" catch-all (awaiting_sub_agents,
+--       awaiting_continuation, cancelling, awaiting_recovery). Pure
+--       function; does not look up tool names.
+--
+--   connection_only_display(state: conn/ConnectionState,
+--                           attempts: Integer) -> DisplayedActivity
+--       The connection-chip-only display used when there is no agent
+--       activity to surface alongside (reconnecting/offline without
+--       captured activity, plus the transient connecting /
+--       reconnected_display / disconnected states). Encodes
+--       text + dot_class + has_timer=false.
+--
+--   non_working_display(phase: ObservedPhase) -> DisplayedActivity
+--       The idle / terminal / approval / error display. text reads
+--       the static phase label (e.g. "idle", "context exhausted");
+--       dot_class is the per-phase visual treatment; has_timer=false.
+--
+--   render_retry_modifier_for(view: ClientView) -> String
+--       "" when no TurnRetryContext{view: view} exists;
+--       " (retry K/N <reason>)" when one does. Leading space so the
+--       suffix concatenates cleanly onto a base reason text. K is
+--       retry.attempt, N is retry.max_attempts, <reason> comes from
+--       retry.reason_text.
+--
+--   render_frozen_retry_modifier(retry: RetryContext?) -> String
+--       "" when retry is null; same " (retry K/N <reason>)" format
+--       as render_retry_modifier_for otherwise. Reads from a frozen
+--       LastKnownActivity.retry snapshot rather than the live
+--       TurnRetryContext, so the reconnect display surfaces the
+--       retry context that was visible at disconnect time.
+--
+--   str(n: Integer) -> String
+--       Standard integer-to-decimal-string formatting. Used inline
+--       in DisplayedActivity.text construction.
+--
+-- State lookups:
+--
+--   current_tool_name(view: ClientView) -> String
+--       The tool_name of the most-recently-started InflightToolTimer
+--       for the given view. Reads from the entity directly; assumes
+--       at least one InflightToolTimer exists for the view (the
+--       caller, DisplayWhenToolExecuting, gates on
+--       phase = tool_executing which implies a running tool).
+--       Parallel-tool policy is deferred (see
+--       `deferred MultipleParallelToolsInOneAssistantMessage`).
+--
+--   current_retry_for(view: ClientView) -> RetryContext?
+--       TurnRetryContext{view: view}.retry when the entity exists;
+--       null otherwise. The LastKnownActivity capture rule uses this
+--       to snapshot retry alongside the base activity at the moment
+--       of degrade.
+--
+-- Invariant predicates (used only inside `invariant` blocks):
+--
+--   live_timer_count_in(text: String) -> Integer
+--       Count of distinct live elapsed-counter occurrences inside a
+--       rendered display string. The format is "<reason> Ns" where N
+--       is a positive integer followed by 's' (and possibly a retry
+--       suffix). The helper does NOT match "(retry 2/5)" as a
+--       counter — the elapsed is the unprefixed " Ns" token before
+--       the optional retry parenthetical.
+--
+--   elapsed_values_in(display: StateBarDisplay) -> Set<ElapsedValue>
+--       All elapsed-value tokens that appear in the display, each
+--       annotated with a `.source` field that traces back to one of
+--       the server-authoritative timestamps allowed by the
+--       ElapsedTracesToServerTimestamp invariant.
+--
+--   most_recent_event_was_init(view: ClientView) -> Boolean
+--       True iff the most recent SSE event delivered to the client
+--       view was an Init (any variant). Used by the
+--       InitClearsCapturedActivity invariant to assert wipe-on-init
+--       semantics structurally.
+--
+------------------------------------------------------------
+
+------------------------------------------------------------
 -- Rules — ObservedPhase
 ------------------------------------------------------------
 
@@ -762,6 +871,56 @@ rule InflightToolTimerRemovedOnResult {
     requires: exists InflightToolTimer{view: view, tool_use_id: tool_use_id}
 
     ensures: not exists InflightToolTimer{view: view, tool_use_id: tool_use_id}
+}
+
+-- Orphan-cleanup paths: an InflightToolTimer is created at dispatch
+-- and removed on the matching tool-result event. Several failure
+-- modes can leave the timer without a corresponding result event —
+-- without explicit cleanup the entity would persist with `started_at`
+-- ticking forever in the UI, and a later attempt to recreate it for
+-- the same tool_use_id would hit a `not exists` precondition failure
+-- on InflightToolTimerCreated. These rules close those holes
+-- structurally; the implementation discards the inline DOM timer on
+-- the same edges.
+
+-- Conversation reaches a terminal state (Archived, etc.): every
+-- in-flight tool timer for the view is removed. The conversation
+-- can no longer produce a tool result, so the timer cannot complete
+-- via the normal path.
+-- Event shape: SseConversationBecameTerminal(view).
+rule InflightToolTimerRemovedOnConversationTerminal {
+    when: SseConversationBecameTerminal(view)
+
+    ensures: for t in InflightToolTimer{view: view}:
+        not exists t
+}
+
+-- Phase exited `tool_executing` without the matching tool result —
+-- a cancellation that fired before the running tool surfaced its
+-- output (cancelling_tool path), or an error that took the conversation
+-- out of tool_executing into an error/recovery state. The runtime
+-- guarantees no tool result for the cancelled tool, so the timer
+-- cannot complete via SseToolResultReceived. Cleared on the phase
+-- exit edge.
+rule InflightToolTimerRemovedOnToolPhaseExit {
+    when: ObservedPhaseUpdatedFromWorking(view, tool_executing, new_phase)
+
+    ensures: for t in InflightToolTimer{view: view}:
+        not exists t
+}
+
+-- Hard-delete of the conversation removes the per-view state
+-- entirely. Mirrors the runtime cascade (REQ-BED-032 in bedrock).
+-- Defensive; in practice the ClientView itself is destroyed when the
+-- conversation is hard-deleted, so the timers go with it. The rule
+-- exists so the invariant holds without depending on actor-destruction
+-- ordering.
+-- Event shape: SseConversationHardDeleted(view).
+rule InflightToolTimerRemovedOnConversationDelete {
+    when: SseConversationHardDeleted(view)
+
+    ensures: for t in InflightToolTimer{view: view}:
+        not exists t
 }
 
 ------------------------------------------------------------
