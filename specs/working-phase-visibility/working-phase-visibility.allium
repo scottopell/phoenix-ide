@@ -12,17 +12,26 @@
 --        clear rules that prevent connection state from masking agent
 --        state during reconnects.
 --
--- Source of truth:
+-- Source of truth: this spec is a forward contract — the
+-- wire/runtime changes listed under "implementation targets" below
+-- are not yet present in the repo at the time the spec lands; the
+-- spec is what the implementation will be built against. Existing
+-- carriers (already in code) are listed separately.
+--
+-- Already in code (carriers reused by this spec):
 --   ui/src/components/StateBar.tsx — derivation host
 --   ui/src/conversation/atom.ts — phaseEnteredAt / toolStartedAt /
---       lastSseEventAt fields
+--       lastSseEventAt fields target landing spots
 --   ui/src/components/MessageComponents.tsx — inline tool/bubble timers
---   crates/phoenix-ide/src/api/wire.rs — StateChange.state_updated_at,
---       LlmFirstByte event
 --   crates/phoenix-ide/src/db/schema.rs — Conversation.state_updated_at
 --       (already exists; this spec reuses it as the entry timestamp)
---   crates/phoenix-ide/src/runtime/executor.rs — LlmFirstByte emission,
---       per-tool started_at injection into message display_data
+--
+-- Implementation targets (this spec is a forward contract for):
+--   crates/phoenix-ide/src/api/wire.rs — adds StateChange.state_updated_at
+--       field and the LlmFirstByte SSE variant
+--   crates/phoenix-ide/src/runtime/executor.rs — emits LlmFirstByte
+--       from the token forwarder, injects per-tool started_at into
+--       the assistant message's display_data.tool_starts map
 --
 -- Includes: DisplayedActivity composition; LastKnownActivity capture
 --           on connected→reconnecting; HeartbeatWatchdog fresh/stale;

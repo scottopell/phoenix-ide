@@ -201,9 +201,9 @@ waiting"), so the spec mandates a placeholder anchored to the spot
 where the text will appear, giving the user spatial continuity. The
 placeholder is implemented as a derived/synthetic render unit (see
 design.md "Pending assistant bubble") rather than a row in the
-messages list; the existing empty-message filter at
-the empty-message filter (`hasRenderableContent` guard in `MessageComponents.tsx`) continues to correctly hide genuinely
-empty historical agent rows.
+messages list; the existing `hasRenderableContent` guard in
+`MessageComponents.tsx` continues to correctly hide genuinely empty
+historical agent rows.
 
 ---
 

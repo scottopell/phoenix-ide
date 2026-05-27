@@ -59,8 +59,11 @@
 --
 -- Requirement traceability: REQ-LRV-001 through REQ-LRV-007 are modelled
 -- here. REQ-LRV-002 (reason classification) is structurally enforced by
--- the exhaustive match between LlmErrorKind's retryable subset and
--- LlmAttemptReason; modelled via the LlmAttemptReasonClassification rule.
+-- the LlmAttemptReason enum (a closed three-variant set) and the
+-- classify_retry_reason() helper that maps LlmErrorKind's retryable
+-- subset into it; consumed by RuntimeEmitsLlmAttemptOnScheduleRetry's
+-- `reason in { ... }` precondition and the
+-- LlmAttemptReasonInRetryableSet invariant.
 -- REQ-LRV-005 (cancellation routes through Cancelling) is a property of
 -- the state machine transitions and the StaleRetryTimeoutAbsorbed
 -- behaviour already modelled in specs/conversation_atom/; this spec
@@ -72,20 +75,22 @@
 -- sse_wire.
 
 ------------------------------------------------------------
--- Value Types
+-- Enumerations
 ------------------------------------------------------------
 
 -- Why a retry attempt is being scheduled. Mirrors the retryable subset
 -- of LlmErrorKind exactly (`llm/error.rs:111` — Network, RateLimit,
 -- ServerError). Non-retryable LlmErrorKind variants terminate the turn
 -- without scheduling a retry, so they never reach this enum.
-value LlmAttemptReason {
-    -- one of: rate_limit, server_error, network
-    -- (declared as an enum in the implementation; Allium v3 grammar
-    -- represents the three-value distinction via the equality
-    -- predicates in the rules below)
-    kind: String
+enum LlmAttemptReason {
+    rate_limit
+    | server_error
+    | network
 }
+
+------------------------------------------------------------
+-- Value Types
+------------------------------------------------------------
 
 -- The retry context surfaced to the client for one in-flight retry.
 -- Moved here from working-phase-visibility's PLACEHOLDER block on
@@ -103,7 +108,8 @@ value LlmAttemptReason {
 --                   `state_machine/transition.rs:183`). Carried
 --                   per-event so a future per-provider policy is
 --                   wire-compatible.
---   reason:         Classified per LlmAttemptReasonClassification.
+--   reason:         One of the LlmAttemptReason enum variants, set by
+--                   classify_retry_reason() from the inbound LlmError.
 --   reason_text:    Human-rendered form of `reason` ("rate limit",
 --                   "server error", "network error"). Set by
 --                   the populator rule from a shared helper
@@ -144,6 +150,37 @@ entity TurnRetryContext {
     retry:           RetryContext
 }
 
+-- The most recent LlmAttempt broadcast for a conversation. Created /
+-- replaced by RuntimeEmitsLlmAttemptOnScheduleRetry; consumed by the
+-- LlmAttemptReason* and LlmAttemptDoesNotEscapeConversationBoundary
+-- invariants. This is the spec's projection of the runtime broadcast
+-- side-effect — the actual on-wire envelope is owned by sse_wire (the
+-- SseStream delivery rules); this entity tracks "the producer just
+-- emitted an LlmAttempt for this conversation" so cross-spec
+-- invariants can be expressed locally.
+entity LlmAttemptBroadcast {
+    conversation_id:           String
+    payload:                   RetryContext
+    -- The conversation on whose SSE stream the event was delivered.
+    -- Structurally equal to `conversation_id` by REQ-LRV-004 (the
+    -- producer broadcasts only on its own conversation's stream); the
+    -- separate field makes that invariant expressible.
+    delivered_on_conversation: String
+}
+
+-- The spec's projection of the persisted assistant message's
+-- display_data.retry_count field. Modeled as a small entity rather
+-- than as an extension to sse_wire/PersistedMessage so the surface
+-- can expose just the retry-count carrier without importing a wider
+-- contract from another spec. The implementation's authoritative
+-- record IS the runtime's MessageDisplayData.retry_count: u32 field;
+-- this entity is the spec-level shadow set by RetryCountPersistedAtTurnEnd.
+entity PersistedAssistantMessage {
+    conversation_id: String
+    message_id:      String
+    retry_count:     Integer
+}
+
 ------------------------------------------------------------
 -- Helpers (pure functions referenced by the rules below)
 ------------------------------------------------------------
@@ -156,17 +193,17 @@ entity TurnRetryContext {
 --
 --   classify_retry_reason(error_kind: LlmErrorKind) -> LlmAttemptReason
 --       Maps the retryable subset of LlmErrorKind to LlmAttemptReason:
---           Network     -> LlmAttemptReason{kind: "network"}
---           RateLimit   -> LlmAttemptReason{kind: "rate_limit"}
---           ServerError -> LlmAttemptReason{kind: "server_error"}
+--           Network     -> network
+--           RateLimit   -> rate_limit
+--           ServerError -> server_error
 --       Undefined on non-retryable variants (which never reach
 --       Effect::ScheduleRetry per is_retryable() in llm/error.rs:111).
 --
 --   reason_to_text(reason: LlmAttemptReason) -> String
---       Maps reason.kind to its human-rendered form:
---           "rate_limit"   -> "rate limit"
---           "server_error" -> "server error"
---           "network"      -> "network error"
+--       Maps the enum variant to its human-rendered form:
+--           rate_limit   -> "rate limit"
+--           server_error -> "server error"
+--           network      -> "network error"
 --       The strings are not normative wire syntax; they are the
 --       implementation's single source of truth and are referenced by
 --       working-phase-visibility's render_retry_modifier_for helper
@@ -190,42 +227,24 @@ entity TurnRetryContext {
 ------------------------------------------------------------
 
 ------------------------------------------------------------
--- Rules — LlmAttempt classification + emission
+-- Rules — LlmAttempt emission
 ------------------------------------------------------------
 
--- REQ-LRV-002: the runtime-side classification of LlmErrorKind to
--- LlmAttemptReason. Documents the contract that the wire emission
--- (RuntimeEmitsLlmAttemptOnScheduleRetry below) honors. Modelling this
--- as a rule (rather than @guidance) makes the three-way mapping
--- structural: if a future LlmErrorKind variant becomes retryable, the
--- match here must be extended or the rule is incomplete.
+-- REQ-LRV-001 / REQ-LRV-002: the SSE wire emission. Fires from the
+-- executor's Effect::ScheduleRetry handler (`executor.rs:1408-1418`),
+-- immediately before the spawned tokio sleep that drives the backoff.
+-- The emission and the sleep happen in the same effect arm, so there
+-- is no ordering window in which the sleep completes (and a
+-- RetryTimeout outcome lands) before the LlmAttempt event has been
+-- queued for broadcast.
 --
--- Event shape: RuntimeClassifiesRetryError(conv_id, error_kind).
--- Fires inside handle_core_error_retry / handle_core_continuation at
--- the moment the rule's `if error_kind.is_retryable() && *attempt <
--- MAX_RETRY_ATTEMPTS` guard passes.
-rule LlmAttemptReasonClassification {
-    when: RuntimeClassifiesRetryError(conv_id, error_kind)
-
-    -- The three retryable variants in LlmErrorKind. The runtime
-    -- guarantees this rule fires only inside the retryable guard, so
-    -- the four non-retryable variants (UsageLimitReached,
-    -- ServerOverloaded, Auth, InvalidRequest, ContentFilter,
-    -- ContextWindowExceeded) never trigger.
-    requires: error_kind in { "network", "rate_limit", "server_error" }
-
-    let reason = classify_retry_reason(error_kind)
-
-    ensures: ClassifiedRetryReason{conv_id}.reason = reason
-}
-
--- REQ-LRV-001: the SSE wire emission. Fires from the executor's
--- Effect::ScheduleRetry handler (`executor.rs:1408-1418`),
--- immediately before the spawned tokio sleep that drives the
--- backoff. The emission and the sleep happen in the same effect
--- arm, so there is no ordering window in which the sleep
--- completes (and a RetryTimeout outcome lands) before the
--- LlmAttempt event has been queued for broadcast.
+-- The `reason` argument is one of the three LlmAttemptReason enum
+-- variants. The runtime maps the inbound LlmErrorKind to this enum
+-- via classify_retry_reason() (declared in the Helpers block), which
+-- mirrors the retryable subset of LlmErrorKind (`llm/error.rs:111` —
+-- is_retryable() returns true for exactly Network/RateLimit/ServerError).
+-- Non-retryable LlmErrorKind variants terminate the turn without
+-- scheduling a retry, so they never reach this rule.
 --
 -- Event shape: EffectScheduleRetryEmitted(conv_id, attempt, delay_ms,
 --                                          reason, resets_at).
@@ -234,7 +253,7 @@ rule RuntimeEmitsLlmAttemptOnScheduleRetry {
 
     requires: attempt >= 1
     requires: attempt <= max_retry_attempts()
-    requires: reason.kind in { "network", "rate_limit", "server_error" }
+    requires: reason in { rate_limit, server_error, network }
     requires: delay_ms >= 0
 
     -- The LlmAttempt event is constructed here. The actual SSE
@@ -249,7 +268,8 @@ rule RuntimeEmitsLlmAttemptOnScheduleRetry {
         resets_at:      resets_at
     }
 
-    ensures: LlmAttemptBroadcast{conv_id}.payload = payload
+    ensures: LlmAttemptBroadcast{conversation_id: conv_id}.payload                   = payload
+    ensures: LlmAttemptBroadcast{conversation_id: conv_id}.delivered_on_conversation = conv_id
 
     @guidance
         -- Implementation: inside the Effect::ScheduleRetry arm of
@@ -304,7 +324,7 @@ rule TurnRetryContextUpdatedOnLlmAttempt {
         resets_at:      resets_at
     }
 
-    ensures: TurnRetryContext{conv_id}.retry = payload
+    ensures: TurnRetryContext{conversation_id: conv_id}.retry = payload
 }
 
 -- REQ-LRV-003 (cross-spec) / REQ-WPV-003 (per the consumer): the
@@ -373,7 +393,8 @@ rule RetryCountPersistedAtTurnEnd {
     -- underflows).
     let count = final_attempt - 1
 
-    ensures: PersistedAssistantMessage{message_id}.display_data_retry_count = count
+    ensures: PersistedAssistantMessage{message_id: message_id}.conversation_id = conv_id
+    ensures: PersistedAssistantMessage{message_id: message_id}.retry_count     = count
 
     @guidance
         -- Implementation: inside the Effect::persist_agent_message
@@ -421,11 +442,13 @@ invariant TurnRetryContextPresentBetweenAttemptAndTurnBoundary {
 
 -- REQ-LRV-002: the wire emission only carries reason values from the
 -- retryable subset. Structurally enforced by the
--- RuntimeEmitsLlmAttemptOnScheduleRetry rule's reason.kind precondition.
+-- RuntimeEmitsLlmAttemptOnScheduleRetry rule's `reason` precondition
+-- (`reason in { rate_limit, server_error, network }`) and the
+-- LlmAttemptReason enum's closed set of variants.
 invariant LlmAttemptReasonInRetryableSet {
     for conv_id in LlmAttemptBroadcast:
-        LlmAttemptBroadcast{conv_id}.payload.reason.kind
-            in { "network", "rate_limit", "server_error" }
+        LlmAttemptBroadcast{conversation_id: conv_id}.payload.reason
+            in { rate_limit, server_error, network }
 }
 
 -- REQ-LRV-004: LlmAttempt is emitted on the conversation whose
@@ -439,7 +462,7 @@ invariant LlmAttemptDoesNotEscapeConversationBoundary {
     -- Modelled as a sse_wire-level property; this spec asserts the
     -- non-leak by construction of broadcast_tx scope.
     for conv_id in LlmAttemptBroadcast:
-        LlmAttemptBroadcast{conv_id}.delivered_on_conversation = conv_id
+        LlmAttemptBroadcast{conversation_id: conv_id}.delivered_on_conversation = conv_id
 }
 
 -- REQ-LRV-007: LlmAttempt is replay-eligible; RateLimitSnapshot is
@@ -483,7 +506,7 @@ surface RetryContextProducer {
     facing consumer_conversation: String
 
     exposes:
-        TurnRetryContext{conversation_id}
+        TurnRetryContext{conversation_id: consumer_conversation}.retry
         RetryContext
 
     @guarantee TurnBoundaryClears
@@ -512,7 +535,7 @@ surface RetryCountPersistedSurface {
     facing message_consumer: String  -- message_id
 
     exposes:
-        PersistedAssistantMessage{message_id}.display_data_retry_count
+        PersistedAssistantMessage{message_id: message_consumer}.retry_count
 
     @guarantee NonNegativeRetryCount
         -- retry_count is always >= 0. Zero means "did not retry" and

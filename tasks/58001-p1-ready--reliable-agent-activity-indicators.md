@@ -19,9 +19,11 @@ distinguish:
 
 - A long-running tool (e.g. bash compile)
 - A slow LLM call (high TTFT)
-- An LLM retry loop (429 / 5xx backoff happening *inside*
-  `complete_streaming`, invisible to the executor and therefore to the
-  UI)
+- An LLM retry loop (429 / 5xx backoff scheduled by the executor's
+  `Effect::ScheduleRetry` handler in `runtime/executor.rs`, driven by
+  the state machine's retry transitions in `state_machine/transition.rs`
+  — `attempt` IS on the wire via `StateChange.state.attempt`, but the
+  reason / delay / resets_at are not)
 - A wedged server (TCP still open, no events flowing)
 - A reconnect where the previous activity is forgotten by the UI
 
@@ -48,19 +50,28 @@ one elapsed counter, derived from the phase's state_updated_at.
 
 ## Current state (pointers)
 
-- `ui/src/components/the `toolElapsedSeconds` pattern in StateBar.tsx, 408-409` — existing
-  `toolExecutingStartedAt` elapsed-seconds pattern (template to copy)
-- `ui/src/components/the connection short-circuit in StateBar.tsx` — connection state currently
+- `ui/src/components/StateBar.tsx` — search for `toolElapsedSeconds` /
+  `toolExecutingStartedAt` for the existing elapsed-seconds pattern
+  (template to copy for the other working phases)
+- `ui/src/components/StateBar.tsx` — connection state currently
   short-circuits and *masks* agent state during reconnect
 - `crates/phoenix-ide/src/api/wire.rs` — SseWireEvent variants;
   `StateChange` doesn't carry `state_updated_at` on the wire even though
   `Conversation.state_updated_at` already exists on the row
   (`db/schema.rs:476`, bumped on every transition via `db.rs:676`)
 - `crates/phoenix-ide/src/llm/error.rs:81-105` — retry classification
-- `crates/phoenix-ide/src/llm/anthropic.rs` — retry loop lives inside
-  `complete_streaming`; no event emitted on retry
-- `crates/phoenix-ide/src/runtime/executor.rs:1630, 1740-1764` — LLM
-  dispatch + token forwarder; natural place to emit first-byte event
+  (`is_retryable()` defines the retryable subset: Network, RateLimit,
+  ServerError)
+- `crates/phoenix-ide/src/state_machine/transition.rs` —
+  `handle_core_error_retry` / `handle_core_continuation` schedule the
+  retry via `Effect::ScheduleRetry { delay, attempt }`. The LLM client
+  itself (`anthropic::complete_streaming` etc.) makes one attempt and
+  returns `Result<LlmResponse, LlmError>`; the executor + state
+  machine own the retry loop.
+- `crates/phoenix-ide/src/runtime/executor.rs` — `Effect::ScheduleRetry`
+  handler (search the file) is the natural emission point for the new
+  `LlmAttempt` SSE event; the LLM dispatch + token forwarder code is
+  where `LlmFirstByte` plugs in.
 
 ## Proposed stages
 
@@ -96,14 +107,18 @@ Each stage stands alone and ships value independently.
 
 ### Stage B — retry visibility (biggest trust win)
 
-- New SSE event `LlmAttempt { attempt, max, reason, backing_off_ms,
-  resets_at? }` emitted from the retry loop inside the LLM clients
-  (anthropic.rs, openai.rs, fireworks.rs).
-- StateBar consumes it and shows
-  `"anthropic retry 2/5, backing off 4s after rate limit"` per the
-  precedence rule above.
-- Persist nothing — purely ephemeral; on reconnect the next attempt's
-  event (or success) supersedes it.
+- New SSE event `LlmAttempt { attempt, max_attempts, reason,
+  backing_off_ms, resets_at? }` emitted from the executor's
+  `Effect::ScheduleRetry` handler (`runtime/executor.rs` — search for
+  `Effect::ScheduleRetry`), immediately before the spawned tokio sleep
+  that drives the backoff. See `specs/llm-retry-visibility/` for the
+  full producer contract.
+- StateBar consumes it and shows the retry suffix on the base reason
+  per REQ-WPV-003: `"thinking 4s (retry 2/3 after rate limit)"`.
+- Replayed via the SSE replay ring (`sse_wire.allium` whitelist) so a
+  reconnect mid-backoff reconstructs the suffix.
+- Post-hoc audit trail: `display_data.retry_count: u32` on the
+  persisted assistant message, badge rendered when > 0.
 
 ### Stage C — sub-phase split for the LLM call
 

@@ -60,9 +60,9 @@ Wire format changes are additive:
   so the client `EventSource` observes it for the watchdog. Forward-
   compatible: legacy clients that don't listen for `ping` ignore it.
 
-Client-side, a shared `useElapsedSeconds(startedAt)` hook (extracted from
-the existing `toolElapsedSeconds` pattern at the `toolElapsedSeconds` pattern in `StateBar.tsx`) feeds
-both the StateBar and the inline indicators. The conversation atom gains
+Client-side, a shared `useElapsedSeconds(startedAt)` hook (extracted
+from the existing `toolElapsedSeconds` pattern in `StateBar.tsx`)
+feeds both the StateBar and the inline indicators. The conversation atom gains
 `phaseEnteredAt`, `toolStartedAt` (per tool-use-id), and `lastSseEventAt`
 fields. The StateBar's display string is derived from a single function
 that takes `(connectionState, convState, phaseEnteredAt, lastKnownActivity,
@@ -77,10 +77,10 @@ in the sibling spec `specs/llm-retry-visibility/`.
 |-------------|--------|-------|
 | **REQ-WPV-001:** Server-authoritative state-entry timestamp | ❌ New | Adds `state_updated_at` to `StateChange` (sourced from existing `Conversation.state_updated_at`); Init already exposes it via flatten. ts-rs regen + `parity_*` test update required |
 | **REQ-WPV-002:** Inline elapsed-time on in-flight artifacts | ❌ New | Tool widget timer reads from the assistant message's `display_data.tool_starts[tool_use_id]` map (typed `BTreeMap<String, i64>`); pending assistant bubble is the synthetic render unit specified by REQ-WPV-006 below |
-| **REQ-WPV-003:** StateBar derivation rule | 🔄 Extend | Existing the `stateText` composition block in `StateBar.tsx` composition gains retry-modifier and degraded-signal precedence; existing `tool_executing` timer path becomes a special case of the generalised rule |
+| **REQ-WPV-003:** StateBar derivation rule | 🔄 Extend | The existing `stateText` composition block in `StateBar.tsx` gains retry-modifier and degraded-signal precedence; the existing `tool_executing` timer path becomes a special case of the generalised rule |
 | **REQ-WPV-004:** Heartbeat watchdog | ❌ New | Threshold 35s; depends on keep-alive switch from SSE comment to typed `ping` event |
-| **REQ-WPV-005:** Connection state does not mask agent state | 🔄 Rewrite | the connection short-circuit in `StateBar.tsx` currently short-circuits; replace with composition that retains last-known activity with frozen elapsed |
-| **REQ-WPV-006:** Pending assistant bubble | ❌ New | Synthetic `pending_agent` tail unit added to `ui/src/conversation/renderUnits.ts` (parallel to the existing `streaming_agent` unit), gated on `atom.phase.type === 'llm_requesting'` + empty `streamingBuffer`. The `MessageComponents.tsx` empty-message filter (`hasRenderableContent` guard) (`hasRenderableContent` guard in `MessageComponents.tsx`) is NOT changed — the placeholder is a derived render unit, not a message row |
+| **REQ-WPV-005:** Connection state does not mask agent state | 🔄 Rewrite | `StateBar.tsx` currently short-circuits on connection state; replace with composition that retains last-known activity with frozen elapsed |
+| **REQ-WPV-006:** Pending assistant bubble | ❌ New | Synthetic `pending_agent` tail unit added to `ui/src/conversation/renderUnits.ts` (parallel to the existing `streaming_agent` unit), gated on `atom.phase.type === 'llm_requesting'` + empty `streamingBuffer`. The `hasRenderableContent` guard in `MessageComponents.tsx` is NOT changed — the placeholder is a derived render unit, not a message row |
 | **REQ-WPV-007:** First-byte sub-phase distinction | ❌ New | Driven by new `LlmFirstByte` event; `streaming` displays without elapsed counter |
 | **REQ-WPV-008:** Display continuity across reload | ❌ New | Acceptance criterion for REQ-WPV-001 + REQ-WPV-005; integration-test target |
 

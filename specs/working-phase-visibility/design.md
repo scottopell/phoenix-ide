@@ -90,9 +90,9 @@ LlmFirstByte {
 }
 ```
 
-Emitted exactly once per LLM request, from the token forwarder in
-the forwarder task in `executor.rs`, immediately before the first `Token` event for
-that request is forwarded. The two events are emitted atomically (no
+Emitted exactly once per LLM request, from the token forwarder task
+in `executor.rs`, immediately before the first `Token` event for that
+request is forwarded. The two events are emitted atomically (no
 client can observe a `Token` for a request without first observing the
 `LlmFirstByte`). When an LLM request completes with zero tokens (an error
 or early termination), `LlmFirstByte` is NOT emitted.
@@ -340,10 +340,10 @@ messages table only after the `LlmResponse` transition (the
 `Effect::persist_agent_message` path in
 `crates/phoenix-ide/src/state_machine/transition.rs` ~L711), so during
 the pre-first-byte `llm_requesting` window the message list literally
-contains no row for the in-flight turn. The live streaming bubble after the first byte is
-already materialised by the `renderUnits` machinery as a synthetic
-`streaming_agent` tail unit driven by `streamingBuffer`
-(`ui/src/conversation/`renderUnits.ts` (the `streaming_agent` tail unit)`).
+contains no row for the in-flight turn. The live streaming bubble after the first byte is already materialised
+by the `renderUnits` machinery as a synthetic `streaming_agent` tail
+unit driven by `streamingBuffer` (see the `streaming_agent` tail unit
+in `ui/src/conversation/renderUnits.ts`).
 
 Add a new synthetic tail unit (`pending_agent` or similar) emitted by
 `renderUnits.ts` immediately before the existing `streaming_agent` tail

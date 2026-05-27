@@ -37,25 +37,25 @@ The retry is driven by the **executor + state machine**:
 
 1. `LlmRequesting { attempt: N }` is the active state.
 2. LLM client returns `Err(LlmError)`.
-3. Executor maps `LlmErrorKind` → `LlmOutcome`
-   (``llm_error_to_llm_outcome` in executor.rs`):
+3. Executor maps `LlmErrorKind` → `LlmOutcome` via `llm_error_to_outcome`
+   in `executor.rs`:
    - `RateLimit` → `LlmOutcome::RateLimited { retry_after }`
    - `ServerError` / `ServerOverloaded` → `LlmOutcome::ServerError { ... }`
    - `Network` → retryable
    - Others (`Auth`, `UsageLimitReached`, `ContentFilter`,
      `ContextWindowExceeded`, `InvalidRequest`) → non-retryable
-4. State machine handles retryable error in `handle_core_llm_error`
-   (``handle_core_error_retry` in transition.rs`):
+4. State machine handles retryable error in `handle_core_error_retry`
+   in `transition.rs`. For the `LlmRequesting` path:
    ```rust
-   CoreState::AwaitingContinuation {
-       rejected_tool_calls: ...,
-       attempt: new_attempt,   // = N + 1
-   }
-   .with_effect(Effect::ScheduleRetry {
-       delay,
-       attempt: new_attempt,
-   })
+   CoreState::LlmRequesting { attempt: new_attempt }   // = N + 1
+       .with_effect(Effect::PersistState)
+       .with_effect(Effect::ScheduleRetry { delay, attempt: new_attempt })
+       .with_effect(Effect::notify_state_change())
    ```
+   For the `AwaitingContinuation` retry path (post tool-round, handled
+   by `handle_core_continuation`), the state stays in
+   `AwaitingContinuation { rejected_tool_calls, attempt: new_attempt }`
+   with the same `ScheduleRetry` effect.
 5. Executor handles `Effect::ScheduleRetry` (`executor.rs:1408-1418`):
    ```rust
    Effect::ScheduleRetry { delay, attempt } => {
@@ -69,8 +69,11 @@ The retry is driven by the **executor + state machine**:
        Ok(None)
    }
    ```
-6. State machine transitions `AwaitingContinuation → LlmRequesting`
-   on `RetryTimeout` (`the `RetryTimeout` case in `handle_core_error_retry``).
+6. State machine transitions back to the requesting state on
+   `RetryTimeout` (the `RetryTimeout` arm of `handle_core_error_retry`
+   for `LlmRequesting`, and of `handle_core_continuation` for
+   `AwaitingContinuation`), firing `Effect::RequestLlm` /
+   `Effect::RequestContinuation`.
 
 ### What's already on the wire
 
@@ -218,16 +221,21 @@ Plus updates to `specs/sse_wire/sse_wire.allium`:
 ## Code paths to verify when drafting
 
 - `executor.rs:1408-1418` — `Effect::ScheduleRetry` handler
-- `the `complete_streaming` call site in executor.rs` — `complete_streaming` call site
-- ``llm_error_to_llm_outcome` in executor.rs` — `LlmError` → `LlmOutcome` mapping
-- ``handle_core_error_retry` in transition.rs` — `handle_core_llm_error` retry transition
-- ``handle_core_continuation` in transition.rs` — continuation retry handler
-- ``ConvState::AwaitingContinuation` in state.rs` — `AwaitingContinuation { rejected_tool_calls,
+- `executor.rs` — `complete_streaming` call site (single attempt
+  per LLM client)
+- `executor.rs` — `llm_error_to_outcome` function (`LlmError` →
+  `LlmOutcome` mapping)
+- `transition.rs` — `handle_core_error_retry` (`LlmRequesting` retry
+  transition)
+- `transition.rs` — `handle_core_continuation` (`AwaitingContinuation`
+  retry transition, post tool-round)
+- `state.rs` — `ConvState::AwaitingContinuation { rejected_tool_calls,
   attempt }`
 - `llm/error.rs:81-115` — `LlmErrorKind` + `is_retryable`
 - `wire.rs:328-331` — `RateLimitSnapshot` for overlap analysis
-- `llm/anthropic.rs:343-` — `complete_streaming` (single attempt)
-- ``complete_streaming` in llm/openai.rs (~L452-)` — same shape
+- `llm/anthropic.rs` — `complete_streaming` (single attempt; search
+  the file for the function definition)
+- `llm/openai.rs` — `complete_streaming` (same shape)
 - `llm/service.rs:138-158` — dispatch layer
 
 ## Pre-flight checklist
