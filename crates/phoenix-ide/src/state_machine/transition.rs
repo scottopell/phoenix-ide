@@ -102,7 +102,7 @@ fn resolve_task_file(
         .and_then(|c| c.as_os_str().to_str());
 
     match &source {
-        TaskSource::Taskmd { status, .. } => {
+        TaskSource::Taskmd { status, id, .. } => {
             // A taskmd-named file is required to live under the project's tasks
             // dir — that's where `taskmd validate` (and the project's task
             // tooling generally) expects taskmd files. A plain `.md` brief that
@@ -123,6 +123,32 @@ fn resolve_task_file(
                      Acceptable statuses: {}.",
                     allowed.join(", ")
                 ));
+            }
+            // Revalidate ID uniqueness at acceptance time. The Explore-mode
+            // prompt surfaces a "next available ID" hint that is computed
+            // without a reservation (no atomic taskmd new), so two concurrent
+            // drafts on the same worktree can be told the same ID. Catch the
+            // collision here before the proposal is shown for approval.
+            let tasks_dir_abs = cwd.join(tasks_dir_name);
+            if let Ok(entries) = std::fs::read_dir(&tasks_dir_abs) {
+                for entry in entries.flatten() {
+                    let other_name = entry.file_name().to_string_lossy().into_owned();
+                    if other_name == filename {
+                        continue;
+                    }
+                    if let Some(parsed) = taskmd_core::filename::parse_filename(&other_name) {
+                        if parsed.id == *id {
+                            return Err(format!(
+                                "task ID '{id}' is already used by \
+                                 '{tasks_dir_name}/{other_name}'. The prompt-time \
+                                 'next available' hint is computed, not reserved -- \
+                                 pick a different ID (e.g. increment the 3-digit \
+                                 sequence) and rename your task file before calling \
+                                 propose_task again."
+                            ));
+                        }
+                    }
+                }
             }
         }
         TaskSource::PlainMarkdown { .. } => {
@@ -4296,6 +4322,64 @@ mod resolve_task_file_tests {
             .unwrap();
         let err = resolve_task_file(tmp.path(), "tasks", "inner-link.md").unwrap_err();
         assert!(err.contains("must be a regular file"), "got: {err}");
+    }
+
+    #[test]
+    fn duplicate_taskmd_id_is_rejected_even_with_different_slug() {
+        // Race: two concurrent Explore drafts received the same "next ID" hint
+        // and wrote files with the same ID but different slugs. Acceptance
+        // must reject the second one.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("tasks")).unwrap();
+        std::fs::write(
+            tmp.path().join("tasks/12345-p1-ready--first-draft.md"),
+            "# First\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join("tasks/12345-p2-ready--second-draft.md"),
+            "# Second\n",
+        )
+        .unwrap();
+        let err =
+            resolve_task_file(tmp.path(), "tasks", "tasks/12345-p2-ready--second-draft.md")
+                .unwrap_err();
+        assert!(err.contains("already used by"), "got: {err}");
+        assert!(err.contains("12345-p1-ready--first-draft.md"), "got: {err}");
+    }
+
+    #[test]
+    fn duplicate_taskmd_id_check_skips_self() {
+        // The proposed file legitimately matches its own filename; that is not
+        // a duplicate.
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("tasks")).unwrap();
+        std::fs::write(
+            tmp.path().join("tasks/12345-p1-ready--my-task.md"),
+            "# My task\n",
+        )
+        .unwrap();
+        let snap = resolve_task_file(tmp.path(), "tasks", "tasks/12345-p1-ready--my-task.md")
+            .expect("self-match should not count as duplicate");
+        assert_eq!(snap.title, "My task");
+    }
+
+    #[test]
+    fn duplicate_taskmd_id_check_ignores_non_taskmd_files() {
+        // A README.md or other plain markdown in tasks/ must not block a
+        // taskmd file (parse_filename returns None for non-pattern names).
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("tasks")).unwrap();
+        std::fs::write(tmp.path().join("tasks/_TEMPLATE.md"), "# Template\n").unwrap();
+        std::fs::write(tmp.path().join("tasks/README.md"), "# Readme\n").unwrap();
+        std::fs::write(
+            tmp.path().join("tasks/12345-p1-ready--my-task.md"),
+            "# My task\n",
+        )
+        .unwrap();
+        let snap = resolve_task_file(tmp.path(), "tasks", "tasks/12345-p1-ready--my-task.md")
+            .expect("ancillary files must not trigger duplicate check");
+        assert_eq!(snap.title, "My task");
     }
 
     #[test]
