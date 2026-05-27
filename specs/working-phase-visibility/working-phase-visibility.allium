@@ -271,11 +271,11 @@ entity PendingAssistantBubble {
     -- sequence_ids (LlmFirstByte is emitted immediately before the
     -- first Token, taking one seq; the Token takes the next). Both are
     -- strictly greater than any prior event for this conversation, so
-    -- a Message event with seq > first_token_seq is unambiguously this
+    -- a Message event with seq > first_byte_seq is unambiguously this
     -- bubble's completion. SseWireEvent::Message does NOT carry the
     -- request_id, so wire-level request_id correlation is unavailable
     -- and this seq-based form is the only reliable correlator.
-    first_token_seq: Integer?
+    first_byte_seq: Integer?
 
     transitions state {
         not_present -> placeholder
@@ -446,13 +446,17 @@ config {
 -- State lookups:
 --
 --   current_tool_name(view: ClientView) -> String
---       The tool_name of the most-recently-started InflightToolTimer
---       for the given view. Reads from the entity directly; assumes
---       at least one InflightToolTimer exists for the view (the
---       caller, DisplayWhenToolExecuting, gates on
---       phase = tool_executing which implies a running tool).
---       Parallel-tool policy is deferred (see
---       `deferred MultipleParallelToolsInOneAssistantMessage`).
+--       The display name of the most-recently-started InflightToolTimer
+--       for the given view. InflightToolTimer itself only stores
+--       (view, tool_use_id, started_at); the name is resolved by
+--       joining the timer's tool_use_id with the matching
+--       ContentBlock::ToolUse{id, name, input} on the assistant
+--       message (the runtime persists tool-use blocks by id, and the
+--       client already has them via the message list). Assumes at
+--       least one InflightToolTimer exists for the view (the caller,
+--       DisplayWhenToolExecuting, gates on phase = tool_executing
+--       which implies a running tool). Parallel-tool policy is
+--       deferred (see `deferred MultipleParallelToolsInOneAssistantMessage`).
 --
 --   current_retry_for(view: ClientView) -> RetryContext?
 --       TurnRetryContext{view: view}.retry when the entity exists;
@@ -706,7 +710,7 @@ rule PendingBubblePlaceholderCreated {
 
     ensures: PendingAssistantBubble{view}.state             = placeholder
     ensures: PendingAssistantBubble{view}.placeholder_since = ObservedPhase{view}.state_updated_at
-    ensures: PendingAssistantBubble{view}.first_token_seq   = null
+    ensures: PendingAssistantBubble{view}.first_byte_seq   = null
     -- request_id stays null until LlmFirstByte arrives; the placeholder
     -- bubble doesn't need it for rendering, only the streaming bubble
     -- does (to correlate the persisted Message back to itself).
@@ -742,7 +746,7 @@ rule PendingBubbleSeededFromInit {
 
     ensures: PendingAssistantBubble{view}.state             = placeholder
     ensures: PendingAssistantBubble{view}.placeholder_since = state_updated_at
-    ensures: PendingAssistantBubble{view}.first_token_seq   = null
+    ensures: PendingAssistantBubble{view}.first_byte_seq   = null
     ensures: PendingAssistantBubble{view}.request_id        = null
     -- If the server-side turn had already passed first-byte before
     -- reload, the next Token event (replayed from the SSE ring) will
@@ -757,7 +761,7 @@ rule PendingBubbleSeededFromInit {
 -- and `sequence_id` (the wire-envelope seq, monotonic per stream); we
 -- store the seq on the bubble so PendingBubbleCompletedOnMessage can
 -- correlate the persisted assistant Message back to this bubble (a
--- Message with role=assistant and seq > first_token_seq is THIS
+-- Message with role=assistant and seq > first_byte_seq is THIS
 -- bubble's completion). request_id alone is unsuitable because
 -- SseWireEvent::Message does not carry it.
 -- Event shape: SseLlmFirstByteReceived(view, request_id, sequence_id).
@@ -768,7 +772,7 @@ rule PendingBubbleTransitionsToStreaming {
 
     ensures: PendingAssistantBubble{view}.state           = streaming
     ensures: PendingAssistantBubble{view}.request_id      = request_id
-    ensures: PendingAssistantBubble{view}.first_token_seq = sequence_id
+    ensures: PendingAssistantBubble{view}.first_byte_seq = sequence_id
 }
 
 -- REQ-WPV-006: phase left llm_requesting without any Token. The bubble
@@ -782,7 +786,7 @@ rule PendingBubbleResetOnEmptyPhaseExit {
     ensures: PendingAssistantBubble{view}.state             = not_present
     ensures: PendingAssistantBubble{view}.request_id        = null
     ensures: PendingAssistantBubble{view}.placeholder_since = null
-    ensures: PendingAssistantBubble{view}.first_token_seq   = null
+    ensures: PendingAssistantBubble{view}.first_byte_seq   = null
 }
 
 -- REQ-WPV-006: phase left llm_requesting WHILE the bubble was in
@@ -805,7 +809,7 @@ rule PendingBubbleResetOnStreamingPhaseExit {
     ensures: PendingAssistantBubble{view}.state             = not_present
     ensures: PendingAssistantBubble{view}.request_id        = null
     ensures: PendingAssistantBubble{view}.placeholder_since = null
-    ensures: PendingAssistantBubble{view}.first_token_seq   = null
+    ensures: PendingAssistantBubble{view}.first_byte_seq   = null
 }
 
 -- The streaming bubble becomes the canonical persisted message on the
@@ -816,9 +820,9 @@ rule PendingBubbleResetOnStreamingPhaseExit {
 --
 -- Correlation: SseWireEvent::Message payloads do NOT carry request_id
 -- (only Token events do). We compare the inbound message's seq to the
--- bubble's stored first_token_seq (set when the bubble transitioned
+-- bubble's stored first_byte_seq (set when the bubble transitioned
 -- to streaming). A Message with role=assistant and seq >
--- first_token_seq is the completion of THIS bubble's request — by
+-- first_byte_seq is the completion of THIS bubble's request — by
 -- SSE sequence_id monotonicity (sse_wire.allium) and the singleton
 -- nature of in-flight LLM requests per conversation.
 -- Event shape: SseMessageReceived(view, message_role, message_seq).
@@ -827,12 +831,12 @@ rule PendingBubbleCompletedOnMessage {
 
     requires: PendingAssistantBubble{view}.state = streaming
     requires: message_role = assistant
-    requires: message_seq > PendingAssistantBubble{view}.first_token_seq
+    requires: message_seq > PendingAssistantBubble{view}.first_byte_seq
 
     ensures: PendingAssistantBubble{view}.state             = not_present
     ensures: PendingAssistantBubble{view}.request_id        = null
     ensures: PendingAssistantBubble{view}.placeholder_since = null
-    ensures: PendingAssistantBubble{view}.first_token_seq   = null
+    ensures: PendingAssistantBubble{view}.first_byte_seq   = null
 }
 
 ------------------------------------------------------------
@@ -1365,9 +1369,15 @@ deferred Req008ReloadContinuity
 --   - Pending assistant bubble: placeholder bubble appears at the
 --     bottom of the conversation during llm_requesting with no tokens;
 --     contents swap from elapsed counter to streamed text on first
---     token without DOM remount. The empty-message filter at
---     MessageComponents.tsx:635-638 is amended to retain the live
---     in-flight target.
+--     token without DOM remount. Implemented as a synthetic
+--     `pending_agent` tail unit in `ui/src/conversation/renderUnits.ts`
+--     (parallel to the existing `streaming_agent` unit), NOT by
+--     amending the empty-message filter at MessageComponents.tsx —
+--     no assistant message row exists in the messages table during
+--     pre-first-byte llm_requesting (responses are persisted only
+--     after LlmResponse), so there is nothing to retain via filter
+--     amendment. The empty-message filter is left unchanged. See
+--     design.md "Pending assistant bubble" for the reasoning.
 --
 --   - Per-tool started_at carrier: a typed `tool_starts: BTreeMap<
 --     String, i64>` field on the assistant message's display_data,

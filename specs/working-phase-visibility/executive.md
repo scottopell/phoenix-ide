@@ -76,7 +76,7 @@ in the sibling spec `specs/llm-retry-visibility/`.
 | Requirement | Status | Notes |
 |-------------|--------|-------|
 | **REQ-WPV-001:** Server-authoritative state-entry timestamp | ❌ New | Adds `state_updated_at` to `StateChange` (sourced from existing `Conversation.state_updated_at`); Init already exposes it via flatten. ts-rs regen + `parity_*` test update required |
-| **REQ-WPV-002:** Inline elapsed-time on in-flight artifacts | ❌ New | Tool widget timer via the assistant message's `display_data.tool_starts[tool_use_id]` map (typed `BTreeMap<String, i64>`); pending assistant bubble retains empty agent message during `llm_requesting` |
+| **REQ-WPV-002:** Inline elapsed-time on in-flight artifacts | ❌ New | Tool widget timer reads from the assistant message's `display_data.tool_starts[tool_use_id]` map (typed `BTreeMap<String, i64>`); pending assistant bubble is the synthetic render unit specified by REQ-WPV-006 below |
 | **REQ-WPV-003:** StateBar derivation rule | 🔄 Extend | Existing `StateBar.tsx:341-422` composition gains retry-modifier and degraded-signal precedence; existing `tool_executing` timer path becomes a special case of the generalised rule |
 | **REQ-WPV-004:** Heartbeat watchdog | ❌ New | Threshold 35s; depends on keep-alive switch from SSE comment to typed `ping` event |
 | **REQ-WPV-005:** Connection state does not mask agent state | 🔄 Rewrite | `StateBar.tsx:349-373` currently short-circuits; replace with composition that retains last-known activity with frozen elapsed |

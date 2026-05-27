@@ -209,10 +209,12 @@ The SSE keep-alive sent by axum's `KeepAlive` API is an SSE comment line
 (`: ping\n\n`). Standard `EventSource` does NOT fire any handler for
 comments. To observe them for the watchdog, two options:
 
-**Option A (preferred):** Switch the SSE keep-alive to a typed event with
-`event: ping` and `data: ""`. EventSource fires the `ping` event handler;
-the client listens and bumps `lastSseEventAt`. The axum 0.7 API for
-KeepAlive carries an `Event`, not a raw string (cf.
+**Option A (preferred):** Switch the SSE keep-alive to a typed event named
+`ping` with a non-empty `data` payload (any non-empty string works —
+the client listener bumps `lastSseEventAt` and discards the body).
+EventSource fires the `ping` event handler; the client listens and
+bumps `lastSseEventAt`. The axum 0.7 API for KeepAlive carries an
+`Event`, not a raw string (cf.
 <https://docs.rs/axum/latest/axum/response/sse/struct.KeepAlive.html>):
 
 ```rust

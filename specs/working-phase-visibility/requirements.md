@@ -136,8 +136,11 @@ THE SYSTEM SHALL clear the degraded-signal indicator immediately
 comment line (`: ping\n\n`, see `api/sse.rs:71` / `handlers.rs:3279`), and
 standard `EventSource` does NOT fire any handler for comments. For this
 requirement to be implementable as written, the keep-alive MUST be switched
-to a typed event (`event: ping\ndata:\n\n`) so the client `EventSource`
-observes it via an explicit `ping` listener. This switch is owned by
+to a typed event with a **non-empty** `data` field
+(`event: ping\ndata: ping\n\n`) so the client `EventSource` observes it
+via an explicit `ping` listener. Empty-data events are dropped by the
+browser (per axum's `Event::data` docs); the listener bumps
+`lastSseEventAt` and discards the body. This switch is owned by
 design.md ("Server keep-alive observation") and is forward-compatible:
 clients that don't listen for `ping` simply ignore it.
 

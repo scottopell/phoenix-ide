@@ -83,14 +83,30 @@ value InitSnapshot {
 -- event was first emitted — that is, the entry's seq is the one the
 -- client's reducer rules will see if/when the entry replays via init.
 --
--- `event_type` matches the SseWireEvent's `type` discriminator
--- ("token", "state_change", "message", "message_updated",
--- "agent_done", "conversation_update", "conversation_became_terminal",
--- "error", "browser_session_state", "steer_message_queued",
--- "llm_first_byte"). Init itself is never in the ring (init is
--- per-subscriber, never broadcast). ConversationHardDeleted is
--- excluded by construction (a
--- deleted conversation cannot subsequently receive a subscribe).
+-- `event_type` matches the SseWireEvent's `type` discriminator. The
+-- full set defined by `crates/phoenix-ide/src/api/wire.rs::event_type`
+-- is:
+--   "init", "message", "message_updated", "state_change", "token",
+--   "agent_done", "conversation_became_terminal",
+--   "conversation_update", "error", "browser_session_state",
+--   "steer_message_queued", "rate_limit_snapshot",
+--   "conversation_hard_deleted", "llm_first_byte"
+--
+-- Ring eligibility (which events can appear as a PendingEventEntry):
+--   - "message" enters the ring via the eager-assistant path
+--     (EagerAssistantMessageAppendedToReplayRing below).
+--   - "token", "state_change", "message_updated", "agent_done",
+--     "conversation_update", "conversation_became_terminal",
+--     "error", "browser_session_state", "steer_message_queued",
+--     "llm_first_byte" enter via the ephemeral path
+--     (EphemeralEventAppendedToReplayRing below).
+--   - Excluded entirely:
+--     - "init" (per-subscriber, never broadcast)
+--     - "conversation_hard_deleted" (terminal; no subsequent init
+--       can fire, so replay is moot)
+--     - "rate_limit_snapshot" (mid-stream codex quota snapshot;
+--       point-in-time data whose semantics are stale on reconnect,
+--       so intentionally not replayed)
 --
 -- `payload` is opaque at this level — it is whatever the wire-format
 -- carries for that event_type. The replay path serialises the entry
@@ -515,7 +531,7 @@ rule PersistedMessageClearsReplayRing {
 -- persisted, replaying tokens without the preceding first-byte marker
 -- leaves the pending bubble stuck in `placeholder` while text streams,
 -- violating REQ-WPV-007/008. The boundary marker shares the ring's
--- ordering guarantees so the bubble's first_token_seq correlation
+-- ordering guarantees so the bubble's first_byte_seq correlation
 -- holds across replay.
 --
 -- Append happens atomically with broadcast: the entry's seq IS the
