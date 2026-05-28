@@ -4,7 +4,7 @@ import { FolderTree } from 'lucide-react';
 import { api, canChangeModelInState, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 import type { ConnectionState } from '../hooks';
 import { useIsMobile } from '../hooks';
-import { getStateDescription } from '../utils';
+import { getStateDescription, isAgentWorking } from '../utils';
 import { ContextIndicator } from './ContextIndicator';
 
 const CheckIcon = () => (
@@ -281,26 +281,6 @@ function formatElapsed(seconds: number): string {
  *  second consumer materialises this should move to `config.ts`. */
 const HEARTBEAT_WATCHDOG_SECONDS = 35;
 
-/** The set of ConversationState discriminants that count as "working"
- *  for the purpose of the elapsed counter, heartbeat watchdog gating,
- *  and last-known-activity capture. Mirrors the Allium spec's
- *  `WorkingPhase` enum (specs/working-phase-visibility/). When new
- *  working states are added to the wire, extend both sides. */
-function isWorkingPhase(t: ConversationState['type']): boolean {
-  return (
-    t === 'llm_requesting' ||
-    t === 'awaiting_llm' ||
-    t === 'seeded_llm_requesting' ||
-    t === 'tool_executing' ||
-    t === 'awaiting_sub_agents' ||
-    t === 'awaiting_continuation' ||
-    t === 'cancelling' ||
-    t === 'cancelling_tool' ||
-    t === 'cancelling_sub_agents' ||
-    t === 'awaiting_recovery'
-  );
-}
-
 export function StateBar({
   conversation,
   convState,
@@ -351,7 +331,11 @@ export function StateBar({
   // StateChange + Init, so the counter survives reconnect, page reload,
   // and multi-tab observation. Ticks every second; reset to 0 the
   // instant the phase leaves the working set.
-  const phaseIsWorking = isWorkingPhase(convState.type);
+  // Working-phase set (elapsed counter, heartbeat watchdog gating,
+  // last-known-activity capture) is the single `isAgentWorking`
+  // predicate from utils — same set the rest of the UI gates on, with
+  // exhaustiveness enforced via `satisfies never`.
+  const phaseIsWorking = isAgentWorking(convState);
   const [phaseElapsedSeconds, setPhaseElapsedSeconds] = useState(0);
   useEffect(() => {
     if (!phaseIsWorking || phaseStateUpdatedAt == null) {

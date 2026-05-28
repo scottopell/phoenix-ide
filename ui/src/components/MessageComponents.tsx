@@ -1437,7 +1437,7 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
             flight. Hidden once the result lands (the static
             duration above takes over). Server-clock sourced — the
             counter ticks correctly across reconnect / reload. */}
-        {!hasOutput && toolStartedAtMs != null && (
+        {result == null && toolStartedAtMs != null && (
           <span
             className="tool-block-elapsed"
             title={`Started ${new Date(toolStartedAtMs).toLocaleTimeString()}`}
