@@ -1,4 +1,4 @@
-import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import type { ComponentProps } from 'react';
 import { MemoryRouter } from 'react-router-dom';
@@ -78,6 +78,10 @@ function renderStateBar({
   modelContextWindow = 200_000,
   continuation,
   onSendMessage,
+  connectionState = 'connected',
+  connectionAttempt = 0,
+  phaseStateUpdatedAt,
+  lastSseEventAt,
 }: {
   conversation?: Conversation;
   convState?: ComponentProps<typeof StateBar>['convState'];
@@ -85,12 +89,16 @@ function renderStateBar({
   modelContextWindow?: number;
   continuation?: ComponentProps<typeof StateBar>['continuation'];
   onSendMessage?: ComponentProps<typeof StateBar>['onSendMessage'];
+  connectionState?: ComponentProps<typeof StateBar>['connectionState'];
+  connectionAttempt?: number;
+  phaseStateUpdatedAt?: number | null;
+  lastSseEventAt?: number;
 } = {}) {
   const props: ComponentProps<typeof StateBar> = {
     conversation,
     convState,
-    connectionState: 'connected',
-    connectionAttempt: 0,
+    connectionState,
+    connectionAttempt,
     nextRetryIn: null,
     contextWindowUsed,
     modelContextWindow,
@@ -100,6 +108,12 @@ function renderStateBar({
   }
   if (onSendMessage) {
     props.onSendMessage = onSendMessage;
+  }
+  if (phaseStateUpdatedAt !== undefined) {
+    props.phaseStateUpdatedAt = phaseStateUpdatedAt;
+  }
+  if (lastSseEventAt !== undefined) {
+    props.lastSseEventAt = lastSseEventAt;
   }
   return render(
     <MemoryRouter>
@@ -282,5 +296,161 @@ describe('StateBar manual continuation action', () => {
     fireEvent.click(screen.getByText('100k'));
 
     expect(screen.queryByRole('button', { name: /end & summarize now/i })).not.toBeInTheDocument();
+  });
+});
+
+// Working-phase indicators (REQ-WPV-001 / 003 / 004 / 005). The reducer
+// math driving these is unit-tested above; these tests pin the StateBar's
+// composition function — which combinations of (connectionState, convState,
+// phaseStateUpdatedAt, lastSseEventAt) produce which text + dot class.
+describe('StateBar working-phase indicators', () => {
+  const T_NOW = 1_700_000_000_000; // any stable wall-clock anchor
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(T_NOW);
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('renders the live elapsed counter for llm_requesting (REQ-WPV-001/003)', () => {
+    // 7 seconds into the llm_requesting phase.
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW - 7_000,
+      lastSseEventAt: T_NOW - 1_000,
+    });
+    expect(screen.getByText(/thinking.*7s/i)).toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/working/);
+  });
+
+  it('renders the live counter for non-llm working phases too (REQ-WPV-001)', () => {
+    // tool_executing is the same generalized path now.
+    renderStateBar({
+      convState: { type: 'tool_executing', attempt: 1, current_tool: 'bash' },
+      phaseStateUpdatedAt: T_NOW - 12_000,
+      lastSseEventAt: T_NOW - 1_000,
+    });
+    // The state-description helper produces "running bash" or similar;
+    // we just assert the elapsed suffix is present.
+    expect(screen.getByText(/\b12s\b/)).toBeInTheDocument();
+  });
+
+  it('overrides working text with "no signal from server" when watchdog stale (REQ-WPV-004)', () => {
+    // 40s since the last observed SSE event > 35s threshold.
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW - 50_000,
+      lastSseEventAt: T_NOW - 40_000,
+    });
+    expect(screen.getByText(/no signal from server for 40s/i)).toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/degraded/);
+  });
+
+  it('does NOT trip the watchdog when not in a working phase', () => {
+    // Even after a long silence, idle conversations are not "stuck."
+    renderStateBar({
+      convState: { type: 'idle' },
+      phaseStateUpdatedAt: T_NOW - 60_000,
+      lastSseEventAt: T_NOW - 60_000,
+    });
+    expect(screen.queryByText(/no signal from server/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/ready/i)).toBeInTheDocument();
+  });
+
+  it('does NOT trip the watchdog when the connection has already degraded', () => {
+    // Reconnecting / offline carry their own messaging; the watchdog
+    // should disarm to avoid duplicate "no signal" + "reconnecting" text.
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      connectionState: 'reconnecting',
+      connectionAttempt: 2,
+      phaseStateUpdatedAt: T_NOW - 10_000,
+      lastSseEventAt: T_NOW - 60_000, // > 35s but connection isn't healthy
+    });
+    expect(screen.queryByText(/no signal from server/i)).not.toBeInTheDocument();
+  });
+
+  it('shows BOTH connection + last-known activity during reconnecting (REQ-WPV-005)', () => {
+    // The capture happens on the connected→reconnecting transition;
+    // a single render starting in reconnecting won't have the snapshot,
+    // so this test re-renders the component to simulate the edge.
+    const { rerender } = render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'llm_requesting', attempt: 1 }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          phaseStateUpdatedAt={T_NOW - 12_000}
+          lastSseEventAt={T_NOW - 1_000}
+        />
+      </MemoryRouter>,
+    );
+    // First render — connected, working: shows "thinking ... 12s".
+    expect(screen.getByText(/thinking.*12s/i)).toBeInTheDocument();
+    // Connection drops mid-working — capture snapshot, freeze elapsed.
+    rerender(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'llm_requesting', attempt: 1 }}
+          connectionState="reconnecting"
+          connectionAttempt={2}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          phaseStateUpdatedAt={T_NOW - 12_000}
+          lastSseEventAt={T_NOW - 1_000}
+        />
+      </MemoryRouter>,
+    );
+    // Now we should see "reconnecting (2) — last: thinking ... 12s".
+    expect(screen.getByText(/reconnecting \(2\).*last.*thinking.*12s/i)).toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/reconnecting/);
+  });
+
+  it('shows BOTH offline chip + last-known activity during offline (REQ-WPV-005)', () => {
+    const { rerender } = render(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'tool_executing', attempt: 1, current_tool: 'bash' }}
+          connectionState="connected"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          phaseStateUpdatedAt={T_NOW - 8_000}
+          lastSseEventAt={T_NOW - 1_000}
+        />
+      </MemoryRouter>,
+    );
+    rerender(
+      <MemoryRouter>
+        <StateBar
+          conversation={makeConversation()}
+          convState={{ type: 'tool_executing', attempt: 1, current_tool: 'bash' }}
+          connectionState="offline"
+          connectionAttempt={0}
+          nextRetryIn={null}
+          contextWindowUsed={0}
+          modelContextWindow={200_000}
+          phaseStateUpdatedAt={T_NOW - 8_000}
+          lastSseEventAt={T_NOW - 1_000}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByText(/^offline.*last.*8s/i)).toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/offline/);
   });
 });

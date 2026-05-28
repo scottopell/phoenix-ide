@@ -2,11 +2,53 @@
 //!
 //! Streams lorem-ipsum-style responses with realistic delays and cycles
 //! through different response types: plain text, markdown, and tool calls.
+//!
+//! Test-driver markers (parsed from the latest user message text):
+//! - `[[scenario:NAME]]` — force a specific scripted response
+//!   (`plain_text`, `markdown`, `bash`, `read_file`, `think`,
+//!   `multi_tool`, `long`, `patch`).
+//! - `[[perf:N]]` — deterministic text-only response of ~N words
+//!   (performance fingerprint, no rand).
+//! - `[[ttft:N]]` — override time-to-first-token sleep with N ms.
+//!   Drives the pre-first-byte `pending_agent` placeholder bubble
+//!   (specs/working-phase-visibility/ REQ-WPV-006).
+//! - `[[stall:after_n,ms]]` — emit `after_n` chunks, sleep `ms`,
+//!   then continue. Drives the heartbeat watchdog (REQ-WPV-004)
+//!   without ending the turn.
+//! - `[[retry:KIND,N]]` — first N calls for this conversation
+//!   return `LlmError::<KIND>` where KIND ∈ {`rate_limit`,
+//!   `server_error`, `network`}; (N+1)th call succeeds. Drives
+//!   `Effect::ScheduleRetry` end-to-end (Stage B / specs/llm-retry-visibility/).
+//!
+//! Markers compose freely. Opt-in via `PHOENIX_ENABLE_MOCK_MODEL=1`.
 
 use super::types::{ContentBlock, LlmRequest, LlmResponse, Usage};
 use super::{LlmError, LlmService, TokenChunk};
 use async_trait::async_trait;
+use std::collections::HashMap;
+use std::sync::Mutex;
 use tokio::sync::broadcast;
+
+/// Per-conversation retry-attempt counter, keyed by `LlmRequest.cache_key`
+/// (which is the conversation id at the call site — `executor.rs` builds
+/// it via `PromptCacheKey::stable(&conv_id)`). The `[[retry:KIND,N]]`
+/// marker reads & increments this on each `complete_streaming` call so a
+/// scripted scenario can request "first N attempts fail, the (N+1)th
+/// succeeds" without the request carrying its own attempt counter.
+///
+/// Entries are never garbage-collected — the mock is dev-only and the
+/// table size is bounded by active conversations, so the leak is
+/// acceptable. Tests that need a clean slate use a fresh conversation
+/// per case (the normal pattern) rather than poking this map.
+static RETRY_COUNTS: Mutex<Option<HashMap<String, u32>>> = Mutex::new(None);
+
+fn bump_retry_count(key: &str) -> u32 {
+    let mut guard = RETRY_COUNTS.lock().expect("RETRY_COUNTS mutex");
+    let map = guard.get_or_insert_with(HashMap::new);
+    let entry = map.entry(key.to_string()).or_insert(0);
+    *entry += 1;
+    *entry
+}
 
 /// Mock LLM service that produces canned responses for UI development.
 pub struct MockLlmService;
@@ -212,6 +254,108 @@ fn parse_perf_words(request: &LlmRequest) -> Option<usize> {
         .map(|n| n.min(MAX_PERF_WORDS))
 }
 
+/// TTFT-override marker (REQ-WPV-001 / 006 test driver): a user message
+/// containing `[[ttft:N]]` overrides the mock's default 200ms
+/// time-to-first-token sleep with `N` milliseconds. Useful range
+/// 100ms…30000ms; values above `MAX_TTFT_MS` are clamped to that ceiling
+/// so a typo doesn't park the dev-mock for an hour. Composes freely with
+/// `[[scenario:NAME]]`, `[[perf:N]]`, and `[[stall:…]]`. Dev-only
+/// (`PHOENIX_ENABLE_MOCK_MODEL=1`).
+fn parse_ttft_ms(request: &LlmRequest) -> Option<u64> {
+    let text = latest_user_text(request)?;
+    let start = text.find("[[ttft:")? + "[[ttft:".len();
+    let rest = text.get(start..)?;
+    let end = rest.find("]]")?;
+    rest.get(..end)?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.min(MAX_TTFT_MS))
+}
+
+/// Mid-stream stall marker (REQ-WPV-004 test driver): a user message
+/// containing `[[stall:after_n,ms]]` makes the mock emit `after_n` token
+/// chunks normally, sleep for `ms` milliseconds, then continue streaming
+/// the remainder. The chunk channel stays alive across the sleep so the
+/// turn does NOT end during the stall — exactly the failure mode the
+/// heartbeat watchdog is meant to surface (server holds the connection
+/// open but stops sending data). Use `ms ≥ 35000` to drive the watchdog
+/// past its threshold. Both args clamp to `MAX_STALL_AFTER_N` /
+/// `MAX_STALL_MS` so a typo can't park dev forever.
+fn parse_stall(request: &LlmRequest) -> Option<(usize, u64)> {
+    let text = latest_user_text(request)?;
+    let start = text.find("[[stall:")? + "[[stall:".len();
+    let rest = text.get(start..)?;
+    let end = rest.find("]]")?;
+    let body = rest.get(..end)?.trim();
+    let (after_n, ms) = body.split_once(',')?;
+    let after_n = after_n.trim().parse::<usize>().ok()?;
+    let ms = ms.trim().parse::<u64>().ok()?;
+    Some((after_n.min(MAX_STALL_AFTER_N), ms.min(MAX_STALL_MS)))
+}
+
+/// Retry-simulation marker (Stage B `llm-retry-visibility` test driver):
+/// a user message containing `[[retry:KIND,N]]` makes the mock return
+/// `LlmError::<KIND>` (without emitting any tokens) for the first N
+/// `complete_streaming` calls bound to the same conversation; the
+/// (N+1)th call streams the normal scenario. KIND ∈ {`rate_limit`,
+/// `server_error`, `network`} — exactly the retryable subset of
+/// `LlmErrorKind` per `is_retryable` in `llm/error.rs:111`. The
+/// per-conversation attempt counter lives in `RETRY_COUNTS` keyed by
+/// `request.cache_key` (the conversation id at the call site).
+///
+/// Combined with the state machine's `MAX_RETRY_ATTEMPTS = 3`
+/// (`transition.rs:183`), `[[retry:rate_limit,2]]` produces:
+///   attempt 1 → LlmError::RateLimit → ScheduleRetry, attempt 2
+///   attempt 2 → LlmError::RateLimit → ScheduleRetry, attempt 3
+///   attempt 3 → success → turn completes
+/// `[[retry:rate_limit,3]]` exercises the give-up path
+/// (transition to Error after MAX_RETRY_ATTEMPTS).
+fn parse_retry(request: &LlmRequest) -> Option<(crate::llm::LlmErrorKind, u32)> {
+    let text = latest_user_text(request)?;
+    let start = text.find("[[retry:")? + "[[retry:".len();
+    let rest = text.get(start..)?;
+    let end = rest.find("]]")?;
+    let body = rest.get(..end)?.trim();
+    let (kind_str, n_str) = body.split_once(',')?;
+    let kind = match kind_str.trim() {
+        "rate_limit" => crate::llm::LlmErrorKind::RateLimit,
+        "server_error" => crate::llm::LlmErrorKind::ServerError,
+        "network" => crate::llm::LlmErrorKind::Network,
+        _ => return None,
+    };
+    let n = n_str.trim().parse::<u32>().ok()?.min(MAX_RETRY_N);
+    Some((kind, n))
+}
+
+/// Shared helper: the latest user message's text, concatenated across any
+/// Text content blocks. Returns `None` if there are no user messages or
+/// they carry no Text blocks. Used by every `[[…:…]]` marker parser.
+fn latest_user_text(request: &LlmRequest) -> Option<String> {
+    request.messages.iter().rev().find_map(|m| {
+        if m.role == super::types::MessageRole::User {
+            Some(
+                m.content
+                    .iter()
+                    .filter_map(|b| match b {
+                        ContentBlock::Text { text } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            )
+        } else {
+            None
+        }
+    })
+}
+
+/// Ceilings for the test-driver markers — clamped so a typo (`[[ttft:1000000000]]`)
+/// can't park dev forever. Generous enough to cover every realistic test scenario.
+const MAX_TTFT_MS: u64 = 60_000; // 60s — covers heartbeat watchdog at 35s + headroom
+const MAX_STALL_AFTER_N: usize = 10_000;
+const MAX_STALL_MS: u64 = 120_000; // 2min
+const MAX_RETRY_N: u32 = 10; // far above any real MAX_RETRY_ATTEMPTS
+
 /// Deterministic text of exactly `n_words` words, built by cycling the words
 /// of `LONG_TEXT`. Pure function of `n_words` — no rand, no time, no state.
 fn perf_text(n_words: usize) -> String {
@@ -381,10 +525,23 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
 }
 
 /// Stream text word-by-word with small delays to simulate real LLM output.
-async fn stream_text(text: &str, chunk_tx: &broadcast::Sender<TokenChunk>) {
+///
+/// `stall = Some((after_n, ms))` inserts a single sleep of `ms`
+/// milliseconds after the first `after_n` chunks have been sent (and
+/// before the (after_n+1)th). Set via the `[[stall:after_n,ms]]`
+/// test marker. The chunk channel stays open across the sleep, so
+/// the turn does NOT end during the stall — this is exactly the
+/// failure mode the heartbeat watchdog (REQ-WPV-004) is meant to
+/// surface (server holds the connection open but stops sending data).
+async fn stream_text_with_optional_stall(
+    text: &str,
+    chunk_tx: &broadcast::Sender<TokenChunk>,
+    stall: Option<(usize, u64)>,
+) {
     // Split into small chunks (roughly word-sized) for realistic streaming
     let mut chars = text.chars().peekable();
     let mut buf = String::new();
+    let mut chunks_sent: usize = 0;
 
     while let Some(ch) = chars.next() {
         buf.push(ch);
@@ -394,6 +551,14 @@ async fn stream_text(text: &str, chunk_tx: &broadcast::Sender<TokenChunk>) {
         if flush && !buf.is_empty() {
             let _ = chunk_tx.send(TokenChunk::Text(buf.clone()));
             buf.clear();
+            chunks_sent += 1;
+            // Mid-stream stall hook (REQ-WPV-004): fires exactly once,
+            // immediately after the `after_n`th chunk lands on the wire.
+            if let Some((after_n, ms)) = stall {
+                if chunks_sent == after_n {
+                    tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                }
+            }
             // Small delay between chunks: 15-40ms feels realistic
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
@@ -430,6 +595,29 @@ impl LlmService for MockLlmService {
         request: &LlmRequest,
         chunk_tx: &broadcast::Sender<TokenChunk>,
     ) -> Result<LlmResponse, LlmError> {
+        // `[[retry:KIND,N]]` driver — the first N calls for this
+        // conversation fail with the requested LlmErrorKind; the
+        // (N+1)th call falls through to the normal scenario. The
+        // conversation key comes from `request.cache_key`, which the
+        // executor builds via `PromptCacheKey::stable(&conv_id)`.
+        if let Some((kind, fail_n)) = parse_retry(request) {
+            let attempt = bump_retry_count(request.cache_key.as_str());
+            if attempt <= fail_n {
+                let message = format!(
+                    "mock retry simulation: attempt {attempt}/{fail_n} returning {kind:?}"
+                );
+                return Err(match kind {
+                    crate::llm::LlmErrorKind::RateLimit => LlmError::rate_limit(message),
+                    crate::llm::LlmErrorKind::ServerError => LlmError::server_error(message),
+                    crate::llm::LlmErrorKind::Network => LlmError::network(message),
+                    // parse_retry only emits the three retryable variants;
+                    // any other kind escaped its validation and is a bug.
+                    _ => unreachable!("parse_retry only emits retryable kinds"),
+                });
+            }
+            // attempt > fail_n: fall through to the normal scenario.
+        }
+
         let (content, streamable_text) = if let Some(n) = parse_perf_words(request) {
             let t = perf_text(n);
             (vec![ContentBlock::Text { text: t.clone() }], t)
@@ -437,12 +625,18 @@ impl LlmService for MockLlmService {
             build_response(&Scenario::from_message(request))
         };
 
-        // Simulate initial latency (time-to-first-token)
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Initial latency (time-to-first-token). `[[ttft:N]]` overrides
+        // the default 200ms — useful for exercising the pre-first-byte
+        // `pending_agent` placeholder bubble.
+        let ttft_ms = parse_ttft_ms(request).unwrap_or(200);
+        tokio::time::sleep(std::time::Duration::from_millis(ttft_ms)).await;
 
-        // Stream the text portion
+        // Stream the text portion. `[[stall:after_n,ms]]` inserts a
+        // mid-stream sleep after the first `after_n` chunks to drive
+        // the heartbeat watchdog without ending the turn.
         if !streamable_text.is_empty() {
-            stream_text(&streamable_text, chunk_tx).await;
+            let stall = parse_stall(request);
+            stream_text_with_optional_stall(&streamable_text, chunk_tx, stall).await;
         }
 
         Ok(LlmResponse {
@@ -516,6 +710,81 @@ mod tests {
         }
         assert!(parse_scenario(&user_req("no marker here")).is_none());
         assert!(parse_scenario(&user_req("[[scenario:bogus]]")).is_none());
+    }
+
+    #[test]
+    fn ttft_marker_parsed() {
+        assert_eq!(parse_ttft_ms(&user_req("[[ttft:5000]] hi")), Some(5000));
+        assert_eq!(parse_ttft_ms(&user_req("[[ttft:0]] hi")), Some(0));
+        // Clamped to the ceiling so a typo can't park dev forever.
+        assert_eq!(
+            parse_ttft_ms(&user_req("[[ttft:9999999]]")),
+            Some(MAX_TTFT_MS)
+        );
+        assert_eq!(parse_ttft_ms(&user_req("no marker")), None);
+        assert_eq!(parse_ttft_ms(&user_req("[[ttft:abc]]")), None);
+    }
+
+    #[test]
+    fn stall_marker_parsed() {
+        assert_eq!(
+            parse_stall(&user_req("[[stall:5,40000]] hi")),
+            Some((5, 40000))
+        );
+        assert_eq!(parse_stall(&user_req("[[stall:0,1000]]")), Some((0, 1000)));
+        // Both args clamp; verify each ceiling.
+        assert_eq!(
+            parse_stall(&user_req("[[stall:99999999,1000]]")),
+            Some((MAX_STALL_AFTER_N, 1000))
+        );
+        assert_eq!(
+            parse_stall(&user_req("[[stall:5,99999999]]")),
+            Some((5, MAX_STALL_MS))
+        );
+        // Malformed shapes are rejected.
+        assert_eq!(parse_stall(&user_req("[[stall:5]]")), None);
+        assert_eq!(parse_stall(&user_req("[[stall:abc,def]]")), None);
+        assert_eq!(parse_stall(&user_req("no marker")), None);
+    }
+
+    #[test]
+    fn retry_marker_parsed() {
+        use crate::llm::LlmErrorKind;
+        assert_eq!(
+            parse_retry(&user_req("[[retry:rate_limit,2]] hi")),
+            Some((LlmErrorKind::RateLimit, 2))
+        );
+        assert_eq!(
+            parse_retry(&user_req("[[retry:server_error,3]]")),
+            Some((LlmErrorKind::ServerError, 3))
+        );
+        assert_eq!(
+            parse_retry(&user_req("[[retry:network,1]]")),
+            Some((LlmErrorKind::Network, 1))
+        );
+        // KINDs outside the retryable subset are rejected — auth, usage_limit,
+        // etc. don't reach the retry loop in the real runtime either, so the
+        // mock refuses to fake them.
+        assert_eq!(parse_retry(&user_req("[[retry:auth,1]]")), None);
+        assert_eq!(parse_retry(&user_req("[[retry:bogus,1]]")), None);
+        // N is clamped to MAX_RETRY_N.
+        assert_eq!(
+            parse_retry(&user_req("[[retry:rate_limit,9999]]")),
+            Some((LlmErrorKind::RateLimit, MAX_RETRY_N))
+        );
+        assert_eq!(parse_retry(&user_req("no marker")), None);
+    }
+
+    #[test]
+    fn retry_counter_increments_per_call() {
+        // Two distinct cache_keys must not share a counter.
+        let key_a = "conv-a";
+        let key_b = "conv-b";
+        assert_eq!(bump_retry_count(key_a), 1);
+        assert_eq!(bump_retry_count(key_a), 2);
+        assert_eq!(bump_retry_count(key_b), 1);
+        assert_eq!(bump_retry_count(key_a), 3);
+        assert_eq!(bump_retry_count(key_b), 2);
     }
 
     #[test]
