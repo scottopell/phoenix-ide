@@ -327,7 +327,7 @@ describe('StateBar working-phase indicators', () => {
       phaseStateUpdatedAt: T_NOW - 7_000,
       lastSseEventAt: T_NOW - 1_000,
     });
-    expect(screen.getByText(/awaiting response.*7s/i)).toBeInTheDocument();
+    expect(screen.getByText(/awaiting LLM response.*7s/i)).toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/working/);
   });
@@ -403,8 +403,8 @@ describe('StateBar working-phase indicators', () => {
         />
       </MemoryRouter>,
     );
-    // First render — connected, working: shows "awaiting response ... 12s".
-    expect(screen.getByText(/awaiting response.*12s/i)).toBeInTheDocument();
+    // First render — connected, working: shows "awaiting LLM response ... 12s".
+    expect(screen.getByText(/awaiting LLM response.*12s/i)).toBeInTheDocument();
     // Connection drops mid-working — capture snapshot, freeze elapsed.
     rerender(
       <MemoryRouter>
@@ -421,10 +421,50 @@ describe('StateBar working-phase indicators', () => {
         />
       </MemoryRouter>,
     );
-    // Now we should see "reconnecting (2) — last: awaiting response ... 12s".
-    expect(screen.getByText(/reconnecting \(2\).*last.*awaiting response.*12s/i)).toBeInTheDocument();
+    // Now we should see "reconnecting (2) — last: awaiting LLM response ... 12s".
+    expect(screen.getByText(/reconnecting \(2\).*last.*awaiting LLM response.*12s/i)).toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/reconnecting/);
+  });
+
+  // Disambiguation: llm_requesting and awaiting_user_response both
+  // previously rendered the word "awaiting response", which conflated
+  // "waiting on the LLM" with "waiting on the human user". The fix
+  // qualifies the LLM case with "LLM response" and rewrites the user
+  // case as a direct second-person address.
+  it('renders "awaiting LLM response Ns" for llm_requesting (pre-first-byte)', () => {
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW - 4_000,
+      lastSseEventAt: T_NOW - 1_000,
+    });
+    expect(screen.getByText(/awaiting LLM response.*4s/i)).toBeInTheDocument();
+    // Negative-case the ambiguous prose to make sure the old label
+    // can't sneak back in.
+    expect(screen.queryByText(/^awaiting response\b/i)).not.toBeInTheDocument();
+  });
+
+  it('renders "awaiting your reply" for awaiting_user_response', () => {
+    renderStateBar({
+      convState: {
+        type: 'awaiting_user_response',
+        questions: [
+          {
+            question: 'Which option?',
+            header: 'Pick one',
+            options: [{ label: 'A' }, { label: 'B' }],
+            multiSelect: false,
+          },
+        ],
+      },
+      // awaiting_user_response is not a working phase — no counter,
+      // and the prose must not mention "LLM response".
+    });
+    expect(screen.getByText(/awaiting your reply/i)).toBeInTheDocument();
+    expect(screen.queryByText(/awaiting LLM response/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/^awaiting response\b/i)).not.toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/approval/);
   });
 
   it('switches to "streaming" (no counter) once first byte arrives (REQ-WPV-007)', () => {
@@ -435,9 +475,9 @@ describe('StateBar working-phase indicators', () => {
       firstByteRequestId: 'req-abc',
     });
     expect(screen.getByText(/^streaming$/i)).toBeInTheDocument();
-    // The pre-first-byte "awaiting response Ns" form must NOT be present once
+    // The pre-first-byte "awaiting LLM response Ns" form must NOT be present once
     // the first byte has arrived.
-    expect(screen.queryByText(/awaiting response.*4s/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/awaiting LLM response.*4s/i)).not.toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/working/);
   });

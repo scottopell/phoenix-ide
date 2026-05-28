@@ -71,7 +71,7 @@ interface StateBarProps {
   /** Request id of the LLM request whose first byte has been observed
    *  on this turn, or `null` before the first `LlmFirstByte` event.
    *  When non-null AND the phase is `llm_requesting`, the StateBar
-   *  switches from `awaiting response Ns` (with counter) to `streaming` (no
+   *  switches from `awaiting LLM response Ns` (with counter) to `streaming` (no
    *  counter) per REQ-WPV-007 — the stream itself is the visible
    *  progress signal so an additional counter is redundant. */
   firstByteRequestId?: string | null;
@@ -389,7 +389,7 @@ export function StateBar({
   // Last-known activity capture (REQ-WPV-005). When the connection
   // leaves the healthy set during a working phase, freeze a snapshot
   // of (phase, elapsed-at-disconnect) so the reconnecting/offline
-  // display shows "reconnecting (N) — last: awaiting response 12s" instead of
+  // display shows "reconnecting (N) — last: awaiting LLM response 12s" instead of
   // masking the agent's state entirely. Cleared on return to a
   // healthy connection.
   const lastKnownActivityRef = useRef<{
@@ -470,7 +470,7 @@ export function StateBar({
   let dotClass = 'dot';
   let stateText = '';
 
-  // Format the working-phase reason as "<base> Ns" (e.g. "awaiting response 4s",
+  // Format the working-phase reason as "<base> Ns" (e.g. "awaiting LLM response 4s",
   // "running bash 12s") for use in both the live and the frozen-last-
   // known-activity paths below.
   const formatWorkingReason = (
@@ -562,7 +562,11 @@ export function StateBar({
             break;
           case 'awaiting_user_response':
             dotClass += ' approval';
-            stateText = 'awaiting response';
+            // "your reply" disambiguates from `awaiting LLM response`
+            // (the llm_requesting label). Both surface in the same
+            // StateBar slot; the prose has to make clear who the user
+            // is waiting on.
+            stateText = 'awaiting your reply';
             break;
           case 'error':
             dotClass += ' error';
@@ -584,7 +588,7 @@ export function StateBar({
             // `toolExecutingStartedAt`.
             dotClass += ' working';
             // REQ-WPV-007: once the first byte for the current LLM
-            // request lands, switch the base reason from `awaiting response Ns`
+            // request lands, switch the base reason from `awaiting LLM response Ns`
             // to `streaming` (no counter — the stream itself is the
             // progress signal). The transition applies only while
             // the phase is one of the llm_requesting family; tool/

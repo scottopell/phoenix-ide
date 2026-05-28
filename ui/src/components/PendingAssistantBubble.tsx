@@ -11,7 +11,7 @@ import { getStateDescription } from '../utils';
  *
  * Label comes from `getStateDescription(phase)` — the same helper the
  * StateBar uses — so the bubble's prose stays in sync with whatever
- * the StateBar shows for the same phase (`awaiting response` for
+ * the StateBar shows for the same phase (`awaiting LLM response` for
  * `llm_requesting`, `preparing request` for `awaiting_llm`, `starting`
  * for `seeded_llm_requesting`). Hardcoded prose was the prior shape;
  * it diverged from the StateBar on the non-`llm_requesting` variants
@@ -40,8 +40,8 @@ export function PendingAssistantBubble({ slug }: { slug: string }) {
   // Strip the trailing `...` that `getStateDescription` appends to
   // working-phase prose — the elapsed counter is the "we're still
   // waiting" affordance, so the ellipsis would double up. e.g.
-  // `"awaiting response..."` becomes `"awaiting response"`, then we render
-  // `"awaiting response 4s"`.
+  // `"awaiting LLM response..."` becomes `"awaiting LLM response"`, then we render
+  // `"awaiting LLM response 4s"`.
   const label = getStateDescription(phase).replace(/\.{3}$/, '');
 
   return (

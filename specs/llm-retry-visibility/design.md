@@ -168,7 +168,7 @@ checklist). Rationale:
 - Without replay, a client that reconnects mid-backoff sees
   `StateChange(LlmRequesting{attempt:2})` from Init's `conversation.state`
   but has no way to recover the retry reason. The StateBar would
-  show "awaiting response Ns" without the "(retry 2/3 after rate limit)"
+  show "awaiting LLM response Ns" without the "(retry 2/3 after rate limit)"
   suffix — a regression in user trust during exactly the failure mode
   this spec is trying to surface.
 - The replay cost is small: `LlmAttempt` is a fixed-size event (no

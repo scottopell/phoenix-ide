@@ -27,9 +27,9 @@ entirely during reconnects. This spec adds:
   visible.
 - **Connection-state does not mask agent state**: during reconnect, display
   both the connection chip AND the last-known agent activity with elapsed
-  frozen at disconnect (`reconnecting (2) — last: awaiting response 12s`).
+  frozen at disconnect (`reconnecting (2) — last: awaiting LLM response 12s`).
 - A **first-byte sub-phase split**: `llm_requesting` displays as
-  `awaiting response Ns` until the first token arrives, then transitions to
+  `awaiting LLM response Ns` until the first token arrives, then transitions to
   `streaming` (no counter, since the stream itself is the progress signal).
 
 ## Technical Summary

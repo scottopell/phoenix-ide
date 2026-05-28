@@ -85,13 +85,15 @@ export function getStateDescription(state: ConversationState): string {
     case 'llm_requesting':
       // Pre-first-byte: request is on the wire but we have no observable
       // evidence of model activity (could be queued, prefilling, throttled,
-      // generating-but-buffering). `awaiting response` describes the
+      // generating-but-buffering). `awaiting LLM response` describes the
       // client's actual state — neutral about what the server is doing.
+      // The "LLM" qualifier disambiguates from `awaiting_user_response`
+      // (which means waiting on the human user, not the model).
       // Post-first-byte the StateBar switches to `streaming` because
       // tokens flowing IS observable evidence (REQ-WPV-007).
       return state.attempt > 1
-        ? `awaiting response (retry ${state.attempt})...`
-        : 'awaiting response...';
+        ? `awaiting LLM response (retry ${state.attempt})...`
+        : 'awaiting LLM response...';
     case 'seeded_llm_requesting':
       return state.attempt > 1 ? `starting (retry ${state.attempt})...` : 'starting...';
     case 'tool_executing': {
@@ -119,7 +121,11 @@ export function getStateDescription(state: ConversationState): string {
     case 'awaiting_task_approval':
       return 'awaiting approval';
     case 'awaiting_user_response':
-      return 'awaiting response';
+      // Disambiguated from `llm_requesting`'s "awaiting LLM response":
+      // this one is waiting on the *human user* to reply to an
+      // agent-posed question. Direct address ("your") makes the
+      // expected next action unmistakable.
+      return 'awaiting your reply';
     case 'error':
       return 'error';
     case 'awaiting_recovery':
