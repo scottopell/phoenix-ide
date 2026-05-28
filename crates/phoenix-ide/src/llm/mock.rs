@@ -328,6 +328,47 @@ fn parse_retry(request: &LlmRequest) -> Option<(crate::llm::LlmErrorKind, u32)> 
     Some((kind, n))
 }
 
+/// Slow-tool marker (REQ-WPV-002 visual driver): a user message
+/// containing `[[slow-tool:N]]` makes the mock emit a `bash` `tool_use`
+/// whose command is `sleep N && echo done`, so the real bash tool's
+/// execution genuinely takes ~N seconds. Used to visually verify the
+/// inline elapsed-time counter in the tool-use block ticks while the
+/// tool is running. `N` clamps to `MAX_SLOW_TOOL_S` so a typo can't
+/// park dev forever. Composes with `[[ttft:…]]` and `[[retry:…]]`.
+fn parse_slow_tool(request: &LlmRequest) -> Option<u64> {
+    let text = latest_user_text(request)?;
+    let start = text.find("[[slow-tool:")? + "[[slow-tool:".len();
+    let rest = text.get(start..)?;
+    let end = rest.find("]]")?;
+    rest.get(..end)?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|n| n.min(MAX_SLOW_TOOL_S))
+}
+
+/// Build the `(content, streamable_text)` tuple for a `[[slow-tool:N]]`
+/// invocation: a short preamble + a `bash` `tool_use` that sleeps N
+/// seconds. Standalone so both the streaming and non-streaming
+/// `LlmService` paths can share it.
+fn build_slow_tool_response(seconds: u64) -> (Vec<ContentBlock>, String) {
+    let text = format!("Running a slow command ({seconds}s) so you can watch the timer tick.");
+    (
+        vec![
+            ContentBlock::Text { text: text.clone() },
+            ContentBlock::ToolUse {
+                id: tool_use_id(),
+                name: "bash".to_string(),
+                input: serde_json::json!({
+                    "op": "run",
+                    "cmd": format!("sleep {seconds} && echo done")
+                }),
+            },
+        ],
+        text,
+    )
+}
+
 /// Shared helper: the latest user message's text, concatenated across any
 /// Text content blocks. Returns `None` if there are no user messages or
 /// they carry no Text blocks. Used by every `[[…:…]]` marker parser.
@@ -355,6 +396,7 @@ const MAX_TTFT_MS: u64 = 60_000; // 60s — covers heartbeat watchdog at 35s + h
 const MAX_STALL_AFTER_N: usize = 10_000;
 const MAX_STALL_MS: u64 = 120_000; // 2min
 const MAX_RETRY_N: u32 = 10; // far above any real MAX_RETRY_ATTEMPTS
+const MAX_SLOW_TOOL_S: u64 = 120; // 2min — generous; goal is visual verification
 
 /// Deterministic text of exactly `n_words` words, built by cycling the words
 /// of `LONG_TEXT`. Pure function of `n_words` — no rand, no time, no state.
@@ -572,7 +614,9 @@ async fn stream_text_with_optional_stall(
 #[async_trait]
 impl LlmService for MockLlmService {
     async fn complete(&self, request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        let content = if let Some(n) = parse_perf_words(request) {
+        let content = if let Some(seconds) = parse_slow_tool(request) {
+            build_slow_tool_response(seconds).0
+        } else if let Some(n) = parse_perf_words(request) {
             vec![ContentBlock::Text { text: perf_text(n) }]
         } else {
             build_response(&Scenario::from_message(request)).0
@@ -618,7 +662,9 @@ impl LlmService for MockLlmService {
             // attempt > fail_n: fall through to the normal scenario.
         }
 
-        let (content, streamable_text) = if let Some(n) = parse_perf_words(request) {
+        let (content, streamable_text) = if let Some(seconds) = parse_slow_tool(request) {
+            build_slow_tool_response(seconds)
+        } else if let Some(n) = parse_perf_words(request) {
             let t = perf_text(n);
             (vec![ContentBlock::Text { text: t.clone() }], t)
         } else {
@@ -723,6 +769,37 @@ mod tests {
         );
         assert_eq!(parse_ttft_ms(&user_req("no marker")), None);
         assert_eq!(parse_ttft_ms(&user_req("[[ttft:abc]]")), None);
+    }
+
+    #[test]
+    fn slow_tool_marker_parsed() {
+        assert_eq!(parse_slow_tool(&user_req("[[slow-tool:5]] hi")), Some(5));
+        assert_eq!(parse_slow_tool(&user_req("[[slow-tool:0]]")), Some(0));
+        // Clamped to the ceiling.
+        assert_eq!(
+            parse_slow_tool(&user_req("[[slow-tool:9999999]]")),
+            Some(MAX_SLOW_TOOL_S)
+        );
+        assert_eq!(parse_slow_tool(&user_req("no marker")), None);
+        assert_eq!(parse_slow_tool(&user_req("[[slow-tool:abc]]")), None);
+    }
+
+    #[test]
+    fn slow_tool_emits_bash_sleep_tool_use() {
+        let (content, _) = build_slow_tool_response(7);
+        // Expect a text preamble + a bash ToolUse whose cmd is `sleep 7 && echo done`.
+        assert_eq!(content.len(), 2);
+        let cmd = match &content[1] {
+            ContentBlock::ToolUse { name, input, .. } => {
+                assert_eq!(name, "bash");
+                input
+                    .get("cmd")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            }
+            _ => None,
+        };
+        assert_eq!(cmd.as_deref(), Some("sleep 7 && echo done"));
     }
 
     #[test]

@@ -130,6 +130,7 @@ function usesGfmSyntax(text: string): boolean {
 }
 
 /** Format a tool execution duration for display in the tool block header.
+ *  < 1s    -> "743ms" (integer milliseconds)
  *  < 10s   -> "3.2s" (one decimal place)
  *  < 60s   -> "42s"
  *  >= 60s  -> "1m 4s" (seconds part omitted when 0: "2m")
@@ -138,6 +139,9 @@ function usesGfmSyntax(text: string): boolean {
  *  59 999 ms -> "59s", 60 000 ms -> "1m", 119 999 ms -> "1m 59s".
  */
 function formatToolDuration(ms: number): string {
+  if (ms < 1000) {
+    return `${Math.round(ms)}ms`;
+  }
   const totalSeconds = Math.floor(ms / 1000);
   if (totalSeconds < 10) {
     return `${(ms / 1000).toFixed(1)}s`;
