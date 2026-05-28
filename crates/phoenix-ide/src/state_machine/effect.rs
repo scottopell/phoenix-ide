@@ -1,9 +1,10 @@
 //! Effects produced by state transitions
 
 use crate::db::{ImageData, MessageContent, ToolContent, ToolContentImage, ToolResult, UsageData};
-use crate::llm::ContentBlock;
+use crate::llm::{ContentBlock, LlmAttemptReason};
 use crate::state_machine::state::{AssistantMessage, SubAgentOutcome, SubAgentResult, ToolCall};
 use crate::tools::bash_check::display_command;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::fmt;
 use std::path::Path;
@@ -135,8 +136,18 @@ pub enum Effect {
     /// Notify connected clients that the agent finished its turn (parent only).
     NotifyAgentDone,
 
-    /// Schedule a retry
-    ScheduleRetry { delay: Duration, attempt: u32 },
+    /// Schedule a retry after a retryable LLM error. Carries the
+    /// classified `reason` and any quota-reset timestamp from the
+    /// upstream error so the executor can emit `SseEvent::LlmAttempt`
+    /// (specs/llm-retry-visibility/, REQ-LRV-001) immediately before
+    /// spawning the backoff sleep, surfacing retry context to the
+    /// client during the otherwise-silent backoff window.
+    ScheduleRetry {
+        delay: Duration,
+        attempt: u32,
+        reason: LlmAttemptReason,
+        resets_at: Option<DateTime<Utc>>,
+    },
 
     /// Atomically persist a complete checkpoint (REQ-BED-007, FM-2 Prevention)
     PersistCheckpoint { data: CheckpointData },

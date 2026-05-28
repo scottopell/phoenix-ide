@@ -74,7 +74,7 @@ mod types;
 pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
-pub use error::{LlmError, LlmErrorKind};
+pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
 // Re-exported types: QuotaDetails is consumed by `LlmOutcome::UsageLimitReached`
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.

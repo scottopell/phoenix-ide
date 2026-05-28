@@ -65,7 +65,12 @@ export type SseLlmFirstByteData = Omit<
   Extract<SseWireEvent, { type: 'llm_first_byte' }>,
   'type'
 >;
+export type SseLlmAttemptData = Omit<
+  Extract<SseWireEvent, { type: 'llm_attempt' }>,
+  'type'
+>;
 export type SseAgentDoneData = Omit<Extract<SseWireEvent, { type: 'agent_done' }>, 'type'>;
+export type { LlmAttemptReason } from './LlmAttemptReason';
 export type SseConversationBecameTerminalData = Omit<
   Extract<SseWireEvent, { type: 'conversation_became_terminal' }>,
   'type'

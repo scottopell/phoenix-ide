@@ -325,6 +325,7 @@ fn arb_llm_error_event() -> impl Strategy<Value = Event> {
             error_kind,
             attempt,
             recovery_in_progress: false,
+        resets_at: None,
         }
     })
 }
@@ -751,6 +752,7 @@ proptest! {
             error_kind,
             attempt,
             recovery_in_progress: false,
+        resets_at: None,
         };
 
         let result = transition(&state, &test_context(), event);
@@ -778,6 +780,7 @@ proptest! {
             error_kind: error_kind.clone(),
             attempt,
             recovery_in_progress: false,
+        resets_at: None,
         };
 
         let result = transition(&state, &test_context(), event);
@@ -800,6 +803,7 @@ proptest! {
             error_kind: ErrorKind::Network, // Retryable but exhausted
             attempt: 3,
             recovery_in_progress: false,
+        resets_at: None,
         };
 
         let result = transition(&state, &test_context(), event);
@@ -1141,6 +1145,7 @@ fn test_retry_cycle() {
             error_kind: ErrorKind::Network,
             attempt: 1,
             recovery_in_progress: false,
+        resets_at: None,
         },
     )
     .unwrap();
@@ -1894,7 +1899,7 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                     request_id: "test-req-id".to_string(),
                 }
             }
-            1 => LlmOutcome::RateLimited { retry_after: None },
+            1 => LlmOutcome::RateLimited { retry_after: None, resets_at: None },
             2 => LlmOutcome::ServerError {
                 status: 500,
                 body: msg,
@@ -2068,7 +2073,7 @@ proptest! {
     fn prop_rate_limited_is_retryable(attempt in 1u32..3) {
         let ctx = test_context();
         let state = ConvState::LlmRequesting { attempt };
-        let outcome = EffectOutcome::Llm(LlmOutcome::RateLimited { retry_after: None });
+        let outcome = EffectOutcome::Llm(LlmOutcome::RateLimited { retry_after: None, resets_at: None });
         let result = handle_outcome(&state, &ctx, outcome);
         prop_assert!(result.is_ok());
         match result.unwrap().new_state {

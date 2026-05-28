@@ -1437,7 +1437,29 @@ where
 
             Effect::ExecuteTool { tool } => self.dispatch_tool_execution(tool).await,
 
-            Effect::ScheduleRetry { delay, attempt } => {
+            Effect::ScheduleRetry {
+                delay,
+                attempt,
+                reason,
+                resets_at,
+            } => {
+                // REQ-LRV-001: surface the retry context to clients before
+                // the backoff window opens. Two sequential `send_seq`
+                // calls below (LlmAttempt → eventual StateChange/Token
+                // path on the next attempt) keep the StateBar's retry
+                // suffix in lockstep with the state machine. Emitted
+                // BEFORE the tokio sleep so a client subscribing in the
+                // backoff window observes it via the replay ring.
+                let backing_off_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::LlmAttempt {
+                    sequence_id: seq,
+                    attempt,
+                    max_attempts: crate::state_machine::transition::MAX_RETRY_ATTEMPTS,
+                    reason,
+                    backing_off_ms,
+                    resets_at,
+                });
+
                 // Typed oneshot for retry timeout
                 let outcome_tx = self.outcome_tx.clone();
                 tokio::spawn(async move {
@@ -2462,6 +2484,7 @@ where
                             error_kind: llm_error_to_db_error(e.kind),
                             attempt: 0,
                             recovery_in_progress: e.recovery_in_progress,
+                            resets_at: e.quota.as_ref().and_then(|q| q.resets_at),
                         })
                         .await;
                 }
@@ -3630,7 +3653,14 @@ fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> crate::db::ErrorKind
 fn llm_error_to_outcome(error: crate::llm::LlmError) -> LlmOutcome {
     use crate::llm::LlmErrorKind;
     match error.kind {
-        LlmErrorKind::RateLimit => LlmOutcome::RateLimited { retry_after: None },
+        LlmErrorKind::RateLimit => LlmOutcome::RateLimited {
+            retry_after: None,
+            // Thread `resets_at` from the upstream `QuotaDetails` when the
+            // 429 response included one. Surfaces on `SseEvent::LlmAttempt`
+            // so the retry suffix can show "(retry K/N after rate limit,
+            // resets at HH:MM)" — specs/llm-retry-visibility/.
+            resets_at: error.quota.as_ref().and_then(|q| q.resets_at),
+        },
         LlmErrorKind::UsageLimitReached => {
             // The codex parser always attaches a QuotaDetails to UsageLimitReached
             // errors; fall back to an empty payload only as a defensive measure

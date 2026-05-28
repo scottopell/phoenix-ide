@@ -13,6 +13,7 @@ import {
   SseStateChangeDataSchema,
   SseTokenDataSchema,
   SseLlmFirstByteDataSchema,
+  SseLlmAttemptDataSchema,
   SseConversationUpdateDataSchema,
   SseAgentDoneDataSchema,
   SseConversationBecameTerminalDataSchema,
@@ -453,6 +454,30 @@ export function useConnection({
               type: 'sse_llm_first_byte',
               sequenceId: res.data.sequence_id,
               requestId: res.data.request_id,
+            });
+          });
+
+          // REQ-LRV-001 / REQ-WPV-003: retry-context marker. Emitted from
+          // the executor's Effect::ScheduleRetry handler immediately
+          // before the spawned backoff sleep. The reducer stamps the
+          // turnRetryContext so the StateBar can append a
+          // "(retry K/N <reason>)" suffix to the base reason.
+          on('llm_attempt', (e) => {
+            const res = parseEvent(
+              SseLlmAttemptDataSchema,
+              e,
+              'llm_attempt',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_llm_attempt',
+              sequenceId: res.data.sequence_id,
+              attempt: res.data.attempt,
+              maxAttempts: res.data.max_attempts,
+              reason: res.data.reason,
+              backingOffMs: res.data.backing_off_ms,
+              resetsAt: res.data.resets_at ? Date.parse(res.data.resets_at) : null,
             });
           });
 

@@ -143,6 +143,15 @@ pub enum Event {
         /// running and may resolve this error. The transition function uses this
         /// to choose `AwaitingRecovery` vs `Error` (REQ-BED-030).
         recovery_in_progress: bool,
+        /// Upstream quota window reset time, when known. Populated only for
+        /// rate-limit errors whose `LlmError.quota` carried a `resets_at`
+        /// value (see `llm/rate_limit.rs::QuotaDetails`). Threaded onto
+        /// `Effect::ScheduleRetry` and out to `SseEvent::LlmAttempt` so
+        /// the client can surface "(retry K/N after rate limit, resets at
+        /// HH:MM)" — specs/llm-retry-visibility/ REQ-LRV-001. `None` for
+        /// network/server-error retries and for rate-limit errors whose
+        /// upstream response didn't include the reset timestamp.
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     RetryTimeout {
         attempt: u32,
@@ -346,6 +355,8 @@ pub enum CoreEvent {
         error_kind: ErrorKind,
         attempt: u32,
         recovery_in_progress: bool,
+        /// Quota reset timestamp; see `Event::LlmError::resets_at`.
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     RetryTimeout {
         attempt: u32,
@@ -496,11 +507,13 @@ impl TryFrom<Event> for ParentEvent {
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                resets_at,
             } => Ok(ParentEvent::Core(CoreEvent::LlmError {
                 message,
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                resets_at,
             })),
             Event::RetryTimeout { attempt } => {
                 Ok(ParentEvent::Core(CoreEvent::RetryTimeout { attempt }))
@@ -637,11 +650,13 @@ impl TryFrom<Event> for SubAgentEvent {
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                resets_at,
             } => Ok(SubAgentEvent::Core(CoreEvent::LlmError {
                 message,
                 error_kind,
                 attempt,
                 recovery_in_progress,
+                resets_at,
             })),
             Event::RetryTimeout { attempt } => {
                 Ok(SubAgentEvent::Core(CoreEvent::RetryTimeout { attempt }))

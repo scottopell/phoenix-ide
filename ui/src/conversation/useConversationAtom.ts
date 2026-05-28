@@ -223,6 +223,27 @@ export function usePhase(slug: string): import('../api').ConversationState {
 }
 
 /**
+ * Returns the per-turn retry context for `slug`, or `null` when no
+ * retry has fired this turn. Used by `PendingAssistantBubble` so the
+ * bubble surfaces "(retry K/N after <reason>)" in lockstep with the
+ * StateBar (specs/llm-retry-visibility/ REQ-LRV-001 / 003).
+ */
+export function useTurnRetryContext(
+  slug: string,
+): ConversationAtom['turnRetryContext'] {
+  const store = useConversationStore();
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => store.getSnapshot(slug).turnRetryContext,
+    [store, slug],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+/**
  * Returns the streaming buffer's `requestId` for `slug`, or null when
  * no buffer is active. Re-renders the consumer on streaming-start,
  * streaming-end, AND streaming-restart (a new buffer with a fresh

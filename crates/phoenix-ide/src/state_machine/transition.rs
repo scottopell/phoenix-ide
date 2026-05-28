@@ -14,6 +14,7 @@
 use super::effect::{compute_bash_display_data, CheckpointData};
 use super::event::{CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent};
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
+use crate::llm::LlmAttemptReason;
 use super::state::{
     AssistantMessage, ContextExhaustionBehavior, CoreState, ModeKind, ParentState, RecoveryKind,
     SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
@@ -180,7 +181,40 @@ fn resolve_task_file(
     })
 }
 
-const MAX_RETRY_ATTEMPTS: u32 = 3;
+/// The retry-budget ceiling for retryable LLM errors. Surfaced via
+/// `SseEvent::LlmAttempt.max_attempts` on every retry-scheduling event
+/// so the client can render `(retry K/N <reason>)` (specs/llm-retry-visibility/
+/// REQ-LRV-001). `pub` exposure is for the executor's
+/// `Effect::ScheduleRetry` handler, which sends the value on the wire.
+pub const MAX_RETRY_ATTEMPTS: u32 = 3;
+
+/// Project a runtime `ErrorKind` onto the three retryable
+/// `LlmAttemptReason` variants. `is_retryable()` is the gate for
+/// `Effect::ScheduleRetry`; this helper is the wire-side projection of
+/// the same predicate. `TimedOut` collapses to `Network` because the
+/// upstream `LlmErrorKind` never distinguishes them (timeouts arrive
+/// as `LlmErrorKind::Network`); the runtime keeps the kinds separate
+/// for non-LLM paths but the LlmAttempt reader doesn't care.
+fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
+    match kind {
+        ErrorKind::RateLimit => LlmAttemptReason::RateLimit,
+        ErrorKind::ServerError => LlmAttemptReason::ServerError,
+        ErrorKind::Network | ErrorKind::TimedOut => LlmAttemptReason::Network,
+        // The caller guards on `is_retryable()`, which only admits the
+        // variants above. Any other kind reaching this match would be a
+        // genuine bug in the runtime; fall back to Network so the wire
+        // event is well-formed and let the panic-via-tracing pattern
+        // (none here — silent fallback) surface during integration.
+        ErrorKind::Auth
+        | ErrorKind::UsageLimitReached
+        | ErrorKind::ServerOverloaded
+        | ErrorKind::InvalidRequest
+        | ErrorKind::Cancelled
+        | ErrorKind::SubAgentError
+        | ErrorKind::ContextExhausted
+        | ErrorKind::ContentFilter => LlmAttemptReason::Network,
+    }
+}
 
 /// Discriminator for a `propose_task` tool call found in an LLM response: the
 /// payload either parsed into the typed input or failed serde (carrying the
@@ -1235,11 +1269,17 @@ fn handle_core_error_retry(
 ) -> Result<CoreTransitionResult, TransitionError> {
     match (state, event) {
         // Retryable LlmError below max -> retry (shared)
-        (CoreState::LlmRequesting { attempt }, CoreEvent::LlmError { error_kind, .. })
-            if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS =>
-        {
+        (
+            CoreState::LlmRequesting { attempt },
+            CoreEvent::LlmError {
+                ref error_kind,
+                resets_at,
+                ..
+            },
+        ) if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
             let new_attempt = attempt + 1;
             let delay = retry_delay(new_attempt);
+            let reason = error_kind_to_attempt_reason(error_kind);
 
             Ok(CoreTransitionResult::new(CoreState::LlmRequesting {
                 attempt: new_attempt,
@@ -1248,6 +1288,8 @@ fn handle_core_error_retry(
             .with_effect(Effect::ScheduleRetry {
                 delay,
                 attempt: new_attempt,
+                reason,
+                resets_at,
             })
             .with_effect(Effect::notify_state_change()))
         }
@@ -1308,10 +1350,15 @@ fn handle_core_continuation(
                 rejected_tool_calls,
                 attempt,
             },
-            CoreEvent::LlmError { error_kind, .. },
+            CoreEvent::LlmError {
+                ref error_kind,
+                resets_at,
+                ..
+            },
         ) if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
             let new_attempt = attempt + 1;
             let delay = retry_delay(new_attempt);
+            let reason = error_kind_to_attempt_reason(error_kind);
 
             Ok(CoreTransitionResult::new(CoreState::AwaitingContinuation {
                 rejected_tool_calls: rejected_tool_calls.clone(),
@@ -1321,6 +1368,8 @@ fn handle_core_continuation(
             .with_effect(Effect::ScheduleRetry {
                 delay,
                 attempt: new_attempt,
+                reason,
+                resets_at,
             })
             .with_effect(Effect::notify_state_change()))
         }
@@ -2370,13 +2419,17 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
             usage,
             request_id,
         },
-        LlmOutcome::RateLimited { retry_after: _ } => {
+        LlmOutcome::RateLimited {
+            retry_after: _,
+            resets_at,
+        } => {
             let attempt = current_attempt(state);
             Event::LlmError {
                 message: "Rate limited".to_string(),
                 error_kind: ErrorKind::RateLimit,
                 attempt,
                 recovery_in_progress: false,
+                resets_at,
             }
         }
         LlmOutcome::UsageLimitReached {
@@ -2389,6 +2442,8 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::UsageLimitReached,
                 attempt,
                 recovery_in_progress: false,
+                // Non-retryable: never reaches Effect::ScheduleRetry.
+                resets_at: None,
             }
         }
         LlmOutcome::ServerError { status, body } => {
@@ -2398,6 +2453,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::ServerError,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
         LlmOutcome::ServerOverloaded { message } => {
@@ -2407,6 +2463,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::ServerOverloaded,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
         LlmOutcome::NetworkError { message } => {
@@ -2416,6 +2473,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::Network,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
         LlmOutcome::TokenBudgetExceeded => {
@@ -2425,6 +2483,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::ContextExhausted,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
         LlmOutcome::AuthError {
@@ -2437,6 +2496,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::Auth,
                 attempt,
                 recovery_in_progress,
+                resets_at: None,
             }
         }
         LlmOutcome::RequestRejected { message } => {
@@ -2446,6 +2506,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::InvalidRequest,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
         LlmOutcome::Cancelled => {
@@ -2455,6 +2516,7 @@ fn llm_outcome_to_event(outcome: LlmOutcome, state: &ConvState) -> Event {
                 error_kind: ErrorKind::Cancelled,
                 attempt,
                 recovery_in_progress: false,
+                resets_at: None,
             }
         }
     }
@@ -2632,6 +2694,7 @@ mod tests {
                 error_kind: ErrorKind::ContextExhausted,
                 attempt: 1,
                 recovery_in_progress: false,
+            resets_at: None,
             },
         )
         .unwrap();
@@ -2665,6 +2728,7 @@ mod tests {
                 error_kind: ErrorKind::InvalidRequest,
                 attempt: 1,
                 recovery_in_progress: false,
+            resets_at: None,
             },
         )
         .unwrap();
@@ -2692,6 +2756,7 @@ mod tests {
                     error_kind: ErrorKind::ContextExhausted,
                     attempt,
                     recovery_in_progress: false,
+                resets_at: None,
                 },
             )
             .unwrap();
@@ -3169,6 +3234,7 @@ mod tests {
                 error_kind: ErrorKind::Network, // retryable
                 attempt: 3,
                 recovery_in_progress: false,
+            resets_at: None,
             },
         )
         .unwrap();
@@ -3218,6 +3284,7 @@ mod tests {
                 error_kind: ErrorKind::Auth, // non-retryable
                 attempt: 1,
                 recovery_in_progress: false,
+            resets_at: None,
             },
         )
         .unwrap();
@@ -3251,6 +3318,7 @@ mod tests {
                 error_kind: ErrorKind::Network,
                 attempt: 3,
                 recovery_in_progress: false,
+            resets_at: None,
             },
         )
         .unwrap();

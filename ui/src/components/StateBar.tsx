@@ -75,6 +75,16 @@ interface StateBarProps {
    *  counter) per REQ-WPV-007 — the stream itself is the visible
    *  progress signal so an additional counter is redundant. */
   firstByteRequestId?: string | null;
+  /** Per-turn retry context populated by the `sse_llm_attempt` reducer.
+   *  When non-null AND the conversation is in a working phase, the
+   *  StateBar appends "(retry K/N <reason>)" after the base reason and
+   *  the elapsed counter — REQ-WPV-003 / REQ-LRV-001. Cleared on
+   *  `agent_done` and on terminal `error`. */
+  turnRetryContext?: {
+    attempt: number;
+    maxAttempts: number;
+    reasonText: string;
+  } | null;
   /** Mobile/tablet-only: opens the file browser overlay. When omitted (e.g. on
    *  desktop where `FileExplorerPanel` provides the same affordance), the
    *  button is not rendered. The explicit `| undefined` is required under
@@ -307,6 +317,7 @@ export function StateBar({
   phaseStateUpdatedAt,
   lastSseEventAt,
   firstByteRequestId,
+  turnRetryContext,
   onOpenFiles,
   onSendMessage,
   showError,
@@ -470,7 +481,17 @@ export function StateBar({
   let dotClass = 'dot';
   let stateText = '';
 
-  // Format the working-phase reason as "<base> Ns" (e.g. "awaiting LLM response 4s",
+  // REQ-WPV-003 / REQ-LRV-001: when a retry has fired this turn, append
+  // "(retry K/N after <reason>)" to the base reason. Returns "" when no
+  // retry context exists. Leading space so the suffix concatenates
+  // cleanly onto either the live or the frozen-last-known reason.
+  const retrySuffix =
+    turnRetryContext != null
+      ? ` (retry ${turnRetryContext.attempt}/${turnRetryContext.maxAttempts} after ${turnRetryContext.reasonText})`
+      : '';
+
+  // Format the working-phase reason as "<base> Ns <retry?>" (e.g.
+  // "awaiting LLM response 4s (retry 2/3 after rate limit)",
   // "running bash 12s") for use in both the live and the frozen-last-
   // known-activity paths below.
   const formatWorkingReason = (
@@ -478,7 +499,9 @@ export function StateBar({
     elapsedSeconds: number
   ): string => {
     const base = getStateDescription(phase);
-    return elapsedSeconds > 0 ? `${base} ... ${formatElapsed(elapsedSeconds)}` : base;
+    const withElapsed =
+      elapsedSeconds > 0 ? `${base} ... ${formatElapsed(elapsedSeconds)}` : base;
+    return `${withElapsed}${retrySuffix}`;
   };
 
   if (!conversation) {
@@ -599,7 +622,12 @@ export function StateBar({
                 convState.type === 'awaiting_llm') &&
               firstByteRequestId != null
             ) {
-              stateText = 'streaming';
+              // REQ-WPV-003: retry suffix carries through every working
+              // phase, including streaming. A turn that retried once and
+              // is now streaming should still surface "(retry 2/3 …)"
+              // so the user has the full context for "why has this
+              // taken so long?".
+              stateText = `streaming${retrySuffix}`;
             } else {
               stateText = formatWorkingReason(convState, phaseElapsedSeconds);
             }

@@ -1,5 +1,9 @@
 import { useEffect, useState } from 'react';
-import { usePhase, usePhaseStateUpdatedAt } from '../conversation/useConversationAtom';
+import {
+  usePhase,
+  usePhaseStateUpdatedAt,
+  useTurnRetryContext,
+} from '../conversation/useConversationAtom';
 import { getStateDescription } from '../utils';
 
 /**
@@ -23,6 +27,7 @@ import { getStateDescription } from '../utils';
 export function PendingAssistantBubble({ slug }: { slug: string }) {
   const phaseStateUpdatedAt = usePhaseStateUpdatedAt(slug);
   const phase = usePhase(slug);
+  const turnRetryContext = useTurnRetryContext(slug);
 
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   useEffect(() => {
@@ -44,12 +49,23 @@ export function PendingAssistantBubble({ slug }: { slug: string }) {
   // `"awaiting LLM response 4s"`.
   const label = getStateDescription(phase).replace(/\.{3}$/, '');
 
+  // REQ-LRV-001 / REQ-WPV-003: when a retry has fired this turn,
+  // append "(retry K/N after <reason>)" to the bubble so the in-flight
+  // surface stays in sync with the StateBar's suffix.
+  const retrySuffix =
+    turnRetryContext != null
+      ? ` (retry ${turnRetryContext.attempt}/${turnRetryContext.maxAttempts} after ${turnRetryContext.reasonText})`
+      : '';
+
   return (
     <div className="message-row agent">
       <div className="message-content pending-assistant-bubble">
         <span className="pending-assistant-bubble__label">{label}</span>
         {phaseStateUpdatedAt != null && (
           <span className="pending-assistant-bubble__elapsed"> {elapsedSeconds}s</span>
+        )}
+        {retrySuffix && (
+          <span className="pending-assistant-bubble__retry">{retrySuffix}</span>
         )}
       </div>
     </div>

@@ -91,11 +91,16 @@ export function getStateDescription(state: ConversationState): string {
       // (which means waiting on the human user, not the model).
       // Post-first-byte the StateBar switches to `streaming` because
       // tokens flowing IS observable evidence (REQ-WPV-007).
-      return state.attempt > 1
-        ? `awaiting LLM response (retry ${state.attempt})...`
-        : 'awaiting LLM response...';
+      //
+      // No `(retry N)` suffix here — the StateBar appends a richer
+      // `(retry K/N after <reason>)` from `turnRetryContext` (REQ-LRV-001)
+      // and the pending bubble does the same; baking the bare attempt
+      // count into the description would double up.
+      return 'awaiting LLM response...';
     case 'seeded_llm_requesting':
-      return state.attempt > 1 ? `starting (retry ${state.attempt})...` : 'starting...';
+      // Same rationale as `llm_requesting`: defer to
+      // `turnRetryContext` for retry surfacing.
+      return 'starting...';
     case 'tool_executing': {
       // `current_tool.name` is authoritative on both wire paths; see
       // ToolCall's custom Serialize impl in state_machine/state.rs.

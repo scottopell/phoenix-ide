@@ -38,6 +38,12 @@ pub enum LlmOutcome {
     RateLimited {
         #[allow(dead_code)] // Populated when provider sends Retry-After header
         retry_after: Option<Duration>,
+        /// Quota window reset timestamp from the upstream `QuotaDetails`,
+        /// when the 429 response included one. Threaded through to
+        /// `Event::LlmError.resets_at` → `Effect::ScheduleRetry.resets_at`
+        /// → `SseEvent::LlmAttempt.resets_at` so the client can surface
+        /// "(retry K/N after rate limit, resets at HH:MM)" — specs/llm-retry-visibility/.
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// Quota window exhausted (codex backend 429 with `usage_limit_reached`) — terminal.
     /// `details` carries plan + reset + windows; `message` is the pre-rendered

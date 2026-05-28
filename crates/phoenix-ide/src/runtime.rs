@@ -787,6 +787,38 @@ pub enum SseEvent {
         /// transition to the right pending bubble.
         request_id: String,
     },
+    /// Retry-context marker emitted from the executor's
+    /// `Effect::ScheduleRetry` handler immediately before the spawned
+    /// backoff sleep. Carries everything the StateBar's retry suffix
+    /// needs — `(retry K/N <reason>)` per
+    /// specs/working-phase-visibility/ REQ-WPV-003 — so the user can
+    /// distinguish "rate-limit retry storm" from a wedged server during
+    /// the otherwise-silent backoff window. Replays via the ephemeral
+    /// SSE ring so mid-backoff reconnects reconstruct the suffix.
+    /// Specs: `specs/llm-retry-visibility/`, REQ-LRV-001 .. REQ-LRV-003.
+    LlmAttempt {
+        sequence_id: i64,
+        /// 1-indexed attempt this retry is scheduled FOR; matches the
+        /// `state.attempt` carried on the next `StateChange`.
+        attempt: u32,
+        /// Retry-budget ceiling (`MAX_RETRY_ATTEMPTS` from the state
+        /// machine — currently 3). Carried per-event so a future
+        /// per-provider policy is wire-compatible without a spec change.
+        max_attempts: u32,
+        /// Classified reason — one of `rate_limit`, `server_error`,
+        /// `network` (the retryable subset of `LlmErrorKind`).
+        reason: crate::llm::LlmAttemptReason,
+        /// `delay` from `Effect::ScheduleRetry`, in milliseconds.
+        /// Informational at v1 (the client doesn't count down); the
+        /// field exists so a future "backing off Ns" sub-display can be
+        /// added without a wire change.
+        backing_off_ms: u64,
+        /// Upstream quota window reset timestamp when the rate-limit
+        /// response included one (`None` for `server_error` / `network`
+        /// retries and for `rate_limit` retries whose 429 lacked a
+        /// `resets_at`). RFC3339 string on the wire.
+        resets_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
     AgentDone {
         sequence_id: i64,
     },

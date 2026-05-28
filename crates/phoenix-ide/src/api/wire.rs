@@ -290,6 +290,22 @@ pub enum SseWireEvent {
         sequence_id: i64,
         request_id: String,
     },
+    /// Retry-context marker: emitted from the executor's
+    /// `Effect::ScheduleRetry` handler immediately before the spawned
+    /// backoff sleep. Drives the StateBar's `(retry K/N <reason>)`
+    /// suffix per specs/working-phase-visibility/ REQ-WPV-003 and
+    /// specs/llm-retry-visibility/. Replays via the ephemeral SSE ring
+    /// so mid-backoff reconnects reconstruct the suffix.
+    LlmAttempt {
+        sequence_id: i64,
+        attempt: u32,
+        max_attempts: u32,
+        reason: crate::llm::LlmAttemptReason,
+        backing_off_ms: u64,
+        #[ts(optional)]
+        #[serde(skip_serializing_if = "Option::is_none")]
+        resets_at: Option<DateTime<Utc>>,
+    },
     /// Ephemeral streaming token (LLM delta).
     Token {
         sequence_id: i64,
@@ -360,6 +376,7 @@ impl SseWireEvent {
             SseWireEvent::MessageUpdated { .. } => "message_updated",
             SseWireEvent::StateChange { .. } => "state_change",
             SseWireEvent::LlmFirstByte { .. } => "llm_first_byte",
+            SseWireEvent::LlmAttempt { .. } => "llm_attempt",
             SseWireEvent::Token { .. } => "token",
             SseWireEvent::AgentDone { .. } => "agent_done",
             SseWireEvent::ConversationBecameTerminal { .. } => "conversation_became_terminal",
@@ -447,6 +464,21 @@ impl From<SseEvent> for SseWireEvent {
             } => SseWireEvent::LlmFirstByte {
                 sequence_id,
                 request_id,
+            },
+            SseEvent::LlmAttempt {
+                sequence_id,
+                attempt,
+                max_attempts,
+                reason,
+                backing_off_ms,
+                resets_at,
+            } => SseWireEvent::LlmAttempt {
+                sequence_id,
+                attempt,
+                max_attempts,
+                reason,
+                backing_off_ms,
+                resets_at,
             },
             SseEvent::Token {
                 sequence_id,

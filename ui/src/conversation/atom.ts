@@ -8,6 +8,7 @@ import {
   SseMessageUpdatedDataSchema,
   SseAgentDoneDataSchema,
   SseLlmFirstByteDataSchema,
+  SseLlmAttemptDataSchema,
   SseConversationUpdateDataSchema,
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
@@ -77,6 +78,28 @@ export interface ConversationAtom {
    *  pending bubble's spec-level `placeholder → streaming` edge
    *  (REQ-WPV-006). */
   firstByteRequestId: string | null;
+  /** Per-turn retry context: most recent `LlmAttempt` for the current
+   *  turn (specs/llm-retry-visibility/ REQ-LRV-001 / REQ-WPV-003). The
+   *  StateBar composes "(retry K/N <reason>)" from these fields and
+   *  appends as a suffix to the base reason. `null` when no retry has
+   *  fired this turn. Cleared on `agent_done` (success) and on terminal
+   *  `error` events; survives intra-turn phase transitions
+   *  (llm_requesting → tool_executing) per REQ-WPV-003's `executing bash
+   *  12s (retry 2/5)` example. */
+  turnRetryContext: {
+    attempt: number;
+    maxAttempts: number;
+    reason: 'rate_limit' | 'server_error' | 'network';
+    /** Human-rendered reason ("rate limit", "server error",
+     *  "network error"). Source of truth lives on the client because
+     *  the wire transport is the snake_case enum. */
+    reasonText: string;
+    backingOffMs: number;
+    /** unix ms; converted from the wire's RFC3339 string once. `null`
+     *  when the wire omitted the field (non-rate-limit retries; rate
+     *  limits whose 429 didn't include a reset timestamp). */
+    resetsAt: number | null;
+  } | null;
   /** Per-connection generation that produced the events this atom has accepted.
    *  `null` until `connection_opened` lands. Wire-originated actions tagged
    *  with a non-matching `epoch` are dropped at the reducer boundary — the
@@ -174,6 +197,22 @@ export type SSEAction =
       requestId: string;
       epoch?: number;
     }
+  | {
+      // REQ-LRV-001 + REQ-WPV-003: per-turn retry context populator.
+      // Emitted from the executor's Effect::ScheduleRetry handler
+      // immediately before the spawned backoff sleep. The reducer
+      // stamps `turnRetryContext` on the atom; the StateBar appends
+      // "(retry K/N <reason>)" to the base reason.
+      type: 'sse_llm_attempt';
+      sequenceId: number;
+      attempt: number;
+      maxAttempts: number;
+      reason: 'rate_limit' | 'server_error' | 'network';
+      backingOffMs: number;
+      /** unix ms; null when the wire omitted the field. */
+      resetsAt: number | null;
+      epoch?: number;
+    }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
   | { type: 'sse_browser_session_state'; sequenceId: number; active: boolean; epoch?: number }
   // `sequenceId` is present when the error originated on the wire (server's
@@ -255,9 +294,26 @@ export function createInitialAtom(): ConversationAtom {
     phaseStateUpdatedAt: null,
     lastSseEventAt: Date.now(),
     firstByteRequestId: null,
+    turnRetryContext: null,
     connectionEpoch: null,
     connectionState: 'connecting',
   };
+}
+
+/** Human-rendered prose for an `LlmAttemptReason`. The wire transports
+ *  the snake_case enum; this function is the single source of truth for
+ *  the user-facing strings the StateBar appends in `(retry K/N <reason>)`.
+ *  Specs: `specs/llm-retry-visibility/` REQ-LRV-002 + the consumer's
+ *  `render_retry_modifier_for` helper. */
+function reasonText(reason: 'rate_limit' | 'server_error' | 'network'): string {
+  switch (reason) {
+    case 'rate_limit':
+      return 'rate limit';
+    case 'server_error':
+      return 'server error';
+    case 'network':
+      return 'network error';
+  }
 }
 
 export function breadcrumbFromPhase(
@@ -529,6 +585,26 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_llm_first_byte',
         sequenceId: res.output.sequence_id,
         requestId: res.output.request_id,
+      });
+    }
+    case 'llm_attempt': {
+      const res = v.safeParse(SseLlmAttemptDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending llm_attempt entry', {
+            issues: res.issues,
+          });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_llm_attempt',
+        sequenceId: res.output.sequence_id,
+        attempt: res.output.attempt,
+        maxAttempts: res.output.max_attempts,
+        reason: res.output.reason,
+        backingOffMs: res.output.backing_off_ms,
+        resetsAt: res.output.resets_at ? Date.parse(res.output.resets_at) : null,
       });
     }
     case 'conversation_update': {
@@ -850,6 +926,10 @@ export function conversationReducer(
         // but agent_done can fire without a preceding state_change in
         // some terminal paths, so we clear here defensively.
         firstByteRequestId: null,
+        // REQ-WPV-003 + REQ-LRV-003: clear the retry context on turn end.
+        // Surfacing "(retry 2/5)" on a turn that has finished or aborted
+        // is confusing (the user reads it as "still retrying").
+        turnRetryContext: null,
       }));
     }
 
@@ -857,6 +937,21 @@ export function conversationReducer(
       return applyIfNewer(atom, 'sse_llm_first_byte', action.sequenceId, (a) => ({
         ...a,
         firstByteRequestId: action.requestId,
+        lastSseEventAt: Date.now(),
+      }));
+    }
+
+    case 'sse_llm_attempt': {
+      return applyIfNewer(atom, 'sse_llm_attempt', action.sequenceId, (a) => ({
+        ...a,
+        turnRetryContext: {
+          attempt: action.attempt,
+          maxAttempts: action.maxAttempts,
+          reason: action.reason,
+          reasonText: reasonText(action.reason),
+          backingOffMs: action.backingOffMs,
+          resetsAt: action.resetsAt,
+        },
         lastSseEventAt: Date.now(),
       }));
     }
@@ -933,13 +1028,18 @@ export function conversationReducer(
       // can't re-pop a toast the user already dismissed. Client-synthesized
       // errors (schema violations, malformed JSON) have no sequenceId and
       // apply unconditionally — they're not on the server's total order.
+      //
+      // REQ-LRV-003: a turn-terminal `error` clears the retry context.
+      // Surfacing "(retry 2/5)" on a finalised error reads as "still
+      // retrying" when the turn has actually given up.
       if (action.sequenceId !== undefined) {
         return applyIfNewer(atom, 'sse_error', action.sequenceId, (a) => ({
           ...a,
           uiError: action.error,
+          turnRetryContext: null,
         }));
       }
-      return { ...atom, uiError: action.error };
+      return { ...atom, uiError: action.error, turnRetryContext: null };
 
     case 'clear_error':
       return { ...atom, uiError: null };

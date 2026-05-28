@@ -107,6 +107,60 @@ pub enum LlmErrorKind {
     ContextWindowExceeded,
 }
 
+/// The retryable-error classification that ships on the wire as part of
+/// `SseWireEvent::LlmAttempt`. Mirrors the retryable subset of
+/// `LlmErrorKind` exactly — adding a new retryable kind requires adding
+/// a variant here and updating `LlmAttemptReason::from_kind`, which the
+/// compiler forces via exhaustive `match`.
+///
+/// Specs: `specs/llm-retry-visibility/`. The wire-level snake_case is
+/// emitted by `serde` via the rename_all attribute so the JSON values
+/// match the spec's `{rate_limit, server_error, network}` set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(ts_rs::TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+#[serde(rename_all = "snake_case")]
+pub enum LlmAttemptReason {
+    /// Server returned 429 (rate-limit throttle). Transient — the
+    /// state machine schedules a retry with exponential backoff.
+    RateLimit,
+    /// Server returned 5xx. Retryable; same backoff as RateLimit.
+    ServerError,
+    /// Network / timeout. Retryable.
+    Network,
+}
+
+impl LlmAttemptReason {
+    /// Project an `LlmErrorKind` onto the retryable subset. Returns `None`
+    /// for non-retryable kinds (the state machine's
+    /// `error_kind.is_retryable()` guard ensures `Effect::ScheduleRetry`
+    /// is only fired for retryable kinds, so the `None` branch is
+    /// structurally unreachable from the runtime; callers still
+    /// gracefully `unwrap_or` so a future code change doesn't panic).
+    ///
+    /// Currently the runtime threads `db::ErrorKind` through
+    /// `Event::LlmError` rather than `LlmErrorKind`, so the projection
+    /// helper `state_machine::transition::error_kind_to_attempt_reason`
+    /// is what the wire emission actually calls. This `from_kind` is
+    /// retained for callers that hold an `LlmErrorKind` directly
+    /// (tests, future producers).
+    #[allow(dead_code)]
+    pub fn from_kind(kind: LlmErrorKind) -> Option<Self> {
+        match kind {
+            LlmErrorKind::Network => Some(Self::Network),
+            LlmErrorKind::RateLimit => Some(Self::RateLimit),
+            LlmErrorKind::ServerError => Some(Self::ServerError),
+            // Non-retryable kinds never reach Effect::ScheduleRetry.
+            LlmErrorKind::UsageLimitReached
+            | LlmErrorKind::ServerOverloaded
+            | LlmErrorKind::Auth
+            | LlmErrorKind::InvalidRequest
+            | LlmErrorKind::ContentFilter
+            | LlmErrorKind::ContextWindowExceeded => None,
+        }
+    }
+}
+
 impl LlmErrorKind {
     pub fn is_retryable(self) -> bool {
         match self {

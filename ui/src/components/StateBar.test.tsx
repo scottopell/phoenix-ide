@@ -83,6 +83,7 @@ function renderStateBar({
   phaseStateUpdatedAt,
   lastSseEventAt,
   firstByteRequestId,
+  turnRetryContext,
 }: {
   conversation?: Conversation;
   convState?: ComponentProps<typeof StateBar>['convState'];
@@ -95,6 +96,7 @@ function renderStateBar({
   phaseStateUpdatedAt?: number | null;
   lastSseEventAt?: number;
   firstByteRequestId?: string | null;
+  turnRetryContext?: ComponentProps<typeof StateBar>['turnRetryContext'];
 } = {}) {
   const props: ComponentProps<typeof StateBar> = {
     conversation,
@@ -119,6 +121,9 @@ function renderStateBar({
   }
   if (firstByteRequestId !== undefined) {
     props.firstByteRequestId = firstByteRequestId;
+  }
+  if (turnRetryContext !== undefined) {
+    props.turnRetryContext = turnRetryContext;
   }
   return render(
     <MemoryRouter>
@@ -330,6 +335,59 @@ describe('StateBar working-phase indicators', () => {
     expect(screen.getByText(/awaiting LLM response.*7s/i)).toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/working/);
+  });
+
+  // Retry-suffix composition (REQ-WPV-003 / REQ-LRV-001). The
+  // `turnRetryContext` is populated by `sse_llm_attempt` and survives
+  // intra-turn phase transitions, so the suffix appears on every
+  // working-phase rendering until agent_done / error clears it.
+  it('appends "(retry K/N after <reason>)" during llm_requesting pre-first-byte', () => {
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 2 },
+      phaseStateUpdatedAt: T_NOW - 5_000,
+      lastSseEventAt: T_NOW - 1_000,
+      turnRetryContext: { attempt: 2, maxAttempts: 3, reasonText: 'rate limit' },
+    });
+    expect(
+      screen.getByText(/awaiting LLM response.*5s.*\(retry 2\/3 after rate limit\)/i)
+    ).toBeInTheDocument();
+  });
+
+  it('appends the retry suffix even when first byte has arrived ("streaming (retry…)")', () => {
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 3 },
+      phaseStateUpdatedAt: T_NOW - 2_000,
+      lastSseEventAt: T_NOW - 200,
+      firstByteRequestId: 'req-xyz',
+      turnRetryContext: { attempt: 3, maxAttempts: 3, reasonText: 'server error' },
+    });
+    expect(screen.getByText(/^streaming \(retry 3\/3 after server error\)$/i)).toBeInTheDocument();
+  });
+
+  it('appends the retry suffix on tool_executing too (carries across intra-turn transitions)', () => {
+    renderStateBar({
+      convState: {
+        type: 'tool_executing',
+        current_tool: { id: 'bash-1', name: 'bash', input: {} },
+        remaining_tools: [],
+      },
+      phaseStateUpdatedAt: T_NOW - 12_000,
+      lastSseEventAt: T_NOW - 1_000,
+      turnRetryContext: { attempt: 2, maxAttempts: 3, reasonText: 'network error' },
+    });
+    expect(
+      screen.getByText(/\b12s.*\(retry 2\/3 after network error\)/i)
+    ).toBeInTheDocument();
+  });
+
+  it('omits the retry suffix when turnRetryContext is null', () => {
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW - 4_000,
+      lastSseEventAt: T_NOW - 1_000,
+      turnRetryContext: null,
+    });
+    expect(screen.queryByText(/\(retry/i)).not.toBeInTheDocument();
   });
 
   it('renders the live counter for non-llm working phases too (REQ-WPV-001)', () => {

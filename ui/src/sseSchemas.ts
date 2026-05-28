@@ -33,6 +33,7 @@ import type {
   SseStateChangeData as WireStateChangeData,
   SseTokenData as WireTokenData,
   SseLlmFirstByteData as WireLlmFirstByteData,
+  SseLlmAttemptData as WireLlmAttemptData,
   SseAgentDoneData as WireAgentDoneData,
   SseConversationBecameTerminalData as WireConversationBecameTerminalData,
   SseConversationUpdateData as WireConversationUpdateData,
@@ -264,6 +265,21 @@ export const SseLlmFirstByteDataSchema = v.looseObject({
   sequence_id: v.number(),
   request_id: v.string(),
 }) satisfies v.GenericSchema<unknown, WireLlmFirstByteData>;
+
+/** `llm_attempt`: retry-context marker emitted from the executor's
+ *  `Effect::ScheduleRetry` handler immediately before the spawned
+ *  backoff sleep. Drives the StateBar's `(retry K/N <reason>)`
+ *  suffix per specs/llm-retry-visibility/ REQ-LRV-001 / 003. */
+export const SseLlmAttemptDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  attempt: v.number(),
+  max_attempts: v.number(),
+  reason: v.picklist(['rate_limit', 'server_error', 'network']),
+  backing_off_ms: v.number(),
+  /** RFC3339 string when known; omitted from JSON when None on the
+   *  Rust side (`skip_serializing_if = "Option::is_none"`). */
+  resets_at: v.exactOptional(v.string()),
+}) satisfies v.GenericSchema<unknown, WireLlmAttemptData>;
 
 /** `conversation_update`: partial conversation metadata update. The backend
  *  sends a strict subset of the Conversation fields (see Rust

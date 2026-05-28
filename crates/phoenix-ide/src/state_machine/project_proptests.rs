@@ -592,6 +592,7 @@ mod random_walk {
                             error_kind,
                             attempt: *attempt,
                             recovery_in_progress: recovery,
+                        resets_at: None,
                         }
                     }
                     2 => Event::UserCancel { reason: None },
@@ -719,6 +720,7 @@ mod random_walk {
                         error_kind,
                         attempt: *attempt,
                         recovery_in_progress: false,
+                    resets_at: None,
                     }
                 }
                 _ => Event::UserCancel { reason: None },
