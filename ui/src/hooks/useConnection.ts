@@ -438,7 +438,7 @@ export function useConnection({
 
           // REQ-WPV-007: first-byte marker. Emitted exactly once per LLM
           // request immediately before the first `token` event for the
-          // same `request_id`. Drives the StateBar's `thinking Ns` →
+          // same `request_id`. Drives the StateBar's `awaiting response Ns` →
           // `streaming` transition; the reducer stamps
           // `firstByteRequestId` on the atom.
           on('llm_first_byte', (e) => {

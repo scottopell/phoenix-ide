@@ -40,7 +40,7 @@ export type HistoricalUnit =
 export type TailUnit =
   | { kind: 'sub_agent_status'; key: string; state: AwaitingSubAgentsState }
   | { kind: 'streaming_agent'; key: string }
-  // REQ-WPV-006: synthetic "thinking Ns" bubble during pre-first-byte
+  // REQ-WPV-006: synthetic "awaiting response Ns" bubble during pre-first-byte
   // llm_requesting. Lives parallel to `streaming_agent` — same screen
   // slot, different contents (elapsed counter vs streamed text). Only
   // emitted when the phase is llm_requesting AND no streaming handle
@@ -222,7 +222,7 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
   ) {
     // REQ-WPV-006: pre-first-byte llm_requesting with no streaming
     // buffer yet — emit a placeholder bubble so the user sees a
-    // "thinking Ns" anchor at the spot where the assistant text will
+    // "awaiting response Ns" anchor at the spot where the assistant text will
     // appear. The `streaming_agent` unit above is the post-first-byte
     // continuation of this slot; the two are mutually exclusive by
     // construction (the `else if` here).

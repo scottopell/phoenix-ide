@@ -83,7 +83,15 @@ export function getStateDescription(state: ConversationState): string {
     case 'awaiting_llm':
       return 'preparing request...';
     case 'llm_requesting':
-      return state.attempt > 1 ? `thinking (retry ${state.attempt})...` : 'thinking...';
+      // Pre-first-byte: request is on the wire but we have no observable
+      // evidence of model activity (could be queued, prefilling, throttled,
+      // generating-but-buffering). `awaiting response` describes the
+      // client's actual state — neutral about what the server is doing.
+      // Post-first-byte the StateBar switches to `streaming` because
+      // tokens flowing IS observable evidence (REQ-WPV-007).
+      return state.attempt > 1
+        ? `awaiting response (retry ${state.attempt})...`
+        : 'awaiting response...';
     case 'seeded_llm_requesting':
       return state.attempt > 1 ? `starting (retry ${state.attempt})...` : 'starting...';
     case 'tool_executing': {

@@ -6,7 +6,7 @@ import type { Breadcrumb } from '../types';
 
 const BREADCRUMB_TITLES: Record<string, string> = {
   user: 'Your message',
-  llm: 'AI is thinking',
+  llm: 'Awaiting LLM response',
   tool: 'Running a tool',
   subagents: 'Running sub-agents in parallel',
 };

@@ -119,7 +119,7 @@ value EventClock {
 -- `retry` carries any unresolved retry context that was visible at the
 -- moment we degraded (REQ-WPV-003: the retry modifier is part of the
 -- most-specific known activity). Without it the reconnect display
--- would silently drop `(retry 2/5)` from a frozen "last: thinking 12s"
+-- would silently drop `(retry 2/5)` from a frozen "last: awaiting response 12s"
 -- even though that was the most specific signal we had — which is
 -- exactly the "connection state masking agent state" failure REQ-WPV-005
 -- forbids.
@@ -384,7 +384,7 @@ config {
 -- Display-text formatters (return DisplayedActivity or String):
 --
 --   base_reason_text_for(phase: ObservedPhase) -> String
---       The leading prose for the base reason, e.g. "thinking",
+--       The leading prose for the base reason, e.g. "awaiting response",
 --       "executing bash", "awaiting sub-agents". Does NOT include the
 --       elapsed counter; just the verb-phrase.
 --
@@ -1061,8 +1061,16 @@ rule DisplayWhenStreaming {
     }
 }
 
--- REQ-WPV-003 / REQ-WPV-007: pre-first-byte llm_requesting → "thinking Ns".
-rule DisplayWhenThinking {
+-- REQ-WPV-003 / REQ-WPV-007: pre-first-byte llm_requesting →
+-- "awaiting response Ns". The label is deliberate: pre-first-byte the
+-- only OBSERVABLE state is "request on the wire, no tokens yet" — the
+-- model could be queued, prefilling, throttled, or
+-- generating-but-buffering, and we can't distinguish those. "Awaiting
+-- response" describes the client's observable state without claiming
+-- knowledge of model-internal activity. Post-first-byte the rule
+-- below (DisplayWhenStreaming) switches to "streaming", which IS
+-- observably true once tokens start flowing.
+rule DisplayWhenAwaitingResponse {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
@@ -1075,7 +1083,7 @@ rule DisplayWhenThinking {
     let retry_suffix = render_retry_modifier_for(view)
 
     ensures: StateBarDisplay{view}.activity = DisplayedActivity{
-        text:      "thinking " + str(secs) + "s" + retry_suffix,
+        text:      "awaiting response " + str(secs) + "s" + retry_suffix,
         dot_class: working,
         has_timer: true
     }

@@ -73,7 +73,7 @@ export interface ConversationAtom {
    *  on every `state_change` event (the phase-entry edge — every new
    *  llm_requesting attempt starts in pre-first-byte) and on the
    *  turn-terminal `agent_done` event. Drives REQ-WPV-007's
-   *  `thinking Ns` → `streaming` transition in the StateBar and the
+   *  `awaiting response Ns` → `streaming` transition in the StateBar and the
    *  pending bubble's spec-level `placeholder → streaming` edge
    *  (REQ-WPV-006). */
   firstByteRequestId: string | null;
@@ -165,7 +165,7 @@ export type SSEAction =
   | {
       // REQ-WPV-007: first-byte marker for the LLM request identified by
       // `requestId`. The reducer stamps this on the atom so the StateBar
-      // can switch from `thinking Ns` to `streaming` (no counter); the
+      // can switch from `awaiting response Ns` to `streaming` (no counter); the
       // pending bubble's spec-level `placeholder → streaming` edge is
       // also gated by this signal (REQ-WPV-006). Emitted exactly once
       // per request; never on requests that error before any tokens.

@@ -105,13 +105,13 @@ selected by the precedence:
 multiple counters compounds into noise; the user reads "one number,
 explained" faster than three numbers in different units. Retry is a modifier
 on the base state, not a replacement, because the question "what's it doing
-right now?" still has its primary answer in the phase (thinking, waiting on
-a tool, etc.) and the question "why is it taking this long?" is the
+right now?" still has its primary answer in the phase (awaiting response,
+waiting on a tool, etc.) and the question "why is it taking this long?" is the
 secondary answer that the modifier addresses.
 
 **Format examples (illustrative, not normative wire syntax):**
-- `thinking 4s`
-- `thinking 4s (retry 2/5 after rate limit)`
+- `awaiting response 4s`
+- `awaiting response 4s (retry 2/5 after rate limit)`
 - `executing bash 12s`
 - `executing bash 12s (retry 2/5)` *(when a tool itself didn't retry but the
   surrounding turn did before reaching this tool — display the most recent
@@ -162,7 +162,7 @@ THE SYSTEM SHALL display BOTH the connection state AND the last-known agent
 activity:
 - Connection chip: `reconnecting (N)`
 - Last-known agent activity, with elapsed time **frozen at disconnect**:
-  `last: thinking 12s`
+  `last: awaiting response 12s`
 
 WHEN the connection re-establishes
 THE SYSTEM SHALL resume live derivation from the (possibly new) phase carried
@@ -210,7 +210,7 @@ historical agent rows.
 ### REQ-WPV-007: First-Byte Sub-Phase Distinction
 
 WHEN the first token of an LLM response arrives over the SSE stream
-THE SYSTEM SHALL transition the displayed base reason from `thinking Ns`
+THE SYSTEM SHALL transition the displayed base reason from `awaiting response Ns`
 (pre-first-byte) to `streaming` (post-first-byte), without resetting the
 phase elapsed timer
 
@@ -222,7 +222,7 @@ progress; an additional counter is redundant)
 because they share a phase (`llm_requesting`). The user-meaningful boundary
 is the first byte: pre-first-byte the user has no signal of life, post-
 first-byte the text itself is the signal. Splitting the display reduces the
-window in which "thinking..." can hide a real problem.
+window in which "awaiting response..." can hide a real problem.
 
 ---
 

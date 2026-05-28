@@ -327,7 +327,7 @@ describe('StateBar working-phase indicators', () => {
       phaseStateUpdatedAt: T_NOW - 7_000,
       lastSseEventAt: T_NOW - 1_000,
     });
-    expect(screen.getByText(/thinking.*7s/i)).toBeInTheDocument();
+    expect(screen.getByText(/awaiting response.*7s/i)).toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/working/);
   });
@@ -403,8 +403,8 @@ describe('StateBar working-phase indicators', () => {
         />
       </MemoryRouter>,
     );
-    // First render — connected, working: shows "thinking ... 12s".
-    expect(screen.getByText(/thinking.*12s/i)).toBeInTheDocument();
+    // First render — connected, working: shows "awaiting response ... 12s".
+    expect(screen.getByText(/awaiting response.*12s/i)).toBeInTheDocument();
     // Connection drops mid-working — capture snapshot, freeze elapsed.
     rerender(
       <MemoryRouter>
@@ -421,8 +421,8 @@ describe('StateBar working-phase indicators', () => {
         />
       </MemoryRouter>,
     );
-    // Now we should see "reconnecting (2) — last: thinking ... 12s".
-    expect(screen.getByText(/reconnecting \(2\).*last.*thinking.*12s/i)).toBeInTheDocument();
+    // Now we should see "reconnecting (2) — last: awaiting response ... 12s".
+    expect(screen.getByText(/reconnecting \(2\).*last.*awaiting response.*12s/i)).toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/reconnecting/);
   });
@@ -435,9 +435,9 @@ describe('StateBar working-phase indicators', () => {
       firstByteRequestId: 'req-abc',
     });
     expect(screen.getByText(/^streaming$/i)).toBeInTheDocument();
-    // The pre-first-byte "thinking Ns" form must NOT be present once
+    // The pre-first-byte "awaiting response Ns" form must NOT be present once
     // the first byte has arrived.
-    expect(screen.queryByText(/thinking.*4s/i)).not.toBeInTheDocument();
+    expect(screen.queryByText(/awaiting response.*4s/i)).not.toBeInTheDocument();
     const dot = document.querySelector('.dot');
     expect(dot?.className).toMatch(/working/);
   });

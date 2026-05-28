@@ -315,8 +315,8 @@ formal derivation):
 - `degradedSignal` → `"no signal from server for Ns"` (overrides the working
   phase text; the user needs to know the channel is suspect before they
   trust any further detail).
-- Working phase, no retry, no first byte yet, `llm_requesting` → `"thinking
-  Ns"`.
+- Working phase, no retry, no first byte yet, `llm_requesting` →
+  `"awaiting response Ns"`.
 - Working phase, no retry, first byte received, `llm_requesting` →
   `"streaming"` (no counter, per REQ-WPV-007).
 - Working phase, no retry, `tool_executing` → `"executing <tool_name> Ns"`.
