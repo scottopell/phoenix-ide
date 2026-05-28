@@ -12,14 +12,30 @@ but be deliberate about it.
 ## 1. `allium check` passes with zero errors
 
 ```bash
-allium check specs/*/*.allium 2>&1 | grep '"severity":"error"' | wc -l
-# Expected: 0
+set -o pipefail
+for f in specs/*/*.allium; do
+  errs=$(allium check "$f" 2>&1 \
+    | python3 -c "import json,sys; d=json.load(sys.stdin); print(sum(1 for x in d.get('diagnostics',[]) if x.get('severity')=='error'))")
+  if [ "$errs" != "0" ]; then
+    echo "$f: $errs errors"
+    exit 1
+  fi
+done
+echo "All specs parse with 0 errors."
 ```
 
 A spec that doesn't parse is broken, not stylistically off. Run
 locally before every push — CI rounds are slow.
 
-`allium check` returns JSON; the script above is the canonical
+**Why per-file and not `allium check specs/*/*.allium | grep | wc -l`?**
+The naive pipeline silently reports 0 if `allium` is missing or exits
+non-zero with non-JSON output — `grep` finds no matches and `wc -l`
+prints `0`, defeating the gate. `set -o pipefail` plus the explicit
+JSON parse forces a real failure when the tool didn't run. If you
+don't have `python3` handy, substitute `jq '[.diagnostics[] |
+select(.severity == "error")] | length'`.
+
+`allium check` returns JSON; the loop above is the canonical
 zero-errors check. Warnings (e.g. "Deferred specification should
 include a location hint") are non-blocking but indicate stylistic
 gaps worth fixing.

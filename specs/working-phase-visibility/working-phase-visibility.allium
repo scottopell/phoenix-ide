@@ -438,11 +438,15 @@ config {
 --       joining the timer's tool_use_id with the matching
 --       ContentBlock::ToolUse{id, name, input} on the assistant
 --       message (the runtime persists tool-use blocks by id, and the
---       client already has them via the message list). Assumes at
---       least one InflightToolTimer exists for the view (the caller,
---       DisplayWhenToolExecuting, gates on phase = tool_executing
---       which implies a running tool). Parallel-tool policy is
---       deferred (see `deferred MultipleParallelToolsInOneAssistantMessage`).
+--       client already has them via the message list).
+--       Precondition: at least one InflightToolTimer exists for the
+--       view — enforced by the caller (DisplayWhenToolExecutingWithTimer
+--       gates on `exists InflightToolTimer{view: view}`). The
+--       complementary DisplayWhenToolExecutingNoTimerYet rule covers
+--       the brief window between the `tool_executing` state_change
+--       and the MessageUpdated that creates the timer; that rule
+--       does not call this helper. Parallel-tool policy is deferred
+--       (see `deferred MultipleParallelToolsInOneAssistantMessage`).
 --
 --   current_retry_for(view: ClientView) -> llm_retry/RetryContext?
 --       llm_retry/TurnRetryContext{conversation_id:
@@ -1077,17 +1081,19 @@ rule DisplayWhenThinking {
     }
 }
 
--- REQ-WPV-003: tool_executing → "executing <tool_name> Ns". The tool
--- name comes from the active tool-use block; if there are multiple
--- (parallel dispatch — currently not supported), use the most recently
--- started one.
-rule DisplayWhenToolExecuting {
+-- REQ-WPV-003: tool_executing → "executing <tool_name> Ns" when an
+-- InflightToolTimer exists for the view (the timer's tool_use_id
+-- identifies the active tool). If multiple timers exist (parallel
+-- dispatch — currently not supported), the most recently started one
+-- wins per current_tool_name's docs.
+rule DisplayWhenToolExecutingWithTimer {
     when: DerivationTriggered(view)
 
     requires: HeartbeatWatchdog{view}.freshness = fresh
     requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI code: 'connected'; see ObservedPhase comment above
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase = tool_executing
+    requires: exists InflightToolTimer{view: view}
 
     let secs         = (now() - ObservedPhase{view}.state_updated_at) / 1000
     let tool_name    = current_tool_name(view)
@@ -1095,6 +1101,37 @@ rule DisplayWhenToolExecuting {
 
     ensures: StateBarDisplay{view}.activity = DisplayedActivity{
         text:      "executing " + tool_name + " " + str(secs) + "s" + retry_suffix,
+        dot_class: working,
+        has_timer: true
+    }
+}
+
+-- Brief no-timer window inside tool_executing. The runtime's transition
+-- order is `Effect::NotifyStateChange` (sets phase=tool_executing on
+-- the wire) then `Effect::ExecuteTool` (which emits the MessageUpdated
+-- that creates the InflightToolTimer). In between, the rule above is
+-- inapplicable (`exists InflightToolTimer` fails); this rule covers
+-- the gap with a tool-name-less display so the StateBar remains
+-- defined. Elapsed time is still server-authoritative
+-- (state_updated_at). The window closes within one frame in practice
+-- (both effects fire from the same `apply_transition_result`
+-- invocation), so the user typically sees "executing <name> Ns"
+-- without ever observing the fallback; the rule exists for
+-- correctness, not UX.
+rule DisplayWhenToolExecutingNoTimerYet {
+    when: DerivationTriggered(view)
+
+    requires: HeartbeatWatchdog{view}.freshness = fresh
+    requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live
+    requires: ObservedPhase{view}.working = true
+    requires: ObservedPhase{view}.phase = tool_executing
+    requires: not exists InflightToolTimer{view: view}
+
+    let secs         = (now() - ObservedPhase{view}.state_updated_at) / 1000
+    let retry_suffix = render_retry_modifier_for(view)
+
+    ensures: StateBarDisplay{view}.activity = DisplayedActivity{
+        text:      "executing " + str(secs) + "s" + retry_suffix,
         dot_class: working,
         has_timer: true
     }
@@ -1208,11 +1245,11 @@ surface ConversationActivityFeed {
     facing user_view: ClientView
 
     exposes:
-        StateBarDisplay{view}
-        PendingAssistantBubble{view}.state
-        PendingAssistantBubble{view}.placeholder_since
-        PendingAssistantBubble{view}.request_id
-        InflightToolTimer.started_at  -- keyed by tool_use_id
+        StateBarDisplay{view: user_view}
+        PendingAssistantBubble{view: user_view}.state
+        PendingAssistantBubble{view: user_view}.placeholder_since
+        PendingAssistantBubble{view: user_view}.request_id
+        InflightToolTimer{view: user_view}.started_at  -- one per tool_use_id
 
     @guarantee SingleSourceOfElapsedTime
         -- Every elapsed value visible to the user traces back to a

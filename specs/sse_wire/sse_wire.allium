@@ -98,20 +98,31 @@ value InitSnapshot {
 --   - "token", "state_change", "message_updated", "agent_done",
 --     "conversation_update", "conversation_became_terminal",
 --     "error", "browser_session_state", "steer_message_queued",
---     "llm_first_byte", "llm_attempt" enter via the ephemeral path
---     (EphemeralEventAppendedToReplayRing below).
+--     "rate_limit_snapshot", "llm_first_byte", "llm_attempt" enter
+--     via the ephemeral path (EphemeralEventAppendedToReplayRing
+--     below). All non-Message broadcasts go through
+--     `SseBroadcaster::send_seq`, which unconditionally appends to
+--     the ring (`runtime.rs::send_with_ring` with `RingOp::Append`).
 --   - Excluded entirely:
 --     - "init" (per-subscriber, never broadcast)
 --     - "conversation_hard_deleted" (terminal; no subsequent init
 --       can fire, so replay is moot)
---     - "rate_limit_snapshot" (mid-stream codex quota snapshot;
---       point-in-time data whose semantics are stale on reconnect,
---       so intentionally not replayed). Distinguish from
---       "llm_attempt" — both involve rate-limit data but the
---       snapshot is mid-call quota informational, while llm_attempt
---       is the per-retry context whose preservation across reconnect
---       is load-bearing for the StateBar's retry suffix display
---       (see specs/llm-retry-visibility/, REQ-LRV-007).
+--
+-- Note on `rate_limit_snapshot` replay: the snapshot represents a
+-- point-in-time codex quota state, so a stale snapshot replayed on
+-- reconnect can paint the UI's quota chip with data that has since
+-- been superseded. The runtime currently accepts that staleness in
+-- exchange for the structural simplicity of "all broadcasts ride the
+-- ring." A future change could add a `send_seq_no_ring` broadcaster
+-- variant for genuinely-point-in-time events (snapshots, mid-stream
+-- diagnostics); flagged here so a future review can revisit it. Until
+-- then the whitelist and the broadcaster agree that
+-- "rate_limit_snapshot" replays.
+--
+-- Distinguish from "llm_attempt" on rationale (the per-retry
+-- context's reconnect preservation is load-bearing for the StateBar's
+-- retry suffix display per specs/llm-retry-visibility/ REQ-LRV-007;
+-- the snapshot replay is acceptable but not load-bearing).
 --
 -- `payload` is opaque at this level — it is whatever the wire-format
 -- carries for that event_type. The replay path serialises the entry
@@ -526,10 +537,10 @@ rule PersistedMessageClearsReplayRing {
 -- Every non-Message broadcast appends to the ring. Includes:
 -- token, state_change, message_updated, agent_done, conversation_update,
 -- conversation_became_terminal, error, browser_session_state,
--- steer_message_queued, llm_first_byte, llm_attempt. Excludes Init
--- (per-stream, never broadcast) and ConversationHardDeleted (terminal
--- action; no subsequent init can fire for this conversation, so
--- replay is moot).
+-- steer_message_queued, rate_limit_snapshot, llm_first_byte,
+-- llm_attempt. Excludes Init (per-stream, never broadcast) and
+-- ConversationHardDeleted (terminal action; no subsequent init can
+-- fire for this conversation, so replay is moot).
 --
 -- `llm_first_byte` (introduced by specs/working-phase-visibility/)
 -- MUST replay alongside the `token` events it precedes — if a client
@@ -557,7 +568,7 @@ rule EphemeralEventAppendedToReplayRing {
         "token", "state_change", "message_updated", "agent_done",
         "conversation_update", "conversation_became_terminal", "error",
         "browser_session_state", "steer_message_queued",
-        "llm_first_byte", "llm_attempt"
+        "rate_limit_snapshot", "llm_first_byte", "llm_attempt"
     }
 
     let ring = ReplayRing{conversation_id: conv_id}
