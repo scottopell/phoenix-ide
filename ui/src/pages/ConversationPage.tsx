@@ -1343,6 +1343,8 @@ function ConversationPageContent() {
         }
         onUpgradeModel={handleUpgradeModel}
         toolExecutingStartedAt={atom.toolExecutingStartedAt}
+        phaseStateUpdatedAt={atom.phaseStateUpdatedAt}
+        lastSseEventAt={atom.lastSseEventAt}
         onOpenFiles={isDesktop ? undefined : () => setShowFileBrowser(true)}
         onSendMessage={(text) => handleSend(text, [])}
         showError={showError}

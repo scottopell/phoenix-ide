@@ -49,8 +49,25 @@ interface StateBarProps {
   onUpgradeModel?: (newModelId: string) => void;
   /** `Date.now()` timestamp when the current tool_executing phase began.
    *  Used to render a live elapsed-time counter ("running bash ... 4s").
-   *  `null` or `undefined` when not in tool_executing. */
+   *  `null` or `undefined` when not in tool_executing.
+   *  @deprecated Stage A: superseded by `phaseStateUpdatedAt` (server-
+   *  authoritative; covers every working phase). Retained while the
+   *  tool widget header continues to read it; the StateBar's elapsed
+   *  counter now derives from `phaseStateUpdatedAt`. */
   toolExecutingStartedAt?: number | null;
+  /** Server clock (unix ms) at which the conversation entered its
+   *  current phase. Sourced from `Conversation.state_updated_at` and
+   *  bumped on every `StateChange` SSE event. Used by the StateBar's
+   *  elapsed counter for every working phase (REQ-WPV-001). `null`
+   *  before the first Init/StateChange lands. */
+  phaseStateUpdatedAt?: number | null;
+  /** Client-clock (unix ms) of the most recent SSE event observed on
+   *  this connection (including the typed `ping` keep-alive). Fed
+   *  into the heartbeat watchdog: when the connection is `connected`
+   *  AND the conversation is in a working phase AND
+   *  `now() - lastSseEventAt > 35000`, the StateBar surfaces a
+   *  "no signal from server for Ns" degraded indicator (REQ-WPV-004). */
+  lastSseEventAt?: number;
   /** Mobile/tablet-only: opens the file browser overlay. When omitted (e.g. on
    *  desktop where `FileExplorerPanel` provides the same affordance), the
    *  button is not rendered. The explicit `| undefined` is required under
@@ -240,6 +257,33 @@ function formatElapsed(seconds: number): string {
   return s > 0 ? `${m}m ${s}s` : `${m}m`;
 }
 
+/** Heartbeat watchdog threshold (REQ-WPV-004). 35 s is ~2.3x the 15 s
+ *  server keep-alive interval, so a single missed keep-alive does not
+ *  trigger the watchdog. Defined here (rather than imported from a
+ *  shared config) because the StateBar is the sole consumer; if a
+ *  second consumer materialises this should move to `config.ts`. */
+const HEARTBEAT_WATCHDOG_SECONDS = 35;
+
+/** The set of ConversationState discriminants that count as "working"
+ *  for the purpose of the elapsed counter, heartbeat watchdog gating,
+ *  and last-known-activity capture. Mirrors the Allium spec's
+ *  `WorkingPhase` enum (specs/working-phase-visibility/). When new
+ *  working states are added to the wire, extend both sides. */
+function isWorkingPhase(t: ConversationState['type']): boolean {
+  return (
+    t === 'llm_requesting' ||
+    t === 'awaiting_llm' ||
+    t === 'seeded_llm_requesting' ||
+    t === 'tool_executing' ||
+    t === 'awaiting_sub_agents' ||
+    t === 'awaiting_continuation' ||
+    t === 'cancelling' ||
+    t === 'cancelling_tool' ||
+    t === 'cancelling_sub_agents' ||
+    t === 'awaiting_recovery'
+  );
+}
+
 export function StateBar({
   conversation,
   convState,
@@ -253,6 +297,8 @@ export function StateBar({
   continuation,
   onUpgradeModel,
   toolExecutingStartedAt,
+  phaseStateUpdatedAt,
+  lastSseEventAt,
   onOpenFiles,
   onSendMessage,
   showError,
@@ -275,21 +321,96 @@ export function StateBar({
   const pickerRef = useRef<HTMLSpanElement>(null);
   const prRef = useRef<HTMLSpanElement>(null);
 
-  // Live elapsed-time counter for tool_executing state.
-  // Ticks every second; cleared immediately when leaving tool_executing.
-  const [toolElapsedSeconds, setToolElapsedSeconds] = useState(0);
+  // Live elapsed-time counter, generalized for every working phase
+  // (REQ-WPV-001 / REQ-WPV-003). The source of truth is the server-
+  // authoritative `phaseStateUpdatedAt` (unix ms) carried on
+  // StateChange + Init, so the counter survives reconnect, page reload,
+  // and multi-tab observation. Ticks every second; reset to 0 the
+  // instant the phase leaves the working set.
+  const phaseIsWorking = isWorkingPhase(convState.type);
+  const [phaseElapsedSeconds, setPhaseElapsedSeconds] = useState(0);
   useEffect(() => {
-    if (convState.type !== 'tool_executing' || !toolExecutingStartedAt) {
-      setToolElapsedSeconds(0);
+    if (!phaseIsWorking || phaseStateUpdatedAt == null) {
+      setPhaseElapsedSeconds(0);
       return;
     }
-    // Compute immediately (avoids 1s lag on first render after transition)
-    setToolElapsedSeconds(Math.floor((Date.now() - toolExecutingStartedAt) / 1000));
+    // Compute immediately to avoid the 1s render lag after a phase
+    // transition; then tick once per second.
+    setPhaseElapsedSeconds(Math.max(0, Math.floor((Date.now() - phaseStateUpdatedAt) / 1000)));
     const interval = window.setInterval(() => {
-      setToolElapsedSeconds(Math.floor((Date.now() - toolExecutingStartedAt) / 1000));
+      setPhaseElapsedSeconds(
+        Math.max(0, Math.floor((Date.now() - phaseStateUpdatedAt) / 1000))
+      );
     }, 1000);
     return () => window.clearInterval(interval);
-  }, [convState.type, toolExecutingStartedAt]);
+  }, [phaseIsWorking, phaseStateUpdatedAt]);
+
+  // Heartbeat watchdog (REQ-WPV-004). When the connection is healthy
+  // AND the agent is working AND no SSE event of any kind (typed
+  // `ping` keep-alives included) has arrived for HEARTBEAT_WATCHDOG_MS,
+  // we surface a degraded-signal indicator. Ticks once per second to
+  // re-evaluate; cleared the instant any event lands or the connection
+  // leaves the healthy state. The 35 s threshold is ~2.3x the 15 s
+  // server keep-alive interval — one missed keep-alive does not
+  // trip the watchdog.
+  const [watchdogSeconds, setWatchdogSeconds] = useState(0);
+  const watchdogArmed =
+    (connectionState === 'connected' || connectionState === 'reconnected') &&
+    phaseIsWorking &&
+    typeof lastSseEventAt === 'number';
+  useEffect(() => {
+    if (!watchdogArmed) {
+      setWatchdogSeconds(0);
+      return;
+    }
+    const compute = () => {
+      const elapsed = Math.max(0, Math.floor((Date.now() - lastSseEventAt!) / 1000));
+      setWatchdogSeconds(elapsed);
+    };
+    compute();
+    const interval = window.setInterval(compute, 1000);
+    return () => window.clearInterval(interval);
+  }, [watchdogArmed, lastSseEventAt]);
+  const watchdogStale = watchdogArmed && watchdogSeconds >= HEARTBEAT_WATCHDOG_SECONDS;
+
+  // Last-known activity capture (REQ-WPV-005). When the connection
+  // leaves the healthy set during a working phase, freeze a snapshot
+  // of (phase, elapsed-at-disconnect) so the reconnecting/offline
+  // display shows "reconnecting (N) — last: thinking 12s" instead of
+  // masking the agent's state entirely. Cleared on return to a
+  // healthy connection.
+  const lastKnownActivityRef = useRef<{
+    phase: ConversationState;
+    elapsedSecondsAtDisconnect: number;
+  } | null>(null);
+  const connectionHealthy =
+    connectionState === 'connected' || connectionState === 'reconnected';
+  useEffect(() => {
+    if (connectionHealthy) {
+      // Healthy connection — drop any frozen snapshot so the live
+      // path takes over again.
+      lastKnownActivityRef.current = null;
+      return;
+    }
+    // Degraded — capture iff we were working at the moment we
+    // degraded and we don't already have a snapshot for this
+    // degraded window.
+    if (
+      lastKnownActivityRef.current == null &&
+      phaseIsWorking &&
+      phaseStateUpdatedAt != null
+    ) {
+      lastKnownActivityRef.current = {
+        phase: convState,
+        elapsedSecondsAtDisconnect: Math.max(
+          0,
+          Math.floor((Date.now() - phaseStateUpdatedAt) / 1000)
+        ),
+      };
+    }
+    // No-op on subsequent renders during the same degraded window —
+    // the snapshot is by-construction frozen.
+  }, [connectionHealthy, phaseIsWorking, phaseStateUpdatedAt, convState]);
 
   // Close model picker on outside click
   useEffect(() => {
@@ -336,11 +457,28 @@ export function StateBar({
   let dotClass = 'dot';
   let stateText = '';
 
+  // Format the working-phase reason as "<base> Ns" (e.g. "thinking 4s",
+  // "running bash 12s") for use in both the live and the frozen-last-
+  // known-activity paths below.
+  const formatWorkingReason = (
+    phase: ConversationState,
+    elapsedSeconds: number
+  ): string => {
+    const base = getStateDescription(phase);
+    return elapsedSeconds > 0 ? `${base} ... ${formatElapsed(elapsedSeconds)}` : base;
+  };
+
   if (!conversation) {
     dotClass += ' hidden';
     stateText = '';
+  } else if (watchdogStale) {
+    // REQ-WPV-004: degraded-signal indicator overrides every working-
+    // state message. The user needs to know the channel is suspect
+    // before they trust further detail.
+    dotClass += ' degraded';
+    stateText = `no signal from server for ${formatElapsed(watchdogSeconds)}`;
   } else {
-    // Determine dot and text based on connection state first
+    // Determine dot and text based on connection state first.
     switch (connectionState) {
       case 'disconnected':
         dotClass += ' connecting';
@@ -352,15 +490,41 @@ export function StateBar({
         stateText = 'connecting...';
         break;
 
-      case 'reconnecting':
+      case 'reconnecting': {
+        // REQ-WPV-005: don't mask agent activity. If we were working
+        // when we degraded, show both the connection chip AND the
+        // last-known agent activity with its elapsed FROZEN at
+        // disconnect (honest about what we don't know — the agent
+        // may or may not still be doing the thing).
         dotClass += ' reconnecting';
-        stateText = `reconnecting (${connectionAttempt})...`;
+        const snap = lastKnownActivityRef.current;
+        if (snap) {
+          stateText = `reconnecting (${connectionAttempt}) — last: ${formatWorkingReason(
+            snap.phase,
+            snap.elapsedSecondsAtDisconnect
+          )}`;
+        } else {
+          stateText = `reconnecting (${connectionAttempt})...`;
+        }
         break;
+      }
 
-      case 'offline':
+      case 'offline': {
+        // Same composition as reconnecting; the connection-chip text
+        // changes from "reconnecting (N)" to "offline" but the
+        // last-known activity is still surfaced when we have it.
         dotClass += ' offline';
-        stateText = 'offline';
+        const snap = lastKnownActivityRef.current;
+        if (snap) {
+          stateText = `offline — last: ${formatWorkingReason(
+            snap.phase,
+            snap.elapsedSecondsAtDisconnect
+          )}`;
+        } else {
+          stateText = 'offline';
+        }
         break;
+      }
 
       case 'reconnected':
         dotClass += ' reconnected';
@@ -399,12 +563,14 @@ export function StateBar({
           case 'awaiting_sub_agents': case 'awaiting_continuation':
           case 'cancelling': case 'cancelling_tool': case 'cancelling_sub_agents':
           case 'awaiting_recovery':
+            // REQ-WPV-001/003: elapsed counter is keyed off the
+            // server-authoritative `phaseStateUpdatedAt`, so every
+            // working phase gets a live "<reason> Ns" display (not
+            // just tool_executing). The previous tool-only counter
+            // is retained on the tool widget header itself via
+            // `toolExecutingStartedAt`.
             dotClass += ' working';
-            if (convState.type === 'tool_executing' && toolElapsedSeconds > 0) {
-              stateText = `${getStateDescription(convState)} ... ${formatElapsed(toolElapsedSeconds)}`;
-            } else {
-              stateText = getStateDescription(convState);
-            }
+            stateText = formatWorkingReason(convState, phaseElapsedSeconds);
             break;
           default: convState satisfies never;
         }

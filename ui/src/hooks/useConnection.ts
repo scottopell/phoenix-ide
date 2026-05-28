@@ -278,9 +278,26 @@ export function useConnection({
           const on = (type: string, handler: (e: Event) => void) => {
             es.addEventListener(type, (e) => {
               if (!isCurrentOwner()) return;
+              // REQ-WPV-004: bump the heartbeat-watchdog clock before
+              // delegating to per-event processing, on EVERY named
+              // event (native EventSource has no wildcard so this
+              // wrapper is the single place to do it). Specs:
+              // specs/working-phase-visibility/ design.md
+              // "EventSource listener wiring (required)".
+              stampedDispatch({ type: 'sse_event_observed' });
               handler(e);
             });
           };
+
+          // Typed `ping` keep-alive (REQ-WPV-004). The handler is empty:
+          // the lastSseEventAt bump happens in `on()` above, which is
+          // the entire purpose of this listener. Without an explicit
+          // registration, EventSource silently drops named events and
+          // the watchdog goes stale during a turn that only emits
+          // pings (server keep-alive without any data flowing).
+          on('ping', () => {
+            /* lastSseEventAt bump only; no payload to consume */
+          });
 
           on('init', (e) => {
             const res = parseEvent(SseInitDataSchema, e, 'init', stampedDispatch);
@@ -347,6 +364,8 @@ export function useConnection({
               type: 'sse_state_change',
               sequenceId: res.data.sequence_id,
               phase: nextPhase,
+              // RFC3339 → unix ms once at the SSE boundary (REQ-WPV-001).
+              stateUpdatedAt: Date.parse(res.data.state_updated_at),
             });
           });
 

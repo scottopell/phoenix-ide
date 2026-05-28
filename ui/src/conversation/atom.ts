@@ -50,6 +50,22 @@ export interface ConversationAtom {
    *  `null` when not in `tool_executing`. Used by StateBar to render a live
    *  elapsed-time counter. */
   toolExecutingStartedAt: number | null;
+  /** Server clock (unix ms) at which the conversation entered its current
+   *  `phase`. Sourced from `StateChange.state_updated_at` and from
+   *  `Init.conversation.state_updated_at`, both RFC3339 strings on the
+   *  wire that the SSE-handler converts to ms via `Date.parse(s)` once.
+   *  `null` until the first Init/StateChange lands. Used by StateBar to
+   *  render the working-phase elapsed counter; survives reconnect /
+   *  reload because the value is server-authoritative (REQ-WPV-001). */
+  phaseStateUpdatedAt: number | null;
+  /** Client-clock (unix ms) of the most recent SSE event observed on this
+   *  connection — any named event, including the typed `ping` keep-alive.
+   *  Initialised to `Date.now()` on creation; bumped by every wire-event
+   *  reducer action. Used by the heartbeat watchdog (REQ-WPV-004): when
+   *  `connectionState === 'live'` AND the phase is working AND
+   *  `now() - lastSseEventAt > HEARTBEAT_WATCHDOG_MS`, the StateBar
+   *  surfaces a "no signal from server for Ns" degraded indicator. */
+  lastSseEventAt: number;
   /** Per-connection generation that produced the events this atom has accepted.
    *  `null` until `connection_opened` lands. Wire-originated actions tagged
    *  with a non-matching `epoch` are dropped at the reducer boundary — the
@@ -122,7 +138,17 @@ export type SSEAction =
       durationMs?: number;
       epoch?: number;
     }
-  | { type: 'sse_state_change'; sequenceId: number; phase: ConversationState; epoch?: number }
+  | {
+      type: 'sse_state_change';
+      sequenceId: number;
+      phase: ConversationState;
+      /** Server clock (unix ms) for the new phase's entry time. Converted
+       *  from the wire's RFC3339 `state_updated_at` once at the SSE
+       *  handler boundary; the reducer stores it on the atom as a number
+       *  (REQ-WPV-001). */
+      stateUpdatedAt: number;
+      epoch?: number;
+    }
   | { type: 'sse_agent_done'; sequenceId: number; epoch?: number }
   | { type: 'sse_token'; sequenceId: number; delta: string; requestId: string; epoch?: number }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
@@ -145,6 +171,15 @@ export type SSEAction =
   // is accepted even when the atom retains a higher epoch from a prior
   // visit. Carries no epoch itself — see comment above on the action class.
   | { type: 'connection_reset' }
+  // Synthesized by `useConnection` on EVERY named SSE event (including
+  // the typed `ping` keep-alive) before delegating to per-event reducer
+  // handling. Bumps `lastSseEventAt` so the heartbeat watchdog can
+  // distinguish "no signal" from "slow LLM stream still emitting".
+  // No `epoch` — the watchdog is a client-side measurement of local
+  // silence, not a server-stream state, so a stale executor's late
+  // event-observed bump is benign (the worst it does is delay a
+  // genuine watchdog trip by one tick).
+  | { type: 'sse_event_observed' }
   // Coarse connection lifecycle indicator, dispatched from useConnection.
   | {
       type: 'connection_state';
@@ -194,6 +229,8 @@ export function createInitialAtom(): ConversationAtom {
     streamingBuffer: null,
     uiError: null,
     toolExecutingStartedAt: null,
+    phaseStateUpdatedAt: null,
+    lastSseEventAt: Date.now(),
     connectionEpoch: null,
     connectionState: 'connecting',
   };
@@ -406,6 +443,7 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_state_change',
         sequenceId: res.output.sequence_id,
         phase: parseConversationState(res.output.state),
+        stateUpdatedAt: Date.parse(res.output.state_updated_at),
       });
     }
     case 'message': {
@@ -615,6 +653,17 @@ export function conversationReducer(
         streamingBuffer: phase1StreamingBuffer,
         uiError: null,
         toolExecutingStartedAt: p.phase.type === 'tool_executing' ? Date.now() : null,
+        // REQ-WPV-001: seed the server-authoritative phase-entry timestamp
+        // from `Init.conversation.state_updated_at` (RFC3339 on the wire,
+        // converted to ms here). Falls back to `null` if the server
+        // omitted it (old payload during rollout, or a brand-new
+        // conversation that hasn't yet had a state transition).
+        phaseStateUpdatedAt: p.conversation.state_updated_at
+          ? Date.parse(p.conversation.state_updated_at)
+          : null,
+        // Bump the watchdog clock — Init is itself an event the user
+        // observed (REQ-WPV-004).
+        lastSseEventAt: Date.now(),
       };
 
       // Phase 2 — fold pending events through the reducer. Each entry is a
@@ -729,6 +778,9 @@ export function conversationReducer(
         return {
           ...a,
           phase: action.phase,
+          // REQ-WPV-001: store the server-authoritative entry time.
+          phaseStateUpdatedAt: action.stateUpdatedAt,
+          lastSseEventAt: Date.now(),
           breadcrumbs,
           breadcrumbSequenceIds,
           toolExecutingStartedAt,
@@ -854,6 +906,13 @@ export function conversationReducer(
 
     case 'connection_state':
       return { ...atom, connectionState: action.state };
+
+    case 'sse_event_observed':
+      // REQ-WPV-004: cheap, no-payload action fired from useConnection's
+      // event wrapper on every named SSE event. Bumps the watchdog
+      // clock so a working phase with active token flow doesn't false-
+      // positive into "no signal from server."
+      return { ...atom, lastSseEventAt: Date.now() };
 
     case 'local_phase_change':
       if (action.expectedConversationId !== atom.conversationId) return atom;

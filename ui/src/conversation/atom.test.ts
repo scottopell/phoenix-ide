@@ -324,7 +324,15 @@ describe('conversationReducer', () => {
       return { type: 'token', sequence_id: seq, text, request_id: 'req-1' };
     }
     function stateChangeEntry(seq: number, state: Record<string, unknown>): unknown {
-      return { type: 'state_change', sequence_id: seq, state, presentation_mode: 'default' };
+      return {
+        type: 'state_change',
+        sequence_id: seq,
+        state,
+        presentation_mode: 'default',
+        // REQ-WPV-001: required on the wire; tests use a stable fixture
+        // value so the elapsed-time math is deterministic.
+        state_updated_at: '2026-05-28T00:00:00.000Z',
+      };
     }
     function messageEntry(seq: number, msg: Message): unknown {
       return { type: 'message', sequence_id: seq, message: msg };

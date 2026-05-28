@@ -53,6 +53,14 @@ export interface Conversation {
   updated_at: string;
   message_count: number;
   state?: ConversationState;
+  /** RFC3339 server clock at which the conversation entered its current
+   *  `state`. Bumped on every transition by the runtime (db.rs:676);
+   *  re-emitted on every `StateChange` SSE event for parity with this
+   *  Init carrier. The SSE Init handler converts to ms via
+   *  `Date.parse(s)` once before storing on the atom as
+   *  `phaseStateUpdatedAt`. Specs:
+   *  `specs/working-phase-visibility/` REQ-WPV-001. */
+  state_updated_at?: string;
   branch_name?: string | null;
   worktree_path?: string | null;
   base_branch?: string | null;

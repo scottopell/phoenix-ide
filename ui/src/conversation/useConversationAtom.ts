@@ -177,6 +177,30 @@ export function useStreamingBuffer(slug: string): StreamingBuffer | null {
 }
 
 /**
+ * Returns the server-authoritative `phaseStateUpdatedAt` (unix ms) for
+ * `slug`. Re-renders the consumer on every phase transition, since the
+ * value changes wholesale per `StateChange` SSE event. Returned as a
+ * number so `Object.is` comparison short-circuits when the timestamp
+ * is unchanged.
+ *
+ * Used by the pending-assistant-bubble and any other leaf component
+ * that needs to render a live elapsed-time counter without prop-
+ * drilling through the full atom (REQ-WPV-001).
+ */
+export function usePhaseStateUpdatedAt(slug: string): number | null {
+  const store = useConversationStore();
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => store.getSnapshot(slug).phaseStateUpdatedAt,
+    [store, slug],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+/**
  * Returns the streaming buffer's `requestId` for `slug`, or null when
  * no buffer is active. Re-renders the consumer on streaming-start,
  * streaming-end, AND streaming-restart (a new buffer with a fresh

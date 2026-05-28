@@ -399,6 +399,7 @@ describe('parseEvent', () => {
           sequence_id: 12,
           state: { type: 'awaiting_llm' },
           presentation_mode: 'working',
+          state_updated_at: '2026-05-28T00:00:00.000Z',
         }),
         'state_change',
         dispatch,
