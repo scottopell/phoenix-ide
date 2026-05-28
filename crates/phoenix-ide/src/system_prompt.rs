@@ -640,12 +640,8 @@ pub fn build_system_prompt_with_options(
                     let _ = write!(
                         prompt,
                         "\n\nThe next available taskmd ID for this worktree is \
-                         `{next_id}` (computed at prompt time, not reserved). \
-                         Use it when drafting a new task file \
-                         (e.g. `{tasks_dir_name}/{next_id}-p2-ready--my-slug.md`). \
-                         If `propose_task` rejects it because a concurrent draft \
-                         claimed the same ID, increment the 3-digit sequence and \
-                         rename your file."
+                         `{next_id}` -- use it when drafting a new task file \
+                         (e.g. `{tasks_dir_name}/{next_id}-p2-ready--my-slug.md`)."
                     );
                 }
             }
@@ -1239,15 +1235,6 @@ mod tests {
         assert!(
             prompt.contains(&format!("`{expected_id}`")),
             "expected ID `{expected_id}` in prompt: {prompt}"
-        );
-        // Hint must be honest about being unreserved + describe recovery.
-        assert!(
-            prompt.contains("not reserved"),
-            "prompt should disclose that the ID is not reserved: {prompt}"
-        );
-        assert!(
-            prompt.contains("propose_task"),
-            "prompt should describe recovery via propose_task rejection: {prompt}"
         );
     }
 
