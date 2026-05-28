@@ -201,6 +201,28 @@ export function usePhaseStateUpdatedAt(slug: string): number | null {
 }
 
 /**
+ * Returns the current `phase` (full ConvState discriminated union) for
+ * `slug`. Re-renders on every state_change because the reducer
+ * returns a fresh phase object reference per event. Used by
+ * `PendingAssistantBubble` to derive its display label from
+ * `getStateDescription(phase)` so the bubble's prose stays in sync
+ * with whatever the StateBar would render for the same phase — REQ-WPV-001's
+ * "UI reflects the real state" goal.
+ */
+export function usePhase(slug: string): import('../api').ConversationState {
+  const store = useConversationStore();
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => store.getSnapshot(slug).phase,
+    [store, slug],
+  );
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+/**
  * Returns the streaming buffer's `requestId` for `slug`, or null when
  * no buffer is active. Re-renders the consumer on streaming-start,
  * streaming-end, AND streaming-restart (a new buffer with a fresh

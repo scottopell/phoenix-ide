@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
-import { usePhaseStateUpdatedAt } from '../conversation/useConversationAtom';
+import { usePhase, usePhaseStateUpdatedAt } from '../conversation/useConversationAtom';
+import { getStateDescription } from '../utils';
 
 /**
  * Pre-first-byte placeholder rendered as the synthetic `pending_agent`
@@ -8,13 +9,20 @@ import { usePhaseStateUpdatedAt } from '../conversation/useConversationAtom';
  * arrives, so the visual transition is contents-only (no DOM remount,
  * no scroll jump).
  *
- * Reads `phaseStateUpdatedAt` from the conversation atom and ticks an
- * elapsed-seconds counter at 1 Hz — server-authoritative timestamp
- * means the counter survives reconnect/reload and stays consistent
- * across tabs viewing the same conversation.
+ * Label comes from `getStateDescription(phase)` — the same helper the
+ * StateBar uses — so the bubble's prose stays in sync with whatever
+ * the StateBar shows for the same phase (`thinking` for `llm_requesting`,
+ * `preparing request` for `awaiting_llm`, `starting` for
+ * `seeded_llm_requesting`). Hardcoded prose was the prior shape; it
+ * diverged from the StateBar on the non-`llm_requesting` variants and
+ * defeated the spec's "UI reflects current state" goal.
+ *
+ * Elapsed counter ticks at 1 Hz, derived from `phaseStateUpdatedAt`
+ * (server-authoritative — survives reconnect, reload, multi-tab).
  */
 export function PendingAssistantBubble({ slug }: { slug: string }) {
   const phaseStateUpdatedAt = usePhaseStateUpdatedAt(slug);
+  const phase = usePhase(slug);
 
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   useEffect(() => {
@@ -29,10 +37,17 @@ export function PendingAssistantBubble({ slug }: { slug: string }) {
     return () => window.clearInterval(interval);
   }, [phaseStateUpdatedAt]);
 
+  // Strip the trailing `...` that `getStateDescription` appends to
+  // working-phase prose — the elapsed counter is the "we're still
+  // waiting" affordance, so the ellipsis would double up. e.g.
+  // `"thinking..."` becomes `"thinking"`, then we render
+  // `"thinking 4s"`.
+  const label = getStateDescription(phase).replace(/\.{3}$/, '');
+
   return (
     <div className="message-row agent">
       <div className="message-content pending-assistant-bubble">
-        <span className="pending-assistant-bubble__label">thinking</span>
+        <span className="pending-assistant-bubble__label">{label}</span>
         {phaseStateUpdatedAt != null && (
           <span className="pending-assistant-bubble__elapsed"> {elapsedSeconds}s</span>
         )}
