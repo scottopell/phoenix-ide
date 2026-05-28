@@ -1,10 +1,6 @@
 import type { ErrorKind } from './generated/ErrorKind';
-
-export interface ErrorPresentation {
-  kind: ErrorKind;
-  can_auto_retry: boolean;
-  can_user_resume: boolean;
-}
+import type { ErrorPresentation } from './generated/ErrorPresentation';
+export type { ErrorPresentation } from './generated/ErrorPresentation';
 
 export function getErrorPresentation(errorKind?: ErrorKind): ErrorPresentation | undefined {
   if (!errorKind) return undefined;

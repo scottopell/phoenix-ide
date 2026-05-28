@@ -282,8 +282,8 @@ pub enum SseWireEvent {
         duration_ms: Option<u64>,
     },
     /// Conversation phase transition. `state` is opaque here — the UI has
-    /// its own tagged-union validator (`parseConversationState`). Error
-    /// states additionally carry typed presentation policy.
+    /// its own tagged-union validator (`parseConversationState`). States that
+    /// carry an `error_kind` additionally carry typed presentation policy.
     StateChange {
         sequence_id: i64,
         #[ts(type = "unknown")]

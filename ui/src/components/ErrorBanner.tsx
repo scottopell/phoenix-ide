@@ -1,6 +1,7 @@
 import { AlertCircle } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useCodexQuota } from '../codexQuota';
+import type { ErrorKind } from '../generated/ErrorKind';
 import type { ErrorPresentation } from '../errorPresentation';
 
 import type { QuotaDetails } from '../sseSchemas';
@@ -25,7 +26,7 @@ interface ErrorBannerProps {
  */
 function humanizeError(
   message: string,
-  errorKind?: string,
+  errorKind?: ErrorKind,
 ): { title: string; details: string | null } {
   if (errorKind === 'usage_limit_reached') {
     return { title: 'Usage limit reached', details: message };
