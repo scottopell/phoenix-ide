@@ -1345,6 +1345,7 @@ function ConversationPageContent() {
         toolExecutingStartedAt={atom.toolExecutingStartedAt}
         phaseStateUpdatedAt={atom.phaseStateUpdatedAt}
         lastSseEventAt={atom.lastSseEventAt}
+        firstByteRequestId={atom.firstByteRequestId}
         onOpenFiles={isDesktop ? undefined : () => setShowFileBrowser(true)}
         onSendMessage={(text) => handleSend(text, [])}
         showError={showError}

@@ -83,7 +83,7 @@ duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: 
  *
  * Specs: `specs/working-phase-visibility/` REQ-WPV-001.
  */
-state_updated_at: string, } | { "type": "token", sequence_id: number, text: string, request_id: string, } | { "type": "agent_done", sequence_id: number, } | { "type": "conversation_became_terminal", sequence_id: number, } | { "type": "conversation_update", sequence_id: number, conversation: unknown, } | { "type": "error", sequence_id: number, message: string, 
+state_updated_at: string, } | { "type": "llm_first_byte", sequence_id: number, request_id: string, } | { "type": "token", sequence_id: number, text: string, request_id: string, } | { "type": "agent_done", sequence_id: number, } | { "type": "conversation_became_terminal", sequence_id: number, } | { "type": "conversation_update", sequence_id: number, conversation: unknown, } | { "type": "error", sequence_id: number, message: string, 
 /**
  * Generated as `unknown` — the existing UI reads only the flat
  * `message` field. Kind-aware consumers can narrow against

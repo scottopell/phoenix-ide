@@ -280,6 +280,16 @@ pub enum SseWireEvent {
         /// Specs: `specs/working-phase-visibility/` REQ-WPV-001.
         state_updated_at: DateTime<Utc>,
     },
+    /// First-byte marker: emitted exactly once per LLM request,
+    /// immediately before the first `Token` event for the same
+    /// `request_id`. Drives the StateBar's `thinking Ns` → `streaming`
+    /// transition and the pending-assistant-bubble's spec-level
+    /// `placeholder → streaming` edge. Specs:
+    /// `specs/working-phase-visibility/` REQ-WPV-006 / REQ-WPV-007.
+    LlmFirstByte {
+        sequence_id: i64,
+        request_id: String,
+    },
     /// Ephemeral streaming token (LLM delta).
     Token {
         sequence_id: i64,
@@ -349,6 +359,7 @@ impl SseWireEvent {
             SseWireEvent::Message { .. } => "message",
             SseWireEvent::MessageUpdated { .. } => "message_updated",
             SseWireEvent::StateChange { .. } => "state_change",
+            SseWireEvent::LlmFirstByte { .. } => "llm_first_byte",
             SseWireEvent::Token { .. } => "token",
             SseWireEvent::AgentDone { .. } => "agent_done",
             SseWireEvent::ConversationBecameTerminal { .. } => "conversation_became_terminal",
@@ -429,6 +440,13 @@ impl From<SseEvent> for SseWireEvent {
                 state: serde_json::to_value(&state).unwrap_or(Value::Null),
                 presentation_mode,
                 state_updated_at,
+            },
+            SseEvent::LlmFirstByte {
+                sequence_id,
+                request_id,
+            } => SseWireEvent::LlmFirstByte {
+                sequence_id,
+                request_id,
             },
             SseEvent::Token {
                 sequence_id,

@@ -222,6 +222,11 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             type: 'sse_state_change',
             sequenceId: res.output.sequence_id,
             phase: parseConversationState(res.output.state),
+            // REQ-WPV-001: thread the server-authoritative entry time
+            // (RFC3339 → ms) onto the atom so this inline-stream path
+            // produces the same indicator behavior as the main SSE
+            // path in useConnection.
+            stateUpdatedAt: Date.parse(res.output.state_updated_at),
           },
         });
       });

@@ -1793,9 +1793,27 @@ where
         let request_id_for_fwd = request_id.clone();
         let forwarder_handle = tokio::spawn(async move {
             let mut rx = chunk_rx;
+            // REQ-WPV-007: emit `SseEvent::LlmFirstByte` exactly once
+            // per request, immediately before the first `Token` event
+            // for the same `request_id`. The two events get
+            // consecutive sequence_ids from the same broadcaster, so
+            // the client cannot observe a Token without first
+            // observing the marker. If this request completes with
+            // zero text chunks (the LLM errored or terminated before
+            // emitting any), `LlmFirstByte` is NOT emitted.
+            let mut first_text_seen = false;
             loop {
                 match rx.recv().await {
                     Ok(crate::llm::TokenChunk::Text(text)) => {
+                        if !first_text_seen {
+                            first_text_seen = true;
+                            let request_id_for_first = request_id_for_fwd.clone();
+                            let _ =
+                                broadcast_tx_for_tokens.send_seq(|seq| SseEvent::LlmFirstByte {
+                                    sequence_id: seq,
+                                    request_id: request_id_for_first,
+                                });
+                        }
                         let _ = broadcast_tx_for_tokens.send_seq(|seq| SseEvent::Token {
                             sequence_id: seq,
                             text,

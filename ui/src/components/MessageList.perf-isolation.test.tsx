@@ -159,6 +159,7 @@ describe('MessageList streaming-isolation perf invariant', () => {
       type: 'sse_state_change',
       sequenceId: 1,
       phase: llmRequesting,
+      stateUpdatedAt: 0,
     });
 
     const messageListCounter = makeCounter();
@@ -280,6 +281,7 @@ describe('MessageList streaming-isolation perf invariant', () => {
         type: 'sse_state_change',
         sequenceId: 1,
         phase: llmRequesting,
+        stateUpdatedAt: 0,
       });
       store.dispatch(slug, {
         type: 'sse_token',

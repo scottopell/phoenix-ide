@@ -68,6 +68,13 @@ interface StateBarProps {
    *  `now() - lastSseEventAt > 35000`, the StateBar surfaces a
    *  "no signal from server for Ns" degraded indicator (REQ-WPV-004). */
   lastSseEventAt?: number;
+  /** Request id of the LLM request whose first byte has been observed
+   *  on this turn, or `null` before the first `LlmFirstByte` event.
+   *  When non-null AND the phase is `llm_requesting`, the StateBar
+   *  switches from `thinking Ns` (with counter) to `streaming` (no
+   *  counter) per REQ-WPV-007 — the stream itself is the visible
+   *  progress signal so an additional counter is redundant. */
+  firstByteRequestId?: string | null;
   /** Mobile/tablet-only: opens the file browser overlay. When omitted (e.g. on
    *  desktop where `FileExplorerPanel` provides the same affordance), the
    *  button is not rendered. The explicit `| undefined` is required under
@@ -296,13 +303,19 @@ export function StateBar({
   onRetryNow,
   continuation,
   onUpgradeModel,
-  toolExecutingStartedAt,
+  toolExecutingStartedAt: _deprecatedToolStartedAt,
   phaseStateUpdatedAt,
   lastSseEventAt,
+  firstByteRequestId,
   onOpenFiles,
   onSendMessage,
   showError,
 }: StateBarProps) {
+  // `toolExecutingStartedAt` is kept on the prop type for the
+  // tool-widget header (which still reads it from the atom). The
+  // StateBar's own elapsed counter switched to `phaseStateUpdatedAt`
+  // in Stage A — the destructured value is intentionally unused here.
+  void _deprecatedToolStartedAt;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
   const [prStatus, setPrStatus] = useState<PrStatusResponse | null>(null);
@@ -570,7 +583,22 @@ export function StateBar({
             // is retained on the tool widget header itself via
             // `toolExecutingStartedAt`.
             dotClass += ' working';
-            stateText = formatWorkingReason(convState, phaseElapsedSeconds);
+            // REQ-WPV-007: once the first byte for the current LLM
+            // request lands, switch the base reason from `thinking Ns`
+            // to `streaming` (no counter — the stream itself is the
+            // progress signal). The transition applies only while
+            // the phase is one of the llm_requesting family; tool/
+            // sub-agent phases retain their elapsed counter.
+            if (
+              (convState.type === 'llm_requesting' ||
+                convState.type === 'seeded_llm_requesting' ||
+                convState.type === 'awaiting_llm') &&
+              firstByteRequestId != null
+            ) {
+              stateText = 'streaming';
+            } else {
+              stateText = formatWorkingReason(convState, phaseElapsedSeconds);
+            }
             break;
           default: convState satisfies never;
         }

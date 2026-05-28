@@ -195,6 +195,14 @@ mod tests {
                 "presentation_mode": presentation_mode,
                 "state_updated_at": state_updated_at,
             }),
+            SseEvent::LlmFirstByte {
+                sequence_id,
+                request_id,
+            } => json!({
+                "type": "llm_first_byte",
+                "sequence_id": sequence_id,
+                "request_id": request_id,
+            }),
             SseEvent::Token {
                 sequence_id,
                 text,
@@ -632,6 +640,15 @@ mod tests {
         let event = SseEvent::Token {
             sequence_id: 15,
             text: "Hel".to_string(),
+            request_id: "req-42".to_string(),
+        };
+        assert_parity(&event);
+    }
+
+    #[test]
+    fn parity_llm_first_byte() {
+        let event = SseEvent::LlmFirstByte {
+            sequence_id: 21,
             request_id: "req-42".to_string(),
         };
         assert_parity(&event);

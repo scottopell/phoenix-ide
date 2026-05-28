@@ -82,6 +82,7 @@ function renderStateBar({
   connectionAttempt = 0,
   phaseStateUpdatedAt,
   lastSseEventAt,
+  firstByteRequestId,
 }: {
   conversation?: Conversation;
   convState?: ComponentProps<typeof StateBar>['convState'];
@@ -93,6 +94,7 @@ function renderStateBar({
   connectionAttempt?: number;
   phaseStateUpdatedAt?: number | null;
   lastSseEventAt?: number;
+  firstByteRequestId?: string | null;
 } = {}) {
   const props: ComponentProps<typeof StateBar> = {
     conversation,
@@ -114,6 +116,9 @@ function renderStateBar({
   }
   if (lastSseEventAt !== undefined) {
     props.lastSseEventAt = lastSseEventAt;
+  }
+  if (firstByteRequestId !== undefined) {
+    props.firstByteRequestId = firstByteRequestId;
   }
   return render(
     <MemoryRouter>
@@ -330,7 +335,11 @@ describe('StateBar working-phase indicators', () => {
   it('renders the live counter for non-llm working phases too (REQ-WPV-001)', () => {
     // tool_executing is the same generalized path now.
     renderStateBar({
-      convState: { type: 'tool_executing', attempt: 1, current_tool: 'bash' },
+      convState: {
+        type: 'tool_executing',
+        current_tool: { id: 'bash-1', name: 'bash', input: {} },
+        remaining_tools: [],
+      },
       phaseStateUpdatedAt: T_NOW - 12_000,
       lastSseEventAt: T_NOW - 1_000,
     });
@@ -418,12 +427,41 @@ describe('StateBar working-phase indicators', () => {
     expect(dot?.className).toMatch(/reconnecting/);
   });
 
+  it('switches to "streaming" (no counter) once first byte arrives (REQ-WPV-007)', () => {
+    renderStateBar({
+      convState: { type: 'llm_requesting', attempt: 1 },
+      phaseStateUpdatedAt: T_NOW - 4_000,
+      lastSseEventAt: T_NOW - 1_000,
+      firstByteRequestId: 'req-abc',
+    });
+    expect(screen.getByText(/^streaming$/i)).toBeInTheDocument();
+    // The pre-first-byte "thinking Ns" form must NOT be present once
+    // the first byte has arrived.
+    expect(screen.queryByText(/thinking.*4s/i)).not.toBeInTheDocument();
+    const dot = document.querySelector('.dot');
+    expect(dot?.className).toMatch(/working/);
+  });
+
+  it('keeps the elapsed counter for non-llm working phases even with firstByteRequestId set', () => {
+    // First byte applies only to llm_requesting-family states; a
+    // tool_executing phase keeps its elapsed counter even if a
+    // first-byte signal from a prior LLM request is still on the atom.
+    renderStateBar({
+      convState: { type: 'tool_executing', current_tool: { id: 'bash-1', name: 'bash', input: {} }, remaining_tools: [] },
+      phaseStateUpdatedAt: T_NOW - 9_000,
+      lastSseEventAt: T_NOW - 1_000,
+      firstByteRequestId: 'req-prior',
+    });
+    expect(screen.queryByText(/^streaming$/i)).not.toBeInTheDocument();
+    expect(screen.getByText(/\b9s\b/)).toBeInTheDocument();
+  });
+
   it('shows BOTH offline chip + last-known activity during offline (REQ-WPV-005)', () => {
     const { rerender } = render(
       <MemoryRouter>
         <StateBar
           conversation={makeConversation()}
-          convState={{ type: 'tool_executing', attempt: 1, current_tool: 'bash' }}
+          convState={{ type: 'tool_executing', current_tool: { id: 'bash-1', name: 'bash', input: {} }, remaining_tools: [] }}
           connectionState="connected"
           connectionAttempt={0}
           nextRetryIn={null}
@@ -438,7 +476,7 @@ describe('StateBar working-phase indicators', () => {
       <MemoryRouter>
         <StateBar
           conversation={makeConversation()}
-          convState={{ type: 'tool_executing', attempt: 1, current_tool: 'bash' }}
+          convState={{ type: 'tool_executing', current_tool: { id: 'bash-1', name: 'bash', input: {} }, remaining_tools: [] }}
           connectionState="offline"
           connectionAttempt={0}
           nextRetryIn={null}

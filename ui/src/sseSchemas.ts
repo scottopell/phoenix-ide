@@ -32,6 +32,7 @@ import type {
   SseMessageUpdatedData as WireMessageUpdatedData,
   SseStateChangeData as WireStateChangeData,
   SseTokenData as WireTokenData,
+  SseLlmFirstByteData as WireLlmFirstByteData,
   SseAgentDoneData as WireAgentDoneData,
   SseConversationBecameTerminalData as WireConversationBecameTerminalData,
   SseConversationUpdateData as WireConversationUpdateData,
@@ -253,6 +254,16 @@ export const SseTokenDataSchema = v.looseObject({
   text: v.string(),
   request_id: v.string(),
 }) satisfies v.GenericSchema<unknown, WireTokenData>;
+
+/** `llm_first_byte`: marker emitted exactly once per LLM request,
+ *  immediately before the first `Token` event for the same `request_id`.
+ *  Drives the StateBar's `thinking Ns` → `streaming` transition and
+ *  the pending-assistant-bubble's spec-level `placeholder → streaming`
+ *  edge. Specs: `specs/working-phase-visibility/` REQ-WPV-006 / 007. */
+export const SseLlmFirstByteDataSchema = v.looseObject({
+  sequence_id: v.number(),
+  request_id: v.string(),
+}) satisfies v.GenericSchema<unknown, WireLlmFirstByteData>;
 
 /** `conversation_update`: partial conversation metadata update. The backend
  *  sends a strict subset of the Conversation fields (see Rust

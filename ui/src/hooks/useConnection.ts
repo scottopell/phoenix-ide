@@ -12,6 +12,7 @@ import {
   SseMessageUpdatedDataSchema,
   SseStateChangeDataSchema,
   SseTokenDataSchema,
+  SseLlmFirstByteDataSchema,
   SseConversationUpdateDataSchema,
   SseAgentDoneDataSchema,
   SseConversationBecameTerminalDataSchema,
@@ -431,6 +432,26 @@ export function useConnection({
               type: 'sse_token',
               sequenceId: res.data.sequence_id,
               delta: res.data.text,
+              requestId: res.data.request_id,
+            });
+          });
+
+          // REQ-WPV-007: first-byte marker. Emitted exactly once per LLM
+          // request immediately before the first `token` event for the
+          // same `request_id`. Drives the StateBar's `thinking Ns` →
+          // `streaming` transition; the reducer stamps
+          // `firstByteRequestId` on the atom.
+          on('llm_first_byte', (e) => {
+            const res = parseEvent(
+              SseLlmFirstByteDataSchema,
+              e,
+              'llm_first_byte',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_llm_first_byte',
+              sequenceId: res.data.sequence_id,
               requestId: res.data.request_id,
             });
           });

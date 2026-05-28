@@ -7,6 +7,7 @@ import {
   SseMessageDataSchema,
   SseMessageUpdatedDataSchema,
   SseAgentDoneDataSchema,
+  SseLlmFirstByteDataSchema,
   SseConversationUpdateDataSchema,
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
@@ -66,6 +67,16 @@ export interface ConversationAtom {
    *  `now() - lastSseEventAt > HEARTBEAT_WATCHDOG_MS`, the StateBar
    *  surfaces a "no signal from server for Ns" degraded indicator. */
   lastSseEventAt: number;
+  /** Request id of the LLM request whose first byte has been observed on
+   *  this turn, or `null` if no first-byte marker has arrived since the
+   *  last phase entry. Set by the `sse_llm_first_byte` reducer; cleared
+   *  on every `state_change` event (the phase-entry edge — every new
+   *  llm_requesting attempt starts in pre-first-byte) and on the
+   *  turn-terminal `agent_done` event. Drives REQ-WPV-007's
+   *  `thinking Ns` → `streaming` transition in the StateBar and the
+   *  pending bubble's spec-level `placeholder → streaming` edge
+   *  (REQ-WPV-006). */
+  firstByteRequestId: string | null;
   /** Per-connection generation that produced the events this atom has accepted.
    *  `null` until `connection_opened` lands. Wire-originated actions tagged
    *  with a non-matching `epoch` are dropped at the reducer boundary — the
@@ -151,6 +162,18 @@ export type SSEAction =
     }
   | { type: 'sse_agent_done'; sequenceId: number; epoch?: number }
   | { type: 'sse_token'; sequenceId: number; delta: string; requestId: string; epoch?: number }
+  | {
+      // REQ-WPV-007: first-byte marker for the LLM request identified by
+      // `requestId`. The reducer stamps this on the atom so the StateBar
+      // can switch from `thinking Ns` to `streaming` (no counter); the
+      // pending bubble's spec-level `placeholder → streaming` edge is
+      // also gated by this signal (REQ-WPV-006). Emitted exactly once
+      // per request; never on requests that error before any tokens.
+      type: 'sse_llm_first_byte';
+      sequenceId: number;
+      requestId: string;
+      epoch?: number;
+    }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
   | { type: 'sse_browser_session_state'; sequenceId: number; active: boolean; epoch?: number }
   // `sequenceId` is present when the error originated on the wire (server's
@@ -231,6 +254,7 @@ export function createInitialAtom(): ConversationAtom {
     toolExecutingStartedAt: null,
     phaseStateUpdatedAt: null,
     lastSseEventAt: Date.now(),
+    firstByteRequestId: null,
     connectionEpoch: null,
     connectionState: 'connecting',
   };
@@ -491,6 +515,22 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         sequenceId: res.output.sequence_id,
       });
     }
+    case 'llm_first_byte': {
+      const res = v.safeParse(SseLlmFirstByteDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending llm_first_byte entry', {
+            issues: res.issues,
+          });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_llm_first_byte',
+        sequenceId: res.output.sequence_id,
+        requestId: res.output.request_id,
+      });
+    }
     case 'conversation_update': {
       const res = v.safeParse(SseConversationUpdateDataSchema, entry);
       if (!res.success) {
@@ -664,6 +704,12 @@ export function conversationReducer(
         // Bump the watchdog clock — Init is itself an event the user
         // observed (REQ-WPV-004).
         lastSseEventAt: Date.now(),
+        // REQ-WPV-007: an Init snapshot lands the authoritative phase;
+        // any first-byte signal from before this Init is by definition
+        // pre-reset state and must not bleed forward. If the replayed
+        // pending events contain a first-byte for the current request,
+        // the SseLlmFirstByteDataSchema path below re-stamps it.
+        firstByteRequestId: null,
       };
 
       // Phase 2 — fold pending events through the reducer. Each entry is a
@@ -781,6 +827,12 @@ export function conversationReducer(
           // REQ-WPV-001: store the server-authoritative entry time.
           phaseStateUpdatedAt: action.stateUpdatedAt,
           lastSseEventAt: Date.now(),
+          // REQ-WPV-007: every phase transition resets the first-byte
+          // signal. The next llm_requesting attempt starts in pre-first-
+          // byte; non-llm phases (tool_executing, idle, …) don't have a
+          // first-byte concept and must clear it so a subsequent
+          // llm_requesting doesn't inherit a stale value.
+          firstByteRequestId: null,
           breadcrumbs,
           breadcrumbSequenceIds,
           toolExecutingStartedAt,
@@ -793,6 +845,19 @@ export function conversationReducer(
         ...a,
         phase: { type: 'idle' },
         streamingBuffer: null,
+        // REQ-WPV-007: turn boundary clears the first-byte signal. The
+        // sse_state_change handler also clears it on phase transitions,
+        // but agent_done can fire without a preceding state_change in
+        // some terminal paths, so we clear here defensively.
+        firstByteRequestId: null,
+      }));
+    }
+
+    case 'sse_llm_first_byte': {
+      return applyIfNewer(atom, 'sse_llm_first_byte', action.sequenceId, (a) => ({
+        ...a,
+        firstByteRequestId: action.requestId,
+        lastSseEventAt: Date.now(),
       }));
     }
 

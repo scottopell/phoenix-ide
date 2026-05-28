@@ -61,6 +61,10 @@ export type SseStateChangeData = Omit<
   'type'
 >;
 export type SseTokenData = Omit<Extract<SseWireEvent, { type: 'token' }>, 'type'>;
+export type SseLlmFirstByteData = Omit<
+  Extract<SseWireEvent, { type: 'llm_first_byte' }>,
+  'type'
+>;
 export type SseAgentDoneData = Omit<Extract<SseWireEvent, { type: 'agent_done' }>, 'type'>;
 export type SseConversationBecameTerminalData = Omit<
   Extract<SseWireEvent, { type: 'conversation_became_terminal' }>,

@@ -956,6 +956,7 @@ describe('conversationReducer', () => {
         type: 'sse_state_change',
         sequenceId: 1,
         phase: { type: 'awaiting_llm' },
+        stateUpdatedAt: 0,
       });
 
       expect(next.phase.type).toBe('awaiting_llm');
@@ -972,6 +973,7 @@ describe('conversationReducer', () => {
           current_tool: { id: 'tool-1', name: 'bash', input: { _tool: 'bash' } },
           remaining_tools: [],
         },
+        stateUpdatedAt: 0,
       });
 
       expect(next.breadcrumbs).toHaveLength(1);
@@ -986,6 +988,7 @@ describe('conversationReducer', () => {
         type: 'sse_state_change',
         sequenceId: 10,
         phase: { type: 'awaiting_llm' },
+        stateUpdatedAt: 0,
       });
 
       expect(next).toBe(atom);
@@ -1001,6 +1004,7 @@ describe('conversationReducer', () => {
         type: 'sse_state_change',
         sequenceId: 10,
         phase: { type: 'llm_requesting', attempt: 2 },
+        stateUpdatedAt: 0,
       });
 
       expect(next.breadcrumbs).toHaveLength(1);
@@ -1023,6 +1027,7 @@ describe('conversationReducer', () => {
             { agent_id: 'a1', task: 'task1', outcome: { type: 'success' } },
           ],
         },
+        stateUpdatedAt: 0,
       });
 
       expect(next.breadcrumbs).toHaveLength(1);
@@ -1036,6 +1041,7 @@ describe('conversationReducer', () => {
         type: 'sse_state_change',
         sequenceId: 7,
         phase: { type: 'awaiting_llm' },
+        stateUpdatedAt: 0,
       });
 
       expect(next.lastSequenceId).toBe(7);
