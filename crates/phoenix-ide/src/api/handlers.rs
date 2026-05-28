@@ -953,12 +953,23 @@ async fn create_conversation(
     // New conversations are pinned to the current global default LLM language.
     // Once set, this conversation (and all its chain continuations / sub-agents)
     // stays in that language even if the global default later changes.
-    let default_language = state
-        .runtime
-        .db()
-        .get_default_llm_language()
-        .await
-        .unwrap_or_default();
+    //
+    // A DB read failure here would silently flip every new conversation back
+    // to phoenix-native, hiding a partially-migrated or otherwise unhealthy
+    // settings table. Log at warn so operators see it, then fall back —
+    // refusing to create the conversation over a *preference* read is too
+    // strong a coupling.
+    let default_language = match state.runtime.db().get_default_llm_language().await {
+        Ok(lang) => lang,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Failed to read default LLM language from app_settings; falling back to default. \
+                 Check that migration 010 ran and app_settings is readable."
+            );
+            crate::llm_language::LlmLanguage::default()
+        }
+    };
     let conversation = state
         .runtime
         .db()

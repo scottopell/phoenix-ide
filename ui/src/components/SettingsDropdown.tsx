@@ -409,9 +409,14 @@ function LlmLanguageSection() {
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   // Monotonic save id (mirrors NotificationsSection): rapid clicks issue
-  // multiple PUTs and we apply only the latest response to setting, so
-  // out-of-order completions don't overwrite the user's current selection.
+  // multiple PUTs and we apply only the latest response, so out-of-order
+  // completions don't overwrite the user's current selection.
   const latestSaveRef = useRef(0);
+  // Live mirror of `setting`, read in the click handler so rapid clicks
+  // (Phoenix → Caveman → Phoenix) compare against the value the previous
+  // click just installed rather than a stale closure capture — without
+  // putting side effects inside a setState updater.
+  const settingRef = useRef<LlmLanguageSetting | null>(null);
   // Last server-confirmed value — used to roll back the optimistic
   // selection if the latest PUT fails.
   const confirmedRef = useRef<LlmLanguageSetting | null>(null);
@@ -427,6 +432,7 @@ function LlmLanguageSection() {
       .then((loaded) => {
         if (!mountedRef.current) return;
         confirmedRef.current = loaded;
+        settingRef.current = loaded;
         setSetting(loaded);
       })
       .catch((err) => {
@@ -436,35 +442,41 @@ function LlmLanguageSection() {
   }, []);
 
   const select = useCallback((next: string) => {
+    // Read the live value via ref, not a closure — captures stale state.
+    const current = settingRef.current;
+    if (!current || current.language === next) return;
+
+    const saveId = latestSaveRef.current + 1;
+    latestSaveRef.current = saveId;
+
+    // Optimistic local update. Pure setState (no side effects inside the
+    // updater); the PUT is fired from the handler scope.
+    const optimistic = { ...current, language: next };
+    settingRef.current = optimistic;
+    setSetting(optimistic);
+    setSaving(true);
     setError(null);
-    // Functional setSetting so the equality check (and the PUT decision)
-    // reads the live state — not a stale closure capture. With rapid clicks
-    // before React re-renders (Phoenix → Caveman → Phoenix), each click
-    // sees the value the previous click just installed instead of the
-    // mount-time setting.
-    setSetting((prev) => {
-      if (!prev || prev.language === next) return prev;
-      const saveId = latestSaveRef.current + 1;
-      latestSaveRef.current = saveId;
-      setSaving(true);
-      api.updateLlmLanguageSetting(next)
-        .then((saved) => {
-          // Only the latest save's response is allowed to mutate state.
-          // Earlier PUTs that arrive out of order are dropped on the floor.
-          if (!mountedRef.current || latestSaveRef.current !== saveId) return;
-          confirmedRef.current = saved;
-          setSetting(saved);
-          setSaving(false);
-        })
-        .catch((err: unknown) => {
-          if (!mountedRef.current || latestSaveRef.current !== saveId) return;
-          // Roll back the optimistic selection so the UI matches the server.
-          if (confirmedRef.current) setSetting(confirmedRef.current);
-          setError(err instanceof Error ? err.message : 'Failed to save LLM language');
-          setSaving(false);
-        });
-      return { ...prev, language: next };
-    });
+
+    api.updateLlmLanguageSetting(next)
+      .then((saved) => {
+        // Only the latest save's response is allowed to mutate state.
+        // Earlier PUTs that arrive out of order are dropped on the floor.
+        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
+        confirmedRef.current = saved;
+        settingRef.current = saved;
+        setSetting(saved);
+        setSaving(false);
+      })
+      .catch((err: unknown) => {
+        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
+        // Roll back to the last server-confirmed value so the UI matches the server.
+        if (confirmedRef.current) {
+          settingRef.current = confirmedRef.current;
+          setSetting(confirmedRef.current);
+        }
+        setError(err instanceof Error ? err.message : 'Failed to save LLM language');
+        setSaving(false);
+      });
   }, []);
 
   if (!setting && !error) return null;
@@ -477,19 +489,28 @@ function LlmLanguageSection() {
         descriptions). Applies to new conversations only.
       </div>
       {setting && (
-        <div className="settings-theme-row">
-          {setting.available.map((lang) => (
-            <button
-              key={lang}
-              type="button"
-              className={`settings-theme-btn${setting.language === lang ? ' active' : ''}`}
-              onClick={() => select(lang)}
-              disabled={saving}
-              title={llmLanguageTooltip(lang)}
-            >
-              {llmLanguageLabel(lang)}
-            </button>
-          ))}
+        <div
+          className="settings-theme-row"
+          role="radiogroup"
+          aria-label="LLM language"
+        >
+          {setting.available.map((lang) => {
+            const active = setting.language === lang;
+            return (
+              <button
+                key={lang}
+                type="button"
+                role="radio"
+                aria-checked={active}
+                className={`settings-theme-btn${active ? ' active' : ''}`}
+                onClick={() => select(lang)}
+                disabled={saving}
+                title={llmLanguageTooltip(lang)}
+              >
+                {llmLanguageLabel(lang)}
+              </button>
+            );
+          })}
         </div>
       )}
       {saving && <div className="settings-section__hint">Saving…</div>}
