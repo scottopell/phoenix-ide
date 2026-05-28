@@ -774,17 +774,15 @@ pub enum SseEvent {
     },
     /// Emitted exactly once per LLM request immediately before the first
     /// `Token` event for that request, so the client can transition the
-    /// StateBar's base reason from `thinking Ns` (pre-first-byte) to
-    /// `streaming` (post-first-byte) per REQ-WPV-007, and so the pending
-    /// assistant bubble's spec-level state machine has the discrete
-    /// `placeholder → streaming` edge it needs (REQ-WPV-006). NOT emitted
+    /// StateBar's base reason from `awaiting LLM response Ns` (pre-first-byte)
+    /// to `streaming` (post-first-byte) per REQ-WPV-007. NOT emitted
     /// when an LLM request completes with zero tokens (errors, early
-    /// termination). Specs: `specs/working-phase-visibility/`.
+    /// termination). Spec: `specs/working-phase-visibility/`.
     LlmFirstByte {
         sequence_id: i64,
         /// Matches the `request_id` carried on `Token` events for the same
         /// LLM request, so the client can correlate the first-byte
-        /// transition to the right pending bubble.
+        /// transition with the right StateBar phase.
         request_id: String,
     },
     /// Retry-context marker emitted from the executor's

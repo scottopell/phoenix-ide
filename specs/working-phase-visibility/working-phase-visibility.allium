@@ -35,8 +35,9 @@
 --
 -- Includes: DisplayedActivity composition; LastKnownActivity capture
 --           on connected→reconnecting; HeartbeatWatchdog fresh/stale;
---           PendingAssistantBubble lifecycle; per-artifact inline
---           timer lifecycles.
+--           FirstByteTracker (pre-/post-first-byte sensor for the
+--           StateBar's streaming vs awaiting discrimination);
+--           per-artifact inline timer lifecycles.
 -- Excludes:
 --   - Server-side phase transitions (specs/conversation_atom/)
 --   - Retry/backoff lifecycle and LlmAttempt event production
@@ -189,17 +190,15 @@ enum HeartbeatFreshness {
     | stale
 }
 
--- Lifecycle of the placeholder assistant bubble that appears during
--- llm_requesting with no tokens yet. The bubble is a reusable
--- singleton: it returns to `not_present` after each turn so the next
--- turn can re-arm it. `not_present` is the idle ground state; the
--- "complete" outcome (assistant message persisted) and the "removed"
--- outcome (phase exited without tokens) both route back to
--- `not_present` rather than terminal states.
-enum PendingBubbleState {
-    not_present
-    | placeholder
-    | streaming
+-- Per-conversation first-byte sensor used by the StateBar derivation
+-- rules to distinguish `awaiting LLM response Ns` (pre-first-byte)
+-- from `streaming` (post-first-byte). `pre_first_byte` is the idle
+-- ground state and the state on entry to any working phase; the
+-- tracker flips to `post_first_byte` on `LlmFirstByte` and resets to
+-- `pre_first_byte` on every phase transition. REQ-WPV-007.
+enum FirstByteTrackerState {
+    pre_first_byte
+    | post_first_byte
 }
 
 ------------------------------------------------------------
@@ -234,50 +233,27 @@ entity ObservedPhase {
     state_updated_at: Timestamp
 }
 
--- The pending placeholder bubble. Singleton per ClientView. DOM presence
--- is gated on state in { placeholder, streaming } (the streaming state
--- still holds the same bubble; only its contents change from elapsed-
--- counter to streamed text per REQ-WPV-002). After a turn completes the
--- bubble returns to `not_present` so the next turn can re-arm it — the
--- state machine is reusable across turns, not single-shot.
-entity PendingAssistantBubble {
+-- Per-view first-byte sensor. Records whether the most recent (or
+-- current) LLM request has emitted its first token yet. Used by the
+-- StateBar derivation rules to switch between
+-- `awaiting LLM response Ns` and `streaming`. Resets to
+-- `pre_first_byte` on every phase transition, so a fresh
+-- `llm_requesting` entry never inherits a stale first-byte flag from
+-- a prior request. REQ-WPV-007.
+entity FirstByteTracker {
     view: ClientView
 
-    state: PendingBubbleState
+    state: FirstByteTrackerState
 
-    -- The request_id of the LLM request this bubble is bound to. The
-    -- placeholder bubble is created BEFORE we know which request_id the
-    -- forwarder will assign — the value is set when LlmFirstByte
-    -- arrives carrying that id (PendingBubbleTransitionsToStreaming
-    -- rule below) and cleared on return to not_present. Null during
-    -- the `placeholder` phase; non-null during `streaming`.
+    -- The request_id of the LLM request whose first byte was observed,
+    -- captured from the `LlmFirstByte.request_id`. Null while
+    -- `pre_first_byte`. Used only for traceability/audit; the display
+    -- rules consume `state` directly.
     request_id: String?
 
-    -- Server-authoritative; matches ObservedPhase.state_updated_at when
-    -- the bubble is in `placeholder` state. Used for the inline elapsed
-    -- counter inside the bubble.
-    placeholder_since: Timestamp?
-
-    -- The SSE sequence_id stored on the bubble to correlate the
-    -- persisted assistant Message back to this bubble's request. Set
-    -- to the LlmFirstByte event's own sequence_id on the streaming
-    -- transition. Per sse_wire.allium, each SSE event carries its own
-    -- monotonic sequence_id from SseBroadcaster.next_seq, so LlmFirstByte
-    -- and the first Token that follows it have DIFFERENT consecutive
-    -- sequence_ids (LlmFirstByte is emitted immediately before the
-    -- first Token, taking one seq; the Token takes the next). Both are
-    -- strictly greater than any prior event for this conversation, so
-    -- a Message event with seq > first_byte_seq is unambiguously this
-    -- bubble's completion. SseWireEvent::Message does NOT carry the
-    -- request_id, so wire-level request_id correlation is unavailable
-    -- and this seq-based form is the only reliable correlator.
-    first_byte_seq: Integer?
-
     transitions state {
-        not_present -> placeholder
-        placeholder -> streaming
-        placeholder -> not_present
-        streaming -> not_present
+        pre_first_byte -> post_first_byte
+        post_first_byte -> pre_first_byte
     }
 }
 
@@ -686,149 +662,43 @@ rule LastKnownActivityClearedOnReconnect {
 }
 
 ------------------------------------------------------------
--- Rules — PendingAssistantBubble
+-- Rules — FirstByteTracker
 ------------------------------------------------------------
 
--- REQ-WPV-006: enter llm_requesting with no tokens → arm placeholder.
--- The bubble is a reusable singleton, so the precondition admits any
--- non-active state (not_present after the previous turn cleaned up).
--- The placeholder_since stamp is taken from the just-set
--- ObservedPhase.state_updated_at so the inline elapsed counter ticks
--- from phase entry, not from this rule's firing time.
-rule PendingBubblePlaceholderCreated {
+-- REQ-WPV-007: every phase transition into a working phase resets the
+-- tracker to `pre_first_byte`. This guarantees a fresh `llm_requesting`
+-- entry never inherits a stale `post_first_byte` flag from a prior
+-- request, so the StateBar's `awaiting LLM response Ns` → `streaming`
+-- discrimination is bound to the *current* request.
+rule FirstByteTrackerArmedOnPhaseEntry {
     when: ObservedPhaseUpdatedToWorking(view, llm_requesting)
 
-    requires: PendingAssistantBubble{view}.state = not_present
-
-    ensures: PendingAssistantBubble{view}.state             = placeholder
-    ensures: PendingAssistantBubble{view}.placeholder_since = ObservedPhase{view}.state_updated_at
-    ensures: PendingAssistantBubble{view}.first_byte_seq   = null
-    -- request_id stays null until LlmFirstByte arrives; the placeholder
-    -- bubble doesn't need it for rendering, only the streaming bubble
-    -- does (to correlate the persisted Message back to itself).
+    ensures: FirstByteTracker{view}.state      = pre_first_byte
+    ensures: FirstByteTracker{view}.request_id = null
 }
 
--- REQ-WPV-006 + REQ-WPV-008: a fresh Init that lands while the
--- conversation is in `llm_requesting` and no streaming tokens have
--- arrived yet needs to re-arm the placeholder bubble. The phase-
--- transition trigger `ObservedPhaseUpdatedToWorking` does NOT fire on
--- Init (Init replaces the snapshot wholesale; there is no edge), so
--- without this rule a page reload or reconnect mid-`llm_requesting`
--- would leave the StateBar showing the right phase but the message
--- area missing its in-flight placeholder. The state_updated_at on the
--- Init carrier seeds `placeholder_since` so the elapsed counter
--- continues from the phase entry (not from reload time).
---
--- Gated on `pending_truncated = false`: when the SSE replay ring
--- overflowed, REQ-WPV-008's truncated-branch requires showing a
--- degraded notice in place of inline indicators (the in-flight detail
--- cannot be reliably reconstructed until the next checkpoint).
--- Seeding a fresh-looking placeholder here would conflict with that.
---
--- Event shape: SseInitReceived(view, raw_state, state_updated_at,
--- pending_truncated). `pending_truncated` is the existing
--- `Init.pending_truncated` flag defined in sse_wire.allium.
-rule PendingBubbleSeededFromInit {
-    when: SseInitReceived(view, raw_state, state_updated_at, pending_truncated)
-
-    requires: is_working_phase(raw_state)
-    requires: working_phase_of(raw_state) = llm_requesting
-    requires: PendingAssistantBubble{view}.state = not_present
-    requires: pending_truncated = false
-
-    ensures: PendingAssistantBubble{view}.state             = placeholder
-    ensures: PendingAssistantBubble{view}.placeholder_since = state_updated_at
-    ensures: PendingAssistantBubble{view}.first_byte_seq   = null
-    ensures: PendingAssistantBubble{view}.request_id        = null
-    -- If the server-side turn had already passed first-byte before
-    -- reload, the next Token event (replayed from the SSE ring) will
-    -- carry the request_id and the regular streaming-transition path
-    -- catches up; the bubble is only stuck in `placeholder` for the
-    -- pre-first-byte case.
-}
-
--- REQ-WPV-007: LlmFirstByte arrives → transition to streaming. Same DOM
--- node, contents swap from elapsed counter to streamed text. The event
--- carries both `request_id` (correlator the runtime uses internally)
--- and `sequence_id` (the wire-envelope seq, monotonic per stream); we
--- store the seq on the bubble so PendingBubbleCompletedOnMessage can
--- correlate the persisted assistant Message back to this bubble (a
--- Message with role=assistant and seq > first_byte_seq is THIS
--- bubble's completion). request_id alone is unsuitable because
--- SseWireEvent::Message does not carry it.
+-- REQ-WPV-007: LlmFirstByte arrives → tracker flips to post_first_byte.
+-- DisplayWhenStreaming uses this transition to switch the StateBar
+-- base reason from `awaiting LLM response Ns` to `streaming`.
 -- Event shape: SseLlmFirstByteReceived(view, request_id, sequence_id).
-rule PendingBubbleTransitionsToStreaming {
+rule FirstByteTrackerObservesFirstByte {
     when: SseLlmFirstByteReceived(view, request_id, sequence_id)
 
-    requires: PendingAssistantBubble{view}.state = placeholder
+    requires: FirstByteTracker{view}.state = pre_first_byte
 
-    ensures: PendingAssistantBubble{view}.state           = streaming
-    ensures: PendingAssistantBubble{view}.request_id      = request_id
-    ensures: PendingAssistantBubble{view}.first_byte_seq = sequence_id
+    ensures: FirstByteTracker{view}.state      = post_first_byte
+    ensures: FirstByteTracker{view}.request_id = request_id
 }
 
--- REQ-WPV-006: phase left llm_requesting without any Token. The bubble
--- returns to `not_present` (NOT a terminal state) so the next
--- llm_requesting entry can re-arm it. Clears the per-bubble fields.
-rule PendingBubbleResetOnEmptyPhaseExit {
+-- REQ-WPV-007: any phase transition OUT of llm_requesting clears the
+-- tracker, regardless of whether the first byte was observed. A
+-- subsequent re-entry to llm_requesting will be re-armed by
+-- FirstByteTrackerArmedOnPhaseEntry.
+rule FirstByteTrackerClearedOnPhaseExit {
     when: ObservedPhaseUpdatedFromWorking(view, llm_requesting, new_phase)
 
-    requires: PendingAssistantBubble{view}.state = placeholder
-
-    ensures: PendingAssistantBubble{view}.state             = not_present
-    ensures: PendingAssistantBubble{view}.request_id        = null
-    ensures: PendingAssistantBubble{view}.placeholder_since = null
-    ensures: PendingAssistantBubble{view}.first_byte_seq   = null
-}
-
--- REQ-WPV-006: phase left llm_requesting WHILE the bubble was in
--- `streaming` (some tokens arrived, then the turn errored or was
--- cancelled before the assistant Message was persisted). Without this
--- rule the bubble would stay stuck in `streaming` showing partial
--- text into the error/cancel/retry state, and the next
--- llm_requesting entry would fail the `state = not_present`
--- precondition on PendingBubblePlaceholderCreated.
---
--- The implementation discards the buffered streaming text from the UI
--- on this transition (the partial response is not the canonical
--- output of the turn); a recovery/retry attempt arms a fresh
--- placeholder via the normal phase-transition path.
-rule PendingBubbleResetOnStreamingPhaseExit {
-    when: ObservedPhaseUpdatedFromWorking(view, llm_requesting, new_phase)
-
-    requires: PendingAssistantBubble{view}.state = streaming
-
-    ensures: PendingAssistantBubble{view}.state             = not_present
-    ensures: PendingAssistantBubble{view}.request_id        = null
-    ensures: PendingAssistantBubble{view}.placeholder_since = null
-    ensures: PendingAssistantBubble{view}.first_byte_seq   = null
-}
-
--- The streaming bubble becomes the canonical persisted message on the
--- next assistant Message event arrival, then returns to `not_present`
--- so the next turn can re-arm. The DOM transition from the live
--- streaming buffer to the canonical persisted message is handled by
--- the implementation; the bubble entity itself just resets.
---
--- Correlation: SseWireEvent::Message payloads do NOT carry request_id
--- (only Token events do). We compare the inbound message's seq to the
--- bubble's stored first_byte_seq (set when the bubble transitioned
--- to streaming). A Message with role=assistant and seq >
--- first_byte_seq is the completion of THIS bubble's request — by
--- SSE sequence_id monotonicity (sse_wire.allium) and the singleton
--- nature of in-flight LLM requests per conversation.
--- Event shape: SseMessageReceived(view, message_role, message_seq).
-rule PendingBubbleCompletedOnMessage {
-    when: SseMessageReceived(view, message_role, message_seq)
-
-    requires: PendingAssistantBubble{view}.state = streaming
-    requires: message_role = assistant
-    requires: message_seq > PendingAssistantBubble{view}.first_byte_seq
-
-    ensures: PendingAssistantBubble{view}.state             = not_present
-    ensures: PendingAssistantBubble{view}.request_id        = null
-    ensures: PendingAssistantBubble{view}.placeholder_since = null
-    ensures: PendingAssistantBubble{view}.first_byte_seq   = null
+    ensures: FirstByteTracker{view}.state      = pre_first_byte
+    ensures: FirstByteTracker{view}.request_id = null
 }
 
 ------------------------------------------------------------
@@ -1050,7 +920,7 @@ rule DisplayWhenStreaming {
     requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI code: 'connected'; see ObservedPhase comment above
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase = llm_requesting
-    requires: PendingAssistantBubble{view}.state = streaming
+    requires: FirstByteTracker{view}.state = post_first_byte
 
     let retry_suffix = render_retry_modifier_for(view)
 
@@ -1077,7 +947,7 @@ rule DisplayWhenAwaitingResponse {
     requires: conn/ClientConnection{conversation_id: view.conversation_id}.state = live  -- UI code: 'connected'; see ObservedPhase comment above
     requires: ObservedPhase{view}.working = true
     requires: ObservedPhase{view}.phase = llm_requesting
-    requires: PendingAssistantBubble{view}.state in { not_present, placeholder }
+    requires: FirstByteTracker{view}.state = pre_first_byte
 
     let secs         = (now() - ObservedPhase{view}.state_updated_at) / 1000
     let retry_suffix = render_retry_modifier_for(view)
@@ -1222,10 +1092,14 @@ invariant InitClearsCapturedActivity {
         implies LastKnownActivityCapture{view: v}.captured = null
 }
 
--- REQ-WPV-006: the placeholder bubble is bound to a llm_requesting phase.
-invariant PlaceholderBubbleImpliesLlmRequesting {
+-- REQ-WPV-007: a `post_first_byte` tracker state implies the
+-- conversation is still in `llm_requesting`. Crossing out of
+-- llm_requesting always resets the tracker (per
+-- FirstByteTrackerClearedOnPhaseExit), so this invariant is the
+-- structural counterpart of that rule.
+invariant PostFirstByteImpliesLlmRequesting {
     for v in ClientView:
-        PendingAssistantBubble{view: v}.state = placeholder
+        FirstByteTracker{view: v}.state = post_first_byte
         implies (ObservedPhase{view: v}.working = true
                  and ObservedPhase{view: v}.phase = llm_requesting)
 }
@@ -1245,18 +1119,15 @@ invariant WatchdogStaleOnlyWhenWorkingAndLive {
 
 -- The single surface this spec exposes to the rendering layer. The
 -- StateBar component reads StateBarDisplay; the MessageList reads
--- PendingAssistantBubble and InflightToolTimer to render the inline
--- indicators. The composition machinery (rules above) is encapsulated
--- — consumers do not access ObservedPhase, HeartbeatWatchdog, or
+-- InflightToolTimer to render the per-tool inline timer. The
+-- composition machinery (rules above) is encapsulated — consumers do
+-- not access ObservedPhase, HeartbeatWatchdog, FirstByteTracker, or
 -- LastKnownActivityCapture directly.
 surface ConversationActivityFeed {
     facing user_view: ClientView
 
     exposes:
         StateBarDisplay{view: user_view}
-        PendingAssistantBubble{view: user_view}.state
-        PendingAssistantBubble{view: user_view}.placeholder_since
-        PendingAssistantBubble{view: user_view}.request_id
         InflightToolTimer{view: user_view}.started_at  -- one per tool_use_id
 
     @guarantee SingleSourceOfElapsedTime
@@ -1363,18 +1234,13 @@ deferred Req008ReloadContinuity
 --     the stream itself is the progress signal and an additional
 --     counter is redundant.
 --
---   - Pending assistant bubble: placeholder bubble appears at the
---     bottom of the conversation during llm_requesting with no tokens;
---     contents swap from elapsed counter to streamed text on first
---     token without DOM remount. Implemented as a synthetic
---     `pending_agent` tail unit in `ui/src/conversation/renderUnits.ts`
---     (parallel to the existing `streaming_agent` unit), NOT by
---     amending the empty-message filter at MessageComponents.tsx —
---     no assistant message row exists in the messages table during
---     pre-first-byte llm_requesting (responses are persisted only
---     after LlmResponse), so there is nothing to retain via filter
---     amendment. The empty-message filter is left unchanged. See
---     design.md "Pending assistant bubble" for the reasoning.
+--   - Pending assistant bubble: REMOVED. An earlier draft (REQ-WPV-006)
+--     specified a synthetic placeholder bubble during pre-first-byte
+--     llm_requesting; review established the bubble's text exactly
+--     duplicated the StateBar's, which is a fixed-position chrome
+--     element always visible regardless of scroll. The pre-first-byte
+--     affordance lives in the StateBar (DisplayWhenAwaitingResponse)
+--     alone. See requirements.md REQ-WPV-006 note.
 --
 --   - Per-tool started_at carrier: a typed `tool_starts: BTreeMap<
 --     String, i64>` field on the assistant message's display_data,

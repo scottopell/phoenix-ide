@@ -282,10 +282,9 @@ pub enum SseWireEvent {
     },
     /// First-byte marker: emitted exactly once per LLM request,
     /// immediately before the first `Token` event for the same
-    /// `request_id`. Drives the StateBar's `thinking Ns` → `streaming`
-    /// transition and the pending-assistant-bubble's spec-level
-    /// `placeholder → streaming` edge. Specs:
-    /// `specs/working-phase-visibility/` REQ-WPV-006 / REQ-WPV-007.
+    /// `request_id`. Drives the StateBar's `awaiting LLM response Ns`
+    /// → `streaming` transition. Spec:
+    /// `specs/working-phase-visibility/` REQ-WPV-007.
     LlmFirstByte {
         sequence_id: i64,
         request_id: String,

@@ -556,44 +556,6 @@ describe('buildRenderUnits', () => {
       expect(out.tailUnits.filter((u) => u.kind === 'streaming_agent')).toEqual([]);
     });
 
-    // REQ-WPV-006: pre-first-byte placeholder bubble.
-    it('emits a pending_agent tail unit during llm_requesting with no streamingHandle', () => {
-      const out = buildRenderUnits({
-        messages: [],
-        pendingMessages: [],
-        convState: { type: 'llm_requesting', attempt: 1 },
-        streamingHandle: null,
-      });
-      expect(out.tailUnits.filter((u) => u.kind === 'pending_agent')).toEqual([
-        { kind: 'pending_agent', key: 'pending-agent' },
-      ]);
-    });
-
-    it('does NOT emit pending_agent once a streaming_agent is active', () => {
-      const out = buildRenderUnits({
-        messages: [],
-        pendingMessages: [],
-        convState: { type: 'llm_requesting', attempt: 1 },
-        streamingHandle: { key: 'stream-c1-12345' },
-      });
-      // The two slots are mutually exclusive — streaming_agent takes
-      // over the same screen position once first-byte arrives.
-      expect(out.tailUnits.filter((u) => u.kind === 'pending_agent')).toEqual([]);
-      expect(out.tailUnits.filter((u) => u.kind === 'streaming_agent')).toEqual([
-        { kind: 'streaming_agent', key: 'stream-c1-12345' },
-      ]);
-    });
-
-    it('does NOT emit pending_agent when not in llm_requesting', () => {
-      const out = buildRenderUnits({
-        messages: [],
-        pendingMessages: [],
-        convState: { type: 'idle' },
-        streamingHandle: null,
-      });
-      expect(out.tailUnits.filter((u) => u.kind === 'pending_agent')).toEqual([]);
-    });
-
     it('emits pending_user at the tail of historicalUnits; sub_agent_status before streaming_agent in tailUnits', () => {
       const state: ConversationState = {
         type: 'awaiting_sub_agents',

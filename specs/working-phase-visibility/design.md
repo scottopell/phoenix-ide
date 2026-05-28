@@ -85,7 +85,7 @@ LlmFirstByte {
     sequence_id: i64,
     /// Matches the `request_id` carried on `Token` events for the same
     /// LLM request, so the client can correlate the first-byte transition
-    /// to the right pending bubble.
+    /// with the right StateBar phase.
     request_id: String,
 }
 ```
@@ -184,7 +184,7 @@ shape to the client.
 // On the phase atom (or alongside convState):
 phaseStateUpdatedAt: number | null  // unix ms, from server
 
-// On the inline-artifact atoms (tool-use blocks, pending assistant bubble):
+// On the tool-use blocks:
 toolStartedAt: Record<ToolUseId, number>  // from display_data.tool_starts
 
 // On the connection observer:
@@ -334,56 +334,16 @@ header. Tick via the same one-second interval pattern used for the
 StateBar's `toolElapsedSeconds` (the `toolElapsedSeconds` pattern in StateBar.tsx) — extract to a
 shared `useElapsedSeconds(startedAt)` hook.
 
-**Pending assistant bubble:** there is no persisted empty assistant
-message to retain — text-only LLM responses are committed to the
-messages table only after the `LlmResponse` transition (the
-`Effect::persist_agent_message` path in
-`crates/phoenix-ide/src/state_machine/transition.rs` ~L711), so during
-the pre-first-byte `llm_requesting` window the message list literally
-contains no row for the in-flight turn. The live streaming bubble after the first byte is already materialised
-by the `renderUnits` machinery as a synthetic `streaming_agent` tail
-unit driven by `streamingBuffer` (see the `streaming_agent` tail unit
-in `ui/src/conversation/renderUnits.ts`).
-
-Add a new synthetic tail unit (`pending_agent` or similar) emitted by
-`renderUnits.ts` immediately before the existing `streaming_agent` tail
-unit's slot. Discriminator (when to emit):
-
-- The atom's `phase: ConversationState` discriminant equals
-  `'llm_requesting'` or `'seeded_llm_requesting'`, checked via
-  `atom.phase.type === 'llm_requesting'` etc. ConversationState is the
-  discriminated union defined in `ui/src/api.ts:215`; its discriminator
-  field is `type`, not `phase`.
-- `streamingBuffer` is empty (no tokens for the current request yet).
-- `PendingAssistantBubble` (the spec-level entity defined in
-  `working-phase-visibility.allium`) is in `placeholder` state — the
-  reducer mirrors this from the same triggers the spec's rules consume.
-
-**Why not `awaiting_llm`?** That variant is set client-side via
-`local_phase_change` (`ConversationPage.tsx:577`) the moment the user
-presses send, before any server StateChange has landed; its
-`state_updated_at` would be stale (the previous phase's timestamp) or
-absent, so the elapsed counter would start from the wrong time. The
-spec deliberately gates the timer on server-authoritative timestamps
-only, so the `awaiting_llm` window stays uncounted. If a "sending..."
-affordance is needed during that brief gap, render it separately
-without an elapsed counter (it's not the same artifact as the pending
-bubble).
-
-The unit's payload carries `placeholder_since` (sourced from the atom's
-`phaseStateUpdatedAt`); the React component renders the elapsed counter
-where the streamed text would appear. On the first token, the reducer
-clears `placeholder` (per the bubble lifecycle in the Allium spec), the
-`pending_agent` tail unit drops out of `renderUnits`, and the existing
-`streaming_agent` tail unit takes over the same screen slot — same
-visual position, contents transition from counter to streamed text. On
-the final assistant `Message` arrival, the streaming unit retires and
-the persisted message renders in its place.
-
-The empty-message filter (`hasRenderableContent` guard in `MessageComponents.tsx`) is NOT
-changed — it correctly hides genuinely empty historical agent rows. The
-placeholder is a derived/synthetic unit, not a row in the messages
-list.
+**Pre-first-byte affordance:** the pre-first-byte `llm_requesting`
+window is surfaced entirely through the StateBar (the
+`"awaiting LLM response Ns"` base reason composed in the rule above,
+plus the first-byte → `"streaming"` transition per REQ-WPV-007). An
+earlier draft of this spec (REQ-WPV-006) also added a synthetic
+`pending_agent` tail unit rendering a duplicate placeholder bubble in
+the message list; that requirement was removed after empirical review
+established the bubble's text exactly duplicated the StateBar's, which
+is a fixed-position chrome element always visible regardless of
+scroll. See requirements.md REQ-WPV-006 note.
 
 ## Connection-State Composition
 

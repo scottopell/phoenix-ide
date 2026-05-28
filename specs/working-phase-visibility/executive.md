@@ -76,16 +76,17 @@ in the sibling spec `specs/llm-retry-visibility/`.
 | Requirement | Status | Notes |
 |-------------|--------|-------|
 | **REQ-WPV-001:** Server-authoritative state-entry timestamp | ❌ New | Adds `state_updated_at` to `StateChange` (sourced from existing `Conversation.state_updated_at`); Init already exposes it via flatten. ts-rs regen + `parity_*` test update required |
-| **REQ-WPV-002:** Inline elapsed-time on in-flight artifacts | ❌ New | Tool widget timer reads from the assistant message's `display_data.tool_starts[tool_use_id]` map (typed `BTreeMap<String, i64>`); pending assistant bubble is the synthetic render unit specified by REQ-WPV-006 below |
+| **REQ-WPV-002:** Inline elapsed-time on in-flight artifacts | ❌ New | Tool widget timer reads from the assistant message's `display_data.tool_starts[tool_use_id]` map (typed `BTreeMap<String, i64>`). The pre-first-byte affordance lives in the StateBar (REQ-WPV-003); no separate placeholder bubble |
 | **REQ-WPV-003:** StateBar derivation rule | 🔄 Extend | The existing `stateText` composition block in `StateBar.tsx` gains retry-modifier and degraded-signal precedence; the existing `tool_executing` timer path becomes a special case of the generalised rule |
 | **REQ-WPV-004:** Heartbeat watchdog | ❌ New | Threshold 35s; depends on keep-alive switch from SSE comment to typed `ping` event |
 | **REQ-WPV-005:** Connection state does not mask agent state | 🔄 Rewrite | `StateBar.tsx` currently short-circuits on connection state; replace with composition that retains last-known activity with frozen elapsed |
-| **REQ-WPV-006:** Pending assistant bubble | ❌ New | Synthetic `pending_agent` tail unit added to `ui/src/conversation/renderUnits.ts` (parallel to the existing `streaming_agent` unit), gated on `atom.phase.type === 'llm_requesting'` + empty `streamingBuffer`. The `hasRenderableContent` guard in `MessageComponents.tsx` is NOT changed — the placeholder is a derived render unit, not a message row |
+| **REQ-WPV-006:** REMOVED | — | Originally specified a pending assistant placeholder bubble. Removed: text duplicated the StateBar (a fixed-position chrome element always visible). See requirements.md REQ-WPV-006 note |
 | **REQ-WPV-007:** First-byte sub-phase distinction | ❌ New | Driven by new `LlmFirstByte` event; `streaming` displays without elapsed counter |
 | **REQ-WPV-008:** Display continuity across reload | ❌ New | Acceptance criterion for REQ-WPV-001 + REQ-WPV-005; integration-test target |
 
-**Progress:** 0 of 8 implemented. REQ-WPV-003 and REQ-WPV-005 are
-extensions/rewrites of existing logic; the other six are greenfield
+**Progress:** 0 of 7 active requirements implemented. REQ-WPV-006 was
+removed before implementation. REQ-WPV-003 and REQ-WPV-005 are
+extensions/rewrites of existing logic; the other five are greenfield
 additions on existing infrastructure.
 
 ## Cross-Spec Dependencies
@@ -128,18 +129,10 @@ The corresponding Allium spec is
   `fresh` on any event. Invariant: `stale` is reachable only from
   `connected` (a reconnecting/offline socket already conveys the same
   information).
-- `PendingAssistantBubble` lifecycle (reusable across turns; idle
-  ground state is `not_present`): `not_present → placeholder` (entering
-  `llm_requesting`, no tokens) → `streaming` (first token received) →
-  `not_present` on the next assistant `Message` event (turn complete).
-  The "phase exited llm_requesting without any token" path also returns
-  the bubble to `not_present`. The state enum has three values —
-  `not_present | placeholder | streaming` — no terminal states, so the
-  bubble can re-arm on every subsequent turn.
 - Invariants: exactly one live timer in the StateBar at a time; the
-  inline-artifact timer (on a tool or pending bubble) is independent and
-  may coexist; `LastKnownActivity` is set iff `connectionState !=
-  connected` and we transitioned from a working phase.
+  inline per-tool timer is independent and may coexist;
+  `LastKnownActivity` is set iff `connectionState != connected` and we
+  transitioned from a working phase.
 - Surface `ConversationActivityFeed` facing the UI, exposing the derived
   `DisplayedActivity` (and the per-artifact elapsed values) without
   exposing the underlying composition machinery.

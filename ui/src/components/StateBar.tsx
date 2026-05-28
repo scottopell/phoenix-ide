@@ -501,8 +501,7 @@ export function StateBar({
     // Strip a trailing `...` from the base label: descriptions for
     // working phases (`llm_requesting` → "awaiting LLM response...")
     // already end in an ellipsis. Appending `... <elapsed>` directly
-    // would produce "awaiting LLM response... ... 7s". Same strip the
-    // PendingAssistantBubble applies before rendering its label.
+    // would produce "awaiting LLM response... ... 7s".
     const base = getStateDescription(phase).replace(/\.{3}$/, '');
     const withElapsed =
       elapsedSeconds > 0 ? `${base} ... ${formatElapsed(elapsedSeconds)}` : base;

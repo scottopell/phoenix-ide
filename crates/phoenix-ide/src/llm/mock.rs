@@ -10,8 +10,9 @@
 //! - `[[perf:N]]` — deterministic text-only response of ~N words
 //!   (performance fingerprint, no rand).
 //! - `[[ttft:N]]` — override time-to-first-token sleep with N ms.
-//!   Drives the pre-first-byte `pending_agent` placeholder bubble
-//!   (specs/working-phase-visibility/ REQ-WPV-006).
+//!   Useful for exercising the StateBar's pre-first-byte
+//!   `awaiting LLM response Ns` window
+//!   (specs/working-phase-visibility/ REQ-WPV-007).
 //! - `[[stall:after_n,ms]]` — emit `after_n` chunks, sleep `ms`,
 //!   then continue. Drives the heartbeat watchdog (REQ-WPV-004)
 //!   without ending the turn.
@@ -678,8 +679,8 @@ impl LlmService for MockLlmService {
         };
 
         // Initial latency (time-to-first-token). `[[ttft:N]]` overrides
-        // the default 200ms — useful for exercising the pre-first-byte
-        // `pending_agent` placeholder bubble.
+        // the default 200ms — useful for exercising the StateBar's
+        // pre-first-byte `awaiting LLM response Ns` window.
         let ttft_ms = parse_ttft_ms(request).unwrap_or(200);
         tokio::time::sleep(std::time::Duration::from_millis(ttft_ms)).await;
 

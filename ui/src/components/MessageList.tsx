@@ -10,7 +10,6 @@ import {
   formatMessageTime,
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
-import { PendingAssistantBubble } from './PendingAssistantBubble';
 import { MessageContextMenu } from './MessageContextMenu';
 import { useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
@@ -133,12 +132,6 @@ function renderTailUnit(
     case 'streaming_agent':
       if (!slug) return null;
       return <StreamingMessage slug={slug} />;
-    case 'pending_agent':
-      // REQ-WPV-006: pre-first-byte placeholder bubble. The component
-      // reads `phaseStateUpdatedAt` from the atom internally so the
-      // elapsed counter ticks live without prop drilling.
-      if (!slug) return null;
-      return <PendingAssistantBubble slug={slug} />;
   }
 }
 
@@ -151,8 +144,7 @@ function renderUnit(
 ): JSX.Element | null {
   if (
     unit.kind === 'sub_agent_status' ||
-    unit.kind === 'streaming_agent' ||
-    unit.kind === 'pending_agent'
+    unit.kind === 'streaming_agent'
   ) {
     return renderTailUnit(unit, slug);
   }

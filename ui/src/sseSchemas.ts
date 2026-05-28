@@ -258,9 +258,8 @@ export const SseTokenDataSchema = v.looseObject({
 
 /** `llm_first_byte`: marker emitted exactly once per LLM request,
  *  immediately before the first `Token` event for the same `request_id`.
- *  Drives the StateBar's `awaiting LLM response Ns` → `streaming` transition and
- *  the pending-assistant-bubble's spec-level `placeholder → streaming`
- *  edge. Specs: `specs/working-phase-visibility/` REQ-WPV-006 / 007. */
+ *  Drives the StateBar's `awaiting LLM response Ns` → `streaming` transition.
+ *  Spec: `specs/working-phase-visibility/` REQ-WPV-007. */
 export const SseLlmFirstByteDataSchema = v.looseObject({
   sequence_id: v.number(),
   request_id: v.string(),

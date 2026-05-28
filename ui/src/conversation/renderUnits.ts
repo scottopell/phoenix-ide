@@ -39,15 +39,7 @@ export type HistoricalUnit =
 
 export type TailUnit =
   | { kind: 'sub_agent_status'; key: string; state: AwaitingSubAgentsState }
-  | { kind: 'streaming_agent'; key: string }
-  // REQ-WPV-006: synthetic "awaiting LLM response Ns" bubble during pre-first-byte
-  // llm_requesting. Lives parallel to `streaming_agent` — same screen
-  // slot, different contents (elapsed counter vs streamed text). Only
-  // emitted when the phase is llm_requesting AND no streaming handle
-  // exists (no tokens yet for the current request). The leaf component
-  // reads `phaseStateUpdatedAt` from the atom to render the live counter;
-  // this carrier only conveys the key for React reconciliation.
-  | { kind: 'pending_agent'; key: string };
+  | { kind: 'streaming_agent'; key: string };
 
 export type RenderUnit = HistoricalUnit | TailUnit;
 
@@ -75,13 +67,6 @@ export interface BuildInputs {
  *  uses this to preserve the inner component identity across
  *  re-derivations. */
 export const SUB_AGENT_STATUS_KEY = 'sub-agent-status';
-
-/** Singleton key for the pending-assistant-bubble tail unit
- *  (REQ-WPV-006). Distinct from the streaming bubble's key (which is
- *  per-request derived from the streamingHandle) so React reconciles
- *  the two as separate components, even though they occupy the same
- *  screen slot. */
-export const PENDING_AGENT_KEY = 'pending-agent';
 
 function getMessageType(msg: Message): string {
   return msg.message_type || msg.type || '';
@@ -214,21 +199,6 @@ export function buildRenderUnits(inputs: BuildInputs): RenderUnits {
     tailUnits.push({
       kind: 'streaming_agent',
       key: streamingHandle.key,
-    });
-  } else if (
-    convState.type === 'llm_requesting' ||
-    convState.type === 'seeded_llm_requesting' ||
-    convState.type === 'awaiting_llm'
-  ) {
-    // REQ-WPV-006: pre-first-byte llm_requesting with no streaming
-    // buffer yet — emit a placeholder bubble so the user sees a
-    // "awaiting LLM response Ns" anchor at the spot where the assistant text will
-    // appear. The `streaming_agent` unit above is the post-first-byte
-    // continuation of this slot; the two are mutually exclusive by
-    // construction (the `else if` here).
-    tailUnits.push({
-      kind: 'pending_agent',
-      key: PENDING_AGENT_KEY,
     });
   }
 

@@ -177,33 +177,24 @@ misleading. The "last:" prefix communicates that this is stale data.
 
 ---
 
-### REQ-WPV-006: Pending Assistant Bubble During llm_requesting
+### REQ-WPV-006: REMOVED
 
-WHEN the conversation phase is `llm_requesting` (or its variants:
-`awaiting_llm`, `seeded_llm_requesting`) AND no tokens have been received
-for the current LLM request
-THE SYSTEM SHALL render an empty assistant message bubble at the bottom of
-the conversation containing the elapsed-time indicator
+Originally specified a synthetic placeholder assistant bubble during the
+pre-first-byte `llm_requesting` window. Removed after empirical review:
+the bubble's text content (`awaiting LLM response Ns` + retry suffix)
+exactly duplicated the StateBar's text (REQ-WPV-003), which is a
+fixed-position chrome element always visible regardless of scroll. The
+spec's original rationale claimed the StateBar "can scroll out of the
+user's field of view" — that premise was wrong. Without unique
+information value, the bubble's only contribution was a spatial anchor,
+which did not justify the cost of an extra render unit, a tail-unit
+component, and the React/Virtuoso reconciliation work to make
+pre-first-byte → streaming a continuous-identity transition (which the
+prior implementation did NOT achieve — see the PR thread that led to
+removal).
 
-WHEN the first token arrives for that request
-THE SYSTEM SHALL transition the bubble's contents from the elapsed-time
-placeholder to the streaming text (REQ-WPV-002)
-
-WHEN the phase exits `llm_requesting` without any tokens having arrived (an
-error or cancellation path)
-THE SYSTEM SHALL remove the placeholder bubble
-
-**Rationale:** During the pre-first-byte window the conversation has no
-assistant row in the messages table to render — text-only LLM responses
-are persisted only after the `LlmResponse` transition completes (see
-design.md). The absence *is* the information the user needs ("we're
-waiting"), so the spec mandates a placeholder anchored to the spot
-where the text will appear, giving the user spatial continuity. The
-placeholder is implemented as a derived/synthetic render unit (see
-design.md "Pending assistant bubble") rather than a row in the
-messages list; the existing `hasRenderableContent` guard in
-`MessageComponents.tsx` continues to correctly hide genuinely empty
-historical agent rows.
+The pre-first-byte phase is still surfaced to the user via the
+StateBar's `awaiting LLM response Ns` text (REQ-WPV-003 / REQ-WPV-007).
 
 ---
 
