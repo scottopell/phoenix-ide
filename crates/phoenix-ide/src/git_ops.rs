@@ -256,12 +256,11 @@ pub(crate) fn materialize_branch(cwd: &Path, branch_name: &str) -> Result<(), Gi
             )
             .is_ok()
         {
-            let current_head =
-                run_git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]).unwrap_or_default();
-            if current_head.trim() == branch_name {
+            if let Some(worktree_path) = find_branch_in_worktree_list(cwd, branch_name) {
                 tracing::debug!(
                     branch = %branch_name,
-                    "Cannot fast-forward: branch is currently checked out"
+                    worktree = %worktree_path,
+                    "Cannot fast-forward: branch is checked out in a worktree"
                 );
             } else {
                 let _ = run_git(
@@ -695,6 +694,27 @@ mod tests {
         run_git(dir, &["commit", "--allow-empty", "-q", "-m", "init"]).unwrap();
     }
 
+    fn commit_file(dir: &Path, name: &str, content: &str, message: &str) {
+        std::fs::write(dir.join(name), content).unwrap();
+        run_git(dir, &["add", name]).unwrap();
+        run_git(dir, &["commit", "-q", "-m", message]).unwrap();
+    }
+
+    fn clone_repo(source: &Path, dest: &Path) {
+        run_git(
+            std::env::current_dir().unwrap().as_path(),
+            &[
+                "clone",
+                "--quiet",
+                source.to_str().unwrap(),
+                dest.to_str().unwrap(),
+            ],
+        )
+        .unwrap();
+        run_git(dest, &["config", "user.email", "probe@test"]).unwrap();
+        run_git(dest, &["config", "user.name", "probe"]).unwrap();
+    }
+
     #[test]
     fn repo_root_from_phoenix_worktree_matches_canonical_shape() {
         let root = Path::new("/repo");
@@ -782,6 +802,108 @@ mod tests {
         run_git(clone.path(), &["config", "user.name", "probe"]).unwrap();
 
         assert_eq!(effective_base_ref(clone.path(), "main"), "origin/main");
+    }
+
+    #[test]
+    fn materialize_branch_does_not_move_branch_checked_out_in_main_worktree() {
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path());
+
+        let clone = TempDir::new().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        let original_main = run_git(clone.path(), &["rev-parse", "main"]).unwrap();
+
+        run_git(clone.path(), &["branch", "task-pending-test", "main"]).unwrap();
+        let pending_worktree = TempDir::new().unwrap();
+        run_git(
+            clone.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                pending_worktree.path().to_str().unwrap(),
+                "task-pending-test",
+            ],
+        )
+        .unwrap();
+
+        commit_file(
+            upstream.path(),
+            "upstream.txt",
+            "new upstream content\n",
+            "advance main",
+        );
+        let advanced_main = run_git(upstream.path(), &["rev-parse", "main"]).unwrap();
+
+        materialize_branch(pending_worktree.path(), "main").unwrap();
+
+        assert_eq!(
+            run_git(clone.path(), &["rev-parse", "origin/main"]).unwrap(),
+            advanced_main
+        );
+        assert_eq!(
+            run_git(clone.path(), &["rev-parse", "main"]).unwrap(),
+            original_main
+        );
+        assert_eq!(
+            run_git(clone.path(), &["status", "--porcelain"]).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn materialize_branch_does_not_move_branch_checked_out_in_other_worktree() {
+        let upstream = TempDir::new().unwrap();
+        init_repo(upstream.path());
+        run_git(upstream.path(), &["checkout", "-q", "-b", "feature"]).unwrap();
+        commit_file(
+            upstream.path(),
+            "feature.txt",
+            "old feature content\n",
+            "create feature",
+        );
+        let original_feature = run_git(upstream.path(), &["rev-parse", "feature"]).unwrap();
+        run_git(upstream.path(), &["checkout", "-q", "main"]).unwrap();
+
+        let clone = TempDir::new().unwrap();
+        clone_repo(upstream.path(), clone.path());
+        run_git(clone.path(), &["branch", "feature", &original_feature]).unwrap();
+        let feature_worktree = TempDir::new().unwrap();
+        run_git(
+            clone.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                feature_worktree.path().to_str().unwrap(),
+                "feature",
+            ],
+        )
+        .unwrap();
+
+        run_git(upstream.path(), &["checkout", "-q", "feature"]).unwrap();
+        commit_file(
+            upstream.path(),
+            "feature.txt",
+            "new feature content\n",
+            "advance feature",
+        );
+        let advanced_feature = run_git(upstream.path(), &["rev-parse", "feature"]).unwrap();
+
+        materialize_branch(clone.path(), "feature").unwrap();
+
+        assert_eq!(
+            run_git(clone.path(), &["rev-parse", "origin/feature"]).unwrap(),
+            advanced_feature
+        );
+        assert_eq!(
+            run_git(clone.path(), &["rev-parse", "feature"]).unwrap(),
+            original_feature
+        );
+        assert_eq!(
+            run_git(feature_worktree.path(), &["status", "--porcelain"]).unwrap(),
+            ""
+        );
     }
 
     #[test]
