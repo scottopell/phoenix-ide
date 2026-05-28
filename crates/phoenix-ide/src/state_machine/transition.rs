@@ -50,6 +50,41 @@ struct TaskFileSnapshot {
     plan: String,
 }
 
+/// Reject the proposal if any other taskmd-pattern file in `tasks_dir_abs`
+/// already uses `id`. The proposed file itself (matched by `current_filename`)
+/// is skipped; non-taskmd siblings (`_TEMPLATE.md`, `README.md`, anything that
+/// doesn't match the `NNNNN-pX-status--slug.md` pattern) are ignored.
+fn check_taskmd_id_unique(
+    tasks_dir_abs: &Path,
+    tasks_dir_name: &str,
+    id: &str,
+    current_filename: &str,
+) -> Result<(), String> {
+    let Ok(entries) = std::fs::read_dir(tasks_dir_abs) else {
+        return Ok(());
+    };
+    for entry in entries.flatten() {
+        let other_name = entry.file_name().to_string_lossy().into_owned();
+        if other_name == current_filename {
+            continue;
+        }
+        let Some(parsed) = taskmd_core::filename::parse_filename(&other_name) else {
+            continue;
+        };
+        if parsed.id == id {
+            return Err(format!(
+                "task ID '{id}' is already used by \
+                 '{tasks_dir_name}/{other_name}'. The prompt-time \
+                 'next available' hint is computed, not reserved -- \
+                 pick a different ID (e.g. increment the 3-digit \
+                 sequence) and rename your task file before calling \
+                 propose_task again."
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Read and validate a task file referenced by `propose_task`.
 ///
 /// The task file may be either a taskmd 1.0 filename (`NNNNN-pX-status--slug.md`
@@ -129,27 +164,7 @@ fn resolve_task_file(
             // without a reservation (no atomic taskmd new), so two concurrent
             // drafts on the same worktree can be told the same ID. Catch the
             // collision here before the proposal is shown for approval.
-            let tasks_dir_abs = cwd.join(tasks_dir_name);
-            if let Ok(entries) = std::fs::read_dir(&tasks_dir_abs) {
-                for entry in entries.flatten() {
-                    let other_name = entry.file_name().to_string_lossy().into_owned();
-                    if other_name == filename {
-                        continue;
-                    }
-                    if let Some(parsed) = taskmd_core::filename::parse_filename(&other_name) {
-                        if parsed.id == *id {
-                            return Err(format!(
-                                "task ID '{id}' is already used by \
-                                 '{tasks_dir_name}/{other_name}'. The prompt-time \
-                                 'next available' hint is computed, not reserved -- \
-                                 pick a different ID (e.g. increment the 3-digit \
-                                 sequence) and rename your task file before calling \
-                                 propose_task again."
-                            ));
-                        }
-                    }
-                }
-            }
+            check_taskmd_id_unique(&cwd.join(tasks_dir_name), tasks_dir_name, id, filename)?;
         }
         TaskSource::PlainMarkdown { .. } => {
             // Any markdown file inside the worktree is acceptable as a plain
@@ -4341,9 +4356,8 @@ mod resolve_task_file_tests {
             "# Second\n",
         )
         .unwrap();
-        let err =
-            resolve_task_file(tmp.path(), "tasks", "tasks/12345-p2-ready--second-draft.md")
-                .unwrap_err();
+        let err = resolve_task_file(tmp.path(), "tasks", "tasks/12345-p2-ready--second-draft.md")
+            .unwrap_err();
         assert!(err.contains("already used by"), "got: {err}");
         assert!(err.contains("12345-p1-ready--first-draft.md"), "got: {err}");
     }
