@@ -570,7 +570,9 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
 ///
 /// `stall = Some((after_n, ms))` inserts a single sleep of `ms`
 /// milliseconds after the first `after_n` chunks have been sent (and
-/// before the (after_n+1)th). Set via the `[[stall:after_n,ms]]`
+/// before the (after_n+1)th). `after_n = 0` is special-cased to stall
+/// *before* the first chunk lands — useful for driving the watchdog
+/// when no tokens flow at all. Set via the `[[stall:after_n,ms]]`
 /// test marker. The chunk channel stays open across the sleep, so
 /// the turn does NOT end during the stall — this is exactly the
 /// failure mode the heartbeat watchdog (REQ-WPV-004) is meant to
@@ -584,6 +586,7 @@ async fn stream_text_with_optional_stall(
     let mut chars = text.chars().peekable();
     let mut buf = String::new();
     let mut chunks_sent: usize = 0;
+    let mut stall_fired = false;
 
     while let Some(ch) = chars.next() {
         buf.push(ch);
@@ -591,16 +594,19 @@ async fn stream_text_with_optional_stall(
         let flush = ch.is_whitespace() || ch == '\n' || buf.len() > 15 || chars.peek().is_none();
 
         if flush && !buf.is_empty() {
-            let _ = chunk_tx.send(TokenChunk::Text(buf.clone()));
-            buf.clear();
-            chunks_sent += 1;
             // Mid-stream stall hook (REQ-WPV-004): fires exactly once,
-            // immediately after the `after_n`th chunk lands on the wire.
+            // before sending the (after_n+1)th chunk. `after_n = 0`
+            // fires before the very first chunk, so the watchdog
+            // observes a stalled stream without any tokens flowing.
             if let Some((after_n, ms)) = stall {
-                if chunks_sent == after_n {
+                if !stall_fired && chunks_sent >= after_n {
+                    stall_fired = true;
                     tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
                 }
             }
+            let _ = chunk_tx.send(TokenChunk::Text(buf.clone()));
+            buf.clear();
+            chunks_sent += 1;
             // Small delay between chunks: 15-40ms feels realistic
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }

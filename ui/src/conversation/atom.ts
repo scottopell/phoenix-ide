@@ -1098,7 +1098,11 @@ export function conversationReducer(
     case 'local_phase_change':
       if (action.expectedConversationId !== atom.conversationId) return atom;
       // Optimistic client-side phase update — does NOT bump lastSequenceId.
-      return { ...atom, phase: action.phase };
+      // Clear `phaseStateUpdatedAt` so the StateBar / pending bubble do not
+      // render an elapsed counter using the *previous* phase's server
+      // timestamp. The next server `state_change` will install the
+      // authoritative entry time for the new phase.
+      return { ...atom, phase: action.phase, phaseStateUpdatedAt: null };
 
     case 'local_conversation_update':
       if (action.expectedConversationId !== atom.conversationId) return atom;
