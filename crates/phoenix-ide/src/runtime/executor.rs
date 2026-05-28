@@ -2011,11 +2011,94 @@ where
     /// Dispatch tool execution: resolve the tool, build the execution context,
     /// spawn the background task, and wire up the outcome channel.
     #[allow(clippy::too_many_lines)]
+    /// REQ-WPV-002: broadcast `tool_starts[tool_use_id] = now_unix_ms` on
+    /// the parent assistant message via `MessageUpdated` so the client's
+    /// tool widget can render a live elapsed counter sourced from the
+    /// server clock. The state machine is guaranteed to be in
+    /// `ToolExecuting` when `dispatch_tool_execution` fires (only
+    /// `Effect::ExecuteTool { tool }` reaches that method, and that
+    /// effect is only emitted on entry to / between tools of
+    /// `ToolExecuting`), so the destructure below is structurally safe;
+    /// the defensive `else` arm covers a hypothetical future call path.
+    ///
+    /// Why broadcast-only (no DB write): the assistant message that
+    /// owns this tool_use is NOT persisted yet during the tool round —
+    /// it lives in the state machine via `BroadcastAssistantMessage`
+    /// (the eager broadcast, ring-replayable per sse_wire.allium's
+    /// `EagerAssistantMessageAppendedToReplayRing`) and the DB write
+    /// happens later via `PersistCheckpoint` at the end of the round.
+    /// `update_message_display_data` against an unpersisted message
+    /// row no-ops with `MessageNotFound`. The client merges the
+    /// broadcast `MessageUpdated.display_data` shallowly onto the
+    /// in-memory message — that's the entire surface the live elapsed
+    /// counter consumes (REQ-WPV-002). Once the tool result lands and
+    /// the round checkpoint persists, the message's permanent
+    /// `display_data` doesn't need `tool_starts` because the
+    /// per-result `duration_ms` (`schema.rs:649`) takes over the
+    /// display.
+    fn broadcast_tool_start_timestamp(&self, tool_use_id: &str) {
+        let assistant_message_id = match &self.state {
+            ConvState::ToolExecuting {
+                assistant_message, ..
+            }
+            | ConvState::CancellingTool {
+                assistant_message, ..
+            } => assistant_message.message_id.clone(),
+            _ => {
+                tracing::warn!(
+                    conv_id = %self.context.conversation_id,
+                    tool_use_id = %tool_use_id,
+                    state = self.state.variant_name(),
+                    "tool_starts broadcast skipped — dispatch_tool_execution called outside ToolExecuting/CancellingTool"
+                );
+                return;
+            }
+        };
+
+        // Build the patch: { "tool_starts": { <id>: <unix_ms> } }.
+        // The client's MessageUpdated reducer merges this shallowly
+        // onto the existing message's display_data, so omitting the
+        // existing bash/etc. keys is safe.
+        let now_ms = Utc::now().timestamp_millis();
+        let mut tool_starts = serde_json::Map::new();
+        tool_starts.insert(
+            tool_use_id.to_string(),
+            serde_json::Value::Number(serde_json::Number::from(now_ms)),
+        );
+        let mut patch = serde_json::Map::new();
+        patch.insert(
+            "tool_starts".to_string(),
+            serde_json::Value::Object(tool_starts),
+        );
+        let display_for_broadcast = serde_json::Value::Object(patch);
+
+        let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
+            sequence_id: seq,
+            message_id: assistant_message_id.clone(),
+            display_data: Some(display_for_broadcast),
+            content: None,
+            duration_ms: None,
+        });
+    }
+
     async fn dispatch_tool_execution(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
         // Special handling for spawn_agents tool
         if tool.name() == "spawn_agents" {
             return self.handle_spawn_agents_tool(tool).await;
         }
+
+        // REQ-WPV-002: stamp the per-tool start time into the parent
+        // assistant message's `display_data.tool_starts[tool_use_id]` map
+        // (unix ms, server-authoritative) and broadcast `MessageUpdated`
+        // so the client's tool widget can render a live elapsed counter
+        // that survives reconnect / reload / multi-tab. The runtime
+        // discovers the parent message_id by destructuring the current
+        // ToolExecuting state — the state machine guarantees we're in
+        // ToolExecuting when this method is called (the only path here
+        // is `Effect::ExecuteTool { tool }` which fires on entry to
+        // ToolExecuting). If the destructure fails it's a bug and we
+        // silently skip the stamp rather than panic.
+        self.broadcast_tool_start_timestamp(&tool.id);
 
         // Typed oneshot channel: background task gets Sender<ToolExecOutcome>,
         // physically cannot send an LlmOutcome or other type.

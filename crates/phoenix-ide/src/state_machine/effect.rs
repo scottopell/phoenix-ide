@@ -265,13 +265,38 @@ impl Effect {
     ///
     /// The `cwd` parameter is used to determine whether to strip cd prefixes from
     /// bash commands in the display (REQ-BASH-011).
+    ///
+    /// `final_attempt` is the `attempt` field of the `LlmRequesting` /
+    /// `AwaitingContinuation` state being transitioned out of — i.e. how
+    /// many tries the LLM took to produce this response. The helper
+    /// stamps `retry_count = saturating_sub(1)` into the message's
+    /// `display_data` so the UI can render a post-hoc `(retried Nx)`
+    /// badge on the persisted assistant message (specs/llm-retry-visibility/
+    /// REQ-LRV-006). 1 means "succeeded on first try"; the badge is
+    /// hidden in that case.
     pub fn persist_agent_message(
         blocks: Vec<ContentBlock>,
         usage: Option<UsageData>,
         cwd: &Path,
         message_id: String,
+        final_attempt: u32,
     ) -> Self {
-        let display_data = compute_bash_display_data(&blocks, cwd);
+        let mut display_data = compute_bash_display_data(&blocks, cwd);
+        let retry_count = final_attempt.saturating_sub(1);
+        if retry_count > 0 {
+            // Only stamp the key when we actually retried — keeps the
+            // persisted JSON minimal for the common no-retry case and
+            // lets the UI's `display_data?.retry_count > 0` check
+            // double as a `display_data?.retry_count !== undefined`
+            // guard.
+            let display_obj = display_data.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+            if let Some(map) = display_obj.as_object_mut() {
+                map.insert(
+                    "retry_count".to_string(),
+                    Value::Number(serde_json::Number::from(retry_count)),
+                );
+            }
+        }
         Effect::PersistMessage {
             content: MessageContent::agent(blocks),
             display_data,

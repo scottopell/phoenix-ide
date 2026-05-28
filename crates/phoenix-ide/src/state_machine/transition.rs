@@ -188,6 +188,30 @@ fn resolve_task_file(
 /// `Effect::ScheduleRetry` handler, which sends the value on the wire.
 pub const MAX_RETRY_ATTEMPTS: u32 = 3;
 
+/// Stamp `retry_count = saturating_sub(1)` onto an assistant message's
+/// display_data (the JSON-blob form `Option<serde_json::Value>`) iff
+/// the final attempt count is > 1. No-op for first-try successes so
+/// the persisted JSON stays minimal and the UI's
+/// `retry_count > 0` check doubles as a presence check. Used by both
+/// the `persist_agent_message` helper (no-tool LlmResponse path) and
+/// the tool-round inline assistant_message build
+/// (handle_core_llm_response's ToolExecuting branch). Specs:
+/// `specs/llm-retry-visibility/` REQ-LRV-006.
+fn stamp_retry_count(display_data: &mut Option<serde_json::Value>, final_attempt: u32) {
+    let retry_count = final_attempt.saturating_sub(1);
+    if retry_count == 0 {
+        return;
+    }
+    let display_obj =
+        display_data.get_or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    if let Some(map) = display_obj.as_object_mut() {
+        map.insert(
+            "retry_count".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(retry_count)),
+        );
+    }
+}
+
 /// Project a runtime `ErrorKind` onto the three retryable
 /// `LlmAttemptReason` variants. `is_retryable()` is the gate for
 /// `Effect::ScheduleRetry`; this helper is the wire-side projection of
@@ -735,9 +759,10 @@ fn handle_core_llm_response(
     else {
         unreachable!("handle_core_llm_response called with non-LlmResponse event");
     };
-    let CoreState::LlmRequesting { .. } = state else {
+    let CoreState::LlmRequesting { attempt } = state else {
         unreachable!("handle_core_llm_response called in non-LlmRequesting state");
     };
+    let final_attempt = *attempt;
 
     if tool_calls.is_empty() && content.is_empty() {
         tracing::debug!("LLM returned end_turn with empty content — no message to persist");
@@ -753,6 +778,7 @@ fn handle_core_llm_response(
                 Some(usage_data),
                 &context.working_dir,
                 request_id,
+                final_attempt,
             ))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_agent_done()));
@@ -761,7 +787,13 @@ fn handle_core_llm_response(
     // Has tools -> ToolExecuting
     let first = tool_calls[0].clone();
     let rest = tool_calls[1..].to_vec();
-    let display_data = compute_bash_display_data(&content, &context.working_dir);
+    let mut display_data = compute_bash_display_data(&content, &context.working_dir);
+    // REQ-LRV-006: same retry_count stamp as the no-tool path
+    // (persist_agent_message above). The tool-round flow persists the
+    // assistant message via PersistCheckpoint, not persist_agent_message,
+    // so we have to inline the stamp here instead of going through the
+    // helper.
+    stamp_retry_count(&mut display_data, final_attempt);
     let assistant_message =
         AssistantMessage::new(request_id, content, Some(usage_data), display_data);
     // Broadcast (not persist) the assistant message now so the UI's main
@@ -1703,7 +1735,7 @@ pub fn transition_parent(
         // issues with guards on the same event payload.
         // ============================================================
         (
-            ParentState::Core(CoreState::LlmRequesting { .. }),
+            ParentState::Core(CoreState::LlmRequesting { attempt }),
             ParentEvent::Core(CoreEvent::LlmResponse {
                 content,
                 tool_calls,
@@ -1712,6 +1744,7 @@ pub fn transition_parent(
                 ..
             }),
         ) => {
+            let final_attempt = *attempt;
             // REQ-BED-028: propose_task interception (checked first).
             //
             // Find the propose_task call whether it parsed as typed input or
@@ -1954,8 +1987,14 @@ pub fn transition_parent(
 
             // REQ-BED-019: Context exhaustion check (after propose_task/ask_user_question)
             if should_trigger_continuation(&usage_data, context.context_window) {
-                let tr =
-                    handle_context_exhaustion(context, content, tool_calls, usage_data, request_id);
+                let tr = handle_context_exhaustion(
+                    context,
+                    content,
+                    tool_calls,
+                    usage_data,
+                    request_id,
+                    final_attempt,
+                );
                 return Ok(ParentTransitionResult {
                     new_state: ParentState::try_from(tr.new_state)
                         .expect("handle_context_exhaustion returns parent-valid state"),
@@ -2233,7 +2272,7 @@ pub fn transition_sub_agent(
         // borrow-after-move issues with guards)
         // ============================================================
         (
-            SubAgentState::Core(CoreState::LlmRequesting { .. }),
+            SubAgentState::Core(CoreState::LlmRequesting { attempt }),
             SubAgentEvent::Core(CoreEvent::LlmResponse {
                 content,
                 tool_calls,
@@ -2242,10 +2281,17 @@ pub fn transition_sub_agent(
                 ..
             }),
         ) => {
+            let final_attempt = *attempt;
             // Context exhaustion check first (sub-agent fails immediately)
             if should_trigger_continuation(&usage_data, context.context_window) {
-                let tr =
-                    handle_context_exhaustion(context, content, tool_calls, usage_data, request_id);
+                let tr = handle_context_exhaustion(
+                    context,
+                    content,
+                    tool_calls,
+                    usage_data,
+                    request_id,
+                    final_attempt,
+                );
                 return Ok(SubAgentTransitionResult {
                     new_state: SubAgentState::try_from(tr.new_state)
                         .expect("sub-agent context exhaustion returns Failed"),
@@ -2265,6 +2311,7 @@ pub fn transition_sub_agent(
                         Some(usage_data),
                         &context.working_dir,
                         request_id,
+                        final_attempt,
                     ));
                 }
                 return Ok(tr.with_effect(Effect::PersistState).with_effect(
@@ -2313,6 +2360,7 @@ pub fn transition_sub_agent(
                             Some(usage_data),
                             &context.working_dir,
                             request_id,
+                            final_attempt,
                         ))
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::NotifyParent {
@@ -2331,6 +2379,7 @@ pub fn transition_sub_agent(
                             Some(usage_data),
                             &context.working_dir,
                             request_id,
+                            final_attempt,
                         ))
                         .with_effect(Effect::PersistState)
                         .with_effect(Effect::NotifyParent {
@@ -2588,6 +2637,7 @@ fn handle_context_exhaustion(
     tool_calls: Vec<ToolCall>,
     usage_data: UsageData,
     request_id: String,
+    final_attempt: u32,
 ) -> TransitionResult {
     use crate::state_machine::state::SubAgentOutcome;
 
@@ -2603,6 +2653,7 @@ fn handle_context_exhaustion(
                 Some(usage_data),
                 &ctx.working_dir,
                 request_id,
+                final_attempt,
             ))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
@@ -2621,6 +2672,7 @@ fn handle_context_exhaustion(
                 Some(usage_data),
                 &ctx.working_dir,
                 request_id,
+                final_attempt,
             ))
             .with_effect(Effect::PersistState)
             .with_effect(Effect::NotifyParent {
@@ -3016,6 +3068,7 @@ mod tests {
                 cache_creation_tokens: 0,
             },
             "test-req-id".to_string(),
+        1,
         );
 
         // Sub-agent should go to Failed, not AwaitingContinuation
@@ -3073,6 +3126,7 @@ mod tests {
                 cache_creation_tokens: 0,
             },
             "test-req-id".to_string(),
+        1,
         );
 
         // Parent should go to AwaitingContinuation

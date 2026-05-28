@@ -864,19 +864,35 @@ export function conversationReducer(
       return applyIfNewer(atom, 'sse_message_updated', action.sequenceId, (a) => {
         const idx = a.messages.findIndex((m) => m.message_id === action.messageId);
         if (idx < 0) return a;
-        // Merge `durationMs` into `display_data` so `ToolUseBlock` can read it
-        // from a single place regardless of whether the message arrived via
-        // reconnect (DB-persisted `display_data`) or live connection (typed wire
-        // field). Both paths converge here on the client.
-        const durPatch =
+        const existing = a.messages[idx]!;
+        const existingDisplay = (existing.display_data ?? {}) as Record<string, unknown>;
+        // REQ-WPV-002: shallow-merge `displayData` rather than replace
+        // wholesale. The runtime emits partial patches (e.g. just
+        // `{tool_starts: {...}}` from `dispatch_tool_execution`) and
+        // wholesale replacement would wipe existing keys (`bash`,
+        // `retry_count`, `duration_ms`, etc.) that earlier broadcasts
+        // or the persisted message set. Each emitter is responsible
+        // for sending only the keys it owns.
+        const mergedDisplay =
+          action.displayData !== undefined
+            ? { ...existingDisplay, ...action.displayData }
+            : existingDisplay;
+        // `durationMs` is a typed convenience field for tool-result
+        // updates — merge into the same display_data so consumers
+        // read from a single place regardless of source path.
+        const withDuration =
           action.durationMs !== undefined
-            ? { display_data: { ...(a.messages[idx]!.display_data ?? {}), duration_ms: action.durationMs } }
-            : {};
+            ? { ...mergedDisplay, duration_ms: action.durationMs }
+            : mergedDisplay;
         const merged = {
-          ...a.messages[idx]!,
-          ...(action.displayData !== undefined && { display_data: action.displayData }),
+          ...existing,
+          // Only overwrite display_data when at least one of the
+          // contributing fields was present; otherwise preserve the
+          // existing reference for cheap downstream equality checks.
+          ...((action.displayData !== undefined || action.durationMs !== undefined) && {
+            display_data: withDuration,
+          }),
           ...(action.content !== undefined && { content: action.content }),
-          ...durPatch,
         };
         const newMessages = [...a.messages];
         newMessages[idx] = merged;

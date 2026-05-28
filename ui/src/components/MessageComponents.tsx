@@ -648,6 +648,28 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
               {formatMessageTime(timestamp)}
             </span>
           )}
+          {/* REQ-LRV-006: post-hoc retry badge. The runtime stamps
+              `display_data.retry_count` on the persisted assistant
+              message iff the turn retried (max(0, final_attempt - 1)).
+              Zero is encoded as "field absent" on the JSON, so the
+              `> 0` check doubles as a presence check. The badge is
+              the long-lived record of "this answer took N tries" once
+              the live retry suffix on the StateBar has cleared. */}
+          {(() => {
+            const dd = message.display_data as Record<string, unknown> | undefined;
+            const retryCount = typeof dd?.['retry_count'] === 'number' ? (dd['retry_count'] as number) : 0;
+            if (retryCount > 0) {
+              return (
+                <span
+                  className="message-retry-badge"
+                  title={`This response succeeded after ${retryCount} retry${retryCount === 1 ? '' : ' attempts'}.`}
+                >
+                  retried {retryCount}x
+                </span>
+              );
+            }
+            return null;
+          })()}
         </div>
       )}
       <div className="message-content">
@@ -673,12 +695,25 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
             if (block.name === 'think') {
               return <ThinkAside key={block.id || i} block={block} />;
             }
+            // REQ-WPV-002: read the per-tool start time from the
+            // parent assistant message's `display_data.tool_starts`
+            // (typed `{ [tool_use_id]: unix_ms }` on the Rust side).
+            // When present, the widget renders a live elapsed counter
+            // that survives reconnect / reload / multi-tab.
+            const toolStartsMap = (message.display_data as Record<string, unknown> | undefined)?.[
+              'tool_starts'
+            ] as Record<string, number> | undefined;
+            const toolStartedAtMs =
+              block.id && toolStartsMap && typeof toolStartsMap[block.id] === 'number'
+                ? (toolStartsMap[block.id] as number)
+                : undefined;
             return (
               <ToolUseBlock
                 key={block.id || i}
                 block={block}
                 result={toolResults.get(block.id || '')}
                 onOpenFile={onOpenFile}
+                toolStartedAtMs={toolStartedAtMs}
               />
             );
           }
@@ -741,6 +776,12 @@ interface ToolUseBlockProps {
   block: ContentBlock;
   result: Message | undefined;
   onOpenFile: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  /** Server-clock unix ms when the runtime began dispatching this
+   *  tool — sourced from the parent assistant message's
+   *  `display_data.tool_starts[block.id]` (REQ-WPV-002). When present
+   *  and no `result` has landed yet, the tool widget renders a live
+   *  elapsed counter that survives reconnect / reload / multi-tab. */
+  toolStartedAtMs?: number | undefined;
 }
 
 // Helper to parse image data from read_image tool result
@@ -1240,7 +1281,7 @@ export function KeywordSearchView({
 
 export const ToolUseBlock = memo(ToolUseBlockImpl);
 
-function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
+function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUseBlockProps) {
   const name = block.name || 'tool';
   const input = block.input || {};
   const toolId = block.id || '';
@@ -1265,6 +1306,25 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
     const v = dd?.['duration_ms'];
     return typeof v === 'number' ? v : undefined;
   })();
+
+  // REQ-WPV-002: live elapsed counter while the tool is in flight
+  // (block exists, no result yet). Source is the server-authoritative
+  // `tool_starts[block.id]` stamped by `dispatch_tool_execution`, so
+  // the counter survives reconnect / reload / multi-tab. Cleared the
+  // instant the result lands (the static `durationMs` from the tool
+  // result takes over).
+  const [inflightElapsedSeconds, setInflightElapsedSeconds] = useState(0);
+  useEffect(() => {
+    if (result != null || toolStartedAtMs == null) {
+      setInflightElapsedSeconds(0);
+      return;
+    }
+    const compute = () =>
+      setInflightElapsedSeconds(Math.max(0, Math.floor((Date.now() - toolStartedAtMs) / 1000)));
+    compute();
+    const interval = window.setInterval(compute, 1000);
+    return () => window.clearInterval(interval);
+  }, [result, toolStartedAtMs]);
 
   const rawResultText = resultContent?.content || resultContent?.result || resultContent?.error || '';
   const isError = resultContent?.is_error || !!resultContent?.error;
@@ -1367,6 +1427,18 @@ function ToolUseBlockImpl({ block, result, onOpenFile }: ToolUseBlockProps) {
             {durationMs !== undefined && (
               <span className="tool-block-duration">&bull; {formatToolDuration(durationMs)}</span>
             )}
+          </span>
+        )}
+        {/* REQ-WPV-002: live elapsed counter while the tool is in
+            flight. Hidden once the result lands (the static
+            duration above takes over). Server-clock sourced — the
+            counter ticks correctly across reconnect / reload. */}
+        {!hasOutput && toolStartedAtMs != null && (
+          <span
+            className="tool-block-elapsed"
+            title={`Started ${new Date(toolStartedAtMs).toLocaleTimeString()}`}
+          >
+            &bull; {inflightElapsedSeconds}s
           </span>
         )}
       </div>
