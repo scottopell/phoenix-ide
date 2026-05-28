@@ -26,10 +26,12 @@ pub enum LlmLanguage {
 }
 
 impl LlmLanguage {
-    /// All known languages in display order. Single source of truth — the
-    /// settings API response, the migration's `DEFAULT 'phoenix-native'`,
-    /// and any future UI dropdown all key off this list. Adding a variant
-    /// here is the only edit required to expose a new language.
+    /// All known languages in display order. Single source of truth for the
+    /// settings API response and any UI dropdown so the available choices
+    /// can't drift from what the backend accepts. Adding a variant here
+    /// makes it visible to clients, but you still have to supply
+    /// translations (base prompt, mode blocks, chain prompts, tool
+    /// overrides as needed) elsewhere in this file for it to be useful.
     pub const ALL: &'static [Self] = &[Self::PhoenixNative, Self::Caveman];
 
     pub const fn as_str(self) -> &'static str {
@@ -259,34 +261,47 @@ about the summary itself — just the summary."
 // read_file, search, think.
 // =============================================================================
 
-/// Returns a caveman-language description for the named tool, or `None` if
-/// the tool has no caveman override (caller falls back to phoenix-native).
+/// Returns a translated description for the named tool, or `None` if the
+/// tool has no override in this language (caller falls back to
+/// phoenix-native). Matched explicitly per-language so a future variant
+/// doesn't silently inherit some other language's strings.
 pub fn tool_description_override(tool_name: &str, lang: LlmLanguage) -> Option<&'static str> {
-    if lang == LlmLanguage::PhoenixNative {
-        return None;
-    }
-    // Caveman overrides only for the prototype-covered tools.
-    Some(match tool_name {
-        "think" => {
-            "Think before do. Plan steps. Spot bad idea early. No tool fire, no file change."
-        }
-        "read_file" => {
-            "Read file. Get numbered line. For big file, use offset and limit."
-        }
-        "search" => {
-            "Search word across many file. Pick file with grep-like pattern."
-        }
-        "bash" => {
-            "Run bash command. Four flavor: \
-             `run` (start), `peek` (look at running thing), `wait` (block until done), `kill` (stop). \
-             Run not detach. Long thing keep run until you wait or kill. Same id only one time."
-        }
-        "patch" => {
-            "Change file. Do exact replace, append at end, or overwrite whole file. Tell op and content."
-        }
-        _ => return None,
-    })
+    let table: &[(&str, &str)] = match lang {
+        LlmLanguage::PhoenixNative => return None,
+        LlmLanguage::Caveman => CAVEMAN_TOOL_DESCRIPTIONS,
+    };
+    table
+        .iter()
+        .find(|(name, _)| *name == tool_name)
+        .map(|(_, desc)| *desc)
 }
+
+/// Caveman tool descriptions. Tools not in this table fall back to their
+/// phoenix-native `description()`.
+const CAVEMAN_TOOL_DESCRIPTIONS: &[(&str, &str)] = &[
+    (
+        "think",
+        "Think before do. Plan steps. Spot bad idea early. No tool fire, no file change.",
+    ),
+    (
+        "read_file",
+        "Read file. Get numbered line. For big file, use offset and limit.",
+    ),
+    (
+        "search",
+        "Search word across many file. Pick file with grep-like pattern.",
+    ),
+    (
+        "bash",
+        "Run bash command. Four flavor: \
+         `run` (start), `peek` (look at running thing), `wait` (block until done), `kill` (stop). \
+         Run not detach. Long thing keep run until you wait or kill. Same id only one time.",
+    ),
+    (
+        "patch",
+        "Change file. Do exact replace, append at end, or overwrite whole file. Tell op and content.",
+    ),
+];
 
 #[cfg(test)]
 mod tests {

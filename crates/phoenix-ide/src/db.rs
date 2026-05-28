@@ -2217,6 +2217,75 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm_language::LlmLanguage;
+
+    #[tokio::test]
+    async fn app_setting_roundtrips_through_db() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Missing key reads back as None.
+        assert!(db.get_app_setting("never_set").await.unwrap().is_none());
+
+        // Insert.
+        db.set_app_setting("key", "value-1").await.unwrap();
+        assert_eq!(
+            db.get_app_setting("key").await.unwrap().as_deref(),
+            Some("value-1")
+        );
+
+        // Upsert overwrites.
+        db.set_app_setting("key", "value-2").await.unwrap();
+        assert_eq!(
+            db.get_app_setting("key").await.unwrap().as_deref(),
+            Some("value-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn default_llm_language_unset_returns_phoenix_native() {
+        let db = Database::open_in_memory().await.unwrap();
+        assert_eq!(
+            db.get_default_llm_language().await.unwrap(),
+            LlmLanguage::PhoenixNative
+        );
+    }
+
+    #[tokio::test]
+    async fn default_llm_language_set_persists_and_reads_back() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        db.set_default_llm_language(LlmLanguage::Caveman)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_default_llm_language().await.unwrap(),
+            LlmLanguage::Caveman
+        );
+
+        // Switch back.
+        db.set_default_llm_language(LlmLanguage::PhoenixNative)
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_default_llm_language().await.unwrap(),
+            LlmLanguage::PhoenixNative
+        );
+    }
+
+    #[tokio::test]
+    async fn default_llm_language_falls_back_when_value_unknown() {
+        let db = Database::open_in_memory().await.unwrap();
+        // Forge a value this build doesn't recognize (forward-compat: an
+        // older binary reading a DB written by a newer one). Should fall
+        // back to the default rather than poison startup.
+        db.set_app_setting("default_llm_language", "klingon")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_default_llm_language().await.unwrap(),
+            LlmLanguage::default()
+        );
+    }
 
     #[tokio::test]
     async fn test_create_and_get_conversation() {

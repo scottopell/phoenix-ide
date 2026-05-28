@@ -383,6 +383,22 @@ function NotificationsSection() {
   );
 }
 
+// Friendly labels/tooltips for the language ids the backend ships. An
+// unknown id (e.g. one added on the server before the UI is updated)
+// falls back to the raw string so we never silently mislabel it.
+const LLM_LANGUAGE_LABELS: Record<string, { label: string; tooltip: string }> = {
+  'phoenix-native': { label: 'Phoenix', tooltip: 'Default Phoenix prose' },
+  caveman: { label: 'Caveman', tooltip: 'Ugg. Why use many word.' },
+};
+
+function llmLanguageLabel(lang: string): string {
+  return LLM_LANGUAGE_LABELS[lang]?.label ?? lang;
+}
+
+function llmLanguageTooltip(lang: string): string {
+  return LLM_LANGUAGE_LABELS[lang]?.tooltip ?? lang;
+}
+
 /**
  * Global default LLM language. Applied only to NEW conversations; existing
  * conversations stay in whatever language they were created with, and chain
@@ -420,29 +436,36 @@ function LlmLanguageSection() {
   }, []);
 
   const select = useCallback((next: string) => {
-    if (!setting || setting.language === next) return;
-    const saveId = latestSaveRef.current + 1;
-    latestSaveRef.current = saveId;
-    setSetting({ ...setting, language: next });
-    setSaving(true);
     setError(null);
-    api.updateLlmLanguageSetting(next)
-      .then((saved) => {
-        // Only the latest save's response is allowed to mutate state.
-        // Earlier PUTs that arrive out of order are dropped on the floor.
-        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
-        confirmedRef.current = saved;
-        setSetting(saved);
-        setSaving(false);
-      })
-      .catch((err: unknown) => {
-        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
-        // Roll back the optimistic selection so the UI matches the server.
-        if (confirmedRef.current) setSetting(confirmedRef.current);
-        setError(err instanceof Error ? err.message : 'Failed to save LLM language');
-        setSaving(false);
-      });
-  }, [setting]);
+    // Functional setSetting so the equality check (and the PUT decision)
+    // reads the live state — not a stale closure capture. With rapid clicks
+    // before React re-renders (Phoenix → Caveman → Phoenix), each click
+    // sees the value the previous click just installed instead of the
+    // mount-time setting.
+    setSetting((prev) => {
+      if (!prev || prev.language === next) return prev;
+      const saveId = latestSaveRef.current + 1;
+      latestSaveRef.current = saveId;
+      setSaving(true);
+      api.updateLlmLanguageSetting(next)
+        .then((saved) => {
+          // Only the latest save's response is allowed to mutate state.
+          // Earlier PUTs that arrive out of order are dropped on the floor.
+          if (!mountedRef.current || latestSaveRef.current !== saveId) return;
+          confirmedRef.current = saved;
+          setSetting(saved);
+          setSaving(false);
+        })
+        .catch((err: unknown) => {
+          if (!mountedRef.current || latestSaveRef.current !== saveId) return;
+          // Roll back the optimistic selection so the UI matches the server.
+          if (confirmedRef.current) setSetting(confirmedRef.current);
+          setError(err instanceof Error ? err.message : 'Failed to save LLM language');
+          setSaving(false);
+        });
+      return { ...prev, language: next };
+    });
+  }, []);
 
   if (!setting && !error) return null;
 
@@ -462,9 +485,9 @@ function LlmLanguageSection() {
               className={`settings-theme-btn${setting.language === lang ? ' active' : ''}`}
               onClick={() => select(lang)}
               disabled={saving}
-              title={lang === 'caveman' ? 'Ugg. Why use many word.' : 'Default Phoenix prose'}
+              title={llmLanguageTooltip(lang)}
             >
-              {lang === 'phoenix-native' ? 'Phoenix' : lang === 'caveman' ? 'Caveman' : lang}
+              {llmLanguageLabel(lang)}
             </button>
           ))}
         </div>

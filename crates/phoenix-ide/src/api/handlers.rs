@@ -613,8 +613,17 @@ async fn update_llm_language_setting(
     State(state): State<AppState>,
     Json(req): Json<LlmLanguageSettingRequest>,
 ) -> Result<Json<LlmLanguageSettingResponse>, AppError> {
-    let lang = crate::llm_language::LlmLanguage::parse(&req.language)
-        .ok_or_else(|| AppError::BadRequest(format!("unknown llm_language: {}", req.language)))?;
+    let lang = crate::llm_language::LlmLanguage::parse(&req.language).ok_or_else(|| {
+        let allowed: Vec<&str> = crate::llm_language::LlmLanguage::ALL
+            .iter()
+            .map(|l| l.as_str())
+            .collect();
+        AppError::BadRequest(format!(
+            "invalid `language` field: {:?} (allowed: {})",
+            req.language,
+            allowed.join(", "),
+        ))
+    })?;
     state
         .db
         .set_default_llm_language(lang)
