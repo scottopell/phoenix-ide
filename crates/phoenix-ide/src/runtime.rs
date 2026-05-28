@@ -35,6 +35,7 @@ use crate::state_machine::{ConvContext, ConvState, Event};
 use crate::system_prompt::ModeContext;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
+use chrono::{DateTime, Utc};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
@@ -756,6 +757,11 @@ pub enum SseEvent {
         state: ConvState,
         /// Presentation mode for UI display (`idle`/`working`/`needs_action`/`error`/`done`)
         presentation_mode: String,
+        /// Server clock at which the conversation entered this state — the
+        /// same `Conversation.state_updated_at` value the runtime bumps on
+        /// every state transition. Specs: `specs/working-phase-visibility/`
+        /// REQ-WPV-001.
+        state_updated_at: DateTime<Utc>,
     },
     /// Ephemeral streaming token. Not persisted, but still carries a
     /// `sequence_id` from the same counter so reconnects don't strand tokens
@@ -1460,7 +1466,7 @@ impl RuntimeManager {
 
         // Determine initial state: check if conversation needs auto-continuation
         // REQ-BED-007 says resume from idle, but we need to handle interrupted turns
-        let (initial_state, needs_auto_continue) =
+        let (initial_state, initial_state_updated_at, needs_auto_continue) =
             self.determine_resume_state(conversation_id).await?;
 
         let runtime: ProductionRuntime = ConversationRuntime::new(
@@ -1478,6 +1484,7 @@ impl RuntimeManager {
             event_tx.clone(),
             broadcaster.clone(),
         )
+        .with_state_updated_at(initial_state_updated_at)
         .with_steering_queue(conv.steering_queue)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
@@ -1736,10 +1743,17 @@ impl RuntimeManager {
     ///
     /// Delegates to `recovery::should_auto_continue` for the actual logic.
     /// See that module for comprehensive tests.
+    ///
+    /// Returns `(state, state_updated_at, needs_auto_continue)`. The
+    /// `state_updated_at` is the row's value (the runtime's entry timestamp
+    /// for the resumed state); the executor uses it to seed
+    /// `ConversationRuntime.state_updated_at` so the first post-resume
+    /// `SseEvent::StateChange` carries the real entry time, not the
+    /// runtime-construction time (specs/working-phase-visibility/ REQ-WPV-001).
     async fn determine_resume_state(
         &self,
         conversation_id: &str,
-    ) -> Result<(ConvState, bool), String> {
+    ) -> Result<(ConvState, DateTime<Utc>, bool), String> {
         // States that survive restart (preserved by reset_all_to_idle) must be
         // restored from the DB, not derived from message history. The recovery
         // heuristic only applies to transient states that were reset to Idle.
@@ -1748,6 +1762,8 @@ impl RuntimeManager {
             .get_conversation(conversation_id)
             .await
             .map_err(|e| e.to_string())?;
+
+        let row_state_updated_at = conv.state_updated_at;
 
         match &conv.state {
             ConvState::AwaitingTaskApproval { .. }
@@ -1761,7 +1777,7 @@ impl RuntimeManager {
                     state = ?std::mem::discriminant(&conv.state),
                     "Restoring persisted state (survives restart)"
                 );
-                return Ok((conv.state, false));
+                return Ok((conv.state, row_state_updated_at, false));
             }
             _ => {}
         }
@@ -1789,7 +1805,15 @@ impl RuntimeManager {
             );
         }
 
-        Ok((decision.state, decision.needs_auto_continue))
+        // For the auto-continue path, the runtime synthesises a recovery
+        // turn and transitions out of the resumed state almost immediately,
+        // so the row's entry timestamp is the right seed (apply_transition
+        // will bump it on the next state change).
+        Ok((
+            decision.state,
+            row_state_updated_at,
+            decision.needs_auto_continue,
+        ))
     }
 
     /// Get the database handle

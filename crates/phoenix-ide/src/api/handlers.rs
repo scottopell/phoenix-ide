@@ -3350,11 +3350,16 @@ async fn run_credential_helper(State(state): State<AppState>) -> impl IntoRespon
         Ok::<Event, Infallible>(Event::default().event("message").data(data.to_string()))
     });
 
+    // Typed `ping` event with non-empty data so the client EventSource
+    // observes the keep-alive (the previous `.text("ping")` form emitted an
+    // SSE comment line that EventSource does NOT surface). See
+    // specs/working-phase-visibility/ REQ-WPV-004 + design.md "Server
+    // keep-alive observation."
     Sse::new(event_stream)
         .keep_alive(
             KeepAlive::new()
                 .interval(std::time::Duration::from_secs(15))
-                .text("ping"),
+                .event(Event::default().event("ping").data("ping")),
         )
         .into_response()
 }

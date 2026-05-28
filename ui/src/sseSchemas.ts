@@ -239,6 +239,12 @@ export const SseStateChangeDataSchema = v.looseObject({
   sequence_id: v.number(),
   state: v.unknown(),
   presentation_mode: v.string(),
+  /** RFC3339 string on the wire — the same shape as the Init carrier
+   *  (`Conversation.state_updated_at` via `#[serde(flatten)]`). The
+   *  SSE-handler boundary converts to ms once via `Date.parse(s)`
+   *  before storing on the atom. Specs:
+   *  `specs/working-phase-visibility/` REQ-WPV-001. */
+  state_updated_at: v.string(),
 }) satisfies v.GenericSchema<unknown, WireStateChangeData>;
 
 /** `token`: ephemeral streaming delta during an LLM request. */

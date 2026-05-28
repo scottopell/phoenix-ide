@@ -29,6 +29,7 @@ use crate::state_machine::{
 };
 use crate::system_prompt::{build_system_prompt, ModeContext};
 use crate::tools::{BrowserSessionManager, ToolContext};
+use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, oneshot};
@@ -158,6 +159,17 @@ where
 {
     context: ConvContext,
     state: ConvState,
+    /// Server clock at which the conversation entered `state` — initialised
+    /// from the loaded `Conversation.state_updated_at` (or `Utc::now()` for
+    /// fresh runtimes) and bumped to `Utc::now()` whenever `state` is
+    /// reassigned by `apply_transition`. Carried on every `SseEvent::StateChange`
+    /// emission so the client's elapsed-time display can derive
+    /// `now() - state_updated_at` without any per-event timestamping
+    /// (specs/working-phase-visibility/ REQ-WPV-001). The in-memory value
+    /// is sub-millisecond ahead of the DB row's `state_updated_at` because
+    /// the DB write uses its own `Utc::now()`; the drift is below the
+    /// display's per-second rounding so the parity is preserved end-to-end.
+    state_updated_at: DateTime<Utc>,
     storage: S,
     llm_client: Arc<L>,
     tool_executor: Arc<T>,
@@ -256,6 +268,7 @@ where
         Self {
             context,
             state,
+            state_updated_at: Utc::now(),
             storage,
             llm_client: Arc::new(llm_client),
             tool_executor: Arc::new(tool_executor),
@@ -301,6 +314,16 @@ where
     #[cfg(test)]
     pub fn with_parent_tool_cycle_cap(mut self, cap: u32) -> Self {
         self.parent_tool_cycle_cap = cap;
+        self
+    }
+
+    /// Override the initial `state_updated_at` from the loaded DB row so
+    /// the very first `SseEvent::StateChange` after resume carries the
+    /// real entry timestamp rather than the runtime-construction time.
+    /// New (never-persisted) conversations don't call this — the
+    /// constructor default (`Utc::now()`) is correct for them.
+    pub fn with_state_updated_at(mut self, ts: DateTime<Utc>) -> Self {
+        self.state_updated_at = ts;
         self
     }
 
@@ -726,8 +749,15 @@ where
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
 
-        // Update state
+        // Update state. Bump the entry timestamp on every reassignment so
+        // every SseEvent::StateChange the executor subsequently emits
+        // carries a fresh, server-authoritative state_updated_at
+        // (specs/working-phase-visibility/ REQ-WPV-001). The DB write in
+        // `persist_state_effect` uses its own `Utc::now()`; the resulting
+        // sub-millisecond drift is below the client display's per-second
+        // rounding.
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
+        self.state_updated_at = Utc::now();
 
         // Log notable state transitions at INFO. "Notable" means transitions that cross
         // a meaningful phase boundary (idle↔active, entering/leaving tool execution,
@@ -876,6 +906,7 @@ where
         )
         .map_err(|e| format!("steering drain transition failed: {e:?}"))?;
         self.state = drain_result.new_state;
+        self.state_updated_at = Utc::now();
         for effect in drain_result.effects {
             if let Some(gen_event) = self.execute_effect(effect).await? {
                 generated_events.push(gen_event);
@@ -904,6 +935,7 @@ where
                 sequence_id: seq,
                 state: self.state.clone(),
                 presentation_mode: self.state.presentation_mode().to_string(),
+                state_updated_at: self.state_updated_at,
             });
         }
         Ok(None)
@@ -1429,6 +1461,7 @@ where
                     sequence_id: seq,
                     state: self.state.clone(),
                     presentation_mode: self.state.presentation_mode().to_string(),
+                    state_updated_at: self.state_updated_at,
                 });
                 Ok(None)
             }
@@ -1598,6 +1631,7 @@ where
                     sequence_id: seq,
                     state: ConvState::ContextExhausted { summary },
                     presentation_mode: "needs_action".to_string(),
+                    state_updated_at: self.state_updated_at,
                 });
                 Ok(None)
             }
@@ -2428,9 +2462,14 @@ where
         let conv_id = &self.context.conversation_id;
 
         // Update state. Mode is preserved (Branch stays Branch, Work stays Work).
+        // Bump the in-memory state_updated_at to match the DB write so the
+        // Terminal SseEvent::StateChange below carries the correct entry
+        // time (REQ-WPV-001). `self.state` itself is not mutated because the
+        // runtime is about to exit after this function returns.
         self.storage
             .update_state(conv_id, &ConvState::Terminal)
             .await?;
+        self.state_updated_at = Utc::now();
         // Legitimate cwd mutation (task 13012, teardown fallback): the
         // worktree is gone by this point, but API handlers (search_files,
         // list_skills, list_tasks, get_system_prompt) read conv.cwd for
@@ -2462,6 +2501,7 @@ where
             sequence_id: seq,
             state: ConvState::Terminal,
             presentation_mode: ConvState::Terminal.presentation_mode().to_string(),
+            state_updated_at: self.state_updated_at,
         });
         let _ = self
             .broadcast_tx
@@ -2652,6 +2692,7 @@ where
                     priority: priority_backup,
                     plan: plan_backup,
                 };
+                self.state_updated_at = Utc::now();
 
                 // Broadcast an error so the UI knows, but don't propagate — the
                 // conversation stays in AwaitingTaskApproval for retry.
@@ -2716,6 +2757,7 @@ where
                     priority: priority_backup,
                     plan: plan_backup,
                 };
+                self.state_updated_at = Utc::now();
                 let _ = self.broadcast_tx.send_seq(|seq| SseEvent::Error {
                     sequence_id: seq,
                     error: crate::runtime::user_facing_error::UserFacingError::retryable(

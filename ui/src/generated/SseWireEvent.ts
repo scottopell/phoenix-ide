@@ -72,7 +72,18 @@ message: unknown, } | { "type": "message_updated", sequence_id: number, message_
  * `MessageUpdated` event is emitted for a tool-result message;
  * absent (`undefined` on the TS side) for all other update paths.
  */
-duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: unknown, presentation_mode: string, } | { "type": "token", sequence_id: number, text: string, request_id: string, } | { "type": "agent_done", sequence_id: number, } | { "type": "conversation_became_terminal", sequence_id: number, } | { "type": "conversation_update", sequence_id: number, conversation: unknown, } | { "type": "error", sequence_id: number, message: string, 
+duration_ms?: number, } | { "type": "state_change", sequence_id: number, state: unknown, presentation_mode: string, 
+/**
+ * Server clock at which the conversation entered this state — the
+ * same `Conversation.state_updated_at: DateTime<Utc>` value the
+ * runtime bumps on every state transition. RFC3339 on the wire,
+ * matching the existing Init carrier (which carries the same
+ * field via `#[serde(flatten)]` on `EnrichedConversation`); the
+ * client converts to ms once at the SSE-handler boundary.
+ *
+ * Specs: `specs/working-phase-visibility/` REQ-WPV-001.
+ */
+state_updated_at: string, } | { "type": "token", sequence_id: number, text: string, request_id: string, } | { "type": "agent_done", sequence_id: number, } | { "type": "conversation_became_terminal", sequence_id: number, } | { "type": "conversation_update", sequence_id: number, conversation: unknown, } | { "type": "error", sequence_id: number, message: string, 
 /**
  * Generated as `unknown` — the existing UI reads only the flat
  * `message` field. Kind-aware consumers can narrow against

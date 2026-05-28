@@ -270,6 +270,15 @@ pub enum SseWireEvent {
         #[ts(type = "unknown")]
         state: Value,
         presentation_mode: String,
+        /// Server clock at which the conversation entered this state — the
+        /// same `Conversation.state_updated_at: DateTime<Utc>` value the
+        /// runtime bumps on every state transition. RFC3339 on the wire,
+        /// matching the existing Init carrier (which carries the same
+        /// field via `#[serde(flatten)]` on `EnrichedConversation`); the
+        /// client converts to ms once at the SSE-handler boundary.
+        ///
+        /// Specs: `specs/working-phase-visibility/` REQ-WPV-001.
+        state_updated_at: DateTime<Utc>,
     },
     /// Ephemeral streaming token (LLM delta).
     Token {
@@ -414,10 +423,12 @@ impl From<SseEvent> for SseWireEvent {
                 sequence_id,
                 state,
                 presentation_mode,
+                state_updated_at,
             } => SseWireEvent::StateChange {
                 sequence_id,
                 state: serde_json::to_value(&state).unwrap_or(Value::Null),
                 presentation_mode,
+                state_updated_at,
             },
             SseEvent::Token {
                 sequence_id,

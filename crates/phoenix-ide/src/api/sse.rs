@@ -66,10 +66,18 @@ pub fn sse_stream(
 
     let combined = init.chain(broadcasts);
 
+    // Typed `ping` event with non-empty data so the browser's EventSource
+    // observes it via an explicit listener and the heartbeat watchdog can
+    // bump `lastSseEventAt` (specs/working-phase-visibility/ REQ-WPV-004).
+    // The previous `.text("ping")` form emitted an SSE comment line which
+    // EventSource does NOT surface, leaving the watchdog blind to keep-
+    // alives. axum's `Event::data` drops empty-data events so the payload
+    // MUST be non-empty; the listener bumps lastSseEventAt and discards
+    // the body.
     let sse = Sse::new(combined).keep_alive(
         KeepAlive::new()
             .interval(Duration::from_secs(15))
-            .text("ping"),
+            .event(Event::default().event("ping").data("ping")),
     );
 
     let mut headers = HeaderMap::new();
@@ -179,11 +187,13 @@ mod tests {
                 sequence_id,
                 state,
                 presentation_mode,
+                state_updated_at,
             } => json!({
                 "type": "state_change",
                 "sequence_id": sequence_id,
                 "state": serde_json::to_value(state).unwrap_or(Value::Null),
                 "presentation_mode": presentation_mode,
+                "state_updated_at": state_updated_at,
             }),
             SseEvent::Token {
                 sequence_id,
@@ -431,6 +441,7 @@ mod tests {
                 sequence_id: 44,
                 state: ConvState::LlmRequesting { attempt: 1 },
                 presentation_mode: "working".to_string(),
+                state_updated_at: ts(),
             },
             SseEvent::Message { message: eager },
         ];
@@ -600,6 +611,7 @@ mod tests {
             sequence_id: 13,
             state: ConvState::Idle,
             presentation_mode: "idle".to_string(),
+            state_updated_at: ts(),
         };
         assert_parity(&event);
     }
@@ -610,6 +622,7 @@ mod tests {
             sequence_id: 14,
             state: ConvState::LlmRequesting { attempt: 1 },
             presentation_mode: "working".to_string(),
+            state_updated_at: ts(),
         };
         assert_parity(&event);
     }
@@ -751,6 +764,7 @@ mod tests {
             sequence_id: seq,
             state: ConvState::LlmRequesting { attempt: 1 },
             presentation_mode: "working".to_string(),
+            state_updated_at: ts(),
         });
         let _ = broadcaster.send_seq(|seq| SseEvent::Token {
             sequence_id: seq,
