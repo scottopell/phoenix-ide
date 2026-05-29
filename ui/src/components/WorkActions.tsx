@@ -125,13 +125,13 @@ function WorkViewerActions({ conversationId, diffFetch, setDiffFetch }: { conver
 function PrRemediationActions({ conversationId, prStatus, onSendMessage, showError }: { conversationId: string; prStatus: PrStatusResponse | null; onSendMessage?: ((text: string) => void) | undefined; showError?: ((message: string) => void) | undefined }) {
   const [loading, setLoading] = useState(false);
   const canAddress = !!prStatus?.found && prStatus.display_state === 'open' && !!onSendMessage;
-  if (!prStatus?.found) return null;
+  if (!prStatus?.found || prStatus.display_state !== 'open') return null;
   return (
     <button
       type="button"
       className="work-actions-btn work-actions-pr-remediate"
       disabled={!canAddress || loading}
-      title={!canAddress ? 'Available for open PRs when conversation input is available' : undefined}
+      title={!canAddress ? 'Conversation input is unavailable' : undefined}
       onClick={async () => {
         if (!canAddress) return;
         setLoading(true);

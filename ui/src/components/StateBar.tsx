@@ -93,8 +93,6 @@ interface StateBarProps {
    *  assigns `undefined` from a ternary, which the strict mode rejects
    *  without this annotation. */
   onOpenFiles?: (() => void) | undefined;
-  onSendMessage?: ((text: string) => void) | undefined;
-  showError?: ((message: string) => void) | undefined;
   prStatusState?: ConversationPrStatusState;
 }
 
@@ -256,8 +254,6 @@ export function StateBar({
   firstByteRequestId,
   turnRetryContext,
   onOpenFiles,
-  onSendMessage: _onSendMessage,
-  showError: _showError,
   prStatusState,
 }: StateBarProps) {
   // `toolExecutingStartedAt` is kept on the prop type for the
@@ -265,8 +261,6 @@ export function StateBar({
   // StateBar's own elapsed counter switched to `phaseStateUpdatedAt`
   // in Stage A — the destructured value is intentionally unused here.
   void _deprecatedToolStartedAt;
-  void _onSendMessage;
-  void _showError;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
   const [prPopoverOpen, setPrPopoverOpen] = useState(false);

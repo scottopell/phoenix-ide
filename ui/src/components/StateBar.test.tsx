@@ -77,7 +77,6 @@ function renderStateBar({
   contextWindowUsed = 0,
   modelContextWindow = 200_000,
   continuation,
-  onSendMessage,
   prStatus,
   connectionState = 'connected',
   connectionAttempt = 0,
@@ -91,7 +90,6 @@ function renderStateBar({
   contextWindowUsed?: number;
   modelContextWindow?: number;
   continuation?: ComponentProps<typeof StateBar>['continuation'];
-  onSendMessage?: ComponentProps<typeof StateBar>['onSendMessage'];
   prStatus?: PrStatusResponse;
   connectionState?: ComponentProps<typeof StateBar>['connectionState'];
   connectionAttempt?: number;
@@ -111,9 +109,6 @@ function renderStateBar({
   };
   if (continuation) {
     props.continuation = continuation;
-  }
-  if (onSendMessage) {
-    props.onSendMessage = onSendMessage;
   }
   if (prStatus) {
     props.prStatusState = { status: 'ready', prStatus };

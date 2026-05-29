@@ -147,9 +147,25 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     fireEvent.click(mark);
     expect(api.markMerged).not.toHaveBeenCalled();
   });
-});
 
-describe('WorkControlBar — PR cleanup guidance', () => {
+  it('marks merged after explicit manual fallback is enabled', async () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, unavailable_reason: 'not_authenticated' }, true)}
+      />
+    );
+
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    expect(mark.textContent).toMatch(/mark as merged/i);
+    fireEvent.click(mark);
+    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
+  });
+
+
   it('shows Checking PR while shared PR status is loading', () => {
     renderWithProviders(
       <WorkControlBar
