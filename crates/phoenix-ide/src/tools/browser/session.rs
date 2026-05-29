@@ -58,6 +58,13 @@ const IDLE_TIMEOUT: Duration = Duration::from_mins(30);
 /// Cleanup check interval (60 seconds)
 const CLEANUP_INTERVAL: Duration = Duration::from_mins(1);
 
+// Hard ceiling on cold-start session creation: chromium launch + first
+// page + listener setup. chromiumoxide's launch/new_page awaits are
+// otherwise unbounded — a stalled chromium subprocess or wedged CDP socket
+// hangs the caller forever. Bounded here, the one choke point every tool
+// routes through on first use, so no call site can forget it. Task 45001.
+const SESSION_INIT_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Default viewport dimensions
 const DEFAULT_VIEWPORT_WIDTH: u32 = 1024;
 const DEFAULT_VIEWPORT_HEIGHT: u32 = 768;
@@ -75,6 +82,9 @@ pub enum BrowserError {
 
     #[error("Chrome not available: {0}")]
     ChromeNotAvailable(String),
+
+    #[error("Browser session init timed out after {0:?}")]
+    InitTimeout(Duration),
 }
 
 impl From<chromiumoxide::error::CdpError> for BrowserError {
@@ -882,18 +892,23 @@ impl BrowserSessionManager {
         }
 
         tracing::info!(work_scope = %work_scope, "Creating new browser session");
-        let session = BrowserSession::new(&key).await?;
-        let session_arc = Arc::new(RwLock::new(session));
+        let session_arc = tokio::time::timeout(SESSION_INIT_TIMEOUT, async {
+            let session = BrowserSession::new(&key).await?;
+            let session_arc = Arc::new(RwLock::new(session));
 
-        // Set up console log listener
-        if let Err(e) = BrowserSession::setup_console_listener(session_arc.clone()).await {
-            tracing::warn!(error = %e, "Failed to set up console listener");
-        }
+            // Set up console log listener
+            if let Err(e) = BrowserSession::setup_console_listener(session_arc.clone()).await {
+                tracing::warn!(error = %e, "Failed to set up console listener");
+            }
 
-        // Set up the profiling trace listener (REQ-BT-019.9 / .12).
-        if let Err(e) = BrowserSession::setup_profiling_listener(session_arc.clone()).await {
-            tracing::warn!(error = %e, "Failed to set up profiling listener");
-        }
+            // Set up the profiling trace listener (REQ-BT-019.9 / .12).
+            if let Err(e) = BrowserSession::setup_profiling_listener(session_arc.clone()).await {
+                tracing::warn!(error = %e, "Failed to set up profiling listener");
+            }
+            Ok::<_, BrowserError>(session_arc)
+        })
+        .await
+        .map_err(|_| BrowserError::InitTimeout(SESSION_INIT_TIMEOUT))??;
 
         sessions.insert(
             key,
