@@ -28,11 +28,15 @@ Implementation lives in task 58001.
   added to `StateChange` as a typed field. RFC3339 on both carriers.
   Client converts to ms once at the SSE-handler boundary. No parallel
   representations.
-- **Pending assistant bubble is a synthetic render unit**
-  (`pending_agent` tail unit in `renderUnits.ts`), NOT a retained
-  empty message — text-only LLM responses aren't persisted until
-  after the `LlmResponse` transition completes
-  (`state_machine/transition.rs` ~L711).
+- **Pending assistant bubble** (was: a synthetic `pending_agent` tail
+  unit in `renderUnits.ts`, NOT a retained empty message) — **DECIDED
+  AGAINST and removed during PR #155** (commit `3dfadc0`, REQ-WPV-006).
+  Empirical review found the pre-first-byte placeholder bubble added
+  more flicker/complexity than value; the StateBar's `awaiting LLM
+  response Ns` line is now the sole pre-first-byte surface. This bullet
+  is kept for posterity so the absence reads as a decision, not an
+  oversight. See `specs/working-phase-visibility/` REQ-WPV-006 (marked
+  REMOVED).
 - **Per-tool started_at** on the assistant message's
   `display_data.tool_starts: BTreeMap<String, i64>` map keyed by
   `tool_use_id`. NOT a new field on `ContentBlock::ToolUse`

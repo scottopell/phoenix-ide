@@ -223,9 +223,14 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             sequenceId: res.output.sequence_id,
             phase: parseConversationState(res.output.state),
             // REQ-WPV-001: thread the server-authoritative entry time
-            // (RFC3339 → ms) onto the atom so this inline-stream path
-            // produces the same indicator behavior as the main SSE
-            // path in useConnection.
+            // (RFC3339 → ms) onto the atom. NOTE: this inline sub-agent
+            // stream does NOT register the llm_first_byte / llm_attempt /
+            // ping listeners (nor dispatch sse_event_observed) that
+            // useConnection has — the sub-agent message view renders none
+            // of the first-byte / retry-suffix / heartbeat-watchdog
+            // indicators, so those are intentionally omitted here. If this
+            // view ever grows a StateBar-style indicator, those listeners
+            // must be added too.
             stateUpdatedAt: Date.parse(res.output.state_updated_at),
           },
         });
