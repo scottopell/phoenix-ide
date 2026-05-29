@@ -2,6 +2,8 @@
 .phoenix.pid
 .vite.pid
 .vite.proxy
+.phoenix.port
+.vite.port
 __pycache__/
 
 # Logs
