@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { memo, useEffect, useMemo, useRef, useState } from 'react';
 import { useTheme } from '../hooks/useTheme';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -96,9 +96,10 @@ export function StreamingMessageView({ buffer }: StreamingMessageViewProps) {
     };
   }, []);
 
-  if (!buffer) return null;
+  // Parse once per text change, not on theme-only re-renders.
+  const blocks = useMemo(() => parseStreamingBlocks(displayText), [displayText]);
 
-  const blocks = parseStreamingBlocks(displayText);
+  if (!buffer) return null;
 
   return (
     <div className="streaming-message agent-message">
@@ -112,7 +113,28 @@ export function StreamingMessageView({ buffer }: StreamingMessageViewProps) {
   );
 }
 
-function StreamingBlock({ block, syntaxStyle }: { block: StreamingBlock; syntaxStyle: Record<string, React.CSSProperties> }) {
+type StreamingBlockProps = {
+  block: StreamingBlock;
+  syntaxStyle: Record<string, React.CSSProperties>;
+};
+
+// Each parse returns fresh block objects, so referential `memo` would never
+// hit. A completed block is immutable by construction — its rendered output
+// is fully determined by (type, content, complete, lang) + the syntax theme.
+// Comparing those fields lets every block except the growing tail skip the
+// per-frame ReactMarkdown re-parse / Prism re-highlight during streaming.
+function streamingBlocksEqual(prev: StreamingBlockProps, next: StreamingBlockProps): boolean {
+  if (prev.syntaxStyle !== next.syntaxStyle) return false;
+  const a = prev.block;
+  const b = next.block;
+  if (a.type !== b.type || a.content !== b.content) return false;
+  if (a.type === 'code' && b.type === 'code') {
+    return a.complete === b.complete && a.lang === b.lang;
+  }
+  return true;
+}
+
+const StreamingBlock = memo(function StreamingBlock({ block, syntaxStyle }: StreamingBlockProps) {
   if (block.type === 'markdown') {
     return (
       <div className="agent-text-block">
@@ -143,4 +165,4 @@ function StreamingBlock({ block, syntaxStyle }: { block: StreamingBlock; syntaxS
       <code className="streaming-code">{block.content}</code>
     </pre>
   );
-}
+}, streamingBlocksEqual);
