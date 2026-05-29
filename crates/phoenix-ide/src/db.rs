@@ -183,6 +183,14 @@ fn pr_association_rank(state: &crate::api::PrDisplayState) -> u8 {
     }
 }
 
+fn work_scope_db_key(scope: &crate::work_scope::WorkScope) -> (&'static str, &str) {
+    match scope {
+        crate::work_scope::WorkScope::Worktree(value) => ("Worktree", value.as_str()),
+        crate::work_scope::WorkScope::Conversation(value) => ("Conversation", value.as_str()),
+        crate::work_scope::WorkScope::Global => ("Global", ""),
+    }
+}
+
 /// Thread-safe database handle
 #[derive(Clone)]
 pub struct Database {
@@ -196,10 +204,7 @@ impl Database {
     }
 
     async fn work_scope_id(&self, scope: &crate::work_scope::WorkScope) -> DbResult<Option<i64>> {
-        let (scope_type, scope_value) = match scope {
-            crate::work_scope::WorkScope::Worktree(value) => ("Worktree", value.as_str()),
-            crate::work_scope::WorkScope::Conversation(value) => ("Conversation", value.as_str()),
-        };
+        let (scope_type, scope_value) = work_scope_db_key(scope);
         let id = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM work_scopes WHERE scope_type = ?1 AND scope_value = ?2",
         )
@@ -215,10 +220,7 @@ impl Database {
         scope: &crate::work_scope::WorkScope,
         observations: &[WorkScopePrObservation],
     ) -> DbResult<i64> {
-        let (scope_type, scope_value) = match scope {
-            crate::work_scope::WorkScope::Worktree(value) => ("Worktree", value.as_str()),
-            crate::work_scope::WorkScope::Conversation(value) => ("Conversation", value.as_str()),
-        };
+        let (scope_type, scope_value) = work_scope_db_key(scope);
         let now = Utc::now().to_rfc3339();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
