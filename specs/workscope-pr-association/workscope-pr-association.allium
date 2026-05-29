@@ -67,8 +67,15 @@ value PrStatusView {
     refresh: PrRefreshMetadata
 }
 
+
 value PrAutoFixContext {
     target: PrIdentity
+}
+
+value PrAutoFixAffordance {
+    enabled: Boolean
+    target: PrIdentity?
+    disabled_reason: String?
 }
 
 ------------------------------------------------------------
@@ -88,16 +95,28 @@ contract WorkScopePrStatusContract {
         -- masquerade as unavailable.
 }
 
+
 contract WorkScopePrAutoFixContract {
     create_context: (conversation: bedrock/Conversation) -> PrAutoFixContext
 
-
     @invariant StatusAndActionUseSamePrimary
-        -- The StateBar-rendered PR and the auto-fix target are both derived
-        -- from the same WorkScope primary. If a response contains stale
-        -- not_found metadata with a persisted primary, number-based auto-fix
-        -- may remain available for that primary; if the provider is
-        -- unavailable, auto-fix is disabled until the provider issue is fixed.
+        -- When a WorkScope has an associated primary PR, auto-fix targets that
+        -- PR by number. Branch-based discovery is only a fallback when no
+        -- associated primary exists. This is the same primary rendered by the
+        -- PR status surface.
+}
+
+contract StateBarPrAffordanceContract {
+    derive_affordance: (status: PrStatusView) -> PrAutoFixAffordance
+
+    @invariant NotFoundStalePrimaryIsActionable
+        -- A stale not_found refresh means branch discovery did not find the
+        -- associated PR. It does not make a persisted open primary unsafe for
+        -- auto-fix, because auto-fix refreshes that primary by PR number.
+
+    @invariant UnavailableProviderIsNotActionable
+        -- An unavailable refresh means the provider cannot currently refresh
+        -- PR data at all. The UI disables auto-fix and surfaces the reason.
 }
 
 ------------------------------------------------------------
@@ -185,6 +204,12 @@ entity PrAutoFixContextResult {
     conversation: bedrock/Conversation
     scope: WorkScope
     target: PrIdentity
+}
+
+-- Observable StateBar auto-fix affordance derived from a PR status result.
+entity PrAutoFixAffordanceResult {
+    status: PrStatusResult
+    affordance: PrAutoFixAffordance
 }
 
 ------------------------------------------------------------
@@ -403,6 +428,63 @@ rule BranchAutoFixFallbackWithoutAssociation {
     )
 }
 
+
+rule StateBarEnablesAutoFixForFreshOpenPrimary {
+    when: StateBarRendersStatus(status)
+
+    requires: status.pr != null
+    requires: status.pr.display_state = open
+    requires: status.refresh.state = fresh
+
+    ensures: PrAutoFixAffordanceResult.created(
+        status: status,
+        affordance: enabled_auto_fix(status.pr)
+    )
+}
+
+rule StateBarEnablesAutoFixForStaleNotFoundOpenPrimary {
+    when: StateBarRendersStatus(status)
+
+    requires: status.pr != null
+    requires: status.pr.display_state = open
+    requires: status.refresh.state = not_found
+    requires: status.refresh.stale = true
+
+    ensures: PrAutoFixAffordanceResult.created(
+        status: status,
+        affordance: enabled_auto_fix(status.pr)
+    )
+
+    @guidance
+        -- The disabled copy must not tell the user to refresh branch status in
+        -- this case: branch refresh has already said not_found. The available
+        -- action is number-based auto-fix against the persisted primary.
+}
+
+rule StateBarDisablesAutoFixWhenRefreshUnavailable {
+    when: StateBarRendersStatus(status)
+
+    requires: status.pr != null
+    requires: status.pr.display_state = open
+    requires: status.refresh.state = unavailable
+
+    ensures: PrAutoFixAffordanceResult.created(
+        status: status,
+        affordance: disabled_auto_fix(status.refresh.reason)
+    )
+}
+
+rule StateBarDisablesAutoFixForNonOpenPrimary {
+    when: StateBarRendersStatus(status)
+
+    requires: status.pr = null or status.pr.display_state != open
+
+    ensures: PrAutoFixAffordanceResult.created(
+        status: status,
+        affordance: disabled_auto_fix(non_open_reason(status.pr))
+    )
+}
+
 rule AbandonBestEffortRefreshIsBoundedAndNonFatal {
     when: ConversationAbandoned(conversation)
 
@@ -487,6 +569,21 @@ surface PrAutoFixApi {
 
     contracts:
         fulfils WorkScopePrAutoFixContract
+}
+
+surface StateBarPrAffordance {
+    facing user: ConversationUser
+
+    context status: PrStatusResult
+
+    exposes:
+        PrAutoFixAffordance
+
+    provides:
+        StateBarRendersStatus(status)
+
+    contracts:
+        fulfils StateBarPrAffordanceContract
 }
 
 surface AbandonCleanup {
