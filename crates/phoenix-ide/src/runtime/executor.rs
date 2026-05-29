@@ -913,8 +913,17 @@ where
             Event::SteerDrainedUserMessages { entries },
         )
         .map_err(|e| format!("steering drain transition failed: {e:?}"))?;
-        self.state = drain_result.new_state;
-        self.state_updated_at = Utc::now();
+        let drain_old_state = std::mem::replace(&mut self.state, drain_result.new_state);
+        // Same gating as apply_transition_result: only stamp a fresh entry
+        // time when the drain actually changes phase. A mid-turn drain
+        // re-enters the same LlmRequesting state and emits only PersistState
+        // (no StateChange) — bumping then would advance the persisted
+        // state_updated_at with no matching SSE, so a later reconnect would
+        // read a DB timestamp newer than any StateChange the client saw and
+        // jump the elapsed counter (REQ-WPV-001).
+        if self.state != drain_old_state {
+            self.state_updated_at = Utc::now();
+        }
         for effect in drain_result.effects {
             if let Some(gen_event) = self.execute_effect(effect).await? {
                 generated_events.push(gen_event);

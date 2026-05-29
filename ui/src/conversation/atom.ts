@@ -791,6 +791,14 @@ export function conversationReducer(
         // pending events contain a first-byte for the current request,
         // the SseLlmFirstByteDataSchema path below re-stamps it.
         firstByteRequestId: null,
+        // REQ-WPV-003 / REQ-LRV: same reasoning for the retry suffix. Clear
+        // any retry context carried over from before this Init — otherwise a
+        // reconnect-init after a finished retried turn (whose `agent_done`
+        // replay was missed, e.g. truncated ring) would preserve a stale
+        // `(retry N)` and surface it on the NEXT turn. If the turn is
+        // genuinely mid-backoff, the replayed `llm_attempt` in Phase 2
+        // re-stamps it.
+        turnRetryContext: null,
       };
 
       // Phase 2 — fold pending events through the reducer. Each entry is a
