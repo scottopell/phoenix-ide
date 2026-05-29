@@ -1,10 +1,3 @@
----
-created: 2026-05-25
-priority: p1
-status: ready
-artifact: phoenix-client.py
----
-
 phoenix-client.py fails against any HTTPS prod URL (e.g. https://essmbp.local:8031) with "Error: cannot connect to Phoenix server. Is it running? (./dev.py up)" even though the server is up and responding (curl -ks works fine).
 
 httpx.Client() in PhoenixClient.__init__ uses default cert verification — the prod TLS cert (essmbp.local self-signed / local CA) isn't in the system trust store the script's python env sees. The catch-all in main() then misreports the TLS failure as "cannot connect", hiding the real error.

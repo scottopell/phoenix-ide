@@ -1,10 +1,3 @@
----
-created: 2026-05-28
-priority: p2
-status: ready
-artifact: ui/src/conversation/atom.ts
----
-
 Retry context (attempt N/max, reason, resets_at) disappears from the StateBar on a FRESH page reload that lands mid-retry-backoff.
 
 ## Symptom
