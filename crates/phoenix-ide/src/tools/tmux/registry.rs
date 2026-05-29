@@ -647,6 +647,7 @@ pub async fn spawn_session(
     // immediately after can come back empty with a 0 exit. Poll list-panes
     // until the pane exists so the postcondition "spawn_session returns =>
     // pane usable" holds for every caller, not just well-timed ones. Task 62006.
+    let mut last_diag = String::from("no probe ran");
     for attempt in 0..PANE_READY_MAX_ATTEMPTS {
         let panes = tokio::process::Command::new("tmux")
             .args([
@@ -671,13 +672,23 @@ pub async fn spawn_session(
         if panes.status.success() && !panes.stdout.is_empty() {
             return Ok(());
         }
+        // Retain the last probe's exit/stderr so an exhausted poll says WHY
+        // (no session vs socket/auth error vs empty pane list), not just "never
+        // became ready".
+        last_diag = format!(
+            "exit {:?}, stderr: {}",
+            panes.status.code(),
+            String::from_utf8_lossy(&panes.stderr).trim()
+        );
         if attempt + 1 < PANE_READY_MAX_ATTEMPTS {
             tokio::time::sleep(PANE_READY_POLL_INTERVAL).await;
         }
     }
     Err(TmuxError::SpawnFailed {
         socket_path: socket_path.to_path_buf(),
-        reason: "session spawned but pane never became ready".to_string(),
+        reason: format!(
+            "session spawned but pane never became ready after {PANE_READY_MAX_ATTEMPTS} probes (last: {last_diag})"
+        ),
     })
 }
 
