@@ -1157,7 +1157,7 @@ mod tests {
 
         let models = registry.available_models();
         assert!(!models.is_empty());
-        assert!(models.contains(&"claude-opus-4-5".to_string()));
+        assert!(models.contains(&"claude-opus-4-6".to_string()));
     }
 
     #[test]
@@ -1176,12 +1176,12 @@ mod tests {
     fn test_custom_default_model() {
         let config = LlmConfig {
             anthropic_api_key: Some("test-key".to_string()),
-            default_model: Some("claude-opus-4-5".to_string()),
+            default_model: Some("claude-opus-4-6".to_string()),
             ..Default::default()
         };
         let registry = ModelRegistry::new(&config);
 
-        assert_eq!(registry.default_model_id(), "claude-opus-4-5");
+        assert_eq!(registry.default_model_id(), "claude-opus-4-6");
     }
 
     #[tokio::test]
@@ -1485,7 +1485,7 @@ mod tests {
         // Check specific model
         let opus = model_infos
             .iter()
-            .find(|m| m.id == "claude-opus-4-7")
+            .find(|m| m.id == "claude-opus-4-8")
             .unwrap();
         assert_eq!(opus.provider, "Anthropic");
         assert!(opus.description.contains("most capable"));

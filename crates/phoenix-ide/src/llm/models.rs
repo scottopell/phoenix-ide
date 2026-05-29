@@ -45,7 +45,7 @@ pub enum ApiFormat {
 pub struct ModelSpec {
     /// User-facing model ID (e.g., "claude-4.5-opus")
     pub id: String,
-    /// API name used by the provider (e.g., "claude-opus-4-5-20251101")
+    /// API name used by the provider (e.g., "claude-haiku-4-5-20251001")
     pub api_name: String,
     /// Provider for this model
     pub provider: Provider,
@@ -93,13 +93,23 @@ pub fn all_models() -> Vec<ModelSpec> {
         // retired April 30, 2026 and is no longer required (or accepted on
         // older models). See migration 009 for legacy `-1m` id rewrite.
         ModelSpec {
+            id: "claude-opus-4-8".into(),
+            api_name: "claude-opus-4-8".into(),
+            provider: Provider::Anthropic,
+            api_format: ApiFormat::Anthropic,
+            description: "Claude Opus 4.8 (most capable, slower)".into(),
+            context_window: 1_000_000,
+            recommended: true,
+            supports_tool_search: true,
+        },
+        ModelSpec {
             id: "claude-opus-4-7".into(),
             api_name: "claude-opus-4-7".into(),
             provider: Provider::Anthropic,
             api_format: ApiFormat::Anthropic,
-            description: "Claude Opus 4.7 (most capable, slower)".into(),
+            description: "Claude Opus 4.7 (legacy)".into(),
             context_window: 1_000_000,
-            recommended: true,
+            recommended: false,
             supports_tool_search: true,
         },
         ModelSpec {
@@ -131,16 +141,6 @@ pub fn all_models() -> Vec<ModelSpec> {
             context_window: 200_000,
             recommended: true,
             supports_tool_search: false,
-        },
-        ModelSpec {
-            id: "claude-opus-4-5".into(),
-            api_name: "claude-opus-4-5-20251101".into(),
-            provider: Provider::Anthropic,
-            api_format: ApiFormat::Anthropic,
-            description: "Claude Opus 4.5 (legacy)".into(),
-            context_window: 200_000,
-            recommended: false,
-            supports_tool_search: true,
         },
         // OpenAI models
         // Context windows here are the platform-API ceilings (what gateway/
