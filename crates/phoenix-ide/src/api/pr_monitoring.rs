@@ -368,7 +368,7 @@ fn get_pr_status_with_client(client: &dyn GhClient, branch_name: &str) -> PrStat
     };
     let pr_identity = gh_pr_to_identity(&pr);
     PrStatusRefresh {
-        response: fresh_response(pr_identity, checks),
+        response: fresh_response(pr_identity, checks, attempted_at),
         observations,
     }
 }
@@ -389,13 +389,6 @@ pub(crate) fn capture_pr_auto_fix_context_for_pr(
         ));
     }
     let client = ShellGhClient::new(worktree);
-    let repo = client.repo_view().map_err(|e| {
-        let reason = e.kind.unavailable_reason();
-        PrMonitorError::BadRequest(format!(
-            "PR context unavailable: {}",
-            unavailable_reason_message(&reason)
-        ))
-    })?;
     let pr = client.pr_view(pr_number).map_err(|e| {
         let reason = e.kind.unavailable_reason();
         PrMonitorError::BadRequest(format!(
@@ -403,11 +396,17 @@ pub(crate) fn capture_pr_auto_fix_context_for_pr(
             unavailable_reason_message(&reason)
         ))
     })?;
-    let observation = gh_pr_to_observation(&repo, pr.clone());
+    let observation = match client.repo_view() {
+        Ok(repo) => Some(gh_pr_to_observation(&repo, pr.clone())),
+        Err(e) => {
+            tracing::debug!(pr = pr_number, error = %e.message, "gh repo view failed; associated PR auto-fix will not persist observation");
+            None
+        }
+    };
     let response = capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client)?;
     Ok(PrAutoFixCapture {
         response,
-        observations: vec![observation],
+        observations: observation.into_iter().collect(),
     })
 }
 
@@ -536,8 +535,12 @@ fn capture_pr_auto_fix_context_for_pr_item(
     })
 }
 
-fn fresh_response(pr: PrIdentity, checks: CapturedPrChecks) -> PrStatusResponse {
-    let now = Utc::now().to_rfc3339();
+fn fresh_response(
+    pr: PrIdentity,
+    checks: CapturedPrChecks,
+    attempted_at: String,
+) -> PrStatusResponse {
+    let refreshed_at = Utc::now().to_rfc3339();
     PrStatusResponse {
         found: true,
         unavailable_reason: None,
@@ -551,14 +554,14 @@ fn fresh_response(pr: PrIdentity, checks: CapturedPrChecks) -> PrStatusResponse 
         check_state: matches!(pr.display_state, PrDisplayState::Open).then_some(checks.state),
         check_summary: matches!(pr.display_state, PrDisplayState::Open).then_some(checks.summary),
         feedback_summary: None,
-        updated_at: pr.updated_at.clone().or_else(|| Some(now.clone())),
+        updated_at: pr.updated_at.clone().or_else(|| Some(refreshed_at.clone())),
         display_state: Some(pr.display_state.clone()),
         pr: Some(pr),
         refresh: PrRefreshMetadata {
             state: PrRefreshState::Fresh,
             reason: None,
-            last_attempted_at: now.clone(),
-            last_refreshed_at: Some(now),
+            last_attempted_at: attempted_at,
+            last_refreshed_at: Some(refreshed_at),
             stale: false,
         },
     }
@@ -636,6 +639,36 @@ pub(crate) fn stale_response_with_refresh_state(
             last_refreshed_at: Some(pr.last_seen_at),
             stale: true,
         },
+    }
+}
+
+pub(crate) fn persisted_primary_response(
+    pr: &WorkScopePrAssociation,
+    mut refresh: PrRefreshMetadata,
+    stale: bool,
+) -> PrStatusResponse {
+    let identity = association_to_identity(pr);
+    refresh.stale = stale;
+    if refresh.last_refreshed_at.is_none() && !stale {
+        refresh.last_refreshed_at = Some(pr.last_seen_at.clone());
+    }
+    PrStatusResponse {
+        found: true,
+        unavailable_reason: refresh.reason.clone(),
+        number: Some(identity.number),
+        title: Some(identity.title.clone()),
+        url: Some(identity.url.clone()),
+        state: Some(identity.state.clone()),
+        draft: Some(identity.draft),
+        base: Some(identity.base.clone()),
+        head: Some(identity.head.clone()),
+        check_state: None,
+        check_summary: None,
+        feedback_summary: None,
+        updated_at: identity.updated_at.clone(),
+        display_state: Some(identity.display_state.clone()),
+        pr: Some(identity),
+        refresh,
     }
 }
 

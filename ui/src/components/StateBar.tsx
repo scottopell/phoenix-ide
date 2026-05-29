@@ -167,12 +167,24 @@ function prBadgeLabel(pr: PrStatusResponse): string {
   return n;
 }
 
+function prRefreshStaleText(pr: PrStatusResponse): string {
+  if (pr.refresh.state === 'not_found') return 'no PR found for current branch';
+  if (pr.refresh.state === 'unavailable') return `refresh unavailable (${pr.refresh.reason ?? 'unknown'})`;
+  return 'refresh did not produce fresh PR data';
+}
+
 function prTooltip(pr: PrStatusResponse): string {
   const label = pr.number ? `PR #${pr.number}` : 'PR';
   const title = pr.title ? ` — ${pr.title}` : '';
   const state = pr.display_state ?? 'unknown';
   const checks = pr.check_state ?? 'unknown';
-  return `${label}${title}\nState: ${state}\nChecks: ${checks}`;
+  const freshness = pr.refresh.stale
+    ? `
+Refresh: stale (${prRefreshStaleText(pr)})`
+    : '';
+  return `${label}${title}
+State: ${state}
+Checks: ${checks}${freshness}`;
 }
 
 function prCheckStatusText(pr: PrStatusResponse): string {
@@ -191,7 +203,6 @@ function prSummaryText(pr: PrStatusResponse): string {
 }
 
 function PrStatusPopover({ pr }: { pr: PrStatusResponse }) {
-
   const attentionNames = [
     ...(pr.check_summary?.failing_names ?? []),
     ...(pr.check_summary?.pending_names ?? []),
@@ -207,7 +218,8 @@ function PrStatusPopover({ pr }: { pr: PrStatusResponse }) {
       </div>
       <div className="pr-popover-muted">{prSummaryText(pr)}</div>
       {attentionNames.length > 0 && (
-        <div className="pr-popover-list" title={attentionNames.join('\n')}>
+        <div className="pr-popover-list" title={attentionNames.join('
+')}>
           {attentionNames.join(' · ')}
         </div>
       )}

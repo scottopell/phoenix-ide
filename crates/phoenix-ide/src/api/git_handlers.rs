@@ -399,21 +399,29 @@ pub(crate) async fn get_conversation_pr_status(
             .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
-    if refresh.response.refresh.state != crate::api::types::PrRefreshState::Fresh {
-        if let Some(pr) = db
-            .primary_work_scope_pr_association(&work_scope)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?
-        {
+    if let Some(primary) = db
+        .primary_work_scope_pr_association(&work_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        if refresh.response.refresh.state != crate::api::types::PrRefreshState::Fresh {
             return Ok(Json(
                 crate::api::pr_monitoring::stale_response_with_refresh_state(
-                    pr,
+                    primary,
                     refresh.response.refresh.state,
                     refresh.response.refresh.reason.clone(),
                     refresh.response.refresh.last_attempted_at,
                     refresh.response.unavailable_reason.clone(),
                 ),
             ));
+        }
+
+        if refresh.response.number != Some(primary.pr_number) {
+            return Ok(Json(crate::api::pr_monitoring::persisted_primary_response(
+                &primary,
+                refresh.response.refresh,
+                false,
+            )));
         }
     }
 
