@@ -11543,10 +11543,12 @@ html * {
   flex-direction: column;
   gap: 6px;
   max-height: 480px;
+  min-height: 0;
   overflow-y: auto;
 }
 
 .search-results-file {
+  flex: 0 0 auto;
   border: 1px solid var(--border-color);
   border-radius: 4px;
   background: var(--code-bg);
@@ -11593,6 +11595,7 @@ button.search-results-filepath:hover {
 
 .search-result-line {
   display: flex;
+  flex: 0 0 auto;
   align-items: baseline;
   gap: 10px;
   padding: 2px 8px;
@@ -11671,10 +11674,12 @@ button.search-result-line {
   flex-direction: column;
   gap: 6px;
   max-height: 480px;
+  min-height: 0;
   overflow-y: auto;
 }
 
 .keyword-search-hit {
+  flex: 0 0 auto;
   border: 1px solid var(--border-color);
   border-radius: 4px;
   background: var(--code-bg);

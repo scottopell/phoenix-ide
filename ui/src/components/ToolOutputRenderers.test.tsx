@@ -1,3 +1,4 @@
+import { readFileSync } from 'node:fs';
 import { describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, within } from '@testing-library/react';
 import {
@@ -213,3 +214,28 @@ describe('KeywordSearchView', () => {
     expect(screen.getByText('No relevant files found.')).toBeTruthy();
   });
 });
+
+
+describe('search result CSS contracts', () => {
+  const css = readFileSync('src/index.css', 'utf8');
+
+  function ruleFor(selector: string): string {
+    const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const match = css.match(new RegExp(`${escapedSelector}\\s*\\{(?<body>[^}]+)\\}`));
+    const body = match?.groups?.['body'];
+    expect(body, `${selector} rule exists`).toBeTruthy();
+    return body!;
+  }
+
+  it('keeps scrollable search result children from shrinking vertically', () => {
+    expect(ruleFor('.search-results-list')).toMatch(/overflow-y:\s*auto;/);
+    expect(ruleFor('.search-results-list')).toMatch(/min-height:\s*0;/);
+    expect(ruleFor('.keyword-search-list')).toMatch(/overflow-y:\s*auto;/);
+    expect(ruleFor('.keyword-search-list')).toMatch(/min-height:\s*0;/);
+
+    expect(ruleFor('.search-results-file')).toMatch(/flex:\s*0\s+0\s+auto;/);
+    expect(ruleFor('.search-result-line')).toMatch(/flex:\s*0\s+0\s+auto;/);
+    expect(ruleFor('.keyword-search-hit')).toMatch(/flex:\s*0\s+0\s+auto;/);
+  });
+});
+
