@@ -25,6 +25,8 @@ import {
   SseMessageUpdatedDataSchema,
   SseStateChangeDataSchema,
   SseTokenDataSchema,
+  SseLlmFirstByteDataSchema,
+  SseLlmAttemptDataSchema,
   SseConversationUpdateDataSchema,
   SseAgentDoneDataSchema,
   SseConversationBecameTerminalDataSchema,
@@ -428,6 +430,90 @@ describe('parseEvent', () => {
           SseStateChangeDataSchema,
           makeEvent({ state: { type: 'awaiting_llm' } }),
           'state_change',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+        expect(actions).toHaveLength(1);
+      });
+    });
+  });
+
+  describe('llm_first_byte schema', () => {
+    it('accepts a valid llm_first_byte payload', () => {
+      const { dispatch } = mockDispatch();
+      const res = parseEvent(
+        SseLlmFirstByteDataSchema,
+        makeEvent({ sequence_id: 7, request_id: 'req-abc' }),
+        'llm_first_byte',
+        dispatch,
+      );
+      expect(res.ok).toBe(true);
+    });
+
+    it('rejects llm_first_byte missing request_id', () => {
+      inProdMode(() => {
+        const { dispatch, actions } = mockDispatch();
+        const res = parseEvent(
+          SseLlmFirstByteDataSchema,
+          makeEvent({ sequence_id: 7 }),
+          'llm_first_byte',
+          dispatch,
+        );
+        expect(res.ok).toBe(false);
+        expect(actions).toHaveLength(1);
+      });
+    });
+  });
+
+  describe('llm_attempt schema', () => {
+    it('accepts a valid llm_attempt payload with resets_at', () => {
+      const { dispatch } = mockDispatch();
+      const res = parseEvent(
+        SseLlmAttemptDataSchema,
+        makeEvent({
+          sequence_id: 9,
+          attempt: 2,
+          max_attempts: 3,
+          reason: 'rate_limit',
+          backing_off_ms: 1500,
+          resets_at: '2026-05-28T00:00:00.000Z',
+        }),
+        'llm_attempt',
+        dispatch,
+      );
+      expect(res.ok).toBe(true);
+    });
+
+    it('accepts a valid llm_attempt payload omitting optional resets_at', () => {
+      const { dispatch } = mockDispatch();
+      const res = parseEvent(
+        SseLlmAttemptDataSchema,
+        makeEvent({
+          sequence_id: 9,
+          attempt: 1,
+          max_attempts: 3,
+          reason: 'network',
+          backing_off_ms: 500,
+        }),
+        'llm_attempt',
+        dispatch,
+      );
+      expect(res.ok).toBe(true);
+    });
+
+    it('rejects llm_attempt with an unknown reason (picklist drift guard)', () => {
+      inProdMode(() => {
+        const { dispatch, actions } = mockDispatch();
+        const res = parseEvent(
+          SseLlmAttemptDataSchema,
+          makeEvent({
+            sequence_id: 9,
+            attempt: 1,
+            max_attempts: 3,
+            reason: 'quota_exceeded',
+            backing_off_ms: 500,
+          }),
+          'llm_attempt',
           dispatch,
         );
         expect(res.ok).toBe(false);

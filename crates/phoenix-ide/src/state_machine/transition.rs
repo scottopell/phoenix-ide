@@ -1753,6 +1753,19 @@ pub fn transition_parent(
             }),
         ) => {
             let final_attempt = *attempt;
+            // REQ-LRV-006: stamp the retry count onto every parent-intercepted
+            // assistant message (propose_task / ask_user_question — typed,
+            // malformed, and validation-retry branches all persist a
+            // checkpointed AssistantMessage). Without this the retry audit
+            // trail is missing on exactly these tool replies, unlike the
+            // normal no-tool/tool paths. `content` is a parameter (not
+            // captured by ref) so each branch can still move its own `content`
+            // into `AssistantMessage::new` after calling this.
+            let make_display_data = |c: &[crate::llm::ContentBlock]| {
+                let mut dd = compute_bash_display_data(c, &context.working_dir);
+                stamp_retry_count(&mut dd, final_attempt);
+                dd
+            };
             // REQ-BED-028: propose_task interception (checked first).
             //
             // Find the propose_task call whether it parsed as typed input or
@@ -1783,7 +1796,7 @@ pub fn transition_parent(
 
                 if tool_calls.len() > 1 {
                     let msg = "propose_task must be the only tool in response".to_string();
-                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let display_data = make_display_data(&content);
                     let assistant_message = AssistantMessage::new(
                         request_id.clone(),
                         content,
@@ -1818,8 +1831,7 @@ pub fn transition_parent(
                             "propose_task input failed to parse: {err}. Re-emit the \
                              call with a valid payload (expected `{{\"task_file\": \"<path>\"}}`)."
                         );
-                        let display_data =
-                            compute_bash_display_data(&content, &context.working_dir);
+                        let display_data = make_display_data(&content);
                         let assistant_message = AssistantMessage::new(
                             request_id.clone(),
                             content,
@@ -1852,8 +1864,7 @@ pub fn transition_parent(
                         // Validation failed: surface the error as a tool_result and
                         // re-request the LLM so it can fix the file (or pick another)
                         // and retry.
-                        let display_data =
-                            compute_bash_display_data(&content, &context.working_dir);
+                        let display_data = make_display_data(&content);
                         let assistant_message = AssistantMessage::new(
                             request_id.clone(),
                             content,
@@ -1878,7 +1889,7 @@ pub fn transition_parent(
 
                 let tool_result =
                     ToolResult::success(tool.id.clone(), "Plan submitted for review".to_string());
-                let display_data = compute_bash_display_data(&content, &context.working_dir);
+                let display_data = make_display_data(&content);
                 let assistant_message = AssistantMessage::new(
                     request_id.clone(),
                     content,
@@ -1915,7 +1926,7 @@ pub fn transition_parent(
             }) {
                 if tool_calls.len() > 1 {
                     let msg = "ask_user_question must be the only tool in response".to_string();
-                    let display_data = compute_bash_display_data(&content, &context.working_dir);
+                    let display_data = make_display_data(&content);
                     let assistant_message = AssistantMessage::new(
                         request_id.clone(),
                         content,
@@ -1944,8 +1955,7 @@ pub fn transition_parent(
                             "ask_user_question input failed to parse: {err}. Re-emit the \
                              call with a valid `questions` array."
                         );
-                        let display_data =
-                            compute_bash_display_data(&content, &context.working_dir);
+                        let display_data = make_display_data(&content);
                         let assistant_message = AssistantMessage::new(
                             request_id.clone(),
                             content,
@@ -1972,7 +1982,7 @@ pub fn transition_parent(
                     tool.id.clone(),
                     "Awaiting user response. See following message for answers.".to_string(),
                 );
-                let display_data = compute_bash_display_data(&content, &context.working_dir);
+                let display_data = make_display_data(&content);
                 let assistant_message = AssistantMessage::new(
                     request_id.clone(),
                     content,

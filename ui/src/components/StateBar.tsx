@@ -390,6 +390,11 @@ export function StateBar({
   const lastKnownActivityRef = useRef<{
     phase: ConversationState;
     elapsedSecondsAtDisconnect: number;
+    // REQ-WPV-007: whether the live label was `streaming` (first byte had
+    // landed) at the moment we degraded. Without this the frozen "last: …"
+    // line regresses to "awaiting LLM response Ns" even though tokens were
+    // already flowing when the connection dropped.
+    wasStreaming: boolean;
   } | null>(null);
   const connectionHealthy =
     connectionState === 'connected' || connectionState === 'reconnected';
@@ -408,12 +413,18 @@ export function StateBar({
       phaseIsWorking &&
       phaseStateUpdatedAt != null
     ) {
+      const wasStreaming =
+        (convState.type === 'llm_requesting' ||
+          convState.type === 'seeded_llm_requesting' ||
+          convState.type === 'awaiting_llm') &&
+        firstByteRequestId != null;
       lastKnownActivityRef.current = {
         phase: convState,
         elapsedSecondsAtDisconnect: Math.max(
           0,
           Math.floor((Date.now() - phaseStateUpdatedAt) / 1000)
         ),
+        wasStreaming,
       };
     }
     // No-op on subsequent renders during the same degraded window —
@@ -480,8 +491,16 @@ export function StateBar({
   // known-activity paths below.
   const formatWorkingReason = (
     phase: ConversationState,
-    elapsedSeconds: number
+    elapsedSeconds: number,
+    streaming = false
   ): string => {
+    // REQ-WPV-007: mirror the live path — if the first byte had landed,
+    // the label is `streaming` (no elapsed counter), with the retry suffix
+    // carried through. Used for the frozen last-known-activity display so a
+    // mid-stream disconnect doesn't regress to "awaiting LLM response Ns".
+    if (streaming) {
+      return `streaming${retrySuffix}`;
+    }
     // Strip a trailing `...` from the base label: descriptions for
     // working phases (`llm_requesting` → "awaiting LLM response...")
     // already end in an ellipsis. Appending `... <elapsed>` directly
@@ -525,7 +544,8 @@ export function StateBar({
         if (snap) {
           stateText = `reconnecting (${connectionAttempt}) — last: ${formatWorkingReason(
             snap.phase,
-            snap.elapsedSecondsAtDisconnect
+            snap.elapsedSecondsAtDisconnect,
+            snap.wasStreaming
           )}`;
         } else {
           stateText = `reconnecting (${connectionAttempt})...`;
@@ -542,7 +562,8 @@ export function StateBar({
         if (snap) {
           stateText = `offline — last: ${formatWorkingReason(
             snap.phase,
-            snap.elapsedSecondsAtDisconnect
+            snap.elapsedSecondsAtDisconnect,
+            snap.wasStreaming
           )}`;
         } else {
           stateText = 'offline';
