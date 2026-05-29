@@ -33,6 +33,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::work_scope::WorkScope;
 
@@ -48,6 +49,11 @@ const DEFAULT_SOCKET_SUBDIR: &str = "tmux-sockets";
 /// Default session name created on lazy spawn (REQ-TMUX-002 /
 /// `TMUX_DEFAULT_SESSION`).
 pub const TMUX_DEFAULT_SESSION: &str = "main";
+
+// Bound on the post-spawn pane-readiness poll: 50 * 100ms = 5s ceiling.
+// Conservative — under normal load the pane is ready on the first probe.
+const PANE_READY_MAX_ATTEMPTS: u32 = 50;
+const PANE_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Filename for the Phoenix-shipped tmux server config, written into
 /// the socket directory and passed via `tmux -f` on every invocation.
@@ -634,7 +640,45 @@ pub async fn spawn_session(
             ),
         });
     }
-    Ok(())
+
+    // `new-session -d` returns once the server has accepted the session, but
+    // the pane's shell is not necessarily in steady state — under load, a
+    // format-string query (`display-message -p '#{pane_current_path}'`) issued
+    // immediately after can come back empty with a 0 exit. Poll list-panes
+    // until the pane exists so the postcondition "spawn_session returns =>
+    // pane usable" holds for every caller, not just well-timed ones. Task 62006.
+    for attempt in 0..PANE_READY_MAX_ATTEMPTS {
+        let panes = tokio::process::Command::new("tmux")
+            .args([
+                "-f",
+                &config_path.to_string_lossy(),
+                "-S",
+                &socket_path.to_string_lossy(),
+                "list-panes",
+                "-t",
+                TMUX_DEFAULT_SESSION,
+            ])
+            .env_remove("TMUX")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .await
+            .map_err(|e| TmuxError::SpawnFailed {
+                socket_path: socket_path.to_path_buf(),
+                reason: format!("failed to probe pane readiness: {e}"),
+            })?;
+        if panes.status.success() && !panes.stdout.is_empty() {
+            return Ok(());
+        }
+        if attempt + 1 < PANE_READY_MAX_ATTEMPTS {
+            tokio::time::sleep(PANE_READY_POLL_INTERVAL).await;
+        }
+    }
+    Err(TmuxError::SpawnFailed {
+        socket_path: socket_path.to_path_buf(),
+        reason: "session spawned but pane never became ready".to_string(),
+    })
 }
 
 /// Default socket directory: `$PHOENIX_DATA_DIR/tmux-sockets/` if set,
