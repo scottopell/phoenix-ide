@@ -39,7 +39,9 @@ class PhoenixError(Exception):
 def _detect_api_url() -> str:
     """Detect API URL from environment or dev.py conventions.
 
-    Priority: PHOENIX_API_URL env var > dev.py port detection > default 8000.
+    Priority: PHOENIX_API_URL env var > dev.py status `URL:` line (carries the
+    correct scheme — dev serves https with a self-signed cert) > dev.py port
+    (http fallback) > default 8000.
     """
     env_url = os.environ.get('PHOENIX_API_URL')
     if env_url:
@@ -53,25 +55,55 @@ def _detect_api_url() -> str:
             capture_output=True, text=True, timeout=5,
             cwd=Path(__file__).parent,
         )
+        port = None
         for line in result.stdout.splitlines():
+            stripped = line.strip()
+            # Prefer the authoritative "URL: https://localhost:8034" line —
+            # it carries the scheme. dev now serves TLS, so rebuilding
+            # "http://localhost:<port>" from the port line sends plaintext to
+            # an https socket ("illegal request line").
+            if stripped.startswith('URL:'):
+                return stripped.split('URL:', 1)[1].strip()
             if 'Phoenix=' in line:
                 # Parse "Default ports: Phoenix=8033, Vite=8042"
                 for part in line.split(','):
                     if 'Phoenix=' in part:
                         port = part.split('Phoenix=')[1].strip().rstrip(',')
-                        return f"http://localhost:{port}"
+        if port:
+            return f"http://localhost:{port}"
     except Exception:
         pass
 
     return "http://localhost:8000"
 
 
+# Hosts whose TLS we don't verify by default: dev/prod here serve self-signed
+# (or local-CA) certs the script's python env doesn't trust. PHOENIX_TLS_INSECURE
+# forces it off for any host; otherwise localhost / 127.0.0.1 / *.local are
+# treated as trusted-by-locality. Returns the value to pass as httpx `verify`.
+def _tls_verify(url: str) -> bool:
+    if os.environ.get('PHOENIX_TLS_INSECURE'):
+        return False
+    try:
+        from urllib.parse import urlparse
+        host = (urlparse(url).hostname or '').lower()
+    except Exception:
+        return True
+    if host in ('localhost', '127.0.0.1', '::1') or host.endswith('.local'):
+        return False
+    return True
+
+
 class PhoenixClient:
     def __init__(self, base_url: str, password: str | None = None):
         self.base_url = base_url.rstrip('/')
         self.password = password
+        # Self-signed dev/prod TLS: don't verify for localhost/*.local (or when
+        # PHOENIX_TLS_INSECURE is set). Stored so every client this instance
+        # builds (re-auth, SSE) uses the same policy.
+        self.verify = _tls_verify(self.base_url)
         cookies = {"phoenix-auth": password} if password else {}
-        self.http = httpx.Client(timeout=30.0, cookies=cookies)
+        self.http = httpx.Client(timeout=30.0, cookies=cookies, verify=self.verify)
 
     def check_auth(self) -> dict:
         """Check auth status. Returns { auth_required, authenticated }."""
@@ -99,7 +131,7 @@ class PhoenixClient:
         pw = getpass.getpass("Phoenix password: ")
         self.password = pw
         self.http = httpx.Client(
-            timeout=30.0, cookies={"phoenix-auth": pw}
+            timeout=30.0, cookies={"phoenix-auth": pw}, verify=self.verify
         )
         # Verify
         status = self.check_auth()
@@ -185,7 +217,7 @@ class PhoenixClient:
         )
 
         cookies = {"phoenix-auth": self.password} if self.password else {}
-        with httpx.Client(timeout=sse_timeout, cookies=cookies) as client:
+        with httpx.Client(timeout=sse_timeout, cookies=cookies, verify=self.verify) as client:
             with connect_sse(client, "GET", url) as event_source:
                 for event in event_source.iter_sse():
                     # Check overall timeout
@@ -482,8 +514,23 @@ def main_with_error_handling():
     except httpx.HTTPStatusError as e:
         click.echo(f"API error: {e.response.status_code} - {e.response.text}", err=True)
         sys.exit(1)
-    except httpx.ConnectError:
-        click.echo("Error: cannot connect to Phoenix server. Is it running? (./dev.py up)", err=True)
+    except httpx.ConnectError as e:
+        # A TLS verify failure surfaces as ConnectError wrapping an SSLError;
+        # don't collapse it into the generic "is it running?" message (which
+        # hides the real cause — see task 60409).
+        msg = str(e)
+        if 'SSL' in msg or 'CERTIFICATE' in msg.upper():
+            click.echo(
+                f"Error: TLS verification failed connecting to the server: {e}\n"
+                "If this is a self-signed dev/prod cert, set PHOENIX_TLS_INSECURE=1 "
+                "(localhost/*.local are already trusted by locality).",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"Error: cannot connect to Phoenix server ({e}). Is it running? (./dev.py up)",
+                err=True,
+            )
         sys.exit(1)
     except (httpx.ReadTimeout, httpx.ConnectTimeout) as e:
         click.echo(f"Error: connection timed out ({e})", err=True)
