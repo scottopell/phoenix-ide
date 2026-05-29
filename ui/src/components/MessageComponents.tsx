@@ -666,7 +666,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
               return (
                 <span
                   className="message-retry-badge"
-                  title={`This response succeeded after ${retryCount} retry${retryCount === 1 ? '' : ' attempts'}.`}
+                  title={`This response succeeded after ${retryCount} retry attempt${retryCount === 1 ? '' : 's'}.`}
                 >
                   retried {retryCount}x
                 </span>

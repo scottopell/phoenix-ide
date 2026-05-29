@@ -207,24 +207,29 @@ distinct SSE wire variants, with non-overlapping lifecycles:
 - `RateLimitSnapshot` is emitted mid-call (on a successful turn from
   parsed `x-codex-*` headers, or on a terminal 429 replayed from
   `UsageLimitReached.details`). It carries the full `QuotaDetails`.
-  It is **excluded from the replay ring** (`sse_wire.allium`,
-  PendingEventEntry block) because its semantics are stale on
-  reconnect.
+  Like all `send_seq` broadcasts it **is appended to the replay ring**
+  and whitelisted in `sse_wire.allium` (`EphemeralEventAppendedToReplayRing`),
+  but its semantics are **point-in-time**: a reconnecting client treats
+  a replayed snapshot as possibly-stale quota data (the live quota may
+  have moved since), so dropping or ignoring a replayed snapshot is
+  acceptable.
 - `LlmAttempt` is emitted at retry-schedule time (from
   `Effect::ScheduleRetry`). It carries only the per-attempt context
-  needed to render the retry modifier on the StateBar. It **is
-  included in the replay ring** so a reconnecting client can
-  reconstruct the in-flight retry display.
+  needed to render the retry modifier on the StateBar. It is **also in
+  the replay ring**, and unlike `RateLimitSnapshot` it is
+  **load-bearing on reconnect**: a mid-backoff reconnect must replay it
+  to reconstruct the in-flight retry display.
 
 **Rationale:** Both events involve rate-limit data, but they answer
 different questions ("what is the current quota?" vs "what is the
-current retry context?") and have different staleness properties.
-Unifying them would mean either dropping `RateLimitSnapshot`'s
-exclusion from the ring (degrading reconnect correctness for codex
-clients) or attaching retry context to the QuotaDetails carrier
-(structurally implies a quota snapshot exists, which it doesn't for
-non-codex providers). Keeping them distinct preserves both
-contracts.
+current retry context?") and have different staleness properties on
+reconnect — `RateLimitSnapshot` is informational/point-in-time while
+`LlmAttempt` is load-bearing for reconstructing the retry suffix.
+Unifying them would mean attaching retry context to the QuotaDetails
+carrier (which structurally implies a quota snapshot exists, and it
+doesn't for non-codex providers) or coercing the load-bearing retry
+event into the point-in-time staleness contract. Keeping them distinct
+preserves both contracts.
 
 ---
 
