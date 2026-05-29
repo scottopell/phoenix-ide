@@ -429,7 +429,7 @@ export function StateBar({
     }
     // No-op on subsequent renders during the same degraded window —
     // the snapshot is by-construction frozen.
-  }, [connectionHealthy, phaseIsWorking, phaseStateUpdatedAt, convState]);
+  }, [connectionHealthy, phaseIsWorking, phaseStateUpdatedAt, convState, firstByteRequestId]);
 
   // Close model picker on outside click
   useEffect(() => {
