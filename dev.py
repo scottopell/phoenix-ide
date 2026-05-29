@@ -470,32 +470,41 @@ def get_pid(pid_file: Path) -> int | None:
     return None
 
 
-def kill_process_group(pid: int) -> None:
+def kill_process_group(pid: int) -> bool:
     """SIGTERM a process's whole group, escalating to SIGKILL if it lingers.
 
     Kills the group (not just the pid) to catch child workers — e.g. Vite's
     pnpm parent spawns node children that survive if only the parent is killed.
     Servers are started with start_new_session=True, so each is its own session
     leader (pgid == pid) and the group never spans unrelated processes.
+
+    Returns True if the process is gone afterward, False if it survived both
+    signals (e.g. EPERM) — callers must not report success on a False.
     """
-    try:
-        os.killpg(os.getpgid(pid), signal.SIGTERM)
-    except (OSError, ProcessLookupError):
+
+    def _signal(sig: int) -> None:
+        # Best-effort: a missing group/pid means it is already gone; a genuine
+        # failure to kill is surfaced via the is_process_running check below,
+        # not by raising, so the final return value is the single source of truth.
         try:
-            os.kill(pid, signal.SIGTERM)
-        except OSError:
-            return
+            os.killpg(os.getpgid(pid), sig)
+        except (OSError, ProcessLookupError):
+            try:
+                os.kill(pid, sig)
+            except OSError:
+                pass
+
+    _signal(signal.SIGTERM)
     for _ in range(10):
         if not is_process_running(pid):
-            return
+            return True
         time.sleep(0.1)
-    try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
-    except (OSError, ProcessLookupError):
-        try:
-            os.kill(pid, signal.SIGKILL)
-        except OSError:
-            pass
+    _signal(signal.SIGKILL)
+    for _ in range(5):
+        if not is_process_running(pid):
+            return True
+        time.sleep(0.1)
+    return not is_process_running(pid)
 
 
 def stop_process(pid_file: Path, name: str) -> bool:
@@ -506,10 +515,10 @@ def stop_process(pid_file: Path, name: str) -> bool:
     if pid is None:
         return False
     try:
-        kill_process_group(pid)
-        print(f"Stopped {name} (PID {pid})")
-    except OSError as e:
-        print(f"Could not stop {name}: {e}")
+        if kill_process_group(pid):
+            print(f"Stopped {name} (PID {pid})")
+        else:
+            print(f"Could not stop {name} (PID {pid}); still running")
     finally:
         unregister_dev_process(name.lower())
         if pid_file.exists():
@@ -646,18 +655,22 @@ def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
                 continue
             # Worktree gone. Kill only if the pid is alive and still rooted in
             # that deleted tree (guards against PID reuse).
+            kept = False
             if is_process_running(pid):
                 cwd = _process_cwd(pid)
                 if cwd is not None and not cwd.exists() and str(cwd).startswith(worktree):
-                    if not dry_run:
-                        kill_process_group(pid)
                     handled.add(pid)
-                    reaped += 1
-                    if verbose:
-                        print(f"  {verb} {rec.get('kind', '?')} (PID {pid}, port {rec.get('port', '?')}) — {worktree}")
+                    if dry_run or kill_process_group(pid):
+                        reaped += 1
+                        if verbose:
+                            print(f"  {verb} {rec.get('kind', '?')} (PID {pid}, port {rec.get('port', '?')}) — {worktree}")
+                    else:
+                        kept = True  # kill failed; keep the record so a later reap retries
+                        if verbose:
+                            print(f"  Failed to kill PID {pid} ({worktree}); keeping record to retry")
                 elif verbose:
                     print(f"  Skipping registry PID {pid}: no longer rooted in deleted {worktree} (PID reused?)")
-            if not dry_run:
+            if not dry_run and not kept:
                 rec_file.unlink(missing_ok=True)
 
     for pid, command in _list_dev_processes():
@@ -666,8 +679,10 @@ def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
         cwd = _process_cwd(pid)
         if cwd is None or cwd.exists() or "/worktrees/" not in str(cwd):
             continue
-        if not dry_run:
-            kill_process_group(pid)
+        if not dry_run and not kill_process_group(pid):
+            if verbose:
+                print(f"  Failed to kill orphan (PID {pid}) — cwd {cwd}")
+            continue
         reaped += 1
         if verbose:
             print(f"  {verb} orphan (PID {pid}) — cwd {cwd}")
