@@ -116,6 +116,7 @@ Mid-QA on a sub-agent's commit you spot drift in a file that was out of their sc
 ```bash
 ./dev.py up          # Build and start Phoenix + Vite (auto-seeds DB if empty)
 ./dev.py down        # Stop all servers
+./dev.py reap        # Kill dev servers orphaned by deleted worktrees (--dry-run to preview)
 ./dev.py restart     # Rebuild Rust, restart Phoenix (Vite keeps running)
 ./dev.py status      # Check what's running
 ./dev.py seed        # Populate dev DB with representative conversations (idempotent)
@@ -127,6 +128,8 @@ Mid-QA on a sub-agent's commit you spot drift in a file that was out of their sc
 In dev mode, Vite serves `ui/` with hot reload. In production, `ui/dist/` is embedded into the Rust binary via RustEmbed.
 
 Each git worktree gets unique ports and database automatically.
+
+Deleting a worktree (e.g. via the harness) without running `./dev.py down` first orphans its Phoenix/Vite servers — the `.pid` files live inside the worktree and vanish with it, but the processes keep running and holding their ports. To survive this, each spawned server is also recorded in `~/.phoenix-ide/dev-registry/` (outside any worktree). `./dev.py up` auto-reaps such orphans before starting, and `./dev.py reap` cleans them on demand. A process is only killed when its working directory points into a now-deleted worktree, so live servers are never touched.
 
 Phoenix must treat the user's Git worktrees as owned environments: fetching remote refs is safe, but moving a local branch ref that is checked out in any worktree is not. Before any operation that updates `refs/heads/*`, check all worktrees and skip the ref move if the branch is checked out.
 

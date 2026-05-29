@@ -218,6 +218,11 @@ DEV_PORT_MAX = 8050
 
 # Database directory
 DB_DIR = Path.home() / ".phoenix-ide"
+# Dev-server registry. Lives in $HOME, NOT in the worktree, so the kill-handle
+# for a spawned server survives the worktree being deleted out from under it
+# (the in-worktree .pid files do not). `./dev.py reap` reads it to clean up
+# servers orphaned when a worktree is removed without `./dev.py down` first.
+DEV_REGISTRY_DIR = DB_DIR / "dev-registry"
 TLS_CA_DIR = DB_DIR / "tls"
 TLS_BUNDLE_DIR = DB_DIR / "tls-bundles"
 TLS_INSTALL_DIR = DB_DIR / "tls"
@@ -465,36 +470,48 @@ def get_pid(pid_file: Path) -> int | None:
     return None
 
 
+def kill_process_group(pid: int) -> None:
+    """SIGTERM a process's whole group, escalating to SIGKILL if it lingers.
+
+    Kills the group (not just the pid) to catch child workers — e.g. Vite's
+    pnpm parent spawns node children that survive if only the parent is killed.
+    Servers are started with start_new_session=True, so each is its own session
+    leader (pgid == pid) and the group never spans unrelated processes.
+    """
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except OSError:
+            return
+    for _ in range(10):
+        if not is_process_running(pid):
+            return
+        time.sleep(0.1)
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (OSError, ProcessLookupError):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+
+
 def stop_process(pid_file: Path, name: str) -> bool:
     """Stop a process by PID file. Returns True if was running."""
     global _db_lock
-    
+
     pid = get_pid(pid_file)
     if pid is None:
         return False
     try:
-        # Kill the entire process group to catch child workers (e.g., Vite
-        # spawns node child processes that survive if only the parent is killed)
-        try:
-            pgid = os.getpgid(pid)
-            os.killpg(pgid, signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            os.kill(pid, signal.SIGTERM)
-        # Wait briefly for graceful shutdown
-        for _ in range(10):
-            if not is_process_running(pid):
-                break
-            time.sleep(0.1)
-        else:
-            try:
-                pgid = os.getpgid(pid)
-                os.killpg(pgid, signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                os.kill(pid, signal.SIGKILL)
+        kill_process_group(pid)
         print(f"Stopped {name} (PID {pid})")
     except OSError as e:
         print(f"Could not stop {name}: {e}")
     finally:
+        unregister_dev_process(name.lower())
         if pid_file.exists():
             pid_file.unlink()
         if name == "Phoenix" and PHOENIX_PORT_FILE.exists():
@@ -508,6 +525,163 @@ def stop_process(pid_file: Path, name: str) -> bool:
             _db_lock.release()
             _db_lock = None
     return True
+
+
+def _registry_path(kind: str) -> Path:
+    return DEV_REGISTRY_DIR / f"{get_worktree_hash()}.{kind}.json"
+
+
+def register_dev_process(kind: str, pid: int, port: int) -> None:
+    """Record a spawned dev server outside the worktree so `reap` can find it
+    even after the worktree directory (and its .pid files) are deleted.
+
+    Best-effort: a registry failure must never block a server from starting.
+    """
+    try:
+        DEV_REGISTRY_DIR.mkdir(parents=True, exist_ok=True)
+        _registry_path(kind).write_text(
+            json.dumps({"kind": kind, "pid": pid, "worktree": str(ROOT), "port": port})
+        )
+    except OSError:
+        pass
+
+
+def unregister_dev_process(kind: str) -> None:
+    """Remove a dev server's registry record (clean shutdown via `down`)."""
+    try:
+        _registry_path(kind).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _process_cwd(pid: int) -> Path | None:
+    """Return a live process's working directory via lsof, or None.
+
+    lsof reports the recorded path even when the directory has been deleted,
+    which is exactly what lets reap recognise an orphan of a removed worktree.
+    Uses lsof rather than /proc because this is macOS-first tooling.
+    """
+    try:
+        out = subprocess.run(
+            ["lsof", "-a", "-p", str(pid), "-d", "cwd", "-Fn"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in out.splitlines():
+        if line.startswith("n"):
+            return Path(line[1:])
+    return None
+
+
+def _looks_like_dev_server(command: str) -> bool:
+    """True if a process command line is a Phoenix/Vite dev server we spawn.
+
+    Matches the debug/release Phoenix binary (underscore name — the prod binary
+    is `phoenix-ide` with a dash and won't match), the Vite worker, and the
+    pnpm parent that launches it.
+    """
+    return (
+        "/target/release/phoenix_ide" in command
+        or "/target/debug/phoenix_ide" in command
+        or "vite/bin/vite.js" in command
+        or "pnpm run dev" in command
+    )
+
+
+def _list_dev_processes() -> list[tuple[int, str]]:
+    """Enumerate (pid, command) for every live Phoenix/Vite dev process."""
+    try:
+        out = subprocess.run(
+            ["ps", "-axww", "-o", "pid=,command="],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    procs = []
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        pid_str, _, command = line.partition(" ")
+        if not pid_str.isdigit() or not _looks_like_dev_server(command):
+            continue
+        procs.append((int(pid_str), command))
+    return procs
+
+
+def reap_orphans(verbose: bool = True, dry_run: bool = False) -> int:
+    """Kill dev servers orphaned when their worktree was deleted without `down`.
+
+    A process is reaped only when its live cwd resolves to a directory that no
+    longer exists — a condition a recycled PID cannot satisfy, so the kill is
+    safe. Two sources are checked: the registry (authoritative, survives the
+    worktree's deletion) and a heuristic process scan (catches orphans spawned
+    before the registry existed). Servers whose worktree still exists, including
+    the current one, are never touched. With dry_run, reports what would be
+    killed and mutates nothing (no kills, no registry-record removal).
+    """
+    verb = "Would reap" if dry_run else "Reaped"
+    reaped = 0
+    handled: set[int] = set()
+
+    if DEV_REGISTRY_DIR.exists():
+        for rec_file in sorted(DEV_REGISTRY_DIR.glob("*.json")):
+            try:
+                rec = json.loads(rec_file.read_text())
+                pid = int(rec["pid"])
+                worktree = str(rec["worktree"])
+            except (OSError, KeyError, ValueError, json.JSONDecodeError):
+                if not dry_run:
+                    rec_file.unlink(missing_ok=True)
+                continue
+            if Path(worktree).exists():
+                # Live worktree: not an orphan. Drop the record only if dead.
+                if not is_process_running(pid) and not dry_run:
+                    rec_file.unlink(missing_ok=True)
+                continue
+            # Worktree gone. Kill only if the pid is alive and still rooted in
+            # that deleted tree (guards against PID reuse).
+            if is_process_running(pid):
+                cwd = _process_cwd(pid)
+                if cwd is not None and not cwd.exists() and str(cwd).startswith(worktree):
+                    if not dry_run:
+                        kill_process_group(pid)
+                    handled.add(pid)
+                    reaped += 1
+                    if verbose:
+                        print(f"  {verb} {rec.get('kind', '?')} (PID {pid}, port {rec.get('port', '?')}) — {worktree}")
+                elif verbose:
+                    print(f"  Skipping registry PID {pid}: no longer rooted in deleted {worktree} (PID reused?)")
+            if not dry_run:
+                rec_file.unlink(missing_ok=True)
+
+    for pid, command in _list_dev_processes():
+        if pid in handled:
+            continue
+        cwd = _process_cwd(pid)
+        if cwd is None or cwd.exists() or "/worktrees/" not in str(cwd):
+            continue
+        if not dry_run:
+            kill_process_group(pid)
+        reaped += 1
+        if verbose:
+            print(f"  {verb} orphan (PID {pid}) — cwd {cwd}")
+
+    if verbose and reaped == 0:
+        print("No orphaned dev servers found.")
+    return reaped
+
+
+def cmd_reap(dry_run: bool = False) -> None:
+    """Kill dev servers orphaned by deleted worktrees."""
+    n = reap_orphans(verbose=True, dry_run=dry_run)
+    if n and not dry_run:
+        print(f"Reaped {n} orphaned dev process group(s).")
 
 
 def ensure_ui_deps():
@@ -631,6 +805,7 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
         )
         PHOENIX_PID_FILE.write_text(str(proc.pid))
     PHOENIX_PORT_FILE.write_text(str(port) + "\n")
+    register_dev_process("phoenix", proc.pid, port)
 
     # Verify it started
     time.sleep(0.5)
@@ -682,6 +857,7 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False):
     )
     VITE_PID_FILE.write_text(str(proc.pid))
     VITE_PORT_FILE.write_text(str(port) + "\n")
+    register_dev_process("vite", proc.pid, port)
 
     time.sleep(1)
     if not is_process_running(proc.pid):
@@ -705,6 +881,11 @@ def cmd_up(
     tls: bool = False,
 ):
     """Build and start Phoenix + Vite dev servers."""
+    # Self-heal: reclaim ports/PIDs from servers orphaned when a worktree was
+    # deleted without `./dev.py down`. Runs before port selection so freed
+    # ports are available to probe. Quiet unless something was actually reaped.
+    if reap_orphans(verbose=False):
+        print("Reaped orphaned dev servers from deleted worktrees.")
     default_phoenix, default_vite = get_default_ports()
     preferred_phoenix = phoenix_port or default_phoenix
     preferred_vite = vite_port or default_vite
@@ -4259,6 +4440,9 @@ def main():
     # down
     sub.add_parser("down", help="Stop all servers")
 
+    reap_parser = sub.add_parser("reap", help="Kill dev servers orphaned by deleted worktrees")
+    reap_parser.add_argument("--dry-run", action="store_true", help="List what would be reaped without killing anything")
+
     # restart
     restart_parser = sub.add_parser("restart", help="Rebuild Rust and restart Phoenix")
     restart_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto from worktree hash)")
@@ -4345,6 +4529,8 @@ def main():
         )
     elif args.command == "down":
         cmd_down()
+    elif args.command == "reap":
+        cmd_reap(dry_run=args.dry_run)
     elif args.command == "restart":
         cmd_restart(phoenix_port=args.port, tls=args.https)
     elif args.command == "status":
