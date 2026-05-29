@@ -1,7 +1,8 @@
 import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
 import { FolderTree } from 'lucide-react';
-import { api, canChangeModelInState, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
+import { canChangeModelInState, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
+import type { ConversationPrStatusState } from '../hooks/useConversationPrStatus';
 import type { ConnectionState } from '../hooks';
 import { useIsMobile } from '../hooks';
 import { getStateDescription, isAgentWorking } from '../utils';
@@ -94,6 +95,7 @@ interface StateBarProps {
   onOpenFiles?: (() => void) | undefined;
   onSendMessage?: ((text: string) => void) | undefined;
   showError?: ((message: string) => void) | undefined;
+  prStatusState?: ConversationPrStatusState;
 }
 
 /** Format a context window size in tokens for compact display (e.g. 200k, 1M). */
@@ -181,43 +183,7 @@ function prSummaryText(pr: PrStatusResponse): string {
   return `${s.passing} pass · ${s.pending} pending · ${s.failing} fail · ${s.skipped} skip · ${s.unknown} unknown`;
 }
 
-function PrCiPopover({
-  pr,
-  conversationId,
-  onSendMessage,
-  onClose,
-  showError,
-  loading,
-  setLoading,
-}: {
-  pr: PrStatusResponse;
-  conversationId: string;
-  onSendMessage?: ((text: string) => void) | undefined;
-  onClose: () => void;
-  showError?: ((message: string) => void) | undefined;
-  loading: boolean;
-  setLoading: (loading: boolean) => void;
-}) {
-  const canAutoFix = pr.found && pr.display_state === 'open' && !!onSendMessage;
-  const unavailable = !canAutoFix
-    ? pr.display_state !== 'open'
-      ? 'Available for open, non-draft PRs only'
-      : 'Conversation input is unavailable'
-    : undefined;
-  const handleAutoFix = async () => {
-    if (!canAutoFix) return;
-    setLoading(true);
-    try {
-      const context = await api.createPrAutoFixContext(conversationId);
-      onSendMessage(context.message);
-      onClose();
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Failed to capture PR context';
-      showError?.(message);
-    } finally {
-      setLoading(false);
-    }
-  };
+function PrStatusPopover({ pr }: { pr: PrStatusResponse }) {
 
   const attentionNames = [
     ...(pr.check_summary?.failing_names ?? []),
@@ -241,15 +207,6 @@ function PrCiPopover({
         </div>
       )}
       {pr.url && <a href={pr.url} target="_blank" rel="noreferrer">Open PR/checks ↗</a>}
-      <button
-        type="button"
-        className="pr-autofix-btn"
-        disabled={!canAutoFix || loading}
-        title={unavailable}
-        onClick={handleAutoFix}
-      >
-        {loading ? 'Capturing...' : 'Auto-fix CI & address comments'}
-      </button>
     </div>
   );
 }
@@ -299,20 +256,20 @@ export function StateBar({
   firstByteRequestId,
   turnRetryContext,
   onOpenFiles,
-  onSendMessage,
-  showError,
+  onSendMessage: _onSendMessage,
+  showError: _showError,
+  prStatusState,
 }: StateBarProps) {
   // `toolExecutingStartedAt` is kept on the prop type for the
   // tool-widget header (which still reads it from the atom). The
   // StateBar's own elapsed counter switched to `phaseStateUpdatedAt`
   // in Stage A — the destructured value is intentionally unused here.
   void _deprecatedToolStartedAt;
+  void _onSendMessage;
+  void _showError;
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pickerShowAll, setPickerShowAll] = useState(false);
-  const [prStatus, setPrStatus] = useState<PrStatusResponse | null>(null);
-  const [prLoading, setPrLoading] = useState(false);
   const [prPopoverOpen, setPrPopoverOpen] = useState(false);
-  const [prAutoFixLoading, setPrAutoFixLoading] = useState(false);
   // Mobile breakpoint mirrors the @media (max-width: 768px) block in index.css.
   const isMobile = useIsMobile();
   const [mobileExpanded, setMobileExpanded] = useState(false);
@@ -713,60 +670,9 @@ export function StateBar({
   const baseBranch = conversation?.base_branch;
   const branchName = conversation?.branch_name;
   const taskTitle = conversation?.task_title;
+  const prStatus = prStatusState?.status === 'ready' ? prStatusState.prStatus : null;
+  const prLoading = prStatusState?.status === 'loading';
   const prHint = prStatus && !prStatus.found ? unavailablePrHint(prStatus.unavailable_reason) : null;
-
-  useEffect(() => {
-    // Drop the previous conversation's PR status immediately so the badge/hint
-    // never shows stale data while the new fetch is in flight.
-    setPrStatus(null);
-    if (!conversation?.id || !branchName) {
-      setPrLoading(false);
-      return;
-    }
-
-    let cancelled = false;
-    let timeout: number | null = null;
-    // Per-effect-run sequence: fetchStatus fires from the initial call, the
-    // 60s poll, and visibilitychange; only the most recent response may apply
-    // so an out-of-order resolution can't clobber fresher data.
-    let latestSeq = 0;
-
-    const fetchStatus = async () => {
-      const seq = ++latestSeq;
-      const fresh = () => !cancelled && seq === latestSeq;
-      setPrLoading(true);
-      try {
-        const status = await api.getPrStatus(conversation.id);
-        if (fresh()) setPrStatus(status);
-      } catch {
-        if (fresh()) setPrStatus({ found: false, unavailable_reason: 'command_failed' });
-      } finally {
-        if (fresh()) setPrLoading(false);
-      }
-    };
-
-    const schedule = () => {
-      if (timeout != null) window.clearTimeout(timeout);
-      timeout = window.setTimeout(async () => {
-        await fetchStatus();
-        if (!cancelled) schedule();
-      }, 60_000);
-    };
-
-    void fetchStatus();
-    schedule();
-
-    const onVisible = () => {
-      if (document.visibilityState === 'visible') void fetchStatus();
-    };
-    document.addEventListener('visibilitychange', onVisible);
-
-    return () => {
-      cancelled = true;
-      if (timeout != null) window.clearTimeout(timeout);
-      document.removeEventListener('visibilitychange', onVisible);
-    };
-  }, [conversation?.id, branchName]);
 
   const showMobileCollapsed = isMobile && !mobileExpanded;
   const headerProps = showMobileCollapsed
@@ -893,15 +799,7 @@ export function StateBar({
                             {prBadgeLabel(prStatus)}
                           </button>
                           {prPopoverOpen && conversation && (
-                            <PrCiPopover
-                              pr={prStatus}
-                              conversationId={conversation.id}
-                              onSendMessage={onSendMessage}
-                              onClose={() => setPrPopoverOpen(false)}
-                              showError={showError}
-                              loading={prAutoFixLoading}
-                              setLoading={setPrAutoFixLoading}
-                            />
+                            <PrStatusPopover pr={prStatus} />
                           )}
                         </span>
                       )}
@@ -928,15 +826,7 @@ export function StateBar({
                             {prBadgeLabel(prStatus)}
                           </button>
                           {prPopoverOpen && conversation && (
-                            <PrCiPopover
-                              pr={prStatus}
-                              conversationId={conversation.id}
-                              onSendMessage={onSendMessage}
-                              onClose={() => setPrPopoverOpen(false)}
-                              showError={showError}
-                              loading={prAutoFixLoading}
-                              setLoading={setPrAutoFixLoading}
-                            />
+                            <PrStatusPopover pr={prStatus} />
                           )}
                         </span>
                       )}

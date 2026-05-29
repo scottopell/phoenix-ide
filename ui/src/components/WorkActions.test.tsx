@@ -1,4 +1,4 @@
-// Tests for WorkActions continuation gate (REQ-BED-031, task 24696 Phase 5).
+// Tests for WorkControlBar continuation gate (REQ-BED-031, task 24696 Phase 5).
 //
 // When the parent conversation has a continuation, abandon and mark-as-merged
 // must be disabled on the parent — the action belongs on the continuation.
@@ -10,7 +10,8 @@ import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { useEffect } from 'react';
 import type { ReactElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
-import { WorkActions } from './WorkActions';
+import { WorkControlBar } from './WorkActions';
+import { api, type PrStatusResponse } from '../api';
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import {
   BrowserViewStateProvider,
@@ -21,7 +22,7 @@ import type { DiffViewerPayload } from '../contexts/ViewerStateContext';
 import { FileExplorerProvider } from './FileExplorer';
 
 // All four providers are needed: FileExplorerProvider for the
-// useFileExplorer().closeFile call WorkActions makes during the
+// useFileExplorer().closeFile call WorkControlBar makes during the
 // single-slot enforcement, ReviewNotesProvider for the diff viewer's
 // notes context, and the two viewer-state providers (Diff + Browser)
 // so the View-Diff and View-Browser controls can publish their state.
@@ -44,7 +45,7 @@ const renderWithProviders = (ui: ReactElement) =>
 
 /** Test helper: subscribes to DiffViewerStateContext and forwards every
  *  payload to the provided callback so tests can assert on what the
- *  WorkActions push. */
+ *  WorkControlBar push. */
 function CapturePayload({ onPayload }: { onPayload: (p: DiffViewerPayload | null) => void }) {
   const { payload } = useDiffViewerState();
   useEffect(() => {
@@ -58,26 +59,37 @@ vi.mock('../api', () => ({
     abandonTask: vi.fn().mockResolvedValue({ success: true }),
     markMerged: vi.fn().mockResolvedValue({ success: true }),
     getConversationDiff: vi.fn(),
-    getPrStatus: vi.fn().mockResolvedValue({ found: false }),
+    createPrAutoFixContext: vi.fn().mockResolvedValue({ message: 'Address `.phoenix/pr-context/pr-12.json`' }),
   },
 }));
 
-describe('WorkActions — continuation gate (REQ-BED-031)', () => {
-  beforeEach(async () => {
+function prStatusHandle(prStatus: PrStatusResponse = { found: false }, manualFallbackEnabled = false) {
+  return {
+    state: { status: 'ready' as const, prStatus },
+    manualFallbackEnabled,
+    enableManualFallback: vi.fn(),
+  };
+}
+
+const loadingPrStatusHandle = {
+  state: { status: 'loading' as const, prStatus: null },
+  manualFallbackEnabled: false,
+  enableManualFallback: vi.fn(),
+};
+
+describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
+  beforeEach(() => {
     vi.clearAllMocks();
-    const { api } = await import('../api');
-    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ found: false });
   });
 
   it('disables Abandon and Mark-as-Merged when continuedInConvId is set', async () => {
     renderWithProviders(
-      <WorkActions
+      <WorkControlBar
         conversationId="conv-1"
         convModeLabel="Work"
         phaseType="idle"
-        branchName="feat/x"
-        baseBranch="main"
         continuedInConvId="continuation-id"
+        prStatusHandle={prStatusHandle()}
       />
     );
 
@@ -94,25 +106,20 @@ describe('WorkActions — continuation gate (REQ-BED-031)', () => {
   });
 
   it('enables Abandon and Mark-as-Merged when continuedInConvId is null', async () => {
-    const { api } = await import('../api');
-
     renderWithProviders(
-      <WorkActions
+      <WorkControlBar
         conversationId="conv-1"
         convModeLabel="Work"
         phaseType="idle"
-        branchName="feat/x"
-        baseBranch="main"
         continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
       />
     );
 
     const abandon = screen.getByTestId('abandon-button') as HTMLButtonElement;
     const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
 
-    // Mark-as-Merged is disabled until the PR-status fetch resolves (so a
-    // fast click can't cleanup a still-open PR). The mocked getPrStatus
-    // resolves to { found: false } → no PR → cleanup is allowed.
+    // Shared PR status is ready and no PR was found, so cleanup is allowed.
     await waitFor(() => {
       expect(abandon.disabled).toBe(false);
       expect(mark.disabled).toBe(false);
@@ -125,56 +132,66 @@ describe('WorkActions — continuation gate (REQ-BED-031)', () => {
     expect(api.markMerged).toHaveBeenCalledWith('conv-1');
   });
   it('requires an explicit manual fallback click when gh is unavailable', async () => {
-    const { api } = await import('../api');
-    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({
-      found: false,
-      unavailable_reason: 'not_authenticated',
-    });
-
     renderWithProviders(
-      <WorkActions
+      <WorkControlBar
         conversationId="conv-1"
         convModeLabel="Work"
         phaseType="idle"
-        branchName="feat/x"
-        baseBranch="main"
         continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: false, unavailable_reason: 'not_authenticated' })}
       />
     );
 
     const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
-    await waitFor(() => expect(mark.textContent).toMatch(/manual fallback/i));
+    expect(mark.textContent).toMatch(/manual fallback/i);
     fireEvent.click(mark);
     expect(api.markMerged).not.toHaveBeenCalled();
-    await waitFor(() => expect(mark.textContent).toMatch(/mark as merged/i));
-    fireEvent.click(mark);
-    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
   });
 });
 
-describe('WorkActions — PR cleanup guidance', () => {
-  beforeEach(async () => {
+describe('WorkControlBar — PR cleanup guidance', () => {
+  it('shows Checking PR while shared PR status is loading', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={loadingPrStatusHandle}
+      />,
+    );
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    expect(mark.textContent).toMatch(/Checking PR/i);
+    expect(mark.disabled).toBe(true);
+  });
+
+  it('shows Clean up merged PR when GitHub reports merged', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-merged"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: true, number: 136, display_state: 'merged' })}
+      />,
+    );
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    expect(mark.textContent).toMatch(/Clean up merged PR/i);
+    expect(mark.disabled).toBe(false);
+  });
+
+  beforeEach(() => {
     vi.clearAllMocks();
-    const { api } = await import('../api');
-    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ found: false });
   });
 
   it('guides closed-unmerged PRs toward Abandon instead of waiting for merge cleanup', async () => {
-    const { api } = await import('../api');
-    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({
-      found: true,
-      number: 133,
-      display_state: 'closed',
-    });
-
     renderWithProviders(
-      <WorkActions
+      <WorkControlBar
         conversationId="conv-closed"
         convModeLabel="Work"
         phaseType="idle"
-        branchName="feat/closed-pr"
-        baseBranch="main"
         continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: true, number: 133, display_state: 'closed' })}
       />,
     );
 
@@ -195,21 +212,14 @@ describe('WorkActions — PR cleanup guidance', () => {
     ['open', 134],
     ['draft', 135],
   ] as const)('keeps %s PRs blocked until GitHub reports merged', async (displayState, number) => {
-    const { api } = await import('../api');
-    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({
-      found: true,
-      number,
-      display_state: displayState,
-    });
 
     renderWithProviders(
-      <WorkActions
+      <WorkControlBar
         conversationId={`conv-${displayState}`}
         convModeLabel="Work"
         phaseType="idle"
-        branchName={`feat/${displayState}-pr`}
-        baseBranch="main"
         continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: true, number, display_state: displayState })}
       />,
     );
 
@@ -228,11 +238,9 @@ describe('WorkActions — PR cleanup guidance', () => {
   });
 });
 
-describe('WorkActions — View Diff (task 08641 + 08654 follow-on)', () => {
-  beforeEach(async () => {
+describe('WorkControlBar — View Diff (task 08641 + 08654 follow-on)', () => {
+  beforeEach(() => {
     vi.clearAllMocks();
-    const { api } = await import('../api');
-    (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ found: false });
   });
 
   it('fetches the diff and publishes the payload to DiffViewerStateContext', async () => {
@@ -247,13 +255,12 @@ describe('WorkActions — View Diff (task 08641 + 08654 follow-on)', () => {
     let captured: DiffViewerPayload | null = null;
     renderWithProviders(
       <>
-        <WorkActions
+        <WorkControlBar
           conversationId="conv-1"
           convModeLabel="Branch"
           phaseType="idle"
-          branchName="feat/x"
-          baseBranch="main"
           continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
         />
         <CapturePayload onPayload={(p) => { captured = p; }} />
       </>,
@@ -288,13 +295,12 @@ describe('WorkActions — View Diff (task 08641 + 08654 follow-on)', () => {
     let captured: DiffViewerPayload | null = null;
     renderWithProviders(
       <>
-        <WorkActions
+        <WorkControlBar
           conversationId="conv-1"
           convModeLabel="Work"
           phaseType="idle"
-          branchName="feat/x"
-          baseBranch="main"
           continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
         />
         <CapturePayload onPayload={(p) => { captured = p; }} />
       </>,
@@ -314,13 +320,12 @@ describe('WorkActions — View Diff (task 08641 + 08654 follow-on)', () => {
 
   it('does not render the View Diff button in Direct mode', async () => {
     renderWithProviders(
-      <WorkActions
+      <WorkControlBar
         conversationId="conv-1"
         convModeLabel="Direct"
         phaseType="idle"
-        branchName={undefined}
-        baseBranch={null}
         continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
       />
     );
 

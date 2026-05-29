@@ -20,6 +20,8 @@ import {
   useAutoAuth,
   derivePendingMessages,
   deriveFailedMessages,
+  useConversationPrStatus,
+  DraftLifecycle,
 } from '../hooks';
 import { useToast } from '../hooks/useToast';
 import { Toast } from '../components/Toast';
@@ -27,14 +29,13 @@ import { useAppMachine } from '../hooks/useAppMachine';
 import { StateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
-import { WorkActions } from '../components/WorkActions';
+import { WorkControlBar } from '../components/WorkActions';
 import { useConversationAtom, useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
 import {
   useResizablePane,
   useIsDesktop,
   useIsWideDesktop,
   useDraftActions,
-  DraftLifecycle,
 } from '../hooks';
 
 // Conditional overlays / heavy panels — code-split so the default render path
@@ -144,6 +145,11 @@ function ConversationPageContent() {
   // Derived from atom
   const conversationId = atom.conversationId ?? undefined;
   const conversation = atom.conversation;
+  const prStatusHandle = useConversationPrStatus({
+    conversationId,
+    convModeLabel: conversation?.conv_mode_label,
+    branchName: conversation?.branch_name,
+  });
 
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
@@ -1282,14 +1288,14 @@ function ConversationPageContent() {
       ) : convStateForChildren.type !== 'context_exhausted' && convStateForChildren.type !== 'awaiting_task_approval' && convStateForChildren.type !== 'handed_off' && convStateForChildren.type !== 'terminal' ? (
         <>
         {conversationId && (
-          <WorkActions
+          <WorkControlBar
             conversationId={conversationId}
             convModeLabel={conversation.conv_mode_label}
             phaseType={convStateForChildren.type}
-            branchName={conversation.branch_name ?? undefined}
-            baseBranch={conversation.base_branch}
             continuedInConvId={conversation.continued_in_conv_id}
             onSendMessage={(text) => handleSend(text, [])}
+            showError={showError}
+            prStatusHandle={prStatusHandle}
           />
         )}
         {credentialStatus && credentialStatus !== 'not_configured' && credentialStatus !== 'valid' && (
@@ -1348,8 +1354,7 @@ function ConversationPageContent() {
         firstByteRequestId={atom.firstByteRequestId}
         turnRetryContext={atom.turnRetryContext}
         onOpenFiles={isDesktop ? undefined : () => setShowFileBrowser(true)}
-        onSendMessage={(text) => handleSend(text, [])}
-        showError={showError}
+        prStatusState={prStatusHandle.state}
       />
       </div>
 

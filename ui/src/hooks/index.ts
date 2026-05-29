@@ -20,6 +20,8 @@ export { useResizablePane } from './useResizablePane';
 export type { UseResizablePaneOptions, UseResizablePaneResult } from './useResizablePane';
 export { useModels } from './useModels';
 export { useAutoAuth } from './useAutoAuth';
+export { useConversationPrStatus } from './useConversationPrStatus';
+export type { ConversationPrStatusHandle, ConversationPrStatusState } from './useConversationPrStatus';
 export { useTheme } from './useTheme';
 export { useScopedState } from './useScopedState';
 export { useMediaQuery, useIsDesktop, useIsWideDesktop, useIsMobile } from './useMediaQuery';

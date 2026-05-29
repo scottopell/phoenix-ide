@@ -78,6 +78,7 @@ function renderStateBar({
   modelContextWindow = 200_000,
   continuation,
   onSendMessage,
+  prStatus,
   connectionState = 'connected',
   connectionAttempt = 0,
   phaseStateUpdatedAt,
@@ -91,6 +92,7 @@ function renderStateBar({
   modelContextWindow?: number;
   continuation?: ComponentProps<typeof StateBar>['continuation'];
   onSendMessage?: ComponentProps<typeof StateBar>['onSendMessage'];
+  prStatus?: PrStatusResponse;
   connectionState?: ComponentProps<typeof StateBar>['connectionState'];
   connectionAttempt?: number;
   phaseStateUpdatedAt?: number | null;
@@ -113,6 +115,9 @@ function renderStateBar({
   if (onSendMessage) {
     props.onSendMessage = onSendMessage;
   }
+  if (prStatus) {
+    props.prStatusState = { status: 'ready', prStatus };
+  }
   if (phaseStateUpdatedAt !== undefined) {
     props.phaseStateUpdatedAt = phaseStateUpdatedAt;
   }
@@ -132,8 +137,8 @@ function renderStateBar({
   );
 }
 
-function mockPrStatus(status: PrStatusResponse) {
-  (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue(status);
+function mockPrStatus(status: PrStatusResponse): PrStatusResponse {
+  return status;
 }
 
 describe('StateBar PR badge', () => {
@@ -146,7 +151,7 @@ describe('StateBar PR badge', () => {
     [{ display_state: 'closed', check_state: 'unknown' }, /#12 closed/i, 'pr-badge--failing'],
     [{ display_state: 'open', check_state: 'unknown' }, /^#12$/i, 'pr-badge--unknown'],
   ] as const)('renders %s as %s', async (state, label, className) => {
-    mockPrStatus({
+    renderStateBar({ prStatus: mockPrStatus({
       found: true,
       number: 12,
       title: 'Add PR tracking',
@@ -157,9 +162,7 @@ describe('StateBar PR badge', () => {
       head: 'task-123-pr-status',
       display_state: state.display_state,
       check_state: state.check_state,
-    } as PrStatusResponse);
-
-    renderStateBar();
+    } as PrStatusResponse) });
 
     const badge = await screen.findByRole('button', { name: label });
     expect(badge).toHaveClass('pr-badge', className);
@@ -167,33 +170,27 @@ describe('StateBar PR badge', () => {
   });
 
   it('renders no badge when gh finds no PR', async () => {
-    mockPrStatus({ found: false });
+    renderStateBar({ prStatus: mockPrStatus({ found: false }) });
 
-    renderStateBar();
-
-    await waitFor(() => expect(api.getPrStatus).toHaveBeenCalledWith('conv-1'));
     expect(screen.queryByText(/^#\d+/)).not.toBeInTheDocument();
   });
 
   it('renders a compact gh authentication hint when status is unavailable', async () => {
-    mockPrStatus({ found: false, unavailable_reason: 'not_authenticated' });
+    renderStateBar({ prStatus: mockPrStatus({ found: false, unavailable_reason: 'not_authenticated' }) });
 
-    renderStateBar();
-
-    expect(await screen.findByText('gh auth')).toBeInTheDocument();
+    expect(screen.getByText('gh auth')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: /^#\d+/ })).not.toBeInTheDocument();
   });
 
-  it('does not fetch PR status for conversations without a branch', async () => {
+  it('does not fetch PR status itself for conversations without a branch', async () => {
     renderStateBar({ conversation: makeConversation({ branch_name: null, base_branch: null }) });
 
     await waitFor(() => expect(screen.getByText('track-pr-status')).toBeInTheDocument());
     expect(api.getPrStatus).not.toHaveBeenCalled();
   });
 
-  it('opens CI popover and sends auto-fix message from captured context', async () => {
-    const onSendMessage = vi.fn();
-    mockPrStatus({
+  it('opens read-only CI popover without remediation action', async () => {
+    renderStateBar({ prStatus: mockPrStatus({
       found: true,
       number: 12,
       title: 'Fix CI',
@@ -214,15 +211,12 @@ describe('StateBar PR badge', () => {
         pending_names: [],
       },
       feedback_summary: { total: 2, unresolved: 2, items: [], coverage: [] },
-    });
+    }) });
 
-    renderStateBar({ onSendMessage });
     fireEvent.click(await screen.findByRole('button', { name: /#12 checks ✗/i }));
     expect(await screen.findByRole('dialog', { name: /PR CI monitoring/i })).toBeInTheDocument();
-    fireEvent.click(screen.getByRole('button', { name: /Auto-fix CI & address comments/i }));
-
-    await waitFor(() => expect(api.createPrAutoFixContext).toHaveBeenCalledWith('conv-1'));
-    await waitFor(() => expect(onSendMessage).toHaveBeenCalledWith('Address `.phoenix/pr-context/pr-12.json`'));
+    expect(screen.queryByRole('button', { name: /Auto-fix CI & address comments/i })).not.toBeInTheDocument();
+    expect(api.createPrAutoFixContext).not.toHaveBeenCalled();
   });
 });
 
