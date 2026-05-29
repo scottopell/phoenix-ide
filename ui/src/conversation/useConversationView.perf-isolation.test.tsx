@@ -99,6 +99,14 @@ describe('useConversationView perf isolation (Finding B)', () => {
     const viewRenders = { current: 0 };
     const clockRenders = { current: 0 };
 
+    // Drive `lastSseEventAt` off a controlled clock so the heartbeat bump is
+    // guaranteed to produce a strictly-greater timestamp than the seeded
+    // value. Real `Date.now()` can return the same millisecond, in which case
+    // the primitive snapshot is unchanged and the clock subscriber correctly
+    // does not re-render — which would flake the assertion below.
+    let now = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+
     render(
       <ConversationProvider>
         <Harness
@@ -132,7 +140,9 @@ describe('useConversationView perf isolation (Finding B)', () => {
     const clockBaseline = clockRenders.current;
 
     // A heartbeat bump (every token + every ping dispatches this). Must NOT
-    // touch the page view; MUST re-render the clock subscriber.
+    // touch the page view; MUST re-render the clock subscriber. Advance the
+    // controlled clock first so the bumped timestamp is strictly greater.
+    now += 1;
     act(() => {
       store!.dispatch(SLUG, { type: 'sse_event_observed' });
     });
@@ -176,5 +186,7 @@ describe('useConversationView perf isolation (Finding B)', () => {
       });
     });
     expect(viewRenders.current).toBeGreaterThan(viewAfterClock);
+
+    nowSpy.mockRestore();
   });
 });

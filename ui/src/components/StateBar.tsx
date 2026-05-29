@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
-import { useLastSseEventAt } from '../conversation';
+import { useLastSseEventAt } from '../conversation/useConversationAtom';
 import { FolderTree } from 'lucide-react';
 import { canChangeModelInState, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 import type { ConversationPrStatusState } from '../hooks/useConversationPrStatus';
