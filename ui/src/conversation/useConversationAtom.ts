@@ -39,6 +39,137 @@ export function useConversationAtom(slug: string): [ConversationAtom, Dispatch<S
   return [atom, dispatch];
 }
 
+/**
+ * The slice of the conversation atom that `<ConversationPage>` actually
+ * renders from. Deliberately excludes the two highest-frequency fields:
+ *
+ *   - `streamingBuffer` — churns on every `sse_token`; consumed only by
+ *     `<StreamingMessage>` / `<MessageList>` via their own slice selectors.
+ *   - `lastSseEventAt` — churns on every observed event (every token AND
+ *     every `ping` keep-alive); consumed only by the StateBar watchdog,
+ *     which now subscribes to it directly via {@link useLastSseEventAt}.
+ *
+ * Excluding them is what keeps the page (and its non-memoized children —
+ * StateBar, InputArea, WorkActions, BreadcrumbBar) out of per-token /
+ * per-ping render churn. The heavy `<MessageList>` was already insulated
+ * by `memo` + stable slice props; this extends the same isolation to the
+ * rest of the page tree.
+ */
+export type ConversationPageView = Pick<
+  ConversationAtom,
+  | 'conversationId'
+  | 'conversation'
+  | 'phase'
+  | 'messages'
+  | 'breadcrumbs'
+  | 'contextWindow'
+  | 'systemPrompt'
+  | 'uiError'
+  | 'toolExecutingStartedAt'
+  | 'phaseStateUpdatedAt'
+  | 'firstByteRequestId'
+  | 'turnRetryContext'
+>;
+
+const PAGE_VIEW_KEYS: readonly (keyof ConversationPageView)[] = [
+  'conversationId',
+  'conversation',
+  'phase',
+  'messages',
+  'breadcrumbs',
+  'contextWindow',
+  'systemPrompt',
+  'uiError',
+  'toolExecutingStartedAt',
+  'phaseStateUpdatedAt',
+  'firstByteRequestId',
+  'turnRetryContext',
+];
+
+function pageViewsEqual(a: ConversationPageView, b: ConversationPageView): boolean {
+  // Each field is reference-stable in the reducer when unchanged (every
+  // case spreads `...a` and replaces only the fields it mutates), so
+  // per-field `Object.is` is sufficient — no deep compare needed.
+  for (const k of PAGE_VIEW_KEYS) {
+    if (!Object.is(a[k], b[k])) return false;
+  }
+  return true;
+}
+
+/**
+ * Like {@link useConversationAtom}, but the subscriber only re-renders when
+ * a field the page actually renders from changes — NOT on `sse_token`
+ * (streaming buffer) or `sse_event_observed` (heartbeat clock).
+ *
+ * `getSnapshot` rebuilds the view object on each call but returns the
+ * previously-cached reference when every selected field is unchanged, so
+ * `useSyncExternalStore`'s `Object.is` check elides the render. Same
+ * caching contract as {@link useConversationsList}.
+ */
+export function useConversationView(
+  slug: string,
+): [ConversationPageView, Dispatch<SSEAction>] {
+  const store = useConversationStore();
+  const lastRef = useRef<ConversationPageView | null>(null);
+
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(() => {
+    const a = store.getSnapshot(slug);
+    const next: ConversationPageView = {
+      conversationId: a.conversationId,
+      conversation: a.conversation,
+      phase: a.phase,
+      messages: a.messages,
+      breadcrumbs: a.breadcrumbs,
+      contextWindow: a.contextWindow,
+      systemPrompt: a.systemPrompt,
+      uiError: a.uiError,
+      toolExecutingStartedAt: a.toolExecutingStartedAt,
+      phaseStateUpdatedAt: a.phaseStateUpdatedAt,
+      firstByteRequestId: a.firstByteRequestId,
+      turnRetryContext: a.turnRetryContext,
+    };
+    const prev = lastRef.current;
+    if (prev && pageViewsEqual(prev, next)) return prev;
+    lastRef.current = next;
+    return next;
+  }, [store, slug]);
+
+  const atom = useSyncExternalStore(subscribe, getSnapshot);
+
+  const dispatch = useCallback(
+    (action: SSEAction) => store.dispatch(slug, action),
+    [store, slug],
+  );
+
+  return [atom, dispatch];
+}
+
+/**
+ * Subscribes to just the heartbeat-watchdog clock (`lastSseEventAt`) for
+ * `slug`. Consumed below the page boundary (by `<ConnectedStateBar>`) so
+ * the per-event bump re-renders only the StateBar, not the whole page.
+ * The value is a primitive, so `Object.is` makes the snapshot trivially
+ * stable between equal observations.
+ */
+export function useLastSseEventAt(slug: string): number {
+  const store = useConversationStore();
+
+  const subscribe = useCallback(
+    (listener: () => void) => store.subscribe(slug, listener),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => store.getSnapshot(slug).lastSseEventAt,
+    [store, slug],
+  );
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
 /** Derived selectors to avoid passing the raw atom to child components. */
 export function useConversationSelectors(slug: string) {
   const [atom, dispatch] = useConversationAtom(slug);

@@ -26,11 +26,11 @@ import {
 import { useToast } from '../hooks/useToast';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
-import { StateBar } from '../components/StateBar';
+import { ConnectedStateBar } from '../components/StateBar';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
-import { useConversationAtom, useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
+import { useConversationView, useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
 import {
   useResizablePane,
   useIsDesktop,
@@ -139,8 +139,13 @@ function ConversationPageContent() {
   const navigate = useNavigate();
   const createConversationWithStore = useCreateConversationWithStore();
 
-  // Atom-backed conversation state (survives navigation via ConversationProvider)
-  const [atom, dispatch] = useConversationAtom(slug!);
+  // Atom-backed conversation state (survives navigation via ConversationProvider).
+  // `useConversationView` subscribes to only the fields the page renders from,
+  // so per-token streaming churn and per-ping heartbeat bumps don't re-render
+  // this component (and its non-memoized children). The streaming buffer is
+  // read by <StreamingMessage>/<MessageList> via their own slice selectors;
+  // the heartbeat clock by <ConnectedStateBar> via useLastSseEventAt.
+  const [atom, dispatch] = useConversationView(slug!);
 
   // Derived from atom
   const conversationId = atom.conversationId ?? undefined;
@@ -1332,7 +1337,8 @@ function ConversationPageContent() {
         </>
       ) : null}
       <BreadcrumbBar breadcrumbs={atom.breadcrumbs} visible={atom.breadcrumbs.length > 0} />
-      <StateBar
+      <ConnectedStateBar
+        slug={slug!}
         conversation={conversation as Conversation}
         convState={convStateForChildren}
         connectionState={connectionInfo.state}
@@ -1350,7 +1356,6 @@ function ConversationPageContent() {
         onUpgradeModel={handleUpgradeModel}
         toolExecutingStartedAt={atom.toolExecutingStartedAt}
         phaseStateUpdatedAt={atom.phaseStateUpdatedAt}
-        lastSseEventAt={atom.lastSseEventAt}
         firstByteRequestId={atom.firstByteRequestId}
         turnRetryContext={atom.turnRetryContext}
         onOpenFiles={isDesktop ? undefined : () => setShowFileBrowser(true)}

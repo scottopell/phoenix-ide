@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
+import { useLastSseEventAt } from '../conversation';
 import { FolderTree } from 'lucide-react';
 import { canChangeModelInState, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 import type { ConversationPrStatusState } from '../hooks/useConversationPrStatus';
@@ -909,4 +910,20 @@ export function StateBar({
       )}
     </>
   );
+}
+
+/**
+ * StateBar wired to the live heartbeat clock. Subscribing to
+ * `lastSseEventAt` HERE — below the ConversationPage boundary — means the
+ * per-event bump (every token, every `ping`) re-renders only the StateBar,
+ * not the whole page. The page passes every other (low-frequency) prop
+ * through; `<StateBar>` itself stays a pure presentational component so its
+ * tests can keep injecting `lastSseEventAt` directly.
+ */
+export function ConnectedStateBar({
+  slug,
+  ...rest
+}: Omit<StateBarProps, 'lastSseEventAt'> & { slug: string }) {
+  const lastSseEventAt = useLastSseEventAt(slug);
+  return <StateBar {...rest} lastSseEventAt={lastSseEventAt} />;
 }
