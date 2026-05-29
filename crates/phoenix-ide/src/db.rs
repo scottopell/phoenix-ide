@@ -679,7 +679,10 @@ impl Database {
     /// Update conversation state with an explicit `state_updated_at`. The
     /// runtime threads its in-memory entry timestamp here so the DB row and
     /// the `StateChange` wire event share one value (REQ-WPV-001) — no
-    /// clock-drift between the two `now()` reads.
+    /// clock-drift between the two `now()` reads. `updated_at` stays `now()`
+    /// (NOT the phase-entry time): it is a monotonic last-modified marker, and
+    /// effects can persist other rows before `PersistState` runs, so binding
+    /// it to the (earlier) phase-entry stamp would let `updated_at` regress.
     pub async fn update_conversation_state_at(
         &self,
         id: &str,
@@ -689,10 +692,11 @@ impl Database {
         let state_json = serde_json::to_string(state).unwrap();
 
         let result = sqlx::query(
-            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
+            "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?3 WHERE id = ?4",
         )
         .bind(&state_json)
         .bind(state_updated_at.to_rfc3339())
+        .bind(Utc::now().to_rfc3339())
         .bind(id)
         .execute(&self.pool)
         .await?;

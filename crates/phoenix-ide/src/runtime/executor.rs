@@ -165,10 +165,10 @@ where
     /// reassigned by `apply_transition`. Carried on every `SseEvent::StateChange`
     /// emission so the client's elapsed-time display can derive
     /// `now() - state_updated_at` without any per-event timestamping
-    /// (specs/working-phase-visibility/ REQ-WPV-001). The in-memory value
-    /// is sub-millisecond ahead of the DB row's `state_updated_at` because
-    /// the DB write uses its own `Utc::now()`; the drift is below the
-    /// display's per-second rounding so the parity is preserved end-to-end.
+    /// (specs/working-phase-visibility/ REQ-WPV-001). This same value is
+    /// threaded into the DB write via `StateStore::update_state`, so the
+    /// persisted `Conversation.state_updated_at` and the SSE-carried value
+    /// are identical — no clock drift between the two.
     state_updated_at: DateTime<Utc>,
     storage: S,
     llm_client: Arc<L>,
@@ -749,13 +749,12 @@ where
     ) -> Result<Vec<Event>, String> {
         let mut generated_events = Vec::new();
 
-        // Update state. Bump the entry timestamp on every reassignment so
-        // every SseEvent::StateChange the executor subsequently emits
-        // carries a fresh, server-authoritative state_updated_at
-        // (specs/working-phase-visibility/ REQ-WPV-001). The DB write in
-        // `persist_state_effect` uses its own `Utc::now()`; the resulting
-        // sub-millisecond drift is below the client display's per-second
-        // rounding.
+        // Update state. Bump the entry timestamp on phase change so every
+        // SseEvent::StateChange the executor subsequently emits carries a
+        // fresh, server-authoritative state_updated_at
+        // (specs/working-phase-visibility/ REQ-WPV-001). `persist_state_effect`
+        // threads this same value into the DB write, so the persisted row and
+        // the SSE value match exactly.
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
         // Only stamp a fresh entry time when the phase actually changes.
         // Several events absorb as no-ops (Terminal absorbs unknown events;
