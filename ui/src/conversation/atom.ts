@@ -782,9 +782,9 @@ export function conversationReducer(
         phaseStateUpdatedAt: p.conversation.state_updated_at
           ? Date.parse(p.conversation.state_updated_at)
           : null,
-        // Bump the watchdog clock — Init is itself an event the user
-        // observed (REQ-WPV-004).
-        lastSseEventAt: Date.now(),
+        // (Watchdog clock `lastSseEventAt` is bumped by the unconditional
+        // `sse_event_observed` dispatch in useConnection's on() wrapper, the
+        // single source for it — see the `sse_event_observed` case.)
         // REQ-WPV-007: an Init snapshot lands the authoritative phase;
         // any first-byte signal from before this Init is by definition
         // pre-reset state and must not bleed forward. If the replayed
@@ -878,10 +878,26 @@ export function conversationReducer(
         // `retry_count`, `duration_ms`, etc.) that earlier broadcasts
         // or the persisted message set. Each emitter is responsible
         // for sending only the keys it owns.
-        const mergedDisplay =
-          action.displayData !== undefined
-            ? { ...existingDisplay, ...action.displayData }
-            : existingDisplay;
+        let mergedDisplay = existingDisplay;
+        if (action.displayData !== undefined) {
+          mergedDisplay = { ...existingDisplay, ...action.displayData };
+          // `tool_starts` is an accumulating map keyed by tool_use_id; each
+          // `dispatch_tool_execution` patch carries ONLY the newly-started
+          // tool. The shallow spread above would replace the whole map, so a
+          // second tool's start wipes the first tool's timestamp. Deep-merge
+          // the nested map so every in-flight tool keeps its start time
+          // (REQ-WPV-002).
+          const prevStarts = existingDisplay['tool_starts'];
+          const nextStarts = action.displayData['tool_starts'];
+          const isObj = (v: unknown): v is Record<string, unknown> =>
+            typeof v === 'object' && v !== null && !Array.isArray(v);
+          if (isObj(prevStarts) && isObj(nextStarts)) {
+            mergedDisplay = {
+              ...mergedDisplay,
+              tool_starts: { ...prevStarts, ...nextStarts },
+            };
+          }
+        }
         // `durationMs` is a typed convenience field for tool-result
         // updates — merge into the same display_data so consumers
         // read from a single place regardless of source path.
@@ -928,7 +944,6 @@ export function conversationReducer(
           phase,
           // REQ-WPV-001: store the server-authoritative entry time.
           phaseStateUpdatedAt: action.stateUpdatedAt,
-          lastSseEventAt: Date.now(),
           // REQ-WPV-007: every phase transition resets the first-byte
           // signal. The next llm_requesting attempt starts in pre-first-
           // byte; non-llm phases (tool_executing, idle, …) don't have a
@@ -963,7 +978,6 @@ export function conversationReducer(
       return applyIfNewer(atom, 'sse_llm_first_byte', action.sequenceId, (a) => ({
         ...a,
         firstByteRequestId: action.requestId,
-        lastSseEventAt: Date.now(),
       }));
     }
 
@@ -978,7 +992,6 @@ export function conversationReducer(
           backingOffMs: action.backingOffMs,
           resetsAt: action.resetsAt,
         },
-        lastSseEventAt: Date.now(),
       }));
     }
 
@@ -1103,6 +1116,12 @@ export function conversationReducer(
       // event wrapper on every named SSE event. Bumps the watchdog
       // clock so a working phase with active token flow doesn't false-
       // positive into "no signal from server."
+      //
+      // This is the SINGLE source for `lastSseEventAt`. Per-event reducers
+      // deliberately do NOT bump it: this dispatch is unconditional (fires
+      // before the event's own action and is not gated by `applyIfNewer`),
+      // so even a stale/duplicate event or a payload-less keep-alive `ping`
+      // correctly resets the heartbeat — "any observed traffic = alive."
       return { ...atom, lastSseEventAt: Date.now() };
 
     case 'local_phase_change':
