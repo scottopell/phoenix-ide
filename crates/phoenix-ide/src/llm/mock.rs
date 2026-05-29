@@ -10,7 +10,7 @@
 //! - `[[perf:N]]` — deterministic text-only response of ~N words
 //!   (performance fingerprint, no rand).
 //! - `[[ttft:N]]` — override time-to-first-token sleep with N ms.
-//!   Useful for exercising the StateBar's pre-first-byte
+//!   Useful for exercising the `StateBar`'s pre-first-byte
 //!   `awaiting LLM response Ns` window
 //!   (specs/working-phase-visibility/ REQ-WPV-007).
 //! - `[[stall:after_n,ms]]` — emit `after_n` chunks, sleep `ms`,
@@ -307,11 +307,11 @@ fn parse_stall(request: &LlmRequest) -> Option<(usize, u64)> {
 ///
 /// Combined with the state machine's `MAX_RETRY_ATTEMPTS = 3`
 /// (`transition.rs:183`), `[[retry:rate_limit,2]]` produces:
-///   attempt 1 → LlmError::RateLimit → ScheduleRetry, attempt 2
-///   attempt 2 → LlmError::RateLimit → ScheduleRetry, attempt 3
+///   attempt 1 → `LlmError::RateLimit` → `ScheduleRetry`, attempt 2
+///   attempt 2 → `LlmError::RateLimit` → `ScheduleRetry`, attempt 3
 ///   attempt 3 → success → turn completes
 /// `[[retry:rate_limit,3]]` exercises the give-up path
-/// (transition to Error after MAX_RETRY_ATTEMPTS).
+/// (transition to Error after `MAX_RETRY_ATTEMPTS`).
 fn parse_retry(request: &LlmRequest) -> Option<(crate::llm::LlmErrorKind, u32)> {
     let text = latest_user_text(request)?;
     let start = text.find("[[retry:")? + "[[retry:".len();
@@ -571,7 +571,7 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
 ///
 /// `stall = Some((after_n, ms))` inserts a single sleep of `ms`
 /// milliseconds after the first `after_n` chunks have been sent (and
-/// before the (after_n+1)th). `after_n = 0` is special-cased to stall
+/// before the (`after_n+1)th`). `after_n = 0` is special-cased to stall
 /// *before* the first chunk lands — useful for driving the watchdog
 /// when no tokens flow at all. Set via the `[[stall:after_n,ms]]`
 /// test marker. The chunk channel stays open across the sleep, so
@@ -654,9 +654,8 @@ impl LlmService for MockLlmService {
         if let Some((kind, fail_n)) = parse_retry(request) {
             let attempt = bump_retry_count(request.cache_key.as_str());
             if attempt <= fail_n {
-                let message = format!(
-                    "mock retry simulation: attempt {attempt}/{fail_n} returning {kind:?}"
-                );
+                let message =
+                    format!("mock retry simulation: attempt {attempt}/{fail_n} returning {kind:?}");
                 return Err(match kind {
                     crate::llm::LlmErrorKind::RateLimit => LlmError::rate_limit(message),
                     crate::llm::LlmErrorKind::ServerError => LlmError::server_error(message),

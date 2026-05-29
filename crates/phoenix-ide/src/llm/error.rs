@@ -113,18 +113,17 @@ pub enum LlmErrorKind {
 /// a variant here and updating `LlmAttemptReason::from_kind`, which the
 /// compiler forces via exhaustive `match`.
 ///
-/// Specs: `specs/llm-retry-visibility/`. The wire-level snake_case is
-/// emitted by `serde` via the rename_all attribute so the JSON values
+/// Specs: `specs/llm-retry-visibility/`. The wire-level `snake_case` is
+/// emitted by `serde` via the `rename_all` attribute so the JSON values
 /// match the spec's `{rate_limit, server_error, network}` set.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[derive(ts_rs::TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, ts_rs::TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 #[serde(rename_all = "snake_case")]
 pub enum LlmAttemptReason {
     /// Server returned 429 (rate-limit throttle). Transient — the
     /// state machine schedules a retry with exponential backoff.
     RateLimit,
-    /// Server returned 5xx. Retryable; same backoff as RateLimit.
+    /// Server returned 5xx. Retryable; same backoff as `RateLimit`.
     ServerError,
     /// Network / timeout. Retryable.
     Network,

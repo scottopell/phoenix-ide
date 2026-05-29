@@ -7,8 +7,8 @@
  * a variant here and updating `LlmAttemptReason::from_kind`, which the
  * compiler forces via exhaustive `match`.
  *
- * Specs: `specs/llm-retry-visibility/`. The wire-level snake_case is
- * emitted by `serde` via the rename_all attribute so the JSON values
+ * Specs: `specs/llm-retry-visibility/`. The wire-level `snake_case` is
+ * emitted by `serde` via the `rename_all` attribute so the JSON values
  * match the spec's `{rate_limit, server_error, network}` set.
  */
 export type LlmAttemptReason = "rate_limit" | "server_error" | "network";

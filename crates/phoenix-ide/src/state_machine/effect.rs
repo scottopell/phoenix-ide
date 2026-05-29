@@ -289,7 +289,8 @@ impl Effect {
             // lets the UI's `display_data?.retry_count > 0` check
             // double as a `display_data?.retry_count !== undefined`
             // guard.
-            let display_obj = display_data.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
+            let display_obj =
+                display_data.get_or_insert_with(|| Value::Object(serde_json::Map::new()));
             if let Some(map) = display_obj.as_object_mut() {
                 map.insert(
                     "retry_count".to_string(),

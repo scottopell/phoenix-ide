@@ -325,7 +325,7 @@ fn arb_llm_error_event() -> impl Strategy<Value = Event> {
             error_kind,
             attempt,
             recovery_in_progress: false,
-        resets_at: None,
+            resets_at: None,
         }
     })
 }
@@ -1145,7 +1145,7 @@ fn test_retry_cycle() {
             error_kind: ErrorKind::Network,
             attempt: 1,
             recovery_in_progress: false,
-        resets_at: None,
+            resets_at: None,
         },
     )
     .unwrap();
@@ -1899,7 +1899,10 @@ fn arb_llm_outcome() -> impl Strategy<Value = LlmOutcome> {
                     request_id: "test-req-id".to_string(),
                 }
             }
-            1 => LlmOutcome::RateLimited { retry_after: None, resets_at: None },
+            1 => LlmOutcome::RateLimited {
+                retry_after: None,
+                resets_at: None,
+            },
             2 => LlmOutcome::ServerError {
                 status: 500,
                 body: msg,

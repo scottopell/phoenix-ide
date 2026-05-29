@@ -282,7 +282,7 @@ pub enum SseWireEvent {
     },
     /// First-byte marker: emitted exactly once per LLM request,
     /// immediately before the first `Token` event for the same
-    /// `request_id`. Drives the StateBar's `awaiting LLM response Ns`
+    /// `request_id`. Drives the `StateBar`'s `awaiting LLM response Ns`
     /// → `streaming` transition. Spec:
     /// `specs/working-phase-visibility/` REQ-WPV-007.
     LlmFirstByte {
@@ -291,7 +291,7 @@ pub enum SseWireEvent {
     },
     /// Retry-context marker: emitted from the executor's
     /// `Effect::ScheduleRetry` handler immediately before the spawned
-    /// backoff sleep. Drives the StateBar's `(retry K/N <reason>)`
+    /// backoff sleep. Drives the `StateBar`'s `(retry K/N <reason>)`
     /// suffix per specs/working-phase-visibility/ REQ-WPV-003 and
     /// specs/llm-retry-visibility/. Replays via the ephemeral SSE ring
     /// so mid-backoff reconnects reconstruct the suffix.

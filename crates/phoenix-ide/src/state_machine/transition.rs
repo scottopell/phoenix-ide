@@ -14,13 +14,13 @@
 use super::effect::{compute_bash_display_data, CheckpointData};
 use super::event::{CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent};
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
-use crate::llm::LlmAttemptReason;
 use super::state::{
     AssistantMessage, ContextExhaustionBehavior, CoreState, ModeKind, ParentState, RecoveryKind,
     SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use crate::db::{ErrorKind, ToolResult, UsageData};
+use crate::llm::LlmAttemptReason;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -189,13 +189,13 @@ fn resolve_task_file(
 pub const MAX_RETRY_ATTEMPTS: u32 = 3;
 
 /// Stamp `retry_count = saturating_sub(1)` onto an assistant message's
-/// display_data (the JSON-blob form `Option<serde_json::Value>`) iff
+/// `display_data` (the JSON-blob form `Option<serde_json::Value>`) iff
 /// the final attempt count is > 1. No-op for first-try successes so
 /// the persisted JSON stays minimal and the UI's
 /// `retry_count > 0` check doubles as a presence check. Used by both
-/// the `persist_agent_message` helper (no-tool LlmResponse path) and
-/// the tool-round inline assistant_message build
-/// (handle_core_llm_response's ToolExecuting branch). Specs:
+/// the `persist_agent_message` helper (no-tool `LlmResponse` path) and
+/// the tool-round inline `assistant_message` build
+/// (`handle_core_llm_response`'s `ToolExecuting` branch). Specs:
 /// `specs/llm-retry-visibility/` REQ-LRV-006.
 fn stamp_retry_count(display_data: &mut Option<serde_json::Value>, final_attempt: u32) {
     let retry_count = final_attempt.saturating_sub(1);
@@ -218,17 +218,18 @@ fn stamp_retry_count(display_data: &mut Option<serde_json::Value>, final_attempt
 /// the same predicate. `TimedOut` collapses to `Network` because the
 /// upstream `LlmErrorKind` never distinguishes them (timeouts arrive
 /// as `LlmErrorKind::Network`); the runtime keeps the kinds separate
-/// for non-LLM paths but the LlmAttempt reader doesn't care.
+/// for non-LLM paths but the `LlmAttempt` reader doesn't care.
 fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
     match kind {
         ErrorKind::RateLimit => LlmAttemptReason::RateLimit,
         ErrorKind::ServerError => LlmAttemptReason::ServerError,
         ErrorKind::Network | ErrorKind::TimedOut => LlmAttemptReason::Network,
-        // The caller guards on `is_retryable()`, which only admits the
-        // variants above. Any other kind reaching this match would be a
-        // genuine bug in the runtime; fall back to Network so the wire
-        // event is well-formed and let the panic-via-tracing pattern
-        // (none here — silent fallback) surface during integration.
+        // Non-retryable kinds. `db::ErrorKind::is_retryable` admits exactly
+        // the four kinds matched above, and every caller guards on it before
+        // reaching here, so a non-retryable kind landing in this arm is a
+        // runtime invariant violation. Log it (a wrong `reason` on the wire
+        // is a capability gap, not a crash — keep returning a well-formed
+        // value rather than panicking the conversation).
         ErrorKind::Auth
         | ErrorKind::UsageLimitReached
         | ErrorKind::ServerOverloaded
@@ -236,7 +237,14 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         | ErrorKind::Cancelled
         | ErrorKind::SubAgentError
         | ErrorKind::ContextExhausted
-        | ErrorKind::ContentFilter => LlmAttemptReason::Network,
+        | ErrorKind::ContentFilter => {
+            tracing::error!(
+                ?kind,
+                "error_kind_to_attempt_reason reached with a non-retryable kind; \
+                 is_retryable() guard should preclude this — defaulting wire reason to network"
+            );
+            LlmAttemptReason::Network
+        }
     }
 }
 
@@ -2746,7 +2754,7 @@ mod tests {
                 error_kind: ErrorKind::ContextExhausted,
                 attempt: 1,
                 recovery_in_progress: false,
-            resets_at: None,
+                resets_at: None,
             },
         )
         .unwrap();
@@ -2780,7 +2788,7 @@ mod tests {
                 error_kind: ErrorKind::InvalidRequest,
                 attempt: 1,
                 recovery_in_progress: false,
-            resets_at: None,
+                resets_at: None,
             },
         )
         .unwrap();
@@ -2808,7 +2816,7 @@ mod tests {
                     error_kind: ErrorKind::ContextExhausted,
                     attempt,
                     recovery_in_progress: false,
-                resets_at: None,
+                    resets_at: None,
                 },
             )
             .unwrap();
@@ -3068,7 +3076,7 @@ mod tests {
                 cache_creation_tokens: 0,
             },
             "test-req-id".to_string(),
-        1,
+            1,
         );
 
         // Sub-agent should go to Failed, not AwaitingContinuation
@@ -3126,7 +3134,7 @@ mod tests {
                 cache_creation_tokens: 0,
             },
             "test-req-id".to_string(),
-        1,
+            1,
         );
 
         // Parent should go to AwaitingContinuation
@@ -3288,7 +3296,7 @@ mod tests {
                 error_kind: ErrorKind::Network, // retryable
                 attempt: 3,
                 recovery_in_progress: false,
-            resets_at: None,
+                resets_at: None,
             },
         )
         .unwrap();
@@ -3338,7 +3346,7 @@ mod tests {
                 error_kind: ErrorKind::Auth, // non-retryable
                 attempt: 1,
                 recovery_in_progress: false,
-            resets_at: None,
+                resets_at: None,
             },
         )
         .unwrap();
@@ -3372,7 +3380,7 @@ mod tests {
                 error_kind: ErrorKind::Network,
                 attempt: 3,
                 recovery_in_progress: false,
-            resets_at: None,
+                resets_at: None,
             },
         )
         .unwrap();
