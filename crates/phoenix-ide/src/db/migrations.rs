@@ -59,6 +59,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "rewrite_one_million_context_model_ids_to_base",
         sql: MIGRATION_009,
     },
+    Migration {
+        version: 10,
+        name: "rewrite_opus_4_5_to_4_6",
+        sql: MIGRATION_010,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -266,6 +271,18 @@ UPDATE chain_qa SET model = 'claude-opus-4-6'   WHERE model = 'claude-opus-4-6-1
 UPDATE chain_qa SET model = 'claude-sonnet-4-6' WHERE model = 'claude-sonnet-4-6-1m';
 ";
 
+/// Rewrite `claude-opus-4-5` to `claude-opus-4-6` across persisted state.
+/// Opus 4.5's spec is removed in the same commit; without this migration,
+/// any `conversations`, `turn_usage`, or `chain_qa` row pinned to 4-5 would
+/// fail `ModelRegistry::get()` after upgrade. 4-6 is the nearest still-
+/// supported Opus, preserving the user's "I picked Opus" intent. Mirrors
+/// the migration-009 pattern.
+const MIGRATION_010: &str = r"
+UPDATE conversations SET model = 'claude-opus-4-6' WHERE model = 'claude-opus-4-5';
+UPDATE turn_usage   SET model = 'claude-opus-4-6' WHERE model = 'claude-opus-4-5';
+UPDATE chain_qa     SET model = 'claude-opus-4-6' WHERE model = 'claude-opus-4-5';
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -367,7 +384,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 9);
+        assert_eq!(first, 10);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -940,5 +957,54 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn migration_010_rewrites_opus_4_5_to_4_6() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        let seeds = [
+            ("c-opus-5", "claude-opus-4-5"),
+            ("c-opus-6", "claude-opus-4-6"),
+            ("c-other", "claude-sonnet-4-6"),
+        ];
+        for (id, model) in seeds {
+            sqlx::query(
+                "INSERT INTO conversations (id, model, conv_mode, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+                 VALUES (?, ?, '{\"mode\":\"Direct\"}', '{\"type\":\"idle\"}', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+            )
+            .bind(id)
+            .bind(model)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        async fn model_for(pool: &SqlitePool, id: &str) -> Option<String> {
+            sqlx::query("SELECT model FROM conversations WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+                .get::<Option<String>, _>("model")
+        }
+
+        assert_eq!(
+            model_for(&pool, "c-opus-5").await.as_deref(),
+            Some("claude-opus-4-6")
+        );
+        assert_eq!(
+            model_for(&pool, "c-opus-6").await.as_deref(),
+            Some("claude-opus-4-6"),
+            "already-4-6 rows must not be touched"
+        );
+        assert_eq!(
+            model_for(&pool, "c-other").await.as_deref(),
+            Some("claude-sonnet-4-6"),
+            "non-Opus rows must not be touched"
+        );
     }
 }
