@@ -1670,7 +1670,7 @@ describe('breadcrumbFromPhase', () => {
   it('returns null for non-breadcrumb phases', () => {
     expect(breadcrumbFromPhase({ type: 'idle' }, 1)).toBeNull();
     expect(breadcrumbFromPhase({ type: 'awaiting_llm' }, 1)).toBeNull();
-    expect(breadcrumbFromPhase({ type: 'error', message: 'err' }, 1)).toBeNull();
+    expect(breadcrumbFromPhase({ type: 'error', message: 'err', error_kind: 'server_error' }, 1)).toBeNull();
   });
 
   it('returns tool breadcrumb with queue depth', () => {

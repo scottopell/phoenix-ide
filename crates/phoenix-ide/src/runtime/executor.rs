@@ -3851,12 +3851,12 @@ mod error_mapping_tests {
     fn test_usage_limit_reached_is_terminal_after_mapping() {
         let db_kind = llm_error_to_db_error(LlmErrorKind::UsageLimitReached);
         assert!(
-            !db_kind.is_retryable(),
+            !db_kind.is_auto_retryable(),
             "UsageLimitReached must NOT be retryable after mapping"
         );
         let db_kind = llm_error_to_db_error(LlmErrorKind::ServerOverloaded);
         assert!(
-            !db_kind.is_retryable(),
+            !db_kind.is_auto_retryable(),
             "ServerOverloaded must NOT be retryable after mapping"
         );
     }
@@ -3867,7 +3867,7 @@ mod error_mapping_tests {
         let llm_error = LlmErrorKind::ServerError;
         let db_error = llm_error_to_db_error(llm_error);
         assert!(
-            db_error.is_retryable(),
+            db_error.is_auto_retryable(),
             "ServerError must be retryable after mapping to db::ErrorKind"
         );
     }

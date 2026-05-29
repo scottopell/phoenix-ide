@@ -53,11 +53,29 @@ use serde_json::Value;
 use ts_rs::TS;
 
 use crate::chain_runtime::ChainSseEvent;
-use crate::db::{Message, MessageType, UsageData};
+use crate::db::{ErrorKind, Message, MessageType, UsageData};
 use crate::runtime::{
     user_facing_error::UserFacingError, ConversationMetadataUpdate, EnrichedConversation,
     SseBreadcrumb, SseEvent,
 };
+
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ErrorPresentation {
+    pub kind: ErrorKind,
+    pub can_auto_retry: bool,
+    pub can_user_resume: bool,
+}
+
+impl ErrorPresentation {
+    fn from_kind(kind: &ErrorKind) -> Self {
+        Self {
+            kind: kind.clone(),
+            can_auto_retry: kind.is_auto_retryable(),
+            can_user_resume: kind.is_user_resumable(),
+        }
+    }
+}
 
 /// A message enriched for API output: bash `tool_use` blocks have their
 /// `display` field merged into `content`. This is what `EnrichedMessage`
@@ -264,7 +282,8 @@ pub enum SseWireEvent {
         duration_ms: Option<u64>,
     },
     /// Conversation phase transition. `state` is opaque here — the UI has
-    /// its own tagged-union validator (`parseConversationState`).
+    /// its own tagged-union validator (`parseConversationState`). States that
+    /// carry an `error_kind` additionally carry typed presentation policy.
     StateChange {
         sequence_id: i64,
         #[ts(type = "unknown")]
@@ -279,6 +298,9 @@ pub enum SseWireEvent {
         ///
         /// Specs: `specs/working-phase-visibility/` REQ-WPV-001.
         state_updated_at: DateTime<Utc>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        #[ts(optional)]
+        error: Option<ErrorPresentation>,
     },
     /// First-byte marker: emitted exactly once per LLM request,
     /// immediately before the first `Token` event for the same
@@ -451,12 +473,16 @@ impl From<SseEvent> for SseWireEvent {
                 state,
                 presentation_mode,
                 state_updated_at,
-            } => SseWireEvent::StateChange {
-                sequence_id,
-                state: serde_json::to_value(&state).unwrap_or(Value::Null),
-                presentation_mode,
-                state_updated_at,
-            },
+            } => {
+                let error = state.error_kind().map(ErrorPresentation::from_kind);
+                SseWireEvent::StateChange {
+                    sequence_id,
+                    state: serde_json::to_value(&state).unwrap_or(Value::Null),
+                    presentation_mode,
+                    state_updated_at,
+                    error,
+                }
+            }
             SseEvent::LlmFirstByte {
                 sequence_id,
                 request_id,

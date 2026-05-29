@@ -410,3 +410,20 @@ THE SYSTEM SHALL show the current agent state (streaming may have completed duri
 AND NOT attempt to reconstruct missed token events
 
 **Rationale:** Navigation between conversations should feel instantaneous for recently-visited conversations. The reconnection cursor (`lastSequenceId`) must survive navigation — it cannot live in component state that unmounts. Missed streaming tokens during navigation are acceptable; the finalized message will arrive via normal reconnection.
+
+---
+
+### REQ-CONV-021: Error Resume Affordance
+
+WHEN a persisted conversation enters an error state whose typed error policy is user-resumable
+THE SYSTEM SHALL display a retry/resume affordance in the conversation error banner
+AND that affordance SHALL send `continue` through the normal chat message path
+
+WHEN a persisted conversation error is not user-resumable (for example usage-limit exhaustion or context exhaustion)
+THE SYSTEM SHALL NOT display the same retry/resume affordance
+AND SHALL display recovery guidance appropriate to that error kind
+
+WHEN an authentication failure enters a persisted error state
+THE SYSTEM SHALL treat it as non-auto-retryable but user-resumable after credentials are refreshed or fixed
+
+**Rationale:** Runtime automatic retry safety and user-triggered resume are separate capabilities. Auth failures must not spin in an automatic retry loop, but users should not have to abandon a conversation after fixing credentials.

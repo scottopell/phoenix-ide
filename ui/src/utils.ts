@@ -1,6 +1,8 @@
 // Utility functions
 
 import type { ConversationState, ToolCall, PendingSubAgent, SubAgentResult, UserQuestion } from './api';
+import { getErrorPresentation } from './errorPresentation';
+import type { ErrorKind } from './generated/ErrorKind';
 
 /** Format a keyboard shortcut for the current platform (Cmd on macOS, Ctrl elsewhere) */
 export function formatShortcut(shortcut: string): string {
@@ -141,6 +143,20 @@ export function getStateDescription(state: ConversationState): string {
   }
 }
 
+function stringOr(value: unknown, fallback: string): string {
+  return typeof value === 'string' ? value : fallback;
+}
+
+function invalidRequestError(message: string): ConversationState {
+  const error = getErrorPresentation('invalid_request')!;
+  return { type: 'error', message, error_kind: error.kind, error };
+}
+
+function serverError(message: string): ConversationState {
+  const error = getErrorPresentation('server_error')!;
+  return { type: 'error', message, error_kind: error.kind, error };
+}
+
 export function parseConversationState(raw: unknown): ConversationState {
   if (!raw || typeof raw !== 'object') {
     return { type: 'idle' };
@@ -159,7 +175,7 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'seeded_llm_requesting': {
       const seed = obj['seed_message_id'];
       if (typeof seed !== 'string' || seed.trim() === '') {
-        return { type: 'error', message: 'Invalid seeded request state: missing seed message' };
+        return invalidRequestError('Invalid seeded request state: missing seed message');
       }
       return {
         type: 'seeded_llm_requesting',
@@ -200,16 +216,24 @@ export function parseConversationState(raw: unknown): ConversationState {
     case 'handed_off': {
       const successor = obj['successor_conv_id'];
       if (typeof successor !== 'string' || successor.trim() === '') {
-        return { type: 'error', message: 'Invalid handed-off state: missing successor conversation' };
+        return invalidRequestError('Invalid handed-off state: missing successor conversation');
       }
       return { type: 'handed_off', successor_conv_id: successor };
     }
     case 'error': {
       const errorKind = obj['error_kind'];
+      if (typeof errorKind !== 'string' || errorKind.length === 0) {
+        return serverError(stringOr(obj['message'], 'Unknown error'));
+      }
+      const presentation = getErrorPresentation(errorKind as ErrorKind);
+      if (!presentation) {
+        return serverError(`Unknown error kind: ${errorKind}`);
+      }
       return {
         type: 'error',
-        message: (obj['message'] as string) ?? 'Unknown error',
-        ...(typeof errorKind === 'string' && errorKind.length > 0 ? { error_kind: errorKind } : {}),
+        message: stringOr(obj['message'], 'Unknown error'),
+        error_kind: presentation.kind,
+        error: presentation,
       };
     }
     case 'awaiting_recovery':
@@ -220,7 +244,7 @@ export function parseConversationState(raw: unknown): ConversationState {
       };
     default:
       console.warn(`Unknown conversation state type: ${String(type)}`);
-      return { type: 'error', message: `Unknown state: ${String(type)}` };
+      return invalidRequestError(`Unknown state: ${String(type)}`);
   }
 }
 

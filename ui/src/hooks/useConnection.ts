@@ -355,7 +355,11 @@ export function useConnection({
             if (!res.ok) return;
             // `data.state` is opaque at the SSE boundary; parseConversationState
             // performs its own discriminated-union validation.
-            const nextPhase = parseConversationState(res.data.state);
+            const parsedPhase = parseConversationState(res.data.state);
+            const nextPhase =
+              res.data.error && parsedPhase.type === 'error'
+                ? { ...parsedPhase, error: res.data.error }
+                : parsedPhase;
             notifyConversationStateChange(
               latestConversationRef.current,
               latestPhaseRef.current,

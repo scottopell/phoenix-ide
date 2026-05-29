@@ -13,7 +13,7 @@ interface DirectoryPickerProps {
   value: string;
   onChange: (path: string) => void;
   onStatusChange?: (status: DirStatus) => void;
-  onGitStatusChange?: ((isGit: boolean) => void) | undefined;
+  onGitStatusChange?: ((isGit: boolean | null) => void) | undefined;
   onDismiss?: () => void;
   placeholder?: string;
   className?: string;
@@ -55,6 +55,7 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusCh
   const [pathStatus, setPathStatus] = useState<DirStatus>(() =>
     value.trim().startsWith('/') ? 'exists' : 'checking'
   );
+  const validationSeqRef = useRef(0);
   const isFirstValidation = useRef(true);
 
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -123,39 +124,49 @@ export function DirectoryPicker({ value, onChange, onStatusChange, onGitStatusCh
 
   // Validate path (debounced 300ms)
   useEffect(() => {
+    const seq = ++validationSeqRef.current;
     const trimmed = value.trim();
     if (!trimmed || !trimmed.startsWith('/')) {
       setPathStatus('invalid');
       onStatusChangeRef.current?.('invalid');
+      onGitStatusChangeRef.current?.(null);
       return;
     }
 
-    if (isFirstValidation.current) {
-      isFirstValidation.current = false;
-    } else {
+    const firstValidationForValue = isFirstValidation.current;
+    isFirstValidation.current = false;
+    if (!firstValidationForValue) {
       setPathStatus('checking');
       onStatusChangeRef.current?.('checking');
     }
-
     const timeoutId = setTimeout(async () => {
+      const applyIfLatest = (fn: () => void) => {
+        if (seq === validationSeqRef.current) fn();
+      };
       try {
         const validation = await api.validateCwd(trimmed);
         if (validation.valid) {
-          setPathStatus('exists');
-          onStatusChangeRef.current?.('exists');
-          onGitStatusChangeRef.current?.(validation.is_git);
+          applyIfLatest(() => {
+            setPathStatus('exists');
+            onStatusChangeRef.current?.('exists');
+            onGitStatusChangeRef.current?.(validation.is_git);
+          });
         } else {
           const parentPath = trimmed.substring(0, trimmed.lastIndexOf('/')) || '/';
           const parentValidation = await api.validateCwd(parentPath);
-          const status: DirStatus = parentValidation.valid ? 'will-create' : 'invalid';
-          setPathStatus(status);
-          onStatusChangeRef.current?.(status);
-          onGitStatusChangeRef.current?.(false);
+          applyIfLatest(() => {
+            const status: DirStatus = parentValidation.valid ? 'will-create' : 'invalid';
+            setPathStatus(status);
+            onStatusChangeRef.current?.(status);
+            onGitStatusChangeRef.current?.(null);
+          });
         }
       } catch {
-        setPathStatus('invalid');
-        onStatusChangeRef.current?.('invalid');
-        onGitStatusChangeRef.current?.(false);
+        applyIfLatest(() => {
+          setPathStatus('invalid');
+          onStatusChangeRef.current?.('invalid');
+          onGitStatusChangeRef.current?.(null);
+        });
       }
     }, 300);
 

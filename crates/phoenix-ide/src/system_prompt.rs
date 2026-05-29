@@ -490,6 +490,24 @@ pub fn discover_guidance_files(working_dir: &Path) -> Vec<GuidanceFile> {
     files
 }
 
+/// Compute the next taskmd ID for this worktree, but only if the project
+/// actually uses taskmd (signalled by a `_TEMPLATE.md` marker inside the
+/// tasks directory). Returns `None` for plain-markdown task workflows so the
+/// Explore prompt doesn't promise an ID convention the project isn't using.
+///
+/// Explore mode disables bash, so the agent can't run `taskmd next` itself —
+/// we precompute the ID server-side and inject it into the prompt.
+fn next_taskmd_id(working_dir: &Path, tasks_dir_name: &str) -> Option<String> {
+    let tasks_dir = working_dir.join(tasks_dir_name);
+    if !tasks_dir
+        .join(taskmd_core::constants::TEMPLATE_FILENAME)
+        .is_file()
+    {
+        return None;
+    }
+    Some(taskmd_core::ids::next_id(&tasks_dir))
+}
+
 /// Build the complete system prompt for a conversation.
 pub fn build_system_prompt(
     working_dir: &Path,
@@ -618,6 +636,14 @@ pub fn build_system_prompt_with_options(
                      mode. `bash` is unavailable. If the user asks you to change \
                      code directly, explain that you must propose a task first."
                 );
+                if let Some(next_id) = next_taskmd_id(working_dir, tasks_dir_name) {
+                    let _ = write!(
+                        prompt,
+                        "\n\nThe next available taskmd ID for this worktree is \
+                         `{next_id}` -- use it when drafting a new task file \
+                         (e.g. `{tasks_dir_name}/{next_id}-p2-ready--my-slug.md`)."
+                    );
+                }
             }
             ModeContext::Work {
                 branch_name,
@@ -1178,6 +1204,102 @@ mod tests {
             skills.is_empty(),
             "sub-skills of non-skill dirs should not be found"
         );
+    }
+
+    #[test]
+    fn test_explore_mode_injects_next_taskmd_id_when_marker_present() {
+        let temp = TempDir::new().unwrap();
+        let tasks_dir = temp.path().join("tasks");
+        fs::create_dir(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join(taskmd_core::constants::TEMPLATE_FILENAME),
+            "# Task Title\n",
+        )
+        .unwrap();
+
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&ModeContext::Explore),
+            Some(temp.path()),
+            None,
+        );
+
+        assert!(prompt.contains("Explore mode"));
+        assert!(
+            prompt.contains("next available taskmd ID for this worktree"),
+            "expected next-id hint in prompt: {prompt}"
+        );
+        let expected_id = taskmd_core::ids::next_id(&tasks_dir);
+        assert!(
+            prompt.contains(&format!("`{expected_id}`")),
+            "expected ID `{expected_id}` in prompt: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_explore_mode_omits_next_taskmd_id_when_marker_absent() {
+        let temp = TempDir::new().unwrap();
+        let tasks_dir = temp.path().join("tasks");
+        fs::create_dir(&tasks_dir).unwrap();
+        // No _TEMPLATE.md — plain-markdown workflow, not taskmd-managed.
+        fs::write(tasks_dir.join("plan.md"), "# Plan\n").unwrap();
+
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&ModeContext::Explore),
+            Some(temp.path()),
+            None,
+        );
+
+        assert!(prompt.contains("Explore mode"));
+        assert!(
+            !prompt.contains("next available taskmd ID"),
+            "next-id hint should be omitted when no _TEMPLATE.md marker: {prompt}"
+        );
+    }
+
+    #[test]
+    fn test_explore_mode_omits_next_taskmd_id_when_tasks_dir_absent() {
+        let temp = TempDir::new().unwrap();
+        // No tasks/ directory at all.
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&ModeContext::Explore),
+            Some(temp.path()),
+            None,
+        );
+        assert!(!prompt.contains("next available taskmd ID"));
+    }
+
+    #[test]
+    fn test_next_taskmd_id_respects_custom_tasks_dir_name() {
+        let temp = TempDir::new().unwrap();
+        let tasks_dir = temp.path().join("task-archive");
+        fs::create_dir(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join(taskmd_core::constants::TEMPLATE_FILENAME),
+            "# Task Title\n",
+        )
+        .unwrap();
+
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "task-archive",
+            false,
+            Some(&ModeContext::Explore),
+            Some(temp.path()),
+            None,
+        );
+
+        let expected_id = taskmd_core::ids::next_id(&tasks_dir);
+        assert!(prompt.contains(&format!("`{expected_id}`")));
+        assert!(prompt.contains(&format!("`task-archive/{expected_id}")));
     }
 
     #[test]

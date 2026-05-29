@@ -1,12 +1,15 @@
 import { AlertCircle } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { useCodexQuota } from '../codexQuota';
+import type { ErrorKind } from '../generated/ErrorKind';
+import type { ErrorPresentation } from '../errorPresentation';
+
 import type { QuotaDetails } from '../sseSchemas';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
 
 interface ErrorBannerProps {
   message: string;
-  errorKind?: string | undefined;
+  error?: ErrorPresentation | undefined;
   onRetry: () => void;
   onDismiss: () => void;
 }
@@ -23,7 +26,7 @@ interface ErrorBannerProps {
  */
 function humanizeError(
   message: string,
-  errorKind?: string,
+  errorKind?: ErrorKind,
 ): { title: string; details: string | null } {
   if (errorKind === 'usage_limit_reached') {
     return { title: 'Usage limit reached', details: message };
@@ -120,23 +123,11 @@ function titleForUsageLimit(quota: QuotaDetails | null): string {
   return 'Usage limit reached';
 }
 
-export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBannerProps) {
+export function ErrorBanner({ message, error, onRetry, onDismiss }: ErrorBannerProps) {
   const codexQuota = useCodexQuota();
-
-  // `usage_limit_reached` is terminal — retry will hit the same wall.
-  // The actionable next step is switching models or waiting until the
-  // window resets, not re-sending the same prompt.
+  const errorKind = error?.kind;
   const isUsageLimit = errorKind === 'usage_limit_reached';
-  // Mirror of backend `ErrorKind::is_retryable()` in
-  // `crates/phoenix-ide/src/db/schema.rs`. Strings are the serde
-  // snake_case wire form. Keep these in lockstep — a new retryable
-  // variant added there must be added here, or the UI will incorrectly
-  // hide the retry button.
-  const isRetryable =
-    !isUsageLimit &&
-    (!errorKind ||
-      errorKind === 'unknown' ||
-      ['rate_limit', 'network', 'server_error', 'timed_out'].includes(errorKind));
+  const canUserResume = error?.can_user_resume ?? false;
 
   const { title, details } = humanizeError(message, errorKind);
   // For a usage-limit error, prefer a structured title that includes
@@ -159,7 +150,7 @@ export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBan
 
       {/* Retry bar — mirrors the input actions bar */}
       <div className="error-action-bar">
-        {isRetryable ? (
+        {canUserResume ? (
           <button className="error-retry-btn" onClick={onRetry}>
             ↺ Retry — sends &ldquo;continue&rdquo;
           </button>
@@ -167,7 +158,9 @@ export function ErrorBanner({ message, errorKind, onRetry, onDismiss }: ErrorBan
           <span className="error-action-hint">
             {isUsageLimit
               ? 'Switch to a different model in the picker, or wait for the window to reset.'
-              : 'Start a new conversation to continue.'}
+              : errorKind === 'auth'
+                ? 'Refresh or fix authentication, then retry to continue this conversation.'
+                : 'Start a new conversation to continue.'}
           </span>
         )}
         <button className="error-dismiss-btn" onClick={onDismiss} title="Dismiss error">

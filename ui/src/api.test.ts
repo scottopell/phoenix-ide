@@ -92,7 +92,7 @@ describe('canChangeModelInState (task 02713)', () => {
   // a tsc error (mirrors the Rust exhaustiveness guard).
   const cases: ReadonlyArray<readonly [ConversationState, boolean]> = [
     [{ type: 'idle' }, true],
-    [{ type: 'error', message: 'overloaded' }, true],
+    [{ type: 'error', message: 'overloaded', error_kind: 'server_overloaded' }, true],
     [{ type: 'awaiting_llm' }, false],
     [{ type: 'llm_requesting', attempt: 1 }, false],
     [{ type: 'tool_executing', current_tool: { id: 't', name: 'bash', input: {} }, remaining_tools: [] }, false],

@@ -23,6 +23,7 @@
 // required fields are present and typed correctly.
 
 import * as v from 'valibot';
+import type { ErrorKind as WireErrorKind } from './generated/sse';
 import type { Conversation, Message } from './api';
 // Generated wire types — aliased so we can reuse the short `Sse*Data`
 // names for the transform-output types consumers actually want.
@@ -41,6 +42,7 @@ import type {
   SseConversationHardDeletedData as WireConversationHardDeletedData,
   SseBrowserSessionStateData as WireBrowserSessionStateData,
   SseSteerMessageQueuedData as WireSteerMessageQueuedData,
+  ErrorPresentation as WireErrorPresentation,
   SseRateLimitSnapshotData as WireRateLimitSnapshotData,
   QuotaDetails as WireQuotaDetails,
   RateLimitWindow as WireRateLimitWindow,
@@ -232,6 +234,27 @@ export const SseMessageUpdatedDataSchema = v.looseObject({
   duration_ms: v.exactOptional(v.number()),
 }) satisfies v.GenericSchema<unknown, WireMessageUpdatedData>;
 
+const ERROR_KIND_OPTIONS = [
+  'auth',
+  'rate_limit',
+  'usage_limit_reached',
+  'network',
+  'invalid_request',
+  'server_error',
+  'server_overloaded',
+  'timed_out',
+  'cancelled',
+  'sub_agent_error',
+  'context_exhausted',
+  'content_filter',
+] as const satisfies readonly WireErrorKind[];
+
+const ErrorPresentationSchema = v.looseObject({
+  kind: v.picklist(ERROR_KIND_OPTIONS),
+  can_auto_retry: v.boolean(),
+  can_user_resume: v.boolean(),
+}) satisfies v.GenericSchema<unknown, WireErrorPresentation>;
+
 /** `state_change`: conversation phase transition. The inner `state` is a
  *  discriminated union by `type` (idle / awaiting_llm / tool_executing / …).
  *  Rather than re-derive that union here, we pass the raw value to
@@ -247,6 +270,7 @@ export const SseStateChangeDataSchema = v.looseObject({
    *  before storing on the atom. Specs:
    *  `specs/working-phase-visibility/` REQ-WPV-001. */
   state_updated_at: v.string(),
+  error: v.exactOptional(ErrorPresentationSchema),
 }) satisfies v.GenericSchema<unknown, WireStateChangeData>;
 
 /** `token`: ephemeral streaming delta during an LLM request. */

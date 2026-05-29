@@ -17,6 +17,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -30,6 +31,8 @@ UI_DIR = ROOT / "ui"
 PHOENIX_PID_FILE = ROOT / ".phoenix.pid"
 VITE_PID_FILE = ROOT / ".vite.pid"
 VITE_PROXY_FILE = ROOT / ".vite.proxy"
+PHOENIX_PORT_FILE = ROOT / ".phoenix.port"
+VITE_PORT_FILE = ROOT / ".vite.port"
 LOG_FILE = ROOT / "phoenix.log"
 
 # ANSI/terminal control sequences: CSI escapes (colour, cursor) plus the
@@ -196,14 +199,21 @@ EXE_DEV_CONFIG = Path("/exe.dev/shelley.json")
 DEFAULT_GATEWAY = "http://169.254.169.254/gateway/llm"
 LOCAL_AI_PROXY = "http://127.0.0.1:8462"
 
-# Dev ports: 8030-8050 range, offset by worktree path hash to avoid collisions.
-# 8031 is reserved for prod. Dev uses two blocks offset by worktree hash:
-#   Phoenix API: 8032-8040  (PORT_RANGE=9, offsets 0-8)
-#   Vite:        8041-8049  (PORT_RANGE=9, offsets 0-8)
-BASE_PHOENIX_PORT = 8032
-BASE_VITE_PORT = 8041
-PORT_RANGE = 9
-DEV_PORT_MIN = 8030
+# Dev ports are assigned deterministically from the worktree path hash. Keep
+# Phoenix and Vite in disjoint blocks so each worktree has a stable pair while
+# avoiding the birthday-problem collisions we saw with a 9-slot pool.
+#
+# Workspace port forwarding currently exposes 8000-8050 plus 8080/8443. Reserve
+# 8031 for prod and use most of the remaining 8000-series ports for dev:
+#   Phoenix API: 8000-8030  (31 slots)
+#   Vite:        8032-8050  (19 slots)
+# The two ports are derived from different hash slices so worktrees with the
+# same Phoenix slot do not necessarily collide on Vite too.
+BASE_PHOENIX_PORT = 8000
+PHOENIX_PORT_RANGE = 31
+BASE_VITE_PORT = 8032
+VITE_PORT_RANGE = 19
+DEV_PORT_MIN = 8000
 DEV_PORT_MAX = 8050
 
 # Database directory
@@ -289,26 +299,80 @@ def get_worktree_hash() -> str:
     return hashlib.md5(str(ROOT).encode()).hexdigest()[:8]
 
 
+def get_port_offsets() -> tuple[int, int]:
+    """Get deterministic Phoenix/Vite port offsets from different hash slices."""
+    worktree_hash = get_worktree_hash()
+    phoenix_offset = int(worktree_hash[:4], 16) % PHOENIX_PORT_RANGE
+    vite_offset = int(worktree_hash[4:8], 16) % VITE_PORT_RANGE
+    return phoenix_offset, vite_offset
+
+
+def _port_is_available(port: int) -> bool:
+    """Return true when localhost can bind the port for a dev server."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError:
+            return False
+    return True
+
+
+def _select_available_port(base: int, range_size: int, preferred_offset: int, reserved: set[int]) -> tuple[int, int]:
+    """Pick a deterministic available port, probing forward on collisions."""
+    for step in range(range_size):
+        offset = (preferred_offset + step) % range_size
+        port = base + offset
+        if port in reserved or port == PROD_PORT:
+            continue
+        if _port_is_available(port):
+            return port, offset
+    first = base
+    last = base + range_size - 1
+    print(f"ERROR: no available dev port in range {first}-{last}.", file=sys.stderr)
+    sys.exit(1)
+
+
 def get_port_offset() -> int:
-    """Get deterministic port offset from worktree path hash."""
-    return int(get_worktree_hash()[:4], 16) % PORT_RANGE
+    """Get the Phoenix port offset for legacy status output."""
+    phoenix_offset, _ = get_port_offsets()
+    return phoenix_offset
 
 
 def get_default_ports() -> tuple[int, int]:
-    """Get default Phoenix and Vite ports for this worktree."""
-    offset = get_port_offset()
-    phoenix = BASE_PHOENIX_PORT + offset
-    vite = BASE_VITE_PORT + offset
+    """Get deterministic hash-based Phoenix and Vite ports for this worktree."""
+    phoenix_offset, vite_offset = get_port_offsets()
+    phoenix = BASE_PHOENIX_PORT + phoenix_offset
+    vite = BASE_VITE_PORT + vite_offset
     for name, port in [("Phoenix", phoenix), ("Vite", vite)]:
         if port == PROD_PORT:
             print(f"ERROR: {name} port {port} collides with prod port {PROD_PORT}.", file=sys.stderr)
-            print(f"  Worktree hash produced offset {offset}. Use --port to override.", file=sys.stderr)
+            print(f"  Worktree hash produced offsets Phoenix={phoenix_offset}, Vite={vite_offset}. Use --port to override.", file=sys.stderr)
             sys.exit(1)
         if not (DEV_PORT_MIN <= port <= DEV_PORT_MAX):
             print(f"ERROR: {name} port {port} outside allowed range {DEV_PORT_MIN}-{DEV_PORT_MAX}.", file=sys.stderr)
-            print(f"  Worktree hash produced offset {offset}. Use --port to override.", file=sys.stderr)
+            print(f"  Worktree hash produced offsets Phoenix={phoenix_offset}, Vite={vite_offset}. Use --port to override.", file=sys.stderr)
             sys.exit(1)
     return (phoenix, vite)
+
+
+def select_dev_ports(preferred_phoenix: int, preferred_vite: int) -> tuple[int, int]:
+    """Select available dev ports, preferring the deterministic hash-based pair."""
+    preferred_phoenix_offset = preferred_phoenix - BASE_PHOENIX_PORT
+    preferred_vite_offset = preferred_vite - BASE_VITE_PORT
+    phoenix, _ = _select_available_port(
+        BASE_PHOENIX_PORT,
+        PHOENIX_PORT_RANGE,
+        preferred_phoenix_offset,
+        reserved={PROD_PORT},
+    )
+    vite, _ = _select_available_port(
+        BASE_VITE_PORT,
+        VITE_PORT_RANGE,
+        preferred_vite_offset,
+        reserved={PROD_PORT, phoenix},
+    )
+    return phoenix, vite
 
 
 def get_db_path() -> Path:
@@ -433,6 +497,10 @@ def stop_process(pid_file: Path, name: str) -> bool:
     finally:
         if pid_file.exists():
             pid_file.unlink()
+        if name == "Phoenix" and PHOENIX_PORT_FILE.exists():
+            PHOENIX_PORT_FILE.unlink()
+        if name == "Vite" and VITE_PORT_FILE.exists():
+            VITE_PORT_FILE.unlink()
         if name == "Vite" and VITE_PROXY_FILE.exists():
             VITE_PROXY_FILE.unlink()
         # Release database lock if stopping Phoenix
@@ -562,6 +630,7 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
             start_new_session=True,
         )
         PHOENIX_PID_FILE.write_text(str(proc.pid))
+    PHOENIX_PORT_FILE.write_text(str(port) + "\n")
 
     # Verify it started
     time.sleep(0.5)
@@ -604,7 +673,7 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False):
     # Start Vite in background (bind to 0.0.0.0 for external access).
     # pnpm passes args after the script name directly — no `--` separator.
     proc = subprocess.Popen(
-        ["pnpm", "run", "dev", "--port", str(port), "--host", "0.0.0.0"],
+        ["pnpm", "run", "dev", "--port", str(port), "--strictPort", "--host", "0.0.0.0"],
         cwd=UI_DIR,
         env=env,
         stdout=subprocess.DEVNULL,
@@ -612,6 +681,7 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False):
         start_new_session=True,
     )
     VITE_PID_FILE.write_text(str(proc.pid))
+    VITE_PORT_FILE.write_text(str(port) + "\n")
 
     time.sleep(1)
     if not is_process_running(proc.pid):
@@ -636,11 +706,22 @@ def cmd_up(
 ):
     """Build and start Phoenix + Vite dev servers."""
     default_phoenix, default_vite = get_default_ports()
-    phoenix_port = phoenix_port or default_phoenix
-    vite_port = vite_port or default_vite
+    preferred_phoenix = phoenix_port or default_phoenix
+    preferred_vite = vite_port or default_vite
+    phoenix_pid = get_pid(PHOENIX_PID_FILE)
+    vite_pid = get_pid(VITE_PID_FILE)
+    phoenix_port = int(PHOENIX_PORT_FILE.read_text().strip()) if phoenix_pid and PHOENIX_PORT_FILE.exists() else preferred_phoenix
+    vite_port = int(VITE_PORT_FILE.read_text().strip()) if vite_pid and VITE_PORT_FILE.exists() else preferred_vite
+    if not phoenix_pid and not vite_pid and phoenix_port == preferred_phoenix and vite_port == preferred_vite:
+        phoenix_port, vite_port = select_dev_ports(preferred_phoenix, preferred_vite)
+    elif not phoenix_pid and phoenix_port == preferred_phoenix:
+        phoenix_port, _ = select_dev_ports(preferred_phoenix, vite_port)
+    elif not vite_pid and vite_port == preferred_vite:
+        _, vite_port = select_dev_ports(phoenix_port, preferred_vite)
     
     print(f"Worktree: {ROOT}")
-    print(f"  Hash: {get_worktree_hash()}, Port offset: +{get_port_offset()}")
+    phoenix_offset, vite_offset = get_port_offsets()
+    print(f"  Hash: {get_worktree_hash()}, Port offsets: Phoenix +{phoenix_offset}, Vite +{vite_offset}")
     print()
     
     build_rust(release=True)
@@ -1602,8 +1683,14 @@ def cmd_down():
 def cmd_restart(phoenix_port: int | None = None, tls: bool = False):
     """Rebuild Rust and restart Phoenix (Vite stays for hot reload)."""
     default_phoenix, default_vite = get_default_ports()
-    phoenix_port = phoenix_port or default_phoenix
-    vite_was_running = get_pid(VITE_PID_FILE) is not None
+    phoenix_pid = get_pid(PHOENIX_PID_FILE)
+    vite_pid = get_pid(VITE_PID_FILE)
+    preferred_phoenix = phoenix_port or default_phoenix
+    phoenix_port = int(PHOENIX_PORT_FILE.read_text().strip()) if phoenix_pid and PHOENIX_PORT_FILE.exists() else preferred_phoenix
+    vite_port = int(VITE_PORT_FILE.read_text().strip()) if vite_pid and VITE_PORT_FILE.exists() else default_vite
+    if not phoenix_pid:
+        phoenix_port, _ = select_dev_ports(phoenix_port, vite_port)
+    vite_was_running = vite_pid is not None
 
     build_rust(release=True)
     stop_process(PHOENIX_PID_FILE, "Phoenix")
@@ -1612,9 +1699,9 @@ def cmd_restart(phoenix_port: int | None = None, tls: bool = False):
     api_scheme = "https" if phoenix_tls else "http"
 
     if vite_was_running:
-        start_vite(port=default_vite, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
+        start_vite(port=vite_port, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
         print(f"Phoenix restarted. Vite ready for UI hot reload.")
-        print(f"  UI:  http://localhost:{default_vite}")
+        print(f"  UI:  http://localhost:{vite_port}")
         print(f"  API: {api_scheme}://localhost:{phoenix_port}")
     else:
         print(f"Phoenix restarted. Vite not running (start with ./dev.py up).")
@@ -1626,17 +1713,21 @@ def cmd_status():
     phoenix_pid = get_pid(PHOENIX_PID_FILE)
     vite_pid = get_pid(VITE_PID_FILE)
     default_phoenix, default_vite = get_default_ports()
+    running_phoenix = int(PHOENIX_PORT_FILE.read_text().strip()) if phoenix_pid and PHOENIX_PORT_FILE.exists() else default_phoenix
+    running_vite = int(VITE_PORT_FILE.read_text().strip()) if vite_pid and VITE_PORT_FILE.exists() else default_vite
     
     print(f"Worktree: {ROOT}")
     print(f"  Hash: {get_worktree_hash()}")
     print(f"  Default ports: Phoenix={default_phoenix}, Vite={default_vite}")
+    if running_phoenix != default_phoenix or running_vite != default_vite:
+        print(f"  Running ports: Phoenix={running_phoenix}, Vite={running_vite}")
     print(f"  Database: {get_db_path()}")
     print()
 
     if phoenix_pid:
         print(f"Phoenix: running (PID {phoenix_pid})")
-        if scheme := _probe_phoenix_scheme(default_phoenix):
-            print(f"  URL: {scheme}://localhost:{default_phoenix}")
+        if scheme := _probe_phoenix_scheme(running_phoenix):
+            print(f"  URL: {scheme}://localhost:{running_phoenix}")
     else:
         print("Phoenix: stopped")
 
@@ -1650,10 +1741,10 @@ def cmd_status():
             import ssl
             import urllib.request
 
-            scheme = _probe_phoenix_scheme(default_phoenix) or "http"
+            scheme = _probe_phoenix_scheme(running_phoenix) or "http"
             context = ssl._create_unverified_context() if scheme == "https" else None
             with urllib.request.urlopen(
-                f"{scheme}://localhost:{default_phoenix}/api/models",
+                f"{scheme}://localhost:{running_phoenix}/api/models",
                 timeout=2,
                 context=context,
             ) as resp:

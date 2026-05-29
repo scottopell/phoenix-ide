@@ -78,6 +78,30 @@ impl LlmError {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoRetryPolicy {
+    AutoRetryable,
+    NoAutoRetry,
+}
+
+impl AutoRetryPolicy {
+    pub fn allows_auto_retry(self) -> bool {
+        matches!(self, Self::AutoRetryable)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserResumePolicy {
+    Resumable,
+    NotResumable,
+}
+
+impl UserResumePolicy {
+    pub fn allows_user_resume(self) -> bool {
+        matches!(self, Self::Resumable)
+    }
+}
+
 /// Error classification for retry logic.
 ///
 /// No `Unknown` variant. No `#[non_exhaustive]`. Adding a new error class
@@ -161,16 +185,38 @@ impl LlmAttemptReason {
 }
 
 impl LlmErrorKind {
-    pub fn is_retryable(self) -> bool {
+    pub fn auto_retry_policy(self) -> AutoRetryPolicy {
         match self {
-            Self::Network | Self::RateLimit | Self::ServerError => true,
+            Self::Network | Self::RateLimit | Self::ServerError => AutoRetryPolicy::AutoRetryable,
             Self::UsageLimitReached
             | Self::ServerOverloaded
             | Self::Auth
             | Self::InvalidRequest
             | Self::ContentFilter
-            | Self::ContextWindowExceeded => false,
+            | Self::ContextWindowExceeded => AutoRetryPolicy::NoAutoRetry,
         }
+    }
+
+    pub fn is_auto_retryable(self) -> bool {
+        self.auto_retry_policy().allows_auto_retry()
+    }
+
+    pub fn user_resume_policy(self) -> UserResumePolicy {
+        match self {
+            Self::Auth
+            | Self::Network
+            | Self::RateLimit
+            | Self::ServerError
+            | Self::ServerOverloaded => UserResumePolicy::Resumable,
+            Self::UsageLimitReached
+            | Self::InvalidRequest
+            | Self::ContentFilter
+            | Self::ContextWindowExceeded => UserResumePolicy::NotResumable,
+        }
+    }
+
+    pub fn is_user_resumable(self) -> bool {
+        self.user_resume_policy().allows_user_resume()
     }
 }
 
@@ -486,9 +532,37 @@ mod tests {
     }
 
     #[test]
-    fn usage_limit_reached_is_not_retryable() {
-        assert!(!LlmErrorKind::UsageLimitReached.is_retryable());
-        assert!(!LlmErrorKind::ServerOverloaded.is_retryable());
-        assert!(LlmErrorKind::RateLimit.is_retryable());
+    fn all_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {
+        use AutoRetryPolicy::{AutoRetryable, NoAutoRetry};
+        use LlmErrorKind::{
+            Auth, ContentFilter, ContextWindowExceeded, InvalidRequest, Network, RateLimit,
+            ServerError, ServerOverloaded, UsageLimitReached,
+        };
+        use UserResumePolicy::{NotResumable, Resumable};
+
+        let cases = [
+            (Network, AutoRetryable, Resumable),
+            (RateLimit, AutoRetryable, Resumable),
+            (UsageLimitReached, NoAutoRetry, NotResumable),
+            (ServerError, AutoRetryable, Resumable),
+            (ServerOverloaded, NoAutoRetry, Resumable),
+            (Auth, NoAutoRetry, Resumable),
+            (InvalidRequest, NoAutoRetry, NotResumable),
+            (ContentFilter, NoAutoRetry, NotResumable),
+            (ContextWindowExceeded, NoAutoRetry, NotResumable),
+        ];
+
+        for (kind, auto_retry, user_resume) in cases {
+            assert_eq!(
+                kind.auto_retry_policy(),
+                auto_retry,
+                "auto retry for {kind:?}"
+            );
+            assert_eq!(
+                kind.user_resume_policy(),
+                user_resume,
+                "user resume for {kind:?}"
+            );
+        }
     }
 }

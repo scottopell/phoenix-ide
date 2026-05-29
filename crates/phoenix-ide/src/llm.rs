@@ -74,7 +74,7 @@ mod types;
 pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
-pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
+pub use error::{AutoRetryPolicy, LlmAttemptReason, LlmError, LlmErrorKind, UserResumePolicy};
 // Re-exported types: QuotaDetails is consumed by `LlmOutcome::UsageLimitReached`
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.
@@ -171,7 +171,8 @@ impl LlmService for LoggingService {
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     error = %e.message,
-                    retryable = e.kind.is_retryable(),
+                    auto_retryable = e.kind.is_auto_retryable(),
+                    user_resumable = e.kind.is_user_resumable(),
                     "LLM request failed"
                 );
             }
@@ -204,7 +205,8 @@ impl LlmService for LoggingService {
                     model = %self.model_id,
                     duration_ms = u64::try_from(duration.as_millis()).unwrap_or(u64::MAX),
                     error = %e.message,
-                    retryable = e.kind.is_retryable(),
+                    auto_retryable = e.kind.is_auto_retryable(),
+                    user_resumable = e.kind.is_user_resumable(),
                     "LLM streaming request failed"
                 );
             }

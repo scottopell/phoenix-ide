@@ -11,23 +11,20 @@ export const DIR_STATUS_CONFIG = {
 } as const;
 
 export function SettingsFields({
-  cwd, setCwd, dirStatus, onDirStatusChange, onGitStatusChange,
+  cwd, setCwd, onDirStatusChange, onGitStatusChange,
   selectedModel, setSelectedModel, models,
   showAllModels, setShowAllModels
 }: {
   cwd: string;
   setCwd: (v: string) => void;
-  dirStatus: DirStatus;
   onDirStatusChange: (status: DirStatus) => void;
-  onGitStatusChange?: (isGit: boolean) => void;
+  onGitStatusChange?: (isGit: boolean | null) => void;
   selectedModel: string | null;
   setSelectedModel: (v: string) => void;
   models: ModelsResponse | null;
   showAllModels: boolean;
   setShowAllModels: (v: boolean) => void;
 }) {
-  const dirStatusClass = DIR_STATUS_CONFIG[dirStatus].class;
-
   // Filter and group models
   const filteredModels = models?.models.filter(m => showAllModels || m.recommended) || [];
   const totalCount = models?.models.length || 0;
@@ -49,12 +46,7 @@ export function SettingsFields({
   return (
     <>
       <label className="settings-field">
-        <span className="settings-field-label">
-          Directory
-          <span className={`field-status ${dirStatusClass}`}>
-            {DIR_STATUS_CONFIG[dirStatus].label}
-          </span>
-        </span>
+        <span className="settings-field-label">Directory</span>
         <DirectoryPicker
           value={cwd}
           onChange={setCwd}

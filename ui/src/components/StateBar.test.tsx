@@ -251,7 +251,7 @@ describe('StateBar model picker enablement (task 02713)', () => {
   }
 
   it('renders the model picker as an interactive button in error state', () => {
-    const { container } = renderWithState({ type: 'error', message: 'overloaded' });
+    const { container } = renderWithState({ type: 'error', message: 'overloaded', error_kind: 'server_overloaded' });
     expect(container.querySelector('button.conv-model--button')).not.toBeNull();
   });
 

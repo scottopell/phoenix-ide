@@ -5,14 +5,14 @@ import { LlmStatusBanner } from './LlmStatusBanner';
 import { SettingsFields } from './SettingsFields';
 import type { DirStatus } from './SettingsFields';
 import type { GitBranchEntry, ModelsResponse, TaskEntry } from '../api';
-import type { ConversationIntent, StartingPoint } from '../hooks/useCreateConversation';
+import type { NewConversationWorkflow } from '../hooks/useCreateConversation';
 
 interface ConversationSettingsProps {
   cwd: string;
   setCwd: (v: string) => void;
   dirStatus: DirStatus;
   onDirStatusChange: (status: DirStatus) => void;
-  onGitStatusChange?: (isGit: boolean) => void;
+  onGitStatusChange?: (isGit: boolean | null) => void;
   selectedModel: string | null;
   setSelectedModel: (v: string) => void;
   models: ModelsResponse | null;
@@ -24,24 +24,16 @@ interface ConversationSettingsProps {
   isGitDir?: boolean | null;
   /** Error message to display */
   error?: string | null;
-  /** Selected user intent */
-  intent?: ConversationIntent;
-  /** Callback to change user intent */
-  setIntent?: (m: ConversationIntent) => void;
-  startingPoint?: StartingPoint | null;
-  setStartingPoint?: (p: StartingPoint | null) => void;
+  workflow?: NewConversationWorkflow;
+  setWorkflow?: (workflow: NewConversationWorkflow) => void;
   tasks?: TaskEntry[];
   /** Available git branches for the current directory */
   branches?: GitBranchEntry[];
   /** Currently checked-out branch */
   currentBranch?: string | null;
-  /** User-selected base branch (null means use current) */
-  baseBranch?: string | null;
-  /** Callback to change base branch selection */
-  setBaseBranch?: (b: string | null) => void;
   /** Remote default branch name (e.g. "main") */
   defaultBranch?: string | null;
-  /** Current search query for remote branch search */
+  gitMetadataLoading?: boolean;
   branchSearch?: string;
   /** Callback to update branch search query */
   setBranchSearch?: (q: string) => void;
@@ -77,16 +69,13 @@ export function ConversationSettings({
   recentDirs,
   isGitDir,
   error,
-  intent = 'direct',
-  setIntent,
-  startingPoint,
-  setStartingPoint,
+  workflow = { kind: 'direct' },
+  setWorkflow,
   tasks = [],
   branches,
   currentBranch,
-  baseBranch,
-  setBaseBranch,
   defaultBranch,
+  gitMetadataLoading,
   branchSearch = '',
   setBranchSearch,
   branchSearchLoading,
@@ -94,7 +83,6 @@ export function ConversationSettings({
   const radioGroupName = useId();
   const [comboOpen, setComboOpen] = useState(false);
   const [taskPickerOpen, setTaskPickerOpen] = useState(false);
-  const [branchPickerOpen, setBranchPickerOpen] = useState(false);
   const [taskDetail, setTaskDetail] = useState<{ path: string; content: string } | null>(null);
   const [taskDetailLoading, setTaskDetailLoading] = useState(false);
   const [taskPage, setTaskPage] = useState(0);
@@ -113,29 +101,40 @@ export function ConversationSettings({
     return () => document.removeEventListener('mousedown', handler);
   }, [comboOpen]);
 
-  const selectBranch = useCallback((name: string) => {
-    setBaseBranch?.(name === currentBranch ? null : name);
-    setStartingPoint?.({ kind: 'branch', name });
-    setBranchSearch?.('');
-    setComboOpen(false);
-  }, [currentBranch, setBaseBranch, setBranchSearch, setStartingPoint]);
+  const defaultStartBranch = defaultBranch ?? currentBranch ?? branches?.[0]?.name ?? null;
+  const selectedName = workflow.kind === 'planFromBranch'
+    ? (workflow.baseBranch ?? defaultStartBranch ?? '')
+    : workflow.kind === 'planFromTask'
+      ? (workflow.baseBranch ?? defaultStartBranch ?? '')
+      : workflow.kind === 'continueBranch'
+        ? (workflow.branch ?? defaultStartBranch ?? '')
+        : (defaultStartBranch ?? '');
+  const selectedTask = workflow.kind === 'planFromTask' ? workflow.task : null;
 
-  const selectCheckoutBranch = useCallback((name: string) => {
-    setStartingPoint?.({ kind: 'checkoutBranch', name });
+  const selectPlanBranch = useCallback((name: string) => {
+    setWorkflow?.({ kind: 'planFromBranch', baseBranch: name });
     setBranchSearch?.('');
     setComboOpen(false);
-  }, [setBranchSearch, setStartingPoint]);
+  }, [setBranchSearch, setWorkflow]);
+
+  const selectContinueBranch = useCallback((name: string) => {
+    setWorkflow?.({ kind: 'continueBranch', branch: name });
+    setBranchSearch?.('');
+    setComboOpen(false);
+  }, [setBranchSearch, setWorkflow]);
 
   const selectTask = useCallback((task: TaskEntry) => {
-    setStartingPoint?.({ kind: 'task', task });
+    setWorkflow?.({ kind: 'planFromTask', task, baseBranch: workflow.kind === 'planFromTask' ? (workflow.baseBranch ?? defaultStartBranch) : defaultStartBranch });
     setBranchSearch?.('');
     setComboOpen(false);
-  }, [setBranchSearch, setStartingPoint]);
+  }, [defaultStartBranch, setBranchSearch, setWorkflow, workflow]);
 
-  const selectedName = startingPoint?.kind === 'branch' || startingPoint?.kind === 'checkoutBranch'
-    ? startingPoint.name
-    : (baseBranch ?? currentBranch ?? defaultBranch ?? '');
-  const selectedTask = startingPoint?.kind === 'task' ? startingPoint.task : null;
+  const chooseWorkflow = useCallback((next: NewConversationWorkflow) => {
+    setWorkflow?.(next);
+    setTaskPickerOpen(false);
+    setComboOpen(false);
+    setBranchSearch?.('');
+  }, [setBranchSearch, setWorkflow]);
 
   useEffect(() => {
     if (!selectedTask) {
@@ -162,6 +161,10 @@ export function ConversationSettings({
     return () => { cancelled = true; };
   }, [selectedTask]);
   const activeTasks = tasks.filter(t => !['done', 'wont-do'].includes(t.status));
+  const hasActiveTasks = activeTasks.length > 0;
+  const gitAlternatesClass = hasActiveTasks
+    ? 'new-conv-workflow-alternates new-conv-workflow-alternates--three'
+    : 'new-conv-workflow-alternates new-conv-workflow-alternates--two';
   const sortedActiveTasks = activeTasks.toSorted((a, b) => {
     const priorityRank = (p: string) => {
       const rank = Number(p.replace(/^p/, ''));
@@ -219,7 +222,6 @@ export function ConversationSettings({
       <SettingsFields
         cwd={cwd}
         setCwd={setCwd}
-        dirStatus={dirStatus}
         onDirStatusChange={onDirStatusChange}
         {...(onGitStatusChange ? { onGitStatusChange } : {})}
         selectedModel={selectedModel}
@@ -229,163 +231,102 @@ export function ConversationSettings({
         setShowAllModels={setShowAllModels}
       />
 
-      {dirStatus === 'exists' && isGitDir !== null && isGitDir !== undefined && (
-        <div className="new-conv-workflow-layout">
+      {dirStatus === 'exists' && isGitDir === true && (
+        <div className="new-conv-workflow-layout" ref={comboRef}>
+          <div className="new-conv-workflow-heading">
+            <span className="settings-field-label">Workflow</span>
+            <span className="new-conv-workflow-hint">Choose how Phoenix should use this Git repository.</span>
+          </div>
           <div className="new-conv-workflows">
             <label
-              className={`workflow-card ${intent === 'direct' ? 'workflow-card--active' : ''}`}
-              onClick={() => setIntent?.('direct')}
+              className={`workflow-card workflow-card--hero ${workflow.kind === 'planFromBranch' ? 'workflow-card--active' : ''}`}
+              onClick={() => chooseWorkflow({ kind: 'planFromBranch', baseBranch: workflow.kind === 'planFromBranch' ? (workflow.baseBranch ?? defaultStartBranch) : defaultStartBranch })}
             >
               <input
+                className="workflow-card-radio"
                 type="radio"
                 name={radioGroupName}
-                checked={intent === 'direct'}
-                onChange={() => setIntent?.('direct')}
+                checked={workflow.kind === 'planFromBranch'}
+                onChange={() => chooseWorkflow({ kind: 'planFromBranch', baseBranch: workflow.kind === 'planFromBranch' ? (workflow.baseBranch ?? defaultStartBranch) : defaultStartBranch })}
               />
               <span className="workflow-card-content">
-                <strong>Direct</strong>
-                <span>Familiar chat mode. The agent works directly in this folder.</span>
+                <strong>Chat in a fresh worktree</strong>
+                <span>Recommended for Git repos. Start from the default branch in an isolated worktree.</span>
               </span>
             </label>
-            {isGitDir && (
+          </div>
+          <div className={gitAlternatesClass}>
+            {hasActiveTasks && (
               <label
-                className={`workflow-card ${intent === 'fromExistingWork' ? 'workflow-card--active' : ''}`}
-                onClick={() => setIntent?.('fromExistingWork')}
+                className={`workflow-card ${workflow.kind === 'planFromTask' ? 'workflow-card--active' : ''}`}
+                onClick={() => chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: workflow.kind === 'planFromTask' ? (workflow.baseBranch ?? defaultStartBranch) : defaultStartBranch })}
               >
                 <input
+                  className="workflow-card-radio"
                   type="radio"
                   name={radioGroupName}
-                  checked={intent === 'fromExistingWork'}
-                  onChange={() => setIntent?.('fromExistingWork')}
+                  checked={workflow.kind === 'planFromTask'}
+                  onChange={() => chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: workflow.kind === 'planFromTask' ? (workflow.baseBranch ?? defaultStartBranch) : defaultStartBranch })}
                 />
                 <span className="workflow-card-content">
-                  <strong>Worktree-based</strong>
-                  <span>Use a separate git worktree. Default: start from latest {defaultBranch ?? 'default branch'}.</span>
+                  <strong>Start from a task</strong>
+                  <span>Pick a task file and approve the plan before Work mode.</span>
                 </span>
               </label>
             )}
+
+            <label
+              className={`workflow-card ${workflow.kind === 'continueBranch' ? 'workflow-card--active' : ''}`}
+              onClick={() => chooseWorkflow({ kind: 'continueBranch', branch: workflow.kind === 'continueBranch' ? (workflow.branch ?? defaultStartBranch) : defaultStartBranch })}
+            >
+              <input
+                className="workflow-card-radio"
+                type="radio"
+                name={radioGroupName}
+                checked={workflow.kind === 'continueBranch'}
+                onChange={() => chooseWorkflow({ kind: 'continueBranch', branch: workflow.kind === 'continueBranch' ? (workflow.branch ?? defaultStartBranch) : defaultStartBranch })}
+              />
+              <span className="workflow-card-content">
+                <strong>Chat in a specific branch</strong>
+                <span>Check out an existing branch in its own worktree.</span>
+              </span>
+            </label>
+
+            <label
+              className={`workflow-card workflow-card--discouraged ${workflow.kind === 'direct' ? 'workflow-card--active' : ''}`}
+              onClick={() => chooseWorkflow({ kind: 'direct' })}
+            >
+              <input
+                className="workflow-card-radio"
+                type="radio"
+                name={radioGroupName}
+                checked={workflow.kind === 'direct'}
+                onChange={() => chooseWorkflow({ kind: 'direct' })}
+              />
+              <span className="workflow-card-content">
+                <strong>Work in this folder</strong>
+                <span>Edits the current checkout directly. Use when isolation is not needed.</span>
+              </span>
+            </label>
           </div>
 
-          <div className="new-conv-workflow-detail">
-            {intent === 'direct' && (
-              <div className="workflow-detail-empty">
-                <strong>Direct</strong>
-                <span>Use this when you want the familiar coding-agent chat experience in the selected folder.</span>
-              </div>
-            )}
+          {workflow.kind !== 'direct' && workflow.kind !== 'planFromBranch' && (
+            <div className="new-conv-workflow-detail">
+              <div className="git-workflow-panel">
+                <div className="git-workflow-summary">
+                  Isolated workflows use a separate git worktree so this folder stays untouched.
+                  {gitMetadataLoading && <span className="branch-combobox-loading"> Loading branches...</span>}
+                </div>
 
-            {isGitDir && intent === 'fromExistingWork' && (
-              <div className="git-workflow-panel" ref={comboRef}>
-                <button
-                  type="button"
-                  className={`git-workflow-option ${startingPoint?.kind === 'branch' ? 'git-workflow-option--active' : ''}`}
-                  onClick={() => {
-                    selectBranch(defaultBranch ?? currentBranch ?? selectedName);
-                    setTaskPickerOpen(false);
-                    setBranchPickerOpen(false);
-                  }}
-                >
-                  <span className="git-workflow-title">Start fresh from default branch</span>
-                  <span className="git-workflow-desc">New worktree from latest {(defaultBranch ?? selectedName) || 'default branch'}.</span>
-                </button>
-
-                <button
-                  type="button"
-            className={`git-workflow-option ${taskPickerOpen || selectedTask ? 'git-workflow-option--active' : ''}`}
-            onClick={() => {
-              setStartingPoint?.(null);
-              setTaskPickerOpen(open => !open);
-              setBranchPickerOpen(false);
-            }}
-
-                >
-                  <span className="git-workflow-title">Pick a task</span>
-                  <span className="git-workflow-desc">
-                    {selectedTask ? `${selectedTask.priority} ${selectedTask.id}: ${selectedTask.slug}` : taskPickerOpen ? 'Select a task below' : `${activeTasks.length} active tasks`}
-                  </span>
-                </button>
-                {taskPickerOpen && (
-                  <div className="task-start-list">
-                    {activeTasks.length === 0 && <div className="task-start-empty">No active tasks found.</div>}
-                    {pagedTasks.map(t => (
-                      <button
-                        key={t.path}
-                        type="button"
-                        className={`task-start-item ${selectedTask?.path === t.path ? 'task-start-item--active' : ''}`}
-                        onClick={() => selectTask(t)}
-                      >
-                        <span className={`task-start-priority task-start-priority--${t.priority}`}>{t.priority}</span>
-                        <span className="task-start-main">
-                          <span className="task-start-title">{t.id} · {t.slug}</span>
-                          <span className="task-start-meta">{t.status}{t.conversation_slug ? ' · active conversation' : ''}</span>
-                        </span>
-                      </button>
-                    ))}
-                    {taskPageCount > 1 && (
-                      <div className="task-start-pagination">
-                        <span>
-                          Showing {clampedTaskPage * taskPageSize + 1}-{Math.min((clampedTaskPage + 1) * taskPageSize, sortedActiveTasks.length)} of {sortedActiveTasks.length}
-                        </span>
-                        <span className="task-start-pagination-controls">
-                          <button
-                            type="button"
-                            className="task-start-page-button"
-                            disabled={clampedTaskPage === 0}
-                            onClick={() => setTaskPage(page => Math.max(0, page - 1))}
-                          >
-                            Prev
-                          </button>
-                          <button
-                            type="button"
-                            className="task-start-page-button"
-                            disabled={clampedTaskPage >= taskPageCount - 1}
-                            onClick={() => setTaskPage(page => Math.min(taskPageCount - 1, page + 1))}
-                          >
-                            Next
-                          </button>
-                        </span>
-                      </div>
-                    )}
-                  </div>
-                )}
-                {selectedTask && (
-                  <div className="task-start-detail">
-                    <div className="task-start-detail-title">
-                      <span>{selectedTask.id} · {selectedTask.slug}</span>
-                      <span className="task-start-detail-meta">{selectedTask.priority} · {selectedTask.status}</span>
-                    </div>
-                    <div className="task-start-detail-markdown">
-                      {taskDetailLoading
-                        ? 'Loading task details...'
-                        : <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{taskDetail?.content ?? ''}</ReactMarkdown>}
-                    </div>
-                  </div>
-                )}
-
-                <button
-                  type="button"
-                  className={`git-workflow-option ${startingPoint?.kind === 'checkoutBranch' ? 'git-workflow-option--active' : ''}`}
-                  onClick={() => {
-                    const branch = startingPoint?.kind === 'checkoutBranch'
-                      ? startingPoint.name
-                      : (currentBranch ?? defaultBranch ?? selectedName);
-                    if (branch) selectCheckoutBranch(branch);
-                    setBranchPickerOpen(open => !open);
-                    setTaskPickerOpen(false);
-                  }}
-                >
-                  <span className="git-workflow-title">Work in branch</span>
-                  <span className="git-workflow-desc">New worktree with an existing branch checked out.</span>
-                </button>
-                {branchPickerOpen && (
+                {workflow.kind === 'planFromTask' && (
                   <div className="branch-combobox">
-                    <span className="settings-field-label">Branch to work in</span>
+                    <span className="settings-field-label">Base branch for planning</span>
                     <input
                       ref={inputRef}
                       type="text"
                       className="settings-input branch-combobox-input"
                       placeholder={comboOpen ? 'Type to filter branches...' : undefined}
-                      value={comboOpen ? branchSearch : (startingPoint?.kind === 'checkoutBranch' ? selectedName : '')}
+                      value={comboOpen ? branchSearch : selectedName}
                       readOnly={!comboOpen}
                       onFocus={() => setComboOpen(true)}
                       onChange={(e) => setBranchSearch?.(e.target.value)}
@@ -397,9 +338,128 @@ export function ConversationSettings({
                           const tag = branchTag(b);
                           return (
                             <div
-                              key={`checkout:${b.name}`}
-                              className={`branch-combobox-item ${startingPoint?.kind === 'checkoutBranch' && selectedName === b.name ? 'branch-combobox-item--selected' : ''}`}
-                              onClick={() => selectCheckoutBranch(b.name)}
+                              key={`base:${b.name}`}
+                              className={`branch-combobox-item ${selectedName === b.name ? 'branch-combobox-item--selected' : ''}`}
+                              onClick={() => {
+                                if (workflow.kind === 'planFromTask') {
+                                  setWorkflow?.({ ...workflow, baseBranch: b.name });
+                                  setBranchSearch?.('');
+                                  setComboOpen(false);
+                                } else {
+                                  selectPlanBranch(b.name);
+                                }
+                              }}
+                            >
+                              <span className="branch-combobox-item-name">{branchLabel(b, currentBranch)}</span>
+                              {tag && <span className={tag.className}>{tag.text}</span>}
+                            </div>
+                          );
+                        })}
+                        {displayBranches.length === 0 && !branchSearchLoading && (
+                          <div className="branch-combobox-empty">No branches found</div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {workflow.kind === 'planFromTask' && (
+                  <>
+                    <button
+                      type="button"
+                      className={`git-workflow-option ${taskPickerOpen || selectedTask ? 'git-workflow-option--active' : ''}`}
+                      onClick={() => {
+                        setTaskPickerOpen(open => !open);
+                      }}
+                    >
+                      <span className="git-workflow-title">Task file</span>
+                      <span className="git-workflow-desc">
+                        {selectedTask ? `${selectedTask.priority} ${selectedTask.id}: ${selectedTask.slug}` : taskPickerOpen ? 'Select a task below' : `${activeTasks.length} active tasks`}
+                      </span>
+                    </button>
+                    {(taskPickerOpen || !selectedTask) && (
+                      <div className="task-start-list">
+                        {activeTasks.length === 0 && <div className="task-start-empty">No active tasks found.</div>}
+                        {pagedTasks.map(t => (
+                          <button
+                            key={t.path}
+                            type="button"
+                            className={`task-start-item ${selectedTask?.path === t.path ? 'task-start-item--active' : ''}`}
+                            onClick={() => selectTask(t)}
+                          >
+                            <span className={`task-start-priority task-start-priority--${t.priority}`}>{t.priority}</span>
+                            <span className="task-start-main">
+                              <span className="task-start-title">{t.id} · {t.slug}</span>
+                              <span className="task-start-meta">{t.status}{t.conversation_slug ? ' · active conversation' : ''}</span>
+                            </span>
+                          </button>
+                        ))}
+                        {taskPageCount > 1 && (
+                          <div className="task-start-pagination">
+                            <span>
+                              Showing {clampedTaskPage * taskPageSize + 1}-{Math.min((clampedTaskPage + 1) * taskPageSize, sortedActiveTasks.length)} of {sortedActiveTasks.length}
+                            </span>
+                            <span className="task-start-pagination-controls">
+                              <button
+                                type="button"
+                                className="task-start-page-button"
+                                disabled={clampedTaskPage === 0}
+                                onClick={() => setTaskPage(page => Math.max(0, page - 1))}
+                              >
+                                Prev
+                              </button>
+                              <button
+                                type="button"
+                                className="task-start-page-button"
+                                disabled={clampedTaskPage >= taskPageCount - 1}
+                                onClick={() => setTaskPage(page => Math.min(taskPageCount - 1, page + 1))}
+                              >
+                                Next
+                              </button>
+                            </span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                    {selectedTask && (
+                      <div className="task-start-detail">
+                        <div className="task-start-detail-title">
+                          <span>{selectedTask.id} · {selectedTask.slug}</span>
+                          <span className="task-start-detail-meta">{selectedTask.priority} · {selectedTask.status}</span>
+                        </div>
+                        <div className="task-start-detail-markdown">
+                          {taskDetailLoading
+                            ? 'Loading task details...'
+                            : <ReactMarkdown remarkPlugins={REMARK_PLUGINS}>{taskDetail?.content ?? ''}</ReactMarkdown>}
+                        </div>
+                      </div>
+                    )}
+                  </>
+                )}
+
+                {workflow.kind === 'continueBranch' && (
+                  <div className="branch-combobox">
+                    <span className="settings-field-label">Branch to continue</span>
+                    <input
+                      ref={inputRef}
+                      type="text"
+                      className="settings-input branch-combobox-input"
+                      placeholder={comboOpen ? 'Type to filter branches...' : undefined}
+                      value={comboOpen ? branchSearch : selectedName}
+                      readOnly={!comboOpen}
+                      onFocus={() => setComboOpen(true)}
+                      onChange={(e) => setBranchSearch?.(e.target.value)}
+                    />
+                    {branchSearchLoading && <span className="branch-combobox-loading">...</span>}
+                    {comboOpen && (
+                      <div className="branch-combobox-dropdown">
+                        {displayBranches.map(b => {
+                          const tag = branchTag(b);
+                          return (
+                            <div
+                              key={`continue:${b.name}`}
+                              className={`branch-combobox-item ${selectedName === b.name ? 'branch-combobox-item--selected' : ''}`}
+                              onClick={() => selectContinueBranch(b.name)}
                             >
                               <span className="branch-combobox-item-name">{branchLabel(b, currentBranch)}</span>
                               {b.conflict_slug && <span className="branch-tag branch-tag--conflict">active</span>}
@@ -415,17 +475,17 @@ export function ConversationSettings({
                   </div>
                 )}
               </div>
-            )}
-          </div>
+            </div>
+          )}
         </div>
       )}
 
       {(() => {
-        const selectedBranch = startingPoint?.kind === 'checkoutBranch'
+        const selectedBranch = workflow.kind === 'continueBranch'
           ? displayBranches.find(b => b.name === selectedName)
           : undefined;
         const conflictSlug = selectedTask?.conversation_slug ?? selectedBranch?.conflict_slug;
-        if (!conflictSlug || intent === 'direct') return null;
+        if (!conflictSlug || workflow.kind === 'direct') return null;
         return (
           <div className="branch-conflict-banner">
             This starting point already has an active conversation.{' '}

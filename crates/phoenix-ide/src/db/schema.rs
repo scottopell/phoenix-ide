@@ -1,6 +1,6 @@
 //! Database schema and types
 
-use crate::llm::ContentBlock;
+use crate::llm::{AutoRetryPolicy, ContentBlock, UserResumePolicy};
 pub use crate::state_machine::state::ConvState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -555,8 +555,9 @@ impl Conversation {
 /// No `Unknown` variant. Every error gets an explicit, intentional classification.
 /// Adding a new error class requires handling it in every consumer — the compiler
 /// forces it.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ts_rs::TS)]
 #[serde(rename_all = "snake_case")]
+#[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum ErrorKind {
     /// Authentication failed (401, 403) - not retryable
     Auth,
@@ -585,10 +586,12 @@ pub enum ErrorKind {
 }
 
 impl ErrorKind {
-    /// Returns true if this error type should trigger automatic retry
-    pub fn is_retryable(&self) -> bool {
+    /// Policy for runtime-initiated retry while the same turn is still in flight.
+    pub fn auto_retry_policy(&self) -> AutoRetryPolicy {
         match self {
-            Self::Network | Self::RateLimit | Self::ServerError | Self::TimedOut => true,
+            Self::Network | Self::RateLimit | Self::ServerError | Self::TimedOut => {
+                AutoRetryPolicy::AutoRetryable
+            }
             Self::Auth
             | Self::UsageLimitReached
             | Self::ServerOverloaded
@@ -596,8 +599,34 @@ impl ErrorKind {
             | Self::Cancelled
             | Self::SubAgentError
             | Self::ContextExhausted
-            | Self::ContentFilter => false,
+            | Self::ContentFilter => AutoRetryPolicy::NoAutoRetry,
         }
+    }
+
+    pub fn is_auto_retryable(&self) -> bool {
+        self.auto_retry_policy().allows_auto_retry()
+    }
+
+    /// Policy for a persisted error state accepting a user-triggered `continue`.
+    pub fn user_resume_policy(&self) -> UserResumePolicy {
+        match self {
+            Self::Auth
+            | Self::RateLimit
+            | Self::Network
+            | Self::ServerError
+            | Self::ServerOverloaded
+            | Self::TimedOut => UserResumePolicy::Resumable,
+            Self::UsageLimitReached
+            | Self::InvalidRequest
+            | Self::Cancelled
+            | Self::SubAgentError
+            | Self::ContextExhausted
+            | Self::ContentFilter => UserResumePolicy::NotResumable,
+        }
+    }
+
+    pub fn is_user_resumable(&self) -> bool {
+        self.user_resume_policy().allows_user_resume()
     }
 }
 
@@ -1309,53 +1338,88 @@ mod error_kind_tests {
     use super::*;
 
     #[test]
-    fn test_retryable_errors() {
-        // These should be retryable
-        assert!(
-            ErrorKind::Network.is_retryable(),
-            "Network errors should be retryable"
-        );
-        assert!(
-            ErrorKind::RateLimit.is_retryable(),
-            "Rate limit errors should be retryable"
-        );
-        assert!(
-            ErrorKind::ServerError.is_retryable(),
-            "Server errors (5xx) should be retryable"
-        );
-        assert!(
-            ErrorKind::TimedOut.is_retryable(),
-            "Timeout errors should be retryable"
-        );
-    }
+    fn all_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {
+        use crate::llm::{AutoRetryPolicy, UserResumePolicy};
+        use ErrorKind::{
+            Auth, Cancelled, ContentFilter, ContextExhausted, InvalidRequest, Network, RateLimit,
+            ServerError, ServerOverloaded, SubAgentError, TimedOut, UsageLimitReached,
+        };
 
-    #[test]
-    fn test_non_retryable_errors() {
-        // These should NOT be retryable
-        assert!(
-            !ErrorKind::Auth.is_retryable(),
-            "Auth errors should not be retryable"
-        );
-        assert!(
-            !ErrorKind::InvalidRequest.is_retryable(),
-            "Invalid request errors should not be retryable"
-        );
-        assert!(
-            !ErrorKind::Cancelled.is_retryable(),
-            "Cancelled errors should not be retryable"
-        );
-        assert!(
-            !ErrorKind::SubAgentError.is_retryable(),
-            "Sub-agent errors should not be retryable"
-        );
-        assert!(
-            !ErrorKind::ContextExhausted.is_retryable(),
-            "Context exhausted errors should not be retryable"
-        );
-        assert!(
-            !ErrorKind::ContentFilter.is_retryable(),
-            "Content filter errors should not be retryable"
-        );
+        let cases = [
+            (
+                Network,
+                AutoRetryPolicy::AutoRetryable,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                RateLimit,
+                AutoRetryPolicy::AutoRetryable,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                UsageLimitReached,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                ServerError,
+                AutoRetryPolicy::AutoRetryable,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                ServerOverloaded,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                TimedOut,
+                AutoRetryPolicy::AutoRetryable,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                Auth,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::Resumable,
+            ),
+            (
+                InvalidRequest,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                Cancelled,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                SubAgentError,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                ContextExhausted,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+            (
+                ContentFilter,
+                AutoRetryPolicy::NoAutoRetry,
+                UserResumePolicy::NotResumable,
+            ),
+        ];
+
+        for (kind, auto_retry, user_resume) in cases {
+            assert_eq!(
+                kind.auto_retry_policy(),
+                auto_retry,
+                "auto retry for {kind:?}"
+            );
+            assert_eq!(
+                kind.user_resume_policy(),
+                user_resume,
+                "user resume for {kind:?}"
+            );
+        }
     }
 
     #[test]

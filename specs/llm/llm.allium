@@ -11,7 +11,7 @@
 -- Includes: The internal ContentBlock kinds; LlmRequest / LlmResponse /
 --           LlmMessage shape; the Usage token-accounting value; the
 --           streaming TokenChunk; the LlmErrorKind taxonomy and its
---           retryable/terminal partition; the rule that structured quota
+--           automatic retry and user-resume partitions; the rule that structured quota
 --           detail is carried by an error iff it is a usage-limit
 --           exhaustion.
 --
@@ -86,8 +86,8 @@ enum ContentKind {
 
 -- Exhaustive error taxonomy. No `Unknown`, no catch-all: adding a class
 -- forces a variant here and an explicit decision in every classifier and
--- every consumer (REQ-LLM-006). The retryable/terminal split is a
--- structural property — see the `retryable` derived field on LlmError
+-- every consumer (REQ-LLM-006). The automatic retry / user-resume split is a
+-- structural property — see the derived fields on LlmError
 -- and the RetryablePartition invariant.
 --
 -- rate_limit and usage_limit_reached are deliberately distinct: a 429
@@ -200,8 +200,9 @@ entity LlmResponse {
 -- classifiers (Anthropic SSE / HTTP status; Responses SSE / codex
 -- backend). `kind` is set once at creation and never transitions.
 --
--- `retryable` is derived, not stored: the retry decision is a pure
--- function of `kind`, so it cannot drift out of sync with the taxonomy.
+-- `auto_retryable` and `user_resumable` are derived, not stored: each
+-- decision is a pure function of `kind`, so they cannot drift out of sync
+-- with the taxonomy or with each other.
 -- `has_quota` records whether structured QuotaDetails is attached; it is
 -- bound to `usage_limit_reached` by QuotaBoundToUsageLimit.
 entity LlmError {
@@ -215,11 +216,13 @@ entity LlmError {
     -- snapshots, credits) is attached to this error.
     has_quota: Boolean
 
-    -- The retry decision. Exactly three kinds are retryable; every other
-    -- kind is terminal. usage_limit_reached and server_overloaded are
-    -- terminal on purpose — retrying them is wasted work and the
-    -- user-facing recovery differs (wait for reset / pick another model).
-    retryable: kind = network or kind = rate_limit or kind = server_error
+    -- Automatic runtime retry decision. Exactly three kinds are auto-retryable;
+    -- every other kind requires stopping the in-flight turn.
+    auto_retryable: kind = network or kind = rate_limit or kind = server_error
+
+    -- User-triggered resume from a persisted conversation error. Auth is not
+    -- auto-retryable, but is resumable after credentials are fixed.
+    user_resumable: kind = auth or kind = network or kind = rate_limit or kind = server_error or kind = server_overloaded
 }
 
 ------------------------------------------------------------
@@ -238,14 +241,19 @@ invariant QuotaBoundToUsageLimit {
         (e.kind = usage_limit_reached) implies e.has_quota
 }
 
--- The retryable set is exactly {network, rate_limit, server_error}.
--- Because `retryable` is a derived field this holds by construction; the
+-- The auto-retryable set is exactly {network, rate_limit, server_error}.
+-- Because `auto_retryable` is a derived field this holds by construction; the
 -- invariant is the place a future taxonomy change is forced to restate
 -- the partition deliberately rather than let a new kind default into
 -- either bucket.
-invariant RetryablePartition {
+invariant AutoRetryablePartition {
     for e in LlmErrors:
-        e.retryable = (e.kind = network or e.kind = rate_limit or e.kind = server_error)
+        e.auto_retryable = (e.kind = network or e.kind = rate_limit or e.kind = server_error)
+}
+
+invariant UserResumablePartition {
+    for e in LlmErrors:
+        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = rate_limit or e.kind = server_error or e.kind = server_overloaded)
 }
 
 -- Token accounting is non-negative. Each count is an unsigned quantity
@@ -280,7 +288,7 @@ invariant UsageNonNegative {
 --     produces them — its SSE error mapping has no branch for either, so
 --     an Anthropic context-window overflow surfaces as the generic
 --     invalid_request kind. Accepted: invalid_request and
---     context_window_exceeded are both terminal/non-retryable, so retry
+--     context_window_exceeded remains non-auto-retryable and non-user-resumable.
 --     behaviour is identical, and nothing currently consumes the finer
 --     kinds (both are #[allow(dead_code)] in error.rs). Revisit if a
 --     consumer needs the finer Anthropic classification.

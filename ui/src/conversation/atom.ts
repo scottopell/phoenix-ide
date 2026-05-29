@@ -1,5 +1,6 @@
 import * as v from 'valibot';
 import type { ConversationState, Message, Conversation, ToolResultContent } from '../api';
+import type { ErrorPresentation } from '../errorPresentation';
 import type { Breadcrumb } from '../types';
 import {
   SseTokenDataSchema,
@@ -181,6 +182,9 @@ export type SSEAction =
        *  handler boundary; the reducer stores it on the atom as a number
        *  (REQ-WPV-001). */
       stateUpdatedAt: number;
+      /** Error presentation (#175): kind + auto-retry/user-resume policy,
+       *  present when the new phase carries an error. */
+      error?: ErrorPresentation;
       epoch?: number;
     }
   | { type: 'sse_agent_done'; sequenceId: number; epoch?: number }
@@ -524,6 +528,7 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         sequenceId: res.output.sequence_id,
         phase: parseConversationState(res.output.state),
         stateUpdatedAt: Date.parse(res.output.state_updated_at),
+        ...(res.output.error ? { error: res.output.error } : {}),
       });
     }
     case 'message': {
@@ -902,7 +907,11 @@ export function conversationReducer(
 
     case 'sse_state_change': {
       return applyIfNewer(atom, 'sse_state_change', action.sequenceId, (a) => {
-        const newCrumb = breadcrumbFromPhase(action.phase, action.sequenceId);
+        const phase =
+          action.phase.type === 'error' && action.error
+            ? { ...action.phase, error: action.error }
+            : action.phase;
+        const newCrumb = breadcrumbFromPhase(phase, action.sequenceId);
         const { breadcrumbs, breadcrumbSequenceIds } = applyBreadcrumb(
           a.breadcrumbs,
           a.breadcrumbSequenceIds,
@@ -915,7 +924,8 @@ export function conversationReducer(
           action.phase.type === 'tool_executing' ? Date.now() : null;
         return {
           ...a,
-          phase: action.phase,
+          // main (#175): `phase` is the error-enriched phase computed above.
+          phase,
           // REQ-WPV-001: store the server-authoritative entry time.
           phaseStateUpdatedAt: action.stateUpdatedAt,
           lastSseEventAt: Date.now(),

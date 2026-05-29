@@ -55,7 +55,7 @@ compiler forces it.
 transient per-window throttle (retry in seconds) or a quota window having reset-on-a-
 calendar-boundary (retry next Sunday). Treating both as `RateLimit` either wastes work
 or misclassifies recovery, depending on which way the default lands. The split keeps
-`is_retryable()` honest.
+automatic retry policy honest and separate from user-triggered resume policy.
 
 ```rust
 pub struct LlmError {
@@ -90,10 +90,32 @@ pub enum LlmErrorKind {
     // No Unknown. No _.
 }
 
+pub enum AutoRetryPolicy { AutoRetryable, NoAutoRetry }
+pub enum UserResumePolicy { Resumable, NotResumable }
+
 impl LlmErrorKind {
-    pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Network | Self::RateLimit | Self::ServerError)
-        // UsageLimitReached and ServerOverloaded are intentionally terminal.
+    pub fn auto_retry_policy(&self) -> AutoRetryPolicy {
+        match self {
+            Self::Network | Self::RateLimit | Self::ServerError => AutoRetryPolicy::AutoRetryable,
+            Self::UsageLimitReached
+            | Self::ServerOverloaded
+            | Self::Auth
+            | Self::InvalidRequest
+            | Self::ContentFilter
+            | Self::ContextWindowExceeded => AutoRetryPolicy::NoAutoRetry,
+        }
+    }
+
+    pub fn user_resume_policy(&self) -> UserResumePolicy {
+        match self {
+            Self::Auth | Self::Network | Self::RateLimit | Self::ServerError | Self::ServerOverloaded => {
+                UserResumePolicy::Resumable
+            }
+            Self::UsageLimitReached
+            | Self::InvalidRequest
+            | Self::ContentFilter
+            | Self::ContextWindowExceeded => UserResumePolicy::NotResumable,
+        }
     }
 }
 
@@ -574,7 +596,7 @@ impl LlmService for LoggingService {
                     "model" => &self.model_id,
                     "duration_ms" => duration.as_millis(),
                     "error" => %e.message,
-                    "retryable" => e.kind.is_retryable(),
+                    "auto_retryable" => e.kind.is_auto_retryable(),
                 );
             }
         }

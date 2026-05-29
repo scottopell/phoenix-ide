@@ -213,7 +213,7 @@ fn stamp_retry_count(display_data: &mut Option<serde_json::Value>, final_attempt
 }
 
 /// Project a runtime `ErrorKind` onto the three retryable
-/// `LlmAttemptReason` variants. `is_retryable()` is the gate for
+/// `LlmAttemptReason` variants. `is_auto_retryable()` is the gate for
 /// `Effect::ScheduleRetry`; this helper is the wire-side projection of
 /// the same predicate. `TimedOut` collapses to `Network` because the
 /// upstream `LlmErrorKind` never distinguishes them (timeouts arrive
@@ -224,10 +224,10 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
         ErrorKind::RateLimit => LlmAttemptReason::RateLimit,
         ErrorKind::ServerError => LlmAttemptReason::ServerError,
         ErrorKind::Network | ErrorKind::TimedOut => LlmAttemptReason::Network,
-        // Non-retryable kinds. `db::ErrorKind::is_retryable` admits exactly
-        // the four kinds matched above, and every caller guards on it before
-        // reaching here, so a non-retryable kind landing in this arm is a
-        // runtime invariant violation. Log it (a wrong `reason` on the wire
+        // Non-retryable kinds. `db::ErrorKind::is_auto_retryable` admits
+        // exactly the four kinds matched above, and every caller guards on it
+        // before reaching here, so a non-retryable kind landing in this arm is
+        // a runtime invariant violation. Log it (a wrong `reason` on the wire
         // is a capability gap, not a crash — keep returning a well-formed
         // value rather than panicking the conversation).
         ErrorKind::Auth
@@ -241,7 +241,7 @@ fn error_kind_to_attempt_reason(kind: &ErrorKind) -> LlmAttemptReason {
             tracing::error!(
                 ?kind,
                 "error_kind_to_attempt_reason reached with a non-retryable kind; \
-                 is_retryable() guard should preclude this — defaulting wire reason to network"
+                 is_auto_retryable() guard should preclude this — defaulting wire reason to network"
             );
             LlmAttemptReason::Network
         }
@@ -1316,7 +1316,7 @@ fn handle_core_error_retry(
                 resets_at,
                 ..
             },
-        ) if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
+        ) if error_kind.is_auto_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
             let new_attempt = attempt + 1;
             let delay = retry_delay(new_attempt);
             let reason = error_kind_to_attempt_reason(error_kind);
@@ -1343,7 +1343,7 @@ fn handle_core_error_retry(
                 ..
             },
         ) => {
-            let error_message = if error_kind.is_retryable() {
+            let error_message = if error_kind.is_auto_retryable() {
                 format!("Failed after {attempt} attempts: {message}")
             } else {
                 message
@@ -1395,7 +1395,7 @@ fn handle_core_continuation(
                 resets_at,
                 ..
             },
-        ) if error_kind.is_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
+        ) if error_kind.is_auto_retryable() && *attempt < MAX_RETRY_ATTEMPTS => {
             let new_attempt = attempt + 1;
             let delay = retry_delay(new_attempt);
             let reason = error_kind_to_attempt_reason(error_kind);
@@ -2126,7 +2126,7 @@ pub fn transition_parent(
                 ref error_kind,
                 ..
             }),
-        ) if !error_kind.is_retryable() || {
+        ) if !error_kind.is_auto_retryable() || {
             // Check if we're at/past max retries
             match state {
                 ParentState::Core(CoreState::AwaitingContinuation { attempt, .. }) => {
@@ -2256,8 +2256,8 @@ pub fn transition_sub_agent(
                 error_kind,
                 ..
             }),
-        ) if !error_kind.is_retryable() || *attempt >= MAX_RETRY_ATTEMPTS => {
-            let error_message = if error_kind.is_retryable() {
+        ) if !error_kind.is_auto_retryable() || *attempt >= MAX_RETRY_ATTEMPTS => {
+            let error_message = if error_kind.is_auto_retryable() {
                 format!("Failed after {attempt} attempts: {message}")
             } else {
                 message
@@ -2726,7 +2726,7 @@ pub fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> ErrorKind {
     }
 }
 
-// ErrorKind::is_retryable() is now defined in db/schema.rs
+// ErrorKind::is_auto_retryable() is now defined in db/schema.rs
 
 #[cfg(test)]
 mod tests {

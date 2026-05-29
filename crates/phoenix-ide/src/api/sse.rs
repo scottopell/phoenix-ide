@@ -188,13 +188,23 @@ mod tests {
                 state,
                 presentation_mode,
                 state_updated_at,
-            } => json!({
-                "type": "state_change",
-                "sequence_id": sequence_id,
-                "state": serde_json::to_value(state).unwrap_or(Value::Null),
-                "presentation_mode": presentation_mode,
-                "state_updated_at": state_updated_at,
-            }),
+            } => {
+                let mut obj = json!({
+                    "type": "state_change",
+                    "sequence_id": sequence_id,
+                    "state": serde_json::to_value(state).unwrap_or(Value::Null),
+                    "presentation_mode": presentation_mode,
+                    "state_updated_at": state_updated_at,
+                });
+                if let Some(error_kind) = state.error_kind() {
+                    obj["error"] = json!({
+                        "kind": error_kind,
+                        "can_auto_retry": error_kind.is_auto_retryable(),
+                        "can_user_resume": error_kind.is_user_resumable(),
+                    });
+                }
+                obj
+            }
             SseEvent::LlmFirstByte {
                 sequence_id,
                 request_id,

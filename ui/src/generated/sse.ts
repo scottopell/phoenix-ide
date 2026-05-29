@@ -17,6 +17,8 @@ export type { SseBreadcrumb } from './SseBreadcrumb';
 export type { UsageData } from './UsageData';
 export type { UserFacingError } from './UserFacingError';
 export type { UserFacingErrorKind } from './UserFacingErrorKind';
+export type { ErrorPresentation } from './ErrorPresentation';
+export type { ErrorKind } from './ErrorKind';
 
 // Bash tool input and bash/tmux tool response wire types.
 export type { BashOp } from './BashOp';
