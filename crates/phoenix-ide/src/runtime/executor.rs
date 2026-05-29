@@ -757,7 +757,16 @@ where
         // sub-millisecond drift is below the client display's per-second
         // rounding.
         let old_state = std::mem::replace(&mut self.state, result.new_state.clone());
-        self.state_updated_at = Utc::now();
+        // Only stamp a fresh entry time when the phase actually changes.
+        // Several events absorb as no-ops (Terminal absorbs unknown events;
+        // an empty steering drain re-enters the same state) and reach here
+        // with new_state == old_state; bumping then would reset the client's
+        // elapsed counter (REQ-WPV-001) for a phase the agent never left.
+        // No-op transitions emit no PersistState effect, so the DB row keeps
+        // its prior value too — gating here keeps the in-memory stamp in sync.
+        if self.state != old_state {
+            self.state_updated_at = Utc::now();
+        }
 
         // Log notable state transitions at INFO. "Notable" means transitions that cross
         // a meaningful phase boundary (idle↔active, entering/leaving tool execution,
@@ -2022,9 +2031,9 @@ where
     /// the defensive `else` arm covers a hypothetical future call path.
     ///
     /// Why broadcast-only (no DB write): the assistant message that
-    /// owns this tool_use is NOT persisted yet during the tool round —
+    /// owns this `tool_use` is NOT persisted yet during the tool round —
     /// it lives in the state machine via `BroadcastAssistantMessage`
-    /// (the eager broadcast, ring-replayable per sse_wire.allium's
+    /// (the eager broadcast, ring-replayable per `sse_wire.allium`'s
     /// `EagerAssistantMessageAppendedToReplayRing`) and the DB write
     /// happens later via `PersistCheckpoint` at the end of the round.
     /// `update_message_display_data` against an unpersisted message
