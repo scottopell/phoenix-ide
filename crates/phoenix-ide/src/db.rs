@@ -667,16 +667,32 @@ impl Database {
         Ok(rows)
     }
 
-    /// Update conversation state
+    /// Update conversation state, stamping `state_updated_at = now()`.
+    /// Callers that own the authoritative entry timestamp (the runtime
+    /// executor) should use [`Self::update_conversation_state_at`] so the
+    /// persisted stamp matches the one carried on the `StateChange` SSE.
     pub async fn update_conversation_state(&self, id: &str, state: &ConvState) -> DbResult<()> {
-        let now = Utc::now();
+        self.update_conversation_state_at(id, state, Utc::now())
+            .await
+    }
+
+    /// Update conversation state with an explicit `state_updated_at`. The
+    /// runtime threads its in-memory entry timestamp here so the DB row and
+    /// the `StateChange` wire event share one value (REQ-WPV-001) — no
+    /// clock-drift between the two `now()` reads.
+    pub async fn update_conversation_state_at(
+        &self,
+        id: &str,
+        state: &ConvState,
+        state_updated_at: DateTime<Utc>,
+    ) -> DbResult<()> {
         let state_json = serde_json::to_string(state).unwrap();
 
         let result = sqlx::query(
             "UPDATE conversations SET state = ?1, state_updated_at = ?2, updated_at = ?2 WHERE id = ?3",
         )
         .bind(&state_json)
-        .bind(now.to_rfc3339())
+        .bind(state_updated_at.to_rfc3339())
         .bind(id)
         .execute(&self.pool)
         .await?;

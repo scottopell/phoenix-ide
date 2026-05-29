@@ -936,7 +936,11 @@ where
     /// 60004) since the drain emits its own authoritative state-change.
     async fn persist_state_effect(&mut self, broadcast: bool) -> Result<Option<Event>, String> {
         self.storage
-            .update_state(&self.context.conversation_id, &self.state)
+            .update_state(
+                &self.context.conversation_id,
+                &self.state,
+                self.state_updated_at,
+            )
             .await?;
 
         if broadcast {
@@ -2595,14 +2599,14 @@ where
         let conv_id = &self.context.conversation_id;
 
         // Update state. Mode is preserved (Branch stays Branch, Work stays Work).
-        // Bump the in-memory state_updated_at to match the DB write so the
-        // Terminal SseEvent::StateChange below carries the correct entry
-        // time (REQ-WPV-001). `self.state` itself is not mutated because the
-        // runtime is about to exit after this function returns.
-        self.storage
-            .update_state(conv_id, &ConvState::Terminal)
-            .await?;
+        // Stamp the entry time first and thread it into the DB write so the
+        // persisted row and the Terminal SseEvent::StateChange below carry the
+        // identical value (REQ-WPV-001). `self.state` itself is not mutated
+        // because the runtime is about to exit after this function returns.
         self.state_updated_at = Utc::now();
+        self.storage
+            .update_state(conv_id, &ConvState::Terminal, self.state_updated_at)
+            .await?;
         // Legitimate cwd mutation (task 13012, teardown fallback): the
         // worktree is gone by this point, but API handlers (search_files,
         // list_skills, list_tasks, get_system_prompt) read conv.cwd for

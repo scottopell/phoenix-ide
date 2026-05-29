@@ -100,8 +100,16 @@ pub trait MessageStore: Send + Sync {
 /// Storage for conversation state
 #[async_trait]
 pub trait StateStore: Send + Sync {
-    /// Update the conversation state (full state as JSON)
-    async fn update_state(&self, conv_id: &str, state: &ConvState) -> Result<(), String>;
+    /// Update the conversation state (full state as JSON). `state_updated_at`
+    /// is the runtime's authoritative phase-entry timestamp; persisting it
+    /// (rather than a fresh `now()` at the storage layer) keeps the DB row and
+    /// the `StateChange` SSE on one value (REQ-WPV-001).
+    async fn update_state(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String>;
 
     /// Get the current conversation state
     #[allow(dead_code)] // API completeness
@@ -298,8 +306,15 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
 
 #[async_trait]
 impl<T: StateStore + ?Sized> StateStore for Arc<T> {
-    async fn update_state(&self, conv_id: &str, state: &ConvState) -> Result<(), String> {
-        (**self).update_state(conv_id, state).await
+    async fn update_state(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        (**self)
+            .update_state(conv_id, state, state_updated_at)
+            .await
     }
 
     async fn get_state(&self, conv_id: &str) -> Result<ConvState, String> {
@@ -522,9 +537,14 @@ impl MessageStore for DatabaseStorage {
 
 #[async_trait]
 impl StateStore for DatabaseStorage {
-    async fn update_state(&self, conv_id: &str, state: &ConvState) -> Result<(), String> {
+    async fn update_state(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
         self.db
-            .update_conversation_state(conv_id, state)
+            .update_conversation_state_at(conv_id, state, state_updated_at)
             .await
             .map_err(|e| e.to_string())
     }

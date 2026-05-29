@@ -550,7 +550,14 @@ impl MessageStore for InMemoryStorage {
 
 #[async_trait]
 impl StateStore for InMemoryStorage {
-    async fn update_state(&self, conv_id: &str, state: &ConvState) -> Result<(), String> {
+    async fn update_state(
+        &self,
+        conv_id: &str,
+        state: &ConvState,
+        _state_updated_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), String> {
+        // In-memory test storage tracks only the state value, not its entry
+        // timestamp, so the threaded stamp is intentionally unused here.
         self.states
             .lock()
             .unwrap()
