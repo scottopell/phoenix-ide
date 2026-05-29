@@ -20,11 +20,18 @@
 --           connection-epoch monotonic guard (wire-side cross-conv
 --           contamination); expectedConversationId guard on
 --           client-originated actions (post-navigation stale-dispatch
---           contamination).
+--           contamination); heartbeat-watchdog clock (the
+--           sse_event_observed bump of lastSseEventAt); and the
+--           render-subscription isolation that keeps the page-view
+--           projection out of per-token / per-ping churn.
 --
 -- Excludes: HTTP/SSE transport (see sse_wire spec, if written).
 --           ConnectionMachine (see connection_machine spec, if written).
---           Message rendering (how atom.messages projects to DOM).
+--           DOM projection of atom fields — component internals, JSX,
+--           how a Message renders. The render-SUBSCRIPTION layer (which
+--           atom fields each consumer selects, and the render isolation
+--           that buys) IS in scope, modelled by RenderSubscriptionIsolation
+--           below; the DOM projection of those fields is not.
 --           Server-side state machine (see bedrock).
 --           The queued-message derivation in useMessageQueue (see
 --           user_message_queue spec, if written).
@@ -105,6 +112,16 @@ entity ConversationAtom {
     streamingBuffer: StreamingBuffer?
     uiError: UIError?
     connectionState: String
+    -- Client-clock (unix ms) of the most recent SSE event observed on
+    -- this connection — ANY named event, including the typed `ping`
+    -- keep-alive. Initialised to now() at atom creation; the
+    -- SseEventObserved rule is its single writer. Drives the heartbeat
+    -- watchdog (REQ-WPV-004): a working phase whose last observed event
+    -- is older than HEARTBEAT_WATCHDOG_MS is surfaced as degraded. It is
+    -- the higher-frequency of the two churn fields (bumped on every token
+    -- AND every ping), which is why RenderSubscriptionIsolation excludes
+    -- it from the page-view projection.
+    lastSseEventAt: Timestamp
     -- The connection generation that produced wire events this atom is
     -- accepting. Null until the first `connection_opened` lands; lifted
     -- monotonically thereafter. Wire-originated actions stamped with a
@@ -670,6 +687,43 @@ rule ConnectionReset {
         -- correctness barrier.
 }
 
+------------------------------------------------------------
+-- Rules — heartbeat watchdog clock
+------------------------------------------------------------
+-- `sse_event_observed` is dispatched by useConnection's event wrapper
+-- on EVERY named SSE event (token, state_change, message, AND the typed
+-- `ping` keep-alive) before the event's own per-action dispatch. It is
+-- the single writer of lastSseEventAt. Unlike every wire rule above it
+-- bypasses BOTH guards: no `epoch` (the watchdog measures local silence,
+-- not server-stream generation, so a stale executor's late bump is
+-- benign) and no applyIfNewer (a payload-less ping carries no
+-- sequence_id, and "any observed traffic = alive" must hold even for
+-- duplicates). lastSequenceId is therefore untouched.
+rule SseEventObserved {
+    when: SseEventObservedDispatched(atom)
+
+    ensures: atom.lastSseEventAt = now()
+    ensures: atom.lastSequenceId = atom.lastSequenceId
+
+    @guidance
+        -- atom.ts `sse_event_observed` case. The bump is unconditional;
+        -- per-event reducers deliberately do NOT touch lastSseEventAt so
+        -- this stays the single source. now() is the client wall clock
+        -- (Date.now()), not a server timestamp — the watchdog compares it
+        -- against the local clock in StateBar, so both ends are local.
+        --
+        -- Altitude note: this is the reducer-field half of the heartbeat
+        -- watchdog. The watchdog STATE MACHINE (fresh/stale freshness,
+        -- the 35s tick check) is modelled separately in
+        -- working-phase-visibility.allium, whose WatchdogResetOnAnyEvent
+        -- rule fires on the same dispatch and sets its own
+        -- HeartbeatWatchdog.last_event_at = now(). That spec's
+        -- last_event_at is the watchdog SM's view of THIS field; the two
+        -- must stay in lockstep. WatchdogResetOnAnyEvent's @guidance owns
+        -- the authoritative list of named-event listeners that fan into
+        -- this dispatch (init, message, token, ping, ...).
+}
+
 -- Seeds initial data from localStorage cache or an initial REST fetch.
 -- No-op if SSE has already provided authoritative data.
 rule SetInitialData {
@@ -765,6 +819,59 @@ invariant ConnectionEpochNonNegative {
     for a in ConversationAtoms:
         a.connectionEpoch != null implies a.connectionEpoch >= 0
 }
+
+-- lastSseEventAt is always a positive client timestamp. It is seeded to
+-- now() at creation and only ever rewritten to now() by SseEventObserved,
+-- so it can never be zero or negative. (The watchdog's "no signal"
+-- decision is a now()-minus-lastSseEventAt comparison; a zero here would
+-- read as "decades of silence" and false-trip on the first frame.)
+invariant LastSseEventAtPositive {
+    for a in ConversationAtoms:
+        a.lastSseEventAt > 0
+}
+
+------------------------------------------------------------
+-- Render Subscription Isolation
+------------------------------------------------------------
+-- This section is the authoritative home for the page-view render
+-- isolation contract. It previously lived as a prose comment on the
+-- ConversationPageView type in ui/src/conversation/useConversationAtom.ts;
+-- per AGENTS.md ("comments are local facts, not distributed
+-- specifications") a cross-component contract belongs here, where the
+-- perf-isolation test (useConversationView.perf-isolation.test.tsx) can
+-- be read against it.
+--
+-- THE CONTRACT. The atom has two highest-frequency fields:
+--
+--   - streamingBuffer — churns on every sse_token (SseTokenAccumulated).
+--   - lastSseEventAt   — churns on every observed event, i.e. every token
+--                        AND every ping keep-alive (SseEventObserved). The
+--                        higher-frequency of the two.
+--
+-- <ConversationPage> must NOT subscribe to either. It selects a stable
+-- projection (useConversationView / ConversationPageView) over only the
+-- fields it renders — conversationId, conversation, phase, messages,
+-- breadcrumbs, contextWindow, systemPrompt, uiError, toolExecutingStartedAt,
+-- phaseStateUpdatedAt, firstByteRequestId, turnRetryContext — compared
+-- by a cached-reference equality so an excluded-field bump yields an
+-- equal projection and no page re-render.
+--
+-- The two volatile fields are consumed by narrower subscribers BELOW the
+-- page boundary, so their churn re-renders only the leaf that needs it:
+--
+--   - streamingBuffer → <MessageList> / <StreamingMessage> via their own
+--                        slice selectors (already memo + stable props).
+--   - lastSseEventAt  → <ConnectedStateBar> via useLastSseEventAt, whose
+--                        primitive snapshot makes Object.is bail out the
+--                        StateBar between equal observations.
+--
+-- WHY IT MATTERS. Excluding the volatile fields is what keeps the page
+-- and its non-memoized children (StateBar, InputArea, WorkActions,
+-- BreadcrumbBar) out of per-token / per-ping render churn. If a future
+-- change reads streamingBuffer or lastSseEventAt back into the page-view
+-- projection, or drops the cached-reference equality, the render-count
+-- assertions in useConversationView.perf-isolation.test.tsx fail — that
+-- test is the executable witness for this contract.
 
 ------------------------------------------------------------
 -- Open Questions

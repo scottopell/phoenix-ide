@@ -40,20 +40,13 @@ export function useConversationAtom(slug: string): [ConversationAtom, Dispatch<S
 }
 
 /**
- * The slice of the conversation atom that `<ConversationPage>` actually
- * renders from. Deliberately excludes the two highest-frequency fields:
- *
- *   - `streamingBuffer` — churns on every `sse_token`; consumed only by
- *     `<StreamingMessage>` / `<MessageList>` via their own slice selectors.
- *   - `lastSseEventAt` — churns on every observed event (every token AND
- *     every `ping` keep-alive); consumed only by the StateBar watchdog,
- *     which now subscribes to it directly via {@link useLastSseEventAt}.
- *
- * Excluding them is what keeps the page (and its non-memoized children —
- * StateBar, InputArea, WorkActions, BreadcrumbBar) out of per-token /
- * per-ping render churn. The heavy `<MessageList>` was already insulated
- * by `memo` + stable slice props; this extends the same isolation to the
- * rest of the page tree.
+ * The fields `<ConversationPage>` renders from. Excludes the two
+ * highest-frequency atom fields (`streamingBuffer`, `lastSseEventAt`) so
+ * their churn does not re-render the page. The render-isolation contract
+ * — why those are excluded and which leaf subscribers consume them — is
+ * specified in specs/conversation_atom/conversation_atom.allium
+ * (Render Subscription Isolation) and witnessed by
+ * useConversationView.perf-isolation.test.tsx.
  */
 export type ConversationPageView = Pick<
   ConversationAtom,
