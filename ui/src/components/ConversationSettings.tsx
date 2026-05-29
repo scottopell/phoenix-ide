@@ -31,8 +31,6 @@ interface ConversationSettingsProps {
   branches?: GitBranchEntry[];
   /** Currently checked-out branch */
   currentBranch?: string | null;
-  /** Remote default branch name (e.g. "main") */
-  defaultBranch?: string | null;
   gitMetadataLoading?: boolean;
   branchSearch?: string;
   /** Callback to update branch search query */
@@ -74,7 +72,6 @@ export function ConversationSettings({
   tasks = [],
   branches,
   currentBranch,
-  defaultBranch,
   gitMetadataLoading,
   branchSearch = '',
   setBranchSearch,
@@ -101,14 +98,13 @@ export function ConversationSettings({
     return () => document.removeEventListener('mousedown', handler);
   }, [comboOpen]);
 
-  const defaultStartBranch = defaultBranch ?? currentBranch ?? branches?.[0]?.name ?? null;
   const selectedName = workflow.kind === 'planFromBranch'
-    ? (workflow.baseBranch ?? defaultStartBranch ?? '')
+    ? (workflow.baseBranch ?? '')
     : workflow.kind === 'planFromTask'
-      ? (workflow.baseBranch ?? defaultStartBranch ?? '')
+      ? (workflow.baseBranch ?? '')
       : workflow.kind === 'continueBranch'
-        ? (workflow.branch ?? defaultStartBranch ?? '')
-        : (defaultStartBranch ?? '');
+        ? (workflow.branch ?? '')
+        : '';
   const selectedTask = workflow.kind === 'planFromTask' ? workflow.task : null;
 
   const selectPlanBranch = useCallback((name: string) => {
@@ -124,10 +120,10 @@ export function ConversationSettings({
   }, [setBranchSearch, setWorkflow]);
 
   const selectTask = useCallback((task: TaskEntry) => {
-    setWorkflow?.({ kind: 'planFromTask', task, baseBranch: workflow.kind === 'planFromTask' ? (workflow.baseBranch ?? defaultStartBranch) : defaultStartBranch });
+    setWorkflow?.({ kind: 'planFromTask', task, baseBranch: workflow.kind === 'planFromTask' ? workflow.baseBranch : null });
     setBranchSearch?.('');
     setComboOpen(false);
-  }, [defaultStartBranch, setBranchSearch, setWorkflow, workflow]);
+  }, [setBranchSearch, setWorkflow, workflow]);
 
   const chooseWorkflow = useCallback((next: NewConversationWorkflow) => {
     setWorkflow?.(next);
@@ -240,14 +236,14 @@ export function ConversationSettings({
           <div className="new-conv-workflows">
             <label
               className={`workflow-card workflow-card--hero ${workflow.kind === 'planFromBranch' ? 'workflow-card--active' : ''}`}
-              onClick={() => chooseWorkflow({ kind: 'planFromBranch', baseBranch: workflow.kind === 'planFromBranch' ? (workflow.baseBranch ?? defaultStartBranch) : defaultStartBranch })}
+              onClick={() => chooseWorkflow({ kind: 'planFromBranch', baseBranch: workflow.kind === 'planFromBranch' ? workflow.baseBranch : null })}
             >
               <input
                 className="workflow-card-radio"
                 type="radio"
                 name={radioGroupName}
                 checked={workflow.kind === 'planFromBranch'}
-                onChange={() => chooseWorkflow({ kind: 'planFromBranch', baseBranch: workflow.kind === 'planFromBranch' ? (workflow.baseBranch ?? defaultStartBranch) : defaultStartBranch })}
+                onChange={() => chooseWorkflow({ kind: 'planFromBranch', baseBranch: workflow.kind === 'planFromBranch' ? workflow.baseBranch : null })}
               />
               <span className="workflow-card-content">
                 <strong>Chat in a fresh worktree</strong>
@@ -259,14 +255,14 @@ export function ConversationSettings({
             {hasActiveTasks && (
               <label
                 className={`workflow-card ${workflow.kind === 'planFromTask' ? 'workflow-card--active' : ''}`}
-                onClick={() => chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: workflow.kind === 'planFromTask' ? (workflow.baseBranch ?? defaultStartBranch) : defaultStartBranch })}
+                onClick={() => chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: workflow.kind === 'planFromTask' ? workflow.baseBranch : null })}
               >
                 <input
                   className="workflow-card-radio"
                   type="radio"
                   name={radioGroupName}
                   checked={workflow.kind === 'planFromTask'}
-                  onChange={() => chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: workflow.kind === 'planFromTask' ? (workflow.baseBranch ?? defaultStartBranch) : defaultStartBranch })}
+                  onChange={() => chooseWorkflow({ kind: 'planFromTask', task: workflow.kind === 'planFromTask' ? workflow.task : null, baseBranch: workflow.kind === 'planFromTask' ? workflow.baseBranch : null })}
                 />
                 <span className="workflow-card-content">
                   <strong>Start from a task</strong>
@@ -277,14 +273,14 @@ export function ConversationSettings({
 
             <label
               className={`workflow-card ${workflow.kind === 'continueBranch' ? 'workflow-card--active' : ''}`}
-              onClick={() => chooseWorkflow({ kind: 'continueBranch', branch: workflow.kind === 'continueBranch' ? (workflow.branch ?? defaultStartBranch) : defaultStartBranch })}
+              onClick={() => chooseWorkflow({ kind: 'continueBranch', branch: workflow.kind === 'continueBranch' ? workflow.branch : null })}
             >
               <input
                 className="workflow-card-radio"
                 type="radio"
                 name={radioGroupName}
                 checked={workflow.kind === 'continueBranch'}
-                onChange={() => chooseWorkflow({ kind: 'continueBranch', branch: workflow.kind === 'continueBranch' ? (workflow.branch ?? defaultStartBranch) : defaultStartBranch })}
+                onChange={() => chooseWorkflow({ kind: 'continueBranch', branch: workflow.kind === 'continueBranch' ? workflow.branch : null })}
               />
               <span className="workflow-card-content">
                 <strong>Chat in a specific branch</strong>

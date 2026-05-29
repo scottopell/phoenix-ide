@@ -119,6 +119,31 @@ describe('/new workflow modes', () => {
     expect(api.listGitBranches).not.toHaveBeenCalled();
   });
 
+  it('submits the metadata-selected fresh worktree without requiring branch reselection', async () => {
+    renderPage();
+
+    await settleValidation();
+    await screen.findAllByText('Chat in a fresh worktree');
+    await waitFor(() => expect(api.listGitBranches).toHaveBeenCalledWith('/repo'));
+
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, { target: { value: 'wake up default' } });
+    await waitFor(() => expect(screen.getAllByRole('button', { name: 'Send' })[0]).toBeEnabled());
+    fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
+
+    await waitFor(() => expect(api.createConversation).toHaveBeenCalled());
+    expect(api.createConversation).toHaveBeenCalledWith(
+      '/repo',
+      'wake up default',
+      expect.any(String),
+      'claude-3-5-sonnet',
+      [],
+      'managed',
+      'main',
+    );
+    expect(screen.queryByText('Pick a Git branch to start from.')).not.toBeInTheDocument();
+    expect(screen.queryByText('Pick a Git starting point')).not.toBeInTheDocument();
+  });
+
   it('submits plan-from-branch as managed mode with the default base branch', async () => {
     renderPage();
 
@@ -140,7 +165,6 @@ describe('/new workflow modes', () => {
       'main',
     );
   });
-
   it('submits continue-branch as branch mode with the selected branch', async () => {
     renderPage();
 

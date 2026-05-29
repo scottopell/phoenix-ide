@@ -362,7 +362,20 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   const setWorkflowFromUser = (next: NewConversationWorkflow) => {
     workflowTouchedCwdRef.current = cwd.trim();
-    setWorkflow(next);
+    const initialBranch = defaultBranch ?? currentBranch;
+    if (!initialBranch || workflowBranch(next)) {
+      setWorkflow(next);
+      return;
+    }
+    if (next.kind === 'planFromBranch') {
+      setWorkflow({ ...next, baseBranch: initialBranch });
+    } else if (next.kind === 'planFromTask') {
+      setWorkflow({ ...next, baseBranch: initialBranch });
+    } else if (next.kind === 'continueBranch') {
+      setWorkflow({ ...next, branch: initialBranch });
+    } else {
+      setWorkflow(next);
+    }
   };
 
   return {
