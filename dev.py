@@ -32,6 +32,11 @@ VITE_PID_FILE = ROOT / ".vite.pid"
 VITE_PROXY_FILE = ROOT / ".vite.proxy"
 LOG_FILE = ROOT / "phoenix.log"
 
+# ANSI/terminal control sequences: CSI escapes (colour, cursor) plus the
+# SO/SI shift bytes rustfmt emits around its diff colours. Used to scrub
+# captured subprocess output before it is buffered and reprinted.
+_CONTROL_SEQ_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|[\x0e\x0f]")
+
 
 def _node_env() -> dict:
     """Return an env dict with the correct Node.js binary prepended to PATH.
@@ -1810,7 +1815,18 @@ def cmd_check():
         from collections import deque
         TAIL_LINES = 200
         t0 = time.monotonic()
-        env = node_env() if Path(cwd) == UI_DIR else None
+        # Captured lanes buffer stdout into `buf` and reprint it via plain
+        # print() on failure, so terminal color codes are never wanted here —
+        # they only mangle the buffered text (cargo clippy disables color on a
+        # pipe, but rustfmt's --check diff and some node tools key off
+        # COLORTERM/TERM rather than isatty). Force color off explicitly and
+        # neutralise any inherited FORCE_COLOR override. node_env() returns a
+        # cached shared dict, so copy before mutating.
+        env = dict(node_env()) if Path(cwd) == UI_DIR else os.environ.copy()
+        env["CARGO_TERM_COLOR"] = "never"
+        env["NO_COLOR"] = "1"
+        env.pop("FORCE_COLOR", None)
+        env.pop("CLICOLOR_FORCE", None)
         buf: deque[str] = deque(maxlen=TAIL_LINES)
         truncated = False
 
@@ -1825,7 +1841,12 @@ def cmd_check():
             for line in proc.stdout:
                 if len(buf) == buf.maxlen:
                     truncated = True
-                buf.append(line.rstrip("\n"))
+                # Strip terminal control sequences before buffering. The env
+                # above disables color for tools that honour it, but rustfmt's
+                # --check diff colours via the `term` crate keyed on $TERM and
+                # ignores both NO_COLOR and CARGO_TERM_COLOR; this is the
+                # tool-agnostic backstop so the reprinted buffer stays clean.
+                buf.append(_CONTROL_SEQ_RE.sub("", line).rstrip("\n"))
             proc.stdout.close()
 
         rt = threading.Thread(target=reader, daemon=True)
