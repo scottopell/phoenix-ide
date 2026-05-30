@@ -79,16 +79,19 @@ is one more typed key).
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-LRV-001:** Retry context wire event | ❌ New | `SseWireEvent::LlmAttempt` + emission from `Effect::ScheduleRetry` (`executor.rs:1408`). ts-rs regen + `parity_*` test update required |
-| **REQ-LRV-002:** Retry reason classification | ❌ New | `LlmAttemptReason` enum mirrors retryable `LlmErrorKind` subset; exhaustive `match` enforces both sides |
-| **REQ-LRV-003:** Cross-spec contract with working-phase-visibility | 🔄 Replace | Removes the PLACEHOLDER block in `working-phase-visibility.allium`; adds `use "../llm-retry-visibility/llm-retry-visibility.allium" as llm_retry` import; this spec owns the canonical `RetryContext` value + `TurnRetryContext` populator |
-| **REQ-LRV-004:** Sub-agent retries stay local | ❌ New | Each conversation's SSE stream carries only its own retries; cross-conv rollups deferred |
-| **REQ-LRV-005:** Cancellation routes through `Cancelling` | 🔄 Document | Behaviour already correct in the state machine; spec makes the contract explicit |
-| **REQ-LRV-006:** Post-hoc retry badge on assistant message | ❌ New | Typed `retry_count: u32` on `MessageDisplayData`; rendered by `MessageComponents.tsx` |
-| **REQ-LRV-007:** `LlmAttempt` and `RateLimitSnapshot` distinct | ❌ New | Documents the wire-level distinction; `LlmAttempt` IS in the replay ring, `RateLimitSnapshot` is NOT |
+| **REQ-LRV-001:** Retry context wire event | ✅ Complete | `SseWireEvent::LlmAttempt` / `SseEvent::LlmAttempt` exist, are emitted from `Effect::ScheduleRetry`, replay via the ephemeral ring, and have generated TS + parity coverage. |
+| **REQ-LRV-002:** Retry reason classification | ✅ Complete | `LlmAttemptReason` is a closed enum for rate-limit/server-error/network and is threaded from retryable error classification into `Effect::ScheduleRetry`. |
+| **REQ-LRV-003:** Cross-spec contract with working-phase-visibility | ✅ Complete | `working-phase-visibility.allium` imports this spec; `RetryContext` / `TurnRetryContext` are canonical here and consumed by the StateBar retry modifier. |
+| **REQ-LRV-004:** Sub-agent retries stay local | ✅ Complete | `LlmAttempt` is emitted on the conversation runtime handling the retry; no cross-conversation retry rollup is produced. |
+| **REQ-LRV-005:** Cancellation routes through `Cancelling` | ✅ Complete | Cancellation continues through the state-machine cancellation path; stale retry timeouts are ignored after the state has moved on. |
+| **REQ-LRV-006:** Post-hoc retry badge on assistant message | ✅ Complete | Final retry count is stamped into assistant-message `display_data.retry_count`; `MessageComponents.tsx` renders the persisted `(retried Nx)` badge. |
+| **REQ-LRV-007:** `LlmAttempt` and `RateLimitSnapshot` distinct | ✅ Complete | `LlmAttempt` and `RateLimitSnapshot` remain separate wire variants; only `LlmAttempt` is the backoff/retry-context event. |
 
-**Progress:** 0 of 7 implemented. Stage B of task 58001 in
-`specs/working-phase-visibility/` is gated on this spec landing.
+**Progress:** 7 of 7 requirements implemented. Task 58003 is complete;
+implementation evidence lives in `runtime.rs`, `runtime/executor.rs`,
+`state_machine/{effect,event,transition}.rs`, `api/{wire,sse}.rs`,
+`ui/src/hooks/useConnection.ts`, `ui/src/conversation/atom.ts`,
+`ui/src/components/{StateBar,MessageComponents}.tsx`, and generated SSE types.
 
 ## Cross-Spec Dependencies
 

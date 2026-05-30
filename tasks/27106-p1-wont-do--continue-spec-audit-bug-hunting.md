@@ -1,8 +1,22 @@
-<!--
-ID 27106 chosen as the next free slot above 27105.
-Created without `taskmd new` since the binary isn't installed in this
-env; run `./dev.py tasks fix` if reallocation needed.
--->
+# Continue systematic spec-audit bug hunting (high-ROI 🚧 / ❌ rollup)
+
+## Closure note
+
+Closed as **wont-do** in favor of the repo-local
+`spec-audit-bug-hunt` skill. This was a reusable workflow, not a
+single implementation deliverable that should remain in the standing P1
+queue.
+
+The skill captures the useful behavior from this task:
+
+- refresh the executive-table inventory,
+- prioritize high-ROI 🚧 / ❌ rows,
+- close small spec-code gaps with matching executive updates,
+- and create concrete follow-up tasks for ambiguous or significant gaps.
+
+The original task body remains below for historical context.
+
+---
 
 # Continue systematic spec-audit bug hunting (high-ROI 🚧 / ❌ rollup)
 

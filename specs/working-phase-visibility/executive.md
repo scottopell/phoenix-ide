@@ -75,19 +75,20 @@ in the sibling spec `specs/llm-retry-visibility/`.
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-WPV-001:** Server-authoritative state-entry timestamp | ❌ New | Adds `state_updated_at` to `StateChange` (sourced from existing `Conversation.state_updated_at`); Init already exposes it via flatten. ts-rs regen + `parity_*` test update required |
-| **REQ-WPV-002:** Inline elapsed-time on in-flight artifacts | ❌ New | Tool widget timer reads from the assistant message's `display_data.tool_starts[tool_use_id]` map (typed `BTreeMap<String, i64>`). The pre-first-byte affordance lives in the StateBar (REQ-WPV-003); no separate placeholder bubble |
-| **REQ-WPV-003:** StateBar derivation rule | 🔄 Extend | The existing `stateText` composition block in `StateBar.tsx` gains retry-modifier and degraded-signal precedence; the existing `tool_executing` timer path becomes a special case of the generalised rule |
-| **REQ-WPV-004:** Heartbeat watchdog | ❌ New | Threshold 35s; depends on keep-alive switch from SSE comment to typed `ping` event |
-| **REQ-WPV-005:** Connection state does not mask agent state | 🔄 Rewrite | `StateBar.tsx` currently short-circuits on connection state; replace with composition that retains last-known activity with frozen elapsed |
+| **REQ-WPV-001:** Server-authoritative state-entry timestamp | ✅ Complete | `StateChange` carries `state_updated_at` from the runtime's server-authoritative phase timestamp; generated TS and SSE parity coverage are present. |
+| **REQ-WPV-002:** Inline elapsed-time on in-flight artifacts | ✅ Complete | Tool widgets read `display_data.tool_starts[tool_use_id]` and render live in-flight elapsed time; the LLM pre-first-byte affordance is surfaced in the StateBar. |
+| **REQ-WPV-003:** StateBar derivation rule | ✅ Complete | `StateBar.tsx` composes one phase-derived base reason with the retry modifier from `turnRetryContext` and degraded-signal precedence. |
+| **REQ-WPV-004:** Heartbeat watchdog | ✅ Complete | Server keep-alive is a typed `ping` event; `useConnection.ts` observes it and `StateBar.tsx` surfaces `no signal from server` after the 35s watchdog threshold. |
+| **REQ-WPV-005:** Connection state does not mask agent state | ✅ Complete | Reconnecting/offline display preserves the last-known working activity with frozen elapsed text alongside the connection state. |
 | **REQ-WPV-006:** REMOVED | — | Originally specified a pending assistant placeholder bubble. Removed: text duplicated the StateBar (a fixed-position chrome element always visible). See requirements.md REQ-WPV-006 note |
-| **REQ-WPV-007:** First-byte sub-phase distinction | ❌ New | Driven by new `LlmFirstByte` event; `streaming` displays without elapsed counter |
-| **REQ-WPV-008:** Display continuity across reload | ❌ New | Acceptance criterion for REQ-WPV-001 + REQ-WPV-005; integration-test target |
+| **REQ-WPV-007:** First-byte sub-phase distinction | ✅ Complete | Runtime emits `LlmFirstByte`; client reducer records first-byte state and the StateBar changes from awaiting-LLM elapsed text to `streaming`. |
+| **REQ-WPV-008:** Display continuity across reload | ✅ Complete | Init/StateChange phase timestamps, replayed `LlmAttempt`, typed pings, and StateBar tests cover reload/reconnect continuity for working indicators. |
 
-**Progress:** 0 of 7 active requirements implemented. REQ-WPV-006 was
-removed before implementation. REQ-WPV-003 and REQ-WPV-005 are
-extensions/rewrites of existing logic; the other five are greenfield
-additions on existing infrastructure.
+**Progress:** 7 of 7 active requirements implemented. REQ-WPV-006 was
+removed before implementation. Task 58001 is complete; implementation
+evidence lives in `runtime/executor.rs`, `api/{wire,sse,handlers}.rs`,
+`ui/src/hooks/useConnection.ts`, `ui/src/conversation/atom.ts`,
+`ui/src/components/{StateBar,MessageComponents}.tsx`, and generated SSE types.
 
 ## Cross-Spec Dependencies
 

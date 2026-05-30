@@ -144,6 +144,29 @@ asymmetry in a comment so future readers know why.
   reference-stable across `DesktopLayout` re-renders.
 - `./dev.py check` passes.
 
+## 2026-05 triage rebaseline
+
+This batch is partially stale but not complete. Keep it `p1-ready` for the
+remaining structural work only:
+
+- **Phase 1 mostly complete:** `useMessageQueue` now uses an in-render
+  reset keyed by `conversationId`, and the UI has a shared reactive
+  breakpoint hook in `ui/src/hooks/useMediaQuery.ts` consumed by
+  `DesktopLayout`, `ConversationListPage`, `CommandPalette`, and
+  `ConversationPage`.
+- **Phase 3 complete:** `ConversationList.tsx` now exposes memoized
+  `<ConversationRow>` and `<ChainBlock>` components with stable ID keys.
+- **Still remaining:** `FileExplorerProvider` is still a global provider
+  taking `scopeKey`, and `useFileExplorer()` still takes no slug argument.
+  The provider-topology part of this task remains current: make file
+  explorer state structurally slug-keyed so wrong-slug `openFile` calls are
+  type-impossible.
+
+Do not re-do the completed viewport/message-queue/row-componentization work
+unless a fresh audit finds a regression. The next implementation should focus
+on the file-explorer provider topology and update/delete the existing
+`FileExplorerContext` scope-key tests accordingly.
+
 ## Dependencies
 
 - **Task C** (single Conversation source of truth) lands first. This
