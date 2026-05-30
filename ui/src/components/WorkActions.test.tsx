@@ -158,6 +158,38 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     expect(api.markMerged).not.toHaveBeenCalled();
   });
 
+  it('keeps manual cleanup fallback reachable for stale PR data when gh is unavailable', async () => {
+    const handle = prStatusHandle({
+      found: true,
+      number: 134,
+      display_state: 'open',
+      unavailable_reason: 'not_authenticated',
+      refresh: {
+        state: 'unavailable',
+        reason: 'not_authenticated',
+        last_attempted_at: '2026-01-01T00:00:00Z',
+        last_refreshed_at: '2025-12-31T00:00:00Z',
+        stale: true,
+      },
+    });
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-stale-unavailable"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={handle}
+      />,
+    );
+
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    expect(mark.disabled).toBe(false);
+    expect(mark.textContent).toMatch(/manual fallback/i);
+    fireEvent.click(mark);
+    expect(api.markMerged).not.toHaveBeenCalled();
+    expect(handle.enableManualFallback).toHaveBeenCalled();
+  });
+
   it('marks merged after explicit manual fallback is enabled', async () => {
     renderWithProviders(
       <WorkControlBar

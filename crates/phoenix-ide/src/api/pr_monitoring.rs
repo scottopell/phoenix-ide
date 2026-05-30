@@ -18,13 +18,19 @@ const LOG_SNIPPET_LIMIT: usize = 16 * 1024;
 #[derive(Debug)]
 pub(crate) enum PrMonitorError {
     BadRequest(String),
+    BadRequestWithObservations {
+        message: String,
+        observations: Vec<WorkScopePrObservation>,
+    },
     Internal(String),
 }
 
 impl std::fmt::Display for PrMonitorError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::BadRequest(message) | Self::Internal(message) => write!(f, "{message}"),
+            Self::BadRequest(message)
+            | Self::BadRequestWithObservations { message, .. }
+            | Self::Internal(message) => write!(f, "{message}"),
         }
     }
 }
@@ -403,7 +409,19 @@ pub(crate) fn capture_pr_auto_fix_context_for_pr(
             None
         }
     };
-    let response = capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client)?;
+    let response = match capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client) {
+        Ok(response) => response,
+        Err(PrMonitorError::BadRequest(message)) => {
+            if let Some(observation) = observation {
+                return Err(PrMonitorError::BadRequestWithObservations {
+                    message,
+                    observations: vec![observation],
+                });
+            }
+            return Err(PrMonitorError::BadRequest(message));
+        }
+        Err(err) => return Err(err),
+    };
     Ok(PrAutoFixCapture {
         response,
         observations: observation.into_iter().collect(),
@@ -446,7 +464,7 @@ fn capture_pr_auto_fix_context_for_branch_with_client(
             None
         }
     };
-    let observations = repo
+    let observations: Vec<WorkScopePrObservation> = repo
         .as_ref()
         .map(|repo| {
             prs.iter()
@@ -458,7 +476,19 @@ fn capture_pr_auto_fix_context_for_branch_with_client(
     let pr = choose_pr(prs).ok_or_else(|| {
         PrMonitorError::BadRequest("No pull request found for this branch".to_string())
     })?;
-    let response = capture_pr_auto_fix_context_for_pr_item(worktree, pr, client)?;
+    let response =
+        capture_pr_auto_fix_context_for_pr_item(worktree, pr, client).map_err(|err| {
+            if let PrMonitorError::BadRequest(message) = err {
+                if !observations.is_empty() {
+                    return PrMonitorError::BadRequestWithObservations {
+                        message,
+                        observations: observations.clone(),
+                    };
+                }
+                return PrMonitorError::BadRequest(message);
+            }
+            err
+        })?;
     Ok(PrAutoFixCapture {
         response,
         observations,
@@ -1614,6 +1644,31 @@ mod tests {
             unavailable_reason_message(&PrUnavailableReason::NotAuthenticated),
             "GitHub CLI is not authenticated"
         );
+    }
+
+    #[test]
+    fn non_open_auto_fix_error_carries_observations() {
+        let temp = TempDir::new().unwrap();
+        let gh = FakeGh {
+            prs: Ok(vec![pr(7, "MERGED", false, "2026-01-01")]),
+            repo: Ok(repo()),
+            ..FakeGh::default()
+        };
+        let err = capture_pr_auto_fix_context_for_branch_with_client(temp.path(), "branch", &gh)
+            .unwrap_err();
+        match err {
+            PrMonitorError::BadRequestWithObservations {
+                message,
+                observations,
+            } => {
+                assert!(message.contains("Auto-fix is only available"));
+                assert_eq!(observations.len(), 1);
+                assert_eq!(observations[0].pr_number, 7);
+                assert_eq!(observations[0].state, "MERGED");
+            }
+            other => panic!("expected observations on non-open error, got {other:?}"),
+        }
+        assert!(!temp.path().join(".phoenix/pr-context").exists());
     }
 
     #[test]

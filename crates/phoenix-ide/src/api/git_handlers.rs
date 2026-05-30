@@ -420,7 +420,7 @@ pub(crate) async fn get_conversation_pr_status(
             return Ok(Json(crate::api::pr_monitoring::persisted_primary_response(
                 &primary,
                 refresh.response.refresh,
-                false,
+                true,
             )));
         }
     }
@@ -472,35 +472,39 @@ pub(crate) async fn create_pr_auto_fix_context(
 
     let result = tokio::task::spawn_blocking(move || {
         let worktree = PathBuf::from(worktree_path);
-        let capture_result = if let Some(pr) = associated_pr {
+        if let Some(pr) = associated_pr {
             crate::api::pr_monitoring::capture_pr_auto_fix_context_for_pr(&worktree, pr.pr_number)
-                .map(|capture| (capture.response, capture.observations))
         } else {
             crate::api::pr_monitoring::capture_pr_auto_fix_context_for_branch(
                 &worktree,
                 &branch_name,
             )
-            .map(|capture| (capture.response, capture.observations))
-        };
-        capture_result.map_err(|e| match e {
-            crate::api::pr_monitoring::PrMonitorError::BadRequest(message) => {
-                AppError::BadRequest(message)
-            }
-            crate::api::pr_monitoring::PrMonitorError::Internal(message) => {
-                AppError::Internal(message)
-            }
-        })
+        }
     })
     .await
-    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))??;
+    .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
 
-    if !result.1.is_empty() {
-        db.upsert_work_scope_pr_observations(&work_scope, &result.1)
+    let (response, observations) = match result {
+        Ok(capture) => (Ok(capture.response), capture.observations),
+        Err(crate::api::pr_monitoring::PrMonitorError::BadRequestWithObservations {
+            message,
+            observations,
+        }) => (Err(AppError::BadRequest(message)), observations),
+        Err(crate::api::pr_monitoring::PrMonitorError::BadRequest(message)) => {
+            return Err(AppError::BadRequest(message));
+        }
+        Err(crate::api::pr_monitoring::PrMonitorError::Internal(message)) => {
+            return Err(AppError::Internal(message));
+        }
+    };
+
+    if !observations.is_empty() {
+        db.upsert_work_scope_pr_observations(&work_scope, &observations)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
-    Ok(Json(result.0))
+    Ok(Json(response?))
 }
 
 /// `GET /api/conversations/:id/diff` — committed and uncommitted changes
