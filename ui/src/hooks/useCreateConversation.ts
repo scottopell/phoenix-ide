@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef } from 'react';
 import { api } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import type { GitBranchEntry, ImageData, ModelsResponse, TaskEntry } from '../api';
@@ -157,6 +157,18 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setWorkflow(prev => workflowNeedsGit(prev) ? { kind: 'direct' } : prev);
     setBranchSearch('');
   }, [cwd]);
+
+  // Default to the fresh-worktree workflow synchronously (before paint) the
+  // moment a directory is confirmed to be a Git repo, so the selector never
+  // flashes 'direct' while branch/task metadata is still loading. baseBranch
+  // is filled in once the fetch below resolves. An explicit user choice for
+  // this cwd is honored via workflowTouchedCwdRef.
+  useLayoutEffect(() => {
+    if (isGitDir !== true) return;
+    const trimmedCwd = cwd.trim();
+    if (!trimmedCwd || workflowTouchedCwdRef.current === trimmedCwd) return;
+    setWorkflow(prev => prev.kind === 'direct' ? { kind: 'planFromBranch', baseBranch: null } : prev);
+  }, [isGitDir, cwd]);
 
   useEffect(() => {
     if (!isGitDir) {
