@@ -45,7 +45,19 @@ export function useConversationPrStatus({
         setState({ status: 'ready', prStatus });
         if (!prStatus.unavailable_reason) setManualFallbackEnabled(false);
       } catch {
-        if (fresh()) setState({ status: 'ready', prStatus: { found: false, unavailable_reason: 'command_failed' } });
+        if (fresh()) setState({
+          status: 'ready',
+          prStatus: {
+            found: false,
+            unavailable_reason: 'command_failed',
+            refresh: {
+              state: 'unavailable',
+              reason: 'command_failed',
+              last_attempted_at: new Date().toISOString(),
+              stale: false,
+            },
+          },
+        });
       }
     };
 

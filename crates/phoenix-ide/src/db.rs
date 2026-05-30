@@ -90,6 +90,99 @@ pub enum ContinueOutcome {
     ParentNotContextExhausted { state_variant: &'static str },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkScopePrObservation {
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub draft: bool,
+    pub display_state: crate::api::PrDisplayState,
+    pub base: String,
+    pub head: String,
+    pub github_updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkScopePrAssociation {
+    pub work_scope_id: i64,
+    pub repo_owner: String,
+    pub repo_name: String,
+    pub pr_number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub draft: bool,
+    pub display_state: crate::api::PrDisplayState,
+    pub base: String,
+    pub head: String,
+    pub github_updated_at: Option<String>,
+    pub first_seen_at: String,
+    pub last_seen_at: String,
+}
+
+fn pr_display_state_db(state: &crate::api::PrDisplayState) -> &'static str {
+    match state {
+        crate::api::PrDisplayState::Open => "open",
+        crate::api::PrDisplayState::Draft => "draft",
+        crate::api::PrDisplayState::Merged => "merged",
+        crate::api::PrDisplayState::Closed => "closed",
+    }
+}
+
+fn pr_display_state_from_db(value: &str) -> DbResult<crate::api::PrDisplayState> {
+    match value {
+        "open" => Ok(crate::api::PrDisplayState::Open),
+        "draft" => Ok(crate::api::PrDisplayState::Draft),
+        "merged" => Ok(crate::api::PrDisplayState::Merged),
+        "closed" => Ok(crate::api::PrDisplayState::Closed),
+        other => Err(DbError::Serialization(format!(
+            "invalid PR display_state in database: {other}"
+        ))),
+    }
+}
+
+fn row_to_work_scope_pr(row: &SqliteRow) -> DbResult<WorkScopePrAssociation> {
+    let display_state: String = row.get("display_state");
+    Ok(WorkScopePrAssociation {
+        work_scope_id: row.get("work_scope_id"),
+        repo_owner: row.get("repo_owner"),
+        repo_name: row.get("repo_name"),
+        pr_number: row.get::<i64, _>("pr_number").cast_unsigned(),
+        title: row.get("title"),
+        url: row.get("url"),
+        state: row.get("state"),
+        draft: row.get::<bool, _>("draft"),
+        display_state: pr_display_state_from_db(&display_state)?,
+        base: row.get("base"),
+        head: row.get("head"),
+        github_updated_at: row.get("github_updated_at"),
+        first_seen_at: row.get("first_seen_at"),
+        last_seen_at: row.get("last_seen_at"),
+    })
+}
+
+pub fn sort_work_scope_pr_associations(prs: &mut [WorkScopePrAssociation]) {
+    prs.sort_by(|a, b| {
+        pr_association_rank(&a.display_state)
+            .cmp(&pr_association_rank(&b.display_state))
+            .then_with(|| b.github_updated_at.cmp(&a.github_updated_at))
+            .then_with(|| b.last_seen_at.cmp(&a.last_seen_at))
+            .then_with(|| b.pr_number.cmp(&a.pr_number))
+    });
+}
+
+fn pr_association_rank(state: &crate::api::PrDisplayState) -> u8 {
+    match state {
+        crate::api::PrDisplayState::Open => 0,
+        crate::api::PrDisplayState::Draft => 1,
+        crate::api::PrDisplayState::Merged => 2,
+        crate::api::PrDisplayState::Closed => 3,
+    }
+}
+
 /// Thread-safe database handle
 #[derive(Clone)]
 pub struct Database {
@@ -100,6 +193,116 @@ impl Database {
     /// Access the underlying connection pool (for migrations and testing).
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    async fn work_scope_id(&self, scope: &crate::work_scope::WorkScope) -> DbResult<Option<i64>> {
+        let (scope_type, scope_value) = match scope {
+            crate::work_scope::WorkScope::Worktree(value) => ("Worktree", value.as_str()),
+            crate::work_scope::WorkScope::Conversation(value) => ("Conversation", value.as_str()),
+        };
+        let id = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM work_scopes WHERE scope_type = ?1 AND scope_value = ?2",
+        )
+        .bind(scope_type)
+        .bind(scope_value)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    pub async fn upsert_work_scope_pr_observations(
+        &self,
+        scope: &crate::work_scope::WorkScope,
+        observations: &[WorkScopePrObservation],
+    ) -> DbResult<i64> {
+        let (scope_type, scope_value) = match scope {
+            crate::work_scope::WorkScope::Worktree(value) => ("Worktree", value.as_str()),
+            crate::work_scope::WorkScope::Conversation(value) => ("Conversation", value.as_str()),
+        };
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO work_scopes (scope_type, scope_value, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(scope_type, scope_value) DO UPDATE SET updated_at = excluded.updated_at",
+        )
+        .bind(scope_type)
+        .bind(scope_value)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        let work_scope_id = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM work_scopes WHERE scope_type = ?1 AND scope_value = ?2",
+        )
+        .bind(scope_type)
+        .bind(scope_value)
+        .fetch_one(&mut *tx)
+        .await?;
+        for pr in observations {
+            sqlx::query(
+                "INSERT INTO work_scope_pr_associations (
+                    work_scope_id, repo_owner, repo_name, pr_number, title, url, state, draft,
+                    display_state, base, head, github_updated_at, first_seen_at, last_seen_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+                 ON CONFLICT(work_scope_id, repo_owner, repo_name, pr_number) DO UPDATE SET
+                    title = excluded.title,
+                    url = excluded.url,
+                    state = excluded.state,
+                    draft = excluded.draft,
+                    display_state = excluded.display_state,
+                    base = excluded.base,
+                    head = excluded.head,
+                    github_updated_at = excluded.github_updated_at,
+                    last_seen_at = excluded.last_seen_at",
+            )
+            .bind(work_scope_id)
+            .bind(&pr.repo_owner)
+            .bind(&pr.repo_name)
+            .bind(pr.pr_number.cast_signed())
+            .bind(&pr.title)
+            .bind(&pr.url)
+            .bind(&pr.state)
+            .bind(pr.draft)
+            .bind(pr_display_state_db(&pr.display_state))
+            .bind(&pr.base)
+            .bind(&pr.head)
+            .bind(&pr.github_updated_at)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(work_scope_id)
+    }
+
+    pub async fn list_work_scope_pr_associations(
+        &self,
+        scope: &crate::work_scope::WorkScope,
+    ) -> DbResult<Vec<WorkScopePrAssociation>> {
+        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = sqlx::query(
+            "SELECT work_scope_id, repo_owner, repo_name, pr_number, title, url, state, draft,
+                    display_state, base, head, github_updated_at, first_seen_at, last_seen_at
+             FROM work_scope_pr_associations
+             WHERE work_scope_id = ?1",
+        )
+        .bind(work_scope_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|row| row_to_work_scope_pr(&row))
+            .collect()
+    }
+
+    pub async fn primary_work_scope_pr_association(
+        &self,
+        scope: &crate::work_scope::WorkScope,
+    ) -> DbResult<Option<WorkScopePrAssociation>> {
+        let mut prs = self.list_work_scope_pr_associations(scope).await?;
+        sort_work_scope_pr_associations(&mut prs);
+        Ok(prs.into_iter().next())
     }
 
     /// Open or create database at the given path
@@ -2285,6 +2488,60 @@ mod tests {
             db.get_default_llm_language().await.unwrap(),
             LlmLanguage::default()
         );
+    }
+
+    #[tokio::test]
+    async fn work_scope_pr_association_upsert_preserves_first_seen_and_updates_primary() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = crate::work_scope::WorkScope::Worktree("/tmp/ws-pr".to_string());
+        let closed = WorkScopePrObservation {
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 1,
+            title: "closed".to_string(),
+            url: "https://example.test/1".to_string(),
+            state: "CLOSED".to_string(),
+            draft: false,
+            display_state: crate::api::PrDisplayState::Closed,
+            base: "main".to_string(),
+            head: "branch".to_string(),
+            github_updated_at: Some("2024-01-02T00:00:00Z".to_string()),
+        };
+        db.upsert_work_scope_pr_observations(&scope, std::slice::from_ref(&closed))
+            .await
+            .unwrap();
+        let first = db.list_work_scope_pr_associations(&scope).await.unwrap();
+        let first_seen = first[0].first_seen_at.clone();
+        let last_seen = first[0].last_seen_at.clone();
+
+        let mut updated = closed.clone();
+        updated.title = "closed updated".to_string();
+        db.upsert_work_scope_pr_observations(&scope, &[updated])
+            .await
+            .unwrap();
+        let second = db.list_work_scope_pr_associations(&scope).await.unwrap();
+        assert_eq!(second[0].first_seen_at, first_seen);
+        assert!(second[0].last_seen_at >= last_seen);
+        assert_eq!(second[0].title, "closed updated");
+
+        let open = WorkScopePrObservation {
+            pr_number: 2,
+            title: "open".to_string(),
+            url: "https://example.test/2".to_string(),
+            state: "OPEN".to_string(),
+            display_state: crate::api::PrDisplayState::Open,
+            github_updated_at: Some("2024-01-01T00:00:00Z".to_string()),
+            ..closed
+        };
+        db.upsert_work_scope_pr_observations(&scope, &[open])
+            .await
+            .unwrap();
+        let primary = db
+            .primary_work_scope_pr_association(&scope)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(primary.pr_number, 2);
     }
 
     #[tokio::test]

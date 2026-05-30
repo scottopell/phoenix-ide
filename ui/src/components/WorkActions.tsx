@@ -122,16 +122,21 @@ function WorkViewerActions({ conversationId, diffFetch, setDiffFetch }: { conver
   </>;
 }
 
+function prRefreshUnavailableText(prStatus: PrStatusResponse): string {
+  return `Resolve PR refresh issue before auto-fix: refresh unavailable (${prStatus.refresh.reason ?? 'unknown'})`;
+}
+
 function PrRemediationActions({ conversationId, prStatus, onSendMessage, showError }: { conversationId: string; prStatus: PrStatusResponse | null; onSendMessage?: ((text: string) => void) | undefined; showError?: ((message: string) => void) | undefined }) {
   const [loading, setLoading] = useState(false);
-  const canAddress = !!prStatus?.found && prStatus.display_state === 'open' && !!onSendMessage;
+  const refreshUnavailable = prStatus?.refresh.state === 'unavailable';
+  const canAddress = !!prStatus?.found && prStatus.display_state === 'open' && !refreshUnavailable && !!onSendMessage;
   if (!prStatus?.found || prStatus.display_state !== 'open') return null;
   return (
     <button
       type="button"
       className="work-actions-btn work-actions-pr-remediate"
       disabled={!canAddress || loading}
-      title={!canAddress ? 'Conversation input is unavailable' : undefined}
+      title={!canAddress ? (refreshUnavailable ? prRefreshUnavailableText(prStatus) : 'Conversation input is unavailable') : undefined}
       onClick={async () => {
         if (!canAddress) return;
         setLoading(true);

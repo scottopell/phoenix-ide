@@ -63,9 +63,19 @@ vi.mock('../api', () => ({
   },
 }));
 
-function prStatusHandle(prStatus: PrStatusResponse = { found: false }, manualFallbackEnabled = false) {
+function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, manualFallbackEnabled = false) {
+  const status: PrStatusResponse = {
+    found: false,
+    refresh: {
+      state: 'not_found',
+      last_attempted_at: '2026-01-01T00:00:00Z',
+      last_refreshed_at: '2026-01-01T00:00:00Z',
+      stale: false,
+    },
+    ...prStatus,
+  };
   return {
-    state: { status: 'ready' as const, prStatus },
+    state: { status: 'ready' as const, prStatus: status },
     manualFallbackEnabled,
     enableManualFallback: vi.fn(),
   };

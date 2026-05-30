@@ -38,7 +38,7 @@ beforeAll(() => {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue({ found: false });
+  (api.getPrStatus as ReturnType<typeof vi.fn>).mockResolvedValue(mockPrStatus({ found: false }));
   (api.createPrAutoFixContext as ReturnType<typeof vi.fn>).mockResolvedValue({
     artifact_path: '.phoenix/pr-context/pr-12.json',
     pr_number: 12,
@@ -134,8 +134,17 @@ function renderStateBar({
   );
 }
 
-function mockPrStatus(status: PrStatusResponse): PrStatusResponse {
-  return status;
+function mockPrStatus(status: Partial<PrStatusResponse>): PrStatusResponse {
+  return {
+    found: false,
+    refresh: {
+      state: 'not_found',
+      last_attempted_at: '2026-01-01T00:00:00Z',
+      last_refreshed_at: '2026-01-01T00:00:00Z',
+      stale: false,
+    },
+    ...status,
+  };
 }
 
 describe('StateBar PR badge', () => {
@@ -159,7 +168,7 @@ describe('StateBar PR badge', () => {
       head: 'task-123-pr-status',
       display_state: state.display_state,
       check_state: state.check_state,
-    } as PrStatusResponse) });
+    }) });
 
     const badge = await screen.findByRole('button', { name: label });
     expect(badge).toHaveClass('pr-badge', className);

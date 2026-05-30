@@ -652,9 +652,45 @@ pub struct PrAutoFixContextResponse {
     pub message: String,
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrRefreshState {
+    Fresh,
+    Unavailable,
+    NotFound,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PrRefreshMetadata {
+    pub state: PrRefreshState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<PrUnavailableReason>,
+    pub last_attempted_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_refreshed_at: Option<String>,
+    pub stale: bool,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PrIdentity {
+    pub number: u64,
+    pub title: String,
+    pub url: String,
+    pub state: String,
+    pub draft: bool,
+    pub display_state: PrDisplayState,
+    pub base: String,
+    pub head: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PrStatusResponse {
     pub found: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pr: Option<PrIdentity>,
+    pub refresh: PrRefreshMetadata,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<PrUnavailableReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -685,8 +721,17 @@ pub struct PrStatusResponse {
 
 impl PrStatusResponse {
     pub fn not_found() -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
         Self {
             found: false,
+            pr: None,
+            refresh: PrRefreshMetadata {
+                state: PrRefreshState::NotFound,
+                reason: None,
+                last_attempted_at: now.clone(),
+                last_refreshed_at: Some(now),
+                stale: false,
+            },
             unavailable_reason: None,
             number: None,
             title: None,
@@ -704,7 +749,15 @@ impl PrStatusResponse {
     }
 
     pub fn unavailable(reason: PrUnavailableReason) -> Self {
+        let now = chrono::Utc::now().to_rfc3339();
         Self {
+            refresh: PrRefreshMetadata {
+                state: PrRefreshState::Unavailable,
+                reason: Some(reason.clone()),
+                last_attempted_at: now,
+                last_refreshed_at: None,
+                stale: false,
+            },
             unavailable_reason: Some(reason),
             ..Self::not_found()
         }

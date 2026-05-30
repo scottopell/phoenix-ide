@@ -198,6 +198,9 @@ function PrStatusPopover({ pr }: { pr: PrStatusResponse }) {
   ].slice(0, 5);
   return (
     <div className="pr-popover" role="dialog" aria-label="PR CI monitoring">
+      {pr.refresh.stale && (
+        <div className="pr-popover-muted">Stale PR data; {prRefreshStaleText(pr)}.</div>
+      )}
       <div className="pr-popover-row">
         <span>CI</span>
         <strong>{prCheckStatusText(pr)}</strong>

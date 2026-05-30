@@ -69,6 +69,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_llm_language_and_app_settings",
         sql: MIGRATION_011,
     },
+    Migration {
+        version: 12,
+        name: "create_work_scope_pr_associations",
+        sql: MIGRATION_012,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -301,6 +306,38 @@ CREATE TABLE IF NOT EXISTS app_settings (
 );
 ";
 
+const MIGRATION_012: &str = r"
+CREATE TABLE IF NOT EXISTS work_scopes (
+    id INTEGER PRIMARY KEY,
+    scope_type TEXT NOT NULL,
+    scope_value TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(scope_type, scope_value)
+);
+
+CREATE TABLE IF NOT EXISTS work_scope_pr_associations (
+    work_scope_id INTEGER NOT NULL REFERENCES work_scopes(id) ON DELETE CASCADE,
+    repo_owner TEXT NOT NULL,
+    repo_name TEXT NOT NULL,
+    pr_number INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    url TEXT NOT NULL,
+    state TEXT NOT NULL,
+    draft INTEGER NOT NULL,
+    display_state TEXT NOT NULL,
+    base TEXT NOT NULL,
+    head TEXT NOT NULL,
+    github_updated_at TEXT,
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    PRIMARY KEY (work_scope_id, repo_owner, repo_name, pr_number)
+);
+
+CREATE INDEX IF NOT EXISTS idx_work_scope_pr_primary
+ON work_scope_pr_associations(work_scope_id, display_state, github_updated_at, last_seen_at);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -402,7 +439,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 11);
+        assert_eq!(first, 12);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

@@ -168,8 +168,32 @@ export interface PrAutoFixContextResponse {
   message: string;
 }
 
+export type PrRefreshState = 'fresh' | 'unavailable' | 'not_found';
+
+export interface PrIdentity {
+  number: number;
+  title: string;
+  url: string;
+  state: string;
+  draft: boolean;
+  display_state: PrDisplayState;
+  base: string;
+  head: string;
+  updated_at?: string;
+}
+
+export interface PrRefreshMetadata {
+  state: PrRefreshState;
+  reason?: PrUnavailableReason;
+  last_attempted_at: string;
+  last_refreshed_at?: string;
+  stale: boolean;
+}
+
 export interface PrStatusResponse {
   found: boolean;
+  pr?: PrIdentity;
+  refresh: PrRefreshMetadata;
   unavailable_reason?: PrUnavailableReason;
   number?: number;
   title?: string;

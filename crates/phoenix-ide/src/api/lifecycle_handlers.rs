@@ -16,7 +16,7 @@ use axum::{
     extract::{Path, State},
     Json,
 };
-use std::path::PathBuf;
+use std::path::{Path as StdPath, PathBuf};
 
 // ============================================================
 // Terminal-action gate (REQ-BED-031)
@@ -206,17 +206,29 @@ pub(crate) async fn abandon_task(
     }
 
     // Accept both Work and Branch mode
-    let (worktree_path, base_branch, is_work_mode) = match &conv.conv_mode {
+    let (worktree_path, base_branch, branch_name, is_work_mode) = match &conv.conv_mode {
         ConvMode::Work {
             worktree_path,
             base_branch,
+            branch_name,
             ..
-        } => (worktree_path.to_string(), base_branch.to_string(), true),
+        } => (
+            worktree_path.to_string(),
+            base_branch.to_string(),
+            branch_name.to_string(),
+            true,
+        ),
         ConvMode::Branch {
             worktree_path,
             base_branch,
+            branch_name,
             ..
-        } => (worktree_path.to_string(), base_branch.to_string(), false),
+        } => (
+            worktree_path.to_string(),
+            base_branch.to_string(),
+            branch_name.to_string(),
+            false,
+        ),
         _ => {
             return Err(AppError::BadRequest(
                 "Conversation must be in Work or Branch mode to abandon".to_string(),
@@ -361,6 +373,36 @@ pub(crate) async fn abandon_task(
         None
     };
 
+    let pr_scope = crate::work_scope::WorkScope::resolve(&id, Some(StdPath::new(&worktree_path)));
+    if StdPath::new(&worktree_path).is_dir() {
+        let refresh_worktree = PathBuf::from(&worktree_path);
+        let refresh_branch = branch_name.clone();
+        let refresh_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let refresh = tokio::task::spawn_blocking(move || {
+            crate::api::pr_monitoring::get_pr_status_for_branch_with_deadline(
+                &refresh_worktree,
+                &refresh_branch,
+                refresh_deadline,
+            )
+        })
+        .await;
+        match refresh {
+            Ok(refresh) if !refresh.observations.is_empty() => {
+                if let Err(e) = state
+                    .db
+                    .upsert_work_scope_pr_observations(&pr_scope, &refresh.observations)
+                    .await
+                {
+                    tracing::warn!(error = %e, "Best-effort PR association refresh before abandon failed");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!(error = %e, "Best-effort PR refresh task failed before abandon");
+            }
+        }
+    }
+
     // 2c. Resource cleanup: bash kill, tmux kill, worktree remove, branch
     // delete (Work mode only), browser kill. Shared with hard-delete and
     // archive so any attached terminal/process group is torn down here
@@ -378,10 +420,17 @@ pub(crate) async fn abandon_task(
     // 4. Route through state machine (REQ-BED-029, REQ-BED-001)
     let repo_root_str = repo_root.display().to_string();
     let mode_label = if is_work_mode { "Work" } else { "Branch" };
+    let pr_hint = state
+        .db
+        .primary_work_scope_pr_association(&pr_scope)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .map(|pr| format!(" PR #{} preserves history.", pr.pr_number))
+        .unwrap_or_default();
     let system_message = if is_work_mode {
-        "Task abandoned. Worktree and branch deleted.".to_string()
+        format!("Task abandoned. Worktree and branch deleted.{pr_hint}")
     } else {
-        "Abandoned. Worktree removed, branch kept.".to_string()
+        format!("Abandoned. Worktree removed, branch kept.{pr_hint}")
     };
     tracing::info!(
         conversation_id = %id,
