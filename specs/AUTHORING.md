@@ -138,7 +138,35 @@ of `specs/sse_wire/sse_wire.allium`'s
 grep -rn '<new-name>' specs/
 ```
 
-## 8. `./dev.py tasks validate` passes
+## 8. The spec reads as a timeless description, not a changelog
+
+A spec describes the ideal current state as if it had always been that
+way — design *intent* for a future reader, not a history of how it got
+here. Grep your diff for the language that betrays a changelog:
+
+```bash
+# Task / PR references, time-relative framing, status/decision logs:
+grep -nE 'task [0-9]{3,}|tasks/[0-9]|PR #|see #[0-9]|RESOLVED [0-9]|Open Question|Q[0-9]\. |Progress:|Status Summary|✅|currently|for now|at the moment|recently|previously|landed|MVP|rollout|stopgap' specs/<your-spec>/*
+```
+
+For each hit, rewrite to a standing fact (see AGENTS.md "Specs are
+timeless" for the full list of what to excise):
+
+- Task/PR/bug references → name the **invariant or bug class** in
+  timeless terms; cross-reference other **specs by path**, not tasks
+  by ID.
+- `currently` / `for now` / `Phase 1 (current)` / `landed` → state
+  what *is*. (Sequential phases *within one operation* are fine.)
+- `✅ Complete` / `Progress: N of M` / per-rule status columns →
+  delete. A rule-to-code-anchor map is fine; a *status* table is not.
+- Resolved "Open Questions" / `RESOLVED <date>` decision logs →
+  restate the decision **as a fact with rationale** ("Design
+  Decisions" section) and delete the question.
+
+When you touch a spec, leave it more timeless than you found it — fix
+adjacent drift in the same file even if you didn't introduce it.
+
+## 9. `./dev.py tasks validate` passes
 
 ```bash
 ./dev.py tasks validate
@@ -147,7 +175,7 @@ grep -rn '<new-name>' specs/
 If the spec change is tied to a new task, validate the task file
 follows the canonical filename pattern.
 
-## 9. PR description matches the branch state
+## 10. PR description matches the branch state
 
 If your PR description claims a cross-spec import that the branch
 intentionally doesn't have (sibling spec in follow-up commit),

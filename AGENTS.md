@@ -257,6 +257,16 @@ Enumerate Allium specs with `ls specs/*/*.allium`. Cross-spec dependencies are d
 
 **Both formats are authoritative.** If the code disagrees with either spEARS or Allium, one of them is wrong. spEARS requirements (REQ-* IDs) define what must be built; Allium's transition graph, preconditions, and invariants define exact behaviour. `@guidance` blocks in Allium describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right.
 
+**Specs are timeless.** A spec describes the ideal current state of the system as if it had always been that way — it is the guidebook a future reader uses to understand design *intent*, not a record of how the design got here. Write every spec as a standing description, never as a changelog or a snapshot of in-flight work. Concretely, the following do **not** belong in a spec file:
+
+- **Task / PR / issue references** as the reason for a behaviour — `task 02679`, `PR #155`, `see #186`. Cite the *invariant* or *bug class* in timeless terms instead ("an emit-vs-persist race that drops a finalized message"), and cross-reference other **specs** by path, not tasks by ID.
+- **Time- or state-relative framing** of the design — `currently`, `for now`, `recently`, `previously`, `used to`, `will soon`, `Phase 1 (current)`, `landed in tasks/62001`, `MVP`. State what *is*. (Sequential phases *within a single operation* — "phase 1: snapshot, phase 2: apply pending" — are fine; they describe algorithm structure, not a rollout schedule.)
+- **Status / progress tracking** — `✅ Complete`, `Progress: 10 of 10`, "implemented in", per-rule completion columns. Implementation status lives in tasks and git, not the spec. A requirement-to-surface or rule-to-code-anchor map is fine; a *status* table is not.
+- **Decision logs and resolved "Open Questions"** — `Q3. RESOLVED 2026-05-10: …`, dated entries, "we decided", stream-of-consciousness ("actually no — see below"). Once a question is resolved, state the decision **as a fact** with its rationale (a "Design Decisions" section), and delete the question. An *unresolved* open question is never left as prose — resolve it per the rule above.
+- **Line-number citations that rot** — prefer symbol names (`SseBroadcaster::send_seq`) over `runtime.rs:529`. See `specs/AUTHORING.md` §2.
+
+When you touch a spec, leave it more timeless than you found it, even for drift you didn't introduce.
+
 **Before pushing a spec change**, run the pre-flight checklist in [`specs/AUTHORING.md`](specs/AUTHORING.md). The checklist captures the failure modes that drove 8 rounds of review iteration on PR #155 (wire-shape mismatches, Allium grammar bugs, undeclared helpers, cross-file drift, stale citations, cross-spec whitelist gaps) so future spec authors don't repay them.
 
 ---
