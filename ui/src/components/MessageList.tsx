@@ -10,6 +10,7 @@ import {
   formatMessageTime,
 } from './MessageComponents';
 import { StreamingMessage } from './StreamingMessage';
+import { RenderProfiler } from '../dev/renderProfiler';
 import { MessageContextMenu } from './MessageContextMenu';
 import { useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
@@ -131,7 +132,11 @@ function renderTailUnit(
       return <SubAgentStatus stateData={unit.state} />;
     case 'streaming_agent':
       if (!slug) return null;
-      return <StreamingMessage slug={slug} />;
+      return (
+        <RenderProfiler id="StreamingMessage">
+          <StreamingMessage slug={slug} />
+        </RenderProfiler>
+      );
   }
 }
 
