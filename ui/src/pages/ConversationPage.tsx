@@ -164,7 +164,7 @@ function ConversationPageContent() {
   });
 
   // Mobile-only file browser overlay. The prose reader itself reads its
-  // open-file state from `fileExplorer.proseReaderState` (URL-driven), so
+  // open-file state from `fileExplorer.openFileState` (URL-driven), so
   // mobile and desktop share a single source of truth — opening or closing
   // a file just rewrites `?file=...&root=...` on the current URL, which
   // means an iOS PWA cold reload restores the exact view.
@@ -849,8 +849,8 @@ function ConversationPageContent() {
   // Wide desktop (≥1280px) renders it as a split-pane sibling inside
   // the main return below (task 08654).
   if (isDesktop && !isWideDesktop) {
-    if (fileExplorer.proseReaderState) {
-      const prs = fileExplorer.proseReaderState;
+    if (fileExplorer.openFileState) {
+      const prs = fileExplorer.openFileState;
       return (
         <div id="app">
           <Suspense fallback={null}>
@@ -934,7 +934,7 @@ function ConversationPageContent() {
   // .conversation-column when wide-desktop and a viewer (file OR diff)
   // is open. CSS in .app-split-pane (index.css) flexes children
   // horizontally.
-  const splitPanePrs = fileExplorer.proseReaderState;
+  const splitPanePrs = fileExplorer.openFileState;
   const showSplitPaneViewer =
     isDesktop
     && isWideDesktop
@@ -1354,14 +1354,14 @@ function ConversationPageContent() {
       {/* Mobile prose reader overlay — reads URL-driven state from
           FileExplorerProvider so cold reload (e.g. iOS PWA return) restores
           the exact file the user was viewing. */}
-      {!isDesktop && fileExplorer.proseReaderState && (
+      {!isDesktop && fileExplorer.openFileState && (
         <Suspense fallback={null}>
           <FileViewer
-            filePath={fileExplorer.proseReaderState.path}
-            rootDir={fileExplorer.proseReaderState.rootDir}
+            filePath={fileExplorer.openFileState.path}
+            rootDir={fileExplorer.openFileState.rootDir}
             onClose={handleCloseProseReader}
             onSendNotes={handleSendNotes}
-            patchContext={fileExplorer.proseReaderState.patchContext ?? undefined}
+            patchContext={fileExplorer.openFileState.patchContext ?? undefined}
           />
         </Suspense>
       )}

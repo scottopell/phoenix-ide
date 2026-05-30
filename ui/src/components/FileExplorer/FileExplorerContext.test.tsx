@@ -1,6 +1,6 @@
 // Tests for the FileExplorer adapter over the unified viewer slot.
 //
-// openFile/closeFile/proseReaderState project the slot's prose state. The URL
+// openFile/closeFile/openFileState project the slot's prose state. The URL
 // contract, patchContext scoping, and REQ-VS-014 persistence/restoration live
 // in ViewerSlotProvider (see ViewerSlotContext.test.tsx for the slot-level
 // transitions); these tests assert the prose behavior end-to-end through the
@@ -71,7 +71,7 @@ describe('FileExplorer adapter — URL-driven open file', () => {
 
     act(() => { latest!.openFile('/repo/README.md', '/repo'); });
     expect(latest!.activeFile).toBe('/repo/README.md');
-    expect(latest!.proseReaderState).toEqual({
+    expect(latest!.openFileState).toEqual({
       path: '/repo/README.md',
       rootDir: '/repo',
     });
@@ -81,12 +81,12 @@ describe('FileExplorer adapter — URL-driven open file', () => {
 
     act(() => { latest!.closeFile(); });
     expect(latest!.activeFile).toBeNull();
-    expect(latest!.proseReaderState).toBeNull();
+    expect(latest!.openFileState).toBeNull();
     expect(search).not.toContain('file=');
     expect(search).not.toContain('root=');
   });
 
-  it('hydrates proseReaderState from legacy file/root URL params (no ?viewer=)', () => {
+  it('hydrates openFileState from legacy file/root URL params (no ?viewer=)', () => {
     let latest: ReturnType<typeof useFileExplorer> | null = null;
     const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
 
@@ -102,7 +102,7 @@ describe('FileExplorer adapter — URL-driven open file', () => {
     );
 
     expect(latest!.activeFile).toBe('/repo/README.md');
-    expect(latest!.proseReaderState).toEqual({ path: '/repo/README.md', rootDir: '/repo' });
+    expect(latest!.openFileState).toEqual({ path: '/repo/README.md', rootDir: '/repo' });
   });
 
   it('clears patchContext when scopeKey changes; URL-driven path/rootDir survive', () => {
@@ -128,15 +128,15 @@ describe('FileExplorer adapter — URL-driven open file', () => {
         firstModifiedLine: 3,
       });
     });
-    expect(latest!.proseReaderState?.path).toBe('/repo/x.ts');
-    expect(latest!.proseReaderState?.rootDir).toBe('/repo');
-    expect(latest!.proseReaderState?.patchContext?.firstModifiedLine).toBe(3);
+    expect(latest!.openFileState?.path).toBe('/repo/x.ts');
+    expect(latest!.openFileState?.rootDir).toBe('/repo');
+    expect(latest!.openFileState?.patchContext?.firstModifiedLine).toBe(3);
 
     act(() => { setKey!('conv-B'); });
 
-    expect(latest!.proseReaderState?.path).toBe('/repo/x.ts');
-    expect(latest!.proseReaderState?.rootDir).toBe('/repo');
-    expect(latest!.proseReaderState?.patchContext).toBeUndefined();
+    expect(latest!.openFileState?.path).toBe('/repo/x.ts');
+    expect(latest!.openFileState?.rootDir).toBe('/repo');
+    expect(latest!.openFileState?.patchContext).toBeUndefined();
   });
 });
 

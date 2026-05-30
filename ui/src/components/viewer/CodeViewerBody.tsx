@@ -20,7 +20,7 @@ export function CodeViewerBody({
   registerLineRef,
 }: CodeViewerBodyProps) {
   return (
-    <div className="prose-reader-code">
+    <div className="viewer-code">
       <SyntaxHighlighter
         style={oneDark}
         language={language}
@@ -38,7 +38,7 @@ export function CodeViewerBody({
                     lineNumber={lineNumber}
                     lineContent={lines[idx] || ''}
                     onAnnotate={onAnnotate}
-                    className="prose-code-line"
+                    className="viewer-code-line"
                     isModified={modifiedLines.has(lineNumber)}
                     isHighlighted={highlightedLine === lineNumber}
                     lineRef={(el) => registerLineRef(lineNumber, el)}

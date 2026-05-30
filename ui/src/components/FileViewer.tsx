@@ -109,14 +109,14 @@ export function FileViewer({
       onSend={() => undefined}
       onClose={onClose}
     >
-      <div className="prose-reader-content">
+      <div className="viewer-content">
         {loading ? (
-          <div className="prose-reader-loading">
+          <div className="viewer-loading">
             <Loader2 size={32} className="spinning" />
             <span>Loading file...</span>
           </div>
         ) : (
-          <div className="prose-reader-error">
+          <div className="viewer-error">
             <AlertCircle size={32} />
             <span>{error ?? 'Failed to load file'}</span>
             <button onClick={onClose}>Close</button>

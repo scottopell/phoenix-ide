@@ -54,7 +54,7 @@ function renderPalette(activeConversation: Conversation) {
         openFile: mocks.openFile,
         activeFile: null,
         closeFile: vi.fn(),
-        proseReaderState: null,
+        openFileState: null,
       }}>
         <CommandPalette
           conversations={[activeConversation]}

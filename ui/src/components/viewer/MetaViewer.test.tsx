@@ -29,14 +29,14 @@ describe('MetaViewer payload routing', () => {
 
   it('routes a code payload to the syntax-highlighted code body', () => {
     const { container } = renderViewer({ ...textCommon, kind: 'code', language: 'rust', content: 'fn main() {}' });
-    expect(container.querySelector('.prose-reader-code')).not.toBeNull();
-    expect(container.querySelector('.prose-code-line')).not.toBeNull();
+    expect(container.querySelector('.viewer-code')).not.toBeNull();
+    expect(container.querySelector('.viewer-code-line')).not.toBeNull();
   });
 
   it('routes a plain-text payload to line-numbered text', () => {
     const { container } = renderViewer({ ...textCommon, kind: 'text', content: 'plain line' });
     expect(screen.getByText('plain line')).toBeInTheDocument();
-    expect(container.querySelector('.prose-reader-text')).not.toBeNull();
+    expect(container.querySelector('.viewer-text')).not.toBeNull();
   });
 
   it('routes an image payload to the image body', () => {
@@ -61,7 +61,7 @@ describe('MetaViewer payload routing', () => {
     });
 
     // Source mode: code body present, no iframe.
-    expect(container.querySelector('.prose-reader-code')).not.toBeNull();
+    expect(container.querySelector('.viewer-code')).not.toBeNull();
     expect(container.querySelector('iframe')).toBeNull();
 
     fireEvent.click(screen.getByRole('button', { name: 'Preview' }));

@@ -15,7 +15,7 @@ export function TextViewerBody({
 }: ViewerBodyProps) {
   const lines = content.split('\n');
   return (
-    <div className="prose-reader-text">
+    <div className="viewer-text">
       {lines.map((line, index) => {
         const lineNumber = index + 1;
         return (
@@ -24,13 +24,13 @@ export function TextViewerBody({
             lineNumber={lineNumber}
             lineContent={line}
             onAnnotate={onAnnotate}
-            className="prose-line"
+            className="viewer-text-line"
             isModified={modifiedLines.has(lineNumber)}
             isHighlighted={highlightedLine === lineNumber}
             lineRef={(el) => registerLineRef(lineNumber, el)}
           >
-            <span className="prose-line__number">{lineNumber}</span>
-            <span className="prose-line__content">{line || ' '}</span>
+            <span className="viewer-text-line__number">{lineNumber}</span>
+            <span className="viewer-text-line__content">{line || ' '}</span>
           </AnnotatableBlock>
         );
       })}

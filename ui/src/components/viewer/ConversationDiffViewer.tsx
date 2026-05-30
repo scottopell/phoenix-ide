@@ -79,12 +79,12 @@ export function ConversationDiffViewer({
     >
       <div className="diff-viewer-body">
         {state.status === 'loading' ? (
-          <div className="prose-reader-loading">
+          <div className="viewer-loading">
             <Loader2 size={32} className="spinning" />
             <span>Loading diff...</span>
           </div>
         ) : (
-          <div className="prose-reader-error">
+          <div className="viewer-error">
             <AlertCircle size={32} />
             <span>{state.message}</span>
             <button onClick={onClose}>Close</button>

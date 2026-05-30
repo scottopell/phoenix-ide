@@ -23,12 +23,12 @@ interface HtmlViewerBodyProps extends ViewerBodyProps {
 export function HtmlViewerBody({ mode, previewUrl, ...bodyProps }: HtmlViewerBodyProps) {
   if (mode === 'preview') {
     return (
-      <div className="prose-reader-html-preview">
+      <div className="viewer-html-preview">
         <iframe
           src={previewUrl}
           sandbox="allow-same-origin"
           title="HTML Preview"
-          className="prose-reader-iframe"
+          className="viewer-iframe"
         />
       </div>
     );

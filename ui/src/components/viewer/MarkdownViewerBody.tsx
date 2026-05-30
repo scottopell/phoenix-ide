@@ -36,7 +36,7 @@ export function MarkdownViewerBody({
           lineNumber={ln}
           lineContent={rawLineContent}
           onAnnotate={onAnnotate}
-          className="prose-block"
+          className="viewer-markdown-block"
           isModified={modifiedLines.has(ln)}
           isHighlighted={highlightedLine === ln}
           lineRef={(el) => registerLineRef(ln, el)}
@@ -48,7 +48,7 @@ export function MarkdownViewerBody({
     };
 
   return (
-    <div className="prose-reader-markdown">
+    <div className="viewer-markdown">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         components={{

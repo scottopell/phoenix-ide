@@ -31,7 +31,7 @@ import { ImageViewerBody } from './ImageViewerBody';
 import type { ViewerBodyProps } from './AnnotatableBlock';
 
 export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
-  useRegisterFocusScope('prose-reader');
+  useRegisterFocusScope('file-viewer');
 
   const { absolutePath, title, onClose, onSendNotes, inline } = payload;
   const textLike = isTextLikePayload(payload);
@@ -254,7 +254,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
         ) : null
       }
     >
-      <div className="prose-reader-content" ref={contentRef}>
+      <div className="viewer-content" ref={contentRef}>
         {body}
       </div>
     </ViewerShell>

@@ -5,4 +5,4 @@ export { FileBrowserOverlay } from './FileBrowserOverlay';
 export { RecentFilesStrip } from './RecentFilesStrip';
 export { FileExplorerProvider } from './FileExplorerContext';
 export { useFileExplorer } from '../../hooks/useFileExplorer';
-export type { ProseReaderState, PatchContext } from './fileExplorerTypes';
+export type { OpenFileState, PatchContext } from './fileExplorerTypes';

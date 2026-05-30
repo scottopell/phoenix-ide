@@ -5,7 +5,7 @@ export interface PatchContext {
   firstModifiedLine?: number;
 }
 
-export interface ProseReaderState {
+export interface OpenFileState {
   path: string;
   rootDir: string;
   patchContext?: PatchContext;
@@ -19,7 +19,7 @@ export interface FileExplorerContextValue {
   /** Close the file viewer */
   closeFile: () => void;
   /** Full prose reader state (path + rootDir + patchContext) */
-  proseReaderState: ProseReaderState | null;
+  openFileState: OpenFileState | null;
 }
 
 export const FileExplorerContext = createContext<FileExplorerContextValue | null>(null);

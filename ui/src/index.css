@@ -4434,11 +4434,11 @@ html * {
  * Prose Reader Component (REQ-PF-005 through REQ-PF-013)
  * ============================================================ */
 
-/* `.prose-reader-overlay` is gone — superseded by `.viewer-shell--overlay`
+/* `.viewer-overlay` is gone — superseded by `.viewer-shell--overlay`
  * defined in the "Shared viewer primitives" block. The old class had no
  * remaining consumers in the JSX after the ProseReader refactor. */
 
-.prose-reader-header {
+.viewer-header {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -4447,7 +4447,7 @@ html * {
   background: var(--bg-secondary);
 }
 
-.prose-reader-btn {
+.viewer-btn {
   background: transparent;
   border: none;
   color: var(--text-secondary);
@@ -4462,12 +4462,12 @@ html * {
   min-height: 36px;
 }
 
-.prose-reader-btn:hover {
+.viewer-btn:hover {
   background: var(--bg-tertiary);
   color: var(--text-primary);
 }
 
-.prose-reader-title {
+.viewer-title {
   flex: 1;
   font-size: 14px;
   font-weight: 500;
@@ -4477,13 +4477,13 @@ html * {
   white-space: nowrap;
 }
 
-.prose-reader-actions {
+.viewer-actions {
   display: flex;
   align-items: center;
   gap: 8px;
 }
 
-.prose-reader-badge {
+.task-approval-badge {
   display: flex;
   align-items: center;
   gap: 4px;
@@ -4498,11 +4498,11 @@ html * {
   transition: opacity 0.15s;
 }
 
-.prose-reader-badge:hover {
+.task-approval-badge:hover {
   opacity: 0.9;
 }
 
-.prose-reader-send-btn {
+.viewer-send-btn {
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4515,11 +4515,11 @@ html * {
   transition: opacity 0.15s;
 }
 
-.prose-reader-send-btn:hover {
+.viewer-send-btn:hover {
   opacity: 0.9;
 }
 
-.prose-reader-banner {
+.viewer-banner {
   background: var(--bg-tertiary);
   padding: 8px 16px;
   border-bottom: 1px solid var(--border-color);
@@ -4527,18 +4527,18 @@ html * {
   color: var(--text-secondary);
 }
 
-.prose-reader-banner-text {
+.viewer-banner-text {
   font-weight: 500;
 }
 
-.prose-reader-content {
+.viewer-content {
   flex: 1;
   overflow-y: auto;
   overscroll-behavior: contain;
 }
 
-.prose-reader-loading,
-.prose-reader-error {
+.viewer-loading,
+.viewer-error {
   display: flex;
   flex-direction: column;
   align-items: center;
@@ -4549,7 +4549,7 @@ html * {
   height: 100%;
 }
 
-.prose-reader-error button {
+.viewer-error button {
   margin-top: 8px;
   padding: 8px 16px;
   background: var(--accent-blue);
@@ -4581,7 +4581,7 @@ html * {
 }
 
 /* Text/Code display */
-.prose-reader-text {
+.viewer-text {
   font-family: var(--font-mono);
   font-size: 13px;
   line-height: 1.5;
@@ -4648,12 +4648,12 @@ html * {
 @media (hover: none) { .annotatable__btn { display: none; } }
 
 /* === View-specific layout (compose with .annotatable) === */
-.prose-line {
+.viewer-text-line {
   display: flex;
   min-height: 24px;
 }
 
-.prose-line__number {
+.viewer-text-line__number {
   width: 48px;
   padding: 0 12px;
   text-align: right;
@@ -4663,17 +4663,17 @@ html * {
   font-size: 12px;
 }
 
-.prose-line__content {
+.viewer-text-line__content {
   flex: 1;
   padding: 0 16px;
   white-space: pre;
   overflow-x: auto;
 }
 
-.prose-code-line { display: block; }
+.viewer-code-line { display: block; }
 
 /* Markdown display */
-.prose-reader-markdown {
+.viewer-markdown {
   padding: 16px;
   max-width: 800px;
   margin: 0 auto;
@@ -4681,27 +4681,27 @@ html * {
 }
 
 /* stylelint-disable no-descending-specificity --
-   The `.prose-reader-markdown *` rules below target a distinct DOM scope
+   The `.viewer-markdown *` rules below target a distinct DOM scope
    from the `.agent-text-block *:first-child` and `.message-content code/p`
    rules in the markdown section above. Different components, orthogonal
-   properties; keep all `.prose-reader-markdown` rules grouped together. */
-.prose-reader-markdown h1,
-.prose-reader-markdown h2,
-.prose-reader-markdown h3 {
+   properties; keep all `.viewer-markdown` rules grouped together. */
+.viewer-markdown h1,
+.viewer-markdown h2,
+.viewer-markdown h3 {
   margin-top: 24px;
   margin-bottom: 12px;
   color: var(--text-primary);
 }
 
-.prose-reader-markdown h1 { font-size: 1.75rem; }
-.prose-reader-markdown h2 { font-size: 1.5rem; }
-.prose-reader-markdown h3 { font-size: 1.25rem; }
+.viewer-markdown h1 { font-size: 1.75rem; }
+.viewer-markdown h2 { font-size: 1.5rem; }
+.viewer-markdown h3 { font-size: 1.25rem; }
 
-.prose-reader-markdown p {
+.viewer-markdown p {
   margin-bottom: 12px;
 }
 
-.prose-reader-markdown code {
+.viewer-markdown code {
   background: var(--bg-tertiary);
   padding: 2px 6px;
   border-radius: 4px;
@@ -4709,68 +4709,68 @@ html * {
   font-size: 0.9em;
 }
 
-.prose-reader-markdown pre {
+.viewer-markdown pre {
   margin: 16px 0;
   border-radius: 8px;
   overflow-x: auto;
 }
 
-.prose-reader-markdown pre code {
+.viewer-markdown pre code {
   background: none;
   padding: 0;
 }
 /* stylelint-enable no-descending-specificity */
 
-.prose-reader-markdown ul,
-.prose-reader-markdown ol {
+.viewer-markdown ul,
+.viewer-markdown ol {
   margin-bottom: 12px;
   padding-left: 24px;
 }
 
-.prose-reader-markdown blockquote {
+.viewer-markdown blockquote {
   border-left: 4px solid var(--border-color);
   padding-left: 16px;
   margin: 12px 0;
   color: var(--text-secondary);
 }
 
-.prose-block {
+.viewer-markdown-block {
   padding: 4px 8px;
   border-radius: 4px;
   cursor: default;
 }
 
 /* Code display */
-.prose-reader-code {
+.viewer-code {
   font-size: 13px;
 }
 
-.prose-reader-code pre {
+.viewer-code pre {
   margin: 0 !important;
   border-radius: 0 !important;
 }
 
 /* HTML preview -- needs content area to act as flex column */
-.prose-reader-content:has(.prose-reader-html-preview) {
+.viewer-content:has(.viewer-html-preview) {
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
-.prose-reader-html-preview {
+.viewer-html-preview {
   flex: 1;
   display: flex;
   min-height: 0;
 }
 
-.prose-reader-iframe {
+.viewer-iframe {
   width: 100%;
   border: none;
   background: #fff;
   flex: 1;
 }
 
-.prose-reader-view-toggle {
+.viewer-view-toggle {
   font-size: 11px;
   font-family: var(--font-mono, monospace);
   padding: 2px 8px;
@@ -4782,19 +4782,19 @@ html * {
   transition: background 150ms, color 150ms;
 }
 
-.prose-reader-view-toggle:hover {
+.viewer-view-toggle:hover {
   background: var(--bg-tertiary);
   color: var(--text-primary);
 }
 
-.prose-reader-view-toggle.active {
+.viewer-view-toggle.active {
   background: var(--bg-tertiary);
   color: var(--text-primary);
   border-color: var(--text-muted);
 }
 
 /* Annotation Dialog (REQ-PF-007) */
-.prose-reader-annotation-overlay {
+.task-approval-annotation-overlay {
   position: fixed;
   inset: 0;
   background: rgb(0 0 0 / 50%);
@@ -4810,7 +4810,7 @@ html * {
   to { opacity: 1; }
 }
 
-.prose-reader-annotation-dialog {
+.task-approval-annotation-dialog {
   background: var(--bg-primary);
   width: 100%;
   max-width: 500px;
@@ -4824,7 +4824,7 @@ html * {
   to { transform: translateY(0); }
 }
 
-.prose-reader-annotation-header {
+.task-approval-annotation-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -4833,7 +4833,7 @@ html * {
   color: var(--text-primary);
 }
 
-.prose-reader-annotation-header button {
+.task-approval-annotation-header button {
   background: transparent;
   border: none;
   color: var(--text-secondary);
@@ -4841,7 +4841,7 @@ html * {
   padding: 4px;
 }
 
-.prose-reader-annotation-preview {
+.task-approval-annotation-preview {
   background: var(--bg-tertiary);
   padding: 8px 12px;
   border-radius: 6px;
@@ -4854,7 +4854,7 @@ html * {
   white-space: nowrap;
 }
 
-.prose-reader-annotation-input {
+.task-approval-annotation-input {
   width: 100%;
   border: 1px solid var(--border-color);
   border-radius: 8px;
@@ -4866,18 +4866,18 @@ html * {
   margin-bottom: 12px;
 }
 
-.prose-reader-annotation-input:focus {
+.task-approval-annotation-input:focus {
   outline: none;
   border-color: var(--accent-blue);
 }
 
-.prose-reader-annotation-actions {
+.task-approval-annotation-actions {
   display: flex;
   gap: 8px;
   justify-content: flex-end;
 }
 
-.prose-reader-annotation-actions button {
+.task-approval-annotation-actions button {
   padding: 10px 16px;
   border-radius: 8px;
   font-size: 14px;
@@ -4887,25 +4887,25 @@ html * {
   min-height: 44px;
 }
 
-.prose-reader-annotation-actions button:first-child {
+.task-approval-annotation-actions button:first-child {
   background: var(--bg-tertiary);
   border: none;
   color: var(--text-secondary);
 }
 
-.prose-reader-annotation-actions button.primary {
+.task-approval-annotation-actions button.primary {
   background: var(--accent-blue);
   border: none;
   color: white;
 }
 
-.prose-reader-annotation-actions button:disabled {
+.task-approval-annotation-actions button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
 
 /* Notes Panel (REQ-PF-008) */
-.prose-reader-notes-panel {
+.task-approval-notes-panel {
   position: fixed;
   bottom: 0;
   left: 0;
@@ -4920,7 +4920,7 @@ html * {
   animation: slide-up 0.2s ease-out;
 }
 
-.prose-reader-notes-header {
+.task-approval-notes-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -4930,9 +4930,9 @@ html * {
 }
 
 /* stylelint-disable-next-line no-descending-specificity --
-   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
-   rule stays with the prose-reader-notes-header styles. */
-.prose-reader-notes-header button {
+   Distinct DOM scope from `.task-approval-annotation-actions button:first-child`;
+   rule stays with the task-approval-notes-header styles. */
+.task-approval-notes-header button {
   background: transparent;
   border: none;
   color: var(--text-secondary);
@@ -4940,29 +4940,29 @@ html * {
   padding: 4px;
 }
 
-.prose-reader-notes-list {
+.task-approval-notes-list {
   flex: 1;
   overflow-y: auto;
   padding: 8px 0;
 }
 
-.prose-reader-note {
+.task-approval-note {
   padding: 12px 16px;
   border-bottom: 1px solid var(--border-color);
 }
 
-.prose-reader-note:last-child {
+.task-approval-note:last-child {
   border-bottom: none;
 }
 
-.prose-reader-note-header {
+.task-approval-note-header {
   display: flex;
   align-items: center;
   justify-content: space-between;
   margin-bottom: 4px;
 }
 
-.prose-reader-note-line {
+.task-approval-note-line {
   background: var(--accent-blue);
   color: white;
   border: none;
@@ -4972,7 +4972,7 @@ html * {
   cursor: pointer;
 }
 
-.prose-reader-note-delete {
+.task-approval-note-delete {
   background: transparent;
   border: none;
   color: var(--text-muted);
@@ -4980,11 +4980,11 @@ html * {
   padding: 4px;
 }
 
-.prose-reader-note-delete:hover {
+.task-approval-note-delete:hover {
   color: var(--error-color, #ef4444);
 }
 
-.prose-reader-note-preview {
+.task-approval-note-preview {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-muted);
@@ -4994,12 +4994,12 @@ html * {
   white-space: nowrap;
 }
 
-.prose-reader-note-text {
+.task-approval-note-text {
   font-size: 14px;
   color: var(--text-primary);
 }
 
-.prose-reader-notes-actions {
+.task-approval-notes-actions {
   display: flex;
   gap: 8px;
   padding: 12px 16px;
@@ -5007,9 +5007,9 @@ html * {
 }
 
 /* stylelint-disable-next-line no-descending-specificity --
-   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
-   rule stays with the prose-reader-notes-actions styles. */
-.prose-reader-notes-actions button {
+   Distinct DOM scope from `.task-approval-annotation-actions button:first-child`;
+   rule stays with the task-approval-notes-actions styles. */
+.task-approval-notes-actions button {
   flex: 1;
   padding: 12px;
   border-radius: 8px;
@@ -5023,20 +5023,20 @@ html * {
   min-height: 44px;
 }
 
-.prose-reader-notes-actions button:first-child {
+.task-approval-notes-actions button:first-child {
   background: var(--bg-tertiary);
   border: none;
   color: var(--text-secondary);
 }
 
-.prose-reader-notes-actions button.primary {
+.task-approval-notes-actions button.primary {
   background: var(--success-color, #10b981);
   border: none;
   color: white;
 }
 
 /* Close Confirmation (REQ-PF-010) */
-.prose-reader-confirm-overlay {
+.task-approval-confirm-overlay {
   position: fixed;
   inset: 0;
   background: rgb(0 0 0 / 50%);
@@ -5047,7 +5047,7 @@ html * {
   padding: 16px;
 }
 
-.prose-reader-confirm-dialog {
+.task-approval-confirm-dialog {
   background: var(--bg-primary);
   border-radius: 12px;
   padding: 20px;
@@ -5057,22 +5057,22 @@ html * {
 
 /* stylelint-disable-next-line no-descending-specificity --
    Distinct DOM scope from `.message-content p:last-child`; rule stays with
-   the prose-reader-confirm-dialog styles. */
-.prose-reader-confirm-dialog p {
+   the task-approval-confirm-dialog styles. */
+.task-approval-confirm-dialog p {
   margin-bottom: 16px;
   color: var(--text-primary);
   font-size: 14px;
 }
 
-.prose-reader-confirm-actions {
+.task-approval-confirm-actions {
   display: flex;
   gap: 8px;
 }
 
 /* stylelint-disable-next-line no-descending-specificity --
-   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
-   rule stays with the prose-reader-confirm-actions styles. */
-.prose-reader-confirm-actions button {
+   Distinct DOM scope from `.task-approval-annotation-actions button:first-child`;
+   rule stays with the task-approval-confirm-actions styles. */
+.task-approval-confirm-actions button {
   flex: 1;
   padding: 12px;
   border-radius: 8px;
@@ -5083,12 +5083,12 @@ html * {
   min-height: 44px;
 }
 
-.prose-reader-confirm-actions button:first-child {
+.task-approval-confirm-actions button:first-child {
   background: var(--bg-tertiary);
   color: var(--text-secondary);
 }
 
-.prose-reader-confirm-actions button.danger {
+.task-approval-confirm-actions button.danger {
   background: var(--error-color, #ef4444);
   color: white;
 }
@@ -6482,7 +6482,7 @@ html * {
 /* stylelint-disable no-descending-specificity --
    `.init-error h2/p/button` rules target a distinct DOM scope from the
    global `.agent-text-block`, `.message-content`, and
-   `.prose-reader-annotation-actions` rules earlier in the file. Different
+   `.task-approval-annotation-actions` rules earlier in the file. Different
    components; keep `.init-error` rules grouped. */
 .init-error h2 {
   font-size: 24px;
@@ -7898,20 +7898,20 @@ html * {
 }
 
 /* Prose reader inline mode (desktop, replaces conversation content) */
-.prose-reader-inline {
+.viewer-inline {
   display: flex;
   flex-direction: column;
   height: 100%;
   background: var(--bg-primary);
 }
 
-.prose-reader-inline .prose-reader-header {
+.viewer-inline .viewer-header {
   position: sticky;
   top: 0;
   z-index: 10;
 }
 
-.prose-reader-inline .prose-reader-content {
+.viewer-inline .viewer-content {
   flex: 1;
   overflow-y: auto;
 }
@@ -10156,7 +10156,7 @@ html * {
 /* ============================================================
  * Shared viewer primitives (ViewerShell / NotesPanel /
  * AnnotationDialog). Aliases that inherit visual styling from the
- * existing .prose-reader-* selectors so FileView and DiffView render
+ * existing .viewer-* selectors so FileView and DiffView render
  * identically.
  * ============================================================ */
 
@@ -10307,8 +10307,8 @@ html * {
   color: var(--text-secondary);
 }
 
-/* Body must be a flex column so child viewers (.prose-reader-content,
- * .diff-viewer-body, .prose-reader-html-preview) can use `flex: 1` to
+/* Body must be a flex column so child viewers (.viewer-content,
+ * .diff-viewer-body, .viewer-html-preview) can use `flex: 1` to
  * fill available height. Without `display: flex` the children's flex
  * properties have no effect and the HTML preview iframe collapses. */
 .viewer-shell-body {
@@ -10348,7 +10348,7 @@ html * {
 }
 
 /* stylelint-disable-next-line no-descending-specificity --
-   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   Distinct DOM scope from `.task-approval-annotation-actions button:first-child`;
    rule stays with the notes-panel-header styles. */
 .notes-panel-header button {
   background: transparent;
@@ -10451,7 +10451,7 @@ html * {
 }
 
 /* stylelint-disable-next-line no-descending-specificity --
-   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   Distinct DOM scope from `.task-approval-annotation-actions button:first-child`;
    rule stays with the notes-panel-actions styles. */
 .notes-panel-actions button {
   flex: 1;
@@ -10519,7 +10519,7 @@ html * {
 }
 
 /* stylelint-disable-next-line no-descending-specificity --
-   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   Distinct DOM scope from `.task-approval-annotation-actions button:first-child`;
    rule stays with the annotation-dialog-header styles. */
 .annotation-dialog-header button {
   background: transparent;
@@ -10570,7 +10570,7 @@ html * {
 }
 
 /* stylelint-disable-next-line no-descending-specificity --
-   Distinct DOM scope from `.prose-reader-annotation-actions button:first-child`;
+   Distinct DOM scope from `.task-approval-annotation-actions button:first-child`;
    rule stays with the annotation-dialog-actions styles. */
 .annotation-dialog-actions button {
   padding: 6px 14px;

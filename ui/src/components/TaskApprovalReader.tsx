@@ -336,7 +336,7 @@ export function TaskApprovalReader({
             lineNumber={ln}
             lineContent={rawLineContent}
             onAnnotate={handleLongPress}
-            className="prose-block"
+            className="viewer-markdown-block"
             isHighlighted={highlightedLine === ln}
             lineRef={(el) => {
               if (el) lineRefs.current.set(ln, el);
@@ -408,7 +408,7 @@ export function TaskApprovalReader({
           {notes.length > 0 && (
             <>
               <button
-                className="prose-reader-badge"
+                className="task-approval-badge"
                 onClick={() => setShowNotesPanel(!showNotesPanel)}
                 aria-label={`${notes.length} notes`}
               >
@@ -422,7 +422,7 @@ export function TaskApprovalReader({
 
       {/* Plan content */}
       <div className="task-approval-content">
-        <div className="prose-reader-markdown">{renderPlanMarkdown}</div>
+        <div className="viewer-markdown">{renderPlanMarkdown}</div>
       </div>
 
       {/* Action toolbar */}
@@ -472,32 +472,32 @@ export function TaskApprovalReader({
       {/* Annotation Dialog */}
       {annotatingLine && (
         <div
-          className="prose-reader-annotation-overlay"
+          className="task-approval-annotation-overlay"
           onClick={() => setAnnotatingLine(null)}
         >
           <div
-            className="prose-reader-annotation-dialog"
+            className="task-approval-annotation-dialog"
             onClick={(e) => e.stopPropagation()}
           >
-            <div className="prose-reader-annotation-header">
+            <div className="task-approval-annotation-header">
               <span>Line {annotatingLine.lineNumber}</span>
               <button onClick={() => setAnnotatingLine(null)}>
                 <X size={18} />
               </button>
             </div>
-            <div className="prose-reader-annotation-preview">
+            <div className="task-approval-annotation-preview">
               {annotatingLine.lineContent.slice(0, 100)}
               {annotatingLine.lineContent.length > 100 && '...'}
             </div>
             <textarea
               ref={noteInputRef}
-              className="prose-reader-annotation-input"
+              className="task-approval-annotation-input"
               placeholder="Add your note..."
               value={noteInput}
               onChange={(e) => setNoteInput(e.target.value)}
               rows={3}
             />
-            <div className="prose-reader-annotation-actions">
+            <div className="task-approval-annotation-actions">
               <button onClick={() => setAnnotatingLine(null)}>Cancel</button>
               <button
                 className="primary"
@@ -513,39 +513,39 @@ export function TaskApprovalReader({
 
       {/* Notes Panel */}
       {showNotesPanel && (
-        <div className="prose-reader-notes-panel">
-          <div className="prose-reader-notes-header">
+        <div className="task-approval-notes-panel">
+          <div className="task-approval-notes-header">
             <span>Notes ({notes.length})</span>
             <button onClick={() => setShowNotesPanel(false)}>
               <ChevronDown size={18} />
             </button>
           </div>
-          <div className="prose-reader-notes-list">
+          <div className="task-approval-notes-list">
             {notes.map((note) => (
-              <div key={note.id} className="prose-reader-note">
-                <div className="prose-reader-note-header">
+              <div key={note.id} className="task-approval-note">
+                <div className="task-approval-note-header">
                   <button
-                    className="prose-reader-note-line"
+                    className="task-approval-note-line"
                     onClick={() => handleJumpToLine(note.lineNumber)}
                   >
                     Line {note.lineNumber}
                   </button>
                   <button
-                    className="prose-reader-note-delete"
+                    className="task-approval-note-delete"
                     onClick={() => handleDeleteNote(note.id)}
                   >
                     <Trash2 size={14} />
                   </button>
                 </div>
-                <div className="prose-reader-note-preview">
+                <div className="task-approval-note-preview">
                   {note.lineContent.slice(0, 60)}
                   {note.lineContent.length > 60 && '...'}
                 </div>
-                <div className="prose-reader-note-text">{note.note}</div>
+                <div className="task-approval-note-text">{note.note}</div>
               </div>
             ))}
           </div>
-          <div className="prose-reader-notes-actions">
+          <div className="task-approval-notes-actions">
             <button onClick={handleClearAll}>Clear All</button>
             <button className="primary" onClick={handleSendFeedback}>
               <Send size={16} />
@@ -557,16 +557,16 @@ export function TaskApprovalReader({
 
       {/* Discard Confirmation */}
       {discardConfirmOpen && (
-        <div className="prose-reader-confirm-overlay">
+        <div className="task-approval-confirm-overlay">
           <div
-            className="prose-reader-confirm-dialog"
+            className="task-approval-confirm-dialog"
             onClick={(e) => e.stopPropagation()}
           >
             <p>
               Discard this task? The agent will be informed the task was
               rejected.
             </p>
-            <div className="prose-reader-confirm-actions">
+            <div className="task-approval-confirm-actions">
               <button onClick={() => setDiscardConfirmOpen(false)}>
                 Cancel
               </button>
