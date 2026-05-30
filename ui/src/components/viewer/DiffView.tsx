@@ -8,22 +8,18 @@
  * conversation-scoped pile with FileView; Send drops the entire pile.
  */
 
-import { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import { useCallback, useMemo, useRef } from 'react';
 import { MessageSquarePlus } from 'lucide-react';
-import { useReviewNotes } from '../../contexts/ReviewNotesContext';
-import type {
-  DiffSection,
-  NoteAnchor,
-  ReviewNote,
-} from '../../contexts/ReviewNotesContext';
+import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { useLongPress } from '../../hooks/useLongPress';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { ViewerShell } from './ViewerShell';
 import { NotesPanel } from './NotesPanel';
 import { AnnotationDialog } from './AnnotationDialog';
-import { formatNotesForSend } from './formatNotes';
 import { parseUnifiedDiff } from './diffParse';
 import type { DiffLine, DiffSegment } from './diffParse';
+import { useDiffReviewNotes, diffKey } from './useDiffReviewNotes';
+import type { AnnotateTarget } from './useDiffReviewNotes';
 
 export interface DiffViewProps {
   open: boolean;
@@ -45,10 +41,6 @@ export interface DiffViewProps {
   inline?: boolean;
 }
 
-type AnnotateTarget =
-  | { kind: 'line'; section: DiffSection; segment: DiffSegment; line: DiffLine }
-  | { kind: 'file'; section: DiffSection; segment: DiffSegment; diffPos: number };
-
 interface SectionDef {
   /** Header rendered above this section's diff. */
   title: string;
@@ -61,13 +53,6 @@ interface SectionDef {
   truncatedKib?: number | undefined;
   /** When true, `truncatedKib` is a lower bound — render with "≥". */
   saturated?: boolean | undefined;
-}
-
-/** Compose a unique key from the section discriminator + the per-section
- *  diff position. Used by `lineRefs`, `noteSet`, and the highlight
- *  state so committed/uncommitted positions never collide. */
-function diffKey(section: DiffSection, diffPos: number): string {
-  return `${section}:${diffPos}`;
 }
 
 export function DiffView({
@@ -85,11 +70,8 @@ export function DiffView({
   inline,
 }: DiffViewProps) {
   useRegisterFocusScope('diff-viewer');
-  const reviewNotes = useReviewNotes();
-
-  const [annotating, setAnnotating] = useState<AnnotateTarget | null>(null);
-  const [showPanel, setShowPanel] = useState(false);
-  const [highlightedKey, setHighlightedKey] = useState<string | null>(null);
+  const notes = useDiffReviewNotes(onSendNotes);
+  const { highlightedKey } = notes;
   // Keyed by `${section}:${diffPos}` so committed and uncommitted
   // positions occupy disjoint namespaces.
   const lineRefs = useRef<Map<string, HTMLElement>>(new Map());
@@ -125,66 +107,24 @@ export function DiffView({
     ],
   );
 
-  // Clear highlight after animation
-  useEffect(() => {
-    if (highlightedKey !== null) {
-      const timer = setTimeout(() => setHighlightedKey(null), 2000);
-      return () => clearTimeout(timer);
-    }
-    return undefined;
-  }, [highlightedKey]);
+  const diffNotes = notes.diffNotes;
 
-  const diffNotes = useMemo(() => reviewNotes.notesForDiff(), [reviewNotes]);
-
-  const handleSubmitNote = useCallback(
-    (body: string) => {
-      if (!annotating) return;
-      let anchor: NoteAnchor;
-      let lineContent: string;
-      if (annotating.kind === 'line') {
-        anchor = {
-          kind: 'diff',
-          section: annotating.section,
-          filePath: annotating.segment.filePath,
-          newLine: annotating.line.newLine,
-          oldLine: annotating.line.oldLine,
-          diffPos: annotating.line.diffPos,
-        };
-        lineContent = annotating.line.text;
-      } else {
-        anchor = {
-          kind: 'diff-file',
-          section: annotating.section,
-          filePath: annotating.segment.filePath,
-          diffPos: annotating.diffPos,
-        };
-        lineContent = '';
+  // Jump-to-line lives here, not in the notes hook, because it needs the DOM
+  // refs the rendered sections register into `lineRefs`.
+  const { highlight, closePanel } = notes;
+  const handleJumpTo = useCallback(
+    (note: ReviewNote) => {
+      if (note.anchor.kind !== 'diff' && note.anchor.kind !== 'diff-file') return;
+      const key = diffKey(note.anchor.section, note.anchor.diffPos);
+      const el = lineRefs.current.get(key);
+      if (el) {
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        highlight(key);
       }
-      reviewNotes.addNote(anchor, lineContent, body);
-      setAnnotating(null);
+      closePanel();
     },
-    [annotating, reviewNotes],
+    [highlight, closePanel],
   );
-
-  const handleSend = useCallback(() => {
-    const formatted = formatNotesForSend(reviewNotes.notes);
-    if (formatted) {
-      onSendNotes(formatted);
-      reviewNotes.clear();
-      setShowPanel(false);
-    }
-  }, [reviewNotes, onSendNotes]);
-
-  const handleJumpTo = useCallback((note: ReviewNote) => {
-    if (note.anchor.kind !== 'diff' && note.anchor.kind !== 'diff-file') return;
-    const key = diffKey(note.anchor.section, note.anchor.diffPos);
-    const el = lineRefs.current.get(key);
-    if (el) {
-      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      setHighlightedKey(key);
-    }
-    setShowPanel(false);
-  }, []);
 
   if (!open) return null;
 
@@ -200,11 +140,11 @@ export function DiffView({
         </span>
       }
       noteCount={diffNotes.length}
-      onToggleNotes={() => setShowPanel((v) => !v)}
-      onSend={handleSend}
+      onToggleNotes={notes.togglePanel}
+      onSend={notes.send}
       onClose={onClose}
       panel={
-        showPanel ? (
+        notes.showPanel ? (
           // Panel scope = THIS viewer's notes. Cross-viewer notes
           // (file-anchored) live in the same global pile but only
           // surface in their own viewer's panel — Send All still
@@ -212,20 +152,20 @@ export function DiffView({
           <NotesPanel
             notes={diffNotes}
             onJumpTo={handleJumpTo}
-            onRemove={reviewNotes.removeNote}
-            onClearAll={() => { reviewNotes.clear(); setShowPanel(false); }}
-            onSend={handleSend}
-            onClose={() => setShowPanel(false)}
+            onRemove={notes.removeNote}
+            onClearAll={notes.clearAll}
+            onSend={notes.send}
+            onClose={notes.closePanel}
           />
         ) : null
       }
       dialog={
-        annotating ? (
+        notes.annotating ? (
           <AnnotationDialog
-            anchorLabel={anchorDialogLabel(annotating)}
-            lineContent={annotating.kind === 'line' ? annotating.line.text : ''}
-            onSubmit={handleSubmitNote}
-            onCancel={() => setAnnotating(null)}
+            anchorLabel={anchorDialogLabel(notes.annotating)}
+            lineContent={notes.annotating.kind === 'line' ? notes.annotating.line.text : ''}
+            onSubmit={notes.submitNote}
+            onCancel={notes.cancelAnnotate}
           />
         ) : null
       }
@@ -245,12 +185,8 @@ export function DiffView({
                 <DiffSection
                   key={s.id}
                   section={s}
-                  onAnnotateLine={(segment, line) =>
-                    setAnnotating({ kind: 'line', section: s.id, segment, line })
-                  }
-                  onAnnotateFile={(segment, diffPos) =>
-                    setAnnotating({ kind: 'file', section: s.id, segment, diffPos })
-                  }
+                  onAnnotateLine={(segment, line) => notes.startAnnotateLine(s.id, segment, line)}
+                  onAnnotateFile={(segment, diffPos) => notes.startAnnotateFile(s.id, segment, diffPos)}
                   highlightedKey={highlightedKey}
                   // Section-scoped: filter diff notes to only those
                   // anchored in THIS section before computing the
