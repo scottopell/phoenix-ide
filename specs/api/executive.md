@@ -6,21 +6,19 @@ The HTTP API enables frontend clients to interact with PhoenixIDE conversations.
 
 ## Technical Summary
 
-RESTful API with JSON request/response bodies. SSE streaming broadcasts `init`, `message`, `state_change`, and `agent_done` events to all connected clients. SSE `init` event includes `last_sequence_id`; reconnection uses `?after=N` to receive only missed messages in init event. Endpoint paths match Shelley API for frontend compatibility. Server struct holds database, LLM registry, and active conversation runtimes. Gzip compression for large responses; SSE uncompressed for flush-per-event. CSRF protection via custom header. No authentication in MVP (single-user deployment). Images sent inline as base64 in chat messages.
+RESTful API with JSON request/response bodies. SSE streaming broadcasts conversation events to all connected clients (`init`, `message`, `state_change`, `token`, `agent_done`, and the full set enumerated in `specs/sse_wire/`). The `init` snapshot includes `last_sequence_id` and the `ReplayRing`'s `pending_events`, so a reconnecting client resyncs durable DB state and resumes any in-flight ephemeral state in one payload. Endpoint paths match Shelley API for frontend compatibility. Server struct holds database, LLM registry, and active conversation runtimes. Gzip compression for large responses; SSE uncompressed for flush-per-event. CSRF protection via custom header. Single-user deployment with no authentication. Images sent inline as base64 in chat messages.
 
-## Status Summary
+## Requirement Map
 
-| Requirement | Status | Notes |
-|-------------|--------|-------|
-| **REQ-API-001:** Conversation Listing | ✅ Complete | GET /api/conversations and /archived |
-| **REQ-API-002:** Conversation Creation | ✅ Complete | Slug: day-time-word-word format |
-| **REQ-API-003:** Message Retrieval | ✅ Complete | GET with after_sequence param |
-| **REQ-API-004:** User Actions | ✅ Complete | POST chat, cancel endpoints |
-| **REQ-API-005:** Real-time Streaming | ✅ Complete | Task 582. SSE with init, token events (`request_id` for correlation), and ?after reconnection |
-| **REQ-API-006:** Conversation Lifecycle | ✅ Complete | Archive (terminal), delete (terminal), rename. Both terminal transitions run REQ-BED-032 cleanup cascade |
-| **REQ-API-007:** Slug Resolution | ✅ Complete | GET /api/conversation-by-slug/{slug} |
-| **REQ-API-008:** Directory Browser | ✅ Complete | validate-cwd and list-directory |
-| **REQ-API-009:** Model Information | ✅ Complete | GET /api/models with default |
-| **REQ-API-010:** Static Assets | ✅ Complete | Route defined (no embedded assets in MVP) |
-
-**Progress:** 10 of 10 complete
+| Requirement | Surface |
+|-------------|---------|
+| **REQ-API-001:** Conversation Listing | GET /api/conversations and /archived |
+| **REQ-API-002:** Conversation Creation | Slug: day-time-word-word format |
+| **REQ-API-003:** Message Retrieval | GET with `after_sequence` param |
+| **REQ-API-004:** User Actions | POST chat, cancel endpoints |
+| **REQ-API-005:** Real-time Streaming | SSE with init, token events (`request_id` for correlation), and `ReplayRing`-backed reconnection |
+| **REQ-API-006:** Conversation Lifecycle | Archive (terminal), delete (terminal), rename. Both terminal transitions run the REQ-BED-032 cleanup cascade |
+| **REQ-API-007:** Slug Resolution | GET /api/conversation-by-slug/{slug} |
+| **REQ-API-008:** Directory Browser | validate-cwd and list-directory |
+| **REQ-API-009:** Model Information | GET /api/models with default |
+| **REQ-API-010:** Static Assets | UI assets served from the binary (embedded), with a filesystem fallback |

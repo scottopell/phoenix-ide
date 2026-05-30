@@ -145,10 +145,10 @@ AND run the resource-cleanup cascade (REQ-BED-032) — releasing the
 
 THE SYSTEM SHALL NOT expose an `unarchive` operation. Archive is a
 terminal lifecycle transition; the row is preserved for retrospection
-but the conversation cannot resume in-place. Reviewing the unified
-cleanup cascade in PR #135 made it clear that "live resources reclaimed
-but row claims it can be resumed" is structurally incoherent — see
-REQ-BED-032 rationale.
+but the conversation cannot resume in-place. The unified cleanup cascade
+reclaims a conversation's live resources, so a state in which "live
+resources reclaimed but row claims it can be resumed" is structurally
+incoherent — see REQ-BED-032 rationale.
 
 WHEN client requests delete
 THE SYSTEM SHALL permanently remove conversation and all messages
@@ -212,7 +212,7 @@ AND apply appropriate cache headers
 
 ### REQ-API-012: Reconnect Replay Buffer
 
-WHEN the server emits a non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, conversation_became_terminal, error, browser_session_state, steer_message_queued)
+WHEN the server emits a non-Message SSE event (token, state_change, message_updated, agent_done, conversation_update, conversation_became_terminal, error, browser_session_state, steer_message_queued, rate_limit_snapshot, llm_first_byte, llm_attempt)
 THE SYSTEM SHALL retain the event in a per-conversation in-memory ring buffer until the next persisted Message broadcast replaces it (anchor reset)
 
 WHEN the server emits an eager (non-persisted) assistant Message via the runtime's BroadcastAssistantMessage effect

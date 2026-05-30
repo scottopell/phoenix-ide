@@ -164,13 +164,12 @@ Message queued for state machine processing. Updates arrive via SSE stream.
 
 ```
 GET /api/conversation/{id}/stream
-GET /api/conversation/{id}/stream?after=42
 Accept: text/event-stream
 
 Response 200:
 Content-Type: text/event-stream
 
-data: {"type": "init", "conversation": Conversation, "messages": [Message, ...], "agent_working": true, "last_sequence_id": 57}
+data: {"type": "init", "conversation": Conversation, "messages": [Message, ...], "last_sequence_id": 57, "pending_events": [...]}
 
 data: {"type": "message", "message": Message}
 
@@ -179,48 +178,45 @@ data: {"type": "state_change", "state": "tool_executing", "state_data": {...}}
 data: {"type": "agent_done"}
 ```
 
-With `after=N` parameter, init event includes only messages with `sequence_id > N`. This enables seamless reconnection: client stores last_sequence_id, reconnects with `?after=<last_sequence_id>`, receives missed messages in init, then continues streaming.
+Every broadcast event except `init` carries a `sequence_id` from a single per-conversation monotonic counter. The `init` snapshot reports `last_sequence_id` (the highest sequence the server has emitted) plus the ring's pending events, and the client uses these as the floor for replay-suppression. The authoritative wire shape and the full event-type set live in `specs/sse_wire/` (`SseWireEvent` in `crates/phoenix-ide/src/api/wire.rs`); this section covers only the API-surface essentials.
 
 #### Event Types
 
+The core event types a client must handle:
+
 | Type | Description | Payload |
 |------|-------------|--------|
-| `init` | Initial state on connect | Conversation + messages (filtered by after) + last_sequence_id |
-| `message` | New message added | Single message |
-| `state_change` | Conversation state changed | New state + state_data |
-| `token` | Streaming text chunk (REQ-BED-025) | `{ text, request_id }` |
-| `agent_done` | Agent finished turn | None |
-| `error` | Error occurred | Error message |
+| `init` | Initial snapshot on connect | Conversation + messages + `last_sequence_id` + `pending_events` (ring replay) |
+| `message` | A newly persisted message | Single message (carries `sequence_id`) |
+| `state_change` | Conversation phase transition | New state + state_data |
+| `token` | Streaming text chunk | `{ sequence_id, text, request_id }` |
+| `agent_done` | Agent finished turn | `{ sequence_id }` |
+| `error` | User-facing error | `{ sequence_id, message, error }` |
+
+The complete set additionally includes `message_updated`, `llm_first_byte`, `llm_attempt`, `conversation_became_terminal`, `conversation_hard_deleted`, `conversation_update`, `browser_session_state`, `steer_message_queued`, and `rate_limit_snapshot` — enumerated authoritatively in `specs/sse_wire/`.
 
 #### Token Streaming Events
 
-Token events are ephemeral display data — not persisted, no `sequence_id`. They are
-produced by the `StreamToken` fire-and-forget effect during LLM generation and routed
-directly to the SSE broadcast channel.
+Token events are *ephemeral*: they are never persisted as DB rows and are never reconstructed from the DB on `init`. They do carry a `sequence_id` from the same counter as every other event, and they are buffered in the per-conversation `ReplayRing` so a reconnect mid-stream replays them.
 
 ```
 event: token
-data: {"text": "Let me ", "request_id": "req_abc123"}
+data: {"sequence_id": 58, "text": "Let me ", "request_id": "req_abc123"}
 
 event: token
-data: {"text": "search for ", "request_id": "req_abc123"}
+data: {"sequence_id": 59, "text": "search for ", "request_id": "req_abc123"}
 ```
 
-`request_id` lets the UI correlate chunks to the correct in-flight LLM request and
-discard stale tokens from a previous request that may arrive after a state transition.
+`request_id` lets the UI correlate chunks to the correct in-flight LLM request.
 
 #### Reconnection During Streaming
 
-Token events are not persisted. On reconnect:
+Reconnection is handled by the `init` snapshot, which carries both the durable DB state and the `ReplayRing`'s `pending_events` (the ephemeral events broadcast since the last persisted message). On reconnect:
 
-- **If LLM call completed:** The `init` event includes the finalized `message`. Client
-  renders it directly. No partial content.
-- **If LLM call still running:** The `init` event reflects in-progress state
-  (`agent_working: true`). Client shows activity indicator. When the LLM call completes,
-  the `message` event arrives on the new connection. Chunks emitted before reconnect
-  are lost — the user sees the finalized message when complete.
+- **If the LLM call completed:** the finalized `message` is in the DB snapshot. The client renders it directly.
+- **If the LLM call is still running:** `pending_events` carries the in-flight streaming tokens, current state, and any eager-broadcast assistant message, so the client resumes the in-progress view rather than blanking out. When the ring has overflowed (`pending_truncated`), the client falls back to a DB-only resync.
 
-No changes to existing reconnection logic are needed.
+The replay-buffer contract is specified in REQ-API-012 and `specs/sse_wire/`.
 
 ### Cancel (REQ-API-004)
 
@@ -355,7 +351,7 @@ HTTP status codes:
 
 - CORS headers for local development
 - CSRF protection via custom header requirement
-- No authentication in MVP (single-user local deployment)
+- No authentication (single-user local deployment)
 
 ## Compression
 
@@ -371,7 +367,7 @@ API designed to match Shelley's API surface for frontend compatibility:
 
 Features not implemented return appropriate errors:
 - Browser tools: Tool not available
-- Model switching mid-conversation: Not supported in MVP
+- Model switching mid-conversation: Not supported
 
 ## Implementation Notes
 
@@ -402,19 +398,7 @@ impl Server {
 
 ### SSE Broadcasting
 
-```rust
-struct ConversationBroadcaster {
-    subscribers: Vec<Sender<SseEvent>>,
-}
-
-impl ConversationBroadcaster {
-    fn broadcast(&self, event: SseEvent) {
-        for sub in &self.subscribers {
-            let _ = sub.send(event.clone());
-        }
-    }
-}
-```
+Each conversation owns a `SseBroadcaster` (`crates/phoenix-ide/src/runtime.rs`) wrapping a tokio broadcast channel, a monotonic `AtomicI64` sequence counter, and the per-conversation `ReplayRing`. Events are allocated a sequence and emitted atomically with their ring operation via `send_seq` (ephemeral events, appended to the ring) or `send_persisted_message` (persisted messages, which reset the ring anchor). Per-client `sse_stream` handlers subscribe to the channel. The full broadcasting contract — ordering invariants, ring lifecycle, and replay semantics — is specified in `specs/sse_wire/`.
 
 ## File Organization
 

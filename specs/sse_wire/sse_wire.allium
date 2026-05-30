@@ -7,9 +7,11 @@
 --        in what order, and under what conditions. The server-side
 --        dual to conversation_atom.allium (the client-side reducer).
 --
--- Includes: All nine SSE event types (init, message, message_updated,
---           state_change, token, agent_done, conversation_became_terminal,
---           conversation_update, error); ordering constraints between them;
+-- Includes: All SSE event types (init, message, message_updated,
+--           state_change, token, llm_first_byte, llm_attempt, agent_done,
+--           conversation_became_terminal, conversation_hard_deleted,
+--           conversation_update, browser_session_state, steer_message_queued,
+--           rate_limit_snapshot, error); ordering constraints between them;
 --           the persist-before-broadcast invariant; broadcast-lag semantics;
 --           the per-conversation ReplayRing that buffers ephemeral events
 --           between persisted Message anchors so reconnecting clients can
@@ -20,7 +22,7 @@
 --           the wire variant is shared.
 --
 -- Excludes: Client-side reducer behaviour (see conversation_atom.allium).
---           Client reconnect lifecycle (see connection_machine.allium, task 02681).
+--           Client reconnect lifecycle (see connection_machine.allium).
 --           Bedrock state machine internals (see bedrock.allium).
 --           HTTP transport mechanics, TLS, authentication.
 --           Message content shape (opaque to this spec).
@@ -29,18 +31,17 @@
 --           MessageContent, Conversation shape) are declared opaque.
 --           Server-side specs govern their internals.
 --
--- Rationale: task 02679 (streaming-finalizes-then-disappears) identified
---           a class of bugs at the ordering boundary between DB persistence
---           and SSE broadcast. Naming the ordering invariants formally makes
---           emit-vs-persist races a spec violation rather than an open mystery.
+-- Rationale: the ordering boundary between DB persistence and SSE broadcast
+--           is a source of emit-vs-persist races (a finalized streaming
+--           message that then disappears from the client view). Naming the
+--           ordering invariants formally makes such a race a spec violation
+--           rather than an undiagnosable mystery.
 --
 -- Cross-references:
 --   specs/conversation_atom/conversation_atom.allium — client reducer (the dual)
---   tasks/02679 — streaming-finalize-disappear bug; PersistBeforeBroadcast is
---                 the formal statement of the leading fix hypothesis
---   tasks/02681 — connection_machine.allium (reconnect lifecycle)
+--   specs/connection_machine/connection_machine.allium — reconnect lifecycle
 --   src/api/wire.rs — SseWireEvent, the Rust wire type
---   src/runtime.rs  — SseBroadcaster, sequence counter, send_message/send_seq
+--   src/runtime.rs  — SseBroadcaster, sequence counter, send_persisted_message/send_seq
 --   src/api/sse.rs  — sse_stream, BroadcastStreamRecvError::Lagged handling
 
 ------------------------------------------------------------
@@ -111,13 +112,10 @@ value InitSnapshot {
 -- Note on `rate_limit_snapshot` replay: the snapshot represents a
 -- point-in-time codex quota state, so a stale snapshot replayed on
 -- reconnect can paint the UI's quota chip with data that has since
--- been superseded. The runtime currently accepts that staleness in
--- exchange for the structural simplicity of "all broadcasts ride the
--- ring." A future change could add a `send_seq_no_ring` broadcaster
--- variant for genuinely-point-in-time events (snapshots, mid-stream
--- diagnostics); flagged here so a future review can revisit it. Until
--- then the whitelist and the broadcaster agree that
--- "rate_limit_snapshot" replays.
+-- been superseded. The protocol accepts that staleness in exchange for
+-- the structural simplicity of "all broadcasts ride the ring": the
+-- whitelist and the broadcaster agree that "rate_limit_snapshot"
+-- replays like any other ephemeral event.
 --
 -- Distinguish from "llm_attempt" on rationale (the per-retry
 -- context's reconnect preservation is load-bearing for the StateBar's
@@ -347,8 +345,8 @@ rule LagCloseStream {
         -- No events are silently dropped: SQLite holds all state
         -- regardless of broadcast lag. The reconnect init snapshot is
         -- equivalent to a fresh load — no gaps visible to the client.
-        -- See connection_machine.allium (task 02681) for the client-side
-        -- reconnect lifecycle.
+        -- See connection_machine.allium for the client-side reconnect
+        -- lifecycle.
 }
 
 ------------------------------------------------------------
@@ -789,7 +787,7 @@ rule ErrorBroadcast {
 -- in the database. This formalises the persist-before-broadcast
 -- ordering: the DB write commits before the broadcast fires.
 --
--- Violation scenario (task 02679 hypothesis): MessageBroadcast fires
+-- Violation scenario: MessageBroadcast fires
 -- before db.save_message() completes. A client that reconnects during
 -- the broadcast-lag close window issues a fresh init. The init reads
 -- from a DB that has not yet committed the message — the message
@@ -871,76 +869,54 @@ invariant InitSnapshotMirrorsRing {
 -- src/runtime.rs once the implementation lands).
 
 ------------------------------------------------------------
--- Open Questions
+-- Design Decisions
 ------------------------------------------------------------
 -- Kept as prose rather than `open question` declarations so the file
--- remains parseable. These are design-intent clarifications discovered
--- during the ReplayRing extension; each either needs explicit
--- confirmation before the implementation lands or is a deferred
--- follow-up the next reader should be aware of.
+-- remains parseable. These record the design intent behind choices
+-- that are not otherwise visible in the rules and invariants above.
 --
--- Q1. Wire shape: shared `message` event vs split
---     `message_ephemeral` / `message`. Today the eager assistant
---     broadcast and the persisted Message both emit
---     SseWireEvent::Message. The distinction lives only in the
---     broadcaster's ring lifecycle (send_ephemeral_message appends,
---     send_persisted_message anchors + appends through MessageBroadcast).
---     Pro shared: smaller wire surface; client cannot accidentally
---       branch on "is this real?" — the persisted vs ephemeral
---       distinction is a server-side hygiene concern.
---     Pro split: lets future UI features render eager Messages
---       distinctly (e.g., a faint "in-flight" treatment, or omitting
---       them from a Share view). Today no consumer needs this.
---     Decision: stay with shared. Promote to split only if a
---     concrete consumer needs it.
+-- Wire shape: shared `message` event, not a split
+--     `message_ephemeral` / `message`. The eager assistant broadcast
+--     and the persisted Message both emit SseWireEvent::Message; the
+--     distinction lives only in the broadcaster's ring lifecycle
+--     (send_ephemeral_message appends; send_persisted_message anchors
+--     and appends through MessageBroadcast). A shared variant keeps the
+--     wire surface small and prevents the client from branching on
+--     "is this real?" -- persisted-vs-ephemeral is a server-side
+--     hygiene concern. A split would only earn its keep if a concrete
+--     consumer needed to render eager Messages distinctly (e.g. a faint
+--     "in-flight" treatment, or omitting them from a Share view).
 --
--- Q2. ReplayRing capacity unit: event count vs bytes. Today: count
---     (512 entries). Tokens dominate the entry count during LLM
---     streaming; each is small (~tens of bytes serialised). A pure
---     count cap exposes us to pathological cases where a tool result
---     with a large payload counts the same as one token. If that
---     ever becomes a real failure mode, switch to a hybrid
---     (max_entries OR max_bytes, whichever hits first). Today: count.
+-- ReplayRing capacity is bounded by entry count (`replay_ring_capacity`),
+--     not by bytes. Tokens dominate the entry count during LLM
+--     streaming and each is small (~tens of bytes serialised). The
+--     aggregate serialised byte size is tracked as an observability
+--     metric only (no enforcement), so a pathological
+--     large-event-dominated ring can be detected before it becomes a
+--     memory issue without paying a serialisation cost on every append.
 --
---     RESOLVED 2026-05-10: cap by count; ALSO track aggregate
---     serialised bytes as an observability metric so we can detect
---     the pathological case (large-event-dominated rings) before it
---     causes a memory issue. Surface via the existing tracing
---     subscriber as a debug counter on every append, and as a gauge
---     readable by an ops-side dashboard if one is later added. No
---     enforcement on bytes today; metric-only.
---
--- Q3. RESOLVED 2026-05-10: on ring overflow, force a full resync —
---     do not deliver partial pending_events. Once the ring exceeds
---     `replay_ring_capacity` between two persisted Message anchors,
---     the ring transitions to a "truncated" state where:
+-- Ring overflow forces a full resync rather than partial replay. Once
+--     the ring exceeds `replay_ring_capacity` between two persisted
+--     Message anchors it transitions to a "truncated" state:
 --       (a) further appends are no-ops (ring entries do not grow),
 --       (b) ring.entries is cleared,
 --       (c) ring.truncated is set true.
 --     The init snapshot then carries pending_events = empty list and
---     pending_truncated = true. The client renders the DB snapshot
---     and waits for the next persisted Message (or state_change /
---     other live events) to repopulate the UI.
+--     pending_truncated = true; the client renders the DB snapshot and
+--     waits for the next persisted Message (or other live event) to
+--     repopulate the UI. Partial replay is rejected because an
+--     incomplete in-progress view that "fills in" later is hard to
+--     distinguish from a bug. The only thing temporarily lost is the
+--     in-flight streaming preview; the next Message broadcast restores
+--     authoritative state.
 --
---     Rationale: partial replay was deemed misleading — the user
---     would see an incomplete in-progress view that "fills in" later
---     in a way that's hard to distinguish from a bug. Full resync is
---     a clean, consistent fallback: the only thing the user
---     temporarily loses is the in-flight streaming preview, and the
---     next Message broadcast restores authoritative state.
---
--- Q4. Per-event vs per-byte cap. See Q2. Bytes would also handle
---     pathological event sizes; punted to a follow-up.
---
--- Q5. RESOLVED 2026-05-10: accept as-is. The ring is in-process
---     memory only; a server restart loses it. On restart the next
---     subscribe gets an empty pending_events and the client falls
---     back to DB-only reconstruction. This is correct by
---     construction: the underlying LLM stream itself did not survive
---     the restart (the in-flight call is lost), so a recovered ring
---     would replay events for a turn that is restarting from
---     scratch anyway. The state machine's existing recovery path
---     (ConvState persisted, retry LlmRequesting) handles the rest.
---     A future "graceful restart" feature that preserves in-flight
---     LLM turns across restarts would need to revisit this — flagged
---     for that hypothetical work.
+-- The ring is in-process memory only; a server restart loses it. After
+--     a restart the next subscribe gets an empty pending_events and the
+--     client falls back to DB-only reconstruction. This is correct by
+--     construction: the underlying LLM stream did not survive the
+--     restart either (the in-flight call is lost), so a recovered ring
+--     would only replay events for a turn that is restarting from
+--     scratch. The state machine's recovery path (ConvState persisted,
+--     retry LlmRequesting) handles continuation. A "graceful restart"
+--     feature that preserved in-flight LLM turns across restarts would
+--     need to revisit this.

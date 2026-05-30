@@ -469,8 +469,8 @@ rule SseAgentDoneApplied {
 -- `token` — streaming delta. Phase-guarded: only accumulates while the
 -- conversation is in llm_requesting. Tokens that arrive outside that
 -- phase (scheduler race, reconnect replay) are silently dropped. This
--- is the client-side half of the "ghost streaming message" defense
--- (task 24683). The applyIfNewer guard handles sequence-id replays.
+-- is the client-side half of the "ghost streaming message" defense.
+-- The applyIfNewer guard handles sequence-id replays.
 rule SseTokenAccumulated {
     when: SseTokenDispatched(atom, delta, seq)
 
@@ -874,49 +874,41 @@ invariant LastSseEventAtPositive {
 -- test is the executable witness for this contract.
 
 ------------------------------------------------------------
--- Open Questions
+-- Design Decisions
 ------------------------------------------------------------
 -- Kept as prose rather than `open question` declarations so the file
--- remains parseable. Both are design-intent clarifications rather than
--- blocking ambiguities; they live here for the next reader.
+-- remains parseable. These record design intent that is not otherwise
+-- visible in the rules above.
 --
--- Q1. SseErrorWireOriginated uses applyIfNewer, so a server replay of
---     the same error on reconnect is dropped. But ClearError (user
---     dismissed) sets uiError = null without touching lastSequenceId.
---     A fresh error on a later sequence_id would therefore land and
---     re-pop. Is that desired? Today it is — a new error is new
---     information — but this is the kind of detail that wants
---     explicit confirmation.
+-- Error re-display after dismissal. SseErrorWireOriginated uses
+--     applyIfNewer, so a server replay of the same error on reconnect
+--     is dropped. ClearError (user dismissed) sets uiError = null
+--     without touching lastSequenceId, so a fresh error on a later
+--     sequence_id lands and re-pops. This is intended: a new error is
+--     new information and warrants surfacing again.
 --
--- Q2. SseInitReconnectMerge uses max(atom.lastSequenceId,
---     payload.last_sequence_id) to prevent regression when live
---     events raced ahead of the init payload. Consider the reverse:
---     if the client's atom.lastSequenceId was advanced by a
---     dropped-but-seq-observed event (SseMessageDedupReplay), it
---     could be ahead of events the payload actually reflects.
---     Payload's per-message sequence_ids are the ground truth for
---     what happened; the envelope last_sequence_id is the server's
---     witness. Today this is fine; flag if the dedup behavior ever
---     changes.
+-- Reconnect floor. SseInitReconnectMerge uses
+--     max(atom.lastSequenceId, payload.last_sequence_id) to prevent
+--     regression when live events raced ahead of the init payload. The
+--     payload's per-message sequence_ids are the ground truth for what
+--     happened; the envelope last_sequence_id is the server's witness
+--     of its own tip. Taking the max keeps the client from re-accepting
+--     events it already advanced past.
 --
--- Q3. apply_pending_in_order is described as a fold over per-event
---     reducer dispatches. The semantics depend on whether dispatch
---     observes atom mutations in real time (it does in the real
---     reducer — each dispatch produces the next atom state, which
---     the next dispatch sees). The spec rule's `ensures: atom =
---     apply_pending_in_order(...)` is meant to denote that
---     sequential-fold behaviour. If a future implementation tried to
---     batch pending dispatches into a single atomic mutation (e.g.,
---     to avoid React re-renders per token), the per-event preconditions
---     (applyIfNewer comparing to atom.lastSequenceId) would still need
---     to see entry-by-entry floor advancement. Worth re-checking the
---     implementation matches this denotation.
+-- Pending replay is a sequential fold. apply_pending_in_order folds the
+--     pending entries through the per-event reducer dispatches, and the
+--     order is load-bearing: each dispatch produces the next atom
+--     state, which the next dispatch sees, so the per-event applyIfNewer
+--     guard observes entry-by-entry floor advancement against
+--     atom.lastSequenceId. An implementation that batched pending
+--     dispatches into a single atomic mutation would still have to
+--     preserve that entry-by-entry floor advancement for the dedup to
+--     remain correct.
 --
--- Q4. Token replay and streamingBuffer reconstruction. After a
---     reconnect, snapshot phase 1 sets streamingBuffer = null, then
---     phase 2's pending replay re-accumulates tokens. If the client
---     had already seen tokens 1..N before disconnect, replay re-emits
---     them, producing exactly the same buffer text. Idempotent in
---     terms of final state, but the user briefly sees the buffer
---     re-build from empty. Acceptable today; revisit if the visible
---     reset becomes confusing in practice.
+-- Token replay rebuilds the streaming buffer. After a reconnect,
+--     snapshot phase 1 sets streamingBuffer = null and phase 2's
+--     pending replay re-accumulates tokens. Tokens already seen before
+--     the disconnect are re-emitted, producing the same buffer text:
+--     idempotent in final state, though the buffer visibly rebuilds
+--     from empty. The reconstructed view is authoritative; the
+--     transient rebuild is the cost of a single uniform replay path.
