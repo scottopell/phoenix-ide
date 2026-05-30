@@ -6,10 +6,15 @@ import { DiffView } from './DiffView';
 
 type DiffPayload = Awaited<ReturnType<typeof api.getConversationDiff>>;
 
+// The resolved variants carry the conversationId they were fetched for. The
+// provider stays mounted across conversation switches (only the prop changes),
+// so a stale `ready`/`error` from the previous conversation could otherwise
+// render for one frame before the refetch effect runs. Gating on a matching
+// conversationId makes that cross-conversation render structurally impossible.
 type LoadState =
   | { status: 'loading' }
-  | { status: 'error'; message: string }
-  | { status: 'ready'; payload: DiffPayload };
+  | { status: 'error'; message: string; conversationId: string }
+  | { status: 'ready'; payload: DiffPayload; conversationId: string };
 
 interface ConversationDiffViewerProps {
   conversationId: string;
@@ -38,16 +43,20 @@ export function ConversationDiffViewer({
     setState({ status: 'loading' });
     api
       .getConversationDiff(conversationId)
-      .then((payload) => { if (!cancelled) setState({ status: 'ready', payload }); })
+      .then((payload) => { if (!cancelled) setState({ status: 'ready', payload, conversationId }); })
       .catch((err: unknown) => {
         if (!cancelled) {
-          setState({ status: 'error', message: err instanceof Error ? err.message : 'Failed to load diff' });
+          setState({ status: 'error', message: err instanceof Error ? err.message : 'Failed to load diff', conversationId });
         }
       });
     return () => { cancelled = true; };
   }, [conversationId]);
 
-  if (state.status === 'ready') {
+  // Treat a resolved state from a previous conversation as still-loading until
+  // the effect refetches for the current conversationId.
+  const resolved = state.status !== 'loading' && state.conversationId === conversationId;
+
+  if (resolved && state.status === 'ready') {
     const p = state.payload;
     return (
       <DiffView
@@ -78,16 +87,16 @@ export function ConversationDiffViewer({
       onClose={onClose}
     >
       <div className="diff-viewer-body">
-        {state.status === 'loading' ? (
-          <div className="viewer-loading">
-            <Loader2 size={32} className="spinning" />
-            <span>Loading diff...</span>
-          </div>
-        ) : (
+        {resolved && state.status === 'error' ? (
           <div className="viewer-error">
             <AlertCircle size={32} />
             <span>{state.message}</span>
             <button onClick={onClose}>Close</button>
+          </div>
+        ) : (
+          <div className="viewer-loading">
+            <Loader2 size={32} className="spinning" />
+            <span>Loading diff...</span>
           </div>
         )}
       </div>

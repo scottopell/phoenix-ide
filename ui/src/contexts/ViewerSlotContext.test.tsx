@@ -150,4 +150,36 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
     act(() => { h.setActive(false); });
     expect(h.get().slot.kind).toBe('none');
   });
+
+  it('entering a conversation whose session is already active is NOT a rising edge', () => {
+    // The provider stays mounted across conversation switches; only scopeKey +
+    // browserSessionActive change. A scope change must reseed the edge tracker,
+    // so entering a conversation that already had an active session does not
+    // auto-open the browser (only a session that *just* started does).
+    let latest: ViewerSlotValue | null = null;
+    let setScope: ((s: string) => void) | null = null;
+    let setActive: ((v: boolean) => void) | null = null;
+    function Harness() {
+      const [scope, setScopeState] = useState('conv-A');
+      const [active, setActiveState] = useState(false);
+      setScope = setScopeState;
+      setActive = setActiveState;
+      return (
+        <ViewerSlotProvider scopeKey={scope} browserSessionActive={active}>
+          <Capture onCtx={(c) => { latest = c; }} />
+        </ViewerSlotProvider>
+      );
+    }
+    render(
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes>
+          <Route path="/c/:slug" element={<Harness />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    expect(latest!.slot.kind).toBe('none');
+    // Switch to a different conversation that already has an active session.
+    act(() => { setScope!('conv-B'); setActive!(true); });
+    expect(latest!.slot.kind).toBe('none');
+  });
 });

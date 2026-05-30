@@ -228,9 +228,23 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   // browser viewer only when the slot is empty (never steals prose/diff);
   // falling edge auto-closes only when the browser viewer is showing, without
   // clearing storage (a system close, not a user close).
+  //
+  // The provider is mounted once in DesktopLayout and lives across conversation
+  // switches, so the edge tracker is scoped: on a scopeKey change (conversation
+  // entry) we reseed prevActiveRef to the new conversation's flag WITHOUT
+  // firing. Entering a conversation whose session was already active is not a
+  // rising edge (REQ-VS-008: the session must have *just* started); only a flag
+  // change within the same conversation is a true edge. Without this reseed, the
+  // prior conversation's flag would be misread as an edge on entry.
   const prevActiveRef = useRef(browserSessionActive);
+  const edgeScopeRef = useRef(scopeKey);
   const slotKind = slot.kind;
   useEffect(() => {
+    if (edgeScopeRef.current !== scopeKey) {
+      edgeScopeRef.current = scopeKey;
+      prevActiveRef.current = browserSessionActive;
+      return;
+    }
     const prev = prevActiveRef.current;
     prevActiveRef.current = browserSessionActive;
     if (!prev && browserSessionActive && slotKind === 'none') {
@@ -238,7 +252,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     } else if (prev && !browserSessionActive && slotKind === 'browser') {
       clearSlot(false);
     }
-  }, [browserSessionActive, slotKind, openBrowser, clearSlot]);
+  }, [scopeKey, browserSessionActive, slotKind, openBrowser, clearSlot]);
 
   const value = useMemo<ViewerSlotValue>(
     () => ({ slot, browserSessionActive, openProse, openDiff, openBrowser, close }),
