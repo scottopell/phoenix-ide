@@ -87,6 +87,9 @@ interface ProfilerApi {
   disable: () => void;
   reset: () => void;
   dump: () => void;
+  /** Machine-readable counterpart to dump() — returns the per-region stats as
+   *  a plain object so an automated driver can read them via page.evaluate. */
+  snapshot: () => Record<string, { commits: number; updates: number; avgMs: number; maxMs: number; totalMs: number }>;
   auto: (intervalMs?: number) => void;
   stop: () => void;
 }
@@ -130,6 +133,19 @@ if (import.meta.env.DEV && typeof window !== 'undefined') {
     },
     reset: () => stats.clear(),
     dump,
+    snapshot: () => {
+      const out: Record<string, { commits: number; updates: number; avgMs: number; maxMs: number; totalMs: number }> = {};
+      for (const [id, s] of stats) {
+        out[id] = {
+          commits: s.commits,
+          updates: s.updates,
+          avgMs: Number((s.totalActualMs / s.commits).toFixed(3)),
+          maxMs: Number(s.maxActualMs.toFixed(3)),
+          totalMs: Number(s.totalActualMs.toFixed(2)),
+        };
+      }
+      return out;
+    },
     auto: (intervalMs = 2000) => {
       if (autoTimer) clearInterval(autoTimer);
       autoTimer = setInterval(dump, intervalMs);
