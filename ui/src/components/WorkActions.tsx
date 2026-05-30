@@ -42,13 +42,13 @@ function deriveWorkLifecycleControls({
   const prClosedUnmerged = !!prStatus?.found && prStatus.display_state === 'closed';
   const prUnavailable = !!prStatus?.unavailable_reason;
   const prUnavailableStale = prUnavailable && prStatus?.refresh.state === 'unavailable' && !!prStatus.refresh.stale;
-  const prBlocksCleanup = !!prStatus?.found && !prMerged && !prUnavailableStale;
+  const prBlocksCleanup = !!prStatus?.found && !prMerged && (!prUnavailableStale || prClosedUnmerged);
   const completeDisabled = isLoading || hasContinuation || prChecking || (!!prBlocksCleanup && !manualFallbackEnabled);
   const completeLabel = prChecking
     ? 'Checking PR…'
     : prMerged
       ? 'Clean up merged PR'
-      : prClosedUnmerged && !prUnavailableStale
+      : prClosedUnmerged
         ? 'PR closed without merge'
         : prBlocksCleanup
           ? 'Waiting for PR merge'
@@ -61,7 +61,7 @@ function deriveWorkLifecycleControls({
       ? 'Checking PR status…'
       : prMerged
         ? 'GitHub reports this PR is merged. Clean up Phoenix local state.'
-        : prClosedUnmerged && !prUnavailableStale
+        : prClosedUnmerged
           ? `GitHub reports PR #${prStatus?.number} is closed without merge. Use Abandon to clean up Phoenix local state.`
           : prBlocksCleanup
             ? `GitHub reports PR #${prStatus?.number} is ${prStatus?.display_state}; merge it before cleanup.`

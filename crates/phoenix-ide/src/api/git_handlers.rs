@@ -406,22 +406,24 @@ pub(crate) async fn get_conversation_pr_status(
     {
         if refresh.response.refresh.state != crate::api::types::PrRefreshState::Fresh {
             return Ok(Json(
-                crate::api::pr_monitoring::stale_response_with_refresh_state(
-                    primary,
+                crate::api::pr_monitoring::stale_primary_response_with_refresh_state(
+                    &primary,
                     refresh.response.refresh.state,
                     refresh.response.refresh.reason.clone(),
                     refresh.response.refresh.last_attempted_at,
-                    refresh.response.unavailable_reason.clone(),
                 ),
             ));
         }
 
         if refresh.response.number != Some(primary.pr_number) {
-            return Ok(Json(crate::api::pr_monitoring::persisted_primary_response(
-                &primary,
-                refresh.response.refresh,
-                true,
-            )));
+            return Ok(Json(
+                crate::api::pr_monitoring::stale_primary_response_with_refresh_state(
+                    &primary,
+                    refresh.response.refresh.state,
+                    refresh.response.refresh.reason.clone(),
+                    refresh.response.refresh.last_attempted_at,
+                ),
+            ));
         }
     }
 

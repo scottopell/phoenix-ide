@@ -190,6 +190,35 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     expect(handle.enableManualFallback).toHaveBeenCalled();
   });
 
+  it('keeps stale unavailable closed PRs directed to Abandon', async () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-stale-closed"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 135,
+          display_state: 'closed',
+          unavailable_reason: 'not_authenticated',
+          refresh: {
+            state: 'unavailable',
+            reason: 'not_authenticated',
+            last_attempted_at: '2026-01-01T00:00:00Z',
+            last_refreshed_at: '2025-12-31T00:00:00Z',
+            stale: true,
+          },
+        })}
+      />,
+    );
+
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    expect(mark.disabled).toBe(true);
+    expect(mark.textContent).toMatch(/closed without merge/i);
+    expect(mark.title).toMatch(/Use Abandon/i);
+  });
+
   it('marks merged after explicit manual fallback is enabled', async () => {
     renderWithProviders(
       <WorkControlBar

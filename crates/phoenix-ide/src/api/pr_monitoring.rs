@@ -672,6 +672,25 @@ pub(crate) fn stale_response_with_refresh_state(
     }
 }
 
+pub(crate) fn stale_primary_response_with_refresh_state(
+    pr: &WorkScopePrAssociation,
+    refresh_state: PrRefreshState,
+    refresh_reason: Option<PrUnavailableReason>,
+    attempted_at: String,
+) -> PrStatusResponse {
+    persisted_primary_response(
+        pr,
+        PrRefreshMetadata {
+            state: refresh_state,
+            reason: refresh_reason,
+            last_attempted_at: attempted_at,
+            last_refreshed_at: Some(pr.last_seen_at.clone()),
+            stale: true,
+        },
+        true,
+    )
+}
+
 pub(crate) fn persisted_primary_response(
     pr: &WorkScopePrAssociation,
     mut refresh: PrRefreshMetadata,
@@ -1540,6 +1559,44 @@ mod tests {
             normalize_checks(&[check("skip", "SKIPPED", "skip")]),
             PrCheckState::Passing
         );
+    }
+
+    #[test]
+    fn stale_primary_response_marks_mismatch_stale_with_primary_timestamp() {
+        let primary = WorkScopePrAssociation {
+            work_scope_id: 1,
+            repo_owner: "owner".to_string(),
+            repo_name: "repo".to_string(),
+            pr_number: 42,
+            title: "cached primary".to_string(),
+            url: "https://example.test/42".to_string(),
+            state: "OPEN".to_string(),
+            draft: false,
+            display_state: PrDisplayState::Open,
+            base: "main".to_string(),
+            head: "old-branch".to_string(),
+            github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            first_seen_at: "2026-01-01T00:00:00Z".to_string(),
+            last_seen_at: "2026-01-02T00:00:00Z".to_string(),
+        };
+
+        let response = stale_primary_response_with_refresh_state(
+            &primary,
+            PrRefreshState::Fresh,
+            None,
+            "2026-01-03T00:00:00Z".to_string(),
+        );
+
+        assert!(response.found);
+        assert_eq!(response.number, Some(42));
+        assert_eq!(response.refresh.state, PrRefreshState::Fresh);
+        assert!(response.refresh.stale);
+        assert_eq!(response.refresh.last_attempted_at, "2026-01-03T00:00:00Z");
+        assert_eq!(
+            response.refresh.last_refreshed_at,
+            Some("2026-01-02T00:00:00Z".to_string())
+        );
+        assert_eq!(response.unavailable_reason, None);
     }
 
     #[test]

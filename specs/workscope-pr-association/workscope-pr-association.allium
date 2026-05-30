@@ -20,9 +20,10 @@
 --   - Manual PR attach/switch UI.
 --   - Background scanners, webhooks, or scheduled refresh.
 --
--- Source of truth:
---   tasks/67006-p1-done--workscope-pr-association.md
---   PR #148 review decisions.
+-- Design basis:
+--   WorkScope-owned PR association is a standing runtime invariant: PR
+--   identity is learned from provider observations, persisted by WorkScope,
+--   and reused by status/action surfaces until fresher provider facts replace it.
 --
 -- Dependencies: specs/bedrock/bedrock.allium
 
@@ -219,6 +220,73 @@ entity PrAutoFixAffordanceResult {
 config {
     abandon_refresh_deadline_ms: Integer = 10000
 }
+
+------------------------------------------------------------
+-- Helpers (pure functions referenced by the rules below)
+------------------------------------------------------------
+--
+-- Helper names used below are documented here with their signatures and
+-- semantics so rule references stay unambiguous.
+--
+--   resolve_work_scope(conversation: bedrock/Conversation) -> WorkScope
+--       Returns the durable WorkScope key for a conversation. Work and Branch
+--       conversations with a managed worktree resolve to a worktree scope;
+--       conversations without a worktree resolve to a conversation scope.
+--       Continuations that inherit a worktree resolve to the same scope as the
+--       predecessor.
+--
+--   identity_from_fact(fact: observed PR fact) -> PrIdentity
+--       Converts one provider observation into the canonical PR identity stored
+--       in WorkScopePrAssociation and returned by status/action surfaces.
+--
+--   rank_for_identity(identity: PrIdentity) -> PrimaryRank
+--       Maps display_state to the primary-selection rank: open non-draft,
+--       draft, merged, then closed.
+--
+--   primary_pr(scope: WorkScope) -> PrIdentity?
+--       Selects the highest-ranked persisted PR for a scope, tie-breaking by
+--       provider update time and then observation time. Returns null when the
+--       scope has no persisted PR association.
+--
+--   refresh_branch_prs(conversation: bedrock/Conversation) -> result
+--       Performs provider branch discovery for the conversation's current head
+--       branch and returns observed PR facts plus explicit refresh metadata.
+--
+--   branch_primary(result: refresh result) -> PrIdentity?
+--       Selects the primary PR from a single branch refresh result before the
+--       result is combined with durable WorkScope history.
+--
+--   provider_refresh_by_number(pr: PrIdentity) -> result
+--       Refreshes a persisted associated PR by number and returns the updated
+--       PR fact, independent of current branch discovery.
+--
+--   fresh_metadata(attempted_at: Timestamp) -> PrRefreshMetadata
+--       Produces fresh refresh metadata with stale=false and no unavailable
+--       reason.
+--
+--   stale_not_found_metadata(attempted_at: Timestamp) -> PrRefreshMetadata
+--       Produces stale metadata for persisted PR identity when branch discovery
+--       completes but finds no current-branch PR.
+--
+--   stale_unavailable_metadata(attempted_at: Timestamp, reason: PrUnavailableReason) -> PrRefreshMetadata
+--       Produces stale metadata for persisted PR identity when provider refresh
+--       is unavailable.
+--
+--   unavailable_metadata(attempted_at: Timestamp, reason: PrUnavailableReason) -> PrRefreshMetadata
+--       Produces unavailable metadata when no persisted PR identity can be shown.
+--
+--   enabled_auto_fix(target: PrIdentity) -> PrAutoFixAffordance
+--       Returns an enabled StateBar affordance targeting the supplied PR.
+--
+--   disabled_auto_fix(reason: String) -> PrAutoFixAffordance
+--       Returns a disabled StateBar affordance with no target and a user-facing
+--       disabled reason.
+--
+--   non_open_reason(pr: PrIdentity) -> String
+--       Returns the auto-fix rejection message for a PR whose latest display
+--       state is not open.
+--
+-------------------------------------------------------------
 
 ------------------------------------------------------------
 -- Rules
