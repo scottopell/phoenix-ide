@@ -20,6 +20,7 @@ import {
   ConversationStore,
   useConversationView,
   useLastSseEventAt,
+  useLastSseEventAtRef,
 } from './';
 import { ConversationContext } from './ConversationContext';
 import type { Conversation } from '../api';
@@ -186,6 +187,68 @@ describe('useConversationView perf isolation (Finding B)', () => {
       });
     });
     expect(viewRenders.current).toBeGreaterThan(viewAfterClock);
+
+    nowSpy.mockRestore();
+  });
+});
+
+// The StateBar watchdog samples the heartbeat clock via useLastSseEventAtRef
+// (a ref) instead of useLastSseEventAt (a value), so the per-event bump does
+// not re-render the StateBar subtree. This pins that no-re-render guarantee:
+// if the hook ever reverts to a value subscription, the host render count
+// climbs on the heartbeat and this fails.
+describe('useLastSseEventAtRef (heartbeat clock — ref, no host re-render)', () => {
+  it('tracks the bump in its ref without re-rendering the host', () => {
+    let store: ConversationStore | undefined;
+    const hostRenders = { current: 0 };
+    let clockRef: { current: number } | undefined;
+
+    let now = 1_700_000_000_000;
+    const nowSpy = vi.spyOn(Date, 'now').mockImplementation(() => now);
+
+    function RefHost() {
+      clockRef = useLastSseEventAtRef(SLUG);
+      hostRenders.current += 1;
+      return null;
+    }
+    function Capture() {
+      const s = useContext(ConversationContext);
+      if (s) store = s;
+      return <RefHost />;
+    }
+
+    render(
+      <ConversationProvider>
+        <Capture />
+      </ConversationProvider>,
+    );
+
+    act(() => {
+      store!.dispatch(SLUG, {
+        type: 'set_initial_data',
+        conversationId: CONV_ID,
+        conversation: makeConv(),
+        messages: [],
+        phase: { type: 'idle' },
+        contextWindow: { used: 0 },
+      });
+      store!.dispatch(SLUG, { type: 'connection_opened', epoch: 1 });
+    });
+
+    const baselineRenders = hostRenders.current;
+    const baselineClock = clockRef!.current;
+
+    // A heartbeat bump with an advanced clock.
+    now += 5_000;
+    act(() => {
+      store!.dispatch(SLUG, { type: 'sse_event_observed' });
+    });
+
+    // The ref tracked the new timestamp...
+    expect(clockRef!.current).toBe(now);
+    expect(clockRef!.current).toBeGreaterThan(baselineClock);
+    // ...but the host did NOT re-render on the bump.
+    expect(hostRenders.current).toBe(baselineRenders);
 
     nowSpy.mockRestore();
   });

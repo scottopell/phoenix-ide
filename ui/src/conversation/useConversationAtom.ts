@@ -1,4 +1,4 @@
-import { useCallback, useContext, useSyncExternalStore, useRef, type Dispatch } from 'react';
+import { useCallback, useContext, useEffect, useSyncExternalStore, useRef, type MutableRefObject, type Dispatch } from 'react';
 import type { ConversationAtom, SSEAction, StreamingBuffer } from './atom';
 import type { Conversation } from '../api';
 import { ConversationContext } from './ConversationContext';
@@ -161,6 +161,31 @@ export function useLastSseEventAt(slug: string): number {
   );
 
   return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+/**
+ * Like {@link useLastSseEventAt}, but writes the heartbeat clock into a ref
+ * instead of returning it as a render-driving value. The heartbeat bumps on
+ * every token AND every `ping`; a value subscription re-renders its host on
+ * each bump. The StateBar watchdog only samples this clock on its 1s
+ * interval, so reading it from a ref lets the StateBar subtree skip the
+ * per-event re-render entirely (the host never re-renders on the bump).
+ * See the Render Subscription Isolation section in
+ * specs/conversation_atom/conversation_atom.allium.
+ */
+export function useLastSseEventAtRef(slug: string): MutableRefObject<number> {
+  const store = useConversationStore();
+  const ref = useRef<number>(store.getSnapshot(slug).lastSseEventAt);
+  useEffect(() => {
+    const update = () => {
+      ref.current = store.getSnapshot(slug).lastSseEventAt;
+    };
+    // Catch any bump between the initial render and this effect's commit,
+    // then keep the ref current for every subsequent bump — no re-render.
+    update();
+    return store.subscribe(slug, update);
+  }, [store, slug]);
+  return ref;
 }
 
 /** Derived selectors to avoid passing the raw atom to child components. */

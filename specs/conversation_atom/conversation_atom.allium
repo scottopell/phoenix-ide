@@ -861,9 +861,14 @@ invariant LastSseEventAtPositive {
 --
 --   - streamingBuffer → <MessageList> / <StreamingMessage> via their own
 --                        slice selectors (already memo + stable props).
---   - lastSseEventAt  → <ConnectedStateBar> via useLastSseEventAt, whose
---                        primitive snapshot makes Object.is bail out the
---                        StateBar between equal observations.
+--   - lastSseEventAt  → <ConnectedStateBar> via useLastSseEventAtRef, which
+--                        writes the clock into a ref WITHOUT re-rendering on
+--                        the bump. The StateBar watchdog samples that ref on
+--                        its 1s interval, so the bar re-renders at most once
+--                        per second, never per event. (The degraded "no
+--                        signal" indicator therefore clears on the first tick
+--                        after signal resumes — within the watchdog's own 1s
+--                        tick granularity, not instantly.)
 --
 -- WHY IT MATTERS. Excluding the volatile fields is what keeps the page
 -- and its non-memoized children (StateBar, InputArea, WorkActions,

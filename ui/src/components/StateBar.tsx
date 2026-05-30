@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, type KeyboardEvent as ReactKeyboardEvent } from 'react';
 import { Link } from 'react-router-dom';
-import { useLastSseEventAt } from '../conversation/useConversationAtom';
+import { useLastSseEventAtRef } from '../conversation/useConversationAtom';
 import { FolderTree } from 'lucide-react';
 import { canChangeModelInState, type Conversation, type ConversationState, type ModelInfo, type PrStatusResponse } from '../api';
 import type { ConversationPrStatusState } from '../hooks/useConversationPrStatus';
@@ -63,13 +63,21 @@ interface StateBarProps {
    *  elapsed counter for every working phase (REQ-WPV-001). `null`
    *  before the first Init/StateChange lands. */
   phaseStateUpdatedAt?: number | null;
-  /** Client-clock (unix ms) of the most recent SSE event observed on
-   *  this connection (including the typed `ping` keep-alive). Fed
-   *  into the heartbeat watchdog: when the connection is `connected`
+  /** Ref to the client-clock (unix ms) of the most recent SSE event
+   *  observed on this connection (including the typed `ping` keep-alive).
+   *  Fed into the heartbeat watchdog: when the connection is `connected`
    *  AND the conversation is in a working phase AND
-   *  `now() - lastSseEventAt > 35000`, the StateBar surfaces a
-   *  "no signal from server for Ns" degraded indicator (REQ-WPV-004). */
-  lastSseEventAt?: number;
+   *  `now() - current > 35000`, the StateBar surfaces a "no signal from
+   *  server for Ns" degraded indicator (REQ-WPV-004).
+   *
+   *  Passed as a REF, not a value: the heartbeat bumps on every token and
+   *  every `ping`, but the watchdog only samples it on its 1s interval.
+   *  Reading from a ref keeps the bump out of the render path so the
+   *  StateBar subtree does not re-render per event (the indicator clears
+   *  on the next tick after signal resumes — within the watchdog's own 1s
+   *  granularity). `<ConnectedStateBar>` supplies it via
+   *  `useLastSseEventAtRef`; tests inject a plain `{ current }`. */
+  lastSseEventAtRef?: { readonly current: number };
   /** Request id of the LLM request whose first byte has been observed
    *  on this turn, or `null` before the first `LlmFirstByte` event.
    *  When non-null AND the phase is `llm_requesting`, the StateBar
@@ -251,7 +259,7 @@ export function StateBar({
   onUpgradeModel,
   toolExecutingStartedAt: _deprecatedToolStartedAt,
   phaseStateUpdatedAt,
-  lastSseEventAt,
+  lastSseEventAtRef,
   firstByteRequestId,
   turnRetryContext,
   onOpenFiles,
@@ -317,20 +325,26 @@ export function StateBar({
   const watchdogArmed =
     (connectionState === 'connected' || connectionState === 'reconnected') &&
     phaseIsWorking &&
-    typeof lastSseEventAt === 'number';
+    typeof lastSseEventAtRef?.current === 'number';
   useEffect(() => {
     if (!watchdogArmed) {
       setWatchdogSeconds(0);
       return;
     }
+    // Read the heartbeat clock from the ref on each tick rather than from a
+    // render-time value. The ref is mutated (silently, no re-render) by
+    // `useLastSseEventAtRef` on every event; sampling it here at 1 Hz is the
+    // watchdog's only consumer, so the StateBar never re-renders per event.
+    // The interval is created once per armed window — `lastSseEventAtRef` is
+    // a stable object, so a fresh event does not tear it down and rebuild it.
     const compute = () => {
-      const elapsed = Math.max(0, Math.floor((Date.now() - lastSseEventAt!) / 1000));
+      const elapsed = Math.max(0, Math.floor((Date.now() - lastSseEventAtRef!.current) / 1000));
       setWatchdogSeconds(elapsed);
     };
     compute();
     const interval = window.setInterval(compute, 1000);
     return () => window.clearInterval(interval);
-  }, [watchdogArmed, lastSseEventAt]);
+  }, [watchdogArmed, lastSseEventAtRef]);
   const watchdogStale = watchdogArmed && watchdogSeconds >= HEARTBEAT_WATCHDOG_SECONDS;
 
   // Last-known activity capture (REQ-WPV-005). When the connection
@@ -913,17 +927,18 @@ export function StateBar({
 }
 
 /**
- * StateBar wired to the live heartbeat clock. Subscribing to
- * `lastSseEventAt` HERE — below the ConversationPage boundary — means the
- * per-event bump (every token, every `ping`) re-renders only the StateBar,
- * not the whole page. The page passes every other (low-frequency) prop
- * through; `<StateBar>` itself stays a pure presentational component so its
- * tests can keep injecting `lastSseEventAt` directly.
+ * StateBar wired to the live heartbeat clock. Subscribes to `lastSseEventAt`
+ * as a REF (`useLastSseEventAtRef`) rather than a value, so the per-event
+ * bump (every token, every `ping`) does NOT re-render this wrapper — and
+ * therefore does not re-render the StateBar subtree below it. The watchdog
+ * reads the ref on its 1s interval. The page passes every other
+ * (low-frequency) prop through; `<StateBar>` stays a pure presentational
+ * component so its tests can inject a plain `{ current }` ref directly.
  */
 export function ConnectedStateBar({
   slug,
   ...rest
-}: Omit<StateBarProps, 'lastSseEventAt'> & { slug: string }) {
-  const lastSseEventAt = useLastSseEventAt(slug);
-  return <StateBar {...rest} lastSseEventAt={lastSseEventAt} />;
+}: Omit<StateBarProps, 'lastSseEventAtRef'> & { slug: string }) {
+  const lastSseEventAtRef = useLastSseEventAtRef(slug);
+  return <StateBar {...rest} lastSseEventAtRef={lastSseEventAtRef} />;
 }

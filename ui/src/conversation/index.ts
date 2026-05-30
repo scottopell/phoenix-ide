@@ -6,6 +6,7 @@ export {
   useConversationAtom,
   useConversationView,
   useLastSseEventAt,
+  useLastSseEventAtRef,
   useConversationSnapshot,
   useConversationsList,
   useConversationSelectors,

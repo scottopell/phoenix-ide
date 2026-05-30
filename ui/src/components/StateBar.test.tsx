@@ -117,7 +117,9 @@ function renderStateBar({
     props.phaseStateUpdatedAt = phaseStateUpdatedAt;
   }
   if (lastSseEventAt !== undefined) {
-    props.lastSseEventAt = lastSseEventAt;
+    // StateBar reads the heartbeat clock from a ref (see useLastSseEventAtRef);
+    // wrap the test's plain timestamp so the watchdog samples it.
+    props.lastSseEventAtRef = { current: lastSseEventAt };
   }
   if (firstByteRequestId !== undefined) {
     props.firstByteRequestId = firstByteRequestId;
@@ -446,7 +448,7 @@ describe('StateBar working-phase indicators', () => {
           contextWindowUsed={0}
           modelContextWindow={200_000}
           phaseStateUpdatedAt={T_NOW - 12_000}
-          lastSseEventAt={T_NOW - 1_000}
+          lastSseEventAtRef={{ current: T_NOW - 1_000 }}
         />
       </MemoryRouter>,
     );
@@ -464,7 +466,7 @@ describe('StateBar working-phase indicators', () => {
           contextWindowUsed={0}
           modelContextWindow={200_000}
           phaseStateUpdatedAt={T_NOW - 12_000}
-          lastSseEventAt={T_NOW - 1_000}
+          lastSseEventAtRef={{ current: T_NOW - 1_000 }}
         />
       </MemoryRouter>,
     );
@@ -555,7 +557,7 @@ describe('StateBar working-phase indicators', () => {
           contextWindowUsed={0}
           modelContextWindow={200_000}
           phaseStateUpdatedAt={T_NOW - 8_000}
-          lastSseEventAt={T_NOW - 1_000}
+          lastSseEventAtRef={{ current: T_NOW - 1_000 }}
         />
       </MemoryRouter>,
     );
@@ -570,7 +572,7 @@ describe('StateBar working-phase indicators', () => {
           contextWindowUsed={0}
           modelContextWindow={200_000}
           phaseStateUpdatedAt={T_NOW - 8_000}
-          lastSseEventAt={T_NOW - 1_000}
+          lastSseEventAtRef={{ current: T_NOW - 1_000 }}
         />
       </MemoryRouter>,
     );
