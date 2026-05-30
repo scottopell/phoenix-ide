@@ -99,7 +99,6 @@ if (import.meta.env.DEV && typeof window !== 'undefined') {
 
   const dump = () => {
     if (stats.size === 0) {
-      // eslint-disable-next-line no-console
       console.info(
         ENABLED
           ? '[profiler] no commits recorded yet'
@@ -117,7 +116,6 @@ if (import.meta.env.DEV && typeof window !== 'undefined') {
         'total ms': Number(s.totalActualMs.toFixed(1)),
       };
     }
-    // eslint-disable-next-line no-console
     console.table(rows);
   };
 
@@ -149,7 +147,6 @@ if (import.meta.env.DEV && typeof window !== 'undefined') {
     auto: (intervalMs = 2000) => {
       if (autoTimer) clearInterval(autoTimer);
       autoTimer = setInterval(dump, intervalMs);
-      // eslint-disable-next-line no-console
       console.info(`[profiler] auto-dump every ${intervalMs}ms — __phoenixProfiler.stop() to halt`);
     },
     stop: () => {
