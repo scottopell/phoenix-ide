@@ -62,13 +62,23 @@ function workflowBranch(workflow: NewConversationWorkflow): string | null {
 // 'direct' selected unless the user explicitly chose it. A null branch on an
 // override means "still follow the default branch" and is filled in once
 // branch metadata loads.
+//
+// branchUnavailable is the settled "the fetch finished and found no usable
+// branch" signal (unborn or branchless repo). Only then does the default fall
+// back to 'direct' — otherwise such a repo would be stuck on planFromBranch with
+// no branch and Send permanently disabled. While the fetch is still pending the
+// flag is false, so a normal repo never flashes 'direct'.
 export function effectiveWorkflow(
   override: NewConversationWorkflow | null,
   isGitDir: boolean | null,
   fallbackBranch: string | null,
+  branchUnavailable: boolean,
 ): NewConversationWorkflow {
   if (isGitDir !== true) return { kind: 'direct' };
-  if (!override) return { kind: 'planFromBranch', baseBranch: fallbackBranch };
+  if (!override) {
+    if (!fallbackBranch && branchUnavailable) return { kind: 'direct' };
+    return { kind: 'planFromBranch', baseBranch: fallbackBranch };
+  }
   switch (override.kind) {
     case 'planFromBranch':
       return { ...override, baseBranch: override.baseBranch ?? fallbackBranch };
@@ -130,6 +140,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [currentBranch, setCurrentBranch] = useState<string | null>(null);
   const [defaultBranch, setDefaultBranch] = useState<string | null>(null);
   const [gitMetadataLoading, setGitMetadataLoading] = useState(false);
+  // Set once a branch fetch settles with no usable branch (unborn/branchless
+  // repo, or the fetch failed). Distinct from "fetch not started yet" so the
+  // default can degrade to 'direct' only after we actually know there is no
+  // branch — never during the initial load window.
+  const [branchUnavailable, setBranchUnavailable] = useState(false);
   const [branchSearch, setBranchSearch] = useState('');
   const [branchSearchLoading, setBranchSearchLoading] = useState(false);
 
@@ -138,7 +153,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const draftBeforeVoiceRef = useRef<string>('');
   const metadataRequestSeqRef = useRef(0);
 
-  const workflow = effectiveWorkflow(workflowOverride, isGitDir, defaultBranch ?? currentBranch);
+  const workflow = effectiveWorkflow(workflowOverride, isGitDir, defaultBranch ?? currentBranch, branchUnavailable);
 
   // Subscribe to the shared models poller so credential transitions
   // (Codex sign-in/sign-out, gateway flips) reach this page without a
@@ -180,6 +195,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     setCurrentBranch(null);
     setDefaultBranch(null);
     setGitMetadataLoading(false);
+    setBranchUnavailable(false);
     setWorkflowOverride(null);
     setBranchSearch('');
   }, [cwd]);
@@ -191,6 +207,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       setCurrentBranch(null);
       setDefaultBranch(null);
       setGitMetadataLoading(false);
+      setBranchUnavailable(false);
       setBranchSearch('');
       return;
     }
@@ -200,6 +217,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
     const requestSeq = ++metadataRequestSeqRef.current;
     let cancelled = false;
     setGitMetadataLoading(true);
+    setBranchUnavailable(false);
     Promise.allSettled([
       api.listGitBranches(trimmedCwd),
       api.listProjectTasks(trimmedCwd),
@@ -211,11 +229,17 @@ export function useCreateConversation(navigate: (path: string) => void) {
         setBranches(resp.branches);
         setCurrentBranch(resp.current);
         setDefaultBranch(resp.default_branch ?? null);
+        // Unborn/branchless repo: HEAD points at no commit, so neither a
+        // default nor a current branch resolves. Record it so the default
+        // workflow degrades to 'direct' instead of a branchless planFromBranch
+        // the user can't send.
+        setBranchUnavailable(!(resp.default_branch || resp.current));
       } else {
         console.warn('Failed to fetch git branches:', branchesResult.reason);
         setBranches([]);
         setCurrentBranch(null);
         setDefaultBranch(null);
+        setBranchUnavailable(true);
       }
 
       if (tasksResult.status === 'fulfilled') {
