@@ -218,8 +218,7 @@ function PrStatusPopover({ pr }: { pr: PrStatusResponse }) {
       </div>
       <div className="pr-popover-muted">{prSummaryText(pr)}</div>
       {attentionNames.length > 0 && (
-        <div className="pr-popover-list" title={attentionNames.join('
-')}>
+        <div className="pr-popover-list" title={attentionNames.join('\n')}>
           {attentionNames.join(' · ')}
         </div>
       )}
