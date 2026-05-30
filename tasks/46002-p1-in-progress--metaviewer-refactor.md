@@ -17,6 +17,50 @@ This task establishes the final internal viewer API shape so the follow-up Pierr
 - Do not add `@pierre/diffs` in this task. Define the final diff payload/API shape using current DiffView underneath.
 - Review-note behavior should move toward shared hooks, not one giant MetaViewer god-component and not fully duplicated renderer-owned logic.
 
+## Aligned scope decisions
+
+Resolved with the task owner before implementation. These refine (and where noted,
+supersede) the looser prose above.
+
+- **Single-slot unification is in scope, in full.** Collapse `FileExplorerProvider`,
+  `DiffViewerStateProvider`, and `BrowserViewStateProvider` into one
+  `ViewerSlotProvider` whose state is the discriminated union already specified in
+  `specs/viewer_slot/` (`kind ∈ {none, prose, diff, browser}`, URL as source of
+  truth). Delete the three coordinating `useEffect`s in `ConversationPage.tsx`; the
+  type system enforces the mutex. This drives `specs/viewer_slot/` REQ-VS-002/003/006/007/012
+  to complete; its 58 Allium obligations are the acceptance target for the slot half.
+- **Browser is a slot member, not a resolved payload.** `kind = browser` participates
+  in the mutex, but carries a live-session handle (`browser_session_active`) routed to
+  the existing browser component — it is not a `MetaViewerPayload`. MetaViewer renders
+  only resolved content kinds.
+- **Per-kind loaders; `FileViewer` keeps its role.** `FileViewer` stays the file
+  loader, retyped to emit a typed `MetaViewerPayload`. The diff viewer gets a parallel
+  **mount-time** loader keyed on the URL comparator, moving the payload out of
+  `DiffViewerStateProvider` (per viewer_slot REQ-VS-003/006). No central resolver / no
+  DI registry — viewers fetch their own payloads on mount, matching `specs/viewer_slot/`.
+- **Image becomes a first-class `ImageViewerBody`**, out of `FileViewer`'s inline
+  special-case.
+- **Full rename now.** Remove `ProseReader` as a production import path; rename
+  `prose-reader-*` CSS classes to renderer-neutral names. Bounded test-only aliases are
+  the only permitted shim.
+- **Dedup file-type classification.** The server already returns `file_type`
+  (`specs/prose-feedback/` REQ-PF-004) while the client re-derives via
+  `getFileType`/`getLanguage`. Extract one tested typed utility and resolve the
+  redundant client-side derivation.
+- **Split review-note hooks.** `useFileReviewNotes` + `useDiffReviewNotes` over a small
+  shared core. Preserve all three anchor kinds (`file`, `diff`, `diff-file`) and
+  `formatNotesForSend` semantics. Do not build a generic cross-renderer framework.
+- **`TaskApprovalReader`: audit + document.** Reuse extracted primitives only where
+  trivial; otherwise document why approval-plan rendering stays separate. It layers on
+  top of the slot (see `specs/viewer_slot/` exclusions) and is out of the mutex.
+- **Specs: update existing only.** Refresh `specs/viewer_slot/` status and
+  `specs/prose-feedback/` for the renderer-body split + file-type dedup. No new
+  `specs/metaviewer/` directory and no new Allium — payload routing is a data transform
+  (AGENTS.md), and the slot state machine is already specified in `specs/viewer_slot/`.
+- **Delivery: one PR, commit-staged** on `claude/p1-tasks-pierre-diff-A8fbM`
+  (extract bodies → unified slot/state contract → notes hooks → rename/CSS/spec
+  cleanup). `./dev.py check` green.
+
 ## Goals
 
 1. Introduce a typed central `MetaViewer` API that routes resolved viewer payloads to specialized body renderers inside `ViewerShell`.
