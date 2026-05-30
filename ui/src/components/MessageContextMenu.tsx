@@ -51,6 +51,17 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
 
   const handleContextMenu = useCallback(
     (e: MouseEvent) => {
+      // Defer to the native browser menu when the user shift-right-clicks
+      // (universal escape hatch) or right-clicks a target the browser handles
+      // better than we can: links, images, and editable fields.
+      const target = e.target as HTMLElement | null;
+      if (
+        e.shiftKey ||
+        target?.closest('a[href], img, input, textarea, [contenteditable]')
+      ) {
+        return;
+      }
+
       // Walk up from target to find .message element
       let el = e.target as HTMLElement | null;
 
