@@ -1,4 +1,4 @@
-import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent, type ReactNode } from 'react';
+import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { api, canChangeModelInState, ExpansionError, type Conversation, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
@@ -31,7 +31,7 @@ import { RenderProfiler } from '../dev/renderProfiler';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
-import { useConversationView, useConversationSnapshot, useCreateConversationWithStore } from '../conversation';
+import { useConversationView, useCreateConversationWithStore } from '../conversation';
 import {
   useResizablePane,
   useIsDesktop,
@@ -47,8 +47,8 @@ import {
 const FileViewer = lazy(() =>
   import('../components/FileViewer').then((m) => ({ default: m.FileViewer })),
 );
-const DiffView = lazy(() =>
-  import('../components/viewer/DiffView').then((m) => ({ default: m.DiffView })),
+const ConversationDiffViewer = lazy(() =>
+  import('../components/viewer/ConversationDiffViewer').then((m) => ({ default: m.ConversationDiffViewer })),
 );
 const TaskApprovalReader = lazy(() =>
   import('../components/TaskApprovalReader').then((m) => ({ default: m.TaskApprovalReader })),
@@ -67,12 +67,7 @@ const BrowserViewPanel = lazy(() =>
 );
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
-import {
-  BrowserViewStateProvider,
-  DiffViewerStateProvider,
-  useBrowserViewState,
-  useDiffViewerState,
-} from '../contexts/ViewerStateContext';
+import { useViewerSlot } from '../contexts/ViewerSlotContext';
 
 const TERMINAL_COLLAPSED_PX = 32;
 
@@ -100,38 +95,13 @@ export function ConversationPage() {
   const { slug } = useParams<{ slug: string }>();
   return (
     <ReviewNotesProvider scopeKey={slug}>
-      <DiffViewerStateProvider scopeKey={slug}>
-        <BrowserViewWrapper slug={slug}>
-          {/* Mounted above ConversationPageContent's viewer early-returns
-              so draft persistence survives composer unmounts. */}
-          {slug && <DraftLifecycle slug={slug} />}
-          <ConversationPageContent />
-        </BrowserViewWrapper>
-      </DiffViewerStateProvider>
+      {/* The viewer slot (prose / diff / browser) is provided by DesktopLayout,
+          which wraps every conversation route. Mounted above
+          ConversationPageContent's viewer early-returns so draft persistence
+          survives composer unmounts. */}
+      {slug && <DraftLifecycle slug={slug} />}
+      <ConversationPageContent />
     </ReviewNotesProvider>
-  );
-}
-
-/** Bridges the conversation atom's `browser_session_active` flag into the
- *  `BrowserViewStateProvider`. Sits above `ConversationPageContent` so the
- *  provider can be a thin pass-through. `useConversationSnapshot` returns
- *  the same `Conversation` reference across renders unless the row itself
- *  changes, so this wrapper does not re-render on token churn. */
-function BrowserViewWrapper({
-  slug,
-  children,
-}: {
-  slug: string | undefined;
-  children: ReactNode;
-}) {
-  const conversation = useConversationSnapshot(slug ?? null);
-  return (
-    <BrowserViewStateProvider
-      scopeKey={slug}
-      browserSessionActive={conversation?.browser_session_active ?? false}
-    >
-      {children}
-    </BrowserViewStateProvider>
   );
 }
 
@@ -160,47 +130,20 @@ function ConversationPageContent() {
   // Page-level state — not conversation data
   const [error, setError] = useState<string | null>(null);
 
-  // File explorer context (shared with desktop panel)
+  // File explorer context (shared with desktop panel) — a projection of the
+  // unified viewer slot below.
   const fileExplorer = useFileExplorer();
-  // Diff viewer slot — lifted out of WorkActions so the diff can mount
-  // inline beside chat at ≥1280px (task 08654 follow-on).
-  const diffViewer = useDiffViewerState();
-  // Browser live-view slot (REQ-BT-018). Mutually exclusive with prose +
-  // diff. Auto-mount logic lives below in the messages effect.
-  const browserView = useBrowserViewState();
-  // Single-slot model: opening one viewer closes the other so the user
-  // never sees both fighting for the split pane. When both are set,
-  // file wins (most-recent-action — fileExplorer.openFile is what
-  // triggered this collision since the user just clicked a file). The
-  // alternate ordering (user clicks View Diff while file is open)
-  // closes the file via fileExplorer.closeFile in the click handler
-  // chain elsewhere; this effect catches the file-clicks-while-diff-open
-  // case the click handlers don't reach.
-  const closeDiff = diffViewer.close;
-  const closeBrowserView = browserView.closePanel;
-  useEffect(() => {
-    if (fileExplorer.proseReaderState && diffViewer.payload) {
-      closeDiff();
-    }
-  }, [fileExplorer.proseReaderState, diffViewer.payload, closeDiff]);
-  // Browser view is mutually exclusive with prose + diff. If anything else
-  // is in the slot, close the browser view; the user's most recent action
-  // wins. The reverse direction (closing prose/diff when the user opens
-  // browser) is handled in `handleOpenBrowserView` below.
-  useEffect(() => {
-    if (browserView.open && (fileExplorer.proseReaderState || diffViewer.payload)) {
-      closeBrowserView();
-    }
-  }, [browserView.open, fileExplorer.proseReaderState, diffViewer.payload, closeBrowserView]);
-  // Close handlers also clear the OTHER viewer to be safe (for cases
-  // where state machines briefly hold both during transitions).
-  const handleCloseDiff = useCallback(() => closeDiff(), [closeDiff]);
-  const handleCloseBrowserView = useCallback(() => closeBrowserView(), [closeBrowserView]);
-  const handleOpenBrowserView = useCallback(() => {
-    fileExplorer.closeFile();
-    closeDiff();
-    browserView.openPanel();
-  }, [fileExplorer, closeDiff, browserView]);
+  // Unified viewer slot (specs/viewer_slot): one mutually-exclusive surface
+  // (prose / diff / browser) derived from the URL. Mutual exclusion is
+  // structural — opening any viewer rewrites `?viewer=` and the others close.
+  // No coordinating effects: the type system enforces the single slot.
+  const viewerSlot = useViewerSlot();
+  const slotKind = viewerSlot.slot.kind;
+  const diffOpen = slotKind === 'diff';
+  const browserOpen = slotKind === 'browser';
+  const handleCloseDiff = viewerSlot.close;
+  const handleCloseBrowserView = viewerSlot.close;
+  const handleOpenBrowserView = viewerSlot.openBrowser;
   // ConversationPage was previously snapshotting `isDesktop` at mount and
   // never resubscribing — a window resize across 1025px wouldn't update
   // the layout until the user navigated. The shared hooks now subscribe
@@ -520,33 +463,10 @@ function ConversationPageContent() {
     }
   }, [atom.conversation]);
 
-  // REQ-BT-018: react to edges of the server-authoritative
-  // `browser_session_active` flag. Rising edge (false→true) auto-mounts
-  // the live view if the slot is empty. Falling edge (true→false) closes
-  // the panel so the user isn't left staring at a stale "No browser yet"
-  // overlay after a kill / idle-cleanup. The `prevRef` is seeded with the
-  // current value so a page that mounts with `active === true` does NOT
-  // trigger auto-open — only in-page transitions do.
-  const browserSessionActive = browserView.browserSessionActive;
-  const openBrowserPanel = browserView.openPanel;
-  const prevBrowserSessionActiveRef = useRef(browserSessionActive);
-  useEffect(() => {
-    const wasActive = prevBrowserSessionActiveRef.current;
-    prevBrowserSessionActiveRef.current = browserSessionActive;
-    if (!wasActive && browserSessionActive) {
-      if (!fileExplorer.proseReaderState && !diffViewer.payload) {
-        openBrowserPanel();
-      }
-    } else if (wasActive && !browserSessionActive) {
-      closeBrowserView();
-    }
-  }, [
-    browserSessionActive,
-    openBrowserPanel,
-    closeBrowserView,
-    fileExplorer.proseReaderState,
-    diffViewer.payload,
-  ]);
+  // REQ-BT-018 browser-session edges (rising-edge auto-open, falling-edge
+  // auto-close) live in ViewerSlotProvider now — the slot owns the
+  // browser_session_active flag and the single-slot mutex, so the edge handling
+  // is no longer duplicated here.
 
   // Stable refs — needed inside sendMessage which is memoized with a stable
   // identity across renders.
@@ -946,21 +866,12 @@ function ConversationPageContent() {
         </div>
       );
     }
-    if (diffViewer.payload) {
-      const dv = diffViewer.payload;
+    if (diffOpen && conversationId) {
       return (
         <div id="app">
           <Suspense fallback={null}>
-            <DiffView
-              open
-              comparator={dv.comparator}
-              commitLog={dv.commit_log}
-              committedDiff={dv.committed_diff}
-              committedTruncatedKib={dv.committed_truncated_kib}
-              committedSaturated={dv.committed_saturated}
-              uncommittedDiff={dv.uncommitted_diff}
-              uncommittedTruncatedKib={dv.uncommitted_truncated_kib}
-              uncommittedSaturated={dv.uncommitted_saturated}
+            <ConversationDiffViewer
+              conversationId={conversationId}
               onClose={handleCloseDiff}
               onSendNotes={handleSendNotes}
               inline
@@ -969,7 +880,7 @@ function ConversationPageContent() {
         </div>
       );
     }
-    if (browserView.open && conversationId) {
+    if (browserOpen && conversationId) {
       return (
         <div id="app">
           <Suspense fallback={null}>
@@ -1024,12 +935,10 @@ function ConversationPageContent() {
   // is open. CSS in .app-split-pane (index.css) flexes children
   // horizontally.
   const splitPanePrs = fileExplorer.proseReaderState;
-  const splitPaneDiff = diffViewer.payload;
-  const splitPaneBrowser = browserView.open;
   const showSplitPaneViewer =
     isDesktop
     && isWideDesktop
-    && (splitPanePrs !== null || splitPaneDiff !== null || splitPaneBrowser);
+    && (splitPanePrs !== null || diffOpen || browserOpen);
 
   return (
     <div
@@ -1043,7 +952,7 @@ function ConversationPageContent() {
     >
       <div className="conversation-column">
       {seedBreadcrumb}
-      {browserView.browserSessionActive && !browserView.open && (
+      {viewerSlot.browserSessionActive && !browserOpen && (
         <div className="browser-view-launcher">
           <button
             type="button"
@@ -1459,18 +1368,10 @@ function ConversationPageContent() {
       {/* Diff overlay: rendered as a full-screen overlay whenever the
           diff viewer is open AND the split pane isn't (mobile, narrow
           desktop, or any future case where the split is unavailable). */}
-      {diffViewer.payload && !showSplitPaneViewer && (
+      {diffOpen && !showSplitPaneViewer && conversationId && (
         <Suspense fallback={null}>
-          <DiffView
-            open
-            comparator={diffViewer.payload.comparator}
-            commitLog={diffViewer.payload.commit_log}
-            committedDiff={diffViewer.payload.committed_diff}
-            committedTruncatedKib={diffViewer.payload.committed_truncated_kib}
-            committedSaturated={diffViewer.payload.committed_saturated}
-            uncommittedDiff={diffViewer.payload.uncommitted_diff}
-            uncommittedTruncatedKib={diffViewer.payload.uncommitted_truncated_kib}
-            uncommittedSaturated={diffViewer.payload.uncommitted_saturated}
+          <ConversationDiffViewer
+            conversationId={conversationId}
             onClose={handleCloseDiff}
             onSendNotes={handleSendNotes}
           />
@@ -1479,7 +1380,7 @@ function ConversationPageContent() {
       {/* Browser view overlay: same fallback role as the diff overlay above
           — mobile, narrow desktop, or any case where the split pane is
           unavailable. REQ-BT-018. */}
-      {browserView.open && !showSplitPaneViewer && conversationId && (
+      {browserOpen && !showSplitPaneViewer && conversationId && (
         <Suspense fallback={null}>
           <div className="browser-view-overlay">
             <BrowserViewPanel
@@ -1529,17 +1430,9 @@ function ConversationPageContent() {
           />
           <div className="conversation-viewer-pane">
             <Suspense fallback={null}>
-              {splitPaneDiff ? (
-                <DiffView
-                  open
-                  comparator={splitPaneDiff.comparator}
-                  commitLog={splitPaneDiff.commit_log}
-                  committedDiff={splitPaneDiff.committed_diff}
-                  committedTruncatedKib={splitPaneDiff.committed_truncated_kib}
-                  committedSaturated={splitPaneDiff.committed_saturated}
-                  uncommittedDiff={splitPaneDiff.uncommitted_diff}
-                  uncommittedTruncatedKib={splitPaneDiff.uncommitted_truncated_kib}
-                  uncommittedSaturated={splitPaneDiff.uncommitted_saturated}
+              {diffOpen && conversationId ? (
+                <ConversationDiffViewer
+                  conversationId={conversationId}
                   onClose={handleCloseDiff}
                   onSendNotes={handleSendNotes}
                   inline
@@ -1553,7 +1446,7 @@ function ConversationPageContent() {
                   patchContext={splitPanePrs.patchContext ?? undefined}
                   inline
                 />
-              ) : splitPaneBrowser && conversationId ? (
+              ) : browserOpen && conversationId ? (
                 <BrowserViewPanel
                   conversationId={conversationId}
                   onClose={handleCloseBrowserView}

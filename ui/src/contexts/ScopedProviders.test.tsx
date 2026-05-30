@@ -11,17 +11,9 @@ import { describe, it, expect } from 'vitest';
 import { render, act } from '@testing-library/react';
 import { useEffect } from 'react';
 import { ReviewNotesProvider, useReviewNotes } from './ReviewNotesContext';
-import { DiffViewerStateProvider, useDiffViewerState } from './ViewerStateContext';
-import type { DiffViewerPayload } from './ViewerStateContext';
 
 function NotesConsumer({ onCtx }: { onCtx: (ctx: ReturnType<typeof useReviewNotes>) => void }) {
   const ctx = useReviewNotes();
-  useEffect(() => { onCtx(ctx); }, [ctx, onCtx]);
-  return null;
-}
-
-function DiffConsumer({ onCtx }: { onCtx: (ctx: ReturnType<typeof useDiffViewerState>) => void }) {
-  const ctx = useDiffViewerState();
   useEffect(() => { onCtx(ctx); }, [ctx, onCtx]);
   return null;
 }
@@ -78,35 +70,5 @@ describe('ReviewNotesProvider scopeKey reset (task 02703)', () => {
       </ReviewNotesProvider>,
     );
     expect(latest!.notes).toHaveLength(1);
-  });
-});
-
-describe('DiffViewerStateProvider scopeKey reset (task 02703)', () => {
-  const samplePayload: DiffViewerPayload = {
-    comparator: 'HEAD',
-    commit_log: '',
-    committed_diff: 'diff --git a/x b/x',
-    uncommitted_diff: '',
-  };
-
-  it('drops the diff payload when scopeKey changes', () => {
-    let latest: ReturnType<typeof useDiffViewerState> | null = null;
-    const onCtx = (ctx: ReturnType<typeof useDiffViewerState>) => { latest = ctx; };
-
-    const { rerender } = render(
-      <DiffViewerStateProvider scopeKey="conv-A">
-        <DiffConsumer onCtx={onCtx} />
-      </DiffViewerStateProvider>,
-    );
-
-    act(() => { latest!.open(samplePayload); });
-    expect(latest!.payload).not.toBeNull();
-
-    rerender(
-      <DiffViewerStateProvider scopeKey="conv-B">
-        <DiffConsumer onCtx={onCtx} />
-      </DiffViewerStateProvider>,
-    );
-    expect(latest!.payload).toBeNull();
   });
 });

@@ -8,6 +8,7 @@ import {
 import { useResizablePane, useIsDesktop } from '../hooks';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
+import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
@@ -93,7 +94,11 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // See task 08664: previously the early-return on !isDesktop produced a
   // different React tree, unmounting ConversationPage and resetting its state.
   return (
-    <FileExplorerProvider scopeKey={activeSlug ?? undefined}>
+    <ViewerSlotProvider
+      scopeKey={activeSlug ?? undefined}
+      browserSessionActive={activeConversation?.browser_session_active ?? false}
+    >
+     <FileExplorerProvider>
       <div className={isDesktop ? 'desktop-layout' : undefined}>
         {isDesktop && (
           <Sidebar
@@ -142,6 +147,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
         {isDesktop && <CommandPalette conversations={conversations} activeConversation={activeConversation} />}
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
-    </FileExplorerProvider>
+     </FileExplorerProvider>
+    </ViewerSlotProvider>
   );
 }

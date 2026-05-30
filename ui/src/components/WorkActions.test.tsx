@@ -12,45 +12,24 @@ import type { ReactElement } from 'react';
 import { MemoryRouter } from 'react-router-dom';
 import { WorkControlBar } from './WorkActions';
 import { api, type PrStatusResponse } from '../api';
-import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
-import {
-  BrowserViewStateProvider,
-  DiffViewerStateProvider,
-  useDiffViewerState,
-} from '../contexts/ViewerStateContext';
-import type { DiffViewerPayload } from '../contexts/ViewerStateContext';
-import { FileExplorerProvider } from './FileExplorer';
+import { ViewerSlotProvider, useViewerSlot } from '../contexts/ViewerSlotContext';
 
-// All four providers are needed: FileExplorerProvider for the
-// useFileExplorer().closeFile call WorkControlBar makes during the
-// single-slot enforcement, ReviewNotesProvider for the diff viewer's
-// notes context, and the two viewer-state providers (Diff + Browser)
-// so the View-Diff and View-Browser controls can publish their state.
-// MemoryRouter is required because FileExplorerProvider reads the
-// open-file path from URL search params.
+// WorkViewerActions reads the unified viewer slot; MemoryRouter backs the
+// slot's URL contract.
 const renderWithProviders = (ui: ReactElement) =>
   render(
     <MemoryRouter>
-      <FileExplorerProvider>
-        <ReviewNotesProvider>
-          <DiffViewerStateProvider>
-            <BrowserViewStateProvider browserSessionActive={false}>
-              {ui}
-            </BrowserViewStateProvider>
-          </DiffViewerStateProvider>
-        </ReviewNotesProvider>
-      </FileExplorerProvider>
+      <ViewerSlotProvider browserSessionActive={false}>
+        {ui}
+      </ViewerSlotProvider>
     </MemoryRouter>,
   );
 
-/** Test helper: subscribes to DiffViewerStateContext and forwards every
- *  payload to the provided callback so tests can assert on what the
- *  WorkControlBar push. */
-function CapturePayload({ onPayload }: { onPayload: (p: DiffViewerPayload | null) => void }) {
-  const { payload } = useDiffViewerState();
-  useEffect(() => {
-    onPayload(payload);
-  }, [payload, onPayload]);
+/** Subscribes to the viewer slot so tests can assert the kind the
+ *  WorkControlBar transitioned it to. */
+function CaptureSlotKind({ onKind }: { onKind: (kind: string) => void }) {
+  const { slot } = useViewerSlot();
+  useEffect(() => { onKind(slot.kind); }, [slot.kind, onKind]);
   return null;
 }
 
@@ -259,16 +238,8 @@ describe('WorkControlBar — View Diff (task 08641 + 08654 follow-on)', () => {
     vi.clearAllMocks();
   });
 
-  it('fetches the diff and publishes the payload to DiffViewerStateContext', async () => {
-    const { api } = await import('../api');
-    (api.getConversationDiff as ReturnType<typeof vi.fn>).mockResolvedValue({
-      comparator: 'origin/main',
-      commit_log: 'abcdef0 feat: thing',
-      committed_diff: 'diff --git a/x.txt b/x.txt\n+++ b/x.txt\n+hello',
-      uncommitted_diff: '',
-    });
-
-    let captured: DiffViewerPayload | null = null;
+  it('opens the diff slot when View Diff is clicked (payload fetched on mount by the viewer)', () => {
+    let kind = 'none';
     renderWithProviders(
       <>
         <WorkControlBar
@@ -276,62 +247,17 @@ describe('WorkControlBar — View Diff (task 08641 + 08654 follow-on)', () => {
           convModeLabel="Branch"
           phaseType="idle"
           continuedInConvId={null}
-        prStatusHandle={prStatusHandle()}
+          prStatusHandle={prStatusHandle()}
         />
-        <CapturePayload onPayload={(p) => { captured = p; }} />
+        <CaptureSlotKind onKind={(k) => { kind = k; }} />
       </>,
     );
 
+    expect(kind).toBe('none');
     fireEvent.click(screen.getByTestId('view-diff-button'));
-
-    await waitFor(() => {
-      expect(api.getConversationDiff).toHaveBeenCalledWith('conv-1');
-    });
-    await waitFor(() => {
-      expect(captured).not.toBeNull();
-    });
-    // Once the fetch resolves, the loading label should clear back to "View Diff"
-    // — the dialog itself is mounted by ConversationPage in production, not
-    // here, so we don't assert on its DOM.
-    await waitFor(() => {
-      expect(
-        (screen.getByTestId('view-diff-button') as HTMLButtonElement).textContent,
-      ).toMatch(/view diff/i);
-    });
-    expect(captured!.comparator).toBe('origin/main');
-    expect(captured!.commit_log).toBe('abcdef0 feat: thing');
-  });
-
-  it('shows the server error message when the fetch fails and does NOT publish a payload', async () => {
-    const { api } = await import('../api');
-    (api.getConversationDiff as ReturnType<typeof vi.fn>).mockRejectedValue(
-      new Error('Worktree no longer exists: /tmp/wt'),
-    );
-
-    let captured: DiffViewerPayload | null = null;
-    renderWithProviders(
-      <>
-        <WorkControlBar
-          conversationId="conv-1"
-          convModeLabel="Work"
-          phaseType="idle"
-          continuedInConvId={null}
-        prStatusHandle={prStatusHandle()}
-        />
-        <CapturePayload onPayload={(p) => { captured = p; }} />
-      </>,
-    );
-
-    fireEvent.click(screen.getByTestId('view-diff-button'));
-
-    await waitFor(() => {
-      expect(screen.getByText(/worktree no longer exists/i)).toBeInTheDocument();
-    });
-    // No payload published.
-    expect(captured).toBeNull();
-    // Button label returns to "View Diff" so the user can retry.
-    const viewDiff = screen.getByTestId('view-diff-button') as HTMLButtonElement;
-    expect(viewDiff.textContent).toMatch(/view diff/i);
+    expect(kind).toBe('diff');
+    // WorkActions no longer fetches; the diff viewer fetches on mount.
+    expect(api.getConversationDiff).not.toHaveBeenCalled();
   });
 
   it('does not render the View Diff button in Direct mode', async () => {

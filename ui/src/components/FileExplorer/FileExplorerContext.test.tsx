@@ -1,13 +1,15 @@
-// Tests for FileExplorerProvider's URL-driven prose-reader state.
+// Tests for the FileExplorer adapter over the unified viewer slot.
 //
-// path + rootDir live in the URL search params (?file=&root=) so an iOS PWA
-// cold reload restores the open file (the URL is the only state that
-// survives a JS context kill). patchContext (Set<number> highlights) lives
-// in scoped state and resets when the scopeKey changes.
+// openFile/closeFile/proseReaderState project the slot's prose state. The URL
+// contract, patchContext scoping, and REQ-VS-014 persistence/restoration live
+// in ViewerSlotProvider (see ViewerSlotContext.test.tsx for the slot-level
+// transitions); these tests assert the prose behavior end-to-end through the
+// adapter, since that is what the file explorer panel + command palette use.
 
 import { describe, it, expect, beforeEach } from 'vitest';
 import { render, act, fireEvent } from '@testing-library/react';
 import { useEffect, useState } from 'react';
+import type { ReactNode } from 'react';
 import {
   MemoryRouter,
   Routes,
@@ -16,6 +18,7 @@ import {
   useNavigate,
 } from 'react-router-dom';
 import { FileExplorerProvider } from './FileExplorerContext';
+import { ViewerSlotProvider } from '../../contexts/ViewerSlotContext';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import {
   clearLastViewer,
@@ -23,22 +26,27 @@ import {
   setLastViewer,
 } from '../../storage/lastViewerStorage';
 
-// Tiny consumer that exposes the context via a callback so the test can
-// observe state and drive openFile/closeFile imperatively.
+function Providers({ scopeKey, children }: { scopeKey?: string; children: ReactNode }) {
+  return (
+    <ViewerSlotProvider scopeKey={scopeKey} browserSessionActive={false}>
+      <FileExplorerProvider>{children}</FileExplorerProvider>
+    </ViewerSlotProvider>
+  );
+}
+
 function Consumer({ onCtx }: { onCtx: (ctx: ReturnType<typeof useFileExplorer>) => void }) {
   const ctx = useFileExplorer();
   useEffect(() => { onCtx(ctx); }, [ctx, onCtx]);
   return null;
 }
 
-// Captures the current location.search so tests can assert URL state.
 function LocationCapture({ onSearch }: { onSearch: (s: string) => void }) {
   const location = useLocation();
   useEffect(() => { onSearch(location.search); }, [location.search, onSearch]);
   return null;
 }
 
-describe('FileExplorerProvider — URL-driven open file', () => {
+describe('FileExplorer adapter — URL-driven open file', () => {
   it('openFile writes path + root to the URL; closeFile clears them', () => {
     let latest: ReturnType<typeof useFileExplorer> | null = null;
     let search = '';
@@ -51,10 +59,10 @@ describe('FileExplorerProvider — URL-driven open file', () => {
           <Route
             path="/c/:slug"
             element={
-              <FileExplorerProvider scopeKey="conv-A">
+              <Providers scopeKey="conv-A">
                 <Consumer onCtx={onCtx} />
                 <LocationCapture onSearch={onSearch} />
-              </FileExplorerProvider>
+              </Providers>
             }
           />
         </Routes>
@@ -67,6 +75,7 @@ describe('FileExplorerProvider — URL-driven open file', () => {
       path: '/repo/README.md',
       rootDir: '/repo',
     });
+    expect(search).toContain('viewer=prose');
     expect(search).toContain('file=%2Frepo%2FREADME.md');
     expect(search).toContain('root=%2Frepo');
 
@@ -77,7 +86,7 @@ describe('FileExplorerProvider — URL-driven open file', () => {
     expect(search).not.toContain('root=');
   });
 
-  it('hydrates proseReaderState from initial URL search params', () => {
+  it('hydrates proseReaderState from legacy file/root URL params (no ?viewer=)', () => {
     let latest: ReturnType<typeof useFileExplorer> | null = null;
     const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
 
@@ -86,21 +95,14 @@ describe('FileExplorerProvider — URL-driven open file', () => {
         <Routes>
           <Route
             path="/c/:slug"
-            element={
-              <FileExplorerProvider scopeKey="conv-A">
-                <Consumer onCtx={onCtx} />
-              </FileExplorerProvider>
-            }
+            element={<Providers scopeKey="conv-A"><Consumer onCtx={onCtx} /></Providers>}
           />
         </Routes>
       </MemoryRouter>,
     );
 
     expect(latest!.activeFile).toBe('/repo/README.md');
-    expect(latest!.proseReaderState).toEqual({
-      path: '/repo/README.md',
-      rootDir: '/repo',
-    });
+    expect(latest!.proseReaderState).toEqual({ path: '/repo/README.md', rootDir: '/repo' });
   });
 
   it('clears patchContext when scopeKey changes; URL-driven path/rootDir survive', () => {
@@ -108,18 +110,10 @@ describe('FileExplorerProvider — URL-driven open file', () => {
     let setKey: ((k: string) => void) | null = null;
     const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
 
-    // Stable parent that owns scopeKey state. The MemoryRouter and its
-    // location stay mounted across scopeKey changes, so we can test that
-    // the URL-driven path/rootDir persist while patchContext (scoped
-    // state) resets.
     function ScopeHarness() {
       const [scopeKey, setScopeKey] = useState('conv-A');
       setKey = setScopeKey;
-      return (
-        <FileExplorerProvider scopeKey={scopeKey}>
-          <Consumer onCtx={onCtx} />
-        </FileExplorerProvider>
-      );
+      return <Providers scopeKey={scopeKey}><Consumer onCtx={onCtx} /></Providers>;
     }
 
     render(
@@ -138,52 +132,35 @@ describe('FileExplorerProvider — URL-driven open file', () => {
     expect(latest!.proseReaderState?.rootDir).toBe('/repo');
     expect(latest!.proseReaderState?.patchContext?.firstModifiedLine).toBe(3);
 
-    // Switch scopeKey without remounting the Router.
     act(() => { setKey!('conv-B'); });
 
-    // path + rootDir come from the URL — unchanged by scopeKey.
     expect(latest!.proseReaderState?.path).toBe('/repo/x.ts');
     expect(latest!.proseReaderState?.rootDir).toBe('/repo');
-    // patchContext is scoped — resets on scopeKey change.
     expect(latest!.proseReaderState?.patchContext).toBeUndefined();
   });
 });
 
-// REQ-VS-014: per-conversation last-viewer persistence on in-app navigation.
-//
-// react-router's MemoryRouter mints location.key === 'default' on the
-// initial render (mirrors the SPA cold-reload behaviour the implementation
-// gates on). Any subsequent navigate() call mints a fresh key, which is how
-// the in-app branch is exercised below.
-describe('FileExplorerProvider — REQ-VS-014 last-viewer persistence', () => {
+describe('FileExplorer adapter — REQ-VS-014 last-viewer persistence', () => {
   beforeEach(() => {
     localStorage.clear();
   });
 
   it('writes the URL params to storage when a file is opened', () => {
     let latest: ReturnType<typeof useFileExplorer> | null = null;
-    const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => {
-      latest = ctx;
-    };
+    const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
 
     render(
       <MemoryRouter initialEntries={['/c/conv-A']}>
         <Routes>
           <Route
             path="/c/:slug"
-            element={
-              <FileExplorerProvider scopeKey="conv-A">
-                <Consumer onCtx={onCtx} />
-              </FileExplorerProvider>
-            }
+            element={<Providers scopeKey="conv-A"><Consumer onCtx={onCtx} /></Providers>}
           />
         </Routes>
       </MemoryRouter>,
     );
 
-    act(() => {
-      latest!.openFile('/repo/README.md', '/repo');
-    });
+    act(() => { latest!.openFile('/repo/README.md', '/repo'); });
 
     const stored = getLastViewer('conv-A');
     expect(stored).not.toBeNull();
@@ -193,33 +170,23 @@ describe('FileExplorerProvider — REQ-VS-014 last-viewer persistence', () => {
 
   it('clears the storage entry when the file is closed', () => {
     let latest: ReturnType<typeof useFileExplorer> | null = null;
-    const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => {
-      latest = ctx;
-    };
+    const onCtx = (ctx: ReturnType<typeof useFileExplorer>) => { latest = ctx; };
 
     render(
       <MemoryRouter initialEntries={['/c/conv-A']}>
         <Routes>
           <Route
             path="/c/:slug"
-            element={
-              <FileExplorerProvider scopeKey="conv-A">
-                <Consumer onCtx={onCtx} />
-              </FileExplorerProvider>
-            }
+            element={<Providers scopeKey="conv-A"><Consumer onCtx={onCtx} /></Providers>}
           />
         </Routes>
       </MemoryRouter>,
     );
 
-    act(() => {
-      latest!.openFile('/repo/README.md', '/repo');
-    });
+    act(() => { latest!.openFile('/repo/README.md', '/repo'); });
     expect(getLastViewer('conv-A')).not.toBeNull();
 
-    act(() => {
-      latest!.closeFile();
-    });
+    act(() => { latest!.closeFile(); });
     expect(getLastViewer('conv-A')).toBeNull();
   });
 
@@ -227,23 +194,11 @@ describe('FileExplorerProvider — REQ-VS-014 last-viewer persistence', () => {
     setLastViewer('conv-A', 'file=%2Frepo%2FREADME.md&root=%2Frepo');
 
     let search = '';
-    const onSearch = (s: string) => {
-      search = s;
-    };
+    const onSearch = (s: string) => { search = s; };
 
-    // Harness with a button that triggers an in-app navigate(), which mints
-    // a fresh location.key. Without it, MemoryRouter's initial 'default'
-    // key would (correctly) suppress the restore effect.
     function NavHarness() {
       const navigate = useNavigate();
-      return (
-        <button
-          data-testid="enter"
-          onClick={() => navigate('/c/conv-A')}
-        >
-          enter
-        </button>
-      );
+      return <button data-testid="enter" onClick={() => navigate('/c/conv-A')}>enter</button>;
     }
 
     const { getByTestId } = render(
@@ -252,19 +207,13 @@ describe('FileExplorerProvider — REQ-VS-014 last-viewer persistence', () => {
           <Route path="/" element={<NavHarness />} />
           <Route
             path="/c/:slug"
-            element={
-              <FileExplorerProvider scopeKey="conv-A">
-                <LocationCapture onSearch={onSearch} />
-              </FileExplorerProvider>
-            }
+            element={<Providers scopeKey="conv-A"><LocationCapture onSearch={onSearch} /></Providers>}
           />
         </Routes>
       </MemoryRouter>,
     );
 
-    act(() => {
-      fireEvent.click(getByTestId('enter'));
-    });
+    act(() => { fireEvent.click(getByTestId('enter')); });
 
     expect(search).toContain('file=%2Frepo%2FREADME.md');
     expect(search).toContain('root=%2Frepo');
@@ -274,20 +223,14 @@ describe('FileExplorerProvider — REQ-VS-014 last-viewer persistence', () => {
     setLastViewer('conv-A', 'file=%2Frepo%2FREADME.md&root=%2Frepo');
 
     let search = '';
-    const onSearch = (s: string) => {
-      search = s;
-    };
+    const onSearch = (s: string) => { search = s; };
 
     render(
       <MemoryRouter initialEntries={['/c/conv-A']}>
         <Routes>
           <Route
             path="/c/:slug"
-            element={
-              <FileExplorerProvider scopeKey="conv-A">
-                <LocationCapture onSearch={onSearch} />
-              </FileExplorerProvider>
-            }
+            element={<Providers scopeKey="conv-A"><LocationCapture onSearch={onSearch} /></Providers>}
           />
         </Routes>
       </MemoryRouter>,
@@ -298,24 +241,15 @@ describe('FileExplorerProvider — REQ-VS-014 last-viewer persistence', () => {
   });
 
   it('does NOT restore when the URL already carries viewer params', () => {
-    // Set storage to a different file than the URL has, then navigate in-app
-    // to a URL that already has params. Restore must not overwrite.
     setLastViewer('conv-A', 'file=%2Frepo%2FOLD.md&root=%2Frepo');
 
     let search = '';
-    const onSearch = (s: string) => {
-      search = s;
-    };
+    const onSearch = (s: string) => { search = s; };
 
     function NavHarness() {
       const navigate = useNavigate();
       return (
-        <button
-          data-testid="enter"
-          onClick={() =>
-            navigate('/c/conv-A?file=%2Frepo%2FNEW.md&root=%2Frepo')
-          }
-        >
+        <button data-testid="enter" onClick={() => navigate('/c/conv-A?file=%2Frepo%2FNEW.md&root=%2Frepo')}>
           enter
         </button>
       );
@@ -327,19 +261,13 @@ describe('FileExplorerProvider — REQ-VS-014 last-viewer persistence', () => {
           <Route path="/" element={<NavHarness />} />
           <Route
             path="/c/:slug"
-            element={
-              <FileExplorerProvider scopeKey="conv-A">
-                <LocationCapture onSearch={onSearch} />
-              </FileExplorerProvider>
-            }
+            element={<Providers scopeKey="conv-A"><LocationCapture onSearch={onSearch} /></Providers>}
           />
         </Routes>
       </MemoryRouter>,
     );
 
-    act(() => {
-      fireEvent.click(getByTestId('enter'));
-    });
+    act(() => { fireEvent.click(getByTestId('enter')); });
 
     expect(search).toContain('file=%2Frepo%2FNEW.md');
     expect(search).not.toContain('OLD.md');
@@ -349,20 +277,11 @@ describe('FileExplorerProvider — REQ-VS-014 last-viewer persistence', () => {
     setLastViewer('conv-A', 'file=%2Frepo%2FA.md&root=%2Frepo');
 
     let search = '';
-    const onSearch = (s: string) => {
-      search = s;
-    };
+    const onSearch = (s: string) => { search = s; };
 
     function NavHarness() {
       const navigate = useNavigate();
-      return (
-        <button
-          data-testid="enter-B"
-          onClick={() => navigate('/c/conv-B')}
-        >
-          enter B
-        </button>
-      );
+      return <button data-testid="enter-B" onClick={() => navigate('/c/conv-B')}>enter B</button>;
     }
 
     const { getByTestId } = render(
@@ -371,23 +290,16 @@ describe('FileExplorerProvider — REQ-VS-014 last-viewer persistence', () => {
           <Route path="/" element={<NavHarness />} />
           <Route
             path="/c/:slug"
-            element={
-              <FileExplorerProvider scopeKey="conv-B">
-                <LocationCapture onSearch={onSearch} />
-              </FileExplorerProvider>
-            }
+            element={<Providers scopeKey="conv-B"><LocationCapture onSearch={onSearch} /></Providers>}
           />
         </Routes>
       </MemoryRouter>,
     );
 
-    act(() => {
-      fireEvent.click(getByTestId('enter-B'));
-    });
+    act(() => { fireEvent.click(getByTestId('enter-B')); });
 
     expect(search).not.toContain('file=');
     expect(search).not.toContain('A.md');
-    // A's entry is undisturbed.
     expect(getLastViewer('conv-A')).toBe('file=%2Frepo%2FA.md&root=%2Frepo');
 
     clearLastViewer('conv-A');

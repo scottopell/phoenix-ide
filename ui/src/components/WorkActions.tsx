@@ -1,13 +1,7 @@
 import { useState } from 'react';
 import { api, type PrStatusResponse } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
-import { useBrowserViewState, useDiffViewerState } from '../contexts/ViewerStateContext';
-import { useFileExplorer } from '../hooks/useFileExplorer';
-
-type FetchState =
-  | { status: 'idle' }
-  | { status: 'loading' }
-  | { status: 'error'; message: string };
+import { useViewerSlot } from '../contexts/ViewerSlotContext';
 
 interface WorkControlBarProps {
   conversationId: string;
@@ -81,39 +75,25 @@ function deriveWorkLifecycleControls({
   };
 }
 
-function WorkViewerActions({ conversationId, diffFetch, setDiffFetch }: { conversationId: string; diffFetch: FetchState; setDiffFetch: (state: FetchState) => void }) {
-  const diffViewer = useDiffViewerState();
-  const browserView = useBrowserViewState();
-  const fileExplorer = useFileExplorer();
+function WorkViewerActions() {
+  const viewerSlot = useViewerSlot();
   return <>
     <button
       className="work-actions-btn work-actions-view-diff"
-      disabled={diffFetch.status === 'loading'}
       data-testid="view-diff-button"
-      onClick={async () => {
-        setDiffFetch({ status: 'loading' });
-        try {
-          const resp = await api.getConversationDiff(conversationId);
-          fileExplorer.closeFile();
-          diffViewer.open(resp);
-          setDiffFetch({ status: 'idle' });
-        } catch (err) {
-          setDiffFetch({ status: 'error', message: err instanceof Error ? err.message : 'Failed to load diff' });
-        }
-      }}
+      // Opening the diff slot writes ?viewer=diff (structurally closing any
+      // other viewer); the diff viewer fetches its payload on mount, so it
+      // survives reload and shows its own loading/error state.
+      onClick={() => viewerSlot.openDiff()}
     >
-      {diffFetch.status === 'loading' ? 'Loading...' : 'View Diff'}
+      View Diff
     </button>
-    {browserView.browserSessionActive && !browserView.open && (
+    {viewerSlot.browserSessionActive && viewerSlot.slot.kind !== 'browser' && (
       <button
         type="button"
         className="work-actions-btn work-actions-view-browser"
         data-testid="view-browser-button"
-        onClick={() => {
-          fileExplorer.closeFile();
-          diffViewer.close();
-          browserView.openPanel();
-        }}
+        onClick={() => viewerSlot.openBrowser()}
         title="Show the live browser view"
       >
         View Browser
@@ -154,7 +134,6 @@ export function WorkControlBar({ conversationId, convModeLabel, phaseType, conti
   const [error, setError] = useState<string | null>(null);
   const [markingMerged, setMarkingMerged] = useState(false);
   const [abandoning, setAbandoning] = useState(false);
-  const [diffFetch, setDiffFetch] = useState<FetchState>({ status: 'idle' });
   const isLoading = markingMerged || abandoning;
   const lifecycle = deriveWorkLifecycleControls({
     convModeLabel,
@@ -169,7 +148,7 @@ export function WorkControlBar({ conversationId, convModeLabel, phaseType, conti
   return (
     <div className="work-actions-bar">
       <span className="work-actions-label">Done?</span>
-      <WorkViewerActions conversationId={conversationId} diffFetch={diffFetch} setDiffFetch={setDiffFetch} />
+      <WorkViewerActions />
       <PrRemediationActions conversationId={conversationId} prStatus={lifecycle.prStatus} onSendMessage={onSendMessage} showError={showError} />
       <button
         className="work-actions-btn work-actions-complete"
@@ -221,7 +200,6 @@ export function WorkControlBar({ conversationId, convModeLabel, phaseType, conti
       )}
       {lifecycle.hasContinuation && <span className="work-actions-continuation-note">Continued — actions belong on the continuation.</span>}
       {error && <div className="work-actions-error">{error}</div>}
-      {diffFetch.status === 'error' && <div className="work-actions-error">{diffFetch.message}</div>}
     </div>
   );
 }
