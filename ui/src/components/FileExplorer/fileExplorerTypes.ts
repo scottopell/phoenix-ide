@@ -18,7 +18,7 @@ export interface FileExplorerContextValue {
   activeFile: string | null;
   /** Close the file viewer */
   closeFile: () => void;
-  /** Full prose reader state (path + rootDir + patchContext) */
+  /** Open-file state (path + rootDir + patchContext) */
   openFileState: OpenFileState | null;
 }
 

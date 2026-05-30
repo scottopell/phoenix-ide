@@ -41,7 +41,7 @@ import {
 
 // Conditional overlays / heavy panels — code-split so the default render path
 // (chat view with no overlay open) doesn't pay their bundle cost.
-// - FileViewer/ProseReader, TaskApprovalReader: pull in react-syntax-highlighter
+// - FileViewer + MetaViewer bodies, TaskApprovalReader: pull in react-syntax-highlighter
 // - TerminalPanel: pulls in xterm + addon (large)
 // - CredentialHelperPanel, FirstTaskWelcome: rarely mounted
 const FileViewer = lazy(() =>
@@ -707,7 +707,7 @@ function ConversationPageContent() {
     [fileExplorer]
   );
 
-  const handleCloseProseReader = useCallback(() => {
+  const handleCloseFileViewer = useCallback(() => {
     fileExplorer.closeFile();
   }, [fileExplorer]);
 
@@ -857,7 +857,7 @@ function ConversationPageContent() {
             <FileViewer
               filePath={prs.path}
               rootDir={prs.rootDir}
-              onClose={handleCloseProseReader}
+              onClose={handleCloseFileViewer}
               onSendNotes={handleSendNotes}
               patchContext={prs.patchContext ?? undefined}
               inline
@@ -1359,7 +1359,7 @@ function ConversationPageContent() {
           <FileViewer
             filePath={fileExplorer.openFileState.path}
             rootDir={fileExplorer.openFileState.rootDir}
-            onClose={handleCloseProseReader}
+            onClose={handleCloseFileViewer}
             onSendNotes={handleSendNotes}
             patchContext={fileExplorer.openFileState.patchContext ?? undefined}
           />
@@ -1441,7 +1441,7 @@ function ConversationPageContent() {
                 <FileViewer
                   filePath={splitPanePrs.path}
                   rootDir={splitPanePrs.rootDir}
-                  onClose={handleCloseProseReader}
+                  onClose={handleCloseFileViewer}
                   onSendNotes={handleSendNotes}
                   patchContext={splitPanePrs.patchContext ?? undefined}
                   inline

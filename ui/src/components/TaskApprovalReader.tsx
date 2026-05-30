@@ -5,8 +5,11 @@
  * Approve, Discard, or Send Feedback. The overlay cannot be dismissed
  * by Escape, back button, or clicking outside.
  *
- * Annotations work the same as ProseReader (long-press or hover button).
- * Plan content comes from ConversationState, not from disk.
+ * Annotations use the same long-press idiom as the file viewer, but this
+ * component is intentionally separate from the MetaViewer file-review stack
+ * (local approval-feedback notes, not the conversation ReviewNotesContext; a
+ * non-dismissible phase overlay, not a viewer slot). See specs/prose-feedback/
+ * for the rationale. Plan content comes from ConversationState, not from disk.
  */
 
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
