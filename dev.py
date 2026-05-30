@@ -2198,27 +2198,26 @@ def cmd_check():
         approach 300s on their own, and when bundled with ~50s of test runtime
         the combined step exceeds the timeout even though nothing is wrong.
 
+        The nextest probe and thread-cap sizing run before clippy on purpose:
+        both are lock-free, so hoisting them keeps clippy → test-compile one
+        uninterrupted hold of the shared cargo target lock and denies lane_e2e
+        a gap to wedge its `cargo build --bin` between them (see lane_e2e).
+
         The final `codegen-stale` step guards against Rust-type edits landing
         without a regenerated `ui/src/generated/` directory (task 02677).
         `cargo test` runs ts-rs' per-type `export_bindings_*` tests which
         overwrite the generated .ts files; if those differ from what's
         committed to git, the developer forgot to regenerate.
         """
-        run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
-        if sys.platform == "darwin":
-            # macOS prod deploy uses native target (launchd_prod_deploy → prod_build target=None),
-            # so the musl smoke check is opt-in: skip cleanly if the cross toolchain isn't installed.
-            # See task 60001 for installing musl-cross-make on this machine.
-            if shutil.which("x86_64-linux-musl-gcc"):
-                run_step("cargo check musl", [
-                    "cargo", "check", "--target", "x86_64-unknown-linux-musl",
-                ])
-            else:
-                print("  i  cargo check musl: skipped (x86_64-linux-musl-gcc not on PATH; see task 60001)")
-        # Linux hosts: the prior fallback was a plain `cargo check`, which is
-        # strictly redundant with `cargo clippy` above (clippy implies check).
-        # Drop it — musl validation belongs on the CI/macOS path that has the
-        # cross toolchain installed.
+        # Probe nextest and size the test-thread cap BEFORE taking the cargo
+        # target lock with clippy. Neither step touches target/ or its lock
+        # (`cargo nextest --version` only prints a version; the /proc/meminfo
+        # read is pure Python), so doing them up front keeps clippy →
+        # test-compile a single uninterrupted lock-holding streak. Were they
+        # left between clippy and test-compile, lane_e2e's `cargo build --bin`
+        # could win the freed lock in that gap and wedge a full bin codegen
+        # between them, delaying the test compile/run. See lane_e2e for the
+        # target-lock sharing contract.
         has_nextest = subprocess.run(
             ["cargo", "nextest", "--version"],
             capture_output=True,
@@ -2240,9 +2239,6 @@ def cmd_check():
         except (OSError, StopIteration):
             mem_cap = cpus
         test_threads = max(2, min(cpus - 1, mem_cap))
-        if test_threads < cpus:
-            print(f"  i  cargo test: capping to {test_threads} threads "
-                  f"(cpus={cpus}, mem_cap={mem_cap})")
         if has_nextest:
             compile_cmd = ["cargo", "nextest", "run", "--no-run"]
             test_cmd = ["cargo", "nextest", "run",
@@ -2251,6 +2247,25 @@ def cmd_check():
             compile_cmd = ["cargo", "test", "--no-run"]
             test_cmd = ["cargo", "test", "--",
                         "--test-threads", str(test_threads)]
+
+        run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
+        if sys.platform == "darwin":
+            # macOS prod deploy uses native target (launchd_prod_deploy → prod_build target=None),
+            # so the musl smoke check is opt-in: skip cleanly if the cross toolchain isn't installed.
+            # See task 60001 for installing musl-cross-make on this machine.
+            if shutil.which("x86_64-linux-musl-gcc"):
+                run_step("cargo check musl", [
+                    "cargo", "check", "--target", "x86_64-unknown-linux-musl",
+                ])
+            else:
+                print("  i  cargo check musl: skipped (x86_64-linux-musl-gcc not on PATH; see task 60001)")
+        # Linux hosts: the prior fallback was a plain `cargo check`, which is
+        # strictly redundant with `cargo clippy` above (clippy implies check).
+        # Drop it — musl validation belongs on the CI/macOS path that has the
+        # cross toolchain installed.
+        if test_threads < cpus:
+            print(f"  i  cargo test: capping to {test_threads} threads "
+                  f"(cpus={cpus}, mem_cap={mem_cap})")
         run_step("cargo test compile", compile_cmd)
         run_step("cargo test", test_cmd)
         # Codegen staleness guard. `cargo test` above re-runs the ts-rs
@@ -2303,10 +2318,25 @@ def cmd_check():
         and an isolated temp DB, then runs a battery of scripted conversations
         through the same HTTP/SSE surface phoenix-client.py uses.
 
-        The cargo bin build inside this lane shares the workspace target dir
-        with `lane_rust`'s cargo invocations — cargo's target lock serializes
-        them, so the bin link is cheap once clippy/test compile have populated
-        target/. Designed to fit in lane_rust's wall-clock shadow.
+        Target-lock sharing with lane_rust. run.py's `cargo build --bin
+        phoenix_ide` and lane_rust's cargo invocations share the one workspace
+        target dir, whose exclusive lock serializes all builds. The `--bin`
+        artifact is NOT a cheap link riding on lane_rust's output: clippy emits
+        only check-mode .rmeta, and `cargo test --no-run` emits cfg(test)
+        harness binaries under deps/ — neither produces target/debug/phoenix_ide,
+        so this build does a full non-test crate codegen + link. Only the
+        external dependency crates are reused.
+
+        The overlap that keeps this lane inside lane_rust's wall-clock shadow
+        comes from nextest, not artifact reuse: `cargo nextest run` splits
+        build from run and releases the target lock for the run phase, so this
+        bin build proceeds in parallel with the test run. On the plain
+        `cargo test` fallback (no nextest installed) the run phase holds the
+        lock end-to-end, so this build serializes after it and adds a full
+        bin codegen to the tail of the critical path — the fallback is slower
+        by design, not broken. lane_rust hoists its lock-free probe/sizing
+        ahead of clippy so this build cannot wedge between clippy and
+        test-compile.
         """
         run_step("e2e", ["uv", "run", "tests/e2e/run.py"])
 
