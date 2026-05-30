@@ -27,6 +27,7 @@ import { useToast } from '../hooks/useToast';
 import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
+import { RenderProfiler } from '../dev/renderProfiler';
 import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
@@ -1055,6 +1056,7 @@ function ConversationPageContent() {
           </button>
         </div>
       )}
+      <RenderProfiler id="MessageList">
       <MessageList
         messages={atom.messages}
         pendingMessages={pendingMessages}
@@ -1066,6 +1068,7 @@ function ConversationPageContent() {
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}
       />
+      </RenderProfiler>
       {atom.uiError && (
         <div className="sse-error-toast" role="alert">
           <span className="sse-error-text">
@@ -1258,6 +1261,7 @@ function ConversationPageContent() {
             />
           </Suspense>
         )}
+        <RenderProfiler id="InputArea">
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
@@ -1274,6 +1278,7 @@ function ConversationPageContent() {
           onRetry={handleRetry}
           onDismissError={dismiss}
         />
+        </RenderProfiler>
         </>
       ) : convStateForChildren.type === 'error' ? (
         <ErrorBanner
@@ -1318,6 +1323,7 @@ function ConversationPageContent() {
           convModeLabel={conversation.conv_mode_label}
           messageCount={conversation.message_count}
         />
+        <RenderProfiler id="InputArea">
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
@@ -1334,9 +1340,11 @@ function ConversationPageContent() {
           onRetry={handleRetry}
           onDismissError={dismiss}
         />
+        </RenderProfiler>
         </>
       ) : null}
       <BreadcrumbBar breadcrumbs={atom.breadcrumbs} visible={atom.breadcrumbs.length > 0} />
+      <RenderProfiler id="StateBar">
       <ConnectedStateBar
         slug={slug!}
         conversation={conversation as Conversation}
@@ -1361,6 +1369,7 @@ function ConversationPageContent() {
         onOpenFiles={isDesktop ? undefined : () => setShowFileBrowser(true)}
         prStatusState={prStatusHandle.state}
       />
+      </RenderProfiler>
       </div>
 
       {/* Terminal split-pane (REQ-TERM-001) — collapsed = 32px header strip.
