@@ -522,12 +522,19 @@ pub(crate) fn create_worktree(
             ],
         )
         .map_err(|e| {
+            // `git worktree add -b` creates the branch ref before checking out
+            // files. A mid-checkout failure (commonly ENOSPC) rolls back the
+            // worktree dir + admin entry but leaves the branch we created behind.
+            // Roll it back so a retry isn't permanently poisoned by a stale ref.
+            cleanup_failed_worktree(cwd, &worktree_path, Some(branch_name));
             GitOpError::Git(format!(
                 "Failed to create worktree with new branch '{branch_name}' from '{start_point}': {e}"
             ))
         })?;
     } else {
         run_git(cwd, &["worktree", "add", &worktree_path_str, branch_name]).map_err(|e| {
+            // Branch pre-existed; clean only the partial worktree, never the branch.
+            cleanup_failed_worktree(cwd, &worktree_path, None);
             GitOpError::Git(format!(
                 "Failed to create worktree for branch '{branch_name}': {e}"
             ))
@@ -540,6 +547,49 @@ pub(crate) fn create_worktree(
     }
 
     Ok(worktree_path_str)
+}
+
+/// Best-effort rollback of a partially-created worktree after `git worktree add`
+/// fails. Every step is non-fatal: the original add error is what gets surfaced;
+/// these cleanups only stop the failure from leaving artifacts that poison a retry.
+///
+/// `created_branch` is `Some(name)` only when the caller passed `-b` and thus owns
+/// the branch ref. In the checkout-existing-branch path it is `None` — deleting a
+/// pre-existing branch would be data loss.
+fn cleanup_failed_worktree(cwd: &Path, worktree_path: &Path, created_branch: Option<&str>) {
+    let worktree_path_str = worktree_path.to_string_lossy().to_string();
+
+    // 1. Drop any admin entry + partial dir git registered before it bailed.
+    if let Err(e) = run_git(cwd, &["worktree", "remove", &worktree_path_str, "--force"]) {
+        tracing::debug!(
+            error = %e,
+            worktree = %worktree_path_str,
+            "worktree remove during failed-add cleanup failed; trying fs + prune"
+        );
+        if worktree_path.exists() {
+            if let Err(rm_err) = std::fs::remove_dir_all(worktree_path) {
+                tracing::debug!(error = %rm_err, "fs cleanup of partial worktree failed");
+            }
+        }
+        let _ = run_git(cwd, &["worktree", "prune"]);
+    }
+
+    // 2. Delete the branch we created, but only if it isn't checked out elsewhere
+    //    (defensive: a failed add means it shouldn't be, but never move a ref a
+    //    worktree owns — see AGENTS.md worktree-safety rule).
+    if let Some(branch) = created_branch {
+        if find_branch_in_worktree_list(cwd, branch).is_some() {
+            tracing::debug!(branch, "leaked-branch cleanup skipped: still checked out");
+            return;
+        }
+        if let Err(e) = run_git(cwd, &["branch", "-D", branch]) {
+            tracing::debug!(
+                error = %e,
+                branch,
+                "leaked-branch cleanup failed (non-fatal)"
+            );
+        }
+    }
 }
 
 /// Check if a branch is already checked out in any worktree.
@@ -903,6 +953,98 @@ mod tests {
         assert_eq!(
             run_git(feature_worktree.path(), &["status", "--porcelain"]).unwrap(),
             ""
+        );
+    }
+
+    fn branch_exists(dir: &Path, branch: &str) -> bool {
+        run_git(
+            dir,
+            &[
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .is_ok()
+    }
+
+    #[test]
+    fn cleanup_failed_worktree_deletes_branch_we_created() {
+        // Models the leak: `git worktree add -b` made the branch, then checkout
+        // failed and git rolled back the dir/admin entry. The branch must go.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        run_git(tmp.path(), &["branch", "task-pending-deadbeef", "main"]).unwrap();
+        assert!(branch_exists(tmp.path(), "task-pending-deadbeef"));
+
+        let phantom = tmp.path().join(".phoenix/worktrees/deadbeef");
+        cleanup_failed_worktree(tmp.path(), &phantom, Some("task-pending-deadbeef"));
+
+        assert!(!branch_exists(tmp.path(), "task-pending-deadbeef"));
+    }
+
+    #[test]
+    fn cleanup_failed_worktree_preserves_preexisting_branch() {
+        // Checkout-existing-branch path passes None: the branch predates us and
+        // must survive a failed add — deleting it would be data loss.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        run_git(tmp.path(), &["branch", "existing-feature", "main"]).unwrap();
+
+        let phantom = tmp.path().join(".phoenix/worktrees/cafe");
+        cleanup_failed_worktree(tmp.path(), &phantom, None);
+
+        assert!(branch_exists(tmp.path(), "existing-feature"));
+    }
+
+    #[test]
+    fn cleanup_failed_worktree_spares_branch_checked_out_elsewhere() {
+        // Safety guard: never delete a ref a live worktree owns, even if asked.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        run_git(tmp.path(), &["branch", "task-pending-live", "main"]).unwrap();
+        let live_wt = TempDir::new().unwrap();
+        run_git(
+            tmp.path(),
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                live_wt.path().to_str().unwrap(),
+                "task-pending-live",
+            ],
+        )
+        .unwrap();
+
+        let phantom = tmp.path().join(".phoenix/worktrees/other");
+        cleanup_failed_worktree(tmp.path(), &phantom, Some("task-pending-live"));
+
+        assert!(branch_exists(tmp.path(), "task-pending-live"));
+    }
+
+    #[test]
+    fn create_worktree_failure_leaves_no_leaked_branch() {
+        // End-to-end: force `git worktree add -b` to fail by pre-creating a
+        // colliding child path, then assert no `task-pending-*` ref survives.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
+
+        // Occupy the worktree target with a non-empty dir so `add` aborts.
+        let conv_id = "feedface-0000-0000-0000-000000000000";
+        let target = tmp.path().join(".phoenix/worktrees").join(conv_id);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("squatter"), "blocks the add\n").unwrap();
+
+        let res = create_worktree(tmp.path(), conv_id, "task-pending-feedface", Some("main"));
+        assert!(res.is_err(), "add into a non-empty dir should fail");
+
+        let branches = run_git(tmp.path(), &["branch", "--list", "task-pending-*"]).unwrap();
+        assert_eq!(
+            branches.trim(),
+            "",
+            "no task-pending branch may leak: {branches:?}"
         );
     }
 
