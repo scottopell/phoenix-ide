@@ -18,6 +18,7 @@ import type {
   CodeViewDiffItem,
   DiffLineAnnotation,
   FileDiffMetadata,
+  LineTypes,
 } from '@pierre/diffs';
 import type { DiffSection, NoteAnchor, ReviewNote } from '../../contexts/ReviewNotesContext';
 
@@ -62,9 +63,14 @@ export interface BuiltSection {
 /**
  * Parse one section's raw unified diff into Pierre diff items. Permissive: a
  * parse failure is captured as `error` (not thrown) so a malformed section
- * degrades to a fallback without taking down the conversation page. Item ids
- * are de-duplicated with a `#n` suffix should the same path appear twice within
- * a section (pathological, but keeps CodeView's unique-id invariant intact).
+ * degrades to a fallback without taking down the conversation page.
+ *
+ * A well-formed unified diff lists each path once per section. Should the same
+ * path nonetheless appear twice (a malformed/pathological diff), item ids are
+ * de-duplicated with a `#n` suffix purely to preserve CodeView's unique-id
+ * invariant. Notes remain anchored by `(section, filePath)`, so the rare
+ * duplicate occurrences share notes — best-effort isolation is not attempted
+ * for an input that should not occur.
  */
 export function buildSectionItems(section: DiffSection, rawDiff: string): BuiltSection {
   if (!rawDiff.trim()) return { items: [], error: null };
@@ -114,6 +120,61 @@ export function noteToAnnotation(note: ReviewNote): PhoenixDiffAnnotation | null
 }
 
 /**
+ * Resolve a Pierre (side, lineNumber) pair to a diff note's line fields. The
+ * additions side and a changed/added line anchor on the new-file number
+ * (`newLine`); a genuinely removed line anchors on the old-file number
+ * (`oldLine`).
+ *
+ * A *context* (unchanged) line is the subtle case: in split view it is
+ * clickable from the deletions (left) pane, where Pierre reports it on the
+ * `deletions` side with its old-file number — but it was not removed. Treating
+ * that as `oldLine` would label the note "Removed line N". Context lines exist
+ * on both sides, so this normalises them to their new-file number (the same
+ * `newLine` field additions use), walking the hunk's content blocks to map the
+ * old-file number across intervening changes. Purely structural — derived from
+ * the parsed hunks, no Pierre line-type input required.
+ */
+export function resolveDiffAnchorLine(
+  fileDiff: FileDiffMetadata,
+  side: AnnotationSide,
+  lineNumber: number,
+): { newLine?: number; oldLine?: number } {
+  if (side === 'additions') return { newLine: lineNumber };
+  for (const h of fileDiff.hunks) {
+    if (lineNumber < h.deletionStart || lineNumber >= h.deletionStart + h.deletionCount) continue;
+    let delLine = h.deletionStart;
+    let addLine = h.additionStart;
+    for (const seg of h.hunkContent) {
+      if (seg.type === 'context') {
+        if (lineNumber >= delLine && lineNumber < delLine + seg.lines) {
+          return { newLine: addLine + (lineNumber - delLine) };
+        }
+        delLine += seg.lines;
+        addLine += seg.lines;
+      } else {
+        if (lineNumber >= delLine && lineNumber < delLine + seg.deletions) return { oldLine: lineNumber };
+        delLine += seg.deletions;
+        addLine += seg.additions;
+      }
+    }
+    break;
+  }
+  return { oldLine: lineNumber };
+}
+
+/** Stable 32-bit FNV-1a hash of a string, base-36 encoded. Used to fold a
+ *  file's line *content* into the render signature without carrying the full
+ *  text around for equality comparison. */
+function hashContent(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193);
+  }
+  return (h >>> 0).toString(36);
+}
+
+/**
  * A signature of everything PhoenixDiffCodeView draws for one diff item: the
  * parsed file fingerprint plus the line/file notes (and which one is flashed).
  * The wrapper turns a change in this string into a bumped `CodeViewItem.version`
@@ -128,7 +189,10 @@ export function itemRenderSignature(
   highlightedNoteId: string | null,
 ): string {
   const filePath = fileDiff.name;
-  // Cheap content fingerprint: changes when a refetch reparses this path.
+  // Content fingerprint: line counts alone miss an edit that changes line text
+  // without changing the shape (e.g. `foo`→`bar` becoming `foo`→`baz`), so the
+  // actual addition/deletion text is hashed in. Otherwise the version wouldn't
+  // bump on a refetch and Pierre would keep rendering the stale line content.
   const fp = [
     fileDiff.name,
     fileDiff.prevName ?? '',
@@ -137,6 +201,7 @@ export function itemRenderSignature(
     fileDiff.hunks.length,
     fileDiff.additionLines.length,
     fileDiff.deletionLines.length,
+    hashContent(`${fileDiff.additionLines.join('\n')} ${fileDiff.deletionLines.join('\n')}`),
   ].join('|');
   const lineNotes: string[] = [];
   const fileNotes: string[] = [];
@@ -228,4 +293,73 @@ export function scrollTargetForNote(note: ReviewNote): NoteScrollTarget | null {
   if (a.newLine !== undefined) return { id, line: { lineNumber: a.newLine, side: 'additions' } };
   if (a.oldLine !== undefined) return { id, line: { lineNumber: a.oldLine, side: 'deletions' } };
   return { id };
+}
+
+/** A diff line resolved from a touch point: which item it belongs to plus the
+ *  Pierre annotation side and line number, ready to feed annotation logic. */
+export interface TouchedLine {
+  item: PhoenixDiffItem;
+  side: AnnotationSide;
+  lineNumber: number;
+}
+
+function lineTypeFromElement(el: HTMLElement): LineTypes | undefined {
+  const t = el.getAttribute('data-line-type');
+  if (t === 'change-deletion' || t === 'change-addition' || t === 'context' || t === 'context-expanded') {
+    return t;
+  }
+  return undefined;
+}
+
+/** Mirror of Pierre's `getAnnotationSide`: a changed line's side is fixed by its
+ *  type; a context line takes the side of the code column it was touched in. */
+function annotationSideFor(lineType: LineTypes, codeElement: HTMLElement): AnnotationSide {
+  if (lineType === 'change-deletion') return 'deletions';
+  if (lineType === 'change-addition') return 'additions';
+  return codeElement.hasAttribute('data-deletions') ? 'deletions' : 'additions';
+}
+
+/**
+ * Resolve a touched diff line from a pointer event's composed path — Pierre
+ * drives `onLineEnter` off mouse pointer-moves only (a stationary touch never
+ * fires it), so the touch long-press cannot read the hovered line and must
+ * resolve the line under the finger itself. This mirrors Pierre's internal
+ * `resolvePointerTarget`: walk the composed path reading the line number /
+ * line-type / enclosing code column off Pierre's own data attributes, and
+ * identify the owning item by matching the path against the rendered items'
+ * container elements (which appear in the composed path as shadow hosts).
+ *
+ * This is the single sanctioned exception to the wrapper's "no DOM scraping"
+ * rule: there is no typed Pierre callback for a touch press target, so the
+ * attributes Pierre itself emits are read here. Returns null when the path does
+ * not land on a resolvable line within a known item.
+ */
+export function resolveTouchedLine(
+  path: readonly EventTarget[],
+  renderedItems: ReadonlyArray<{ element: HTMLElement; item: PhoenixDiffItem }>,
+): TouchedLine | null {
+  let item: PhoenixDiffItem | undefined;
+  let lineNumber: number | undefined;
+  let lineType: LineTypes | undefined;
+  let codeElement: HTMLElement | undefined;
+  for (const node of path) {
+    if (!(node instanceof HTMLElement)) continue;
+    if (item === undefined) {
+      const match = renderedItems.find((r) => r.element === node);
+      if (match) item = match.item;
+    }
+    if (lineNumber === undefined) {
+      const raw = node.getAttribute('data-column-number') ?? node.getAttribute('data-line');
+      if (raw != null) {
+        const n = Number.parseInt(raw, 10);
+        if (!Number.isNaN(n)) {
+          lineNumber = n;
+          lineType = lineTypeFromElement(node);
+        }
+      }
+    }
+    if (codeElement === undefined && node.hasAttribute('data-code')) codeElement = node;
+  }
+  if (!item || lineNumber === undefined || lineType === undefined || !codeElement) return null;
+  return { item, side: annotationSideFor(lineType, codeElement), lineNumber };
 }

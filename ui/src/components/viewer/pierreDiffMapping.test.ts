@@ -7,6 +7,8 @@ import {
   itemRenderSignature,
   lineTextAt,
   noteToAnnotation,
+  resolveDiffAnchorLine,
+  resolveTouchedLine,
   scrollTargetForNote,
   sectionFromItemId,
 } from './pierreDiffMapping';
@@ -269,6 +271,118 @@ describe('itemRenderSignature (drives CodeView item version bumps)', () => {
       null,
     );
     expect(other).toBe(base());
+  });
+});
+
+describe('itemRenderSignature content fingerprint', () => {
+  // Two diffs of the same shape (one context, one deletion, two additions, one
+  // context) but different added text. Line counts/hunk shape are identical, so
+  // only a content hash distinguishes them.
+  const shaped = (added: string) =>
+    [
+      'diff --git a/src/foo.ts b/src/foo.ts',
+      '--- a/src/foo.ts',
+      '+++ b/src/foo.ts',
+      '@@ -1,3 +1,4 @@',
+      ' const a = 1;',
+      '-const b = 2;',
+      `+const b = ${added};`,
+      '+const c = 4;',
+      ' const d = 5;',
+    ].join('\n');
+
+  it('bumps when line text changes without changing the diff shape', () => {
+    const a = buildSectionItems('committed', shaped('3')).items[0]!.fileDiff;
+    const b = buildSectionItems('committed', shaped('9')).items[0]!.fileDiff;
+    expect(a.additionLines.length).toBe(b.additionLines.length);
+    expect(a.hunks.length).toBe(b.hunks.length);
+    expect(itemRenderSignature(a, [], 'committed', null)).not.toBe(
+      itemRenderSignature(b, [], 'committed', null),
+    );
+  });
+});
+
+describe('resolveDiffAnchorLine', () => {
+  // @@ -1,3 +1,4 @@   1:context  2:-del  ->2,3:+add   3:context(->4)
+  const fileDiff = buildSectionItems('committed', ADD_FILE).items[0]!.fileDiff;
+
+  it('keeps an addition-side line on the new-file number', () => {
+    expect(resolveDiffAnchorLine(fileDiff, 'additions', 2)).toEqual({ newLine: 2 });
+  });
+
+  it('keeps a genuinely removed line on the old-file number', () => {
+    expect(resolveDiffAnchorLine(fileDiff, 'deletions', 2)).toEqual({ oldLine: 2 });
+  });
+
+  it('normalises a context line touched on the deletions pane to its new-file number', () => {
+    // Old line 1 (` const a = 1;`) is context → new line 1, not "Removed line 1".
+    expect(resolveDiffAnchorLine(fileDiff, 'deletions', 1)).toEqual({ newLine: 1 });
+    // Old line 3 (` const d = 5;`) is context after a +1 net change → new line 4.
+    expect(resolveDiffAnchorLine(fileDiff, 'deletions', 3)).toEqual({ newLine: 4 });
+  });
+});
+
+describe('resolveTouchedLine', () => {
+  const item = buildSectionItems('committed', ADD_FILE).items[0]!;
+
+  /** Build a Pierre-like line subtree and return its composed-path order. */
+  function buildPath(opts: {
+    line: number;
+    lineType: string;
+    sideAttr: 'data-additions' | 'data-deletions';
+    attr?: 'data-line' | 'data-column-number';
+  }): { path: HTMLElement[]; container: HTMLElement } {
+    const container = document.createElement('div');
+    const code = document.createElement('div');
+    code.setAttribute('data-code', '');
+    code.setAttribute(opts.sideAttr, '');
+    const lineEl = document.createElement('span');
+    lineEl.setAttribute(opts.attr ?? 'data-line', String(opts.line));
+    lineEl.setAttribute('data-line-type', opts.lineType);
+    code.appendChild(lineEl);
+    container.appendChild(code);
+    // composed path is innermost-first, up through the item container.
+    return { path: [lineEl, code, container], container };
+  }
+
+  it('resolves an addition line to its item, side, and number', () => {
+    const { path, container } = buildPath({ line: 2, lineType: 'change-addition', sideAttr: 'data-additions' });
+    expect(resolveTouchedLine(path, [{ element: container, item }])).toEqual({
+      item,
+      side: 'additions',
+      lineNumber: 2,
+    });
+  });
+
+  it('resolves a deletion line to the deletions side', () => {
+    const { path, container } = buildPath({ line: 2, lineType: 'change-deletion', sideAttr: 'data-deletions' });
+    expect(resolveTouchedLine(path, [{ element: container, item }])).toMatchObject({
+      side: 'deletions',
+      lineNumber: 2,
+    });
+  });
+
+  it('takes a context line side from the touched code column', () => {
+    const left = buildPath({ line: 3, lineType: 'context', sideAttr: 'data-deletions' });
+    expect(resolveTouchedLine(left.path, [{ element: left.container, item }])).toMatchObject({
+      side: 'deletions',
+      lineNumber: 3,
+    });
+    const right = buildPath({ line: 4, lineType: 'context', sideAttr: 'data-additions', attr: 'data-column-number' });
+    expect(resolveTouchedLine(right.path, [{ element: right.container, item }])).toMatchObject({
+      side: 'additions',
+      lineNumber: 4,
+    });
+  });
+
+  it('returns null when the path is not within a known item', () => {
+    const { path } = buildPath({ line: 2, lineType: 'change-addition', sideAttr: 'data-additions' });
+    expect(resolveTouchedLine(path, [])).toBeNull();
+  });
+
+  it('returns null when no resolvable line is in the path', () => {
+    const container = document.createElement('div');
+    expect(resolveTouchedLine([container], [{ element: container, item }])).toBeNull();
   });
 });
 

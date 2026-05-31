@@ -91,15 +91,15 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     vi.useFakeTimers();
     try {
       renderDiff();
-      const container = screen.getByTestId('codeview-mock');
-      // Pierre reports the hovered line; then a held touch pointer fires.
-      fireEvent.click(screen.getByTestId('mock-line-enter-committed:foo.txt'));
+      // The press is dispatched on the line element so its composed path lets
+      // the touch resolver recover the line under the finger (no hover ref).
+      const lineEl = screen.getByTestId('mock-line-el-committed:foo.txt');
 
       const press = (type: string, x = 0, y = 0) => {
         const ev = new Event(type, { bubbles: true });
         Object.assign(ev, { pointerType: 'touch', clientX: x, clientY: y });
         act(() => {
-          container.dispatchEvent(ev);
+          lineEl.dispatchEvent(ev);
         });
       };
 
@@ -109,7 +109,7 @@ describe('DiffView (Pierre CodeView wiring)', () => {
       act(() => vi.advanceTimersByTime(600));
       expect(screen.queryByText('foo.txt:1')).not.toBeInTheDocument();
 
-      // A still 500ms hold opens the dialog anchored at the hovered line.
+      // A still 500ms hold opens the dialog anchored at the resolved line.
       press('pointerdown');
       act(() => vi.advanceTimersByTime(500));
       expect(screen.getByText('foo.txt:1')).toBeInTheDocument();

@@ -40,6 +40,11 @@ export function itemVersion(id: string): number | undefined {
 /* eslint-disable @typescript-eslint/no-explicit-any */
 export function makeCodeViewMock() {
   const CodeView = React.forwardRef(function CodeViewMock(props: any, ref: any) {
+    // Per-item container elements, keyed by id, so getRenderedItems() can hand
+    // back the same { element, item } shape the real CodeView exposes — the
+    // touch resolver matches a pointer's composed path against these.
+    const itemEls = React.useRef(new Map<string, HTMLElement>());
+
     React.useImperativeHandle(ref, () => ({
       scrollTo: (target: unknown) => codeViewMockState.scrollToCalls.push(target),
       addItems: () => undefined,
@@ -49,7 +54,19 @@ export function makeCodeViewMock() {
       setSelectedLines: () => undefined,
       getSelectedLines: () => null,
       clearSelectedLines: () => undefined,
-      getInstance: () => undefined,
+      getInstance: () => ({
+        getRenderedItems: () =>
+          (props.items ?? [])
+            .filter((it: any) => itemEls.current.has(it.id))
+            .map((it: any) => ({
+              id: it.id,
+              type: 'diff',
+              item: it,
+              version: it.version,
+              element: itemEls.current.get(it.id),
+              instance: {},
+            })),
+      }),
     }));
 
     codeViewMockState.lastItems = [...(props.items ?? [])];
@@ -57,10 +74,23 @@ export function makeCodeViewMock() {
     return (
       <div data-testid="codeview-mock" className={props.className} ref={props.containerRef}>
         {(props.items ?? []).map((item: any) => (
-          <div key={item.id} data-item-id={item.id}>
+          <div
+            key={item.id}
+            data-item-id={item.id}
+            ref={(el: HTMLElement | null) => {
+              if (el) itemEls.current.set(item.id, el);
+              else itemEls.current.delete(item.id);
+            }}
+          >
             {props.renderHeaderPrefix?.(item)}
             {props.renderHeaderMetadata?.(item)}
             <span data-filename>{item.fileDiff?.name}</span>
+            {/* Pierre-like line DOM (data attributes the touch resolver reads). */}
+            <div data-code="" data-additions="">
+              <span data-line="1" data-line-type="change-addition" data-testid={`mock-line-el-${item.id}`}>
+                line text
+              </span>
+            </div>
             {(item.annotations ?? []).map((ann: any, i: number) => (
               <div key={i} data-annotation>
                 {props.renderAnnotation?.(ann, item)}
@@ -73,13 +103,6 @@ export function makeCodeViewMock() {
               }
             >
               line
-            </button>
-            {/* Drives Pierre's onLineEnter so the long-press handler knows the line. */}
-            <button
-              data-testid={`mock-line-enter-${item.id}`}
-              onClick={() => props.options?.onLineEnter?.(lineProps, { type: 'diff', item })}
-            >
-              enter
             </button>
             {/* A touch tap: onLineClick with a touch pointer (should NOT annotate). */}
             <button
