@@ -163,7 +163,9 @@ To bump the pnpm version: edit `packageManager` in `ui/package.json`, run
 
 Prefer logical splits over a single kitchen-sink commit when concerns are distinct. Use conventional-commit-ish prefixes (`fix:`, `feat:`, `refactor:`, `build:`, `tasks:`, `docs:`) matching the existing log style.
 
-**Push still requires explicit user authorization.** Pushes affect others and trigger deploys; keep them opt-in.
+**Agents are authorized to commit freely and to push to the branch they're working on without asking.** Pushing a bug fix or completed unit of work is routine business — don't gate it behind a confirmation, including a `--force-with-lease` to land a rebase on a branch you own.
+
+**Destructive remote operations remain prohibited** without explicit authorization: lease-less force-pushes, deleting remote branches or tags, or rewriting history on `main` or a branch you don't own. When a push would affect work that isn't yours, ask first.
 
 ---
 
