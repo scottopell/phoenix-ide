@@ -148,6 +148,74 @@ describe('lineTextAt', () => {
   });
 });
 
+describe('edge-case diffs', () => {
+  const BINARY = [
+    'diff --git a/img.png b/img.png',
+    'new file mode 100644',
+    'index 0000000..1111111',
+    'Binary files /dev/null and b/img.png differ',
+  ].join('\n');
+
+  const RENAME = [
+    'diff --git a/old.ts b/new.ts',
+    'similarity index 80%',
+    'rename from old.ts',
+    'rename to new.ts',
+    'index aaa..bbb 100644',
+    '--- a/old.ts',
+    '+++ b/new.ts',
+    '@@ -1,2 +1,2 @@',
+    ' keep',
+    '-was',
+    '+now',
+  ].join('\n');
+
+  it('produces a header-only item for a binary/added file (no hunks)', () => {
+    const { items, error } = buildSectionItems('committed', BINARY);
+    expect(error).toBeNull();
+    expect(items).toHaveLength(1);
+    expect(items[0]!.id).toBe('committed:img.png');
+    expect(items[0]!.fileDiff.hunks).toHaveLength(0);
+  });
+
+  it('gives a renamed file a stable identity via name + prevName', () => {
+    const { items } = buildSectionItems('uncommitted', RENAME);
+    expect(items[0]!.id).toBe('uncommitted:new.ts');
+    expect(items[0]!.fileDiff.name).toBe('new.ts');
+    expect(items[0]!.fileDiff.prevName).toBe('old.ts');
+  });
+
+  it('recovers context-line text on either side', () => {
+    const fileDiff = buildSectionItems('committed', ADD_FILE).items[0]!.fileDiff;
+    // Line 1 is the context line ` const a = 1;` — present on both sides.
+    expect(lineTextAt(fileDiff, 'additions', 1)).toBe('const a = 1;');
+    expect(lineTextAt(fileDiff, 'deletions', 1)).toBe('const a = 1;');
+  });
+});
+
+describe('legacy diffPos compatibility', () => {
+  // A note created by the previous viewer may still carry diffPos. The new
+  // renderer must ignore it: identity is side + line number.
+  const legacy = note({
+    kind: 'diff',
+    section: 'committed',
+    filePath: 'src/foo.ts',
+    newLine: 3,
+    diffPos: 7,
+  });
+
+  it('maps to an annotation by side+line, not diffPos', () => {
+    expect(noteToAnnotation(legacy)).toMatchObject({ side: 'additions', lineNumber: 3 });
+  });
+
+  it('scrolls by line, not diffPos', () => {
+    expect(scrollTargetForNote(legacy)).toEqual({
+      id: 'committed:src/foo.ts',
+      line: { lineNumber: 3, side: 'additions' },
+    });
+  });
+});
+
 describe('scrollTargetForNote', () => {
   it('targets a line for a diff note', () => {
     expect(

@@ -102,4 +102,34 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     renderDiff('', '');
     expect(screen.getByText(/No changes vs/)).toBeInTheDocument();
   });
+
+  it('renders the truncation indicator with a ≥ prefix when saturated', () => {
+    render(
+      <ReviewNotesProvider>
+        <DiffView
+          open
+          comparator="origin/main"
+          commitLog=""
+          committedDiff={COMMITTED}
+          committedTruncatedKib={5}
+          committedSaturated
+          uncommittedDiff=""
+          onClose={() => undefined}
+          onSendNotes={() => undefined}
+        />
+      </ReviewNotesProvider>,
+    );
+    expect(screen.getByText(/truncated; ≥5 KiB total/)).toBeInTheDocument();
+  });
+
+  it('shows a section-scoped parse error for a malformed diff instead of crashing', () => {
+    renderDiff('this is not a diff at all', '');
+    expect(screen.getByRole('alert')).toHaveTextContent(/could not be parsed/i);
+  });
+
+  it('keeps the same path in committed and uncommitted as distinct items', () => {
+    const { container } = renderDiff(COMMITTED, COMMITTED);
+    expect(container.querySelector('[data-item-id="committed:foo.txt"]')).toBeTruthy();
+    expect(container.querySelector('[data-item-id="uncommitted:foo.txt"]')).toBeTruthy();
+  });
 });
