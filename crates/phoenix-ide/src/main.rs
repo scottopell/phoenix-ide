@@ -9,19 +9,21 @@ mod chain_runtime;
 mod db;
 pub(crate) mod git_ops;
 mod llm;
-mod llm_language;
 mod message_expander;
-mod platform;
 mod runtime;
 pub mod skills;
 mod state_machine;
 mod system_prompt;
-mod task_source;
 mod terminal;
 mod title_generator;
 mod tls;
 mod tools;
-mod work_scope;
+
+// Domain-vocabulary leaves now live in the acyclic `phoenix-core` base crate.
+// Re-export them at their historical crate-root paths so existing
+// `crate::llm_language::…` / `crate::task_source::…` call sites resolve
+// unchanged (move-down, re-export-up).
+use phoenix_core::{llm_language, platform, task_source, work_scope};
 
 use api::{create_router, AppState};
 use db::Database;

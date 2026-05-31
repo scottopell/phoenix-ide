@@ -38,6 +38,7 @@ impl WorkScope {
     /// Stable string form for use as a registry/map key. Worktree,
     /// conversation, and global namespaces are kept disjoint so values
     /// that happen to look alike across variants cannot collide.
+    #[must_use] 
     pub fn stable_key(&self) -> String {
         match self {
             Self::Worktree(path) => format!("worktree:{path}"),

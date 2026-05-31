@@ -5,6 +5,9 @@ edition = "2021"
 rust-version = "1.94"
 
 [dependencies]
+# Shared domain vocabulary (acyclic base crate)
+phoenix-core = { path = "../phoenix-core" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
