@@ -84,7 +84,8 @@ function anchorLabel(n: ReviewNote): string {
     case 'diff':
       if (n.anchor.newLine !== undefined) return `New line ${n.anchor.newLine}`;
       if (n.anchor.oldLine !== undefined) return `Removed line ${n.anchor.oldLine}`;
-      return `Diff position ${n.anchor.diffPos}`;
+      if (n.anchor.diffPos !== undefined) return `Diff position ${n.anchor.diffPos}`;
+      return 'Diff line';
     case 'diff-file':
       return 'File-level';
   }

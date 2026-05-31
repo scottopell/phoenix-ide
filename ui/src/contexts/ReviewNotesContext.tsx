@@ -4,11 +4,11 @@ import { generateUUID } from '../utils/uuid';
 import { useScopedState } from '../hooks/useScopedState';
 
 /**
- * Which sub-section of the diff viewer a note was anchored in.
- * `diffPos` (the line index inside the unified diff text) restarts at
- * 0 for each section, so the section discriminator is required to
- * disambiguate notes — without it, position 5 in committed and
- * position 5 in uncommitted would collide on lookup.
+ * Which sub-section of the diff viewer a note was anchored in. The same file
+ * can appear in both sections (committed and uncommitted), so the section
+ * discriminator is required to disambiguate notes — it is also baked into the
+ * Pierre `CodeView` item id (`${section}:${filePath}`) so the two can never
+ * collide on lookup or jump.
  */
 export type DiffSection = 'committed' | 'uncommitted';
 
@@ -18,15 +18,15 @@ export type DiffSection = 'committed' | 'uncommitted';
  * `kind: 'file'` — note on a single file's line, addressed by absolute path
  * and 1-based line number.
  *
- * `kind: 'diff'` — note on a position in a unified diff. `filePath` is
- * extracted from the most recent `diff --git` header. `newLine` is the
- * post-change line number if computable; absent for `-` (deletion-only),
- * binary files, and file-level notes. `diffPos` is the line index within
- * the unified diff text — stable across UI re-renders. `section`
- * disambiguates the per-section position namespace.
+ * `kind: 'diff'` — note on a line in a unified diff, identified by
+ * (`section`, `filePath`, side + line number): `newLine` for an addition or
+ * context line, `oldLine` for a deletion. `diffPos` (the raw line index within
+ * the unified diff text) is an optional legacy field — the Pierre renderer
+ * identifies and jumps to lines by side + line number, never by `diffPos`. It
+ * is retained only so notes carrying it continue to format/label correctly.
  *
- * `kind: 'diff-file'` — file-level diff note (no line anchor; the user
- * is commenting on the whole file change). Also section-scoped.
+ * `kind: 'diff-file'` — file-level diff note (no line anchor; the user is
+ * commenting on the whole file change). Also section-scoped.
  */
 export type NoteAnchor =
   | { kind: 'file'; filePath: string; lineNumber: number }
@@ -36,13 +36,12 @@ export type NoteAnchor =
       filePath: string;
       newLine?: number | undefined;
       oldLine?: number | undefined;
-      diffPos: number;
+      diffPos?: number | undefined;
     }
   | {
       kind: 'diff-file';
       section: DiffSection;
       filePath: string;
-      diffPos: number;
     };
 
 export interface ReviewNote {

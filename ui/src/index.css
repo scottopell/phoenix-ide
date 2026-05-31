@@ -8178,11 +8178,16 @@ html * {
 
 .diff-viewer-body {
   flex: 1;
-  overflow-y: auto;
+  min-height: 0;
+
+  /* The Pierre CodeView owns diff scrolling/virtualization, so the body itself
+   * does not scroll — it is a fixed-height flex column whose CodeView child
+   * fills the remaining space and scrolls internally. */
+  overflow: hidden;
   padding: 16px;
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: 16px;
 }
 
 .diff-viewer-empty {
@@ -8253,6 +8258,153 @@ html * {
 
 .diff-context {
   color: var(--text-secondary);
+}
+
+/* Commit-log block sits above the diff surface; cap its height so a long log
+ * doesn't crowd out the diff (which has its own scroll). */
+.diff-pre-log {
+  max-height: 160px;
+  overflow-y: auto;
+}
+
+/* === Pierre diff surface (PhoenixDiffCodeView) === */
+
+/* Wrapper fills the remaining body height; the CodeView inside scrolls. */
+.phoenix-diff-codeview-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.phoenix-diff-codeview {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Section labels + truncation, above the single virtualized surface. */
+.diff-summary-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.diff-summary-section {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.diff-summary-label {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+/* committed/uncommitted badge — reused in the summary bar and each file header.
+ * align-self keeps it baseline-stable next to header text. */
+.phoenix-diff-section-badge {
+  align-self: center;
+  font-size: 10px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+}
+
+.phoenix-diff-section-badge--committed {
+  color: var(--accent-green, #22c55e);
+  background: color-mix(in srgb, var(--accent-green, #22c55e) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent-green, #22c55e) 35%, transparent);
+}
+
+.phoenix-diff-section-badge--uncommitted {
+  color: var(--accent-yellow, #eab308);
+  background: color-mix(in srgb, var(--accent-yellow, #eab308) 12%, transparent);
+  border-color: color-mix(in srgb, var(--accent-yellow, #eab308) 35%, transparent);
+}
+
+/* File-level note affordance in the Pierre file header metadata slot. */
+.phoenix-diff-file-note-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.phoenix-diff-file-note-btn:hover {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+}
+
+.phoenix-diff-file-note-count {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--accent-blue, #58a6ff);
+}
+
+/* Gutter add-note affordance on the hovered/focused line. */
+.phoenix-diff-add-note {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.phoenix-diff-add-note:hover,
+.phoenix-diff-add-note:focus-visible {
+  background: var(--accent-blue, #58a6ff);
+  color: #fff;
+}
+
+/* Inline note rendered under an annotated line via renderAnnotation. */
+.phoenix-diff-note {
+  margin: 2px 0 2px 12px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--accent-blue, #58a6ff);
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 8%, var(--bg-secondary));
+  border-radius: 0 4px 4px 0;
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+}
+
+.phoenix-diff-note--flash {
+  animation: phoenix-diff-note-flash 2s ease-out;
+}
+
+@keyframes phoenix-diff-note-flash {
+  0%,
+  30% {
+    background: color-mix(in srgb, var(--accent-blue, #58a6ff) 35%, var(--bg-secondary));
+  }
+
+  100% {
+    background: color-mix(in srgb, var(--accent-blue, #58a6ff) 8%, var(--bg-secondary));
+  }
+}
+
+.diff-section-error {
+  font-size: 12px;
+  color: var(--accent-red, #ef4444);
+  background: color-mix(in srgb, var(--accent-red, #ef4444) 8%, transparent);
+  border: 1px solid color-mix(in srgb, var(--accent-red, #ef4444) 25%, transparent);
+  border-radius: 4px;
+  padding: 6px 10px;
 }
 
 .work-actions-error {

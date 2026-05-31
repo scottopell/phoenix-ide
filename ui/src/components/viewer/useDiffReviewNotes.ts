@@ -2,48 +2,58 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useReviewNotes } from '../../contexts/ReviewNotesContext';
 import type { DiffSection, NoteAnchor, ReviewNote } from '../../contexts/ReviewNotesContext';
 import { formatNotesForSend } from './formatNotes';
-import type { DiffLine, DiffSegment } from './diffParse';
 
-/**
- * Composite key from the section discriminator + per-section diff position, so
- * committed and uncommitted positions never collide. Shared with DiffView's
- * ref/highlight maps.
- */
-export function diffKey(section: DiffSection, diffPos: number): string {
-  return `${section}:${diffPos}`;
+/** A line the user is about to annotate. Side identity is carried as the
+ *  optional `newLine` (addition/context) or `oldLine` (deletion) — exactly one
+ *  is set — matching the Pierre annotation side the note maps to. */
+export interface LineAnnotateTarget {
+  kind: 'line';
+  section: DiffSection;
+  filePath: string;
+  newLine?: number | undefined;
+  oldLine?: number | undefined;
+  /** Raw line text, quoted into the formatted note. Recovered from typed
+   *  Pierre hunk data, never DOM-scraped. */
+  lineContent: string;
+}
+
+/** A whole-file (header) annotation target. */
+export interface FileAnnotateTarget {
+  kind: 'file';
+  section: DiffSection;
+  filePath: string;
 }
 
 /** What an in-progress diff annotation targets: a single line or a whole file. */
-export type AnnotateTarget =
-  | { kind: 'line'; section: DiffSection; segment: DiffSegment; line: DiffLine }
-  | { kind: 'file'; section: DiffSection; segment: DiffSegment; diffPos: number };
+export type AnnotateTarget = LineAnnotateTarget | FileAnnotateTarget;
 
 /**
  * Diff-scoped review-note lifecycle, the diff counterpart to
- * `useFileReviewNotes`. Owns the annotation target, panel visibility, and
- * jump highlight (keyed by `section:diffPos`), plus the add/send/clear
- * operations against the conversation-scoped `ReviewNotesContext`.
+ * `useFileReviewNotes`. Owns the annotation target, panel visibility, and the
+ * jump highlight (keyed by note id), plus the add/send/clear operations against
+ * the conversation-scoped `ReviewNotesContext`.
  *
  * The two hooks share the context and the send/clear semantics but diverge on
  * anchor shape — file notes carry an absolute path + line number, diff notes
- * carry a section + diffPos and a file-level variant — which is why they are
- * separate hooks rather than one parameterized over kind.
+ * carry a section + side/line number and a file-level variant — which is why
+ * they are separate hooks rather than one parameterized over kind.
  *
- * Scrolling on jump stays in DiffView, which owns the line DOM refs; the hook
- * exposes `highlight(key)` to flash the line after the view scrolls to it.
+ * Scrolling on jump lives in the Pierre wrapper, which holds the typed
+ * `CodeView` handle; the hook exposes `highlight(noteId)` to flash the note's
+ * annotation after the view scrolls to it.
  */
 export interface DiffReviewNotes {
   diffNotes: ReviewNote[];
   annotating: AnnotateTarget | null;
-  startAnnotateLine: (section: DiffSection, segment: DiffSegment, line: DiffLine) => void;
-  startAnnotateFile: (section: DiffSection, segment: DiffSegment, diffPos: number) => void;
+  startAnnotateLine: (target: Omit<LineAnnotateTarget, 'kind'>) => void;
+  startAnnotateFile: (section: DiffSection, filePath: string) => void;
   cancelAnnotate: () => void;
   submitNote: (body: string) => void;
   showPanel: boolean;
   togglePanel: () => void;
   closePanel: () => void;
-  highlightedKey: string | null;
-  highlight: (key: string) => void;
+  highlightedNoteId: string | null;
+  highlight: (noteId: string) => void;
   send: () => void;
   clearAll: () => void;
   removeNote: (id: string) => void;
@@ -53,24 +63,22 @@ export function useDiffReviewNotes(onSendNotes: (notes: string) => void): DiffRe
   const reviewNotes = useReviewNotes();
   const [annotating, setAnnotating] = useState<AnnotateTarget | null>(null);
   const [showPanel, setShowPanel] = useState(false);
-  const [highlightedKey, setHighlightedKey] = useState<string | null>(null);
+  const [highlightedNoteId, setHighlightedNoteId] = useState<string | null>(null);
 
   const diffNotes = useMemo(() => reviewNotes.notesForDiff(), [reviewNotes]);
 
   useEffect(() => {
-    if (highlightedKey === null) return undefined;
-    const timer = setTimeout(() => setHighlightedKey(null), 2000);
+    if (highlightedNoteId === null) return undefined;
+    const timer = setTimeout(() => setHighlightedNoteId(null), 2000);
     return () => clearTimeout(timer);
-  }, [highlightedKey]);
+  }, [highlightedNoteId]);
 
   const startAnnotateLine = useCallback(
-    (section: DiffSection, segment: DiffSegment, line: DiffLine) =>
-      setAnnotating({ kind: 'line', section, segment, line }),
+    (target: Omit<LineAnnotateTarget, 'kind'>) => setAnnotating({ kind: 'line', ...target }),
     [],
   );
   const startAnnotateFile = useCallback(
-    (section: DiffSection, segment: DiffSegment, diffPos: number) =>
-      setAnnotating({ kind: 'file', section, segment, diffPos }),
+    (section: DiffSection, filePath: string) => setAnnotating({ kind: 'file', section, filePath }),
     [],
   );
   const cancelAnnotate = useCallback(() => setAnnotating(null), []);
@@ -84,18 +92,16 @@ export function useDiffReviewNotes(onSendNotes: (notes: string) => void): DiffRe
         anchor = {
           kind: 'diff',
           section: annotating.section,
-          filePath: annotating.segment.filePath,
-          newLine: annotating.line.newLine,
-          oldLine: annotating.line.oldLine,
-          diffPos: annotating.line.diffPos,
+          filePath: annotating.filePath,
+          newLine: annotating.newLine,
+          oldLine: annotating.oldLine,
         };
-        lineContent = annotating.line.text;
+        lineContent = annotating.lineContent;
       } else {
         anchor = {
           kind: 'diff-file',
           section: annotating.section,
-          filePath: annotating.segment.filePath,
-          diffPos: annotating.diffPos,
+          filePath: annotating.filePath,
         };
         lineContent = '';
       }
@@ -107,7 +113,7 @@ export function useDiffReviewNotes(onSendNotes: (notes: string) => void): DiffRe
 
   const togglePanel = useCallback(() => setShowPanel((v) => !v), []);
   const closePanel = useCallback(() => setShowPanel(false), []);
-  const highlight = useCallback((key: string) => setHighlightedKey(key), []);
+  const highlight = useCallback((noteId: string) => setHighlightedNoteId(noteId), []);
 
   const send = useCallback(() => {
     const formatted = formatNotesForSend(reviewNotes.notes);
@@ -133,7 +139,7 @@ export function useDiffReviewNotes(onSendNotes: (notes: string) => void): DiffRe
     showPanel,
     togglePanel,
     closePanel,
-    highlightedKey,
+    highlightedNoteId,
     highlight,
     send,
     clearAll,

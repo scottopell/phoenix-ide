@@ -87,7 +87,7 @@ describe('formatNotesForSend', () => {
   it('renders file-level diff notes using the same per-section grouping', () => {
     const out = formatNotesForSend([
       note({
-        anchor: { kind: 'diff-file', section: 'committed', filePath: 'src/a.rs', diffPos: 0 },
+        anchor: { kind: 'diff-file', section: 'committed', filePath: 'src/a.rs' },
         body: 'whole-file critique',
       }),
     ]);

@@ -49,7 +49,9 @@ export function formatNotesForSend(notes: ReviewNote[]): string | null {
           ? `New line ${n.anchor.newLine}`
           : n.anchor.oldLine !== undefined
             ? `Removed line ${n.anchor.oldLine}`
-            : `Diff position ${n.anchor.diffPos}`;
+            : n.anchor.diffPos !== undefined
+              ? `Diff position ${n.anchor.diffPos}`
+              : 'Diff line';
       s.entries.push(formatLineEntry(label, n.lineContent, n.body));
     } else {
       // diff-file (file-level diff note)

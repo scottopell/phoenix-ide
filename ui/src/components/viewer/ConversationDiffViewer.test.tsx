@@ -6,6 +6,14 @@ import { api } from '../../api';
 
 vi.mock('../../api', () => ({ api: { getConversationDiff: vi.fn() } }));
 
+// CodeView renders asynchronously through Shiki; the mock surfaces the parsed
+// file name synchronously so the loader's conversation-keyed behavior is
+// observable. The diff for `MARKER` touches the file `MARKER.txt`.
+vi.mock('@pierre/diffs/react', async () => {
+  const { makeCodeViewMock } = await import('./__testutils__/codeViewMock');
+  return makeCodeViewMock();
+});
+
 function payloadFor(marker: string) {
   return {
     comparator: 'origin/main',
@@ -36,7 +44,7 @@ describe('ConversationDiffViewer — conversation-keyed payload', () => {
     });
 
     const { rerender } = renderViewer('conv-1');
-    await waitFor(() => expect(screen.getByText('+CONV1')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('CONV1.txt')).toBeInTheDocument());
 
     // Switch conversation; conv-2's fetch is still pending.
     rerender(
@@ -46,10 +54,10 @@ describe('ConversationDiffViewer — conversation-keyed payload', () => {
     );
 
     // conv-1's diff must be gone; loading shown until conv-2 resolves.
-    expect(screen.queryByText('+CONV1')).not.toBeInTheDocument();
+    expect(screen.queryByText('CONV1.txt')).not.toBeInTheDocument();
     expect(screen.getByText('Loading diff...')).toBeInTheDocument();
 
     resolveConv2!(payloadFor('CONV2'));
-    await waitFor(() => expect(screen.getByText('+CONV2')).toBeInTheDocument());
+    await waitFor(() => expect(screen.getByText('CONV2.txt')).toBeInTheDocument());
   });
 });

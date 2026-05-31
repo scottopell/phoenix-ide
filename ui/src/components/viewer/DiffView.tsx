@@ -1,25 +1,26 @@
 /**
- * DiffView — multi-file unified-diff viewer with review-notes
- * integration. Built on the shared `viewer/` primitives.
+ * DiffView — multi-file diff viewer with review-notes integration, rendered by
+ * `@pierre/diffs` CodeView (via PhoenixDiffCodeView) on the shared `viewer/`
+ * primitives.
  *
- * Long-press on any add/del/context line opens the AnnotationDialog
- * to add a note anchored to (filePath, newLine, diffPos). Long-press
- * on a `diff --git` header creates a file-level note. Notes share the
- * conversation-scoped pile with FileView; Send drops the entire pile.
+ * The committed and uncommitted diffs render as one virtualized CodeView
+ * surface (committed files first); each file header carries a section badge and
+ * a file-level note affordance. Lines are annotated via the gutter `+` or a
+ * line click. Notes share the conversation-scoped pile with FileView; Send
+ * drops the entire pile. Jump-to-line uses Pierre's typed scroll target.
  */
 
-import { useCallback, useMemo, useRef } from 'react';
-import { MessageSquarePlus } from 'lucide-react';
+import { useCallback, useRef, useState } from 'react';
+import { Columns2, Rows3 } from 'lucide-react';
 import type { DiffSection, ReviewNote } from '../../contexts/ReviewNotesContext';
-import { useLongPress } from '../../hooks/useLongPress';
 import { useRegisterFocusScope } from '../../hooks/useFocusScope';
 import { ViewerShell } from './ViewerShell';
 import { NotesPanel } from './NotesPanel';
 import { AnnotationDialog } from './AnnotationDialog';
-import { parseUnifiedDiff } from './diffParse';
-import type { DiffLine, DiffSegment } from './diffParse';
-import { useDiffReviewNotes, diffKey } from './useDiffReviewNotes';
+import { useDiffReviewNotes } from './useDiffReviewNotes';
 import type { AnnotateTarget } from './useDiffReviewNotes';
+import { PhoenixDiffCodeView } from './PhoenixDiffCodeView';
+import type { PhoenixDiffCodeViewHandle } from './PhoenixDiffCodeView';
 
 export interface DiffViewProps {
   open: boolean;
@@ -37,22 +38,16 @@ export interface DiffViewProps {
   /** Drop the formatted review-notes pile into the chat input. Same
    *  signature as ProseReader's onSendNotes. */
   onSendNotes: (notes: string) => void;
-  /** Render inline (no overlay) for desktop split-pane mode (08654). */
+  /** Render inline (no overlay) for desktop split-pane mode. */
   inline?: boolean;
 }
 
-interface SectionDef {
-  /** Header rendered above this section's diff. */
-  title: string;
-  /** Section discriminator — also flows onto note anchors so the
-   *  per-section diffPos namespaces don't collide (a note at position 5
-   *  in committed must look up a different ref/highlight than a note at
-   *  position 5 in uncommitted). */
-  id: DiffSection;
-  body: string;
-  truncatedKib?: number | undefined;
-  /** When true, `truncatedKib` is a lower bound — render with "≥". */
-  saturated?: boolean | undefined;
+type DiffStyle = 'unified' | 'split';
+const DIFF_STYLE_KEY = 'phoenix-diff-style';
+
+function initialDiffStyle(): DiffStyle {
+  const stored = localStorage.getItem(DIFF_STYLE_KEY);
+  return stored === 'split' ? 'split' : 'unified';
 }
 
 export function DiffView({
@@ -71,56 +66,27 @@ export function DiffView({
 }: DiffViewProps) {
   useRegisterFocusScope('diff-viewer');
   const notes = useDiffReviewNotes(onSendNotes);
-  const { highlightedKey } = notes;
-  // Keyed by `${section}:${diffPos}` so committed and uncommitted
-  // positions occupy disjoint namespaces.
-  const lineRefs = useRef<Map<string, HTMLElement>>(new Map());
+  const codeViewRef = useRef<PhoenixDiffCodeViewHandle>(null);
 
-  // Two parsed sections — committed and uncommitted. Each segment-list
-  // is parsed independently. We compose a stable diffPos namespace by
-  // prefixing position with the section id, so notes anchor uniquely.
-  const sections: SectionDef[] = useMemo(
-    () => [
-      {
-        id: 'committed',
-        title: `Committed changes (vs ${comparator})`,
-        body: committedDiff,
-        truncatedKib: committedTruncatedKib,
-        saturated: committedSaturated,
-      },
-      {
-        id: 'uncommitted',
-        title: 'Uncommitted changes',
-        body: uncommittedDiff,
-        truncatedKib: uncommittedTruncatedKib,
-        saturated: uncommittedSaturated,
-      },
-    ],
-    [
-      comparator,
-      committedDiff,
-      committedTruncatedKib,
-      committedSaturated,
-      uncommittedDiff,
-      uncommittedTruncatedKib,
-      uncommittedSaturated,
-    ],
-  );
+  const [diffStyle, setDiffStyle] = useState<DiffStyle>(initialDiffStyle);
+  const toggleDiffStyle = useCallback(() => {
+    setDiffStyle((prev) => {
+      const next = prev === 'unified' ? 'split' : 'unified';
+      localStorage.setItem(DIFF_STYLE_KEY, next);
+      return next;
+    });
+  }, []);
 
   const diffNotes = notes.diffNotes;
-
-  // Jump-to-line lives here, not in the notes hook, because it needs the DOM
-  // refs the rendered sections register into `lineRefs`.
   const { highlight, closePanel } = notes;
+
+  // Jump uses Pierre's typed scroll target via the wrapper handle, then flashes
+  // the note's annotation — no DOM scraping.
   const handleJumpTo = useCallback(
     (note: ReviewNote) => {
       if (note.anchor.kind !== 'diff' && note.anchor.kind !== 'diff-file') return;
-      const key = diffKey(note.anchor.section, note.anchor.diffPos);
-      const el = lineRefs.current.get(key);
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        highlight(key);
-      }
+      codeViewRef.current?.scrollToNote(note);
+      highlight(note.id);
       closePanel();
     },
     [highlight, closePanel],
@@ -139,6 +105,16 @@ export function DiffView({
           Diff vs <code>{comparator}</code>
         </span>
       }
+      headerExtras={
+        <button
+          className="viewer-shell-btn"
+          onClick={toggleDiffStyle}
+          aria-label={diffStyle === 'unified' ? 'Switch to split view' : 'Switch to unified view'}
+          title={diffStyle === 'unified' ? 'Split view' : 'Unified view'}
+        >
+          {diffStyle === 'unified' ? <Columns2 size={18} /> : <Rows3 size={18} />}
+        </button>
+      }
       noteCount={diffNotes.length}
       onToggleNotes={notes.togglePanel}
       onSend={notes.send}
@@ -146,9 +122,8 @@ export function DiffView({
       panel={
         notes.showPanel ? (
           // Panel scope = THIS viewer's notes. Cross-viewer notes
-          // (file-anchored) live in the same global pile but only
-          // surface in their own viewer's panel — Send All still
-          // drops the entire pile so the user doesn't lose them.
+          // (file-anchored) live in the same global pile but only surface in
+          // their own viewer's panel — Send All still drops the entire pile.
           <NotesPanel
             notes={diffNotes}
             onJumpTo={handleJumpTo}
@@ -163,7 +138,7 @@ export function DiffView({
         notes.annotating ? (
           <AnnotationDialog
             anchorLabel={anchorDialogLabel(notes.annotating)}
-            lineContent={notes.annotating.kind === 'line' ? notes.annotating.line.text : ''}
+            lineContent={notes.annotating.kind === 'line' ? notes.annotating.lineContent : ''}
             onSubmit={notes.submitNote}
             onCancel={notes.cancelAnnotate}
           />
@@ -177,42 +152,29 @@ export function DiffView({
           </div>
         ) : (
           <>
-            {commitLog.trim() && (
-              <CommitLogSection commitLog={commitLog} />
-            )}
-            {sections.map((s) =>
-              s.body.trim() ? (
-                <DiffSection
-                  key={s.id}
-                  section={s}
-                  onAnnotateLine={(segment, line) => notes.startAnnotateLine(s.id, segment, line)}
-                  onAnnotateFile={(segment, diffPos) => notes.startAnnotateFile(s.id, segment, diffPos)}
-                  highlightedKey={highlightedKey}
-                  // Section-scoped: filter diff notes to only those
-                  // anchored in THIS section before computing the
-                  // "has note" set, so the per-line indicator dots
-                  // don't bleed across sections.
-                  noteKeys={diffNotes.flatMap((n) => {
-                    if (n.anchor.kind === 'diff' || n.anchor.kind === 'diff-file') {
-                      if (n.anchor.section === s.id) {
-                        return [diffKey(s.id, n.anchor.diffPos)];
-                      }
-                    }
-                    return [];
-                  })}
-                  registerLineRef={(diffPos, el) => {
-                    const key = diffKey(s.id, diffPos);
-                    if (el) lineRefs.current.set(key, el);
-                    else lineRefs.current.delete(key);
-                  }}
-                />
-              ) : null,
-            )}
+            {commitLog.trim() && <CommitLogSection commitLog={commitLog} />}
+            <DiffSummaryBar
+              comparator={comparator}
+              committedDiff={committedDiff}
+              committedTruncatedKib={committedTruncatedKib}
+              committedSaturated={committedSaturated}
+              uncommittedDiff={uncommittedDiff}
+              uncommittedTruncatedKib={uncommittedTruncatedKib}
+              uncommittedSaturated={uncommittedSaturated}
+            />
+            <PhoenixDiffCodeView
+              ref={codeViewRef}
+              committedDiff={committedDiff}
+              uncommittedDiff={uncommittedDiff}
+              diffStyle={diffStyle}
+              notes={diffNotes}
+              highlightedNoteId={notes.highlightedNoteId}
+              onAnnotateLine={notes.startAnnotateLine}
+              onAnnotateFile={notes.startAnnotateFile}
+            />
           </>
         )}
       </div>
-      {/* Shimmer to indicate loading would go here in a future iteration. */}
-      <DiffViewLoadingShim />
     </ViewerShell>
   );
 }
@@ -232,157 +194,81 @@ function CommitLogSection({ commitLog }: { commitLog: string }) {
   );
 }
 
-interface DiffSectionProps {
-  section: SectionDef;
-  onAnnotateLine: (segment: DiffSegment, line: DiffLine) => void;
-  onAnnotateFile: (segment: DiffSegment, diffPos: number) => void;
-  /** Composite key (`${section}:${diffPos}`) of the currently
-   *  highlighted line, or null. Section-scoped so committed/uncommitted
-   *  positions don't collide. */
-  highlightedKey: string | null;
-  /** Composite keys of lines that have a note attached, scoped to
-   *  THIS section. */
-  noteKeys: string[];
-  registerLineRef: (diffPos: number, el: HTMLElement | null) => void;
+interface DiffSummaryBarProps {
+  comparator: string;
+  committedDiff: string;
+  committedTruncatedKib?: number | undefined;
+  committedSaturated?: boolean | undefined;
+  uncommittedDiff: string;
+  uncommittedTruncatedKib?: number | undefined;
+  uncommittedSaturated?: boolean | undefined;
 }
 
-function DiffSection({
-  section,
-  onAnnotateLine,
-  onAnnotateFile,
-  highlightedKey,
-  noteKeys,
-  registerLineRef,
-}: DiffSectionProps) {
-  const segments = useMemo(() => parseUnifiedDiff(section.body), [section.body]);
-  const noteSet = useMemo(() => new Set(noteKeys), [noteKeys]);
-
+/** Section labels + truncation indicators above the diff surface. The diff
+ *  itself is a single virtualized CodeView; each file header carries its own
+ *  committed/uncommitted badge, so this strip provides the comparator context
+ *  and the per-section truncation state. */
+function DiffSummaryBar({
+  comparator,
+  committedDiff,
+  committedTruncatedKib,
+  committedSaturated,
+  uncommittedDiff,
+  uncommittedTruncatedKib,
+  uncommittedSaturated,
+}: DiffSummaryBarProps) {
   return (
-    <section className="diff-section">
-      <h3 className="diff-section-title">
-        {section.title}
-        {section.truncatedKib !== undefined && (
-          <span className="diff-section-truncated">
-            (truncated; {section.saturated ? '≥' : ''}{section.truncatedKib} KiB total)
-          </span>
-        )}
-      </h3>
-      <div className="diff-pre diff-pre-diff" role="region" aria-label={section.title}>
-        {segments.map((seg, segIdx) =>
-          seg.lines.map((line) => {
-            // First line of each segment is the `diff --git` header — that
-            // line is the file-level annotate target.
-            const isFileHeader =
-              line.kind === 'file-header' && line.text.startsWith('diff --git');
-            const key = diffKey(section.id, line.diffPos);
-            return (
-              <DiffLineRow
-                key={`${segIdx}-${line.diffPos}`}
-                segment={seg}
-                line={line}
-                isFileHeader={isFileHeader}
-                onAnnotateLine={onAnnotateLine}
-                onAnnotateFile={onAnnotateFile}
-                highlighted={highlightedKey === key}
-                hasNote={noteSet.has(key)}
-                registerRef={(el) => registerLineRef(line.diffPos, el)}
-              />
-            );
-          }),
-        )}
-      </div>
-    </section>
+    <div className="diff-summary-bar">
+      {committedDiff.trim() && (
+        <SectionLabel
+          label={`Committed changes (vs ${comparator})`}
+          section="committed"
+          truncatedKib={committedTruncatedKib}
+          saturated={committedSaturated}
+        />
+      )}
+      {uncommittedDiff.trim() && (
+        <SectionLabel
+          label="Uncommitted changes"
+          section="uncommitted"
+          truncatedKib={uncommittedTruncatedKib}
+          saturated={uncommittedSaturated}
+        />
+      )}
+    </div>
   );
 }
 
-interface DiffLineRowProps {
-  segment: DiffSegment;
-  line: DiffLine;
-  isFileHeader: boolean;
-  onAnnotateLine: (segment: DiffSegment, line: DiffLine) => void;
-  onAnnotateFile: (segment: DiffSegment, diffPos: number) => void;
-  highlighted: boolean;
-  hasNote: boolean;
-  registerRef: (el: HTMLElement | null) => void;
-}
-
-function DiffLineRow({
-  segment,
-  line,
-  isFileHeader,
-  onAnnotateLine,
-  onAnnotateFile,
-  highlighted,
-  hasNote,
-  registerRef,
-}: DiffLineRowProps) {
-  const annotatable =
-    isFileHeader || line.kind === 'add' || line.kind === 'del' || line.kind === 'context';
-
-  const lp = useLongPress<void>(() => {
-    if (isFileHeader) onAnnotateFile(segment, line.diffPos);
-    else onAnnotateLine(segment, line);
-  });
-
-  const cls = [
-    'diff-line',
-    `diff-${line.kind}`,
-    annotatable && 'annotatable',
-    highlighted && 'annotatable--highlighted',
-    hasNote && 'diff-line--has-note',
-  ]
-    .filter(Boolean)
-    .join(' ');
-
-  if (!annotatable) {
-    return (
-      <div ref={registerRef} className={cls} data-diff-pos={line.diffPos}>
-        {line.text || ' '}
-      </div>
-    );
-  }
-
+function SectionLabel({
+  label,
+  section,
+  truncatedKib,
+  saturated,
+}: {
+  label: string;
+  section: DiffSection;
+  truncatedKib?: number | undefined;
+  saturated?: boolean | undefined;
+}) {
   return (
-    <div
-      ref={registerRef}
-      className={cls}
-      data-diff-pos={line.diffPos}
-      onTouchStart={(e) => lp.start(e, undefined)}
-      onTouchMove={lp.move}
-      onTouchEnd={lp.end}
-      onMouseDown={(e) => lp.start(e, undefined)}
-      onMouseMove={lp.move}
-      onMouseUp={lp.end}
-      onMouseLeave={lp.end}
-    >
-      {line.text || ' '}
-      <button
-        className="annotatable__btn"
-        onClick={(e) => {
-          e.stopPropagation();
-          if (isFileHeader) onAnnotateFile(segment, line.diffPos);
-          else onAnnotateLine(segment, line);
-        }}
-        aria-label="Add note"
-        title="Add note"
-      >
-        <MessageSquarePlus size={14} />
-      </button>
+    <div className={`diff-summary-section diff-summary-section--${section}`}>
+      <span className={`phoenix-diff-section-badge phoenix-diff-section-badge--${section}`}>
+        {section}
+      </span>
+      <span className="diff-summary-label">{label}</span>
+      {truncatedKib !== undefined && (
+        <span className="diff-section-truncated">
+          (truncated; {saturated ? '≥' : ''}
+          {truncatedKib} KiB total)
+        </span>
+      )}
     </div>
   );
 }
 
 function anchorDialogLabel(t: AnnotateTarget): string {
-  if (t.kind === 'file') return `${t.segment.filePath} (file-level)`;
-  const { line, segment } = t;
-  if (line.newLine !== undefined) return `${segment.filePath}:${line.newLine}`;
-  if (line.oldLine !== undefined) return `${segment.filePath}:-${line.oldLine}`;
-  return `${segment.filePath} (diff position ${line.diffPos})`;
-}
-
-// Reserved for a future loading/error UI inside the shell. Currently
-// DiffView receives pre-fetched diff text from its parent so there is
-// nothing in-component to render here.
-function DiffViewLoadingShim() {
-  return null;
+  if (t.kind === 'file') return `${t.filePath} (file-level)`;
+  if (t.newLine !== undefined) return `${t.filePath}:${t.newLine}`;
+  if (t.oldLine !== undefined) return `${t.filePath}:-${t.oldLine}`;
+  return t.filePath;
 }
