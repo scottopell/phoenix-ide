@@ -1,4 +1,4 @@
-import { render, screen, fireEvent, within } from '@testing-library/react';
+import { render, screen, fireEvent, within, act } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { DiffView } from './DiffView';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
@@ -85,6 +85,43 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     fireEvent.change(screen.getByPlaceholderText(/Add your note/), { target: { value: 'via click' } });
     fireEvent.click(screen.getByRole('button', { name: 'Add Note' }));
     expect(screen.getByRole('button', { name: '1 notes' })).toBeInTheDocument();
+  });
+
+  it('adds a line note via a 500ms touch long-press (cancels on movement)', () => {
+    vi.useFakeTimers();
+    try {
+      renderDiff();
+      const container = screen.getByTestId('codeview-mock');
+      // Pierre reports the hovered line; then a held touch pointer fires.
+      fireEvent.click(screen.getByTestId('mock-line-enter-committed:foo.txt'));
+
+      const press = (type: string, x = 0, y = 0) => {
+        const ev = new Event(type, { bubbles: true });
+        Object.assign(ev, { pointerType: 'touch', clientX: x, clientY: y });
+        act(() => {
+          container.dispatchEvent(ev);
+        });
+      };
+
+      // Movement before the threshold cancels the press → no dialog.
+      press('pointerdown');
+      press('pointermove', 50, 50);
+      act(() => vi.advanceTimersByTime(600));
+      expect(screen.queryByText('foo.txt:1')).not.toBeInTheDocument();
+
+      // A still 500ms hold opens the dialog anchored at the hovered line.
+      press('pointerdown');
+      act(() => vi.advanceTimersByTime(500));
+      expect(screen.getByText('foo.txt:1')).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('does not annotate on a plain touch tap (onLineClick ignores touch)', () => {
+    renderDiff();
+    fireEvent.click(screen.getByTestId('mock-line-tap-committed:foo.txt'));
+    expect(screen.queryByText('foo.txt:1')).not.toBeInTheDocument();
   });
 
   it('adds a file-level note from the header metadata affordance', () => {

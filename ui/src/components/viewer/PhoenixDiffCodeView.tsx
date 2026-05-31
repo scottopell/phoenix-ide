@@ -9,13 +9,14 @@
  * indicator, line identity, or jump path ever scrapes Pierre's DOM.
  *
  * Note affordances:
- *   - line notes: gutter `+` on the hovered line, plus click-to-annotate.
+ *   - line notes: gutter `+` on the hovered line (pointer), click-to-annotate
+ *     (mouse/pen), and a 500ms long-press (touch — cancels on movement).
  *   - file-level notes: a `+` button in the file header metadata slot.
  * Both flow up through `onAnnotateLine` / `onAnnotateFile` to the shared
  * `useDiffReviewNotes` lifecycle.
  */
 
-import { forwardRef, useCallback, useImperativeHandle, useMemo, useRef } from 'react';
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useMemo, useRef } from 'react';
 import { MessageSquarePlus } from 'lucide-react';
 import { CodeView } from '@pierre/diffs/react';
 import type { CodeViewHandle, CodeViewItem } from '@pierre/diffs/react';
@@ -63,6 +64,14 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
   ) {
     const { theme } = useTheme();
     const codeViewRef = useRef<CodeViewHandle<Meta>>(null);
+    // CodeView root element — long-press pointer listeners attach here (line
+    // pointer events are composed and bubble out of Pierre's shadow DOM).
+    const containerRef = useRef<HTMLDivElement>(null);
+    // The diff line the pointer is currently over, tracked via Pierre's typed
+    // onLineEnter/onLineLeave (no DOM scraping). The long-press timer reads this
+    // at fire time to know which line to annotate.
+    type HoveredLine = { section: DiffSection; fileDiff: FileDiffMetadata; side: AnnotationSide; lineNumber: number };
+    const hoveredLine = useRef<HoveredLine | null>(null);
     // Monotonic per-item version. Pierre's controlled reconciler reuses a record
     // with the same id unless its `version` changes, so we bump the version
     // whenever an item's render signature (file content + its notes + flash)
@@ -117,17 +126,81 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
         // implement the diff case and narrow on context.type, casting through
         // `unknown` to satisfy the intersection without re-stating both shapes.
         onLineClick: ((
+          props: { annotationSide: AnnotationSide; lineNumber: number; event?: { pointerType?: string } },
+          context: { type: 'diff' | 'file'; item: PhoenixDiffItem },
+        ) => {
+          if (context.type !== 'diff') return;
+          // Touch annotates via long-press, not tap, so a tap doesn't eagerly
+          // open the dialog (the long-press handler owns the touch path).
+          if (props.event?.pointerType === 'touch') return;
+          const section = sectionFromItemId(context.item.id);
+          if (!section) return;
+          annotateLine(section, context.item.fileDiff, props.annotationSide, props.lineNumber);
+        }) as unknown as NonNullable<CodeViewOptions<Meta>['onLineClick']>,
+        // Track the hovered/pressed line for the long-press handler.
+        onLineEnter: ((
           props: { annotationSide: AnnotationSide; lineNumber: number },
           context: { type: 'diff' | 'file'; item: PhoenixDiffItem },
         ) => {
           if (context.type !== 'diff') return;
           const section = sectionFromItemId(context.item.id);
           if (!section) return;
-          annotateLine(section, context.item.fileDiff, props.annotationSide, props.lineNumber);
-        }) as unknown as NonNullable<CodeViewOptions<Meta>['onLineClick']>,
+          hoveredLine.current = {
+            section,
+            fileDiff: context.item.fileDiff,
+            side: props.annotationSide,
+            lineNumber: props.lineNumber,
+          };
+        }) as unknown as NonNullable<CodeViewOptions<Meta>['onLineEnter']>,
+        onLineLeave: (() => {
+          hoveredLine.current = null;
+        }) as unknown as NonNullable<CodeViewOptions<Meta>['onLineLeave']>,
       }),
       [theme, diffStyle, annotateLine],
     );
+
+    // Touch long-press → annotate the line under the finger. Pierre owns line
+    // pointer handling, so we listen on the (composed) container and read the
+    // typed hovered line; a 500ms hold with no movement opens the dialog.
+    useEffect(() => {
+      const el = containerRef.current;
+      if (!el) return undefined;
+      const MOVE_CANCEL_PX = 10;
+      const HOLD_MS = 500;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let startX = 0;
+      let startY = 0;
+      const clear = () => {
+        if (timer) clearTimeout(timer);
+        timer = undefined;
+      };
+      const onDown = (e: PointerEvent) => {
+        if (e.pointerType !== 'touch') return;
+        startX = e.clientX;
+        startY = e.clientY;
+        clear();
+        timer = setTimeout(() => {
+          const l = hoveredLine.current;
+          if (l) annotateLine(l.section, l.fileDiff, l.side, l.lineNumber);
+        }, HOLD_MS);
+      };
+      const onMove = (e: PointerEvent) => {
+        if (timer && (Math.abs(e.clientX - startX) > MOVE_CANCEL_PX || Math.abs(e.clientY - startY) > MOVE_CANCEL_PX)) {
+          clear();
+        }
+      };
+      el.addEventListener('pointerdown', onDown);
+      el.addEventListener('pointermove', onMove);
+      el.addEventListener('pointerup', clear);
+      el.addEventListener('pointercancel', clear);
+      return () => {
+        clear();
+        el.removeEventListener('pointerdown', onDown);
+        el.removeEventListener('pointermove', onMove);
+        el.removeEventListener('pointerup', clear);
+        el.removeEventListener('pointercancel', clear);
+      };
+    }, [annotateLine]);
 
     const renderAnnotation = useCallback(
       (annotation: { metadata?: Meta }) => {
@@ -249,6 +322,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
         {items.length > 0 ? (
           <CodeView<Meta>
             ref={codeViewRef}
+            containerRef={containerRef}
             items={items}
             options={options}
             className="phoenix-diff-codeview"

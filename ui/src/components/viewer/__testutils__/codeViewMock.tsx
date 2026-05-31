@@ -53,8 +53,9 @@ export function makeCodeViewMock() {
     }));
 
     codeViewMockState.lastItems = [...(props.items ?? [])];
+    const lineProps = { annotationSide: 'additions', lineNumber: 1, lineType: 'change-addition', type: 'diff-line' };
     return (
-      <div data-testid="codeview-mock" className={props.className}>
+      <div data-testid="codeview-mock" className={props.className} ref={props.containerRef}>
         {(props.items ?? []).map((item: any) => (
           <div key={item.id} data-item-id={item.id}>
             {props.renderHeaderPrefix?.(item)}
@@ -68,13 +69,26 @@ export function makeCodeViewMock() {
             <button
               data-testid={`mock-line-click-${item.id}`}
               onClick={() =>
-                props.options?.onLineClick?.(
-                  { annotationSide: 'additions', lineNumber: 1, lineType: 'change-addition', type: 'diff-line' },
-                  { type: 'diff', item },
-                )
+                props.options?.onLineClick?.({ ...lineProps, event: { pointerType: 'mouse' } }, { type: 'diff', item })
               }
             >
               line
+            </button>
+            {/* Drives Pierre's onLineEnter so the long-press handler knows the line. */}
+            <button
+              data-testid={`mock-line-enter-${item.id}`}
+              onClick={() => props.options?.onLineEnter?.(lineProps, { type: 'diff', item })}
+            >
+              enter
+            </button>
+            {/* A touch tap: onLineClick with a touch pointer (should NOT annotate). */}
+            <button
+              data-testid={`mock-line-tap-${item.id}`}
+              onClick={() =>
+                props.options?.onLineClick?.({ ...lineProps, event: { pointerType: 'touch' } }, { type: 'diff', item })
+              }
+            >
+              tap
             </button>
             {props.renderGutterUtility?.(() => ({ lineNumber: 1, side: 'additions' }), item)}
           </div>
