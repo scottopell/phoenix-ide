@@ -19,13 +19,13 @@ pub mod executor;
 pub mod interpreter;
 pub mod matching;
 pub mod planner;
-pub mod types;
 
 #[cfg(test)]
 mod proptests;
 
 pub use planner::PatchPlanner;
-pub use types::*;
+// `types` (PatchInput, …) moved to phoenix-core. Alias back + glob re-export.
+pub use phoenix_core::domain::patch_types::{self as types, *};
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;

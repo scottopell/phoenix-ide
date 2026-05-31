@@ -44,10 +44,12 @@ impl PromptCacheKey {
     /// never hit. Use only when there's no natural caching cohort (currently
     /// only test fixtures — production call sites all have a stable cohort).
     #[allow(dead_code)] // public API kept for legitimate one-off production use
+    #[must_use] 
     pub fn ephemeral() -> Self {
         Self(uuid::Uuid::new_v4().to_string())
     }
 
+    #[must_use] 
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -213,6 +215,7 @@ impl ContentBlock {
     /// `type` tag. Single source of truth for the variant name in logs and
     /// diagnostics; `prop_content_block_type_tag_valid` asserts it stays in
     /// lockstep with the serde output.
+    #[must_use] 
     pub fn type_tag(&self) -> &'static str {
         match self {
             ContentBlock::Text { .. } => "text",
@@ -275,6 +278,7 @@ pub struct LlmResponse {
 
 impl LlmResponse {
     /// Extract all tool use requests from the response
+    #[must_use] 
     pub fn tool_uses(&self) -> Vec<(&str, &str, &serde_json::Value)> {
         self.content
             .iter()
@@ -288,6 +292,7 @@ impl LlmResponse {
     }
 
     /// Get text content from the response
+    #[must_use] 
     pub fn text(&self) -> String {
         self.content
             .iter()
@@ -314,6 +319,7 @@ pub struct Usage {
 }
 
 impl Usage {
+    #[must_use] 
     pub fn context_window_used(&self) -> u64 {
         self.input_tokens + self.output_tokens + self.cache_creation_tokens + self.cache_read_tokens
     }

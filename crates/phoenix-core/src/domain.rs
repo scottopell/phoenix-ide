@@ -1,0 +1,10 @@
+//! The shared domain-model closure: serializable types co-owned by the
+//! db, state-machine, llm and tools layers. Lives in the base crate so those
+//! layers depend *down* onto a common vocabulary instead of onto each other.
+
+pub mod bash_types;
+pub mod kill_signal;
+pub mod llm_types;
+pub mod mode_context;
+pub mod patch_types;
+pub mod skill_invocation;

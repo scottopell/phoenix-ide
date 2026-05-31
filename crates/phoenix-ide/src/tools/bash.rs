@@ -23,11 +23,12 @@ mod operations;
 pub mod reaper;
 pub mod registry;
 pub mod ring;
-pub mod types;
 
 pub use reaper::{install_reaper, shutdown_kill_tree};
 pub use registry::{BashHandleError, BashHandleRegistry, ConversationHandles};
-pub use types::{BashOp, BashToolInput};
+// `types` (BashOp, BashToolInput) moved to phoenix-core. Alias the module back
+// as `types` and re-export the items so existing paths resolve unchanged.
+pub use phoenix_core::domain::bash_types::{self as types, BashOp, BashToolInput};
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;

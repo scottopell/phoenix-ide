@@ -1,6 +1,6 @@
 //! Request parsing and validation for the modern bash tool input schema.
 
-use super::handle::KillSignal;
+use crate::domain::kill_signal::KillSignal;
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
@@ -15,6 +15,7 @@ pub enum BashOp {
 }
 
 impl BashOp {
+    #[must_use] 
     pub fn as_field_name(self) -> &'static str {
         match self {
             BashOp::Run => "run",

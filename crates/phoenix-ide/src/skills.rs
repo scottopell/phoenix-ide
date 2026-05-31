@@ -7,17 +7,9 @@ pub mod builtin;
 
 use crate::system_prompt::SkillMetadata;
 
-/// The result of invoking a skill.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct SkillInvocation {
-    /// The skill name (e.g., "build")
-    pub name: String,
-    /// The fully expanded skill body: frontmatter stripped, base directory
-    /// prepended, arguments substituted (REQ-SK-001, REQ-SK-003, REQ-SK-004)
-    pub body: String,
-    /// Absolute path to the skill's directory
-    pub skill_dir: String,
-}
+// `SkillInvocation` is a domain-vocabulary type embedded in conversation
+// events; it now lives in phoenix-core. Re-export at the historical path.
+pub use phoenix_core::domain::skill_invocation::SkillInvocation;
 
 /// Invoke a skill by name: look up in pre-discovered skills, read SKILL.md,
 /// strip frontmatter, prepend base directory, substitute arguments.

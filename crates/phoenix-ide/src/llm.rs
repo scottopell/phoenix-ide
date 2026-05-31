@@ -69,7 +69,6 @@ pub mod rate_limit;
 mod registry;
 mod service;
 pub(crate) mod sse;
-mod types;
 
 pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
@@ -87,7 +86,10 @@ pub use registry::{
     AuthStyle, CredentialSource, GatewayStatus, LlmAuth, LlmConfig, ModelRegistry, ResolvedAuth,
 };
 pub use service::LlmServiceImpl;
-pub use types::*;
+// `types` (ContentBlock, Usage, ImageSource, …) moved to phoenix-core. Alias
+// the module back as `types` and glob-re-export so both `crate::llm::types::X`
+// and `crate::llm::X` paths resolve unchanged.
+pub use phoenix_core::domain::llm_types::{self as types, *};
 
 use async_trait::async_trait;
 use std::sync::Arc;

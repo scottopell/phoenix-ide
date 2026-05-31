@@ -2517,9 +2517,13 @@ name = "phoenix-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "libc",
  "serde",
  "serde_json",
  "taskmd-core",
+ "thiserror 2.0.18",
+ "ts-rs",
+ "uuid",
 ]
 
 [[package]]

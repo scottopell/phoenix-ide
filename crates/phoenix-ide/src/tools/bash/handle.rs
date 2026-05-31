@@ -26,10 +26,8 @@
 //!   doesn't require swapping the `Arc<HandleState>` (which would
 //!   invalidate readers' ring snapshots).
 
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::SystemTime;
-use ts_rs::TS;
 
 use tokio::sync::watch;
 use tokio::sync::{Mutex, RwLock};
@@ -62,33 +60,11 @@ impl std::fmt::Display for HandleId {
     }
 }
 
-/// Kill signal the agent may request. Sent EXACTLY ONCE per kill call —
-/// no auto-escalation (REQ-BASH-003).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "UPPERCASE")]
-#[ts(export, export_to = "../../../ui/src/generated/")]
-pub enum KillSignal {
-    Term,
-    Kill,
-}
-
-impl KillSignal {
-    /// Stable string identifier used in tool responses.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            KillSignal::Term => "TERM",
-            KillSignal::Kill => "KILL",
-        }
-    }
-
-    #[cfg(unix)]
-    pub fn as_libc(self) -> i32 {
-        match self {
-            KillSignal::Term => libc::SIGTERM,
-            KillSignal::Kill => libc::SIGKILL,
-        }
-    }
-}
+// `KillSignal` now lives in the phoenix-core domain crate (the bash tool input
+// schema in `bash_types` co-owns it). Re-export at the historical path so
+// `super::handle::KillSignal` / `crate::tools::bash::handle::KillSignal`
+// callers resolve unchanged.
+pub use phoenix_core::domain::kill_signal::KillSignal;
 
 /// Cause of a handle's transition to a terminal state.
 ///

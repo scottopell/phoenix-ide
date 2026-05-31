@@ -5,6 +5,7 @@
 //! Every other phoenix-ide crate depends on it; it depends on nothing in the
 //! workspace. See `specs/` for the layering rationale.
 
+pub mod domain;
 pub mod llm_language;
 pub mod platform;
 pub mod task_source;
