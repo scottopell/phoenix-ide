@@ -4,6 +4,7 @@ import {
   buildSectionItems,
   fileNotesFor,
   itemId,
+  itemRenderSignature,
   lineTextAt,
   noteToAnnotation,
   scrollTargetForNote,
@@ -213,6 +214,61 @@ describe('legacy diffPos compatibility', () => {
       id: 'committed:src/foo.ts',
       line: { lineNumber: 3, side: 'additions' },
     });
+  });
+});
+
+describe('itemRenderSignature (drives CodeView item version bumps)', () => {
+  const fileDiff = buildSectionItems('committed', ADD_FILE).items[0]!.fileDiff;
+  const base = () => itemRenderSignature(fileDiff, [], 'committed', null);
+
+  it('is stable for identical inputs', () => {
+    expect(base()).toBe(base());
+  });
+
+  it('changes when a line note is added', () => {
+    const withNote = itemRenderSignature(
+      fileDiff,
+      [note({ kind: 'diff', section: 'committed', filePath: 'src/foo.ts', newLine: 2 })],
+      'committed',
+      null,
+    );
+    expect(withNote).not.toBe(base());
+  });
+
+  it('changes when a note body is edited', () => {
+    const a = itemRenderSignature(fileDiff, [note({ kind: 'diff', section: 'committed', filePath: 'src/foo.ts', newLine: 2 }, { body: 'one' })], 'committed', null);
+    const b = itemRenderSignature(fileDiff, [note({ kind: 'diff', section: 'committed', filePath: 'src/foo.ts', newLine: 2 }, { body: 'two' })], 'committed', null);
+    expect(a).not.toBe(b);
+  });
+
+  it('changes when the flashed note changes', () => {
+    const n = note({ kind: 'diff', section: 'committed', filePath: 'src/foo.ts', newLine: 2 }, { id: 'x1' });
+    const noFlash = itemRenderSignature(fileDiff, [n], 'committed', null);
+    const flash = itemRenderSignature(fileDiff, [n], 'committed', 'x1');
+    expect(noFlash).not.toBe(flash);
+  });
+
+  it('changes when a file-level note is added (header count)', () => {
+    const withFile = itemRenderSignature(
+      fileDiff,
+      [note({ kind: 'diff-file', section: 'committed', filePath: 'src/foo.ts' })],
+      'committed',
+      null,
+    );
+    expect(withFile).not.toBe(base());
+  });
+
+  it('ignores notes from the other section / other files', () => {
+    const other = itemRenderSignature(
+      fileDiff,
+      [
+        note({ kind: 'diff', section: 'uncommitted', filePath: 'src/foo.ts', newLine: 2 }),
+        note({ kind: 'diff', section: 'committed', filePath: 'src/bar.ts', newLine: 2 }),
+      ],
+      'committed',
+      null,
+    );
+    expect(other).toBe(base());
   });
 });
 

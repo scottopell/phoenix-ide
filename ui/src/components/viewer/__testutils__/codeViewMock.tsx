@@ -16,10 +16,23 @@
  */
 import React from 'react';
 
-export const codeViewMockState: { scrollToCalls: unknown[] } = { scrollToCalls: [] };
+export const codeViewMockState: { scrollToCalls: unknown[]; lastItems: unknown[] } = {
+  scrollToCalls: [],
+  lastItems: [],
+};
 
 export function resetCodeViewMock(): void {
   codeViewMockState.scrollToCalls = [];
+  codeViewMockState.lastItems = [];
+}
+
+/** Latest controlled `version` Pierre would reconcile against for an item. */
+export function itemVersion(id: string): number | undefined {
+  const item = codeViewMockState.lastItems.find(
+    (i): i is { id: string; version?: number } =>
+      typeof i === 'object' && i !== null && (i as { id?: string }).id === id,
+  );
+  return item?.version;
 }
 
 // The mock intentionally mirrors only the surface PhoenixDiffCodeView touches;
@@ -39,6 +52,7 @@ export function makeCodeViewMock() {
       getInstance: () => undefined,
     }));
 
+    codeViewMockState.lastItems = [...(props.items ?? [])];
     return (
       <div data-testid="codeview-mock" className={props.className}>
         {(props.items ?? []).map((item: any) => (

@@ -2,7 +2,7 @@ import { render, screen, fireEvent, within } from '@testing-library/react';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { DiffView } from './DiffView';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
-import { codeViewMockState, resetCodeViewMock } from './__testutils__/codeViewMock';
+import { codeViewMockState, itemVersion, resetCodeViewMock } from './__testutils__/codeViewMock';
 
 vi.mock('@pierre/diffs/react', async () => {
   const { makeCodeViewMock } = await import('./__testutils__/codeViewMock');
@@ -67,6 +67,15 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     // Panel also lists it.
     fireEvent.click(badge);
     expect(within(screen.getByText(/^Notes \(/).closest('.notes-panel')!).getByText('looks good')).toBeInTheDocument();
+  });
+
+  it('bumps the CodeView item version when a note is added (controlled reconcile)', () => {
+    renderDiff();
+    const before = itemVersion('committed:foo.txt');
+    addNoteViaGutter('versioned');
+    const after = itemVersion('committed:foo.txt');
+    expect(typeof after).toBe('number');
+    expect(after!).toBeGreaterThan(before ?? 0);
   });
 
   it('adds a line note via line click (onLineClick)', () => {

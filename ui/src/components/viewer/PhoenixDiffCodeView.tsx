@@ -27,6 +27,7 @@ import {
   annotationsForFile,
   buildSectionItems,
   fileNotesFor,
+  itemRenderSignature,
   lineTextAt,
   scrollTargetForNote,
   sectionFromItemId,
@@ -62,6 +63,11 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
   ) {
     const { theme } = useTheme();
     const codeViewRef = useRef<CodeViewHandle<Meta>>(null);
+    // Monotonic per-item version. Pierre's controlled reconciler reuses a record
+    // with the same id unless its `version` changes, so we bump the version
+    // whenever an item's render signature (file content + its notes + flash)
+    // changes. Keyed by item id; survives reparses.
+    const itemVersions = useRef<Map<string, { sig: string; version: number }>>(new Map());
 
     // Parse is the expensive step — memoize on raw text only, independent of
     // note churn. Annotation attachment (cheap) re-runs when notes change.
@@ -69,15 +75,23 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
     const uncommitted = useMemo(() => buildSectionItems('uncommitted', uncommittedDiff), [uncommittedDiff]);
 
     const items = useMemo<PhoenixDiffItem[]>(() => {
+      const vmap = itemVersions.current;
       const attach = (built: PhoenixDiffItem[]): PhoenixDiffItem[] =>
         built.map((it) => {
           const section = sectionFromItemId(it.id);
           if (!section) return it;
           const anns = annotationsForFile(notes, section, it.fileDiff.name);
-          return anns.length > 0 ? { ...it, annotations: anns } : it;
+          // Bump the controlled-item version whenever this item's rendered
+          // content changes, so Pierre reconciles instead of keeping a stale
+          // annotation/flash/header-count record.
+          const sig = itemRenderSignature(it.fileDiff, notes, section, highlightedNoteId);
+          const prev = vmap.get(it.id);
+          const version = prev && prev.sig === sig ? prev.version : (prev?.version ?? 0) + 1;
+          if (!prev || prev.sig !== sig) vmap.set(it.id, { sig, version });
+          return anns.length > 0 ? { ...it, annotations: anns, version } : { ...it, version };
         });
       return [...attach(committed.items), ...attach(uncommitted.items)];
-    }, [committed.items, uncommitted.items, notes]);
+    }, [committed.items, uncommitted.items, notes, highlightedNoteId]);
 
     const annotateLine = useCallback(
       (section: DiffSection, fileDiff: FileDiffMetadata, side: AnnotationSide, lineNumber: number) => {

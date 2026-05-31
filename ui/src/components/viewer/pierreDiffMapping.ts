@@ -113,6 +113,45 @@ export function noteToAnnotation(note: ReviewNote): PhoenixDiffAnnotation | null
   return null;
 }
 
+/**
+ * A signature of everything PhoenixDiffCodeView draws for one diff item: the
+ * parsed file fingerprint plus the line/file notes (and which one is flashed).
+ * The wrapper turns a change in this string into a bumped `CodeViewItem.version`
+ * so Pierre's controlled reconciler re-renders the item — without a version
+ * bump it keeps the prior record and the inline annotation / flash / file-note
+ * count would go stale even though the items array is new.
+ */
+export function itemRenderSignature(
+  fileDiff: FileDiffMetadata,
+  notes: readonly ReviewNote[],
+  section: DiffSection,
+  highlightedNoteId: string | null,
+): string {
+  const filePath = fileDiff.name;
+  // Cheap content fingerprint: changes when a refetch reparses this path.
+  const fp = [
+    fileDiff.name,
+    fileDiff.prevName ?? '',
+    fileDiff.type,
+    fileDiff.unifiedLineCount,
+    fileDiff.hunks.length,
+    fileDiff.additionLines.length,
+    fileDiff.deletionLines.length,
+  ].join('|');
+  const lineNotes: string[] = [];
+  const fileNotes: string[] = [];
+  for (const n of notes) {
+    const a = n.anchor;
+    const flash = n.id === highlightedNoteId ? '*' : '';
+    if (a.kind === 'diff' && a.section === section && a.filePath === filePath) {
+      lineNotes.push(`${n.id}:${a.newLine ?? ''}:${a.oldLine ?? ''}:${n.body}:${flash}`);
+    } else if (a.kind === 'diff-file' && a.section === section && a.filePath === filePath) {
+      fileNotes.push(`${n.id}:${n.body}:${flash}`);
+    }
+  }
+  return `${fp}#L[${lineNotes.join(',')}]#F[${fileNotes.join(',')}]`;
+}
+
 /** All line annotations for a given (section, filePath), in note order. */
 export function annotationsForFile(
   notes: readonly ReviewNote[],
