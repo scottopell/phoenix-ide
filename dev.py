@@ -2548,10 +2548,20 @@ def cmd_check():
     # closed-over verification run share one decision. Neither probe touches
     # the cargo target lock (`cargo nextest --version` only prints a version;
     # the /proc/meminfo read is pure Python).
-    has_nextest = subprocess.run(
-        ["cargo", "nextest", "--version"],
-        capture_output=True,
-    ).returncode == 0
+    #
+    # This probe runs on the main path before any lane (and its
+    # LANE_JOIN_TIMEOUT) exists, so a rustup/network/cargo-home stall here
+    # would hang the whole check with no timeout or summary. Bound it and
+    # treat any stall/error as "no nextest" — the plain `cargo test` fallback
+    # is always correct, just slower.
+    try:
+        has_nextest = subprocess.run(
+            ["cargo", "nextest", "--version"],
+            capture_output=True, timeout=30,
+        ).returncode == 0
+    except (subprocess.TimeoutExpired, OSError):
+        has_nextest = False
+        print("  i  cargo nextest probe stalled/failed — using plain `cargo test`")
     # nextest defaults to available_parallelism (= num_cpus). On low-RAM
     # boxes, num_cpus parallel test threads can swap and stall sensitive
     # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
@@ -2599,6 +2609,15 @@ def cmd_check():
         codegen_cmd = ["cargo", "test", "export_bindings"]
 
     print("Regenerating codegen (serial, pre-fan-out)...\n")
+    # Cold-target safety: compile the test harnesses under their own
+    # CHECK_TIMEOUT before running the tiny codegen tests, mirroring
+    # lane_rust's compile/run split. On a cold target/CI the harness compile
+    # alone can approach the timeout; bundling it with the codegen run under
+    # one budget would reintroduce exactly the timeout case that split exists
+    # to avoid (and the later lane_rust `cargo test compile` cannot rescue a
+    # pre-step that has already timed out). lane_rust's own compile step then
+    # rides this warm cache.
+    run_step("codegen compile", compile_cmd)
     run_step("codegen", codegen_cmd)
     # Staleness guard: a non-empty porcelain status under ui/src/generated/ —
     # modified or untracked — means the developer's Rust types and the
