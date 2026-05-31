@@ -20,7 +20,7 @@ pub enum PlatformCapability {
 impl PlatformCapability {
     /// Probe the current platform for sandboxing support.
     /// Called once at server startup.
-    #[must_use] 
+    #[must_use]
     pub fn detect() -> Self {
         // On macOS, check for sandbox-exec
         if cfg!(target_os = "macos")
@@ -45,7 +45,7 @@ impl PlatformCapability {
     }
 
     /// Whether a sandbox is available for read-only bash enforcement
-    #[must_use] 
+    #[must_use]
     pub fn has_sandbox(self) -> bool {
         match self {
             Self::None => false,

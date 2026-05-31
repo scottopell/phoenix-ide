@@ -3,7 +3,11 @@
 //! Provides persistence for conversations and messages.
 
 mod migrations;
-mod schema;
+// The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
+// …) moved to the phoenix-core domain crate to break the db↔state_machine
+// cycle. Alias the module back as `schema` so the persistence logic in this
+// file and `crate::db::*` call sites resolve unchanged.
+use phoenix_core::domain::db_schema as schema;
 
 pub use migrations::run_pending_migrations;
 pub use schema::*;

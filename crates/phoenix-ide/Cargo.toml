@@ -104,6 +104,10 @@ which = "8"
 ts-rs = { version = "12", features = ["serde-compat", "chrono-impl"] }
 
 [dev-dependencies]
+# Re-declared with test-support so phoenix-core's #[cfg(test)] domain
+# constructors (ContentBlock::tool_use, …) are visible to this crate's tests.
+# Dev-only: production `cargo build` never enables the feature.
+phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
 tempfile = "3"
 proptest = "1"
 # `test-util` enables `tokio::time::pause`/`advance`, used by the

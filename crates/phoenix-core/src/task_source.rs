@@ -43,7 +43,7 @@ impl Priority {
     pub const P3: Self = Priority(taskmd_core::constants::Priority::P3);
     pub const P4: Self = Priority(taskmd_core::constants::Priority::P4);
 
-    #[must_use] 
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         self.0.as_str()
     }
@@ -114,7 +114,7 @@ impl TaskSource {
     /// taskmd is tried first: if the name matches the taskmd pattern it is a
     /// [`TaskSource::Taskmd`] regardless of extension casing, otherwise any
     /// `.md` file is a [`TaskSource::PlainMarkdown`].
-    #[must_use] 
+    #[must_use]
     pub fn detect(filename: &str) -> Option<Self> {
         if let Some(parsed) = taskmd_core::filename::parse_filename(filename) {
             return Some(Self::Taskmd {
@@ -143,7 +143,7 @@ impl TaskSource {
 
     /// Display priority for the approval UI. taskmd files carry one in the
     /// filename; plain-markdown files default to `p2`.
-    #[must_use] 
+    #[must_use]
     pub fn priority(&self) -> Priority {
         match self {
             Self::Taskmd { priority, .. } => *priority,
@@ -153,7 +153,7 @@ impl TaskSource {
 
     /// UI title: the body's first `# H1`, else a title-cased fallback derived
     /// from the slug (taskmd) or file stem (plain markdown).
-    #[must_use] 
+    #[must_use]
     pub fn title(&self, body: &str) -> String {
         extract_h1(body).unwrap_or_else(|| match self {
             Self::Taskmd { slug, .. } => identifier_to_title(slug),
@@ -171,7 +171,7 @@ impl TaskSource {
     ///   (the approval mutex only serializes; it does not uniquify). The
     ///   `task_id` is the sanitized stem (or the conv-id prefix when the stem
     ///   sanitizes to empty), kept non-empty for the conversation record.
-    #[must_use] 
+    #[must_use]
     pub fn branch_and_id(&self, conv_id: &str) -> (String, String) {
         match self {
             Self::Taskmd { id, slug, .. } => (format!("task-{id}-{slug}"), id.clone()),

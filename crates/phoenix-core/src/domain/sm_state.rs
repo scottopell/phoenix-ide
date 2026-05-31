@@ -1,9 +1,9 @@
 //! Conversation state types
 
-use crate::db::{ErrorKind, ToolResult, UsageData};
-use crate::llm::ContentBlock;
-use crate::tools::patch::types::PatchInput;
-use crate::tools::BashToolInput;
+use crate::domain::bash_types::BashToolInput;
+use crate::domain::db_schema::{ErrorKind, ToolResult, UsageData};
+use crate::domain::llm_types::ContentBlock;
+use crate::domain::patch_types::PatchInput;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::path::PathBuf;
@@ -320,6 +320,7 @@ impl From<AskUserQuestionInput> for ToolInput {
 
 impl ToolInput {
     /// Get the tool name
+    #[must_use]
     pub fn tool_name(&self) -> &str {
         match self {
             ToolInput::Bash(_) => "bash",
@@ -337,11 +338,13 @@ impl ToolInput {
     }
 
     /// Check if this is a sub-agent terminal tool
+    #[must_use]
     pub fn is_terminal_tool(&self) -> bool {
         matches!(self, ToolInput::SubmitResult(_) | ToolInput::SubmitError(_))
     }
 
     /// Convert to JSON Value for tool execution
+    #[must_use]
     pub fn to_value(&self) -> Value {
         match self {
             ToolInput::Bash(input) => serde_json::to_value(input).unwrap_or(Value::Null),
@@ -365,6 +368,7 @@ impl ToolInput {
     /// and `ToolInput::Unknown` only when the tool name itself is not
     /// registered. The two cases are structurally distinct so callers can
     /// surface a malformed-known input separately from an unsupported tool.
+    #[must_use]
     pub fn from_name_and_value(name: &str, value: Value) -> Self {
         fn parse<T>(name: &str, value: Value) -> ToolInput
         where
@@ -411,7 +415,7 @@ mod tests {
         let ToolInput::Bash(input) = input else {
             panic!("expected bash input");
         };
-        assert_eq!(input.op, crate::tools::BashOp::Run);
+        assert_eq!(input.op, crate::domain::bash_types::BashOp::Run);
         assert_eq!(input.cmd.as_deref(), Some("echo legacy"));
     }
 
@@ -698,6 +702,7 @@ impl ToolCall {
     }
 
     /// Get the tool name
+    #[must_use]
     pub fn name(&self) -> &str {
         self.input.tool_name()
     }
@@ -749,6 +754,7 @@ impl AssistantMessage {
     /// eventual `agent_turn` render unit by `message_id`, and the two match
     /// exactly because they're the same string. Tests can pass a fresh
     /// `Uuid::new_v4().to_string()` if they don't care about the wire trace.
+    #[must_use]
     pub fn new(
         message_id: String,
         content: Vec<ContentBlock>,
@@ -766,6 +772,7 @@ impl AssistantMessage {
 
     /// Returns references to the `ToolUse` blocks in content.
     /// Used by `CheckpointData::tool_round()` to enforce the matching-count invariant.
+    #[must_use]
     pub fn tool_uses(&self) -> Vec<&ContentBlock> {
         self.content
             .iter()
@@ -1378,6 +1385,7 @@ impl TryFrom<ConvState> for SubAgentState {
 
 impl CoreState {
     /// Stable variant name (mirrors `ConvState::variant_name`)
+    #[must_use]
     pub fn variant_name(&self) -> &'static str {
         match self {
             CoreState::Idle => "Idle",
@@ -1394,6 +1402,7 @@ impl CoreState {
 
 impl ParentState {
     /// Stable variant name
+    #[must_use]
     pub fn variant_name(&self) -> &'static str {
         match self {
             ParentState::Core(c) => c.variant_name(),
@@ -1406,6 +1415,7 @@ impl ParentState {
         }
     }
 
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -1419,6 +1429,7 @@ impl ParentState {
 impl SubAgentState {
     /// Stable variant name
     #[allow(dead_code)] // Will be used when callers migrate to split types
+    #[must_use]
     pub fn variant_name(&self) -> &'static str {
         match self {
             SubAgentState::Core(c) => c.variant_name(),
@@ -1427,6 +1438,7 @@ impl SubAgentState {
         }
     }
 
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -1436,6 +1448,7 @@ impl SubAgentState {
 
     /// Get reference to core state if this is a Core variant
     #[allow(dead_code)] // Will be used when callers migrate to split types
+    #[must_use]
     pub fn as_core(&self) -> Option<&CoreState> {
         match self {
             SubAgentState::Core(c) => Some(c),
@@ -1512,6 +1525,7 @@ impl ConvState {
     /// Check if this is a terminal state — cannot transition out.
     /// `Completed`/`Failed` are sub-agent specific; `Terminal` is the
     /// user-facing lifecycle end state (complete/abandon).
+    #[must_use]
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -1533,6 +1547,7 @@ impl ConvState {
     /// Used by REQ-BED-032's `RejectHardDeleteWhileBusy` rule. The
     /// hard-delete cascade refuses to fire while busy because the cleanup
     /// would race the in-flight tool execution's own teardown.
+    #[must_use]
     pub fn is_busy(&self) -> bool {
         matches!(
             self,
@@ -1548,10 +1563,12 @@ impl ConvState {
     /// True only for `Idle` and `Error` — the states with nothing in
     /// flight that a model swap would race. Error-state recovery
     /// ("pick another model") is specified by REQ-LLM-006.
+    #[must_use]
     pub fn allows_model_change(&self) -> bool {
         matches!(self, ConvState::Idle | ConvState::Error { .. })
     }
 
+    #[must_use]
     pub fn error_kind(&self) -> Option<&ErrorKind> {
         match self {
             Self::Error { error_kind, .. }
@@ -1567,6 +1584,7 @@ impl ConvState {
     /// `Debug` format of the variant's payloads — task 24682 follow-up.
     /// This is the single source of truth; do not inline another
     /// `match self { ... => "Name" }` elsewhere.
+    #[must_use]
     pub fn variant_name(&self) -> &'static str {
         match self {
             ConvState::Idle => "Idle",
@@ -1593,6 +1611,7 @@ impl ConvState {
     ///
     /// Returns `StepResult::Terminal` for states that cannot produce further transitions,
     /// forcing the executor to exit explicitly rather than relying on channel lifecycle.
+    #[must_use]
     pub fn step_result(&self) -> StepResult {
         match self {
             ConvState::Completed { result } => {
@@ -1630,6 +1649,7 @@ impl ConvState {
     /// Note: `ContextExhausted` always returns `"needs_action"` here.
     /// Callers that have a full `Conversation` and want the `"done"` variant
     /// for the case where `continued_in_conv_id.is_some()` must override this.
+    #[must_use]
     pub fn presentation_mode(&self) -> &'static str {
         match self {
             ConvState::Idle => "idle",
@@ -1654,6 +1674,7 @@ impl ConvState {
 
     /// Semantic category for UI display. This is the single source of truth
     /// for mapping raw conversation states to visual indicators.
+    #[must_use]
     pub fn display_state(&self) -> DisplayState {
         match self {
             ConvState::Idle => DisplayState::Idle,
@@ -1783,7 +1804,7 @@ pub struct ConvContext {
     /// How this conversation handles context exhaustion
     pub context_exhaustion_behavior: ContextExhaustionBehavior,
     /// Conversation mode context for system prompt (stable per mode, updated on Explore->Work)
-    pub mode_context: Option<crate::system_prompt::ModeContext>,
+    pub mode_context: Option<crate::domain::mode_context::ModeContext>,
     /// Maximum LLM turns for this conversation (0 = unlimited, for parent conversations)
     pub max_turns: u32,
     /// Desired base branch for Managed mode (set at creation, consumed at task approval)

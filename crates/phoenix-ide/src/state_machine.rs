@@ -5,10 +5,16 @@
 //! for executor-produced outcomes.
 
 pub(crate) mod effect;
-pub mod event;
 pub mod outcome;
-pub mod state;
 pub(crate) mod transition;
+
+// The state-machine *types* (ConvState, Event, SteerEntry, …) moved to the
+// phoenix-core domain crate to break the db↔state_machine cycle. The pure
+// reducer (`transition`, `handle_outcome`) stays here and depends *down* on
+// them. Alias the modules back so `state::`/`event::` and
+// `crate::state_machine::{state,event}::…` paths resolve unchanged.
+pub use phoenix_core::domain::sm_event as event;
+pub use phoenix_core::domain::sm_state as state;
 
 #[cfg(test)]
 mod project_proptests;

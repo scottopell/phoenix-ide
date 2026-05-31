@@ -34,7 +34,7 @@ impl LlmLanguage {
     /// overrides as needed) elsewhere in this file for it to be useful.
     pub const ALL: &'static [Self] = &[Self::PhoenixNative, Self::Caveman];
 
-    #[must_use] 
+    #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::PhoenixNative => "phoenix-native",
@@ -42,13 +42,13 @@ impl LlmLanguage {
         }
     }
 
-    #[must_use] 
+    #[must_use]
     pub fn parse(s: &str) -> Option<Self> {
         Self::ALL.iter().copied().find(|lang| lang.as_str() == s)
     }
 
     /// Parse with fallback to default for unknown / NULL values from old DB rows.
-    #[must_use] 
+    #[must_use]
     pub fn parse_or_default(s: &str) -> Self {
         Self::parse(s).unwrap_or_default()
     }
@@ -58,7 +58,7 @@ impl LlmLanguage {
 // System-prompt text variants.
 // =============================================================================
 
-#[must_use] 
+#[must_use]
 pub fn base_prompt(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {
@@ -72,7 +72,7 @@ Be concise in your responses. When using tools, explain what you're doing briefl
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn sub_agent_suffix(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {
@@ -87,7 +87,7 @@ pub fn sub_agent_suffix(lang: LlmLanguage) -> &'static str {
 // Mode context blocks. Each accepts the same fields the phoenix-native
 // version uses so language is a pure swap.
 
-#[must_use] 
+#[must_use]
 pub fn mode_explore(lang: LlmLanguage, tasks_dir_name: &str) -> String {
     match lang {
         LlmLanguage::PhoenixNative => format!(
@@ -133,7 +133,7 @@ pub fn mode_explore(lang: LlmLanguage, tasks_dir_name: &str) -> String {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn mode_work(
     lang: LlmLanguage,
     branch_name: &str,
@@ -171,7 +171,7 @@ pub fn mode_work(
 /// Optional hint appended to the Explore-mode prose telling the agent the
 /// next available taskmd ID for this worktree. Language-aware so caveman
 /// stays terse.
-#[must_use] 
+#[must_use]
 pub fn next_taskmd_id_hint(lang: LlmLanguage, tasks_dir_name: &str, next_id: &str) -> String {
     match lang {
         LlmLanguage::PhoenixNative => format!(
@@ -185,7 +185,7 @@ pub fn next_taskmd_id_hint(lang: LlmLanguage, tasks_dir_name: &str, next_id: &st
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn mode_direct(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {
@@ -199,7 +199,7 @@ pub fn mode_direct(lang: LlmLanguage) -> &'static str {
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn mode_branch(
     lang: LlmLanguage,
     branch_name: &str,
@@ -230,7 +230,7 @@ pub fn mode_branch(
 // Chain Q&A system prompts.
 // =============================================================================
 
-#[must_use] 
+#[must_use]
 pub fn chain_answer_system_prompt(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {
@@ -250,7 +250,7 @@ provided content."
     }
 }
 
-#[must_use] 
+#[must_use]
 pub fn chain_leaf_summary_system_prompt(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {
@@ -277,7 +277,7 @@ about the summary itself — just the summary."
 /// tool has no override in this language (caller falls back to
 /// phoenix-native). Matched explicitly per-language so a future variant
 /// doesn't silently inherit some other language's strings.
-#[must_use] 
+#[must_use]
 pub fn tool_description_override(tool_name: &str, lang: LlmLanguage) -> Option<&'static str> {
     let table: &[(&str, &str)] = match lang {
         LlmLanguage::PhoenixNative => return None,

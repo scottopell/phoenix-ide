@@ -1,6 +1,6 @@
 //! Events that can occur in a conversation
 
-use crate::db::{ErrorKind, ImageData, ToolResult};
+use crate::domain::db_schema::{ErrorKind, ImageData, ToolResult};
 use serde::{Deserialize, Serialize};
 
 /// A steering message that has been queued for delivery when the conversation
@@ -13,7 +13,7 @@ pub struct SteerEntry {
     pub images: Vec<ImageData>,
     pub message_id: String,
     pub user_agent: Option<String>,
-    pub skill_invocation: Option<crate::skills::SkillInvocation>,
+    pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
 }
 
 /// Versioned on-disk envelope around the FIFO steering queue.
@@ -45,6 +45,7 @@ impl SteeringQueueEnvelope {
     /// produced it. New envelope variants added here will fail to compile
     /// at every reader site until they handle the new case — preventing
     /// the silent-loss bug class.
+    #[must_use]
     pub fn into_entries(self) -> Vec<SteerEntry> {
         match self {
             Self::V1 { entries } => entries,
@@ -55,6 +56,9 @@ impl SteeringQueueEnvelope {
     /// envelope and a pre-envelope bare JSON array (which is treated as
     /// V1). Failure is propagated rather than swallowed; callers decide
     /// whether to default to empty after logging.
+    ///
+    /// # Errors
+    /// Returns `Err` if `s` is not valid JSON for a steering-queue envelope.
     pub fn from_json(s: &str) -> Result<Self, serde_json::Error> {
         let value: serde_json::Value = serde_json::from_str(s)?;
         if value.is_array() {
@@ -66,6 +70,9 @@ impl SteeringQueueEnvelope {
     }
 
     /// Serialise the queue in the current envelope variant.
+    ///
+    /// # Errors
+    /// Returns `Err` if the entries fail to serialise to JSON.
     pub fn to_json(entries: &[SteerEntry]) -> Result<String, serde_json::Error> {
         let env = Self::V1 {
             entries: entries.to_vec(),
@@ -92,8 +99,8 @@ pub fn decode_steering_queue(conversation_id: &str, raw: &str) -> Vec<SteerEntry
         }
     }
 }
-use crate::llm::{ContentBlock, Usage};
-use crate::state_machine::state::{
+use crate::domain::llm_types::{ContentBlock, Usage};
+use crate::domain::sm_state::{
     PendingSubAgent, QuestionAnnotation, SubAgentOutcome, TaskApprovalOutcome, ToolCall,
 };
 use std::collections::HashMap;
@@ -115,7 +122,7 @@ pub enum Event {
         user_agent: Option<String>,
         /// If this message triggered a skill invocation, the details are here.
         /// When present, the message is persisted as `MessageContent::Skill`.
-        skill_invocation: Option<crate::skills::SkillInvocation>,
+        skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
     },
     UserCancel {
         /// Why the cancel was issued. `None` means user-initiated or parent-propagated.
@@ -264,7 +271,7 @@ pub enum Event {
         /// Client-generated UUID — canonical identifier for this message.
         message_id: String,
         user_agent: Option<String>,
-        skill_invocation: Option<crate::skills::SkillInvocation>,
+        skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
     },
     /// Removes a steering entry from the executor's in-memory queue.
     /// Intercepted by the executor before reaching the state machine.
@@ -294,6 +301,7 @@ impl Event {
     /// error types (e.g. `TransitionError::InvalidTransition`) and tracing
     /// so they can carry a discriminator without the `Debug` format of the
     /// variant's payloads — task 24682 follow-up. Single source of truth.
+    #[must_use]
     pub fn variant_name(&self) -> &'static str {
         match self {
             Event::UserMessage { .. } => "UserMessage",
@@ -338,7 +346,7 @@ pub enum CoreEvent {
         images: Vec<ImageData>,
         message_id: String,
         user_agent: Option<String>,
-        skill_invocation: Option<crate::skills::SkillInvocation>,
+        skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
     },
     UserCancel {
         reason: Option<String>,
@@ -727,6 +735,7 @@ impl TryFrom<Event> for SubAgentEvent {
 
 impl CoreEvent {
     /// Stable variant name for error reporting
+    #[must_use]
     pub fn variant_name(&self) -> &'static str {
         match self {
             CoreEvent::UserMessage { .. } => "UserMessage",
@@ -748,6 +757,7 @@ impl CoreEvent {
 
 impl ParentEvent {
     /// Stable variant name for error reporting
+    #[must_use]
     pub fn variant_name(&self) -> &'static str {
         match self {
             ParentEvent::Core(e) => e.variant_name(),
@@ -767,6 +777,7 @@ impl ParentEvent {
 impl SubAgentEvent {
     /// Stable variant name for error reporting
     #[allow(dead_code)] // Will be used when callers migrate from Event
+    #[must_use]
     pub fn variant_name(&self) -> &'static str {
         match self {
             SubAgentEvent::Core(e) => e.variant_name(),
@@ -780,7 +791,7 @@ impl SubAgentEvent {
 #[cfg(test)]
 mod spec_runtime_name_alignment_tests {
     use super::*;
-    use crate::state_machine::state::TaskApprovalOutcome;
+    use crate::domain::sm_state::TaskApprovalOutcome;
 
     /// Lock the event variant name to the spec trigger name. The four
     /// `UserApprovesTaskCurrentConversation` / `UserApprovesTaskFreshWorkConversation`

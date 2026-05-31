@@ -73,7 +73,9 @@ pub(crate) mod sse;
 pub use codex_credential::{CodexCredential, CODEX_BACKEND_URL, CODEX_BRIDGE_CONTEXT_WINDOW};
 pub use credential_helper::{CredentialHelper, CredentialStatus};
 pub use discovery::{discover_models, probe_gateway, DiscoveryConfig};
-pub use error::{AutoRetryPolicy, LlmAttemptReason, LlmError, LlmErrorKind, UserResumePolicy};
+pub use error::{LlmAttemptReason, LlmError, LlmErrorKind};
+// AutoRetryPolicy / UserResumePolicy now live in phoenix-core; reach them via
+// `crate::llm::error::…` (error.rs re-exports them) or the domain crate.
 // Re-exported types: QuotaDetails is consumed by `LlmOutcome::UsageLimitReached`
 // and the executor mapper. CreditsSnapshot / RateLimitWindow live behind it,
 // accessed via the `rate_limit` submodule.

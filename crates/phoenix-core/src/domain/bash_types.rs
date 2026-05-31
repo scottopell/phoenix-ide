@@ -15,7 +15,7 @@ pub enum BashOp {
 }
 
 impl BashOp {
-    #[must_use] 
+    #[must_use]
     pub fn as_field_name(self) -> &'static str {
         match self {
             BashOp::Run => "run",

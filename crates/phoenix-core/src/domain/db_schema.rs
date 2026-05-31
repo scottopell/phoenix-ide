@@ -1,7 +1,8 @@
 //! Database schema and types
 
-use crate::llm::{AutoRetryPolicy, ContentBlock, UserResumePolicy};
-pub use crate::state_machine::state::ConvState;
+use crate::domain::llm_types::ContentBlock;
+use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
+pub use crate::domain::sm_state::ConvState;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -15,6 +16,7 @@ pub enum NotificationToggle {
 }
 
 impl NotificationToggle {
+    #[must_use]
     pub fn as_bool(self) -> bool {
         matches!(self, Self::Enabled)
     }
@@ -94,6 +96,8 @@ impl Default for NotificationSettings {
 pub struct NonEmptyString(String);
 
 impl NonEmptyString {
+    /// # Errors
+    /// Returns `Err` if the input string is empty.
     pub fn new(s: impl Into<String>) -> Result<Self, &'static str> {
         let s = s.into();
         if s.is_empty() {
@@ -103,6 +107,7 @@ impl NonEmptyString {
         }
     }
 
+    #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -350,6 +355,7 @@ impl Default for ConvMode {
 
 impl ConvMode {
     /// Human-readable label for UI display
+    #[must_use]
     pub fn label(&self) -> &'static str {
         match self {
             Self::Explore { .. } => "Explore",
@@ -360,6 +366,7 @@ impl ConvMode {
     }
 
     /// The branch name if in Work or Branch mode, None otherwise.
+    #[must_use]
     pub fn branch_name(&self) -> Option<&str> {
         match self {
             Self::Work { branch_name, .. } | Self::Branch { branch_name, .. } => {
@@ -386,6 +393,7 @@ impl ConvMode {
     }
 
     /// The base branch if in Work or Branch mode, None otherwise.
+    #[must_use]
     pub fn base_branch(&self) -> Option<&str> {
         match self {
             Self::Work { base_branch, .. } | Self::Branch { base_branch, .. } => {
@@ -396,6 +404,7 @@ impl ConvMode {
     }
 
     /// The task ID if in Work mode, None otherwise. Branch mode has no task.
+    #[must_use]
     pub fn task_id(&self) -> Option<&str> {
         match self {
             Self::Work { task_id, .. } => Some(task_id.as_str()),
@@ -404,6 +413,7 @@ impl ConvMode {
     }
 
     /// The task title if in Work mode, None otherwise. Branch mode has no task.
+    #[must_use]
     pub fn task_title(&self) -> Option<&str> {
         match self {
             Self::Work { task_title, .. } => Some(task_title.as_str()),
@@ -414,6 +424,7 @@ impl ConvMode {
     /// Extract `WorktreeConfig` from Work or Branch mode. Returns None for
     /// Explore and Direct.
     #[allow(dead_code)] // Introduced for A2/C1 phases; tested in conv_mode_tests
+    #[must_use]
     pub fn worktree_config(&self) -> Option<WorktreeConfig> {
         match self {
             Self::Work {
@@ -453,6 +464,7 @@ pub struct Project {
 /// Detect the git repository root for a given directory path.
 ///
 /// Returns `None` if the path is not inside a git repository.
+#[must_use]
 pub fn detect_git_repo_root(path: &Path) -> Option<String> {
     let output = std::process::Command::new("git")
         .arg("rev-parse")
@@ -524,7 +536,7 @@ pub struct Conversation {
     /// Delivered (FIFO) when the conversation next reaches `Idle`.
     /// `#[serde(default)]` handles old DB rows that predate this column.
     #[serde(default)]
-    pub steering_queue: Vec<crate::state_machine::event::SteerEntry>,
+    pub steering_queue: Vec<crate::domain::sm_event::SteerEntry>,
     /// LLM-facing prose language fixed at creation (e.g. `phoenix-native`,
     /// `caveman`). Chain continuations and sub-agents inherit it.
     /// `#[serde(default)]` handles old DB rows that predate this column.
@@ -534,6 +546,7 @@ pub struct Conversation {
 
 /// Derive a human-readable title from a kebab-case slug.
 /// E.g., "my-test-conversation" -> "My Test Conversation"
+#[must_use]
 pub fn title_from_slug(slug: &str) -> String {
     slug.split('-')
         .filter(|s| !s.is_empty())
@@ -553,10 +566,12 @@ pub fn title_from_slug(slug: &str) -> String {
 
 impl Conversation {
     /// Check if the agent is currently working (derived from `display_state`)
+    #[must_use]
     pub fn is_agent_working(&self) -> bool {
-        self.state.display_state() == crate::state_machine::state::DisplayState::Working
+        self.state.display_state() == crate::domain::sm_state::DisplayState::Working
     }
 
+    #[must_use]
     pub fn file_root(&self) -> &str {
         self.conv_mode.worktree_path().unwrap_or(&self.cwd)
     }
@@ -599,6 +614,7 @@ pub enum ErrorKind {
 
 impl ErrorKind {
     /// Policy for runtime-initiated retry while the same turn is still in flight.
+    #[must_use]
     pub fn auto_retry_policy(&self) -> AutoRetryPolicy {
         match self {
             Self::Network | Self::RateLimit | Self::ServerError | Self::TimedOut => {
@@ -615,11 +631,13 @@ impl ErrorKind {
         }
     }
 
+    #[must_use]
     pub fn is_auto_retryable(&self) -> bool {
         self.auto_retry_policy().allows_auto_retry()
     }
 
     /// Policy for a persisted error state accepting a user-triggered `continue`.
+    #[must_use]
     pub fn user_resume_policy(&self) -> UserResumePolicy {
         match self {
             Self::Auth
@@ -637,6 +655,7 @@ impl ErrorKind {
         }
     }
 
+    #[must_use]
     pub fn is_user_resumable(&self) -> bool {
         self.user_resume_policy().allows_user_resume()
     }
@@ -697,6 +716,7 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
+    #[must_use]
     pub fn success(tool_use_id: String, output: String) -> Self {
         Self {
             tool_use_id,
@@ -709,6 +729,7 @@ impl ToolResult {
         }
     }
 
+    #[must_use]
     pub fn error(tool_use_id: String, error: String) -> Self {
         Self {
             tool_use_id,
@@ -721,6 +742,7 @@ impl ToolResult {
         }
     }
 
+    #[must_use]
     pub fn cancelled(tool_use_id: String, message: &str) -> Self {
         Self {
             tool_use_id,
@@ -733,6 +755,7 @@ impl ToolResult {
 
     /// Create a successful result with display data for UI rendering
     #[allow(dead_code)]
+    #[must_use]
     pub fn success_with_display(
         tool_use_id: String,
         output: String,
@@ -749,15 +772,18 @@ impl ToolResult {
         }
     }
 
+    #[must_use]
     pub fn is_error(&self) -> bool {
         matches!(self.outcome, ToolOutcome::Error { .. })
     }
 
     #[allow(dead_code)] // Used in tests; main code uses is_error()
+    #[must_use]
     pub fn is_success(&self) -> bool {
         matches!(self.outcome, ToolOutcome::Success { .. })
     }
 
+    #[must_use]
     pub fn output(&self) -> &str {
         match &self.outcome {
             ToolOutcome::Success { output, .. } | ToolOutcome::Error { output, .. } => output,
@@ -765,6 +791,7 @@ impl ToolResult {
         }
     }
 
+    #[must_use]
     pub fn display_data(&self) -> Option<&serde_json::Value> {
         match &self.outcome {
             ToolOutcome::Success { display_data, .. } | ToolOutcome::Error { display_data, .. } => {
@@ -774,6 +801,7 @@ impl ToolResult {
         }
     }
 
+    #[must_use]
     pub fn images(&self) -> &[ToolContentImage] {
         match &self.outcome {
             ToolOutcome::Success { images, .. } | ToolOutcome::Error { images, .. } => images,
@@ -854,6 +882,7 @@ impl UserContent {
     }
 
     /// The text to deliver to the LLM: expanded form if present, display text otherwise.
+    #[must_use]
     pub fn llm_text(&self) -> &str {
         self.llm_text.as_deref().unwrap_or(&self.text)
     }
@@ -868,8 +897,9 @@ pub struct ImageData {
 
 impl ImageData {
     /// Convert to LLM `ImageSource` format
-    pub fn to_image_source(&self) -> crate::llm::ImageSource {
-        crate::llm::ImageSource::Base64 {
+    #[must_use]
+    pub fn to_image_source(&self) -> crate::domain::llm_types::ImageSource {
+        crate::domain::llm_types::ImageSource::Base64 {
             media_type: self.media_type.clone(),
             data: self.data.clone(),
         }
@@ -958,6 +988,7 @@ pub enum MessageContent {
 
 impl MessageContent {
     /// Get the message type for this content
+    #[must_use]
     pub fn message_type(&self) -> MessageType {
         match self {
             Self::User(_) => MessageType::User,
@@ -971,6 +1002,7 @@ impl MessageContent {
     }
 
     /// Serialize content to JSON value (without type tag)
+    #[must_use]
     pub fn to_json(&self) -> Value {
         match self {
             Self::User(c) => serde_json::to_value(c).unwrap_or(Value::Null),
@@ -984,6 +1016,10 @@ impl MessageContent {
     }
 
     /// Deserialize content from JSON value using the message type as discriminator
+    ///
+    /// # Errors
+    /// Returns `Err` if `value` does not deserialize into the content shape
+    /// implied by `msg_type`.
     pub fn from_json(msg_type: MessageType, value: Value) -> Result<Self, String> {
         match msg_type {
             MessageType::User => serde_json::from_value(value)
@@ -1021,6 +1057,7 @@ impl MessageContent {
     }
 
     /// Create agent content
+    #[must_use]
     pub fn agent(blocks: Vec<ContentBlock>) -> Self {
         Self::Agent(blocks)
     }
@@ -1161,6 +1198,7 @@ pub enum ChainQaStatus {
 impl ChainQaStatus {
     /// Persisted (lowercase) string representation. Stable across releases —
     /// changing this breaks DB rows in flight.
+    #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
             Self::InFlight => "in_flight",
@@ -1173,6 +1211,7 @@ impl ChainQaStatus {
     /// Parse the persisted string back into the enum. Returns `None` for
     /// unknown values; callers (currently `parse_chain_qa_row` in `db.rs`)
     /// surface this as a typed error so unknown values are loud, not silent.
+    #[must_use]
     pub fn from_db_str(s: &str) -> Option<Self> {
         Some(match s {
             "in_flight" => Self::InFlight,
@@ -1220,7 +1259,7 @@ pub struct ChainQaRow {
 }
 
 /// Type alias for backward compatibility — `Usage` is the canonical type.
-pub type UsageData = crate::llm::Usage;
+pub type UsageData = crate::domain::llm_types::Usage;
 
 /// Aggregated token counts and turn count for a query scope.
 #[derive(Debug, Serialize)]
@@ -1351,7 +1390,7 @@ mod error_kind_tests {
 
     #[test]
     fn all_error_kinds_have_explicit_auto_retry_and_user_resume_policy() {
-        use crate::llm::{AutoRetryPolicy, UserResumePolicy};
+        use crate::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
         use ErrorKind::{
             Auth, Cancelled, ContentFilter, ContextExhausted, InvalidRequest, Network, RateLimit,
             ServerError, ServerOverloaded, SubAgentError, TimedOut, UsageLimitReached,

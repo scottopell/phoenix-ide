@@ -78,29 +78,10 @@ impl LlmError {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutoRetryPolicy {
-    AutoRetryable,
-    NoAutoRetry,
-}
-
-impl AutoRetryPolicy {
-    pub fn allows_auto_retry(self) -> bool {
-        matches!(self, Self::AutoRetryable)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UserResumePolicy {
-    Resumable,
-    NotResumable,
-}
-
-impl UserResumePolicy {
-    pub fn allows_user_resume(self) -> bool {
-        matches!(self, Self::Resumable)
-    }
-}
+// AutoRetryPolicy / UserResumePolicy are co-owned by the persisted error-kind
+// schema (phoenix-core domain) and this taxonomy; they live in the base crate.
+// Re-export so `crate::llm::error::…` and `crate::llm::…` paths are unchanged.
+pub use phoenix_core::domain::retry_policy::{AutoRetryPolicy, UserResumePolicy};
 
 /// Error classification for retry logic.
 ///

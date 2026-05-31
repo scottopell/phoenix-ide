@@ -8,6 +8,13 @@ description = "Shared domain vocabulary for Phoenix IDE: serializable types with
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Exposes `#[cfg(test)]` domain constructors (e.g. ContentBlock::tool_use) to
+# downstream crates' test builds. A `#[cfg(test)]` item is invisible across a
+# crate boundary, so dependents that need these helpers in their own tests
+# enable this feature via dev-dependencies. Off in production builds.
+test-support = []
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -17,6 +24,7 @@ ts-rs = { version = "12", features = ["serde-compat", "chrono-impl"] }
 libc = "0.2"
 uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
+tracing = "0.1"
 
 [lints]
 workspace = true
