@@ -228,11 +228,15 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
         const section = sectionFromItemId(item.id);
         if (!section) return null;
         const filePath = item.fileDiff.name;
-        const count = fileNotesFor(notes, section, filePath).length;
+        const fileNotes = fileNotesFor(notes, section, filePath);
+        const count = fileNotes.length;
+        // File-level notes have no inline annotation to flash, so a jump from
+        // the panel highlights the header affordance itself.
+        const flash = fileNotes.some((n) => n.id === highlightedNoteId);
         return (
           <button
             type="button"
-            className="phoenix-diff-file-note-btn"
+            className={`phoenix-diff-file-note-btn${flash ? ' phoenix-diff-file-note-btn--flash' : ''}`}
             onClick={() => onAnnotateFile(section, filePath)}
             aria-label={`Add file-level note to ${filePath}`}
             title="Add file-level note"
@@ -242,7 +246,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
           </button>
         );
       },
-      [notes, onAnnotateFile],
+      [notes, highlightedNoteId, onAnnotateFile],
     );
 
     const renderGutterUtility = useCallback(
