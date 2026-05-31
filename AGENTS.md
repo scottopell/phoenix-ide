@@ -1,12 +1,26 @@
 # Agent Instructions for phoenix-ide
 
-## What Is This?
+This file has four parts, in reading order:
+
+1. **Orientation** — what Phoenix is and where things live.
+2. **Working in this repo** — your workflow as a developer or agent operating here.
+3. **Extending the codebase** — procedures for adding to Phoenix safely.
+4. **Constraints on the artifact** — rules the Phoenix code and product must satisfy.
+
+Parts 2 and 4 are deliberately separate: part 2 governs *how you work*, part 4 governs *what the code must be*. A rule about your git workflow lives in part 2; a rule about how Phoenix-the-app manipulates git lives in part 4. Keep them from bleeding into each other.
+
+---
+
+## Orientation
+*What Phoenix is and where things live.*
+
+### What Is This?
 
 LLM-powered coding agent. Rust backend (axum, SQLite) + React frontend (TypeScript, XState).
 
 The core is a **state machine-driven conversation runtime**: messages flow through deterministic state transitions, tools execute as effects, and everything persists to SQLite for crash recovery.
 
-## Architecture
+### Architecture
 
 ```
 crates/phoenix-ide/src/
@@ -35,7 +49,10 @@ phoenix-client.py  # CLI client — interact with the app without a browser
 
 ---
 
-## Task Tracking
+## Working in this repo
+*How you—developer or agent—operate day to day. Workflow, not artifact rules.*
+
+### Task Tracking
 
 **Create tasks with `taskmd new` — do not write task files directly.**
 
@@ -73,9 +90,7 @@ taskmd status <id> in-progress     # Transition a task by renaming the file
 ./dev.py tasks validate            # Check filenames + IDs (also runs in ./dev.py check)
 ```
 
----
-
-## Issue Discovery Protocol
+### Issue Discovery Protocol
 
 The trigger: you just noticed something. For example:
 
@@ -85,31 +100,29 @@ The trigger: you just noticed something. For example:
 - An escape-hatch API that undermines a "correct by construction" design.
 - A reducer branch that skips a helper all other branches go through.
 
-### First question: is this my current work?
+#### First question: is this my current work?
 
-- **Yes** — on-path, or a tiny adjacent fix the user would expect → just do it.
+- **Yes** — on-path, or an adjacent fix the user would expect → just do it.
 - **No** — capture it, keep moving.
 
-### Capturing: default to in-conversation TODO
+#### Capturing: default to in-conversation TODO
 
 `taskmd new` is for items that won't be addressed this session. During active work, an in-conversation TODO is lower friction and keeps context with the discussion.
 
-### Example
+#### Example
 
 Mid-QA on a sub-agent's commit you spot drift in a file that was out of their scope:
 
 - **Right**: add to in-conversation TODO, finish QA, batch cleanup at session end.
 - **Wrong**: interrupt QA with `taskmd new` for each observation — fragments review, dilutes the repo's task list.
 
-### Never
+#### Never
 
 - Silently delete regression files
 - Say "this is unrelated" and move on without recording
 - Leave mock data, hardcoded fixtures, or stub values committed
 
----
-
-## Development
+### Development
 
 **Always use `./dev.py`** — it configures LLM gateway automatically.
 
@@ -127,25 +140,13 @@ Mid-QA on a sub-agent's commit you spot drift in a file that was out of their sc
 
 In dev mode, Vite serves `ui/` with hot reload. In production, `ui/dist/` is embedded into the Rust binary via RustEmbed.
 
-Each git worktree gets unique ports and database automatically.
-
-Deleting a worktree (e.g. via the harness) without running `./dev.py down` first orphans its Phoenix/Vite servers — the `.pid` files live inside the worktree and vanish with it, but the processes keep running and holding their ports. To survive this, each spawned server is also recorded in `~/.phoenix-ide/dev-registry/` (outside any worktree). `./dev.py up` auto-reaps such orphans before starting, and `./dev.py reap` cleans them on demand. A process is only killed when its working directory points into a now-deleted worktree, so live servers are never touched.
-
-Phoenix must treat the user's Git worktrees as owned environments: fetching remote refs is safe, but moving a local branch ref that is checked out in any worktree is not. Before any operation that updates `refs/heads/*`, check all worktrees and skip the ref move if the branch is checked out.
+Each git worktree gets unique ports and a database automatically. Servers orphaned by a deleted worktree are auto-reaped on `./dev.py up`; `./dev.py reap` cleans them on demand (`--dry-run` to preview).
 
 **Logs:** Dev server logs to `phoenix.log` in the project root. Production logs to `~/.phoenix-ide/prod.log`.
 
-⚠️ Do NOT use `cargo run` directly—server needs LLM gateway config from `./dev.py`.
+⚠️ Do NOT use `cargo run` directly—server needs LLM gateway config from `./dev.py` via `.phoenix-ide.env` and/or `.phoenix-ide.dev.env`
 
-If you're in a Claude Code remote sandbox (`IS_SANDBOX=yes`) and need to drive the UI in a real browser, `npx agent-browser` works once pointed at the pre-installed Playwright Chrome and given cert/sandbox args:
-
-```bash
-export AGENT_BROWSER_EXECUTABLE_PATH=/opt/pw-browsers/chromium-1194/chrome-linux/chrome
-export AGENT_BROWSER_ARGS="--ignore-certificate-errors,--disable-dev-shm-usage,--no-sandbox"
-npx agent-browser open http://localhost:8042
-```
-
-### Node + pnpm
+#### Node + pnpm
 
 The UI uses pnpm via Corepack, pinned in `ui/package.json#packageManager`.
 `./dev.py` validates the corepack/pnpm versions on every run and prints
@@ -155,9 +156,17 @@ bootstrap doc to keep in sync.
 To bump the pnpm version: edit `packageManager` in `ui/package.json`, run
 `pnpm install` to regenerate `pnpm-lock.yaml`, commit both.
 
----
+#### Driving the UI in a sandbox
 
-## Commits and pushes
+If you're in a Claude Code remote sandbox (`IS_SANDBOX=yes`) and need to drive the UI in a real browser, `npx agent-browser` works once pointed at the pre-installed Playwright Chrome and given cert/sandbox args:
+
+```bash
+export AGENT_BROWSER_EXECUTABLE_PATH=/opt/pw-browsers/chromium-1194/chrome-linux/chrome
+export AGENT_BROWSER_ARGS="--ignore-certificate-errors,--disable-dev-shm-usage,--no-sandbox"
+npx agent-browser open http://localhost:8042
+```
+
+### Commits and pushes
 
 **Agents are authorized to commit in this repo without asking.** Commits are local and reversible; holding working-tree changes uncommitted across a long session costs more than it saves. (`./dev.py prod deploy` does warn loudly about dirty state but builds from HEAD regardless — easy to miss at the end of a long build log.) Commit completed units of work as you go.
 
@@ -167,9 +176,7 @@ Prefer logical splits over a single kitchen-sink commit when concerns are distin
 
 **Destructive remote operations remain prohibited** without explicit authorization: lease-less force-pushes, deleting remote branches or tags, or rewriting history on `main` or a branch you don't own. When a push would affect work that isn't yours, ask first.
 
----
-
-## Testing
+### Testing
 
 ```bash
 cargo test                       # All tests
@@ -179,9 +186,38 @@ cargo test -- --nocapture        # See println! output
 
 Property tests live in `**/proptests.rs` files. Run with `cargo test proptests`.
 
+### Production
+
+```bash
+./dev.py prod deploy [version]   # Build + install systemd service
+./dev.py prod status             # Show status
+./dev.py prod stop               # Stop service
+```
+
+Builds static ~9MB binary with embedded UI. Runs on port 8031, database at `~/.phoenix-ide/prod.db`.
+
 ---
 
-## TypeScript codegen for SSE types (task 02677)
+## Extending the codebase
+*Procedures for adding to Phoenix without breaking its invariants.*
+
+### Adding a New Tool
+
+See [`crates/phoenix-ide/src/tools/think.rs`](crates/phoenix-ide/src/tools/think.rs) as the simplest example.
+
+1. Create `crates/phoenix-ide/src/tools/your_tool.rs` implementing the `Tool` trait:
+   - `name()` — tool identifier
+   - `description()` — shown to LLM
+   - `input_schema()` — JSON schema for parameters
+   - `run()` — async execution, returns `ToolOutput`
+
+2. Register in `crates/phoenix-ide/src/tools.rs` → `ToolRegistry::new_with_options()`
+
+3. Add spec in `specs/your-tool/executive.md` (see existing specs for format)
+
+**Before modifying any existing tool**, read its spec in `specs/<tool>/executive.md`.
+
+### TypeScript codegen for SSE types
 
 The SSE wire format is typed on the Rust side in [`src/api/wire.rs`](src/api/wire.rs) (`SseWireEvent`). `#[derive(ts_rs::TS)]` emits the matching TypeScript under `ui/src/generated/` during `cargo test` — those files are checked into git. The valibot schemas in `ui/src/sseSchemas.ts` are annotated `satisfies v.GenericSchema<unknown, WireInitData>` etc., so a Rust-side change surfaces as a tsc error until the schema is updated.
 
@@ -198,98 +234,14 @@ Byte-for-byte wire parity with the pre-typed `json!()` path is guarded by the `p
 
 ---
 
-## Adding a New Tool
+## Constraints on the artifact
+*What the Phoenix code and product must be. These bind the code, not your workflow—when a plan conflicts with one, the plan loses and you note why.*
 
-See [`crates/phoenix-ide/src/tools/think.rs`](crates/phoenix-ide/src/tools/think.rs) as the simplest example.
-
-1. Create `crates/phoenix-ide/src/tools/your_tool.rs` implementing the `Tool` trait:
-   - `name()` — tool identifier
-   - `description()` — shown to LLM
-   - `input_schema()` — JSON schema for parameters
-   - `run()` — async execution, returns `ToolOutput`
-
-2. Register in `crates/phoenix-ide/src/tools.rs` → `ToolRegistry::new_with_options()`
-
-3. Add spec in `specs/your-tool/executive.md` (see existing specs for format)
-
-**Before modifying any existing tool**, read its spec in `specs/<tool>/executive.md`.
-
----
-
-## Specifications
-
-This project uses two complementary specification formats. **Both are normative** — code that contradicts either is wrong.
-
-- **spEARS** specs (`requirements.md`, `design.md`, `executive.md`) capture the *what* and *why*, plus the high-level *how*. They establish user need, named requirements (REQ-* IDs), design rationale, and track implementation status.
-- **Allium** specs (`.allium` files) capture *how specifically* — states, transitions, preconditions, postconditions, invariants — precisely enough to generate tests and catch ambiguities.
-
-The two formats complement each other. spEARS without Allium is vague about exact behaviour; Allium without spEARS is unmoored from user need. Together: user story → REQ-IDs → precise behavioural spec → testable implementation → status tracking, traceable end-to-end.
-
-### When to write an Allium spec alongside spEARS
-
-Allium is a heavier tool; not every spEARS spec needs an Allium counterpart. Write one when the system has:
-
-- **State machines** with multiple states and complex transitions (bedrock, projects)
-- **Lifecycle flows** with preconditions that must hold (task approval, complete, abandon)
-- **Multi-step operations** where ordering matters and partial failure is possible
-- **Cross-boundary contracts** where two specs interact (projects importing bedrock)
-
-Do NOT add Allium for: CRUD endpoints, pure data transformations, UI components, tool implementations with no lifecycle. spEARS alone is sufficient there.
-
-### Discovering specs
-
-Both formats live under `specs/<name>/`:
-
-- spEARS: `requirements.md`, `design.md`, `executive.md`
-- Allium: `<name>.allium`
-
-Enumerate Allium specs with `ls specs/*/*.allium`. Cross-spec dependencies are declared in each file's header via `use "./other.allium" as other`. Validate with `allium check specs/<name>/<name>.allium` (install via `cargo install allium-cli`).
-
-### Working with Allium specs
-
-```bash
-# Distill a new spec from existing code
-/allium:distill
-
-# Generate tests from a spec
-/allium:propagate
-```
-
-**Resolving open questions is mandatory.** An open question in an Allium spec is not documentation — it's an unresolved ambiguity that may hide a bug. When distilling, present each open question to the user via `AskUserQuestion` with concrete options (not open-ended). The user decides; you implement the fix. Do not leave open questions as prose notes or "future work." Every ambiguity either becomes a code fix or an explicit design decision before the spec is merged.
-
-**Both formats are authoritative.** If the code disagrees with either spEARS or Allium, one of them is wrong. spEARS requirements (REQ-* IDs) define what must be built; Allium's transition graph, preconditions, and invariants define exact behaviour. `@guidance` blocks in Allium describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right.
-
-**Specs are timeless.** A spec describes the ideal current state of the system as if it had always been that way — it is the guidebook a future reader uses to understand design *intent*, not a record of how the design got here. Write every spec as a standing description, never as a changelog or a snapshot of in-flight work. Concretely, the following do **not** belong in a spec file:
-
-- **Task / PR / issue references** as the reason for a behaviour — `task 02679`, `PR #155`, `see #186`. Cite the *invariant* or *bug class* in timeless terms instead ("an emit-vs-persist race that drops a finalized message"), and cross-reference other **specs** by path, not tasks by ID.
-- **Time- or state-relative framing** of the design — `currently`, `for now`, `recently`, `previously`, `used to`, `will soon`, `Phase 1 (current)`, `landed in tasks/62001`, `MVP`. State what *is*. (Sequential phases *within a single operation* — "phase 1: snapshot, phase 2: apply pending" — are fine; they describe algorithm structure, not a rollout schedule.)
-- **Status / progress tracking** — `✅ Complete`, `Progress: 10 of 10`, "implemented in", per-rule completion columns. Implementation status lives in tasks and git, not the spec. A requirement-to-surface or rule-to-code-anchor map is fine; a *status* table is not.
-- **Decision logs and resolved "Open Questions"** — `Q3. RESOLVED 2026-05-10: …`, dated entries, "we decided", stream-of-consciousness ("actually no — see below"). Once a question is resolved, state the decision **as a fact** with its rationale (a "Design Decisions" section), and delete the question. An *unresolved* open question is never left as prose — resolve it per the rule above.
-- **Line-number citations that rot** — prefer symbol names (`SseBroadcaster::send_seq`) over `runtime.rs:529`. See `specs/AUTHORING.md` §2.
-
-When you touch a spec, leave it more timeless than you found it, even for drift you didn't introduce.
-
-**Before pushing a spec change**, run the pre-flight checklist in [`specs/AUTHORING.md`](specs/AUTHORING.md). The checklist captures the failure modes that drove 8 rounds of review iteration on PR #155 (wire-shape mismatches, Allium grammar bugs, undeclared helpers, cross-file drift, stale citations, cross-spec whitelist gaps) so future spec authors don't repay them.
-
----
-
-## Production
-
-```bash
-./dev.py prod deploy [version]   # Build + install systemd service
-./dev.py prod status             # Show status
-./dev.py prod stop               # Stop service
-```
-
-Builds static ~9MB binary with embedded UI. Runs on port 8031, database at `~/.phoenix-ide/prod.db`.
-
----
-
-## Code Correctness Principles
+### Code Correctness Principles
 
 These are constraints on the technical artifact, not process guidelines. They override existing code patterns and unreviewed plan decisions. When a plan says to do something that violates these, deviate from the plan and note why.
 
-### Correct-by-construction is the governing principle
+#### Correct-by-construction is the governing principle
 
 Design so invalid states cannot be structurally represented. If a type permits a value that is semantically wrong, the type is wrong — fix the type, not the discipline. Runtime checks, comments, and conventions that rely on human vigilance are not substitutes.
 
@@ -304,7 +256,7 @@ pub enum ToolOutputContent {
 }
 ```
 
-### Omission is data loss — unless the component is a typed sink
+#### Omission is data loss — unless the component is a typed sink
 
 If a field exists in struct A and struct B is the next layer that accepts that kind of data, threading it through is required. A component *may* be an intentional consumer/terminator of a value, but this must be enforced by its type — not by implicit omission or a comment. There must be no structural ambiguity between "forgot to thread" and "deliberately consumed."
 
@@ -316,7 +268,7 @@ ContentBlock::ToolResult { images: _, ... } => { ... }
 // AnthropicToolResult carries images; OpenAIToolResult structurally cannot
 ```
 
-### No parallel representations of the same semantic value
+#### No parallel representations of the same semantic value
 
 If data appears in two representations simultaneously, one is redundant. Redundant representations diverge and create ambiguity about which is authoritative. Each field carries data for exactly one consumer, with a non-overlapping contract.
 
@@ -329,7 +281,7 @@ If data appears in two representations simultaneously, one is redundant. Redunda
 //          Non-overlapping consumers, non-overlapping contracts
 ```
 
-### Schema evolution belongs in migrations, not serde annotations
+#### Schema evolution belongs in migrations, not serde annotations
 
 `#[serde(default)]` on a JSON-in-TEXT column field is a patch around a missing migration, not a solution. It is acceptable as a backward-compat shim *during rollout*, but the migration must exist or be tracked as a task. The decision to store structured data as a JSON TEXT blob must be explicitly owned, not treated as an inert constraint to work around.
 
@@ -342,7 +294,7 @@ pub images: Vec<ToolContentImage>,  // old rows silently get empty vec, no migra
 // See db/migrations/ — every structural change to persisted data has a migration
 ```
 
-### Capability gaps are logged, not silenced
+#### Capability gaps are logged, not silenced
 
 When a component drops data because the backend does not support a feature, this must appear in logs at `debug` level or above. Silent omission is indistinguishable from a bug.
 
@@ -357,7 +309,7 @@ if !images.is_empty() {
 }
 ```
 
-### Comments are local facts, not distributed specifications
+#### Comments are local facts, not distributed specifications
 
 A comment is safe when it describes a local fact about the line it's on. A comment is dangerous when it describes a design decision, an invariant, or an operation sequence that could silently become wrong.
 
@@ -398,11 +350,9 @@ run_git(cwd, &["add", &relative_path])?;
 
 When an Allium spec exists for a module, the spec is the authoritative source for design rationale, invariants, and operation sequences. Comments in the code that duplicate spec content will diverge and mislead. If the spec doesn't exist yet, a comment is acceptable as a stopgap, but it must be migrated when the spec is created.
 
----
+### Code Conventions
 
-## Code Conventions
-
-### Module Organization
+#### Module Organization
 
 Use `foo.rs` + `foo/` subdirectory, NOT `foo/mod.rs`. Enforced by clippy.
 
@@ -411,23 +361,84 @@ Use `foo.rs` + `foo/` subdirectory, NOT `foo/mod.rs`. Enforced by clippy.
 ❌ src/tools/mod.rs + src/tools/bash.rs
 ```
 
----
+### Git worktrees are owned environments
 
-## UI Design Philosophy
+Phoenix must treat the user's Git worktrees as owned environments: fetching remote refs is safe, but moving a local branch ref that is checked out in any worktree is not. Before any operation that updates `refs/heads/*`, check all worktrees and skip the ref move if the branch is checked out.
 
-### Information Density, Not Minimalism
+(This constrains how Phoenix-the-app manipulates git on a user's behalf. For *your own* git workflow as a developer in this repo, see [Commits and pushes](#commits-and-pushes).)
+
+### Specifications
+
+This project uses two complementary specification formats. **Both are normative** — code that contradicts either is wrong.
+
+- **spEARS** specs (`requirements.md`, `design.md`, `executive.md`) capture the *what* and *why*, plus the high-level *how*. They establish user need, named requirements (REQ-* IDs), design rationale, and track implementation status.
+- **Allium** specs (`.allium` files) capture *how specifically* — states, transitions, preconditions, postconditions, invariants — precisely enough to generate tests and catch ambiguities.
+
+The two formats complement each other. spEARS without Allium is vague about exact behaviour; Allium without spEARS is unmoored from user need. Together: user story → REQ-IDs → precise behavioural spec → testable implementation → status tracking, traceable end-to-end.
+
+#### When to write an Allium spec alongside spEARS
+
+Allium is a heavier tool; not every spEARS spec needs an Allium counterpart. Write one when the system has:
+
+- **State machines** with multiple states and complex transitions (bedrock, projects)
+- **Lifecycle flows** with preconditions that must hold (task approval, complete, abandon)
+- **Multi-step operations** where ordering matters and partial failure is possible
+- **Cross-boundary contracts** where two specs interact (projects importing bedrock)
+
+Do NOT add Allium for: CRUD endpoints, pure data transformations, UI components, tool implementations with no lifecycle. spEARS alone is sufficient there.
+
+#### Discovering specs
+
+Both formats live under `specs/<name>/`:
+
+- spEARS: `requirements.md`, `design.md`, `executive.md`
+- Allium: `<name>.allium`
+
+Enumerate Allium specs with `ls specs/*/*.allium`. Cross-spec dependencies are declared in each file's header via `use "./other.allium" as other`. Validate with `allium check specs/<name>/<name>.allium` (install via `cargo install allium-cli`).
+
+#### Working with Allium specs
+
+```bash
+# Distill a new spec from existing code
+/allium:distill
+
+# Generate tests from a spec
+/allium:propagate
+```
+
+**Resolving open questions is mandatory.** An open question in an Allium spec is not documentation — it's an unresolved ambiguity that may hide a bug. When distilling, present each open question to the user via `AskUserQuestion` with concrete options (not open-ended). The user decides; you implement the fix. Do not leave open questions as prose notes or "future work." Every ambiguity either becomes a code fix or an explicit design decision before the spec is merged.
+
+**Both formats are authoritative.** If the code disagrees with either spEARS or Allium, one of them is wrong. spEARS requirements (REQ-* IDs) define what must be built; Allium's transition graph, preconditions, and invariants define exact behaviour. `@guidance` blocks in Allium describe implementation sequences — if the code's sequence differs, investigate before assuming the code is right.
+
+**Specs are timeless.** A spec describes the ideal current state of the system as if it had always been that way — it is the guidebook a future reader uses to understand design *intent*, not a record of how the design got here. Write every spec as a standing description, never as a changelog or a snapshot of in-flight work. Concretely, the following do **not** belong in a spec file:
+
+- **Task / PR / issue references** as the reason for a behaviour — `task 02679`, `PR #155`, `see #186`. Cite the *invariant* or *bug class* in timeless terms instead ("an emit-vs-persist race that drops a finalized message"), and cross-reference other **specs** by path, not tasks by ID.
+- **Time- or state-relative framing** of the design — `currently`, `for now`, `recently`, `previously`, `used to`, `will soon`, `Phase 1 (current)`, `landed in tasks/62001`, `MVP`. State what *is*. (Sequential phases *within a single operation* — "phase 1: snapshot, phase 2: apply pending" — are fine; they describe algorithm structure, not a rollout schedule.)
+- **Status / progress tracking** — `✅ Complete`, `Progress: 10 of 10`, "implemented in", per-rule completion columns. Implementation status lives in tasks and git, not the spec. A requirement-to-surface or rule-to-code-anchor map is fine; a *status* table is not. Singular exception, spEARS `executive.md` documents, status tracking is one of their goals. other spEARs documents and allium specifications adhere to this rule strictly.
+
+
+- **Decision logs and resolved "Open Questions"** — `Q3. RESOLVED 2026-05-10: …`, dated entries, "we decided", stream-of-consciousness ("actually no — see below"). Once a question is resolved, state the decision **as a fact** with its rationale (a "Design Decisions" section), and delete the question. An *unresolved* open question is never left as prose — resolve it per the rule above.
+- **Line-number citations that rot** — prefer symbol names (`SseBroadcaster::send_seq`) over `runtime.rs:529`. See `specs/AUTHORING.md` §2.
+
+When you touch a spec, leave it more timeless than you found it, even for drift you didn't introduce.
+
+**Before pushing a spec change**, run the pre-flight checklist in [`specs/AUTHORING.md`](specs/AUTHORING.md). The checklist captures the recurring spec-authoring failure modes — wire-shape mismatches, Allium grammar bugs, undeclared helpers, cross-file drift, stale citations, cross-spec whitelist gaps — so future spec authors don't repay them.
+
+### UI Design Philosophy
+
+#### Information Density, Not Minimalism
 
 - Show status inline (e.g., `DIR ✓ ~/project` — validity and value in one glance)
 - Use symbols and color to convey state without words
 - Progressive disclosure: essentials visible, details on demand
 
-### Input-First Design
+#### Input-First Design
 
 - Primary action (message input) dominates the interface
 - Settings collapsed by default
 - Remember user preferences (last directory, model)
 
-### Feedback Patterns
+#### Feedback Patterns
 
 | State | Pattern |
 |-------|--------|
@@ -438,13 +449,13 @@ Use `foo.rs` + `foo/` subdirectory, NOT `foo/mod.rs`. Enforced by clippy.
 
 Status indicators go **inline** with the value they describe.
 
-### Animation
+#### Animation
 
 - Quick (150-250ms) and purposeful
 - No bounces or playful effects—professional tool
 - Never block user input
 
-### The Test
+#### The Test
 
 Before adding UI: (1) What info does this communicate? (2) Is it already shown elsewhere? (3) Does the user need it?
 
