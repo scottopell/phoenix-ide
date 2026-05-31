@@ -2092,7 +2092,7 @@ def cmd_check():
     # legitimately takes longer — never to mask flakes.
     CHECK_TIMEOUT = 600
 
-    def run_step(name, cmd, cwd=ROOT):
+    def run_step(name, cmd, cwd=ROOT, env_overrides=None):
         # Stream stdout+stderr line-by-line into a bounded buffer so that on
         # timeout we keep the last N lines of output instead of throwing it
         # away. Process is launched in its own session so SIGKILL can target
@@ -2114,6 +2114,11 @@ def cmd_check():
         env["NO_COLOR"] = "1"
         env.pop("FORCE_COLOR", None)
         env.pop("CLICOLOR_FORCE", None)
+        # Caller-supplied overrides (e.g. TS_RS_EXPORT_DIR to redirect ts-rs
+        # codegen) are applied after the color-forcing keys so they can't
+        # accidentally re-enable color.
+        if env_overrides:
+            env.update(env_overrides)
         buf: deque[str] = deque(maxlen=TAIL_LINES)
         truncated = False
 
@@ -2198,16 +2203,20 @@ def cmd_check():
         approach 300s on their own, and when bundled with ~50s of test runtime
         the combined step exceeds the timeout even though nothing is wrong.
 
-        Codegen does NOT run in this lane. The ts-rs `export_bindings_*`
-        tests (re)write `ui/src/generated/` as a side effect; running them
-        here would race the tsc, vitest, eslint, and ast-grep lanes that read
-        that tree in parallel. A serial pre-step in cmd_check regenerates and
-        staleness-checks the tree before the fan-out, and `test_cmd` (built in
-        cmd_check) excludes `export_bindings` from this lane's verification
-        run so the generated tree stays frozen for the whole parallel phase.
-        The pre-step already exercised those tests, so the exclusion drops no
-        coverage. `compile_cmd`/`test_cmd`/the thread cap are computed once in
-        cmd_check and closed over here.
+        The `cargo test` run doubles as codegen: ts-rs' per-type
+        `export_bindings_*` tests rewrite `ui/src/generated/` as a side
+        effect. To stop that write from racing the parallel lanes that read
+        the tree (tsc, vitest, eslint, ast-grep) — ts-rs truncates each file
+        before refilling it, so a reader can catch an empty/partial file —
+        TS_RS_EXPORT_DIR redirects the emitted files into a throwaway dir, and
+        a `codegen-stale` step diffs them against the committed tree. The
+        committed tree the readers consume therefore stays frozen for the
+        whole parallel phase. `compile_cmd`/`test_cmd`/the thread cap are
+        computed once in cmd_check and closed over here.
+
+        Discovery is preserved: every type self-registers via its emitted
+        test, so a new `#[ts(export)]` type is regenerated and checked
+        automatically with no hand-maintained root list to forget.
         """
         run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
         if sys.platform == "darwin":
@@ -2225,7 +2234,48 @@ def cmd_check():
         # Drop it — musl validation belongs on the CI/macOS path that has the
         # cross toolchain installed.
         run_step("cargo test compile", compile_cmd)
-        run_step("cargo test", test_cmd)
+        # Redirect ts-rs codegen to a throwaway dir so the parallel readers
+        # never observe a half-written ui/src/generated/.
+        #
+        # Path math: each type carries `#[ts(export_to = "../../../ui/src/
+        # generated/")]`. ts-rs resolves the final path as
+        # TS_RS_EXPORT_DIR.join(export_to), then normalises away the `..`
+        # components. The default base is `./bindings` under the crate dir, so
+        # the three `..` climb crate→workspace→repo-root and land at
+        # <repo>/ui/src/generated. To preserve that, the override base must
+        # carry >=3 trailing segments; `<tmp>/b/b/b` makes the same three `..`
+        # resolve to `<tmp>/ui/src/generated`. A bare `<tmp>` would let the
+        # `..` climb out of the temp root and write to the wrong place.
+        import tempfile as _tempfile
+        with _tempfile.TemporaryDirectory() as _codegen_tmp:
+            run_step("cargo test", test_cmd, env_overrides={
+                "TS_RS_EXPORT_DIR": str(Path(_codegen_tmp) / "b" / "b" / "b"),
+            })
+            _gen_out = Path(_codegen_tmp) / "ui" / "src" / "generated"
+            # Staleness guard: diff each freshly-emitted file against the
+            # committed tree. Only files ts-rs actually emitted (present in
+            # _gen_out) are compared, which skips hand-authored barrels like
+            # sse.ts that live under ui/src/generated/ but are not ts-rs output
+            # — a whole-tree diff would flag those as committed-only every run.
+            # Tradeoff: a *deleted* `#[ts(export)]` type leaves a stale
+            # committed .ts this check can't see (no emitted counterpart to
+            # diff against); catching that needs a manual delete + regen.
+            run_step("codegen-stale", ["bash", "-c", (
+                'gen="$1"; committed="$2"; drift=""; '
+                'for f in "$gen"/*.ts; do '
+                '  [ -e "$f" ] || continue; '
+                '  base=$(basename "$f"); '
+                '  if ! diff -q "$f" "$committed/$base" >/dev/null 2>&1; then '
+                '    drift="$drift $base"; '
+                '  fi; '
+                'done; '
+                'if [ -n "$drift" ]; then '
+                '  echo "ui/src/generated/ is stale vs Rust source:$drift"; '
+                '  echo ""; '
+                '  echo "Run \'./dev.py codegen\' and commit the result."; '
+                '  exit 1; '
+                'fi'
+            ), "bash", str(_gen_out), str(ROOT / "ui" / "src" / "generated")])
 
     def lane_ui_lint():
         """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
@@ -2544,10 +2594,9 @@ def cmd_check():
         print("  i  commit signing probe failed — disabling commit.gpgsign for tests")
 
     # Probe nextest and size the test-thread cap here in cmd_check scope (not
-    # in lane_rust) so both the serial codegen pre-step below and lane_rust's
-    # closed-over verification run share one decision. Neither probe touches
-    # the cargo target lock (`cargo nextest --version` only prints a version;
-    # the /proc/meminfo read is pure Python).
+    # in lane_rust) so lane_rust's closed-over verification run inherits one
+    # decision. Neither probe touches the cargo target lock (`cargo nextest
+    # --version` only prints a version; the /proc/meminfo read is pure Python).
     has_nextest = subprocess.run(
         ["cargo", "nextest", "--version"],
         capture_output=True,
@@ -2571,52 +2620,21 @@ def cmd_check():
     if test_threads < cpus:
         print(f"  i  cargo test: capping to {test_threads} threads "
               f"(cpus={cpus}, mem_cap={mem_cap})")
-
-    # ts-rs emits a `#[test] export_bindings_*` per `#[ts(export)]` type; those
-    # tests' side effect IS the codegen — they (re)write ui/src/generated/.
-    # Running them inside the parallel fan-out races every lane that reads that
-    # tree (tsc, vitest, eslint, ast-grep), since ts-rs truncates each file
-    # before refilling it (a reader can catch an empty/partial file). So codegen
-    # is pulled out of the fan-out into this serial pre-step: regenerate once,
-    # staleness-check, and only then fan out the readers against a tree that
-    # stays frozen for the rest of the run. lane_rust's verification run
-    # excludes export_bindings (regen already exercised them — no lost
-    # coverage) so it never writes the tree during the parallel phase.
-    #
-    # Discovery is preserved: every type still self-registers via its emitted
-    # test, so a new #[ts(export)] type is regenerated automatically with no
-    # hand-maintained root list to forget.
+    # The `export_bindings_*` tests run in the normal verification pass; their
+    # ts-rs codegen writes are redirected to a throwaway dir inside lane_rust
+    # (see there), so they neither race the readers nor touch the committed
+    # tree. No exclusion filter — every type still self-registers and is
+    # regenerated, preserving discovery with no hand-maintained root list.
     if has_nextest:
         compile_cmd = ["cargo", "nextest", "run", "--no-run"]
         test_cmd = ["cargo", "nextest", "run",
-                    "-E", "not test(/export_bindings/)",
                     "--test-threads", str(test_threads)]
-        codegen_cmd = ["cargo", "nextest", "run", "-E", "test(/export_bindings/)"]
     else:
         compile_cmd = ["cargo", "test", "--no-run"]
         test_cmd = ["cargo", "test", "--",
-                    "--test-threads", str(test_threads), "--skip", "export_bindings"]
-        codegen_cmd = ["cargo", "test", "export_bindings"]
+                    "--test-threads", str(test_threads)]
 
-    print("Regenerating codegen (serial, pre-fan-out)...\n")
-    run_step("codegen", codegen_cmd)
-    # Staleness guard: a non-empty porcelain status under ui/src/generated/ —
-    # modified or untracked — means the developer's Rust types and the
-    # committed TS don't line up. Recorded (not aborted) so the parallel phase
-    # still runs and the developer gets every failure in one pass; the readers
-    # below then validate against the freshly-regenerated (correct) tree.
-    run_step("codegen-stale", ["bash", "-c", (
-        'out=$(git status --porcelain -- ui/src/generated/); '
-        'if [ -n "$out" ]; then '
-        '  echo "ui/src/generated/ has uncommitted changes:"; '
-        '  echo "$out"; '
-        '  echo ""; '
-        '  echo "Run \'./dev.py codegen\' and commit the result."; '
-        '  exit 1; '
-        'fi'
-    )])
-
-    print("\nRunning checks in parallel...\n")
+    print("Running checks in parallel...\n")
 
     # Threads carry the lane name so a hung-thread report names the lane.
     threads = [
