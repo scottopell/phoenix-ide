@@ -21,7 +21,7 @@ export function TextViewerBody({
 }: TextViewerBodyProps) {
   if (mode === 'plainLargeText') {
     return (
-      <div className="viewer-text viewer-text--large" data-testid="viewer-large-text-fallback">
+      <div className="viewer-text" data-testid="viewer-large-text-fallback">
         <pre className="viewer-large-text-pre">{content}</pre>
       </div>
     );
