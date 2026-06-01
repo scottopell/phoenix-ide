@@ -60,7 +60,7 @@ export function makeCodeViewMock() {
             .filter((it: any) => itemEls.current.has(it.id))
             .map((it: any) => ({
               id: it.id,
-              type: 'diff',
+              type: it.type ?? 'diff',
               item: it,
               version: it.version,
               element: itemEls.current.get(it.id),
@@ -70,52 +70,62 @@ export function makeCodeViewMock() {
     }));
 
     codeViewMockState.lastItems = [...(props.items ?? [])];
-    const lineProps = { annotationSide: 'additions', lineNumber: 1, lineType: 'change-addition', type: 'diff-line' };
     return (
       <div data-testid="codeview-mock" className={props.className} ref={props.containerRef}>
-        {(props.items ?? []).map((item: any) => (
-          <div
-            key={item.id}
-            data-item-id={item.id}
-            ref={(el: HTMLElement | null) => {
-              if (el) itemEls.current.set(item.id, el);
-              else itemEls.current.delete(item.id);
-            }}
-          >
-            {props.renderHeaderPrefix?.(item)}
-            {props.renderHeaderMetadata?.(item)}
-            <span data-filename>{item.fileDiff?.name}</span>
-            {/* Pierre-like line DOM (data attributes the touch resolver reads). */}
-            <div data-code="" data-additions="">
-              <span data-line="1" data-line-type="change-addition" data-testid={`mock-line-el-${item.id}`}>
-                line text
-              </span>
-            </div>
-            {(item.annotations ?? []).map((ann: any, i: number) => (
-              <div key={i} data-annotation>
-                {props.renderAnnotation?.(ann, item)}
+        {(props.items ?? []).map((item: any) => {
+          // The mock mirrors both Pierre item shapes: a diff item carries a
+          // side per line, a file item is sideless. Tests for either viewer fire
+          // the same callbacks Phoenix wires.
+          const isFile = item.type === 'file';
+          const lineProps = isFile
+            ? { lineNumber: 1, type: 'line' }
+            : { annotationSide: 'additions', lineNumber: 1, lineType: 'change-addition', type: 'diff-line' };
+          const ctx = { type: isFile ? 'file' : 'diff', item };
+          const hovered = isFile ? { lineNumber: 1 } : { lineNumber: 1, side: 'additions' };
+          return (
+            <div
+              key={item.id}
+              data-item-id={item.id}
+              ref={(el: HTMLElement | null) => {
+                if (el) itemEls.current.set(item.id, el);
+                else itemEls.current.delete(item.id);
+              }}
+            >
+              {props.renderHeaderPrefix?.(item)}
+              {props.renderHeaderMetadata?.(item)}
+              <span data-filename>{isFile ? item.file?.name : item.fileDiff?.name}</span>
+              {/* Pierre-like line DOM (data attributes the touch resolver reads). */}
+              <div data-code="" data-additions="">
+                <span data-line="1" data-line-type="change-addition" data-testid={`mock-line-el-${item.id}`}>
+                  line text
+                </span>
               </div>
-            ))}
-            <button
-              data-testid={`mock-line-click-${item.id}`}
-              onClick={() =>
-                props.options?.onLineClick?.({ ...lineProps, event: { pointerType: 'mouse' } }, { type: 'diff', item })
-              }
-            >
-              line
-            </button>
-            {/* A touch tap: onLineClick with a touch pointer (should NOT annotate). */}
-            <button
-              data-testid={`mock-line-tap-${item.id}`}
-              onClick={() =>
-                props.options?.onLineClick?.({ ...lineProps, event: { pointerType: 'touch' } }, { type: 'diff', item })
-              }
-            >
-              tap
-            </button>
-            {props.renderGutterUtility?.(() => ({ lineNumber: 1, side: 'additions' }), item)}
-          </div>
-        ))}
+              {(item.annotations ?? []).map((ann: any, i: number) => (
+                <div key={i} data-annotation>
+                  {props.renderAnnotation?.(ann, item)}
+                </div>
+              ))}
+              <button
+                data-testid={`mock-line-click-${item.id}`}
+                onClick={() =>
+                  props.options?.onLineClick?.({ ...lineProps, event: { pointerType: 'mouse' } }, ctx)
+                }
+              >
+                line
+              </button>
+              {/* A touch tap: onLineClick with a touch pointer (should NOT annotate). */}
+              <button
+                data-testid={`mock-line-tap-${item.id}`}
+                onClick={() =>
+                  props.options?.onLineClick?.({ ...lineProps, event: { pointerType: 'touch' } }, ctx)
+                }
+              >
+                tap
+              </button>
+              {props.renderGutterUtility?.(() => hovered, item)}
+            </div>
+          );
+        })}
       </div>
     );
   });

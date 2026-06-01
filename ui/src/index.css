@@ -48,6 +48,11 @@
   --input-area-height: 60px;
   --offline-banner-height: 36px;
   --safe-area-bottom: env(safe-area-inset-bottom, 0px);
+
+  /* Per-line shading for the Pierre file code view, injected via unsafeCSS.
+   * Custom properties pierce the shadow boundary into Pierre's rendered rows. */
+  --viewer-modified-line-bg: rgb(255 236 156 / 18%);
+  --viewer-highlight-line-bg: rgb(59 130 246 / 28%);
 }
 
 /* Dark theme (default) */
@@ -8398,6 +8403,52 @@ html * {
   100% {
     background: color-mix(in srgb, var(--accent-blue, #58a6ff) 8%, var(--bg-secondary));
   }
+}
+
+/* === File code viewer (Pierre CodeView, file item) ===
+ * Per-line shading uses --viewer-modified-line-bg / --viewer-highlight-line-bg
+ * (defined in :root), injected into Pierre's rows via the unsafeCSS option. */
+
+.phoenix-file-codeview-wrap {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+.phoenix-file-codeview {
+  flex: 1;
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+}
+
+/* Visual override for Pierre's [data-utility-button] add-note affordance. */
+.phoenix-file-add-note {
+  background: transparent;
+  color: var(--text-muted);
+}
+
+.phoenix-file-add-note:hover,
+.phoenix-file-add-note:focus-visible {
+  background: var(--accent-blue, #58a6ff);
+  color: #fff;
+}
+
+/* Inline note rendered under an annotated line via renderAnnotation. */
+.phoenix-file-note {
+  margin: 2px 0 2px 12px;
+  padding: 6px 10px;
+  border-left: 3px solid var(--accent-blue, #58a6ff);
+  background: color-mix(in srgb, var(--accent-blue, #58a6ff) 8%, var(--bg-secondary));
+  border-radius: 0 4px 4px 0;
+  font-size: 12px;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+}
+
+.phoenix-file-note--flash {
+  animation: phoenix-diff-note-flash 2s ease-out;
 }
 
 .diff-section-error {

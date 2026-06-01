@@ -1,8 +1,16 @@
 import { render, screen, fireEvent } from '@testing-library/react';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { MetaViewer } from './MetaViewer';
 import { ReviewNotesProvider } from '../../contexts/ReviewNotesContext';
 import type { MetaViewerPayload } from './metaViewerTypes';
+import { resetCodeViewMock } from './__testutils__/codeViewMock';
+
+// Code payloads render through Pierre's CodeView; stub it so its async
+// tokenizer doesn't run under happy-dom (see DiffView.test).
+vi.mock('@pierre/diffs/react', async () => {
+  const { makeCodeViewMock } = await import('./__testutils__/codeViewMock');
+  return makeCodeViewMock();
+});
 
 function renderViewer(payload: MetaViewerPayload) {
   return render(
@@ -21,32 +29,31 @@ const common = {
 const textCommon = { ...common, filePath: 'thing', rootDir: '/tmp/project' };
 
 describe('MetaViewer payload routing', () => {
+  beforeEach(() => resetCodeViewMock());
 
   it('routes a markdown payload to rendered markdown', () => {
     renderViewer({ ...textCommon, kind: 'markdown', content: '# Hello\n\nbody text' });
     expect(screen.getByRole('heading', { name: 'Hello' })).toBeInTheDocument();
   });
 
-  it('routes a code payload to the syntax-highlighted code body', () => {
+  it('routes a code payload to the Pierre file code view, not the legacy code body', () => {
     const { container } = renderViewer({ ...textCommon, kind: 'code', language: 'rust', content: 'fn main() {}' });
-    expect(container.querySelector('.viewer-code')).not.toBeNull();
-    expect(container.querySelector('.viewer-code-line')).not.toBeNull();
+    expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
+    // The react-syntax-highlighter path is retired for code.
+    expect(container.querySelector('.viewer-code')).toBeNull();
   });
 
-  it('routes large code payloads to a plain single-node fallback', () => {
+  it('keeps large code on the Pierre view (no plain-text fallback for code)', () => {
     const largeContent = `${'line\n'.repeat(2_001)}tail`;
     const { container } = renderViewer({
       ...textCommon,
       kind: 'code',
       language: 'typescript',
       content: largeContent,
-      renderMode: 'plainLargeText',
     });
 
-    expect(screen.getByTestId('viewer-large-text-fallback')).toBeInTheDocument();
-    expect(container.querySelector('.viewer-code')).toBeNull();
-    expect(container.querySelector('.annotatable')).toBeNull();
-    expect(screen.getByText(/Large file shown as plain text/)).toBeInTheDocument();
+    expect(container.querySelector('.phoenix-file-codeview')).not.toBeNull();
+    expect(screen.queryByTestId('viewer-large-text-fallback')).toBeNull();
   });
 
   it('routes a plain-text payload to line-numbered text', () => {

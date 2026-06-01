@@ -167,7 +167,10 @@ function buildPayload(data: ReadFileResult, ctx: PayloadContext): MetaViewerPayl
   }
 
   const { renderKind, language } = classifyViewerFile(ctx.filePath, data.file_type);
-  const renderMode = textRenderMode(data.content);
+  // Code renders through Pierre's virtualized CodeView, which stays responsive
+  // on large files, so it never needs the plain-text fallback. Text/markdown
+  // still build line-per-node DOM, so they keep the large-file guard.
+  const renderMode = renderKind === 'code' ? 'rich' : textRenderMode(data.content);
   const textCommon = {
     ...common,
     filePath: ctx.filePath,

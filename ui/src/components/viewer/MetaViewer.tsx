@@ -23,7 +23,8 @@ import { isTextLikePayload } from './metaViewerTypes';
 import type { MetaViewerPayload, PatchContext } from './metaViewerTypes';
 import type { ReviewNote } from '../../contexts/ReviewNotesContext';
 import { MarkdownViewerBody } from './MarkdownViewerBody';
-import { CodeViewerBody } from './CodeViewerBody';
+import { PhoenixFileCodeView } from './PhoenixFileCodeView';
+import type { PhoenixFileCodeViewHandle } from './PhoenixFileCodeView';
 import { TextViewerBody } from './TextViewerBody';
 import { HtmlViewerBody } from './HtmlViewerBody';
 import type { HtmlViewMode } from './HtmlViewerBody';
@@ -39,6 +40,13 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const patchContext: PatchContext | undefined = textLike ? payload.patchContext : undefined;
 
   const notes = useFileReviewNotes(absolutePath, onSendNotes, patchContext);
+
+  // Code payloads render through Pierre's CodeView, which owns its own
+  // virtualized scroller and line identity — the lineRef/contentRef machinery
+  // below (scroll restore, jump-to-line, select-all, copy) is bypassed for code
+  // and handled by PhoenixFileCodeView via its typed handle instead.
+  const usePierreCode = payload.kind === 'code';
+  const fileCodeRef = useRef<PhoenixFileCodeViewHandle>(null);
 
   const [htmlViewMode, setHtmlViewMode] = useState<HtmlViewMode>('source');
   const lineRefs = useRef<Map<number, HTMLElement>>(new Map());
@@ -163,14 +171,21 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   const handleJumpTo = useCallback(
     (note: ReviewNote) => {
       if (note.anchor.kind !== 'file' || note.anchor.filePath !== absolutePath) return;
-      const el = lineRefs.current.get(note.anchor.lineNumber);
-      if (el) {
-        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // Code renders in Pierre's own scroller; jump via its typed handle. Other
+      // bodies expose DOM line refs the viewer scrolls directly.
+      if (usePierreCode) {
+        fileCodeRef.current?.scrollToLine(note.anchor.lineNumber);
         highlight(note.anchor.lineNumber);
+      } else {
+        const el = lineRefs.current.get(note.anchor.lineNumber);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          highlight(note.anchor.lineNumber);
+        }
       }
       closePanel();
     },
-    [absolutePath, highlight, closePanel],
+    [absolutePath, highlight, closePanel, usePierreCode],
   );
 
   const modifiedLines = patchContext?.modifiedLines ?? EMPTY_SET;
@@ -183,7 +198,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   };
 
   const largeText = textLike && payload.renderMode === 'plainLargeText';
-  const body = renderBody(payload, bodyProps, htmlViewMode);
+  const body = usePierreCode ? null : renderBody(payload, bodyProps, htmlViewMode);
 
   const headerExtras: ReactNode = textLike ? (
     <>
@@ -235,6 +250,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       onSend={notes.send}
       banner={banner}
       onClose={onClose}
+      bodyScroll={usePierreCode ? 'children' : 'shell'}
       panel={
         notes.showPanel ? (
           <NotesPanel
@@ -258,9 +274,23 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
         ) : null
       }
     >
-      <div className="viewer-content" ref={contentRef}>
-        {body}
-      </div>
+      {usePierreCode ? (
+        <PhoenixFileCodeView
+          ref={fileCodeRef}
+          filePath={absolutePath}
+          content={content}
+          notes={notes.fileNotes}
+          modifiedLines={modifiedLines}
+          highlightedLine={notes.highlightedLine}
+          firstModifiedLine={patchContext?.firstModifiedLine}
+          scrollKey={scrollKey}
+          onAnnotateLine={notes.startAnnotate}
+        />
+      ) : (
+        <div className="viewer-content" ref={contentRef}>
+          {body}
+        </div>
+      )}
     </ViewerShell>
   );
 }
@@ -280,7 +310,9 @@ function renderBody(
     case 'markdown':
       return <MarkdownViewerBody {...bodyProps} />;
     case 'code':
-      return <CodeViewerBody {...bodyProps} language={payload.language} />;
+      // Code renders through PhoenixFileCodeView (Pierre), routed ahead of
+      // renderBody in MetaViewer — this branch is unreachable.
+      return null;
     case 'html':
       return (
         <HtmlViewerBody
