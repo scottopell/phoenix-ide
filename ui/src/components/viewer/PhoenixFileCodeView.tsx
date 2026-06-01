@@ -25,6 +25,7 @@ import { useTheme } from '../../hooks/useTheme';
 import {
   annotationsForFile,
   buildFileItem,
+  contentFingerprint,
   fileItemId,
   fileItemRenderSignature,
   lineDecorationCSS,
@@ -73,17 +74,20 @@ export const PhoenixFileCodeView = forwardRef<PhoenixFileCodeViewHandle, Phoenix
 
     // Parse/build is keyed on text only, independent of note churn.
     const baseItem = useMemo(() => buildFileItem(filePath, content), [filePath, content]);
+    // Hashing scans the whole file — memoize on content so note-only updates
+    // (which recompute the signature) don't re-hash a huge file every edit.
+    const contentFp = useMemo(() => contentFingerprint(content), [content]);
 
     const item = useMemo<PhoenixFileItem>(() => {
       const anns = annotationsForFile(notes, filePath);
       // File-viewer flash is line-driven (the jumped-to line), not a note id, so
       // the note-flash channel is unused; highlightedLine carries the flash.
-      const sig = fileItemRenderSignature(filePath, content, notes, modifiedLines, null, highlightedLine);
+      const sig = fileItemRenderSignature(filePath, contentFp, notes, modifiedLines, null, highlightedLine);
       const prev = itemVersion.current;
       const version = prev.sig === sig ? prev.version : prev.version + 1;
       if (prev.sig !== sig) itemVersion.current = { sig, version };
       return anns.length > 0 ? { ...baseItem, annotations: anns, version } : { ...baseItem, version };
-    }, [baseItem, filePath, content, notes, modifiedLines, highlightedLine]);
+    }, [baseItem, filePath, contentFp, notes, modifiedLines, highlightedLine]);
 
     const items = useMemo(() => [item], [item]);
 

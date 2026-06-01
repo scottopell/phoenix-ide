@@ -127,11 +127,13 @@ export function FileViewer({
   );
 }
 
-const LARGE_TEXT_BYTES = 250_000;
+// content.length is UTF-16 code units, not bytes — the threshold is a
+// character count, named accordingly.
+const LARGE_TEXT_CHARS = 250_000;
 const LARGE_TEXT_LINES = 2_000;
 
 function textRenderMode(content: string): TextRenderMode {
-  if (content.length > LARGE_TEXT_BYTES) return 'plainLargeText';
+  if (content.length > LARGE_TEXT_CHARS) return 'plainLargeText';
   let lines = 1;
   for (let i = 0; i < content.length; i += 1) {
     if (content.charCodeAt(i) === 10) {

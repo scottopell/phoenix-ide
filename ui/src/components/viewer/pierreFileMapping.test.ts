@@ -3,6 +3,7 @@ import type { ReviewNote } from '../../contexts/ReviewNotesContext';
 import {
   annotationsForFile,
   buildFileItem,
+  contentFingerprint,
   fileItemId,
   fileItemRenderSignature,
   lineDecorationCSS,
@@ -60,14 +61,24 @@ describe('pierreFileMapping', () => {
     expect(anns.map((a) => a.lineNumber)).toEqual([3, 1]);
   });
 
+  it('fingerprints content by length + hash, distinguishing same-length edits', () => {
+    expect(contentFingerprint('a\nb')).toBe(contentFingerprint('a\nb'));
+    expect(contentFingerprint('a\nb')).not.toBe(contentFingerprint('a\nc'));
+  });
+
   it('changes the render signature when content, notes, modified lines, or flash change', () => {
-    const base = fileItemRenderSignature(PATH, 'a\nb', [], new Set(), null, null);
-    expect(fileItemRenderSignature(PATH, 'a\nc', [], new Set(), null, null)).not.toBe(base);
-    expect(fileItemRenderSignature(PATH, 'a\nb', [fileNote('n', 1)], new Set(), null, null)).not.toBe(base);
-    expect(fileItemRenderSignature(PATH, 'a\nb', [], new Set([2]), null, null)).not.toBe(base);
-    expect(fileItemRenderSignature(PATH, 'a\nb', [], new Set(), null, 2)).not.toBe(base);
+    const fpB = contentFingerprint('a\nb');
+    const base = fileItemRenderSignature(PATH, fpB, [], new Set(), null, null);
+    expect(fileItemRenderSignature(PATH, contentFingerprint('a\nc'), [], new Set(), null, null)).not.toBe(base);
+    expect(fileItemRenderSignature(PATH, fpB, [fileNote('n', 1)], new Set(), null, null)).not.toBe(base);
+    expect(fileItemRenderSignature(PATH, fpB, [], new Set([2]), null, null)).not.toBe(base);
+    expect(fileItemRenderSignature(PATH, fpB, [], new Set(), null, 2)).not.toBe(base);
     // Stable for identical inputs.
-    expect(fileItemRenderSignature(PATH, 'a\nb', [], new Set(), null, null)).toBe(base);
+    expect(fileItemRenderSignature(PATH, fpB, [], new Set(), null, null)).toBe(base);
+  });
+
+  it('emits canonical (sorted) modified-line selectors regardless of set order', () => {
+    expect(lineDecorationCSS(new Set([5, 2, 9]), null)).toBe(lineDecorationCSS(new Set([9, 5, 2]), null));
   });
 
   it('targets a file note line for jump, and rejects non-file notes', () => {

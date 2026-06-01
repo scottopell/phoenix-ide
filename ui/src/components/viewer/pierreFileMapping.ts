@@ -97,6 +97,14 @@ function hashContent(s: string): string {
   return (h >>> 0).toString(36);
 }
 
+/** A content fingerprint (length + hash) for the render signature. Hashing
+ *  scans the whole file, so the caller memoizes this on `content` alone and
+ *  reuses it across note-only signature recomputes — otherwise a huge file is
+ *  re-hashed on every note edit. */
+export function contentFingerprint(content: string): string {
+  return `${content.length}|${hashContent(content)}`;
+}
+
 /**
  * A signature of everything PhoenixFileCodeView draws for the file item: the
  * content fingerprint, the line notes (and which is flashed), the modified-line
@@ -106,13 +114,13 @@ function hashContent(s: string): string {
  */
 export function fileItemRenderSignature(
   filePath: string,
-  content: string,
+  contentFp: string,
   notes: readonly ReviewNote[],
   modifiedLines: ReadonlySet<number>,
   highlightedNoteId: string | null,
   highlightedLine: number | null,
 ): string {
-  const fp = `${filePath}|${content.length}|${hashContent(content)}`;
+  const fp = `${filePath}|${contentFp}`;
   const lineNotes: string[] = [];
   for (const n of notes) {
     const a = n.anchor;
@@ -152,7 +160,10 @@ export function lineDecorationCSS(
   highlightedLine: number | null,
 ): string {
   const rules: string[] = [];
-  const mods = [...modifiedLines].filter((n) => n !== highlightedLine);
+  // Sort so the emitted CSS is canonical regardless of set insertion order —
+  // an identical modified-line set then yields an identical unsafeCSS string,
+  // avoiding spurious re-injection.
+  const mods = [...modifiedLines].filter((n) => n !== highlightedLine).sort((a, b) => a - b);
   if (mods.length > 0) {
     const sel = mods.map((n) => `[data-line="${n}"]`).join(',');
     rules.push(`${sel}{background:var(--viewer-modified-line-bg);}`);
