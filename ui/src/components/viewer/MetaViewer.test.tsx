@@ -62,6 +62,25 @@ describe('MetaViewer payload routing', () => {
     expect(container.querySelector('.viewer-text')).not.toBeNull();
   });
 
+  it('lets a large HTML file still toggle to the sandboxed preview (fallback only gates source)', () => {
+    const largeHtml = `${'<p>line</p>\n'.repeat(2_001)}<p>tail</p>`;
+    const { container } = renderViewer({
+      ...textCommon,
+      kind: 'html',
+      language: 'html',
+      content: largeHtml,
+      renderMode: 'plainLargeText',
+      previewUrl: '/preview/tmp/project/thing',
+    });
+
+    // Source view falls back to plain text for the large file...
+    expect(screen.getByTestId('viewer-large-text-fallback')).toBeInTheDocument();
+    // ...but switching to Preview must reach the iframe, not stay stranded on <pre>.
+    fireEvent.click(screen.getByRole('button', { name: 'Preview' }));
+    expect(container.querySelector('iframe')).not.toBeNull();
+    expect(screen.queryByTestId('viewer-large-text-fallback')).toBeNull();
+  });
+
   it('routes an image payload to the image body', () => {
     renderViewer({
       ...common,

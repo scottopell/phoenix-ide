@@ -51,11 +51,18 @@ export function buildFileItem(filePath: string, content: string): PhoenixFileIte
 
 /** The bare source line at a 1-based line number, or '' past the end. Used to
  *  quote the line a note is anchored to (Pierre's file onLineClick reports only
- *  the line number). */
+ *  the line number). Scans to the line rather than `split`ing the whole file, so
+ *  annotating one line in a huge file is O(offset) with no array allocation. */
 export function lineTextAt(content: string, lineNumber: number): string {
   if (lineNumber < 1) return '';
-  const lines = content.split('\n');
-  return lines[lineNumber - 1] ?? '';
+  let start = 0;
+  for (let i = 1; i < lineNumber; i++) {
+    const nl = content.indexOf('\n', start);
+    if (nl === -1) return '';
+    start = nl + 1;
+  }
+  const end = content.indexOf('\n', start);
+  return content.slice(start, end === -1 ? content.length : end);
 }
 
 /** Convert a single Phoenix review note into a Pierre file line annotation.

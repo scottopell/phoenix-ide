@@ -206,7 +206,11 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     registerLineRef,
   };
 
-  const largeText = textLike && payload.renderMode === 'plainLargeText';
+  // The plain-text fallback never applies to HTML preview: preview renders an
+  // iframe (no per-line DOM cost), so a large HTML file must still reach it
+  // rather than being stranded on the raw <pre>.
+  const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
+  const largeFallback = textLike && payload.renderMode === 'plainLargeText' && !htmlPreview;
   const body = usePierreCode ? null : renderBody(payload, bodyProps, htmlViewMode);
 
   const headerExtras: ReactNode = textLike ? (
@@ -236,14 +240,18 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     </>
   ) : null;
 
-  const banner: ReactNode = largeText ? (
+  const patchChangeCount = patchContext?.modifiedLines.size ?? 0;
+  const banner: ReactNode = largeFallback ? (
     <span>
       Large file shown as plain text for responsiveness. Rich highlighting and line notes are disabled.
+      {patchChangeCount > 0
+        ? ` Opened from a patch with ${patchChangeCount} change${patchChangeCount !== 1 ? 's' : ''} (not highlighted in this view).`
+        : ''}
     </span>
-  ) : textLike && patchContext && patchContext.modifiedLines.size > 0 ? (
+  ) : textLike && patchChangeCount > 0 ? (
     <span>
-      Viewing {title}: {patchContext.modifiedLines.size} change
-      {patchContext.modifiedLines.size !== 1 ? 's' : ''} from patch
+      Viewing {title}: {patchChangeCount} change
+      {patchChangeCount !== 1 ? 's' : ''} from patch
     </span>
   ) : null;
 
@@ -311,7 +319,10 @@ function renderBody(
   bodyProps: ViewerBodyProps,
   htmlViewMode: HtmlViewMode,
 ): ReactNode {
-  if (isTextLikePayload(payload) && payload.renderMode === 'plainLargeText') {
+  // HTML preview renders an iframe with no per-line cost, so the large-file
+  // fallback must not pre-empt it; only source-like rendering falls back.
+  const htmlPreview = payload.kind === 'html' && htmlViewMode === 'preview';
+  if (isTextLikePayload(payload) && payload.renderMode === 'plainLargeText' && !htmlPreview) {
     return <TextViewerBody {...bodyProps} mode="plainLargeText" />;
   }
 
