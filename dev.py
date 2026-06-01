@@ -2228,6 +2228,30 @@ def cmd_check(gate: bool = True):
     # legitimately takes longer — never to mask flakes.
     CHECK_TIMEOUT = 600
 
+    # Decide which lanes to run (Option A path-gating) BEFORE any
+    # lane-specific setup runs. A skipped lane must not drag in its setup:
+    # a markdown/spec/task-only change must not require Corepack/pnpm or a
+    # working cargo toolchain to be present. --all / PHOENIX_CHECK_ALL=1
+    # (handled in _gate_lanes) forces every lane.
+    if gate:
+        active, skipped = _gate_lanes()
+    else:
+        active, skipped = set(_LANE_INPUTS) | _ALWAYS_ON_LANES, {}
+    if skipped:
+        ran = ", ".join(sorted(active))
+        print(f"  i  incremental gating: running [{ran}]")
+        for lane in sorted(skipped):
+            with results_lock:
+                results.append((lane, 0, 0.0, ""))
+            print(f"  -  {lane:<18s} (skipped — {skipped[lane]})")
+
+    # Lane groups whose shared, expensive setup is gated below. UI lanes need
+    # Corepack/pnpm (ensure_ui_deps); cargo lanes need the rustc/sccache env
+    # and the env-classification probes. Only `rust` consumes the nextest
+    # probe + thread sizing + codegen commands.
+    ui_active = bool(active & {"tsc", "ui-lint", "vitest"})
+    cargo_active = bool(active & {"rust", "e2e"})
+
     def run_step(name, cmd, cwd=ROOT):
         # Stream stdout+stderr line-by-line into a bounded buffer so that on
         # timeout we keep the last N lines of output instead of throwing it
@@ -2622,137 +2646,134 @@ def cmd_check(gate: bool = True):
                 print(f"  ✓ {'spec anchors':<18s} ({elapsed:.1f}s)")
 
     # Bootstrap UI deps so eslint / tsc / vitest can run on a fresh checkout.
-    ensure_ui_deps()
+    # Skipped when no UI lane runs, so a non-UI change never needs pnpm.
+    if ui_active:
+        ensure_ui_deps()
 
     # Enable sccache (if installed) as the rustc wrapper so deps' object files
     # are shared across worktrees / `cargo clean` cycles. Honored by every
     # cargo invocation below because the env is inherited by run_step's
     # subprocesses. Skip cleanly if sccache isn't on PATH or the user has
-    # explicitly set RUSTC_WRAPPER already.
-    if shutil.which("sccache") and "RUSTC_WRAPPER" not in os.environ:
+    # explicitly set RUSTC_WRAPPER already. Only relevant when a cargo lane runs.
+    if cargo_active and shutil.which("sccache") and "RUSTC_WRAPPER" not in os.environ:
         os.environ["RUSTC_WRAPPER"] = "sccache"
         # Default cache dir + 20G cap. Devs can override via SCCACHE_DIR /
         # SCCACHE_CACHE_SIZE before invoking dev.py.
         os.environ.setdefault("SCCACHE_CACHE_SIZE", "20G")
 
-    # Classify the environment up front so the Rust suite skips the
-    # classes of tests that would otherwise produce env-noise failures.
-    #
-    # Contract for `./dev.py check`:
-    #   - Red == broken code. Never "your network is broken" or
-    #     "you don't have Chrome installed".
-    #   - The internal signal env vars (PHOENIX_CHROME_EXECUTABLE,
-    #     PHOENIX_SKIP_BROWSER_TESTS, PHOENIX_SKIP_NETWORK_TESTS,
-    #     GIT_CONFIG_*) are MECHANISM — users never set them by hand.
-    #   - Probes print iff classification CHANGES test behavior:
-    #     auto-skipping a class, overriding a config, etc. Happy paths
-    #     (Chromium found, fetcher reachable, signing works, deps
-    #     present) stay silent so a normal-env run is clean.
-    _classify_browser_env()
-    _classify_network_env()
+    # Env classification + signing probe only matter when a cargo lane runs.
+    if cargo_active:
+        # Classify the environment up front so the Rust suite skips the
+        # classes of tests that would otherwise produce env-noise failures.
+        #
+        # Contract for `./dev.py check`:
+        #   - Red == broken code. Never "your network is broken" or
+        #     "you don't have Chrome installed".
+        #   - The internal signal env vars (PHOENIX_CHROME_EXECUTABLE,
+        #     PHOENIX_SKIP_BROWSER_TESTS, PHOENIX_SKIP_NETWORK_TESTS,
+        #     GIT_CONFIG_*) are MECHANISM — users never set them by hand.
+        #   - Probes print iff classification CHANGES test behavior:
+        #     auto-skipping a class, overriding a config, etc. Happy paths
+        #     (Chromium found, fetcher reachable, signing works, deps
+        #     present) stay silent so a normal-env run is clean.
+        _classify_browser_env()
+        _classify_network_env()
 
-    # Probe for working commit signing. Some envs configure a custom
-    # `gpg.ssh.program` (e.g. cloud sandboxes intercepting commits) that
-    # rejects unrecognised callers, breaking any test that runs `git commit`.
-    # If a probe commit fails, override `commit.gpgsign=false` for child
-    # processes via GIT_CONFIG_COUNT/KEY/VALUE — affects subprocesses only,
-    # not the developer's actual git config.
-    #
-    # Per the print-only-on-behavior-change rule above, the success
-    # branch is silent and only the override branch prints.
-    import tempfile as _tempfile
-    try:
-        with _tempfile.TemporaryDirectory() as _td:
-            subprocess.run(["git", "init", "--quiet"], cwd=_td, check=True,
-                           capture_output=True, timeout=5)
-            subprocess.run(
-                ["git", "-c", "user.email=probe@test", "-c", "user.name=probe",
-                 "commit", "--allow-empty", "-m", "probe"],
-                cwd=_td, check=True, capture_output=True, timeout=10,
-            )
-        _signing_ok = True
-    except Exception:
-        _signing_ok = False
-    if not _signing_ok:
-        os.environ["GIT_CONFIG_COUNT"] = "1"
-        os.environ["GIT_CONFIG_KEY_0"] = "commit.gpgsign"
-        os.environ["GIT_CONFIG_VALUE_0"] = "false"
-        print("  i  commit signing probe failed — disabling commit.gpgsign for tests")
+        # Probe for working commit signing. Some envs configure a custom
+        # `gpg.ssh.program` (e.g. cloud sandboxes intercepting commits) that
+        # rejects unrecognised callers, breaking any test that runs `git commit`.
+        # If a probe commit fails, override `commit.gpgsign=false` for child
+        # processes via GIT_CONFIG_COUNT/KEY/VALUE — affects subprocesses only,
+        # not the developer's actual git config.
+        #
+        # Per the print-only-on-behavior-change rule above, the success
+        # branch is silent and only the override branch prints.
+        import tempfile as _tempfile
+        try:
+            with _tempfile.TemporaryDirectory() as _td:
+                subprocess.run(["git", "init", "--quiet"], cwd=_td, check=True,
+                               capture_output=True, timeout=5)
+                subprocess.run(
+                    ["git", "-c", "user.email=probe@test", "-c", "user.name=probe",
+                     "commit", "--allow-empty", "-m", "probe"],
+                    cwd=_td, check=True, capture_output=True, timeout=10,
+                )
+            _signing_ok = True
+        except Exception:
+            _signing_ok = False
+        if not _signing_ok:
+            os.environ["GIT_CONFIG_COUNT"] = "1"
+            os.environ["GIT_CONFIG_KEY_0"] = "commit.gpgsign"
+            os.environ["GIT_CONFIG_VALUE_0"] = "false"
+            print("  i  commit signing probe failed — disabling commit.gpgsign for tests")
 
-    # Probe nextest and size the test-thread cap here in cmd_check scope (not
-    # in lane_rust) so both the serial codegen pre-step below and lane_rust's
-    # closed-over verification run share one decision. Neither probe touches
-    # the cargo target lock (`cargo nextest --version` only prints a version;
-    # the /proc/meminfo read is pure Python).
-    #
-    # This probe runs on the main path before any lane (and its
-    # LANE_JOIN_TIMEOUT) exists, so a rustup/network/cargo-home stall here
-    # would hang the whole check with no timeout or summary. Bound it and
-    # treat any stall/error as "no nextest" — the plain `cargo test` fallback
-    # is always correct, just slower.
-    try:
-        has_nextest = subprocess.run(
-            ["cargo", "nextest", "--version"],
-            capture_output=True, timeout=30,
-        ).returncode == 0
-    except (subprocess.TimeoutExpired, OSError):
-        has_nextest = False
-        print("  i  cargo nextest probe stalled/failed — using plain `cargo test`")
-    # nextest defaults to available_parallelism (= num_cpus). On low-RAM
-    # boxes, num_cpus parallel test threads can swap and stall sensitive
-    # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
-    # times out if Chrome can't get CPU+RAM during launch). Cap the
-    # thread count by ~1.5 GiB headroom per thread so resource-starved
-    # machines back off, while leaving fast machines effectively unchanged.
-    cpus = os.cpu_count() or 4
-    try:
-        with open("/proc/meminfo") as f:
-            mem_gib = next(
-                int(l.split()[1]) for l in f if l.startswith("MemTotal:")
-            ) / (1024 * 1024)
-        mem_cap = max(1, int(mem_gib // 1.5))
-    except (OSError, StopIteration):
-        mem_cap = cpus
-    test_threads = max(2, min(cpus - 1, mem_cap))
-    if test_threads < cpus:
-        print(f"  i  cargo test: capping to {test_threads} threads "
-              f"(cpus={cpus}, mem_cap={mem_cap})")
-
-    # ts-rs emits a `#[test] export_bindings_*` per `#[ts(export)]` type; those
-    # tests' side effect IS the codegen — they (re)write ui/src/generated/.
-    # Running them inside the parallel fan-out races every lane that reads that
-    # tree (tsc, vitest, eslint, ast-grep), since ts-rs truncates each file
-    # before refilling it (a reader can catch an empty/partial file). So codegen
-    # is pulled out of the fan-out into this serial pre-step: regenerate once,
-    # staleness-check, and only then fan out the readers against a tree that
-    # stays frozen for the rest of the run. lane_rust's verification run
-    # excludes export_bindings (regen already exercised them — no lost
-    # coverage) so it never writes the tree during the parallel phase.
-    #
-    # Discovery is preserved: every type still self-registers via its emitted
-    # test, so a new #[ts(export)] type is regenerated automatically with no
-    # hand-maintained root list to forget.
-    if has_nextest:
-        compile_cmd = ["cargo", "nextest", "run", "--no-run"]
-        test_cmd = ["cargo", "nextest", "run",
-                    "-E", "not test(/export_bindings/)",
-                    "--test-threads", str(test_threads)]
-        codegen_cmd = ["cargo", "nextest", "run", "-E", "test(/export_bindings/)"]
-    else:
-        compile_cmd = ["cargo", "test", "--no-run"]
-        test_cmd = ["cargo", "test", "--",
-                    "--test-threads", str(test_threads), "--skip", "export_bindings"]
-        codegen_cmd = ["cargo", "test", "export_bindings"]
-
-    # Decide which lanes to run (Option A path-gating). Computed before the
-    # codegen pre-step so a non-Rust change skips codegen too. --all /
-    # PHOENIX_CHECK_ALL=1 (handled in _gate_lanes) forces every lane.
-    if gate:
-        active, skipped = _gate_lanes()
-    else:
-        active, skipped = set(_LANE_INPUTS) | _ALWAYS_ON_LANES, {}
-
+    # nextest probe, thread sizing, and codegen command shapes are rust-only.
     if "rust" in active:
+        # Probe nextest and size the test-thread cap here in cmd_check scope (not
+        # in lane_rust) so both the serial codegen pre-step below and lane_rust's
+        # closed-over verification run share one decision. Neither probe touches
+        # the cargo target lock (`cargo nextest --version` only prints a version;
+        # the /proc/meminfo read is pure Python).
+        #
+        # This probe runs on the main path before any lane (and its
+        # LANE_JOIN_TIMEOUT) exists, so a rustup/network/cargo-home stall here
+        # would hang the whole check with no timeout or summary. Bound it and
+        # treat any stall/error as "no nextest" — the plain `cargo test` fallback
+        # is always correct, just slower.
+        try:
+            has_nextest = subprocess.run(
+                ["cargo", "nextest", "--version"],
+                capture_output=True, timeout=30,
+            ).returncode == 0
+        except (subprocess.TimeoutExpired, OSError):
+            has_nextest = False
+            print("  i  cargo nextest probe stalled/failed — using plain `cargo test`")
+        # nextest defaults to available_parallelism (= num_cpus). On low-RAM
+        # boxes, num_cpus parallel test threads can swap and stall sensitive
+        # tests (e.g. browser tests where Chrome's CDP WebSocket handshake
+        # times out if Chrome can't get CPU+RAM during launch). Cap the
+        # thread count by ~1.5 GiB headroom per thread so resource-starved
+        # machines back off, while leaving fast machines effectively unchanged.
+        cpus = os.cpu_count() or 4
+        try:
+            with open("/proc/meminfo") as f:
+                mem_gib = next(
+                    int(l.split()[1]) for l in f if l.startswith("MemTotal:")
+                ) / (1024 * 1024)
+            mem_cap = max(1, int(mem_gib // 1.5))
+        except (OSError, StopIteration):
+            mem_cap = cpus
+        test_threads = max(2, min(cpus - 1, mem_cap))
+        if test_threads < cpus:
+            print(f"  i  cargo test: capping to {test_threads} threads "
+                  f"(cpus={cpus}, mem_cap={mem_cap})")
+
+        # ts-rs emits a `#[test] export_bindings_*` per `#[ts(export)]` type; those
+        # tests' side effect IS the codegen — they (re)write ui/src/generated/.
+        # Running them inside the parallel fan-out races every lane that reads that
+        # tree (tsc, vitest, eslint, ast-grep), since ts-rs truncates each file
+        # before refilling it (a reader can catch an empty/partial file). So codegen
+        # is pulled out of the fan-out into this serial pre-step: regenerate once,
+        # staleness-check, and only then fan out the readers against a tree that
+        # stays frozen for the rest of the run. lane_rust's verification run
+        # excludes export_bindings (regen already exercised them — no lost
+        # coverage) so it never writes the tree during the parallel phase.
+        #
+        # Discovery is preserved: every type still self-registers via its emitted
+        # test, so a new #[ts(export)] type is regenerated automatically with no
+        # hand-maintained root list to forget.
+        if has_nextest:
+            compile_cmd = ["cargo", "nextest", "run", "--no-run"]
+            test_cmd = ["cargo", "nextest", "run",
+                        "-E", "not test(/export_bindings/)",
+                        "--test-threads", str(test_threads)]
+            codegen_cmd = ["cargo", "nextest", "run", "-E", "test(/export_bindings/)"]
+        else:
+            compile_cmd = ["cargo", "test", "--no-run"]
+            test_cmd = ["cargo", "test", "--",
+                        "--test-threads", str(test_threads), "--skip", "export_bindings"]
+            codegen_cmd = ["cargo", "test", "export_bindings"]
+
         print("Regenerating codegen (serial, pre-fan-out)...\n")
         # Cold-target safety: compile the test harnesses under their own
         # CHECK_TIMEOUT before running the tiny codegen tests, mirroring
@@ -2779,14 +2800,6 @@ def cmd_check(gate: bool = True):
             '  exit 1; '
             'fi'
         )])
-
-    if skipped:
-        ran = ", ".join(sorted(active))
-        print(f"  i  incremental gating: running [{ran}]")
-        for lane in sorted(skipped):
-            with results_lock:
-                results.append((lane, 0, 0.0, ""))
-            print(f"  -  {lane:<18s} (skipped — {skipped[lane]})")
 
     print("\nRunning checks in parallel...\n")
 
