@@ -1569,7 +1569,6 @@ impl ConvState {
                 | ConvState::ToolExecuting { .. }
                 | ConvState::AwaitingSubAgents { .. }
                 | ConvState::AwaitingTaskApproval { .. }
-                | ConvState::AwaitingUserResponse { .. }
                 | ConvState::AwaitingRecovery { .. }
         )
     }

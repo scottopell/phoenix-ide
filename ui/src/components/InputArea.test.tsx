@@ -275,6 +275,53 @@ describe('InputArea cancellation affordance', () => {
     expect(onSend).not.toHaveBeenCalled();
   });
 
+  it('keeps Stopping disabled and blocks sends while cancellation is pending', () => {
+    const onSend = vi.fn();
+    render(
+      <InputArea
+        conversationId="conv-cancelling"
+        convState={{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }}
+        images={[]}
+        setImages={() => {}}
+        isOffline={false}
+        failedMessages={[]}
+        draft="do not send"
+        onDraftChange={() => {}}
+        onSend={onSend}
+        onCancel={() => {}}
+        onRetry={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Stopping...' })).toBeDisabled();
+    expect(screen.queryByRole('button', { name: 'Send' })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
+  it('blocks sends while the first send is still optimistic', () => {
+    const onSend = vi.fn();
+    render(
+      <InputArea
+        conversationId="conv-awaiting-llm"
+        convState={{ type: 'awaiting_llm' }}
+        images={[]}
+        setImages={() => {}}
+        isOffline={false}
+        failedMessages={[]}
+        draft="too soon"
+        onDraftChange={() => {}}
+        onSend={onSend}
+        onCancel={() => {}}
+        onRetry={() => {}}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled();
+    fireEvent.keyDown(screen.getByRole('textbox'), { key: 'Enter' });
+    expect(onSend).not.toHaveBeenCalled();
+  });
+
   it('does not call onCancel for Escape while awaiting continuation', () => {
     const onCancel = vi.fn();
     renderInput({

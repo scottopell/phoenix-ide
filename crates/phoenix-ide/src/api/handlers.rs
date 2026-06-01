@@ -4057,6 +4057,43 @@ mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
+    async fn cancel_rejects_awaiting_user_response_without_dispatching_invalid_transition() {
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-question", "question", "/tmp", true, None, None)
+            .await
+            .expect("create");
+        state
+            .db
+            .update_conversation_state(
+                "c-question",
+                &ConvState::AwaitingUserResponse {
+                    questions: vec![],
+                    tool_use_id: "tool-question".to_string(),
+                },
+            )
+            .await
+            .expect("update state");
+
+        let err = cancel_conversation(State(state.clone()), Path("c-question".to_string()))
+            .await
+            .expect_err("question response prompt is dismissed through its dedicated endpoint");
+
+        match err {
+            AppError::Conflict(detail) => assert_eq!(detail.error_type, "cannot_cancel_state"),
+            other => panic!("expected conflict, got {other:?}"),
+        }
+
+        let conv = state
+            .db
+            .get_conversation("c-question")
+            .await
+            .expect("conversation still exists");
+        assert!(matches!(conv.state, ConvState::AwaitingUserResponse { .. }));
+    }
+
+    #[tokio::test]
     async fn search_conversation_files_uses_worktree_path_when_present() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cwd = tmp.path().join("repo");

@@ -100,7 +100,7 @@ describe('canCancelConversationState', () => {
     [{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }, false],
     [{ type: 'cancelling_sub_agents', pending: [] }, false],
     [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, true],
-    [{ type: 'awaiting_user_response', questions: [] }, true],
+    [{ type: 'awaiting_user_response', questions: [] }, false],
     [{ type: 'context_exhausted', summary: 's' }, false],
     [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential' }, true],
     [{ type: 'terminal' }, false],

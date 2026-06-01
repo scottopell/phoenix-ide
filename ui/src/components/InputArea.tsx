@@ -89,6 +89,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const agentWorking = isAgentWorking(convState);
   const canCancel = canCancelConversationState(convState);
   const isCancelling = isCancellingState(convState);
+  const blocksComposerSend =
+    isCancelling ||
+    convState.type === 'awaiting_llm' ||
+    convState.type === 'awaiting_continuation';
   const setDraft = onDraftChange;
   const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -477,7 +481,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     }
 
     if (!text && images.length === 0) return;
-    if (convState.type === 'awaiting_continuation') return;
+    if (blocksComposerSend) return;
     // Allow send while agent is working — the server will queue it as a
     // steering message and deliver it when the conversation reaches Idle.
 
@@ -516,8 +520,22 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       // Non-expansion errors: draft is already cleared; the message queue
       // shows the failure with a retry button.
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [voiceBase, voiceInterim, draft, images, agentWorking, isOffline, onSend, clearDraft]);
+  }, [
+    voiceBase,
+    voiceInterim,
+    draft,
+    images,
+    blocksComposerSend,
+    onSend,
+    clearDraft,
+    setActiveTrigger,
+    setSkillArgumentHint,
+    setImages,
+    setVoiceBase,
+    setVoiceInterim,
+    setExpansionError,
+    setDraft,
+  ]);
 
   // =========================================================================
   // Voice input
@@ -582,8 +600,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const displayedText = voiceBase !== null ? voiceBase : draft;
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
-  const isContinuationProgress = convState.type === 'awaiting_continuation';
-  const canSend = !isContinuationProgress;
+  const canSend = !blocksComposerSend;
   const sendEnabled = canSend && hasContent && !expansionError;
 
   // Cycle placeholder hint each time the input clears (e.g., after send).
@@ -609,11 +626,15 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     : 'Type a message...';
   const placeholder = isOffline
     ? 'Type a message (will send when back online)...'
-    : isContinuationProgress
+    : convState.type === 'awaiting_continuation'
       ? 'Compacting conversation...'
-      : agentWorking
-        ? 'Agent working... send to queue a follow-up'
-        : hint ? `${baseText} (${hint})` : baseText;
+      : isCancelling
+        ? 'Stopping...'
+        : convState.type === 'awaiting_llm'
+          ? 'Preparing request...'
+          : agentWorking
+            ? 'Agent working... send to queue a follow-up'
+            : hint ? `${baseText} (${hint})` : baseText;
 
   // =========================================================================
   // Render
@@ -735,7 +756,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
               disabled={agentWorking}
             />
           )}
-          {canCancel ? (
+          {canCancel || isCancelling ? (
             <button
               className="input-stop-btn"
               onClick={onCancel}
