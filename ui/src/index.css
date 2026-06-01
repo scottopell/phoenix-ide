@@ -4595,6 +4595,7 @@ html * {
 .viewer-large-text-pre {
   margin: 0;
   padding: 12px 16px;
+  overflow-x: auto;
   font-family: inherit;
   font-size: inherit;
   line-height: inherit;

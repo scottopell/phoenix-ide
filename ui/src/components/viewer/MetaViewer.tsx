@@ -72,6 +72,9 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   // can't locate firstModifiedLine. Don't mark scrollRestoredRef here — leave
   // it false so the patchContext effect can still win.
   useLayoutEffect(() => {
+    // PhoenixFileCodeView owns scroll for code (Pierre's own scroller), under
+    // the same scrollKey — let it handle restore so the two don't fight.
+    if (usePierreCode) return;
     if (!content) return;
     if (scrollRestoredRef.current) return;
     const saved = (() => {
@@ -87,11 +90,13 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
         }
       }
     }
-  }, [content, scrollKey]);
+  }, [content, scrollKey, usePierreCode]);
 
   // Auto-scroll to first modified line. Wins over saved scroll when a
   // patchContext is provided and the line element exists.
   useEffect(() => {
+    // Code's patch auto-scroll is handled inside PhoenixFileCodeView.
+    if (usePierreCode) return undefined;
     if (!content || !patchContext?.firstModifiedLine) return undefined;
     const timer = setTimeout(() => {
       const lineEl = lineRefs.current.get(patchContext.firstModifiedLine!);
@@ -101,19 +106,23 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       }
     }, 100);
     return () => clearTimeout(timer);
-  }, [content, patchContext?.firstModifiedLine]);
+  }, [content, patchContext?.firstModifiedLine, usePierreCode]);
 
   // Track scrollTop so visibility-change / unmount saves see the latest value.
   useEffect(() => {
+    if (usePierreCode) return;
     const el = contentRef.current;
     if (!el) return;
     const onScroll = () => { lastScrollTopRef.current = el.scrollTop; };
     el.addEventListener('scroll', onScroll, { passive: true });
     return () => el.removeEventListener('scroll', onScroll);
-  }, [content]);
+  }, [content, usePierreCode]);
 
-  // Persist scroll on backgrounding and unmount.
+  // Persist scroll on backgrounding and unmount. Skipped for code: Pierre's
+  // wrapper persists under the same scrollKey, and the parent's contentRef
+  // never scrolls, so saving here would clobber the real position with 0.
   useEffect(() => {
+    if (usePierreCode) return;
     const save = () => {
       try { localStorage.setItem(scrollKey, String(lastScrollTopRef.current)); } catch { /* storage full */ }
     };
@@ -123,7 +132,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
       document.removeEventListener('visibilitychange', onVis);
       save();
     };
-  }, [scrollKey]);
+  }, [scrollKey, usePierreCode]);
 
   // Cmd/Ctrl+A selects the viewer body, unless an editable element is focused.
   useEffect(() => {

@@ -13,6 +13,7 @@ __pycache__/
 certs/
 
 # UI
+node_modules/
 ui/node_modules
 ui/dist/*
 !ui/dist/.gitkeep
