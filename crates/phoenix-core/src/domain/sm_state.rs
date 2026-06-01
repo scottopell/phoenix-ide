@@ -1561,6 +1561,7 @@ impl ConvState {
     }
 
     /// True when `UserCancel` is a supported user action for this state.
+    #[must_use]
     pub fn allows_user_cancel(&self) -> bool {
         matches!(
             self,
