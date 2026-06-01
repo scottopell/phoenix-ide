@@ -31,11 +31,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use super::{Tool, ToolContext, ToolOutput};
-use crate::api::wire::{TmuxErrorResponse, TmuxToolResponse};
 use invoke::{
     truncate_pair, TMUX_OUTPUT_MAX_BYTES, TMUX_TOOL_DEFAULT_WAIT_SECONDS,
     TMUX_TOOL_MAX_WAIT_SECONDS,
 };
+use phoenix_core::domain::tool_wire::{TmuxErrorResponse, TmuxToolResponse};
 
 /// Pass-through tmux tool.
 ///
