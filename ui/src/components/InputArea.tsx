@@ -347,69 +347,6 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, [draft, voiceBase, skillArgumentHint, setSkillArgumentHint]);
 
   // =========================================================================
-  // Keyboard handling (merged with autocomplete nav)
-  // =========================================================================
-
-  const [acSelectedIndex, setAcSelectedIndex] = useScopedState(conversationId, 0);
-
-  const filteredItems = useMemo(
-    () => fuzzyMatch(acItems, activeTrigger?.query ?? '', (item) => item.label),
-    [acItems, activeTrigger?.query],
-  );
-
-  useEffect(() => {
-    setAcSelectedIndex(0);
-  }, [activeTrigger?.query, setAcSelectedIndex]);
-
-  const handleKeyDown = useCallback(
-    (e: KeyboardEvent<HTMLTextAreaElement>) => {
-      // When autocomplete is open, intercept navigation and confirmation keys
-      if (activeTrigger && filteredItems.length > 0) {
-        if (e.key === 'ArrowDown') {
-          e.preventDefault();
-          setAcSelectedIndex((i) => Math.min(i + 1, filteredItems.length - 1));
-          return;
-        }
-        if (e.key === 'ArrowUp') {
-          e.preventDefault();
-          setAcSelectedIndex((i) => Math.max(i - 1, 0));
-          return;
-        }
-        if (e.key === 'Tab') {
-          const item = filteredItems[acSelectedIndex] ?? filteredItems[0];
-          if (item !== undefined) {
-            e.preventDefault();
-            handleAcSelect(item);
-            return;
-          }
-        }
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          handleAcDismiss();
-          return;
-        }
-        // Enter with autocomplete open: if item selected, complete; otherwise fall through to send
-        if (e.key === 'Enter' && !e.shiftKey) {
-          const item = filteredItems[acSelectedIndex] ?? filteredItems[0];
-          if (item !== undefined) {
-            e.preventDefault();
-            handleAcSelect(item);
-            return;
-          }
-        }
-      }
-
-      // Default: Enter without shift sends message
-      if (e.key === 'Enter' && !e.shiftKey) {
-        e.preventDefault();
-        handleSend();
-      }
-    },
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-    [activeTrigger, filteredItems, acSelectedIndex, handleAcSelect, handleAcDismiss],
-  );
-
-  // =========================================================================
   // Auto-resize
   // =========================================================================
 
@@ -536,6 +473,76 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setExpansionError,
     setDraft,
   ]);
+
+  // =========================================================================
+  // Keyboard handling (merged with autocomplete nav)
+  // =========================================================================
+
+  const [acSelectedIndex, setAcSelectedIndex] = useScopedState(conversationId, 0);
+
+  const filteredItems = useMemo(
+    () => fuzzyMatch(acItems, activeTrigger?.query ?? '', (item) => item.label),
+    [acItems, activeTrigger?.query],
+  );
+
+  useEffect(() => {
+    setAcSelectedIndex(0);
+  }, [activeTrigger?.query, setAcSelectedIndex]);
+
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent<HTMLTextAreaElement>) => {
+      // When autocomplete is open, intercept navigation and confirmation keys
+      if (activeTrigger && filteredItems.length > 0) {
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          setAcSelectedIndex((i) => Math.min(i + 1, filteredItems.length - 1));
+          return;
+        }
+        if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          setAcSelectedIndex((i) => Math.max(i - 1, 0));
+          return;
+        }
+        if (e.key === 'Tab') {
+          const item = filteredItems[acSelectedIndex] ?? filteredItems[0];
+          if (item !== undefined) {
+            e.preventDefault();
+            handleAcSelect(item);
+            return;
+          }
+        }
+        if (e.key === 'Escape') {
+          e.preventDefault();
+          handleAcDismiss();
+          return;
+        }
+        // Enter with autocomplete open: if item selected, complete; otherwise fall through to send
+        if (e.key === 'Enter' && !e.shiftKey) {
+          const item = filteredItems[acSelectedIndex] ?? filteredItems[0];
+          if (item !== undefined) {
+            e.preventDefault();
+            handleAcSelect(item);
+            return;
+          }
+        }
+      }
+
+      // Default: Enter without shift sends message
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        handleSend();
+      }
+    },
+    [
+      activeTrigger,
+      filteredItems,
+      acSelectedIndex,
+      handleAcSelect,
+      handleAcDismiss,
+      handleSend,
+      setAcSelectedIndex,
+    ],
+  );
 
   // =========================================================================
   // Voice input

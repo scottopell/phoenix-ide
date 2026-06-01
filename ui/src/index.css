@@ -1608,6 +1608,14 @@ pre:hover .copy-btn {
   100% { transform: translateX(310%); }
 }
 
+@media (prefers-reduced-motion: reduce) {
+  .continuation-progress-bar-fill {
+    animation: none;
+    transform: translateX(0);
+    width: 100%;
+  }
+}
+
 #message-input {
   width: 100%;
   padding: 10px 80px 10px 12px; /* right padding reserves space for inline buttons */
