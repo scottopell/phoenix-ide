@@ -350,6 +350,7 @@ CREATE TABLE IF NOT EXISTS work_scope_pr_feedback_baselines (
     captured_at TEXT NOT NULL,
     github_updated_at TEXT,
     feedback_identities TEXT NOT NULL,
+    feedback_fingerprints TEXT NOT NULL DEFAULT '[]',
     PRIMARY KEY (work_scope_id, pr_number)
 );
 ";

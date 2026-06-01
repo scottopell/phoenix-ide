@@ -81,7 +81,7 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-031:** Agent-Facing PR Context Baseline | ✅ Complete | Successful PR auto-fix context capture records work-scope/PR baseline with timestamp, PR updated_at, and feedback identities |
 | **REQ-PROJ-032:** Bounded PR Feedback Refresh | ✅ Complete | Routine PR status uses PR updated_at as the gate before fetching feedback surfaces; failures degrade to coarse advisory |
 
-**Progress:** of the 25 active requirements, all 25 complete. REQ-PROJ-009
+**Progress:** of the 28 active requirements, all 28 complete. REQ-PROJ-009
 and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by
 REQ-PROJ-018.
 

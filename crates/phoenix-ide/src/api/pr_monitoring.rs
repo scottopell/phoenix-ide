@@ -131,6 +131,39 @@ impl<'a> ShellGhClient<'a> {
             message: format!("failed to parse {label}: {e}"),
         })
     }
+    fn rest_paginated_json<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        label: &str,
+    ) -> Result<Vec<T>, GhFailure> {
+        let mut all = Vec::new();
+        let mut page = 1u32;
+        loop {
+            let page_arg = page.to_string();
+            let mut items: Vec<T> = self.run_json(
+                &[
+                    "api",
+                    path,
+                    "--paginate",
+                    "-f",
+                    "per_page=100",
+                    "-f",
+                    &format!("page={page_arg}"),
+                ],
+                label,
+            )?;
+            if items.is_empty() {
+                break;
+            }
+            let count = items.len();
+            all.append(&mut items);
+            if count < 100 {
+                break;
+            }
+            page = page.saturating_add(1);
+        }
+        Ok(all)
+    }
 }
 
 impl GhClient for ShellGhClient<'_> {
@@ -201,14 +234,11 @@ impl GhClient for ShellGhClient<'_> {
         repo: &GhRepoView,
         number: u64,
     ) -> Result<Vec<GhIssueComment>, GhFailure> {
-        self.run_json(
-            &[
-                "api",
-                &format!(
-                    "repos/{}/{}/issues/{number}/comments",
-                    repo.owner.login, repo.name
-                ),
-            ],
+        self.rest_paginated_json(
+            &format!(
+                "repos/{}/{}/issues/{number}/comments",
+                repo.owner.login, repo.name
+            ),
             "issue comments",
         )
     }
@@ -218,14 +248,11 @@ impl GhClient for ShellGhClient<'_> {
         repo: &GhRepoView,
         number: u64,
     ) -> Result<Vec<GhReviewComment>, GhFailure> {
-        self.run_json(
-            &[
-                "api",
-                &format!(
-                    "repos/{}/{}/pulls/{number}/comments",
-                    repo.owner.login, repo.name
-                ),
-            ],
+        self.rest_paginated_json(
+            &format!(
+                "repos/{}/{}/pulls/{number}/comments",
+                repo.owner.login, repo.name
+            ),
             "review comments",
         )
     }
@@ -235,14 +262,11 @@ impl GhClient for ShellGhClient<'_> {
         repo: &GhRepoView,
         number: u64,
     ) -> Result<Vec<GhReviewSummary>, GhFailure> {
-        self.run_json(
-            &[
-                "api",
-                &format!(
-                    "repos/{}/{}/pulls/{number}/reviews",
-                    repo.owner.login, repo.name
-                ),
-            ],
+        self.rest_paginated_json(
+            &format!(
+                "repos/{}/{}/pulls/{number}/reviews",
+                repo.owner.login, repo.name
+            ),
             "review summaries",
         )
     }
@@ -255,8 +279,8 @@ impl GhClient for ShellGhClient<'_> {
         let query = r"query($owner:String!, $name:String!, $number:Int!) {
           repository(owner:$owner, name:$name) {
             pullRequest(number:$number) {
-              reviewThreads(first:50) {
-                nodes { isResolved path comments(first:10) { nodes { id body url createdAt author { login } } } }
+              reviewThreads(first:100) {
+                nodes { isResolved path comments(first:100) { nodes { id body url createdAt author { login } } } }
               }
             }
           }
@@ -543,13 +567,6 @@ fn capture_pr_auto_fix_context_for_pr_item(
     let snippets = capture_log_snippets(client, &raw_checks);
     let checks = capture_checks(&raw_checks, snippets);
     let feedback = fetch_pr_feedback(client, pr.number);
-    let feedback_identities = feedback
-        .items
-        .iter()
-        .map(feedback_identity)
-        .collect::<HashSet<_>>()
-        .into_iter()
-        .collect();
     let fetched_at = Utc::now().to_rfc3339();
     let artifact = PrAutoFixContextArtifact {
         manifest_version: ARTIFACT_VERSION,
@@ -562,6 +579,7 @@ fn capture_pr_auto_fix_context_for_pr_item(
             draft: pr.is_draft,
             base: pr.base_ref_name,
             head: pr.head_ref_name,
+            updated_at: pr_updated_at.clone(),
         },
         checks: PrArtifactChecks {
             state: checks.state,
@@ -591,12 +609,7 @@ fn capture_pr_auto_fix_context_for_pr_item(
     let message = format!(
         "Address the PR feedback captured in `{rel_path}`. Use that file as the source of truth for failing CI checks and review comments, fix the issues in this worktree, run targeted tests, commit the changes, and summarize what changed. Do not push unless the user explicitly asks."
     );
-    let baseline = WorkScopePrFeedbackBaselineInput {
-        pr_number: artifact.pr.number,
-        captured_at: fetched_at,
-        github_updated_at: pr_updated_at,
-        feedback_identities,
-    };
+    let baseline = artifact.baseline();
     Ok(CapturedPrAutoFixContext {
         response: PrAutoFixContextResponse {
             artifact_path: rel_path,
@@ -847,8 +860,8 @@ fn limit_log_snippet(mut snippet: PrCheckLogSnippet) -> PrCheckLogSnippet {
     snippet
 }
 
-#[derive(Debug, Serialize)]
-struct PrAutoFixContextArtifact {
+#[derive(Debug, Serialize, Deserialize)]
+pub(crate) struct PrAutoFixContextArtifact {
     manifest_version: u32,
     fetched_at: String,
     pr: PrArtifactMetadata,
@@ -856,7 +869,43 @@ struct PrAutoFixContextArtifact {
     feedback: PrFeedbackSummary,
 }
 
-#[derive(Debug, Serialize)]
+impl PrAutoFixContextArtifact {
+    pub(crate) fn baseline(&self) -> WorkScopePrFeedbackBaselineInput {
+        WorkScopePrFeedbackBaselineInput {
+            pr_number: self.pr.number,
+            captured_at: self.fetched_at.clone(),
+            github_updated_at: self.pr.updated_at.clone(),
+            feedback_identities: self
+                .feedback
+                .items
+                .iter()
+                .map(feedback_identity)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect(),
+            feedback_fingerprints: self
+                .feedback
+                .items
+                .iter()
+                .map(feedback_fingerprint)
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect(),
+        }
+    }
+}
+
+pub(crate) fn read_pr_auto_fix_context_artifact(
+    path: &Path,
+) -> Result<PrAutoFixContextArtifact, PrMonitorError> {
+    let body = std::fs::read_to_string(path).map_err(|e| {
+        PrMonitorError::Internal(format!("Failed to read PR context artifact: {e}"))
+    })?;
+    serde_json::from_str(&body)
+        .map_err(|e| PrMonitorError::Internal(format!("Failed to parse PR context artifact: {e}")))
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 struct PrArtifactMetadata {
     number: u64,
     title: String,
@@ -865,9 +914,10 @@ struct PrArtifactMetadata {
     draft: bool,
     base: String,
     head: String,
+    updated_at: Option<String>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct PrArtifactChecks {
     state: PrCheckState,
     summary: PrCheckSummary,
@@ -1128,6 +1178,22 @@ fn feedback_identity(item: &PrFeedbackItem) -> String {
     )
 }
 
+fn feedback_fingerprint(item: &PrFeedbackItem) -> String {
+    format!(
+        "{:?}:{}:{}:{}:{}:{}:{}|{}",
+        item.source,
+        item.id.clone().unwrap_or_default(),
+        item.url.clone().unwrap_or_default(),
+        item.author,
+        item.path.clone().unwrap_or_default(),
+        item.created_at.clone().unwrap_or_default(),
+        item.resolved
+            .map(|resolved| resolved.to_string())
+            .unwrap_or_default(),
+        item.body
+    )
+}
+
 pub(crate) fn pr_updated_after_baseline(
     baseline: &WorkScopePrFeedbackBaseline,
     current_pr_updated_at: &str,
@@ -1167,11 +1233,22 @@ pub(crate) fn feedback_freshness_from_baseline(
                 new_count: Some(u32::try_from(new_count).unwrap_or(u32::MAX)),
             });
         }
-        if feedback
-            .coverage
+        let baseline_fingerprints: HashSet<&str> = baseline
+            .feedback_fingerprints
             .iter()
-            .any(|coverage| coverage.status != PrFeedbackCoverageStatus::Fetched)
-            && current_pr_updated_at.is_some()
+            .map(String::as_str)
+            .collect();
+        let content_changed = feedback
+            .items
+            .iter()
+            .map(feedback_fingerprint)
+            .any(|fingerprint| !baseline_fingerprints.contains(fingerprint.as_str()));
+        if content_changed
+            || feedback
+                .coverage
+                .iter()
+                .any(|coverage| coverage.status != PrFeedbackCoverageStatus::Fetched)
+                && current_pr_updated_at.is_some()
         {
             return Some(PrFeedbackFreshness {
                 state: PrFeedbackFreshnessState::Updated,
@@ -1181,7 +1258,8 @@ pub(crate) fn feedback_freshness_from_baseline(
         return None;
     }
 
-    if pr_updated_after_baseline(baseline, current_pr_updated_at.unwrap()) {
+    let updated_at = current_pr_updated_at?;
+    if pr_updated_after_baseline(baseline, updated_at) {
         return Some(PrFeedbackFreshness {
             state: PrFeedbackFreshnessState::Updated,
             new_count: None,
@@ -1782,6 +1860,7 @@ mod tests {
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
             feedback_identities: vec!["IssueComment:1".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
         };
         let feedback = PrFeedbackSummary {
             total: 2,
@@ -1833,6 +1912,7 @@ mod tests {
             captured_at: "2026-01-01T00:00:00Z".to_string(),
             github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
             feedback_identities: vec!["IssueComment:1".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
         };
         let feedback = PrFeedbackSummary {
             total: 1,
@@ -1847,6 +1927,46 @@ mod tests {
                 source: PrFeedbackSource::IssueComment,
                 author: "u".to_string(),
                 body: "old".to_string(),
+                path: None,
+                url: None,
+                created_at: None,
+                resolved: None,
+            }],
+        };
+
+        let freshness = feedback_freshness_from_baseline(
+            &baseline,
+            Some("2026-01-02T00:00:00Z"),
+            Some(&feedback),
+        )
+        .unwrap();
+        assert_eq!(freshness.state, PrFeedbackFreshnessState::Updated);
+        assert_eq!(freshness.new_count, None);
+    }
+
+    #[test]
+    fn feedback_freshness_marks_existing_feedback_edits_as_updated() {
+        let baseline = WorkScopePrFeedbackBaseline {
+            work_scope_id: 1,
+            pr_number: 7,
+            captured_at: "2026-01-01T00:00:00Z".to_string(),
+            github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            feedback_identities: vec!["IssueComment:1".to_string()],
+            feedback_fingerprints: vec!["IssueComment:1::::::|old".to_string()],
+        };
+        let feedback = PrFeedbackSummary {
+            total: 1,
+            unresolved: 1,
+            coverage: vec![PrFeedbackCoverage {
+                surface: PrFeedbackCoverageSurface::IssueComments,
+                status: PrFeedbackCoverageStatus::Fetched,
+                detail: None,
+            }],
+            items: vec![PrFeedbackItem {
+                id: Some("1".to_string()),
+                source: PrFeedbackSource::IssueComment,
+                author: "u".to_string(),
+                body: "edited".to_string(),
                 path: None,
                 url: None,
                 created_at: None,

@@ -541,7 +541,7 @@ pub(crate) async fn create_pr_auto_fix_context(
     .await
     .map_err(|e| AppError::Internal(format!("spawn_blocking failed: {e}")))?;
 
-    let (response, observations, result_baseline) = match result {
+    let (response, observations, _result_baseline) = match result {
         Ok(capture) => (
             Ok(capture.response),
             capture.observations,
@@ -565,16 +565,43 @@ pub(crate) async fn create_pr_auto_fix_context(
             .map_err(|e| AppError::Internal(e.to_string()))?;
     }
 
-    if response.is_ok() {
-        let baseline = result_baseline
-            .as_ref()
-            .expect("successful PR context capture has a baseline");
-        db.upsert_work_scope_pr_feedback_baseline(&work_scope, baseline)
-            .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
-    }
-
     Ok(Json(response?))
+}
+
+pub(crate) async fn record_pr_auto_fix_context_baseline(
+    db: &crate::db::Database,
+    conversation_id: &str,
+    text: &str,
+) -> Result<(), AppError> {
+    let Some(raw) = text.strip_prefix("Address the PR feedback captured in `") else {
+        return Ok(());
+    };
+    let Some((artifact_path, _)) = raw.split_once('`') else {
+        return Ok(());
+    };
+
+    let conv = db
+        .get_conversation(conversation_id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let work_scope = match &conv.conv_mode {
+        ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
+            crate::work_scope::WorkScope::resolve(
+                conversation_id,
+                Some(std::path::Path::new(worktree_path.as_str())),
+            )
+        }
+        _ => return Ok(()),
+    };
+    let worktree = std::path::Path::new(&conv.cwd);
+    let artifact =
+        crate::api::pr_monitoring::read_pr_auto_fix_context_artifact(&worktree.join(artifact_path))
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+    let baseline = artifact.baseline();
+    db.upsert_work_scope_pr_feedback_baseline(&work_scope, &baseline)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(())
 }
 
 /// `GET /api/conversations/:id/diff` — committed and uncommitted changes

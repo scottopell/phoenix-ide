@@ -530,7 +530,7 @@ pub enum PrUnavailableReason {
     CommandFailed,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrCheckState {
     Passing,
@@ -548,7 +548,7 @@ pub enum PrDisplayState {
     Closed,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct PrCheckSummary {
     pub passing: u32,
     pub pending: u32,
@@ -559,7 +559,7 @@ pub struct PrCheckSummary {
     pub pending_names: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PrCheckDetail {
     pub name: String,
     pub state: String,
@@ -570,7 +570,7 @@ pub struct PrCheckDetail {
     pub description: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrFeedbackSource {
     IssueComment,
@@ -579,13 +579,13 @@ pub enum PrFeedbackSource {
     ReviewThread,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrCheckLogSource {
     CheckUrl,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PrCheckLogSnippet {
     pub check_name: String,
     pub source: PrCheckLogSource,
@@ -595,7 +595,7 @@ pub struct PrCheckLogSnippet {
     pub truncated: bool,
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrFeedbackCoverageSurface {
     IssueComments,
@@ -604,7 +604,7 @@ pub enum PrFeedbackCoverageSurface {
     ReviewThreads,
 }
 
-#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PrFeedbackCoverageStatus {
     Fetched,
@@ -612,7 +612,7 @@ pub enum PrFeedbackCoverageStatus {
     AuthFailed,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PrFeedbackCoverage {
     pub surface: PrFeedbackCoverageSurface,
     pub status: PrFeedbackCoverageStatus,
@@ -620,7 +620,7 @@ pub struct PrFeedbackCoverage {
     pub detail: Option<String>,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PrFeedbackItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
@@ -637,7 +637,7 @@ pub struct PrFeedbackItem {
     pub resolved: Option<bool>,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct PrFeedbackSummary {
     pub total: u32,
     pub unresolved: u32,

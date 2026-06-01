@@ -113,6 +113,7 @@ pub struct WorkScopePrFeedbackBaseline {
     pub captured_at: String,
     pub github_updated_at: Option<String>,
     pub feedback_identities: Vec<String>,
+    pub feedback_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -121,6 +122,7 @@ pub struct WorkScopePrFeedbackBaselineInput {
     pub captured_at: String,
     pub github_updated_at: Option<String>,
     pub feedback_identities: Vec<String>,
+    pub feedback_fingerprints: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -355,20 +357,27 @@ impl Database {
         feedback_identities.dedup();
         let identities = serde_json::to_string(&feedback_identities)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
+        let mut feedback_fingerprints = baseline.feedback_fingerprints.clone();
+        feedback_fingerprints.sort();
+        feedback_fingerprints.dedup();
+        let fingerprints = serde_json::to_string(&feedback_fingerprints)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
         sqlx::query(
             "INSERT INTO work_scope_pr_feedback_baselines (
-                work_scope_id, pr_number, captured_at, github_updated_at, feedback_identities
-             ) VALUES (?1, ?2, ?3, ?4, ?5)
+                work_scope_id, pr_number, captured_at, github_updated_at, feedback_identities, feedback_fingerprints
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(work_scope_id, pr_number) DO UPDATE SET
                 captured_at = excluded.captured_at,
                 github_updated_at = excluded.github_updated_at,
-                feedback_identities = excluded.feedback_identities",
+                feedback_identities = excluded.feedback_identities,
+                feedback_fingerprints = excluded.feedback_fingerprints",
         )
         .bind(work_scope_id)
         .bind(baseline.pr_number.cast_signed())
         .bind(&baseline.captured_at)
         .bind(&baseline.github_updated_at)
         .bind(identities)
+        .bind(fingerprints)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -384,7 +393,7 @@ impl Database {
             return Ok(None);
         };
         let row = sqlx::query(
-            "SELECT work_scope_id, pr_number, captured_at, github_updated_at, feedback_identities
+            "SELECT work_scope_id, pr_number, captured_at, github_updated_at, feedback_identities, feedback_fingerprints
              FROM work_scope_pr_feedback_baselines
              WHERE work_scope_id = ?1 AND pr_number = ?2",
         )
@@ -396,12 +405,16 @@ impl Database {
             let raw: String = row.get("feedback_identities");
             let feedback_identities =
                 serde_json::from_str(&raw).map_err(|e| DbError::Serialization(e.to_string()))?;
+            let raw_fingerprints: String = row.get("feedback_fingerprints");
+            let feedback_fingerprints = serde_json::from_str(&raw_fingerprints)
+                .map_err(|e| DbError::Serialization(e.to_string()))?;
             Ok(WorkScopePrFeedbackBaseline {
                 work_scope_id: row.get("work_scope_id"),
                 pr_number: row.get::<i64, _>("pr_number").cast_unsigned(),
                 captured_at: row.get("captured_at"),
                 github_updated_at: row.get("github_updated_at"),
                 feedback_identities,
+                feedback_fingerprints,
             })
         })
         .transpose()
@@ -2658,6 +2671,7 @@ mod tests {
                 captured_at: "2026-01-01T00:00:00Z".to_string(),
                 github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
                 feedback_identities: vec!["b".to_string(), "a".to_string(), "a".to_string()],
+                feedback_fingerprints: vec!["fb".to_string(), "fa".to_string(), "fa".to_string()],
             },
         )
         .await
@@ -2670,6 +2684,7 @@ mod tests {
                 captured_at: "2026-01-02T00:00:00Z".to_string(),
                 github_updated_at: Some("2026-01-02T00:00:00Z".to_string()),
                 feedback_identities: vec!["c".to_string()],
+                feedback_fingerprints: vec!["fc".to_string()],
             },
         )
         .await
@@ -2687,6 +2702,7 @@ mod tests {
             Some("2026-01-02T00:00:00Z")
         );
         assert_eq!(baseline.feedback_identities, vec!["c".to_string()]);
+        assert_eq!(baseline.feedback_fingerprints, vec!["fc".to_string()]);
     }
 
     #[tokio::test]

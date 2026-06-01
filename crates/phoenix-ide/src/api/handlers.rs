@@ -9,7 +9,7 @@ use super::chains::{
 };
 use super::git_handlers::{
     create_pr_auto_fix_context, get_conversation_diff, get_conversation_pr_status,
-    list_git_branches,
+    list_git_branches, record_pr_auto_fix_context_baseline,
 };
 use super::lifecycle_handlers::{
     abandon_task, approve_task, mark_merged, reject_task, task_feedback,
@@ -1684,8 +1684,9 @@ async fn send_chat(
                 .collect();
             let chat_llm_text =
                 (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
+            let display_text = expanded.display_text;
             let steer_event = Event::SteerMessage {
-                text: expanded.display_text,
+                text: display_text.clone(),
                 llm_text: chat_llm_text,
                 images,
                 message_id: req.message_id,
@@ -1702,6 +1703,7 @@ async fn send_chat(
                 .enqueue_steer_message(&id, steer_event)
                 .await
                 .map_err(AppError::BadRequest)?;
+            record_pr_auto_fix_context_baseline(state.runtime.db(), &id, &display_text).await?;
             return Ok(Json(ChatResponse {
                 queued: true,
                 steering: true,
@@ -1754,8 +1756,9 @@ async fn send_chat(
     // Send event to runtime with message_id and user_agent.
     // `text` carries the `display_text` (stored in DB, shown in history — REQ-IR-006).
     // `llm_text` is the expanded form delivered to the model when present (REQ-IR-001).
+    let display_text = expanded.display_text;
     let event = Event::UserMessage {
-        text: expanded.display_text,
+        text: display_text.clone(),
         llm_text: chat_llm_text,
         images,
         message_id: req.message_id,
@@ -1768,6 +1771,7 @@ async fn send_chat(
         .send_event(&id, event)
         .await
         .map_err(AppError::BadRequest)?;
+    record_pr_auto_fix_context_baseline(state.runtime.db(), &id, &display_text).await?;
 
     Ok(Json(ChatResponse {
         queued: true,
