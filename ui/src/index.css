@@ -8350,19 +8350,10 @@ html * {
   color: var(--accent-blue, #58a6ff);
 }
 
-/* Gutter add-note affordance on the hovered/focused line. */
+/* Visual override for Pierre's [data-utility-button] add-note affordance. */
 .phoenix-diff-add-note {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  padding: 0;
-  border: none;
-  border-radius: 3px;
   background: transparent;
   color: var(--text-muted);
-  cursor: pointer;
 }
 
 .phoenix-diff-add-note:hover,

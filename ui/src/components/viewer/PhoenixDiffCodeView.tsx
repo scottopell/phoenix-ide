@@ -257,6 +257,7 @@ export const PhoenixDiffCodeView = forwardRef<PhoenixDiffCodeViewHandle, Phoenix
         return (
           <button
             type="button"
+            data-utility-button=""
             className="phoenix-diff-add-note"
             aria-label="Add note to line"
             title="Add note"

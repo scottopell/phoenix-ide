@@ -52,6 +52,8 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     // The committed section badge appears both in the summary bar and the file
     // header — at least one is present.
     expect(screen.getAllByText('committed').length).toBeGreaterThan(0);
+    const addNoteButton = screen.getByRole('button', { name: 'Add note to line' });
+    expect(addNoteButton).toHaveAttribute('data-utility-button');
   });
 
   it('adds a line note via the gutter affordance and surfaces it in the badge, panel, and inline annotation', () => {
