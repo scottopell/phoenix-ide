@@ -30,12 +30,12 @@ use super::handle::{
 use super::registry::{BashHandleError, ConversationHandles, LiveHandleSummary};
 use super::ring::{RingLine, WindowView};
 use super::types::{BashOp, BashToolInput};
-use crate::api::wire::{
+use crate::tools::{ToolContext, ToolOutput};
+use phoenix_core::domain::tool_wire::{
     BashErrorResponse, BashKillPendingKernelPayload, BashLiveHandleSummary, BashResponse,
     BashRingLine, BashRingWindow, BashRunTombstonePayload, BashRunningPayload,
     BashStillRunningPayload, BashTombstonedPayload, BashWaiterPanickedPayload,
 };
-use crate::tools::{ToolContext, ToolOutput};
 
 // ---------------------------------------------------------------------------
 // Configuration constants (REQ-BASH config)
