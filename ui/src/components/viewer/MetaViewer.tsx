@@ -182,6 +182,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     registerLineRef,
   };
 
+  const largeText = textLike && payload.renderMode === 'plainLargeText';
   const body = renderBody(payload, bodyProps, htmlViewMode);
 
   const headerExtras: ReactNode = textLike ? (
@@ -211,13 +212,16 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     </>
   ) : null;
 
-  const banner: ReactNode =
-    textLike && patchContext && patchContext.modifiedLines.size > 0 ? (
-      <span>
-        Viewing {title}: {patchContext.modifiedLines.size} change
-        {patchContext.modifiedLines.size !== 1 ? 's' : ''} from patch
-      </span>
-    ) : null;
+  const banner: ReactNode = largeText ? (
+    <span>
+      Large file shown as plain text for responsiveness. Rich highlighting and line notes are disabled.
+    </span>
+  ) : textLike && patchContext && patchContext.modifiedLines.size > 0 ? (
+    <span>
+      Viewing {title}: {patchContext.modifiedLines.size} change
+      {patchContext.modifiedLines.size !== 1 ? 's' : ''} from patch
+    </span>
+  ) : null;
 
   return (
     <ViewerShell
@@ -268,6 +272,10 @@ function renderBody(
   bodyProps: ViewerBodyProps,
   htmlViewMode: HtmlViewMode,
 ): ReactNode {
+  if (isTextLikePayload(payload) && payload.renderMode === 'plainLargeText') {
+    return <TextViewerBody {...bodyProps} mode="plainLargeText" />;
+  }
+
   switch (payload.kind) {
     case 'markdown':
       return <MarkdownViewerBody {...bodyProps} />;

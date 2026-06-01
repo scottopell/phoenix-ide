@@ -55,4 +55,18 @@ describe('FileViewer typed file responses', () => {
     await waitFor(() => expect(screen.getByText('hello text file')).toBeInTheDocument());
     expect(screen.queryByRole('img')).not.toBeInTheDocument();
   });
+
+  it('routes very line-heavy files to the large plain-text fallback', async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(new Response(JSON.stringify({
+      kind: 'text',
+      content: `${'line\n'.repeat(2_001)}tail`,
+      encoding: 'utf-8',
+      file_type: 'typescript',
+    }), { status: 200, headers: { 'Content-Type': 'application/json' } }));
+
+    renderReader('big.ts');
+
+    expect(await screen.findByTestId('viewer-large-text-fallback')).toBeInTheDocument();
+    expect(screen.getByText(/Large file shown as plain text/)).toBeInTheDocument();
+  });
 });

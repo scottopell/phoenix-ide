@@ -33,6 +33,22 @@ describe('MetaViewer payload routing', () => {
     expect(container.querySelector('.viewer-code-line')).not.toBeNull();
   });
 
+  it('routes large code payloads to a plain single-node fallback', () => {
+    const largeContent = `${'line\n'.repeat(2_001)}tail`;
+    const { container } = renderViewer({
+      ...textCommon,
+      kind: 'code',
+      language: 'typescript',
+      content: largeContent,
+      renderMode: 'plainLargeText',
+    });
+
+    expect(screen.getByTestId('viewer-large-text-fallback')).toBeInTheDocument();
+    expect(container.querySelector('.viewer-code')).toBeNull();
+    expect(container.querySelector('.annotatable')).toBeNull();
+    expect(screen.getByText(/Large file shown as plain text/)).toBeInTheDocument();
+  });
+
   it('routes a plain-text payload to line-numbered text', () => {
     const { container } = renderViewer({ ...textCommon, kind: 'text', content: 'plain line' });
     expect(screen.getByText('plain line')).toBeInTheDocument();

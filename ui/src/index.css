@@ -4587,6 +4587,15 @@ html * {
   line-height: 1.5;
 }
 
+.viewer-large-text-pre {
+  margin: 0;
+  padding: 12px 16px;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  white-space: pre;
+}
+
 /* === Annotatable (shared annotation behavior) === */
 .annotatable {
   position: relative;
@@ -8280,6 +8289,8 @@ html * {
 .phoenix-diff-codeview {
   flex: 1;
   min-height: 0;
+  height: 100%;
+  overflow: auto;
 }
 
 /* Section labels + truncation, above the single virtualized surface. */
@@ -10456,11 +10467,18 @@ html * {
  * properties have no effect and the HTML preview iframe collapses. */
 .viewer-shell-body {
   flex: 1;
-  overflow: auto;
   min-height: 0;
   position: relative;
   display: flex;
   flex-direction: column;
+}
+
+.viewer-shell-body--scroll-shell {
+  overflow: auto;
+}
+
+.viewer-shell-body--scroll-children {
+  overflow: hidden;
 }
 
 /* NotesPanel — sidebar over the viewer body */

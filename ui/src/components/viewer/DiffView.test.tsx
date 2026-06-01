@@ -56,6 +56,12 @@ describe('DiffView (Pierre CodeView wiring)', () => {
     expect(addNoteButton).toHaveAttribute('data-utility-button');
   });
 
+  it('lets DiffView opt out of shell-owned scrolling so CodeView owns the scroll container', () => {
+    const { container } = renderDiff();
+    expect(container.querySelector('.viewer-shell-body--scroll-children')).toBeTruthy();
+    expect(container.querySelector('.diff-viewer-body .phoenix-diff-codeview')).toBeTruthy();
+  });
+
   it('adds a line note via the gutter affordance and surfaces it in the badge, panel, and inline annotation', () => {
     renderDiff();
     addNoteViaGutter('looks good');

@@ -119,6 +119,7 @@ export function DiffView({
       onToggleNotes={notes.togglePanel}
       onSend={notes.send}
       onClose={onClose}
+      bodyScroll="children"
       panel={
         notes.showPanel ? (
           // Panel scope = THIS viewer's notes. Cross-viewer notes

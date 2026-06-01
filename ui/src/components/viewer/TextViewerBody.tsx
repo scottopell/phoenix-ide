@@ -1,5 +1,10 @@
 import { AnnotatableBlock } from './AnnotatableBlock';
 import type { ViewerBodyProps } from './AnnotatableBlock';
+import type { TextRenderMode } from './metaViewerTypes';
+
+interface TextViewerBodyProps extends ViewerBodyProps {
+  mode?: TextRenderMode | undefined;
+}
 
 /**
  * Plain-text body: line-numbered, annotatable, no syntax highlighting. The
@@ -12,7 +17,16 @@ export function TextViewerBody({
   highlightedLine,
   onAnnotate,
   registerLineRef,
-}: ViewerBodyProps) {
+  mode = 'rich',
+}: TextViewerBodyProps) {
+  if (mode === 'plainLargeText') {
+    return (
+      <div className="viewer-text viewer-text--large" data-testid="viewer-large-text-fallback">
+        <pre className="viewer-large-text-pre">{content}</pre>
+      </div>
+    );
+  }
+
   const lines = content.split('\n');
   return (
     <div className="viewer-text">

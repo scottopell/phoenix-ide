@@ -29,6 +29,10 @@ interface ViewerShellProps {
    *  from patch"). */
   banner?: ReactNode;
   onClose: () => void;
+  /** Scroll strategy for the shell body. The default lets file viewers scroll
+   *  their `.viewer-content`; `children` lets virtualized children such as the
+   *  diff CodeView own wheel/trackpad scrolling without a competing parent. */
+  bodyScroll?: 'shell' | 'children' | undefined;
   /** Main content — file render, diff lines, etc. */
   children: ReactNode;
   /** Notes side panel rendered absolutely over the body; caller
@@ -69,6 +73,7 @@ export function ViewerShell({
   panel,
   dialog,
   confirm,
+  bodyScroll = 'shell',
 }: ViewerShellProps) {
   // Esc closes (deferring to caller — they may guard with a confirm).
   // Registered in capture phase with stopPropagation so this shell
@@ -128,7 +133,7 @@ export function ViewerShell({
         </div>
       </div>
       {banner && <div className="viewer-shell-banner">{banner}</div>}
-      <div className="viewer-shell-body">{children}</div>
+      <div className={`viewer-shell-body viewer-shell-body--scroll-${bodyScroll}`}>{children}</div>
       {panel}
       {dialog}
       {confirm}

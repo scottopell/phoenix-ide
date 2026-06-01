@@ -12,6 +12,8 @@
  * loader — every viewable thing flows through the same router.
  */
 
+export type TextRenderMode = 'rich' | 'plainLargeText';
+
 export interface PatchContext {
   modifiedLines: Set<number>;
   firstModifiedLine?: number | undefined;
@@ -36,6 +38,7 @@ interface TextLikePayload extends CommonPayload {
   filePath: string;
   rootDir: string;
   content: string;
+  renderMode?: TextRenderMode | undefined;
   patchContext?: PatchContext | undefined;
 }
 
