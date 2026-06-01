@@ -8133,6 +8133,18 @@ html * {
   border-color: var(--accent-green, #22c55e);
 }
 
+.work-actions-pr-remediate {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.work-actions-pr-freshness {
+  color: var(--accent-yellow, #eab308);
+  font-size: 10px;
+  font-weight: 600;
+}
+
 .work-actions-pr-note {
   color: var(--text-muted);
   font-size: 11px;

@@ -535,9 +535,10 @@ On startup `reconcile_worktrees` scans conversations whose `conv_mode` is `Work`
 
 The StateBar uses PR status as the branch health signal for Work and Branch
 conversations. It shows the PR number plus merge/check state when `gh` can resolve
-a pull request for the branch. It does not render local commits-ahead or
-commits-behind badges; those counts are easy to inspect with git commands when
-needed, but they are not the primary decision point for PR cleanup.
+a pull request for the branch. It does not render local commits-ahead,
+commits-behind, or PR-feedback-freshness badges; those counts are easy to inspect
+with git commands when needed, and feedback freshness belongs beside the remediation
+action that consumes it.
 
 `GET /api/conversations/:id/pr-status` is the data source. It runs `gh pr list --head
 {branch} --state all --json ...` (and `gh pr checks` where needed) from the
@@ -546,6 +547,23 @@ conversation's worktree, in a `spawn_blocking` task, and normalises the result t
 number/title/url/... }` or `{ found: false, unavailable_reason: gh_missing|not_authenticated|not_git_repo|command_failed }`.
 `gh` failures are logged at `debug` and surfaced to the UI as a compact non-blocking
 hint, never as a hard error — the conversation page stays usable without `gh`.
+
+### REQ-PROJ-030 through REQ-PROJ-032 — Work Action remediation freshness
+
+The `Address CI & comments` Work Action owns PR feedback freshness. A successful
+`POST /api/conversations/:id/pr-auto-fix-context` capture writes the artifact passed
+to the agent and records a compact baseline keyed by work scope and PR number:
+capture time, PR `updated_at` when GitHub provides it, and stable feedback identities
+(provider id, URL, or a structural fingerprint fallback). With no baseline, the UI
+shows no freshness marker.
+
+Routine `pr-status` polling remains the main path but stays bounded. The status
+refresh first reads only PR identity/check data. If the current PR `updated_at` is
+newer than the stored baseline, Phoenix fetches full feedback surfaces once to
+compare identities. If that comparison finds unseen feedback it returns a counted
+`new` marker; if surfaces are unavailable it logs at `debug` and returns only a
+coarse `updated` advisory. The marker is advisory and does not affect cleanup,
+abandon, or conversation availability.
 
 `.gitignore` management: the system checks for `.phoenix/worktrees/` in `.gitignore`
 at project creation and appends it if missing.

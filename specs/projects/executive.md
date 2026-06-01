@@ -77,6 +77,9 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-027:** Simplified Managed Completion (Push Branch) | ✅ Complete | Push branch, user merges via PR; gh observes merge state for cleanup; task file on branch, not main |
 | **REQ-PROJ-028:** Managed Mode Worktree from First Message | ✅ Complete | Worktree created on first message with temp branch |
 | **REQ-PROJ-029:** Branch Mode in the Mode Picker | ✅ Complete | Mode picker offers Direct, Managed, and Branch |
+| **REQ-PROJ-030:** PR Feedback Freshness Indicator | ✅ Complete | Work Actions shows advisory `new`/`updated` marker beside `Address CI & comments`; StateBar remains branch health only |
+| **REQ-PROJ-031:** Agent-Facing PR Context Baseline | ✅ Complete | Successful PR auto-fix context capture records work-scope/PR baseline with timestamp, PR updated_at, and feedback identities |
+| **REQ-PROJ-032:** Bounded PR Feedback Refresh | ✅ Complete | Routine PR status uses PR updated_at as the gate before fetching feedback surfaces; failures degrade to coarse advisory |
 
 **Progress:** of the 25 active requirements, all 25 complete. REQ-PROJ-009
 and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by

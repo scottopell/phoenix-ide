@@ -107,9 +107,21 @@ function prRefreshUnavailableText(prStatus: PrStatusResponse): string {
   return `Resolve PR refresh issue before auto-fix: refresh unavailable (${prStatus.refresh.reason ?? 'unknown'})`;
 }
 
+function prFeedbackFreshnessLabel(prStatus: PrStatusResponse): string | null {
+  const freshness = prStatus.feedback_freshness;
+  if (!freshness) return null;
+  if (freshness.state === 'new') {
+    return typeof freshness.new_count === 'number' && freshness.new_count > 0
+      ? `${freshness.new_count} new`
+      : 'new comments';
+  }
+  return 'updated';
+}
+
 function PrRemediationActions({ conversationId, prStatus, onSendMessage, showError }: { conversationId: string; prStatus: PrStatusResponse | null; onSendMessage?: ((text: string) => void) | undefined; showError?: ((message: string) => void) | undefined }) {
   const [loading, setLoading] = useState(false);
   const refreshUnavailable = prStatus?.refresh.state === 'unavailable';
+  const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
   const canAddress = !!prStatus?.found && prStatus.display_state === 'open' && !refreshUnavailable && !!onSendMessage;
   if (!prStatus?.found || prStatus.display_state !== 'open') return null;
   return (
@@ -132,6 +144,7 @@ function PrRemediationActions({ conversationId, prStatus, onSendMessage, showErr
       }}
     >
       {loading ? 'Capturing...' : 'Address CI & comments'}
+      {freshnessLabel && <span className="work-actions-pr-freshness">{freshnessLabel}</span>}
     </button>
   );
 }

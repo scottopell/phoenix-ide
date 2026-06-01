@@ -14,6 +14,7 @@ use schema::{
 };
 
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use sqlx::sqlite::{
     SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow, SqliteSynchronous,
 };
@@ -103,6 +104,23 @@ pub struct WorkScopePrObservation {
     pub base: String,
     pub head: String,
     pub github_updated_at: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkScopePrFeedbackBaseline {
+    pub work_scope_id: i64,
+    pub pr_number: u64,
+    pub captured_at: String,
+    pub github_updated_at: Option<String>,
+    pub feedback_identities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkScopePrFeedbackBaselineInput {
+    pub pr_number: u64,
+    pub captured_at: String,
+    pub github_updated_at: Option<String>,
+    pub feedback_identities: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -305,6 +323,88 @@ impl Database {
         let mut prs = self.list_work_scope_pr_associations(scope).await?;
         sort_work_scope_pr_associations(&mut prs);
         Ok(prs.into_iter().next())
+    }
+
+    pub async fn upsert_work_scope_pr_feedback_baseline(
+        &self,
+        scope: &crate::work_scope::WorkScope,
+        baseline: &WorkScopePrFeedbackBaselineInput,
+    ) -> DbResult<i64> {
+        let (scope_type, scope_value) = work_scope_db_key(scope);
+        let now = Utc::now().to_rfc3339();
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO work_scopes (scope_type, scope_value, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(scope_type, scope_value) DO UPDATE SET updated_at = excluded.updated_at",
+        )
+        .bind(scope_type)
+        .bind(scope_value)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        let work_scope_id = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM work_scopes WHERE scope_type = ?1 AND scope_value = ?2",
+        )
+        .bind(scope_type)
+        .bind(scope_value)
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut feedback_identities = baseline.feedback_identities.clone();
+        feedback_identities.sort();
+        feedback_identities.dedup();
+        let identities = serde_json::to_string(&feedback_identities)
+            .map_err(|e| DbError::Serialization(e.to_string()))?;
+        sqlx::query(
+            "INSERT INTO work_scope_pr_feedback_baselines (
+                work_scope_id, pr_number, captured_at, github_updated_at, feedback_identities
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(work_scope_id, pr_number) DO UPDATE SET
+                captured_at = excluded.captured_at,
+                github_updated_at = excluded.github_updated_at,
+                feedback_identities = excluded.feedback_identities",
+        )
+        .bind(work_scope_id)
+        .bind(baseline.pr_number.cast_signed())
+        .bind(&baseline.captured_at)
+        .bind(&baseline.github_updated_at)
+        .bind(identities)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(work_scope_id)
+    }
+
+    pub async fn work_scope_pr_feedback_baseline(
+        &self,
+        scope: &crate::work_scope::WorkScope,
+        pr_number: u64,
+    ) -> DbResult<Option<WorkScopePrFeedbackBaseline>> {
+        let Some(work_scope_id) = self.work_scope_id(scope).await? else {
+            return Ok(None);
+        };
+        let row = sqlx::query(
+            "SELECT work_scope_id, pr_number, captured_at, github_updated_at, feedback_identities
+             FROM work_scope_pr_feedback_baselines
+             WHERE work_scope_id = ?1 AND pr_number = ?2",
+        )
+        .bind(work_scope_id)
+        .bind(pr_number.cast_signed())
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|row| {
+            let raw: String = row.get("feedback_identities");
+            let feedback_identities =
+                serde_json::from_str(&raw).map_err(|e| DbError::Serialization(e.to_string()))?;
+            Ok(WorkScopePrFeedbackBaseline {
+                work_scope_id: row.get("work_scope_id"),
+                pr_number: row.get::<i64, _>("pr_number").cast_unsigned(),
+                captured_at: row.get("captured_at"),
+                github_updated_at: row.get("github_updated_at"),
+                feedback_identities,
+            })
+        })
+        .transpose()
     }
 
     /// Open or create database at the given path
@@ -2544,6 +2644,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(primary.pr_number, 2);
+    }
+
+    #[tokio::test]
+    async fn work_scope_pr_feedback_baseline_roundtrips_and_replaces() {
+        let db = Database::open_in_memory().await.unwrap();
+        let scope = crate::work_scope::WorkScope::Worktree("/tmp/ws-baseline".to_string());
+
+        db.upsert_work_scope_pr_feedback_baseline(
+            &scope,
+            &WorkScopePrFeedbackBaselineInput {
+                pr_number: 7,
+                captured_at: "2026-01-01T00:00:00Z".to_string(),
+                github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+                feedback_identities: vec!["b".to_string(), "a".to_string(), "a".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        db.upsert_work_scope_pr_feedback_baseline(
+            &scope,
+            &WorkScopePrFeedbackBaselineInput {
+                pr_number: 7,
+                captured_at: "2026-01-02T00:00:00Z".to_string(),
+                github_updated_at: Some("2026-01-02T00:00:00Z".to_string()),
+                feedback_identities: vec!["c".to_string()],
+            },
+        )
+        .await
+        .unwrap();
+
+        let baseline = db
+            .work_scope_pr_feedback_baseline(&scope, 7)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(baseline.pr_number, 7);
+        assert_eq!(baseline.captured_at, "2026-01-02T00:00:00Z");
+        assert_eq!(
+            baseline.github_updated_at.as_deref(),
+            Some("2026-01-02T00:00:00Z")
+        );
+        assert_eq!(baseline.feedback_identities, vec!["c".to_string()]);
     }
 
     #[tokio::test]

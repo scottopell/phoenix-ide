@@ -685,6 +685,20 @@ pub struct PrIdentity {
     pub updated_at: Option<String>,
 }
 
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PrFeedbackFreshnessState {
+    New,
+    Updated,
+}
+
+#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
+pub struct PrFeedbackFreshness {
+    pub state: PrFeedbackFreshnessState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_count: Option<u32>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct PrStatusResponse {
     pub found: bool,
@@ -717,6 +731,8 @@ pub struct PrStatusResponse {
     pub updated_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_state: Option<PrDisplayState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub feedback_freshness: Option<PrFeedbackFreshness>,
 }
 
 impl PrStatusResponse {
@@ -745,6 +761,7 @@ impl PrStatusResponse {
             feedback_summary: None,
             updated_at: None,
             display_state: None,
+            feedback_freshness: None,
         }
     }
 

@@ -338,6 +338,53 @@ commit divergence badges draw attention without telling the user whether the PR 
 ready, merged, blocked, or stale. Users and agents can still inspect git history via
 normal git commands when they need that detail.
 
+### REQ-PROJ-030: PR Feedback Freshness Indicator
+
+WHEN a Work or Branch conversation has an open associated pull request
+AND PR feedback changed since Phoenix last captured agent-facing PR remediation context
+THE SYSTEM SHALL show a compact advisory marker near the `Address CI & comments` Work Action
+SUCH AS `new comments`, `{N} new`, or `updated`
+
+THE SYSTEM SHALL NOT use PR feedback freshness as the StateBar branch-health signal
+
+THE SYSTEM SHALL NOT block cleanup, abandon, or ordinary conversation use based on PR feedback freshness
+
+**Rationale:** Fresh review activity is useful exactly where the user asks the agent to
+address review feedback. It is not branch health, and it is not lifecycle authority.
+
+### REQ-PROJ-031: Agent-Facing PR Context Baseline
+
+WHEN Phoenix successfully captures PR remediation context for an associated pull request
+THE SYSTEM SHALL record that successful capture as the baseline for agent-facing PR feedback freshness
+
+THE SYSTEM SHALL store compact baseline data for the work scope and PR number:
+- capture timestamp
+- pull request `updated_at` timestamp when available
+- stable feedback identities or fingerprints when available
+
+WHEN classifying freshness
+THE SYSTEM SHALL treat feedback as new when current feedback contains stable identities absent from the latest successful baseline
+
+WHEN no successful baseline exists
+THE SYSTEM SHALL NOT show `new comments`
+
+**Rationale:** The baseline is what Phoenix has actually handed to the agent, not what
+GitHub happened to contain at some unrelated time.
+
+### REQ-PROJ-032: Bounded PR Feedback Refresh
+
+WHEN refreshing routine PR status
+THE SYSTEM SHALL keep the poll lightweight and SHALL NOT fetch all PR feedback surfaces unless gated by evidence that feedback may have changed
+
+Evidence includes the pull request `updated_at` timestamp being newer than the latest successful baseline, or an explicit remediation context capture
+
+WHEN full feedback surfaces are unavailable during freshness classification
+THE SYSTEM SHALL degrade to no count or a coarse `updated` advisory
+AND SHALL log the failure
+
+**Rationale:** PR status is polled routinely. Full review surfaces are slower and more
+rate-limit sensitive, so Phoenix fetches them only when they can change the advisory.
+
 ---
 
 ### REQ-PROJ-012: Provide propose_task Tool to Agents

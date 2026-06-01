@@ -1,10 +1,14 @@
 use super::types::{
     PrAutoFixContextResponse, PrCheckDetail, PrCheckLogSnippet, PrCheckLogSource, PrCheckState,
     PrCheckSummary, PrDisplayState, PrFeedbackCoverage, PrFeedbackCoverageStatus,
-    PrFeedbackCoverageSurface, PrFeedbackItem, PrFeedbackSource, PrFeedbackSummary, PrIdentity,
-    PrRefreshMetadata, PrRefreshState, PrStatusResponse, PrUnavailableReason,
+    PrFeedbackCoverageSurface, PrFeedbackFreshness, PrFeedbackFreshnessState, PrFeedbackItem,
+    PrFeedbackSource, PrFeedbackSummary, PrIdentity, PrRefreshMetadata, PrRefreshState,
+    PrStatusResponse, PrUnavailableReason,
 };
-use crate::db::{WorkScopePrAssociation, WorkScopePrObservation};
+use crate::db::{
+    WorkScopePrAssociation, WorkScopePrFeedbackBaseline, WorkScopePrFeedbackBaselineInput,
+    WorkScopePrObservation,
+};
 use crate::git_ops::run_git;
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -383,6 +387,19 @@ fn get_pr_status_with_client(client: &dyn GhClient, branch_name: &str) -> PrStat
 pub(crate) struct PrAutoFixCapture {
     pub response: PrAutoFixContextResponse,
     pub observations: Vec<WorkScopePrObservation>,
+    pub baseline: WorkScopePrFeedbackBaselineInput,
+}
+
+pub(crate) fn fetch_pr_feedback_for_pr(
+    worktree: &Path,
+    pr_number: u64,
+) -> Result<PrFeedbackSummary, PrMonitorError> {
+    if !worktree.is_dir() || run_git(worktree, &["rev-parse", "--is-inside-work-tree"]).is_err() {
+        return Err(PrMonitorError::BadRequest(
+            "Conversation worktree is not a git repository".to_string(),
+        ));
+    }
+    Ok(fetch_pr_feedback(&ShellGhClient::new(worktree), pr_number))
 }
 
 pub(crate) fn capture_pr_auto_fix_context_for_pr(
@@ -409,22 +426,24 @@ pub(crate) fn capture_pr_auto_fix_context_for_pr(
             None
         }
     };
-    let response = match capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client) {
-        Ok(response) => response,
-        Err(PrMonitorError::BadRequest(message)) => {
-            if let Some(observation) = observation {
-                return Err(PrMonitorError::BadRequestWithObservations {
-                    message,
-                    observations: vec![observation],
-                });
+    let CapturedPrAutoFixContext { response, baseline } =
+        match capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client) {
+            Ok(captured) => captured,
+            Err(PrMonitorError::BadRequest(message)) => {
+                if let Some(observation) = observation {
+                    return Err(PrMonitorError::BadRequestWithObservations {
+                        message,
+                        observations: vec![observation],
+                    });
+                }
+                return Err(PrMonitorError::BadRequest(message));
             }
-            return Err(PrMonitorError::BadRequest(message));
-        }
-        Err(err) => return Err(err),
-    };
+            Err(err) => return Err(err),
+        };
     Ok(PrAutoFixCapture {
         response,
         observations: observation.into_iter().collect(),
+        baseline,
     })
 }
 
@@ -476,7 +495,7 @@ fn capture_pr_auto_fix_context_for_branch_with_client(
     let pr = choose_pr(prs).ok_or_else(|| {
         PrMonitorError::BadRequest("No pull request found for this branch".to_string())
     })?;
-    let response =
+    let CapturedPrAutoFixContext { response, baseline } =
         capture_pr_auto_fix_context_for_pr_item(worktree, pr, client).map_err(|err| {
             if let PrMonitorError::BadRequest(message) = err {
                 if !observations.is_empty() {
@@ -492,20 +511,27 @@ fn capture_pr_auto_fix_context_for_branch_with_client(
     Ok(PrAutoFixCapture {
         response,
         observations,
+        baseline,
     })
+}
+
+struct CapturedPrAutoFixContext {
+    response: PrAutoFixContextResponse,
+    baseline: WorkScopePrFeedbackBaselineInput,
 }
 
 fn capture_pr_auto_fix_context_for_pr_item(
     worktree: &Path,
     pr: GhPrListItem,
     client: &dyn GhClient,
-) -> Result<PrAutoFixContextResponse, PrMonitorError> {
+) -> Result<CapturedPrAutoFixContext, PrMonitorError> {
     let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
     if display_state != PrDisplayState::Open {
         return Err(PrMonitorError::BadRequest(
             "Auto-fix is only available for open, non-draft PRs".to_string(),
         ));
     }
+    let pr_updated_at = pr.updated_at.clone();
 
     let raw_checks = match client.pr_checks(pr.number) {
         Ok(checks) => checks,
@@ -517,6 +543,13 @@ fn capture_pr_auto_fix_context_for_pr_item(
     let snippets = capture_log_snippets(client, &raw_checks);
     let checks = capture_checks(&raw_checks, snippets);
     let feedback = fetch_pr_feedback(client, pr.number);
+    let feedback_identities = feedback
+        .items
+        .iter()
+        .map(feedback_identity)
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
     let fetched_at = Utc::now().to_rfc3339();
     let artifact = PrAutoFixContextArtifact {
         manifest_version: ARTIFACT_VERSION,
@@ -558,10 +591,19 @@ fn capture_pr_auto_fix_context_for_pr_item(
     let message = format!(
         "Address the PR feedback captured in `{rel_path}`. Use that file as the source of truth for failing CI checks and review comments, fix the issues in this worktree, run targeted tests, commit the changes, and summarize what changed. Do not push unless the user explicitly asks."
     );
-    Ok(PrAutoFixContextResponse {
-        artifact_path: rel_path,
+    let baseline = WorkScopePrFeedbackBaselineInput {
         pr_number: artifact.pr.number,
-        message,
+        captured_at: fetched_at,
+        github_updated_at: pr_updated_at,
+        feedback_identities,
+    };
+    Ok(CapturedPrAutoFixContext {
+        response: PrAutoFixContextResponse {
+            artifact_path: rel_path,
+            pr_number: artifact.pr.number,
+            message,
+        },
+        baseline,
     })
 }
 
@@ -586,6 +628,7 @@ fn fresh_response(
         feedback_summary: None,
         updated_at: pr.updated_at.clone().or_else(|| Some(refreshed_at.clone())),
         display_state: Some(pr.display_state.clone()),
+        feedback_freshness: None,
         pr: Some(pr),
         refresh: PrRefreshMetadata {
             state: PrRefreshState::Fresh,
@@ -661,6 +704,7 @@ pub(crate) fn stale_response_with_refresh_state(
         feedback_summary: None,
         updated_at: identity.updated_at.clone(),
         display_state: Some(identity.display_state.clone()),
+        feedback_freshness: None,
         pr: Some(identity),
         refresh: PrRefreshMetadata {
             state: refresh_state,
@@ -716,6 +760,7 @@ pub(crate) fn persisted_primary_response(
         feedback_summary: None,
         updated_at: identity.updated_at.clone(),
         display_state: Some(identity.display_state.clone()),
+        feedback_freshness: None,
         pr: Some(identity),
         refresh,
     }
@@ -1064,6 +1109,86 @@ fn review_threads_to_items(threads: Vec<GhReviewThread>) -> Vec<PrFeedbackItem> 
                 })
         })
         .collect()
+}
+
+fn feedback_identity(item: &PrFeedbackItem) -> String {
+    if let Some(id) = &item.id {
+        return format!("{:?}:{id}", item.source);
+    }
+    if let Some(url) = &item.url {
+        return format!("{:?}:url:{url}", item.source);
+    }
+    format!(
+        "{:?}:fingerprint:{}:{}:{}:{}",
+        item.source,
+        item.author,
+        item.path.clone().unwrap_or_default(),
+        item.created_at.clone().unwrap_or_default(),
+        item.body
+    )
+}
+
+pub(crate) fn pr_updated_after_baseline(
+    baseline: &WorkScopePrFeedbackBaseline,
+    current_pr_updated_at: &str,
+) -> bool {
+    let Some(baseline_updated_at) = baseline.github_updated_at.as_deref() else {
+        return true;
+    };
+    match (
+        chrono::DateTime::parse_from_rfc3339(current_pr_updated_at),
+        chrono::DateTime::parse_from_rfc3339(baseline_updated_at),
+    ) {
+        (Ok(current), Ok(baseline)) => current > baseline,
+        _ => current_pr_updated_at != baseline_updated_at,
+    }
+}
+
+pub(crate) fn feedback_freshness_from_baseline(
+    baseline: &WorkScopePrFeedbackBaseline,
+    current_pr_updated_at: Option<&str>,
+    current_feedback: Option<&PrFeedbackSummary>,
+) -> Option<PrFeedbackFreshness> {
+    if let Some(feedback) = current_feedback {
+        let baseline_ids: HashSet<&str> = baseline
+            .feedback_identities
+            .iter()
+            .map(String::as_str)
+            .collect();
+        let new_count = feedback
+            .items
+            .iter()
+            .map(feedback_identity)
+            .filter(|identity| !baseline_ids.contains(identity.as_str()))
+            .count();
+        if new_count > 0 {
+            return Some(PrFeedbackFreshness {
+                state: PrFeedbackFreshnessState::New,
+                new_count: Some(u32::try_from(new_count).unwrap_or(u32::MAX)),
+            });
+        }
+        if feedback
+            .coverage
+            .iter()
+            .any(|coverage| coverage.status != PrFeedbackCoverageStatus::Fetched)
+            && current_pr_updated_at.is_some()
+        {
+            return Some(PrFeedbackFreshness {
+                state: PrFeedbackFreshnessState::Updated,
+                new_count: None,
+            });
+        }
+        return None;
+    }
+
+    if pr_updated_after_baseline(baseline, current_pr_updated_at.unwrap()) {
+        return Some(PrFeedbackFreshness {
+            state: PrFeedbackFreshnessState::Updated,
+            new_count: None,
+        });
+    }
+
+    None
 }
 
 fn dedupe_feedback(items: Vec<PrFeedbackItem>) -> Vec<PrFeedbackItem> {
@@ -1647,6 +1772,96 @@ mod tests {
             .iter()
             .any(|c| c.surface == PrFeedbackCoverageSurface::ReviewThreads
                 && c.status == PrFeedbackCoverageStatus::Unavailable));
+    }
+
+    #[test]
+    fn feedback_freshness_counts_unseen_identities() {
+        let baseline = WorkScopePrFeedbackBaseline {
+            work_scope_id: 1,
+            pr_number: 7,
+            captured_at: "2026-01-01T00:00:00Z".to_string(),
+            github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            feedback_identities: vec!["IssueComment:1".to_string()],
+        };
+        let feedback = PrFeedbackSummary {
+            total: 2,
+            unresolved: 2,
+            coverage: vec![PrFeedbackCoverage {
+                surface: PrFeedbackCoverageSurface::IssueComments,
+                status: PrFeedbackCoverageStatus::Fetched,
+                detail: None,
+            }],
+            items: vec![
+                PrFeedbackItem {
+                    id: Some("1".to_string()),
+                    source: PrFeedbackSource::IssueComment,
+                    author: "u".to_string(),
+                    body: "old".to_string(),
+                    path: None,
+                    url: None,
+                    created_at: None,
+                    resolved: None,
+                },
+                PrFeedbackItem {
+                    id: Some("2".to_string()),
+                    source: PrFeedbackSource::IssueComment,
+                    author: "u".to_string(),
+                    body: "new".to_string(),
+                    path: None,
+                    url: None,
+                    created_at: None,
+                    resolved: None,
+                },
+            ],
+        };
+
+        let freshness = feedback_freshness_from_baseline(
+            &baseline,
+            Some("2026-01-02T00:00:00Z"),
+            Some(&feedback),
+        )
+        .unwrap();
+        assert_eq!(freshness.state, PrFeedbackFreshnessState::New);
+        assert_eq!(freshness.new_count, Some(1));
+    }
+
+    #[test]
+    fn feedback_freshness_degrades_to_updated_when_surface_unavailable() {
+        let baseline = WorkScopePrFeedbackBaseline {
+            work_scope_id: 1,
+            pr_number: 7,
+            captured_at: "2026-01-01T00:00:00Z".to_string(),
+            github_updated_at: Some("2026-01-01T00:00:00Z".to_string()),
+            feedback_identities: vec!["IssueComment:1".to_string()],
+        };
+        let feedback = PrFeedbackSummary {
+            total: 1,
+            unresolved: 1,
+            coverage: vec![PrFeedbackCoverage {
+                surface: PrFeedbackCoverageSurface::ReviewThreads,
+                status: PrFeedbackCoverageStatus::Unavailable,
+                detail: None,
+            }],
+            items: vec![PrFeedbackItem {
+                id: Some("1".to_string()),
+                source: PrFeedbackSource::IssueComment,
+                author: "u".to_string(),
+                body: "old".to_string(),
+                path: None,
+                url: None,
+                created_at: None,
+                resolved: None,
+            }],
+        };
+
+        let freshness = feedback_freshness_from_baseline(
+            &baseline,
+            Some("2026-01-02T00:00:00Z"),
+            Some(&feedback),
+        )
+        .unwrap();
+        assert_eq!(freshness.state, PrFeedbackFreshnessState::Updated);
+        assert_eq!(freshness.new_count, None);
     }
 
     #[test]

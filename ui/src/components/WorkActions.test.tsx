@@ -250,6 +250,46 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     vi.clearAllMocks();
   });
 
+  it('shows PR feedback freshness next to the remediation action', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-freshness"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 137,
+          display_state: 'open',
+          feedback_freshness: { state: 'new', new_count: 3 },
+        })}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /Address CI & comments 3 new/i })).toBeInTheDocument();
+  });
+
+  it('shows a coarse updated marker when feedback cannot be counted', () => {
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-updated"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({
+          found: true,
+          number: 138,
+          display_state: 'open',
+          feedback_freshness: { state: 'updated' },
+        })}
+      />,
+    );
+
+    expect(screen.getByRole('button', { name: /Address CI & comments updated/i })).toBeInTheDocument();
+  });
+
   it('guides closed-unmerged PRs toward Abandon instead of waiting for merge cleanup', async () => {
     renderWithProviders(
       <WorkControlBar

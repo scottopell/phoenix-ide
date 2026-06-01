@@ -74,6 +74,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_work_scope_pr_associations",
         sql: MIGRATION_012,
     },
+    Migration {
+        version: 13,
+        name: "create_pr_feedback_baselines",
+        sql: MIGRATION_013,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -338,6 +343,17 @@ CREATE INDEX IF NOT EXISTS idx_work_scope_pr_primary
 ON work_scope_pr_associations(work_scope_id, display_state, github_updated_at, last_seen_at);
 ";
 
+const MIGRATION_013: &str = r"
+CREATE TABLE IF NOT EXISTS work_scope_pr_feedback_baselines (
+    work_scope_id INTEGER NOT NULL REFERENCES work_scopes(id) ON DELETE CASCADE,
+    pr_number INTEGER NOT NULL,
+    captured_at TEXT NOT NULL,
+    github_updated_at TEXT,
+    feedback_identities TEXT NOT NULL,
+    PRIMARY KEY (work_scope_id, pr_number)
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -439,7 +455,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 12);
+        assert_eq!(first, 13);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

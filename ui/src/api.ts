@@ -190,6 +190,11 @@ export interface PrRefreshMetadata {
   stale: boolean;
 }
 
+export interface PrFeedbackFreshness {
+  state: 'new' | 'updated';
+  new_count?: number;
+}
+
 export interface PrStatusResponse {
   found: boolean;
   pr?: PrIdentity;
@@ -207,6 +212,7 @@ export interface PrStatusResponse {
   feedback_summary?: PrFeedbackSummary;
   updated_at?: string;
   display_state?: PrDisplayState;
+  feedback_freshness?: PrFeedbackFreshness;
 }
 
 export interface Project {
