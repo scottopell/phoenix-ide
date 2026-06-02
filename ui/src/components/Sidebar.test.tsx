@@ -57,8 +57,15 @@ const makeProject = (id: string, path: string): Project => ({
 });
 
 describe('Sidebar — active conversation project filter', () => {
+  let originalScrollDescriptor: PropertyDescriptor | undefined;
+
   beforeEach(() => {
     localStorage.clear();
+    originalScrollDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollIntoView');
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: vi.fn(),
+    });
     apiMock.codexLoginPreflight.mockResolvedValue({
       configured: false,
       account_id: null,
@@ -73,6 +80,11 @@ describe('Sidebar — active conversation project filter', () => {
   afterEach(() => {
     vi.clearAllMocks();
     localStorage.clear();
+    if (originalScrollDescriptor) {
+      Object.defineProperty(Element.prototype, 'scrollIntoView', originalScrollDescriptor);
+    } else {
+      delete (Element.prototype as unknown as { scrollIntoView?: unknown }).scrollIntoView;
+    }
   });
 
   it('clears the project filter when it hides the active conversation', async () => {
