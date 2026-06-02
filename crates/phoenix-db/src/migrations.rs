@@ -304,6 +304,10 @@ CREATE TABLE IF NOT EXISTS app_settings (
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
+///
+/// # Errors
+///
+/// Returns a [`DbError`] if the underlying database operation fails.
 pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
     // Ensure the tracking table exists
     sqlx::raw_sql(

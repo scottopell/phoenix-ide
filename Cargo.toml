@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/phoenix-core", "crates/phoenix-ide", "crates/phoenix-monitor", "crates/phoenix-skills", "crates/phoenix-terminal", "crates/phoenix-tls", "crates/phoenix-tools"]
+members = ["crates/phoenix-core", "crates/phoenix-db", "crates/phoenix-ide", "crates/phoenix-monitor", "crates/phoenix-skills", "crates/phoenix-terminal", "crates/phoenix-tls", "crates/phoenix-tools"]
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }

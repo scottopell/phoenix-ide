@@ -74,18 +74,7 @@ pub struct TaskApprovalHandoffRequest {
     pub response_tx: oneshot::Sender<Result<TaskApprovalHandoffResponse, String>>,
 }
 
-#[derive(Debug, Clone)]
-pub struct TaskApprovalHandoffData {
-    pub task_id: String,
-    pub task_title: String,
-    pub branch_name: String,
-    pub worktree_path: String,
-    pub base_branch: String,
-    pub title: String,
-    pub priority: crate::task_source::Priority,
-    pub plan: String,
-    pub task_file: String,
-}
+pub use phoenix_core::task_handoff::TaskApprovalHandoffData;
 
 #[derive(Debug, Clone)]
 pub struct TaskApprovalHandoffResponse {

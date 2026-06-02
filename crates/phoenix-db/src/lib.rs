@@ -6,16 +6,11 @@ mod migrations;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
-// file and `crate::db::*` call sites resolve unchanged.
+// file and `phoenix_db::*` call sites resolve unchanged.
 use phoenix_core::domain::db_schema as schema;
 
 pub use migrations::run_pending_migrations;
 pub use schema::*;
-use schema::{
-    MIGRATION_CREATE_MCP_DISABLED_SERVERS, MIGRATION_CREATE_PROJECTS,
-    MIGRATION_CREATE_SHARE_TOKENS, MIGRATION_REMOVE_UNKNOWN_ERROR_KIND,
-    MIGRATION_RENAME_MESSAGE_ID, MIGRATION_TYPED_STATE,
-};
 
 use chrono::{DateTime, Utc};
 use sqlx::sqlite::{
@@ -27,7 +22,7 @@ use thiserror::Error;
 
 fn render_approved_task_brief(
     intro: &str,
-    approval: &crate::runtime::TaskApprovalHandoffData,
+    approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
 ) -> String {
     format!(
         "{intro}\n\n\
@@ -48,11 +43,15 @@ fn render_approved_task_brief(
     )
 }
 
-fn approved_task_seed_message(approval: &crate::runtime::TaskApprovalHandoffData) -> String {
+fn approved_task_seed_message(
+    approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+) -> String {
     render_approved_task_brief("Task approved. Execute the approved plan below.", approval)
 }
 
-fn approved_task_handoff_summary(approval: &crate::runtime::TaskApprovalHandoffData) -> String {
+fn approved_task_handoff_summary(
+    approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
+) -> String {
     render_approved_task_brief(
         "Task approved and handed off to a fresh Work conversation.",
         approval,
@@ -102,11 +101,16 @@ pub struct Database {
 
 impl Database {
     /// Access the underlying connection pool (for migrations and testing).
+    #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
 
     /// Open or create database at the given path
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn open(path: &str) -> DbResult<Self> {
         let opts = SqliteConnectOptions::from_str(&format!("sqlite:{path}?mode=rwc"))?
             .journal_mode(SqliteJournalMode::Wal)
@@ -131,6 +135,10 @@ impl Database {
     /// numbered migrations (`run_pending_migrations`), mirroring the production
     /// startup sequence in `main.rs`. Without this, tests that exercise columns
     /// added by numbered migrations would fail against a half-initialized DB.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Used in tests
     pub async fn open_in_memory() -> DbResult<Self> {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")?
@@ -255,6 +263,9 @@ impl Database {
 
     // ==================== Notification Settings ====================
 
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_notification_settings(&self) -> DbResult<NotificationSettings> {
         let rows: Vec<(String, String)> =
             sqlx::query_as("SELECT key, value FROM notification_settings")
@@ -275,6 +286,9 @@ impl Database {
         Ok(settings)
     }
 
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn set_notification_settings(&self, settings: &NotificationSettings) -> DbResult<()> {
         let mut tx = self.pool.begin().await?;
         let pairs = [
@@ -304,6 +318,10 @@ impl Database {
     // ==================== App Settings (generic key/value) ====================
 
     /// Read a single global app setting by key, returning `None` if unset.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_app_setting(&self, key: &str) -> DbResult<Option<String>> {
         let row: Option<(String,)> =
             sqlx::query_as("SELECT value FROM app_settings WHERE key = ?1")
@@ -314,6 +332,10 @@ impl Database {
     }
 
     /// Write a single global app setting (upsert).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn set_app_setting(&self, key: &str, value: &str) -> DbResult<()> {
         sqlx::query(
             "INSERT INTO app_settings (key, value) VALUES (?1, ?2) \
@@ -329,18 +351,27 @@ impl Database {
     /// Return the global default `LlmLanguage` for new conversations.
     /// Falls back to `LlmLanguage::default()` when the row is missing or
     /// holds a value this build doesn't recognize.
-    pub async fn get_default_llm_language(&self) -> DbResult<crate::llm_language::LlmLanguage> {
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_default_llm_language(
+        &self,
+    ) -> DbResult<phoenix_core::llm_language::LlmLanguage> {
         Ok(self
             .get_app_setting("default_llm_language")
             .await?
             .as_deref()
-            .map(crate::llm_language::LlmLanguage::parse_or_default)
+            .map(phoenix_core::llm_language::LlmLanguage::parse_or_default)
             .unwrap_or_default())
     }
 
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn set_default_llm_language(
         &self,
-        lang: crate::llm_language::LlmLanguage,
+        lang: phoenix_core::llm_language::LlmLanguage,
     ) -> DbResult<()> {
         self.set_app_setting("default_llm_language", lang.as_str())
             .await
@@ -349,6 +380,10 @@ impl Database {
     // ==================== MCP Disabled Servers ====================
 
     /// Return the set of MCP server names that have been disabled.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_disabled_mcp_servers(&self) -> DbResult<std::collections::HashSet<String>> {
         let rows: Vec<(String,)> = sqlx::query_as("SELECT server_name FROM mcp_disabled_servers")
             .fetch_all(&self.pool)
@@ -357,6 +392,10 @@ impl Database {
     }
 
     /// Mark an MCP server as disabled (idempotent).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn disable_mcp_server(&self, name: &str) -> DbResult<()> {
         sqlx::query("INSERT OR IGNORE INTO mcp_disabled_servers (server_name) VALUES (?1)")
             .bind(name)
@@ -366,6 +405,10 @@ impl Database {
     }
 
     /// Re-enable an MCP server by removing it from the disabled set.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn enable_mcp_server(&self, name: &str) -> DbResult<()> {
         sqlx::query("DELETE FROM mcp_disabled_servers WHERE server_name = ?1")
             .bind(name)
@@ -380,6 +423,10 @@ impl Database {
     ///
     /// Returns the token string. If a token already exists for this conversation,
     /// returns it instead of creating a duplicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn create_share_token(&self, conversation_id: &str) -> DbResult<String> {
         // Check for existing token first
         if let Some(existing) = self
@@ -409,6 +456,10 @@ impl Database {
     /// Look up a share token record by its token string.
     ///
     /// Returns `(conversation_id, token)` if found, `None` otherwise.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_share_token_by_token(
         &self,
         token: &str,
@@ -422,6 +473,10 @@ impl Database {
     }
 
     /// Get the share token for a conversation, if one exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_share_token_by_conversation(
         &self,
         conversation_id: &str,
@@ -435,6 +490,10 @@ impl Database {
     }
 
     /// Delete the share token for a conversation (revoke sharing).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Will be used by future revoke-share endpoint
     pub async fn delete_share_token(&self, conversation_id: &str) -> DbResult<()> {
         sqlx::query("DELETE FROM share_tokens WHERE conversation_id = ?1")
@@ -449,6 +508,10 @@ impl Database {
     /// Find or create a project by its canonical git repo root path.
     ///
     /// REQ-PROJ-001: Projects are keyed by resolved repo root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn find_or_create_project(&self, canonical_path: &str) -> DbResult<Project> {
         // Try to find existing project
         let existing = sqlx::query(
@@ -488,6 +551,10 @@ impl Database {
     }
 
     /// Get a project by ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_project(&self, id: &str) -> DbResult<Project> {
         let project = sqlx::query(
             "SELECT id, canonical_path, main_ref, created_at,
@@ -503,6 +570,10 @@ impl Database {
     }
 
     /// List all projects with conversation counts
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_projects(&self) -> DbResult<Vec<Project>> {
         let rows = sqlx::query(
             "SELECT p.id, p.canonical_path, p.main_ref, p.created_at,
@@ -519,7 +590,13 @@ impl Database {
 
     // ==================== Conversation Operations ====================
 
-    #[cfg(test)]
+    /// Create a conversation with explore-mode defaults — a test convenience
+    /// wrapper around [`Database::create_conversation_with_project`].
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    #[cfg(any(test, feature = "test-support"))]
     pub async fn create_conversation(
         &self,
         id: &str,
@@ -543,12 +620,20 @@ impl Database {
             None,
             None,
             None,
-            crate::llm_language::LlmLanguage::default(),
+            phoenix_core::llm_language::LlmLanguage::default(),
         )
         .await
     }
 
     /// Create a new conversation, optionally associated with a project.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if persisted JSON columns cannot be (de)serialized.
     #[allow(clippy::too_many_arguments)]
     pub async fn create_conversation_with_project(
         &self,
@@ -563,7 +648,7 @@ impl Database {
         desired_base_branch: Option<&str>,
         seed_parent_id: Option<&str>,
         seed_label: Option<&str>,
-        llm_language: crate::llm_language::LlmLanguage,
+        llm_language: phoenix_core::llm_language::LlmLanguage,
     ) -> DbResult<Conversation> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -643,6 +728,10 @@ impl Database {
     }
 
     /// Get conversation by ID
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation(&self, id: &str) -> DbResult<Conversation> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
@@ -663,6 +752,10 @@ impl Database {
     }
 
     /// Get conversation by slug
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_conversation_by_slug(&self, slug: &str) -> DbResult<Conversation> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
@@ -683,6 +776,10 @@ impl Database {
     }
 
     /// List active (non-archived) user-initiated conversations
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
@@ -702,6 +799,10 @@ impl Database {
     }
 
     /// List archived conversations
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_archived_conversations(&self) -> DbResult<Vec<Conversation>> {
         let rows = sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
@@ -724,6 +825,10 @@ impl Database {
     /// Callers that own the authoritative entry timestamp (the runtime
     /// executor) should use [`Self::update_conversation_state_at`] so the
     /// persisted stamp matches the one carried on the `StateChange` SSE.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn update_conversation_state(&self, id: &str, state: &ConvState) -> DbResult<()> {
         self.update_conversation_state_at(id, state, Utc::now())
             .await
@@ -736,6 +841,14 @@ impl Database {
     /// (NOT the phase-entry time): it is a monotonic last-modified marker, and
     /// effects can persist other rows before `PersistState` runs, so binding
     /// it to the (earlier) phase-entry stamp would let `updated_at` regress.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if persisted JSON columns cannot be (de)serialized.
     pub async fn update_conversation_state_at(
         &self,
         id: &str,
@@ -762,15 +875,19 @@ impl Database {
 
     /// Update the steering queue for a conversation. Persists the FIFO queue
     /// of pending steering messages to `conversations.steering_queue` wrapped
-    /// in the versioned [`SteeringQueueEnvelope`] (see
-    /// [`crate::state_machine::event`]).
+    /// in the versioned [`phoenix_core::domain::sm_event::SteeringQueueEnvelope`]
+    /// (see [`phoenix_core::domain::sm_event`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn update_steering_queue(
         &self,
         id: &str,
-        queue: &[crate::state_machine::event::SteerEntry],
+        queue: &[phoenix_core::domain::sm_event::SteerEntry],
     ) -> DbResult<()> {
         let now = Utc::now();
-        let queue_json = crate::state_machine::event::SteeringQueueEnvelope::to_json(queue)
+        let queue_json = phoenix_core::domain::sm_event::SteeringQueueEnvelope::to_json(queue)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         let result = sqlx::query(
             "UPDATE conversations SET steering_queue = ?1, updated_at = ?2 WHERE id = ?3",
@@ -790,6 +907,10 @@ impl Database {
     /// Read-filter-write inside a transaction so a concurrent
     /// `enqueue_steer_message` cannot lose a steer that arrived during the
     /// drain window.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn remove_steering_entries(&self, id: &str, message_ids: &[String]) -> DbResult<()> {
         if message_ids.is_empty() {
             return Ok(());
@@ -805,11 +926,11 @@ impl Database {
         };
         let queue_str: Option<String> = row.try_get("steering_queue")?;
         let queue_str = queue_str.unwrap_or_else(|| "[]".to_string());
-        let mut queue = crate::state_machine::event::decode_steering_queue(id, &queue_str);
+        let mut queue = phoenix_core::domain::sm_event::decode_steering_queue(id, &queue_str);
         let to_remove: std::collections::HashSet<&str> =
             message_ids.iter().map(String::as_str).collect();
         queue.retain(|entry| !to_remove.contains(entry.message_id.as_str()));
-        let new_json = crate::state_machine::event::SteeringQueueEnvelope::to_json(&queue)
+        let new_json = phoenix_core::domain::sm_event::SteeringQueueEnvelope::to_json(&queue)
             .map_err(|e| DbError::Serialization(e.to_string()))?;
         sqlx::query("UPDATE conversations SET steering_queue = ?1, updated_at = ?2 WHERE id = ?3")
             .bind(&new_json)
@@ -822,6 +943,14 @@ impl Database {
     }
 
     /// Update conversation mode (e.g., Explore -> Work on task approval)
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if persisted JSON columns cannot be (de)serialized.
     pub async fn update_conversation_mode(&self, id: &str, mode: &ConvMode) -> DbResult<()> {
         let now = Utc::now();
         let mode_json = serde_json::to_string(mode).unwrap();
@@ -841,6 +970,10 @@ impl Database {
     }
 
     /// Check if any non-archived conversation for a project is in Work mode
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // May be used for future project-level queries
     pub async fn has_active_work_conversation(&self, project_id: &str) -> DbResult<bool> {
         let row = sqlx::query(
@@ -863,6 +996,10 @@ impl Database {
     /// conversation at the repo root after its worktree is deleted. The
     /// `_recovery_only` suffix exists so this mutation is not casually
     /// reachable — see task 13012 and `cwd_immutability_tests`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn update_conversation_cwd_recovery_only(&self, id: &str, cwd: &str) -> DbResult<()> {
         // Expected invariant: callers (repo_root, worktree_path — both
         // git-derived) pass a non-empty absolute path. This is the only
@@ -893,11 +1030,19 @@ impl Database {
 
     /// Create a fresh Work conversation for an approved-task handoff and link
     /// the Explore predecessor through `continued_in_conv_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if persisted JSON columns cannot be (de)serialized.
     #[allow(clippy::too_many_lines)]
     pub async fn create_task_approval_handoff_conversation(
         &self,
         parent_id: &str,
-        approval: &crate::runtime::TaskApprovalHandoffData,
+        approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
     ) -> DbResult<Conversation> {
         let parent = self.get_conversation(parent_id).await?;
         if let Some(existing_id) = parent.continued_in_conv_id.as_deref() {
@@ -1093,6 +1238,14 @@ impl Database {
     ///     existing continuation).
     ///
     /// The transaction is rolled back via `Drop` if any step fails before `commit`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if persisted JSON columns cannot be (de)serialized.
     #[allow(clippy::too_many_lines)] // single atomic flow; splitting hurts readability
     pub async fn continue_conversation(&self, parent_id: &str) -> DbResult<ContinueOutcome> {
         // Fetch parent outside the transaction — the subsequent INSERT+UPDATE
@@ -1268,6 +1421,10 @@ impl Database {
     /// `continued_in_conv_id` column is a single scalar pointer per row, so
     /// the chain is structurally linear; this method does not need to defend
     /// against fan-out.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn chain_members_forward(&self, root_id: &str) -> DbResult<Vec<String>> {
         let rows = sqlx::query_scalar::<_, String>(
             "WITH RECURSIVE chain(id, next_id, depth) AS (
@@ -1297,6 +1454,10 @@ impl Database {
     ///
     /// Walks the inverse edge `WHERE p.continued_in_conv_id = current.id`
     /// until no predecessor exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn chain_root_of(&self, conv_id: &str) -> DbResult<Option<String>> {
         let row = sqlx::query_scalar::<_, String>(
             "WITH RECURSIVE chain(id, depth) AS (
@@ -1320,6 +1481,10 @@ impl Database {
     /// members), else `None`. Used by per-conversation lifecycle handlers
     /// to refuse archive/delete on chain members and route the caller to
     /// the chain endpoint via `conflict_slug`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn chain_root_if_member(&self, conv_id: &str) -> DbResult<Option<String>> {
         let Some(root) = self.chain_root_of(conv_id).await? else {
             return Ok(None);
@@ -1339,6 +1504,10 @@ impl Database {
     /// calling this. Writing to a non-root row is structurally permitted but
     /// has no UI effect (`parse_conversation_row` only reads `chain_name`
     /// from the root).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Wired via API handlers in Phase 4 (task 02690)
     pub async fn set_chain_name(&self, root_conv_id: &str, name: Option<&str>) -> DbResult<()> {
         let result = sqlx::query("UPDATE conversations SET chain_name = ?1 WHERE id = ?2")
@@ -1357,6 +1526,10 @@ impl Database {
     /// `answer` and `completed_at` are NULL at insertion. The row is
     /// transitioned via [`Database::complete_chain_qa`] or
     /// [`Database::fail_chain_qa`] when the stream resolves.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Wired through `chain_qa::ChainQa::submit_question` (Phase 2/3)
     pub async fn insert_chain_qa(&self, row: NewChainQa) -> DbResult<()> {
         sqlx::query(
@@ -1380,6 +1553,10 @@ impl Database {
     }
 
     /// Mark a Q&A row complete with the final answer (REQ-CHN-005).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Wired through `chain_qa::ChainQa::submit_question` (Phase 2/3)
     pub async fn complete_chain_qa(
         &self,
@@ -1406,6 +1583,10 @@ impl Database {
 
     /// Mark a Q&A row failed; `partial_answer` is preserved when present
     /// (REQ-CHN-005 — failed rows render with whatever tokens streamed).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Wired through `chain_qa::ChainQa::submit_question` (Phase 2/3)
     pub async fn fail_chain_qa(&self, id: &str, partial_answer: Option<&str>) -> DbResult<()> {
         let result = sqlx::query("UPDATE chain_qa SET answer = ?1, status = ?2 WHERE id = ?3")
@@ -1421,6 +1602,10 @@ impl Database {
     }
 
     /// List Q&A rows for a chain in chronological order (REQ-CHN-005).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Wired through `chain_qa::ChainQa::list_history` and Phase 4 API handlers
     pub async fn list_chain_qa(&self, root_conv_id: &str) -> DbResult<Vec<ChainQaRow>> {
         let rows = sqlx::query(
@@ -1444,6 +1629,10 @@ impl Database {
     /// (REQ-CHN-005) — any row still `in_flight` after a process exit has
     /// no live stream behind it and would otherwise render as an
     /// indefinite "still working…" placeholder.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn sweep_in_flight_chain_qa(&self) -> DbResult<usize> {
         let result = sqlx::query("UPDATE chain_qa SET status = ?1 WHERE status = ?2")
             .bind(ChainQaStatus::Abandoned.as_str())
@@ -1454,6 +1643,10 @@ impl Database {
     }
 
     /// Update the model for a conversation (e.g., upgrading from 200k to 1M context).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn update_conversation_model(&self, id: &str, model: &str) -> DbResult<()> {
         let now = Utc::now();
         let result =
@@ -1470,6 +1663,10 @@ impl Database {
     }
 
     /// Get all non-archived Work/Branch conversations (for startup worktree reconciliation).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_work_conversations(&self) -> DbResult<Vec<Conversation>> {
         sqlx::query(
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
@@ -1488,6 +1685,10 @@ impl Database {
     }
 
     /// Archive a conversation
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn archive_conversation(&self, id: &str) -> DbResult<()> {
         let now = Utc::now();
 
@@ -1505,6 +1706,10 @@ impl Database {
     }
 
     /// Delete a conversation and all its messages
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
         // Messages are deleted by CASCADE
         let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
@@ -1519,6 +1724,10 @@ impl Database {
     }
 
     /// Rename conversation (update slug)
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn rename_conversation(&self, id: &str, new_slug: &str) -> DbResult<()> {
         let now = Utc::now();
 
@@ -1551,6 +1760,14 @@ impl Database {
 
     /// Reset all conversations to idle on server restart.
     /// Also repairs any orphaned `tool_use` by injecting synthetic `tool_result`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if persisted JSON columns cannot be (de)serialized.
     pub async fn reset_all_to_idle(&self) -> DbResult<()> {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
@@ -1588,7 +1805,7 @@ impl Database {
     /// going to make another LLM call, so injecting a synthetic `tool_result`
     /// only adds noise to history).
     async fn repair_orphaned_tool_use(&self, now: &DateTime<Utc>) -> DbResult<()> {
-        use crate::llm::ContentBlock;
+        use phoenix_core::domain::llm_types::ContentBlock;
 
         // Skip conversations whose state is preserved across restarts; their
         // history is frozen and shouldn't be amended with synthetic results.
@@ -1686,6 +1903,10 @@ impl Database {
     /// The `message_id` is the canonical identifier for this message, typically
     /// generated by the client for user messages (enabling idempotent retries)
     /// or by the server for agent/tool messages.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn add_message(
         &self,
         message_id: &str,
@@ -1731,6 +1952,14 @@ impl Database {
     /// Formally: enforces the `PersistBeforeBroadcast` invariant in
     /// `specs/sse_wire/sse_wire.allium` at the sequence-allocation level,
     /// not just at the "DB write happens-before broadcast" level.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if persisted JSON columns cannot be (de)serialized.
     pub async fn add_message_with_seq(
         &self,
         message_id: &str,
@@ -1786,6 +2015,14 @@ impl Database {
     /// to align the durable row's timestamp with the eager-broadcast
     /// timestamp atomically — a single INSERT, no transient
     /// `Utc::now()` value visible to a concurrent reconnect.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if persisted JSON columns cannot be (de)serialized.
     #[allow(clippy::too_many_arguments)]
     pub async fn add_message_with_seq_at(
         &self,
@@ -1841,6 +2078,10 @@ impl Database {
     }
 
     /// Get messages for a conversation
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_messages(&self, conversation_id: &str) -> DbResult<Vec<Message>> {
         let rows = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
@@ -1855,6 +2096,10 @@ impl Database {
     }
 
     /// Get messages after a sequence ID
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_messages_after(
         &self,
         conversation_id: &str,
@@ -1874,6 +2119,10 @@ impl Database {
     }
 
     /// Get a message by its `message_id`
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_message_by_id(&self, message_id: &str) -> DbResult<Message> {
         sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
@@ -1891,6 +2140,10 @@ impl Database {
 
     /// Check if a message with the given `message_id` already exists
     /// Used for idempotent message sends - returns true if duplicate
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn message_exists(&self, message_id: &str) -> DbResult<bool> {
         let row = sqlx::query("SELECT COUNT(*) FROM messages WHERE message_id = ?1")
             .bind(message_id)
@@ -1901,6 +2154,10 @@ impl Database {
     }
 
     /// Get the last sequence ID for a conversation
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn get_last_sequence_id(&self, conversation_id: &str) -> DbResult<i64> {
         let row = sqlx::query(
             "SELECT COALESCE(MAX(sequence_id), 0) FROM messages WHERE conversation_id = ?1",
@@ -1913,6 +2170,10 @@ impl Database {
 
     /// Update `display_data` for an existing message
     /// Used to enrich tool results with additional data after execution (e.g., subagent outcomes)
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn update_message_display_data(
         &self,
         message_id: &str,
@@ -1934,6 +2195,10 @@ impl Database {
     /// Update the `content` text field inside a tool result message's JSON.
     /// Used to write actual sub-agent outcomes into the `spawn_agents` tool result
     /// so that `build_llm_messages_static` feeds them to the LLM.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn update_tool_message_content(
         &self,
         message_id: &str,
@@ -1956,12 +2221,16 @@ impl Database {
     ///
     /// `root_conversation_id` is the top-level conversation that owns the work
     /// tree; for a top-level conversation it equals `conversation_id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn insert_turn_usage(
         &self,
         conversation_id: &str,
         root_conversation_id: &str,
         model: &str,
-        usage: &crate::llm::Usage,
+        usage: &phoenix_core::domain::llm_types::Usage,
     ) -> DbResult<()> {
         let now_str = Utc::now().to_rfc3339();
         sqlx::query(
@@ -1988,6 +2257,10 @@ impl Database {
     /// `own` covers only rows where `conversation_id` matches; `total` covers
     /// all rows under the same root (i.e. the top-level conversation plus all
     /// its sub-agents).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
     #[allow(dead_code)] // Callers added in Phase 4
     pub async fn get_conversation_usage(
         &self,
@@ -2105,14 +2378,14 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         .try_get::<Option<String>, _>("llm_language")
         .unwrap_or(None)
         .as_deref()
-        .map(crate::llm_language::LlmLanguage::parse_or_default)
+        .map(phoenix_core::llm_language::LlmLanguage::parse_or_default)
         .unwrap_or_default();
 
     let steering_queue = row
         .try_get::<Option<String>, _>("steering_queue")
         .unwrap_or(None)
         .as_deref()
-        .map(|s| crate::state_machine::event::decode_steering_queue(&id, s))
+        .map(|s| phoenix_core::domain::sm_event::decode_steering_queue(&id, s))
         .unwrap_or_default();
 
     Ok(Conversation {
@@ -2221,7 +2494,7 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::llm_language::LlmLanguage;
+    use phoenix_core::llm_language::LlmLanguage;
 
     #[tokio::test]
     async fn app_setting_roundtrips_through_db() {
@@ -2311,7 +2584,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_add_and_get_messages() {
-        use crate::llm::ContentBlock;
+        use phoenix_core::domain::llm_types::ContentBlock;
 
         let db = Database::open_in_memory().await.unwrap();
 
@@ -2468,7 +2741,7 @@ mod tests {
         let approval_state = ConvState::AwaitingTaskApproval {
             task_file: "tasks/12345-p1-ready--fix-the-widget.md".to_string(),
             title: "Fix the widget".to_string(),
-            priority: crate::task_source::Priority::P1,
+            priority: phoenix_core::task_source::Priority::P1,
             plan: "Step 1: read code\nStep 2: fix bug".to_string(),
         };
         db.update_conversation_state("conv-1", &approval_state)
@@ -2492,14 +2765,14 @@ mod tests {
         {
             assert_eq!(task_file, "tasks/12345-p1-ready--fix-the-widget.md");
             assert_eq!(title, "Fix the widget");
-            assert_eq!(priority, crate::task_source::Priority::P1);
+            assert_eq!(priority, phoenix_core::task_source::Priority::P1);
             assert_eq!(plan, "Step 1: read code\nStep 2: fix bug");
         }
     }
 
     #[tokio::test]
     async fn test_reset_repairs_orphaned_tool_use() {
-        use crate::llm::ContentBlock;
+        use phoenix_core::domain::llm_types::ContentBlock;
 
         let db = Database::open_in_memory().await.unwrap();
 
@@ -2569,7 +2842,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_does_not_duplicate_complete_exchanges() {
-        use crate::llm::ContentBlock;
+        use phoenix_core::domain::llm_types::ContentBlock;
 
         let db = Database::open_in_memory().await.unwrap();
 
@@ -2626,7 +2899,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_repairs_multiple_orphaned_tools() {
-        use crate::llm::ContentBlock;
+        use phoenix_core::domain::llm_types::ContentBlock;
 
         let db = Database::open_in_memory().await.unwrap();
 
@@ -2704,8 +2977,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_reset_skips_repair_for_preserved_state_conversations() {
-        use crate::llm::ContentBlock;
-        use crate::state_machine::ConvState;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::ConvState;
 
         let db = Database::open_in_memory().await.unwrap();
 
@@ -2913,7 +3186,7 @@ mod tests {
             None,
             None,
             None,
-            crate::llm_language::LlmLanguage::default(),
+            phoenix_core::llm_language::LlmLanguage::default(),
         )
         .await
         .unwrap();
@@ -3160,7 +3433,7 @@ mod tests {
             None,
             None,
             None,
-            crate::llm_language::LlmLanguage::default(),
+            phoenix_core::llm_language::LlmLanguage::default(),
         )
         .await
         .unwrap();
@@ -3276,14 +3549,14 @@ mod tests {
         .await
         .unwrap();
 
-        let approval = crate::runtime::TaskApprovalHandoffData {
+        let approval = phoenix_core::task_handoff::TaskApprovalHandoffData {
             task_id: "27002".to_string(),
             task_title: "Approve Fresh".to_string(),
             branch_name: "task-27002-approve-fresh".to_string(),
             worktree_path: "/tmp/.phoenix/worktrees/handoff-parent".to_string(),
             base_branch: "main".to_string(),
             title: "Approve Fresh".to_string(),
-            priority: crate::task_source::Priority::P1,
+            priority: phoenix_core::task_source::Priority::P1,
             plan: "Do the work".to_string(),
             task_file: "tasks/27002-p1-ready--approve-fresh.md".to_string(),
         };

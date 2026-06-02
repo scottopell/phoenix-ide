@@ -2529,6 +2529,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-db"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "libsqlite3-sys",
+ "phoenix-core",
+ "rand 0.10.1",
+ "serde_json",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "phoenix-monitor"
 version = "0.8.1"
 dependencies = [
@@ -2626,6 +2642,7 @@ dependencies = [
  "nix 0.31.3",
  "nucleo-matcher",
  "phoenix-core",
+ "phoenix-db",
  "phoenix-skills",
  "phoenix-terminal",
  "phoenix-tls",

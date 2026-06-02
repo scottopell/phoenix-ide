@@ -6,7 +6,6 @@
 mod api;
 mod chain_qa;
 mod chain_runtime;
-mod db;
 pub(crate) mod git_ops;
 mod llm;
 mod message_expander;
@@ -41,6 +40,12 @@ pub use phoenix_skills as skills;
 // shutdown kill-tree pass) resolve unchanged (move-down, re-export-up). The
 // axum/HTTP glue that drives tools stayed behind in `api`.
 use phoenix_tools as tools;
+
+// SQLite persistence (conversations, messages, steering queues, migrations)
+// now lives in the `phoenix-db` crate, a leaf depending only on phoenix-core.
+// Re-export at the historical `crate::db::…` path so existing call sites
+// resolve unchanged (move-down, re-export-up).
+use phoenix_db as db;
 
 use api::{create_router, AppState};
 use db::Database;
