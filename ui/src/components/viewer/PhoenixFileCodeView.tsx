@@ -236,7 +236,12 @@ export const PhoenixFileCodeView = forwardRef<PhoenixFileCodeViewHandle, Phoenix
         })();
         if (saved !== null) {
           const pos = Number.parseInt(saved, 10);
-          if (!Number.isNaN(pos)) cv.scrollTo({ type: 'position', position: pos });
+          if (!Number.isNaN(pos)) {
+            cv.scrollTo({ type: 'position', position: pos });
+            // Seed lastScrollTop with the restored value so a close/background
+            // before Pierre's first onScroll doesn't save 0 over the position.
+            lastScrollTop.current = pos;
+          }
         }
       }, 50);
       return () => clearTimeout(timer);
