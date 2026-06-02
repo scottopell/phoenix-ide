@@ -25,20 +25,22 @@ export function useConversationPrStatus({
   const [state, setState] = useState<ConversationPrStatusState>({ status: 'disabled', prStatus: null });
   const [manualFallbackEnabled, setManualFallbackEnabled] = useState(false);
   const latestSeqRef = useRef(0);
+  const activeScopeRef = useRef<string | null>(null);
+  const scopeKey = conversationId && branchName && (convModeLabel === 'Work' || convModeLabel === 'Branch')
+    ? `${conversationId}\0${branchName}\0${convModeLabel}`
+    : null;
 
   const refresh = useCallback(async () => {
-    if (!conversationId || !branchName || (convModeLabel !== 'Work' && convModeLabel !== 'Branch')) {
-      setState({ status: 'disabled', prStatus: null });
-      return;
-    }
+    if (!scopeKey || !conversationId) return;
+    if (activeScopeRef.current !== scopeKey) return;
     const seq = ++latestSeqRef.current;
     try {
       const prStatus = await api.getPrStatus(conversationId);
-      if (seq !== latestSeqRef.current) return;
+      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
       setState({ status: 'ready', prStatus });
       if (!prStatus.unavailable_reason) setManualFallbackEnabled(false);
     } catch {
-      if (seq !== latestSeqRef.current) return;
+      if (seq !== latestSeqRef.current || activeScopeRef.current !== scopeKey) return;
       setState({
         status: 'ready',
         prStatus: {
@@ -53,12 +55,13 @@ export function useConversationPrStatus({
         },
       });
     }
-  }, [conversationId, convModeLabel, branchName]);
+  }, [conversationId, scopeKey]);
 
   useEffect(() => {
     setManualFallbackEnabled(false);
     latestSeqRef.current += 1;
-    if (!conversationId || !branchName || (convModeLabel !== 'Work' && convModeLabel !== 'Branch')) {
+    activeScopeRef.current = scopeKey;
+    if (!scopeKey) {
       setState({ status: 'disabled', prStatus: null });
       return;
     }
@@ -88,10 +91,11 @@ export function useConversationPrStatus({
     return () => {
       cancelled = true;
       latestSeqRef.current += 1;
+      if (activeScopeRef.current === scopeKey) activeScopeRef.current = null;
       if (timeout != null) window.clearTimeout(timeout);
       document.removeEventListener('visibilitychange', onVisible);
     };
-  }, [conversationId, convModeLabel, branchName, refresh]);
+  }, [scopeKey, refresh]);
 
   return {
     state,

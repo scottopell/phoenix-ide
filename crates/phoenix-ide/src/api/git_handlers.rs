@@ -568,22 +568,52 @@ pub(crate) async fn create_pr_auto_fix_context(
     Ok(Json(response?))
 }
 
-fn pr_auto_fix_artifact_path(conv: &crate::db::Conversation, artifact_path: &str) -> PathBuf {
-    match &conv.conv_mode {
+fn validate_pr_auto_fix_artifact_path(artifact_path: &str) -> Result<(), AppError> {
+    let path = std::path::Path::new(artifact_path);
+    if path.is_absolute() {
+        return Err(AppError::BadRequest(
+            "Invalid PR context artifact path".to_string(),
+        ));
+    }
+
+    let components = path.components().collect::<Vec<_>>();
+    let valid_prefix = matches!(components.first(), Some(std::path::Component::Normal(part)) if *part == ".phoenix")
+        && matches!(components.get(1), Some(std::path::Component::Normal(part)) if *part == "pr-context")
+        && components.len() > 2;
+    let only_normal_components = components
+        .iter()
+        .all(|component| matches!(component, std::path::Component::Normal(_)));
+    if valid_prefix && only_normal_components {
+        return Ok(());
+    }
+
+    Err(AppError::BadRequest(
+        "Invalid PR context artifact path".to_string(),
+    ))
+}
+
+fn pr_auto_fix_artifact_path(
+    conv: &crate::db::Conversation,
+    artifact_path: &str,
+) -> Result<PathBuf, AppError> {
+    validate_pr_auto_fix_artifact_path(artifact_path)?;
+    Ok(match &conv.conv_mode {
         ConvMode::Work { worktree_path, .. } | ConvMode::Branch { worktree_path, .. } => {
             let worktree_artifact =
                 std::path::Path::new(worktree_path.as_str()).join(artifact_path);
             if worktree_artifact.exists() {
-                return worktree_artifact;
+                worktree_artifact
+            } else {
+                let cwd_artifact = std::path::Path::new(&conv.cwd).join(artifact_path);
+                if cwd_artifact.exists() {
+                    cwd_artifact
+                } else {
+                    worktree_artifact
+                }
             }
-            let cwd_artifact = std::path::Path::new(&conv.cwd).join(artifact_path);
-            if cwd_artifact.exists() {
-                return cwd_artifact;
-            }
-            worktree_artifact
         }
         _ => std::path::Path::new(&conv.cwd).join(artifact_path),
-    }
+    })
 }
 
 pub(crate) async fn record_pr_auto_fix_context_baseline(
@@ -612,7 +642,7 @@ pub(crate) async fn record_pr_auto_fix_context_baseline(
         _ => return Ok(()),
     };
     let artifact = crate::api::pr_monitoring::read_pr_auto_fix_context_artifact(
-        &pr_auto_fix_artifact_path(&conv, artifact_path),
+        &pr_auto_fix_artifact_path(&conv, artifact_path)?,
     )
     .map_err(|e| AppError::Internal(e.to_string()))?;
     let baseline = artifact.baseline();
@@ -766,7 +796,10 @@ mod tests {
             },
         );
 
-        assert_eq!(pr_auto_fix_artifact_path(&conv, artifact_path), artifact);
+        assert_eq!(
+            pr_auto_fix_artifact_path(&conv, artifact_path).unwrap(),
+            artifact
+        );
     }
 
     #[test]
@@ -793,7 +826,29 @@ mod tests {
             },
         );
 
-        assert_eq!(pr_auto_fix_artifact_path(&conv, artifact_path), artifact);
+        assert_eq!(
+            pr_auto_fix_artifact_path(&conv, artifact_path).unwrap(),
+            artifact
+        );
+    }
+
+    #[test]
+    fn pr_auto_fix_artifact_path_rejects_paths_outside_pr_context_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let conv = conversation_with_mode(temp.path(), ConvMode::Direct);
+
+        for artifact_path in [
+            "/tmp/pr-12.json",
+            "../.phoenix/pr-context/pr-12.json",
+            ".phoenix/../pr-context/pr-12.json",
+            ".phoenix/not-pr-context/pr-12.json",
+            ".phoenix/pr-context/../secrets.json",
+        ] {
+            assert!(
+                pr_auto_fix_artifact_path(&conv, artifact_path).is_err(),
+                "expected {artifact_path} to be rejected",
+            );
+        }
     }
 
     #[test]
