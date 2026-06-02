@@ -2385,6 +2385,118 @@ def _gate_lanes():
     return active, skipped
 
 
+# Crate-level scoping for the rust lane (Stage 3 / per-crate gating).
+#
+# When the rust lane runs, we can often narrow `cargo clippy`/`cargo test` to
+# just the changed crate(s) PLUS their reverse dependencies, instead of the
+# whole workspace. The reverse-dependency closure is computed live from
+# `cargo metadata` so it stays correct as crates are added/removed — no
+# hand-maintained graph to drift.
+#
+# CONTRACT: this helper only ever NARROWS. Any uncertainty returns None, which
+# the caller treats as "scope to the full workspace". A wrong narrowing would
+# silently skip tests that should run (a correctness bug strictly worse than
+# no gating), so every ambiguous case fails safe to full.
+
+# Rust changes that are NOT confined to a single crate's source — these force a
+# full-workspace rust lane because their blast radius isn't a crate subtree.
+_RUST_NONCRATE_PREFIXES = (".cargo/", "rust-toolchain", "ui/src/generated/")
+_RUST_NONCRATE_FILES = ("Cargo.toml", "Cargo.lock")
+
+
+def _workspace_rdeps_map():
+    """Map each workspace crate -> set of crates that (transitively) depend on
+    it, INCLUDING the crate itself. Derived from `cargo metadata`. Returns None
+    on any failure (caller falls back to full workspace)."""
+    try:
+        out = subprocess.run(
+            ["cargo", "metadata", "--format-version", "1", "--no-deps"],
+            cwd=ROOT, capture_output=True, text=True, timeout=60,
+        )
+        if out.returncode != 0:
+            return None
+        meta = json.loads(out.stdout)
+    except (subprocess.TimeoutExpired, OSError, json.JSONDecodeError):
+        return None
+    ws = {p["name"] for p in meta["packages"]}
+    # direct intra-workspace dependency edges: crate -> {deps in ws}
+    deps = {
+        p["name"]: {d["name"] for d in p["dependencies"] if d["name"] in ws}
+        for p in meta["packages"]
+    }
+    # also map a crate's manifest directory (relative to ROOT) for path->crate
+    manifest_dir = {}
+    for p in meta["packages"]:
+        try:
+            rel = Path(p["manifest_path"]).parent.relative_to(ROOT)
+            manifest_dir[str(rel)] = p["name"]
+        except ValueError:
+            pass
+    # transitive reverse-deps: who must be re-checked when `target` changes
+    rmap = {}
+    for target in ws:
+        closure = {target}
+        changed = True
+        while changed:
+            changed = False
+            for crate, crate_deps in deps.items():
+                if crate not in closure and (closure & crate_deps):
+                    closure.add(crate)
+                    changed = True
+        rmap[target] = closure
+    return rmap, manifest_dir
+
+
+def _crate_for_path(rel_path, manifest_dir):
+    """Return the workspace crate owning a repo-relative path, or None if the
+    path isn't inside a known crate's directory."""
+    # Longest manifest-dir prefix wins (handles nested crates/ layouts).
+    best = None
+    for d, name in manifest_dir.items():
+        if rel_path == d or rel_path.startswith(d + "/"):
+            if best is None or len(d) > len(best[0]):
+                best = (d, name)
+    return best[1] if best else None
+
+
+def _rust_scope_crates(paths):
+    """Given the changed repo-relative paths, return the set of crate names the
+    rust lane should scope to (changed crates + their reverse-dep closure), or
+    None to mean 'no safe narrowing — run the full workspace'.
+
+    Returns None (full) when:
+      - a non-crate rust input changed (Cargo.lock, .cargo/, rust-toolchain,
+        ui/src/generated/) — blast radius isn't a crate subtree;
+      - any changed path under crates/ can't be mapped to a crate;
+      - cargo metadata is unavailable.
+    """
+    rust_paths = [
+        p for p in paths
+        if p.startswith("crates/")
+        or p in _RUST_NONCRATE_FILES
+        or p.startswith(_RUST_NONCRATE_PREFIXES)
+    ]
+    # Non-crate-confined rust change -> can't narrow.
+    for p in rust_paths:
+        if p in _RUST_NONCRATE_FILES or p.startswith(_RUST_NONCRATE_PREFIXES):
+            return None
+    crate_paths = [p for p in rust_paths if p.startswith("crates/")]
+    if not crate_paths:
+        return None
+    built = _workspace_rdeps_map()
+    if built is None:
+        return None
+    rmap, manifest_dir = built
+    scope = set()
+    for p in crate_paths:
+        crate = _crate_for_path(p, manifest_dir)
+        if crate is None or crate not in rmap:
+            # A crate path we can't attribute — fail safe to full.
+            return None
+        scope |= rmap[crate]
+    return scope or None
+
+
 def cmd_check(gate: bool = True):
     """Run lint, format check, tests, and task validation in parallel."""
     results = []  # (name, returncode, elapsed, output)
@@ -2420,6 +2532,29 @@ def cmd_check(gate: bool = True):
     # probe + thread sizing + codegen commands.
     ui_active = bool(active & {"tsc", "ui-lint", "vitest"})
     cargo_active = bool(active & {"rust", "e2e"})
+
+    # Stage 3 / per-crate gating: when the rust lane runs under gating, try to
+    # narrow clippy + test to the changed crate(s) and their reverse-dep
+    # closure instead of the whole workspace. `rust_scope` is either a list of
+    # crate names to pass as `-p <crate>` flags, or None meaning "no safe
+    # narrowing — run the full workspace". Only narrows when gating is on and
+    # the rust lane is active; --all / PHOENIX_CHECK_ALL forces None (full).
+    rust_scope = None
+    if gate and "rust" in active:
+        _scope = _rust_scope_crates(_changed_paths_vs_base() or set())
+        if _scope is not None:
+            rust_scope = sorted(_scope)
+            print(f"  i  rust scope: -p {' -p '.join(rust_scope)} "
+                  f"(changed crate(s) + reverse-deps)")
+
+    def _pflags():
+        """`-p crate` flags for the current rust scope, or [] for full workspace."""
+        if not rust_scope:
+            return []
+        out = []
+        for c in rust_scope:
+            out += ["-p", c]
+        return out
 
     def run_step(name, cmd, cwd=ROOT):
         # Stream stdout+stderr line-by-line into a bounded buffer so that on
@@ -2538,7 +2673,10 @@ def cmd_check(gate: bool = True):
         coverage. `compile_cmd`/`test_cmd`/the thread cap are computed once in
         cmd_check and closed over here.
         """
-        run_step("cargo clippy", ["cargo", "clippy", "--", "-D", "warnings"])
+        # Scope clippy to the changed crate(s)+rdeps when gating narrowed it;
+        # otherwise lint the whole workspace. `-p` flags go before `--`.
+        run_step("cargo clippy",
+                 ["cargo", "clippy", *_pflags(), "--", "-D", "warnings"])
         if sys.platform == "darwin":
             # macOS prod deploy uses native target (launchd_prod_deploy → prod_build target=None),
             # so the musl smoke check is opt-in: skip cleanly if the cross toolchain isn't installed.
@@ -2931,15 +3069,21 @@ def cmd_check(gate: bool = True):
         # Discovery is preserved: every type still self-registers via its emitted
         # test, so a new #[ts(export)] type is regenerated automatically with no
         # hand-maintained root list to forget.
+        # `_pflags()` narrows compile + verification to the rust scope (changed
+        # crate(s)+rdeps) when gating set one; empty => full workspace. Codegen
+        # is deliberately NOT narrowed: ts-rs `export_bindings_*` tests live in
+        # phoenix-core but a change anywhere could in principle touch a derived
+        # type's shape, and the staleness guard must see the whole generated
+        # tree — so codegen always runs full.
         if has_nextest:
-            compile_cmd = ["cargo", "nextest", "run", "--no-run"]
-            test_cmd = ["cargo", "nextest", "run",
+            compile_cmd = ["cargo", "nextest", "run", *_pflags(), "--no-run"]
+            test_cmd = ["cargo", "nextest", "run", *_pflags(),
                         "-E", "not test(/export_bindings/)",
                         "--test-threads", str(test_threads)]
             codegen_cmd = ["cargo", "nextest", "run", "-E", "test(/export_bindings/)"]
         else:
-            compile_cmd = ["cargo", "test", "--no-run"]
-            test_cmd = ["cargo", "test", "--",
+            compile_cmd = ["cargo", "test", *_pflags(), "--no-run"]
+            test_cmd = ["cargo", "test", *_pflags(), "--",
                         "--test-threads", str(test_threads), "--skip", "export_bindings"]
             codegen_cmd = ["cargo", "test", "export_bindings"]
 
