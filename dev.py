@@ -2368,10 +2368,12 @@ def cmd_check(gate: bool = True):
     # narrow clippy + test to the changed crate(s) and their reverse-dep
     # closure instead of the whole workspace. `rust_scope` is either a list of
     # crate names to pass as `-p <crate>` flags, or None meaning "no safe
-    # narrowing — run the full workspace". Only narrows when gating is on and
-    # the rust lane is active; --all / PHOENIX_CHECK_ALL forces None (full).
+    # narrowing — run the full workspace". Both escape hatches force full:
+    # the `--all` flag (gate=False) and the PHOENIX_CHECK_ALL=1 env var — kept
+    # in lockstep with _gate_lanes(), which honors the same env var.
+    _force_full = (not gate) or os.environ.get("PHOENIX_CHECK_ALL") == "1"
     rust_scope = None
-    if gate and "rust" in active:
+    if not _force_full and "rust" in active:
         _scope = _rust_scope_crates(_changed_paths_vs_base() or set())
         if _scope is not None:
             rust_scope = sorted(_scope)
