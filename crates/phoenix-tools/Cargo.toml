@@ -1,0 +1,78 @@
+[package]
+name = "phoenix-tools"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Tool implementations for Phoenix IDE: bash, patch, browser, tmux, search, keyword search, skills, and sub-agent coordination. The Tool trait, ToolContext, and ToolRegistry live here. Core-only — no axum/HTTP glue."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Shared domain vocabulary (llm_types, bash_types, tool_wire), the narrow
+# LlmSelector/CompletionService capability traits, WorkScope, and TaskSource.
+phoenix-core = { path = "../phoenix-core" }
+
+# Terminal-core (ActiveTerminals, ShellIntegrationStatus) for the
+# terminal-command tools.
+phoenix-terminal = { path = "../phoenix-terminal" }
+
+# Skill discovery + invocation for the `skill` tool.
+phoenix-skills = { path = "../phoenix-skills" }
+
+# Async tool trait.
+async-trait = "0.1"
+
+# Async runtime (process spawning, PTY, locks, cancellation).
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+futures = "0.3"
+
+# Serialization (tool inputs/outputs are JSON).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Browser automation via Chrome DevTools Protocol.
+chromiumoxide = { version = "0.9", default-features = false, features = ["fetcher", "rustls", "zip0"] }
+
+# Static-analysis bash parser for bash_check.
+brush-parser = "0.4"
+
+# Gitignore-aware directory walking + glob/regex matching for search.
+ignore = "0.4"
+globset = "0.4"
+regex = "1"
+
+# Diff generation for patch.
+similar = "3"
+
+# Confusable/homoglyph detection.
+unicode-security = "0.1.2"
+
+# Base64 (image payloads, screencast frames).
+base64 = "0.22"
+
+# Hashing (deterministic socket/session keying).
+sha2 = "0.11"
+
+# UUIDs for browser scratch-file paths.
+uuid = { version = "1", features = ["v4"] }
+
+# Locating tmux on PATH at registry init.
+which = "8"
+
+# Process-group / signal management for bash.
+libc = "0.2"
+
+# Typed errors.
+thiserror = "2"
+
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+futures = "0.3"
+
+[lints]
+workspace = true
