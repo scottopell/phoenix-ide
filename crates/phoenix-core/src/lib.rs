@@ -7,6 +7,7 @@
 
 pub mod domain;
 pub mod llm_language;
+pub mod llm_service;
 pub mod platform;
 pub mod task_source;
 pub mod work_scope;

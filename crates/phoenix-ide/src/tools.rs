@@ -51,9 +51,9 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
-use crate::llm::ModelRegistry;
 use crate::work_scope::WorkScope;
 pub use browser::session::BrowserSession;
+use phoenix_core::llm_service::LlmSelector;
 
 /// Typed image data for LLM consumption.
 #[derive(Debug, Clone)]
@@ -190,8 +190,10 @@ pub struct ToolContext {
     /// `bash_handle_registry()`.
     bash_handles: Arc<BashHandleRegistry>,
 
-    /// LLM registry for tools that need model access
-    llm_registry: Arc<ModelRegistry>,
+    /// LLM selector for tools that need model access. Holds the narrow
+    /// base-crate [`LlmSelector`] trait object rather than the concrete
+    /// `ModelRegistry`, so tools depend only on the completion capability.
+    llm_selector: Arc<dyn LlmSelector>,
 
     /// Active PTY terminal sessions — used by the terminal-command tools
     /// (`terminal_last_command`, `terminal_command_history`).
@@ -225,7 +227,7 @@ impl ToolContext {
         working_dir: PathBuf,
         browser_sessions: Arc<BrowserSessionManager>,
         bash_handles: Arc<BashHandleRegistry>,
-        llm_registry: Arc<ModelRegistry>,
+        llm_selector: Arc<dyn LlmSelector>,
         terminals: crate::terminal::ActiveTerminals,
         tmux_registry: Arc<TmuxRegistry>,
         worktree_path: Option<PathBuf>,
@@ -237,7 +239,7 @@ impl ToolContext {
             working_dir,
             browser_sessions,
             bash_handles,
-            llm_registry,
+            llm_selector,
             terminals,
             tmux_registry,
             worktree_path,
@@ -280,9 +282,9 @@ impl ToolContext {
         &self.bash_handles
     }
 
-    /// Get the LLM registry
-    pub fn llm_registry(&self) -> &Arc<ModelRegistry> {
-        &self.llm_registry
+    /// Get the LLM selector
+    pub fn llm_selector(&self) -> &Arc<dyn LlmSelector> {
+        &self.llm_selector
     }
 
     /// Resolve the conversation's tmux server, lazily spawning it on
@@ -612,13 +614,13 @@ impl ToolRegistry {
 impl ToolRegistry {
     /// Legacy constructor - use mode-aware constructors instead
     #[deprecated(note = "Use ToolRegistry::explore_*() or standard() instead")]
-    pub fn new(_working_dir: PathBuf, _llm_registry: Arc<ModelRegistry>) -> Self {
+    pub fn new(_working_dir: PathBuf, _llm_selector: Arc<dyn LlmSelector>) -> Self {
         Self::new_with_options(false)
     }
 
     /// Legacy constructor - use `for_subagent()` instead
     #[deprecated(note = "Use ToolRegistry::for_subagent() instead")]
-    pub fn new_for_subagent(_working_dir: PathBuf, _llm_registry: Arc<ModelRegistry>) -> Self {
+    pub fn new_for_subagent(_working_dir: PathBuf, _llm_selector: Arc<dyn LlmSelector>) -> Self {
         Self::for_subagent()
     }
 }
