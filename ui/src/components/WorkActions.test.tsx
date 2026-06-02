@@ -57,6 +57,7 @@ function prStatusHandle(prStatus: Partial<PrStatusResponse> = { found: false }, 
     state: { status: 'ready' as const, prStatus: status },
     manualFallbackEnabled,
     enableManualFallback: vi.fn(),
+    refresh: vi.fn().mockResolvedValue(undefined),
   };
 }
 
@@ -64,6 +65,7 @@ const loadingPrStatusHandle = {
   state: { status: 'loading' as const, prStatus: null },
   manualFallbackEnabled: false,
   enableManualFallback: vi.fn(),
+  refresh: vi.fn().mockResolvedValue(undefined),
 };
 
 describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
@@ -290,6 +292,46 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     expect(screen.getByRole('button', { name: /Address CI & comments updated/i })).toBeInTheDocument();
   });
 
+  it('keeps remediation loading until send completes and then refreshes PR status', async () => {
+    let resolveSend!: () => void;
+    const sendPromise = new Promise<void>((resolve) => { resolveSend = resolve; });
+    const onSendMessage = vi.fn(() => sendPromise);
+    const handle = prStatusHandle({
+      found: true,
+      number: 139,
+      display_state: 'open',
+      feedback_freshness: { state: 'new', new_count: 2 },
+    });
+
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-remediate"
+        convModeLabel="Work"
+        phaseType="idle"
+        continuedInConvId={null}
+        onSendMessage={onSendMessage}
+        prStatusHandle={handle}
+      />,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /Address CI & comments 2 new/i }));
+
+    await waitFor(() => {
+      expect(onSendMessage).toHaveBeenCalledWith('Address `.phoenix/pr-context/pr-12.json`');
+    });
+    expect(screen.getByRole('button', { name: /Capturing/i })).toBeDisabled();
+    expect(handle.refresh).not.toHaveBeenCalled();
+
+    resolveSend();
+
+    await waitFor(() => {
+      expect(handle.refresh).toHaveBeenCalledTimes(1);
+    });
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: /Address CI & comments 2 new/i })).not.toBeDisabled();
+    });
+  });
+
   it('guides closed-unmerged PRs toward Abandon instead of waiting for merge cleanup', async () => {
     renderWithProviders(
       <WorkControlBar
@@ -318,7 +360,6 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     ['open', 134],
     ['draft', 135],
   ] as const)('keeps %s PRs blocked until GitHub reports merged', async (displayState, number) => {
-
     renderWithProviders(
       <WorkControlBar
         conversationId={`conv-${displayState}`}

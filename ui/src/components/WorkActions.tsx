@@ -8,7 +8,7 @@ interface WorkControlBarProps {
   convModeLabel: string | undefined;
   phaseType: string;
   continuedInConvId: string | null | undefined;
-  onSendMessage?: (text: string) => void;
+  onSendMessage?: (text: string) => Promise<void> | void;
   showError?: (message: string) => void;
   prStatusHandle: ConversationPrStatusHandle;
 }
@@ -118,7 +118,19 @@ function prFeedbackFreshnessLabel(prStatus: PrStatusResponse): string | null {
   return 'updated';
 }
 
-function PrRemediationActions({ conversationId, prStatus, onSendMessage, showError }: { conversationId: string; prStatus: PrStatusResponse | null; onSendMessage?: ((text: string) => void) | undefined; showError?: ((message: string) => void) | undefined }) {
+function PrRemediationActions({
+  conversationId,
+  prStatus,
+  onSendMessage,
+  onRefreshPrStatus,
+  showError,
+}: {
+  conversationId: string;
+  prStatus: PrStatusResponse | null;
+  onSendMessage?: ((text: string) => Promise<void> | void) | undefined;
+  onRefreshPrStatus: () => Promise<void>;
+  showError?: ((message: string) => void) | undefined;
+}) {
   const [loading, setLoading] = useState(false);
   const refreshUnavailable = prStatus?.refresh.state === 'unavailable';
   const freshnessLabel = prStatus ? prFeedbackFreshnessLabel(prStatus) : null;
@@ -135,7 +147,8 @@ function PrRemediationActions({ conversationId, prStatus, onSendMessage, showErr
         setLoading(true);
         try {
           const context = await api.createPrAutoFixContext(conversationId);
-          onSendMessage(context.message);
+          await onSendMessage(context.message);
+          await onRefreshPrStatus();
         } catch (err) {
           showError?.(err instanceof Error ? err.message : 'Failed to capture PR context');
         } finally {
@@ -168,7 +181,13 @@ export function WorkControlBar({ conversationId, convModeLabel, phaseType, conti
     <div className="work-actions-bar">
       <span className="work-actions-label">Done?</span>
       <WorkViewerActions />
-      <PrRemediationActions conversationId={conversationId} prStatus={lifecycle.prStatus} onSendMessage={onSendMessage} showError={showError} />
+      <PrRemediationActions
+        conversationId={conversationId}
+        prStatus={lifecycle.prStatus}
+        onSendMessage={onSendMessage}
+        onRefreshPrStatus={prStatusHandle.refresh}
+        showError={showError}
+      />
       <button
         className="work-actions-btn work-actions-complete"
         disabled={lifecycle.completeDisabled}
