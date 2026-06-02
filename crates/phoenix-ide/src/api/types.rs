@@ -570,14 +570,10 @@ pub enum PrCheckState {
     Unknown,
 }
 
-#[derive(Debug, Serialize, Clone, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum PrDisplayState {
-    Open,
-    Draft,
-    Merged,
-    Closed,
-}
+// PrDisplayState is co-owned by this api layer (serialized to the client) and
+// the persisted db layer; it lives in phoenix-core. Re-export at the historical
+// `crate::api::PrDisplayState` path so existing call sites resolve unchanged.
+pub use phoenix_core::domain::pr_display_state::PrDisplayState;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub struct PrCheckSummary {

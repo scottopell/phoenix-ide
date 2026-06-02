@@ -9,6 +9,7 @@ pub mod llm_error_kind;
 pub mod llm_types;
 pub mod mode_context;
 pub mod patch_types;
+pub mod pr_display_state;
 pub mod quota_details;
 pub mod retry_policy;
 pub mod skill_invocation;

@@ -103,7 +103,7 @@ pub struct WorkScopePrObservation {
     pub url: String,
     pub state: String,
     pub draft: bool,
-    pub display_state: crate::api::PrDisplayState,
+    pub display_state: phoenix_core::domain::pr_display_state::PrDisplayState,
     pub base: String,
     pub head: String,
     pub github_updated_at: Option<String>,
@@ -138,7 +138,7 @@ pub struct WorkScopePrAssociation {
     pub url: String,
     pub state: String,
     pub draft: bool,
-    pub display_state: crate::api::PrDisplayState,
+    pub display_state: phoenix_core::domain::pr_display_state::PrDisplayState,
     pub base: String,
     pub head: String,
     pub github_updated_at: Option<String>,
@@ -146,21 +146,25 @@ pub struct WorkScopePrAssociation {
     pub last_seen_at: String,
 }
 
-fn pr_display_state_db(state: &crate::api::PrDisplayState) -> &'static str {
+fn pr_display_state_db(
+    state: &phoenix_core::domain::pr_display_state::PrDisplayState,
+) -> &'static str {
     match state {
-        crate::api::PrDisplayState::Open => "open",
-        crate::api::PrDisplayState::Draft => "draft",
-        crate::api::PrDisplayState::Merged => "merged",
-        crate::api::PrDisplayState::Closed => "closed",
+        phoenix_core::domain::pr_display_state::PrDisplayState::Open => "open",
+        phoenix_core::domain::pr_display_state::PrDisplayState::Draft => "draft",
+        phoenix_core::domain::pr_display_state::PrDisplayState::Merged => "merged",
+        phoenix_core::domain::pr_display_state::PrDisplayState::Closed => "closed",
     }
 }
 
-fn pr_display_state_from_db(value: &str) -> DbResult<crate::api::PrDisplayState> {
+fn pr_display_state_from_db(
+    value: &str,
+) -> DbResult<phoenix_core::domain::pr_display_state::PrDisplayState> {
     match value {
-        "open" => Ok(crate::api::PrDisplayState::Open),
-        "draft" => Ok(crate::api::PrDisplayState::Draft),
-        "merged" => Ok(crate::api::PrDisplayState::Merged),
-        "closed" => Ok(crate::api::PrDisplayState::Closed),
+        "open" => Ok(phoenix_core::domain::pr_display_state::PrDisplayState::Open),
+        "draft" => Ok(phoenix_core::domain::pr_display_state::PrDisplayState::Draft),
+        "merged" => Ok(phoenix_core::domain::pr_display_state::PrDisplayState::Merged),
+        "closed" => Ok(phoenix_core::domain::pr_display_state::PrDisplayState::Closed),
         other => Err(DbError::Serialization(format!(
             "invalid PR display_state in database: {other}"
         ))),
@@ -197,20 +201,22 @@ pub fn sort_work_scope_pr_associations(prs: &mut [WorkScopePrAssociation]) {
     });
 }
 
-fn pr_association_rank(state: &crate::api::PrDisplayState) -> u8 {
+fn pr_association_rank(state: &phoenix_core::domain::pr_display_state::PrDisplayState) -> u8 {
     match state {
-        crate::api::PrDisplayState::Open => 0,
-        crate::api::PrDisplayState::Draft => 1,
-        crate::api::PrDisplayState::Merged => 2,
-        crate::api::PrDisplayState::Closed => 3,
+        phoenix_core::domain::pr_display_state::PrDisplayState::Open => 0,
+        phoenix_core::domain::pr_display_state::PrDisplayState::Draft => 1,
+        phoenix_core::domain::pr_display_state::PrDisplayState::Merged => 2,
+        phoenix_core::domain::pr_display_state::PrDisplayState::Closed => 3,
     }
 }
 
-fn work_scope_db_key(scope: &crate::work_scope::WorkScope) -> (&'static str, &str) {
+fn work_scope_db_key(scope: &phoenix_core::work_scope::WorkScope) -> (&'static str, &str) {
     match scope {
-        crate::work_scope::WorkScope::Worktree(value) => ("Worktree", value.as_str()),
-        crate::work_scope::WorkScope::Conversation(value) => ("Conversation", value.as_str()),
-        crate::work_scope::WorkScope::Global => ("Global", ""),
+        phoenix_core::work_scope::WorkScope::Worktree(value) => ("Worktree", value.as_str()),
+        phoenix_core::work_scope::WorkScope::Conversation(value) => {
+            ("Conversation", value.as_str())
+        }
+        phoenix_core::work_scope::WorkScope::Global => ("Global", ""),
     }
 }
 
@@ -227,7 +233,10 @@ impl Database {
         &self.pool
     }
 
-    async fn work_scope_id(&self, scope: &crate::work_scope::WorkScope) -> DbResult<Option<i64>> {
+    async fn work_scope_id(
+        &self,
+        scope: &phoenix_core::work_scope::WorkScope,
+    ) -> DbResult<Option<i64>> {
         let (scope_type, scope_value) = work_scope_db_key(scope);
         let id = sqlx::query_scalar::<_, i64>(
             "SELECT id FROM work_scopes WHERE scope_type = ?1 AND scope_value = ?2",
@@ -239,9 +248,11 @@ impl Database {
         Ok(id)
     }
 
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn upsert_work_scope_pr_observations(
         &self,
-        scope: &crate::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScope,
         observations: &[WorkScopePrObservation],
     ) -> DbResult<i64> {
         let (scope_type, scope_value) = work_scope_db_key(scope);
@@ -301,9 +312,11 @@ impl Database {
         Ok(work_scope_id)
     }
 
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn list_work_scope_pr_associations(
         &self,
-        scope: &crate::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScope,
     ) -> DbResult<Vec<WorkScopePrAssociation>> {
         let Some(work_scope_id) = self.work_scope_id(scope).await? else {
             return Ok(Vec::new());
@@ -322,18 +335,22 @@ impl Database {
             .collect()
     }
 
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn primary_work_scope_pr_association(
         &self,
-        scope: &crate::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScope,
     ) -> DbResult<Option<WorkScopePrAssociation>> {
         let mut prs = self.list_work_scope_pr_associations(scope).await?;
         sort_work_scope_pr_associations(&mut prs);
         Ok(prs.into_iter().next())
     }
 
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn upsert_work_scope_pr_feedback_baseline(
         &self,
-        scope: &crate::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScope,
         baseline: &WorkScopePrFeedbackBaselineInput,
     ) -> DbResult<i64> {
         let (scope_type, scope_value) = work_scope_db_key(scope);
@@ -388,9 +405,11 @@ impl Database {
         Ok(work_scope_id)
     }
 
+    /// # Errors
+    /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn work_scope_pr_feedback_baseline(
         &self,
-        scope: &crate::work_scope::WorkScope,
+        scope: &phoenix_core::work_scope::WorkScope,
         pr_number: u64,
     ) -> DbResult<Option<WorkScopePrFeedbackBaseline>> {
         let Some(work_scope_id) = self.work_scope_id(scope).await? else {
@@ -2885,7 +2904,7 @@ mod tests {
     #[tokio::test]
     async fn work_scope_pr_association_upsert_preserves_first_seen_and_updates_primary() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = crate::work_scope::WorkScope::Worktree("/tmp/ws-pr".to_string());
+        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-pr".to_string());
         let closed = WorkScopePrObservation {
             repo_owner: "owner".to_string(),
             repo_name: "repo".to_string(),
@@ -2894,7 +2913,7 @@ mod tests {
             url: "https://example.test/1".to_string(),
             state: "CLOSED".to_string(),
             draft: false,
-            display_state: crate::api::PrDisplayState::Closed,
+            display_state: phoenix_core::domain::pr_display_state::PrDisplayState::Closed,
             base: "main".to_string(),
             head: "branch".to_string(),
             github_updated_at: Some("2024-01-02T00:00:00Z".to_string()),
@@ -2921,7 +2940,7 @@ mod tests {
             title: "open".to_string(),
             url: "https://example.test/2".to_string(),
             state: "OPEN".to_string(),
-            display_state: crate::api::PrDisplayState::Open,
+            display_state: phoenix_core::domain::pr_display_state::PrDisplayState::Open,
             github_updated_at: Some("2024-01-01T00:00:00Z".to_string()),
             ..closed
         };
@@ -2939,7 +2958,7 @@ mod tests {
     #[tokio::test]
     async fn work_scope_pr_feedback_baseline_roundtrips_and_replaces() {
         let db = Database::open_in_memory().await.unwrap();
-        let scope = crate::work_scope::WorkScope::Worktree("/tmp/ws-baseline".to_string());
+        let scope = phoenix_core::work_scope::WorkScope::Worktree("/tmp/ws-baseline".to_string());
 
         db.upsert_work_scope_pr_feedback_baseline(
             &scope,
