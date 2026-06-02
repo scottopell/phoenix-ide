@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { useNavigate, useLocation } from 'react-router-dom';
 import { api, getConvDisplayState } from '../api';
 import type { ChainView, Conversation, Project } from '../api';
@@ -70,6 +70,8 @@ export function Sidebar({
   }, [refetchCodexPreflight]);
 
   const [showArchived, setShowArchived] = useState(false);
+  const lastProjectFilterRevealSlugRef = useRef<string | null>(null);
+  const lastArchiveRevealSlugRef = useRef<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Conversation | null>(null);
   const [deleteChainTarget, setDeleteChainTarget] = useState<ChainView | null>(null);
   const [renameTarget, setRenameTarget] = useState<Conversation | null>(null);
@@ -140,14 +142,40 @@ export function Sidebar({
   }, [archivedConversations, activeProjectId]);
 
   useEffect(() => {
-    if (!activeProjectId || !activeSlug) return;
+    if (!activeSlug) {
+      lastProjectFilterRevealSlugRef.current = null;
+      return;
+    }
+    if (lastProjectFilterRevealSlugRef.current === activeSlug) return;
 
     const activeConversation = [...conversations, ...archivedConversations]
       .find((c) => c.slug === activeSlug);
-    if (activeConversation && activeConversation.project_id !== activeProjectId) {
+    if (!activeConversation) return;
+
+    if (activeProjectId && activeConversation.project_id !== activeProjectId) {
       setActiveProjectId(null);
     }
+    lastProjectFilterRevealSlugRef.current = activeSlug;
   }, [activeProjectId, activeSlug, conversations, archivedConversations, setActiveProjectId]);
+
+  useEffect(() => {
+    if (!activeSlug) {
+      lastArchiveRevealSlugRef.current = null;
+      return;
+    }
+    if (lastArchiveRevealSlugRef.current === activeSlug) return;
+
+    const inActiveList = conversations.some((c) => c.slug === activeSlug);
+    const inArchivedList = archivedConversations.some((c) => c.slug === activeSlug);
+    if (!inActiveList && !inArchivedList) return;
+
+    if (inArchivedList && !inActiveList && !showArchived) {
+      setShowArchived(true);
+    } else if (inActiveList && showArchived) {
+      setShowArchived(false);
+    }
+    lastArchiveRevealSlugRef.current = activeSlug;
+  }, [activeSlug, conversations, archivedConversations, showArchived]);
 
   const handleNewClick = useCallback(() => {
     navigate('/new');

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, waitFor } from '@testing-library/react';
+import { render, fireEvent, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import type { Conversation, Project } from '../api';
 
@@ -104,37 +104,61 @@ describe('Sidebar — active conversation project filter', () => {
     expect(container.querySelector('[data-id="hidden-active-id"]')!.classList.contains('active')).toBe(true);
   });
 
-  it('keeps existing chain grouping and active-row rendering after filter clearing', async () => {
-    localStorage.setItem('phoenix:sidebar-project-filter', 'proj-1');
-    const root = makeConv('root-id', 'root-slug', {
-      project_id: 'proj-2',
-      cwd: '/home/user/two',
-      continued_in_conv_id: 'leaf-id',
-      chain_name: 'filtered chain',
-    });
-    const leaf = makeConv('leaf-id', 'leaf-slug', {
-      project_id: 'proj-2',
-      cwd: '/home/user/two',
-    });
+  it('preserves a manually selected project tab after the active route has been revealed', async () => {
+    const conversations = [
+      makeConv('active-id', 'active-project-one', { project_id: 'proj-1', cwd: '/home/user/one' }),
+      makeConv('browse-id', 'browse-project-two', { project_id: 'proj-2', cwd: '/home/user/two' }),
+    ];
 
-    const { container } = render(
-      <MemoryRouter initialEntries={['/c/leaf-slug']}>
+    const { container, getByRole } = render(
+      <MemoryRouter initialEntries={['/c/active-project-one']}>
         <Sidebar
           collapsed={false}
           onToggle={vi.fn()}
-          conversations={[leaf, root]}
+          conversations={conversations}
           archivedConversations={[]}
-          activeSlug="leaf-slug"
+          activeSlug="active-project-one"
           onConversationCreated={vi.fn()}
         />
       </MemoryRouter>,
     );
 
     await waitFor(() => {
-      expect(container.querySelector('.conv-chain-block')).not.toBeNull();
+      expect(container.querySelector('[data-id="active-id"]')).not.toBeNull();
     });
-    expect(container.querySelector('.conv-chain-name-label')!.textContent).toBe('filtered chain');
-    expect(container.querySelectorAll('.conv-item-chain-member').length).toBe(2);
-    expect(container.querySelector('[data-id="leaf-id"]')!.classList.contains('active')).toBe(true);
+
+    fireEvent.click(getByRole('button', { name: 'two' }));
+
+    await waitFor(() => {
+      expect(localStorage.getItem('phoenix:sidebar-project-filter')).toBe('proj-2');
+    });
+    expect(container.querySelector('[data-id="active-id"]')).toBeNull();
+    expect(container.querySelector('[data-id="browse-id"]')).not.toBeNull();
+  });
+
+  it('shows the archived list when the active conversation is archived', async () => {
+    const archived = makeConv('archived-id', 'archived-active', {
+      archived: true,
+      project_id: 'proj-1',
+    });
+
+    const { container } = render(
+      <MemoryRouter initialEntries={['/c/archived-active']}>
+        <Sidebar
+          collapsed={false}
+          onToggle={vi.fn()}
+          conversations={[]}
+          archivedConversations={[archived]}
+          activeSlug="archived-active"
+          onConversationCreated={vi.fn()}
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector('[data-id="archived-id"]')).not.toBeNull();
+    });
+    expect(container.querySelector('[data-id="archived-id"]')!.classList.contains('active')).toBe(true);
+    expect(container.querySelector('.archive-toggle')!.textContent).toBe('Active');
   });
 });
