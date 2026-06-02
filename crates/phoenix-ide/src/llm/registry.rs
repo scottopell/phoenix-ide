@@ -1050,6 +1050,39 @@ impl ModelRegistry {
     }
 }
 
+/// Adapter that presents an `Arc<dyn LlmService>` as the narrow base-crate
+/// [`phoenix_core::llm_service::CompletionService`]. A blanket
+/// `impl CompletionService for T: LlmService` would violate the orphan rule
+/// (both trait and type parameter are foreign to the base crate), and unsizing
+/// coercion between two distinct trait objects (`Arc<dyn LlmService>` ->
+/// `Arc<dyn CompletionService>`) isn't available — so the selector wraps the
+/// service in this local newtype and flattens the rich `LlmError` to a display
+/// string at the boundary.
+struct AsCompletion(Arc<dyn LlmService>);
+
+#[async_trait::async_trait]
+impl phoenix_core::llm_service::CompletionService for AsCompletion {
+    async fn complete(&self, request: &super::LlmRequest) -> Result<super::LlmResponse, String> {
+        LlmService::complete(self.0.as_ref(), request)
+            .await
+            .map_err(|e| e.to_string())
+    }
+}
+
+impl phoenix_core::llm_service::LlmSelector for ModelRegistry {
+    fn get(&self, model_id: &str) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+        ModelRegistry::get(self, model_id).map(|svc| {
+            Arc::new(AsCompletion(svc)) as Arc<dyn phoenix_core::llm_service::CompletionService>
+        })
+    }
+
+    fn default_service(&self) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
+        ModelRegistry::default(self).map(|svc| {
+            Arc::new(AsCompletion(svc)) as Arc<dyn phoenix_core::llm_service::CompletionService>
+        })
+    }
+}
+
 /// Result of [`ModelRegistry::reload_codex_credential`]. Surfaced so the
 /// caller can log a precise "swapped path X -> Y" line without re-acquiring
 /// the registry's internal locks.

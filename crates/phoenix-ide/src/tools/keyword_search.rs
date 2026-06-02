@@ -116,15 +116,17 @@ impl KeywordSearchTool {
     }
 
     /// Select an LLM for filtering
-    fn select_filter_llm(ctx: &ToolContext) -> Option<Arc<dyn crate::llm::LlmService>> {
+    fn select_filter_llm(
+        ctx: &ToolContext,
+    ) -> Option<Arc<dyn phoenix_core::llm_service::CompletionService>> {
         // Try preferred models in order
         for model_id in PREFERRED_MODELS {
-            if let Some(svc) = ctx.llm_registry().get(model_id) {
+            if let Some(svc) = ctx.llm_selector().get(model_id) {
                 return Some(svc);
             }
         }
         // Fall back to any available model
-        ctx.llm_registry().default()
+        ctx.llm_selector().default_service()
     }
 
     /// Filter results using LLM
