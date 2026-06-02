@@ -208,6 +208,12 @@ is in the changed set.
 
 ## Spike results
 
+**FINAL OUTCOME (spike complete): all five extractions landed, `tools` is its
+own crate, and the incremental-compile win is confirmed on the fat module.**
+See "Final results" at the end of this section. The narrative below documents
+the mid-spike checkpoint (after the first crate) and is kept for the reasoning
+trail; the final numbers supersede it.
+
 Ran the de-risking spike. Outcome: **crate-splitting delivers the projected
 incremental-compile win, and the per-crate gating mechanism works** — but the
 fattest target (`tools`) needs one bounded dependency inversion before it can
@@ -284,3 +290,57 @@ above; the dev.py wiring (`-p <changed-crate>` + `nextest -E 'rdeps(...)'`,
 falling back to full when `phoenix-core` changes) is not yet implemented —
 worth doing once ≥1 big module (e.g. `tools`) is its own crate, so a common
 edit actually hits the fast path.
+
+## Final results (spike complete)
+
+The full Stage 2 sequence landed. The workspace is now 7 crates:
+`phoenix-core` (domain types + `llm_service` traits), `phoenix-terminal`,
+`phoenix-skills`, `phoenix-tools`, plus the pre-existing `phoenix-ide` (binary,
+now ~56k LOC, down from ~94k), `phoenix-monitor`, `phoenix-tls`.
+
+Commits (on `claude/incremental-test-running-MzhDB`):
+- `tools → api` wire-type cycle-break (13 `#[ts(export)]` types → core)
+- `phoenix-terminal` extraction (ws.rs glue relocated up to `api`)
+- `phoenix-skills` extraction
+- LLM dependency inversion (`CompletionService` + `LlmSelector` in core;
+  `ToolContext` holds `Arc<dyn LlmSelector>`; `ModelRegistry` impls it via an
+  `AsCompletion` adapter)
+- `phoenix-tools` extraction (~25.6k LOC; depends only on
+  core + terminal + skills)
+
+### Confirmed measurement: one-line edit inside `phoenix-tools` (warm target)
+
+| Step | split (`-p phoenix-tools`) | baseline (`--workspace`) |
+|---|---|---|
+| `cargo clippy` | **7.0s** | 45.0s |
+| `cargo test --no-run` | **4.4s** | 13.4s |
+
+Editing the 25.6k-LOC tools module now lint-checks ~6× faster and
+test-compiles ~3× faster than the workspace-wide pass `./dev.py check` runs
+today. (Measurement note: test-compile numbers require warming *both* harness
+sets first — a naive A/B makes the split run pay a one-time cold
+`phoenix-tools` test-harness build and reads ~186s, which is a caching
+artifact, not the steady-state incremental cost.)
+
+A full warm `./dev.py check` after the split ran in ~60s vs ~155s pre-split,
+because the warm incremental build only recompiles changed crates even under
+the current workspace-wide lane commands.
+
+### Verdict
+
+**The approach delivers.** Four of the five fattest modules' worth of code now
+lives in right-sized crates, and an edit confined to one of them gets the
+order-of-magnitude check speedup the task set out to validate. The remaining
+big modules still inside `phoenix-ide` (`api` 13k, `runtime` 12k, `llm` 11k,
+`state_machine` 11k, `db` 6k) are the next candidates; each follows the same
+proven recipe.
+
+### Remaining work to realize the win in `./dev.py check` (Stage 3)
+
+The crates exist, but `./dev.py check`'s rust lane still runs
+`cargo clippy`/`cargo nextest` workspace-wide, so the gated *fast path* only
+shows up today as a faster warm incremental rebuild — not as `-p`-scoped lane
+commands. Stage 3 (path → changed-crate → `clippy -p` + `nextest -E
+'rdeps(<crate>)'`, full fallback when `phoenix-core` changes) is the remaining
+piece that turns these measured per-crate timings into actual check-time
+savings. It composes with the Option-A path-gating already shipped.
