@@ -1,150 +1,109 @@
 ---
 name: phoenix-extract-crate
-description: Procedure and invariants for splitting a module out of the phoenix-ide monolith into its own acyclic workspace crate (and for the per-crate `./dev.py check` gating that pays for it). Use when extracting a crate, breaking a dependency cycle to enable extraction, sinking a shared type into phoenix-core, or rebasing in-flight extraction work onto a moved main.
+description: The methodology for splitting a large crate into smaller ones — the decision principles and workflow that lead to a clean result, not one extraction's steps. Use when planning or executing a crate split, deciding what belongs in a shared base crate vs. what stays put, breaking a dependency cycle to enable a split, or sequencing any large incremental refactor where partial progress must stay shippable.
 ---
 
-# Extracting a Crate from phoenix-ide
+# Crate Extraction Methodology
 
-Splitting a module into its own library crate lets Cargo recompile only the
-changed crate + its dependents, and lets `./dev.py check` lint/test only the
-affected crates. The win is **proportional to how much code lives in
-right-sized crates** — a one-line edit in an extracted crate checks in ~3–7s
-vs ~40–45s workspace-wide.
+How to split a monolithic crate into a layered, acyclic workspace without a
+big-bang rewrite. This is the *reasoning*, not a checklist — the specifics of
+any one extraction (which modules, what they measured) belong in its task file.
 
-## The governing principle: types sink, behavior floats
+## 1. De-risk before you commit: spike, then decide
 
-`phoenix-core` is the **acyclic base crate**: it holds the shared, serializable
-*domain vocabulary* (`domain::{llm_types, db_schema, sm_state, sm_event,
-bash_types, tool_wire, patch_types, kill_signal, …}` + leaves `llm_language`,
-`task_source`, `work_scope`, `platform`) and narrow service traits
-(`CompletionService`, `LlmSelector`). **Logic stays up** in the crate that owns
-it and depends *down* onto core. Every other crate depends only on core and on
-crates strictly below it. The graph must be a DAG — verify after every step.
+A large refactor's payoff is a hypothesis until measured. Don't commit to N
+extractions on a projection. Extract the **single highest-payoff target**, wire
+up the **minimal end-to-end** version of the win (not just the structural
+change — the thing that actually delivers value), and **measure the real delta
+against the baseline**. Then gate: if the delta matches the projection,
+continue; if not, you've spent one unit of effort, not N, and you keep whatever
+banked value the first step produced. The entry point to a big refactor is the
+cheapest experiment that would falsify it.
 
-When two crates need the same type, the type sinks to core; the *behavior*
-(parsing, I/O, anything pulling `reqwest`/`axum`/`sqlx`) stays in the crate
-that owns it. Example: `QuotaDetails`/`RateLimitWindow`/`CreditsSnapshot` are
-pure data → core; the `reqwest::HeaderMap` parsing fns stay in
-`llm/rate_limit.rs` and reference the sunk types.
+## 2. Know whether your changes are a package deal
 
-**Move-down, re-export-up.** In the parent that used to own the module, replace
-`mod <name>;` with `use phoenix_<name> as <name>;` (or `pub use`) so existing
-`crate::<name>::…` call sites resolve unchanged. Defer call-site rewrites.
+Before starting, ask what *each* part delivers **alone**. If the structural
+change (the split) and the change that monetizes it (e.g. per-unit gating) each
+deliver ~zero value in isolation and only pay off together, then budget for
+**both or neither** — landing half and declaring victory ships cost with no
+benefit. If a phase *does* have standalone value (cleaner boundaries,
+compiler-enforced layering), that's a legitimate reason to do it — but say so
+explicitly and justify it on *those* grounds, not on the headline metric it
+doesn't yet move.
 
-## Before extracting: break wrong-way edges first
+## 3. The layering rule: types sink, behavior floats
 
-A module can only be lifted cleanly once it points *down*. Find upward/sibling
-edges with `rg "crate::(api|runtime|llm|db|tools|skills|system_prompt)" crates/phoenix-ide/src/<module>`.
-For each:
+Design so cycles are unrepresentable. Establish one **acyclic base crate**
+(here, `phoenix-core`) holding the shared, serializable *vocabulary* — the data
+types and narrow service traits multiple crates speak in. Everything else
+depends *downward* onto it and never sideways or up.
 
-- **Shared pure-data type** referenced upward/sideways → sink it to
-  `phoenix-core::domain`, re-export from the original location.
-- **Concrete dependency on a heavy service** (e.g. `ToolContext` held
-  `Arc<ModelRegistry>`, dragging in the 11k-LOC `llm` module) → invert behind a
-  narrow trait in core (`Arc<dyn LlmSelector>`), impl the trait on the concrete
-  type via an adapter. Do **not** move the heavy module into core — that drags
-  its deps (reqwest, providers) and cycles into the "vocabulary" crate.
-- **Misfiled glue** (e.g. `terminal/ws.rs` used `AppState`/`RuntimeManager`) →
-  relocate it *up* into the layer it actually belongs to (`api`), leaving the
-  crate's *core* (tmux, line streams) depending only on `phoenix-core`.
-- **Doc-link `///` edges** → not compile edges; downgrade to plain text or
-  intra-doc links.
+The decision rule when two crates need the same thing:
 
-Extract bottom-up so each new crate's deps are already crates or core.
+- **Pure data** (the type, its POD fields, derives) → **sinks** to the base.
+- **Behavior** (parsing, I/O, anything pulling a heavy dep like `reqwest`,
+  `axum`, `sqlx`) → **stays** in the crate that owns it, referencing the sunk
+  type.
 
-## Per-extraction recipe
+A type and its inherent impl can't live in different crates, so if an impl
+needs a heavy dep, the type can't sink with that impl attached — split the impl
+or reconsider. Never solve a cycle by dragging a heavy module *into* the base
+crate "because everyone needs it": that pollutes the vocabulary layer with the
+very deps it exists to stay free of.
 
-1. `git mv` the module's files into `crates/phoenix-<name>/src/` (`foo.rs` +
-   `foo/`, never `foo/mod.rs` — clippy-enforced). `lib.rs` is the old `<module>.rs`.
-2. Create `Cargo.toml`: copy an existing leaf crate's shape (`edition = "2021"`,
-   `rust-version = "1.94"`, `[lints] workspace = true`). Add **only** the
-   external deps the moved files actually use — derive them from `use`
-   statements *and* inline paths (`uuid::`, `tracing::`, `taskmd_core::` are
-   easy to miss because they aren't always in a `use`).
-3. Add to workspace `members` (alphabetical) and as a path dep of the crates
-   that need it.
-4. Move-down/re-export-up in the parent (see above).
-5. Rewrite intra-moved-file paths: `crate::<module>::X` → `crate::X`;
-   `crate::<other-extracted>::Y` → `phoenix_<other>::Y` or
-   `phoenix_core::domain::…`.
-6. Validate (all must pass — see checklist).
-7. Commit (one extraction = one commit). Push when the unit is complete.
+## 4. Make the graph a DAG *first*, as separate steps
 
-## Known gotchas (expect these every time)
+A module can only be lifted cleanly once it points only downward. Find the
+wrong-way edges and fix each as its own validated commit *before* the
+extraction — don't tangle cycle-breaking with the move. The edge tells you the
+fix:
 
-- **Cross-crate `#[cfg(test)]` is invisible.** A test-only helper in crate X
-  used by crate Y's tests must be gated
-  `#[cfg(any(test, feature = "test-support"))]`; X exposes a `test-support`
-  feature; Y enables it via dev-dependencies (off in production builds). See
-  phoenix-core's `ContentBlock::tool_use`, phoenix-db's `create_conversation`.
-- **New public-API clippy surface.** Promoting binary-private code to library
-  API fires pedantic lints the binary hid: `must_use_candidate`,
-  `missing_errors_doc`. Auto-fix the first with
-  `cargo clippy --fix -p phoenix-<name> --lib --allow-dirty`; add a one-line
-  `# Errors` (and `# Panics` where `.expect()`/`unreachable!()` guard
-  invariants) doc per flagged `pub fn`. **Fix, don't `#[allow]`.**
-- **ts-rs `export_to` is manifest-dir-relative**, and all `crates/*` sit at the
-  same depth, so `"../../../ui/src/generated/"` resolves unchanged after a
-  move — but the new crate needs the `ts-rs` dep and the generated TS must come
-  out **byte-identical** (the codegen-stale guard enforces this).
-- **`cargo fmt` after `clippy --fix`** — the fixer leaves trailing whitespace.
-- **Inherent impls can't split across crates.** If a sinking type has an
-  inherent impl that needs a heavy dep, you cannot move the type while leaving
-  that impl behind. Either the impl is pure (move it too) or the type can't
-  sink — stop and reconsider.
+- **shared data type** referenced up/sideways → sink it (rule 3).
+- **concrete dependency on a heavy service** → invert behind a **narrow trait**
+  in the base; the heavy type impls the trait. (Depend on an interface you own,
+  not a concretion you don't.)
+- **misfiled glue** living in the wrong layer → relocate it *up* to the layer
+  it actually belongs to; the genuine core stays low.
+- **doc-link-only references** → not compile edges; downgrade them.
 
-## Validation checklist (every extraction)
+Extract bottom-up, so each new crate's dependencies are already crates or base.
 
-```bash
-cargo check -p phoenix-<name> && cargo check -p phoenix_ide
-cargo clippy --workspace -- -D warnings          # default targets, matches ./dev.py check
-cargo fmt --check
-PHOENIX_SKIP_BROWSER_TESTS=1 PHOENIX_SKIP_NETWORK_TESTS=1 cargo test --workspace
-cargo test --workspace export_bindings           # then:
-git status --porcelain -- ui/src/generated/      # MUST be empty (no codegen drift)
-```
+## 5. Keep every step incremental and reversible
 
-Acyclicity (production code only — doc-links are fine):
+- **Move-down, re-export-up.** When you relocate code, re-export it at its
+  original path so existing call sites resolve unchanged. This decouples the
+  mechanical *move* from the optional *call-site rewrite* — two independently
+  reviewable, independently revertible changes instead of one sprawling diff.
+- **One logical move = one commit, each a green checkpoint.** Never batch
+  extractions. A half-finished refactor then leaves a working, shippable tree
+  at every commit — abandoning midway costs nothing structurally.
 
-```bash
-# the new crate must not reach back up
-rg "crate::(api|runtime|llm|db|tools|skills|system_prompt|chain_runtime|chain_qa)" crates/phoenix-<name>/src/
-# a true leaf reaches nothing in the workspace
-cargo metadata --no-deps --format-version 1   # inspect the crate's workspace deps
-```
+## 6. Trust only the real gate
 
-The authoritative gate is `PHOENIX_CHECK_ALL=1 ./dev.py check` — **all 17 lanes
-green**. Browser/Chrome + network test failures are environmental, not
-regressions; the `PHOENIX_SKIP_*` vars above isolate them.
+A clean `cargo check` is not integration. A clean rebase with zero textual
+conflicts is **not** integration — code that landed on the mainline while you
+worked can be swept into a newly-extracted crate carrying paths that compiled
+in the monolith but don't resolve across the new boundary, or needing deps the
+new crate's manifest lacks. Before declaring done, run the **authoritative
+end-to-end gate** (what CI runs — here `PHOENIX_CHECK_ALL=1 ./dev.py check`,
+all lanes), not a proxy. Surface what it says honestly; a green proxy over a red
+gate is worse than no signal.
 
-## Stage 3: per-crate `./dev.py check` gating (the payoff)
+## 7. Tighten at the new boundary, don't loosen
 
-Extraction alone barely moves check wall-clock — the lane still runs
-workspace-wide. The gating in `dev.py` narrows `cargo clippy`/`cargo test` to
-the changed crate(s) **+ their transitive reverse-dependency closure** (computed
-live from `cargo metadata`, threaded as `-p <crate>` flags). `rdeps`, not
-`deps`: a change can break dependents, so you test upward.
+Promoting code across a new crate boundary turns private code into public API
+and surfaces stricter lints (must-use, missing-`# Errors`/`# Panics` docs). That
+warning is the new *contract* becoming visible — **satisfy it** (auto-fix where
+the tool can; write the one-line doc where it can't). Reaching for `#[allow]` to
+quiet it discards the boundary's value. The refactor should leave the code held
+to a higher standard than it found it, never a weaker one.
 
-**Fail-safe by construction — only narrows, never wrongly skips:**
-- `phoenix-core` changed → full closure (everything depends on it).
-- `Cargo.lock` / workspace `Cargo.toml` / `.cargo/` / `rust-toolchain` /
-  `ui/src/generated/` changed → full.
-- any unattributable path or a `cargo metadata` failure → full.
-- `--all` flag **or** `PHOENIX_CHECK_ALL=1` → full (both escape hatches must
-  force full in lockstep — a past bug had the env var skip lanes but not the
-  rust-scope narrowing).
-- **codegen is never narrowed** — the ts-rs export tests + staleness guard must
-  see the whole generated tree.
+## 8. Any work-skipping optimization must fail safe
 
-## Rebasing in-flight extraction work onto a moved main
-
-A crate split is many commits; `main` moves under you. If your base was
-squash-merged, recover with `git rebase --onto origin/main <last-merged-commit>
-<your-branch>` — replay only the post-merge commits. **Zero textual conflicts
-does NOT mean it integrates**: code `main` added to the *monolith* after you
-diverged gets swept into your *extracted* crate with monolith-era paths
-(`crate::work_scope`, `crate::api::PrDisplayState`) that no longer resolve
-cross-crate, and may need deps the crate's `Cargo.toml` lacks (e.g. `serde`).
-Always run a full `PHOENIX_CHECK_ALL=1 ./dev.py check` on the rebased branch and
-fix the integration drift with the same sink/repoint recipe — a clean rebase is
-necessary, not sufficient.
+If the split is paid for by an optimization that *narrows* work (lint/test only
+the changed crate + its reverse-dependency closure), its correctness property is
+**only ever narrow, never wrongly skip**. Every ambiguous input — an
+unattributable path, a base-crate change, a tooling failure, a lockfile/codegen
+touch — falls back to the **full** run. Escape hatches (a flag and an env var)
+must force full in lockstep; a half-wired bypass that skips one dimension but
+not another is a silent correctness hole.
