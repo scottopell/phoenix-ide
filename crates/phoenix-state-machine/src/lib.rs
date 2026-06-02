@@ -4,9 +4,9 @@
 //! Two pure entry points: `transition()` for user events, `handle_outcome()`
 //! for executor-produced outcomes.
 
-pub(crate) mod effect;
+pub mod effect;
 pub mod outcome;
-pub(crate) mod transition;
+pub mod transition;
 
 // The state-machine *types* (ConvState, Event, SteerEntry, …) moved to the
 // phoenix-core domain crate to break the db↔state_machine cycle. The pure

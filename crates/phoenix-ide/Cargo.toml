@@ -44,6 +44,10 @@ phoenix-tools = { path = "../phoenix-tools" }
 # Extracted so the persistence layer is a leaf depending only on phoenix-core.
 phoenix-db = { path = "../phoenix-db" }
 
+# Pure conversation reducer (Elm-architecture state machine). Extracted so the
+# runtime/executor depend *down* onto the reducer + shared domain vocabulary.
+phoenix-state-machine = { path = "../phoenix-state-machine" }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

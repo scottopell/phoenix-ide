@@ -19,8 +19,8 @@ use super::state::{
     SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
-use crate::db::{ErrorKind, ToolResult, UsageData};
-use crate::llm::LlmAttemptReason;
+use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
+use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
@@ -47,7 +47,7 @@ const ACCEPTABLE_PROPOSE_STATUSES: &[taskmd_core::constants::Status] = &[
 struct TaskFileSnapshot {
     task_file: String,
     title: String,
-    priority: crate::task_source::Priority,
+    priority: phoenix_core::task_source::Priority,
     plan: String,
 }
 
@@ -57,7 +57,7 @@ struct TaskFileSnapshot {
 /// — id/priority/status/slug come from the filename; this form is *required* to
 /// live under the project's tasks dir) or any other markdown file anywhere in
 /// the worktree (a plain task brief — title from the body's `# H1`, priority
-/// defaults to `p2`). See [`crate::task_source::TaskSource`].
+/// defaults to `p2`). See [`phoenix_core::task_source::TaskSource`].
 ///
 /// The state machine treats this read as a deterministic data-load — like
 /// reading the conversation cwd off disk — not as an external side effect.
@@ -67,7 +67,7 @@ fn resolve_task_file(
     tasks_dir_name: &str,
     task_file: &str,
 ) -> Result<TaskFileSnapshot, String> {
-    use crate::task_source::TaskSource;
+    use phoenix_core::task_source::TaskSource;
 
     if task_file.is_empty() {
         return Err("task_file is required".to_string());
@@ -272,6 +272,7 @@ pub struct TransitionResult {
 }
 
 impl TransitionResult {
+    #[must_use]
     pub fn new(state: ConvState) -> Self {
         Self {
             new_state: state,
@@ -279,12 +280,14 @@ impl TransitionResult {
         }
     }
 
+    #[must_use]
     pub fn with_effect(mut self, effect: Effect) -> Self {
         self.effects.push(effect);
         self
     }
 
     #[allow(dead_code)] // Builder method
+    #[must_use]
     pub fn with_effects(mut self, effects: impl IntoIterator<Item = Effect>) -> Self {
         self.effects.extend(effects);
         self
@@ -349,6 +352,11 @@ pub enum TransitionError {
 ///
 /// Only valid for parent (top-level) conversations. Sub-agent conversations
 /// don't accept chat HTTP traffic.
+///
+/// # Errors
+///
+/// Returns [`TransitionError`] when the conversation is in a state that does
+/// not accept a new user message.
 pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), TransitionError> {
     match state {
         // Idle and Error: transition_core arm (Idle | Error, UserMessage) → LlmRequesting
@@ -395,6 +403,11 @@ pub fn check_user_message_acceptable(state: &ConvState) -> Result<(), Transition
 ///
 /// REQ-BED-001: This function is pure - given the same inputs, it always
 /// produces the same outputs, with no I/O side effects.
+///
+/// # Errors
+///
+/// Returns [`TransitionError`] when the event is not valid for the current
+/// state.
 pub fn transition(
     state: &ConvState,
     context: &ConvContext,
@@ -566,6 +579,11 @@ impl CoreTransitionResult {
 /// Does NOT handle: `propose_task` interception (parent-only), terminal tools
 /// (sub-agent-only), `LlmError` -> `Error` vs `Failed` (diverges by type),
 /// `UserCancel` from `LlmRequesting` (parent -> `Idle`, sub-agent -> `Failed`).
+///
+/// # Errors
+///
+/// Returns [`TransitionError`] when the core event is not valid for the
+/// current core state.
 #[allow(clippy::too_many_lines)]
 pub fn transition_core(
     state: &CoreState,
@@ -729,7 +747,7 @@ pub fn transition_core(
 /// Build a `PersistMessage` effect from a queued steering entry.
 /// `idempotent: true` because steering-queue re-drain after crash recovery
 /// may re-emit this effect with the same `message_id`.
-fn steer_entry_to_persist_effect(entry: &crate::state_machine::event::SteerEntry) -> Effect {
+fn steer_entry_to_persist_effect(entry: &crate::event::SteerEntry) -> Effect {
     Effect::persist_user_message(
         entry.text.clone(),
         entry.llm_text.clone(),
@@ -1459,6 +1477,18 @@ fn handle_core_continuation(
 
 /// Parent transition function. Handles parent-only states and events, delegates
 /// core state + core event combinations to `transition_core`.
+///
+/// # Errors
+///
+/// Returns [`TransitionError`] when the parent event is not valid for the
+/// current parent state.
+///
+/// # Panics
+///
+/// Panics if internal invariants are violated — e.g. a per-tool result count
+/// that does not match the tool-call count, or a core transition that yields a
+/// state the parent layer cannot represent. These reflect reducer bugs, not
+/// reachable inputs.
 #[allow(clippy::too_many_lines)]
 pub fn transition_parent(
     state: &ParentState,
@@ -1545,7 +1575,7 @@ pub fn transition_parent(
         ) => Ok(
             ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting { attempt: 1 }))
                 .with_effect(Effect::PersistMessage {
-                    content: crate::db::MessageContent::system(
+                    content: phoenix_core::domain::db_schema::MessageContent::system(
                         "Plan not approved. The user provided feedback below. \
                          You must call propose_task again with a revised plan \
                          that addresses their feedback.",
@@ -1556,7 +1586,7 @@ pub fn transition_parent(
                     idempotent: false,
                 })
                 .with_effect(Effect::PersistMessage {
-                    content: crate::db::MessageContent::user(annotations),
+                    content: phoenix_core::domain::db_schema::MessageContent::user(annotations),
                     display_data: None,
                     usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
@@ -1576,7 +1606,9 @@ pub fn transition_parent(
         ) => Ok(
             ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
                 .with_effect(Effect::PersistMessage {
-                    content: crate::db::MessageContent::system("Task rejected."),
+                    content: phoenix_core::domain::db_schema::MessageContent::system(
+                        "Task rejected.",
+                    ),
                     display_data: None,
                     usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
@@ -1650,7 +1682,7 @@ pub fn transition_parent(
                     attempt: 1,
                 }))
                 .with_effect(Effect::PersistMessage {
-                    content: crate::db::MessageContent::user(user_text),
+                    content: phoenix_core::domain::db_schema::MessageContent::user(user_text),
                     display_data: None,
                     usage_data: None,
                     message_id: uuid::Uuid::new_v4().to_string(),
@@ -1761,7 +1793,7 @@ pub fn transition_parent(
             // normal no-tool/tool paths. `content` is a parameter (not
             // captured by ref) so each branch can still move its own `content`
             // into `AssistantMessage::new` after calling this.
-            let make_display_data = |c: &[crate::llm::ContentBlock]| {
+            let make_display_data = |c: &[phoenix_core::domain::llm_types::ContentBlock]| {
                 let mut dd = compute_bash_display_data(c, &context.working_dir);
                 stamp_retry_count(&mut dd, final_attempt);
                 dd
@@ -2173,13 +2205,24 @@ pub fn transition_parent(
 /// Sub-agent transition function. Handles sub-agent-only states and events,
 /// intercepts core events with sub-agent-specific behavior, delegates the
 /// rest to `transition_core`.
+///
+/// # Errors
+///
+/// Returns [`TransitionError`] when the sub-agent event is not valid for the
+/// current sub-agent state.
+///
+/// # Panics
+///
+/// Panics if internal invariants are violated — e.g. a per-tool result count
+/// mismatch, or `is_terminal_tool` disagreeing with the terminal-tool match.
+/// These reflect reducer bugs, not reachable inputs.
 #[allow(clippy::too_many_lines)]
 pub fn transition_sub_agent(
     state: &SubAgentState,
     context: &ConvContext,
     event: SubAgentEvent,
 ) -> Result<SubAgentTransitionResult, TransitionError> {
-    use crate::state_machine::state::SubAgentOutcome;
+    use crate::state::SubAgentOutcome;
 
     match (state, event) {
         // ============================================================
@@ -2432,6 +2475,11 @@ pub fn transition_sub_agent(
 /// current state. The executor logs and discards `Err` — state unchanged.
 ///
 /// REQ-BED-001: Pure function — given the same inputs, always the same outputs.
+///
+/// # Errors
+///
+/// Returns [`InvalidOutcome`] when the outcome is not valid for the current
+/// state; the executor logs and discards it, leaving state unchanged.
 pub fn handle_outcome(
     state: &ConvState,
     context: &ConvContext,
@@ -2636,13 +2684,13 @@ fn should_trigger_continuation(usage: &UsageData, context_window: usize) -> bool
 /// Handle context exhaustion based on conversation type (REQ-BED-019, REQ-BED-024)
 fn handle_context_exhaustion(
     ctx: &ConvContext,
-    blocks: Vec<crate::llm::ContentBlock>,
+    blocks: Vec<phoenix_core::domain::llm_types::ContentBlock>,
     tool_calls: Vec<ToolCall>,
     usage_data: UsageData,
     request_id: String,
     final_attempt: u32,
 ) -> TransitionResult {
-    use crate::state_machine::state::SubAgentOutcome;
+    use crate::state::SubAgentOutcome;
 
     match ctx.context_exhaustion_behavior {
         ContextExhaustionBehavior::ThresholdBasedContinuation => {
@@ -2689,11 +2737,11 @@ fn handle_context_exhaustion(
 }
 
 /// Extract concatenated text from content blocks for implicit sub-agent completion.
-fn extract_text_from_content(blocks: &[crate::llm::ContentBlock]) -> String {
+fn extract_text_from_content(blocks: &[phoenix_core::domain::llm_types::ContentBlock]) -> String {
     blocks
         .iter()
         .filter_map(|b| match b {
-            crate::llm::ContentBlock::Text { text } => Some(text.as_str()),
+            phoenix_core::domain::llm_types::ContentBlock::Text { text } => Some(text.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -2706,18 +2754,31 @@ fn retry_delay(attempt: u32) -> Duration {
 }
 
 #[allow(dead_code)] // Conversion utility
-pub fn llm_error_to_db_error(kind: crate::llm::LlmErrorKind) -> ErrorKind {
+#[must_use]
+pub fn llm_error_to_db_error(
+    kind: phoenix_core::domain::llm_error_kind::LlmErrorKind,
+) -> ErrorKind {
     // Explicit match arms — no catch-all. The compiler enforces exhaustiveness.
     match kind {
-        crate::llm::LlmErrorKind::Auth => ErrorKind::Auth,
-        crate::llm::LlmErrorKind::RateLimit => ErrorKind::RateLimit,
-        crate::llm::LlmErrorKind::UsageLimitReached => ErrorKind::UsageLimitReached,
-        crate::llm::LlmErrorKind::Network => ErrorKind::Network,
-        crate::llm::LlmErrorKind::InvalidRequest => ErrorKind::InvalidRequest,
-        crate::llm::LlmErrorKind::ServerError => ErrorKind::ServerError,
-        crate::llm::LlmErrorKind::ServerOverloaded => ErrorKind::ServerOverloaded,
-        crate::llm::LlmErrorKind::ContentFilter => ErrorKind::ContentFilter,
-        crate::llm::LlmErrorKind::ContextWindowExceeded => ErrorKind::ContextExhausted,
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::Auth => ErrorKind::Auth,
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::RateLimit => ErrorKind::RateLimit,
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::UsageLimitReached => {
+            ErrorKind::UsageLimitReached
+        }
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::Network => ErrorKind::Network,
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::InvalidRequest => {
+            ErrorKind::InvalidRequest
+        }
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::ServerError => ErrorKind::ServerError,
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::ServerOverloaded => {
+            ErrorKind::ServerOverloaded
+        }
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::ContentFilter => {
+            ErrorKind::ContentFilter
+        }
+        phoenix_core::domain::llm_error_kind::LlmErrorKind::ContextWindowExceeded => {
+            ErrorKind::ContextExhausted
+        }
     }
 }
 
@@ -2909,8 +2970,8 @@ mod tests {
 
     #[test]
     fn test_cancellation_produces_synthetic_results() {
-        use crate::llm::ContentBlock;
-        use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use phoenix_core::domain::llm_types::ContentBlock;
 
         // Build an AssistantMessage with 3 tool_use blocks matching the 3 tools
         let assistant_message = AssistantMessage::new(
@@ -2940,16 +3001,22 @@ mod tests {
             &ConvState::ToolExecuting {
                 current_tool: ToolCall::new(
                     "tool-1",
-                    ToolInput::Bash(crate::tools::BashToolInput::run("echo 1")),
+                    ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                        "echo 1",
+                    )),
                 ),
                 remaining_tools: vec![
                     ToolCall::new(
                         "tool-2",
-                        ToolInput::Bash(crate::tools::BashToolInput::run("echo 2")),
+                        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                            "echo 2",
+                        )),
                     ),
                     ToolCall::new(
                         "tool-3",
-                        ToolInput::Bash(crate::tools::BashToolInput::run("echo 3")),
+                        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                            "echo 3",
+                        )),
                     ),
                 ],
                 completed_results: vec![],
@@ -3060,8 +3127,8 @@ mod tests {
 
     #[test]
     fn test_subagent_context_exhaustion_fails_immediately() {
-        use crate::llm::ContentBlock;
-        use crate::state_machine::state::ContextExhaustionBehavior;
+        use crate::state::ContextExhaustionBehavior;
+        use phoenix_core::domain::llm_types::ContentBlock;
 
         // Create a sub-agent context
         let subagent_ctx = ConvContext {
@@ -3077,7 +3144,7 @@ mod tests {
             desired_base_branch: None,
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
-            llm_language: crate::llm_language::LlmLanguage::default(),
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
         };
 
         let result = handle_context_exhaustion(
@@ -3128,14 +3195,16 @@ mod tests {
 
     #[test]
     fn test_parent_context_exhaustion_triggers_continuation() {
-        use crate::llm::ContentBlock;
-        use crate::state_machine::state::{ToolCall, ToolInput};
+        use crate::state::{ToolCall, ToolInput};
+        use phoenix_core::domain::llm_types::ContentBlock;
 
         let parent_ctx = test_context(); // Uses ThresholdBasedContinuation
 
         let tool_calls = vec![ToolCall::new(
             "tool-1",
-            ToolInput::Bash(crate::tools::BashToolInput::run("echo test")),
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                "echo test",
+            )),
         )];
 
         let result = handle_context_exhaustion(
@@ -3180,8 +3249,8 @@ mod tests {
 
     #[test]
     fn test_subagent_text_only_response_is_implicit_completion() {
-        use crate::llm::{ContentBlock, Usage};
-        use crate::state_machine::state::ContextExhaustionBehavior;
+        use crate::state::ContextExhaustionBehavior;
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
         let subagent_ctx = ConvContext {
             mode_context: None,
@@ -3196,7 +3265,7 @@ mod tests {
             desired_base_branch: None,
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
-            llm_language: crate::llm_language::LlmLanguage::default(),
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
         };
 
         let result = transition(
@@ -3245,7 +3314,7 @@ mod tests {
 
     #[test]
     fn test_parent_text_only_response_still_goes_idle() {
-        use crate::llm::{ContentBlock, Usage};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
         let parent_ctx = test_context();
 
@@ -3286,7 +3355,7 @@ mod tests {
 
     #[test]
     fn test_subagent_llm_retries_exhausted_notifies_parent() {
-        use crate::state_machine::state::ContextExhaustionBehavior;
+        use crate::state::ContextExhaustionBehavior;
 
         let subagent_ctx = ConvContext {
             mode_context: None,
@@ -3301,7 +3370,7 @@ mod tests {
             desired_base_branch: None,
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
-            llm_language: crate::llm_language::LlmLanguage::default(),
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
         };
 
         // attempt == MAX_RETRY_ATTEMPTS (3), retryable error → retries exhausted
@@ -3337,7 +3406,7 @@ mod tests {
 
     #[test]
     fn test_subagent_llm_non_retryable_error_notifies_parent() {
-        use crate::state_machine::state::ContextExhaustionBehavior;
+        use crate::state::ContextExhaustionBehavior;
 
         let subagent_ctx = ConvContext {
             mode_context: None,
@@ -3352,7 +3421,7 @@ mod tests {
             desired_base_branch: None,
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
-            llm_language: crate::llm_language::LlmLanguage::default(),
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
         };
 
         // Non-retryable error at attempt 1 → immediate failure
@@ -3425,9 +3494,7 @@ mod tests {
     // ========================================================================
 
     fn make_ask_user_question_tool_call(tool_id: &str) -> ToolCall {
-        use crate::state_machine::state::{
-            AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion,
-        };
+        use crate::state::{AskUserQuestionInput, QuestionOption, ToolInput, UserQuestion};
         ToolCall::new(
             tool_id,
             ToolInput::AskUserQuestion(AskUserQuestionInput {
@@ -3455,7 +3522,7 @@ mod tests {
 
     #[test]
     fn test_llm_response_with_ask_user_question_goes_to_awaiting() {
-        use crate::llm::{ContentBlock, Usage};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
         let ctx = test_context();
         let tool = make_ask_user_question_tool_call("tool-auq-1");
@@ -3505,14 +3572,16 @@ mod tests {
 
     #[test]
     fn test_ask_user_question_must_be_only_tool() {
-        use crate::llm::{ContentBlock, Usage};
-        use crate::state_machine::state::ToolInput;
+        use crate::state::ToolInput;
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
         let ctx = test_context();
         let auq_tool = make_ask_user_question_tool_call("tool-auq-1");
         let bash_tool = ToolCall::new(
             "tool-bash-1",
-            ToolInput::Bash(crate::tools::BashToolInput::run("echo test")),
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                "echo test",
+            )),
         );
 
         let result = transition(
@@ -3565,8 +3634,8 @@ mod tests {
 
     #[test]
     fn test_propose_task_must_be_only_tool() {
-        use crate::llm::{ContentBlock, Usage};
-        use crate::state_machine::state::{ProposeTaskInput, ToolInput};
+        use crate::state::{ProposeTaskInput, ToolInput};
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
         let ctx = test_context();
         let propose_tool = ToolCall::new(
@@ -3577,7 +3646,9 @@ mod tests {
         );
         let bash_tool = ToolCall::new(
             "tool-bash-1",
-            ToolInput::Bash(crate::tools::BashToolInput::run("echo test")),
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                "echo test",
+            )),
         );
 
         let result = transition(
@@ -3638,8 +3709,8 @@ mod tests {
     /// the precise serde diagnostic and skipping the typed approval path.
     #[test]
     fn test_malformed_propose_task_surfaces_serde_error_to_llm() {
-        use crate::llm::{ContentBlock, Usage};
-        use crate::state_machine::state::ToolInput;
+        use crate::state::ToolInput;
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
         let ctx = test_context();
         // Construct via from_name_and_value so we exercise the same path the
@@ -3705,8 +3776,8 @@ mod tests {
     /// Task 13018 follow-up: same structural backstop for ask_user_question.
     #[test]
     fn test_malformed_ask_user_question_surfaces_serde_error_to_llm() {
-        use crate::llm::{ContentBlock, Usage};
-        use crate::state_machine::state::ToolInput;
+        use crate::state::ToolInput;
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 
         let ctx = test_context();
         let bad_payload = serde_json::json!({"questions": "not-an-array"});
@@ -3766,7 +3837,7 @@ mod tests {
 
     #[test]
     fn test_awaiting_user_response_with_answer_goes_to_llm_requesting() {
-        use crate::state_machine::state::UserQuestion;
+        use crate::state::UserQuestion;
 
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
@@ -3816,7 +3887,7 @@ mod tests {
 
     #[test]
     fn test_awaiting_user_response_dismisses_without_resuming_llm() {
-        use crate::state_machine::state::UserQuestion;
+        use crate::state::UserQuestion;
 
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
@@ -3863,7 +3934,7 @@ mod tests {
 
     #[test]
     fn test_awaiting_user_response_rejects_user_message() {
-        use crate::state_machine::state::UserQuestion;
+        use crate::state::UserQuestion;
 
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
@@ -3896,7 +3967,7 @@ mod tests {
 
     #[test]
     fn test_user_message_after_question_dismissal_resumes_agent() {
-        use crate::state_machine::state::UserQuestion;
+        use crate::state::UserQuestion;
 
         let state = ConvState::AwaitingUserResponse {
             questions: vec![UserQuestion {
@@ -3973,12 +4044,12 @@ mod tests {
 
     #[test]
     fn user_trigger_continuation_in_tool_executing_is_absorbed() {
-        use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall, ToolInput};
 
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(crate::tools::BashToolInput::run("echo")),
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
             ),
             remaining_tools: vec![],
             completed_results: vec![],
@@ -4071,8 +4142,8 @@ mod tests {
     // SteerDrainedUserMessages transition tests
     // ============================================================================
 
-    fn mk_steer_entry(id: &str, text: &str) -> crate::state_machine::event::SteerEntry {
-        crate::state_machine::event::SteerEntry {
+    fn mk_steer_entry(id: &str, text: &str) -> crate::event::SteerEntry {
+        crate::event::SteerEntry {
             text: text.to_string(),
             llm_text: None,
             images: vec![],
@@ -4246,12 +4317,12 @@ mod tests {
 
     #[test]
     fn steer_drained_from_tool_executing_rejected() {
-        use crate::state_machine::state::{AssistantMessage, ToolCall, ToolInput};
+        use crate::state::{AssistantMessage, ToolCall, ToolInput};
 
         let state = ConvState::ToolExecuting {
             current_tool: ToolCall::new(
                 "tool-1",
-                ToolInput::Bash(crate::tools::BashToolInput::run("echo")),
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
             ),
             remaining_tools: vec![],
             completed_results: vec![],
@@ -4359,7 +4430,7 @@ mod resolve_task_file_tests {
         let snap = resolve_task_file(tmp.path(), "tasks", "tasks/12345-p1-ready--fix-login.md")
             .expect("taskmd file should resolve");
         assert_eq!(snap.title, "Repair login");
-        assert_eq!(snap.priority, crate::task_source::Priority::P1);
+        assert_eq!(snap.priority, phoenix_core::task_source::Priority::P1);
         assert!(snap.plan.contains("plan body"));
     }
 
@@ -4402,7 +4473,7 @@ mod resolve_task_file_tests {
         let snap = resolve_task_file(tmp.path(), "tasks", "docs/plan.md")
             .expect("plain markdown should resolve");
         assert_eq!(snap.title, "Migrate the database");
-        assert_eq!(snap.priority, crate::task_source::Priority::P2);
+        assert_eq!(snap.priority, phoenix_core::task_source::Priority::P2);
         assert_eq!(snap.task_file, "docs/plan.md");
         assert!(snap.plan.contains("step one"));
 

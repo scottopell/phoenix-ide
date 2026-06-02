@@ -1,0 +1,16 @@
+[package]
+name = "phoenix-bash-display"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Bash command display simplification for Phoenix IDE: strips boilerplate `cd` prefixes from scripts for UI display. Pure brush-parser leaf — no phoenix-core/crate dependencies."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Bash AST parsing for semantic `cd`-prefix stripping (&& vs || vs ;).
+brush-parser = "0.4"
+
+[lints]
+workspace = true

@@ -767,7 +767,7 @@ impl ModelRegistry {
 
     /// Get the context window size for a model (REQ-BED-022)
     pub fn context_window(&self, model_id: &str) -> usize {
-        let default = crate::state_machine::state::DEFAULT_CONTEXT_WINDOW;
+        let default = phoenix_core::domain::sm_state::DEFAULT_CONTEXT_WINDOW;
         let specs = self.specs.read().ok();
         let services = self.services.read().ok();
         match (specs.as_deref(), services.as_deref()) {

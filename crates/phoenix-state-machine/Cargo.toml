@@ -1,0 +1,49 @@
+[package]
+name = "phoenix-state-machine"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Pure conversation state machine for Phoenix IDE: Elm-architecture reducer over the shared domain vocabulary. Two pure entry points (transition, handle_outcome) plus effect/outcome types. No I/O, HTTP, or persistence glue."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Shared domain vocabulary (ConvState, Event, ContentBlock, db schema types,
+# BashToolInput, QuotaDetails, LlmLanguage, Priority, …) — the reducer depends
+# *down* onto this base crate.
+phoenix-core = { path = "../phoenix-core" }
+
+# `cd`-prefix stripping for bash command display data (effect.rs).
+phoenix-bash-display = { path = "../phoenix-bash-display" }
+
+# Serialization for JSON-valued tool inputs / display data.
+serde_json = "1"
+
+# Timestamps on persisted messages and outcomes.
+chrono = { version = "0.4", features = ["serde"] }
+
+# TransitionError and friends.
+thiserror = "2"
+
+# Server-generated message identifiers for synthesized messages.
+uuid = { version = "1", features = ["v4"] }
+
+# Structured diagnostics from the reducer.
+tracing = "0.1"
+
+# Task status/priority constants for the propose-task acceptance gate.
+taskmd-core = ">=1.1,<2"
+
+[dev-dependencies]
+# Property-based tests for the reducer's invariants.
+proptest = "1"
+
+# Deterministic RNG for the project proptest harness.
+rand = "0.10"
+
+# Temporary task-file fixtures for the propose-task acceptance tests.
+tempfile = "3"
+
+[lints]
+workspace = true

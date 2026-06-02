@@ -1,10 +1,13 @@
 //! Effects produced by state transitions
 
-use crate::db::{ImageData, MessageContent, ToolContent, ToolContentImage, ToolResult, UsageData};
-use crate::llm::{ContentBlock, LlmAttemptReason};
-use crate::state_machine::state::{AssistantMessage, SubAgentOutcome, SubAgentResult, ToolCall};
-use crate::tools::bash_check::display_command;
+use crate::state::{AssistantMessage, SubAgentOutcome, SubAgentResult, ToolCall};
 use chrono::{DateTime, Utc};
+use phoenix_bash_display::display_command;
+use phoenix_core::domain::db_schema::{
+    ImageData, MessageContent, ToolContent, ToolContentImage, ToolResult, UsageData,
+};
+use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
+use phoenix_core::domain::llm_types::ContentBlock;
 use serde_json::Value;
 use std::fmt;
 use std::path::Path;
@@ -50,6 +53,11 @@ impl CheckpointData {
     /// Construct a `ToolRound` checkpoint, enforcing that the number of
     /// `tool_use` blocks in the assistant message matches the number of
     /// tool results.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PersistError::ResultCountMismatch`] when the `tool_use` count
+    /// in the assistant message differs from the number of tool results.
     pub fn tool_round(
         assistant_message: AssistantMessage,
         tool_results: Vec<ToolResult>,
@@ -74,6 +82,7 @@ impl CheckpointData {
 /// this ID: the former creates the message, the latter updates it in-place
 /// when sub-agent results arrive. Single-sourcing the convention here
 /// prevents silent divergence.
+#[must_use]
 pub fn tool_result_message_id(tool_use_id: &str) -> String {
     format!("{tool_use_id}-result")
 }
@@ -193,13 +202,13 @@ pub enum Effect {
     ApproveTask {
         task_file: String,
         title: String,
-        priority: crate::task_source::Priority,
+        priority: phoenix_core::task_source::Priority,
         plan: String,
     },
     ApproveTaskFreshHandoff {
         task_file: String,
         title: String,
-        priority: crate::task_source::Priority,
+        priority: phoenix_core::task_source::Priority,
         plan: String,
     },
     /// Task completed or abandoned: finalize conversation state, mode, and cwd.
@@ -226,21 +235,23 @@ impl Effect {
         images: Vec<ImageData>,
         message_id: String,
         user_agent: Option<String>,
-        skill_invocation: Option<crate::skills::SkillInvocation>,
+        skill_invocation: Option<phoenix_core::domain::skill_invocation::SkillInvocation>,
         idempotent: bool,
     ) -> Self {
         let text = text.into();
         let content = if let Some(invocation) = skill_invocation {
-            MessageContent::Skill(crate::db::SkillContent {
+            MessageContent::Skill(phoenix_core::domain::db_schema::SkillContent {
                 name: invocation.name,
                 body: invocation.body,
                 trigger: text,
             })
         } else {
             match llm_text {
-                Some(expanded) => MessageContent::User(crate::db::UserContent::with_expansion(
-                    text, expanded, images,
-                )),
+                Some(expanded) => MessageContent::User(
+                    phoenix_core::domain::db_schema::UserContent::with_expansion(
+                        text, expanded, images,
+                    ),
+                ),
                 None => {
                     if images.is_empty() {
                         MessageContent::user(text)
@@ -274,6 +285,7 @@ impl Effect {
     /// badge on the persisted assistant message (specs/llm-retry-visibility/
     /// REQ-LRV-006). 1 means "succeeded on first try"; the badge is
     /// hidden in that case.
+    #[must_use]
     pub fn persist_agent_message(
         blocks: Vec<ContentBlock>,
         usage: Option<UsageData>,
@@ -331,14 +343,17 @@ impl Effect {
         }
     }
 
+    #[must_use]
     pub fn notify_state_change() -> Self {
         Effect::NotifyStateChange
     }
 
+    #[must_use]
     pub fn notify_agent_done() -> Self {
         Effect::NotifyAgentDone
     }
 
+    #[must_use]
     pub fn execute_tool(tool: ToolCall) -> Self {
         Effect::ExecuteTool { tool }
     }
@@ -363,6 +378,7 @@ impl Effect {
 ///
 /// Returns `Some(json)` with display info if there are bash commands,
 /// `None` otherwise.
+#[must_use]
 pub fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<Value> {
     let cwd_str = cwd.to_string_lossy();
     let mut bash_displays: Vec<Value> = Vec::new();
@@ -370,10 +386,12 @@ pub fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<
     for block in blocks {
         if let ContentBlock::ToolUse { id, name, input } = block {
             if name == "bash" {
-                let display = serde_json::from_value::<crate::tools::BashToolInput>(input.clone())
-                    .ok()
-                    .and_then(|input| bash_input_display(&input, &cwd_str))
-                    .or_else(|| legacy_bash_input_display(input, &cwd_str));
+                let display = serde_json::from_value::<
+                    phoenix_core::domain::bash_types::BashToolInput,
+                >(input.clone())
+                .ok()
+                .and_then(|input| bash_input_display(&input, &cwd_str))
+                .or_else(|| legacy_bash_input_display(input, &cwd_str));
                 if let Some(display) = display {
                     bash_displays.push(serde_json::json!({
                         "tool_use_id": id,
@@ -391,24 +409,30 @@ pub fn compute_bash_display_data(blocks: &[ContentBlock], cwd: &Path) -> Option<
     }
 }
 
-fn bash_input_display(input: &crate::tools::BashToolInput, cwd: &str) -> Option<String> {
+fn bash_input_display(
+    input: &phoenix_core::domain::bash_types::BashToolInput,
+    cwd: &str,
+) -> Option<String> {
     match input.op {
-        crate::tools::BashOp::Run => input.cmd.as_deref().map(|cmd| display_command(cmd, cwd)),
-        crate::tools::BashOp::Peek => input
+        phoenix_core::domain::bash_types::BashOp::Run => {
+            input.cmd.as_deref().map(|cmd| display_command(cmd, cwd))
+        }
+        phoenix_core::domain::bash_types::BashOp::Peek => input
             .handle
             .as_deref()
             .map(|handle| format!("peek {handle}")),
-        crate::tools::BashOp::Wait => input.handle.as_deref().map(|handle| {
+        phoenix_core::domain::bash_types::BashOp::Wait => input.handle.as_deref().map(|handle| {
             let suffix = input
                 .wait_seconds
                 .map(|seconds| format!(" (up to {seconds}s)"))
                 .unwrap_or_default();
             format!("wait {handle}{suffix}")
         }),
-        crate::tools::BashOp::Kill => input.handle.as_deref().map(|handle| {
-            let signal = input
-                .signal
-                .map_or("TERM", crate::tools::bash::handle::KillSignal::as_str);
+        phoenix_core::domain::bash_types::BashOp::Kill => input.handle.as_deref().map(|handle| {
+            let signal = input.signal.map_or(
+                "TERM",
+                phoenix_core::domain::kill_signal::KillSignal::as_str,
+            );
             format!("kill {handle} ({signal})")
         }),
     }

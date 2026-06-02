@@ -2513,6 +2513,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-bash-display"
+version = "0.1.0"
+dependencies = [
+ "brush-parser",
+]
+
+[[package]]
 name = "phoenix-core"
 version = "0.1.0"
 dependencies = [
@@ -2567,6 +2574,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-state-machine"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "phoenix-bash-display",
+ "phoenix-core",
+ "proptest",
+ "rand 0.10.1",
+ "serde_json",
+ "taskmd-core",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "phoenix-terminal"
 version = "0.1.0"
 dependencies = [
@@ -2600,6 +2624,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
+ "phoenix-bash-display",
  "phoenix-core",
  "phoenix-skills",
  "phoenix-terminal",
@@ -2644,6 +2669,7 @@ dependencies = [
  "phoenix-core",
  "phoenix-db",
  "phoenix-skills",
+ "phoenix-state-machine",
  "phoenix-terminal",
  "phoenix-tls",
  "phoenix-tools",

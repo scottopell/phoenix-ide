@@ -11,7 +11,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::db::{ConvMode, NonEmptyString};
+    use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
     use proptest::prelude::*;
 
     // ========================================================================
@@ -299,11 +299,11 @@ mod tests {
 
 #[cfg(test)]
 mod state_machine_props {
-    use crate::state_machine::effect::Effect;
-    use crate::state_machine::event::Event;
-    use crate::state_machine::proptests::{arb_error_kind, arb_event, arb_state, test_context};
-    use crate::state_machine::state::{ConvContext, ConvState};
-    use crate::state_machine::transition::transition;
+    use crate::effect::Effect;
+    use crate::event::Event;
+    use crate::proptests::{arb_error_kind, arb_event, arb_state, test_context};
+    use crate::state::{ConvContext, ConvState};
+    use crate::transition::transition;
     use proptest::prelude::*;
     use std::path::PathBuf;
 
@@ -486,15 +486,15 @@ mod state_machine_props {
 
 #[cfg(test)]
 mod random_walk {
-    use crate::db::{ErrorKind, ToolResult};
-    use crate::llm::{ContentBlock, Usage};
-    use crate::state_machine::effect::Effect;
-    use crate::state_machine::event::Event;
-    use crate::state_machine::proptests::{effects_are_valid, is_valid_state, test_context};
-    use crate::state_machine::state::{
+    use crate::effect::Effect;
+    use crate::event::Event;
+    use crate::proptests::{effects_are_valid, is_valid_state, test_context};
+    use crate::state::{
         ConvContext, ConvState, SubAgentOutcome, TaskApprovalOutcome, ToolCall, ToolInput,
     };
-    use crate::state_machine::transition::transition;
+    use crate::transition::transition;
+    use phoenix_core::domain::db_schema::{ErrorKind, ToolResult};
+    use phoenix_core::domain::llm_types::{ContentBlock, Usage};
     use proptest::prelude::*;
     use rand::rngs::StdRng;
     use rand::Rng;
@@ -521,7 +521,7 @@ mod random_walk {
         let id = random_id(rng);
         ToolCall::new(
             id,
-            ToolInput::Think(crate::state_machine::state::ThinkInput {
+            ToolInput::Think(crate::state::ThinkInput {
                 thoughts: random_string(rng, 10),
             }),
         )
@@ -559,7 +559,8 @@ mod random_walk {
                 _ => Event::UserTriggerContinuation,
             },
 
-            ConvState::LlmRequesting { attempt } | ConvState::SeededLlmRequesting { attempt, .. } => {
+            ConvState::LlmRequesting { attempt }
+            | ConvState::SeededLlmRequesting { attempt, .. } => {
                 match rng.random_range(0..4) {
                     0 => {
                         // LlmResponse: text-only or with tool calls
@@ -586,13 +587,14 @@ mod random_walk {
                     1 => {
                         // LlmError with random retryable/non-retryable
                         let error_kind = random_error_kind(rng);
-                        let recovery = rng.random_bool(0.2) && matches!(error_kind, ErrorKind::Auth);
+                        let recovery =
+                            rng.random_bool(0.2) && matches!(error_kind, ErrorKind::Auth);
                         Event::LlmError {
                             message: random_string(rng, 15),
                             error_kind,
                             attempt: *attempt,
                             recovery_in_progress: recovery,
-                        resets_at: None,
+                            resets_at: None,
                         }
                     }
                     2 => Event::UserCancel { reason: None },
@@ -636,7 +638,8 @@ mod random_walk {
                     },
                     _ => {
                         // SubAgentResult for a pending agent
-                        let agent = &pending_sub_agents[rng.random_range(0..pending_sub_agents.len())];
+                        let agent =
+                            &pending_sub_agents[rng.random_range(0..pending_sub_agents.len())];
                         Event::SubAgentResult {
                             agent_id: agent.agent_id.clone(),
                             outcome: SubAgentOutcome::Success {
@@ -720,7 +723,7 @@ mod random_walk {
                         error_kind,
                         attempt: *attempt,
                         recovery_in_progress: false,
-                    resets_at: None,
+                        resets_at: None,
                     }
                 }
                 _ => Event::UserCancel { reason: None },
@@ -729,12 +732,12 @@ mod random_walk {
             ConvState::AwaitingTaskApproval { .. } => match rng.random_range(0..5) {
                 0 => Event::TaskApprovalDecided {
                     outcome: TaskApprovalOutcome::Approved {
-                        handoff: crate::state_machine::state::TaskApprovalHandoff::ContinueInCurrentConversation,
+                        handoff: crate::state::TaskApprovalHandoff::ContinueInCurrentConversation,
                     },
                 },
                 1 => Event::TaskApprovalDecided {
                     outcome: TaskApprovalOutcome::Approved {
-                        handoff: crate::state_machine::state::TaskApprovalHandoff::StartFreshWorkConversation,
+                        handoff: crate::state::TaskApprovalHandoff::StartFreshWorkConversation,
                     },
                 },
                 2 => Event::TaskApprovalDecided {
@@ -758,7 +761,9 @@ mod random_walk {
                                 let answer = if q.options.is_empty() {
                                     random_string(rng, 5)
                                 } else {
-                                    q.options[rng.random_range(0..q.options.len())].label.clone()
+                                    q.options[rng.random_range(0..q.options.len())]
+                                        .label
+                                        .clone()
                                 };
                                 (q.question.clone(), answer)
                             })
@@ -947,7 +952,7 @@ mod random_walk {
         /// propose_task tool calls in LlmResponse events to exercise the guard.
         #[test]
         fn prop_direct_mode_never_reaches_task_approval(seed in 0u64..u64::MAX) {
-            use crate::state_machine::state::{ModeKind, ProposeTaskInput};
+            use crate::state::{ModeKind, ProposeTaskInput};
 
             let mut rng = StdRng::seed_from_u64(seed);
             let mut ctx = ConvContext::new(

@@ -7,9 +7,10 @@
 //! cannot send an `LlmOutcome`. The executor wraps received outcomes in
 //! `EffectOutcome` before passing to `handle_outcome()`.
 
-use crate::db::ToolResult;
-use crate::llm::{ContentBlock, QuotaDetails, Usage};
-use crate::state_machine::state::{SubAgentOutcome, ToolCall};
+use crate::state::{SubAgentOutcome, ToolCall};
+use phoenix_core::domain::db_schema::ToolResult;
+use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+use phoenix_core::domain::quota_details::QuotaDetails;
 use std::time::Duration;
 
 // ============================================================================
@@ -135,7 +136,7 @@ pub enum SpawnOutcome {
     Spawned {
         tool_use_id: String,
         result: ToolResult,
-        spawned: Vec<crate::state_machine::state::PendingSubAgent>,
+        spawned: Vec<crate::state::PendingSubAgent>,
     },
     /// Spawning failed (returns error as a `ToolResult`)
     Failed {

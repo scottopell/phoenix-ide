@@ -10,7 +10,6 @@ pub(crate) mod git_ops;
 mod llm;
 mod message_expander;
 mod runtime;
-mod state_machine;
 mod system_prompt;
 mod title_generator;
 mod tls;
@@ -27,6 +26,11 @@ use phoenix_core::{llm_language, platform, task_source, work_scope};
 // (move-down, re-export-up). The axum/WebSocket glue stayed behind in
 // `api::terminal_ws`.
 use phoenix_terminal as terminal;
+
+// The pure conversation reducer now lives in the `phoenix-state-machine`
+// crate. Re-export it at its historical `crate::state_machine::…` path so
+// existing call sites resolve unchanged (move-down, re-export-up).
+use phoenix_state_machine as state_machine;
 
 // Skill discovery, metadata, and invocation now live in the `phoenix-skills`
 // crate (so the `phoenix-tools` crate can call it without depending on

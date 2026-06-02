@@ -8,8 +8,8 @@
 use super::state::*;
 use super::transition::*;
 use super::*;
-use crate::db::{ErrorKind, ToolResult};
-use crate::llm::{ContentBlock, Usage};
+use phoenix_core::domain::db_schema::{ErrorKind, ToolResult};
+use phoenix_core::domain::llm_types::{ContentBlock, Usage};
 use proptest::prelude::*;
 use std::path::PathBuf;
 
@@ -40,8 +40,8 @@ pub(crate) fn assistant_message_for_tools(tool_ids: &[&str]) -> AssistantMessage
 // Arbitrary Generators
 // ============================================================================
 
-fn arb_bash_input() -> impl Strategy<Value = crate::tools::BashToolInput> {
-    "[a-z ]{1,20}".prop_map(crate::tools::BashToolInput::run)
+fn arb_bash_input() -> impl Strategy<Value = phoenix_core::domain::bash_types::BashToolInput> {
+    "[a-z ]{1,20}".prop_map(phoenix_core::domain::bash_types::BashToolInput::run)
 }
 
 fn arb_think_input() -> impl Strategy<Value = ThinkInput> {
@@ -193,9 +193,9 @@ fn arb_awaiting_task_approval_state() -> impl Strategy<Value = ConvState> {
     (
         "[a-zA-Z ]{1,30}",
         prop_oneof![
-            Just(crate::task_source::Priority::P0),
-            Just(crate::task_source::Priority::P1),
-            Just(crate::task_source::Priority::P2),
+            Just(phoenix_core::task_source::Priority::P0),
+            Just(phoenix_core::task_source::Priority::P1),
+            Just(phoenix_core::task_source::Priority::P2),
         ],
         "[a-zA-Z0-9 .,\n]{1,100}",
         "[0-9]{5}",
@@ -337,11 +337,10 @@ fn arb_retry_timeout_event() -> impl Strategy<Value = Event> {
 fn arb_task_approval_outcome() -> impl Strategy<Value = TaskApprovalOutcome> {
     prop_oneof![
         Just(TaskApprovalOutcome::Approved {
-            handoff:
-                crate::state_machine::state::TaskApprovalHandoff::ContinueInCurrentConversation,
+            handoff: crate::state::TaskApprovalHandoff::ContinueInCurrentConversation,
         }),
         Just(TaskApprovalOutcome::Approved {
-            handoff: crate::state_machine::state::TaskApprovalHandoff::StartFreshWorkConversation,
+            handoff: crate::state::TaskApprovalHandoff::StartFreshWorkConversation,
         }),
         Just(TaskApprovalOutcome::Rejected),
         "[a-zA-Z ]{1,30}"
@@ -1068,7 +1067,7 @@ fn test_complete_tool_cycle() {
     // Step 2: LLM responds with tool call
     let tool = ToolCall::new(
         "tool-123",
-        ToolInput::Bash(crate::tools::BashToolInput::run("ls")),
+        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("ls")),
     );
     let result = transition(
         &state,
@@ -1189,15 +1188,21 @@ fn test_multi_tool_chain() {
 
     let tool1 = ToolCall::new(
         "t1",
-        ToolInput::Bash(crate::tools::BashToolInput::run("echo 1")),
+        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+            "echo 1",
+        )),
     );
     let tool2 = ToolCall::new(
         "t2",
-        ToolInput::Bash(crate::tools::BashToolInput::run("echo 2")),
+        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+            "echo 2",
+        )),
     );
     let tool3 = ToolCall::new(
         "t3",
-        ToolInput::Bash(crate::tools::BashToolInput::run("echo 3")),
+        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+            "echo 3",
+        )),
     );
 
     // LLM responds with 3 tools
@@ -1358,16 +1363,22 @@ fn test_cancel_mid_tool_chain() {
     let state = ConvState::ToolExecuting {
         current_tool: ToolCall::new(
             "t2",
-            ToolInput::Bash(crate::tools::BashToolInput::run("sleep 10")),
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                "sleep 10",
+            )),
         ),
         remaining_tools: vec![
             ToolCall::new(
                 "t3",
-                ToolInput::Bash(crate::tools::BashToolInput::run("echo 3")),
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                    "echo 3",
+                )),
             ),
             ToolCall::new(
                 "t4",
-                ToolInput::Bash(crate::tools::BashToolInput::run("echo 4")),
+                ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                    "echo 4",
+                )),
             ),
         ],
         completed_results: vec![t1_result],
@@ -1439,11 +1450,15 @@ fn test_cancel_mid_tool_chain() {
 fn test_tool_completion_advances_to_next_tool() {
     let tool1 = ToolCall::new(
         "t1",
-        ToolInput::Bash(crate::tools::BashToolInput::run("echo 1")),
+        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+            "echo 1",
+        )),
     );
     let tool2 = ToolCall::new(
         "t2",
-        ToolInput::Bash(crate::tools::BashToolInput::run("echo 2")),
+        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+            "echo 2",
+        )),
     );
 
     let state = ConvState::ToolExecuting {
@@ -1489,7 +1504,9 @@ fn test_tool_completion_advances_to_next_tool() {
 fn test_last_tool_completion_goes_to_llm_requesting() {
     let tool1 = ToolCall::new(
         "t1",
-        ToolInput::Bash(crate::tools::BashToolInput::run("echo 1")),
+        ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+            "echo 1",
+        )),
     );
 
     let state = ConvState::ToolExecuting {
@@ -1761,7 +1778,7 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
     let state = ConvState::ToolExecuting {
         current_tool: ToolCall::new(
             "t1",
-            ToolInput::Bash(crate::tools::BashToolInput::run("echo")),
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
         ),
         remaining_tools: vec![],
         completed_results: vec![],
@@ -1810,7 +1827,7 @@ fn test_spawn_agents_complete_accumulates_ids() {
         ),
         remaining_tools: vec![ToolCall::new(
             "t2",
-            ToolInput::Bash(crate::tools::BashToolInput::run("echo")),
+            ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run("echo")),
         )],
         completed_results: vec![],
         pending_sub_agents: vec![PendingSubAgent {

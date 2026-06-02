@@ -20,6 +20,9 @@ phoenix-terminal = { path = "../phoenix-terminal" }
 # Skill discovery + invocation for the `skill` tool.
 phoenix-skills = { path = "../phoenix-skills" }
 
+# Bash command display simplification (cd-prefix stripping for UI).
+phoenix-bash-display = { path = "../phoenix-bash-display" }
+
 # Async tool trait.
 async-trait = "0.1"
 
