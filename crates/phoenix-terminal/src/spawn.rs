@@ -50,6 +50,14 @@ pub enum PtyExecPlan {
 ///
 /// The argv branching (REQ-TMUX-004) is materialised before fork by the
 /// caller and passed in as `plan` so this function stays synchronous.
+///
+/// # Errors
+/// Returns an error string if any step of the PTY/fork/exec sequence fails
+/// (`openpty`, initial `TIOCSWINSZ`, or `fork`).
+///
+/// # Panics
+/// Panics if a fixed argv literal contains an interior NUL when building the
+/// child's `CString` arguments — impossible for the static literals used here.
 #[allow(clippy::too_many_lines)] // inherently dense fork+exec sequence
 pub fn spawn_pty(
     cwd: &Path,
@@ -232,6 +240,9 @@ pub fn spawn_pty(
 }
 
 /// Apply window size to a PTY master fd (raw).
+///
+/// # Errors
+/// Returns an error string if the `TIOCSWINSZ` ioctl fails.
 pub fn set_winsize_raw(fd: RawFd, dims: Dims) -> Result<(), String> {
     let ws = libc::winsize {
         ws_col: dims.cols,
@@ -332,6 +343,24 @@ fn exec_via_path(prog: &CString, argv: &[CString], envp: &[CString]) {
     }
 }
 
+/// Set a file descriptor to non-blocking mode.
+///
+/// # Errors
+/// Returns an error if either the `F_GETFL` or `F_SETFL` `fcntl` call fails.
+pub fn set_nonblocking(fd: libc::c_int) -> Result<(), std::io::Error> {
+    // SAFETY: `fcntl` syscall on a valid fd.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    if ret == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,20 +406,5 @@ mod tests {
             PtyExecPlan::Shell => {}
             PtyExecPlan::Tmux { .. } => panic!("expected Shell variant"),
         }
-    }
-}
-
-/// Set a file descriptor to non-blocking mode.
-pub fn set_nonblocking(fd: libc::c_int) -> Result<(), std::io::Error> {
-    // SAFETY: `fcntl` syscall on a valid fd.
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags == -1 {
-        return Err(std::io::Error::last_os_error());
-    }
-    let ret = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
-    if ret == -1 {
-        Err(std::io::Error::last_os_error())
-    } else {
-        Ok(())
     }
 }

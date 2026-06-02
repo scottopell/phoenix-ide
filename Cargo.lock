@@ -2541,6 +2541,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-terminal"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "libc",
+ "nix 0.31.3",
+ "phoenix-core",
+ "proptest",
+ "tokio",
+ "tracing",
+ "vte",
+]
+
+[[package]]
 name = "phoenix-tls"
 version = "0.1.0"
 dependencies = [
@@ -2571,6 +2585,7 @@ dependencies = [
  "nix 0.31.3",
  "nucleo-matcher",
  "phoenix-core",
+ "phoenix-terminal",
  "phoenix-tls",
  "proptest",
  "pulldown-cmark",

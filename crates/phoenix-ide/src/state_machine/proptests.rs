@@ -2205,3 +2205,94 @@ proptest! {
         }
     }
 }
+
+// ── ConvState::is_terminal() completeness ─────────────────────────────────────
+//
+// `is_terminal()` gates terminal-session teardown (REQ-TERM-012): the terminal
+// is abandoned when `ConversationBecameTerminal` fires, which fires when
+// `is_terminal()` becomes true. These tests live here (not in phoenix-terminal)
+// because they exercise `ConvState`, which is owned by the state machine.
+
+/// REQ-TERM-012 / `TerminalAbandonedWithConversation`:
+/// Terminal teardown triggers on `ConversationBecameTerminal`, which fires when
+/// `is_terminal()` becomes true. Verify all four terminal states return true.
+#[test]
+fn is_terminal_covers_all_terminal_states() {
+    let terminal_states: &[ConvState] = &[
+        ConvState::Completed {
+            result: "done".into(),
+        },
+        ConvState::Failed {
+            error: "err".into(),
+            error_kind: ErrorKind::Cancelled,
+        },
+        ConvState::ContextExhausted {
+            summary: "summary".into(),
+        },
+        ConvState::Terminal,
+    ];
+
+    for state in terminal_states {
+        assert!(
+            state.is_terminal(),
+            "is_terminal() must return true for {:?} — required for REQ-TERM-012 teardown",
+            std::mem::discriminant(state)
+        );
+    }
+}
+
+/// Non-terminal states must NOT be treated as terminal.
+#[test]
+fn is_terminal_excludes_non_terminal_states() {
+    let non_terminal: &[ConvState] = &[
+        ConvState::Idle,
+        ConvState::AwaitingContinuation {
+            rejected_tool_calls: vec![],
+            attempt: 0,
+        },
+    ];
+
+    for state in non_terminal {
+        assert!(
+            !state.is_terminal(),
+            "is_terminal() must return false for {:?}",
+            std::mem::discriminant(state)
+        );
+    }
+}
+
+proptest! {
+    /// REQ-TERM-012: ConversationBecameTerminal fires when is_terminal() becomes true.
+    /// Property: is_terminal() is stable — calling it twice on the same state
+    /// returns the same value (no side effects, no volatility).
+    ///
+    /// Also verifies Idle is always non-terminal (required: terminal teardown must
+    /// not fire on conversations that haven't ended).
+    #[test]
+    fn prop_is_terminal_is_idempotent(
+        summary in "[a-z ]{0,50}",
+        result in "[a-z ]{0,50}",
+    ) {
+        let states = vec![
+            ConvState::Idle,
+            ConvState::Terminal,
+            ConvState::Completed { result: result.clone() },
+            ConvState::Failed { error: "e".into(), error_kind: ErrorKind::Cancelled },
+            ConvState::ContextExhausted { summary: summary.clone() },
+        ];
+
+        for state in &states {
+            let first = state.is_terminal();
+            let second = state.is_terminal();
+            prop_assert_eq!(first, second,
+                "is_terminal() must be idempotent on {:?}", std::mem::discriminant(state));
+        }
+
+        // Idle is always non-terminal.
+        prop_assert!(!ConvState::Idle.is_terminal(),
+            "Idle must never be terminal — teardown must not fire on active conversations");
+
+        // Terminal is always terminal.
+        prop_assert!(ConvState::Terminal.is_terminal());
+    }
+}

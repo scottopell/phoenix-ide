@@ -26,6 +26,7 @@ use super::types::{
     UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
+use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
 use crate::db::{
     ConvMode, ConversationUsage, ImageData, Message, MessageContent, MessageType,
     NotificationSettings,
@@ -36,7 +37,6 @@ use crate::git_ops::{
 use crate::llm::{ContentBlock, GatewayStatus};
 use crate::runtime::SseEvent;
 use crate::state_machine::{check_user_message_acceptable, ConvState, Event, TransitionError};
-use crate::terminal::{terminal_ws_global_handler, terminal_ws_handler};
 
 use super::browser_view::browser_view_ws_handler;
 

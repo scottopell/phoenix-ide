@@ -1,0 +1,42 @@
+[package]
+name = "phoenix-terminal"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "PTY-backed terminal sessions for Phoenix IDE: spawn, relay, command tracking, and the per-WorkScope session registry. Terminal-core only — no axum/HTTP glue."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Exposes the ANSI/OSC test-stream builders and `full_command` helper
+# (`#[cfg(test)]` only) to downstream crates' test builds. A `#[cfg(test)]`
+# item is invisible across a crate boundary, so dependents that drive the
+# CommandTracker in their own tests enable this feature via dev-dependencies.
+# Off in production builds.
+test-support = []
+
+[dependencies]
+# Shared domain vocabulary (WorkScope keys the session registry).
+phoenix-core = { path = "../phoenix-core" }
+
+# Async runtime + PTY readiness (AsyncFd is epoll-backed).
+tokio = { version = "1", features = ["full"] }
+
+# Async utilities for the WS<->PTY relay.
+futures = "0.3"
+
+# PTY / process management.
+nix = { version = "0.31", features = ["signal", "process", "term", "fs"] }
+libc = "0.2"
+
+# OSC 133 parsing for CommandTracker (REQ-TERM-021).
+vte = "0.15"
+
+tracing = "0.1"
+
+[dev-dependencies]
+proptest = "1"
+
+[lints]
+workspace = true
