@@ -429,6 +429,7 @@ pub(crate) fn fetch_pr_feedback_for_pr(
 pub(crate) fn capture_pr_auto_fix_context_for_pr(
     worktree: &Path,
     pr_number: u64,
+    llm_language: phoenix_core::llm_language::LlmLanguage,
 ) -> Result<PrAutoFixCapture, PrMonitorError> {
     if !worktree.is_dir() || run_git(worktree, &["rev-parse", "--is-inside-work-tree"]).is_err() {
         return Err(PrMonitorError::BadRequest(
@@ -451,7 +452,7 @@ pub(crate) fn capture_pr_auto_fix_context_for_pr(
         }
     };
     let CapturedPrAutoFixContext { response, baseline } =
-        match capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client) {
+        match capture_pr_auto_fix_context_for_pr_item(worktree, pr, &client, llm_language) {
             Ok(captured) => captured,
             Err(PrMonitorError::BadRequest(message)) => {
                 if let Some(observation) = observation {
@@ -474,6 +475,7 @@ pub(crate) fn capture_pr_auto_fix_context_for_pr(
 pub(crate) fn capture_pr_auto_fix_context_for_branch(
     worktree: &Path,
     branch_name: &str,
+    llm_language: phoenix_core::llm_language::LlmLanguage,
 ) -> Result<PrAutoFixCapture, PrMonitorError> {
     if !worktree.is_dir() || run_git(worktree, &["rev-parse", "--is-inside-work-tree"]).is_err() {
         return Err(PrMonitorError::BadRequest(
@@ -484,6 +486,7 @@ pub(crate) fn capture_pr_auto_fix_context_for_branch(
         worktree,
         branch_name,
         &ShellGhClient::new(worktree),
+        llm_language,
     )
 }
 
@@ -491,6 +494,7 @@ fn capture_pr_auto_fix_context_for_branch_with_client(
     worktree: &Path,
     branch_name: &str,
     client: &dyn GhClient,
+    llm_language: phoenix_core::llm_language::LlmLanguage,
 ) -> Result<PrAutoFixCapture, PrMonitorError> {
     let prs = client.pr_list_for_head(branch_name).map_err(|e| {
         let reason = e.kind.unavailable_reason();
@@ -520,18 +524,20 @@ fn capture_pr_auto_fix_context_for_branch_with_client(
         PrMonitorError::BadRequest("No pull request found for this branch".to_string())
     })?;
     let CapturedPrAutoFixContext { response, baseline } =
-        capture_pr_auto_fix_context_for_pr_item(worktree, pr, client).map_err(|err| {
-            if let PrMonitorError::BadRequest(message) = err {
-                if !observations.is_empty() {
-                    return PrMonitorError::BadRequestWithObservations {
-                        message,
-                        observations: observations.clone(),
-                    };
+        capture_pr_auto_fix_context_for_pr_item(worktree, pr, client, llm_language).map_err(
+            |err| {
+                if let PrMonitorError::BadRequest(message) = err {
+                    if !observations.is_empty() {
+                        return PrMonitorError::BadRequestWithObservations {
+                            message,
+                            observations: observations.clone(),
+                        };
+                    }
+                    return PrMonitorError::BadRequest(message);
                 }
-                return PrMonitorError::BadRequest(message);
-            }
-            err
-        })?;
+                err
+            },
+        )?;
     Ok(PrAutoFixCapture {
         response,
         observations,
@@ -548,6 +554,7 @@ fn capture_pr_auto_fix_context_for_pr_item(
     worktree: &Path,
     pr: GhPrListItem,
     client: &dyn GhClient,
+    llm_language: phoenix_core::llm_language::LlmLanguage,
 ) -> Result<CapturedPrAutoFixContext, PrMonitorError> {
     let display_state = normalize_pr_display_state(&pr.state, pr.is_draft);
     if display_state != PrDisplayState::Open {
@@ -606,9 +613,7 @@ fn capture_pr_auto_fix_context_for_pr_item(
         PrMonitorError::Internal(format!("Failed to write PR context artifact: {e}"))
     })?;
 
-    let message = format!(
-        "Address the PR feedback captured in `{rel_path}`. Use that file as the source of truth for failing CI checks and review comments, fix the issues in this worktree, run targeted tests, commit the changes, and summarize what changed. Do not push unless the user explicitly asks."
-    );
+    let message = phoenix_core::llm_language::pr_auto_fix_instruction(llm_language, &rel_path);
     let baseline = artifact.baseline();
     Ok(CapturedPrAutoFixContext {
         response: PrAutoFixContextResponse {
@@ -1996,13 +2001,25 @@ mod tests {
             review_summaries: Ok(vec![]),
             review_threads: Ok(vec![]),
         };
-        let response =
-            capture_pr_auto_fix_context_for_branch_with_client(temp.path(), "branch", &gh)
-                .unwrap()
-                .response;
+        let response = capture_pr_auto_fix_context_for_branch_with_client(
+            temp.path(),
+            "branch",
+            &gh,
+            phoenix_core::llm_language::LlmLanguage::PhoenixNative,
+        )
+        .unwrap()
+        .response;
+        assert_eq!(
+            response.message,
+            phoenix_core::llm_language::pr_auto_fix_instruction(
+                phoenix_core::llm_language::LlmLanguage::PhoenixNative,
+                &response.artifact_path,
+            )
+        );
         assert!(response
             .message
-            .contains("Do not push unless the user explicitly asks"));
+            .contains(&format!("`{}`", response.artifact_path)));
+        assert!(!response.message.to_lowercase().contains("push"));
         let artifact: serde_json::Value = serde_json::from_str(
             &std::fs::read_to_string(temp.path().join(&response.artifact_path)).unwrap(),
         )
@@ -2046,8 +2063,13 @@ mod tests {
             repo: Ok(repo()),
             ..FakeGh::default()
         };
-        let err = capture_pr_auto_fix_context_for_branch_with_client(temp.path(), "branch", &gh)
-            .unwrap_err();
+        let err = capture_pr_auto_fix_context_for_branch_with_client(
+            temp.path(),
+            "branch",
+            &gh,
+            phoenix_core::llm_language::LlmLanguage::PhoenixNative,
+        )
+        .unwrap_err();
         match err {
             PrMonitorError::BadRequestWithObservations {
                 message,
@@ -2070,8 +2092,13 @@ mod tests {
             prs: Ok(vec![]),
             ..FakeGh::default()
         };
-        let err = capture_pr_auto_fix_context_for_branch_with_client(temp.path(), "branch", &gh)
-            .unwrap_err();
+        let err = capture_pr_auto_fix_context_for_branch_with_client(
+            temp.path(),
+            "branch",
+            &gh,
+            phoenix_core::llm_language::LlmLanguage::PhoenixNative,
+        )
+        .unwrap_err();
         assert!(matches!(err, PrMonitorError::BadRequest(_)));
         assert!(!temp.path().join(".phoenix/pr-context").exists());
     }

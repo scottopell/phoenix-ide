@@ -186,6 +186,24 @@ pub fn next_taskmd_id_hint(lang: LlmLanguage, tasks_dir_name: &str, next_id: &st
 }
 
 #[must_use]
+pub const fn pr_auto_fix_instruction_prefix() -> &'static str {
+    "Address the PR feedback captured in `"
+}
+
+#[must_use]
+pub fn pr_auto_fix_instruction(lang: LlmLanguage, artifact_path: &str) -> String {
+    let prefix = pr_auto_fix_instruction_prefix();
+    match lang {
+        LlmLanguage::PhoenixNative => format!(
+            "{prefix}{artifact_path}`. Use that file as the source of truth for failing CI checks and review comments, fix the issues in this worktree, run targeted tests, commit the changes, and summarize what changed."
+        ),
+        LlmLanguage::Caveman => format!(
+            "{prefix}{artifact_path}`. File is truth: failed CI and review comments. Fix in this cave. Run focused tests. Commit changes. Say what changed."
+        ),
+    }
+}
+
+#[must_use]
 pub fn mode_direct(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {
@@ -349,6 +367,27 @@ mod tests {
             caveman.len(),
             native.len()
         );
+    }
+
+    #[test]
+    fn pr_auto_fix_instruction_mentions_artifact_and_omits_push_policy() {
+        let native =
+            pr_auto_fix_instruction(LlmLanguage::PhoenixNative, ".phoenix/pr-context/pr-7.json");
+        assert!(native
+            .starts_with("Address the PR feedback captured in `.phoenix/pr-context/pr-7.json`"));
+        assert!(native.contains("failing CI checks"));
+        assert!(native.contains("review comments"));
+        assert!(native.contains("commit the changes"));
+        assert!(!native.to_lowercase().contains("push"));
+
+        let caveman =
+            pr_auto_fix_instruction(LlmLanguage::Caveman, ".phoenix/pr-context/pr-7.json");
+        assert_ne!(native, caveman);
+        assert!(caveman
+            .starts_with("Address the PR feedback captured in `.phoenix/pr-context/pr-7.json`"));
+        assert!(caveman.contains("failed CI"));
+        assert!(caveman.contains("review comments"));
+        assert!(!caveman.to_lowercase().contains("push"));
     }
 
     #[test]

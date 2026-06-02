@@ -530,11 +530,16 @@ pub(crate) async fn create_pr_auto_fix_context(
     let result = tokio::task::spawn_blocking(move || {
         let worktree = PathBuf::from(worktree_path);
         if let Some(pr) = associated_pr {
-            crate::api::pr_monitoring::capture_pr_auto_fix_context_for_pr(&worktree, pr.pr_number)
+            crate::api::pr_monitoring::capture_pr_auto_fix_context_for_pr(
+                &worktree,
+                pr.pr_number,
+                conv.llm_language,
+            )
         } else {
             crate::api::pr_monitoring::capture_pr_auto_fix_context_for_branch(
                 &worktree,
                 &branch_name,
+                conv.llm_language,
             )
         }
     })
@@ -573,7 +578,8 @@ pub(crate) async fn record_pr_auto_fix_context_baseline(
     conversation_id: &str,
     text: &str,
 ) -> Result<(), AppError> {
-    let Some(raw) = text.strip_prefix("Address the PR feedback captured in `") else {
+    let Some(raw) = text.strip_prefix(phoenix_core::llm_language::pr_auto_fix_instruction_prefix())
+    else {
         return Ok(());
     };
     let Some((artifact_path, _)) = raw.split_once('`') else {
