@@ -31,6 +31,10 @@ tower-http = { version = "0.6", features = ["cors", "fs", "compression-br", "com
 # `phoenix-tls`'s cold-compile cost off `phoenix-tls` itself).
 phoenix-tls = { path = "../phoenix-tls" }
 
+# Skill discovery, metadata, and invocation. Extracted so the future
+# `phoenix-tools` crate can call it without depending on phoenix-ide.
+phoenix-skills = { path = "../phoenix-skills" }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

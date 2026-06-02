@@ -2542,6 +2542,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-skills"
+version = "0.1.0"
+dependencies = [
+ "phoenix-core",
+ "rust-embed",
+ "tempfile",
+]
+
+[[package]]
 name = "phoenix-terminal"
 version = "0.1.0"
 dependencies = [
@@ -2586,6 +2595,7 @@ dependencies = [
  "nix 0.31.3",
  "nucleo-matcher",
  "phoenix-core",
+ "phoenix-skills",
  "phoenix-terminal",
  "phoenix-tls",
  "proptest",

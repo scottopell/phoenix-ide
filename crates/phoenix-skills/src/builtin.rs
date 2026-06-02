@@ -6,13 +6,13 @@
 //!
 //! ## Layout
 //!
-//! Each subdirectory under `src/skills/builtin/` is one skill. The directory
+//! Each subdirectory under `src/builtin/` is one skill. The directory
 //! must contain `SKILL.md` with the standard frontmatter; any other files
 //! (references, scripts, examples) are extracted alongside and visible to
 //! the LLM via the existing skill-base-directory mechanism.
 //!
-//! ```
-//! src/skills/builtin/
+//! ```text
+//! src/builtin/
 //!   allium/
 //!     SKILL.md
 //!     references/
@@ -33,7 +33,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 #[derive(rust_embed::RustEmbed)]
-#[folder = "src/skills/builtin/"]
+#[folder = "src/builtin/"]
 struct BuiltinAssets;
 
 /// Subdirectory under the phoenix data dir where built-ins are extracted.

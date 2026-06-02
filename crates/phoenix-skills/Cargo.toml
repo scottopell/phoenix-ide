@@ -1,0 +1,22 @@
+[package]
+name = "phoenix-skills"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.94"
+description = "Skill discovery, metadata, and invocation for Phoenix IDE: filesystem and built-in skills, frontmatter parsing, and argument substitution. Core-only — no axum/HTTP glue."
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# Shared domain vocabulary (`SkillInvocation`) and `LlmLanguage`.
+phoenix-core = { path = "../phoenix-core" }
+
+# Built-in skills are embedded into the binary and extracted to disk.
+rust-embed = "8"
+
+[dev-dependencies]
+tempfile = "3"
+
+[lints]
+workspace = true
