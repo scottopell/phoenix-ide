@@ -205,3 +205,82 @@ is in the changed set.
 - **Deeper db refactor** (separating `db/schema.rs`'s persistence fns from the
   pure types now in core) is a known follow-up but is an architecture play, not
   a build-time one — track separately.
+
+## Spike results
+
+Ran the de-risking spike. Outcome: **crate-splitting delivers the projected
+incremental-compile win, and the per-crate gating mechanism works** — but the
+fattest target (`tools`) needs one bounded dependency inversion before it can
+be extracted. Recommendation: **continue**, doing the LLM-trait inversion next.
+
+### What landed (committed on the branch)
+
+1. **Cycle-break: bash/tmux wire types → phoenix-core.** `tools` imported 13
+   `#[ts(export)]` bash/tmux response types from `api::wire` (a real
+   production `tools → api` cycle, not the doc-link it was first scoped as).
+   Moved them to `phoenix_core::domain::tool_wire`; generated TS byte-identical.
+2. **Extracted `phoenix-terminal`** (~4.2k LOC). The axum/WebSocket glue
+   (`terminal/ws.rs`, 912 LOC, depends on `api::AppState`/`runtime`) was *not*
+   terminal-core; relocated up to `api::terminal_ws` to avoid re-creating a
+   cycle. `phoenix-terminal` is acyclic (no `api`/`runtime` refs).
+
+### Measurements (warm target, representative one-line edit, this 4-vCPU box)
+
+Incremental cost of an edit, per the affected crate:
+
+| Edit location | `clippy -p <crate>` (split) | `clippy --workspace` (today) |
+|---|---|---|
+| inside `phoenix-terminal` (a real crate) | **3.4s** | 39.7s |
+| inside `phoenix-core` (base) | 3.0s (then rdeps) | — |
+| inside `phoenix-ide` (still the monolith) | 15.0s | 11.9s |
+
+Test-compile, edit inside `phoenix-terminal`: **1.4s** (`-p`) vs **14.4s**
+(`--workspace --no-run`).
+
+Reading the numbers honestly:
+- A change confined to an extracted crate checks in **~3s vs ~40s** — an order
+  of magnitude, and exactly the Bazel-like outcome the task set out to test.
+- The `phoenix-ide` row (15s `-p` ≈ 12s workspace) is the **control**: editing
+  the still-monolithic crate gains nothing from `-p`, because it *is* the bulk.
+  This is expected and is the whole argument for continuing to peel crates out
+  of it — every module moved into its own crate converts a "12s+ workspace
+  recompile" edit into a "~3s single-crate" edit.
+- Net: the win is **proportional to how much code lives in right-sized crates**.
+  Two crates (`core`, `terminal`) prove the mechanism; the payoff scales as the
+  big modules (`tools`, `llm`, `runtime`, `state_machine`, `api`) follow.
+
+### Blocker found (the reason `tools` itself didn't extract this round)
+
+`tools` is not independently extractable yet:
+- `ToolContext` (the shared tool spine) holds `llm_registry: Arc<ModelRegistry>`
+  as a **concrete field**, and `keyword_search.rs` calls the live LLM via
+  `LlmService` (production). `ModelRegistry` (1.5k LOC) + the `LlmService` trait
+  live in phoenix-ide's `llm` module (11k LOC), and `registry.rs` has its own
+  upward edge `→ api::ModelInfo`. So `tools` can't point cleanly down to core.
+  (All 18 `ModelRegistry::new_empty()` calls *in tools* are `#[cfg(test)]`; only
+  the `ToolContext` field + `keyword_search` are production.)
+- Minor, easy: `tools/skill.rs` calls `system_prompt::discover_skills` +
+  `skills::invoke_skill` (one file, two fns); `SkillInvocation` is already in
+  core, `SkillMetadata` + the two fns are a bounded move.
+
+### Recommended next step: invert the LLM dependency (then `tools` is unblocked)
+
+Define `LlmService` + a small selector trait (`get(&str)`/`default() ->
+Arc<dyn LlmService>`) in `phoenix-core`; have `ModelRegistry` impl it;
+change `ToolContext` to hold `Arc<dyn LlmSelector>` instead of
+`Arc<ModelRegistry>`. Then `tools` depends only on core + `phoenix-terminal`.
+Bounded but non-trivial: touches `ToolContext::new` (2 production callers +
+~18 test builders), and requires confirming `LlmResponse`/`LlmError`/
+`TokenChunk` are core-resident (errors live in `llm/error.rs`). Pair with the
+small skills move. Rejected alternatives: moving the whole `llm` module to core
+(drags reqwest/providers + the `api::ModelInfo` cycle into a "domain
+vocabulary" crate); splitting `ToolContext` across crates (the trait ends up in
+core anyway, for worse).
+
+### Stage 3 status
+
+Per-crate gating is mechanically proven by the `clippy -p` / `test -p` numbers
+above; the dev.py wiring (`-p <changed-crate>` + `nextest -E 'rdeps(...)'`,
+falling back to full when `phoenix-core` changes) is not yet implemented —
+worth doing once ≥1 big module (e.g. `tools`) is its own crate, so a common
+edit actually hits the fast path.
