@@ -31,9 +31,14 @@ tower-http = { version = "0.6", features = ["cors", "fs", "compression-br", "com
 # `phoenix-tls`'s cold-compile cost off `phoenix-tls` itself).
 phoenix-tls = { path = "../phoenix-tls" }
 
-# Skill discovery, metadata, and invocation. Extracted so the future
+# Skill discovery, metadata, and invocation. Extracted so the
 # `phoenix-tools` crate can call it without depending on phoenix-ide.
 phoenix-skills = { path = "../phoenix-skills" }
+
+# Tool implementations (bash, patch, browser, tmux, search, …). The Tool
+# trait, ToolContext, and ToolRegistry live here. The axum/HTTP glue that
+# drives tools (api::handlers, api::browser_view) stays in phoenix-ide.
+phoenix-tools = { path = "../phoenix-tools" }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

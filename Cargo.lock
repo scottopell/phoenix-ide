@@ -2573,6 +2573,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-tools"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "base64",
+ "brush-parser",
+ "chromiumoxide",
+ "futures",
+ "globset",
+ "ignore",
+ "libc",
+ "phoenix-core",
+ "phoenix-skills",
+ "phoenix-terminal",
+ "proptest",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "similar 3.1.1",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "unicode-security",
+ "uuid",
+ "which",
+]
+
+[[package]]
 name = "phoenix_ide"
 version = "0.8.1"
 dependencies = [
@@ -2598,6 +2629,7 @@ dependencies = [
  "phoenix-skills",
  "phoenix-terminal",
  "phoenix-tls",
+ "phoenix-tools",
  "proptest",
  "pulldown-cmark",
  "rand 0.10.1",

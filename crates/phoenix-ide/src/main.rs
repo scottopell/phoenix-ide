@@ -15,7 +15,6 @@ mod state_machine;
 mod system_prompt;
 mod title_generator;
 mod tls;
-mod tools;
 
 // Domain-vocabulary leaves now live in the acyclic `phoenix-core` base crate.
 // Re-export them at their historical crate-root paths so existing
@@ -31,10 +30,17 @@ use phoenix_core::{llm_language, platform, task_source, work_scope};
 use phoenix_terminal as terminal;
 
 // Skill discovery, metadata, and invocation now live in the `phoenix-skills`
-// crate (so the future `phoenix-tools` crate can call it without depending on
+// crate (so the `phoenix-tools` crate can call it without depending on
 // phoenix-ide). Re-export at the historical `crate::skills::…` path so existing
 // call sites resolve unchanged (move-down, re-export-up).
 pub use phoenix_skills as skills;
+
+// Tool implementations (bash, patch, browser, tmux, search, …) now live in the
+// `phoenix-tools` crate. Re-export at the historical `crate::tools::…` path so
+// existing call sites (runtime executor, api handlers, browser_view, the
+// shutdown kill-tree pass) resolve unchanged (move-down, re-export-up). The
+// axum/HTTP glue that drives tools stayed behind in `api`.
+use phoenix_tools as tools;
 
 use api::{create_router, AppState};
 use db::Database;
