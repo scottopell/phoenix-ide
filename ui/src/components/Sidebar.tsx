@@ -139,6 +139,16 @@ export function Sidebar({
     return archivedConversations.filter(c => c.project_id === activeProjectId);
   }, [archivedConversations, activeProjectId]);
 
+  useEffect(() => {
+    if (!activeProjectId || !activeSlug) return;
+
+    const activeConversation = [...conversations, ...archivedConversations]
+      .find((c) => c.slug === activeSlug);
+    if (activeConversation && activeConversation.project_id !== activeProjectId) {
+      setActiveProjectId(null);
+    }
+  }, [activeProjectId, activeSlug, conversations, archivedConversations, setActiveProjectId]);
+
   const handleNewClick = useCallback(() => {
     navigate('/new');
   }, [navigate]);

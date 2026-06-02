@@ -4,8 +4,8 @@
 // SIDE-04: Context menu persists across navigation (no click-outside handler)
 // CHN-Sidebar: chain grouping render (REQ-CHN-002, task 02690 Phase 5)
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { render, fireEvent, within, act } from '@testing-library/react';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import { render, fireEvent, within, act, waitFor } from '@testing-library/react';
 import { MemoryRouter, Route, Routes, useLocation } from 'react-router-dom';
 import type { Conversation } from '../api';
 
@@ -37,6 +37,83 @@ vi.mock('../utils', async () => {
 });
 
 import { ConversationList, ConversationRow, ChainBlock } from './ConversationList';
+
+describe('ConversationList — active conversation reveal', () => {
+  let originalScrollDescriptor: PropertyDescriptor | undefined;
+  let scrollIntoViewSpy: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    originalScrollDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'scrollIntoView');
+    scrollIntoViewSpy = vi.fn();
+    Object.defineProperty(Element.prototype, 'scrollIntoView', {
+      configurable: true,
+      value: scrollIntoViewSpy,
+    });
+  });
+
+  afterEach(() => {
+    if (originalScrollDescriptor) {
+      Object.defineProperty(Element.prototype, 'scrollIntoView', originalScrollDescriptor);
+    } else {
+      delete (Element.prototype as unknown as { scrollIntoView?: unknown }).scrollIntoView;
+    }
+  });
+
+  it('scrolls an active standalone conversation into view', async () => {
+    const active = makeConv('active-id', 'active-slug');
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          sidebarMode
+          conversations={[makeConv('other-id', 'other-slug'), active]}
+          activeSlug="active-slug"
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(scrollIntoViewSpy).toHaveBeenCalledWith({ block: 'nearest', behavior: 'smooth' });
+    });
+    expect(container.querySelector('[data-id="active-id"]')!.classList.contains('active')).toBe(true);
+  });
+
+  it('expands a collapsed active chain member and scrolls it into view', async () => {
+    const root = makeConv('root-id', 'root-slug', {
+      continued_in_conv_id: 'leaf-id',
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-01-01T00:00:00Z',
+    });
+    const leaf = makeConv('leaf-id', 'leaf-slug', {
+      presentation_mode: 'done',
+      state: { type: 'terminal' },
+      updated_at: '2024-02-01T00:00:00Z',
+    });
+
+    const { container } = render(
+      <MemoryRouter>
+        <ConversationList
+          {...defaultProps}
+          sidebarMode
+          conversations={[leaf, root]}
+          activeSlug="leaf-slug"
+        />
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('.conv-item-chain-member').length).toBe(2);
+    });
+    await waitFor(() => {
+      expect(scrollIntoViewSpy).toHaveBeenCalledWith({ block: 'nearest', behavior: 'smooth' });
+    });
+    expect(container.querySelector('[data-id="leaf-id"]')!.classList.contains('active')).toBe(true);
+    expect(container.querySelector('.conv-chain-block')!.classList.contains('expanded')).toBe(true);
+  });
+});
+
 
 const makeConv = (id: string, slug: string, overrides: Partial<Conversation> = {}): Conversation => ({
   id,

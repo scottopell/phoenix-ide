@@ -1,4 +1,4 @@
-import { memo, useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { memo, useState, useEffect, useRef, useMemo, useCallback, useLayoutEffect } from 'react';
 import type { ReactNode } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { getConvDisplayState } from '../api';
@@ -437,6 +437,8 @@ export function ConversationList({
   const [collapsedChains, setCollapsedChains] = useState<Set<string>>(new Set());
   const menuRef = useRef<HTMLDivElement>(null);
   const chainMenuRef = useRef<HTMLDivElement>(null);
+  const listRootRef = useRef<HTMLElement>(null);
+  const lastRevealedActiveSlugRef = useRef<string | null>(null);
 
   // Close context menu on click-outside
   useEffect(() => {
@@ -518,13 +520,53 @@ export function ConversationList({
     });
   }, []);
 
+  useLayoutEffect(() => {
+    if (!activeSlug) {
+      lastRevealedActiveSlugRef.current = null;
+      return;
+    }
+    if (lastRevealedActiveSlugRef.current === activeSlug) return;
+
+    for (const item of groupedItems) {
+      if (item.kind === 'single') {
+        if (item.conversation.slug !== activeSlug) continue;
+        listRootRef.current
+          ?.querySelector<HTMLElement>('.conv-item.active')
+          ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        lastRevealedActiveSlugRef.current = activeSlug;
+        return;
+      }
+
+      if (!item.members.some((m) => m.slug === activeSlug)) continue;
+
+      const latestMember = item.members.find(m => m.id === item.latestMemberId);
+      const isCompleted = getConvDisplayState(latestMember) === 'terminal';
+      const collapsed = isCompleted ? !collapsedChains.has(item.rootId) : collapsedChains.has(item.rootId);
+      if (collapsed) {
+        setCollapsedChains((prev) => {
+          const next = new Set(prev);
+          if (isCompleted) next.add(item.rootId);
+          else next.delete(item.rootId);
+          return next;
+        });
+        return;
+      }
+
+      listRootRef.current
+        ?.querySelector<HTMLElement>('.conv-item.active')
+        ?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+      lastRevealedActiveSlugRef.current = activeSlug;
+      return;
+    }
+  }, [activeSlug, groupedItems, collapsedChains]);
+
   const closeRowMenu = useCallback(() => setExpandedId(null), []);
   const closeChainMenu = useCallback(() => setExpandedChainId(null), []);
 
   const isEmpty = displayList.length === 0;
 
   return (
-    <section id="conversation-list" className={`view active ${sidebarMode ? 'sidebar-mode' : ''}`}>
+    <section ref={listRootRef} id="conversation-list" className={`view active ${sidebarMode ? 'sidebar-mode' : ''}`}>
       {!sidebarMode && (
         <div className="view-header">
           <h2>Conversations</h2>
