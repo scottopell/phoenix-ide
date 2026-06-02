@@ -335,12 +335,48 @@ big modules still inside `phoenix-ide` (`api` 13k, `runtime` 12k, `llm` 11k,
 `state_machine` 11k, `db` 6k) are the next candidates; each follows the same
 proven recipe.
 
-### Remaining work to realize the win in `./dev.py check` (Stage 3)
+### Stage 3 (per-crate rust-lane gating) — DONE
 
-The crates exist, but `./dev.py check`'s rust lane still runs
-`cargo clippy`/`cargo nextest` workspace-wide, so the gated *fast path* only
-shows up today as a faster warm incremental rebuild — not as `-p`-scoped lane
-commands. Stage 3 (path → changed-crate → `clippy -p` + `nextest -E
-'rdeps(<crate>)'`, full fallback when `phoenix-core` changes) is the remaining
-piece that turns these measured per-crate timings into actual check-time
-savings. It composes with the Option-A path-gating already shipped.
+`./dev.py check`'s rust lane now narrows `cargo clippy`/`cargo test` to the
+changed crate(s) + their transitive reverse-dependency closure (computed live
+from `cargo metadata`, threaded as `-p <crate>` flags), instead of always
+running workspace-wide. Composes with the Option-A path-gating: gating decides
+*which* lanes run, Stage 3 decides *how wide* the rust lane reaches.
+
+Fail-safe by construction (only narrows, never wrongly skips): a
+`phoenix-core` change → full closure; `Cargo.lock` / workspace `Cargo.toml` /
+`.cargo/` / `rust-toolchain` / `ui/src/generated/` → full; any unattributable
+crate path or `cargo metadata` failure → full; `--all` flag or
+`PHOENIX_CHECK_ALL=1` → full. Codegen is never narrowed (the ts-rs export
+tests + staleness guard must see the whole generated tree).
+
+Live-verified (base=HEAD, real comment-edit per crate):
+
+| Edit in | actual `rust scope` | test binaries built |
+|---|---|---|
+| phoenix-tools | tools + phoenix_ide | 2 of 7 |
+| phoenix-terminal | terminal + tools + phoenix_ide | 3 of 7 |
+| phoenix-skills | skills + tools + phoenix_ide | — |
+| phoenix-core | all 5 dependents (effectively full) | — |
+| phoenix-ide (bin) | phoenix_ide only | — |
+| ui/src/generated/, Cargo.lock, root Cargo.toml, .cargo/ | (none → full) | 7 of 7 |
+
+The correctness property — narrowing never skips a test that should run — was
+confirmed from the `cargo test --no-run --message-format=json` artifact
+stream: a tools edit builds/runs exactly `{phoenix-tools, phoenix_ide}` test
+binaries and correctly excludes terminal/skills/core/monitor/tls.
+
+Verification also caught (and the fix landed) a real defect: the
+`PHOENIX_CHECK_ALL=1` env var initially disabled lane gating but *not* the
+rust-scope narrowing (only the `--all` flag did) — now both escape hatches
+force full, in lockstep with `_gate_lanes()`.
+
+### What's left (future, not part of this spike)
+
+- Peel the remaining big modules out of `phoenix-ide` (`api` 13k, `runtime`
+  12k, `llm` 11k, `state_machine` 11k, `db` 6k) — each follows the proven
+  recipe; every one moved converts a workspace-wide-recompile edit into a
+  scoped one, widening the set of changes that hit the fast path.
+- nextest's `rdeps(...)` selector would let the test lane narrow without
+  per-crate `-p` enumeration once nextest is on the dev/CI path; the current
+  `-p`-flag approach is equivalent and works on plain `cargo test`.
