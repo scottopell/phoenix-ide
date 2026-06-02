@@ -40,6 +40,10 @@ phoenix-skills = { path = "../phoenix-skills" }
 # drives tools (api::handlers, api::browser_view) stays in phoenix-ide.
 phoenix-tools = { path = "../phoenix-tools" }
 
+# SQLite persistence (conversations, messages, steering queues, migrations).
+# Extracted so the persistence layer is a leaf depending only on phoenix-core.
+phoenix-db = { path = "../phoenix-db" }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -126,6 +130,9 @@ phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
 # stream builders (full_command, TerminalStream) are visible to the api-layer
 # WebSocket relay tests. Dev-only.
 phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
+# Re-declared with test-support so phoenix-db's #[cfg(test)] `create_conversation`
+# explore-mode test wrapper is visible to this crate's tests. Dev-only.
+phoenix-db = { path = "../phoenix-db", features = ["test-support"] }
 tempfile = "3"
 proptest = "1"
 # `test-util` enables `tokio::time::pause`/`advance`, used by the
