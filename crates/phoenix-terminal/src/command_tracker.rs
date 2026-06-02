@@ -74,6 +74,7 @@ impl CommandTracker {
     ///
     /// `session_id` is used to construct the disk path for truncated outputs
     /// (`~/.phoenix-ide/terminal-output/<session_id>/<seq>.txt`).
+    #[must_use]
     pub fn new(session_id: String) -> Self {
         Self {
             records: VecDeque::with_capacity(RING_CAPACITY),
@@ -108,6 +109,7 @@ impl CommandTracker {
     }
 
     /// Return the most recently completed command, if any.
+    #[must_use]
     pub fn last_command(&self) -> Option<&CommandRecord> {
         self.records.back()
     }
@@ -116,6 +118,7 @@ impl CommandTracker {
     ///
     /// Clamps `count` to `min(count, RING_CAPACITY)`.  Never panics on an
     /// empty buffer.
+    #[must_use]
     pub fn recent_commands(&self, count: usize) -> Vec<&CommandRecord> {
         let n = count.min(RING_CAPACITY).min(self.records.len());
         self.records.iter().rev().take(n).collect()
@@ -123,6 +126,7 @@ impl CommandTracker {
 
     /// How many records are currently in the ring buffer.
     #[cfg(test)]
+    #[must_use]
     pub fn record_count(&self) -> usize {
         self.records.len()
     }
@@ -130,12 +134,14 @@ impl CommandTracker {
     /// Whether a capture is currently in progress (between C and D).
     #[cfg(test)]
     #[allow(dead_code)]
+    #[must_use]
     pub fn is_capturing(&self) -> bool {
         self.current_capture.is_some()
     }
 
     /// All completed records, oldest first.
     #[cfg(test)]
+    #[must_use]
     pub fn all_records(&self) -> &VecDeque<CommandRecord> {
         &self.records
     }
@@ -314,7 +320,7 @@ impl Perform for CommandTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal::test_helpers::{full_command, TerminalStream};
+    use crate::test_helpers::{full_command, TerminalStream};
 
     fn tracker() -> CommandTracker {
         CommandTracker::new("test-session".to_string())

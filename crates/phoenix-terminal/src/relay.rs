@@ -56,6 +56,9 @@ pub struct PtyMasterIo(pub AsyncFd<OwnedFd>);
 
 impl PtyMasterIo {
     /// Wrap an `OwnedFd` (must already be set to `O_NONBLOCK`).
+    ///
+    /// # Errors
+    /// Returns an error if registering the fd with the tokio reactor fails.
     pub fn new(fd: OwnedFd) -> io::Result<Self> {
         Ok(Self(AsyncFd::new(fd)?))
     }
@@ -443,7 +446,7 @@ mod tests {
     /// This is the core invariant the relay exists to maintain.
     #[tokio::test]
     async fn pty_output_forwarded_to_ws_and_tracker() {
-        use crate::terminal::test_helpers::full_command;
+        use crate::test_helpers::full_command;
 
         let (mut shell_end, pty_end) = tokio::io::duplex(4096);
         let tracker = make_tracker();
@@ -827,7 +830,7 @@ mod tests {
     /// retains the command records it captured before the detach signal.
     #[tokio::test]
     async fn detach_exit_preserves_tracker_state() {
-        use crate::terminal::test_helpers::full_command;
+        use crate::test_helpers::full_command;
 
         let (mut shell_end, pty_end) = tokio::io::duplex(4096);
         let tracker = make_tracker();
@@ -920,7 +923,7 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::similar_names)]
     async fn second_relay_continues_over_same_tracker() {
-        use crate::terminal::test_helpers::full_command;
+        use crate::test_helpers::full_command;
 
         let tracker = make_tracker();
 

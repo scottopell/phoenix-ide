@@ -12,6 +12,7 @@ mod handlers;
 mod lifecycle_handlers;
 mod pr_monitoring;
 mod sse;
+mod terminal_ws;
 mod types;
 pub(crate) mod wire;
 

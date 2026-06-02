@@ -1,6 +1,12 @@
 //! Builder for ANSI/OSC byte sequences used in terminal tests.
 //!
-//! `cfg(test)` only — not compiled into production binaries.
+//! Compiled only under `#[cfg(test)]` or the `test-support` feature — never
+//! into production binaries. Pedantic builder lints are relaxed here: this is
+//! a test fixture, and `#[must_use]`/`Default` ceremony adds noise without
+//! catching real bugs in throwaway test data.
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::return_self_not_must_use)]
+#![allow(clippy::new_without_default)]
 
 /// Builder for constructing ANSI/OSC byte sequences used in tests.
 #[allow(dead_code)]

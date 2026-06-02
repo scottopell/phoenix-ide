@@ -8,6 +8,11 @@ rust-version = "1.94"
 # Shared domain vocabulary (acyclic base crate)
 phoenix-core = { path = "../phoenix-core" }
 
+# PTY-backed terminal sessions (spawn, relay, command tracking, session
+# registry). The axum/WebSocket glue lives here in `api::terminal_ws`, not in
+# the library crate, to keep phoenix-terminal acyclic.
+phoenix-terminal = { path = "../phoenix-terminal" }
+
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
@@ -108,6 +113,10 @@ ts-rs = { version = "12", features = ["serde-compat", "chrono-impl"] }
 # constructors (ContentBlock::tool_use, …) are visible to this crate's tests.
 # Dev-only: production `cargo build` never enables the feature.
 phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+# Re-declared with test-support so phoenix-terminal's #[cfg(test)] ANSI/OSC
+# stream builders (full_command, TerminalStream) are visible to the api-layer
+# WebSocket relay tests. Dev-only.
+phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
 tempfile = "3"
 proptest = "1"
 # `test-util` enables `tokio::time::pause`/`advance`, used by the

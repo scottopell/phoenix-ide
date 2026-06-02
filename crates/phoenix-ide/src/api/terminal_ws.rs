@@ -8,12 +8,8 @@
 //! `run_relay`.  This module handles only the axum/WebSocket wiring: auth, 409
 //! guard, PTY spawn, frame type filtering, and process lifecycle.
 
-use super::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
-use super::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
-use super::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
 use crate::api::AppState;
 use crate::runtime::{RuntimeManager, SseEvent};
-use crate::work_scope::WorkScope;
 use axum::extract::ws::{Message, WebSocket};
 use axum::{
     extract::{Path, State, WebSocketUpgrade},
@@ -21,6 +17,10 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use nix::sys::wait::waitpid;
+use phoenix_core::work_scope::WorkScope;
+use phoenix_terminal::relay::{run_relay, PtyMasterIo, RelayConfig, RelayExit};
+use phoenix_terminal::session::{ActiveTerminals, Dims, StopReason, TerminalHandle};
+use phoenix_terminal::spawn::{set_nonblocking, set_winsize_raw, spawn_pty, PtyExecPlan};
 use std::{
     os::unix::io::{AsRawFd, FromRawFd},
     sync::Arc,
@@ -525,13 +525,13 @@ async fn wait_for_resize(ws: &mut futures::stream::SplitStream<WebSocket>) -> Op
 #[cfg(test)]
 mod reclaim_tests {
     #![allow(clippy::unwrap_used)]
-    use super::super::relay::{run_relay, RelayConfig, RelayExit};
-    use super::super::session::{ShellIntegrationStatus, StopReason, TerminalHandle};
     use super::{acquire_permit, ATTACH_PERMIT_TIMEOUT};
-    use crate::terminal::command_tracker::CommandTracker;
-    use crate::terminal::test_helpers::full_command;
     use futures::channel::mpsc;
     use futures::StreamExt;
+    use phoenix_terminal::command_tracker::CommandTracker;
+    use phoenix_terminal::relay::{run_relay, RelayConfig, RelayExit};
+    use phoenix_terminal::session::{ShellIntegrationStatus, StopReason, TerminalHandle};
+    use phoenix_terminal::test_helpers::full_command;
     use std::sync::{Arc, Mutex};
     use tokio::io::{duplex, AsyncWriteExt};
     use tokio::sync::{watch, Semaphore};

@@ -14,7 +14,6 @@ mod runtime;
 pub mod skills;
 mod state_machine;
 mod system_prompt;
-mod terminal;
 mod title_generator;
 mod tls;
 mod tools;
@@ -24,6 +23,13 @@ mod tools;
 // `crate::llm_language::…` / `crate::task_source::…` call sites resolve
 // unchanged (move-down, re-export-up).
 use phoenix_core::{llm_language, platform, task_source, work_scope};
+
+// Terminal-core (PTY spawn, relay, command tracking, session registry) now
+// lives in the `phoenix-terminal` crate. Re-export it at its historical
+// `crate::terminal::…` path so existing call sites resolve unchanged
+// (move-down, re-export-up). The axum/WebSocket glue stayed behind in
+// `api::terminal_ws`.
+use phoenix_terminal as terminal;
 
 use api::{create_router, AppState};
 use db::Database;

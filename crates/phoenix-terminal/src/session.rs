@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{watch, Semaphore};
 
 use super::command_tracker::CommandTracker;
-use crate::work_scope::WorkScope;
+use phoenix_core::work_scope::WorkScope;
 
 /// Why the current relay should stop.
 ///
@@ -60,6 +60,7 @@ impl Dims {
     ///
     /// All construction sites must go through here so the invariant is
     /// structurally enforced rather than replicated in prose comments.
+    #[must_use]
     pub fn try_new(cols: u16, rows: u16) -> Option<Self> {
         if cols >= 2 && rows >= 1 {
             Some(Self { cols, rows })
@@ -127,17 +128,22 @@ impl std::fmt::Debug for TerminalHandle {
 pub struct ActiveTerminals(pub Arc<Mutex<HashMap<WorkScope, Arc<TerminalHandle>>>>);
 
 impl ActiveTerminals {
+    #[must_use]
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(HashMap::new())))
     }
 
     /// Returns `true` if a terminal is currently active for `scope`.
     ///
-    /// Retained for tests / external consumers; the `ws.rs` handler now goes
-    /// directly to `get` (reclaim path) or `try_insert` (fresh path) without
-    /// a separate pre-check, since a pre-check can't avoid the reclaim race.
+    /// Retained for tests; the WebSocket handler goes directly to `get`
+    /// (reclaim path) or `try_insert` (fresh path) without a separate
+    /// pre-check, since a pre-check can't avoid the reclaim race.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
     #[cfg(test)]
     #[allow(dead_code)]
+    #[must_use]
     pub fn is_active(&self, scope: &WorkScope) -> bool {
         let map = self.0.lock().expect("terminal registry poisoned");
         map.contains_key(scope)
@@ -146,6 +152,10 @@ impl ActiveTerminals {
     /// Attempt to register a new terminal for `scope`.
     ///
     /// Returns `None` if a terminal is already active for the scope.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    #[must_use]
     pub fn try_insert(
         &self,
         scope: WorkScope,
@@ -161,12 +171,19 @@ impl ActiveTerminals {
     }
 
     /// Remove the terminal for `scope`, if present.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
     pub fn remove(&self, scope: &WorkScope) {
         let mut map = self.0.lock().expect("terminal registry poisoned");
         map.remove(scope);
     }
 
     /// Look up an active terminal.
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
+    #[must_use]
     pub fn get(&self, scope: &WorkScope) -> Option<Arc<TerminalHandle>> {
         let map = self.0.lock().expect("terminal registry poisoned");
         map.get(scope).cloned()
@@ -187,6 +204,9 @@ impl ActiveTerminals {
     /// Best-effort. Returns silently if no terminal is registered for the
     /// scope — that is the common case during cascade for scopes that
     /// never spawned a user terminal (sub-agent conversations, etc.).
+    ///
+    /// # Panics
+    /// Panics if the registry mutex is poisoned.
     pub async fn cascade_on_delete(
         &self,
         work_scope: &WorkScope,

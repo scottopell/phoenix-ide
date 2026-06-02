@@ -16,8 +16,7 @@
 use proptest::prelude::*;
 
 use super::session::{ActiveTerminals, Dims};
-use crate::state_machine::state::ConvState;
-use crate::work_scope::WorkScope;
+use phoenix_core::work_scope::WorkScope;
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -32,8 +31,8 @@ fn arb_conv_scope() -> impl Strategy<Value = WorkScope> {
 /// Build a minimal `TerminalHandle` for registry tests.
 /// Uses /dev/null as a stand-in fd since these tests never do PTY I/O.
 fn dummy_handle(_dims: Dims) -> super::session::TerminalHandle {
-    use crate::terminal::command_tracker::CommandTracker;
-    use crate::terminal::session::{ShellIntegrationStatus, StopReason};
+    use crate::command_tracker::CommandTracker;
+    use crate::session::{ShellIntegrationStatus, StopReason};
     use std::fs::OpenOptions;
     use std::os::unix::io::{FromRawFd, IntoRawFd};
 
@@ -122,7 +121,7 @@ fn get_returns_correct_presence() {
 }
 
 /// REQ-TERM-WS-001: Worktree and Conversation scopes with the same inner
-/// string do NOT collide — the registry is keyed by the full WorkScope, not
+/// string do NOT collide — the registry is keyed by the full `WorkScope`, not
 /// the inner string. Two terminals can coexist for `Worktree("/tmp/x")` and
 /// `Conversation("/tmp/x")` without conflict.
 #[test]
@@ -312,97 +311,6 @@ fn dims_zero_cols_is_invalid() {
     assert_eq!(invalid.cols, 0, "zero cols recognized as boundary case");
 }
 
-// ── Unit: is_terminal() completeness ─────────────────────────────────────────
-
-/// REQ-TERM-012 / `TerminalAbandonedWithConversation`:
-/// Terminal teardown triggers on `ConversationBecameTerminal`, which fires when
-/// `is_terminal()` becomes true. Verify all four terminal states return true.
-///
-/// The bug fixed in task 08662 (`ContextExhausted` was missing) means this test
-/// would have caught the regression.
-#[test]
-fn is_terminal_covers_all_terminal_states() {
-    let terminal_states: &[ConvState] = &[
-        ConvState::Completed {
-            result: "done".into(),
-        },
-        ConvState::Failed {
-            error: "err".into(),
-            error_kind: crate::db::ErrorKind::Cancelled,
-        },
-        ConvState::ContextExhausted {
-            summary: "summary".into(),
-        },
-        ConvState::Terminal,
-    ];
-
-    for state in terminal_states {
-        assert!(
-            state.is_terminal(),
-            "is_terminal() must return true for {:?} — required for REQ-TERM-012 teardown",
-            std::mem::discriminant(state)
-        );
-    }
-}
-
-/// Non-terminal states must NOT be treated as terminal.
-#[test]
-fn is_terminal_excludes_non_terminal_states() {
-    let non_terminal: &[ConvState] = &[
-        ConvState::Idle,
-        ConvState::AwaitingContinuation {
-            rejected_tool_calls: vec![],
-            attempt: 0,
-        },
-    ];
-
-    for state in non_terminal {
-        assert!(
-            !state.is_terminal(),
-            "is_terminal() must return false for {:?}",
-            std::mem::discriminant(state)
-        );
-    }
-}
-
-// ── Property: is_terminal() agrees with ConversationBecameTerminal ────────────
-
-proptest! {
-    /// REQ-TERM-012: ConversationBecameTerminal fires when is_terminal() becomes true.
-    /// Property: is_terminal() is stable — calling it twice on the same state
-    /// returns the same value (no side effects, no volatility).
-    ///
-    /// Also verifies Idle is always non-terminal (required: terminal teardown must
-    /// not fire on conversations that haven't ended).
-    #[test]
-    fn prop_is_terminal_is_idempotent(
-        summary in "[a-z ]{0,50}",
-        result in "[a-z ]{0,50}",
-    ) {
-        let states = vec![
-            ConvState::Idle,
-            ConvState::Terminal,
-            ConvState::Completed { result: result.clone() },
-            ConvState::Failed { error: "e".into(), error_kind: crate::db::ErrorKind::Cancelled },
-            ConvState::ContextExhausted { summary: summary.clone() },
-        ];
-
-        for state in &states {
-            let first = state.is_terminal();
-            let second = state.is_terminal();
-            prop_assert_eq!(first, second,
-                "is_terminal() must be idempotent on {:?}", std::mem::discriminant(state));
-        }
-
-        // Idle is always non-terminal.
-        prop_assert!(!ConvState::Idle.is_terminal(),
-            "Idle must never be terminal — teardown must not fire on active conversations");
-
-        // Terminal is always terminal.
-        prop_assert!(ConvState::Terminal.is_terminal());
-    }
-}
-
 // ── Unit: resize frame validation (ResizeFrameRejected rule) ────────────────
 
 /// REQ-TERM-006 / `ResizeFrameRejected`:
@@ -559,8 +467,8 @@ fn build_env_no_duplicate_keys() {
 mod command_tracker_proptest {
     use proptest::prelude::*;
 
-    use crate::terminal::command_tracker::CommandTracker;
-    use crate::terminal::test_helpers::full_command;
+    use crate::command_tracker::CommandTracker;
+    use crate::test_helpers::full_command;
 
     proptest! {
         /// REQ-TERM-021 / CommandRecordRingBufferBound:
@@ -673,8 +581,8 @@ mod command_tracker_proptest {
 mod command_tracker_op_proptest {
     use proptest::prelude::*;
 
-    use crate::terminal::command_tracker::CommandTracker;
-    use crate::terminal::test_helpers::TerminalStream;
+    use crate::command_tracker::CommandTracker;
+    use crate::test_helpers::TerminalStream;
 
     /// A first-class operation on the `CommandTracker` state machine.
     #[derive(Debug, Clone)]
