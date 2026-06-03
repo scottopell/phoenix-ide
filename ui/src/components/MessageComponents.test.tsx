@@ -2,8 +2,15 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { fireEvent, render, screen, waitFor, act } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { SubAgentStatus, AgentMessage } from './MessageComponents';
+import { FilePathContextMenu } from './FilePathContextMenu';
+import { MessageContextMenu } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
 import { api, type ConversationState, type Message } from '../api';
+import { copyToClipboard } from '../utils/clipboard';
+
+vi.mock('../utils/clipboard', () => ({
+  copyToClipboard: vi.fn().mockResolvedValue(true),
+}));
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
@@ -99,6 +106,98 @@ function emitInit(source: FakeEventSource, messages: Message[], pendingEvents: u
     pending_truncated: false,
   });
 }
+
+describe('agent message file paths', () => {
+  beforeEach(() => {
+    vi.mocked(copyToClipboard).mockClear();
+  });
+
+  it('opens a file path on left click', () => {
+    const onOpenFile = vi.fn();
+    render(
+      <MemoryRouter>
+        <AgentMessage
+          message={agentMessage('agent-msg-path-click', [{
+            type: 'text',
+            text: 'Open src/main.rs for details.',
+          }])}
+          toolResults={new Map()}
+          onOpenFile={onOpenFile}
+          filePathRootDir="/repo/project"
+        />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: 'src/main.rs' }));
+
+    expect(onOpenFile).toHaveBeenCalledWith('src/main.rs', new Set(), 0);
+  });
+
+  it('copies absolute and relative paths from the file path context menu', () => {
+    const onOpenFile = vi.fn();
+    render(
+      <MemoryRouter>
+        <div id="messages">
+          <AgentMessage
+            message={agentMessage('agent-msg-path-menu', [{
+              type: 'text',
+              text: 'Open `src/main.rs` and /repo/project/ui/src/App.tsx next.',
+            }])}
+            toolResults={new Map()}
+            onOpenFile={onOpenFile}
+            filePathRootDir="/repo/project/"
+          />
+        </div>
+        <FilePathContextMenu />
+      </MemoryRouter>,
+    );
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'src/main.rs' }), {
+      clientX: 20,
+      clientY: 30,
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Copy absolute path' }));
+    expect(copyToClipboard).toHaveBeenLastCalledWith('/repo/project/src/main.rs');
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: '/repo/project/ui/src/App.tsx' }), {
+      clientX: 20,
+      clientY: 30,
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Copy relative path' }));
+    expect(copyToClipboard).toHaveBeenLastCalledWith('ui/src/App.tsx');
+  });
+
+  it('keeps the message context menu available for non-path message text', () => {
+    const message = agentMessage('agent-msg-context', [{
+      type: 'text',
+      text: 'Plain message text with src/main.rs nearby.',
+    }], 17);
+
+    render(
+      <MemoryRouter>
+        <div id="messages">
+          <AgentMessage
+            message={message}
+            toolResults={new Map()}
+            onOpenFile={vi.fn()}
+            filePathRootDir="/repo/project"
+          />
+        </div>
+        <FilePathContextMenu />
+        <MessageContextMenu messages={[message]} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.contextMenu(screen.getByText(/Plain message text/), {
+      clientX: 20,
+      clientY: 30,
+    });
+
+    expect(screen.getByRole('button', { name: 'Copy as Markdown' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy absolute path' })).not.toBeInTheDocument();
+  });
+});
+
 
 describe('markdown table rendering', () => {
   const wideTableMarkdown = [

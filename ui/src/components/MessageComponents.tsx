@@ -541,6 +541,7 @@ interface AgentMessageProps {
   message: Message;
   toolResults: ReadonlyMap<string, Message>;
   onOpenFile?: ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
+  filePathRootDir?: string | undefined;
   /**
    * When false, suppresses the "Phoenix HH:MM" header row. Used by the list
    * to collapse repeated headers across a run of consecutive agent messages
@@ -552,11 +553,16 @@ interface AgentMessageProps {
 
 export const AgentMessage = memo(AgentMessageImpl);
 
-function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = true }: AgentMessageProps) {
+function AgentMessageImpl({ message, toolResults, onOpenFile, filePathRootDir, isFirstInTurn = true }: AgentMessageProps) {
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
   const { theme } = useTheme();
   const syntaxStyle = theme === 'light' ? oneLight : oneDark;
+
+  const filePathCopyContext = useMemo(
+    () => (filePathRootDir ? { rootDir: filePathRootDir } : undefined),
+    [filePathRootDir],
+  );
 
   // Stable markdown component map — only recreated when onOpenFile identity changes.
   // Keeps ReactMarkdown from remounting SyntaxHighlighter on every parent re-render.
@@ -582,7 +588,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
       const fileClickHandler = onOpenFile
         ? (filePath: string) => onOpenFile(filePath, new Set(), 0)
         : undefined;
-      const linkified = linkifyText(text, fileClickHandler);
+      const linkified = linkifyText(text, fileClickHandler, filePathCopyContext);
       // If linkifyText returned something other than plain text, it found a file path
       if (linkified !== text && fileClickHandler) {
         return <>{linkified}</>;
@@ -601,7 +607,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
       const processChildren = (nodes: React.ReactNode): React.ReactNode[] => {
         return React.Children.toArray(nodes).flatMap((child) => {
           if (typeof child === 'string') {
-            return linkifyText(child, fileClickHandler);
+            return linkifyText(child, fileClickHandler, filePathCopyContext);
           }
           return child;
         });
@@ -616,7 +622,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
       const processChildren = (nodes: React.ReactNode): React.ReactNode[] => {
         return React.Children.toArray(nodes).flatMap((child) => {
           if (typeof child === 'string') {
-            return linkifyText(child, fileClickHandler);
+            return linkifyText(child, fileClickHandler, filePathCopyContext);
           }
           return child;
         });
@@ -624,7 +630,7 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
       return <li>{processChildren(children)}</li>;
     },
     table: MarkdownTable,
-  }), [onOpenFile, syntaxStyle]);
+  }), [onOpenFile, filePathCopyContext, syntaxStyle]);
 
   // Check if there's any renderable content
   const hasRenderableContent = blocks.some(block => {

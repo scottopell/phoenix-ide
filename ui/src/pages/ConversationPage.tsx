@@ -976,6 +976,7 @@ function ConversationPageContent() {
         onRetry={handleRetry}
         onCancelSteering={handleCancelSteering}
         onOpenFile={handleOpenFileFromPatch}
+        filePathRootDir={conversation.worktree_path ?? conversation.cwd ?? '/'}
         conversationId={conversationId}
         slug={slug}
         systemPrompt={atom.systemPrompt ?? undefined}

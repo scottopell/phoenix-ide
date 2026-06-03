@@ -6,6 +6,7 @@
  */
 
 import React from 'react';
+import { resolveFilePathCopyValues } from './filePathCopy';
 
 // Regex for matching URLs (http:// and https://)
 // Avoids matching trailing punctuation that's likely not part of the URL
@@ -144,6 +145,10 @@ export function parseLinks(text: string): LinkifySegment[] {
   return results;
 }
 
+export interface FilePathCopyContext {
+  rootDir: string;
+}
+
 /**
  * Convert text containing URLs and file paths into React elements.
  * URLs are rendered as <a> tags that open in new tabs.
@@ -151,7 +156,8 @@ export function parseLinks(text: string): LinkifySegment[] {
  */
 export function linkifyText(
   text: string,
-  onFileClick?: (filePath: string) => void
+  onFileClick?: (filePath: string) => void,
+  filePathCopyContext?: FilePathCopyContext
 ): React.ReactNode {
   const segments = parseLinks(text);
 
@@ -179,6 +185,9 @@ export function linkifyText(
       );
     }
     if (segment.type === 'file' && onFileClick) {
+      const copyValues = filePathCopyContext
+        ? resolveFilePathCopyValues(segment.filePath!, filePathCopyContext.rootDir)
+        : undefined;
       return (
         <span
           key={index}
@@ -193,6 +202,13 @@ export function linkifyText(
           }}
           className="file-path-link"
           title={`Open ${segment.filePath}`}
+          data-file-path={segment.filePath}
+          {...(copyValues
+            ? {
+                'data-file-absolute-path': copyValues.absolutePath,
+                'data-file-relative-path': copyValues.relativePath,
+              }
+            : {})}
         >
           {segment.content}
         </span>
