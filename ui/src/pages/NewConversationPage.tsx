@@ -34,7 +34,15 @@ function NewConversationFileChips({ files, onRemove }: { files: File[]; onRemove
           <span className="file-attachment-icon">📎</span>
           <span className="file-attachment-name" title={file.name}>{file.name}</span>
           <span className="file-attachment-size">{formatBytes(file.size)}</span>
-          <button type="button" className="file-attachment-remove" onClick={() => onRemove(index)} title="Remove attachment">x</button>
+          <button
+            type="button"
+            className="file-attachment-remove"
+            onClick={() => onRemove(index)}
+            title="Remove attachment"
+            aria-label={`Remove attachment ${file.name}`}
+          >
+            x
+          </button>
         </div>
       ))}
     </div>

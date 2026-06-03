@@ -10,6 +10,7 @@ import {
   ClipboardEvent,
   ChangeEvent,
   DragEvent,
+  type SetStateAction,
 } from 'react';
 // Icon buttons removed from action row -- file browse via sidebar, image attach via paste/drag
 import type { QueuedMessage } from '../hooks';
@@ -38,7 +39,7 @@ interface InputAreaProps {
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
   files?: FileAttachment[];
-  setFiles?: (files: FileAttachment[]) => void;
+  setFiles?: (files: SetStateAction<FileAttachment[]>) => void;
   isOffline: boolean;
   /**
    * Messages whose POST was rejected. Rendered inline with retry/dismiss
@@ -454,7 +455,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setExpansionError(null);
     try {
       const uploaded = await api.uploadAttachments(conversationId, genericFiles);
-      setFiles([...files, ...uploaded]);
+      setFiles(prev => [...prev, ...uploaded]);
     } catch (err) {
       setExpansionError(err instanceof Error ? err.message : 'Failed to upload attachments');
     } finally {
@@ -806,6 +807,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
                 className="file-attachment-remove"
                 onClick={() => handleRemoveFile(index)}
                 title="Remove attachment"
+                aria-label={`Remove attachment ${file.original_name}`}
               >
                 x
               </button>

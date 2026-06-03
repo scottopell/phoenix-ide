@@ -12036,7 +12036,9 @@ button.keyword-search-filepath:hover {
 
 
 /* File attachment composer and message chips */
-.input-area--drag-over .input-textarea-wrap {
+.input-area--drag-over .input-textarea-wrap,
+.input-area--drag-over .new-conv-textarea,
+.input-area--drag-over .new-conv-textarea-mobile {
   border-color: var(--accent-blue);
   box-shadow: 0 0 0 1px var(--accent-blue);
 }
