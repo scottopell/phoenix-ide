@@ -29,7 +29,7 @@ Each requirement maps to where its behavior lives in the implementation.
 | **REQ-VS-001:** User Opens Prose Viewer | `ViewerSlotProvider.openProse` + URL search params; `ui/src/contexts/ViewerSlotContext.tsx` |
 | **REQ-VS-002:** Unified URL Slot Contract | One `ViewerSlotProvider` derives all three viewer kinds from the URL; `FileExplorerProvider` is a thin adapter projecting prose state |
 | **REQ-VS-003:** User Opens Diff Viewer | `?viewer=diff&presentation=fullscreen` for primary View Diff, `?viewer=diff&presentation=pane` where split-pane is intentionally used; `ConversationDiffViewer` fetches the payload on mount from `GET /api/conversations/:id/diff` |
-| **REQ-VS-004:** User Closes Active Viewer | `ViewerSlotProvider.close` clears the `viewer`/`file`/`root` params via `setSearchParams` |
+| **REQ-VS-004:** User Closes Active Viewer | `ViewerSlotProvider.close` clears the `viewer`/`presentation`/`file`/`root` params via `setSearchParams` |
 | **REQ-VS-005:** URL Hydrates Prose | `deriveSlot` reads `?viewer=prose&file=&root=` (and legacy `?file=&root=`) on every render |
 | **REQ-VS-006:** URL Hydrates Diff and Browser | `?viewer=diff&presentation=<mode>` / `?viewer=browser` hydrate from the URL; the diff re-fetches on mount, so cold reload restores both |
 | **REQ-VS-007:** Single-Slot Mutex | Structural: one `viewer` param at a time. The discriminated union enforces it; no coordinating effects |
