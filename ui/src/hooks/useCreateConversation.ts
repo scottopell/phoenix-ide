@@ -11,6 +11,7 @@ import { useCreateConversationWithStore } from '../conversation';
 const LAST_CWD_KEY = 'phoenix-last-cwd';
 const LAST_MODEL_KEY = 'phoenix-last-model';
 const RECENT_DIRS_KEY = 'phoenix-recent-dirs';
+const NEW_CONVERSATION_DRAFT_KEY = 'phoenix-new-conversation-draft';
 const MAX_RECENT = 5;
 
 function relativeTaskPath(cwd: string, taskPath: string): string {
@@ -126,7 +127,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [models, setModels] = useState<ModelsResponse | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | null>(() => localStorage.getItem(LAST_MODEL_KEY));
   const [showAllModels, setShowAllModels] = useState(false);
-  const [draft, setDraft] = useState('');
+  const [draft, setDraft] = useState(() => localStorage.getItem(NEW_CONVERSATION_DRAFT_KEY) || '');
   const [images, setImages] = useState<ImageData[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
@@ -186,6 +187,13 @@ export function useCreateConversation(navigate: (path: string) => void) {
   // Save preferences
   useEffect(() => { localStorage.setItem(LAST_CWD_KEY, cwd); }, [cwd]);
   useEffect(() => { if (selectedModel) localStorage.setItem(LAST_MODEL_KEY, selectedModel); }, [selectedModel]);
+  useEffect(() => {
+    if (draft) {
+      localStorage.setItem(NEW_CONVERSATION_DRAFT_KEY, draft);
+    } else {
+      localStorage.removeItem(NEW_CONVERSATION_DRAFT_KEY);
+    }
+  }, [draft]);
 
   // A new directory drops any prior workflow choice; the active workflow then
   // re-derives from the new git status (and the metadata fetched below).
@@ -393,6 +401,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
       );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
+      localStorage.removeItem(NEW_CONVERSATION_DRAFT_KEY);
       navigate(`/c/${conv.slug}`);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to create conversation');

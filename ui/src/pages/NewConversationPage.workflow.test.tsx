@@ -94,6 +94,37 @@ describe('/new workflow modes', () => {
     vi.clearAllMocks();
   });
 
+  it('preserves typed draft text across unmount and remount', async () => {
+    const firstRender = renderPage();
+    await settleValidation();
+
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, { target: { value: 'remember this draft' } });
+    expect(localStorage.getItem('phoenix-new-conversation-draft')).toBe('remember this draft');
+
+    firstRender.unmount();
+    renderPage();
+
+    expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('remember this draft');
+  });
+
+  it('clears the persisted draft after successfully starting a conversation', async () => {
+    vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
+    const firstRender = renderPage();
+    await settleValidation();
+
+    fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, { target: { value: 'send and clear me' } });
+    expect(localStorage.getItem('phoenix-new-conversation-draft')).toBe('send and clear me');
+    fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
+
+    await waitFor(() => expect(api.createConversation).toHaveBeenCalled());
+    expect(localStorage.getItem('phoenix-new-conversation-draft')).toBeNull();
+
+    firstRender.unmount();
+    renderPage();
+
+    expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('');
+  });
+
   it('shows only direct workflow for non-git directories and submits direct mode', async () => {
     vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
     renderPage();
