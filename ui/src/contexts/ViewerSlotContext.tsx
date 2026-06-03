@@ -2,7 +2,7 @@ import { createContext, useCallback, useContext, useEffect, useMemo, useRef } fr
 import type { ReactNode } from 'react';
 import { useLocation, useSearchParams } from 'react-router-dom';
 import { useScopedState } from '../hooks/useScopedState';
-import type { PatchContext } from '../components/FileExplorer/fileExplorerTypes';
+import type { OpenFileOptions, PatchContext } from '../components/FileExplorer/fileExplorerTypes';
 import { clearLastViewer, getLastViewer, setLastViewer } from '../storage/lastViewerStorage';
 
 /**
@@ -31,6 +31,7 @@ export type DiffPresentation = 'fullscreen' | 'pane';
 export interface ProseFile {
   path: string;
   rootDir: string;
+  focusLine?: number | undefined;
 }
 
 export type ViewerSlot =
@@ -44,7 +45,7 @@ export interface ViewerSlotValue {
   /** Server-authoritative live browser-session flag (from the atom). Gates the
    *  manual browser-open affordance and drives the auto-open/close edges. */
   browserSessionActive: boolean;
-  openProse: (path: string, rootDir: string, patchContext?: PatchContext) => void;
+  openProse: (path: string, rootDir: string, options?: OpenFileOptions) => void;
   openDiff: (presentation: DiffPresentation) => void;
   openDiffFullscreen: () => void;
   openBrowser: () => void;
@@ -57,6 +58,7 @@ const VIEWER_PARAM = 'viewer';
 const DIFF_PRESENTATION_PARAM = 'presentation';
 const FILE_PARAM = 'file';
 const ROOT_PARAM = 'root';
+const LINE_PARAM = 'line';
 
 /** Sentinel for "no conversation entered yet" — distinct from any slug and from
  *  `undefined` (which is itself a valid scopeKey on the no-conversation route). */
@@ -84,9 +86,11 @@ function deriveSlot(
   const effective = viewer ?? (file && root ? 'prose' : null);
 
   switch (effective) {
-    case 'prose':
+    case 'prose': {
       if (!file || !root) return { slot: { kind: 'none' }, malformed: true };
-      return { slot: { kind: 'prose', file: { path: file, rootDir: root }, patchContext }, malformed: false };
+      const focusLine = parseFocusLineParam(searchParams.get(LINE_PARAM));
+      return { slot: { kind: 'prose', file: { path: file, rootDir: root, focusLine }, patchContext }, malformed: false };
+    }
     case 'diff':
       if (presentation !== 'fullscreen' && presentation !== 'pane') {
         return { slot: { kind: 'none' }, malformed: true };
@@ -100,6 +104,16 @@ function deriveSlot(
       // Unknown ?viewer= value — normalize away.
       return { slot: { kind: 'none' }, malformed: true };
   }
+}
+
+function parseFocusLineParam(lineParam: string | null): number | undefined {
+  if (!lineParam || !/^[1-9]\d*$/.test(lineParam)) return undefined;
+  const lineNumber = Number(lineParam);
+  return validFocusLine(lineNumber);
+}
+
+function validFocusLine(lineNumber: number): number | undefined {
+  return Number.isSafeInteger(lineNumber) && lineNumber > 0 ? lineNumber : undefined;
 }
 
 interface ViewerSlotProviderProps {
@@ -141,13 +155,16 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   );
 
   const openProse = useCallback(
-    (path: string, rootDir: string, nextPatchContext?: PatchContext) => {
-      setPatchContext(nextPatchContext ?? null);
+    (path: string, rootDir: string, options?: OpenFileOptions) => {
+      setPatchContext(options?.kind === 'patch' ? options.patchContext : null);
       writeUrl((next) => {
         next.set(VIEWER_PARAM, 'prose');
         next.delete(DIFF_PRESENTATION_PARAM);
         next.set(FILE_PARAM, path);
         next.set(ROOT_PARAM, rootDir);
+        const lineNumber = options?.kind === 'line' ? validFocusLine(options.lineNumber) : undefined;
+        if (lineNumber !== undefined) next.set(LINE_PARAM, String(lineNumber));
+        else next.delete(LINE_PARAM);
       });
     },
     [setPatchContext, writeUrl],
@@ -160,6 +177,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
       next.set(DIFF_PRESENTATION_PARAM, presentation);
       next.delete(FILE_PARAM);
       next.delete(ROOT_PARAM);
+      next.delete(LINE_PARAM);
     });
   }, [setPatchContext, writeUrl]);
 
@@ -172,6 +190,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
       next.delete(DIFF_PRESENTATION_PARAM);
       next.delete(FILE_PARAM);
       next.delete(ROOT_PARAM);
+      next.delete(LINE_PARAM);
     });
   }, [setPatchContext, writeUrl]);
 
@@ -187,6 +206,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
         next.delete(DIFF_PRESENTATION_PARAM);
         next.delete(FILE_PARAM);
         next.delete(ROOT_PARAM);
+        next.delete(LINE_PARAM);
       });
       if (clearStorage && scopeKey) clearLastViewer(scopeKey);
     },
@@ -204,6 +224,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
       next.delete(DIFF_PRESENTATION_PARAM);
       next.delete(FILE_PARAM);
       next.delete(ROOT_PARAM);
+      next.delete(LINE_PARAM);
     });
   }, [malformed, writeUrl]);
 

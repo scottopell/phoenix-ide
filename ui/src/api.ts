@@ -393,6 +393,14 @@ export interface FileSearchEntry {
   is_text_file: boolean;
 }
 
+export interface CodeSearchEntry {
+  path: string;
+  line_number: number;
+  line_text: string;
+  match_start: number;
+  match_end: number;
+}
+
 /** A single skill entry returned by the skills API (REQ-IR-005, REQ-BS-003) */
 export interface SkillEntry {
   name: string;
@@ -976,7 +984,6 @@ export const api = {
     return resp.json();
   },
 
-  /** Search files within a conversation's working directory (REQ-IR-004) */
   async searchConversationFiles(
     convId: string,
     query: string,
@@ -989,6 +996,21 @@ export const api = {
       signal ? { signal } : {},
     );
     if (!resp.ok) throw new Error('Failed to search files');
+    return resp.json();
+  },
+
+  async searchConversationCode(
+    convId: string,
+    query: string,
+    limit = 50,
+    signal?: AbortSignal,
+  ): Promise<{ items: CodeSearchEntry[] }> {
+    const params = new URLSearchParams({ q: query, limit: String(limit) });
+    const resp = await fetch(
+      `/api/conversations/${convId}/code/search?${params}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to search code');
     return resp.json();
   },
 

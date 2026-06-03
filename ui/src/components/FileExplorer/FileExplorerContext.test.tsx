@@ -124,8 +124,11 @@ describe('FileExplorer adapter — URL-driven open file', () => {
 
     act(() => {
       latest!.openFile('/repo/x.ts', '/repo', {
-        modifiedLines: new Set([3, 5]),
-        firstModifiedLine: 3,
+        kind: 'patch',
+        patchContext: {
+          modifiedLines: new Set([3, 5]),
+          firstModifiedLine: 3,
+        },
       });
     });
     expect(latest!.openFileState?.path).toBe('/repo/x.ts');

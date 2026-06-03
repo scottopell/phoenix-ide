@@ -16,7 +16,8 @@ use super::lifecycle_handlers::{
 };
 use super::sse::sse_stream;
 use super::types::{
-    CancelResponse, ChatRequest, ChatResponse, ConflictErrorResponse, ContinueConversationResponse,
+    CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
+    CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
     ConversationListResponse, ConversationResponse, ConversationWithMessagesResponse,
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
@@ -171,6 +172,10 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/api/conversations/:id/files/search",
             get(search_conversation_files),
+        )
+        .route(
+            "/api/conversations/:id/code/search",
+            get(search_conversation_code),
         )
         // Skill discovery for autocomplete (REQ-IR-005)
         .route(
@@ -3240,6 +3245,149 @@ fn fuzzy_score_path(
         .map(|s| i32::try_from(s).unwrap_or(i32::MAX))
 }
 
+const CODE_SEARCH_DEFAULT_LIMIT: usize = 50;
+const CODE_SEARCH_MAX_LIMIT: usize = 100;
+const CODE_SEARCH_MAX_FILE_BYTES: u64 = 1_000_000;
+const CODE_SEARCH_MAX_SCANNED_FILES: usize = 5_000;
+const CODE_SEARCH_MAX_SCANNED_BYTES: u64 = 32_000_000;
+
+/// Gitignore-aware literal content search within the conversation's file root.
+async fn search_conversation_code(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<CodeSearchQuery>,
+) -> Result<Json<CodeSearchResponse>, AppError> {
+    let q = query.q.trim();
+    if q.is_empty() {
+        return Ok(Json(CodeSearchResponse { items: Vec::new() }));
+    }
+
+    let conversation = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    let root = std::path::PathBuf::from(conversation.file_root());
+    if !root.exists() {
+        return Err(AppError::NotFound(
+            "Conversation file root does not exist".to_string(),
+        ));
+    }
+
+    let limit = query
+        .limit
+        .unwrap_or(CODE_SEARCH_DEFAULT_LIMIT)
+        .clamp(1, CODE_SEARCH_MAX_LIMIT);
+    let case_sensitive = q.chars().any(char::is_uppercase);
+    let mut items = Vec::new();
+    let mut scanned_files = 0usize;
+    let mut scanned_bytes = 0u64;
+
+    let walker = ignore::WalkBuilder::new(&root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .filter_entry(|e| e.file_name() != ".git")
+        .build();
+
+    for result in walker {
+        if items.len() >= limit
+            || scanned_files >= CODE_SEARCH_MAX_SCANNED_FILES
+            || scanned_bytes >= CODE_SEARCH_MAX_SCANNED_BYTES
+        {
+            break;
+        }
+
+        let Ok(entry) = result else { continue };
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            continue;
+        }
+
+        let abs_path = entry.path();
+        let (_, extension_says_text) = detect_file_type(abs_path);
+        if !extension_says_text {
+            continue;
+        }
+
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        let size = metadata.len();
+        if size > CODE_SEARCH_MAX_FILE_BYTES {
+            continue;
+        }
+        if scanned_bytes.saturating_add(size) > CODE_SEARCH_MAX_SCANNED_BYTES {
+            break;
+        }
+        scanned_files += 1;
+        scanned_bytes += size;
+
+        let Ok(bytes) = fs::read(abs_path) else {
+            continue;
+        };
+        if !is_valid_text(&bytes) {
+            continue;
+        }
+        let Ok(content) = String::from_utf8(bytes) else {
+            continue;
+        };
+        let rel_path = abs_path
+            .strip_prefix(&root)
+            .unwrap_or(abs_path)
+            .to_string_lossy()
+            .to_string();
+
+        for (idx, raw_line) in content.lines().enumerate() {
+            let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+            if let Some((match_start, match_end)) = find_literal_match(line, q, case_sensitive) {
+                items.push(CodeSearchEntry {
+                    path: rel_path.clone(),
+                    line_number: idx + 1,
+                    line_text: line.to_string(),
+                    match_start,
+                    match_end,
+                });
+                if items.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(Json(CodeSearchResponse { items }))
+}
+
+fn find_literal_match(line: &str, query: &str, case_sensitive: bool) -> Option<(usize, usize)> {
+    if query.is_empty() {
+        return None;
+    }
+
+    let line_chars: Vec<char> = line.chars().collect();
+    let query_chars: Vec<char> = query.chars().collect();
+    if query_chars.len() > line_chars.len() {
+        return None;
+    }
+
+    for start in 0..=line_chars.len() - query_chars.len() {
+        let matched = query_chars.iter().enumerate().all(|(offset, query_char)| {
+            let line_char = line_chars[start + offset];
+            if case_sensitive {
+                line_char == *query_char
+            } else {
+                line_char.to_lowercase().eq(query_char.to_lowercase())
+            }
+        });
+        if matched {
+            return Some((start, start + query_chars.len()));
+        }
+    }
+    None
+}
+
 /// Discover skills available for the conversation's working directory (REQ-IR-005).
 ///
 /// Calls `discover_skills()` from `system_prompt.rs` and returns each skill's
@@ -4190,6 +4338,180 @@ mod hard_delete_cascade_tests {
 
         let paths: Vec<_> = response.items.into_iter().map(|item| item.path).collect();
         assert_eq!(paths, vec!["src/direct.rs"]);
+    }
+
+    #[tokio::test]
+    async fn search_conversation_code_uses_smart_case_and_line_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(cwd.join("src")).expect("dirs");
+        std::fs::write(
+            cwd.join("src/main.rs"),
+            "let metricSourceToOriginProduct = 1;\nlet metricsourcetooriginproduct = 2;\n",
+        )
+        .expect("file");
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation_with_project(
+                "c-code-case",
+                "code-case",
+                cwd.to_str().unwrap(),
+                true,
+                None,
+                None,
+                None,
+                &crate::db::ConvMode::Direct,
+                None,
+                None,
+                None,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create");
+
+        let Json(lower) = search_conversation_code(
+            State(state.clone()),
+            Path("c-code-case".to_string()),
+            Query(CodeSearchQuery {
+                q: "metricsource".to_string(),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .expect("lower search");
+        assert_eq!(lower.items.len(), 2);
+        assert_eq!(lower.items[0].path, "src/main.rs");
+        assert_eq!(lower.items[0].line_number, 1);
+        assert_eq!(lower.items[0].match_start, 4);
+        assert_eq!(lower.items[0].match_end, 16);
+
+        let Json(mixed) = search_conversation_code(
+            State(state),
+            Path("c-code-case".to_string()),
+            Query(CodeSearchQuery {
+                q: "metricSource".to_string(),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .expect("mixed search");
+        let lines: Vec<_> = mixed
+            .items
+            .into_iter()
+            .map(|item| item.line_number)
+            .collect();
+        assert_eq!(lines, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn search_conversation_code_respects_ignore_git_dir_and_bounds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(cwd.join("src")).expect("src dirs");
+        std::fs::create_dir_all(cwd.join("ignored")).expect("ignored dirs");
+        std::fs::create_dir_all(cwd.join(".git")).expect("git dirs");
+        std::fs::write(cwd.join(".gitignore"), "ignored/\n").expect("gitignore");
+        std::fs::write(cwd.join("src/a.rs"), "needle one\nneedle two\n").expect("a");
+        std::fs::write(cwd.join("src/b.rs"), "needle three\n").expect("b");
+        std::fs::write(cwd.join("ignored/hidden.rs"), "needle ignored\n").expect("ignored");
+        std::fs::write(cwd.join(".git/config"), "needle git\n").expect("git");
+        std::fs::write(cwd.join("src/blob.bin"), b"needle\0binary\n").expect("binary");
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation_with_project(
+                "c-code-ignore",
+                "code-ignore",
+                cwd.to_str().unwrap(),
+                true,
+                None,
+                None,
+                None,
+                &crate::db::ConvMode::Direct,
+                None,
+                None,
+                None,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create");
+
+        let Json(response) = search_conversation_code(
+            State(state),
+            Path("c-code-ignore".to_string()),
+            Query(CodeSearchQuery {
+                q: "needle".to_string(),
+                limit: Some(2),
+            }),
+        )
+        .await
+        .expect("search");
+
+        assert_eq!(response.items.len(), 2);
+        assert!(response
+            .items
+            .iter()
+            .all(|item| item.path.starts_with("src/")));
+        assert!(response
+            .items
+            .iter()
+            .all(|item| item.path != "src/blob.bin"));
+    }
+
+    #[tokio::test]
+    async fn search_conversation_code_uses_worktree_path_when_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("repo");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(cwd.join("src")).expect("cwd dirs");
+        std::fs::create_dir_all(worktree.join("src")).expect("worktree dirs");
+        std::fs::write(cwd.join("src/wrong.rs"), "needle wrong\n").expect("cwd file");
+        std::fs::write(worktree.join("src/right.rs"), "needle right\n").expect("worktree file");
+
+        let state = make_test_state().await;
+        let mode = crate::db::ConvMode::Work {
+            branch_name: crate::db::NonEmptyString::new("task-26001").unwrap(),
+            worktree_path: crate::db::NonEmptyString::new(worktree.to_string_lossy().to_string())
+                .unwrap(),
+            base_branch: crate::db::NonEmptyString::new("main").unwrap(),
+            task_id: crate::db::NonEmptyString::new("26001").unwrap(),
+            task_title: crate::db::NonEmptyString::new("Code Search").unwrap(),
+        };
+        state
+            .db
+            .create_conversation_with_project(
+                "c-code-root",
+                "code-root",
+                cwd.to_str().unwrap(),
+                true,
+                None,
+                None,
+                None,
+                &mode,
+                None,
+                None,
+                None,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create");
+
+        let Json(response) = search_conversation_code(
+            State(state),
+            Path("c-code-root".to_string()),
+            Query(CodeSearchQuery {
+                q: "needle".to_string(),
+                limit: Some(10),
+            }),
+        )
+        .await
+        .expect("search");
+
+        let paths: Vec<_> = response.items.into_iter().map(|item| item.path).collect();
+        assert_eq!(paths, vec!["src/right.rs"]);
     }
 
     #[tokio::test]

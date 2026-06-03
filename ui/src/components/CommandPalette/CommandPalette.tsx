@@ -8,6 +8,7 @@ import { CommandPaletteInput } from './CommandPaletteInput';
 import { CommandPaletteResults } from './CommandPaletteResults';
 import { createConversationSource } from './sources/ConversationSource';
 import { createFileSource } from './sources/FileSource';
+import { createCodeSource } from './sources/CodeSource';
 import { createBuiltInActions } from './actions/builtInActions';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import { computeChainRoots } from '../../utils/chains';
@@ -55,19 +56,29 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
     [conversationIdsKey, navigate],
   );
 
-  // FileSource — recomputed only when conversation id or file root actually changes.
+  // FileSource and CodeSource — recomputed only when conversation id or file root actually changes.
   const fileSource = useMemo(
     () =>
       activeConvId && activeFileRoot
-        ? createFileSource(activeConvId, activeFileRoot, (path, rootDir) => openFile(path, rootDir))
+        ? createFileSource(activeConvId, activeFileRoot, (path, rootDir, options) => openFile(path, rootDir, options))
+        : null,
+    [activeConvId, activeFileRoot, openFile],
+  );
+  const codeSource = useMemo(
+    () =>
+      activeConvId && activeFileRoot
+        ? createCodeSource(activeConvId, activeFileRoot, (path, rootDir, options) => openFile(path, rootDir, options))
         : null,
     [activeConvId, activeFileRoot, openFile],
   );
 
-  // Stable sources array — changes only when conversationSource or fileSource identity changes.
+  // Stable sources array — changes only when source identities change.
   const sources: PaletteSource[] = useMemo(
-    () => (fileSource ? [fileSource, conversationSource] : [conversationSource]),
-    [conversationSource, fileSource],
+    () => {
+      const scopedSources = fileSource && codeSource ? [fileSource, codeSource] : [];
+      return [...scopedSources, conversationSource];
+    },
+    [conversationSource, fileSource, codeSource],
   );
 
   // Keep a ref so the search effect always sees the latest sources without

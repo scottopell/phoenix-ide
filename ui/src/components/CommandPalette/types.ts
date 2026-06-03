@@ -30,6 +30,8 @@ export interface PaletteItem {
   id: string;
   title: string;
   subtitle?: string;
+  /** Match snippet for code search results. */
+  snippet?: string;
   icon?: React.ReactNode;
   category: string;
   metadata?: unknown;

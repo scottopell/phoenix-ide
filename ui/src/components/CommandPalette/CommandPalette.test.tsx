@@ -9,6 +9,7 @@ import type { Conversation } from '../../api';
 
 const mocks = vi.hoisted(() => ({
   searchConversationFiles: vi.fn(),
+  searchConversationCode: vi.fn(),
   openFile: vi.fn(),
 }));
 
@@ -19,6 +20,7 @@ vi.mock('../../api', async (importOriginal) => {
     api: {
       ...actual.api,
       searchConversationFiles: mocks.searchConversationFiles,
+      searchConversationCode: mocks.searchConversationCode,
     },
   };
 });
@@ -67,6 +69,7 @@ function renderPalette(activeConversation: Conversation) {
 
 beforeEach(() => {
   mocks.searchConversationFiles.mockReset();
+  mocks.searchConversationCode.mockReset();
   mocks.openFile.mockReset();
 });
 
@@ -97,6 +100,7 @@ describe('CommandPalette file root', () => {
     mocks.searchConversationFiles.mockResolvedValue({
       items: [{ path: 'src/main.rs', is_text_file: true }],
     });
+    mocks.searchConversationCode.mockResolvedValue({ items: [] });
 
     renderPalette(activeConversation);
     fireEvent.keyDown(window, { key: 'p', metaKey: true });
@@ -116,6 +120,49 @@ describe('CommandPalette file root', () => {
     expect(mocks.openFile).toHaveBeenCalledWith(
       '/repo/.phoenix/worktrees/conv-1/src/main.rs',
       '/repo/.phoenix/worktrees/conv-1',
+      undefined,
+    );
+  });
+
+  it('searches code for the active conversation and opens hits at the matched line', async () => {
+    const activeConversation = makeConversation({
+      cwd: '/repo',
+      worktree_path: '/repo/.phoenix/worktrees/conv-1',
+    });
+    mocks.searchConversationFiles.mockResolvedValue({ items: [] });
+    mocks.searchConversationCode.mockResolvedValue({
+      items: [{
+        path: 'src/main.rs',
+        line_number: 42,
+        line_text: 'originProduct := metricSourceToOriginProduct[source]',
+        match_start: 17,
+        match_end: 44,
+      }],
+    });
+
+    renderPalette(activeConversation);
+    fireEvent.keyDown(window, { key: 'p', metaKey: true });
+    fireEvent.change(screen.getByRole('textbox'), { target: { value: 'metricSourceToOriginProduct' } });
+
+    await waitFor(() => {
+      expect(mocks.searchConversationCode).toHaveBeenCalledWith(
+        'conv-1',
+        'metricSourceToOriginProduct',
+        50,
+        expect.any(AbortSignal),
+      );
+    });
+
+    expect(await screen.findByText('metricSourceToOriginProduct')).toBeInTheDocument();
+    expect(screen.getByText('src/main.rs:42')).toBeInTheDocument();
+    expect(screen.getByText('originProduct := metricSourceToOriginProduct[source]')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByText('metricSourceToOriginProduct'));
+
+    expect(mocks.openFile).toHaveBeenCalledWith(
+      '/repo/.phoenix/worktrees/conv-1/src/main.rs',
+      '/repo/.phoenix/worktrees/conv-1',
+      { kind: 'line', lineNumber: 42 },
     );
   });
 });

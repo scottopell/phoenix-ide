@@ -316,6 +316,37 @@ pub struct FileSearchQuery {
     pub limit: Option<usize>,
 }
 
+/// A single code content search result.
+#[derive(Debug, Serialize)]
+pub struct CodeSearchEntry {
+    /// Path relative to the conversation's file root
+    pub path: String,
+    /// 1-based line number of the match
+    pub line_number: usize,
+    /// Full text of the matched line, without the trailing newline
+    pub line_text: String,
+    /// 0-based character offset where the match starts within `line_text`
+    pub match_start: usize,
+    /// 0-based character offset where the match ends within `line_text`
+    pub match_end: usize,
+}
+
+/// Response for conversation-scoped code content search.
+#[derive(Debug, Serialize)]
+pub struct CodeSearchResponse {
+    pub items: Vec<CodeSearchEntry>,
+}
+
+/// Query parameters for code content search.
+#[derive(Debug, Deserialize)]
+pub struct CodeSearchQuery {
+    /// Literal substring query (empty = no results)
+    #[serde(default)]
+    pub q: String,
+    /// Maximum number of results (default 50, capped server-side)
+    pub limit: Option<usize>,
+}
+
 /// A single skill entry returned by the skills API (REQ-IR-005, REQ-BS-003)
 #[derive(Debug, Serialize)]
 pub struct SkillEntry {

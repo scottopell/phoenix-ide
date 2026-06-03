@@ -10,12 +10,13 @@
  * Returns empty results when no convId is available (root route).
  */
 import { api } from '../../../api';
+import type { OpenFileOptions } from '../../FileExplorer/fileExplorerTypes';
 import type { PaletteSource, PaletteItem } from '../types';
 
 export function createFileSource(
   convId: string,
   rootDir: string,
-  openFile: (path: string, rootDir: string) => void,
+  openFile: (path: string, rootDir: string, options?: OpenFileOptions) => void,
 ): PaletteSource {
   return {
     id: 'files',

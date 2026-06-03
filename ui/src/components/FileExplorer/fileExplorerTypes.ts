@@ -5,15 +5,20 @@ export interface PatchContext {
   firstModifiedLine?: number;
 }
 
+export type OpenFileOptions =
+  | { kind: 'patch'; patchContext: PatchContext }
+  | { kind: 'line'; lineNumber: number };
+
 export interface OpenFileState {
   path: string;
   rootDir: string;
   patchContext?: PatchContext;
+  focusLine?: number;
 }
 
 export interface FileExplorerContextValue {
   /** Open a file in the viewer */
-  openFile: (path: string, rootDir: string, patchContext?: PatchContext) => void;
+  openFile: (path: string, rootDir: string, options?: OpenFileOptions) => void;
   /** Currently open file, or null */
   activeFile: string | null;
   /** Close the file viewer */

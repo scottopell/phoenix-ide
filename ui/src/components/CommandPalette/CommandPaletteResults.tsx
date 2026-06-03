@@ -60,6 +60,9 @@ export function CommandPaletteResults({ results, selectedIndex, mode, onHover, o
                 {item.subtitle && mode !== 'action' && (
                   <span className="cp-result-subtitle">{item.subtitle}</span>
                 )}
+                {item.snippet && mode !== 'action' && (
+                  <span className="cp-result-snippet">{item.snippet}</span>
+                )}
               </div>
               {mode === 'action' && item.subtitle && (
                 <span className="cp-shortcut-hint">{item.subtitle}</span>

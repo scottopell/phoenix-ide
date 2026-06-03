@@ -7670,12 +7670,17 @@ html * {
   text-overflow: ellipsis;
 }
 
-.cp-result-subtitle {
+.cp-result-subtitle,
+.cp-result-snippet {
   font-size: 12px;
   color: var(--text-muted);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.cp-result-snippet {
+  font-family: var(--font-mono);
 }
 
 .cp-shortcut-hint {

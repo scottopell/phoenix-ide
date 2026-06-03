@@ -797,7 +797,7 @@ function ConversationPageContent() {
     (filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => {
       const rootDir = conversation?.worktree_path ?? conversation?.cwd ?? '/';
       const fullPath = filePath.startsWith('/') ? filePath : `${rootDir}/${filePath}`;
-      fileExplorer.openFile(fullPath, rootDir, { modifiedLines, firstModifiedLine });
+      fileExplorer.openFile(fullPath, rootDir, { kind: 'patch', patchContext: { modifiedLines, firstModifiedLine } });
     },
     [conversation?.worktree_path, conversation?.cwd, fileExplorer]
   );
@@ -862,6 +862,7 @@ function ConversationPageContent() {
               onClose={handleCloseFileViewer}
               onSendNotes={handleSendNotes}
               patchContext={prs.patchContext ?? undefined}
+              focusLine={prs.focusLine}
               inline
             />
           </Suspense>
@@ -1364,6 +1365,7 @@ function ConversationPageContent() {
             onClose={handleCloseFileViewer}
             onSendNotes={handleSendNotes}
             patchContext={fileExplorer.openFileState.patchContext ?? undefined}
+            focusLine={fileExplorer.openFileState.focusLine}
           />
         </Suspense>
       )}
@@ -1455,6 +1457,7 @@ function ConversationPageContent() {
                   onClose={handleCloseFileViewer}
                   onSendNotes={handleSendNotes}
                   patchContext={splitPanePrs.patchContext ?? undefined}
+                  focusLine={splitPanePrs.focusLine}
                   inline
                 />
               ) : browserOpen && conversationId ? (

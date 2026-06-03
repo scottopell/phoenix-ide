@@ -29,6 +29,8 @@ interface CommonPayload {
   absolutePath: string;
   onClose: () => void;
   onSendNotes: (notes: string) => void;
+  /** Initial search/jump target line. */
+  focusLine?: number | undefined;
   /** Render inline (desktop split-pane) instead of as an overlay. */
   inline?: boolean | undefined;
 }

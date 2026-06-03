@@ -34,7 +34,7 @@ import type { ViewerBodyProps } from './AnnotatableBlock';
 export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
   useRegisterFocusScope('file-viewer');
 
-  const { absolutePath, title, onClose, onSendNotes, inline } = payload;
+  const { absolutePath, title, onClose, onSendNotes, inline, focusLine } = payload;
   const textLike = isTextLikePayload(payload);
   const content = textLike ? payload.content : '';
   const patchContext: PatchContext | undefined = textLike ? payload.patchContext : undefined;
@@ -174,9 +174,29 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
     return () => container.removeEventListener('copy', handleCopy);
   }, []);
 
+  const { highlight, closePanel } = notes;
+
+  // Auto-scroll to a search/jump target line. Runs after file content is loaded
+  // and flashes the line without creating a review note.
+  useEffect(() => {
+    if (!content || !focusLine) return undefined;
+    const timer = setTimeout(() => {
+      if (usePierreCode) {
+        fileCodeRef.current?.scrollToLine(focusLine);
+        highlight(focusLine);
+      } else {
+        const lineEl = lineRefs.current.get(focusLine);
+        if (lineEl) {
+          lineEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+          highlight(focusLine);
+        }
+      }
+    }, 100);
+    return () => clearTimeout(timer);
+  }, [content, focusLine, highlight, usePierreCode]);
+
   // Jump-to-line lives here, not in the notes hook, because it needs the DOM
   // refs the rendered body registers into `lineRefs`.
-  const { highlight, closePanel } = notes;
   const handleJumpTo = useCallback(
     (note: ReviewNote) => {
       if (note.anchor.kind !== 'file' || note.anchor.filePath !== absolutePath) return;
@@ -299,7 +319,7 @@ export function MetaViewer({ payload }: { payload: MetaViewerPayload }) {
           notes={notes.fileNotes}
           modifiedLines={modifiedLines}
           highlightedLine={notes.highlightedLine}
-          firstModifiedLine={patchContext?.firstModifiedLine}
+          firstModifiedLine={patchContext?.firstModifiedLine ?? focusLine}
           scrollKey={scrollKey}
           onAnnotateLine={notes.startAnnotate}
         />
