@@ -66,6 +66,40 @@ async function settleValidation() {
   });
 }
 
+interface DraftStorageFailureOverrides {
+  getItem?: (original: Storage, key: string) => string | null;
+  setItem?: (original: Storage, key: string, value: string) => void;
+  removeItem?: (original: Storage, key: string) => void;
+}
+
+function withDraftStorageFailure(overrides: DraftStorageFailureOverrides): () => void {
+  const original = window.localStorage;
+  const fake = {
+    get length() { return original.length; },
+    clear: () => original.clear(),
+    key: (index: number) => original.key(index),
+    getItem: (key: string) => overrides.getItem?.(original, key) ?? original.getItem(key),
+    setItem: (key: string, value: string) => {
+      if (overrides.setItem) {
+        overrides.setItem(original, key, value);
+      } else {
+        original.setItem(key, value);
+      }
+    },
+    removeItem: (key: string) => {
+      if (overrides.removeItem) {
+        overrides.removeItem(original, key);
+      } else {
+        original.removeItem(key);
+      }
+    },
+  } satisfies Storage;
+  Object.defineProperty(window, 'localStorage', { configurable: true, value: fake });
+  return () => {
+    Object.defineProperty(window, 'localStorage', { configurable: true, value: original });
+  };
+}
+
 describe('/new workflow modes', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -116,13 +150,82 @@ describe('/new workflow modes', () => {
     expect(localStorage.getItem('phoenix-new-conversation-draft')).toBe('send and clear me');
     fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
 
-    await waitFor(() => expect(api.createConversation).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue(''));
     expect(localStorage.getItem('phoenix-new-conversation-draft')).toBeNull();
 
     firstRender.unmount();
     renderPage();
 
     expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('');
+  });
+
+  it('falls back to an empty draft when persisted draft storage cannot be read', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const restoreStorage = withDraftStorageFailure({
+      getItem: (original: Storage, key: string) => {
+        if (key === 'phoenix-new-conversation-draft') throw new Error('storage disabled');
+        return original.getItem(key);
+      },
+    });
+
+    try {
+      renderPage();
+
+      expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('');
+      expect(warnSpy).toHaveBeenCalledWith('Error reading new conversation draft from localStorage:', expect.any(Error));
+    } finally {
+      restoreStorage();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('keeps the composer usable when persisted draft storage cannot be written', async () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const restoreStorage = withDraftStorageFailure({
+      setItem: (original: Storage, key: string, value: string) => {
+        if (key === 'phoenix-new-conversation-draft') throw new Error('quota exceeded');
+        return original.setItem(key, value);
+      },
+    });
+
+    try {
+      renderPage();
+      await settleValidation();
+
+      fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, { target: { value: 'still editable' } });
+
+      expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue('still editable');
+      await waitFor(() => expect(warnSpy).toHaveBeenCalledWith('Error saving new conversation draft to localStorage:', expect.any(Error)));
+    } finally {
+      restoreStorage();
+      warnSpy.mockRestore();
+    }
+  });
+
+  it('still clears the mounted composer when persisted draft clearing fails after send', async () => {
+    vi.mocked(api.validateCwd).mockResolvedValue({ valid: true, is_git: false });
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const restoreStorage = withDraftStorageFailure({
+      removeItem: (original: Storage, key: string) => {
+        if (key === 'phoenix-new-conversation-draft') throw new Error('storage disabled');
+        return original.removeItem(key);
+      },
+    });
+
+    try {
+      renderPage();
+      await settleValidation();
+
+      fireEvent.change(screen.getAllByPlaceholderText('What would you like to work on?')[0]!, { target: { value: 'clear state anyway' } });
+      fireEvent.click(screen.getAllByRole('button', { name: 'Send' })[0]!);
+
+      await waitFor(() => expect(api.createConversation).toHaveBeenCalled());
+      await waitFor(() => expect(screen.getAllByPlaceholderText('What would you like to work on?')[0]).toHaveValue(''));
+      expect(warnSpy).toHaveBeenCalledWith('Error clearing new conversation draft from localStorage:', expect.any(Error));
+    } finally {
+      restoreStorage();
+      warnSpy.mockRestore();
+    }
   });
 
   it('shows only direct workflow for non-git directories and submits direct mode', async () => {
