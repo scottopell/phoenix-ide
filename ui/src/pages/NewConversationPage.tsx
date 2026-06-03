@@ -317,6 +317,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       {llmReady && (
         <div className="new-conv-bottom-input mobile-only">
           <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
+          <NewConversationFileChips files={conv.files} onRemove={conv.removeFile} />
           <textarea
             className="new-conv-textarea-mobile"
             placeholder={inputPlaceholder}

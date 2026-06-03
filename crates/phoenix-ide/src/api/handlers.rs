@@ -29,7 +29,7 @@ use super::types::{
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
 use crate::db::{
-    ConvMode, ConversationUsage, ImageData, Message, MessageContent, MessageType,
+    ConvMode, Conversation, ConversationUsage, ImageData, Message, MessageContent, MessageType,
     NotificationSettings,
 };
 use crate::git_ops::{
@@ -674,15 +674,7 @@ const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 const ATTACHMENT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 fn attachment_root() -> PathBuf {
-    std::env::var_os("PHOENIX_DATA_DIR").map_or_else(
-        || {
-            std::env::var_os("HOME")
-                .map_or_else(std::env::temp_dir, PathBuf::from)
-                .join(".phoenix-ide")
-                .join("attachments")
-        },
-        |dir| PathBuf::from(dir).join("attachments"),
-    )
+    std::env::temp_dir().join("phoenix-ide-attachments")
 }
 
 fn collect_file_paths_from_content(value: &serde_json::Value, paths: &mut HashSet<PathBuf>) {
@@ -825,6 +817,20 @@ async fn delete_conversation_attachments_at_root(root: PathBuf, conversation_id:
 
 async fn delete_conversation_attachments(conversation_id: &str) {
     delete_conversation_attachments_at_root(attachment_root(), conversation_id).await;
+}
+
+async fn rollback_created_conversation_after_attachment_failure(
+    state: &AppState,
+    conversation: &Conversation,
+    id: &str,
+) {
+    delete_conversation_attachments(id).await;
+    if let Err(cleanup_err) = run_resource_cleanup_cascade(state, conversation).await {
+        tracing::warn!(conversation_id = %id, error = ?cleanup_err, "failed to clean resources after initial attachment failure");
+    }
+    if let Err(delete_err) = state.runtime.db().delete_conversation(id).await {
+        tracing::warn!(conversation_id = %id, error = %delete_err, "failed to delete conversation row after initial attachment failure");
+    }
 }
 
 fn sanitize_attachment_name(name: &str) -> String {
@@ -1490,14 +1496,8 @@ async fn create_conversation_with_id(
         {
             Ok(file) => req.files.push(file),
             Err(e) => {
-                delete_conversation_attachments(&id).await;
-                if let Err(cleanup_err) = run_resource_cleanup_cascade(&state, &conversation).await
-                {
-                    tracing::warn!(conversation_id = %id, error = ?cleanup_err, "failed to clean resources after initial attachment storage failure");
-                }
-                if let Err(delete_err) = state.runtime.db().delete_conversation(&id).await {
-                    tracing::warn!(conversation_id = %id, error = %delete_err, "failed to delete conversation row after initial attachment storage failure");
-                }
+                rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
+                    .await;
                 return Err(e);
             }
         }
@@ -1510,14 +1510,23 @@ async fn create_conversation_with_id(
     if !(is_seeded && req.text.trim().is_empty() && req.images.is_empty() && req.files.is_empty()) {
         // Expand `@file` inline references before sending (REQ-IR-001, REQ-IR-007)
         let working_dir_for_expand = std::path::PathBuf::from(&effective_cwd);
-        let expanded_initial = crate::message_expander::expand(&req.text, &working_dir_for_expand)
-            .map_err(|e| {
-                AppError::UnprocessableEntity(ExpansionErrorResponse {
-                    error: e.to_string(),
-                    error_type: e.error_type().to_string(),
-                    reference: e.reference(),
-                })
-            })?;
+        let expanded_initial =
+            match crate::message_expander::expand(&req.text, &working_dir_for_expand) {
+                Ok(expanded) => expanded,
+                Err(e) => {
+                    rollback_created_conversation_after_attachment_failure(
+                        &state,
+                        &conversation,
+                        &id,
+                    )
+                    .await;
+                    return Err(AppError::UnprocessableEntity(ExpansionErrorResponse {
+                        error: e.to_string(),
+                        error_type: e.error_type().to_string(),
+                        reference: e.reference(),
+                    }));
+                }
+            };
 
         // Convert images
         let images: Vec<ImageData> = req
@@ -1547,11 +1556,11 @@ async fn create_conversation_with_id(
             skill_invocation: expanded_initial.skill_invocation,
         };
 
-        state
-            .runtime
-            .send_event(&id, event)
-            .await
-            .map_err(|e| AppError::Internal(e.clone()))?;
+        if let Err(e) = state.runtime.send_event(&id, event).await {
+            rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
+                .await;
+            return Err(AppError::Internal(e));
+        }
     }
 
     Ok(Json(ConversationResponse {
