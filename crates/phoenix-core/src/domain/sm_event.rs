@@ -1,6 +1,6 @@
 //! Events that can occur in a conversation
 
-use crate::domain::db_schema::{ErrorKind, ImageData, ToolResult};
+use crate::domain::db_schema::{ErrorKind, FileAttachment, ImageData, ToolResult};
 use serde::{Deserialize, Serialize};
 
 /// A steering message that has been queued for delivery when the conversation
@@ -11,6 +11,7 @@ pub struct SteerEntry {
     pub text: String,
     pub llm_text: Option<String>,
     pub images: Vec<ImageData>,
+    pub files: Vec<FileAttachment>,
     pub message_id: String,
     pub user_agent: Option<String>,
     pub skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
@@ -116,6 +117,7 @@ pub enum Event {
         /// `None` means no expansion — `text` is used verbatim.
         llm_text: Option<String>,
         images: Vec<ImageData>,
+        files: Vec<FileAttachment>,
         /// Client-generated UUID - the canonical identifier for this message
         message_id: String,
         /// Browser user agent for display (e.g., show iPhone icon in UI)
@@ -268,6 +270,7 @@ pub enum Event {
         /// Expanded text delivered to the LLM when `@` references are present.
         llm_text: Option<String>,
         images: Vec<ImageData>,
+        files: Vec<FileAttachment>,
         /// Client-generated UUID — canonical identifier for this message.
         message_id: String,
         user_agent: Option<String>,
@@ -344,6 +347,7 @@ pub enum CoreEvent {
         text: String,
         llm_text: Option<String>,
         images: Vec<ImageData>,
+        files: Vec<FileAttachment>,
         message_id: String,
         user_agent: Option<String>,
         skill_invocation: Option<crate::domain::skill_invocation::SkillInvocation>,
@@ -485,6 +489,7 @@ impl TryFrom<Event> for ParentEvent {
                 text,
                 llm_text,
                 images,
+                files,
                 message_id,
                 user_agent,
                 skill_invocation,
@@ -492,6 +497,7 @@ impl TryFrom<Event> for ParentEvent {
                 text,
                 llm_text,
                 images,
+                files,
                 message_id,
                 user_agent,
                 skill_invocation,
@@ -626,6 +632,7 @@ impl TryFrom<Event> for SubAgentEvent {
                 text,
                 llm_text,
                 images,
+                files,
                 message_id,
                 user_agent,
                 skill_invocation,
@@ -633,6 +640,7 @@ impl TryFrom<Event> for SubAgentEvent {
                 text,
                 llm_text,
                 images,
+                files,
                 message_id,
                 user_agent,
                 skill_invocation,
@@ -826,6 +834,7 @@ mod steering_queue_envelope_tests {
             text: "do the thing".into(),
             llm_text: None,
             images: vec![],
+            files: vec![],
             message_id: "m-1".into(),
             user_agent: None,
             skill_invocation: None,

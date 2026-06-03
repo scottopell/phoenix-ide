@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, canChangeModelInState, ExpansionError, type Conversation, type ImageData } from '../api';
+import { api, canChangeModelInState, ExpansionError, type Conversation, type FileAttachment, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -195,8 +195,9 @@ function ConversationPageContent() {
   // Toast for question panel feedback
   const { toasts, dismissToast, showInfo, showError } = useToast();
 
-  // Image attachments (not conversation state — cleared on page refresh)
+  // Attachments (not conversation state — cleared on page refresh)
   const [images, setImages] = useState<ImageData[]>([]);
+  const [files, setFiles] = useState<FileAttachment[]>([]);
 
   // Shared models/credential poller — one request loop app-wide.
   const { models: availableModels, credentialStatus } = useModels();
@@ -240,6 +241,7 @@ function ConversationPageContent() {
     setError(null);
     setShowFileBrowser(false);
     setImages([]);
+    setFiles([]);
     setShowTaskApproval(false);
     setShowFirstTaskWelcome(false);
     setContextExhaustedExpanded(true);
@@ -481,7 +483,8 @@ function ConversationPageContent() {
     async (
       localId: string,
       text: string,
-      imgs: { data: string; media_type: string }[] = []
+      imgs: { data: string; media_type: string }[] = [],
+      files: FileAttachment[] = []
     ) => {
       if (!conversationId) return;
 
@@ -489,7 +492,7 @@ function ConversationPageContent() {
 
       try {
         if (isOnline) {
-          const result = await api.sendMessage(conversationId, text, imgs, localId);
+          const result = await api.sendMessage(conversationId, text, imgs, files, localId);
           // Don't touch the queue here. The entry stays `pending` until
           // `atom.messages` contains a row with `message_id == localId`
           // (SSE echo), at which point `pendingMessages` filters it out
@@ -520,7 +523,7 @@ function ConversationPageContent() {
           await queueOperation({
             type: 'send_message',
             conversationId,
-            payload: { text, images: imgs, localId },
+            payload: { text, images: imgs, files, localId },
             createdAt: new Date(),
             retryCount: 0,
             status: 'pending',
@@ -559,18 +562,18 @@ function ConversationPageContent() {
     for (const msg of pendingMessages) {
       if (msg.status === 'steering_queued') continue;
       if (sendingMessagesRef.current.has(msg.localId)) continue;
-      sendMessageRef.current(msg.localId, msg.text, msg.images);
+      sendMessageRef.current(msg.localId, msg.text, msg.images, msg.files ?? []);
     }
   }, [isConnected, conversationId, pendingMessages]);
 
-  const handleSend = async (text: string, attachedImages: ImageData[]) => {
+  const handleSend = async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
     if (!conversationId) return;
 
-    const msg = enqueue(text, attachedImages);
+    const msg = enqueue(text, attachedImages, attachedFiles);
 
     if (isConnected) {
       // Await so expansion errors propagate back to InputArea (REQ-IR-007)
-      await sendMessage(msg.localId, text, attachedImages);
+      await sendMessage(msg.localId, text, attachedImages, attachedFiles);
     }
   };
 
@@ -1181,6 +1184,8 @@ function ConversationPageContent() {
           convState={convStateForChildren}
           images={images}
           setImages={setImages}
+          files={files}
+          setFiles={setFiles}
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}
@@ -1243,6 +1248,8 @@ function ConversationPageContent() {
           convState={convStateForChildren}
           images={images}
           setImages={setImages}
+          files={files}
+          setFiles={setFiles}
           isOffline={isOffline}
           failedMessages={failedMessages}
           convModeLabel={conversation.conv_mode_label}

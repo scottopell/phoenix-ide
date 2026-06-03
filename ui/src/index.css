@@ -12034,3 +12034,66 @@ button.keyword-search-filepath:hover {
   font-size: 12px;
 }
 
+
+/* File attachment composer and message chips */
+.input-area--drag-over .input-textarea-wrap {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 1px var(--accent-blue);
+}
+
+.input-drop-affordance,
+.input-uploading-files {
+  margin-bottom: 4px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgb(59 130 246 / 10%);
+  border: 1px solid rgb(59 130 246 / 30%);
+  color: var(--accent-blue);
+  font-size: 12px;
+}
+
+.file-attachments,
+.message-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0;
+}
+
+.file-attachment-chip,
+.message-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-subtle, rgb(255 255 255 / 10%));
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.file-attachment-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-attachment-size,
+.message-file-size {
+  color: var(--text-muted);
+}
+
+.file-attachment-remove {
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.file-attachment-remove:hover {
+  color: var(--text-primary);
+}

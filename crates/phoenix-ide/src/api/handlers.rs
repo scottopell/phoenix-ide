@@ -16,8 +16,8 @@ use super::lifecycle_handlers::{
 };
 use super::sse::sse_stream;
 use super::types::{
-    CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
-    CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
+    AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry,
+    CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
     ConversationListResponse, ConversationResponse, ConversationWithMessagesResponse,
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
@@ -42,7 +42,7 @@ use crate::state_machine::{check_user_message_acceptable, ConvState, Event, Tran
 use super::browser_view::browser_view_ws_handler;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Multipart, Path, Query, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -55,7 +55,7 @@ use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
 
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
@@ -84,6 +84,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Conversation creation (REQ-API-002)
         .route("/api/conversations/new", post(create_conversation))
+        .route(
+            "/api/conversations/new/with-attachments",
+            post(create_conversation_with_attachments),
+        )
         // Conversation retrieval (REQ-API-003)
         .route("/api/conversations/:id", get(get_conversation))
         .route("/api/conversations/:id/slug", get(get_conversation_slug))
@@ -101,6 +105,10 @@ pub fn create_router(state: AppState) -> Router {
         )
         // User actions (REQ-API-004)
         .route("/api/conversations/:id/chat", post(send_chat))
+        .route(
+            "/api/conversations/:id/attachments",
+            post(upload_conversation_attachments),
+        )
         .route("/api/conversations/:id/cancel", post(cancel_conversation))
         // Steering queue management (task 01001)
         .route(
@@ -653,6 +661,220 @@ async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, App
     ))
 }
 
+const MAX_ATTACHMENT_SIZE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
+
+fn attachment_root() -> PathBuf {
+    std::env::temp_dir().join("phoenix-ide-attachments")
+}
+
+fn sanitize_attachment_name(name: &str) -> String {
+    let basename = FsPath::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment");
+    let sanitized: String = basename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('.').trim_matches('_');
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.chars().take(120).collect()
+    }
+}
+
+fn validate_attachment_file(name: &str, media_type: &str, size: usize) -> Result<(), AppError> {
+    if size == 0 {
+        return Err(AppError::BadRequest(format!(
+            "Attachment '{name}' is empty"
+        )));
+    }
+    if size > MAX_ATTACHMENT_SIZE_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "Attachment '{name}' exceeds the 10 MB per-file limit"
+        )));
+    }
+    if media_type.starts_with("image/") {
+        return Err(AppError::BadRequest(
+            "Image files must use the image attachment channel".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn store_attachment_bytes(
+    conversation_id: &str,
+    original_name: String,
+    media_type: String,
+    bytes: axum::body::Bytes,
+) -> Result<crate::api::types::FileAttachment, AppError> {
+    validate_attachment_file(&original_name, &media_type, bytes.len())?;
+    let dir = attachment_root().join(conversation_id);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create attachment directory: {e}")))?;
+    let filename = format!(
+        "{}-{}",
+        uuid::Uuid::new_v4(),
+        sanitize_attachment_name(&original_name)
+    );
+    let path = dir.join(filename);
+    tokio::fs::write(&path, &bytes)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to write attachment: {e}")))?;
+    Ok(crate::api::types::FileAttachment {
+        original_name,
+        media_type,
+        size_bytes: bytes.len() as u64,
+        stored_path: path.to_string_lossy().into_owned(),
+    })
+}
+
+struct RawAttachmentPart {
+    original_name: String,
+    media_type: String,
+    bytes: axum::body::Bytes,
+}
+
+async fn read_multipart_create_parts(
+    mut multipart: Multipart,
+) -> Result<(CreateConversationRequest, Vec<RawAttachmentPart>), AppError> {
+    let mut metadata: Option<CreateConversationRequest> = None;
+    let mut files = Vec::new();
+    let mut total_bytes = 0usize;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Invalid multipart payload: {e}")))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "metadata" {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Invalid metadata part: {e}")))?;
+            metadata =
+                Some(serde_json::from_slice(&bytes).map_err(|e| {
+                    AppError::BadRequest(format!("Invalid metadata JSON part: {e}"))
+                })?);
+            continue;
+        }
+        if name != "files" {
+            tracing::debug!(part = %name, "ignoring unexpected multipart field");
+            continue;
+        }
+        if files.len() >= MAX_ATTACHMENTS_PER_MESSAGE {
+            return Err(AppError::BadRequest(format!(
+                "A message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} files"
+            )));
+        }
+        let original_name = field
+            .file_name()
+            .map_or_else(|| "attachment".to_string(), ToString::to_string);
+        let media_type = field.content_type().map_or_else(
+            || "application/octet-stream".to_string(),
+            ToString::to_string,
+        );
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Invalid file part: {e}")))?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(AppError::BadRequest(
+                "Attachments exceed the 25 MB total limit".to_string(),
+            ));
+        }
+        validate_attachment_file(&original_name, &media_type, bytes.len())?;
+        files.push(RawAttachmentPart {
+            original_name,
+            media_type,
+            bytes,
+        });
+    }
+
+    let metadata = metadata.ok_or_else(|| {
+        AppError::BadRequest("Multipart create requires a metadata JSON part".to_string())
+    })?;
+    Ok((metadata, files))
+}
+
+async fn read_multipart_attachments(
+    conversation_id: &str,
+    mut multipart: Multipart,
+) -> Result<
+    (
+        Option<CreateConversationRequest>,
+        Vec<crate::api::types::FileAttachment>,
+    ),
+    AppError,
+> {
+    let mut metadata: Option<CreateConversationRequest> = None;
+    let mut files = Vec::new();
+    let mut total_bytes = 0usize;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Invalid multipart payload: {e}")))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "metadata" {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Invalid metadata part: {e}")))?;
+            metadata =
+                Some(serde_json::from_slice(&bytes).map_err(|e| {
+                    AppError::BadRequest(format!("Invalid metadata JSON part: {e}"))
+                })?);
+            continue;
+        }
+
+        if name != "files" {
+            tracing::debug!(part = %name, "ignoring unexpected multipart field");
+            continue;
+        }
+
+        if files.len() >= MAX_ATTACHMENTS_PER_MESSAGE {
+            return Err(AppError::BadRequest(format!(
+                "A message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} files"
+            )));
+        }
+        let original_name = field
+            .file_name()
+            .map_or_else(|| "attachment".to_string(), ToString::to_string);
+        let media_type = field.content_type().map_or_else(
+            || "application/octet-stream".to_string(),
+            ToString::to_string,
+        );
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Invalid file part: {e}")))?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(AppError::BadRequest(
+                "Attachments exceed the 25 MB total limit".to_string(),
+            ));
+        }
+        files
+            .push(store_attachment_bytes(conversation_id, original_name, media_type, bytes).await?);
+    }
+
+    Ok((metadata, files))
+}
+
 // ============================================================
 // Conversation Creation (REQ-API-002)
 // ============================================================
@@ -661,6 +883,16 @@ async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, App
 async fn create_conversation(
     State(state): State<AppState>,
     Json(req): Json<CreateConversationRequest>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    create_conversation_with_id(state, uuid::Uuid::new_v4().to_string(), req, Vec::new()).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn create_conversation_with_id(
+    state: AppState,
+    id: String,
+    mut req: CreateConversationRequest,
+    raw_files: Vec<RawAttachmentPart>,
 ) -> Result<Json<ConversationResponse>, AppError> {
     // Validate directory exists
     let path = PathBuf::from(&req.cwd);
@@ -717,9 +949,6 @@ async fn create_conversation(
         }
         // If we can't find it, fall through to create (shouldn't happen)
     }
-
-    // Generate ID
-    let id = uuid::Uuid::new_v4().to_string();
 
     // Try to generate a title using a cheap LLM model.
     //
@@ -995,11 +1224,23 @@ async fn create_conversation(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    for raw_file in raw_files {
+        req.files.push(
+            store_attachment_bytes(
+                &id,
+                raw_file.original_name,
+                raw_file.media_type,
+                raw_file.bytes,
+            )
+            .await?,
+        );
+    }
+
     // REQ-SEED-001: seeded conversations may be created with an empty
     // `text` — the UI will hydrate the input area from localStorage and the
     // user sends the first message manually. Skip expansion + initial event
     // dispatch in that case.
-    if !(is_seeded && req.text.trim().is_empty()) {
+    if !(is_seeded && req.text.trim().is_empty() && req.images.is_empty() && req.files.is_empty()) {
         // Expand `@file` inline references before sending (REQ-IR-001, REQ-IR-007)
         let working_dir_for_expand = std::path::PathBuf::from(&effective_cwd);
         let expanded_initial = crate::message_expander::expand(&req.text, &working_dir_for_expand)
@@ -1021,6 +1262,9 @@ async fn create_conversation(
             })
             .collect();
 
+        let files: Vec<phoenix_core::domain::db_schema::FileAttachment> =
+            req.files.into_iter().map(Into::into).collect();
+
         // Only set llm_text when expansion actually changed the text (REQ-IR-001)
         let initial_llm_text = (expanded_initial.llm_text != expanded_initial.display_text)
             .then_some(expanded_initial.llm_text);
@@ -1030,6 +1274,7 @@ async fn create_conversation(
             text: expanded_initial.display_text,
             llm_text: initial_llm_text,
             images,
+            files,
             message_id: req.message_id,
             user_agent: None,
             skill_invocation: expanded_initial.skill_invocation,
@@ -1045,6 +1290,16 @@ async fn create_conversation(
     Ok(Json(ConversationResponse {
         conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
     }))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn create_conversation_with_attachments(
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> Result<Json<ConversationResponse>, AppError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let (req, raw_files) = read_multipart_create_parts(multipart).await?;
+    create_conversation_with_id(state, id, req, raw_files).await
 }
 
 // ============================================================
@@ -1598,6 +1853,26 @@ async fn stream_conversation(
 // User Actions (REQ-API-004)
 // ============================================================
 
+async fn upload_conversation_attachments(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    multipart: Multipart,
+) -> Result<Json<AttachmentUploadResponse>, AppError> {
+    state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let (_metadata, files) = read_multipart_attachments(&id, multipart).await?;
+    if files.is_empty() {
+        return Err(AppError::BadRequest(
+            "No file attachments provided".to_string(),
+        ));
+    }
+    Ok(Json(AttachmentUploadResponse { files }))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn send_chat(
     State(state): State<AppState>,
@@ -1687,6 +1962,8 @@ async fn send_chat(
                     media_type: img.media_type,
                 })
                 .collect();
+            let files: Vec<phoenix_core::domain::db_schema::FileAttachment> =
+                req.files.clone().into_iter().map(Into::into).collect();
             let chat_llm_text =
                 (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
             let display_text = expanded.display_text;
@@ -1694,6 +1971,7 @@ async fn send_chat(
                 text: display_text.clone(),
                 llm_text: chat_llm_text,
                 images,
+                files,
                 message_id: req.message_id,
                 user_agent: req.user_agent,
                 skill_invocation: expanded.skill_invocation,
@@ -1755,6 +2033,9 @@ async fn send_chat(
         })
         .collect();
 
+    let files: Vec<phoenix_core::domain::db_schema::FileAttachment> =
+        req.files.into_iter().map(Into::into).collect();
+
     // Only set llm_text when expansion actually changed the text (REQ-IR-001)
     let chat_llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
 
@@ -1766,6 +2047,7 @@ async fn send_chat(
         text: display_text.clone(),
         llm_text: chat_llm_text,
         images,
+        files,
         message_id: req.message_id,
         user_agent: req.user_agent,
         skill_invocation: expanded.skill_invocation,

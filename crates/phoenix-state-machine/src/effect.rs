@@ -4,7 +4,7 @@ use crate::state::{AssistantMessage, SubAgentOutcome, SubAgentResult, ToolCall};
 use chrono::{DateTime, Utc};
 use phoenix_bash_display::display_command;
 use phoenix_core::domain::db_schema::{
-    ImageData, MessageContent, ToolContent, ToolContentImage, ToolResult, UsageData,
+    FileAttachment, ImageData, MessageContent, ToolContent, ToolContentImage, ToolResult, UsageData,
 };
 use phoenix_core::domain::llm_error_kind::LlmAttemptReason;
 use phoenix_core::domain::llm_types::ContentBlock;
@@ -229,10 +229,12 @@ pub enum Effect {
 }
 
 impl Effect {
+    #[allow(clippy::too_many_arguments)]
     pub fn persist_user_message(
         text: impl Into<String>,
         llm_text: Option<String>,
         images: Vec<ImageData>,
+        files: Vec<FileAttachment>,
         message_id: String,
         user_agent: Option<String>,
         skill_invocation: Option<phoenix_core::domain::skill_invocation::SkillInvocation>,
@@ -249,14 +251,14 @@ impl Effect {
             match llm_text {
                 Some(expanded) => MessageContent::User(
                     phoenix_core::domain::db_schema::UserContent::with_expansion(
-                        text, expanded, images,
+                        text, expanded, images, files,
                     ),
                 ),
                 None => {
-                    if images.is_empty() {
+                    if images.is_empty() && files.is_empty() {
                         MessageContent::user(text)
                     } else {
-                        MessageContent::user_with_images(text, images)
+                        MessageContent::user_with_attachments(text, images, files)
                     }
                 }
             }

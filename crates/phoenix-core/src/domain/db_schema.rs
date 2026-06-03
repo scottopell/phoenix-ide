@@ -824,6 +824,8 @@ pub struct UserContent {
     pub text: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImageData>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileAttachment>,
     /// Expanded text delivered to the LLM (REQ-IR-001).
     /// `None` means no expansion occurred and `text` is used verbatim for the LLM.
     /// `Some` holds the fully resolved form (e.g. `<file path="…">…</file>` blocks).
@@ -841,15 +843,25 @@ impl UserContent {
         Self {
             text: text.into(),
             images: Vec::new(),
+            files: Vec::new(),
             llm_text: None,
             is_meta: false,
         }
     }
 
     pub fn with_images(text: impl Into<String>, images: Vec<ImageData>) -> Self {
+        Self::with_attachments(text, images, Vec::new())
+    }
+
+    pub fn with_attachments(
+        text: impl Into<String>,
+        images: Vec<ImageData>,
+        files: Vec<FileAttachment>,
+    ) -> Self {
         Self {
             text: text.into(),
             images,
+            files,
             llm_text: None,
             is_meta: false,
         }
@@ -861,10 +873,12 @@ impl UserContent {
         display_text: impl Into<String>,
         llm_text: impl Into<String>,
         images: Vec<ImageData>,
+        files: Vec<FileAttachment>,
     ) -> Self {
         Self {
             text: display_text.into(),
             images,
+            files,
             llm_text: Some(llm_text.into()),
             is_meta: false,
         }
@@ -876,6 +890,7 @@ impl UserContent {
         Self {
             text: text.into(),
             images: Vec::new(),
+            files: Vec::new(),
             llm_text: None,
             is_meta: true,
         }
@@ -886,6 +901,38 @@ impl UserContent {
     pub fn llm_text(&self) -> &str {
         self.llm_text.as_deref().unwrap_or(&self.text)
     }
+}
+
+/// Non-image file attachment in a user message. The bytes live on disk and the
+/// LLM sees the path as text context; provider-native image payloads remain in
+/// [`ImageData`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FileAttachment {
+    pub original_name: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub stored_path: String,
+}
+
+impl FileAttachment {
+    #[must_use]
+    pub fn llm_context_tag(&self) -> String {
+        format!(
+            "<attached_file name=\"{}\" media_type=\"{}\" size_bytes=\"{}\" path=\"{}\" />",
+            xml_attr_escape(&self.original_name),
+            xml_attr_escape(&self.media_type),
+            self.size_bytes,
+            xml_attr_escape(&self.stored_path)
+        )
+    }
+}
+
+fn xml_attr_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 /// Image attachment in a message
@@ -1054,6 +1101,15 @@ impl MessageContent {
     /// Create user content with images
     pub fn user_with_images(text: impl Into<String>, images: Vec<ImageData>) -> Self {
         Self::User(UserContent::with_images(text, images))
+    }
+
+    /// Create user content with typed attachments.
+    pub fn user_with_attachments(
+        text: impl Into<String>,
+        images: Vec<ImageData>,
+        files: Vec<FileAttachment>,
+    ) -> Self {
+        Self::User(UserContent::with_attachments(text, images, files))
     }
 
     /// Create agent content

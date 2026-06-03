@@ -167,6 +167,7 @@ mod tests {
             content: MessageContent::User(UserContent {
                 text: text.to_string(),
                 images: vec![],
+                files: vec![],
                 llm_text: None,
                 is_meta: false,
             }),
@@ -656,6 +657,7 @@ mod proptests {
             MessageType::User => MessageContent::User(UserContent {
                 text: "user message".to_string(),
                 images: vec![],
+                files: vec![],
                 is_meta: false,
                 llm_text: None,
             }),
@@ -681,6 +683,7 @@ mod proptests {
             _ => MessageContent::User(UserContent {
                 text: "fallback".to_string(),
                 images: vec![],
+                files: vec![],
                 llm_text: None,
                 is_meta: false,
             }),

@@ -438,12 +438,32 @@ function formatBrowserInput(name: string, input: Record<string, unknown>): strin
 // User Message Components
 // ============================================================================
 
+function formatAttachmentBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function FileChips({ files }: { files: { original_name: string; size_bytes: number; stored_path?: string }[] }) {
+  if (files.length === 0) return null;
+  return (
+    <div className="message-files">
+      {files.map((file, idx) => (
+        <span key={`${file.stored_path ?? file.original_name}-${idx}`} className="message-file-chip" title={file.stored_path}>
+          📎 {file.original_name} <span className="message-file-size">{formatAttachmentBytes(file.size_bytes)}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 export const UserMessage = memo(UserMessageImpl);
 
 function UserMessageImpl({ message }: { message: Message }) {
-  const content = message.content as { text?: string; images?: { data: string; media_type: string }[]; is_meta?: boolean };
+  const content = message.content as { text?: string; images?: { data: string; media_type: string }[]; files?: { original_name: string; size_bytes: number; stored_path?: string }[]; is_meta?: boolean };
   const text = content.text || (typeof message.content === 'string' ? message.content : '');
   const images = content.images || [];
+  const files = content.files || [];
   const isMeta = content.is_meta === true;
   const timestamp = message.created_at;
 
@@ -472,6 +492,7 @@ function UserMessageImpl({ message }: { message: Message }) {
             ))}
           </div>
         )}
+        <FileChips files={files} />
       </div>
     </div>
   );
@@ -528,6 +549,7 @@ function QueuedUserMessageImpl({
             ))}
           </div>
         )}
+        <FileChips files={message.files ?? []} />
       </div>
     </div>
   );

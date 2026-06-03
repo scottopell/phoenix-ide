@@ -14,6 +14,7 @@ export class SyncQueue {
           op.conversationId,
           op.payload.text,
           op.payload.images || [],
+          op.payload.files || [],
           op.payload.localId,
         );
         break;
