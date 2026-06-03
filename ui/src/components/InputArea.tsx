@@ -424,6 +424,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   };
 
   const addDroppedFiles = async (dropped: File[]) => {
+    if (isUploadingFiles) {
+      setExpansionError('Wait for the current attachment upload to finish before adding more files.');
+      return;
+    }
     if (!conversationId) {
       setExpansionError('Open a conversation before attaching files.');
       return;
@@ -487,6 +491,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     if (!Array.from(e.dataTransfer.types).includes('Files')) return;
     e.preventDefault();
     setIsDragOver(false);
+    if (isUploadingFiles) {
+      setExpansionError('Wait for the current attachment upload to finish before adding more files.');
+      return;
+    }
     const dropped = Array.from(e.dataTransfer.files);
     if (dropped.length > 0) await addDroppedFiles(dropped);
   };

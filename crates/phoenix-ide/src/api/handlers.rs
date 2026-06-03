@@ -54,6 +54,8 @@ use chrono::{Local, Timelike};
 use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use serde_json::Value;
+use sqlx::Row;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -683,9 +685,43 @@ fn attachment_root() -> PathBuf {
     )
 }
 
+fn collect_file_paths_from_content(value: &serde_json::Value, paths: &mut HashSet<PathBuf>) {
+    if let Some(files) = value.get("files").and_then(serde_json::Value::as_array) {
+        for file in files {
+            if let Some(path) = file.get("stored_path").and_then(serde_json::Value::as_str) {
+                paths.insert(PathBuf::from(path));
+            }
+        }
+    }
+}
+
+async fn referenced_attachment_paths(db: &crate::db::Database) -> HashSet<PathBuf> {
+    let rows = match sqlx::query("SELECT content FROM messages WHERE message_type IN ('user', 'skill') AND content LIKE '%stored_path%'")
+        .fetch_all(db.pool())
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read attachment references; skipping TTL attachment sweep");
+            return HashSet::new();
+        }
+    };
+    let mut paths = HashSet::new();
+    for row in rows {
+        let Ok(content) = row.try_get::<String, _>("content") else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+            collect_file_paths_from_content(&value, &mut paths);
+        }
+    }
+    paths
+}
+
 fn sweep_expired_attachments_blocking(
     root: &std::path::Path,
     cutoff: SystemTime,
+    referenced: &HashSet<PathBuf>,
 ) -> std::io::Result<()> {
     if !root.exists() {
         return Ok(());
@@ -699,7 +735,7 @@ fn sweep_expired_attachments_blocking(
             Err(e) => return Err(e),
         };
         if metadata.is_dir() {
-            sweep_expired_attachments_blocking(&path, cutoff)?;
+            sweep_expired_attachments_blocking(&path, cutoff, referenced)?;
             match std::fs::remove_dir(&path) {
                 Ok(()) => {}
                 Err(e)
@@ -709,7 +745,9 @@ fn sweep_expired_attachments_blocking(
                     ) => {}
                 Err(e) => return Err(e),
             }
-        } else if metadata.modified().is_ok_and(|modified| modified < cutoff) {
+        } else if metadata.modified().is_ok_and(|modified| modified < cutoff)
+            && !referenced.contains(&path)
+        {
             match std::fs::remove_file(&path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -720,14 +758,16 @@ fn sweep_expired_attachments_blocking(
     Ok(())
 }
 
-async fn cleanup_expired_attachments() {
+async fn cleanup_expired_attachments(db: &crate::db::Database) {
     let root = attachment_root();
+    let referenced = referenced_attachment_paths(db).await;
     let cutoff = SystemTime::now()
         .checked_sub(ATTACHMENT_TTL)
         .unwrap_or(SystemTime::UNIX_EPOCH);
-    let result =
-        tokio::task::spawn_blocking(move || sweep_expired_attachments_blocking(&root, cutoff))
-            .await;
+    let result = tokio::task::spawn_blocking(move || {
+        sweep_expired_attachments_blocking(&root, cutoff, &referenced)
+    })
+    .await;
     match result {
         Ok(Ok(())) => {}
         Ok(Err(e)) => tracing::warn!(error = %e, "failed to sweep expired attachments"),
@@ -735,13 +775,13 @@ async fn cleanup_expired_attachments() {
     }
 }
 
-pub(super) fn start_attachment_cleanup_task() {
-    tokio::spawn(async {
-        cleanup_expired_attachments().await;
+pub(super) fn start_attachment_cleanup_task(db: crate::db::Database) {
+    tokio::spawn(async move {
+        cleanup_expired_attachments(&db).await;
         let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
         loop {
             interval.tick().await;
-            cleanup_expired_attachments().await;
+            cleanup_expired_attachments(&db).await;
         }
     });
 }
@@ -970,7 +1010,6 @@ async fn read_multipart_create_parts(
                 "Attachments exceed the 25 MB total limit".to_string(),
             ));
         }
-        cleanup_expired_attachments().await;
         validate_attachment_file(&original_name, &media_type, bytes.len())?;
         files.push(RawAttachmentPart {
             original_name,
@@ -5951,12 +5990,27 @@ mod attachment_storage_tests {
         let expired = conv.join("old.txt");
         std::fs::write(&expired, b"old").expect("write old");
         let cutoff = SystemTime::now() + Duration::from_secs(1);
-        sweep_expired_attachments_blocking(root, cutoff).expect("sweep");
+        sweep_expired_attachments_blocking(root, cutoff, &HashSet::new()).expect("sweep");
         assert!(!expired.exists());
         assert!(
             !conv.exists(),
             "empty conversation attachment dir should be removed"
         );
+    }
+
+    #[test]
+    fn sweep_preserves_expired_referenced_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let conv = root.join("conv-referenced");
+        std::fs::create_dir_all(&conv).expect("create conv dir");
+        let referenced = conv.join("old-but-referenced.txt");
+        std::fs::write(&referenced, b"keep").expect("write referenced");
+        let cutoff = SystemTime::now() + Duration::from_secs(1);
+        let references = HashSet::from([referenced.clone()]);
+        sweep_expired_attachments_blocking(root, cutoff, &references).expect("sweep");
+        assert!(referenced.exists());
+        assert!(conv.exists());
     }
 
     #[test]
@@ -5968,7 +6022,7 @@ mod attachment_storage_tests {
         let recent = conv.join("recent.txt");
         std::fs::write(&recent, b"recent").expect("write recent");
         let cutoff = SystemTime::UNIX_EPOCH;
-        sweep_expired_attachments_blocking(root, cutoff).expect("sweep");
+        sweep_expired_attachments_blocking(root, cutoff, &HashSet::new()).expect("sweep");
         assert!(recent.exists());
         assert!(conv.exists());
     }
