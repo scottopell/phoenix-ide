@@ -41,6 +41,7 @@ const notificationRuntime = {
   settingsRevision: 0,
   permissionCuePending: false,
   lastAttentionKeyByConversationId: new Map<string, string>(),
+  liveNotificationsByConversationId: new Map<string, Map<string, Notification>>(),
 };
 
 export function getBrowserNotificationPermission(): BrowserPermission {
@@ -102,6 +103,7 @@ export function resetNotificationRuntimeForTest(settings?: NotificationSettings)
   notificationRuntime.settingsRevision = 0;
   notificationRuntime.permissionCuePending = false;
   notificationRuntime.lastAttentionKeyByConversationId.clear();
+  notificationRuntime.liveNotificationsByConversationId.clear();
   busyStartedAtByConversation.clear();
   previousSnapshotsById.clear();
 }
@@ -163,6 +165,38 @@ function notificationTag(event: NotificationEvent): string {
   return `${event.type}:${event.conversation.id}`;
 }
 
+function forgetLiveNotification(conversationId: string, tag: string, notification: Notification): void {
+  const notificationsByTag = notificationRuntime.liveNotificationsByConversationId.get(conversationId);
+  if (!notificationsByTag || notificationsByTag.get(tag) !== notification) return;
+  notificationsByTag.delete(tag);
+  if (notificationsByTag.size === 0) {
+    notificationRuntime.liveNotificationsByConversationId.delete(conversationId);
+  }
+}
+
+function rememberLiveNotification(event: NotificationEvent, tag: string, notification: Notification): void {
+  let notificationsByTag = notificationRuntime.liveNotificationsByConversationId.get(event.conversation.id);
+  if (!notificationsByTag) {
+    notificationsByTag = new Map<string, Notification>();
+    notificationRuntime.liveNotificationsByConversationId.set(event.conversation.id, notificationsByTag);
+  }
+  notificationsByTag.set(tag, notification);
+  notification.onclose = () => forgetLiveNotification(event.conversation.id, tag, notification);
+}
+
+export function closeNotificationsForConversation(conversationId: string): void {
+  const notificationsByTag = notificationRuntime.liveNotificationsByConversationId.get(conversationId);
+  if (!notificationsByTag) return;
+  notificationRuntime.liveNotificationsByConversationId.delete(conversationId);
+  for (const notification of notificationsByTag.values()) {
+    notification.close();
+  }
+}
+
+function acknowledgeConversationNotifications(conversation: Conversation): void {
+  closeNotificationsForConversation(conversation.id);
+}
+
 function deliverNotification(event: NotificationEvent): DeliveryResult {
   if (!notificationRuntime.settingsLoaded) return 'not_delivered';
   if (!notificationEnabled(event.type, notificationRuntime.settings)) return 'not_delivered';
@@ -176,18 +210,20 @@ function deliverNotification(event: NotificationEvent): DeliveryResult {
   if (permission !== 'granted') return 'not_delivered';
 
   try {
+    const tag = notificationTag(event);
     const notification = new Notification(event.title, {
       body: event.conversation.slug,
-      tag: notificationTag(event),
+      tag,
     });
+    rememberLiveNotification(event, tag, notification);
     notification.onclick = () => {
       window.focus();
+      acknowledgeConversationNotifications(event.conversation);
       window.dispatchEvent(
         new CustomEvent('phoenix:navigate-to-conversation', {
           detail: { slug: event.conversation.slug },
         }),
       );
-      notification.close();
     };
   } catch (err) {
     if (import.meta.env.DEV && typeof process === 'undefined') {

@@ -135,8 +135,15 @@ THE SYSTEM SHALL display guidance for re-enabling in browser settings, since the
 WHEN I click a desktop notification
 THE SYSTEM SHALL focus the Phoenix browser tab/window
 AND SHALL navigate to the conversation that triggered the notification (`/c/<slug>`)
+AND SHALL dismiss any live desktop notifications Phoenix still owns for that conversation
 
-**Rationale:** The notification exists to interrupt me _into_ a specific conversation. If the click landed me on the conversation list and I had to find the right one, the value drops in half. This is one-click recovery, not "Phoenix is open in some tab somewhere."
+WHEN I open a conversation that has live desktop notifications Phoenix still owns
+THE SYSTEM SHALL treat that navigation as acknowledgement
+AND SHALL dismiss those live desktop notifications without requiring a notification click
+
+THE SYSTEM SHALL NOT dismiss live desktop notifications for other conversations when acknowledging the opened conversation
+
+**Rationale:** The notification exists to interrupt me _into_ a specific conversation. If the click landed me on the conversation list and I had to find the right one, the value drops in half. This is one-click recovery, not "Phoenix is open in some tab somewhere." Opening the triggering conversation through another path is equivalent acknowledgement, so stale OS notifications should not remain visible after the user has already returned to the work. Phoenix can only close browser notifications while the page that created them is alive and still holds their `Notification` instances; notifications that outlive that ownership require a service-worker-owned notification path.
 
 ---
 
