@@ -126,12 +126,30 @@ export function PillStrip({
               item.className ?? '',
             ].filter(Boolean).join(' ');
 
+            // A pill with an `onClick` is an interactive control, so it must
+            // be keyboard-operable (focusable + Enter/Space), not just
+            // clickable — these are navigation/expand affordances. Pills
+            // without `onClick` stay inert, non-focusable text.
+            const onClick = item.onClick;
+
             return (
               <span key={item.key}>
                 <span
                   className={classes}
                   data-index={i}
-                  onClick={item.onClick}
+                  role={onClick ? 'button' : undefined}
+                  tabIndex={onClick ? 0 : undefined}
+                  onClick={onClick}
+                  onKeyDown={
+                    onClick
+                      ? (e) => {
+                          if (e.key === 'Enter' || e.key === ' ') {
+                            e.preventDefault();
+                            onClick();
+                          }
+                        }
+                      : undefined
+                  }
                   onMouseEnter={item.tooltip ? (e) => handleMouseEnter(i, e) : undefined}
                   onMouseLeave={item.tooltip ? handleMouseLeave : undefined}
                   aria-label={item.ariaLabel}

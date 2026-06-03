@@ -29,11 +29,11 @@ interface ConversationNavProps {
  * highlights the chapter currently in view.
  */
 export function ConversationNav({ chapters, activeUnitIndex, onJump }: ConversationNavProps) {
-  // Memoize on the chapter list + active index so PillStrip's `items`
-  // reference is stable across the parent's unrelated re-renders (streaming
-  // token churn, heartbeat). An unstable reference would re-fire PillStrip's
-  // auto-scroll-to-end effect, yanking the bar back while the user reads an
-  // earlier pill.
+  // Memoize on the chapter list + active index so the mapped `items` array is
+  // referentially stable across the parent's unrelated re-renders (streaming
+  // token churn, heartbeat) — this avoids rebuilding the pill list and
+  // re-running PillStrip's per-`items` effects when neither the chapters nor
+  // the active index changed.
   const items: PillItem[] = useMemo(
     () =>
       chapters.map((chapter) => {

@@ -473,9 +473,15 @@ function MessageListImpl({
     if (key === null) return;
     const scroller = scrollerRef.current;
     if (!scroller) return;
-    const row = scroller.querySelector(
-      `[data-render-unit-key="${CSS.escape(key)}"]`,
-    );
+    // CSS.escape may be absent (or throw on a pathological key) in some
+    // environments; guard it so a missing escape degrades to "no pulse"
+    // rather than throwing out of the timer callback (matches FileTree).
+    let row: Element | null = null;
+    try {
+      row = scroller.querySelector(`[data-render-unit-key="${CSS.escape(key)}"]`);
+    } catch {
+      return;
+    }
     // The pulse styling lives on `.message`; fall back to the row wrapper if a
     // unit kind renders without a `.message` element (skill/system don't, but
     // chapters only target user/agent units which do).
