@@ -4212,8 +4212,11 @@ async fn serve_preview_file(
 
 /// Gitignore-aware recursive file search within the conversation's file root.
 ///
-/// Uses the `ignore` crate to respect `.gitignore`, `.ignore`, and other standard
-/// exclusion files. Results are fuzzy-matched against the query when provided.
+/// First call per `cwd` triggers a one-time bootstrap walk via the workspace
+/// indexer; subsequent calls hit the in-memory index that's kept current by
+/// filesystem-event listeners. Results are fuzzy-matched against the query
+/// using nucleo, with per-segment scoring so directory-name hits beat
+/// scattered-char hits in long paths.
 async fn search_conversation_files(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -4237,9 +4240,24 @@ async fn search_conversation_files(
     }
 
     let limit = query.limit.unwrap_or(50);
-    Ok(Json(FileSearchResponse {
-        items: search_files_in_root(&root, &query.q, limit),
-    }))
+    let paths = state
+        .file_indexer
+        .search(root.clone(), &query.q, limit)
+        .await
+        .map_err(AppError::Internal)?;
+
+    let items: Vec<FileSearchEntry> = paths
+        .into_iter()
+        .map(|rel_path| {
+            let (_, is_text_file) = detect_file_type(std::path::Path::new(&rel_path));
+            FileSearchEntry {
+                path: rel_path,
+                is_text_file,
+            }
+        })
+        .collect();
+
+    Ok(Json(FileSearchResponse { items }))
 }
 
 /// Directory-scoped file search for the new-conversation composer (REQ-IR-004).
@@ -4247,6 +4265,11 @@ async fn search_conversation_files(
 /// Walks an explicit working directory rather than a conversation's file root,
 /// so the composer on the `/new` page — which has no conversation yet — can
 /// offer the same `@file` / `./path` autocomplete as an in-conversation composer.
+///
+/// Does not go through the per-workspace [`crate::file_index::WorkspaceIndexer`]:
+/// the composer hands us an arbitrary directory the user is typing into,
+/// not a stable conversation cwd, so caching the walk would be hit-or-miss
+/// and we'd register inotify watches against paths that may never be opened.
 async fn search_project_files(
     Query(query): Query<ProjectFileSearchQuery>,
 ) -> Result<Json<FileSearchResponse>, AppError> {
@@ -4269,8 +4292,9 @@ async fn search_project_files(
 ///
 /// Walks `root` respecting `.gitignore`/`.ignore`/git excludes, scores each file
 /// against `q` (empty `q` = all files alphabetically up to `limit`), and returns
-/// paths relative to `root`. Shared by the conversation-scoped and
-/// directory-scoped search handlers.
+/// paths relative to `root`. Used by [`crate::resolution_root::ResolutionRoot`]
+/// for the new-conversation composer search; the in-conversation handler goes
+/// through the cached [`crate::file_index::WorkspaceIndexer`] instead.
 pub(crate) fn search_files_in_root(
     root: &std::path::Path,
     query: &str,
@@ -5600,6 +5624,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
+            file_indexer: crate::file_index::WorkspaceIndexer::new().expect("notify init"),
         }
     }
 
@@ -7847,6 +7872,7 @@ mod upgrade_model_state_guard_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
+            file_indexer: crate::file_index::WorkspaceIndexer::new().expect("notify init"),
         }
     }
 

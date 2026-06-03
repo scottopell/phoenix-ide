@@ -32,6 +32,7 @@ pub use types::*;
 use crate::chain_qa::ChainQa;
 use crate::db::{Database, Fts5Retriever, MessageRetriever};
 use crate::discovery::DiscoveryRegistry;
+use crate::file_index::WorkspaceIndexer;
 use crate::platform::PlatformCapability;
 use crate::runtime::RuntimeManager;
 use crate::terminal::ActiveTerminals;
@@ -87,6 +88,11 @@ pub struct AppState {
     pub suggest_token: String,
     /// In-memory snapshot of loopback services that explicitly advertise an API catalog.
     pub discovery: Arc<DiscoveryRegistry>,
+    /// Per-workspace file index cache backing Cmd+P file search. The
+    /// indexer walks each `cwd` once on first access and then keeps the
+    /// path set current via `notify`-based filesystem events; see
+    /// [`crate::file_index`].
+    pub file_indexer: Arc<WorkspaceIndexer>,
 }
 
 impl AppState {
@@ -158,6 +164,8 @@ impl AppState {
             .unwrap_or_default();
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
+        let file_indexer = WorkspaceIndexer::new()
+            .expect("notify failed to initialize; cannot run without a file watcher");
         Self {
             runtime,
             llm_registry,
@@ -176,6 +184,7 @@ impl AppState {
             runtime_env,
             suggest_token,
             discovery,
+            file_indexer,
         }
     }
 }

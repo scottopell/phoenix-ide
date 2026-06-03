@@ -89,6 +89,17 @@ export function CommandPalette({ conversations, activeConversation }: CommandPal
     sourcesRef.current = sources;
   });
 
+  // Pre-warm the server-side file index on conversation activation. The first
+  // call per cwd kicks off a one-time bootstrap walk; subsequent searches hit
+  // the in-memory index and return in milliseconds. By firing this when the
+  // active conversation changes (not when the user opens the palette) the
+  // walk overlaps with whatever the user does next — by the time Cmd+P opens
+  // and they start typing, the index is usually ready.
+  useEffect(() => {
+    if (!activeConvId) return;
+    api.searchConversationFiles(activeConvId, '', 1).catch(() => {});
+  }, [activeConvId]);
+
   // Stable boolean for downstream consumers — true when inside a conversation route.
   const hasActiveConversation = activeConvId !== null;
 

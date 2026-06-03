@@ -9,6 +9,7 @@ mod chain_qa;
 mod chain_runtime;
 mod conversation_cwd;
 mod discovery;
+pub(crate) mod file_index;
 pub(crate) mod git_ops;
 mod mcp_oauth_store;
 mod message_expander;

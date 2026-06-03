@@ -120,6 +120,14 @@ ignore = "0.4"
 # skill discovery (resolution_root); also used across tests.
 tempfile = "3"
 
+# Filesystem watching for the per-workspace file index cache. notify provides
+# the cross-platform abstraction (inotify on Linux, FSEvents on macOS,
+# ReadDirectoryChangesW on Windows); notify-debouncer-full coalesces the
+# noisy bursts editors and build tools emit (atomic-save sequences, rename
+# pairs, queue-overflow rescans) into a single sane event stream.
+notify = "8"
+notify-debouncer-full = "0.7"
+
 # Markdown event-stream parser. Used to mask code regions during inline-
 # reference tokenization so `@`/`/` sigils inside fenced/inline/indented
 # code blocks don't get expanded as file or skill references.
