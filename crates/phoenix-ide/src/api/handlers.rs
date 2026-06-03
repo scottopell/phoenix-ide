@@ -56,6 +56,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
+use std::time::{Duration, SystemTime};
 use tokio::io::AsyncWriteExt;
 
 /// Create the API router
@@ -668,6 +669,7 @@ const MAX_ATTACHMENT_SIZE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
 const MAX_MULTIPART_BODY_BYTES: usize = 30 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
+const ATTACHMENT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 fn attachment_root() -> PathBuf {
     std::env::var_os("PHOENIX_DATA_DIR").map_or_else(
@@ -679,6 +681,73 @@ fn attachment_root() -> PathBuf {
         },
         |dir| PathBuf::from(dir).join("attachments"),
     )
+}
+
+fn sweep_expired_attachments_blocking(
+    root: &std::path::Path,
+    cutoff: SystemTime,
+) -> std::io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if metadata.is_dir() {
+            sweep_expired_attachments_blocking(&path, cutoff)?;
+            match std::fs::remove_dir(&path) {
+                Ok(()) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        } else if metadata.modified().is_ok_and(|modified| modified < cutoff) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_expired_attachments() {
+    let root = attachment_root();
+    let cutoff = SystemTime::now()
+        .checked_sub(ATTACHMENT_TTL)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let result =
+        tokio::task::spawn_blocking(move || sweep_expired_attachments_blocking(&root, cutoff))
+            .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "failed to sweep expired attachments"),
+        Err(e) => tracing::warn!(error = %e, "attachment sweep task failed"),
+    }
+}
+
+async fn delete_conversation_attachments_at_root(root: PathBuf, conversation_id: &str) {
+    let path = root.join(conversation_id);
+    match tokio::fs::remove_dir_all(&path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(conversation_id, path = %path.display(), error = %e, "failed to delete conversation attachments");
+        }
+    }
+}
+
+async fn delete_conversation_attachments(conversation_id: &str) {
+    delete_conversation_attachments_at_root(attachment_root(), conversation_id).await;
 }
 
 fn sanitize_attachment_name(name: &str) -> String {
@@ -838,6 +907,7 @@ async fn read_multipart_create_parts(
                 "Attachments exceed the 25 MB total limit".to_string(),
             ));
         }
+        cleanup_expired_attachments().await;
         validate_attachment_file(&original_name, &media_type, bytes.len())?;
         files.push(RawAttachmentPart {
             original_name,
@@ -2753,6 +2823,8 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         .delete_conversation(id)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to delete conversation row: {e}")))?;
+
+    delete_conversation_attachments(id).await;
 
     // Step 6: broadcast. The conversation broadcaster is per-conv today;
     // task 02697 will route this to a sidebar-scoped channel on the UI
@@ -5780,6 +5852,50 @@ mod attachment_storage_tests {
             "secret_notes.txt"
         );
         assert_eq!(sanitize_attachment_name("..."), "attachment");
+    }
+
+    #[test]
+    fn sweep_deletes_expired_files_and_empty_dirs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let conv = root.join("conv-old");
+        std::fs::create_dir_all(&conv).expect("create conv dir");
+        let expired = conv.join("old.txt");
+        std::fs::write(&expired, b"old").expect("write old");
+        let cutoff = SystemTime::now() + Duration::from_secs(1);
+        sweep_expired_attachments_blocking(root, cutoff).expect("sweep");
+        assert!(!expired.exists());
+        assert!(
+            !conv.exists(),
+            "empty conversation attachment dir should be removed"
+        );
+    }
+
+    #[test]
+    fn sweep_keeps_recent_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let conv = root.join("conv-recent");
+        std::fs::create_dir_all(&conv).expect("create conv dir");
+        let recent = conv.join("recent.txt");
+        std::fs::write(&recent, b"recent").expect("write recent");
+        let cutoff = SystemTime::UNIX_EPOCH;
+        sweep_expired_attachments_blocking(root, cutoff).expect("sweep");
+        assert!(recent.exists());
+        assert!(conv.exists());
+    }
+
+    #[tokio::test]
+    async fn hard_delete_attachment_cleanup_removes_conversation_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("conv-delete");
+        make_attachment_dir_private(&dir).await.expect("secure dir");
+        let file = dir.join("attachment.txt");
+        write_attachment_file_private(&file, b"hello")
+            .await
+            .expect("write file");
+        delete_conversation_attachments_at_root(temp.path().to_path_buf(), "conv-delete").await;
+        assert!(!dir.exists());
     }
 
     #[tokio::test]
