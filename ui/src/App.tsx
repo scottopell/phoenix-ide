@@ -4,6 +4,7 @@ import { DesktopLayout } from './components/DesktopLayout';
 import { ShortcutHelpPanel } from './components/ShortcutHelpPanel';
 import { useGlobalKeyboardShortcuts, FocusScopeProvider } from './hooks';
 import { ThemeProvider } from './components/ThemeProvider';
+import { DensityProvider } from './components/DensityProvider';
 import { ConversationProvider } from './conversation';
 import { ChainProvider } from './chain';
 import { api } from './api';
@@ -137,15 +138,17 @@ function App() {
 
   return (
     <ThemeProvider>
-      <BrowserRouter>
-        <FocusScopeProvider>
-          <ConversationProvider>
-            <ChainProvider>
-              <AppRoutes />
-            </ChainProvider>
-          </ConversationProvider>
-        </FocusScopeProvider>
-      </BrowserRouter>
+      <DensityProvider>
+        <BrowserRouter>
+          <FocusScopeProvider>
+            <ConversationProvider>
+              <ChainProvider>
+                <AppRoutes />
+              </ChainProvider>
+            </ConversationProvider>
+          </FocusScopeProvider>
+        </BrowserRouter>
+      </DensityProvider>
     </ThemeProvider>
   );
 }
