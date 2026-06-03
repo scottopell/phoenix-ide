@@ -180,6 +180,11 @@ function rememberLiveNotification(event: NotificationEvent, tag: string, notific
     notificationsByTag = new Map<string, Notification>();
     notificationRuntime.liveNotificationsByConversationId.set(event.conversation.id, notificationsByTag);
   }
+  const previous = notificationsByTag.get(tag);
+  if (previous && previous !== notification) {
+    previous.close();
+    notificationRuntime.liveNotificationsByConversationId.set(event.conversation.id, notificationsByTag);
+  }
   notificationsByTag.set(tag, notification);
   notification.onclose = () => forgetLiveNotification(event.conversation.id, tag, notification);
 }

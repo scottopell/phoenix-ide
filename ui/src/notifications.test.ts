@@ -281,6 +281,35 @@ describe('browser desktop notifications', () => {
     expect(notifications[0]?.closeCalls).toBe(1);
   });
 
+  it('closes a previous live notification before replacing the same tag', () => {
+    grantSettings();
+
+    notifyConversationStateChange(
+      conversation(),
+      { type: 'idle' },
+      { type: 'awaiting_user_response', questions: [] },
+    );
+    notifyConversationStateChange(
+      conversation(),
+      { type: 'awaiting_user_response', questions: [] },
+      { type: 'idle' },
+    );
+    notifyConversationStateChange(
+      conversation(),
+      { type: 'idle' },
+      { type: 'awaiting_user_response', questions: [] },
+    );
+
+    expect(notifications).toHaveLength(2);
+    expect(notifications[0]?.closeCalls).toBe(1);
+    expect(notifications[1]?.closeCalls).toBe(0);
+
+    closeNotificationsForConversation('conv-1');
+
+    expect(notifications[0]?.closeCalls).toBe(1);
+    expect(notifications[1]?.closeCalls).toBe(1);
+  });
+
   it('notification clicks acknowledge the triggering conversation through the shared path', () => {
     grantSettings();
     const dispatch = vi.spyOn(window, 'dispatchEvent');
