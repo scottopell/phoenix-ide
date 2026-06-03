@@ -1,6 +1,10 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import type { Message, ContentBlock } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
+import {
+  FILE_PATH_CONTEXT_MENU_OPEN_EVENT,
+  MESSAGE_CONTEXT_MENU_OPEN_EVENT,
+} from './contextMenuEvents';
 import './MessageContextMenu.css';
 
 interface ToolContext {
@@ -104,12 +108,19 @@ export function MessageContextMenu({ messages }: MessageContextMenuProps) {
       if (!msg) return;
 
       e.preventDefault();
+      window.dispatchEvent(new Event(MESSAGE_CONTEXT_MENU_OPEN_EVENT));
       const newMenu: MenuState = { x: e.clientX, y: e.clientY, message: msg };
       if (toolContext) newMenu.toolContext = toolContext;
       setMenu(newMenu);
     },
     [messages]
   );
+
+  useEffect(() => {
+    const closeMenu = () => setMenu(null);
+    window.addEventListener(FILE_PATH_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+    return () => window.removeEventListener(FILE_PATH_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+  }, []);
 
   // Close on click outside or Escape
   useEffect(() => {

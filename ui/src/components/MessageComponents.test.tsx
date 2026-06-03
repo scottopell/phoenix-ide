@@ -167,6 +167,65 @@ describe('agent message file paths', () => {
     expect(copyToClipboard).toHaveBeenLastCalledWith('ui/src/App.tsx');
   });
 
+  it('reattaches path handling after the messages scroller is replaced', () => {
+    render(<FilePathContextMenu />);
+
+    const oldScroller = document.createElement('div');
+    oldScroller.id = 'messages';
+    oldScroller.innerHTML = '<span role="button" tabindex="0" class="file-path-link" data-file-path="src/old.ts" data-file-absolute-path="/repo/project/src/old.ts" data-file-relative-path="src/old.ts">src/old.ts</span>';
+    document.body.appendChild(oldScroller);
+
+    oldScroller.remove();
+    const newScroller = document.createElement('div');
+    newScroller.id = 'messages';
+    newScroller.innerHTML = '<span role="button" tabindex="0" class="file-path-link" data-file-path="src/new.ts" data-file-absolute-path="/repo/project/src/new.ts" data-file-relative-path="src/new.ts">src/new.ts</span>';
+    document.body.appendChild(newScroller);
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'src/new.ts' }), {
+      clientX: 20,
+      clientY: 30,
+    });
+
+    expect(screen.getByRole('button', { name: 'Copy absolute path' })).toBeInTheDocument();
+    newScroller.remove();
+  });
+
+  it('closes the message context menu when opening the file path menu', () => {
+    const message = agentMessage('agent-msg-overlap', [{
+      type: 'text',
+      text: 'Plain text before src/main.rs then.',
+    }], 18);
+
+    render(
+      <MemoryRouter>
+        <div id="messages">
+          <AgentMessage
+            message={message}
+            toolResults={new Map()}
+            onOpenFile={vi.fn()}
+            filePathRootDir="/repo/project"
+          />
+        </div>
+        <FilePathContextMenu />
+        <MessageContextMenu messages={[message]} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.contextMenu(screen.getByText(/Plain text before/), {
+      clientX: 20,
+      clientY: 30,
+    });
+    expect(screen.getByRole('button', { name: 'Copy as Markdown' })).toBeInTheDocument();
+
+    fireEvent.contextMenu(screen.getByRole('button', { name: 'src/main.rs' }), {
+      clientX: 40,
+      clientY: 50,
+    });
+
+    expect(screen.getByRole('button', { name: 'Copy absolute path' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Copy as Markdown' })).not.toBeInTheDocument();
+  });
+
   it('keeps the message context menu available for non-path message text', () => {
     const message = agentMessage('agent-msg-context', [{
       type: 'text',

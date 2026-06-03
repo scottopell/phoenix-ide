@@ -1,5 +1,9 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { copyToClipboard } from '../utils/clipboard';
+import {
+  FILE_PATH_CONTEXT_MENU_OPEN_EVENT,
+  MESSAGE_CONTEXT_MENU_OPEN_EVENT,
+} from './contextMenuEvents';
 import './MessageContextMenu.css';
 
 interface MenuState {
@@ -17,7 +21,10 @@ export function FilePathContextMenu() {
     if (e.shiftKey) return;
 
     const target = e.target as HTMLElement | null;
-    const filePathEl = target?.closest('.file-path-link') as HTMLElement | null;
+    const messagesContainer = document.getElementById('messages');
+    if (!target || !messagesContainer?.contains(target)) return;
+
+    const filePathEl = target.closest('.file-path-link') as HTMLElement | null;
     if (!filePathEl) return;
 
     const absolutePath = filePathEl.dataset['fileAbsolutePath'];
@@ -26,15 +33,20 @@ export function FilePathContextMenu() {
 
     e.preventDefault();
     e.stopPropagation();
+    window.dispatchEvent(new Event(FILE_PATH_CONTEXT_MENU_OPEN_EVENT));
     setMenu({ x: e.clientX, y: e.clientY, absolutePath, relativePath });
   }, []);
 
   useEffect(() => {
-    const container = document.getElementById('messages');
-    if (!container) return;
-    container.addEventListener('contextmenu', handleContextMenu, { capture: true });
-    return () => container.removeEventListener('contextmenu', handleContextMenu, { capture: true });
+    document.addEventListener('contextmenu', handleContextMenu, { capture: true });
+    return () => document.removeEventListener('contextmenu', handleContextMenu, { capture: true });
   }, [handleContextMenu]);
+
+  useEffect(() => {
+    const closeMenu = () => setMenu(null);
+    window.addEventListener(MESSAGE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+    return () => window.removeEventListener(MESSAGE_CONTEXT_MENU_OPEN_EVENT, closeMenu);
+  }, []);
 
   useEffect(() => {
     if (!menu) return;
