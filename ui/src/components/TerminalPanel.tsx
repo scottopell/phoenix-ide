@@ -572,6 +572,14 @@ export function TerminalPanel({
       const semi = data.indexOf(';');
       const payload = semi === -1 ? data : data.slice(semi + 1);
       if (payload === '?' || payload === '') return;
+      // The payload is attacker-influenceable PTY output. Bound it before
+      // decoding so a pathological sequence can't force a multi-hundred-MB
+      // atob/decode (and clipboard overwrite). 1 MiB of base64 (~768 KB of
+      // text) is far past any realistic terminal selection.
+      if (payload.length > 1024 * 1024) {
+        console.debug('OSC 52 payload exceeds size cap; ignoring', payload.length);
+        return;
+      }
       let text: string;
       try {
         const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
@@ -589,19 +597,20 @@ export function TerminalPanel({
 
     // Highlight-to-copy: when xterm owns the selection (Shift/Alt+drag escapes
     // tmux's mouse grab, or a direct-shell child with no mouse tracking), mirror
-    // the finished selection to the system clipboard. Debounced so a drag copies
-    // once on settle rather than on every intermediate selectionChange. The same
-    // selection also feeds Cmd/Ctrl+Shift+L send-to-LLM above.
-    let selectionCopyTimer: number | null = null;
+    // the finished selection to the system clipboard. The clipboard write must
+    // run inside a user gesture — navigator.clipboard.writeText (and the
+    // execCommand fallback) fail without transient activation — so onSelectionChange
+    // only tracks the latest selection text and the actual copy fires on mouseup.
+    // The same selection also feeds Cmd/Ctrl+Shift+L send-to-LLM above.
+    let latestSelection = '';
     const disposeSelectionCopy = term.onSelectionChange(() => {
-      if (selectionCopyTimer !== null) window.clearTimeout(selectionCopyTimer);
-      selectionCopyTimer = window.setTimeout(() => {
-        selectionCopyTimer = null;
-        if (!term.hasSelection()) return;
-        const sel = term.getSelection();
-        if (sel.length > 0) void copyToClipboard(sel);
-      }, 120);
+      latestSelection = term.hasSelection() ? term.getSelection() : '';
     });
+    const copyLatestSelection = (): void => {
+      if (latestSelection.length > 0) void copyToClipboard(latestSelection);
+    };
+    const termEl = containerRef.current;
+    termEl.addEventListener('mouseup', copyLatestSelection);
 
     // --- Detection timeout (REQ-TERM-015) ---
     detectionTimeoutRef.current = window.setTimeout(() => {
@@ -709,10 +718,7 @@ export function TerminalPanel({
         osc7Dispose.dispose();
         osc52Dispose.dispose();
         disposeSelectionCopy.dispose();
-        if (selectionCopyTimer !== null) {
-          window.clearTimeout(selectionCopyTimer);
-          selectionCopyTimer = null;
-        }
+        termEl.removeEventListener('mouseup', copyLatestSelection);
         window.removeEventListener('resize', handleResize);
         if (activityTimeoutRef.current !== null) {
           window.clearTimeout(activityTimeoutRef.current);
