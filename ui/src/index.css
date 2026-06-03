@@ -381,6 +381,80 @@ body {
   flex-shrink: 0;
 }
 
+/* Conversation navigation strip — the permanent occupant of the top
+   horizontal slot, an outline over the whole conversation. Reuses the
+   breadcrumb pill primitive, but sits ABOVE the message list (border-bottom)
+   rather than below it, and is type-styled per chapter: user prompts in the
+   default text color, assistant prose tinted, the in-view chapter active. */
+#conversation-nav {
+  flex: 0 0 auto;
+  height: var(--breadcrumb-height);
+  background: var(--bg-tertiary);
+  border-bottom: 1px solid var(--border-color);
+  overflow: auto hidden;
+  white-space: nowrap;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: none;
+  padding: 0 12px;
+  position: relative;
+  z-index: 2;
+}
+
+#conversation-nav::-webkit-scrollbar {
+  display: none;
+}
+
+#conversation-nav-trail {
+  display: inline-flex;
+  align-items: center;
+  height: 100%;
+  padding: 0 12px;
+  gap: 4px;
+}
+
+.conversation-nav-item {
+  display: inline-flex;
+  align-items: center;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  padding: 4px 8px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  background: var(--bg-secondary);
+  border-radius: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+  position: relative;
+}
+
+.conversation-nav-item:hover {
+  background: var(--border-color);
+}
+
+/* Assistant prose chapters carry a subtle purple tint so prompts vs. prose
+   are distinguishable at a glance (matching the tool/sub-agent color
+   language used elsewhere). User prompts keep the neutral default. */
+.conversation-nav-item.assistant {
+  color: var(--accent-purple);
+}
+
+.conversation-nav-item.active {
+  color: var(--accent-blue);
+  background: rgb(88 166 255 / 15%);
+}
+
+.conversation-nav-item.assistant.active {
+  color: var(--accent-blue);
+  background: rgb(88 166 255 / 15%);
+}
+
+.conversation-nav-arrow {
+  color: var(--text-muted);
+  font-size: 10px;
+  flex-shrink: 0;
+}
+
 /* Compact density — per-turn inline tool pill strip.
    Reuses the breadcrumb pill visual primitive (.breadcrumb-item) for the
    shell; these rules tune it for the in-message-list context (wraps instead

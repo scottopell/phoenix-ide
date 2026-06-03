@@ -5,7 +5,7 @@ import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
 import { cacheDB } from '../cache';
-import { MessageList } from '../components/MessageList';
+import { ConversationNavStack } from '../components/ConversationNavStack';
 import { ConnectedInputArea } from '../components/InputArea';
 import type { InputAreaHandle } from '../components/InputArea';
 import { ExploreOnboardingBanner } from '../components/ExploreOnboardingBanner';
@@ -28,7 +28,6 @@ import { Toast } from '../components/Toast';
 import { useAppMachine } from '../hooks/useAppMachine';
 import { ConnectedStateBar } from '../components/StateBar';
 import { RenderProfiler } from '../dev/renderProfiler';
-import { BreadcrumbBar } from '../components/BreadcrumbBar';
 import { ErrorBanner } from '../components/ErrorBanner';
 import { WorkControlBar } from '../components/WorkActions';
 import { useConversationView, useCreateConversationWithStore } from '../conversation';
@@ -969,7 +968,7 @@ function ConversationPageContent() {
         </div>
       )}
       <RenderProfiler id="MessageList">
-      <MessageList
+      <ConversationNavStack
         messages={atom.messages}
         pendingMessages={pendingMessages}
         convState={convStateForChildren}
@@ -1255,7 +1254,6 @@ function ConversationPageContent() {
         </RenderProfiler>
         </>
       ) : null}
-      <BreadcrumbBar breadcrumbs={atom.breadcrumbs} visible={atom.breadcrumbs.length > 0} />
       <RenderProfiler id="StateBar">
       <ConnectedStateBar
         slug={slug!}
