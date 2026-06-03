@@ -55,9 +55,10 @@ describe('itemId / sectionFromItemId', () => {
 });
 
 describe('buildSectionItems', () => {
-  it('returns empty (no error) for blank diff', () => {
+  it('returns empty (no error) for blank or missing diff', () => {
     expect(buildSectionItems('committed', '')).toEqual({ items: [], error: null });
     expect(buildSectionItems('committed', '   \n')).toEqual({ items: [], error: null });
+    expect(buildSectionItems('committed', undefined)).toEqual({ items: [], error: null });
   });
 
   it('parses multiple files into section-prefixed diff items', () => {
@@ -66,6 +67,7 @@ describe('buildSectionItems', () => {
     expect(items.map((i) => i.id)).toEqual(['committed:src/foo.ts', 'committed:src/bar.ts']);
     expect(items.every((i) => i.type === 'diff')).toBe(true);
     expect(items[0]!.fileDiff.name).toBe('src/foo.ts');
+    expect(items[0]!.fileDiff.prevName).toBe('');
   });
 
   it('namespaces the same path across sections so they never collide', () => {

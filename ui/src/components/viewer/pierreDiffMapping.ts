@@ -72,8 +72,8 @@ export interface BuiltSection {
  * duplicate occurrences share notes — best-effort isolation is not attempted
  * for an input that should not occur.
  */
-export function buildSectionItems(section: DiffSection, rawDiff: string): BuiltSection {
-  if (!rawDiff.trim()) return { items: [], error: null };
+export function buildSectionItems(section: DiffSection, rawDiff: string | null | undefined): BuiltSection {
+  if (!rawDiff?.trim()) return { items: [], error: null };
 
   let parsed;
   try {
@@ -94,7 +94,11 @@ export function buildSectionItems(section: DiffSection, rawDiff: string): BuiltS
       let n = 1;
       while (seen.has(id)) id = `${base}#${n++}`;
       seen.add(id);
-      items.push({ id, type: 'diff', fileDiff });
+      items.push({
+        id,
+        type: 'diff',
+        fileDiff: { ...fileDiff, prevName: fileDiff.prevName ?? '' },
+      });
     }
   }
 
