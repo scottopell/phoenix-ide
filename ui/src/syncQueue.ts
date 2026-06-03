@@ -7,12 +7,15 @@ export class SyncQueue {
   async processOperation(op: PendingOperation): Promise<void> {
     switch (op.type) {
       case 'send_message':
-        if (!op.payload.text || !op.payload.localId) {
-          throw new Error('send_message requires text and localId');
+        if (!op.payload.localId) {
+          throw new Error('send_message requires localId');
+        }
+        if (!op.payload.text && (op.payload.files || []).length === 0 && (op.payload.images || []).length === 0) {
+          throw new Error('send_message requires text or attachments');
         }
         await api.sendMessage(
           op.conversationId,
-          op.payload.text,
+          op.payload.text || '',
           op.payload.images || [],
           op.payload.files || [],
           op.payload.localId,

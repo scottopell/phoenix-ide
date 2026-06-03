@@ -1013,6 +1013,8 @@ pub struct SkillContent {
     pub body: String,
     /// The original user text that triggered the invocation (for display)
     pub trigger: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<FileAttachment>,
 }
 
 /// Typed message content

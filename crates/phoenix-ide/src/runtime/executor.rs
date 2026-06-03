@@ -2499,9 +2499,14 @@ where
 
                 // Skill messages are delivered as user-role messages (REQ-SK-002)
                 MessageContent::Skill(skill_content) => {
+                    let mut body = skill_content.body.clone();
+                    for file in &skill_content.files {
+                        body.push('\n');
+                        body.push_str(&file.llm_context_tag());
+                    }
                     messages.push(LlmMessage {
                         role: MessageRole::User,
-                        content: vec![ContentBlock::text(&skill_content.body)],
+                        content: vec![ContentBlock::text(body)],
                     });
                 }
 

@@ -735,6 +735,17 @@ async fn cleanup_expired_attachments() {
     }
 }
 
+pub(super) fn start_attachment_cleanup_task() {
+    tokio::spawn(async {
+        cleanup_expired_attachments().await;
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        loop {
+            interval.tick().await;
+            cleanup_expired_attachments().await;
+        }
+    });
+}
+
 async fn delete_conversation_attachments_at_root(root: PathBuf, conversation_id: &str) {
     let path = root.join(conversation_id);
     match tokio::fs::remove_dir_all(&path).await {
@@ -790,6 +801,58 @@ fn validate_attachment_file(name: &str, media_type: &str, size: usize) -> Result
         ));
     }
     Ok(())
+}
+
+async fn validate_submitted_attachments(
+    conversation_id: &str,
+    files: &[crate::api::types::FileAttachment],
+) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    if files.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(AppError::BadRequest(format!(
+            "A message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} files"
+        )));
+    }
+    let expected_dir = attachment_root().join(conversation_id);
+    let canonical_expected_dir = tokio::fs::canonicalize(&expected_dir)
+        .await
+        .map_err(|_| AppError::BadRequest("Attachment directory does not exist".to_string()))?;
+    let mut total_bytes = 0usize;
+    let mut validated = Vec::with_capacity(files.len());
+    for file in files {
+        let size = usize::try_from(file.size_bytes)
+            .map_err(|_| AppError::BadRequest("Attachment size is invalid".to_string()))?;
+        validate_attachment_file(&file.original_name, &file.media_type, size)?;
+        total_bytes = total_bytes.saturating_add(size);
+        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(AppError::BadRequest(
+                "Attachments exceed the 25 MB total limit".to_string(),
+            ));
+        }
+        let path = PathBuf::from(&file.stored_path);
+        let canonical_path = tokio::fs::canonicalize(&path).await.map_err(|_| {
+            AppError::BadRequest(format!("Attachment '{}' is missing", file.original_name))
+        })?;
+        if !canonical_path.starts_with(&canonical_expected_dir) {
+            return Err(AppError::BadRequest(format!(
+                "Attachment '{}' does not belong to this conversation",
+                file.original_name
+            )));
+        }
+        let metadata = tokio::fs::metadata(&canonical_path).await.map_err(|_| {
+            AppError::BadRequest(format!("Attachment '{}' is missing", file.original_name))
+        })?;
+        if !metadata.is_file() || metadata.len() != file.size_bytes {
+            return Err(AppError::BadRequest(format!(
+                "Attachment '{}' metadata does not match stored file",
+                file.original_name
+            )));
+        }
+        validated.push(file.clone().into());
+    }
+    Ok(validated)
 }
 
 async fn make_attachment_dir_private(dir: &std::path::Path) -> Result<(), AppError> {
@@ -1062,6 +1125,19 @@ async fn create_conversation_with_id(
             }
         }
         // If we can't find it, fall through to create (shouldn't happen)
+    }
+
+    if !req.files.is_empty() {
+        let validated = validate_submitted_attachments(&id, &req.files).await?;
+        req.files = validated
+            .into_iter()
+            .map(|file| crate::api::types::FileAttachment {
+                original_name: file.original_name,
+                media_type: file.media_type,
+                size_bytes: file.size_bytes,
+                stored_path: file.stored_path,
+            })
+            .collect();
     }
 
     // Try to generate a title using a cheap LLM model.
@@ -1339,15 +1415,27 @@ async fn create_conversation_with_id(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     for raw_file in raw_files {
-        req.files.push(
-            store_attachment_bytes(
-                &id,
-                raw_file.original_name,
-                raw_file.media_type,
-                raw_file.bytes,
-            )
-            .await?,
-        );
+        match store_attachment_bytes(
+            &id,
+            raw_file.original_name,
+            raw_file.media_type,
+            raw_file.bytes,
+        )
+        .await
+        {
+            Ok(file) => req.files.push(file),
+            Err(e) => {
+                delete_conversation_attachments(&id).await;
+                if let Err(cleanup_err) = run_resource_cleanup_cascade(&state, &conversation).await
+                {
+                    tracing::warn!(conversation_id = %id, error = ?cleanup_err, "failed to clean resources after initial attachment storage failure");
+                }
+                if let Err(delete_err) = state.runtime.db().delete_conversation(&id).await {
+                    tracing::warn!(conversation_id = %id, error = %delete_err, "failed to delete conversation row after initial attachment storage failure");
+                }
+                return Err(e);
+            }
+        }
     }
 
     // REQ-SEED-001: seeded conversations may be created with an empty
@@ -2032,6 +2120,8 @@ async fn send_chat(
         }));
     }
 
+    let validated_files = validate_submitted_attachments(&id, &req.files).await?;
+
     // Fail-fast when the state would reject UserMessage. Without this, the
     // chat POST returns 200, the runtime drops the queued event with only a
     // "Transition rejected" log line, and the optimistic UI is stuck on
@@ -2076,8 +2166,7 @@ async fn send_chat(
                     media_type: img.media_type,
                 })
                 .collect();
-            let files: Vec<phoenix_core::domain::db_schema::FileAttachment> =
-                req.files.clone().into_iter().map(Into::into).collect();
+            let files = validated_files.clone();
             let chat_llm_text =
                 (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
             let display_text = expanded.display_text;
@@ -2147,8 +2236,7 @@ async fn send_chat(
         })
         .collect();
 
-    let files: Vec<phoenix_core::domain::db_schema::FileAttachment> =
-        req.files.into_iter().map(Into::into).collect();
+    let files = validated_files;
 
     // Only set llm_text when expansion actually changed the text (REQ-IR-001)
     let chat_llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);

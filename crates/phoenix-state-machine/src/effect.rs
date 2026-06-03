@@ -246,6 +246,7 @@ impl Effect {
                 name: invocation.name,
                 body: invocation.body,
                 trigger: text,
+                files,
             })
         } else {
             match llm_text {

@@ -586,8 +586,9 @@ function ConversationPageContent() {
     // the user may want to fix the issue that caused the failure).
     dismiss(localId);
     appendDraftCb(msg.text);
+    setFiles(msg.files ?? []);
     requestComposerFocus();
-  }, [queuedMessages, dismiss, appendDraftCb, requestComposerFocus]);
+  }, [queuedMessages, dismiss, appendDraftCb, setFiles, requestComposerFocus]);
 
   const handleCancel = async () => {
     if (!conversationId || !canCancelConversationState(atom.phase)) return;
