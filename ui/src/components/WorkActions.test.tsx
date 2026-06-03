@@ -25,11 +25,9 @@ const renderWithProviders = (ui: ReactElement) =>
     </MemoryRouter>,
   );
 
-/** Subscribes to the viewer slot so tests can assert the kind the
- *  WorkControlBar transitioned it to. */
-function CaptureSlotKind({ onKind }: { onKind: (kind: string) => void }) {
+function CaptureSlot({ onSlot }: { onSlot: (slot: ReturnType<typeof useViewerSlot>['slot']) => void }) {
   const { slot } = useViewerSlot();
-  useEffect(() => { onKind(slot.kind); }, [slot.kind, onKind]);
+  useEffect(() => { onSlot(slot); }, [slot, onSlot]);
   return null;
 }
 
@@ -349,8 +347,8 @@ describe('WorkControlBar — View Diff (task 08641 + 08654 follow-on)', () => {
     vi.clearAllMocks();
   });
 
-  it('opens the diff slot when View Diff is clicked (payload fetched on mount by the viewer)', () => {
-    let kind = 'none';
+  it('opens the fullscreen diff presentation when View Diff is clicked (payload fetched on mount by the viewer)', () => {
+    let slot: ReturnType<typeof useViewerSlot>['slot'] = { kind: 'none' };
     renderWithProviders(
       <>
         <WorkControlBar
@@ -360,13 +358,13 @@ describe('WorkControlBar — View Diff (task 08641 + 08654 follow-on)', () => {
           continuedInConvId={null}
           prStatusHandle={prStatusHandle()}
         />
-        <CaptureSlotKind onKind={(k) => { kind = k; }} />
+        <CaptureSlot onSlot={(s) => { slot = s; }} />
       </>,
     );
 
-    expect(kind).toBe('none');
+    expect(slot).toEqual({ kind: 'none' });
     fireEvent.click(screen.getByTestId('view-diff-button'));
-    expect(kind).toBe('diff');
+    expect(slot).toEqual({ kind: 'diff', presentation: 'fullscreen' });
     // WorkActions no longer fetches; the diff viewer fetches on mount.
     expect(api.getConversationDiff).not.toHaveBeenCalled();
   });

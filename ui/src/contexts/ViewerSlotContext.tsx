@@ -15,7 +15,7 @@ import { clearLastViewer, getLastViewer, setLastViewer } from '../storage/lastVi
  * coordinating effects in ConversationPage with one type.
  *
  *   ?viewer=prose&file=<abs>&root=<abs>   → prose
- *   ?viewer=diff                          → diff   (payload fetched on mount,
+ *   ?viewer=diff&presentation=<mode>      → diff   (payload fetched on mount,
  *                                                    keyed by conversation id)
  *   ?viewer=browser                       → browser
  *   (no ?viewer=)                          → none
@@ -26,6 +26,8 @@ import { clearLastViewer, getLastViewer, setLastViewer } from '../storage/lastVi
  * correct trade: the file still opens, just without highlights.
  */
 
+export type DiffPresentation = 'fullscreen' | 'pane';
+
 export interface ProseFile {
   path: string;
   rootDir: string;
@@ -34,7 +36,7 @@ export interface ProseFile {
 export type ViewerSlot =
   | { kind: 'none' }
   | { kind: 'prose'; file: ProseFile; patchContext: PatchContext | null }
-  | { kind: 'diff' }
+  | { kind: 'diff'; presentation: DiffPresentation }
   | { kind: 'browser' };
 
 export interface ViewerSlotValue {
@@ -43,7 +45,8 @@ export interface ViewerSlotValue {
    *  manual browser-open affordance and drives the auto-open/close edges. */
   browserSessionActive: boolean;
   openProse: (path: string, rootDir: string, patchContext?: PatchContext) => void;
-  openDiff: () => void;
+  openDiff: (presentation: DiffPresentation) => void;
+  openDiffFullscreen: () => void;
   openBrowser: () => void;
   close: () => void;
 }
@@ -51,6 +54,7 @@ export interface ViewerSlotValue {
 const ViewerSlotContext = createContext<ViewerSlotValue | null>(null);
 
 const VIEWER_PARAM = 'viewer';
+const DIFF_PRESENTATION_PARAM = 'presentation';
 const FILE_PARAM = 'file';
 const ROOT_PARAM = 'root';
 
@@ -70,6 +74,7 @@ function deriveSlot(
   patchContext: PatchContext | null,
 ): DerivedSlot {
   const viewer = searchParams.get(VIEWER_PARAM);
+  const presentation = searchParams.get(DIFF_PRESENTATION_PARAM);
   const file = searchParams.get(FILE_PARAM);
   const root = searchParams.get(ROOT_PARAM);
 
@@ -83,7 +88,10 @@ function deriveSlot(
       if (!file || !root) return { slot: { kind: 'none' }, malformed: true };
       return { slot: { kind: 'prose', file: { path: file, rootDir: root }, patchContext }, malformed: false };
     case 'diff':
-      return { slot: { kind: 'diff' }, malformed: false };
+      if (presentation !== 'fullscreen' && presentation !== 'pane') {
+        return { slot: { kind: 'none' }, malformed: true };
+      }
+      return { slot: { kind: 'diff', presentation }, malformed: false };
     case 'browser':
       return { slot: { kind: 'browser' }, malformed: false };
     case null:
@@ -137,6 +145,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
       setPatchContext(nextPatchContext ?? null);
       writeUrl((next) => {
         next.set(VIEWER_PARAM, 'prose');
+        next.delete(DIFF_PRESENTATION_PARAM);
         next.set(FILE_PARAM, path);
         next.set(ROOT_PARAM, rootDir);
       });
@@ -144,19 +153,23 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     [setPatchContext, writeUrl],
   );
 
-  const openDiff = useCallback(() => {
+  const openDiff = useCallback((presentation: DiffPresentation) => {
     setPatchContext(null);
     writeUrl((next) => {
       next.set(VIEWER_PARAM, 'diff');
+      next.set(DIFF_PRESENTATION_PARAM, presentation);
       next.delete(FILE_PARAM);
       next.delete(ROOT_PARAM);
     });
   }, [setPatchContext, writeUrl]);
 
+  const openDiffFullscreen = useCallback(() => openDiff('fullscreen'), [openDiff]);
+
   const openBrowser = useCallback(() => {
     setPatchContext(null);
     writeUrl((next) => {
       next.set(VIEWER_PARAM, 'browser');
+      next.delete(DIFF_PRESENTATION_PARAM);
       next.delete(FILE_PARAM);
       next.delete(ROOT_PARAM);
     });
@@ -171,6 +184,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
       setPatchContext(null);
       writeUrl((next) => {
         next.delete(VIEWER_PARAM);
+        next.delete(DIFF_PRESENTATION_PARAM);
         next.delete(FILE_PARAM);
         next.delete(ROOT_PARAM);
       });
@@ -187,6 +201,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     if (!malformed) return;
     writeUrl((next) => {
       next.delete(VIEWER_PARAM);
+      next.delete(DIFF_PRESENTATION_PARAM);
       next.delete(FILE_PARAM);
       next.delete(ROOT_PARAM);
     });
@@ -218,7 +233,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     if (!isEntry) return;
     if (!scopeKey) return;
     if (location.key === 'default') return;
-    if (searchParams.has(VIEWER_PARAM) || searchParams.has(FILE_PARAM) || searchParams.has(ROOT_PARAM)) return;
+    if (searchParams.has(VIEWER_PARAM) || searchParams.has(FILE_PARAM) || searchParams.has(ROOT_PARAM) || searchParams.has(DIFF_PRESENTATION_PARAM)) return;
     const stored = getLastViewer(scopeKey);
     if (!stored) return;
     setSearchParams(new URLSearchParams(stored), { replace: true });
@@ -255,8 +270,8 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   }, [scopeKey, browserSessionActive, slotKind, openBrowser, clearSlot]);
 
   const value = useMemo<ViewerSlotValue>(
-    () => ({ slot, browserSessionActive, openProse, openDiff, openBrowser, close }),
-    [slot, browserSessionActive, openProse, openDiff, openBrowser, close],
+    () => ({ slot, browserSessionActive, openProse, openDiff, openDiffFullscreen, openBrowser, close }),
+    [slot, browserSessionActive, openProse, openDiff, openDiffFullscreen, openBrowser, close],
   );
 
   return <ViewerSlotContext.Provider value={value}>{children}</ViewerSlotContext.Provider>;

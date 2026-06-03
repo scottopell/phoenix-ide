@@ -5,7 +5,7 @@
 // URL normalization, and the browser-session edges.
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { render, act } from '@testing-library/react';
+import { render, act, waitFor } from '@testing-library/react';
 import { useEffect, useState } from 'react';
 import { MemoryRouter, Routes, Route, useLocation } from 'react-router-dom';
 import { ViewerSlotProvider, useViewerSlot } from './ViewerSlotContext';
@@ -55,9 +55,10 @@ describe('ViewerSlot — open/close transitions', () => {
     expect(h.get().slot.kind).toBe('prose');
     expect(h.search()).toContain('viewer=prose');
 
-    act(() => { h.get().openDiff(); });
-    expect(h.get().slot.kind).toBe('diff');
+    act(() => { h.get().openDiff('pane'); });
+    expect(h.get().slot).toEqual({ kind: 'diff', presentation: 'pane' });
     expect(h.search()).toContain('viewer=diff');
+    expect(h.search()).toContain('presentation=pane');
 
     act(() => { h.get().openBrowser(); });
     expect(h.get().slot.kind).toBe('browser');
@@ -75,16 +76,17 @@ describe('ViewerSlot — structural single-slot mutex', () => {
     act(() => { h.get().openProse('/repo/a.ts', '/repo'); });
     expect(h.search()).toContain('file=');
 
-    act(() => { h.get().openDiff(); });
-    expect(h.get().slot.kind).toBe('diff');
+    act(() => { h.get().openDiffFullscreen(); });
+    expect(h.get().slot).toEqual({ kind: 'diff', presentation: 'fullscreen' });
     expect(h.search()).toContain('viewer=diff');
+    expect(h.search()).toContain('presentation=fullscreen');
     expect(h.search()).not.toContain('file=');
     expect(h.search()).not.toContain('root=');
   });
 
   it('opening prose while diff is open sets the file/root params', () => {
     const h = renderSlot();
-    act(() => { h.get().openDiff(); });
+    act(() => { h.get().openDiff('pane'); });
     act(() => { h.get().openProse('/repo/b.ts', '/repo'); });
     expect(h.get().slot.kind).toBe('prose');
     expect(h.search()).toContain('viewer=prose');
@@ -103,6 +105,33 @@ describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
     const h = renderSlot('/c/conv-A?viewer=bogus');
     expect(h.get().slot.kind).toBe('none');
     expect(h.search()).not.toContain('viewer=');
+  });
+
+  it('parses fullscreen diff URLs and normalizes missing diff presentation to none', async () => {
+    const fullscreen = renderSlot('/c/conv-A?viewer=diff&presentation=fullscreen');
+    expect(fullscreen.get().slot).toEqual({ kind: 'diff', presentation: 'fullscreen' });
+
+    const malformed = renderSlot('/c/conv-A?viewer=diff');
+    expect(malformed.get().slot.kind).toBe('none');
+    await waitFor(() => {
+      expect(malformed.search()).not.toContain('viewer=');
+      expect(malformed.search()).not.toContain('presentation=');
+    });
+  });
+
+  it('removes the diff presentation param when opening prose or browser', () => {
+    const h = renderSlot();
+    act(() => { h.get().openDiffFullscreen(); });
+    expect(h.search()).toContain('presentation=fullscreen');
+
+    act(() => { h.get().openProse('/repo/a.ts', '/repo'); });
+    expect(h.search()).toContain('viewer=prose');
+    expect(h.search()).not.toContain('presentation=');
+
+    act(() => { h.get().openDiffFullscreen(); });
+    act(() => { h.get().openBrowser(); });
+    expect(h.search()).toContain('viewer=browser');
+    expect(h.search()).not.toContain('presentation=');
   });
 });
 

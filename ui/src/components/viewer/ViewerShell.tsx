@@ -2,7 +2,7 @@ import { useEffect } from 'react';
 import { ArrowLeft, MessageSquare, Send } from 'lucide-react';
 import type { ReactNode } from 'react';
 
-export type ViewerMode = 'overlay' | 'inline';
+export type ViewerMode = 'overlay' | 'inline' | 'takeover';
 
 interface ViewerShellProps {
   mode: ViewerMode;
@@ -57,6 +57,8 @@ interface ViewerShellProps {
  * `mode="inline"` — pure flex item with no overlay. Used by the
  * desktop split-pane layout (task 08654) so the viewer can sit beside
  * the chat instead of taking it over.
+ * `mode="takeover"` — fixed full-screen surface above app chrome. Used by
+ * dismissible focused review surfaces such as fullscreen diff.
  */
 export function ViewerShell({
   mode,
@@ -91,12 +93,19 @@ export function ViewerShell({
     return () => window.removeEventListener('keydown', onKey, true);
   }, [onClose, dialog, confirm]);
 
+  const modal = mode !== 'inline';
+  const className = mode === 'inline'
+    ? 'viewer-shell viewer-shell--inline'
+    : mode === 'takeover'
+      ? 'viewer-shell viewer-shell--overlay viewer-shell--takeover'
+      : 'viewer-shell viewer-shell--overlay';
+
   return (
     <div
-      className={mode === 'overlay' ? 'viewer-shell viewer-shell--overlay' : 'viewer-shell viewer-shell--inline'}
-      role={mode === 'overlay' ? 'dialog' : 'region'}
+      className={className}
+      role={modal ? 'dialog' : 'region'}
       aria-label={ariaLabel}
-      aria-modal={mode === 'overlay' ? true : undefined}
+      aria-modal={modal ? true : undefined}
     >
       <div className="viewer-shell-header">
         <button

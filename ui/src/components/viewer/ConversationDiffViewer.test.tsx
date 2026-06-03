@@ -23,10 +23,10 @@ function payloadFor(marker: string) {
   };
 }
 
-function renderViewer(conversationId: string) {
+function renderViewer(conversationId: string, takeover = false) {
   return render(
     <ReviewNotesProvider>
-      <ConversationDiffViewer conversationId={conversationId} onClose={() => undefined} onSendNotes={() => undefined} />
+      <ConversationDiffViewer conversationId={conversationId} onClose={() => undefined} onSendNotes={() => undefined} takeover={takeover} />
     </ReviewNotesProvider>,
   );
 }
@@ -59,5 +59,15 @@ describe('ConversationDiffViewer — conversation-keyed payload', () => {
 
     resolveConv2!(payloadFor('CONV2'));
     await waitFor(() => expect(screen.getByText('CONV2.txt')).toBeInTheDocument());
+  });
+
+  it('renders fullscreen presentation as a takeover dialog', async () => {
+    (api.getConversationDiff as ReturnType<typeof vi.fn>).mockResolvedValue(payloadFor('TAKEOVER'));
+
+    renderViewer('conv-1', true);
+
+    const dialog = await screen.findByRole('dialog', { name: 'Worktree diff' });
+    expect(dialog).toHaveClass('viewer-shell--takeover');
+    expect(dialog).not.toHaveClass('viewer-shell--inline');
   });
 });

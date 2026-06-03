@@ -10449,6 +10449,10 @@ html * {
   height: 100dvh;
 }
 
+.viewer-shell--takeover {
+  z-index: 2100;
+}
+
 .viewer-shell--inline {
   display: flex;
   flex-direction: column;

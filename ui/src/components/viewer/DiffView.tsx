@@ -40,6 +40,8 @@ export interface DiffViewProps {
   onSendNotes: (notes: string) => void;
   /** Render inline (no overlay) for desktop split-pane mode. */
   inline?: boolean;
+  /** Render as a focused full-screen surface above app chrome. */
+  takeover?: boolean;
 }
 
 type DiffStyle = 'unified' | 'split';
@@ -62,7 +64,8 @@ export function DiffView({
   uncommittedSaturated,
   onClose,
   onSendNotes,
-  inline,
+  inline = false,
+  takeover = false,
 }: DiffViewProps) {
   useRegisterFocusScope('diff-viewer');
   const notes = useDiffReviewNotes(onSendNotes);
@@ -98,7 +101,7 @@ export function DiffView({
 
   return (
     <ViewerShell
-      mode={inline ? 'inline' : 'overlay'}
+      mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
       ariaLabel="Worktree diff"
       title={
         <span>

@@ -21,6 +21,7 @@ interface ConversationDiffViewerProps {
   onClose: () => void;
   onSendNotes: (notes: string) => void;
   inline?: boolean | undefined;
+  takeover?: boolean | undefined;
 }
 
 /**
@@ -35,6 +36,7 @@ export function ConversationDiffViewer({
   onClose,
   onSendNotes,
   inline,
+  takeover,
 }: ConversationDiffViewerProps) {
   const [state, setState] = useState<LoadState>({ status: 'loading' });
 
@@ -72,13 +74,14 @@ export function ConversationDiffViewer({
         onClose={onClose}
         onSendNotes={onSendNotes}
         {...(inline !== undefined ? { inline } : {})}
+        {...(takeover !== undefined ? { takeover } : {})}
       />
     );
   }
 
   return (
     <ViewerShell
-      mode={inline ? 'inline' : 'overlay'}
+      mode={inline ? 'inline' : takeover ? 'takeover' : 'overlay'}
       ariaLabel="Worktree diff"
       title="Diff"
       noteCount={0}

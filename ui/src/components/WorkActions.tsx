@@ -79,14 +79,11 @@ function deriveWorkLifecycleControls({
 function WorkViewerActions() {
   const viewerSlot = useViewerSlot();
   return <>
-    <button
-      className="work-actions-btn work-actions-view-diff"
-      data-testid="view-diff-button"
-      // Opening the diff slot writes ?viewer=diff (structurally closing any
-      // other viewer); the diff viewer fetches its payload on mount, so it
-      // survives reload and shows its own loading/error state.
-      onClick={() => viewerSlot.openDiff()}
-    >
+      <button
+        className="work-actions-btn work-actions-view-diff"
+        data-testid="view-diff-button"
+        onClick={() => viewerSlot.openDiffFullscreen()}
+      >
       View Diff
     </button>
     {viewerSlot.browserSessionActive && viewerSlot.slot.kind !== 'browser' && (

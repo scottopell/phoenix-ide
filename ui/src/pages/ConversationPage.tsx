@@ -139,7 +139,9 @@ function ConversationPageContent() {
   // No coordinating effects: the type system enforces the single slot.
   const viewerSlot = useViewerSlot();
   const slotKind = viewerSlot.slot.kind;
-  const diffOpen = slotKind === 'diff';
+  const diffPresentation = viewerSlot.slot.kind === 'diff' ? viewerSlot.slot.presentation : null;
+  const fullscreenDiffOpen = diffPresentation === 'fullscreen';
+  const paneDiffOpen = diffPresentation === 'pane';
   const browserOpen = slotKind === 'browser';
   const handleCloseDiff = viewerSlot.close;
   const handleCloseBrowserView = viewerSlot.close;
@@ -866,7 +868,7 @@ function ConversationPageContent() {
         </div>
       );
     }
-    if (diffOpen && conversationId) {
+    if (paneDiffOpen && conversationId) {
       return (
         <div id="app">
           <Suspense fallback={null}>
@@ -938,7 +940,7 @@ function ConversationPageContent() {
   const showSplitPaneViewer =
     isDesktop
     && isWideDesktop
-    && (splitPanePrs !== null || diffOpen || browserOpen);
+    && (splitPanePrs !== null || paneDiffOpen || browserOpen);
 
   return (
     <div
@@ -1365,10 +1367,19 @@ function ConversationPageContent() {
           />
         </Suspense>
       )}
-      {/* Diff overlay: rendered as a full-screen overlay whenever the
-          diff viewer is open AND the split pane isn't (mobile, narrow
-          desktop, or any future case where the split is unavailable). */}
-      {diffOpen && !showSplitPaneViewer && conversationId && (
+      {/* Fullscreen diff takeover: dismissible review surface above app chrome.
+          Pane presentation remains available for intentional split-pane callers. */}
+      {fullscreenDiffOpen && conversationId && (
+        <Suspense fallback={null}>
+          <ConversationDiffViewer
+            conversationId={conversationId}
+            onClose={handleCloseDiff}
+            onSendNotes={handleSendNotes}
+            takeover
+          />
+        </Suspense>
+      )}
+      {paneDiffOpen && !showSplitPaneViewer && conversationId && (
         <Suspense fallback={null}>
           <ConversationDiffViewer
             conversationId={conversationId}
@@ -1430,7 +1441,7 @@ function ConversationPageContent() {
           />
           <div className="conversation-viewer-pane">
             <Suspense fallback={null}>
-              {diffOpen && conversationId ? (
+              {paneDiffOpen && conversationId ? (
                 <ConversationDiffViewer
                   conversationId={conversationId}
                   onClose={handleCloseDiff}

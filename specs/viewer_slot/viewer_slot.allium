@@ -39,7 +39,7 @@
 --
 --   The URL is the source of truth. Search params encode the slot:
 --     ?viewer=prose&file=<absolute-path>&root=<absolute-path>
---     ?viewer=diff
+--     ?viewer=diff&presentation=<fullscreen|pane>
 --     ?viewer=browser
 --   patchContext (modifiedLines: Set<Integer>) rides alongside in
 --   conversation-scoped state, not in the URL -- it is patch-
@@ -71,12 +71,15 @@ value ProseFile {
     root_dir: String    -- non-empty, absolute
 }
 
--- The diff viewer carries no slot data. The diff endpoint
+-- The diff viewer carries presentation data but no payload data. The
+-- presentation is URL identity (`fullscreen` takeover or `pane` split-pane)
+-- so reload/back/forward restores the same diff surface rather than inferring
+-- it from viewport width. The diff endpoint
 -- (GET /api/conversations/:id/diff) is conversation-keyed, not
 -- comparator-keyed: it returns the diff for the conversation, base
--- determined server-side. So the diff slot is identified entirely by
+-- determined server-side. So the diff payload is identified entirely by
 -- the conversation it belongs to -- no comparator in the URL
--- (?viewer=diff alone). The full payload (committed_diff,
+-- (?viewer=diff&presentation=<mode>). The full payload (committed_diff,
 -- uncommitted_diff, commit_log, truncation flags) is server-fetched on
 -- viewer mount and is never part of slot state: it is too large for a
 -- URL and re-fetches cheaply.
@@ -98,8 +101,7 @@ value PatchContext {
 -- form they would appear in `?...`. Used as the persistence shape for
 -- per-conversation last-viewer storage (REQ-VS-014). Encoded as a
 -- string so the storage helper does not need to mirror the URL grammar
--- -- a future `?viewer=diff` shape will round-trip without spec
--- changes here. "Slot was none" is represented by ABSENCE: the
+-- future viewer URL shapes round-trip without spec changes here. "Slot was none" is represented by ABSENCE: the
 -- implementation removes the localStorage key on close rather than
 -- writing an empty string. Both forms (absent key OR empty string,
 -- should one ever be written) are equivalent at the read site, which
@@ -125,6 +127,8 @@ value ViewerUrlSnapshot {
 -- The four kinds of slot state. Encoded in URL as ?viewer=<kind>.
 -- `none` corresponds to "no ?viewer= param present."
 enum ViewerKind { none | prose | diff | browser }
+
+enum DiffPresentation { fullscreen | pane }
 
 -- Note: ConversationEntered carries an entry-source discriminator
 -- (`cold_reload` vs `in_app`) modelled inline at the event call site
@@ -157,7 +161,11 @@ entity ViewerSlot {
     -- Non-null when the discriminator is set; the type system enforces
     -- absence otherwise.
     prose_file: ProseFile when kind = prose
-    -- The diff variant carries no data: the diff is identified by the
+    -- Diff presentation is slot identity: fullscreen is a dismissible
+    -- takeover over app chrome; pane is the intentional split-pane surface.
+    diff_presentation: DiffPresentation when kind = diff
+
+    -- The diff variant carries no payload data: the diff is identified by the
     -- conversation (conversation-keyed endpoint), and the browser
     -- variant's liveness signal is conversation.browser_session_active.
 
@@ -212,7 +220,7 @@ entity ViewerSlot {
 -- User-driven events: clicking a file row, a View Diff button, the
 -- browser launcher, or the close button on the active viewer.
 --   UserOpensProse(slot, file, patch?)
---   UserOpensDiff(slot)
+--   UserOpensDiff(slot, presentation)
 --   UserOpensBrowser(slot)
 --   UserClosesViewer(slot)
 --
@@ -223,7 +231,7 @@ entity ViewerSlot {
 -- restoration on mount, browser back, or another tab's pushState
 -- via storage events. Treating it as one event keeps the rule set
 -- tight; the implementation reads the URL once and dispatches.
---   UrlSlotChanged(slot, next_kind, next_prose_file?)
+--   UrlSlotChanged(slot, next_kind, next_prose_file?, next_diff_presentation?)
 --
 -- Server-driven events: bedrock's Conversation.browser_session_active
 -- transitioned. The slot listens for the rising edge to auto-open
@@ -271,14 +279,15 @@ rule UserOpensProseFile {
     ensures: slot.kind = prose
     ensures: slot.prose_file = file
     ensures: slot.patch_context = patch
-    -- The diff and browser variants carry no data, so moving to prose
+    -- The diff and browser variants carry no prose data, so moving to prose
     -- leaves nothing else to clear beyond the kind transition.
 }
 
 rule UserOpensDiffViewer {
-    when: UserOpensDiff(slot)
+    when: UserOpensDiff(slot, presentation)
     requires: not slot.conversation.is_terminal
     ensures: slot.kind = diff
+    ensures: slot.diff_presentation = presentation
 }
 
 rule UserOpensBrowserViewer {
@@ -321,12 +330,12 @@ rule UserClosesActiveViewer {
 --   identity (file path), drop ephemeral provenance (which lines
 --   were modified by the message that opened it).
 rule UrlHydratesNone {
-    when: UrlSlotChanged(slot, none, _)
+    when: UrlSlotChanged(slot, none, _, _)
     ensures: slot.kind = none
 }
 
 rule UrlHydratesProse {
-    when: UrlSlotChanged(slot, prose, file)
+    when: UrlSlotChanged(slot, prose, file, _)
     requires: file != null
     ensures: slot.kind = prose
     ensures: slot.prose_file = file
@@ -334,12 +343,14 @@ rule UrlHydratesProse {
 }
 
 rule UrlHydratesDiff {
-    when: UrlSlotChanged(slot, diff, _)
+    when: UrlSlotChanged(slot, diff, _, presentation)
+    requires: presentation != null
     ensures: slot.kind = diff
+    ensures: slot.diff_presentation = presentation
 }
 
 rule UrlHydratesBrowser {
-    when: UrlSlotChanged(slot, browser, _)
+    when: UrlSlotChanged(slot, browser, _, _)
     -- No requires on browser_session_active here: the URL might
     -- restore ?viewer=browser after the session has died. The viewer
     -- mount path renders an "ended" state when active=false; spec'd
@@ -349,14 +360,14 @@ rule UrlHydratesBrowser {
     ensures: slot.kind = browser
 }
 
--- Defensive: the URL has ?viewer=prose but no file param, or an
--- unknown ?viewer= value. The implementation normalizes this away
--- (treat as ?viewer=none), and the spec asserts the rule for
--- correctness. ?viewer=diff and ?viewer=browser are always well-formed
--- (they carry no required params), so only prose can be malformed this way.
+-- Defensive: the URL has ?viewer=prose but no file param, ?viewer=diff with
+-- no presentation mode, or an unknown ?viewer= value. The implementation
+-- normalizes this away (treat as ?viewer=none), and the spec asserts the rule
+-- for correctness. ?viewer=browser is always well-formed because it carries no
+-- required params.
 rule UrlMalformedNormalizesToNone {
-    when: UrlSlotChanged(slot, kind, file)
-    requires: kind = prose and file = null
+    when: UrlSlotChanged(slot, kind, file, presentation)
+    requires: (kind = prose and file = null) or (kind = diff and presentation = null)
     ensures: slot.kind = none
     ensures: UrlNormalizationRequested(slot)  -- triggers a setSearchParams clearing the bogus params
 }
@@ -475,7 +486,7 @@ rule UserOpensProseWritesStorage {
 }
 
 rule UserOpensDiffWritesStorage {
-    when: UserOpensDiff(slot)
+    when: UserOpensDiff(slot, presentation)
     ensures: ViewerSnapshotPersisted(slot)
 }
 
@@ -485,18 +496,19 @@ rule UserOpensBrowserWritesStorage {
 }
 
 rule UrlHydratesProseWritesStorage {
-    when: UrlSlotChanged(slot, prose, file)
+    when: UrlSlotChanged(slot, prose, file, _)
     requires: file != null
     ensures: ViewerSnapshotPersisted(slot)
 }
 
 rule UrlHydratesDiffWritesStorage {
-    when: UrlSlotChanged(slot, diff, _)
+    when: UrlSlotChanged(slot, diff, _, presentation)
+    requires: presentation != null
     ensures: ViewerSnapshotPersisted(slot)
 }
 
 rule UrlHydratesBrowserWritesStorage {
-    when: UrlSlotChanged(slot, browser, _)
+    when: UrlSlotChanged(slot, browser, _, _)
     ensures: ViewerSnapshotPersisted(slot)
 }
 
@@ -599,11 +611,12 @@ surface ConversationViewer {
     exposes:
         slot.kind
         slot.prose_file when slot.kind = prose
+        slot.diff_presentation when slot.kind = diff
 
     provides:
         UserOpensProse(slot, file, patch?)
             when not slot.conversation.is_terminal
-        UserOpensDiff(slot)
+        UserOpensDiff(slot, presentation)
             when not slot.conversation.is_terminal
         UserOpensBrowser(slot)
             when slot.conversation.browser_session_active
@@ -616,9 +629,9 @@ surface ConversationViewer {
 ------------------------------------------------------------
 
 -- @invariant VariantDataPresence
---   prose_file is set iff kind = prose. The diff and browser variants
---   carry no slot data. The `when kind = prose` annotation on the
---   entity field is the structural enforcement; this invariant restates
+--   prose_file is set iff kind = prose. diff_presentation is set iff kind =
+--   diff. Browser carries no slot data. The `when kind = ...` annotations on
+--   entity fields are the structural enforcement; this invariant restates
 --   the contract for spec consumers (and gives `allium analyse` a
 --   target to verify against the rule set).
 invariant ProseDataPresentIffProseKind {
@@ -629,6 +642,16 @@ invariant ProseDataPresentIffProseKind {
 invariant ProseDataAbsentWhenNotProseKind {
     for s in ViewerSlot:
         (s.kind != prose) implies (s.prose_file = null)
+}
+
+invariant DiffPresentationPresentIffDiffKind {
+    for s in ViewerSlot:
+        (s.kind = diff) implies (s.diff_presentation != null)
+}
+
+invariant DiffPresentationAbsentWhenNotDiffKind {
+    for s in ViewerSlot:
+        (s.kind != diff) implies (s.diff_presentation = null)
 }
 
 -- @invariant PatchContextOnlyDuringProse
@@ -666,8 +689,9 @@ invariant PatchContextOnlyDuringProse {
 -- prose state for the file explorer panel and command palette.
 --
 -- The diff payload is fetched on viewer mount keyed on the conversation
--- id (the diff endpoint is conversation-keyed), so diff and browser
--- survive cold reload via the URL alongside prose.
+-- id (the diff endpoint is conversation-keyed), while diff presentation
+-- (`fullscreen` takeover vs `pane`) remains part of the URL-driven slot
+-- identity so cold reload restores the same surface.
 --
 -- Test coverage: every transition in `transitions kind` has a vitest
 -- case driving the URL and asserting the slot
