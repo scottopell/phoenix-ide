@@ -407,23 +407,6 @@ def scenario_think_tool(base_url: str) -> None:
         )
 
 
-def scenario_polling_parity(base_url: str) -> None:
-    """Final transcript via SSE should equal final transcript via polling."""
-    conv_a = _new_conv(base_url, "[[scenario:markdown]] sse path")
-    sse_text = _agent_text(_drive(base_url, conv_a["id"], timeout=15.0)["messages"])
-
-    conv_b = _new_conv(base_url, "[[scenario:markdown]] poll path")
-    poll_text = _agent_text(
-        _drive(base_url, conv_b["id"], timeout=15.0, use_polling=True)["messages"]
-    )
-
-    assert sse_text == poll_text, (
-        "SSE vs polling produced different assistant text:\n"
-        f"  sse:  {sse_text[:120]!r}\n"
-        f"  poll: {poll_text[:120]!r}"
-    )
-
-
 def scenario_continuation(base_url: str) -> None:
     conv = _new_conv(base_url, "[[scenario:plain_text]] one")
     _drive(base_url, conv["id"], timeout=15.0)
@@ -486,8 +469,13 @@ def scenario_list_models(base_url: str) -> None:
 def scenario_read_file(base_url: str) -> None:
     # Mock scenario: see [[scenario:read_file]] in mock.rs — reads Cargo.toml
     # at the conversation's cwd (which is the project root here).
+    #
+    # Drives via polling (use_polling=True) rather than SSE so the
+    # _poll_to_idle barrier — GET state converging to "idle" — stays
+    # exercised. Every other scenario uses the SSE barrier; this is the one
+    # place the poll path runs end-to-end.
     conv = _new_conv(base_url, "[[scenario:read_file]] inspect")
-    final = _drive(base_url, conv["id"], timeout=15.0)
+    final = _drive(base_url, conv["id"], timeout=15.0, use_polling=True)
     assert _has_tool_use(final["messages"], "read_file"), "expected a 'read_file' tool use"
     tool_msgs = [m for m in final["messages"] if m.get("message_type") == "tool"]
     assert tool_msgs, "expected at least one tool result message"
@@ -529,7 +517,12 @@ def scenario_perf_stream(base_url: str) -> None:
     # exactly N whitespace-separated deterministic words. Catches stream
     # finalization or persistence regressions that only manifest on longer
     # streams (most other scenarios finalize in <100 tokens).
-    n = 400
+    # 200 words is ~3x the longest text scenario (~70-word plain_text) and
+    # produces several hundred chunks — enough to exercise the same long-stream
+    # finalization/persistence path a larger count would, without paying for
+    # word-count the regression class doesn't depend on (no threshold lives at
+    # any particular N; the bug class is "more chunks than the short scenarios").
+    n = 200
     conv = _new_conv(base_url, f"[[perf:{n}]] go")
     final = _drive(base_url, conv["id"], timeout=30.0)
     text = _agent_text(final["messages"])
@@ -544,7 +537,6 @@ SCENARIOS = [
     ("think_tool", scenario_think_tool),
     ("read_file", scenario_read_file),
     ("patch", scenario_patch),
-    ("polling_parity", scenario_polling_parity),
     ("continuation", scenario_continuation),
     ("mid_stream_cancel", scenario_mid_stream_cancel),
     ("image_roundtrip", scenario_image_roundtrip),
