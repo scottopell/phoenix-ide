@@ -344,6 +344,11 @@ export function useCreateConversation(navigate: (path: string) => void) {
   };
 
   const addFiles = async (dropped: File[]) => {
+    const unsupportedImage = dropped.find(file => file.type.startsWith('image/') && !SUPPORTED_IMAGE_TYPES.includes(file.type));
+    if (unsupportedImage) {
+      setError(`${unsupportedImage.name} is not a supported image attachment type.`);
+      return;
+    }
     const genericFiles = dropped.filter(file => !SUPPORTED_IMAGE_TYPES.includes(file.type));
     const imageFiles = dropped.filter(file => SUPPORTED_IMAGE_TYPES.includes(file.type));
     if (imageFiles.length > 0) await addImages(imageFiles);

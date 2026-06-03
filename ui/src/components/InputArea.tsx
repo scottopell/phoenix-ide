@@ -109,6 +109,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const conversationIdRef = useRef(conversationId);
+  useEffect(() => { conversationIdRef.current = conversationId; }, [conversationId]);
   const voiceSupported = isWebSpeechSupported();
 
   useImperativeHandle(ref, () => ({
@@ -433,6 +435,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       return;
     }
 
+    const uploadConversationId = conversationId;
+
+    const unsupportedImage = dropped.find(file => file.type.startsWith('image/') && !SUPPORTED_IMAGE_TYPES.includes(file.type));
+    if (unsupportedImage) {
+      setExpansionError(`${unsupportedImage.name} is not a supported image attachment type.`);
+      return;
+    }
     const imageFiles = dropped.filter(file => SUPPORTED_IMAGE_TYPES.includes(file.type));
     const genericFiles = dropped.filter(file => !SUPPORTED_IMAGE_TYPES.includes(file.type));
 
@@ -458,7 +467,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setIsUploadingFiles(true);
     setExpansionError(null);
     try {
-      const uploaded = await api.uploadAttachments(conversationId, genericFiles);
+      const uploaded = await api.uploadAttachments(uploadConversationId, genericFiles);
+      if (conversationIdRef.current !== uploadConversationId) return;
       setFiles(prev => [...prev, ...uploaded]);
     } catch (err) {
       setExpansionError(err instanceof Error ? err.message : 'Failed to upload attachments');

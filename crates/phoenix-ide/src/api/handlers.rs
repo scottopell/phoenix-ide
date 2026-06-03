@@ -686,28 +686,40 @@ fn attachment_root() -> PathBuf {
 }
 
 fn collect_file_paths_from_content(value: &serde_json::Value, paths: &mut HashSet<PathBuf>) {
-    if let Some(files) = value.get("files").and_then(serde_json::Value::as_array) {
-        for file in files {
-            if let Some(path) = file.get("stored_path").and_then(serde_json::Value::as_str) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(path) = map.get("stored_path").and_then(serde_json::Value::as_str) {
                 paths.insert(PathBuf::from(path));
             }
+            for child in map.values() {
+                collect_file_paths_from_content(child, paths);
+            }
         }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_file_paths_from_content(item, paths);
+            }
+        }
+        _ => {}
     }
 }
 
-async fn referenced_attachment_paths(db: &crate::db::Database) -> HashSet<PathBuf> {
-    let rows = match sqlx::query("SELECT content FROM messages WHERE message_type IN ('user', 'skill') AND content LIKE '%stored_path%'")
-        .fetch_all(db.pool())
-        .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to read attachment references; skipping TTL attachment sweep");
-            return HashSet::new();
-        }
-    };
+async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet<PathBuf>, String> {
+    let message_rows = sqlx::query(
+        "SELECT content FROM messages WHERE message_type IN ('user', 'skill') AND content LIKE '%stored_path%'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| format!("failed to read message attachment references: {e}"))?;
+    let steering_rows = sqlx::query(
+        "SELECT steering_queue FROM conversations WHERE steering_queue LIKE '%stored_path%'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| format!("failed to read steering attachment references: {e}"))?;
+
     let mut paths = HashSet::new();
-    for row in rows {
+    for row in message_rows {
         let Ok(content) = row.try_get::<String, _>("content") else {
             continue;
         };
@@ -715,7 +727,15 @@ async fn referenced_attachment_paths(db: &crate::db::Database) -> HashSet<PathBu
             collect_file_paths_from_content(&value, &mut paths);
         }
     }
-    paths
+    for row in steering_rows {
+        let Ok(raw) = row.try_get::<String, _>("steering_queue") else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            collect_file_paths_from_content(&value, &mut paths);
+        }
+    }
+    Ok(paths)
 }
 
 fn sweep_expired_attachments_blocking(
@@ -760,7 +780,13 @@ fn sweep_expired_attachments_blocking(
 
 async fn cleanup_expired_attachments(db: &crate::db::Database) {
     let root = attachment_root();
-    let referenced = referenced_attachment_paths(db).await;
+    let referenced = match referenced_attachment_paths(db).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read attachment references; skipping TTL attachment sweep");
+            return;
+        }
+    };
     let cutoff = SystemTime::now()
         .checked_sub(ATTACHMENT_TTL)
         .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -5979,6 +6005,19 @@ mod attachment_storage_tests {
             "secret_notes.txt"
         );
         assert_eq!(sanitize_attachment_name("..."), "attachment");
+    }
+
+    #[test]
+    fn collects_attachment_paths_from_nested_message_and_steering_json() {
+        let value = serde_json::json!({
+            "v": "v1",
+            "entries": [{
+                "files": [{"stored_path": "/tmp/phoenix-ide-attachments/c/m.txt"}]
+            }]
+        });
+        let mut paths = HashSet::new();
+        collect_file_paths_from_content(&value, &mut paths);
+        assert!(paths.contains(&PathBuf::from("/tmp/phoenix-ide-attachments/c/m.txt")));
     }
 
     #[test]
