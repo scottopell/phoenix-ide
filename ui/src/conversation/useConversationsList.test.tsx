@@ -170,4 +170,35 @@ describe('useConversationsList SSE → sidebar reactivity (task 08684)', () => {
     // List unchanged; no flicker to /stale.
     expect(screen.getByTestId('cwd-alpha').textContent).toBe('/fresh');
   });
+
+  it('excludes sub-agent snapshots from the sidebar list', async () => {
+    // A sub-agent snapshot can reach the store by side channels (e.g.
+    // navigating to its page via the spawn_agents "open" button, or cache
+    // hydration). It must never surface as an independent sidebar row — it
+    // belongs inline in its parent's transcript. The structural marker is a
+    // non-null parent_conversation_id.
+    let store: ConversationStore | undefined;
+    const captureStore = (s: ConversationStore) => {
+      store = s;
+    };
+
+    render(
+      <ConversationProvider>
+        <Consumer onStore={captureStore} />
+      </ConversationProvider>,
+    );
+
+    act(() => {
+      store!.upsertSnapshot('top-level', makeConv('top-level'));
+      store!.upsertSnapshot(
+        'sub-agent',
+        makeConv('sub-agent', { parent_conversation_id: 'conv-top-level' }),
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByTestId('row-top-level')).toBeInTheDocument();
+    });
+    expect(screen.queryByTestId('row-sub-agent')).not.toBeInTheDocument();
+  });
 });

@@ -239,11 +239,18 @@ export function useConversationSnapshot(slug: string | null): Conversation | nul
 }
 
 /**
- * Returns `{ active, archived }` arrays of every Conversation snapshot
- * the store currently holds, sorted by `updated_at DESC`. Reference-
- * stable across re-renders unless `(id, updated_at)` for some row
- * actually changes — a polling tick that returns equivalent rows
+ * Returns `{ active, archived }` arrays of the top-level Conversation
+ * snapshots the store currently holds, sorted by `updated_at DESC`.
+ * Reference-stable across re-renders unless `(id, updated_at)` for some
+ * row actually changes — a polling tick that returns equivalent rows
  * doesn't churn the array reference.
+ *
+ * Sub-agents (rows with a non-null `parent_conversation_id`) are excluded:
+ * they render inline inside their parent's transcript (`SubAgentActivityCard`),
+ * never as independent sidebar rows. The server's list endpoints already
+ * exclude them (`user_initiated = 1`), but a sub-agent snapshot can still
+ * reach the store by other paths — navigating to its page, or cache
+ * hydration — so the sidebar's own derivation must apply the same rule.
  *
  * This is the sidebar's read path post-08684. The previous per-component
  * `Conversation[]` state is gone; both `DesktopLayout` and
@@ -275,6 +282,11 @@ export function useConversationsList(): {
     const nextActive: Conversation[] = [];
     const nextArchived: Conversation[] = [];
     for (const c of all) {
+      // Sub-agents are embedded in their parent's transcript, not listed
+      // as independent sidebar conversations. A non-null
+      // parent_conversation_id is the structural marker of sub-agent
+      // parentage (handoff / continuation conversations leave it null).
+      if (c.parent_conversation_id) continue;
       if (c.archived) nextArchived.push(c);
       else nextActive.push(c);
     }
