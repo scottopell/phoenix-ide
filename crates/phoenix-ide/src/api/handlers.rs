@@ -3335,11 +3335,10 @@ async fn search_conversation_code(
         let Ok(content) = String::from_utf8(bytes) else {
             continue;
         };
-        let rel_path = abs_path
-            .strip_prefix(&root)
-            .unwrap_or(abs_path)
-            .to_string_lossy()
-            .to_string();
+        let Ok(rel_path) = abs_path.strip_prefix(&root) else {
+            continue;
+        };
+        let rel_path = rel_path.to_string_lossy().to_string();
 
         for (idx, raw_line) in content.lines().enumerate() {
             let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);

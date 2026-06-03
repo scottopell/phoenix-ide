@@ -7670,8 +7670,7 @@ html * {
   text-overflow: ellipsis;
 }
 
-.cp-result-subtitle,
-.cp-result-snippet {
+.cp-result-subtitle {
   font-size: 12px;
   color: var(--text-muted);
   white-space: nowrap;
@@ -7680,7 +7679,12 @@ html * {
 }
 
 .cp-result-snippet {
+  font-size: 12px;
+  color: var(--text-muted);
+  overflow: hidden;
   font-family: var(--font-mono);
+  text-overflow: ellipsis;
+  white-space: pre;
 }
 
 .cp-shortcut-hint {
