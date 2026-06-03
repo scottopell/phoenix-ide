@@ -42,7 +42,7 @@ use crate::state_machine::{check_user_message_acceptable, ConvState, Event, Tran
 use super::browser_view::browser_view_ws_handler;
 
 use axum::{
-    extract::{Multipart, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -56,6 +56,7 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path as FsPath, PathBuf};
+use tokio::io::AsyncWriteExt;
 
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
@@ -86,7 +87,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/new", post(create_conversation))
         .route(
             "/api/conversations/new/with-attachments",
-            post(create_conversation_with_attachments),
+            post(create_conversation_with_attachments)
+                .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         // Conversation retrieval (REQ-API-003)
         .route("/api/conversations/:id", get(get_conversation))
@@ -107,7 +109,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/chat", post(send_chat))
         .route(
             "/api/conversations/:id/attachments",
-            post(upload_conversation_attachments),
+            post(upload_conversation_attachments)
+                .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
         )
         .route("/api/conversations/:id/cancel", post(cancel_conversation))
         // Steering queue management (task 01001)
@@ -663,10 +666,19 @@ async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, App
 
 const MAX_ATTACHMENT_SIZE_BYTES: usize = 10 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const MAX_MULTIPART_BODY_BYTES: usize = 30 * 1024 * 1024;
 const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
 
 fn attachment_root() -> PathBuf {
-    std::env::temp_dir().join("phoenix-ide-attachments")
+    std::env::var_os("PHOENIX_DATA_DIR").map_or_else(
+        || {
+            std::env::var_os("HOME")
+                .map_or_else(std::env::temp_dir, PathBuf::from)
+                .join(".phoenix-ide")
+                .join("attachments")
+        },
+        |dir| PathBuf::from(dir).join("attachments"),
+    )
 }
 
 fn sanitize_attachment_name(name: &str) -> String {
@@ -711,6 +723,41 @@ fn validate_attachment_file(name: &str, media_type: &str, size: usize) -> Result
     Ok(())
 }
 
+async fn make_attachment_dir_private(dir: &std::path::Path) -> Result<(), AppError> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create attachment directory: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        tokio::fs::set_permissions(dir, perms).await.map_err(|e| {
+            AppError::Internal(format!("Failed to secure attachment directory: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
+async fn write_attachment_file_private(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), AppError> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create attachment: {e}")))?;
+    file.write_all(bytes)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to write attachment: {e}")))?;
+    Ok(())
+}
+
 async fn store_attachment_bytes(
     conversation_id: &str,
     original_name: String,
@@ -719,18 +766,14 @@ async fn store_attachment_bytes(
 ) -> Result<crate::api::types::FileAttachment, AppError> {
     validate_attachment_file(&original_name, &media_type, bytes.len())?;
     let dir = attachment_root().join(conversation_id);
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to create attachment directory: {e}")))?;
+    make_attachment_dir_private(&dir).await?;
     let filename = format!(
         "{}-{}",
         uuid::Uuid::new_v4(),
         sanitize_attachment_name(&original_name)
     );
     let path = dir.join(filename);
-    tokio::fs::write(&path, &bytes)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to write attachment: {e}")))?;
+    write_attachment_file_private(&path, &bytes).await?;
     Ok(crate::api::types::FileAttachment {
         original_name,
         media_type,
@@ -907,7 +950,8 @@ async fn create_conversation_with_id(
     // hydrate the input area with a draft and let the user review before
     // sending. For unseeded creates the text is still required.
     let is_seeded = req.seed_parent_id.is_some() || req.seed_label.is_some();
-    if !is_seeded && req.text.trim().is_empty() {
+    let has_file_content = !req.files.is_empty() || !raw_files.is_empty();
+    if !is_seeded && req.text.trim().is_empty() && req.images.is_empty() && !has_file_content {
         return Err(AppError::BadRequest(
             "Message text cannot be empty".to_string(),
         ));
@@ -5721,6 +5765,49 @@ mod file_read_tests {
                 assert_eq!(file_type, "text");
             }
             other => panic!("expected text response, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod attachment_storage_tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_attachment_name_to_basename_ascii() {
+        assert_eq!(
+            sanitize_attachment_name("../../secret notes.txt"),
+            "secret_notes.txt"
+        );
+        assert_eq!(sanitize_attachment_name("..."), "attachment");
+    }
+
+    #[tokio::test]
+    async fn writes_private_attachment_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("conv-1");
+        make_attachment_dir_private(&dir).await.expect("secure dir");
+        let file = dir.join("attachment.txt");
+        write_attachment_file_private(&file, b"hello")
+            .await
+            .expect("write file");
+        assert_eq!(tokio::fs::read(&file).await.expect("read"), b"hello");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            let file_mode = std::fs::metadata(&file)
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
         }
     }
 }

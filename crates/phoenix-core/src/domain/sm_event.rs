@@ -11,6 +11,7 @@ pub struct SteerEntry {
     pub text: String,
     pub llm_text: Option<String>,
     pub images: Vec<ImageData>,
+    #[serde(default)]
     pub files: Vec<FileAttachment>,
     pub message_id: String,
     pub user_agent: Option<String>,
@@ -864,6 +865,15 @@ mod steering_queue_envelope_tests {
         let decoded = decode_steering_queue("conv-2", &bare);
         assert_eq!(decoded.len(), 1);
         assert_eq!(decoded[0].message_id, "m-1");
+    }
+
+    #[test]
+    fn accepts_v1_entries_without_files_field() {
+        let json = r#"{"v":"v1","entries":[{"text":"queued","llm_text":null,"images":[],"message_id":"legacy","user_agent":null,"skill_invocation":null}]}"#;
+        let decoded = decode_steering_queue("conv-legacy", json);
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].message_id, "legacy");
+        assert!(decoded[0].files.is_empty());
     }
 
     /// The default column value `[]` parses as an empty queue.
