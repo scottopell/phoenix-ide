@@ -381,6 +381,62 @@ body {
   flex-shrink: 0;
 }
 
+/* Compact density — per-turn inline tool pill strip.
+   Reuses the breadcrumb pill visual primitive (.breadcrumb-item) for the
+   shell; these rules tune it for the in-message-list context (wraps instead
+   of horizontal-scrolls, tighter margin). Tool = purple, sub-agents = yellow,
+   matching the breadcrumb color language. */
+.compact-tool-strip {
+  margin: 4px 0;
+}
+
+.compact-tool-strip > nav {
+  display: block;
+}
+
+.compact-tool-strip > nav > div {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.compact-tool-pill {
+  color: var(--accent-purple);
+}
+
+.compact-tool-pill.subagents {
+  color: var(--accent-yellow);
+  background: rgb(210 153 34 / 15%);
+}
+
+.compact-tool-pill.error {
+  color: var(--accent-red, #f85149);
+  background: rgb(248 81 73 / 12%);
+}
+
+.compact-tool-pill.pending {
+  opacity: 0.6;
+}
+
+/* Compact density — short assistant prose folded to a faded one-liner.
+   Clickable; expands to full markdown. */
+.agent-text-collapsed {
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 13px;
+  line-height: 1.4;
+  padding: 2px 0;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-text-collapsed:hover {
+  color: var(--text-secondary);
+}
+
 /* Main Area */
 #main-area {
   flex: 1 1 auto;

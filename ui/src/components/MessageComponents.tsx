@@ -23,12 +23,15 @@ import type { BashToolInput } from '../generated/sse';
 import { cacheDB } from '../cache';
 import type { QueuedMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
+import { useDensity, isSignificantText } from '../hooks/useDensity';
 import { useConversationInlineStream } from '../hooks/useConversationInlineStream';
 
 import { linkifyText } from '../utils/linkify';
 import { CopyButton } from './CopyButton';
 import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
+import { PillStrip, type PillItem } from './PillStrip';
+import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -534,6 +537,113 @@ function QueuedUserMessageImpl({
 }
 
 // ============================================================================
+// Compact-density helpers
+// ============================================================================
+
+/** First non-empty line of a text block, collapsed to single-line whitespace
+ *  and ellipsized — the faded one-liner shown for insignificant prose in
+ *  compact mode. */
+function firstLineSummary(text: string, maxLen = 140): string {
+  const firstLine = text.split('\n').find((l) => l.trim()) ?? text;
+  const flat = firstLine.replace(/\s+/g, ' ').trim();
+  return flat.length > maxLen ? `${flat.slice(0, maxLen - 1)}…` : flat;
+}
+
+/**
+ * An assistant text block that, in compact mode, is below the significance
+ * threshold. Renders as a faded clickable one-liner that expands to the full
+ * markdown on click — never destructive, the full text is always one click
+ * away (and the title attr carries the first line for hover).
+ */
+const CollapsibleText = memo(CollapsibleTextImpl);
+
+function CollapsibleTextImpl({
+  text,
+  remarkPlugins,
+  components,
+}: {
+  text: string;
+  remarkPlugins: typeof REMARK_PLUGINS;
+  components: React.ComponentProps<typeof ReactMarkdown>['components'];
+}) {
+  const [expanded, setExpanded] = useState(false);
+
+  if (expanded) {
+    return (
+      <div className="agent-text-block">
+        <ReactMarkdown remarkPlugins={remarkPlugins} components={components}>
+          {text}
+        </ReactMarkdown>
+      </div>
+    );
+  }
+
+  const summary = firstLineSummary(text);
+  return (
+    <div
+      className="agent-text-collapsed"
+      role="button"
+      tabIndex={0}
+      title={summary}
+      onClick={() => setExpanded(true)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          setExpanded(true);
+        }
+      }}
+    >
+      {summary}
+    </div>
+  );
+}
+
+/**
+ * The inline mini pill-strip a compact-mode agent turn shows in place of its
+ * tool blocks. Built purely from the turn's own tool_use blocks + paired
+ * results (via `deriveToolStripItems`), never from phase/breadcrumb state.
+ * Clicking any pill calls `onExpand(toolId)` so the parent can reveal the full
+ * tool detail and scroll the clicked tool into view.
+ */
+const CompactToolStrip = memo(CompactToolStripImpl);
+
+function CompactToolStripImpl({
+  items,
+  onExpand,
+}: {
+  items: ToolStripItem[];
+  onExpand: (toolId: string) => void;
+}) {
+  const pills: PillItem[] = useMemo(
+    () =>
+      items.map((item, i) => {
+        const variant = item.isSubAgent ? 'subagents' : 'tool';
+        const classNames = [variant, item.isError ? 'error' : '', !item.hasResult ? 'pending' : '']
+          .filter(Boolean)
+          .join(' ');
+        return {
+          key: item.toolId || `${item.name}-${i}`,
+          label: item.name,
+          className: classNames,
+          ariaLabel: `${item.name}${item.isError ? ' (error)' : ''} — expand tool detail`,
+          onClick: () => onExpand(item.toolId),
+        };
+      }),
+    [items, onExpand],
+  );
+
+  return (
+    <div className="compact-tool-strip">
+      <PillStrip
+        items={pills}
+        pillClassName="compact-tool-pill breadcrumb-item"
+        arrowClassName="breadcrumb-arrow"
+      />
+    </div>
+  );
+}
+
+// ============================================================================
 // Agent Message Components
 // ============================================================================
 
@@ -556,7 +666,45 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
   const blocks = Array.isArray(message.content) ? (message.content as ContentBlock[]) : [];
   const timestamp = message.created_at;
   const { theme } = useTheme();
+  const { density } = useDensity();
+  const compact = density === 'compact';
   const syntaxStyle = theme === 'light' ? oneLight : oneDark;
+
+  // In compact mode, a turn's tool_use blocks collapse into a single inline
+  // pill strip rendered in place of the tool blocks; clicking a pill expands
+  // the full per-tool detail and scrolls the clicked tool into view.
+  // `think` blocks are never part of the strip — they always render as their
+  // own self-collapsing aside, in both densities.
+  const [toolsExpanded, setToolsExpanded] = useState(false);
+  // The tool the user clicked to expand; scrolled into view once the detail
+  // mounts. Cleared after the scroll so re-expansion is idempotent.
+  const pendingScrollToolIdRef = useRef<string | null>(null);
+
+  // Derived purely from this turn's own content blocks + paired results — the
+  // turn is the single source of truth for what it did (never phase state).
+  const toolStripItems = useMemo(
+    () => deriveToolStripItems(message, toolResults),
+    [message, toolResults],
+  );
+
+  const handleExpandTools = useCallback((toolId: string) => {
+    pendingScrollToolIdRef.current = toolId || null;
+    setToolsExpanded(true);
+  }, []);
+
+  // After the full tool detail mounts, scroll the clicked tool into view.
+  useEffect(() => {
+    if (!toolsExpanded) return;
+    const toolId = pendingScrollToolIdRef.current;
+    pendingScrollToolIdRef.current = null;
+    if (!toolId) return;
+    const el = document.querySelector(`[data-tool-id="${toolId}"]`);
+    el?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [toolsExpanded]);
+
+  // Compact mode collapses tools only when there is at least one strip item;
+  // a turn of pure prose / think asides has nothing to collapse.
+  const collapseTools = compact && !toolsExpanded && toolStripItems.length > 0;
 
   // Stable markdown component map — only recreated when onOpenFile identity changes.
   // Keeps ReactMarkdown from remounting SyntaxHighlighter on every parent re-render.
@@ -677,52 +825,85 @@ function AgentMessageImpl({ message, toolResults, onOpenFile, isFirstInTurn = tr
         </div>
       )}
       <div className="message-content">
-        {blocks.map((block, i) => {
-          if (block.type === 'text') {
-            // Skip empty text blocks - they produce empty bubbles
-            if (!block.text || block.text.trim() === '') {
-              return null;
+        {(() => {
+          // In compact mode, all of a turn's tool blocks collapse into one
+          // inline strip painted at the position of the first non-think tool
+          // block. We render it once and suppress the individual full tool
+          // blocks below; `think` asides still render inline (they're
+          // reasoning, not actions). A sentinel tracks whether the strip has
+          // already been emitted so it lands in document order.
+          let stripEmitted = false;
+          return blocks.map((block, i) => {
+            if (block.type === 'text') {
+              // Skip empty text blocks - they produce empty bubbles
+              if (!block.text || block.text.trim() === '') {
+                return null;
+              }
+              const remarkPlugins = usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS;
+              // Compact: short prose folds to a faded expandable one-liner.
+              // Substantial prose (>= threshold) always renders full.
+              if (compact && !isSignificantText(block.text)) {
+                return (
+                  <CollapsibleText
+                    key={i}
+                    text={block.text}
+                    remarkPlugins={remarkPlugins}
+                    components={markdownComponents}
+                  />
+                );
+              }
+              return (
+                <div key={i} className="agent-text-block">
+                  <ReactMarkdown remarkPlugins={remarkPlugins} components={markdownComponents}>
+                    {block.text}
+                  </ReactMarkdown>
+                </div>
+              );
+            } else if (block.type === 'tool_use') {
+              // `think` renders as a subtle inline aside, not the full tool-block
+              // shell — it's model reasoning, not an action. Collapsed by default,
+              // identical in both densities.
+              if (block.name === 'think') {
+                return <ThinkAside key={block.id || i} block={block} />;
+              }
+              // Compact + not yet expanded: paint the collapsed strip once, in
+              // place of the first tool block; suppress the rest.
+              if (collapseTools) {
+                if (stripEmitted) return null;
+                stripEmitted = true;
+                return (
+                  <CompactToolStrip
+                    key="compact-tool-strip"
+                    items={toolStripItems}
+                    onExpand={handleExpandTools}
+                  />
+                );
+              }
+              // REQ-WPV-002: read the per-tool start time from the
+              // parent assistant message's `display_data.tool_starts`
+              // (typed `{ [tool_use_id]: unix_ms }` on the Rust side).
+              // When present, the widget renders a live elapsed counter
+              // that survives reconnect / reload / multi-tab.
+              const toolStartsMap = (message.display_data as Record<string, unknown> | undefined)?.[
+                'tool_starts'
+              ] as Record<string, number> | undefined;
+              const toolStartedAtMs =
+                block.id && toolStartsMap && typeof toolStartsMap[block.id] === 'number'
+                  ? (toolStartsMap[block.id] as number)
+                  : undefined;
+              return (
+                <ToolUseBlock
+                  key={block.id || i}
+                  block={block}
+                  result={toolResults.get(block.id || '')}
+                  onOpenFile={onOpenFile}
+                  toolStartedAtMs={toolStartedAtMs}
+                />
+              );
             }
-            return (
-              <div key={i} className="agent-text-block">
-                <ReactMarkdown
-                  remarkPlugins={usesGfmSyntax(block.text) ? REMARK_PLUGINS : NO_REMARK_PLUGINS}
-                  components={markdownComponents}
-                >
-                  {block.text}
-                </ReactMarkdown>
-              </div>
-            );
-          } else if (block.type === 'tool_use') {
-            // `think` renders as a subtle inline aside, not the full tool-block
-            // shell — it's model reasoning, not an action. Collapsed by default.
-            if (block.name === 'think') {
-              return <ThinkAside key={block.id || i} block={block} />;
-            }
-            // REQ-WPV-002: read the per-tool start time from the
-            // parent assistant message's `display_data.tool_starts`
-            // (typed `{ [tool_use_id]: unix_ms }` on the Rust side).
-            // When present, the widget renders a live elapsed counter
-            // that survives reconnect / reload / multi-tab.
-            const toolStartsMap = (message.display_data as Record<string, unknown> | undefined)?.[
-              'tool_starts'
-            ] as Record<string, number> | undefined;
-            const toolStartedAtMs =
-              block.id && toolStartsMap && typeof toolStartsMap[block.id] === 'number'
-                ? (toolStartsMap[block.id] as number)
-                : undefined;
-            return (
-              <ToolUseBlock
-                key={block.id || i}
-                block={block}
-                result={toolResults.get(block.id || '')}
-                onOpenFile={onOpenFile}
-                toolStartedAtMs={toolStartedAtMs}
-              />
-            );
-          }
-          return null;
-        })}
+            return null;
+          });
+        })()}
       </div>
     </div>
   );
