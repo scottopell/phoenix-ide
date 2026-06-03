@@ -962,8 +962,8 @@ def cmd_up(
 # Representative conversations:
 #   - Direct mode (no git required): standalones + 3-member and 2-member chains
 #   - Explore mode (managed, read-only) chain
-#   - Branch mode: NOT seeded -- requires real `git worktree add` plumbing.
-#     Use the UI's "Branch mode" picker for those scenarios.
+#   - Branch mode diff-review fixture backed by a deterministic local git repo
+#     under `.phoenix/seed-worktrees/diff-review-fixture`.
 #   - Work mode: NOT seeded -- only reachable via propose_task / approval
 #     (human-in-the-loop by design; cannot be faked without a real commit).
 #
@@ -980,6 +980,7 @@ _SEED_CHAIN_3_TEXT = (
 )
 _SEED_CHAIN_2_TEXT = "Debug memory leak in the background worker service"
 _SEED_EXPLORE_TEXT = "Analyze the project structure and summarise the key architectural components"
+_SEED_DIFF_REVIEW_TEXT = "Review the seeded Branch-mode diff fixture"
 
 _SEED_CONTEXT_SUMMARY = "Context limit reached after extended session"
 
@@ -1167,6 +1168,161 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             (proj_id, canonical_path, now),
         )
         return proj_id
+
+    def _run_seed_git(cwd: Path, args: list[str]) -> None:
+        env = os.environ.copy()
+        env.update({
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        })
+        result = subprocess.run(
+            ["git", *args],
+            cwd=cwd,
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"git {' '.join(args)} failed in {cwd}:\n{result.stdout}{result.stderr}"
+            )
+
+    def _write_text(path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+    def _ensure_seed_diff_worktree() -> Path:
+        """Create the deterministic Branch-mode diff fixture worktree."""
+        fixture = ROOT / ".phoenix" / "seed-worktrees" / "diff-review-fixture"
+        if fixture.exists():
+            shutil.rmtree(fixture)
+        fixture.mkdir(parents=True, exist_ok=True)
+
+        _run_seed_git(fixture, ["init", "-q", "-b", "main"])
+        for key, value in [
+            ("user.email", "seed@example.invalid"),
+            ("user.name", "Phoenix Seed"),
+            ("commit.gpgsign", "false"),
+            ("diff.mnemonicPrefix", "false"),
+        ]:
+            _run_seed_git(fixture, ["config", key, value])
+
+        seed_file = fixture / "seed-diff-fixture.txt"
+        _write_text(
+            seed_file,
+            "Phoenix seeded diff fixture\n"
+            "baseline line retained for context\n"
+            "line changed by branch commit\n",
+        )
+        _run_seed_git(fixture, ["add", "seed-diff-fixture.txt"])
+        _run_seed_git(fixture, ["commit", "-q", "-m", "seed baseline"])
+
+        _run_seed_git(fixture, ["checkout", "-q", "-b", "seed-diff-review"])
+        _write_text(
+            seed_file,
+            "Phoenix seeded diff fixture\n"
+            "baseline line retained for context\n"
+            "line changed by branch commit (committed)\n",
+        )
+        _write_text(
+            fixture / "committed-review-note.txt",
+            "This file exists only on the seeded review branch.\n",
+        )
+        _run_seed_git(fixture, ["add", "seed-diff-fixture.txt", "committed-review-note.txt"])
+        _run_seed_git(fixture, ["commit", "-q", "-m", "seed committed diff"])
+
+        _write_text(
+            seed_file,
+            "Phoenix seeded diff fixture\n"
+            "baseline line retained for context\n"
+            "line changed by branch commit (committed)\n"
+            "line changed in the working tree (uncommitted)\n",
+        )
+        _write_text(
+            fixture / "uncommitted-review-note.txt",
+            "This untracked file demonstrates the uncommitted diff section.\n",
+        )
+        return fixture
+
+    def _ensure_diff_review_fixture(
+        conn: sqlite3.Connection,
+        *,
+        project_id: str,
+    ) -> bool:
+        """Ensure a Branch-mode conversation with a deterministic committed and uncommitted diff exists."""
+        worktree = _ensure_seed_diff_worktree()
+        slug = "fixture-diff-review"
+        existing = conn.execute(
+            "SELECT id, archived FROM conversations WHERE slug = ?",
+            (slug,),
+        ).fetchone()
+        if existing is not None:
+            conv_id, archived = existing
+            message_count = conn.execute(
+                "SELECT COUNT(*) FROM messages WHERE conversation_id = ?",
+                (conv_id,),
+            ).fetchone()[0]
+            conv_mode = conn.execute(
+                "SELECT conv_mode FROM conversations WHERE id = ?",
+                (conv_id,),
+            ).fetchone()[0]
+            try:
+                parsed_mode = json.loads(conv_mode)
+            except Exception:
+                parsed_mode = {}
+            if (
+                archived == 0
+                and message_count == 1
+                and parsed_mode.get("mode") == "Branch"
+                and parsed_mode.get("worktree_path") == str(worktree)
+            ):
+                return False
+            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+            conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+
+        conv_id = str(_uuid.uuid4())
+        state_json = json.dumps({"type": "idle"})
+        mode_json = json.dumps({
+            "mode": "Branch",
+            "branch_name": "seed-diff-review",
+            "worktree_path": str(worktree),
+            "base_branch": "main",
+        })
+        conn.execute(
+            "INSERT INTO conversations ("
+            " id, slug, title, cwd, parent_conversation_id, user_initiated,"
+            " state, state_updated_at, created_at, updated_at, archived,"
+            " model, project_id, conv_mode, desired_base_branch,"
+            " seed_parent_id, seed_label"
+            ") VALUES (?, ?, ?, ?, NULL, 1, ?, ?, ?, ?, 0, 'mock', ?, ?, NULL, NULL, ?)",
+            (
+                conv_id,
+                slug,
+                "Fixture Diff Review",
+                str(worktree),
+                state_json,
+                now,
+                now,
+                now,
+                project_id,
+                mode_json,
+                "qa:diff-review",
+            ),
+        )
+        msg_id = str(_uuid.uuid4())
+        conn.execute(
+            "INSERT INTO messages ("
+            " message_id, conversation_id, sequence_id, message_type,"
+            " content, created_at"
+            ") VALUES (?, ?, 0, 'user', ?, ?)",
+            (
+                msg_id,
+                conv_id,
+                json.dumps({"text": _SEED_DIFF_REVIEW_TEXT, "images": []}),
+                now,
+            ),
+        )
+        return True
 
     def _insert_conv(
         conn: sqlite3.Connection,
@@ -1586,6 +1742,10 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
                 conv_mode=direct_mode,
                 cwd=str(ROOT),
             )
+            created_diff_fixture = _ensure_diff_review_fixture(
+                conn,
+                project_id=project_id,
+            )
             conn.commit()
             if not quiet_if_populated:
                 count = _existing_active_count(conn)
@@ -1594,14 +1754,16 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
                     suffixes.append("repaired perf fixture")
                 if created_heavy_fixture:
                     suffixes.append("repaired heavy fixture")
+                if created_diff_fixture:
+                    suffixes.append("repaired diff fixture")
                 suffix = f" + {', '.join(suffixes)}" if suffixes else ""
                 print(f"✓ Dev DB already populated ({count} conversations) — skipping seed{suffix}.")
             return
 
         print("Seeding dev DB with representative conversations...")
 
-        # [1/3] Direct standalones
-        print("  [1/3] Direct standalones")
+        # [1/4] Direct standalones
+        print("  [1/4] Direct standalones")
         for text in _SEED_DIRECT_STANDALONES:
             _insert_conv(
                 conn,
@@ -1611,8 +1773,8 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
                 project_id=project_id,
             )
 
-        # [2/3] Direct chains (3-member + 2-member)
-        print("  [2/3] Direct chains (3-member + 2-member)")
+        # [2/4] Direct chains (3-member + 2-member)
+        print("  [2/4] Direct chains (3-member + 2-member)")
         id1, slug1 = _insert_conv(
             conn, text=_SEED_CHAIN_3_TEXT, conv_mode=direct_mode,
             cwd=str(ROOT), project_id=project_id,
@@ -1638,8 +1800,8 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
             conv_mode=direct_mode, cwd=str(ROOT), project_id=project_id,
         )
 
-        # [3/3] Explore mode chain
-        print("  [3/3] Explore mode chain (2-member)")
+        # [3/4] Explore mode chain
+        print("  [3/4] Explore mode chain (2-member)")
         eid1, eslug1 = _insert_conv(
             conn, text=_SEED_EXPLORE_TEXT, conv_mode=explore_mode,
             cwd=str(ROOT), project_id=project_id,
@@ -1648,6 +1810,13 @@ def cmd_seed(quiet_if_populated: bool = False) -> None:
         _link_continuation(
             conn, parent_id=eid1, parent_slug=eslug1, chain_index=2,
             conv_mode=explore_mode, cwd=str(ROOT), project_id=project_id,
+        )
+
+        # [4/4] Branch diff fixture
+        print("  [4/4] Branch diff fixture")
+        _ensure_diff_review_fixture(
+            conn,
+            project_id=project_id,
         )
 
         _ensure_conversation_load_fixture(
