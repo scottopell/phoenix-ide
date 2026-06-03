@@ -110,7 +110,6 @@ describe('ViewerSlot — structural single-slot mutex', () => {
     act(() => { h.get().openProse('/repo/a.ts', '/repo', { kind: 'line', lineNumber: 1.5 }); });
     expect(h.search()).not.toContain('line=');
   });
-
 });
 
 describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
@@ -151,6 +150,18 @@ describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
     act(() => { h.get().openBrowser(); });
     expect(h.search()).toContain('viewer=browser');
     expect(h.search()).not.toContain('presentation=');
+  });
+
+  it('ignores malformed line params instead of jumping to parsed prefixes', () => {
+    const junk = renderSlot('/c/conv-A?viewer=prose&file=%2Frepo%2Fa.ts&root=%2Frepo&line=42junk');
+    expect(junk.get().slot.kind).toBe('prose');
+    const junkSlot = junk.get().slot;
+    if (junkSlot.kind === 'prose') expect(junkSlot.file.focusLine).toBeUndefined();
+
+    const decimal = renderSlot('/c/conv-A?viewer=prose&file=%2Frepo%2Fa.ts&root=%2Frepo&line=1.5');
+    expect(decimal.get().slot.kind).toBe('prose');
+    const decimalSlot = decimal.get().slot;
+    if (decimalSlot.kind === 'prose') expect(decimalSlot.file.focusLine).toBeUndefined();
   });
 });
 
@@ -200,10 +211,6 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
   });
 
   it('entering a conversation whose session is already active is NOT a rising edge', () => {
-    // The provider stays mounted across conversation switches; only scopeKey +
-    // browserSessionActive change. A scope change must reseed the edge tracker,
-    // so entering a conversation that already had an active session does not
-    // auto-open the browser (only a session that *just* started does).
     let latest: ViewerSlotValue | null = null;
     let setScope: ((s: string) => void) | null = null;
     let setActive: ((v: boolean) => void) | null = null;
@@ -226,7 +233,6 @@ describe('ViewerSlot — browser-session edges (REQ-VS-008/009)', () => {
       </MemoryRouter>,
     );
     expect(latest!.slot.kind).toBe('none');
-    // Switch to a different conversation that already has an active session.
     act(() => { setScope!('conv-B'); setActive!(true); });
     expect(latest!.slot.kind).toBe('none');
   });

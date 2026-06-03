@@ -3329,7 +3329,7 @@ async fn search_conversation_code(
         let Ok(bytes) = fs::read(abs_path) else {
             continue;
         };
-        if !is_valid_text(&bytes) {
+        if bytes.contains(&0) {
             continue;
         }
         let Ok(content) = String::from_utf8(bytes) else {
