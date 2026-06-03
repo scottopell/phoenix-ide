@@ -401,6 +401,14 @@ export function TerminalPanel({
       fontFamily: '"SauceCodePro NF Mono", "Cascadia Code", "JetBrains Mono", "Fira Code", monospace',
       fontSize: 13,
       scrollback: 1000,
+      // When the PTY child is `tmux attach` with `mouse on`, tmux requests
+      // SGR mouse tracking, so xterm forwards drags to tmux instead of making
+      // a local DOM selection — which is what term.getSelection() (send-to-LLM)
+      // and highlight-to-copy both rely on. xterm honors Shift+drag to force a
+      // local selection on every platform; this opt extends that to Option+drag
+      // on macOS so the usual "hold Shift or Alt to escape the app's mouse
+      // grab" muscle memory works here too.
+      macOptionClickForcesSelection: true,
     });
     const fitAddon = new FitAddon();
     term.loadAddon(fitAddon);
@@ -420,9 +428,11 @@ export function TerminalPanel({
     // Returning `false` from the custom handler tells xterm.js to skip
     // its own processing of the event; preventDefault stops the browser
     // default (some browsers focus the URL bar on Cmd+L). The shortcut
-    // works regardless of OSC 133 status or whether a command is running,
-    // and works identically whether the PTY child is a direct shell or
-    // `tmux attach` — xterm.js owns the DOM selection in both cases.
+    // works regardless of OSC 133 status or whether a command is running.
+    // It reads xterm's own selection: under a direct shell any drag selects;
+    // under `tmux attach` with mouse tracking on, the drag must hold Shift
+    // (any platform) or Alt (macOptionClickForcesSelection) to escape tmux's
+    // mouse grab and land an xterm-side selection.
     term.attachCustomKeyEventHandler((e) => {
       if (e.type !== 'keydown') return true;
       const isSendSelection =
@@ -550,6 +560,49 @@ export function TerminalPanel({
       return true;
     });
 
+    // --- OSC 52 clipboard write ---
+    // tmux runs with `set-clipboard on`, so when text is copied inside a tmux
+    // copy-mode selection (the plain mouse-drag path under `mouse on`) tmux
+    // emits `OSC 52 ; <targets> ; <base64>` to its client — us. Route it to the
+    // system clipboard so a plain drag-select copies, mirroring how a native
+    // terminal forwards OSC 52 to the OS. A `?` payload is a clipboard *read*
+    // query; we never answer it (answering would leak clipboard contents to
+    // whatever is running in the PTY).
+    const handleOsc52 = (data: string): void => {
+      const semi = data.indexOf(';');
+      const payload = semi === -1 ? data : data.slice(semi + 1);
+      if (payload === '?' || payload === '') return;
+      let text: string;
+      try {
+        const bytes = Uint8Array.from(atob(payload), (c) => c.charCodeAt(0));
+        text = new TextDecoder().decode(bytes);
+      } catch {
+        console.debug('OSC 52 base64 decode failed');
+        return;
+      }
+      void copyToClipboard(text);
+    };
+    const osc52Dispose = term.parser.registerOscHandler(52, (data: string) => {
+      handleOsc52(data);
+      return true;
+    });
+
+    // Highlight-to-copy: when xterm owns the selection (Shift/Alt+drag escapes
+    // tmux's mouse grab, or a direct-shell child with no mouse tracking), mirror
+    // the finished selection to the system clipboard. Debounced so a drag copies
+    // once on settle rather than on every intermediate selectionChange. The same
+    // selection also feeds Cmd/Ctrl+Shift+L send-to-LLM above.
+    let selectionCopyTimer: number | null = null;
+    const disposeSelectionCopy = term.onSelectionChange(() => {
+      if (selectionCopyTimer !== null) window.clearTimeout(selectionCopyTimer);
+      selectionCopyTimer = window.setTimeout(() => {
+        selectionCopyTimer = null;
+        if (!term.hasSelection()) return;
+        const sel = term.getSelection();
+        if (sel.length > 0) void copyToClipboard(sel);
+      }, 120);
+    });
+
     // --- Detection timeout (REQ-TERM-015) ---
     detectionTimeoutRef.current = window.setTimeout(() => {
       detectionTimeoutRef.current = null;
@@ -654,6 +707,12 @@ export function TerminalPanel({
         disposeOnData.dispose();
         osc133Dispose.dispose();
         osc7Dispose.dispose();
+        osc52Dispose.dispose();
+        disposeSelectionCopy.dispose();
+        if (selectionCopyTimer !== null) {
+          window.clearTimeout(selectionCopyTimer);
+          selectionCopyTimer = null;
+        }
         window.removeEventListener('resize', handleResize);
         if (activityTimeoutRef.current !== null) {
           window.clearTimeout(activityTimeoutRef.current);
