@@ -92,6 +92,23 @@ describe('ViewerSlot — structural single-slot mutex', () => {
     expect(h.search()).toContain('viewer=prose');
     expect(h.search()).toContain('file=%2Frepo%2Fb.ts');
   });
+
+  it('writes only valid positive integer line targets for prose opens', () => {
+    const h = renderSlot();
+
+    act(() => { h.get().openProse('/repo/a.ts', '/repo', { kind: 'line', lineNumber: 42 }); });
+    expect(h.get().slot.kind).toBe('prose');
+    if (h.get().slot.kind === 'prose') expect(h.get().slot.file.focusLine).toBe(42);
+    expect(h.search()).toContain('line=42');
+
+    act(() => { h.get().openProse('/repo/a.ts', '/repo', { kind: 'line', lineNumber: 0 }); });
+    expect(h.search()).not.toContain('line=');
+    if (h.get().slot.kind === 'prose') expect(h.get().slot.file.focusLine).toBeUndefined();
+
+    act(() => { h.get().openProse('/repo/a.ts', '/repo', { kind: 'line', lineNumber: 1.5 }); });
+    expect(h.search()).not.toContain('line=');
+  });
+
 });
 
 describe('ViewerSlot — malformed URL normalization (REQ-VS-012)', () => {
