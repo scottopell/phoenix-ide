@@ -211,7 +211,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Send (with expansion error handling — REQ-IR-007)
   // =========================================================================
 
-  const { reset: resetRefs, setExpansionError } = ir;
+  const { reset: resetRefs, setExpansionError, expansionError } = ir;
 
   const handleSend = useCallback(async () => {
     let text: string;
@@ -223,6 +223,10 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
     if (!text && images.length === 0) return;
     if (blocksComposerSend) return;
+    // The Send button is disabled while an expansion error is shown; gate the
+    // keyboard (Enter) path too so a stale broken @reference isn't resubmitted
+    // before it's corrected (REQ-IR-007).
+    if (expansionError) return;
     // Allow send while agent is working — the server will queue it as a
     // steering message and deliver it when the conversation reaches Idle.
 
@@ -266,6 +270,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     draft,
     images,
     blocksComposerSend,
+    expansionError,
     onSend,
     clearDraft,
     resetRefs,

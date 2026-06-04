@@ -51,6 +51,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     ir.onValueChange(next);
   };
   const handleSend = async () => {
+    // The Send buttons are disabled while an expansion error is shown; gate the
+    // keyboard (Enter) path too so a stale broken @reference can't be resubmitted
+    // before it's corrected.
+    if (ir.expansionError) return;
     ir.reset();
     try {
       await conv.handleSend();

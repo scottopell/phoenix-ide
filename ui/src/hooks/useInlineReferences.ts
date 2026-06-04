@@ -109,8 +109,10 @@ export function useInlineReferences({
   const searchAbortRef = useRef<AbortController | null>(null);
   /** Debounce timer for file search. */
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /** Guards against duplicate in-flight skill fetches. */
-  const fetchingSkillsRef = useRef(false);
+  /** Guards against duplicate in-flight skill fetches. Holds the `cwd` of the
+   *  in-flight request (undefined when idle) so a fetch for directory A does not
+   *  suppress the fetch for directory B after a switch. */
+  const fetchingSkillsCwdRef = useRef<string | undefined>(undefined);
   /**
    * Latest requested `cwd`. A fetch issued for directory A may resolve after
    * the composer has switched to directory B; comparing against this ref lets
@@ -171,8 +173,8 @@ export function useInlineReferences({
   /** Fetch and cache available skills for this directory (once per scope). */
   const fetchSkillItems = useCallback(async () => {
     if (!cwd) return;
-    if (fetchingSkillsRef.current) return;
-    fetchingSkillsRef.current = true;
+    if (fetchingSkillsCwdRef.current === cwd) return;
+    fetchingSkillsCwdRef.current = cwd;
     try {
       const result = await api.listProjectSkills(cwd);
       // Drop the response if the directory changed while it was in flight.
@@ -180,9 +182,9 @@ export function useInlineReferences({
       setSkillItems(result.skills);
     } catch (err) {
       console.warn('Skill list failed:', err);
-      setSkillItems([]);
+      if (latestCwdRef.current === cwd) setSkillItems([]);
     } finally {
-      fetchingSkillsRef.current = false;
+      if (fetchingSkillsCwdRef.current === cwd) fetchingSkillsCwdRef.current = undefined;
     }
   }, [cwd, setSkillItems]);
 
