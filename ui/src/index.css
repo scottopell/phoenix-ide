@@ -2136,6 +2136,101 @@ pre:hover .copy-btn {
   overflow: auto;
 }
 
+/* ── Sub-agent side-docked viewer ──────────────────────────────────────── */
+.subagent-viewer-panel {
+  flex-shrink: 0;
+  border-left: 1px solid var(--border-color);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-primary);
+  overflow: hidden;
+}
+
+.subagent-viewer-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border-color);
+  flex-shrink: 0;
+}
+
+.subagent-viewer-heading {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.subagent-viewer-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.subagent-viewer-subtitle {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.subagent-viewer-action {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: none;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+}
+
+.subagent-viewer-action:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.subagent-viewer-action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.subagent-viewer-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 8px;
+}
+
+/* The shared transcript renderer is styled as an inline card; inside the
+   docked viewer it fills the scroll area instead. */
+.subagent-viewer-content .subagent-activity-panel {
+  margin: 0;
+  padding: 0;
+  border: none;
+  background: transparent;
+  max-height: none;
+  overflow: visible;
+}
+
+.subagent-viewer-content .subagent-final-result {
+  margin-top: 8px;
+}
+
+.subagent-viewer-result-text {
+  white-space: pre-wrap;
+  font-size: 13px;
+  line-height: 1.4;
+  color: var(--text-primary);
+}
+
 .subagent-activity-meta {
   display: flex;
   gap: 10px;

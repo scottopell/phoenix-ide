@@ -23,7 +23,9 @@ import type { BashToolInput } from '../generated/sse';
 import { cacheDB } from '../cache';
 import type { QueuedMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
+import { useIsDesktop } from '../hooks';
 import { useConversationInlineStream } from '../hooks/useConversationInlineStream';
+import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
 
 import { linkifyText } from '../utils/linkify';
 import { CopyButton } from './CopyButton';
@@ -1676,7 +1678,13 @@ function ChildAgentActivity({ message, toolResults }: { message: Message; toolRe
   );
 }
 
-function ChildConversationActivity({ agentId, expanded, running }: { agentId: string; expanded: boolean; running: boolean }) {
+/**
+ * Read-only sub-agent transcript, driven by the inline stream. Used both as
+ * the inline peek inside the parent's `spawn_agents` card (truncated to the
+ * latest steps) and, with `full`, as the body of the side-docked
+ * `SubAgentViewerPanel` (every step, scrollable).
+ */
+export function ChildConversationActivity({ agentId, expanded, running, full = false }: { agentId: string; expanded: boolean; running: boolean; full?: boolean }) {
   const inline = useConversationInlineStream(agentId, expanded, running);
 
   if (!expanded) return null;
@@ -1684,7 +1692,7 @@ function ChildConversationActivity({ agentId, expanded, running }: { agentId: st
   const { atom } = inline;
   const toolResults = buildToolResults(atom.messages);
   const agentMessages = atom.messages.filter((m) => m.message_type === 'agent' || m.type === 'agent');
-  const visibleAgentMessages = agentMessages.slice(-12);
+  const visibleAgentMessages = full ? agentMessages : agentMessages.slice(-12);
   const hiddenCount = Math.max(0, agentMessages.length - visibleAgentMessages.length);
   const toolCount = countToolUses(atom.messages);
 
@@ -1737,7 +1745,7 @@ function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; tas
           <span className={`subagent-status ${statusClass}`}>{getStatusLabel(status)}</span>
           <span className="subagent-expand-toggle">{expanded ? <ChevronUpIcon /> : <ChevronDownIcon />}</span>
         </button>
-        <OpenConversationButton agentId={agentId} />
+        <OpenConversationButton agentId={agentId} task={task} running={running} resultText={resultText} />
       </div>
       {resultText && !expanded && (
         <div className="subagent-result preview">{truncate(resultText, 180)}</div>
@@ -1818,14 +1826,56 @@ const ExternalLinkIcon = () => (
 );
 
 /**
- * Navigates to a sub-agent's conversation. Sub-agent `agent_id` is the
- * child conversation_id by construction (runtime/executor.rs invariant);
- * the route is keyed by slug, so resolve via cacheDB (populated by the
- * sidebar poll + SSE) with a REST fallback for the rare cache miss.
- * Renders nothing if the conversation can't be resolved (e.g. deleted).
+ * Resolves a sub-agent's slug and navigates to its full conversation page.
+ * Sub-agent `agent_id` is the child conversation_id by construction
+ * (runtime/executor.rs invariant); the route is keyed by slug, so resolve via
+ * cacheDB (populated by the sidebar poll + SSE) with a REST fallback for the
+ * rare cache miss. Hides itself only on a 404 (conversation deleted).
+ *
+ * This is the fallback path for `OpenConversationButton` — on desktop the
+ * default action opens the sub-agent in the side panel instead.
  */
-function OpenConversationButton({ agentId }: { agentId: string }) {
+// eslint-disable-next-line react-refresh/only-export-components
+export async function navigateToSubAgent(
+  agentId: string,
+  navigate: (path: string) => void,
+): Promise<'ok' | 'missing'> {
+  const cached = await cacheDB.getConversation(agentId);
+  if (cached?.slug) {
+    navigate(`/c/${cached.slug}`);
+    return 'ok';
+  }
+  // Cache miss: ask the server. `getConversationSlug` returns null only for
+  // 404 (conversation deleted) — that's the one case the caller hides the
+  // button. Transient failures throw and leave the button in place.
+  const slug = await api.getConversationSlug(agentId);
+  if (slug) {
+    navigate(`/c/${slug}`);
+    return 'ok';
+  }
+  return 'missing';
+}
+
+/**
+ * Opens a sub-agent's conversation. On desktop (where a `SubAgentViewerProvider`
+ * is mounted) this docks the sub-agent in the side panel so the parent stays
+ * visible; on mobile, or absent the provider, it falls back to navigating to
+ * the sub-agent's full page.
+ */
+function OpenConversationButton({
+  agentId,
+  task,
+  running,
+  resultText,
+}: {
+  agentId: string;
+  task: string;
+  running: boolean;
+  resultText: string;
+}) {
   const navigate = useNavigate();
+  const viewer = useSubAgentViewer();
+  const isDesktop = useIsDesktop();
   const [busy, setBusy] = useState(false);
   const [missing, setMissing] = useState(false);
   // Synchronous guard against fast double-clicks. `busy` state lags by a
@@ -1833,25 +1883,19 @@ function OpenConversationButton({ agentId }: { agentId: string }) {
   // guard; a ref flips immediately.
   const inFlight = useRef(false);
 
+  const usePanel = viewer !== null && isDesktop;
+
   const onClick = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
+    if (usePanel) {
+      viewer.open({ agentId, task, running, resultText });
+      return;
+    }
     if (inFlight.current) return;
     inFlight.current = true;
     setBusy(true);
     try {
-      const cached = await cacheDB.getConversation(agentId);
-      if (cached?.slug) {
-        navigate(`/c/${cached.slug}`);
-        return;
-      }
-      // Cache miss: ask the server. `getConversationSlug` returns null only
-      // for 404 (conversation deleted) — that's the one case where we hide
-      // the button permanently. Transient failures throw and we leave the
-      // button in place so the user can retry.
-      const slug = await api.getConversationSlug(agentId);
-      if (slug) {
-        navigate(`/c/${slug}`);
-      } else {
+      if ((await navigateToSubAgent(agentId, navigate)) === 'missing') {
         setMissing(true);
       }
     } catch {
@@ -1860,17 +1904,18 @@ function OpenConversationButton({ agentId }: { agentId: string }) {
       inFlight.current = false;
       setBusy(false);
     }
-  }, [agentId, navigate]);
+  }, [usePanel, viewer, agentId, task, running, resultText, navigate]);
 
   if (missing) return null;
 
+  const label = usePanel ? 'Open sub-agent in side panel' : 'Open sub-agent conversation';
   return (
     <button
       type="button"
       className="subagent-open-link"
       onClick={onClick}
-      title="Open sub-agent conversation"
-      aria-label="Open sub-agent conversation"
+      title={label}
+      aria-label={label}
       disabled={busy}
     >
       <ExternalLinkIcon />

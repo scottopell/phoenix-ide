@@ -9,6 +9,8 @@ import { useResizablePane, useIsDesktop } from '../hooks';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
+import { SubAgentViewerProvider, useSubAgentViewer } from '../contexts/SubAgentViewerContext';
+import { SubAgentViewerPanel } from './SubAgentViewerPanel';
 import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
@@ -23,6 +25,33 @@ import {
 
 interface DesktopLayoutProps {
   children: React.ReactNode;
+}
+
+/**
+ * Right-docked sub-agent viewer. Owns its own resizable width and renders
+ * nothing until a sub-agent is opened. A descendant of SubAgentViewerProvider,
+ * mounted only on desktop so the panel never appears where there's no room.
+ */
+function SubAgentViewerDock() {
+  const viewer = useSubAgentViewer();
+  const pane = useResizablePane({
+    key: 'subagent-viewer-width',
+    min: 320,
+    max: () => Math.max(360, Math.round(window.innerWidth * 0.6)),
+    defaultSize: 460,
+  });
+  if (!viewer?.opened) return null;
+  return (
+    <>
+      <PaneDivider
+        orientation="vertical"
+        title="Drag to resize • Double-click to close"
+        onPointerDown={(e) => pane.startDrag(e, 'x', true)}
+        onDoubleClick={viewer.close}
+      />
+      <SubAgentViewerPanel opened={viewer.opened} onClose={viewer.close} width={pane.size} />
+    </>
+  );
 }
 
 export function DesktopLayout({ children }: DesktopLayoutProps) {
@@ -102,6 +131,7 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   // See task 08664: previously the early-return on !isDesktop produced a
   // different React tree, unmounting ConversationPage and resetting its state.
   return (
+    <SubAgentViewerProvider>
     <ViewerSlotProvider
       scopeKey={activeSlug ?? undefined}
       browserSessionActive={activeConversation?.browser_session_active ?? false}
@@ -152,10 +182,12 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
         <div className={isDesktop ? 'desktop-main' : undefined}>
           {children}
         </div>
+        {isDesktop && <SubAgentViewerDock />}
         {isDesktop && <CommandPalette conversations={conversations} activeConversation={activeConversation} />}
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>
      </FileExplorerProvider>
     </ViewerSlotProvider>
+    </SubAgentViewerProvider>
   );
 }
