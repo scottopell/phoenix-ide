@@ -2322,14 +2322,14 @@ pre:hover .copy-btn {
   border-radius: 4px;
 }
 
-.subagent-viewer-action:hover:not(:disabled) {
-  color: var(--text-primary);
-  background: var(--bg-tertiary);
-}
-
 .subagent-viewer-action:disabled {
   opacity: 0.5;
   cursor: default;
+}
+
+.subagent-viewer-action:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
 }
 
 .subagent-viewer-content {
@@ -2348,10 +2348,6 @@ pre:hover .copy-btn {
   background: transparent;
   max-height: none;
   overflow: visible;
-}
-
-.subagent-viewer-content .subagent-final-result {
-  margin-top: 8px;
 }
 
 .subagent-viewer-result-text {
@@ -2451,6 +2447,13 @@ pre:hover .copy-btn {
 .subagent-final-result.failure,
 .subagent-final-result.timed-out {
   border-color: rgb(248 81 73 / 35%);
+}
+
+/* In the docked viewer the final-outcome block is full-width (the base rule's
+   left indent is for the inline card). Placed after the base selector to keep
+   ascending specificity (stylelint no-descending-specificity). */
+.subagent-viewer-content .subagent-final-result {
+  margin: 8px 0 0;
 }
 
 .subagent-final-result-label {

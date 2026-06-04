@@ -172,9 +172,9 @@ fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
 /// sub-agents finish, and the marker is still on the last user message).
 fn already_spawned_agents(request: &LlmRequest) -> bool {
     request.messages.iter().any(|m| {
-        m.content.iter().any(
-            |b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "spawn_agents"),
-        )
+        m.content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "spawn_agents"))
     })
 }
 
@@ -593,7 +593,8 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
         }
 
         Scenario::SpawnAgents => {
-            let text = "I'll spawn two read-only sub-agents to investigate in parallel.".to_string();
+            let text =
+                "I'll spawn two read-only sub-agents to investigate in parallel.".to_string();
             (
                 vec![
                     ContentBlock::Text { text: text.clone() },
