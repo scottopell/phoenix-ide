@@ -46,7 +46,20 @@ fn user_data_dir_for_key(scope_key: &str) -> String {
             .try_into()
             .expect("SHA-256 digest is 32 bytes; first 8 always fits a u64"),
     );
-    format!("/tmp/phoenix-chrome-{prefix:016x}")
+    format!("{USER_DATA_DIR_PREFIX}{prefix:016x}")
+}
+
+/// Filesystem prefix shared by every per-scope Chrome user-data directory.
+/// Profiles are created at `{USER_DATA_DIR_PREFIX}{16-hex}` by
+/// [`user_data_dir_for_key`].
+const USER_DATA_DIR_PREFIX: &str = "/tmp/phoenix-chrome-";
+
+/// Glob matching every per-scope Chrome user-data directory. Exposed so the
+/// About-this-deployment endpoint can report this (known-large, unsized)
+/// ephemeral location without enumerating individual profiles.
+#[must_use]
+pub fn user_data_dir_glob() -> String {
+    format!("{USER_DATA_DIR_PREFIX}*")
 }
 
 /// Maximum console log entries to keep per session

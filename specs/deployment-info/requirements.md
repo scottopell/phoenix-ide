@@ -190,13 +190,13 @@ to a directory or to "inline in the database."
 
 ### REQ-DEPLOY-006: Surface the log location, never the contents
 
-WHEN the deployment is explicitly configured with a log file path
-THE SYSTEM SHALL display that path
+WHEN the running logger is writing to a process-owned log file
+THE SYSTEM SHALL display that file's path
 
-WHEN no log file is explicitly configured
+WHEN the logger writes only to standard output
 THE SYSTEM SHALL state that logs are written to standard output and captured by
 the supervising process, rather than presenting a file path the running process
-does not actually own
+does not actually write
 
 THE SYSTEM SHALL NOT render log file contents on the page
 
@@ -207,10 +207,13 @@ risk leaking sensitive log lines into the browser. The honesty caveat is
 load-bearing: the binary emits structured logs to stdout, and any `.log` file is
 a redirection arranged by the launcher (a shell wrapper or systemd), not by the
 process. Reporting such a redirection path as "the log file" would be a comment
-that lies — the process cannot guarantee it. So the page reports a path only when
-the deployment is configured with one it genuinely owns, and otherwise names the
-real sink (stdout). An authoritative process-owned log path is a separate
-capability the deployment can grow.
+that lies — the process cannot guarantee it. The reported sink is therefore
+derived from what the logger actually does, not from configuration the logger
+might ignore: the page shows a path only when the running logger genuinely
+writes to a file, and otherwise names the real sink (stdout). An authoritative
+process-owned log path is a separate capability the deployment can grow; until
+the logger honors it, the page reports stdout even if an intended path is
+present in the environment.
 
 ---
 

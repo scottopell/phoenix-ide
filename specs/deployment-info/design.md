@@ -96,35 +96,49 @@ requires; the UI renders it as "unavailable," never as `0`.
 
 ### Config capture (`main`)
 
-`DeploymentConfig` is assembled in `main` after the existing TLS resolution and
-before `AppState::new`, then passed into `AppState` as a new field. It holds the
-static facts:
+`DeploymentConfig` is assembled in `main` and passed into `AppState` as a new
+field. It holds the static facts:
 
-- `bind_address: SocketAddr` — the address the listener binds (`0.0.0.0:PORT`).
-- `socket_activated: bool` — from `hot_restart::is_socket_activated()`.
+- `bind_address: SocketAddr` — the address the server is actually bound to.
+  Because socket activation hands the process a systemd-owned socket (often with
+  `PHOENIX_PORT` unset), the listener is acquired *before* the config is built
+  and `bind_address` is taken from `listener.local_addr()`, not the
+  `0.0.0.0:PORT` default. Socket-activation status itself is read live in the
+  handler via `hot_restart::is_socket_activated()` rather than captured.
 - `tls: TlsInfo` — derived from the resolved `tls::ConfigSource`/`LoadedConfig`:
   disabled when the source is `None`; otherwise `mode`, `cert_path`, `key_path`,
   `ca_cert_path` from `LoadedConfig`, and `hosts` from `ConfigSource::Auto`.
-- `data_dir: PathBuf`, `db_path: PathBuf`, `tls_dir: Option<PathBuf>`,
-  `builtin_skills_dir: Option<PathBuf>`, `codex_auth_path: PathBuf`,
-  `attachment_store: AttachmentStore`, `browser_cache_dir: PathBuf` — the
-  on-disk layout, resolved from the same environment logic that the rest of the
-  process uses (`PHOENIX_DB_PATH`, `tls_dir_from_env`, the
-  `skills::builtin::default_extract_dir` target, the codex credential path, the
-  browser fetcher cache dir). Each path is resolved exactly once here so the page
-  reports the same locations the process actually uses.
-- `log: LogInfo` — `stdout` unless a deployment-owned log file is configured.
+- `log: LogInfo` — the sink the logger actually writes to. The tracing layer
+  writes only to stdout, so this is `LogInfo::Stdout`; `LogInfo::File` becomes
+  reachable when the logger is wired to a process-owned file (REQ-DEPLOY-006).
+- `locations: Vec<DiskLocation>` — the on-disk layout. Each `DiskLocation`
+  carries a `label`, a resolved absolute `path`, and a `MeasureMode` dictating
+  how it is sized at request time. The rows are: the database file (`File`); the
+  data directory (`RecurseSmall`); the TLS directory in auto mode
+  (`RecurseSmall`); the built-in skills directory (`RecurseSmall`); the codex
+  credential file (`File`); the attachment store (`InlineDb` while attachments
+  live in the database); the browser binary cache (`NoMeasure`); and the
+  per-scope browser profile glob (`Pattern`). Every path is resolved from the
+  same logic the rest of the process uses (`PHOENIX_DB_PATH`,
+  `tls::ConfigSource::Auto`'s dir, `skills::builtin::default_extract_dir`, the
+  codex credential path, the browser fetcher cache dir, the browser
+  user-data-dir glob) so the page reports the locations the process actually
+  uses.
 
 To avoid generating the auto cert twice, `tls::load_config` is called once in
-`main`; its `LoadedConfig` feeds both the `TlsInfo` capture and the existing
-`serve_https` call. The `ServerConfig` is carried forward to the listener setup
-as it is today.
+`main`; its `LoadedConfig` feeds both the `TlsInfo` capture and the
+`serve_https` call. The `ServerConfig` is carried forward to the already-bound
+listener.
 
-`AttachmentStore` is an enum: `InlineDb` (attachment bytes stored in the SQLite
-database) or `Directory(PathBuf)` (file-based attachment storage). It maps
-directly onto the `DiskSize::inline_db` vs. `DiskSize::measured`/`absent` row for
-the attachment store, giving file-based attachments a stable home in the report
-before that storage mode is active (REQ-DEPLOY-005).
+`MeasureMode` is the sizing policy per location: `File` stats one file;
+`RecurseSmall` walks a small owned directory (never following symlinks, so a
+symlink cycle or link to a large external tree cannot unbound the walk);
+`NoMeasure` reports a known-large real directory as a path with
+`DiskSize::not_measured` (or `absent` when missing); `Pattern` reports a
+glob/pattern location as `not_measured` unconditionally (its literal path never
+exists on disk); `InlineDb` reports the attachment store as `inline_db`, giving
+file-based attachments a stable home in the report before that storage mode is
+active (REQ-DEPLOY-005).
 
 ### Handler (`api`)
 
@@ -139,17 +153,19 @@ Sampling steps:
    from `hot_restart`. `hot_restart` exposes the process start `Instant` and the
    start wall-clock `DateTime<Utc>` through public accessors so the handler can
    report both uptime and an absolute start time.
-2. **Resources:** via the `sysinfo` crate, refreshing only the current process
-   and global memory/CPU. Each metric is mapped to `Some(_)` when sysinfo
-   provides it and `None` when it does not. sysinfo is the cross-platform sampler
-   that satisfies the macOS + Linux requirement without per-OS `/proc` scraping.
-3. **Disk:** one `DiskEntry` per configured location. A `dir_size` helper walks
-   small owned directories (TLS dir, builtin-skills dir) and stats individual
-   files (DB, codex auth) to produce `DiskSize::measured`. Known-large caches
-   (the browser binary cache and per-scope browser profiles) are emitted as
-   `DiskSize::not_measured`. A path that does not exist yields `DiskSize::absent`.
-   The attachment store yields `inline_db` or a measured/absent directory per
-   `AttachmentStore`.
+2. **Resources:** via the `sysinfo` crate, refreshing process and global
+   memory plus the CPU list. Each metric is mapped to `Some(_)` when sysinfo
+   provides it and `None` when it does not. The logical CPU count is the length
+   of sysinfo's CPU list — the host total this field labels — rather than
+   `std::thread::available_parallelism()`, which reflects the process's CPU
+   affinity/quota and would under-report under a cgroup limit. sysinfo is the
+   cross-platform sampler that satisfies the macOS + Linux requirement without
+   per-OS `/proc` scraping.
+3. **Disk:** one `DiskEntry` per configured `DiskLocation`, sized per its
+   `MeasureMode` (see Config capture). `File`/`RecurseSmall` produce
+   `DiskSize::measured`; `NoMeasure`/`Pattern` produce `DiskSize::not_measured`;
+   a missing real path yields `DiskSize::absent`; the attachment store yields
+   `inline_db`.
 4. **`sampled_at`:** `Utc::now()` at the moment the snapshot is assembled.
 
 The `dir_size` helper is bounded: it recurses only the directories the spec
@@ -191,12 +207,14 @@ request cannot trigger a multi-gigabyte walk (REQ-DEPLOY-005).
   per-scope profiles on every page load would make a diagnostic page expensive
   and occasionally slow. `not_measured` states the omission explicitly instead of
   reporting a misleading `0`.
-- **Log path is reported only when process-owned.** The binary logs to stdout;
-  any `.log` file is a launcher redirection the process does not own. Reporting
-  such a path as authoritative would be a claim the process cannot keep, so the
-  page names the real sink (stdout) unless a deployment-owned log file is
-  configured. An authoritative process-owned log file is a separate capability
-  the deployment can grow.
+- **The log sink reflects what the logger does, not configuration it ignores.**
+  The binary logs to stdout; any `.log` file is a launcher redirection the
+  process does not own. Reporting a path the logger does not write would be a
+  claim the process cannot keep, so `LogInfo` is derived from the logger's actual
+  sink — currently always stdout. Honoring an intended log-file path is a
+  separate capability the deployment can grow (it wires the logger and flips the
+  reported sink in one change); until then the page reports stdout even if such a
+  path is present in the environment.
 - **Read-only, single snapshot, no streaming.** The operator question is "what is
   it now," answered by a snapshot plus refresh. A live-streaming gauge would add
   an SSE surface for no proportional benefit.

@@ -30,6 +30,9 @@ pub enum MeasureMode {
     RecurseSmall,
     /// Known-large (e.g. a binary cache); report the path but do not walk it.
     NoMeasure,
+    /// A glob/pattern location (e.g. per-scope profile dirs). Always reported
+    /// as not-measured — existence of the literal pattern path is meaningless.
+    Pattern,
     /// The attachment store while attachment bytes live inside the database.
     InlineDb,
 }
@@ -153,13 +156,21 @@ pub enum DiskSize {
     InlineDb,
 }
 
-/// Where the deployment's logs go. A process-owned file path is reported only
-/// when explicitly configured; otherwise the real sink (stdout) is named.
+/// Where the deployment's logs go. Derived from the sink the logger actually
+/// writes to: a process-owned file path only when the logger writes to one,
+/// otherwise the real sink (stdout).
 #[derive(Serialize, TS, Clone, Debug)]
 #[serde(tag = "sink", rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub enum LogInfo {
-    /// Logs are written to a deployment-owned file at this path.
+    /// Logs are written to a deployment-owned file at this path. Part of the
+    /// wire contract (the page renders it); constructed once the tracing layer
+    /// is wired to honor a process-owned log file — see tasks/58013. The
+    /// `expect` fires when that lands, flagging this attribute for removal.
+    #[expect(
+        dead_code,
+        reason = "wire-contract variant; constructed by tasks/58013"
+    )]
     File { path: String },
     /// Logs are written to standard output, captured by the supervising process.
     Stdout,
@@ -204,14 +215,17 @@ pub async fn deployment_info(State(state): State<AppState>) -> impl IntoResponse
 async fn sample_resources() -> ResourceUsage {
     use sysinfo::{ProcessesToUpdate, System};
 
-    let logical_cpu_count = std::thread::available_parallelism()
-        .ok()
-        .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX));
-
     let mut sys = System::new();
     sys.refresh_memory();
     let system_total_memory_bytes = Some(sys.total_memory());
     let system_available_memory_bytes = Some(sys.available_memory());
+
+    // Host logical CPU count from the system sampler — not
+    // `available_parallelism()`, which reflects the process's CPU
+    // affinity/quota rather than the machine total this field labels.
+    sys.refresh_cpu_all();
+    let cpu_len = sys.cpus().len();
+    let logical_cpu_count = (cpu_len > 0).then(|| u32::try_from(cpu_len).unwrap_or(u32::MAX));
 
     let (process_memory_bytes, process_cpu_percent) = match sysinfo::get_current_pid() {
         Ok(pid) => {
@@ -238,6 +252,7 @@ async fn sample_resources() -> ResourceUsage {
 fn measure_location(loc: &DiskLocation) -> DiskEntry {
     let size = match loc.mode {
         MeasureMode::InlineDb => DiskSize::InlineDb,
+        MeasureMode::Pattern => DiskSize::NotMeasured,
         _ if !loc.path.exists() => DiskSize::Absent,
         MeasureMode::File => std::fs::metadata(&loc.path)
             .map_or(DiskSize::Absent, |m| DiskSize::Measured { bytes: m.len() }),
@@ -257,6 +272,11 @@ fn measure_location(loc: &DiskLocation) -> DiskEntry {
 /// directory it is given — callers only pass directories classified as small,
 /// never the known-large caches. An unreadable subtree contributes nothing
 /// rather than aborting the walk.
+///
+/// Symlinks are never followed: `file_type()` reports the entry's own type (it
+/// does not stat through links), so a symlinked directory is skipped rather
+/// than recursed. This keeps the walk inside the intended subtree and immune to
+/// symlink cycles or links pointing at large external trees.
 fn dir_size(path: &Path) -> u64 {
     let mut total: u64 = 0;
     let mut stack = vec![path.to_path_buf()];
@@ -265,13 +285,18 @@ fn dir_size(path: &Path) -> u64 {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else {
+            let Ok(file_type) = entry.file_type() else {
                 continue;
             };
-            if meta.is_dir() {
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
                 stack.push(entry.path());
-            } else {
-                total = total.saturating_add(meta.len());
+            } else if file_type.is_file() {
+                if let Ok(meta) = entry.metadata() {
+                    total = total.saturating_add(meta.len());
+                }
             }
         }
     }
@@ -352,6 +377,32 @@ mod tests {
         assert_eq!(
             measure_location(&loc(dir.path().join("gone"), MeasureMode::NoMeasure)).size,
             DiskSize::Absent
+        );
+    }
+
+    #[test]
+    fn pattern_is_not_measured_even_when_path_is_a_glob() {
+        // The literal glob never exists on disk, but a Pattern row must still
+        // report not_measured (a pointer to where bytes live), never absent.
+        let entry = measure_location(&loc(
+            PathBuf::from("/tmp/phoenix-chrome-*"),
+            MeasureMode::Pattern,
+        ));
+        assert_eq!(entry.size, DiskSize::NotMeasured);
+        assert_eq!(entry.path, "/tmp/phoenix-chrome-*");
+    }
+
+    #[test]
+    fn dir_size_does_not_follow_symlinked_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("real"), b"12345").unwrap();
+        // A symlink pointing back at the parent would cause an unbounded walk
+        // if followed; it must contribute nothing and not loop.
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+        assert_eq!(
+            measure_location(&loc(dir.path().to_path_buf(), MeasureMode::RecurseSmall)).size,
+            DiskSize::Measured { bytes: 5 }
         );
     }
 

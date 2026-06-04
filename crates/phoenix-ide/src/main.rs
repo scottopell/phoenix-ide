@@ -100,15 +100,12 @@ fn build_deployment_config(
         _ => TlsInfo::disabled(),
     };
 
-    // A process-owned log file is reported only when explicitly configured; the
-    // binary itself logs to stdout (see specs/deployment-info/ REQ-DEPLOY-006).
-    let log = match std::env::var("PHOENIX_LOG_FILE")
-        .ok()
-        .filter(|s| !s.is_empty())
-    {
-        Some(path) => LogInfo::File { path },
-        None => LogInfo::Stdout,
-    };
+    // The tracing layer writes only to stdout, so that is the only sink the
+    // process can truthfully report. Reporting a file path here would point
+    // operators at a file the process never opens. `LogInfo::File` becomes
+    // reachable when the logger is wired to a process-owned file — see
+    // specs/deployment-info/ REQ-DEPLOY-006 and tasks/58013.
+    let log = LogInfo::Stdout;
 
     let db_pb = PathBuf::from(db_path);
     let data_dir = db_pb
@@ -162,6 +159,15 @@ fn build_deployment_config(
         label: "Browser binary cache".to_string(),
         path: tools::browser::session::fetcher_cache_dir(),
         mode: MeasureMode::NoMeasure,
+    });
+
+    // Per-scope Chrome profiles created on demand while browser sessions are
+    // active. A glob, not a single dir, and potentially large — reported as an
+    // unsized pattern row.
+    locations.push(DiskLocation {
+        label: "Browser profiles".to_string(),
+        path: PathBuf::from(tools::browser::session::user_data_dir_glob()),
+        mode: MeasureMode::Pattern,
     });
 
     api::DeploymentConfig {
@@ -380,11 +386,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // Bind (or adopt the systemd socket-activated) listener now, so the
+    // deployment report records the address the server is actually bound to.
+    // Under socket activation PHOENIX_PORT is typically unset and the real
+    // address comes from systemd, not the 0.0.0.0:PORT default.
+    let fallback_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let listener = hot_restart::get_listener(fallback_addr).await?;
+    let socket_activated = hot_restart::is_socket_activated();
+    let bind_address = listener.local_addr().unwrap_or(fallback_addr);
+
     // Static deployment facts served read-only by GET /api/deployment
     // (specs/deployment-info/).
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let deployment = Arc::new(build_deployment_config(
-        addr,
+        bind_address,
         &db_path,
         tls_source.as_ref(),
         loaded_tls.as_ref(),
@@ -454,9 +468,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(cors)
         .layer(compression);
 
-    // Get listener (either from systemd socket activation or bind fresh)
-    let listener = hot_restart::get_listener(addr).await?;
-    let socket_activated = hot_restart::is_socket_activated();
+    // The listener was bound earlier so the deployment report could record the
+    // real bind address (see above).
     if let Some(loaded_tls) = loaded_tls {
         tracing::info!(
             mode = loaded_tls.mode,
