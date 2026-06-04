@@ -68,6 +68,110 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod hot_restart;
 
+/// Assemble the static deployment facts reported by `GET /api/deployment`.
+/// Resolves every path from the same logic the rest of the process uses so the
+/// page reports the locations the process actually opens (specs/deployment-info/).
+fn build_deployment_config(
+    bind_address: SocketAddr,
+    db_path: &str,
+    tls_source: Option<&tls::ConfigSource>,
+    loaded_tls: Option<&tls::LoadedConfig>,
+) -> api::DeploymentConfig {
+    use api::{DiskLocation, LogInfo, MeasureMode, TlsInfo};
+
+    let tls = match (tls_source, loaded_tls) {
+        (Some(source), Some(loaded)) => {
+            let hosts = match source {
+                tls::ConfigSource::Auto { hosts, .. } => hosts.clone(),
+                tls::ConfigSource::Manual(_) => Vec::new(),
+            };
+            TlsInfo {
+                enabled: true,
+                mode: Some(loaded.mode.to_string()),
+                cert_path: Some(loaded.cert_path.display().to_string()),
+                key_path: Some(loaded.key_path.display().to_string()),
+                ca_cert_path: loaded
+                    .ca_cert_path
+                    .as_ref()
+                    .map(|p| p.display().to_string()),
+                hosts,
+            }
+        }
+        _ => TlsInfo::disabled(),
+    };
+
+    // A process-owned log file is reported only when explicitly configured; the
+    // binary itself logs to stdout (see specs/deployment-info/ REQ-DEPLOY-006).
+    let log = match std::env::var("PHOENIX_LOG_FILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+    {
+        Some(path) => LogInfo::File { path },
+        None => LogInfo::Stdout,
+    };
+
+    let db_pb = PathBuf::from(db_path);
+    let data_dir = db_pb
+        .parent()
+        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
+
+    let mut locations = vec![
+        DiskLocation {
+            label: "Database".to_string(),
+            path: db_pb.clone(),
+            mode: MeasureMode::File,
+        },
+        DiskLocation {
+            label: "Data directory".to_string(),
+            path: data_dir,
+            mode: MeasureMode::RecurseSmall,
+        },
+    ];
+
+    if let Some(tls::ConfigSource::Auto { dir, .. }) = tls_source {
+        locations.push(DiskLocation {
+            label: "TLS directory".to_string(),
+            path: dir.clone(),
+            mode: MeasureMode::RecurseSmall,
+        });
+    }
+
+    if let Some(dir) = skills::builtin::default_extract_dir() {
+        locations.push(DiskLocation {
+            label: "Built-in skills".to_string(),
+            path: dir,
+            mode: MeasureMode::RecurseSmall,
+        });
+    }
+
+    locations.push(DiskLocation {
+        label: "Codex credentials".to_string(),
+        path: llm::codex_credential::default_phoenix_auth_path(),
+        mode: MeasureMode::File,
+    });
+
+    // Attachments are stored inline in the database. This row is the stable home
+    // for the file-based attachment directory once that storage mode is active.
+    locations.push(DiskLocation {
+        label: "Attachments".to_string(),
+        path: db_pb,
+        mode: MeasureMode::InlineDb,
+    });
+
+    locations.push(DiskLocation {
+        label: "Browser binary cache".to_string(),
+        path: tools::browser::session::fetcher_cache_dir(),
+        mode: MeasureMode::NoMeasure,
+    });
+
+    api::DeploymentConfig {
+        bind_address,
+        tls,
+        log,
+        locations,
+    }
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // Startup sequence is inherently sequential; splitting would obscure the flow.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -269,6 +373,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tracing::info!("Password authentication enabled (PHOENIX_PASSWORD is set)");
     }
 
+    // Resolve TLS once so both the deployment report and the listener use the
+    // same loaded config (avoids generating the auto cert twice).
+    let loaded_tls = match &tls_source {
+        Some(source) => Some(tls::load_config(source)?),
+        None => None,
+    };
+
+    // Static deployment facts served read-only by GET /api/deployment
+    // (specs/deployment-info/).
+    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let deployment = Arc::new(build_deployment_config(
+        addr,
+        &db_path,
+        tls_source.as_ref(),
+        loaded_tls.as_ref(),
+    ));
+
     // Create application state
     let state = AppState::new(
         db,
@@ -277,6 +398,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         mcp_manager,
         credential_helper,
         password,
+        deployment,
     )
     .await;
 
@@ -333,11 +455,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(compression);
 
     // Get listener (either from systemd socket activation or bind fresh)
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
     let listener = hot_restart::get_listener(addr).await?;
     let socket_activated = hot_restart::is_socket_activated();
-    if let Some(tls_source) = tls_source {
-        let loaded_tls = tls::load_config(&tls_source)?;
+    if let Some(loaded_tls) = loaded_tls {
         tracing::info!(
             mode = loaded_tls.mode,
             cert = %loaded_tls.cert_path.display(),

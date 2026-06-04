@@ -37,7 +37,7 @@ DeploymentInfo {
 BuildInfo {
   version:        string         // env!("CARGO_PKG_VERSION")
   git_sha:        string         // env!("PHOENIX_GIT_SHA"), "unknown" if absent
-  started_at:     string         // RFC3339, process start wall-clock
+  started_at:     string | null  // RFC3339; null if the start time was not recorded
   uptime_seconds: number         // u64
 }
 
@@ -76,10 +76,9 @@ DiskSize =                       // serde-tagged, ts-rs discriminated union
   | { kind: "absent" }           // path does not exist
   | { kind: "inline_db" }        // attachment store: bytes live inside the DB
 
-LogInfo {
-  sink: "file" | "stdout"
-  path: string | null            // present iff sink == "file"
-}
+LogInfo =                        // serde-tagged on `sink`
+  | { sink: "file", path: string }   // a deployment-owned log file
+  | { sink: "stdout" }               // logs go to stdout, captured by the supervisor
 ```
 
 `DiskSize` is an enum, not a `size: number | null`, because the four states are

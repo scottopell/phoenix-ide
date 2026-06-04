@@ -234,6 +234,8 @@ pub fn create_router(state: AppState) -> Router {
         // Version
         .route("/version", get(get_version))
         .route("/api/version", get(get_version_json))
+        // About this deployment (read-only diagnostics)
+        .route("/api/deployment", get(super::deployment::deployment_info))
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
@@ -4102,6 +4104,7 @@ mod hard_delete_cascade_tests {
             terminals,
             chain_qa,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
         }
     }
 
@@ -5281,6 +5284,7 @@ mod upgrade_model_state_guard_tests {
             terminals,
             chain_qa,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
         }
     }
 

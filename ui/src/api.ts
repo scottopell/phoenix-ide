@@ -1,5 +1,6 @@
 import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
+import type { DeploymentInfo } from './generated/DeploymentInfo';
 // Phoenix API Client
 
 // SSE event types come from the runtime schemas in `./sseSchemas`, which
@@ -603,6 +604,12 @@ export const api = {
   async getVersion(): Promise<{ version: string; git_sha: string }> {
     const resp = await fetch('/api/version');
     if (!resp.ok) throw new Error('Failed to load version');
+    return resp.json();
+  },
+
+  async deploymentInfo(): Promise<DeploymentInfo> {
+    const resp = await fetch('/api/deployment');
+    if (!resp.ok) throw new Error('Failed to load deployment info');
     return resp.json();
   },
 

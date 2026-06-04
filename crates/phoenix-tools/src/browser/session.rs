@@ -347,11 +347,17 @@ pub(crate) fn truncate_unicode_safe(s: String, max_bytes: usize) -> String {
     format!("{prefix}…")
 }
 
+/// Directory where the fetcher caches downloaded Chrome binaries. Exposed so
+/// the About-this-deployment endpoint can report this (known-large) cache path.
+pub fn fetcher_cache_dir() -> PathBuf {
+    let base = std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from);
+    base.join(".cache/phoenix-ide/chromium")
+}
+
 impl BrowserSession {
     /// Directory where the fetcher caches downloaded Chrome binaries
     pub(crate) fn fetcher_cache_dir() -> PathBuf {
-        let base = std::env::var("HOME").map_or_else(|_| PathBuf::from("/tmp"), PathBuf::from);
-        base.join(".cache/phoenix-ide/chromium")
+        fetcher_cache_dir()
     }
 
     /// Build a `BrowserConfig` with optional explicit Chrome executable path.

@@ -3785,6 +3785,71 @@ pre:hover .copy-btn {
   padding: 0;
 }
 
+/* About this deployment page */
+.settings-about-link {
+  width: 100%;
+  text-align: left;
+}
+
+.deploy-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 3px 0;
+  font-size: 13px;
+}
+
+.deploy-label {
+  color: var(--text-secondary);
+  flex: 0 0 auto;
+}
+
+.deploy-value {
+  color: var(--text-primary);
+  text-align: right;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.deploy-path {
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.deploy-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.deploy-table td {
+  padding: 4px 8px 4px 0;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.deploy-table__label {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.deploy-table__path {
+  width: 100%;
+  word-break: break-all;
+}
+
+/* stylelint-disable-next-line no-descending-specificity --
+   one-off, scoped to the deployment table's path column. */
+.deploy-table__path code {
+  font-size: 12px;
+}
+
+.deploy-table__size {
+  color: var(--text-primary);
+  white-space: nowrap;
+  text-align: right;
+}
+
 /* Smooth theme transition */
 html * {
   transition: background-color 0.2s ease, border-color 0.2s ease;

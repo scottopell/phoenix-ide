@@ -62,6 +62,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 # Socket configuration
 socket2 = "0.6"
 
+# Cross-platform (macOS + Linux) process/system resource sampling for the
+# About-this-deployment endpoint (specs/deployment-info/).
+sysinfo = "0.33"
+
 # Async utilities
 async-trait = "0.1"
 futures = "0.3"
