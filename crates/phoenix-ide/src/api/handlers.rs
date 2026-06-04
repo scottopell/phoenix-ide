@@ -342,6 +342,7 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         // setup).
         home_dir: std::env::var("HOME").ok(),
         seed_parent_slug: None,
+        parent_conversation_slug: None,
         // Default to `false`; callers that have access to `AppState` set
         // this from the manager's `HashMap` via
         // `enrich_conversation_with_seed`.
@@ -373,6 +374,14 @@ async fn enrich_conversation_with_seed(
     if let Some(parent_id) = conv.seed_parent_id.as_deref() {
         if let Ok(parent) = state.runtime.db().get_conversation(parent_id).await {
             enriched.seed_parent_slug = parent.slug;
+        }
+    }
+    // Resolve the sub-agent parent slug for the breadcrumb, same as the seed
+    // parent above. Sub-agents set `parent_conversation_id` (not
+    // `seed_parent_id`), so the two breadcrumbs are mutually exclusive.
+    if let Some(parent_id) = conv.parent_conversation_id.as_deref() {
+        if let Ok(parent) = state.runtime.db().get_conversation(parent_id).await {
+            enriched.parent_conversation_slug = parent.slug;
         }
     }
     // Reflect current `BrowserSessionManager` state at hydration. The single

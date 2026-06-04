@@ -628,6 +628,12 @@ pub struct EnrichedConversation {
     /// case.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub seed_parent_slug: Option<String>,
+    /// Slug of the sub-agent's parent conversation, resolved for the UI
+    /// breadcrumb. `None` if `inner.parent_conversation_id` is `None` (the
+    /// conversation is not a sub-agent) or the parent has been deleted — the
+    /// UI renders unlinked text in the latter case. Mirrors `seed_parent_slug`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_conversation_slug: Option<String>,
     /// Whether the conversation currently has a live browser session in
     /// `BrowserSessionManager`. Read directly from the manager's `HashMap`
     /// at hydration — single source of truth, no parallel bool. The

@@ -812,6 +812,16 @@ function ConversationPageContent() {
     navigate(`/c/${seedParentSlugForCallback}`);
   }, [seedParentSlugForCallback, navigate]);
 
+  // Sub-agent parent breadcrumb: mirrors the seed-parent link so a sub-agent
+  // opened as a full page (deep link, or the panel's "open as full page"
+  // escape hatch) still has a way back to the conversation that spawned it.
+  const parentConvSlugForCallback = conversation?.parent_conversation_slug;
+  const handleParentConvClick = useCallback((e: ReactMouseEvent) => {
+    if (!parentConvSlugForCallback) return;
+    e.preventDefault();
+    navigate(`/c/${parentConvSlugForCallback}`);
+  }, [parentConvSlugForCallback, navigate]);
+
   if (error) {
     return (
       <div id="app">
@@ -933,6 +943,20 @@ function ConversationPageContent() {
     </div>
   ) : null;
 
+  const parentConvBreadcrumb = conversation.parent_conversation_id ? (
+    <div className="conversation-seed-breadcrumb">
+      {conversation.parent_conversation_slug ? (
+        <a href={`/c/${conversation.parent_conversation_slug}`} onClick={handleParentConvClick}>
+          {'\u2190'} sub-agent of: {conversation.parent_conversation_slug}
+        </a>
+      ) : (
+        <span>
+          {'\u2190'} sub-agent of: (parent deleted)
+        </span>
+      )}
+    </div>
+  ) : null;
+
   // Split-pane viewer: rendered inside `#app` as a sibling of
   // .conversation-column when wide-desktop and a viewer (file OR diff)
   // is open. CSS in .app-split-pane (index.css) flexes children
@@ -955,6 +979,7 @@ function ConversationPageContent() {
     >
       <div className="conversation-column">
       {seedBreadcrumb}
+      {parentConvBreadcrumb}
       {viewerSlot.browserSessionActive && !browserOpen && (
         <div className="browser-view-launcher">
           <button

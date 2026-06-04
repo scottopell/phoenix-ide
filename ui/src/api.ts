@@ -72,6 +72,11 @@ export interface Conversation {
   conv_mode_label?: string;
   project_name?: string | null;
   parent_conversation_id?: string | null;
+  /** Slug of the sub-agent's parent conversation, resolved server-side for the
+   *  breadcrumb link (mirrors `seed_parent_slug`). `null`/absent when this is
+   *  not a sub-agent or the parent has been deleted; the UI renders unlinked
+   *  text in the latter case. */
+  parent_conversation_slug?: string | null;
   user_initiated?: boolean;
   /** Server-user's $SHELL (e.g. "/bin/zsh"); used to tailor the
    *  OSC 133 enablement snippet in the terminal HUD. REQ-TERM-017. */
