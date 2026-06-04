@@ -2,7 +2,6 @@ import {
   useRef,
   useEffect,
   useCallback,
-  useMemo,
   useState,
   forwardRef,
   useImperativeHandle,
@@ -12,27 +11,26 @@ import {
 } from 'react';
 // Icon buttons removed from action row -- file browse via sidebar, image attach via paste/drag
 import type { QueuedMessage } from '../hooks';
-import { useDraftActions, useDraftValue, useScopedState } from '../hooks';
-import type { ConversationState, ImageData, SkillEntry } from '../api';
-import { api, ExpansionError } from '../api';
+import { useDraftActions, useDraftValue, useScopedState, useInlineReferences } from '../hooks';
+import type { ConversationState, ImageData } from '../api';
+import { ExpansionError } from '../api';
 import { canCancelConversationState, isAgentWorking, isCancellingState } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
 import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
-import {
-  InlineAutocomplete,
-  detectTrigger,
-  applyCompletion,
-} from './InlineAutocomplete';
-import type { AutocompleteItem, TriggerState } from './InlineAutocomplete';
-import { fuzzyMatch } from './CommandPalette/fuzzyMatch';
 
 export interface InputAreaHandle {
   focus: () => void;
 }
 
 interface InputAreaProps {
-  conversationId: string | undefined;
+  /**
+   * Working directory the conversation operates in. Scopes inline reference
+   * autocomplete (`@file`, `./path`, `/skill`) to the same root that
+   * `message_expander::expand` resolves against at send time. `undefined`
+   * disables autocomplete fetching.
+   */
+  cwd: string | undefined;
   convState: ConversationState;
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
@@ -71,7 +69,7 @@ interface InputAreaProps {
 }
 
 export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
-  conversationId,
+  cwd,
   convState,
   images,
   setImages,
@@ -113,238 +111,33 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, [focusToken]);
 
   // Voice input: base text (accumulated finals) + interim (current partial)
-  const [voiceBase, setVoiceBase] = useScopedState<string | null>(conversationId, null); // null = not recording
-  const [voiceInterim, setVoiceInterim] = useScopedState(conversationId, '');
+  const [voiceBase, setVoiceBase] = useScopedState<string | null>(cwd, null); // null = not recording
+  const [voiceInterim, setVoiceInterim] = useScopedState(cwd, '');
 
   // =========================================================================
-  // Inline autocomplete state (REQ-IR-004, REQ-IR-005)
+  // Inline autocomplete (REQ-IR-004, REQ-IR-005), scoped to `cwd`
   // =========================================================================
 
-  /** Active trigger state — null when no trigger is open */
-  const [activeTrigger, setActiveTrigger] = useScopedState<TriggerState | null>(conversationId, null);
-  /**
-   * File search results fetched from the server. Skill candidates are NOT
-   * stored here — they're derived during render from `skillItems`
-   * (see `acItems` useMemo below). This avoids the derived-state-in-effect
-   * anti-pattern.
-   */
-  const [fileAcItems, setFileAcItems] = useScopedState<AutocompleteItem[]>(conversationId, []);
-  /** Inline error when an @ref or /skill fails to expand (REQ-IR-007) */
-  const [expansionError, setExpansionError] = useScopedState<string | null>(conversationId, null);
-  /** Ref to abort any in-flight search request */
-  const searchAbortRef = useRef<AbortController | null>(null);
-  /** Debounce timer for search */
-  const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /** Guard to prevent duplicate in-flight skill fetches */
-  const fetchingSkillsRef = useRef(false);
-  /** Cached skill list for the current conversation (REQ-IR-005) */
-  const [skillItems, setSkillItems] = useScopedState<SkillEntry[]>(conversationId, []);
-  /** Argument hint ghost text shown after a skill is selected (REQ-IR-005) */
-  const [skillArgumentHint, setSkillArgumentHint] = useScopedState<string | null>(conversationId, null);
-
-  /**
-   * Autocomplete items to display. Derived from the active trigger mode:
-   * skill triggers map `skillItems` at render time; file triggers use the
-   * results stored in `fileAcItems` by the debounced fetcher.
-   */
-  const acItems = useMemo<AutocompleteItem[]>(() => {
-    if (!activeTrigger) return [];
-    if (activeTrigger.mode === 'skill') {
-      return skillItems.map((s) => ({
-        id: s.name,
-        label: s.name,
-        subtitle: s.description,
-        metadata: s,
-      }));
-    }
-    if (activeTrigger.mode === 'expand' || activeTrigger.mode === 'path') {
-      return fileAcItems;
-    }
-    return [];
-  }, [activeTrigger, skillItems, fileAcItems]);
-
-  // =========================================================================
-  // File search (REQ-IR-004)
-  // =========================================================================
-
-  const fetchFileItems = useCallback(
-    async (query: string) => {
-      if (!conversationId) return;
-
-      // Abort previous request
-      searchAbortRef.current?.abort();
-      const controller = new AbortController();
-      searchAbortRef.current = controller;
-
-      try {
-        const result = await api.searchConversationFiles(
-          conversationId,
-          query,
-          50,
-          controller.signal,
-        );
-        const items: AutocompleteItem[] = result.items.map((entry) => ({
-          id: entry.path,
-          label: entry.path,
-          ...(entry.is_text_file ? {} : { subtitle: 'binary' }),
-          metadata: entry,
-        }));
-        setFileAcItems(items);
-      } catch (err) {
-        // Ignore abort errors
-        if (err instanceof Error && err.name === 'AbortError') return;
-        console.warn('File search failed:', err);
-        setFileAcItems([]);
-      }
-    },
-    [conversationId, setFileAcItems],
-  );
-
-  // =========================================================================
-  // Skill search (REQ-IR-005)
-  // =========================================================================
-
-  /** Fetch and cache available skills for this conversation (once per session) */
-  const fetchSkillItems = useCallback(async () => {
-    if (!conversationId) return;
-    if (fetchingSkillsRef.current) return;
-    fetchingSkillsRef.current = true;
-    try {
-      const result = await api.listConversationSkills(conversationId);
-      setSkillItems(result.skills);
-    } catch (err) {
-      console.warn('Skill list failed:', err);
-      setSkillItems([]);
-    } finally {
-      fetchingSkillsRef.current = false;
-    }
-  }, [conversationId, setSkillItems]);
-
-  // Fire side effects (fetch) on trigger change. No state derivation here —
-  // `acItems` is computed during render via useMemo above.
-  useEffect(() => {
-    if (!activeTrigger) {
-      setFileAcItems([]);
-      return;
-    }
-
-    if (activeTrigger.mode === 'skill') {
-      // Skills are fetched once and cached in skillItems. The derived list is
-      // materialized by the `acItems` useMemo during render, so this effect
-      // only needs to trigger the fetch when necessary.
-      if (skillItems.length === 0) {
-        void fetchSkillItems();
-      }
-      return;
-    }
-
-    if (activeTrigger.mode !== 'expand' && activeTrigger.mode !== 'path') {
-      setFileAcItems([]);
-      return;
-    }
-
-    if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
-    searchTimerRef.current = setTimeout(() => {
-      void fetchFileItems(activeTrigger.query);
-    }, 80);
-
-    return () => {
-      if (searchTimerRef.current) clearTimeout(searchTimerRef.current);
-    };
-  }, [activeTrigger, fetchFileItems, fetchSkillItems, skillItems.length, setFileAcItems]);
-
-  // Cleanup on unmount
-  useEffect(() => {
-    return () => {
-      searchAbortRef.current?.abort();
-    };
-  }, []);
-
-  // =========================================================================
-  // Trigger detection on text change
-  // =========================================================================
-
-  const handleTextChange = useCallback(
-    (newValue: string) => {
-      // Clear expansion error on edit
-      setExpansionError(null);
-
-      const ta = textareaRef.current;
-      const cursor = ta?.selectionStart ?? newValue.length;
-      const trigger = detectTrigger(newValue, cursor);
-      setActiveTrigger(trigger);
-    },
-    [setActiveTrigger, setExpansionError],
-  );
-
-  // =========================================================================
-  // Autocomplete selection
-  // =========================================================================
-
-  const handleAcSelect = useCallback(
-    (item: AutocompleteItem) => {
-      if (!activeTrigger) return;
-
-      const currentValue = voiceBase !== null ? voiceBase : draft;
-
-      let replacement: string;
-      if (activeTrigger.mode === 'expand') {
-        replacement = `@${item.label} `;
-      } else if (activeTrigger.mode === 'skill') {
-        // Insert `/skill-name ` with a trailing space (REQ-IR-005)
-        replacement = `/${item.label} `;
-        // Show argument hint ghost text if the skill has one
-        const skill = item.metadata as SkillEntry | undefined;
-        if (skill?.argument_hint) {
-          setSkillArgumentHint(skill.argument_hint);
-        } else {
-          setSkillArgumentHint(null);
-        }
-      } else {
-        // path mode — trailing space dismisses autocomplete popup
-        replacement = `./${item.label} `;
-      }
-
-      const { newValue, newCursorPos } = applyCompletion(currentValue, activeTrigger, replacement);
-
+  // The autocomplete operates on whichever text is live: the in-progress voice
+  // transcript while recording, otherwise the draft.
+  const acValue = voiceBase !== null ? voiceBase : draft;
+  const applyRefValue = useCallback(
+    (next: string) => {
       if (voiceBase !== null) {
-        setVoiceBase(newValue);
+        setVoiceBase(next);
       } else {
-        setDraft(newValue);
+        setDraft(next);
       }
-
-      setActiveTrigger(null);
-      // fileAcItems is cleared by the trigger-effect when activeTrigger → null.
-      // Restore cursor position after React re-render
-      requestAnimationFrame(() => {
-        const ta = textareaRef.current;
-        if (ta) {
-          ta.setSelectionRange(newCursorPos, newCursorPos);
-          ta.focus();
-        }
-      });
     },
-    [activeTrigger, voiceBase, draft, setDraft, setVoiceBase, setActiveTrigger, setSkillArgumentHint],
+    [voiceBase, setVoiceBase, setDraft],
   );
 
-  const handleAcDismiss = useCallback(() => {
-    setActiveTrigger(null);
-  }, [setActiveTrigger]);
-
-  // Clear argument hint when the user types past the skill name or clears input
-  useEffect(() => {
-    if (skillArgumentHint === null) return;
-    const text = voiceBase !== null ? voiceBase : draft;
-    // Keep hint visible while input starts with a /skill-name pattern;
-    // dismiss it once the user has added arguments (text after the first token has content)
-    const match = /^\/\S+\s(.*)/.exec(text.trimStart());
-    if (match !== null && (match[1] ?? '').length > 0) {
-      // User has started typing arguments — dismiss the hint
-      setSkillArgumentHint(null);
-    } else if (!text.trimStart().startsWith('/')) {
-      setSkillArgumentHint(null);
-    }
-  }, [draft, voiceBase, skillArgumentHint, setSkillArgumentHint]);
+  const ir = useInlineReferences({
+    cwd,
+    textareaRef,
+    value: acValue,
+    setValue: applyRefValue,
+  });
 
   // =========================================================================
   // Auto-resize
@@ -409,6 +202,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Send (with expansion error handling — REQ-IR-007)
   // =========================================================================
 
+  const { reset: resetRefs, setExpansionError } = ir;
+
   const handleSend = useCallback(async () => {
     let text: string;
     if (voiceBase !== null) {
@@ -423,8 +218,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     // steering message and deliver it when the conversation reaches Idle.
 
     // Close autocomplete and ghost text on send
-    setActiveTrigger(null);
-    setSkillArgumentHint(null);
+    resetRefs();
 
     // Clear draft and images eagerly — the message is already queued and
     // visible in the message list, so there's no reason to keep the text in
@@ -465,83 +259,29 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     blocksComposerSend,
     onSend,
     clearDraft,
-    setActiveTrigger,
-    setSkillArgumentHint,
+    resetRefs,
+    setExpansionError,
     setImages,
     setVoiceBase,
     setVoiceInterim,
-    setExpansionError,
     setDraft,
   ]);
 
   // =========================================================================
-  // Keyboard handling (merged with autocomplete nav)
+  // Keyboard handling (autocomplete nav first, then send)
   // =========================================================================
 
-  const [acSelectedIndex, setAcSelectedIndex] = useScopedState(conversationId, 0);
-
-  const filteredItems = useMemo(
-    () => fuzzyMatch(acItems, activeTrigger?.query ?? '', (item) => item.label),
-    [acItems, activeTrigger?.query],
-  );
-
-  useEffect(() => {
-    setAcSelectedIndex(0);
-  }, [activeTrigger?.query, setAcSelectedIndex]);
+  const { onKeyDown: refKeyDown } = ir;
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent<HTMLTextAreaElement>) => {
-      // When autocomplete is open, intercept navigation and confirmation keys
-      if (activeTrigger && filteredItems.length > 0) {
-        if (e.key === 'ArrowDown') {
-          e.preventDefault();
-          setAcSelectedIndex((i) => Math.min(i + 1, filteredItems.length - 1));
-          return;
-        }
-        if (e.key === 'ArrowUp') {
-          e.preventDefault();
-          setAcSelectedIndex((i) => Math.max(i - 1, 0));
-          return;
-        }
-        if (e.key === 'Tab') {
-          const item = filteredItems[acSelectedIndex] ?? filteredItems[0];
-          if (item !== undefined) {
-            e.preventDefault();
-            handleAcSelect(item);
-            return;
-          }
-        }
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          handleAcDismiss();
-          return;
-        }
-        // Enter with autocomplete open: if item selected, complete; otherwise fall through to send
-        if (e.key === 'Enter' && !e.shiftKey) {
-          const item = filteredItems[acSelectedIndex] ?? filteredItems[0];
-          if (item !== undefined) {
-            e.preventDefault();
-            handleAcSelect(item);
-            return;
-          }
-        }
-      }
-
-      // Default: Enter without shift sends message
+      if (refKeyDown(e)) return;
       if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
         handleSend();
       }
     },
-    [
-      activeTrigger,
-      filteredItems,
-      acSelectedIndex,
-      handleAcSelect,
-      handleAcDismiss,
-      handleSend,
-      setAcSelectedIndex,
-    ],
+    [refKeyDown, handleSend],
   );
 
   // =========================================================================
@@ -580,6 +320,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // Textarea event handlers
   // =========================================================================
 
+  const { onValueChange: refValueChange } = ir;
+
   const handleChange = useCallback((e: ChangeEvent<HTMLTextAreaElement>) => {
     const newVal = e.target.value;
     if (voiceBase !== null) {
@@ -588,18 +330,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     } else {
       setDraft(newVal);
     }
-    handleTextChange(newVal);
-  }, [voiceBase, setVoiceBase, setVoiceInterim, setDraft, handleTextChange]);
-
-  const handleSelect = useCallback(() => {
-    // Re-detect trigger on cursor movement (arrow keys, click)
-    const ta = textareaRef.current;
-    if (ta) {
-      const currentVal = voiceBase !== null ? voiceBase : draft;
-      const trigger = detectTrigger(currentVal, ta.selectionStart);
-      setActiveTrigger(trigger);
-    }
-  }, [voiceBase, draft, setActiveTrigger]);
+    refValueChange(newVal);
+  }, [voiceBase, setVoiceBase, setVoiceInterim, setDraft, refValueChange]);
 
   // =========================================================================
   // Derived state
@@ -608,7 +340,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const displayedText = voiceBase !== null ? voiceBase : draft;
   const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
   const canSend = !blocksComposerSend;
-  const sendEnabled = canSend && hasContent && !expansionError;
+  const sendEnabled = canSend && hasContent && !ir.expansionError;
 
   // Cycle placeholder hint each time the input clears (e.g., after send).
   // Advances only when draft goes empty, not on a timer.
@@ -704,31 +436,24 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
       {/* Inline autocomplete dropdown (REQ-IR-004) */}
       <div className="iac-container">
-        <InlineAutocomplete
-          mode={activeTrigger?.mode ?? 'expand'}
-          query={activeTrigger?.query ?? ''}
-          items={acItems}
-          selectedIndex={acSelectedIndex}
-          onSelect={handleAcSelect}
-          visible={activeTrigger !== null}
-        />
+        {ir.dropdown}
       </div>
 
       {/* Skill argument hint ghost text (REQ-IR-005) */}
-      {skillArgumentHint && !expansionError && (
+      {ir.skillArgumentHint && !ir.expansionError && (
         <div className="input-skill-hint" aria-live="polite">
-          <span className="input-skill-hint-text">{skillArgumentHint}</span>
+          <span className="input-skill-hint-text">{ir.skillArgumentHint}</span>
         </div>
       )}
 
       {/* Expansion error inline indicator (REQ-IR-007) */}
-      {expansionError && (
+      {ir.expansionError && (
         <div className="input-expansion-error" role="alert">
           <span className="input-expansion-error-icon">x</span>
-          <span className="input-expansion-error-text">{expansionError}</span>
+          <span className="input-expansion-error-text">{ir.expansionError}</span>
           <button
             className="input-expansion-error-dismiss"
-            onClick={() => setExpansionError(null)}
+            onClick={() => ir.setExpansionError(null)}
             title="Dismiss"
           >
             x
@@ -751,7 +476,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           onChange={handleChange}
           onKeyDown={handleKeyDown}
           onPaste={handlePaste}
-          onSelect={handleSelect}
+          onSelect={ir.onSelectionChange}
         />
         <div className="input-inline-actions">
           {!agentWorking && voiceSupported && (
@@ -804,4 +529,3 @@ export const ConnectedInputArea = forwardRef<InputAreaHandle, ConnectedInputArea
     return <InputArea ref={ref} {...rest} draft={draft} onDraftChange={setDraft} />;
   },
 );
-

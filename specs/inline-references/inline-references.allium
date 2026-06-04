@@ -203,6 +203,13 @@ rule SkillTokenPassThrough {
 
 -- These rules describe the frontend behavior, not backend processing.
 -- They are normative: the frontend must implement these interactions.
+--
+-- The autocomplete engine is scoped to a working directory, not a
+-- conversation: candidates are a pure function of the directory the composer
+-- targets. The same engine therefore drives both the in-conversation composer
+-- and the new-conversation composer (which has a chosen directory but no
+-- conversation yet). Skill and file discovery resolve against that directory —
+-- the same root `expand` uses for `@file` references at send time.
 
 rule FileAutocompleteTriggered {
     when: UserTypes(input, character: "@")
@@ -212,9 +219,10 @@ rule FileAutocompleteTriggered {
     ensures: AutocompleteShown(mode: "file", query: text_after_sigil)
 
     @guidance
-        -- Frontend: detectTrigger() in InlineAutocomplete.tsx
-        -- Shows file suggestions from api.searchConversationFiles()
-        -- Fuzzy match on file path as user continues typing.
+        -- Frontend: detectTrigger() in InlineAutocomplete.tsx, driven by the
+        -- useInlineReferences hook. Shows file suggestions from a
+        -- directory-scoped fuzzy file search keyed on the composer's working
+        -- directory. Fuzzy match on file path as the user continues typing.
 }
 
 rule SkillAutocompleteTriggered {
@@ -225,9 +233,9 @@ rule SkillAutocompleteTriggered {
     ensures: AutocompleteShown(mode: "skill", query: text_after_sigil)
 
     @guidance
-        -- Frontend: detectTrigger() in InlineAutocomplete.tsx
-        -- Shows skill suggestions from api.listConversationSkills()
-        -- Filtered by fuzzy match on skill name.
+        -- Frontend: detectTrigger() in InlineAutocomplete.tsx, driven by the
+        -- useInlineReferences hook. Shows skills discovered from the composer's
+        -- working directory, filtered by fuzzy match on skill name.
 }
 
 rule PathAutocompleteTriggered {

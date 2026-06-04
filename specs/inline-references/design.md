@@ -69,26 +69,49 @@ Skill loading is **always context loading first**. Argument substitution is addi
 
 ### REQ-IR-004 and REQ-IR-005 Implementation: Autocomplete Endpoints
 
+Autocomplete candidates are a pure function of a working directory, so each
+discovery endpoint has two forms: a conversation-scoped form that reads the
+directory from the conversation record, and a directory-scoped form that takes
+the directory as a query parameter. The directory-scoped form serves the
+new-conversation composer, which has chosen a directory but not yet created a
+conversation. Both forms delegate to the same discovery logic (`skill_entries_for_cwd`,
+`search_files_in_root`), so the two composers behave identically.
+
+The directory both forms resolve against is the conversation's `cwd` — the same
+root `message_expander::expand` uses for `@file` references at send time — so
+every autocomplete candidate is one that will actually expand. (A Work-mode
+conversation's worktree is deliberately *not* searched: a worktree-only file
+would autocomplete but then fail to expand.)
+
 **Skill discovery:**
 ```
-GET /api/conversations/:id/skills
-Response: [{ name, description, argument_hint | null }]
+GET /api/conversations/:id/skills          (conversation-scoped)
+GET /api/skills?cwd=<dir>                   (directory-scoped)
+Response: { skills: [{ name, description, argument_hint | null, source, path }] }
 ```
-Calls `discover_skills(conversation.working_dir)`. `argument_hint` comes from the `argument-hint` frontmatter field in `SKILL.md` (extend `parse_skill_frontmatter` and `SkillMetadata` to carry it).
+Calls `discover_skills(<cwd>)`. `argument_hint` comes from the `argument-hint`
+frontmatter field in `SKILL.md`.
 
 **File search:**
-Reuse the existing `GET /api/files/list?path=<dir>` for directory-level browsing. For fuzzy search across the full tree, add:
+Reuse the existing `GET /api/files/list?path=<dir>` for directory-level browsing. For fuzzy search across the full tree:
 ```
-GET /api/conversations/:id/files/search?q=<query>&limit=<n>
-Response: [{ path, is_text_file }]
+GET /api/conversations/:id/files/search?q=<query>&limit=<n>   (conversation-scoped)
+GET /api/files/search?cwd=<dir>&q=<query>&limit=<n>           (directory-scoped)
+Response: { items: [{ path, is_text_file }] }
 ```
-Walks `working_dir` recursively using the `ignore` crate (gitignore-aware), caps results at `limit` (default 50), fuzzy-matches on path components.
+Walks `cwd` recursively using the `ignore` crate (gitignore-aware), caps results at `limit` (default 50), fuzzy-matches on path components.
 
 ## Frontend: Inline Autocomplete
 
 ### REQ-IR-004 Implementation (shared file picker)
 
-Both `@` and `./` triggers open the same `InlineAutocomplete` component. Trigger detection in `InputArea` inspects the text around the cursor on each `onChange`:
+The autocomplete engine lives in the `useInlineReferences` hook, scoped to a
+working directory rather than a conversation. Both the in-conversation composer
+(`InputArea`) and the new-conversation composer consume the hook, passing the
+directory they target; this is what makes inline references work in the
+new-conversation composer before any conversation exists.
+
+Both `@` and `./` triggers open the same `InlineAutocomplete` component. Trigger detection inspects the text around the cursor on each `onChange`:
 
 - `@<partial>` anywhere in the text → open in `expand` mode
 - `./` followed by any characters anywhere in the text → open in `path` mode
@@ -102,7 +125,7 @@ The component is mode-agnostic: it receives items and a query, renders a filtere
 
 ### REQ-IR-008 Implementation (path reference, no expansion)
 
-`./` completion is purely a frontend assist. No backend call is made at send time. The inserted `./path/to/file` string travels to the LLM as-is. The file search endpoint (`GET /api/conversations/:id/files/search`) is used identically to the `@` autocomplete — the only difference is what gets inserted and what happens at send time (nothing).
+`./` completion is purely a frontend assist. No backend call is made at send time. The inserted `./path/to/file` string travels to the LLM as-is. The file search endpoint is used identically to the `@` autocomplete — the only difference is what gets inserted and what happens at send time (nothing).
 
 Because there is no expansion, REQ-IR-007 error handling does not apply. The agent receives the path and is responsible for reading it.
 

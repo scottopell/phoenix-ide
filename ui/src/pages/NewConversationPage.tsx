@@ -8,6 +8,7 @@ import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
 import { useCreateConversation } from '../hooks/useCreateConversation';
 import { useResizablePane } from '../hooks/useResizablePane';
 import { useIsDesktop } from '../hooks/useMediaQuery';
+import { useInlineReferences } from '../hooks';
 
 // Lazy: xterm + addon are a non-trivial bundle slice. Deferred behind the
 // `everExpanded` gate below — the dynamic import only fires once the user
@@ -28,6 +29,27 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const conv = useCreateConversation(navigate);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Inline reference autocomplete (@file, ./path, /skill) scoped to the
+  // selected working directory — the same directory the first message is
+  // expanded against when the conversation is created. The composer renders
+  // both a desktop and a mobile textarea (one hidden by CSS); `inlineRefTextarea`
+  // tracks whichever is focused so trigger detection reads the right caret.
+  const inlineRefTextarea = useRef<HTMLTextAreaElement | null>(null);
+  const ir = useInlineReferences({
+    cwd: conv.cwd,
+    textareaRef: inlineRefTextarea,
+    value: conv.draft,
+    setValue: conv.updateDraft,
+  });
+  const handleDraftChange = (next: string) => {
+    conv.updateDraft(next);
+    ir.onValueChange(next);
+  };
+  const handleSend = () => {
+    ir.reset();
+    conv.handleSend();
+  };
 
   // Real-breakpoint gate for the global terminal. CSS `display:none` would
   // hide it on mobile but React effects (lazy import, WebSocket open,
@@ -89,9 +111,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (ir.onKeyDown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      conv.handleSend();
+      handleSend();
     }
   };
 
@@ -154,15 +177,23 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
           {llmReady && (
             <>
               <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
+              <div className="iac-container">{ir.dropdown}</div>
+              {ir.skillArgumentHint && (
+                <div className="input-skill-hint" aria-live="polite">
+                  <span className="input-skill-hint-text">{ir.skillArgumentHint}</span>
+                </div>
+              )}
               <textarea
                 ref={textareaRef}
                 className="new-conv-textarea"
                 placeholder={inputPlaceholder}
-rows={3}
+                rows={3}
                 value={conv.textareaValue}
-                onChange={(e) => conv.updateDraft(e.target.value)}
+                onChange={(e) => handleDraftChange(e.target.value)}
                 onKeyDown={handleKeyDown}
                 onPaste={handlePaste}
+                onSelect={ir.onSelectionChange}
+                onFocus={(e) => { inlineRefTextarea.current = e.currentTarget; }}
                 disabled={conv.creating}
               />
 
@@ -171,7 +202,7 @@ rows={3}
                 <div className="new-conv-send-group">
                   <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
                   {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
-                  <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
+                  <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend}>{buttonText}</button>
                 </div>
               </div>
             </>
@@ -251,14 +282,22 @@ rows={3}
       {llmReady && (
         <div className="new-conv-bottom-input mobile-only">
           <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
+          <div className="iac-container">{ir.dropdown}</div>
+          {ir.skillArgumentHint && (
+            <div className="input-skill-hint" aria-live="polite">
+              <span className="input-skill-hint-text">{ir.skillArgumentHint}</span>
+            </div>
+          )}
           <textarea
             className="new-conv-textarea-mobile"
             placeholder={inputPlaceholder}
             rows={2}
             value={conv.textareaValue}
-            onChange={(e) => conv.updateDraft(e.target.value)}
+            onChange={(e) => handleDraftChange(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
+            onSelect={ir.onSelectionChange}
+            onFocus={(e) => { inlineRefTextarea.current = e.currentTarget; }}
             disabled={conv.creating}
           />
           <div className="new-conv-input-row">
@@ -266,7 +305,7 @@ rows={3}
               <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
               {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
             </div>
-            <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
+            <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend}>{buttonText}</button>
           </div>
         </div>
       )}

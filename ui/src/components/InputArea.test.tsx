@@ -10,7 +10,7 @@ import { api } from '../api';
 const idleState: ConversationState = { type: 'idle' };
 
 interface InputAreaTestProps {
-  conversationId: string | undefined;
+  cwd: string | undefined;
   convState?: ConversationState;
   draft?: string;
   onDraftChange?: (text: string) => void;
@@ -19,7 +19,7 @@ interface InputAreaTestProps {
 }
 
 function renderInput({
-  conversationId,
+  cwd,
   convState = idleState,
   draft = '',
   onDraftChange = () => {},
@@ -29,7 +29,7 @@ function renderInput({
   const focusProps = focusToken === undefined ? {} : { focusToken };
   return render(
     <InputArea
-      conversationId={conversationId}
+      cwd={cwd}
       convState={convState}
       images={[]}
       setImages={() => {}}
@@ -47,13 +47,13 @@ function renderInput({
 
 describe('InputArea controlled-draft contract', () => {
   it('renders the draft prop and re-renders when the prop changes', () => {
-    const { rerender } = renderInput({ conversationId: 'conv-a', draft: 'draft A' });
+    const { rerender } = renderInput({ cwd: 'conv-a', draft: 'draft A' });
     const textarea = screen.getByRole('textbox') as HTMLTextAreaElement;
     expect(textarea.value).toBe('draft A');
 
     rerender(
       <InputArea
-        conversationId="conv-b"
+        cwd="conv-b"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -70,7 +70,7 @@ describe('InputArea controlled-draft contract', () => {
     expect(textarea.value).toBe('draft B');
   });
 
-  it('clears autocomplete and skill-hint state when conversation changes', async () => {
+  it('clears autocomplete and skill-hint state when cwd changes', async () => {
     const skills: SkillEntry[] = [
       {
         name: 'review',
@@ -80,7 +80,7 @@ describe('InputArea controlled-draft contract', () => {
         path: '/repo/.agents/skills/review/SKILL.md',
       },
     ];
-    vi.spyOn(api, 'listConversationSkills').mockResolvedValue({ skills });
+    vi.spyOn(api, 'listProjectSkills').mockResolvedValue({ skills });
 
     let currentDraft = '';
     const onDraftChange = (text: string) => {
@@ -88,7 +88,7 @@ describe('InputArea controlled-draft contract', () => {
     };
 
     const { rerender } = renderInput({
-      conversationId: 'conv-a',
+      cwd: 'conv-a',
       draft: currentDraft,
       onDraftChange,
     });
@@ -97,7 +97,7 @@ describe('InputArea controlled-draft contract', () => {
     fireEvent.change(textarea, { target: { value: '/r' } });
     rerender(
       <InputArea
-        conversationId="conv-a"
+        cwd="conv-a"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -117,7 +117,7 @@ describe('InputArea controlled-draft contract', () => {
 
     rerender(
       <InputArea
-        conversationId="conv-b"
+        cwd="conv-b"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -145,7 +145,7 @@ describe('InputArea focusToken contract', () => {
     anchor.focus();
     expect(document.activeElement).toBe(anchor);
 
-    renderInput({ conversationId: 'conv-a', focusToken: 0 });
+    renderInput({ cwd: 'conv-a', focusToken: 0 });
 
     expect(document.activeElement).toBe(anchor);
     document.body.removeChild(anchor);
@@ -156,7 +156,7 @@ describe('InputArea focusToken contract', () => {
     document.body.appendChild(anchor);
     anchor.focus();
 
-    renderInput({ conversationId: 'conv-a' });
+    renderInput({ cwd: 'conv-a' });
 
     expect(document.activeElement).toBe(anchor);
     document.body.removeChild(anchor);
@@ -167,12 +167,12 @@ describe('InputArea focusToken contract', () => {
     document.body.appendChild(anchor);
     anchor.focus();
 
-    const { rerender } = renderInput({ conversationId: 'conv-a', focusToken: 0 });
+    const { rerender } = renderInput({ cwd: 'conv-a', focusToken: 0 });
     expect(document.activeElement).toBe(anchor);
 
     rerender(
       <InputArea
-        conversationId="conv-a"
+        cwd="conv-a"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -199,7 +199,7 @@ describe('InputArea focusToken contract', () => {
           <button onClick={() => ref.current?.focus()}>do-focus</button>
           <InputArea
             ref={ref}
-            conversationId="conv-a"
+            cwd="conv-a"
             convState={idleState}
             images={[]}
             setImages={() => {}}
@@ -228,7 +228,7 @@ describe('InputArea cancellation affordance', () => {
   it('shows Stop and calls onCancel for cancellable working states', () => {
     const onCancel = vi.fn();
     renderInput({
-      conversationId: 'conv-cancel',
+      cwd: 'conv-cancel',
       convState: { type: 'llm_requesting', attempt: 1 },
       onCancel,
     });
@@ -240,7 +240,7 @@ describe('InputArea cancellation affordance', () => {
   it('renders continuation progress without a Stop button', () => {
     const onCancel = vi.fn();
     renderInput({
-      conversationId: 'conv-continuation',
+      cwd: 'conv-continuation',
       convState: { type: 'awaiting_continuation', attempt: 1 },
       onCancel,
     });
@@ -254,7 +254,7 @@ describe('InputArea cancellation affordance', () => {
     const onSend = vi.fn();
     render(
       <InputArea
-        conversationId="conv-continuation"
+        cwd="conv-continuation"
         convState={{ type: 'awaiting_continuation', attempt: 1 }}
         images={[]}
         setImages={() => {}}
@@ -279,7 +279,7 @@ describe('InputArea cancellation affordance', () => {
     const onSend = vi.fn();
     render(
       <InputArea
-        conversationId="conv-cancelling"
+        cwd="conv-cancelling"
         convState={{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }}
         images={[]}
         setImages={() => {}}
@@ -303,7 +303,7 @@ describe('InputArea cancellation affordance', () => {
     const onSend = vi.fn();
     render(
       <InputArea
-        conversationId="conv-awaiting-llm"
+        cwd="conv-awaiting-llm"
         convState={{ type: 'awaiting_llm' }}
         images={[]}
         setImages={() => {}}
@@ -325,7 +325,7 @@ describe('InputArea cancellation affordance', () => {
   it('does not call onCancel for Escape while awaiting continuation', () => {
     const onCancel = vi.fn();
     renderInput({
-      conversationId: 'conv-continuation',
+      cwd: 'conv-continuation',
       convState: { type: 'awaiting_continuation', attempt: 1 },
       onCancel,
     });

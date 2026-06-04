@@ -961,6 +961,23 @@ export const api = {
     return resp.json();
   },
 
+  /**
+   * List skills available for a working directory before a conversation exists
+   * (the new-conversation composer). Directory-scoped sibling of
+   * {@link listConversationSkills} (REQ-IR-005).
+   */
+  async listProjectSkills(
+    cwd: string,
+    signal?: AbortSignal,
+  ): Promise<{ skills: SkillEntry[] }> {
+    const resp = await fetch(
+      `/api/skills?cwd=${encodeURIComponent(cwd)}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to list skills');
+    return resp.json();
+  },
+
   /** List tasks from a project tasks/ directory before a conversation exists */
   async listProjectTasks(cwd: string, signal?: AbortSignal): Promise<{ tasks: TaskEntry[] }> {
     const resp = await fetch(
@@ -993,6 +1010,26 @@ export const api = {
     const params = new URLSearchParams({ q: query, limit: String(limit) });
     const resp = await fetch(
       `/api/conversations/${convId}/files/search?${params}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to search files');
+    return resp.json();
+  },
+
+  /**
+   * Search files in a working directory before a conversation exists (the
+   * new-conversation composer). Directory-scoped sibling of
+   * {@link searchConversationFiles} (REQ-IR-004).
+   */
+  async searchProjectFiles(
+    cwd: string,
+    query: string,
+    limit = 50,
+    signal?: AbortSignal,
+  ): Promise<{ items: FileSearchEntry[] }> {
+    const params = new URLSearchParams({ cwd, q: query, limit: String(limit) });
+    const resp = await fetch(
+      `/api/files/search?${params}`,
       signal ? { signal } : {},
     );
     if (!resp.ok) throw new Error('Failed to search files');
