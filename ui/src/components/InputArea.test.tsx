@@ -11,6 +11,7 @@ const idleState: ConversationState = { type: 'idle' };
 
 interface InputAreaTestProps {
   cwd: string | undefined;
+  scopeKey?: string | undefined;
   convState?: ConversationState;
   draft?: string;
   onDraftChange?: (text: string) => void;
@@ -20,6 +21,7 @@ interface InputAreaTestProps {
 
 function renderInput({
   cwd,
+  scopeKey,
   convState = idleState,
   draft = '',
   onDraftChange = () => {},
@@ -30,6 +32,7 @@ function renderInput({
   return render(
     <InputArea
       cwd={cwd}
+      scopeKey={scopeKey ?? cwd}
       convState={convState}
       images={[]}
       setImages={() => {}}
@@ -54,6 +57,7 @@ describe('InputArea controlled-draft contract', () => {
     rerender(
       <InputArea
         cwd="conv-b"
+        scopeKey="conv-b"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -70,7 +74,10 @@ describe('InputArea controlled-draft contract', () => {
     expect(textarea.value).toBe('draft B');
   });
 
-  it('clears autocomplete and skill-hint state when cwd changes', async () => {
+  it('clears autocomplete and skill-hint state when the composer scope changes within one cwd', async () => {
+    // Two conversations in the same repo share a `cwd` but have distinct
+    // `scopeKey`s. Switching between them must reset transient autocomplete /
+    // skill-hint state rather than leak it across conversations.
     const skills: SkillEntry[] = [
       {
         name: 'review',
@@ -88,7 +95,8 @@ describe('InputArea controlled-draft contract', () => {
     };
 
     const { rerender } = renderInput({
-      cwd: 'conv-a',
+      cwd: '/repo',
+      scopeKey: 'conv-a',
       draft: currentDraft,
       onDraftChange,
     });
@@ -97,7 +105,8 @@ describe('InputArea controlled-draft contract', () => {
     fireEvent.change(textarea, { target: { value: '/r' } });
     rerender(
       <InputArea
-        cwd="conv-a"
+        cwd="/repo"
+        scopeKey="conv-a"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -115,9 +124,11 @@ describe('InputArea controlled-draft contract', () => {
     fireEvent.click(screen.getByRole('option', { name: /review/ }));
     expect(screen.getByText('<path>')).toBeInTheDocument();
 
+    // Same cwd, different conversation: transient state must reset.
     rerender(
       <InputArea
-        cwd="conv-b"
+        cwd="/repo"
+        scopeKey="conv-b"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -173,6 +184,7 @@ describe('InputArea focusToken contract', () => {
     rerender(
       <InputArea
         cwd="conv-a"
+        scopeKey="conv-a"
         convState={idleState}
         images={[]}
         setImages={() => {}}
@@ -200,6 +212,7 @@ describe('InputArea focusToken contract', () => {
           <InputArea
             ref={ref}
             cwd="conv-a"
+            scopeKey="conv-a"
             convState={idleState}
             images={[]}
             setImages={() => {}}
@@ -255,6 +268,7 @@ describe('InputArea cancellation affordance', () => {
     render(
       <InputArea
         cwd="conv-continuation"
+        scopeKey="conv-continuation"
         convState={{ type: 'awaiting_continuation', attempt: 1 }}
         images={[]}
         setImages={() => {}}
@@ -280,6 +294,7 @@ describe('InputArea cancellation affordance', () => {
     render(
       <InputArea
         cwd="conv-cancelling"
+        scopeKey="conv-cancelling"
         convState={{ type: 'cancelling_tool', current_tool: { id: 't', name: 'bash', input: {} } }}
         images={[]}
         setImages={() => {}}
@@ -304,6 +319,7 @@ describe('InputArea cancellation affordance', () => {
     render(
       <InputArea
         cwd="conv-awaiting-llm"
+        scopeKey="conv-awaiting-llm"
         convState={{ type: 'awaiting_llm' }}
         images={[]}
         setImages={() => {}}

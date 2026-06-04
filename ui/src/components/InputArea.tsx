@@ -31,6 +31,13 @@ interface InputAreaProps {
    * disables autocomplete fetching.
    */
   cwd: string | undefined;
+  /**
+   * Composer identity (the conversation id). Transient composer state — voice
+   * buffer, active autocomplete trigger, inline expansion error — resets when
+   * this changes, so switching between two conversations that share a `cwd`
+   * doesn't carry one's state into the other.
+   */
+  scopeKey: string | undefined;
   convState: ConversationState;
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
@@ -70,6 +77,7 @@ interface InputAreaProps {
 
 export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
   cwd,
+  scopeKey,
   convState,
   images,
   setImages,
@@ -111,8 +119,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   }, [focusToken]);
 
   // Voice input: base text (accumulated finals) + interim (current partial)
-  const [voiceBase, setVoiceBase] = useScopedState<string | null>(cwd, null); // null = not recording
-  const [voiceInterim, setVoiceInterim] = useScopedState(cwd, '');
+  const [voiceBase, setVoiceBase] = useScopedState<string | null>(scopeKey, null); // null = not recording
+  const [voiceInterim, setVoiceInterim] = useScopedState(scopeKey, '');
 
   // =========================================================================
   // Inline autocomplete (REQ-IR-004, REQ-IR-005), scoped to `cwd`
@@ -134,6 +142,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
 
   const ir = useInlineReferences({
     cwd,
+    scopeKey,
     textareaRef,
     value: acValue,
     setValue: applyRefValue,

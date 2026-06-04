@@ -1179,6 +1179,7 @@ function ConversationPageContent() {
           ref={inputRef}
           slug={slug!}
           cwd={conversation.cwd}
+          scopeKey={conversationId}
           convState={convStateForChildren}
           images={images}
           setImages={setImages}
@@ -1241,6 +1242,7 @@ function ConversationPageContent() {
           ref={inputRef}
           slug={slug!}
           cwd={conversation.cwd}
+          scopeKey={conversationId}
           convState={convStateForChildren}
           images={images}
           setImages={setImages}

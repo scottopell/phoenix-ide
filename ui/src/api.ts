@@ -759,6 +759,11 @@ export const api = {
       if (resp.status === 409) {
         throw new ConflictError(err as ConflictErrorDetail);
       }
+      // The first message is expanded at create time, same as a chat send, so
+      // an unresolvable `@file` reference comes back as 422 (REQ-IR-007).
+      if (resp.status === 422) {
+        throw new ExpansionError(err as ExpansionErrorDetail);
+      }
       throw new Error(err.error || 'Failed to create conversation');
     }
     return (await resp.json()).conversation;

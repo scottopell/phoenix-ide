@@ -33,8 +33,19 @@ export interface UseInlineReferencesParams {
   /**
    * Directory to resolve `@file` / `./path` / `/skill` candidates against.
    * `undefined`/empty disables fetching (the dropdown simply never populates).
+   * The skill/file candidate caches are keyed on this.
    */
   cwd: string | undefined;
+  /**
+   * Identity of the composer this engine belongs to: a conversation id for an
+   * in-conversation composer, a stable key for the new-conversation composer.
+   * Transient UI state (active trigger, in-flight results, expansion error,
+   * skill hint, selection index) resets when this changes. Without it, two
+   * conversations sharing a `cwd` — rendered by the same component tree across
+   * a route-param change — would leak one's stale expansion error (and dropdown)
+   * into the other, wrongly disabling Send.
+   */
+  scopeKey: string | undefined;
   /** The composer textarea — used to read caret position for trigger detection. */
   textareaRef: RefObject<HTMLTextAreaElement>;
   /** Current composer text (already merged with any in-progress voice input). */
@@ -68,25 +79,31 @@ export interface InlineReferences {
 
 export function useInlineReferences({
   cwd,
+  scopeKey,
   textareaRef,
   value,
   setValue,
 }: UseInlineReferencesParams): InlineReferences {
+  // Transient UI state is keyed on the composer identity (`scopeKey`) so it
+  // resets when the composer switches conversations, even within one `cwd`.
   /** Active trigger state — null when no trigger is open. */
-  const [activeTrigger, setActiveTrigger] = useScopedState<TriggerState | null>(cwd, null);
+  const [activeTrigger, setActiveTrigger] = useScopedState<TriggerState | null>(scopeKey, null);
   /**
    * File search results fetched from the server. Skill candidates are NOT
    * stored here — they're derived during render from `skillItems` (see the
    * `acItems` useMemo below), avoiding the derived-state-in-effect anti-pattern.
    */
-  const [fileAcItems, setFileAcItems] = useScopedState<AutocompleteItem[]>(cwd, []);
+  const [fileAcItems, setFileAcItems] = useScopedState<AutocompleteItem[]>(scopeKey, []);
   /** Inline error when an @ref or /skill fails to expand (REQ-IR-007). */
-  const [expansionError, setExpansionError] = useScopedState<string | null>(cwd, null);
+  const [expansionError, setExpansionError] = useScopedState<string | null>(scopeKey, null);
+  /** Argument hint ghost text shown after a skill is selected (REQ-IR-005). */
+  const [skillArgumentHint, setSkillArgumentHint] = useScopedState<string | null>(scopeKey, null);
+  const [acSelectedIndex, setAcSelectedIndex] = useScopedState(scopeKey, 0);
+
+  // The skill catalog is a property of the directory, so it stays keyed on
+  // `cwd` and is shared across same-directory composers.
   /** Cached skill list for the current directory (REQ-IR-005). */
   const [skillItems, setSkillItems] = useScopedState<SkillEntry[]>(cwd, []);
-  /** Argument hint ghost text shown after a skill is selected (REQ-IR-005). */
-  const [skillArgumentHint, setSkillArgumentHint] = useScopedState<string | null>(cwd, null);
-  const [acSelectedIndex, setAcSelectedIndex] = useScopedState(cwd, 0);
 
   /** Aborts any in-flight file search request. */
   const searchAbortRef = useRef<AbortController | null>(null);
@@ -94,6 +111,13 @@ export function useInlineReferences({
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Guards against duplicate in-flight skill fetches. */
   const fetchingSkillsRef = useRef(false);
+  /**
+   * Latest requested `cwd`. A fetch issued for directory A may resolve after
+   * the composer has switched to directory B; comparing against this ref lets
+   * the late response be discarded instead of populating B with A's results.
+   */
+  const latestCwdRef = useRef(cwd);
+  latestCwdRef.current = cwd;
 
   /**
    * Autocomplete items to display, derived from the active trigger mode: skill
@@ -126,6 +150,8 @@ export function useInlineReferences({
 
       try {
         const result = await api.searchProjectFiles(cwd, query, 50, controller.signal);
+        // Drop the response if the directory changed while it was in flight.
+        if (latestCwdRef.current !== cwd) return;
         const items: AutocompleteItem[] = result.items.map((entry) => ({
           id: entry.path,
           label: entry.path,
@@ -149,6 +175,8 @@ export function useInlineReferences({
     fetchingSkillsRef.current = true;
     try {
       const result = await api.listProjectSkills(cwd);
+      // Drop the response if the directory changed while it was in flight.
+      if (latestCwdRef.current !== cwd) return;
       setSkillItems(result.skills);
     } catch (err) {
       console.warn('Skill list failed:', err);

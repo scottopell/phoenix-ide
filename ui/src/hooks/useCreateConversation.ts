@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { api } from '../api';
+import { api, ExpansionError } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import type { GitBranchEntry, ImageData, ModelsResponse, TaskEntry } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
@@ -428,8 +428,14 @@ export function useCreateConversation(navigate: (path: string) => void) {
       clearNewConversationDraft();
       navigate(`/c/${conv.slug}`);
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to create conversation');
       setCreating(false);
+      // An unresolvable @reference in the first message rejects with a 422.
+      // Re-throw so the composer can surface it inline next to the input
+      // (REQ-IR-007) rather than as a page-level error.
+      if (err instanceof ExpansionError) {
+        throw err;
+      }
+      setError(err instanceof Error ? err.message : 'Failed to create conversation');
     }
   };
 

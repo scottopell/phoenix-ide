@@ -5,6 +5,7 @@ import { ConversationSettings } from '../components/ConversationSettings';
 import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
 import { PaneDivider } from '../components/PaneDivider';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
+import { ExpansionError } from '../api';
 import { useCreateConversation } from '../hooks/useCreateConversation';
 import { useResizablePane } from '../hooks/useResizablePane';
 import { useIsDesktop } from '../hooks/useMediaQuery';
@@ -38,6 +39,9 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const inlineRefTextarea = useRef<HTMLTextAreaElement | null>(null);
   const ir = useInlineReferences({
     cwd: conv.cwd,
+    // The new-conversation composer's identity is its directory: switching the
+    // chosen directory resets the dropdown / inline error.
+    scopeKey: conv.cwd,
     textareaRef: inlineRefTextarea,
     value: conv.draft,
     setValue: conv.updateDraft,
@@ -46,9 +50,19 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     conv.updateDraft(next);
     ir.onValueChange(next);
   };
-  const handleSend = () => {
+  const handleSend = async () => {
     ir.reset();
-    conv.handleSend();
+    try {
+      await conv.handleSend();
+    } catch (err) {
+      // The create endpoint expands the first message and rejects unresolvable
+      // `@file` references with the same 422 as a chat send. Surface it inline
+      // next to the composer (REQ-IR-007) instead of the page-level error,
+      // which on mobile renders up in the settings area away from the input.
+      if (err instanceof ExpansionError) {
+        ir.setExpansionError(err.detail.error);
+      }
+    }
   };
 
   // Real-breakpoint gate for the global terminal. CSS `display:none` would
@@ -178,9 +192,16 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             <>
               <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
               <div className="iac-container">{ir.dropdown}</div>
-              {ir.skillArgumentHint && (
+              {ir.skillArgumentHint && !ir.expansionError && (
                 <div className="input-skill-hint" aria-live="polite">
                   <span className="input-skill-hint-text">{ir.skillArgumentHint}</span>
+                </div>
+              )}
+              {ir.expansionError && (
+                <div className="input-expansion-error" role="alert">
+                  <span className="input-expansion-error-icon">x</span>
+                  <span className="input-expansion-error-text">{ir.expansionError}</span>
+                  <button className="input-expansion-error-dismiss" onClick={() => ir.setExpansionError(null)} title="Dismiss">x</button>
                 </div>
               )}
               <textarea
@@ -202,7 +223,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
                 <div className="new-conv-send-group">
                   <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
                   {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
-                  <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend}>{buttonText}</button>
+                  <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend || !!ir.expansionError}>{buttonText}</button>
                 </div>
               </div>
             </>
@@ -283,9 +304,16 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
         <div className="new-conv-bottom-input mobile-only">
           <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
           <div className="iac-container">{ir.dropdown}</div>
-          {ir.skillArgumentHint && (
+          {ir.skillArgumentHint && !ir.expansionError && (
             <div className="input-skill-hint" aria-live="polite">
               <span className="input-skill-hint-text">{ir.skillArgumentHint}</span>
+            </div>
+          )}
+          {ir.expansionError && (
+            <div className="input-expansion-error" role="alert">
+              <span className="input-expansion-error-icon">x</span>
+              <span className="input-expansion-error-text">{ir.expansionError}</span>
+              <button className="input-expansion-error-dismiss" onClick={() => ir.setExpansionError(null)} title="Dismiss">x</button>
             </div>
           )}
           <textarea
@@ -305,7 +333,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
               <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
               {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
             </div>
-            <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend}>{buttonText}</button>
+            <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend || !!ir.expansionError}>{buttonText}</button>
           </div>
         </div>
       )}
