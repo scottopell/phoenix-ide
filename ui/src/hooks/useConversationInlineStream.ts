@@ -87,21 +87,45 @@ function parseEventData(event: Event): unknown | null {
   }
 }
 
-let liveStreamOwner: string | null = null;
+// Single-live-stream slot: at most one *conversation* may be streamed live at
+// a time, but that conversation may legitimately have several concurrent
+// viewers (e.g. an expanded inline card and the docked panel for the same
+// sub-agent). A reference count over the owning conversation id keeps those
+// nested acquires/releases balanced — releasing one viewer must not free the
+// slot while another viewer's EventSource is still open (which would let a
+// *different* conversation acquire and produce two concurrent live streams).
+let liveStreamOwner: { id: string; count: number } | null = null;
 
 function acquireLiveStream(conversationId: string): boolean {
-  if (liveStreamOwner === null || liveStreamOwner === conversationId) {
-    liveStreamOwner = conversationId;
+  if (liveStreamOwner === null) {
+    liveStreamOwner = { id: conversationId, count: 1 };
+    return true;
+  }
+  if (liveStreamOwner.id === conversationId) {
+    liveStreamOwner.count += 1;
     return true;
   }
   return false;
 }
 
 function releaseLiveStream(conversationId: string): void {
-  if (liveStreamOwner === conversationId) {
-    liveStreamOwner = null;
+  if (liveStreamOwner && liveStreamOwner.id === conversationId) {
+    liveStreamOwner.count -= 1;
+    if (liveStreamOwner.count <= 0) {
+      liveStreamOwner = null;
+    }
   }
 }
+
+/** Test-only handle on the live-stream slot accounting. Not part of the public
+ *  surface — production code goes through the hook. */
+export const __testing = {
+  acquireLiveStream,
+  releaseLiveStream,
+  resetLiveStreamSlot: () => {
+    liveStreamOwner = null;
+  },
+};
 
 function maxMessageSequence(messages: Message[]): number {
   let max = 0;
@@ -162,11 +186,14 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
     let retryTimer: number | null = null;
 
     const closeSource = () => {
+      // Release the slot only when we actually had an open EventSource, so a
+      // double close (e.g. self-close on terminal state followed by effect
+      // cleanup) decrements the refcount exactly once.
       if (source) {
         source.close();
         source = null;
+        releaseLiveStream(conversationId);
       }
-      releaseLiveStream(conversationId);
     };
 
     const openLiveStream = () => {
@@ -314,7 +341,11 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         })
         .catch((err) => {
           if (cancelled) return;
-          if (live !== false && isNotFound(err)) {
+          // Retry a 404 only for an explicitly-live stream, where it means a
+          // just-spawned sub-agent hasn't hit the DB yet (spawn race). For
+          // 'auto' (the docked viewer) a 404 means the sub-agent is gone —
+          // surface it as an error instead of retrying forever.
+          if (live === true && isNotFound(err)) {
             retryTimer = window.setTimeout(loadSnapshot, 500);
             return;
           }
