@@ -6,7 +6,7 @@
 //! Test-driver markers (parsed from the latest user message text):
 //! - `[[scenario:NAME]]` — force a specific scripted response
 //!   (`plain_text`, `markdown`, `bash`, `read_file`, `think`,
-//!   `multi_tool`, `long`, `patch`).
+//!   `multi_tool`, `long`, `patch`, `spawn_agents`).
 //! - `[[perf:N]]` — deterministic text-only response of ~N words
 //!   (performance fingerprint, no rand).
 //! - `[[ttft:N]]` — override time-to-first-token sleep with N ms.
@@ -69,12 +69,26 @@ enum Scenario {
     /// overwrites `e2e-mock-patch-out.txt` in the conversation's cwd.
     /// Authored for E2E tests; see `[[scenario:patch]]` callers.
     PatchToolCall,
+    /// Marker-only (not in hash rotation): emits a `spawn_agents` `tool_use`
+    /// that spawns two short read-only sub-agents on the mock model. Fires
+    /// once per conversation (see `Scenario::from_message`); the follow-up
+    /// turn after the sub-agents finish falls through to `PlainText`. Authored
+    /// for sub-agent UI testing; see `[[scenario:spawn_agents]]`.
+    SpawnAgents,
 }
 
 impl Scenario {
     fn from_message(request: &LlmRequest) -> Self {
         // Explicit selection via `[[scenario:NAME]]` marker wins over hashing.
         if let Some(s) = parse_scenario(request) {
+            // `spawn_agents` must fire exactly once. After the sub-agents
+            // finish, the parent makes a follow-up call whose last user
+            // message still carries the marker — if we've already emitted a
+            // spawn_agents tool call in this conversation, wrap up with text
+            // instead of spawning a fresh batch every turn.
+            if matches!(s, Self::SpawnAgents) && already_spawned_agents(request) {
+                return Self::PlainText;
+            }
             return s;
         }
         // Use the last user message to pick a scenario deterministically.
@@ -116,8 +130,8 @@ impl Scenario {
 /// forces selection of a specific scripted response, bypassing the hash-based
 /// roulette. Symmetric with `[[perf:N]]` — both make the mock authorable for
 /// E2E tests. Recognized NAMEs: `plain_text`, `markdown`, `bash`, `read_file`,
-/// `think`, `multi_tool`, `long`, `patch`. Dev-only: mock is opt-in
-/// (`PHOENIX_ENABLE_MOCK_MODEL=1`).
+/// `think`, `multi_tool`, `long`, `patch`, `spawn_agents`. Dev-only: mock is
+/// opt-in (`PHOENIX_ENABLE_MOCK_MODEL=1`).
 fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
     let text = request.messages.iter().rev().find_map(|m| {
         if m.role == super::types::MessageRole::User {
@@ -147,8 +161,21 @@ fn parse_scenario(request: &LlmRequest) -> Option<Scenario> {
         "multi_tool" => Some(Scenario::MultiToolCall),
         "long" => Some(Scenario::LongStreaming),
         "patch" => Some(Scenario::PatchToolCall),
+        "spawn_agents" => Some(Scenario::SpawnAgents),
         _ => None,
     }
+}
+
+/// True if any assistant message in the request history already contains a
+/// `spawn_agents` tool call. Used to make the `spawn_agents` scenario fire
+/// exactly once per conversation (the parent re-calls the LLM after its
+/// sub-agents finish, and the marker is still on the last user message).
+fn already_spawned_agents(request: &LlmRequest) -> bool {
+    request.messages.iter().any(|m| {
+        m.content.iter().any(
+            |b| matches!(b, ContentBlock::ToolUse { name, .. } if name == "spawn_agents"),
+        )
+    })
 }
 
 const PLAIN_TEXT: &str = "I've analyzed the situation and here's what I found. \
@@ -564,6 +591,41 @@ fn build_response(scenario: &Scenario) -> (Vec<ContentBlock>, String) {
                 text,
             )
         }
+
+        Scenario::SpawnAgents => {
+            let text = "I'll spawn two read-only sub-agents to investigate in parallel.".to_string();
+            (
+                vec![
+                    ContentBlock::Text { text: text.clone() },
+                    ContentBlock::ToolUse {
+                        id: tool_use_id(),
+                        name: "spawn_agents".to_string(),
+                        // Explicit `model: "mock"` so the children run on the
+                        // mock too (Explore would otherwise resolve to a cheap
+                        // real model that's unavailable in dev). Low `max_turns`
+                        // so they reach a terminal state quickly — the mock
+                        // never calls `submit_result`.
+                        input: serde_json::json!({
+                            "tasks": [
+                                {
+                                    "task": "Investigate the authentication module for security issues",
+                                    "mode": "explore",
+                                    "model": "mock",
+                                    "max_turns": 2
+                                },
+                                {
+                                    "task": "Analyze database query performance hotspots",
+                                    "mode": "explore",
+                                    "model": "mock",
+                                    "max_turns": 2
+                                }
+                            ]
+                        }),
+                    },
+                ],
+                text,
+            )
+        }
     }
 }
 
@@ -751,6 +813,7 @@ mod tests {
             ("[[scenario:multi_tool]]", Scenario::MultiToolCall),
             ("[[scenario:long]]", Scenario::LongStreaming),
             ("[[scenario:patch]]", Scenario::PatchToolCall),
+            ("[[scenario:spawn_agents]]", Scenario::SpawnAgents),
         ];
         for (text, expected) in cases {
             let req = user_req(text);
