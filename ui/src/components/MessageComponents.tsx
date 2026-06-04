@@ -1905,12 +1905,34 @@ export function ChildConversationActivity({ agentId, expanded, running, full = f
   );
 }
 
-function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; task: string; outcome: SubAgentResult['outcome'] | null }) {
+// Exported for regression testing of the docked-viewer state sync (see
+// SubAgentViewerSync.test.tsx); rendered in-app only via SubAgentSummary.
+export function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; task: string; outcome: SubAgentResult['outcome'] | null }) {
   const [expanded, setExpanded] = useState(false);
   const status = statusKindFromOutcome(outcome);
   const statusClass = status.replace('_', '-');
   const running = status === 'running';
   const resultText = outcome ? getOutcomeText(outcome) : '';
+  const viewer = useSubAgentViewer();
+
+  // Keep the docked viewer's record in sync with this card's live state. The
+  // card re-renders as the sub-agent progresses (running → completed, empty →
+  // final outcome); if this is the agent currently open in the panel, push the
+  // new state so the panel stops streaming a finished agent and shows its final
+  // outcome without a close/reopen. Guarded by an equality check so it
+  // converges (the re-render triggered by `open` is a no-op on the next pass).
+  const open = viewer?.open;
+  const openedRecord = viewer?.opened;
+  useEffect(() => {
+    if (!open || openedRecord?.agentId !== agentId) return;
+    if (
+      openedRecord.running !== running ||
+      openedRecord.resultText !== resultText ||
+      openedRecord.task !== task
+    ) {
+      open({ agentId, task, running, resultText });
+    }
+  }, [open, openedRecord, agentId, task, running, resultText]);
 
   return (
     <div className={`subagent-item activity ${statusClass}`}>
