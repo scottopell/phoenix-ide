@@ -225,13 +225,27 @@ rule NotificationClicked {
     when: UserClicksNotification(notification)
 
     ensures: TabFocused
+    ensures: NotificationAcknowledged(notification.conversation)
     ensures: NavigatedTo(notification.conversation)
 
     @guidance
-        -- Implementation: notification.onclick = () => {
-        --   window.focus();
-        --   navigate(`/c/${conversation.slug}`);
-        -- }
+        -- Implementation: notification.onclick focuses the window, closes live
+        -- notifications for the triggering conversation, then dispatches
+        -- React Router navigation to `/c/${conversation.slug}`.
+}
+
+rule OpenConversationAcknowledgesLiveNotifications {
+    when: ConversationOpened(conversation)
+
+    ensures: NotificationAcknowledged(conversation)
+    ensures: LiveNotificationsClosedFor(conversation)
+
+    @guidance
+        -- Implementation: DesktopLayout observes the active `/c/:slug`
+        -- conversation snapshot and closes live Notification instances retained
+        -- by conversation id. Other conversations' notifications are left open.
+        -- Browser notifications outside the current page's live ownership are
+        -- outside the Web Notification API close contract.
 }
 
 ------------------------------------------------------------
@@ -276,6 +290,7 @@ surface NotificationSettingsPanel {
     context settings: NotificationSettings
 
     exposes:
+        user
         settings.enabled
         settings.notify_task_approval
         settings.notify_question
@@ -287,6 +302,16 @@ surface NotificationSettingsPanel {
         UpdateNotificationSettings(new_settings)
         RequestBrowserPermission
             when BrowserPermission = default
+}
+
+surface ConversationRoute {
+    context conversation: bedrock/Conversation
+
+    exposes:
+        conversation.slug
+
+    provides:
+        ConversationOpened(conversation)
 }
 
 ------------------------------------------------------------

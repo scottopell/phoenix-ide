@@ -3,23 +3,29 @@ import type { Conversation } from './api';
 import {
   AGENT_FINISHED_THRESHOLD_MS,
   DEFAULT_NOTIFICATION_SETTINGS,
+  closeNotificationsForConversation,
   notifyCatchUp,
   notifyConversationStateChange,
   notifyConversationSnapshotChange,
   resetNotificationRuntimeForTest,
 } from './notifications';
 
-const notifications: Array<{ title: string; options: NotificationOptions | undefined }> = [];
+const notifications: MockNotification[] = [];
 
 class MockNotification {
   static permission: NotificationPermission = 'granted';
   onclick: (() => void) | null = null;
+  onclose: (() => void) | null = null;
+  closeCalls = 0;
 
   constructor(public title: string, public options?: NotificationOptions) {
-    notifications.push({ title, options });
+    notifications.push(this);
   }
 
-  close() {}
+  close() {
+    this.closeCalls++;
+    this.onclose?.();
+  }
 }
 
 function conversation(overrides: Partial<Conversation> = {}): Conversation {
@@ -224,5 +230,99 @@ describe('browser desktop notifications', () => {
     ]);
 
     expect(notifications).toHaveLength(0);
+  });
+
+  it('closes delivered notifications when their conversation is acknowledged without clicking', () => {
+    grantSettings();
+
+    notifyConversationStateChange(
+      conversation(),
+      { type: 'idle' },
+      { type: 'awaiting_user_response', questions: [] },
+    );
+    closeNotificationsForConversation('conv-1');
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.closeCalls).toBe(1);
+  });
+
+  it('does not close notifications for other conversations when one conversation is acknowledged', () => {
+    grantSettings();
+
+    notifyConversationStateChange(
+      conversation({ id: 'conv-1', slug: 'conv-a' }),
+      { type: 'idle' },
+      { type: 'awaiting_user_response', questions: [] },
+    );
+    notifyConversationStateChange(
+      conversation({ id: 'conv-2', slug: 'conv-b' }),
+      { type: 'idle' },
+      { type: 'awaiting_user_response', questions: [] },
+    );
+    closeNotificationsForConversation('conv-1');
+
+    expect(notifications).toHaveLength(2);
+    expect(notifications[0]?.closeCalls).toBe(1);
+    expect(notifications[1]?.closeCalls).toBe(0);
+  });
+
+  it('treats repeated conversation acknowledgement as a no-op', () => {
+    grantSettings();
+
+    notifyConversationStateChange(
+      conversation(),
+      { type: 'idle' },
+      { type: 'awaiting_user_response', questions: [] },
+    );
+    closeNotificationsForConversation('conv-1');
+    closeNotificationsForConversation('conv-1');
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0]?.closeCalls).toBe(1);
+  });
+
+  it('closes a previous live notification before replacing the same tag', () => {
+    grantSettings();
+
+    notifyConversationStateChange(
+      conversation(),
+      { type: 'idle' },
+      { type: 'awaiting_user_response', questions: [] },
+    );
+    notifyConversationStateChange(
+      conversation(),
+      { type: 'awaiting_user_response', questions: [] },
+      { type: 'idle' },
+    );
+    notifyConversationStateChange(
+      conversation(),
+      { type: 'idle' },
+      { type: 'awaiting_user_response', questions: [] },
+    );
+
+    expect(notifications).toHaveLength(2);
+    expect(notifications[0]?.closeCalls).toBe(1);
+    expect(notifications[1]?.closeCalls).toBe(0);
+
+    closeNotificationsForConversation('conv-1');
+
+    expect(notifications[0]?.closeCalls).toBe(1);
+    expect(notifications[1]?.closeCalls).toBe(1);
+  });
+
+  it('notification clicks acknowledge the triggering conversation through the shared path', () => {
+    grantSettings();
+    const dispatch = vi.spyOn(window, 'dispatchEvent');
+
+    notifyConversationStateChange(
+      conversation(),
+      { type: 'idle' },
+      { type: 'awaiting_user_response', questions: [] },
+    );
+    notifications[0]?.onclick?.();
+    closeNotificationsForConversation('conv-1');
+
+    expect(notifications[0]?.closeCalls).toBe(1);
+    expect(dispatch).toHaveBeenCalledWith(expect.objectContaining({ type: 'phoenix:navigate-to-conversation' }));
   });
 });

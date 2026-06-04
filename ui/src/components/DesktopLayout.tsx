@@ -14,6 +14,7 @@ import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
 import { useToast } from '../hooks/useToast';
 import {
+  closeNotificationsForConversation,
   consumeNotificationPermissionCue,
   loadNotificationSettingsAndCatchUp,
   notifyCatchUp,
@@ -85,6 +86,13 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const slugMatch = location.pathname.match(/^\/c\/(.+)$/);
   const activeSlug = slugMatch?.[1] ?? null;
   const activeConversation = useConversationSnapshot(activeSlug);
+  const activeConversationId = activeConversation?.id;
+
+  useEffect(() => {
+    if (activeConversationId) {
+      closeNotificationsForConversation(activeConversationId);
+    }
+  }, [activeConversationId]);
 
   const effectiveCwd = activeConversation?.worktree_path ?? activeConversation?.cwd ?? '/';
 

@@ -12,6 +12,7 @@ import {
 import { StreamingMessage } from './StreamingMessage';
 import { RenderProfiler } from '../dev/renderProfiler';
 import { MessageContextMenu } from './MessageContextMenu';
+import { FilePathContextMenu } from './FilePathContextMenu';
 import { useStreamingRequestId } from '../conversation/useConversationAtom';
 import {
   buildRenderUnits,
@@ -50,6 +51,7 @@ interface MessageListProps {
   systemPrompt?: string | undefined;
   conversationId?: string | undefined;
   slug?: string | undefined;
+  filePathRootDir?: string | undefined;
   /** Scroll-spy: the inclusive range of `historicalUnits`/virtuoso item
    *  indices currently rendered. Fired (debounced by virtuoso) as the user
    *  scrolls. The conversation nav uses it to highlight the active chapter. */
@@ -70,6 +72,7 @@ export interface MessageListHandle {
   scrollToUnitIndex: (unitIndex: number) => void;
 }
 
+
 const PIN_TO_BOTTOM_THRESHOLD = 100;
 
 function extractSkillArgs(trigger: string, name: string): string {
@@ -81,6 +84,7 @@ type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedL
 function renderHistoricalUnit(
   unit: HistoricalUnit,
   onOpenFile: OnOpenFile,
+  filePathRootDir: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
 ): JSX.Element | null {
@@ -126,6 +130,7 @@ function renderHistoricalUnit(
           message={unit.agent}
           toolResults={unit.toolResultsByUseId}
           onOpenFile={onOpenFile}
+          filePathRootDir={filePathRootDir}
           isFirstInTurn={unit.isFirstInTurn}
         />
       );
@@ -166,6 +171,7 @@ function renderUnit(
   unit: RenderUnit,
   slug: string | undefined,
   onOpenFile: OnOpenFile,
+  filePathRootDir: string | undefined,
   onRetry: (localId: string) => void,
   onCancelSteering: ((localId: string) => void) | undefined,
 ): JSX.Element | null {
@@ -175,7 +181,7 @@ function renderUnit(
   ) {
     return renderTailUnit(unit, slug);
   }
-  return renderHistoricalUnit(unit, onOpenFile, onRetry, onCancelSteering);
+  return renderHistoricalUnit(unit, onOpenFile, filePathRootDir, onRetry, onCancelSteering);
 }
 
 interface SystemPromptHeaderProps {
@@ -215,6 +221,7 @@ function MessageListImpl({
   systemPrompt,
   conversationId,
   slug,
+  filePathRootDir,
   onVisibleRangeChange,
   onChaptersChange,
 }: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
@@ -546,10 +553,10 @@ function MessageListImpl({
   const itemContent = useCallback(
     (_index: number, unit: RenderUnit) => (
       <div className="virtuoso-row" data-render-unit-key={unit.key}>
-        {renderUnit(unit, slug, onOpenFile, onRetry, onCancelSteering)}
+        {renderUnit(unit, slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering)}
       </div>
     ),
-    [slug, onOpenFile, onRetry, onCancelSteering],
+    [slug, onOpenFile, filePathRootDir, onRetry, onCancelSteering],
   );
 
   const computeItemKey = useCallback(
@@ -619,6 +626,7 @@ function MessageListImpl({
           ↓ New messages
         </button>
       )}
+      <FilePathContextMenu />
       <MessageContextMenu messages={messages} />
     </main>
   );
