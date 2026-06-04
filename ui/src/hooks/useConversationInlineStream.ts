@@ -13,11 +13,11 @@ import {
   type SseInitData,
 } from '../sseSchemas';
 import type { Breadcrumb } from '../types';
-import { parseConversationState } from '../utils';
+import { parseConversationState, isAgentWorking } from '../utils';
 import { conversationReducer, createInitialAtom, type ConversationAtom, type InitPayload } from '../conversation/atom';
 import * as v from 'valibot';
 
-type InlineStreamState =
+export type InlineStreamState =
   | { type: 'idle'; atom: ConversationAtom; error: null }
   | { type: 'connecting'; atom: ConversationAtom; error: null }
   | { type: 'ready'; atom: ConversationAtom; error: null }
@@ -137,8 +137,16 @@ function isNotFound(error: unknown): boolean {
  * Uses the same conversation reducer as the full page, including init pending
  * event replay, so sequence floors/token buffering/message updates follow one
  * protocol contract instead of a parallel sub-agent-specific implementation.
+ *
+ * `live`:
+ *   - `true`  — always open the SSE stream.
+ *   - `false` — snapshot only.
+ *   - `'auto'`— open the SSE stream only if the loaded conversation is still
+ *     working, and self-close once it reaches a terminal state. Lets an
+ *     always-mounted owner (the docked viewer) stream a running sub-agent
+ *     without holding the single live-stream slot open for a finished one.
  */
-export function useConversationInlineStream(conversationId: string, enabled: boolean, live: boolean): InlineStreamState {
+export function useConversationInlineStream(conversationId: string, enabled: boolean, live: boolean | 'auto'): InlineStreamState {
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
 
   useEffect(() => {
@@ -216,12 +224,13 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         if (raw === null) return;
         const res = v.safeParse(SseStateChangeDataSchema, raw);
         if (!res.success) return;
+        const phase = parseConversationState(res.output.state);
         dispatch({
           type: 'atom',
           atomAction: {
             type: 'sse_state_change',
             sequenceId: res.output.sequence_id,
-            phase: parseConversationState(res.output.state),
+            phase,
             // REQ-WPV-001: thread the server-authoritative entry time
             // (RFC3339 → ms) onto the atom. NOTE: this inline sub-agent
             // stream does NOT register the llm_first_byte / llm_attempt /
@@ -234,6 +243,13 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
             stateUpdatedAt: Date.parse(res.output.state_updated_at),
           },
         });
+        // Sub-agent reached a terminal/idle state — stop streaming so we
+        // don't hold the single live-stream slot (or an idle connection)
+        // open after the agent has finished. The final phase is already on
+        // the atom, so consumers see the completed state.
+        if (!isAgentWorking(phase)) {
+          closeSource();
+        }
       });
 
       source.addEventListener('token', (event) => {
@@ -290,11 +306,15 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
               payload: snapshotPayload(data.conversation, data.messages, data.context_window_size ?? 0),
             },
           });
-          if (live) openLiveStream();
+          const phase = data.conversation.state
+            ? parseConversationState(data.conversation.state)
+            : { type: 'idle' as const };
+          const streamLive = live === true || (live === 'auto' && isAgentWorking(phase));
+          if (streamLive) openLiveStream();
         })
         .catch((err) => {
           if (cancelled) return;
-          if (live && isNotFound(err)) {
+          if (live !== false && isNotFound(err)) {
             retryTimer = window.setTimeout(loadSnapshot, 500);
             return;
           }

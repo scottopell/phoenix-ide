@@ -11,18 +11,16 @@ import {
 import { useLocation } from 'react-router-dom';
 
 /**
- * Identity + display context for the sub-agent currently shown in the
- * side-docked viewer. `agentId` is the sub-agent's conversation_id (the
- * `spawn_agents` invariant — see runtime/executor.rs), which the read-only
- * inline stream consumes directly; the rest is what the parent already knows
- * about the spawn so the panel header reads the same as the card.
+ * Stable identity of the sub-agent currently shown in the side-docked viewer.
+ * `agentId` is the sub-agent's conversation_id (the `spawn_agents` invariant —
+ * see runtime/executor.rs), which the read-only stream consumes directly;
+ * `task` is the header title. Live status (running / outcome) is intentionally
+ * NOT stored here — the panel derives it from the sub-agent's own stream, so it
+ * stays correct even after the parent's (virtualized) card unmounts.
  */
 export interface OpenedSubAgent {
   agentId: string;
   task: string;
-  running: boolean;
-  /** Final outcome text, when the sub-agent has completed. */
-  resultText: string;
 }
 
 interface SubAgentViewerValue {

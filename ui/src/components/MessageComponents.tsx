@@ -25,7 +25,7 @@ import type { QueuedMessage } from '../hooks';
 import { useTheme } from '../hooks/useTheme';
 import { useIsDesktop } from '../hooks';
 import { useDensity, isSignificantText } from '../hooks/useDensity';
-import { useConversationInlineStream } from '../hooks/useConversationInlineStream';
+import { useConversationInlineStream, type InlineStreamState } from '../hooks/useConversationInlineStream';
 import { useSubAgentViewer } from '../contexts/SubAgentViewerContext';
 
 import { linkifyText } from '../utils/linkify';
@@ -1861,16 +1861,17 @@ function ChildAgentActivity({ message, toolResults }: { message: Message; toolRe
 }
 
 /**
- * Read-only sub-agent transcript, driven by the inline stream. Used both as
- * the inline peek inside the parent's `spawn_agents` card (truncated to the
- * latest steps) and, with `full`, as the body of the side-docked
- * `SubAgentViewerPanel` (every step, scrollable).
+ * Presentational read-only sub-agent transcript. Stream ownership lives with
+ * the caller so the renderer is reused by both the inline peek
+ * (`ChildConversationActivity`, which opens its own stream) and the always-
+ * mounted docked viewer (`SubAgentViewerPanel`, which owns the stream so it can
+ * derive live status from the same source it renders — see that component for
+ * why card-local state can't be the source of truth under list virtualization).
+ *
+ * `running` drives only the "live" badge; `full` shows every agent step instead
+ * of the latest dozen.
  */
-export function ChildConversationActivity({ agentId, expanded, running, full = false }: { agentId: string; expanded: boolean; running: boolean; full?: boolean }) {
-  const inline = useConversationInlineStream(agentId, expanded, running);
-
-  if (!expanded) return null;
-
+export function SubAgentTranscript({ inline, running, full = false }: { inline: InlineStreamState; running: boolean; full?: boolean }) {
   const { atom } = inline;
   const toolResults = buildToolResults(atom.messages);
   const agentMessages = atom.messages.filter((m) => m.message_type === 'agent' || m.type === 'agent');
@@ -1905,34 +1906,23 @@ export function ChildConversationActivity({ agentId, expanded, running, full = f
   );
 }
 
-// Exported for regression testing of the docked-viewer state sync (see
-// SubAgentViewerSync.test.tsx); rendered in-app only via SubAgentSummary.
-export function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; task: string; outcome: SubAgentResult['outcome'] | null }) {
+/**
+ * Inline peek at a sub-agent's activity inside the parent's `spawn_agents`
+ * card. Owns its own read-only stream; `running` is the card's authoritative
+ * status (the card is mounted whenever it's visible).
+ */
+function ChildConversationActivity({ agentId, expanded, running }: { agentId: string; expanded: boolean; running: boolean }) {
+  const inline = useConversationInlineStream(agentId, expanded, running);
+  if (!expanded) return null;
+  return <SubAgentTranscript inline={inline} running={running} />;
+}
+
+function SubAgentActivityCard({ agentId, task, outcome }: { agentId: string; task: string; outcome: SubAgentResult['outcome'] | null }) {
   const [expanded, setExpanded] = useState(false);
   const status = statusKindFromOutcome(outcome);
   const statusClass = status.replace('_', '-');
   const running = status === 'running';
   const resultText = outcome ? getOutcomeText(outcome) : '';
-  const viewer = useSubAgentViewer();
-
-  // Keep the docked viewer's record in sync with this card's live state. The
-  // card re-renders as the sub-agent progresses (running → completed, empty →
-  // final outcome); if this is the agent currently open in the panel, push the
-  // new state so the panel stops streaming a finished agent and shows its final
-  // outcome without a close/reopen. Guarded by an equality check so it
-  // converges (the re-render triggered by `open` is a no-op on the next pass).
-  const open = viewer?.open;
-  const openedRecord = viewer?.opened;
-  useEffect(() => {
-    if (!open || openedRecord?.agentId !== agentId) return;
-    if (
-      openedRecord.running !== running ||
-      openedRecord.resultText !== resultText ||
-      openedRecord.task !== task
-    ) {
-      open({ agentId, task, running, resultText });
-    }
-  }, [open, openedRecord, agentId, task, running, resultText]);
 
   return (
     <div className={`subagent-item activity ${statusClass}`}>
@@ -1949,7 +1939,7 @@ export function SubAgentActivityCard({ agentId, task, outcome }: { agentId: stri
           <span className={`subagent-status ${statusClass}`}>{getStatusLabel(status)}</span>
           <span className="subagent-expand-toggle">{expanded ? <ChevronUpIcon /> : <ChevronDownIcon />}</span>
         </button>
-        <OpenConversationButton agentId={agentId} task={task} running={running} resultText={resultText} />
+        <OpenConversationButton agentId={agentId} task={task} />
       </div>
       {resultText && !expanded && (
         <div className="subagent-result preview">{truncate(resultText, 180)}</div>
@@ -2069,13 +2059,9 @@ export async function navigateToSubAgent(
 function OpenConversationButton({
   agentId,
   task,
-  running,
-  resultText,
 }: {
   agentId: string;
   task: string;
-  running: boolean;
-  resultText: string;
 }) {
   const navigate = useNavigate();
   const viewer = useSubAgentViewer();
@@ -2092,7 +2078,7 @@ function OpenConversationButton({
   const onClick = useCallback(async (e: React.MouseEvent) => {
     e.stopPropagation();
     if (usePanel) {
-      viewer.open({ agentId, task, running, resultText });
+      viewer.open({ agentId, task });
       return;
     }
     if (inFlight.current) return;
@@ -2108,7 +2094,7 @@ function OpenConversationButton({
       inFlight.current = false;
       setBusy(false);
     }
-  }, [usePanel, viewer, agentId, task, running, resultText, navigate]);
+  }, [usePanel, viewer, agentId, task, navigate]);
 
   if (missing) return null;
 

@@ -11,7 +11,7 @@ function Consumer() {
       <span data-testid="opened">{viewer?.opened?.agentId ?? 'none'}</span>
       <button
         onClick={() =>
-          viewer?.open({ agentId: 'agent-1', task: 'do a thing', running: false, resultText: '' })
+          viewer?.open({ agentId: 'agent-1', task: 'do a thing' })
         }
       >
         open

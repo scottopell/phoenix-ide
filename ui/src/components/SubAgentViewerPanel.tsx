@@ -1,6 +1,8 @@
 import { useCallback, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { ChildConversationActivity, navigateToSubAgent } from './MessageComponents';
+import { SubAgentTranscript, navigateToSubAgent } from './MessageComponents';
+import { useConversationInlineStream } from '../hooks/useConversationInlineStream';
+import { isAgentWorking } from '../utils';
 import type { OpenedSubAgent } from '../contexts/SubAgentViewerContext';
 
 const CloseIcon = () => (
@@ -27,17 +29,27 @@ interface Props {
 /**
  * Side-docked, read-only viewer for a sub-agent's full conversation. Renders
  * alongside the parent conversation so opening a sub-agent doesn't drop the
- * user onto a context-less page. The body reuses the same read-only transcript
- * renderer as the inline peek (`ChildConversationActivity`), un-truncated.
+ * user onto a context-less page.
+ *
+ * The panel owns the sub-agent's read-only stream itself (rather than reading a
+ * snapshot of the parent's spawn card) and derives live status from that
+ * stream's phase. This keeps the status correct even when the parent card
+ * scrolls out of the virtualized message list and unmounts. `live: 'auto'`
+ * means a still-running sub-agent streams live (and self-closes on completion),
+ * while a sub-agent that's already finished when opened loads as a snapshot and
+ * never holds the single live-stream slot open.
  *
  * There is intentionally no composer: a completed sub-agent takes no further
  * input, and a running one is driven by its parent — the panel is for reading.
  */
 export function SubAgentViewerPanel({ opened, onClose, width }: Props) {
-  const { agentId, task, running, resultText } = opened;
+  const { agentId, task } = opened;
   const navigate = useNavigate();
   const [opening, setOpening] = useState(false);
   const inFlight = useRef(false);
+
+  const inline = useConversationInlineStream(agentId, true, 'auto');
+  const running = isAgentWorking(inline.atom.phase);
 
   const openFullPage = useCallback(async () => {
     if (inFlight.current) return;
@@ -86,13 +98,7 @@ export function SubAgentViewerPanel({ opened, onClose, width }: Props) {
         </button>
       </div>
       <div className="subagent-viewer-content">
-        <ChildConversationActivity agentId={agentId} expanded running={running} full />
-        {resultText && (
-          <div className="subagent-final-result">
-            <div className="subagent-final-result-label">final outcome</div>
-            <div className="subagent-viewer-result-text">{resultText}</div>
-          </div>
-        )}
+        <SubAgentTranscript inline={inline} running={running} full />
       </div>
     </aside>
   );
