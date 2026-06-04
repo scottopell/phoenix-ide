@@ -1,5 +1,5 @@
-import { memo, useState, useRef, useCallback, useMemo, useEffect } from 'react';
-import { Virtuoso, type VirtuosoHandle, type VirtuosoProps } from 'react-virtuoso';
+import { memo, useState, useRef, useCallback, useMemo, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { Virtuoso, type VirtuosoHandle, type VirtuosoProps, type ListRange } from 'react-virtuoso';
 import type { Message, ConversationState } from '../api';
 import type { QueuedMessage } from '../hooks';
 import {
@@ -20,6 +20,10 @@ import {
   type TailUnit,
   type RenderUnit,
 } from '../conversation/renderUnits';
+import {
+  buildConversationChapters,
+  type Chapter,
+} from '../conversation/conversationChapters';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -48,7 +52,26 @@ interface MessageListProps {
   conversationId?: string | undefined;
   slug?: string | undefined;
   filePathRootDir?: string | undefined;
+  /** Scroll-spy: the inclusive range of `historicalUnits`/virtuoso item
+   *  indices currently rendered. Fired (debounced by virtuoso) as the user
+   *  scrolls. The conversation nav uses it to highlight the active chapter. */
+  onVisibleRangeChange?: ((range: ListRange) => void) | undefined;
+  /** Conversation chapters derived from the SAME `historicalUnits` array this
+   *  list feeds to virtuoso. MessageList owns the build, so the chapter
+   *  `unitIndex` values are guaranteed to be in virtuoso's coordinate space —
+   *  no second `buildRenderUnits` pass to drift against. */
+  onChaptersChange?: ((chapters: Chapter[]) => void) | undefined;
 }
+
+/** Imperative surface exposed to the conversation nav strip. MessageList owns
+ *  `virtuosoRef`; the nav can't reach it directly because off-screen rows are
+ *  unmounted (react-virtuoso), so a querySelector jump would miss them. */
+export interface MessageListHandle {
+  /** Scroll the render unit at `unitIndex` (a `historicalUnits` index, which
+   *  equals its virtuoso item index) into view and pulse it once mounted. */
+  scrollToUnitIndex: (unitIndex: number) => void;
+}
+
 
 const PIN_TO_BOTTOM_THRESHOLD = 100;
 
@@ -199,7 +222,9 @@ function MessageListImpl({
   conversationId,
   slug,
   filePathRootDir,
-}: MessageListProps) {
+  onVisibleRangeChange,
+  onChaptersChange,
+}: MessageListProps, ref: React.ForwardedRef<MessageListHandle>) {
   const [systemPromptExpanded, setSystemPromptExpanded] = useState(false);
   const [isAtBottom, setIsAtBottom] = useState(true);
   // Tail-content unread tracking: bumped when the visible-unit count grows
@@ -243,6 +268,20 @@ function MessageListImpl({
     () => [...historicalUnits, ...tailUnits],
     [historicalUnits, tailUnits],
   );
+
+  // Chapters are derived here, not in a parent, so they share the exact
+  // `historicalUnits` array virtuoso renders — a chapter's `unitIndex` is
+  // therefore a valid `scrollToIndex` target with no second build to drift
+  // against. Reported up via callback for the nav strip above the list.
+  const chapters = useMemo(
+    () => buildConversationChapters(historicalUnits),
+    [historicalUnits],
+  );
+  const onChaptersChangeRef = useRef(onChaptersChange);
+  onChaptersChangeRef.current = onChaptersChange;
+  useEffect(() => {
+    onChaptersChangeRef.current?.(chapters);
+  }, [chapters]);
 
   const isEmpty = allUnits.length === 0;
 
@@ -427,6 +466,74 @@ function MessageListImpl({
     });
   }, []);
 
+  // Conversation-nav jump + post-mount pulse. The target row is usually
+  // unmounted at click time (react-virtuoso), so we can't add the highlight
+  // class synchronously the way the legacy near-viewport breadcrumb jump did.
+  // We stash the target unit's render-unit key and apply the pulse once the
+  // row exists, after the scroll settles. `data-render-unit-key` is stamped on
+  // every virtuoso row wrapper (see `itemContent`).
+  const pendingPulseKeyRef = useRef<string | null>(null);
+  const pulseTimersRef = useRef<number[]>([]);
+
+  const applyPendingPulse = useCallback(() => {
+    const key = pendingPulseKeyRef.current;
+    if (key === null) return;
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    // CSS.escape may be absent (or throw on a pathological key) in some
+    // environments; guard it so a missing escape degrades to "no pulse"
+    // rather than throwing out of the timer callback (matches FileTree).
+    let row: Element | null = null;
+    try {
+      row = scroller.querySelector(`[data-render-unit-key="${CSS.escape(key)}"]`);
+    } catch {
+      return;
+    }
+    // The pulse styling lives on `.message`; fall back to the row wrapper if a
+    // unit kind renders without a `.message` element (skill/system don't, but
+    // chapters only target user/agent units which do).
+    const target = row?.querySelector('.message') ?? row;
+    if (!target) return;
+    pendingPulseKeyRef.current = null;
+    target.classList.add('breadcrumb-highlight');
+    const t = window.setTimeout(() => {
+      target.classList.remove('breadcrumb-highlight');
+    }, 1500);
+    pulseTimersRef.current.push(t);
+  }, []);
+
+  useEffect(() => {
+    const timers = pulseTimersRef.current;
+    return () => {
+      timers.forEach((t) => clearTimeout(t));
+    };
+  }, []);
+
+  const scrollToUnitIndex = useCallback((unitIndex: number) => {
+    const unit = historicalUnits[unitIndex];
+    if (!unit) return;
+    pendingPulseKeyRef.current = unit.key;
+    virtuosoRef.current?.scrollToIndex({
+      index: unitIndex,
+      align: 'center',
+      behavior: 'smooth',
+    });
+    // The row mounts during the smooth scroll; querying immediately would miss
+    // it. Retry a few times so the pulse lands even on a long jump that takes
+    // a moment to settle. applyPendingPulse is a no-op once the pulse fires
+    // (it clears pendingPulseKeyRef), so the extra ticks are harmless.
+    [120, 320, 600].forEach((delay) => {
+      const t = window.setTimeout(applyPendingPulse, delay);
+      pulseTimersRef.current.push(t);
+    });
+  }, [historicalUnits, applyPendingPulse]);
+
+  useImperativeHandle(ref, () => ({ scrollToUnitIndex }), [scrollToUnitIndex]);
+
+  const handleRangeChanged = useCallback((range: ListRange) => {
+    onVisibleRangeChange?.(range);
+  }, [onVisibleRangeChange]);
+
   const toggleSystemPrompt = useCallback(() => {
     setSystemPromptExpanded((v) => !v);
   }, []);
@@ -498,6 +605,7 @@ function MessageListImpl({
           atBottomThreshold={PIN_TO_BOTTOM_THRESHOLD}
           atBottomStateChange={handleAtBottomStateChange}
           totalListHeightChanged={handleTotalListHeightChanged}
+          rangeChanged={handleRangeChanged}
           // `'LAST'` is library-defined only when `data` has at least
           // one item. When systemPrompt-only renders with empty data,
           // omit this prop entirely — virtuoso's default (no initial
@@ -524,4 +632,4 @@ function MessageListImpl({
   );
 }
 
-export const MessageList = memo(MessageListImpl);
+export const MessageList = memo(forwardRef(MessageListImpl));

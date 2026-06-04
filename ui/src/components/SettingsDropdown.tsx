@@ -9,6 +9,7 @@ import {
   loadNotificationSettings,
   updateNotificationRuntimeSettings,
 } from '../notifications';
+import { useDensity } from '../hooks/useDensity';
 
 type BrowserPermission = NotificationPermission | 'unsupported';
 
@@ -159,6 +160,7 @@ export function SettingsDropdown({
         >
           <h2 id={titleId} className="settings-dropdown-title">Settings</h2>
           <ThemeSection theme={theme} onToggle={onToggleTheme} />
+          <DensitySection />
           {codexPreflight?.already_signed_in && (
             <CodexSection
               preflight={codexPreflight}
@@ -193,6 +195,45 @@ function ThemeSection({ theme, onToggle }: { theme: 'dark' | 'light'; onToggle: 
           onClick={() => { if (theme !== 'dark') onToggle(); }}
         >
           Dark
+        </button>
+      </div>
+    </section>
+  );
+}
+
+/**
+ * Conversation view density. `Full` paints every message exactly as it always
+ * has; `Compact` collapses each agent turn's tool calls into an inline pill
+ * strip and short assistant prose into expandable one-liners. Purely
+ * presentational, persisted via the density context (localStorage).
+ */
+function DensitySection() {
+  const { density, setDensity } = useDensity();
+  return (
+    <section className="settings-section">
+      <h3 className="settings-section__title">Conversation density</h3>
+      <div className="settings-section__hint">
+        Compact collapses each turn's tools into a pill strip and folds short
+        replies — click to expand. Nothing is hidden.
+      </div>
+      <div className="settings-theme-row" role="radiogroup" aria-label="Conversation density">
+        <button
+          type="button"
+          role="radio"
+          aria-checked={density === 'full'}
+          className={`settings-theme-btn${density === 'full' ? ' active' : ''}`}
+          onClick={() => setDensity('full')}
+        >
+          Full
+        </button>
+        <button
+          type="button"
+          role="radio"
+          aria-checked={density === 'compact'}
+          className={`settings-theme-btn${density === 'compact' ? ' active' : ''}`}
+          onClick={() => setDensity('compact')}
+        >
+          Compact
         </button>
       </div>
     </section>
