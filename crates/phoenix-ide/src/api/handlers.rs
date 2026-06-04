@@ -22,9 +22,9 @@ use super::types::{
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
     GatewayStatusApi, ListDirectoryResponse, ListFilesResponse, MkdirResponse, ModelsResponse,
-    NotificationSettingsRequest, ProjectTasksQuery, ReadFileResponse, RenameRequest, SkillEntry,
-    SkillsResponse, SuccessResponse, SystemPromptResponse, TaskEntry, TasksResponse,
-    UpgradeModelRequest, ValidateCwdResponse,
+    NotificationSettingsRequest, ProjectFileSearchQuery, ProjectSkillsQuery, ProjectTasksQuery,
+    ReadFileResponse, RenameRequest, SkillEntry, SkillsResponse, SuccessResponse,
+    SystemPromptResponse, TaskEntry, TasksResponse, UpgradeModelRequest, ValidateCwdResponse,
 };
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
@@ -177,11 +177,18 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/code/search",
             get(search_conversation_code),
         )
+        // Directory-scoped file search for the new-conversation composer,
+        // before a conversation exists to hang the per-conversation route off
+        // of (REQ-IR-004).
+        .route("/api/files/search", get(search_project_files))
         // Skill discovery for autocomplete (REQ-IR-005)
         .route(
             "/api/conversations/:id/skills",
             get(list_conversation_skills),
         )
+        // Directory-scoped skill discovery for the new-conversation composer
+        // (REQ-IR-005).
+        .route("/api/skills", get(list_project_skills))
         // Task listing
         .route("/api/conversations/:id/tasks", get(list_conversation_tasks))
         // Projects (REQ-PROJ-014)
@@ -3117,18 +3124,51 @@ async fn search_conversation_files(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    let root = std::path::PathBuf::from(conversation.file_root());
+    // Search the same directory that `message_expander::expand` resolves
+    // `@file` references against at send time (the conversation's `cwd`), so
+    // every autocomplete candidate is one that will actually expand.
+    let root = std::path::PathBuf::from(&conversation.cwd);
     if !root.exists() {
         return Err(AppError::NotFound(
-            "Conversation file root does not exist".to_string(),
+            "Conversation working directory does not exist".to_string(),
         ));
     }
 
     let limit = query.limit.unwrap_or(50);
-    let q = query.q.to_lowercase();
+    Ok(Json(FileSearchResponse {
+        items: search_files_in_root(&root, &query.q, limit),
+    }))
+}
+
+/// Directory-scoped file search for the new-conversation composer (REQ-IR-004).
+///
+/// Walks an explicit working directory rather than a conversation's file root,
+/// so the composer on the `/new` page — which has no conversation yet — can
+/// offer the same `@file` / `./path` autocomplete as an in-conversation composer.
+async fn search_project_files(
+    Query(query): Query<ProjectFileSearchQuery>,
+) -> Result<Json<FileSearchResponse>, AppError> {
+    let root = std::path::PathBuf::from(&query.cwd);
+    if !root.exists() || !root.is_dir() {
+        return Err(AppError::BadRequest("Directory does not exist".to_string()));
+    }
+    let limit = query.limit.unwrap_or(50);
+    Ok(Json(FileSearchResponse {
+        items: search_files_in_root(&root, &query.q, limit),
+    }))
+}
+
+/// Gitignore-aware fuzzy file search within `root`.
+///
+/// Walks `root` respecting `.gitignore`/`.ignore`/git excludes, scores each file
+/// against `q` (empty `q` = all files alphabetically up to `limit`), and returns
+/// paths relative to `root`. Shared by the conversation-scoped and
+/// directory-scoped search handlers.
+fn search_files_in_root(root: &std::path::Path, query: &str, limit: usize) -> Vec<FileSearchEntry> {
+    let q = query.to_lowercase();
 
     // Walk the directory tree with gitignore awareness
-    let walker = ignore::WalkBuilder::new(&root)
+    let walker = ignore::WalkBuilder::new(root)
         .hidden(false) // include dot-files unless gitignored
         .git_ignore(true)
         .git_global(true)
@@ -3151,7 +3191,7 @@ async fn search_conversation_files(
 
         let abs_path = entry.path();
         let rel_path = abs_path
-            .strip_prefix(&root)
+            .strip_prefix(root)
             .unwrap_or(abs_path)
             .to_string_lossy()
             .to_string();
@@ -3194,8 +3234,7 @@ async fn search_conversation_files(
         items.truncate(limit);
     }
 
-    let results: Vec<FileSearchEntry> = items.into_iter().map(|(_, entry)| entry).collect();
-    Ok(Json(FileSearchResponse { items: results }))
+    items.into_iter().map(|(_, entry)| entry).collect()
 }
 
 /// Score a file path against a fuzzy query using nucleo-matcher.
@@ -3403,9 +3442,35 @@ async fn list_conversation_skills(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
-    let skills = crate::system_prompt::discover_skills(&cwd);
+    Ok(Json(SkillsResponse {
+        skills: skill_entries_for_cwd(&cwd),
+    }))
+}
 
-    let skill_entries: Vec<SkillEntry> = skills
+/// Directory-scoped skill discovery for the new-conversation composer (REQ-IR-005).
+///
+/// Discovers skills from an explicit working directory rather than a
+/// conversation's `cwd`, so the composer on the `/new` page — which has no
+/// conversation yet — can offer the same `/skill` autocomplete.
+async fn list_project_skills(
+    Query(query): Query<ProjectSkillsQuery>,
+) -> Result<Json<SkillsResponse>, AppError> {
+    let cwd = std::path::PathBuf::from(&query.cwd);
+    if !cwd.exists() || !cwd.is_dir() {
+        return Err(AppError::BadRequest("Directory does not exist".to_string()));
+    }
+    Ok(Json(SkillsResponse {
+        skills: skill_entries_for_cwd(&cwd),
+    }))
+}
+
+/// Discover skills available from `cwd` and map them to API entries.
+///
+/// Walks the user's skill catalog (`discover_skills`) and flattens each
+/// [`crate::system_prompt::SkillSource`] into a `(source, path)` pair for the
+/// frontend. Shared by the conversation-scoped and directory-scoped handlers.
+fn skill_entries_for_cwd(cwd: &std::path::Path) -> Vec<SkillEntry> {
+    crate::system_prompt::discover_skills(cwd)
         .into_iter()
         .map(|s| {
             let (source, path) = match &s.source {
@@ -3424,11 +3489,7 @@ async fn list_conversation_skills(
                 path,
             }
         })
-        .collect();
-
-    Ok(Json(SkillsResponse {
-        skills: skill_entries,
-    }))
+        .collect()
 }
 
 // ============================================================
@@ -4245,14 +4306,20 @@ mod hard_delete_cascade_tests {
     }
 
     #[tokio::test]
-    async fn search_conversation_files_uses_worktree_path_when_present() {
+    async fn search_conversation_files_resolves_against_cwd_not_worktree() {
+        // File search resolves against the conversation's `cwd` — the same root
+        // `message_expander::expand` uses for `@file` references at send time —
+        // even for Work-mode conversations that also have a worktree. A
+        // worktree-only file must NOT autocomplete, because it would fail to
+        // expand.
         let tmp = tempfile::tempdir().expect("tempdir");
         let cwd = tmp.path().join("repo");
         let worktree = tmp.path().join("worktree");
         std::fs::create_dir_all(cwd.join("src")).expect("cwd dirs");
         std::fs::create_dir_all(worktree.join("src")).expect("worktree dirs");
-        std::fs::write(cwd.join("src/wrong.rs"), "fn wrong() {}\n").expect("cwd file");
-        std::fs::write(worktree.join("src/right.rs"), "fn right() {}\n").expect("worktree file");
+        std::fs::write(cwd.join("src/in_cwd.rs"), "fn in_cwd() {}\n").expect("cwd file");
+        std::fs::write(worktree.join("src/in_worktree.rs"), "fn in_worktree() {}\n")
+            .expect("worktree file");
 
         let state = make_test_state().await;
         let mode = crate::db::ConvMode::Work {
@@ -4282,11 +4349,12 @@ mod hard_delete_cascade_tests {
             .await
             .expect("create");
 
+        // Unfiltered search returns the cwd file and not the worktree-only file.
         let Json(response) = search_conversation_files(
             State(state),
             Path("c-file-root".to_string()),
             Query(FileSearchQuery {
-                q: "right".to_string(),
+                q: String::new(),
                 limit: Some(10),
             }),
         )
@@ -4294,7 +4362,7 @@ mod hard_delete_cascade_tests {
         .expect("search");
 
         let paths: Vec<_> = response.items.into_iter().map(|item| item.path).collect();
-        assert_eq!(paths, vec!["src/right.rs"]);
+        assert_eq!(paths, vec!["src/in_cwd.rs"]);
     }
 
     #[tokio::test]
@@ -4337,6 +4405,39 @@ mod hard_delete_cascade_tests {
 
         let paths: Vec<_> = response.items.into_iter().map(|item| item.path).collect();
         assert_eq!(paths, vec!["src/direct.rs"]);
+    }
+
+    #[tokio::test]
+    async fn search_project_files_walks_an_explicit_directory() {
+        // The new-conversation composer searches a raw directory with no
+        // conversation in the database.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cwd = tmp.path().join("repo");
+        std::fs::create_dir_all(cwd.join("src")).expect("dirs");
+        std::fs::write(cwd.join("src/project.rs"), "fn project() {}\n").expect("file");
+
+        let Json(response) = search_project_files(Query(ProjectFileSearchQuery {
+            cwd: cwd.to_string_lossy().to_string(),
+            q: "project".to_string(),
+            limit: Some(10),
+        }))
+        .await
+        .expect("search");
+
+        let paths: Vec<_> = response.items.into_iter().map(|item| item.path).collect();
+        assert_eq!(paths, vec!["src/project.rs"]);
+    }
+
+    #[tokio::test]
+    async fn search_project_files_rejects_missing_directory() {
+        let err = search_project_files(Query(ProjectFileSearchQuery {
+            cwd: "/nonexistent/phoenix/test/dir".to_string(),
+            q: String::new(),
+            limit: None,
+        }))
+        .await
+        .expect_err("missing dir rejected");
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     #[tokio::test]

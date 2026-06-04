@@ -316,6 +316,21 @@ pub struct FileSearchQuery {
     pub limit: Option<usize>,
 }
 
+/// Query parameters for directory-scoped file search — used by the composer on
+/// the new-conversation page, where no conversation (and thus no file root)
+/// exists yet. Same fuzzy semantics as [`FileSearchQuery`] plus an explicit
+/// working directory to walk.
+#[derive(Debug, Deserialize)]
+pub struct ProjectFileSearchQuery {
+    /// Working directory to search within.
+    pub cwd: String,
+    /// Fuzzy query string (empty = return all up to limit)
+    #[serde(default)]
+    pub q: String,
+    /// Maximum number of results (default 50)
+    pub limit: Option<usize>,
+}
+
 /// A single code content search result.
 #[derive(Debug, Serialize)]
 pub struct CodeSearchEntry {
@@ -368,6 +383,14 @@ pub struct SkillEntry {
 #[derive(Debug, Serialize)]
 pub struct SkillsResponse {
     pub skills: Vec<SkillEntry>,
+}
+
+/// Query parameters for directory-scoped skill discovery — used by the composer
+/// on the new-conversation page, before a conversation exists (REQ-IR-005).
+#[derive(Debug, Deserialize)]
+pub struct ProjectSkillsQuery {
+    /// Working directory to discover skills from.
+    pub cwd: String,
 }
 
 /// A task file entry returned by the tasks list endpoint.
