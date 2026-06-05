@@ -204,12 +204,14 @@ rule SkillTokenPassThrough {
 -- These rules describe the frontend behavior, not backend processing.
 -- They are normative: the frontend must implement these interactions.
 --
--- The autocomplete engine is scoped to a working directory, not a
--- conversation: candidates are a pure function of the directory the composer
--- targets. The same engine therefore drives both the in-conversation composer
--- and the new-conversation composer (which has a chosen directory but no
--- conversation yet). Skill and file discovery resolve against that directory —
--- the same root `expand` uses for `@file` references at send time.
+-- The autocomplete engine is scoped to a resolution root, not a conversation:
+-- candidates are a pure function of the root the composer's workflow resolves
+-- against (the working directory for a Direct workflow, or a branch's committed
+-- tree for a branch/managed workflow). The same engine drives both the
+-- in-conversation composer and the new-conversation composer (which has a chosen
+-- directory + workflow but no conversation yet). Discovery and the first
+-- message's `expand` build the same root, so a suggestion always resolves at
+-- send time.
 
 rule FileAutocompleteTriggered {
     when: UserTypes(input, character: "@")
@@ -220,9 +222,10 @@ rule FileAutocompleteTriggered {
 
     @guidance
         -- Frontend: detectTrigger() in InlineAutocomplete.tsx, driven by the
-        -- useInlineReferences hook. Shows file suggestions from a
-        -- directory-scoped fuzzy file search keyed on the composer's working
-        -- directory. Fuzzy match on file path as the user continues typing.
+        -- useInlineReferences hook. Shows file suggestions from a fuzzy file
+        -- search against the composer's resolution root (filesystem walk for a
+        -- WorkingDir root, `git ls-tree` for a GitTree root). Fuzzy match on
+        -- file path as the user continues typing.
 }
 
 rule SkillAutocompleteTriggered {
@@ -234,8 +237,10 @@ rule SkillAutocompleteTriggered {
 
     @guidance
         -- Frontend: detectTrigger() in InlineAutocomplete.tsx, driven by the
-        -- useInlineReferences hook. Shows skills discovered from the composer's
-        -- working directory, filtered by fuzzy match on skill name.
+        -- useInlineReferences hook. Shows skills discovered against the composer's
+        -- resolution root (a GitTree root materializes the ref's .claude/skills /
+        -- .agents/skills SKILL.md files so discovery runs unchanged), filtered by
+        -- fuzzy match on skill name.
 }
 
 rule PathAutocompleteTriggered {

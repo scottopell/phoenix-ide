@@ -69,56 +69,81 @@ Skill loading is **always context loading first**. Argument substitution is addi
 
 ### REQ-IR-004 and REQ-IR-005 Implementation: Autocomplete Endpoints
 
-Autocomplete candidates are a pure function of a working directory, so each
-discovery endpoint has two forms: a conversation-scoped form that reads the
-directory from the conversation record, and a directory-scoped form that takes
-the directory as a query parameter. The directory-scoped form serves the
-new-conversation composer, which has chosen a directory but not yet created a
-conversation. Both forms delegate to the same discovery logic (`skill_entries_for_cwd`,
-`search_files_in_root`), so the two composers behave identically.
+Autocomplete candidates are a pure function of a **resolution root** — the same
+root the first message's references expand against. `ResolutionRoot` is the
+single type that answers "where do `@file` / `./path` / `/skill` resolve":
 
-The directory both forms resolve against is the conversation's `cwd` — the same
-root `message_expander::expand` uses for `@file` references at send time — so
-every autocomplete candidate is one that will actually expand. (A Work-mode
-conversation's worktree is deliberately *not* searched: a worktree-only file
-would autocomplete but then fail to expand.)
+- `WorkingDir(dir)` — read the live filesystem. Used by Direct conversations and
+  by every in-conversation composer (the conversation already resolves against
+  its own `cwd`).
+- `GitTree { repo_root, reference }` — read a branch's *committed tree* via
+  `git ls-tree` / `git cat-file`, with no worktree required. Used by
+  branch/managed workflows, whose first message is expanded against a fresh
+  worktree of the chosen branch — i.e. that branch's committed tree. Skill
+  discovery materializes the ref's `.claude/skills` / `.agents/skills`
+  `SKILL.md` files into a temporary directory so the filesystem-based
+  `discover_skills` / `invoke_skill` run unchanged.
+
+A single constructor, `ResolutionRoot::for_create(cwd, mode, base_branch)`,
+builds the root from a conversation's creation parameters. **Both** the composer
+autocomplete endpoints and create-time `message_expander::expand` construct the
+root through it, so the candidate set offered to the user and the set the first
+message expands against cannot diverge. (This closes the failure mode where
+`cwd`-based discovery disagreed with worktree-based expansion: a file present in
+the working directory but absent from the branch's committed tree — uncommitted
+or untracked — is no longer offered, because it is not in the tree the worktree
+will check out.)
+
+Each discovery endpoint has two forms: a conversation-scoped form that reads the
+root from the conversation record (`WorkingDir(conversation.cwd)`), and a
+directory-scoped form that takes the creation parameters as query params and
+calls `for_create`. The directory-scoped form serves the new-conversation
+composer, which has chosen a directory + workflow but not yet created a
+conversation.
 
 **Skill discovery:**
 ```
-GET /api/conversations/:id/skills          (conversation-scoped)
-GET /api/skills?cwd=<dir>                   (directory-scoped)
+GET /api/conversations/:id/skills                         (conversation-scoped)
+GET /api/skills?cwd=<dir>&mode=<m>&base_branch=<b>        (directory-scoped)
 Response: { skills: [{ name, description, argument_hint | null, source, path }] }
 ```
-Calls `discover_skills(<cwd>)`. `argument_hint` comes from the `argument-hint`
-frontmatter field in `SKILL.md`.
+Discovers skills against the resolution root. `argument_hint` comes from the
+`argument-hint` frontmatter field in `SKILL.md`. For a `GitTree` root, `path` is
+the ref-relative `SKILL.md` location (not an ephemeral materialization path).
+`mode`/`base_branch` are absent for Direct (the root is `cwd`).
 
 **File search:**
 Reuse the existing `GET /api/files/list?path=<dir>` for directory-level browsing. For fuzzy search across the full tree:
 ```
-GET /api/conversations/:id/files/search?q=<query>&limit=<n>   (conversation-scoped)
-GET /api/files/search?cwd=<dir>&q=<query>&limit=<n>           (directory-scoped)
+GET /api/conversations/:id/files/search?q=<query>&limit=<n>                  (conversation-scoped)
+GET /api/files/search?cwd=<dir>&q=<query>&limit=<n>&mode=<m>&base_branch=<b> (directory-scoped)
 Response: { items: [{ path, is_text_file }] }
 ```
-Walks `cwd` recursively using the `ignore` crate (gitignore-aware), caps results at `limit` (default 50), fuzzy-matches on path components.
+A `WorkingDir` root walks the directory with the `ignore` crate (gitignore-aware);
+a `GitTree` root lists the ref's committed paths via `git ls-tree`. Both cap at
+`limit` (default 50) and fuzzy-match on path components with the same scorer.
 
 ## Frontend: Inline Autocomplete
 
 ### REQ-IR-004 Implementation (shared file picker)
 
 The autocomplete engine lives in the `useInlineReferences` hook, scoped to a
-working directory rather than a conversation. Both the in-conversation composer
-(`InputArea`) and the new-conversation composer consume the hook, passing the
-directory they target; this is what makes inline references work in the
-new-conversation composer before any conversation exists.
+resolution root rather than a conversation. Both the in-conversation composer
+(`InputArea`) and the new-conversation composer consume the hook; this is what
+makes inline references work in the new-conversation composer before any
+conversation exists.
 
-The new-conversation composer enables autocomplete only when the chosen
-directory is the root the first message will be expanded against. In a
-managed/branch workflow the backend creates a fresh worktree of the selected
-branch and expands against *that*, not the current checkout — so the composer
-suppresses autocomplete (passes `cwd: undefined` to the hook, leaving the
-textarea otherwise unchanged) unless the workflow is Direct or its target
-branch is the one already checked out. This keeps the dropdown from suggesting
-files/skills that may not exist where expansion runs.
+The hook takes `cwd` plus the workflow's `mode` / `baseBranch`, which it forwards
+to the directory-scoped endpoints so discovery resolves against the workflow's
+`GitTree` (branch/managed) or `WorkingDir` (Direct) root. The new-conversation
+composer passes `conv.submission.{mode, baseBranch}` — the *same* mapping the
+create call uses — so what the user is offered and what the first message
+expands against are constructed from one source. An in-conversation composer
+leaves `mode`/`baseBranch` unset: its conversation already resolves against its
+own `cwd`. Because candidates depend on the directory *and* the ref, the skill
+cache and the in-flight staleness guards key on a composite (cwd + mode + branch)
+so switching workflow or branch refetches against the new root, and a late
+response from a previous root is discarded.
 
 Both `@` and `./` triggers open the same `InlineAutocomplete` component. Trigger detection inspects the text around the cursor on each `onChange`:
 
