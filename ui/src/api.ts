@@ -1274,6 +1274,14 @@ export const api = {
     return resp.json();
   },
 
+  async dismissError(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/dismiss-error`, {
+      method: 'POST',
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to dismiss error'); }
+    return resp.json();
+  },
+
   async getMcpStatus(): Promise<McpServerStatus[]> {
     const resp = await fetch('/api/mcp/status');
     if (!resp.ok) throw new Error('Failed to get MCP status');

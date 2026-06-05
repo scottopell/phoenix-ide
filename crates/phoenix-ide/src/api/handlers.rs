@@ -142,6 +142,8 @@ pub fn create_router(state: AppState) -> Router {
             "/api/conversations/:id/dismiss-question",
             post(dismiss_question),
         )
+        // Error dismissal: Error -> Idle (server-authoritative)
+        .route("/api/conversations/:id/dismiss-error", post(dismiss_error))
         // Task abandon (REQ-PROJ-010)
         .route("/api/conversations/:id/abandon-task", post(abandon_task))
         // Mark as merged (REQ-PROJ-026)
@@ -2699,6 +2701,37 @@ async fn dismiss_question(
     state
         .runtime
         .send_event(&id, Event::UserQuestionDismissed)
+        .await
+        .map_err(AppError::BadRequest)?;
+
+    Ok(Json(SuccessResponse { success: true }))
+}
+
+/// Dismiss a persisted `Error` state, returning the conversation to `Idle`.
+/// Server-authoritative counterpart to the error banner's "Dismiss" button:
+/// the client sends this instead of faking the idle phase locally, so the
+/// displayed state and the server state cannot diverge.
+async fn dismiss_error(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<SuccessResponse>, AppError> {
+    let conv = state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+
+    if !matches!(conv.state, ConvState::Error { .. }) {
+        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            "Conversation is not in an error state",
+            "wrong_state",
+        ))));
+    }
+
+    state
+        .runtime
+        .send_event(&id, Event::DismissError)
         .await
         .map_err(AppError::BadRequest)?;
 

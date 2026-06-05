@@ -444,22 +444,30 @@ mod state_machine_props {
     }
 
     // ====================================================================
-    // Property 4: TaskResolved only from Idle
+    // Property 4: TaskResolved reaches Terminal only from disposable states
     //
-    // Non-Idle, non-Terminal states must not successfully transition to
-    // Terminal via TaskResolved.
+    // Terminal cleanup (mark-merged / abandon) is reachable from Idle and
+    // from a *stuck* conversation (Error or ContextExhausted) — those are the
+    // disposable states. Any other non-Terminal state must not transition to
+    // Terminal via TaskResolved (it rejects or no-ops).
     // ====================================================================
 
-    fn arb_non_idle_non_terminal_state() -> impl Strategy<Value = ConvState> {
-        arb_state().prop_filter("must be non-Idle and non-Terminal", |s| {
-            !matches!(s, ConvState::Idle | ConvState::Terminal)
+    fn arb_non_disposable_non_terminal_state() -> impl Strategy<Value = ConvState> {
+        arb_state().prop_filter("must be non-disposable and non-Terminal", |s| {
+            !matches!(
+                s,
+                ConvState::Idle
+                    | ConvState::Terminal
+                    | ConvState::Error { .. }
+                    | ConvState::ContextExhausted { .. }
+            )
         })
     }
 
     proptest! {
         #[test]
-        fn prop_task_resolved_only_from_idle(
-            state in arb_non_idle_non_terminal_state(),
+        fn prop_task_resolved_only_from_disposable_states(
+            state in arb_non_disposable_non_terminal_state(),
         ) {
             let event = Event::TaskResolved {
                 system_message: "completed".to_string(),

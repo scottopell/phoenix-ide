@@ -1730,6 +1730,49 @@ pub fn transition_parent(
         }
 
         // ============================================================
+        // Error dismissal: Error + DismissError -> Idle.
+        //
+        // Server-authoritative path for the UI's "Dismiss" button on an error
+        // banner. The conversation genuinely returns to Idle (persisted +
+        // broadcast) rather than the client faking the phase locally, so the
+        // displayed state and the server state cannot diverge.
+        // ============================================================
+        (
+            ParentState::Core(CoreState::Error { .. }),
+            ParentEvent::Parent(ParentOnlyEvent::DismissError),
+        ) => Ok(
+            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change()),
+        ),
+
+        // ============================================================
+        // Task resolution: terminal cleanup (mark-merged / abandon) ->
+        // Terminal (REQ-BED-029).
+        //
+        // Reachable from a *stuck* conversation, not just Idle: an Error
+        // (e.g. a usage-limit window the user merged around externally) or a
+        // ContextExhausted parent whose work was merged externally must still
+        // be disposable without first forcing a successful LLM turn. All three
+        // converge to Terminal via the same ResolveTask effect. This arm
+        // precedes the ContextExhausted catch-all below so TaskResolved is not
+        // swallowed as a no-op for that state.
+        // ============================================================
+        (
+            ParentState::Core(CoreState::Idle | CoreState::Error { .. })
+            | ParentState::ContextExhausted { .. },
+            ParentEvent::Parent(ParentOnlyEvent::TaskResolved {
+                system_message,
+                repo_root,
+            }),
+        ) => Ok(
+            ParentTransitionResult::new(ParentState::Terminal).with_effect(Effect::ResolveTask {
+                system_message,
+                repo_root,
+            }),
+        ),
+
+        // ============================================================
         // Parent-only state: ContextExhausted
         // ============================================================
         (
@@ -1754,22 +1797,6 @@ pub fn transition_parent(
         }
 
         (ParentState::Terminal, _event) => Ok(ParentTransitionResult::new(ParentState::Terminal)),
-
-        // ============================================================
-        // Task resolution: Idle + TaskResolved -> Terminal (REQ-BED-029)
-        // ============================================================
-        (
-            ParentState::Core(CoreState::Idle),
-            ParentEvent::Parent(ParentOnlyEvent::TaskResolved {
-                system_message,
-                repo_root,
-            }),
-        ) => Ok(
-            ParentTransitionResult::new(ParentState::Terminal).with_effect(Effect::ResolveTask {
-                system_message,
-                repo_root,
-            }),
-        ),
 
         // ============================================================
         // Parent-specific LLM response interceptions (before core)
@@ -3706,12 +3733,12 @@ mod tests {
         );
     }
 
-    /// Task 13018 follow-up: a propose_task whose payload failed to
+    /// Task 13018 follow-up: a `propose_task` whose payload failed to
     /// deserialise (`ToolInput::Malformed{name: "propose_task", ...}`) must
     /// be intercepted in the typed approval flow — the serde error is
-    /// surfaced as a tool_result and the LLM is re-requested. Without this
+    /// surfaced as a `tool_result` and the LLM is re-requested. Without this
     /// interception the malformed call would fall through to the executor
-    /// where propose_task's fallback `run()` returns a generic error, hiding
+    /// where `propose_task`'s fallback `run()` returns a generic error, hiding
     /// the precise serde diagnostic and skipping the typed approval path.
     #[test]
     fn test_malformed_propose_task_surfaces_serde_error_to_llm() {
@@ -3779,7 +3806,7 @@ mod tests {
         assert!(has_request_llm, "must re-request the LLM");
     }
 
-    /// Task 13018 follow-up: same structural backstop for ask_user_question.
+    /// Task 13018 follow-up: same structural backstop for `ask_user_question`.
     #[test]
     fn test_malformed_ask_user_question_surfaces_serde_error_to_llm() {
         use crate::state::ToolInput;
@@ -4419,6 +4446,95 @@ mod tests {
             "empty drain must produce no effects, got {} effects",
             result.effects.len()
         );
+    }
+
+    #[test]
+    fn task_resolved_from_error_reaches_terminal_with_resolve_effect() {
+        // Terminal cleanup (mark-merged / abandon) must be reachable from a
+        // conversation stuck in Error (e.g. a usage-limit window the user
+        // merged around externally) — not just from Idle.
+        let state = ConvState::Error {
+            message: "You've hit your usage limit.".to_string(),
+            error_kind: ErrorKind::UsageLimitReached,
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::TaskResolved {
+                system_message: "Marked as merged.".to_string(),
+                repo_root: "/tmp".to_string(),
+            },
+        )
+        .expect("TaskResolved must be accepted from Error");
+
+        assert!(matches!(result.new_state, ConvState::Terminal));
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::ResolveTask { .. })),
+            "must emit ResolveTask, got {:?}",
+            result.effects
+        );
+    }
+
+    #[test]
+    fn task_resolved_from_context_exhausted_reaches_terminal_with_resolve_effect() {
+        let state = ConvState::ContextExhausted {
+            summary: "ran out of context".to_string(),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::TaskResolved {
+                system_message: "Task abandoned.".to_string(),
+                repo_root: "/tmp".to_string(),
+            },
+        )
+        .expect("TaskResolved must be accepted from ContextExhausted");
+
+        assert!(matches!(result.new_state, ConvState::Terminal));
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::ResolveTask { .. })),
+            "must emit ResolveTask, got {:?}",
+            result.effects
+        );
+    }
+
+    #[test]
+    fn dismiss_error_from_error_returns_to_idle() {
+        let state = ConvState::Error {
+            message: "boom".to_string(),
+            error_kind: ErrorKind::UsageLimitReached,
+        };
+        let result = transition(&state, &test_context(), Event::DismissError)
+            .expect("DismissError must be accepted from Error");
+
+        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistState)),
+            "must persist the idle transition, got {:?}",
+            result.effects
+        );
+    }
+
+    #[test]
+    fn dismiss_error_from_idle_is_invalid() {
+        let err = transition(&ConvState::Idle, &test_context(), Event::DismissError)
+            .expect_err("DismissError is only valid from Error");
+        assert!(matches!(
+            err,
+            TransitionError::InvalidTransition {
+                event: "DismissError",
+                ..
+            }
+        ));
     }
 }
 
