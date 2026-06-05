@@ -94,6 +94,10 @@ vte = "0.15"
 # Gitignore-aware directory walking (for file search)
 ignore = "0.4"
 
+# Temp dirs for materializing a branch ref's SKILL.md files during GitTree
+# skill discovery (resolution_root); also used across tests.
+tempfile = "3"
+
 # Glob matching for search tool's include/exclude params
 globset = "0.4"
 
@@ -137,7 +141,6 @@ phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
 # Re-declared with test-support so phoenix-db's #[cfg(test)] `create_conversation`
 # explore-mode test wrapper is visible to this crate's tests. Dev-only.
 phoenix-db = { path = "../phoenix-db", features = ["test-support"] }
-tempfile = "3"
 proptest = "1"
 # `test-util` enables `tokio::time::pause`/`advance`, used by the
 # bounded-shutdown drain tests to exercise the SHUTDOWN_GRACE timeout
