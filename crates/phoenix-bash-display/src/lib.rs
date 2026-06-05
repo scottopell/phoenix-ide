@@ -186,7 +186,7 @@ fn is_cd_to_cwd_pipeline(pipeline: &Pipeline, cwd: &str) -> bool {
 
     match &pipeline.seq[0] {
         Command::Simple(simple) => is_cd_to_cwd_simple_command(simple, cwd),
-        _ => false,
+        Command::Compound(..) | Command::Function(_) | Command::ExtendedTest(..) => false,
     }
 }
 

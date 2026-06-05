@@ -273,6 +273,15 @@ struct LogLine {
     raw: String,
 }
 
+fn json_value_inline(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::Array(_) | Value::Object(_) => {
+            v.to_string()
+        }
+    }
+}
+
 fn extra_fields(v: &Value) -> String {
     v.get("fields")
         .and_then(Value::as_object)
@@ -281,10 +290,7 @@ fn extra_fields(v: &Value) -> String {
                 .iter()
                 .filter(|(k, _)| k.as_str() != "message")
                 .map(|(k, v)| {
-                    let val = match v {
-                        Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    };
+                    let val = json_value_inline(v);
                     format!("{k}={val}")
                 })
                 .collect::<Vec<_>>()
@@ -681,7 +687,9 @@ fn content_preview(content: &Value, limit: usize) -> String {
             .chars()
             .take(limit)
             .collect(),
-        other => other.to_string().chars().take(limit).collect(),
+        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {
+            content.to_string().chars().take(limit).collect()
+        }
     }
 }
 
@@ -843,10 +851,7 @@ fn render_state_tab(lines: &mut Vec<Line>, detail: &ConversationDetailResponse) 
     ];
     for field in fields {
         if let Some(v) = conv.get(field) {
-            let val = match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
+            let val = json_value_inline(v);
             lines.push(Line::from(vec![
                 Span::styled(format!("{field:<20}"), Style::default().fg(Color::DarkGray)),
                 Span::styled(val, Style::default().fg(Color::White)),
@@ -1359,7 +1364,30 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
                     app.focus = Focus::Detail;
                 }
             }
-            _ => {}
+            KeyCode::Backspace
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::PageUp
+            | KeyCode::PageDown
+            | KeyCode::Tab
+            | KeyCode::BackTab
+            | KeyCode::Delete
+            | KeyCode::Insert
+            | KeyCode::F(_)
+            | KeyCode::Char(_)
+            | KeyCode::Null
+            | KeyCode::Esc
+            | KeyCode::CapsLock
+            | KeyCode::ScrollLock
+            | KeyCode::NumLock
+            | KeyCode::PrintScreen
+            | KeyCode::Pause
+            | KeyCode::Menu
+            | KeyCode::KeypadBegin
+            | KeyCode::Media(_)
+            | KeyCode::Modifier(_) => {}
         },
 
         Focus::Detail => match code {
@@ -1403,7 +1431,27 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
             KeyCode::Char('3') => {
                 app.detail_tab = DetailTab::SubAgents;
             }
-            _ => {}
+            KeyCode::Backspace
+            | KeyCode::Enter
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::BackTab
+            | KeyCode::Delete
+            | KeyCode::Insert
+            | KeyCode::F(_)
+            | KeyCode::Char(_)
+            | KeyCode::Null
+            | KeyCode::CapsLock
+            | KeyCode::ScrollLock
+            | KeyCode::NumLock
+            | KeyCode::PrintScreen
+            | KeyCode::Pause
+            | KeyCode::Menu
+            | KeyCode::KeypadBegin
+            | KeyCode::Media(_)
+            | KeyCode::Modifier(_) => {}
         },
 
         Focus::SubAgentDetail => match code {
@@ -1439,7 +1487,27 @@ fn handle_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
                 app.sub_detail_tab = SubDetailTab::Messages;
                 app.sub_detail_msg_scroll = 0;
             }
-            _ => {}
+            KeyCode::Backspace
+            | KeyCode::Enter
+            | KeyCode::Left
+            | KeyCode::Right
+            | KeyCode::Home
+            | KeyCode::End
+            | KeyCode::BackTab
+            | KeyCode::Delete
+            | KeyCode::Insert
+            | KeyCode::F(_)
+            | KeyCode::Char(_)
+            | KeyCode::Null
+            | KeyCode::CapsLock
+            | KeyCode::ScrollLock
+            | KeyCode::NumLock
+            | KeyCode::PrintScreen
+            | KeyCode::Pause
+            | KeyCode::Menu
+            | KeyCode::KeypadBegin
+            | KeyCode::Media(_)
+            | KeyCode::Modifier(_) => {}
         },
     }
     false
@@ -1560,10 +1628,7 @@ fn print_conv_detail(d: &ConversationDetailResponse) {
 
     let print_field = |label: &str, key: &str| {
         if let Some(v) = conv.get(key) {
-            let val = match v {
-                Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
+            let val = json_value_inline(v);
             println!("{label:<20} {val}");
         }
     };

@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Runtime for executing conversations
 //!
 //! REQ-BED-007: State Persistence

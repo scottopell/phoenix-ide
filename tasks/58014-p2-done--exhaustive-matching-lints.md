@@ -355,3 +355,31 @@ fn transition_sub_agent_completed(
 - The lint rollout has a clear list of intentional local exceptions, if any.
 - The state-machine reducer migration plan focuses on nested exhaustive matching by state and omits competing approaches.
 - The plan identifies `transition_core`, `transition_parent`, and `transition_sub_agent` as the primary migration targets.
+
+## Completion notes
+
+`./dev.py check` passes with the new workspace Clippy denies enabled.
+
+### Rewritten explicitly during lint rollout
+
+- Small content/tool/state classifiers in `phoenix-core`, `phoenix-state-machine`, `phoenix-bash-display`, `phoenix-db`, `phoenix-monitor`, and `phoenix-tools` were rewritten to enumerate known enum variants rather than using wildcard match arms.
+- `sqlx::Error::RowNotFound` mapping now uses `matches!` so the non-exhaustive `sqlx::Error` passthrough remains valid without wildcard enum matching.
+
+### Temporary local rollout exceptions
+
+The remaining `phoenix-ide` wildcard sites are covered by module-local `#![allow(clippy::wildcard_enum_match_arm)]` attributes to keep this lint rollout bounded. These modules contain broader API/runtime/reducer fallback patterns that should be migrated deliberately rather than opportunistically in the lint enablement change:
+
+- `crates/phoenix-ide/src/api/chains.rs`
+- `crates/phoenix-ide/src/api/codex_login.rs`
+- `crates/phoenix-ide/src/api/git_handlers.rs`
+- `crates/phoenix-ide/src/api/handlers.rs`
+- `crates/phoenix-ide/src/api/lifecycle_handlers.rs`
+- `crates/phoenix-ide/src/chain_qa.rs`
+- `crates/phoenix-ide/src/llm/codex_login.rs`
+- `crates/phoenix-ide/src/llm/mock.rs`
+- `crates/phoenix-ide/src/message_expander.rs`
+- `crates/phoenix-ide/src/runtime.rs`
+- `crates/phoenix-ide/src/runtime/executor.rs`
+- `crates/phoenix-ide/src/runtime/recovery.rs`
+
+Follow-up task `58015-p2-ready--nested-state-reducer-exhaustive-matching.md` captures the nested-by-state reducer migration plan for `transition_core`, `transition_parent`, and `transition_sub_agent`.

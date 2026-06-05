@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Conversation lifecycle HTTP handlers: task approval, abandon, mark-merged.
 
 use super::handlers::{run_resource_cleanup_cascade, AppError};

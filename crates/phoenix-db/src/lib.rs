@@ -1082,9 +1082,12 @@ impl Database {
         .try_map(parse_conversation_row)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => DbError::ConversationNotFound(id.to_string()),
-            other => DbError::Sqlx(other),
+        .map_err(|e| {
+            if matches!(e, sqlx::Error::RowNotFound) {
+                DbError::ConversationNotFound(id.to_string())
+            } else {
+                DbError::Sqlx(e)
+            }
         })
     }
 
@@ -1106,9 +1109,12 @@ impl Database {
         .try_map(parse_conversation_row)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => DbError::ConversationNotFound(slug.to_string()),
-            other => DbError::Sqlx(other),
+        .map_err(|e| {
+            if matches!(e, sqlx::Error::RowNotFound) {
+                DbError::ConversationNotFound(slug.to_string())
+            } else {
+                DbError::Sqlx(e)
+            }
         })
     }
 
@@ -2469,9 +2475,12 @@ impl Database {
         .try_map(parse_message_row)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => DbError::MessageNotFound(message_id.to_string()),
-            other => DbError::Sqlx(other),
+        .map_err(|e| {
+            if matches!(e, sqlx::Error::RowNotFound) {
+                DbError::MessageNotFound(message_id.to_string())
+            } else {
+                DbError::Sqlx(e)
+            }
         })
     }
 

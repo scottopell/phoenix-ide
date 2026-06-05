@@ -990,7 +990,19 @@ fn handle_core_tool_complete(
         }
 
         // tool_use_id mismatch or unexpected event variant
-        _ => Err(TransitionError::InvalidTransition {
+        CoreEvent::ToolComplete { .. }
+        | CoreEvent::SpawnAgentsComplete { .. }
+        | CoreEvent::UserMessage { .. }
+        | CoreEvent::UserCancel { .. }
+        | CoreEvent::LlmResponse { .. }
+        | CoreEvent::LlmError { .. }
+        | CoreEvent::RetryTimeout { .. }
+        | CoreEvent::ToolAborted { .. }
+        | CoreEvent::SubAgentResult { .. }
+        | CoreEvent::ContinuationResponse { .. }
+        | CoreEvent::ContinuationFailed { .. }
+        | CoreEvent::UserTriggerContinuation
+        | CoreEvent::SteerDrainedUserMessages { .. } => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
             event: event.variant_name(),
         }),
@@ -1813,7 +1825,17 @@ pub fn transition_parent(
                 ToolInput::Malformed { name, error, .. } if name == "propose_task" => {
                     Some((t, ProposeTaskCall::Malformed(error.as_str())))
                 }
-                _ => None,
+                ToolInput::Bash(_)
+                | ToolInput::Think(_)
+                | ToolInput::Patch(_)
+                | ToolInput::KeywordSearch(_)
+                | ToolInput::ReadImage(_)
+                | ToolInput::SpawnAgents(_)
+                | ToolInput::SubmitResult(_)
+                | ToolInput::SubmitError(_)
+                | ToolInput::AskUserQuestion(_)
+                | ToolInput::Unknown { .. }
+                | ToolInput::Malformed { .. } => None,
             }) {
                 // propose_task is only valid in Managed mode (Explore/Work lifecycle).
                 // Direct and Branch mode should never produce this tool call.
@@ -1957,7 +1979,17 @@ pub fn transition_parent(
                 ToolInput::Malformed { name, error, .. } if name == "ask_user_question" => {
                     Some((t, AskUserQuestionCall::Malformed(error.as_str())))
                 }
-                _ => None,
+                ToolInput::Bash(_)
+                | ToolInput::Think(_)
+                | ToolInput::Patch(_)
+                | ToolInput::KeywordSearch(_)
+                | ToolInput::ReadImage(_)
+                | ToolInput::SpawnAgents(_)
+                | ToolInput::SubmitResult(_)
+                | ToolInput::SubmitError(_)
+                | ToolInput::ProposeTask(_)
+                | ToolInput::Unknown { .. }
+                | ToolInput::Malformed { .. } => None,
             }) {
                 if tool_calls.len() > 1 {
                     let msg = "ask_user_question must be the only tool in response".to_string();
@@ -2162,7 +2194,13 @@ pub fn transition_parent(
                 ParentState::Core(CoreState::AwaitingContinuation { attempt, .. }) => {
                     *attempt >= MAX_RETRY_ATTEMPTS
                 }
-                _ => false,
+                ParentState::Core(_)
+                | ParentState::AwaitingRecovery { .. }
+                | ParentState::AwaitingTaskApproval { .. }
+                | ParentState::AwaitingUserResponse { .. }
+                | ParentState::ContextExhausted { .. }
+                | ParentState::HandedOff { .. }
+                | ParentState::Terminal => false,
             }
         } =>
         {
@@ -2438,7 +2476,18 @@ pub fn transition_sub_agent(
                             },
                         }))
                     }
-                    _ => unreachable!("is_terminal_tool returned true for non-terminal tool"),
+                    ToolInput::Bash(_)
+                    | ToolInput::Think(_)
+                    | ToolInput::Patch(_)
+                    | ToolInput::KeywordSearch(_)
+                    | ToolInput::ReadImage(_)
+                    | ToolInput::SpawnAgents(_)
+                    | ToolInput::ProposeTask(_)
+                    | ToolInput::AskUserQuestion(_)
+                    | ToolInput::Unknown { .. }
+                    | ToolInput::Malformed { .. } => {
+                        unreachable!("is_terminal_tool returned true for non-terminal tool")
+                    }
                 };
             }
 
@@ -2663,7 +2712,20 @@ fn current_attempt(state: &ConvState) -> u32 {
         ConvState::LlmRequesting { attempt }
         | ConvState::SeededLlmRequesting { attempt, .. }
         | ConvState::AwaitingContinuation { attempt, .. } => *attempt,
-        _ => 1,
+        ConvState::Idle
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Completed { .. }
+        | ConvState::Failed { .. }
+        | ConvState::Error { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingTaskApproval { .. }
+        | ConvState::AwaitingUserResponse { .. }
+        | ConvState::ContextExhausted { .. }
+        | ConvState::HandedOff { .. }
+        | ConvState::Terminal => 1,
     }
 }
 
@@ -2745,7 +2807,22 @@ fn extract_text_from_content(blocks: &[phoenix_core::domain::llm_types::ContentB
         .iter()
         .filter_map(|b| match b {
             phoenix_core::domain::llm_types::ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
+            phoenix_core::domain::llm_types::ContentBlock::Image { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::ToolUse { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::ToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::ServerToolUse { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::ToolSearchToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::WebSearchToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::WebFetchToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::CodeExecutionToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::BashCodeExecutionToolResult {
+                ..
+            }
+            | phoenix_core::domain::llm_types::ContentBlock::TextEditorCodeExecutionToolResult {
+                ..
+            }
+            | phoenix_core::domain::llm_types::ContentBlock::McpToolUse { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::McpToolResult { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")

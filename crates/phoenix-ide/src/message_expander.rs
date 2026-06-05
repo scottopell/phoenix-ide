@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Message expansion layer for inline references (REQ-IR-001 through REQ-IR-007)
 //!
 //! Resolves `@path/to/file` and `/skill-name` tokens in user messages before they

@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Chain Q&A backend (REQ-CHN-001, REQ-CHN-004, REQ-CHN-005, REQ-CHN-006).
 //!
 //! Phase 2 of Phoenix Chains v1: bundles per-member context, invokes a

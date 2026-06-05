@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! First-party `ChatGPT`/Codex `OAuth` login (browser + device code flows).
 //!
 //! Phoenix's `codex_credential` module reads `~/.codex/auth.json` produced by

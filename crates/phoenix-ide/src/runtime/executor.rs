@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Conversation runtime executor
 //!
 //! The executor loop receives inputs from two sources:

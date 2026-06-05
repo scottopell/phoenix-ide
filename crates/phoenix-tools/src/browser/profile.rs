@@ -1039,7 +1039,13 @@ fn validate_run_scenario(input: &ProfileInput) -> Result<ScenarioPlan, ToolOutpu
         let kind = match step {
             Step::Navigate { .. } => Some("navigate"),
             Step::Reload => Some("reload"),
-            _ => None,
+            Step::Click { .. }
+            | Step::Type { .. }
+            | Step::Key { .. }
+            | Step::Eval { .. }
+            | Step::WaitSelector { .. }
+            | Step::WaitTiming { .. }
+            | Step::WaitEval { .. } => None,
         };
         if let Some(kind) = kind {
             return Err(ToolOutput::error(format!(

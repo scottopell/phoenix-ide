@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! HTTP request handlers
 //!
 //! REQ-API-001 through REQ-API-010

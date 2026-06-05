@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Phoenix Chains v1 — HTTP API handlers (REQ-CHN-003 / 004 / 005 / 007).
 //!
 //! Four endpoints live here:

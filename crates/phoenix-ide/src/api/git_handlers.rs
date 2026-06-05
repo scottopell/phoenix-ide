@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Git-related HTTP handlers: branch listing, search, conflict detection,
 //! per-conversation diff snapshots.
 

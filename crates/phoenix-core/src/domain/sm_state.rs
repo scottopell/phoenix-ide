@@ -1452,7 +1452,7 @@ impl SubAgentState {
     pub fn as_core(&self) -> Option<&CoreState> {
         match self {
             SubAgentState::Core(c) => Some(c),
-            _ => None,
+            SubAgentState::Completed { .. } | SubAgentState::Failed { .. } => None,
         }
     }
 }
@@ -1588,7 +1588,20 @@ impl ConvState {
             Self::Error { error_kind, .. }
             | Self::Failed { error_kind, .. }
             | Self::AwaitingRecovery { error_kind, .. } => Some(error_kind),
-            _ => None,
+            Self::Idle
+            | Self::LlmRequesting { .. }
+            | Self::SeededLlmRequesting { .. }
+            | Self::ToolExecuting { .. }
+            | Self::CancellingTool { .. }
+            | Self::AwaitingSubAgents { .. }
+            | Self::CancellingSubAgents { .. }
+            | Self::Completed { .. }
+            | Self::AwaitingContinuation { .. }
+            | Self::AwaitingTaskApproval { .. }
+            | Self::AwaitingUserResponse { .. }
+            | Self::ContextExhausted { .. }
+            | Self::HandedOff { .. }
+            | Self::Terminal => None,
         }
     }
 

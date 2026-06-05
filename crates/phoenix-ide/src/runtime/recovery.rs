@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Conversation recovery logic
 //!
 //! Handles detection of interrupted conversations that need auto-continuation.
