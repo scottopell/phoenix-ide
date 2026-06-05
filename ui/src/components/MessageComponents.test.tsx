@@ -560,7 +560,7 @@ describe('SubAgentStatus inline activity', () => {
     }
   });
 
-  it('caps live child streams to one expanded running sub-agent', async () => {
+  it('streams each expanded running sub-agent concurrently (no global single-stream cap)', async () => {
     (api.getConversation as ReturnType<typeof vi.fn>)
       .mockResolvedValueOnce({
         conversation: baseConversation,
@@ -596,8 +596,10 @@ describe('SubAgentStatus inline activity', () => {
     await waitFor(() => expect(FakeEventSource.instances).toHaveLength(1));
     fireEvent.click(screen.getByText(/Second running task/));
 
-    expect(await screen.findByText(/Another live sub-agent stream/)).toBeInTheDocument();
-    expect(FakeEventSource.instances).toHaveLength(1);
+    // The global single-live-stream cap was removed (HTTP/2 multiplexes), so
+    // both expanded running sub-agents stream concurrently with no error.
+    await waitFor(() => expect(FakeEventSource.instances).toHaveLength(2));
+    expect(screen.queryByText(/Another live sub-agent stream/)).not.toBeInTheDocument();
   });
 
   it('preserves expanded state when a pending sub-agent completes', async () => {

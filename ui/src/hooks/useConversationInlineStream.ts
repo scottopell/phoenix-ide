@@ -94,46 +94,6 @@ function parseEventData(event: Event): unknown | null {
 const MAX_NOT_FOUND_RETRIES = 10;
 const NOT_FOUND_RETRY_MS = 500;
 
-// Single-live-stream slot: at most one *conversation* may be streamed live at
-// a time, but that conversation may legitimately have several concurrent
-// viewers (e.g. an expanded inline card and the docked panel for the same
-// sub-agent). A reference count over the owning conversation id keeps those
-// nested acquires/releases balanced — releasing one viewer must not free the
-// slot while another viewer's EventSource is still open (which would let a
-// *different* conversation acquire and produce two concurrent live streams).
-let liveStreamOwner: { id: string; count: number } | null = null;
-
-function acquireLiveStream(conversationId: string): boolean {
-  if (liveStreamOwner === null) {
-    liveStreamOwner = { id: conversationId, count: 1 };
-    return true;
-  }
-  if (liveStreamOwner.id === conversationId) {
-    liveStreamOwner.count += 1;
-    return true;
-  }
-  return false;
-}
-
-function releaseLiveStream(conversationId: string): void {
-  if (liveStreamOwner && liveStreamOwner.id === conversationId) {
-    liveStreamOwner.count -= 1;
-    if (liveStreamOwner.count <= 0) {
-      liveStreamOwner = null;
-    }
-  }
-}
-
-/** Test-only handle on the live-stream slot accounting. Not part of the public
- *  surface — production code goes through the hook. */
-export const __testing = {
-  acquireLiveStream,
-  releaseLiveStream,
-  resetLiveStreamSlot: () => {
-    liveStreamOwner = null;
-  },
-};
-
 function maxMessageSequence(messages: Message[]): number {
   let max = 0;
   for (const message of messages) {
@@ -175,7 +135,7 @@ function isNotFound(error: unknown): boolean {
  *   - `'auto'`— open the SSE stream only if the loaded conversation is still
  *     working, and self-close once it reaches a terminal state. Lets an
  *     always-mounted owner (the docked viewer) stream a running sub-agent
- *     without holding the single live-stream slot open for a finished one.
+ *     without keeping an idle SSE connection open for a finished one.
  */
 export function useConversationInlineStream(conversationId: string, enabled: boolean, live: boolean | 'auto'): InlineStreamState {
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
@@ -194,22 +154,14 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
     let retryTimer: number | null = null;
 
     const closeSource = () => {
-      // Release the slot only when we actually had an open EventSource, so a
-      // double close (e.g. self-close on terminal state followed by effect
-      // cleanup) decrements the refcount exactly once.
       if (source) {
         source.close();
         source = null;
-        releaseLiveStream(conversationId);
       }
     };
 
     const openLiveStream = () => {
       if (cancelled) return;
-      if (!acquireLiveStream(conversationId)) {
-        dispatch({ type: 'error', error: 'Another live sub-agent stream is already open. Collapse it before opening this one live.' });
-        return;
-      }
       source = new EventSource(`/api/conversations/${encodeURIComponent(conversationId)}/stream`);
 
       source.addEventListener('init', (event) => {
