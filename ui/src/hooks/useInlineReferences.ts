@@ -188,6 +188,16 @@ export function useInlineReferences({
     }
   }, [cwd, setSkillItems]);
 
+  // When autocomplete is disabled (no `cwd`), tear down any open dropdown and
+  // stale file results so candidates fetched against a previous root can't stay
+  // visible or be inserted into a context where they no longer resolve.
+  useEffect(() => {
+    if (!cwd) {
+      setActiveTrigger(null);
+      setFileAcItems([]);
+    }
+  }, [cwd, setActiveTrigger, setFileAcItems]);
+
   // Fire side effects (fetch) on trigger change. No state derivation here —
   // `acItems` is computed during render via the useMemo above.
   useEffect(() => {
