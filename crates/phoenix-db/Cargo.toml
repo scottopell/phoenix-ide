@@ -44,6 +44,13 @@ thiserror = "2"
 tracing = "0.1"
 
 [dev-dependencies]
+# Re-declared with test-support so phoenix-core's #[cfg(test)] domain
+# constructors (ContentBlock::tool_use, …) are visible when this crate's own
+# tests are built in isolation (`cargo test -p phoenix-db`), not only when
+# workspace feature unification happens to pull the feature in via phoenix-ide.
+# Dev-only: production `cargo build` never enables it.
+phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+
 # `#[tokio::test]` runtime for the async persistence tests.
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
