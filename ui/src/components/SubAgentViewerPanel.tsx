@@ -34,13 +34,17 @@ interface Props {
  * The panel owns the sub-agent's read-only stream itself (rather than reading a
  * snapshot of the parent's spawn card) and derives live status from that
  * stream's phase. This keeps the status correct even when the parent card
- * scrolls out of the virtualized message list and unmounts. `live: 'auto'`
- * means a still-running sub-agent streams live (and self-closes on completion),
- * while a sub-agent that's already finished when opened loads as a snapshot and
- * never holds the single live-stream slot open.
+ * scrolls out of the virtualized message list and unmounts. The stream is
+ * opened live (not phase-gated) so a just-spawned sub-agent still momentarily
+ * `Idle` is followed once it starts working, and it self-closes when the
+ * sub-agent finishes.
  *
  * There is intentionally no composer: a completed sub-agent takes no further
  * input, and a running one is driven by its parent — the panel is for reading.
+ *
+ * The dock keys this component by `agentId`, so switching sub-agents remounts
+ * it with a fresh stream rather than showing the prior agent's atom under the
+ * new title until the new snapshot lands.
  */
 export function SubAgentViewerPanel({ opened, onClose, width }: Props) {
   const { agentId, task } = opened;
@@ -48,7 +52,7 @@ export function SubAgentViewerPanel({ opened, onClose, width }: Props) {
   const [opening, setOpening] = useState(false);
   const inFlight = useRef(false);
 
-  const inline = useConversationInlineStream(agentId, true, 'auto');
+  const inline = useConversationInlineStream(agentId, true, true);
   const running = isAgentWorking(inline.atom.phase);
 
   const openFullPage = useCallback(async () => {

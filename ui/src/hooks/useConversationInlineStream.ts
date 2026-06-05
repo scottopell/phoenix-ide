@@ -129,15 +129,12 @@ function isNotFound(error: unknown): boolean {
  * event replay, so sequence floors/token buffering/message updates follow one
  * protocol contract instead of a parallel sub-agent-specific implementation.
  *
- * `live`:
- *   - `true`  — always open the SSE stream.
- *   - `false` — snapshot only.
- *   - `'auto'`— open the SSE stream only if the loaded conversation is still
- *     working, and self-close once it reaches a terminal state. Lets an
- *     always-mounted owner (the docked viewer) stream a running sub-agent
- *     without keeping an idle SSE connection open for a finished one.
+ * `live` true opens the SSE stream (and self-closes once the sub-agent reaches
+ * a terminal state); `false` is snapshot-only. `true` streams regardless of the
+ * loaded phase so a just-spawned sub-agent that's still momentarily `Idle`
+ * (created before its initial event) is followed once it starts working.
  */
-export function useConversationInlineStream(conversationId: string, enabled: boolean, live: boolean | 'auto'): InlineStreamState {
+export function useConversationInlineStream(conversationId: string, enabled: boolean, live: boolean): InlineStreamState {
   const [state, dispatch] = useReducer(reducer, undefined, initialState);
 
   useEffect(() => {
@@ -293,11 +290,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
               payload: snapshotPayload(data.conversation, data.messages, data.context_window_size ?? 0),
             },
           });
-          const phase = data.conversation.state
-            ? parseConversationState(data.conversation.state)
-            : { type: 'idle' as const };
-          const streamLive = live === true || (live === 'auto' && isAgentWorking(phase));
-          if (streamLive) openLiveStream();
+          if (live) openLiveStream();
         })
         .catch((err) => {
           if (cancelled) return;
@@ -305,10 +298,10 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
           // RuntimeManager has inserted the freshly-spawned child row (the
           // spawn request is enqueued on an async channel before the parent
           // enters AwaitingSubAgents), so a 404 right after open is often
-          // transient. Retry briefly for any live-capable mode ('auto' and
-          // true), but bound it so a genuinely-missing / deleted sub-agent
-          // surfaces an error instead of looping forever.
-          if (live !== false && isNotFound(err) && notFoundRetries < MAX_NOT_FOUND_RETRIES) {
+          // transient. Retry briefly when streaming live, but bound it so a
+          // genuinely-missing / deleted sub-agent surfaces an error instead of
+          // looping forever.
+          if (live && isNotFound(err) && notFoundRetries < MAX_NOT_FOUND_RETRIES) {
             notFoundRetries += 1;
             retryTimer = window.setTimeout(loadSnapshot, NOT_FOUND_RETRY_MS);
             return;

@@ -1,5 +1,5 @@
 import { useLocation } from 'react-router-dom';
-import { useEffect } from 'react';
+import { lazy, Suspense, useEffect } from 'react';
 import {
   useConversationsList,
   useConversationsRefresh,
@@ -10,7 +10,12 @@ import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { SubAgentViewerProvider, useSubAgentViewer } from '../contexts/SubAgentViewerContext';
-import { SubAgentViewerPanel } from './SubAgentViewerPanel';
+// Code-split: the panel pulls MessageComponents (markdown + syntax highlighting),
+// which must not land in the non-lazy app-shell bundle for routes that never
+// open a sub-agent. Loaded on first open.
+const SubAgentViewerPanel = lazy(() =>
+  import('./SubAgentViewerPanel').then((m) => ({ default: m.SubAgentViewerPanel })),
+);
 import { CommandPalette } from './CommandPalette';
 import { Toast } from './Toast';
 import { PaneDivider } from './PaneDivider';
@@ -49,7 +54,16 @@ function SubAgentViewerDock() {
         onPointerDown={(e) => pane.startDrag(e, 'x', true)}
         onDoubleClick={viewer.close}
       />
-      <SubAgentViewerPanel opened={viewer.opened} onClose={viewer.close} width={pane.size} />
+      <Suspense fallback={null}>
+        {/* Key by agentId so switching sub-agents remounts with a fresh stream
+            instead of showing the prior agent's transcript under the new title. */}
+        <SubAgentViewerPanel
+          key={viewer.opened.agentId}
+          opened={viewer.opened}
+          onClose={viewer.close}
+          width={pane.size}
+        />
+      </Suspense>
     </>
   );
 }

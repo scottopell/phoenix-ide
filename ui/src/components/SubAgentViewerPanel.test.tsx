@@ -48,9 +48,9 @@ describe('SubAgentViewerPanel live status', () => {
     expect(subtitle).not.toContain('live');
   });
 
-  it("requests the stream in 'auto' mode so a finished agent is not held live", () => {
+  it('streams live unconditionally so a just-spawned (momentarily Idle) sub-agent is followed', () => {
     mockStream.mockReturnValue(readyWithPhase({ type: 'idle' }));
     renderPanel();
-    expect(mockStream).toHaveBeenCalledWith('agent-x', true, 'auto');
+    expect(mockStream).toHaveBeenCalledWith('agent-x', true, true);
   });
 });
