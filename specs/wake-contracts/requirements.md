@@ -1,0 +1,438 @@
+# Wake Contracts
+
+## User Story
+
+As an LLM agent, when I have started a long-running command (a build, a test
+suite, a dev server, a sub-agent) and have nothing else to do until it
+produces a useful event, I need a way to tell Phoenix "wake me when this
+specific condition fires" rather than polling the runtime every N seconds.
+Today every wait costs a full conversation round-trip — tool descriptions
+re-fed, history re-fed, an assistant turn spent saying "still waiting" —
+even when I had nothing to contribute in the interim. I need a primitive
+that consumes zero turns until the condition the LLM cares about actually
+holds.
+
+## Background: from polling to wake
+
+Today three tools spawn potentially-long work:
+
+- **`bash`** — `op=run` returns a handle if `wait_seconds` elapses before
+  exit; `op=wait` blocks the same way again on the same handle. To learn
+  that a multi-minute command exited, the LLM must repeatedly invoke
+  `op=wait`, each invocation consuming one full conversation turn.
+- **`tmux_run`** — readiness modes are `return_immediately` and
+  `wait_for_text`. No `wait_for_exit`. For finite long-running commands
+  the LLM polls `tmux capture-pane`, same round-trip cost as bash.
+- **`subagent`** — spawns a sub-conversation; the parent blocks on
+  completion inside the state machine. This is the *only* current
+  spawn-and-wait surface that does not require LLM polling, and it
+  achieves that by hardcoding the wait into the state machine rather
+  than exposing a reusable primitive.
+
+The subagent path proves the runtime *can* resume a conversation on an
+external signal. Wake contracts generalize that capability: any handle
+that the agent has spawned can register a wake condition, and the
+runtime delivers a synthetic tool result back into the conversation
+when the condition holds — without the LLM having to poll.
+
+**No new conversation state.** Wake contracts do *not* introduce an
+`AwaitingWake` conv state. The conversation stays in `Idle` (or
+whatever state it would otherwise be in) while waiting. The
+`Awaiting*` family of states in this codebase exclusively represents
+"waiting on the user" (`AwaitingTaskApproval`, `AwaitingContinuation`).
+Wake is "waiting on the runtime," which is a different category —
+it does not block the user from interacting with the conversation,
+and it is invisible to the user except as a status indicator. The
+contract row in the `wake_contracts` table is the single source of
+truth for "is this conv waiting on something." (See design.md
+§"Why no AwaitingWake state.")
+
+**Persistence boundary:** wake contracts are persisted to SQLite. They
+survive Phoenix restart. A contract registered against a handle that
+itself does not survive restart (e.g., bash handles per
+`specs/bash/`) MUST fire a terminal `forgotten` event on restart so the
+LLM is not left waiting on a signal that can no longer occur. The
+contract is a *Phoenix-side commitment to fire the conversation* — its
+durability does not depend on the underlying handle's durability.
+
+**Scope:** wake contracts are conversation-scoped, not WorkScope-scoped.
+A contract belongs to the conversation that registered it; resolution
+delivers a synthetic tool result into that conversation. Every handle a
+contract can watch — bash, tmux, browser, subagent — is WorkScope-keyed, so
+when a conversation continues into a successor that inherits the same
+WorkScope, the underlying handle transfers to the successor and the contract
+transfers with it: its `conv_id` is re-keyed to the child and subsequent fires
+deliver there. No contract fires `forgotten` at the continuation boundary.
+
+## Requirements
+
+### REQ-WAKE-001: Wake Contract Registration
+
+WHEN agent calls `wait_until { handle: { kind, id }, condition,
+max_wait_seconds }`
+THE SYSTEM SHALL persist a new wake contract row and return control to
+the dispatcher without invoking the LLM and without modifying the
+conversation state
+
+WHEN the contract is persisted
+THE SYSTEM SHALL emit an SSE `WakeContractRegistered` event with the
+contract id, handle reference, condition summary, and `expires_at`
+
+**Rationale:** Registration is the LLM's explicit commitment "I have
+nothing further to do until this fires." The tool call itself does
+not return a synchronous payload to the LLM. The conversation state
+is unchanged — the LLM's next invocation is when the contract fires
+(or expires / is cancelled / is forgotten). See REQ-WAKE-006 for
+delivery semantics; see design.md §"Why no AwaitingWake state" for
+the explicit non-state rationale.
+
+---
+
+### REQ-WAKE-002: Contract Persistence
+
+THE SYSTEM SHALL persist every active wake contract in a `wake_contracts`
+SQLite table with columns `(id, conv_id, handle_kind, handle_id,
+condition_json, expires_at, registered_at, fire_template_json,
+registering_tool_use_id)`
+
+WHEN Phoenix restarts
+THE SYSTEM SHALL on startup re-register every non-fired, non-expired
+contract with the wake-router, and immediately fire `forgotten` for
+every contract whose underlying handle did not survive restart (see
+REQ-WAKE-005 for handle-kind durability)
+
+**Rationale:** The contract is the durable thing AND the single source
+of truth for "is this conv waiting on something." The underlying
+handle may or may not be durable; the contract's persistence is the
+runtime's commitment to deliver a terminal answer in all cases.
+Silent loss on restart is the failure mode this whole spec exists to
+eliminate.
+
+---
+
+### REQ-WAKE-003: Wake Router Service
+
+THE SYSTEM SHALL run a background `wake_router` task that, on each tick
+(target cadence: 1s for handle-terminal conditions; condition-kind-
+specific for future kinds), evaluates every registered contract's
+condition against the current state of the underlying handle
+
+WHEN a condition evaluates to `Fired`
+THE SYSTEM SHALL atomically:
+  1. mark the contract row as fired with cause and observed payload,
+  2. construct a synthetic tool result per REQ-WAKE-006,
+  3. append the tool result to the conversation message log,
+  4. trigger the conversation's next LLM turn (same path as a normal
+     user message arrival or tool result completion), and
+  5. emit `WakeContractFired` SSE
+
+WHEN a contract's `expires_at` passes without firing
+THE SYSTEM SHALL fire the contract with cause `Expired` and the same
+delivery path as a normal fire
+
+**Rationale:** The router is the single writer of contract terminal
+state. Per-condition-kind evaluators are pure functions over (handle
+state, condition); the router orchestrates polling and fan-out. This
+mirrors the existing bash `reaper.rs` and tmux registry patterns.
+
+---
+
+### REQ-WAKE-004: `is_busy()` Derivation
+
+THE conversation `is_busy()` derivation SHALL return true when the
+conversation has at least one pending wake contract
+
+WHEN `is_busy()` would otherwise return false (state == Idle) AND
+`has_pending_wake_contracts(conv)` is true
+THE SYSTEM SHALL return true
+
+**Rationale:** Pit-of-success at the lifecycle boundary. Archive,
+hard-delete, abandon, and mark-merged today all check `is_busy()`
+before proceeding. A conversation with pending wake contracts that
+returned `false` from `is_busy()` would be silently archive-able,
+which would mean either (a) the cascade silently cancels contracts
+the user did not know existed, or (b) the contracts orphan. Neither
+is acceptable. The is_busy() augmentation is a single SQLite count
+query on `wake_contracts WHERE conv_id = ? AND status = pending`.
+
+---
+
+### REQ-WAKE-005: V1 Condition Kinds
+
+THE SYSTEM SHALL support the following condition kinds in v1:
+
+- `HandleTerminal { handle_kind: Bash | TmuxPane | SubAgent, handle_id }`
+  — fires when the named handle reaches a terminal state (exited,
+  killed, signaled, kill_pending_kernel for bash; pane-process-exit
+  for tmux; child-conversation terminal for subagent)
+
+THE SYSTEM SHALL NOT support in v1:
+- `RegexInTmuxPane { pane, pattern }` — deferred
+- `FileChanged { path }` — deferred
+- `PortListening { host, port }` — deferred
+- `WebhookFired { id }` — deferred (security surface)
+
+**Rationale:** HandleTerminal covers the highest-leverage case (build
+finished, test suite done, subagent submitted) and validates the
+abstraction with the simplest possible evaluator (handle status read).
+Other condition kinds are the same edge with different evaluators;
+the v1 contract row schema must accommodate them as a forward-compat
+discriminator.
+
+---
+
+### REQ-WAKE-006: Wake Event Delivery
+
+WHEN a contract fires
+THE SYSTEM SHALL deliver to the conversation a synthetic tool result
+shaped as the tool result the equivalent successful `op=wait` would
+have returned — i.e., for `HandleTerminal/Bash` the tool result MUST
+carry the handle's terminal status (`exited` / `killed` /
+`kill_pending_kernel` / `forgotten`), `exit_code`, `duration_ms`, and
+a final tail window per REQ-BASH-004
+
+THE delivered tool result SHALL be addressable back to the original
+tool call that registered the contract (via `tool_use_id`)
+
+**Rationale:** Pit-of-success: the LLM sees the same shape whether it
+synchronously waited or registered a wake contract. The decision
+between the two is "should I block this turn or not"; the response
+shape is the same. This makes the wake primitive a drop-in
+replacement for `op=wait`, not a parallel pathway.
+
+---
+
+### REQ-WAKE-007: Mandatory Timeout Cap
+
+EVERY wake contract SHALL have an `expires_at` populated at
+registration time
+
+THE SYSTEM SHALL reject registration where `max_wait_seconds` exceeds
+`WAKE_MAX_SECONDS` (v1: 1800s = 30 minutes)
+
+THE SYSTEM SHALL apply a default `max_wait_seconds` of
+`WAKE_DEFAULT_SECONDS` (v1: 600s = 10 minutes) when the caller omits
+it
+
+**Rationale:** A persisted commitment to fire the LLM is a persisted
+commitment to spend money. Unbounded waits are not expressible. The
+cap is enforced at registration so the contract row's `expires_at`
+is always a true upper bound on the conversation's wake latency.
+
+---
+
+### REQ-WAKE-008: User-Visible Status and Cancel
+
+THE conversation UI SHALL render a status indicator on conversations
+with at least one pending wake contract, showing:
+- the count of pending contracts (or a per-contract list if N <= 3)
+- the soonest `expires_at` timestamp
+- a cancel affordance per contract (button or chip dropdown)
+
+WHEN the cancel endpoint
+(`POST /api/conversations/:id/wake/:contract_id/cancel`) is invoked
+THE SYSTEM SHALL fire the contract with cause `Cancelled` via the
+same delivery path as REQ-WAKE-003
+
+**Rationale:** The user must not be confused about "why isn't anything
+happening?" The conv stays in `Idle` while waiting, so the indicator
+is what distinguishes a true-idle conv from a wake-pending conv. The
+indicator is also how the user discovers that
+`POST /api/conversations/:id/messages` will succeed during a wait —
+the wait is non-blocking from the user's standpoint.
+
+---
+
+### REQ-WAKE-009: Conversation-Scoped, Not WorkScope-Scoped
+
+A wake contract SHALL be owned by the conversation that registered it
+
+THE wake-router SHALL fire only the registering conversation, even
+when the underlying handle is WorkScope-keyed and shared across
+continuation
+
+**Rationale:** WorkScope governs *resource* sharing across continuation
+boundaries; wake governs *conversation* resumption. Conflating them
+was explicitly identified as the design error that motivated the
+WorkScope+wake split (see executive.md §"Why two axes").
+
+---
+
+### REQ-WAKE-010: Multiple-Contracts-Per-Conversation Resolution
+
+A conversation MAY hold multiple pending contracts (e.g., agent
+registered two waits in parallel via two `wait_until` calls in one
+turn)
+
+WHEN the first contract fires
+THE SYSTEM SHALL deliver only that contract's payload as the next
+synthetic tool result, and the other pending contracts SHALL continue
+to be evaluated normally (no auto-cancellation of siblings)
+
+**Rationale:** Independent contracts represent independent things the
+LLM cares about. There is no reason to cancel a still-relevant
+`cargo build` watch just because an unrelated `subagent` finished
+first. The LLM consumes the first fire, makes whatever decisions, and
+either lets the other contracts continue to fire on their own
+schedule or cancels them explicitly via the cancel endpoint. This is
+a change from the earlier "first-fire-wins-cancel-siblings" draft;
+that semantics only made sense in a model where the conv was in a
+single-contract-bound `AwaitingWake` state. With contracts as
+free-standing rows the more honest semantics is "each fires
+independently."
+
+---
+
+### REQ-WAKE-011: Terminal-Cause Distinction
+
+THE wake event payload SHALL distinguish:
+- `Fired { observed_payload }` — condition held
+- `Expired` — timeout reached, condition never held
+- `Cancelled` — user cancelled, or lifecycle cascade
+- `Forgotten { reason }` — underlying handle was destroyed before the
+  condition could be evaluated: a hard-delete cascade with no inheriting
+  WorkScope, or a Phoenix restart that dropped an in-memory handle (bash)
+
+**Rationale:** "The wait returned" is not a sufficient description.
+Forgotten is structurally different from expired — the contract was
+never going to be able to fire, regardless of how long the LLM
+waited. The LLM's response to `Forgotten` should be "re-spawn or
+escalate to the user," which is different from `Expired`'s "this
+took too long."
+
+---
+
+### REQ-WAKE-012: Continuation Chain Inheritance
+
+WHEN a conversation has registered wake contracts AND continues into
+a child conversation that inherits the same `WorkScope`
+THE SYSTEM SHALL re-key each pending contract's `conv_id` to the child
+conversation, so subsequent fires deliver into the child — the underlying
+handle (bash, tmux, browser, or subagent) is WorkScope-keyed and transfers to
+the child along with the contract
+
+WHEN no successor inherits the `WorkScope` (the handle is therefore torn down)
+THE SYSTEM SHALL fire the contract with cause `Forgotten`
+
+**Rationale:** Every handle kind a contract can watch is WorkScope-keyed
+(bash per `specs/bash/` REQ-BASH-WS-001), so all of them transfer across a
+continuation that inherits the scope, and their contracts transfer with them.
+A contract reaches `Forgotten` only when its handle is genuinely destroyed — a
+scope torn down with no inheritor, or a Phoenix restart (REQ-WAKE-002) — not as
+a routine consequence of continuation.
+
+---
+
+### REQ-WAKE-013: Concurrent User Message and Wake Fire
+
+WHEN the conversation has a pending wake contract AND the user sends
+a new message to the conversation
+THE SYSTEM SHALL accept the user message normally (conv stays in
+Idle and accepts the message; the contract continues to be evaluated;
+both events append to the message log in the order they arrive)
+
+**Rationale:** Resolved. Because the conv is in `Idle` while waiting
+(REQ-WAKE-004 is the only sticky aspect, and it does not block user
+input), user messages and wake fires are both just events that
+append to the message log. Ordering is by arrival; the next LLM
+turn includes whatever has accumulated since the previous turn.
+The race "both arrive in the same millisecond" is serialized by the
+existing per-conversation lock around message-log appends.
+
+---
+
+### REQ-WAKE-014: Tool Description Guidance
+
+THE description of the `wait_until` tool SHALL state explicitly:
+- when to register a wake vs use synchronous `op=wait` (rule of
+  thumb: if you have anything else useful to do, do that; if you have
+  nothing to do until the handle resolves, register a wake)
+- the cost model: synchronous wait blocks at minimum one turn AT
+  LEAST; wake contracts consume zero turns until fire
+- the cancel mechanism
+
+**Rationale:** Pit-of-success applies to the tool surface. Without
+explicit guidance the LLM will default to synchronous polling
+because that is the shape it learned from training data. The
+description is how that prior is corrected.
+
+---
+
+### REQ-WAKE-015: Cost Observability
+
+THE SYSTEM SHALL emit metrics on:
+- wake contract registration rate (per conv, per handle kind)
+- average fire latency (registration to fire)
+- expired-vs-fired ratio
+- forgotten-vs-fired ratio (broken out by forgotten reason:
+  `phoenix_restart`, `cascade_destroyed_handle`)
+
+**Rationale:** A wake contract is a Phoenix-side commitment to spend
+money. Operators must be able to see "how much wake is happening"
+and "how often is wake the right primitive vs the wrong one."
+Metrics also gate v2 condition kinds — we will not ship
+`RegexInTmuxPane` until v1 metrics show the abstraction is being
+used as intended.
+
+---
+
+### REQ-WAKE-016: Unified Tool Surface
+
+THE SYSTEM SHALL expose a single `wait_until` tool to the LLM, taking
+`{ handle: { kind: Bash | TmuxPane | SubAgent, id }, condition,
+max_wait_seconds }`
+
+THE tool SHALL NOT be split per substrate (no `bash_wait_until`,
+`tmux_wait_until`, `subagent_wait_until`)
+
+**Rationale:** Resolved per Q3 (asking-questions session 2026-05-24).
+Single tool means one description re-fed per turn instead of three,
+which compounds with the description-tax point Henrik panel
+flagged. The unified shape also forward-aligns with the eventual
+`WorkHandle` trait Voss + Marin both recommended — when that trait
+lands, the tool surface stays the same; only the runtime dispatch
+changes. The handle discriminator (`kind` + `id`) is structurally
+explicit and validated at deserialization (per Voss panel: use a
+tagged enum, not flat-Option-soup, to make `{ kind: Bash, id: "t-3" }`
+fail to parse when there is no bash handle named `t-3`).
+
+---
+
+## Status
+
+| Requirement | Status | Notes |
+|-------------|--------|-------|
+| REQ-WAKE-001 | Proposed | Registration tool surface; no conv state mutation |
+| REQ-WAKE-002 | Proposed | SQLite persistence + restart resync |
+| REQ-WAKE-003 | Proposed | wake_router background service |
+| REQ-WAKE-004 | Proposed | `is_busy()` consults contract table |
+| REQ-WAKE-005 | Proposed | HandleTerminal only in v1 |
+| REQ-WAKE-006 | Proposed | Synthetic tool result delivery |
+| REQ-WAKE-007 | Proposed | Mandatory expires_at cap |
+| REQ-WAKE-008 | Proposed | UI status indicator + cancel |
+| REQ-WAKE-009 | Proposed | Conv-scoped (not WorkScope) |
+| REQ-WAKE-010 | Proposed | Independent contracts, no auto-cancel-on-fire |
+| REQ-WAKE-011 | Proposed | Terminal cause discriminator |
+| REQ-WAKE-012 | Proposed | Continuation: all handle kinds (incl. bash) transfer; no continuation-boundary forget |
+| REQ-WAKE-013 | Proposed | User messages just work (conv stays Idle) |
+| REQ-WAKE-014 | Proposed | Tool description discipline |
+| REQ-WAKE-015 | Proposed | Cost observability metrics |
+| REQ-WAKE-016 | Proposed | Unified `wait_until` tool, not per-substrate |
+
+**Progress:** 0 of 16 implemented. **All open questions resolved**
+(per `/asking-questions` session 2026-05-24).
+
+## Dependencies
+
+- `specs/bash/` REQ-BASH-002 (wait semantics) — REQ-WAKE-006
+  delivery format reuses BASH wait response shape
+- `specs/tmux-integration/` — TmuxPane condition kind
+- `specs/subagents/` — SubAgent condition kind
+- `specs/bedrock/` REQ-BED-032 (hard-delete cascade) — REQ-WAKE-004
+  is_busy() augmentation joins the cascade's busy-check
+
+## Related Specs
+
+- `specs/bash/` REQ-BASH-WS-001 / -WS-002 — bash handles are WorkScope-keyed
+  and inherit across a continuation that shares the scope, so REQ-WAKE-012
+  transfers bash contracts to the child like every other handle kind
