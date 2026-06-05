@@ -222,7 +222,11 @@ request cannot trigger a multi-gigabyte walk (REQ-DEPLOY-005).
   report and the wiring share one source of truth and cannot diverge. The binary
   writes the `PHOENIX_LOG_FILE` sink itself (a non-blocking append worker), so a
   reported file path is always one the process genuinely writes — never a mere
-  launcher redirection the process cannot guarantee. stdout and file are
+  launcher redirection the process cannot guarantee. A `PHOENIX_LOG_FILE` that
+  cannot be opened aborts startup rather than degrading silently, so the report
+  is only ever derived from `LogConfig` once every configured sink is actually
+  installed — the report cannot advertise a sink the subscriber isn't writing.
+  stdout and file are
   independent sinks; a deployment enables whichever it needs, or both. This is the
   single mechanism every launch path uses (dev, launchd, daemon, and systemd when
   configured), replacing the previous per-mode mix of shell/plist redirection and

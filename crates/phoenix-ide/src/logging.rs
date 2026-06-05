@@ -54,9 +54,14 @@ impl LogConfig {
 ///
 /// Returns the [`WorkerGuard`] for the file appender (when file logging is
 /// enabled); the caller MUST hold it for the process lifetime so buffered log
-/// lines are flushed on shutdown. Returns `None` when no file sink is active.
-#[must_use]
-pub fn init(config: &LogConfig) -> Option<WorkerGuard> {
+/// lines are flushed on shutdown. Returns `Ok(None)` when no file sink is
+/// active.
+///
+/// Fails (aborting startup) when `PHOENIX_LOG_FILE` is set but cannot be
+/// opened. Honoring the configured sinks exactly — or refusing to start — is
+/// what lets the deployment report derive its file path from [`LogConfig`]
+/// without ever advertising a sink the subscriber isn't writing (REQ-DEPLOY-006).
+pub fn init(config: &LogConfig) -> std::io::Result<Option<WorkerGuard>> {
     let env_filter = EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "phoenix_ide=debug,tower_http=debug".into());
 
@@ -68,26 +73,21 @@ pub fn init(config: &LogConfig) -> Option<WorkerGuard> {
     });
 
     let (file_layer, guard) = match config.file.as_deref() {
-        Some(path) => match open_append(path) {
-            Ok(file) => {
-                let (writer, guard) = tracing_appender::non_blocking(file);
-                let layer = fmt::layer()
-                    .json()
-                    .with_current_span(true)
-                    .with_span_list(false)
-                    .with_writer(writer);
-                (Some(layer), Some(guard))
-            }
-            Err(e) => {
-                // The subscriber isn't up yet, so this is the one place a plain
-                // stderr write is the right call.
-                eprintln!(
-                    "phoenix-ide: failed to open PHOENIX_LOG_FILE {}: {e}",
-                    path.display()
-                );
-                (None, None)
-            }
-        },
+        Some(path) => {
+            let file = open_append(path).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!("failed to open PHOENIX_LOG_FILE {}: {e}", path.display()),
+                )
+            })?;
+            let (writer, guard) = tracing_appender::non_blocking(file);
+            let layer = fmt::layer()
+                .json()
+                .with_current_span(true)
+                .with_span_list(false)
+                .with_writer(writer);
+            (Some(layer), Some(guard))
+        }
         None => (None, None),
     };
 
@@ -98,7 +98,7 @@ pub fn init(config: &LogConfig) -> Option<WorkerGuard> {
         .init();
 
     install_panic_hook();
-    guard
+    Ok(guard)
 }
 
 /// Whether the stdout sink is enabled. Defaults on (unset); only explicit
@@ -179,6 +179,18 @@ mod tests {
         let file = info.file.expect("file sink");
         assert!(std::path::Path::new(&file).is_absolute());
         assert!(file.ends_with("relative.log"));
+    }
+
+    #[test]
+    fn open_append_errors_when_parent_is_not_a_directory() {
+        // A requested file under a path whose parent is a regular file cannot be
+        // created; init turns this Err into a startup abort (fail fast).
+        let blocker =
+            std::env::temp_dir().join(format!("phoenix-logging-test-{}", std::process::id()));
+        std::fs::write(&blocker, b"x").unwrap();
+        let unopenable = blocker.join("nested.log");
+        assert!(open_append(&unopenable).is_err());
+        let _ = std::fs::remove_file(&blocker);
     }
 
     #[test]

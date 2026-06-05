@@ -231,7 +231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // PHOENIX_LOG_FILE). The guard must outlive the program so the file
     // appender's worker flushes on shutdown; held until `main` returns.
     let log_config = logging::LogConfig::from_env();
-    let _log_guard = logging::init(&log_config);
+    let _log_guard = logging::init(&log_config)?;
 
     // Install a rustls crypto provider explicitly. rustls 0.23 refuses
     // to auto-pick when both `ring` and `aws-lc-rs` end up in the dep
