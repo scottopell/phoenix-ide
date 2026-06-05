@@ -76,9 +76,10 @@ DiskSize =                       // serde-tagged, ts-rs discriminated union
   | { kind: "absent" }           // path does not exist
   | { kind: "inline_db" }        // attachment store: bytes live inside the DB
 
-LogInfo =                        // serde-tagged on `sink`
-  | { sink: "file", path: string }   // a deployment-owned log file
-  | { sink: "stdout" }               // logs go to stdout, captured by the supervisor
+LogInfo {                        // independent sinks; both may be active
+  stdout: boolean                // logs written to stdout (supervisor-captured)
+  file:   string | null          // absolute path of the process-owned log file
+}
 ```
 
 `DiskSize` is an enum, not a `size: number | null`, because the four states are
@@ -108,8 +109,10 @@ field. It holds the static facts:
 - `tls: TlsInfo` — derived from the resolved `tls::ConfigSource`/`LoadedConfig`:
   disabled when the source is `None`; otherwise `mode`, `cert_path`, `key_path`,
   `ca_cert_path` from `LoadedConfig`, and `hosts` from `ConfigSource::Auto`.
-- `log: LogInfo` — the sink the logger writes to: a process-owned file path when
-  the logger writes to a file, otherwise stdout (REQ-DEPLOY-006).
+- `log: LogInfo` — the active log sinks, derived from the same `LogConfig` that
+  builds the subscriber (REQ-DEPLOY-006). `LogConfig` is resolved once from
+  `PHOENIX_LOG_STDOUT` (bool, default on) and `PHOENIX_LOG_FILE` (optional path);
+  both sinks are independent and may be active together.
 - `locations: Vec<DiskLocation>` — the static on-disk layout. Each `DiskLocation`
   carries a `label`, an absolute `path`, and a `MeasureMode` dictating how it is
   sized at request time. The rows are: the database file (`File`); the data
@@ -195,8 +198,8 @@ request cannot trigger a multi-gigabyte walk (REQ-DEPLOY-005).
 - **Rendering rules:** `DiskSize` is matched exhaustively — `measured` shows a
   human-readable size, `not_measured` shows "not measured," `absent` shows
   "absent," `inline_db` shows "stored in database." `null` resource values show
-  "unavailable." TLS-disabled renders "Serving plain HTTP." `LogInfo.sink ==
-  "stdout"` renders "stdout (captured by the supervising process)."
+  "unavailable." TLS-disabled renders "Serving plain HTTP." The log section
+  renders one row per sink: stdout on/off, and the file path (or "none").
 - **API:** `api.deploymentInfo()` is a plain `GET /api/deployment` returning the
   `ts_rs`-generated `DeploymentInfo` type imported from `ui/src/generated/`.
 
@@ -214,13 +217,16 @@ request cannot trigger a multi-gigabyte walk (REQ-DEPLOY-005).
   per-scope profiles on every page load would make a diagnostic page expensive
   and occasionally slow. `not_measured` states the omission explicitly instead of
   reporting a misleading `0`.
-- **The log sink reflects what the logger does, not configuration it ignores.**
-  `LogInfo` is derived from the sink the logger actually writes to — a file path
-  only when the logger writes to that file, otherwise stdout. A `.log` path that
-  is merely a launcher redirection (a shell wrapper or systemd), which the
-  process does not itself write, is never reported as the log file: that would be
-  a claim the process cannot keep. The reported sink and the logger's wiring are
-  the same source of truth, so they cannot diverge.
+- **The log sinks reflect what the logger does, not configuration it ignores.**
+  `LogInfo` is built from the same `LogConfig` that wires the subscriber, so the
+  report and the wiring share one source of truth and cannot diverge. The binary
+  writes the `PHOENIX_LOG_FILE` sink itself (a non-blocking append worker), so a
+  reported file path is always one the process genuinely writes — never a mere
+  launcher redirection the process cannot guarantee. stdout and file are
+  independent sinks; a deployment enables whichever it needs, or both. This is the
+  single mechanism every launch path uses (dev, launchd, daemon, and systemd when
+  configured), replacing the previous per-mode mix of shell/plist redirection and
+  journald-only capture.
 - **Read-only, single snapshot, no streaming.** The operator question is "what is
   it now," answered by a snapshot plus refresh. A live-streaming gauge would add
   an SSE surface for no proportional benefit.

@@ -64,9 +64,8 @@ use tower_http::{
     cors::{Any, CorsLayer},
     trace::TraceLayer,
 };
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-
 mod hot_restart;
+mod logging;
 
 /// Assemble the static deployment facts reported by `GET /api/deployment`.
 /// Resolves every path from the same logic the rest of the process uses so the
@@ -76,8 +75,9 @@ fn build_deployment_config(
     db_path: &str,
     tls_source: Option<&tls::ConfigSource>,
     loaded_tls: Option<&tls::LoadedConfig>,
+    log: api::LogInfo,
 ) -> api::DeploymentConfig {
-    use api::{LogInfo, TlsInfo};
+    use api::TlsInfo;
 
     let tls = match (tls_source, loaded_tls) {
         (Some(source), Some(loaded)) => {
@@ -99,13 +99,6 @@ fn build_deployment_config(
         }
         _ => TlsInfo::disabled(),
     };
-
-    // The tracing layer writes only to stdout, so that is the only sink the
-    // process can truthfully report. Reporting a file path here would point
-    // operators at a file the process never opens. `LogInfo::File` becomes
-    // reachable when the logger is wired to a process-owned file — see
-    // specs/deployment-info/ REQ-DEPLOY-006 and tasks/58013.
-    let log = LogInfo::Stdout;
 
     let locations = build_disk_locations(db_path, tls_source, loaded_tls);
 
@@ -234,19 +227,11 @@ fn build_disk_locations(
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // Startup sequence is inherently sequential; splitting would obscure the flow.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize logging
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "phoenix_ide=debug,tower_http=debug".into()),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .json()
-                .with_current_span(true)
-                .with_span_list(false),
-        )
-        .init();
+    // Initialize logging from the configured sinks (PHOENIX_LOG_STDOUT /
+    // PHOENIX_LOG_FILE). The guard must outlive the program so the file
+    // appender's worker flushes on shutdown; held until `main` returns.
+    let log_config = logging::LogConfig::from_env();
+    let _log_guard = logging::init(&log_config);
 
     // Install a rustls crypto provider explicitly. rustls 0.23 refuses
     // to auto-pick when both `ring` and `aws-lc-rs` end up in the dep
@@ -455,6 +440,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &db_path,
         tls_source.as_ref(),
         loaded_tls.as_ref(),
+        log_config.to_log_info(),
     ));
 
     // Create application state

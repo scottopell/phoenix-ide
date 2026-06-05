@@ -15,8 +15,8 @@ the machine is it using right now?"
   cross-platform (macOS + Linux)
 - On-disk locations with sizes for small owned artifacts, paths-only for large
   caches, and a stable row for the attachment store
-- The log sink (a process-owned file path when configured, otherwise stdout) —
-  path only, never contents
+- The active log sinks (stdout and/or a process-owned file path) — path only,
+  never contents
 - A single-snapshot fetch with explicit refresh
 
 **Owned by other specs:**
@@ -51,7 +51,7 @@ nothing.
 | **REQ-DEPLOY-003:** Report network binding and TLS configuration | Planned | `NetworkInfo` from the captured `DeploymentConfig`; `TlsInfo` derived from the resolved `tls::ConfigSource`/`LoadedConfig`. Plain-HTTP stated when disabled. |
 | **REQ-DEPLOY-004:** Report live process and system resource usage | Planned | `ResourceUsage` sampled via the `sysinfo` crate; per-metric `Option` → `null` for unavailable, never `0`. Cross-platform macOS + Linux. |
 | **REQ-DEPLOY-005:** Report on-disk locations and their sizes | Planned | `DiskEntry[]` with a `DiskSize` tagged union (`measured` / `not_measured` / `absent` / `inline_db`). Small owned dirs recursed; large caches paths-only. Attachment store row is `inline_db` until file-based attachment storage is active. |
-| **REQ-DEPLOY-006:** Surface the log location, never the contents | Planned | `LogInfo` reports `stdout` unless a deployment-owned log file is configured. A process-owned log-file path via env var is tracked as a follow-up (`tasks/`); the page does not claim launcher redirection paths it cannot own. |
+| **REQ-DEPLOY-006:** Surface the log sinks, never the contents | Planned | `LogInfo` reports the independent stdout + file sinks, built from the same `LogConfig` (`PHOENIX_LOG_STDOUT` / `PHOENIX_LOG_FILE`) that wires the subscriber. The binary writes the file sink itself, so a reported path is always one the process genuinely writes — never a launcher redirection. |
 | **REQ-DEPLOY-007:** Freshness of sampled values | Planned | `sampled_at` timestamp on every snapshot; the page refresh re-fetches `GET /api/deployment` rather than caching. |
 
 ## Behavioural Specification

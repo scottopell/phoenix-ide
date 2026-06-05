@@ -822,6 +822,13 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
             env["LLM_GATEWAY"] = gateway
     env["PHOENIX_PORT"] = str(port)
     env["PHOENIX_DB_PATH"] = str(db_path)
+    # Unified logging: the binary owns the log file (PHOENIX_LOG_FILE) and writes
+    # JSON there directly. stdout is off so the only writer to the file is the
+    # binary's appender; the Popen redirect below only captures pre-logger /
+    # panic output as a safety net. Same PHOENIX_LOG_FILE mechanism the prod
+    # launchers use.
+    env["PHOENIX_LOG_FILE"] = str(LOG_FILE)
+    env["PHOENIX_LOG_STDOUT"] = "false"
     phoenix_tls = maybe_enable_auto_tls(env, tls)
 
     if get_pid(PHOENIX_PID_FILE):
@@ -855,7 +862,12 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     if "RUST_LOG" not in env:
         env["RUST_LOG"] = "phoenix_ide=debug,tower_http=debug"
 
-    with open(LOG_FILE, "w") as log:
+    # Fresh log per restart, then append: the binary's appender and this
+    # redirect both open the file with O_APPEND, so their writes interleave
+    # safely. Truncating here (not "w" on the Popen handle) gives the
+    # fresh-per-restart behavior without a non-appending second writer.
+    LOG_FILE.write_text("")
+    with open(LOG_FILE, "a") as log:
         proc = subprocess.Popen(
             [str(binary)],
             env=env,
@@ -4268,6 +4280,10 @@ def prod_daemon_deploy():
     prod_pid_path = prod_dir / "prod.pid"
 
     env["PHOENIX_DB_PATH"] = str(prod_db_path)
+    # Unified logging: the binary owns the log file. stdout off so the Popen
+    # redirect below only captures pre-logger / panic output (same file).
+    env["PHOENIX_LOG_FILE"] = str(prod_log_path)
+    env["PHOENIX_LOG_STDOUT"] = "false"
 
     # Load .phoenix-ide.env (overrides auto-detection)
     env_file = _load_env_file(env)
@@ -4291,8 +4307,10 @@ def prod_daemon_deploy():
             pass  # Process already dead or invalid PID
         prod_pid_path.unlink(missing_ok=True)
 
-    # Start daemonized process
-    with open(prod_log_path, "w") as log:
+    # Start daemonized process. Fresh log per deploy, then append: the binary's
+    # appender and this redirect both open O_APPEND so writes interleave safely.
+    prod_log_path.write_text("")
+    with open(prod_log_path, "a") as log:
         proc = subprocess.Popen(
             [str(binary)],
             env=env,
@@ -4622,6 +4640,11 @@ def generate_launchd_plist(
         "PHOENIX_DB_PATH": str(PROD_DB_PATH),
         "PHOENIX_PORT": str(PROD_PORT),
         "PHOENIX_VERSION": version,
+        # Unified logging: the binary appends JSON to this file directly. stdout
+        # is off, so the plist's StandardOut/ErrorPath (same file) only carries
+        # pre-logger / panic output. newsyslog handles rotation.
+        "PHOENIX_LOG_FILE": str(LAUNCHD_LOG_PATH),
+        "PHOENIX_LOG_STDOUT": "false",
     }
     if llm_gateway:
         env_vars["LLM_GATEWAY"] = llm_gateway

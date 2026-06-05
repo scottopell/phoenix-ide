@@ -188,30 +188,30 @@ to a directory or to "inline in the database."
 
 ---
 
-### REQ-DEPLOY-006: Surface the log location, never the contents
+### REQ-DEPLOY-006: Surface the log sinks, never the contents
 
-WHEN the running logger is writing to a process-owned log file
-THE SYSTEM SHALL display that file's path
+THE SYSTEM SHALL report every log sink the running logger is configured to write
+to. Logging fans out to independent sinks, each individually enabled:
 
-WHEN the logger writes only to standard output
-THE SYSTEM SHALL state that logs are written to standard output and captured by
-the supervising process, rather than presenting a file path the running process
-does not actually write
+- WHEN logs are written to standard output THE SYSTEM SHALL indicate the stdout
+  sink is active (captured by the supervising process)
+- WHEN logs are written to a process-owned file THE SYSTEM SHALL display that
+  file's absolute path
+- WHEN a sink is not active THE SYSTEM SHALL indicate its absence rather than
+  implying output that is not produced
 
 THE SYSTEM SHALL NOT render log file contents on the page
 
 **Rationale:** The page's job is orientation, not log viewing. Showing the path
 is a one-step handoff to tools built for tailing and searching; rendering
 contents would turn a lightweight diagnostic page into an unbounded data view and
-risk leaking sensitive log lines into the browser. The honesty caveat is
-load-bearing: the binary emits structured logs to stdout, and any `.log` file is
-a redirection arranged by the launcher (a shell wrapper or systemd), not by the
-process. Reporting such a redirection path as "the log file" would be a comment
-that lies — the process cannot guarantee it. The reported sink is therefore
-derived from what the logger actually does, not from configuration the logger
-might ignore: the page shows a path only when the logger genuinely writes to a
-file, and otherwise names the real sink (stdout). The reported sink and the
-logger's wiring share one source of truth, so they cannot disagree.
+risk leaking sensitive log lines into the browser. The sinks are independent
+because a deployment may want stdout (for a supervisor's journal), a file (for an
+operator to tail), or both at once — nothing structurally couples them. The
+honesty caveat is load-bearing: a path is shown only for a file the process
+*itself* writes, never a launcher redirection the process cannot guarantee. The
+reported sinks are derived from the same configuration that builds the logger, so
+the report and the wiring share one source of truth and cannot disagree.
 
 ---
 
