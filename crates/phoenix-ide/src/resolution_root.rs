@@ -177,27 +177,35 @@ pub struct SkillsView {
 ///
 /// This mirrors `git_ops::materialize_branch`'s ref decision: creation fetches
 /// `origin/<branch>` and fast-forwards the local branch to the remote tip only
-/// when the local ref is an ancestor of it (i.e. local is behind), then makes
-/// the worktree. So:
-/// - both refs exist and local is behind → the remote tip (creation FFs to it);
-/// - both exist but diverged or local is ahead → the local ref (creation keeps it);
+/// when the local ref is an ancestor of it (local is behind) *and* the branch
+/// is not checked out in a worktree (a checked-out branch cannot be moved, so
+/// creation keeps its stale local tip — relevant to managed mode, which builds
+/// a temp branch from the base ref while the base may be checked out in the
+/// main worktree). So:
+/// - both refs exist, local behind, not checked out → the remote tip (creation FFs);
+/// - both exist but diverged / local ahead / checked out → the local ref;
 /// - remote only → `origin/<branch>` (creation makes a local branch there);
 /// - local only → the local ref;
 /// - neither → `None`, leaving the caller to degrade to the working directory.
 ///
 /// Discovery does not fetch (too costly per keystroke), so it sees `origin`
 /// as of the last fetch; the freshness gap that remains is inherent, but a
-/// locally-stale tracking branch no longer offers candidates from an old commit
-/// that creation would discard. The fast-forward-blocked-by-worktree exception
-/// in `materialize_branch` is not mirrored: a branch already checked out in a
-/// worktree cannot be used for a new branch-mode worktree anyway.
+/// locally-stale tracking branch no longer offers candidates from a commit
+/// creation would discard.
 fn resolve_tree_ref(repo_root: &Path, branch: &str) -> Option<String> {
     let remote = format!("origin/{branch}");
     let has_local = verify_commit(repo_root, branch);
     let has_remote = verify_commit(repo_root, &remote);
     match (has_local, has_remote) {
         (true, true) => {
-            if run_git(repo_root, &["merge-base", "--is-ancestor", branch, &remote]).is_ok() {
+            let local_is_ancestor =
+                run_git(repo_root, &["merge-base", "--is-ancestor", branch, &remote]).is_ok();
+            // Creation can only fast-forward the local branch to the remote tip
+            // when the branch isn't pinned by a worktree; otherwise the worktree
+            // is built from the stale local ref, so discovery must match it.
+            if local_is_ancestor
+                && crate::git_ops::find_branch_in_worktree_list(repo_root, branch).is_none()
+            {
                 Some(remote)
             } else {
                 Some(branch.to_string())
@@ -590,10 +598,45 @@ mod tests {
     }
 
     #[test]
-    fn resolve_tree_ref_prefers_remote_when_local_behind_else_keeps_local() {
-        // upstream advances main; a clone whose local main is behind origin/main
-        // should resolve to origin/main (creation fast-forwards to it). After a
-        // local-only commit (local ahead), it should keep the local ref.
+    fn resolve_tree_ref_prefers_remote_for_unpinned_branch_behind_origin() {
+        // A branch that is behind origin and NOT checked out in any worktree is
+        // fast-forwarded by creation, so discovery resolves to the remote tip.
+        let upstream = TempDir::new().unwrap();
+        git(upstream.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(upstream.path().join("a.txt"), "1").unwrap();
+        git(upstream.path(), &["add", "."]);
+        git(upstream.path(), &["commit", "-qm", "c1"]);
+        git(upstream.path(), &["branch", "feature"]); // feature at c1
+
+        let clone = TempDir::new().unwrap();
+        git(
+            clone.path(),
+            &["clone", "-q", upstream.path().to_str().unwrap(), "."],
+        );
+        // Local `feature` at c1, tracking origin/feature; clone stays on `main`,
+        // so `feature` is not checked out in any worktree.
+        git(clone.path(), &["branch", "feature", "origin/feature"]);
+
+        // Advance upstream `feature` to c2 and fetch: local feature now behind.
+        git(upstream.path(), &["checkout", "-q", "feature"]);
+        std::fs::write(upstream.path().join("b.txt"), "2").unwrap();
+        git(upstream.path(), &["add", "."]);
+        git(upstream.path(), &["commit", "-qm", "c2"]);
+        git(clone.path(), &["fetch", "-q", "origin"]);
+
+        assert_eq!(
+            resolve_tree_ref(clone.path(), "feature").as_deref(),
+            Some("origin/feature"),
+            "unpinned branch behind origin → creation FFs to the remote tip"
+        );
+    }
+
+    #[test]
+    fn resolve_tree_ref_keeps_checked_out_branch_even_when_behind_origin() {
+        // The base branch is checked out in the clone's primary worktree, so
+        // creation cannot fast-forward it — the worktree is built from the stale
+        // local tip, and discovery must match that (managed mode builds a temp
+        // branch from this ref). Mirrors materialize_branch's worktree exception.
         let upstream = TempDir::new().unwrap();
         git(upstream.path(), &["init", "-q", "-b", "main"]);
         std::fs::write(upstream.path().join("a.txt"), "1").unwrap();
@@ -605,31 +648,18 @@ mod tests {
             clone.path(),
             &["clone", "-q", upstream.path().to_str().unwrap(), "."],
         );
-        // Equal tips → already an ancestor → prefers the remote ref.
-        assert_eq!(
-            resolve_tree_ref(clone.path(), "main").as_deref(),
-            Some("origin/main")
-        );
 
-        // Advance upstream and fetch: local main is now strictly behind origin.
+        // Advance upstream main and fetch: local main is behind origin/main, but
+        // main is checked out in the clone's primary worktree.
         std::fs::write(upstream.path().join("b.txt"), "2").unwrap();
         git(upstream.path(), &["add", "."]);
         git(upstream.path(), &["commit", "-qm", "c2"]);
         git(clone.path(), &["fetch", "-q", "origin"]);
-        assert_eq!(
-            resolve_tree_ref(clone.path(), "main").as_deref(),
-            Some("origin/main"),
-            "local behind origin → creation FFs to origin tip"
-        );
 
-        // Local-only commit makes local ahead of (diverged from) origin.
-        std::fs::write(clone.path().join("local.txt"), "x").unwrap();
-        git(clone.path(), &["add", "."]);
-        git(clone.path(), &["commit", "-qm", "local"]);
         assert_eq!(
             resolve_tree_ref(clone.path(), "main").as_deref(),
             Some("main"),
-            "local ahead/diverged → creation keeps the local ref"
+            "a checked-out branch can't be fast-forwarded, so creation keeps the local tip"
         );
     }
 
