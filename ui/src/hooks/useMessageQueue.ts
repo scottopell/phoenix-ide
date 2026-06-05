@@ -1,6 +1,6 @@
 import { useState, useCallback } from 'react';
 import { generateUUID } from '../utils/uuid';
-import type { ImageData } from '../api';
+import type { FileAttachment, ImageData } from '../api';
 
 /**
  * A queued message is either:
@@ -21,6 +21,7 @@ export interface QueuedMessage {
   localId: string;
   text: string;
   images: ImageData[];
+  files?: FileAttachment[];
   timestamp: number;
   status: MessageStatus;
 }
@@ -55,7 +56,7 @@ interface UseMessageQueueReturn {
   /** All queued messages (pending or failed). Caller derives which to render where. */
   queuedMessages: QueuedMessage[];
   /** Add a new pending message to the queue. */
-  enqueue: (text: string, images?: ImageData[]) => QueuedMessage;
+  enqueue: (text: string, images?: ImageData[], files?: FileAttachment[]) => QueuedMessage;
   /** Mark a message as failed. */
   markFailed: (localId: string) => void;
   /** Mark a message as steering_queued (server accepted but deferred). */
@@ -78,9 +79,9 @@ function loadQueueFromStorage(storageKey: string | null): QueuedMessage[] {
     return parsed.map((m) => {
       const rawStatus = (m as unknown as { status?: string }).status;
       if (rawStatus === 'sending') {
-        return { ...m, status: 'pending' as const };
-      }
-      return m;
+          return { ...m, files: (m as Partial<QueuedMessage>).files ?? [], status: 'pending' as const };
+        }
+        return { ...m, files: (m as Partial<QueuedMessage>).files ?? [] };
     });
   } catch (error) {
     console.warn('Error reading message queue from localStorage:', error);
@@ -144,11 +145,12 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
   }, [saveToStorage]);
 
   // Add a new message to the queue
-  const enqueue = useCallback((text: string, images: ImageData[] = []): QueuedMessage => {
+  const enqueue = useCallback((text: string, images: ImageData[] = [], files: FileAttachment[] = []): QueuedMessage => {
     const msg: QueuedMessage = {
       localId: generateUUID(),
       text,
       images,
+      files,
       timestamp: Date.now(),
       status: 'pending',
     };

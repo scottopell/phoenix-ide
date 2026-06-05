@@ -1,6 +1,6 @@
 import { defineConfig, type Plugin } from 'vite';
 import react from '@vitejs/plugin-react';
-import { writeFileSync } from 'fs';
+import { readFileSync, writeFileSync } from 'fs';
 import { resolve } from 'path';
 
 // Restore .gitkeep after vite wipes dist/ so fresh worktrees compile.
@@ -19,11 +19,24 @@ const apiScheme = process.env.VITE_API_SCHEME || 'http';
 const proxySecure = process.env.VITE_API_PROXY_SECURE !== 'false';
 const apiTarget = `${apiScheme}://localhost:${apiPort}`;
 
+// Dev HTTPS: when cert/key paths are provided (./dev.py wires these to Phoenix's
+// auto-managed local-CA leaf), serve over TLS. Vite 8's `resolveHttpServer` then
+// uses `http2.createSecureServer` with `allowHTTP1`, so the browser↔dev hop
+// negotiates HTTP/2 — even with the `/api` proxy below — lifting the HTTP/1.1
+// per-host connection cap to match a TLS (h2) prod deployment.
+const httpsCert = process.env.VITE_HTTPS_CERT;
+const httpsKey = process.env.VITE_HTTPS_KEY;
+const httpsServer =
+  httpsCert && httpsKey
+    ? { cert: readFileSync(httpsCert), key: readFileSync(httpsKey) }
+    : undefined;
+
 // https://vitejs.dev/config/
 export default defineConfig({
   plugins: [react(), gitkeep()],
   server: {
     allowedHosts: true,
+    ...(httpsServer ? { https: httpsServer } : {}),
     proxy: {
       '/api': {
         target: apiTarget,

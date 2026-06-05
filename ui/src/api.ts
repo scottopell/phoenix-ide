@@ -1,5 +1,6 @@
 import type { ErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
+import type { DeploymentInfo } from './generated/DeploymentInfo';
 // Phoenix API Client
 
 // SSE event types come from the runtime schemas in `./sseSchemas`, which
@@ -333,7 +334,7 @@ export interface Message {
 }
 
 export type MessageContent = 
-  | { text: string; images?: ImageData[] }  // user message
+  | { text: string; images?: ImageData[]; files?: FileAttachment[] }  // user message
   | ContentBlock[]  // agent message
   | ToolResultContent;  // tool result
 
@@ -362,6 +363,17 @@ export interface ImageData {
   data: string;
   media_type: string;
 }
+
+export interface FileAttachment {
+  original_name: string;
+  media_type: string;
+  size_bytes: number;
+  stored_path: string;
+}
+
+export const MAX_FILE_ATTACHMENT_SIZE = 10 * 1024 * 1024;
+export const MAX_TOTAL_FILE_ATTACHMENT_SIZE = 25 * 1024 * 1024;
+export const MAX_FILE_ATTACHMENTS = 10;
 
 export interface UsageData {
   input_tokens: number;
@@ -611,6 +623,12 @@ export const api = {
     return resp.json();
   },
 
+  async deploymentInfo(): Promise<DeploymentInfo> {
+    const resp = await fetch('/api/deployment');
+    if (!resp.ok) throw new Error('Failed to load deployment info');
+    return resp.json();
+  },
+
   async getNotificationSettings(): Promise<NotificationSettings> {
     const resp = await fetch('/api/settings/notifications');
     if (!resp.ok) throw new Error('Failed to load notification settings');
@@ -743,6 +761,7 @@ export const api = {
     baseBranch?: string | null,
     seedParentId?: string | null,
     seedLabel?: string | null,
+    files: File[] = [],
   ): Promise<Conversation> {
     const body: Record<string, unknown> = { cwd, model, text, message_id: messageId, images, mode };
     if (baseBranch) {
@@ -753,6 +772,23 @@ export const api = {
     }
     if (seedLabel) {
       body['seed_label'] = seedLabel;
+    }
+    if (files.length > 0) {
+      const form = new FormData();
+      form.append('metadata', new Blob([JSON.stringify(body)], { type: 'application/json' }));
+      for (const file of files) form.append('files', file, file.name);
+      const resp = await fetch('/api/conversations/new/with-attachments', {
+        method: 'POST',
+        body: form,
+      });
+      if (!resp.ok) {
+        const err = await resp.json();
+        if (resp.status === 409) {
+          throw new ConflictError(err as ConflictErrorDetail);
+        }
+        throw new Error(err.error || 'Failed to create conversation');
+      }
+      return (await resp.json()).conversation;
     }
     const resp = await fetch('/api/conversations/new', {
       method: 'POST',
@@ -807,6 +843,7 @@ export const api = {
     convId: string,
     text: string,
     images: ImageData[] = [],
+    files: FileAttachment[] = [],
     localId: string,
   ): Promise<{ queued: boolean; steering?: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/chat`, {
@@ -815,6 +852,7 @@ export const api = {
       body: JSON.stringify({
         text,
         images,
+        files,
         message_id: localId,
         user_agent: navigator.userAgent,
       }),
@@ -832,6 +870,20 @@ export const api = {
    *  Calls `DELETE /api/conversations/:id/steering-queue/:message_id`.
    *  404 is silently ignored — the message may have already been delivered.
    */
+  async uploadAttachments(convId: string, files: File[]): Promise<FileAttachment[]> {
+    const form = new FormData();
+    for (const file of files) form.append('files', file, file.name);
+    const resp = await fetch(`/api/conversations/${convId}/attachments`, {
+      method: 'POST',
+      body: form,
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err.error || 'Failed to upload attachments');
+    }
+    return (await resp.json()).files;
+  },
+
   async cancelSteeringMessage(convId: string, messageId: string): Promise<void> {
     const resp = await fetch(
       `/api/conversations/${convId}/steering-queue/${messageId}`,

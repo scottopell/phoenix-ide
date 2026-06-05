@@ -3999,6 +3999,71 @@ pre:hover .copy-btn {
   padding: 0;
 }
 
+/* About this deployment page */
+.settings-about-link {
+  width: 100%;
+  text-align: left;
+}
+
+.deploy-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 3px 0;
+  font-size: 13px;
+}
+
+.deploy-label {
+  color: var(--text-secondary);
+  flex: 0 0 auto;
+}
+
+.deploy-value {
+  color: var(--text-primary);
+  text-align: right;
+  overflow-wrap: anywhere;
+  min-width: 0;
+}
+
+.deploy-path {
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.deploy-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.deploy-table td {
+  padding: 4px 8px 4px 0;
+  vertical-align: top;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.deploy-table__label {
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.deploy-table__path {
+  width: 100%;
+  word-break: break-all;
+}
+
+/* stylelint-disable-next-line no-descending-specificity --
+   one-off, scoped to the deployment table's path column. */
+.deploy-table__path code {
+  font-size: 12px;
+}
+
+.deploy-table__size {
+  color: var(--text-primary);
+  white-space: nowrap;
+  text-align: right;
+}
+
 /* Smooth theme transition */
 html * {
   transition: background-color 0.2s ease, border-color 0.2s ease;
@@ -12248,3 +12313,68 @@ button.keyword-search-filepath:hover {
   font-size: 12px;
 }
 
+
+/* File attachment composer and message chips */
+.input-area--drag-over .input-textarea-wrap,
+.input-area--drag-over .new-conv-textarea,
+.input-area--drag-over .new-conv-textarea-mobile {
+  border-color: var(--accent-blue);
+  box-shadow: 0 0 0 1px var(--accent-blue);
+}
+
+.input-drop-affordance,
+.input-uploading-files {
+  margin-bottom: 4px;
+  padding: 4px 10px;
+  border-radius: 4px;
+  background: rgb(59 130 246 / 10%);
+  border: 1px solid rgb(59 130 246 / 30%);
+  color: var(--accent-blue);
+  font-size: 12px;
+}
+
+.file-attachments,
+.message-files {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0;
+}
+
+.file-attachment-chip,
+.message-file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 320px;
+  padding: 3px 8px;
+  border: 1px solid var(--border-subtle, rgb(255 255 255 / 10%));
+  border-radius: 999px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-size: 12px;
+}
+
+.file-attachment-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.file-attachment-size,
+.message-file-size {
+  color: var(--text-muted);
+}
+
+.file-attachment-remove {
+  border: 0;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  padding: 0 2px;
+}
+
+.file-attachment-remove:hover {
+  color: var(--text-primary);
+}

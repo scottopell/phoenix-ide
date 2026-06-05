@@ -17,7 +17,7 @@ phoenix-terminal = { path = "../phoenix-terminal" }
 tokio = { version = "1", features = ["full"] }
 
 # Web framework
-axum = { version = "0.7", features = ["macros", "ws"] }
+axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
@@ -61,6 +61,10 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 
 # Socket configuration
 socket2 = "0.6"
+
+# Cross-platform (macOS + Linux) process/system resource sampling for the
+# About-this-deployment endpoint (specs/deployment-info/).
+sysinfo = "0.33"
 
 # Async utilities
 async-trait = "0.1"

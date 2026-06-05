@@ -2,14 +2,15 @@
 // Simplified: Pure get/put storage, no TTL or staleness logic
 
 import { generateUUID } from './utils/uuid';
-import type { Conversation, Message } from './api';
+import type { Conversation, FileAttachment, ImageData, Message } from './api';
 
 const DB_NAME = 'phoenix-ide-cache';
 const DB_VERSION = 1;
 
 export interface PendingOperationPayload {
   text?: string;
-  images?: { data: string; media_type: string }[];
+  images?: ImageData[];
+  files?: FileAttachment[];
   localId?: string;
   name?: string;
 }

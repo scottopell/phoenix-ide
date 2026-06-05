@@ -16,8 +16,8 @@ use super::lifecycle_handlers::{
 };
 use super::sse::sse_stream;
 use super::types::{
-    CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry, CodeSearchQuery,
-    CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
+    AttachmentUploadResponse, CancelResponse, ChatRequest, ChatResponse, CodeSearchEntry,
+    CodeSearchQuery, CodeSearchResponse, ConflictErrorResponse, ContinueConversationResponse,
     ConversationListResponse, ConversationResponse, ConversationWithMessagesResponse,
     CreateConversationRequest, CredentialStatusApi, DirectoryEntry, ErrorResponse,
     ExpansionErrorResponse, FileEntry, FileSearchEntry, FileSearchQuery, FileSearchResponse,
@@ -29,7 +29,7 @@ use super::types::{
 use super::AppState;
 use crate::api::terminal_ws::{terminal_ws_global_handler, terminal_ws_handler};
 use crate::db::{
-    ConvMode, ConversationUsage, ImageData, Message, MessageContent, MessageType,
+    ConvMode, Conversation, ConversationUsage, ImageData, Message, MessageContent, MessageType,
     NotificationSettings,
 };
 use crate::git_ops::{
@@ -42,7 +42,7 @@ use crate::state_machine::{check_user_message_acceptable, ConvState, Event, Tran
 use super::browser_view::browser_view_ws_handler;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State},
     http::StatusCode,
     middleware,
     response::{Html, IntoResponse, Redirect, Response},
@@ -54,8 +54,12 @@ use chrono::{Local, Timelike};
 use rand::seq::IndexedRandom;
 use serde::Deserialize;
 use serde_json::Value;
+use sqlx::Row;
+use std::collections::HashSet;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path as FsPath, PathBuf};
+use std::time::{Duration, SystemTime};
+use tokio::io::AsyncWriteExt;
 
 /// Create the API router
 pub fn create_router(state: AppState) -> Router {
@@ -68,6 +72,8 @@ pub fn create_router(state: AppState) -> Router {
         .route("/new", get(serve_spa))
         // Codex/ChatGPT login page (SPA-rendered)
         .route("/codex/login", get(serve_spa))
+        // About this deployment page (SPA-rendered)
+        .route("/about", get(serve_spa))
         // Service worker
         .route("/service-worker.js", get(serve_service_worker))
         // Favicon (referenced from index.html)
@@ -84,6 +90,11 @@ pub fn create_router(state: AppState) -> Router {
         )
         // Conversation creation (REQ-API-002)
         .route("/api/conversations/new", post(create_conversation))
+        .route(
+            "/api/conversations/new/with-attachments",
+            post(create_conversation_with_attachments)
+                .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
+        )
         // Conversation retrieval (REQ-API-003)
         .route("/api/conversations/:id", get(get_conversation))
         .route("/api/conversations/:id/slug", get(get_conversation_slug))
@@ -101,6 +112,11 @@ pub fn create_router(state: AppState) -> Router {
         )
         // User actions (REQ-API-004)
         .route("/api/conversations/:id/chat", post(send_chat))
+        .route(
+            "/api/conversations/:id/attachments",
+            post(upload_conversation_attachments)
+                .layer(DefaultBodyLimit::max(MAX_MULTIPART_BODY_BYTES)),
+        )
         .route("/api/conversations/:id/cancel", post(cancel_conversation))
         // Steering queue management (task 01001)
         .route(
@@ -234,6 +250,8 @@ pub fn create_router(state: AppState) -> Router {
         // Version
         .route("/version", get(get_version))
         .route("/api/version", get(get_version_json))
+        // About this deployment (read-only diagnostics)
+        .route("/api/deployment", get(super::deployment::deployment_info))
         // Auth endpoints (REQ-AUTH-002, REQ-AUTH-003)
         .route("/api/auth/status", get(super::auth::auth_status))
         .route("/api/auth/login", post(super::auth::auth_login))
@@ -662,6 +680,461 @@ async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, App
     ))
 }
 
+const MAX_ATTACHMENT_SIZE_BYTES: usize = 10 * 1024 * 1024;
+const MAX_TOTAL_ATTACHMENT_BYTES: usize = 25 * 1024 * 1024;
+const MAX_MULTIPART_BODY_BYTES: usize = 30 * 1024 * 1024;
+const MAX_ATTACHMENTS_PER_MESSAGE: usize = 10;
+const ATTACHMENT_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+fn attachment_root() -> PathBuf {
+    std::env::temp_dir().join("phoenix-ide-attachments")
+}
+
+fn collect_file_paths_from_content(value: &serde_json::Value, paths: &mut HashSet<PathBuf>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(path) = map.get("stored_path").and_then(serde_json::Value::as_str) {
+                paths.insert(PathBuf::from(path));
+            }
+            for child in map.values() {
+                collect_file_paths_from_content(child, paths);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_file_paths_from_content(item, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+async fn referenced_attachment_paths(db: &crate::db::Database) -> Result<HashSet<PathBuf>, String> {
+    let message_rows = sqlx::query(
+        "SELECT content FROM messages WHERE message_type IN ('user', 'skill') AND content LIKE '%stored_path%'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| format!("failed to read message attachment references: {e}"))?;
+    let steering_rows = sqlx::query(
+        "SELECT steering_queue FROM conversations WHERE steering_queue LIKE '%stored_path%'",
+    )
+    .fetch_all(db.pool())
+    .await
+    .map_err(|e| format!("failed to read steering attachment references: {e}"))?;
+
+    let mut paths = HashSet::new();
+    for row in message_rows {
+        let Ok(content) = row.try_get::<String, _>("content") else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) {
+            collect_file_paths_from_content(&value, &mut paths);
+        }
+    }
+    for row in steering_rows {
+        let Ok(raw) = row.try_get::<String, _>("steering_queue") else {
+            continue;
+        };
+        if let Ok(value) = serde_json::from_str::<serde_json::Value>(&raw) {
+            collect_file_paths_from_content(&value, &mut paths);
+        }
+    }
+    Ok(paths)
+}
+
+fn sweep_expired_attachments_blocking(
+    root: &std::path::Path,
+    cutoff: SystemTime,
+    referenced: &HashSet<PathBuf>,
+) -> std::io::Result<()> {
+    if !root.exists() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(root)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if metadata.is_dir() {
+            sweep_expired_attachments_blocking(&path, cutoff, referenced)?;
+            match std::fs::remove_dir(&path) {
+                Ok(()) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::DirectoryNotEmpty | std::io::ErrorKind::NotFound
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        } else if metadata.modified().is_ok_and(|modified| modified < cutoff)
+            && !referenced.contains(&path)
+        {
+            match std::fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn cleanup_expired_attachments(db: &crate::db::Database) {
+    let root = attachment_root();
+    let referenced = match referenced_attachment_paths(db).await {
+        Ok(paths) => paths,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to read attachment references; skipping TTL attachment sweep");
+            return;
+        }
+    };
+    let cutoff = SystemTime::now()
+        .checked_sub(ATTACHMENT_TTL)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let result = tokio::task::spawn_blocking(move || {
+        sweep_expired_attachments_blocking(&root, cutoff, &referenced)
+    })
+    .await;
+    match result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(error = %e, "failed to sweep expired attachments"),
+        Err(e) => tracing::warn!(error = %e, "attachment sweep task failed"),
+    }
+}
+
+pub(super) fn start_attachment_cleanup_task(db: crate::db::Database) {
+    tokio::spawn(async move {
+        cleanup_expired_attachments(&db).await;
+        let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        loop {
+            interval.tick().await;
+            cleanup_expired_attachments(&db).await;
+        }
+    });
+}
+
+async fn delete_conversation_attachments_at_root(root: PathBuf, conversation_id: &str) {
+    let path = root.join(conversation_id);
+    match tokio::fs::remove_dir_all(&path).await {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(conversation_id, path = %path.display(), error = %e, "failed to delete conversation attachments");
+        }
+    }
+}
+
+async fn delete_conversation_attachments(conversation_id: &str) {
+    delete_conversation_attachments_at_root(attachment_root(), conversation_id).await;
+}
+
+async fn rollback_created_conversation_after_attachment_failure(
+    state: &AppState,
+    conversation: &Conversation,
+    id: &str,
+) {
+    delete_conversation_attachments(id).await;
+    if let Err(cleanup_err) = run_resource_cleanup_cascade(state, conversation).await {
+        tracing::warn!(conversation_id = %id, error = ?cleanup_err, "failed to clean resources after initial attachment failure");
+    }
+    if let Err(delete_err) = state.runtime.db().delete_conversation(id).await {
+        tracing::warn!(conversation_id = %id, error = %delete_err, "failed to delete conversation row after initial attachment failure");
+    }
+}
+
+fn sanitize_attachment_name(name: &str) -> String {
+    let basename = FsPath::new(name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("attachment");
+    let sanitized: String = basename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches('.').trim_matches('_');
+    if trimmed.is_empty() {
+        "attachment".to_string()
+    } else {
+        trimmed.chars().take(120).collect()
+    }
+}
+
+fn validate_attachment_file(name: &str, media_type: &str, size: usize) -> Result<(), AppError> {
+    if size == 0 {
+        return Err(AppError::BadRequest(format!(
+            "Attachment '{name}' is empty"
+        )));
+    }
+    if size > MAX_ATTACHMENT_SIZE_BYTES {
+        return Err(AppError::BadRequest(format!(
+            "Attachment '{name}' exceeds the 10 MB per-file limit"
+        )));
+    }
+    if media_type.starts_with("image/") {
+        return Err(AppError::BadRequest(
+            "Image files must use the image attachment channel".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn validate_submitted_attachments(
+    conversation_id: &str,
+    files: &[crate::api::types::FileAttachment],
+) -> Result<Vec<phoenix_core::domain::db_schema::FileAttachment>, AppError> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    if files.len() > MAX_ATTACHMENTS_PER_MESSAGE {
+        return Err(AppError::BadRequest(format!(
+            "A message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} files"
+        )));
+    }
+    let expected_dir = attachment_root().join(conversation_id);
+    let canonical_expected_dir = tokio::fs::canonicalize(&expected_dir)
+        .await
+        .map_err(|_| AppError::BadRequest("Attachment directory does not exist".to_string()))?;
+    let mut total_bytes = 0usize;
+    let mut validated = Vec::with_capacity(files.len());
+    for file in files {
+        let size = usize::try_from(file.size_bytes)
+            .map_err(|_| AppError::BadRequest("Attachment size is invalid".to_string()))?;
+        validate_attachment_file(&file.original_name, &file.media_type, size)?;
+        total_bytes = total_bytes.saturating_add(size);
+        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(AppError::BadRequest(
+                "Attachments exceed the 25 MB total limit".to_string(),
+            ));
+        }
+        let path = PathBuf::from(&file.stored_path);
+        let canonical_path = tokio::fs::canonicalize(&path).await.map_err(|_| {
+            AppError::BadRequest(format!("Attachment '{}' is missing", file.original_name))
+        })?;
+        if !canonical_path.starts_with(&canonical_expected_dir) {
+            return Err(AppError::BadRequest(format!(
+                "Attachment '{}' does not belong to this conversation",
+                file.original_name
+            )));
+        }
+        let metadata = tokio::fs::metadata(&canonical_path).await.map_err(|_| {
+            AppError::BadRequest(format!("Attachment '{}' is missing", file.original_name))
+        })?;
+        if !metadata.is_file() || metadata.len() != file.size_bytes {
+            return Err(AppError::BadRequest(format!(
+                "Attachment '{}' metadata does not match stored file",
+                file.original_name
+            )));
+        }
+        validated.push(file.clone().into());
+    }
+    Ok(validated)
+}
+
+async fn make_attachment_dir_private(dir: &std::path::Path) -> Result<(), AppError> {
+    tokio::fs::create_dir_all(dir)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create attachment directory: {e}")))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = std::fs::Permissions::from_mode(0o700);
+        tokio::fs::set_permissions(dir, perms).await.map_err(|e| {
+            AppError::Internal(format!("Failed to secure attachment directory: {e}"))
+        })?;
+    }
+    Ok(())
+}
+
+async fn write_attachment_file_private(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<(), AppError> {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create attachment: {e}")))?;
+    file.write_all(bytes)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to write attachment: {e}")))?;
+    Ok(())
+}
+
+async fn store_attachment_bytes(
+    conversation_id: &str,
+    original_name: String,
+    media_type: String,
+    bytes: axum::body::Bytes,
+) -> Result<crate::api::types::FileAttachment, AppError> {
+    validate_attachment_file(&original_name, &media_type, bytes.len())?;
+    let dir = attachment_root().join(conversation_id);
+    make_attachment_dir_private(&dir).await?;
+    let filename = format!(
+        "{}-{}",
+        uuid::Uuid::new_v4(),
+        sanitize_attachment_name(&original_name)
+    );
+    let path = dir.join(filename);
+    write_attachment_file_private(&path, &bytes).await?;
+    Ok(crate::api::types::FileAttachment {
+        original_name,
+        media_type,
+        size_bytes: bytes.len() as u64,
+        stored_path: path.to_string_lossy().into_owned(),
+    })
+}
+
+struct RawAttachmentPart {
+    original_name: String,
+    media_type: String,
+    bytes: axum::body::Bytes,
+}
+
+async fn read_multipart_create_parts(
+    mut multipart: Multipart,
+) -> Result<(CreateConversationRequest, Vec<RawAttachmentPart>), AppError> {
+    let mut metadata: Option<CreateConversationRequest> = None;
+    let mut files = Vec::new();
+    let mut total_bytes = 0usize;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Invalid multipart payload: {e}")))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "metadata" {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Invalid metadata part: {e}")))?;
+            metadata =
+                Some(serde_json::from_slice(&bytes).map_err(|e| {
+                    AppError::BadRequest(format!("Invalid metadata JSON part: {e}"))
+                })?);
+            continue;
+        }
+        if name != "files" {
+            tracing::debug!(part = %name, "ignoring unexpected multipart field");
+            continue;
+        }
+        if files.len() >= MAX_ATTACHMENTS_PER_MESSAGE {
+            return Err(AppError::BadRequest(format!(
+                "A message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} files"
+            )));
+        }
+        let original_name = field
+            .file_name()
+            .map_or_else(|| "attachment".to_string(), ToString::to_string);
+        let media_type = field.content_type().map_or_else(
+            || "application/octet-stream".to_string(),
+            ToString::to_string,
+        );
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Invalid file part: {e}")))?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(AppError::BadRequest(
+                "Attachments exceed the 25 MB total limit".to_string(),
+            ));
+        }
+        validate_attachment_file(&original_name, &media_type, bytes.len())?;
+        files.push(RawAttachmentPart {
+            original_name,
+            media_type,
+            bytes,
+        });
+    }
+
+    let metadata = metadata.ok_or_else(|| {
+        AppError::BadRequest("Multipart create requires a metadata JSON part".to_string())
+    })?;
+    Ok((metadata, files))
+}
+
+async fn read_multipart_attachments(
+    conversation_id: &str,
+    mut multipart: Multipart,
+) -> Result<
+    (
+        Option<CreateConversationRequest>,
+        Vec<crate::api::types::FileAttachment>,
+    ),
+    AppError,
+> {
+    let mut metadata: Option<CreateConversationRequest> = None;
+    let mut files = Vec::new();
+    let mut total_bytes = 0usize;
+
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Invalid multipart payload: {e}")))?
+    {
+        let name = field.name().unwrap_or_default().to_string();
+        if name == "metadata" {
+            let bytes = field
+                .bytes()
+                .await
+                .map_err(|e| AppError::BadRequest(format!("Invalid metadata part: {e}")))?;
+            metadata =
+                Some(serde_json::from_slice(&bytes).map_err(|e| {
+                    AppError::BadRequest(format!("Invalid metadata JSON part: {e}"))
+                })?);
+            continue;
+        }
+
+        if name != "files" {
+            tracing::debug!(part = %name, "ignoring unexpected multipart field");
+            continue;
+        }
+
+        if files.len() >= MAX_ATTACHMENTS_PER_MESSAGE {
+            return Err(AppError::BadRequest(format!(
+                "A message can include at most {MAX_ATTACHMENTS_PER_MESSAGE} files"
+            )));
+        }
+        let original_name = field
+            .file_name()
+            .map_or_else(|| "attachment".to_string(), ToString::to_string);
+        let media_type = field.content_type().map_or_else(
+            || "application/octet-stream".to_string(),
+            ToString::to_string,
+        );
+        let bytes = field
+            .bytes()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Invalid file part: {e}")))?;
+        total_bytes = total_bytes.saturating_add(bytes.len());
+        if total_bytes > MAX_TOTAL_ATTACHMENT_BYTES {
+            return Err(AppError::BadRequest(
+                "Attachments exceed the 25 MB total limit".to_string(),
+            ));
+        }
+        files
+            .push(store_attachment_bytes(conversation_id, original_name, media_type, bytes).await?);
+    }
+
+    Ok((metadata, files))
+}
+
 // ============================================================
 // Conversation Creation (REQ-API-002)
 // ============================================================
@@ -670,6 +1143,16 @@ async fn list_projects(State(state): State<AppState>) -> Result<Json<Value>, App
 async fn create_conversation(
     State(state): State<AppState>,
     Json(req): Json<CreateConversationRequest>,
+) -> Result<Json<ConversationResponse>, AppError> {
+    create_conversation_with_id(state, uuid::Uuid::new_v4().to_string(), req, Vec::new()).await
+}
+
+#[allow(clippy::too_many_lines)]
+async fn create_conversation_with_id(
+    state: AppState,
+    id: String,
+    mut req: CreateConversationRequest,
+    raw_files: Vec<RawAttachmentPart>,
 ) -> Result<Json<ConversationResponse>, AppError> {
     // Validate directory exists
     let path = PathBuf::from(&req.cwd);
@@ -684,7 +1167,8 @@ async fn create_conversation(
     // hydrate the input area with a draft and let the user review before
     // sending. For unseeded creates the text is still required.
     let is_seeded = req.seed_parent_id.is_some() || req.seed_label.is_some();
-    if !is_seeded && req.text.trim().is_empty() {
+    let has_file_content = !req.files.is_empty() || !raw_files.is_empty();
+    if !is_seeded && req.text.trim().is_empty() && req.images.is_empty() && !has_file_content {
         return Err(AppError::BadRequest(
             "Message text cannot be empty".to_string(),
         ));
@@ -727,8 +1211,18 @@ async fn create_conversation(
         // If we can't find it, fall through to create (shouldn't happen)
     }
 
-    // Generate ID
-    let id = uuid::Uuid::new_v4().to_string();
+    if !req.files.is_empty() {
+        let validated = validate_submitted_attachments(&id, &req.files).await?;
+        req.files = validated
+            .into_iter()
+            .map(|file| crate::api::types::FileAttachment {
+                original_name: file.original_name,
+                media_type: file.media_type,
+                size_bytes: file.size_bytes,
+                stored_path: file.stored_path,
+            })
+            .collect();
+    }
 
     // Try to generate a title using a cheap LLM model.
     //
@@ -1004,21 +1498,48 @@ async fn create_conversation(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    for raw_file in raw_files {
+        match store_attachment_bytes(
+            &id,
+            raw_file.original_name,
+            raw_file.media_type,
+            raw_file.bytes,
+        )
+        .await
+        {
+            Ok(file) => req.files.push(file),
+            Err(e) => {
+                rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
+                    .await;
+                return Err(e);
+            }
+        }
+    }
+
     // REQ-SEED-001: seeded conversations may be created with an empty
     // `text` — the UI will hydrate the input area from localStorage and the
     // user sends the first message manually. Skip expansion + initial event
     // dispatch in that case.
-    if !(is_seeded && req.text.trim().is_empty()) {
+    if !(is_seeded && req.text.trim().is_empty() && req.images.is_empty() && req.files.is_empty()) {
         // Expand `@file` inline references before sending (REQ-IR-001, REQ-IR-007)
         let working_dir_for_expand = std::path::PathBuf::from(&effective_cwd);
-        let expanded_initial = crate::message_expander::expand(&req.text, &working_dir_for_expand)
-            .map_err(|e| {
-                AppError::UnprocessableEntity(ExpansionErrorResponse {
-                    error: e.to_string(),
-                    error_type: e.error_type().to_string(),
-                    reference: e.reference(),
-                })
-            })?;
+        let expanded_initial =
+            match crate::message_expander::expand(&req.text, &working_dir_for_expand) {
+                Ok(expanded) => expanded,
+                Err(e) => {
+                    rollback_created_conversation_after_attachment_failure(
+                        &state,
+                        &conversation,
+                        &id,
+                    )
+                    .await;
+                    return Err(AppError::UnprocessableEntity(ExpansionErrorResponse {
+                        error: e.to_string(),
+                        error_type: e.error_type().to_string(),
+                        reference: e.reference(),
+                    }));
+                }
+            };
 
         // Convert images
         let images: Vec<ImageData> = req
@@ -1030,6 +1551,9 @@ async fn create_conversation(
             })
             .collect();
 
+        let files: Vec<phoenix_core::domain::db_schema::FileAttachment> =
+            req.files.into_iter().map(Into::into).collect();
+
         // Only set llm_text when expansion actually changed the text (REQ-IR-001)
         let initial_llm_text = (expanded_initial.llm_text != expanded_initial.display_text)
             .then_some(expanded_initial.llm_text);
@@ -1039,21 +1563,32 @@ async fn create_conversation(
             text: expanded_initial.display_text,
             llm_text: initial_llm_text,
             images,
+            files,
             message_id: req.message_id,
             user_agent: None,
             skill_invocation: expanded_initial.skill_invocation,
         };
 
-        state
-            .runtime
-            .send_event(&id, event)
-            .await
-            .map_err(|e| AppError::Internal(e.clone()))?;
+        if let Err(e) = state.runtime.send_event(&id, event).await {
+            rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
+                .await;
+            return Err(AppError::Internal(e));
+        }
     }
 
     Ok(Json(ConversationResponse {
         conversation: serde_json::to_value(conversation).unwrap_or(Value::Null),
     }))
+}
+
+#[allow(clippy::too_many_lines)]
+async fn create_conversation_with_attachments(
+    State(state): State<AppState>,
+    multipart: Multipart,
+) -> Result<Json<ConversationResponse>, AppError> {
+    let id = uuid::Uuid::new_v4().to_string();
+    let (req, raw_files) = read_multipart_create_parts(multipart).await?;
+    create_conversation_with_id(state, id, req, raw_files).await
 }
 
 // ============================================================
@@ -1607,6 +2142,26 @@ async fn stream_conversation(
 // User Actions (REQ-API-004)
 // ============================================================
 
+async fn upload_conversation_attachments(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    multipart: Multipart,
+) -> Result<Json<AttachmentUploadResponse>, AppError> {
+    state
+        .runtime
+        .db()
+        .get_conversation(&id)
+        .await
+        .map_err(|e| AppError::NotFound(e.to_string()))?;
+    let (_metadata, files) = read_multipart_attachments(&id, multipart).await?;
+    if files.is_empty() {
+        return Err(AppError::BadRequest(
+            "No file attachments provided".to_string(),
+        ));
+    }
+    Ok(Json(AttachmentUploadResponse { files }))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn send_chat(
     State(state): State<AppState>,
@@ -1652,6 +2207,8 @@ async fn send_chat(
         }));
     }
 
+    let validated_files = validate_submitted_attachments(&id, &req.files).await?;
+
     // Fail-fast when the state would reject UserMessage. Without this, the
     // chat POST returns 200, the runtime drops the queued event with only a
     // "Transition rejected" log line, and the optimistic UI is stuck on
@@ -1696,6 +2253,7 @@ async fn send_chat(
                     media_type: img.media_type,
                 })
                 .collect();
+            let files = validated_files.clone();
             let chat_llm_text =
                 (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
             let display_text = expanded.display_text;
@@ -1703,6 +2261,7 @@ async fn send_chat(
                 text: display_text.clone(),
                 llm_text: chat_llm_text,
                 images,
+                files,
                 message_id: req.message_id,
                 user_agent: req.user_agent,
                 skill_invocation: expanded.skill_invocation,
@@ -1764,6 +2323,8 @@ async fn send_chat(
         })
         .collect();
 
+    let files = validated_files;
+
     // Only set llm_text when expansion actually changed the text (REQ-IR-001)
     let chat_llm_text = (expanded.llm_text != expanded.display_text).then_some(expanded.llm_text);
 
@@ -1775,6 +2336,7 @@ async fn send_chat(
         text: display_text.clone(),
         llm_text: chat_llm_text,
         images,
+        files,
         message_id: req.message_id,
         user_agent: req.user_agent,
         skill_invocation: expanded.skill_invocation,
@@ -2436,6 +2998,8 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         .delete_conversation(id)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to delete conversation row: {e}")))?;
+
+    delete_conversation_attachments(id).await;
 
     // Step 6: broadcast. The conversation broadcaster is per-conv today;
     // task 02697 will route this to a sidebar-scoped channel on the UI
@@ -4111,6 +4675,7 @@ mod hard_delete_cascade_tests {
             terminals,
             chain_qa,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
         }
     }
 
@@ -5290,6 +5855,7 @@ mod upgrade_model_state_guard_tests {
             terminals,
             chain_qa,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
         }
     }
 
@@ -5448,6 +6014,121 @@ mod file_read_tests {
                 assert_eq!(file_type, "text");
             }
             other => panic!("expected text response, got {other:?}"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod attachment_storage_tests {
+    use super::*;
+
+    #[test]
+    fn sanitizes_attachment_name_to_basename_ascii() {
+        assert_eq!(
+            sanitize_attachment_name("../../secret notes.txt"),
+            "secret_notes.txt"
+        );
+        assert_eq!(sanitize_attachment_name("..."), "attachment");
+    }
+
+    #[test]
+    fn collects_attachment_paths_from_nested_message_and_steering_json() {
+        let value = serde_json::json!({
+            "v": "v1",
+            "entries": [{
+                "files": [{"stored_path": "/tmp/phoenix-ide-attachments/c/m.txt"}]
+            }]
+        });
+        let mut paths = HashSet::new();
+        collect_file_paths_from_content(&value, &mut paths);
+        assert!(paths.contains(&PathBuf::from("/tmp/phoenix-ide-attachments/c/m.txt")));
+    }
+
+    #[test]
+    fn sweep_deletes_expired_files_and_empty_dirs() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let conv = root.join("conv-old");
+        std::fs::create_dir_all(&conv).expect("create conv dir");
+        let expired = conv.join("old.txt");
+        std::fs::write(&expired, b"old").expect("write old");
+        let cutoff = SystemTime::now() + Duration::from_secs(1);
+        sweep_expired_attachments_blocking(root, cutoff, &HashSet::new()).expect("sweep");
+        assert!(!expired.exists());
+        assert!(
+            !conv.exists(),
+            "empty conversation attachment dir should be removed"
+        );
+    }
+
+    #[test]
+    fn sweep_preserves_expired_referenced_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let conv = root.join("conv-referenced");
+        std::fs::create_dir_all(&conv).expect("create conv dir");
+        let referenced = conv.join("old-but-referenced.txt");
+        std::fs::write(&referenced, b"keep").expect("write referenced");
+        let cutoff = SystemTime::now() + Duration::from_secs(1);
+        let references = HashSet::from([referenced.clone()]);
+        sweep_expired_attachments_blocking(root, cutoff, &references).expect("sweep");
+        assert!(referenced.exists());
+        assert!(conv.exists());
+    }
+
+    #[test]
+    fn sweep_keeps_recent_files() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path();
+        let conv = root.join("conv-recent");
+        std::fs::create_dir_all(&conv).expect("create conv dir");
+        let recent = conv.join("recent.txt");
+        std::fs::write(&recent, b"recent").expect("write recent");
+        let cutoff = SystemTime::UNIX_EPOCH;
+        sweep_expired_attachments_blocking(root, cutoff, &HashSet::new()).expect("sweep");
+        assert!(recent.exists());
+        assert!(conv.exists());
+    }
+
+    #[tokio::test]
+    async fn hard_delete_attachment_cleanup_removes_conversation_dir() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("conv-delete");
+        make_attachment_dir_private(&dir).await.expect("secure dir");
+        let file = dir.join("attachment.txt");
+        write_attachment_file_private(&file, b"hello")
+            .await
+            .expect("write file");
+        delete_conversation_attachments_at_root(temp.path().to_path_buf(), "conv-delete").await;
+        assert!(!dir.exists());
+    }
+
+    #[tokio::test]
+    async fn writes_private_attachment_file() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let dir = temp.path().join("conv-1");
+        make_attachment_dir_private(&dir).await.expect("secure dir");
+        let file = dir.join("attachment.txt");
+        write_attachment_file_private(&file, b"hello")
+            .await
+            .expect("write file");
+        assert_eq!(tokio::fs::read(&file).await.expect("read"), b"hello");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&dir)
+                .expect("dir metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            let file_mode = std::fs::metadata(&file)
+                .expect("file metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
         }
     }
 }

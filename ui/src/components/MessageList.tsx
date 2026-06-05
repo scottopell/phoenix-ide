@@ -75,6 +75,25 @@ export interface MessageListHandle {
 
 const PIN_TO_BOTTOM_THRESHOLD = 100;
 
+function formatAttachmentBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function SkillFileChips({ files }: { files: { original_name: string; size_bytes: number; stored_path?: string }[] }) {
+  if (files.length === 0) return null;
+  return (
+    <div className="message-files">
+      {files.map((file, idx) => (
+        <span key={`${file.stored_path ?? file.original_name}-${idx}`} className="message-file-chip" title={file.stored_path}>
+          📎 {file.original_name} <span className="message-file-size">{formatAttachmentBytes(file.size_bytes)}</span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function extractSkillArgs(trigger: string, name: string): string {
   return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
 }
@@ -100,7 +119,7 @@ function renderHistoricalUnit(
         />
       );
     case 'skill': {
-      const c = unit.message.content as { name?: string; trigger?: string };
+      const c = unit.message.content as { name?: string; trigger?: string; files?: { original_name: string; size_bytes: number; stored_path?: string }[] };
       const trigger = c.trigger || '';
       const args = extractSkillArgs(trigger, c.name || '');
       return (
@@ -120,6 +139,7 @@ function renderHistoricalUnit(
                 <span className="skill-trigger">{args}</span>
               )}
             </div>
+            <SkillFileChips files={c.files ?? []} />
           </div>
         </div>
       );

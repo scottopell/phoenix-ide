@@ -7,6 +7,7 @@ pub mod auth;
 mod browser_view;
 mod chains;
 pub mod codex_login;
+mod deployment;
 mod git_handlers;
 mod handlers;
 mod lifecycle_handlers;
@@ -16,6 +17,7 @@ mod terminal_ws;
 mod types;
 pub(crate) mod wire;
 
+pub use deployment::{absolutize, DeploymentConfig, DiskLocation, LogInfo, MeasureMode, TlsInfo};
 pub use handlers::create_router;
 #[allow(unused_imports)] // Public API re-exports
 pub use types::*;
@@ -49,6 +51,9 @@ pub struct AppState {
     pub chain_qa: ChainQa,
     /// In-flight Codex/ChatGPT login flows. See [`codex_login`].
     pub codex_login: Arc<codex_login::CodexLoginManager>,
+    /// Static deployment facts (binding, TLS, on-disk layout) resolved once at
+    /// startup. Served read-only by `GET /api/deployment`. See [`deployment`].
+    pub deployment: Arc<DeploymentConfig>,
 }
 
 impl AppState {
@@ -60,6 +65,7 @@ impl AppState {
         mcp_manager: Arc<McpClientManager>,
         credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
         password: Option<String>,
+        deployment: Arc<DeploymentConfig>,
     ) -> Self {
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
@@ -70,6 +76,7 @@ impl AppState {
         ));
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
+        handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
         // Chain Q&A is constructed last so it can share the same `Database`
         // and `ModelRegistry` handles. Its internal `ChainRuntimeRegistry`
@@ -89,6 +96,7 @@ impl AppState {
             terminals,
             chain_qa,
             codex_login,
+            deployment,
         }
     }
 }

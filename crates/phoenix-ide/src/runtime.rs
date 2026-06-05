@@ -1309,6 +1309,7 @@ impl RuntimeManager {
                     text: task_text,
                     llm_text: None, // Sub-agent tasks are already fully specified
                     images: vec![],
+                    files: vec![],
                     message_id: uuid::Uuid::new_v4().to_string(),
                     user_agent: Some("Phoenix Sub-Agent".to_string()),
                     skill_invocation: None,
@@ -1700,6 +1701,7 @@ impl RuntimeManager {
             ref text,
             ref llm_text,
             ref images,
+            ref files,
             ref message_id,
             ref user_agent,
             ref skill_invocation,
@@ -1713,6 +1715,7 @@ impl RuntimeManager {
             text: text.clone(),
             llm_text: llm_text.clone(),
             images: images.clone(),
+            files: files.clone(),
             message_id: message_id.clone(),
             user_agent: user_agent.clone(),
             skill_invocation: skill_invocation.clone(),

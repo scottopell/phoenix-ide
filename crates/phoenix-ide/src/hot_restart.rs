@@ -16,6 +16,7 @@
 //!
 //! The mode is auto-detected based on environment variables.
 
+use chrono::{DateTime, Utc};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -27,13 +28,23 @@ static HOT_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Tracks process start time for uptime reporting on shutdown
 static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+/// Tracks process start wall-clock time for absolute start-time reporting.
+static START_WALL: std::sync::OnceLock<DateTime<Utc>> = std::sync::OnceLock::new();
+
 /// Call at startup to record the process start time.
 pub fn record_start_time() {
     START_TIME.get_or_init(Instant::now);
+    START_WALL.get_or_init(Utc::now);
 }
 
-fn uptime_secs() -> u64 {
+/// Process uptime in seconds, or 0 if the start time was never recorded.
+pub fn uptime_secs() -> u64 {
     START_TIME.get().map_or(0, |t| t.elapsed().as_secs())
+}
+
+/// Wall-clock time the process started, if it was recorded.
+pub fn started_at() -> Option<DateTime<Utc>> {
+    START_WALL.get().copied()
 }
 
 /// Tracks whether we're running under systemd socket activation

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { api, type CodexLoginPreflight, type LlmLanguageSetting, type NotificationSettings } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { clearCodexQuota, useCodexQuota } from '../codexQuota';
@@ -61,6 +62,7 @@ export function SettingsDropdown({
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
   const titleId = useId();
+  const navigate = useNavigate();
   const [menuPos, setMenuPos] = useState<{ top: number; left: number; maxHeight: number } | null>(null);
 
   useEffect(() => {
@@ -170,6 +172,15 @@ export function SettingsDropdown({
           )}
           <NotificationsSection />
           <LlmLanguageSection />
+          <section className="settings-section">
+            <button
+              type="button"
+              className="settings-inline-btn settings-about-link"
+              onClick={() => { setOpen(false); navigate('/about'); }}
+            >
+              About this deployment →
+            </button>
+          </section>
           <VersionFooter />
         </div>
       )}

@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useRef, useState, KeyboardEvent, ClipboardEvent, ChangeEvent } from 'react';
+import { lazy, Suspense, useEffect, useRef, useState, KeyboardEvent, ClipboardEvent, ChangeEvent, DragEvent } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ImageAttachments } from '../components/ImageAttachments';
 import { ConversationSettings } from '../components/ConversationSettings';
@@ -18,6 +18,36 @@ const TerminalPanel = lazy(() =>
 );
 
 const GLOBAL_TERMINAL_COLLAPSED_PX = 32;
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+function NewConversationFileChips({ files, onRemove }: { files: File[]; onRemove: (index: number) => void }) {
+  if (files.length === 0) return null;
+  return (
+    <div className="file-attachments" aria-label="Attached files">
+      {files.map((file, index) => (
+        <div key={`${file.name}-${file.size}-${index}`} className="file-attachment-chip">
+          <span className="file-attachment-icon">📎</span>
+          <span className="file-attachment-name" title={file.name}>{file.name}</span>
+          <span className="file-attachment-size">{formatBytes(file.size)}</span>
+          <button
+            type="button"
+            className="file-attachment-remove"
+            onClick={() => onRemove(index)}
+            title="Remove attachment"
+            aria-label={`Remove attachment ${file.name}`}
+          >
+            x
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}
 
 interface NewConversationPageProps {
   desktopMode?: boolean;
@@ -84,8 +114,36 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
 
   const handleFileChange = async (e: ChangeEvent<HTMLInputElement>) => {
     const files = Array.from(e.target.files || []);
-    if (files.length > 0) await conv.addImages(files);
+    if (files.length > 0) await conv.addFiles(files);
     e.target.value = '';
+  };
+
+  const handleDrop = async (e: DragEvent) => {
+    if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+    e.preventDefault();
+    conv.setIsDragOver(false);
+    const dropped = Array.from(e.dataTransfer.files);
+    if (dropped.length > 0) await conv.addFiles(dropped);
+  };
+
+  const handleDragEnter = (e: DragEvent) => {
+    if (Array.from(e.dataTransfer.types).includes('Files')) {
+      e.preventDefault();
+      conv.setIsDragOver(true);
+    }
+  };
+
+  const handleDragOver = (e: DragEvent) => {
+    if (Array.from(e.dataTransfer.types).includes('Files')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  };
+
+  const handleDragLeave = (e: DragEvent) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+      conv.setIsDragOver(false);
+    }
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
@@ -106,7 +164,13 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
     : 'What would you like to work on?';
 
   return (
-    <div className="new-conv-page">
+    <div
+      className={`new-conv-page${conv.isDragOver ? ' input-area--drag-over' : ''}`}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       <input
         ref={fileInputRef}
         type="file"
@@ -153,12 +217,14 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
           {/* Main input — hidden until an LLM is configured */}
           {llmReady && (
             <>
+              {conv.isDragOver && <div className="input-drop-affordance">Drop files to attach</div>}
               <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
+              <NewConversationFileChips files={conv.files} onRemove={conv.removeFile} />
               <textarea
                 ref={textareaRef}
                 className="new-conv-textarea"
                 placeholder={inputPlaceholder}
-rows={3}
+                rows={3}
                 value={conv.textareaValue}
                 onChange={(e) => conv.updateDraft(e.target.value)}
                 onKeyDown={handleKeyDown}
@@ -251,6 +317,7 @@ rows={3}
       {llmReady && (
         <div className="new-conv-bottom-input mobile-only">
           <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
+          <NewConversationFileChips files={conv.files} onRemove={conv.removeFile} />
           <textarea
             className="new-conv-textarea-mobile"
             placeholder={inputPlaceholder}
