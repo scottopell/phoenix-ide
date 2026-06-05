@@ -226,7 +226,12 @@ request cannot trigger a multi-gigabyte walk (REQ-DEPLOY-005).
 
 - `specs/api/` — owns the HTTP router and auth middleware this endpoint registers
   under; `GET /api/deployment` follows the same JSON-handler + auth pattern.
-- `specs/auth/` — the password-auth middleware gates `/api/deployment` like the
-  other `/api/*` routes; the page is not exempt.
+- `specs/auth/` — the `/api/deployment` data endpoint is gated by the
+  password-auth middleware like the other `/api/*` routes. The `/about` SPA
+  route is auth-exempt (alongside `/new` and `/codex/login`) so a
+  password-protected hard load can fetch the SPA shell before the client-side
+  login check renders; the shell then calls the gated endpoint, which is denied
+  until the user authenticates. The exemption covers only the static shell, not
+  the data.
 - `specs/conversation-ui/` — owns the settings dropdown and conversation-list
   chrome the "About this deployment" entry is added to.

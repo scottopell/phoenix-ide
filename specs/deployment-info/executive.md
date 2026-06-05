@@ -66,7 +66,9 @@ normative contract.
 
 - `specs/api/`: `GET /api/deployment` is registered in the same router and behind
   the same auth middleware as the other `/api/*` JSON endpoints.
-- `specs/auth/`: the endpoint is gated by the password middleware; it is not on
-  the auth-exempt list.
+- `specs/auth/`: the `/api/deployment` endpoint is gated by the password
+  middleware and is not on the auth-exempt list. The `/about` SPA route is
+  exempt (like other top-level SPA routes) so the shell loads on a
+  password-protected hard refresh; only the static shell is exempt, not the data.
 - `specs/conversation-ui/`: the "About this deployment" entry lives in the
   settings dropdown mounted in the conversation-list chrome.

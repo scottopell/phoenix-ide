@@ -56,7 +56,7 @@ use db::Database;
 use llm::{LlmConfig, ModelRegistry};
 use std::future::IntoFuture;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use tower_http::{
@@ -68,6 +68,20 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod hot_restart;
 
+/// Make a path absolute for display without requiring it to exist or resolving
+/// symlinks: a relative path is joined onto the process's current directory —
+/// the same base the process resolves it against at startup. The deployment
+/// wire contract specifies absolute `path` values (specs/deployment-info/).
+fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
+}
+
 /// Assemble the static deployment facts reported by `GET /api/deployment`.
 /// Resolves every path from the same logic the rest of the process uses so the
 /// page reports the locations the process actually opens (specs/deployment-info/).
@@ -77,7 +91,7 @@ fn build_deployment_config(
     tls_source: Option<&tls::ConfigSource>,
     loaded_tls: Option<&tls::LoadedConfig>,
 ) -> api::DeploymentConfig {
-    use api::{DiskLocation, LogInfo, MeasureMode, TlsInfo};
+    use api::{LogInfo, TlsInfo};
 
     let tls = match (tls_source, loaded_tls) {
         (Some(source), Some(loaded)) => {
@@ -107,16 +121,41 @@ fn build_deployment_config(
     // specs/deployment-info/ REQ-DEPLOY-006 and tasks/58013.
     let log = LogInfo::Stdout;
 
-    let db_pb = PathBuf::from(db_path);
+    let locations = build_disk_locations(db_path, tls_source, loaded_tls);
+
+    api::DeploymentConfig {
+        bind_address,
+        tls,
+        log,
+        locations,
+    }
+}
+
+/// Build the on-disk location rows reported by `GET /api/deployment`, each with
+/// its sizing policy. Every path is normalized to absolute.
+fn build_disk_locations(
+    db_path: &str,
+    tls_source: Option<&tls::ConfigSource>,
+    loaded_tls: Option<&tls::LoadedConfig>,
+) -> Vec<api::DiskLocation> {
+    use api::{DiskLocation, MeasureMode};
+
+    let db_pb = absolutize(&PathBuf::from(db_path));
     let data_dir = db_pb
         .parent()
-        .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
+        .map_or_else(|| db_pb.clone(), std::path::Path::to_path_buf);
 
-    // Only recurse the data directory when it is Phoenix's own dedicated
-    // `.phoenix-ide` dir. A custom PHOENIX_DB_PATH like `/tmp/phoenix.db` or
-    // `$HOME/phoenix.db` would otherwise make every request walk all of `/tmp`
-    // or the home directory — the opposite of a cheap diagnostic snapshot.
-    let data_dir_mode = if data_dir.file_name() == Some(std::ffi::OsStr::new(".phoenix-ide")) {
+    // Only recurse the data directory when it is a Phoenix-owned dedicated dir
+    // (`.phoenix-ide` for user installs / dev worktrees, `phoenix-ide` for the
+    // native `/var/lib/phoenix-ide` production root). A custom PHOENIX_DB_PATH
+    // like `/tmp/phoenix.db` or `$HOME/phoenix.db` would otherwise make every
+    // request walk all of `/tmp` or the home directory — the opposite of a
+    // cheap diagnostic snapshot.
+    let owned_data_dir = matches!(
+        data_dir.file_name().and_then(std::ffi::OsStr::to_str),
+        Some(".phoenix-ide" | "phoenix-ide")
+    );
+    let data_dir_mode = if owned_data_dir {
         MeasureMode::RecurseSmall
     } else {
         MeasureMode::NoMeasure
@@ -203,12 +242,15 @@ fn build_deployment_config(
         mode: MeasureMode::Pattern,
     });
 
-    api::DeploymentConfig {
-        bind_address,
-        tls,
-        log,
-        locations,
+    // Normalize every reported path to absolute. Env-derived paths
+    // (PHOENIX_DB_PATH, manual TLS cert/key, PHOENIX_TLS_DIR) may be relative;
+    // the wire contract specifies absolute `path` values so operators see where
+    // bytes actually live, not `phoenix.db` or `.`.
+    for loc in &mut locations {
+        loc.path = absolutize(&loc.path);
     }
+
+    locations
 }
 
 #[tokio::main]
@@ -686,6 +728,26 @@ async fn reconcile_worktrees(db: &Database) {
 ///
 /// These run against an on-disk `SQLite` DB (tempdir) so the project/
 /// conversation foreign keys resolve correctly through migrations.
+#[cfg(test)]
+mod absolutize_tests {
+    use super::absolutize;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn absolute_path_is_unchanged() {
+        let p = "/var/lib/phoenix-ide/prod.db";
+        assert_eq!(absolutize(Path::new(p)), PathBuf::from(p));
+    }
+
+    #[test]
+    fn relative_path_is_joined_onto_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = absolutize(Path::new("phoenix.db"));
+        assert!(abs.is_absolute());
+        assert_eq!(abs, cwd.join("phoenix.db"));
+    }
+}
+
 #[cfg(test)]
 mod reconcile_worktrees_tests {
     use super::*;
