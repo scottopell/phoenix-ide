@@ -73,7 +73,8 @@ pub enum LlmErrorKind {
     Network,
     /// Transient rate-limit throttle (per-minute, per-second windows) - retryable with backoff
     RateLimit,
-    /// Quota window exhausted (plan-level cap hit, credits depleted, etc.) - NOT retryable
+    /// Quota window exhausted (plan-level cap hit, credits depleted, etc.) -
+    /// never auto-retried, but user-resumable once the window resets
     UsageLimitReached,
     /// Server error (5xx) - retryable
     ServerError,
@@ -108,11 +109,16 @@ impl LlmErrorKind {
 
     pub fn user_resume_policy(&self) -> UserResumePolicy {
         match self {
-            Self::Auth | Self::Network | Self::RateLimit | Self::ServerError | Self::ServerOverloaded => {
-                UserResumePolicy::Resumable
-            }
-            Self::UsageLimitReached
-            | Self::InvalidRequest
+            // A usage-limit window resets on a clock boundary, so — like
+            // `ServerOverloaded` — the user can resume once it clears, even
+            // though it is never auto-retried.
+            Self::Auth
+            | Self::Network
+            | Self::RateLimit
+            | Self::ServerError
+            | Self::ServerOverloaded
+            | Self::UsageLimitReached => UserResumePolicy::Resumable,
+            Self::InvalidRequest
             | Self::ContentFilter
             | Self::ContextWindowExceeded => UserResumePolicy::NotResumable,
         }

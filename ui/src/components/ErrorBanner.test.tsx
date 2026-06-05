@@ -25,18 +25,21 @@ describe('ErrorBanner', () => {
     expect(screen.queryByText(/start a new conversation/i)).not.toBeInTheDocument();
   });
 
-  it('does not show retry/continue affordance for non-resumable usage limits', () => {
+  it('shows retry/continue affordance for usage limits (window resets on a clock boundary)', () => {
+    const onRetry = vi.fn();
     render(
       <ErrorBanner
         message="You've hit your usage limit. Try again later."
         error={getErrorPresentation('usage_limit_reached')}
-        onRetry={vi.fn()}
+        onRetry={onRetry}
         onDismiss={vi.fn()}
       />,
     );
 
-    expect(screen.queryByRole('button', { name: /retry.*continue/i })).not.toBeInTheDocument();
-    expect(screen.getByText(/switch to a different model/i)).toBeInTheDocument();
+    const retry = screen.getByRole('button', { name: /retry.*continue/i });
+    fireEvent.click(retry);
+    expect(onRetry).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/start a new conversation/i)).not.toBeInTheDocument();
   });
 
   it('still shows retry/continue affordance for transient errors', () => {

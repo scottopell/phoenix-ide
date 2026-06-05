@@ -156,11 +156,9 @@ export function ErrorBanner({ message, error, onRetry, onDismiss }: ErrorBannerP
           </button>
         ) : (
           <span className="error-action-hint">
-            {isUsageLimit
-              ? 'Switch to a different model in the picker, or wait for the window to reset.'
-              : errorKind === 'auth'
-                ? 'Refresh or fix authentication, then retry to continue this conversation.'
-                : 'Start a new conversation to continue.'}
+            {errorKind === 'auth'
+              ? 'Refresh or fix authentication, then retry to continue this conversation.'
+              : 'Start a new conversation to continue.'}
           </span>
         )}
         <button className="error-dismiss-btn" onClick={onDismiss} title="Dismiss error">

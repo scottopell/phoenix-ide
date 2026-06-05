@@ -113,15 +113,19 @@ impl LlmErrorKind {
     #[must_use]
     pub fn user_resume_policy(self) -> UserResumePolicy {
         match self {
+            // A usage-limit window resets on a clock boundary ("try again at
+            // 1:01 AM"). Like `ServerOverloaded`, the user can resume once the
+            // window clears, so it is user-resumable even though it is never
+            // *auto*-retried (no point hammering a reset-on-clock quota).
             Self::Auth
             | Self::Network
             | Self::RateLimit
             | Self::ServerError
-            | Self::ServerOverloaded => UserResumePolicy::Resumable,
-            Self::UsageLimitReached
-            | Self::InvalidRequest
-            | Self::ContentFilter
-            | Self::ContextWindowExceeded => UserResumePolicy::NotResumable,
+            | Self::ServerOverloaded
+            | Self::UsageLimitReached => UserResumePolicy::Resumable,
+            Self::InvalidRequest | Self::ContentFilter | Self::ContextWindowExceeded => {
+                UserResumePolicy::NotResumable
+            }
         }
     }
 
