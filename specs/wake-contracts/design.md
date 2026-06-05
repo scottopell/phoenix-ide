@@ -158,7 +158,7 @@ the contract table says I have zero contracts" failure mode.
 
 ### REQ-WAKE-012 — continuation inheritance: RESOLVED
 
-Every handle kind a contract can watch — bash, tmux, browser, subagent — is
+Every handle kind a contract can watch — bash, tmux, subagent — is
 WorkScope-keyed (bash per `specs/bash/` REQ-BASH-WS-001). When a conversation
 continues into a successor that inherits the same WorkScope, the underlying
 handle transfers to the successor, and the pending contract transfers with it:

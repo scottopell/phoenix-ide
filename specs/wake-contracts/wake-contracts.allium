@@ -127,7 +127,7 @@ entity Contract {
 
     -- The conversation that this contract delivers into on
     -- resolution. Every handle kind a contract can watch (bash,
-    -- tmux, browser, subagent) is WorkScope-keyed, so on a
+    -- tmux, subagent) is WorkScope-keyed, so on a
     -- continuation that inherits the WorkScope the watched handle
     -- transfers to the child and this field is re-keyed to the
     -- child conversation. No handle kind forgets at the boundary.
@@ -394,7 +394,7 @@ rule ContinuationBoundaryHandlesContracts {
 
     @guidance
         -- Every handle kind a contract can watch (bash, tmux,
-        -- browser, subagent) is WorkScope-keyed, so when the child
+        -- subagent) is WorkScope-keyed, so when the child
         -- inherits the same WorkScope the watched handle transfers
         -- to it (bash per specs/bash/ REQ-BASH-WS-001; the others
         -- per the WorkScope foundation). Each pending contract

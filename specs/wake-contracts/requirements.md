@@ -58,7 +58,7 @@ durability does not depend on the underlying handle's durability.
 **Scope:** wake contracts are conversation-scoped, not WorkScope-scoped.
 A contract belongs to the conversation that registered it; resolution
 delivers a synthetic tool result into that conversation. Every handle a
-contract can watch — bash, tmux, browser, subagent — is WorkScope-keyed, so
+contract can watch — bash, tmux, subagent — is WorkScope-keyed, so
 when a conversation continues into a successor that inherits the same
 WorkScope, the underlying handle transfers to the successor and the contract
 transfers with it: its `conv_id` is re-keyed to the child and subsequent fires
@@ -308,7 +308,7 @@ WHEN a conversation has registered wake contracts AND continues into
 a child conversation that inherits the same `WorkScope`
 THE SYSTEM SHALL re-key each pending contract's `conv_id` to the child
 conversation, so subsequent fires deliver into the child — the underlying
-handle (bash, tmux, browser, or subagent) is WorkScope-keyed and transfers to
+handle (bash, tmux, or subagent) is WorkScope-keyed and transfers to
 the child along with the contract
 
 WHEN no successor inherits the `WorkScope` (the handle is therefore torn down)

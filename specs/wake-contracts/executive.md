@@ -52,7 +52,7 @@ just zero intervening turns.
 
 Wake contracts are conversation-scoped, not WorkScope-scoped: a contract is
 owned by one conversation and delivers its synthetic result there. The handles
-it can watch, however, are all WorkScope-keyed (bash, tmux, browser, subagent).
+it can watch, however, are all WorkScope-keyed (bash, tmux, subagent).
 So when a conversation continues into a successor that inherits the same
 WorkScope, every pending contract re-keys its `conv_id` to the successor along
 with the handle it watches — no contract fires `Forgotten` at the continuation
