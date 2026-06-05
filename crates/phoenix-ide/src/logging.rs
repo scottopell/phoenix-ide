@@ -29,17 +29,12 @@ pub struct LogConfig {
 impl LogConfig {
     /// Resolve the sink configuration from the environment.
     pub fn from_env() -> Self {
-        // stdout defaults on; only explicit falsey values disable it.
-        let stdout = std::env::var("PHOENIX_LOG_STDOUT").map_or(true, |v| {
-            !matches!(
-                v.trim().to_ascii_lowercase().as_str(),
-                "0" | "false" | "off" | "no" | ""
-            )
-        });
-        let file = std::env::var_os("PHOENIX_LOG_FILE")
-            .map(PathBuf::from)
-            .filter(|p| !p.as_os_str().is_empty());
-        Self { stdout, file }
+        Self {
+            stdout: stdout_enabled(std::env::var("PHOENIX_LOG_STDOUT").ok().as_deref()),
+            file: std::env::var_os("PHOENIX_LOG_FILE")
+                .map(PathBuf::from)
+                .filter(|p| !p.as_os_str().is_empty()),
+        }
     }
 
     /// The deployment-report view of the active sinks, with the file path made
@@ -106,6 +101,17 @@ pub fn init(config: &LogConfig) -> Option<WorkerGuard> {
     guard
 }
 
+/// Whether the stdout sink is enabled. Defaults on (unset); only explicit
+/// falsey values disable it.
+fn stdout_enabled(var: Option<&str>) -> bool {
+    var.is_none_or(|v| {
+        !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no" | ""
+        )
+    })
+}
+
 /// Open `path` for appending, creating it and any missing parent directories.
 fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
     if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
@@ -137,4 +143,52 @@ fn install_panic_hook() {
         tracing::error!(panic.location = %location, panic.message = %message, "panic");
         default_hook(info);
     }));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stdout_defaults_on_when_unset() {
+        assert!(stdout_enabled(None));
+    }
+
+    #[test]
+    fn stdout_disabled_by_falsey_values() {
+        for v in ["0", "false", "off", "no", "", "FALSE", " Off "] {
+            assert!(!stdout_enabled(Some(v)), "{v:?} should disable stdout");
+        }
+    }
+
+    #[test]
+    fn stdout_enabled_by_truthy_values() {
+        for v in ["1", "true", "on", "yes", "anything"] {
+            assert!(stdout_enabled(Some(v)), "{v:?} should enable stdout");
+        }
+    }
+
+    #[test]
+    fn to_log_info_absolutizes_the_file_and_carries_stdout() {
+        let cfg = LogConfig {
+            stdout: false,
+            file: Some(PathBuf::from("relative.log")),
+        };
+        let info = cfg.to_log_info();
+        assert!(!info.stdout);
+        let file = info.file.expect("file sink");
+        assert!(std::path::Path::new(&file).is_absolute());
+        assert!(file.ends_with("relative.log"));
+    }
+
+    #[test]
+    fn to_log_info_reports_no_file_when_unset() {
+        let cfg = LogConfig {
+            stdout: true,
+            file: None,
+        };
+        let info = cfg.to_log_info();
+        assert!(info.stdout);
+        assert!(info.file.is_none());
+    }
 }
