@@ -360,6 +360,14 @@ pub struct ProjectFileSearchQuery {
     pub q: String,
     /// Maximum number of results (default 50)
     pub limit: Option<usize>,
+    /// Resolved creation mode (`direct`/`managed`/`branch`). Together with
+    /// `base_branch` this selects the resolution root: branch/managed modes
+    /// search the chosen branch's committed tree (what the conversation's fresh
+    /// worktree will hold), so suggestions match create-time expansion.
+    /// Absent ⇒ Direct (search `cwd`).
+    pub mode: Option<String>,
+    /// Branch the conversation will be created on, for branch/managed modes.
+    pub base_branch: Option<String>,
 }
 
 /// A single code content search result.
@@ -422,6 +430,13 @@ pub struct SkillsResponse {
 pub struct ProjectSkillsQuery {
     /// Working directory to discover skills from.
     pub cwd: String,
+    /// Resolved creation mode (`direct`/`managed`/`branch`). With `base_branch`,
+    /// branch/managed modes discover skills from the chosen branch's committed
+    /// `.claude/skills` / `.agents/skills` (plus global + built-in), matching
+    /// what the conversation's worktree will expose. Absent ⇒ Direct (`cwd`).
+    pub mode: Option<String>,
+    /// Branch the conversation will be created on, for branch/managed modes.
+    pub base_branch: Option<String>,
 }
 
 /// A task file entry returned by the tasks list endpoint.

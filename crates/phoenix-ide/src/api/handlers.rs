@@ -1515,10 +1515,27 @@ async fn create_conversation_with_id(
     // user sends the first message manually. Skip expansion + initial event
     // dispatch in that case.
     if !(is_seeded && req.text.trim().is_empty() && req.images.is_empty() && req.files.is_empty()) {
-        // Expand `@file` inline references before sending (REQ-IR-001, REQ-IR-007)
-        let working_dir_for_expand = std::path::PathBuf::from(&effective_cwd);
+        // Expand `@file`/`/skill` inline references before sending
+        // (REQ-IR-001, REQ-IR-007). Resolve against the SAME root the composer
+        // discovered candidates against: a branch/managed conversation expands
+        // against the chosen branch's committed tree (what its fresh worktree
+        // will contain), a Direct conversation against `cwd`.
+        let base_for_root = if resolved_mode == "managed" {
+            managed_base_branch.as_deref()
+        } else {
+            req.base_branch.as_deref()
+        };
+        let resolution_root = if matches!(resolved_mode, "branch" | "managed") {
+            crate::resolution_root::ResolutionRoot::for_create(
+                &req.cwd,
+                resolved_mode,
+                base_for_root,
+            )
+        } else {
+            crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd)
+        };
         let expanded_initial =
-            match crate::message_expander::expand(&req.text, &working_dir_for_expand) {
+            match crate::message_expander::expand(&req.text, &resolution_root) {
                 Ok(expanded) => expanded,
                 Err(e) => {
                     rollback_created_conversation_after_attachment_failure(
@@ -2230,9 +2247,10 @@ async fn send_chat(
                 ))));
             }
 
-            let working_dir = std::path::PathBuf::from(&conversation.cwd);
+            let resolution_root =
+                crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
             let expanded =
-                crate::message_expander::expand(&req.text, &working_dir).map_err(|e| {
+                crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
                     AppError::UnprocessableEntity(ExpansionErrorResponse {
                         error: e.to_string(),
                         error_type: e.error_type().to_string(),
@@ -2298,8 +2316,8 @@ async fn send_chat(
         ))));
     }
 
-    let working_dir = std::path::PathBuf::from(&conversation.cwd);
-    let expanded = crate::message_expander::expand(&req.text, &working_dir).map_err(|e| {
+    let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&conversation.cwd);
+    let expanded = crate::message_expander::expand(&req.text, &resolution_root).map_err(|e| {
         AppError::UnprocessableEntity(ExpansionErrorResponse {
             error: e.to_string(),
             error_type: e.error_type().to_string(),
@@ -3708,13 +3726,18 @@ async fn search_conversation_files(
 async fn search_project_files(
     Query(query): Query<ProjectFileSearchQuery>,
 ) -> Result<Json<FileSearchResponse>, AppError> {
-    let root = std::path::PathBuf::from(&query.cwd);
-    if !root.exists() || !root.is_dir() {
+    let cwd = std::path::PathBuf::from(&query.cwd);
+    if !cwd.exists() || !cwd.is_dir() {
         return Err(AppError::BadRequest("Directory does not exist".to_string()));
     }
+    let root = crate::resolution_root::ResolutionRoot::for_create(
+        &query.cwd,
+        query.mode.as_deref().unwrap_or("direct"),
+        query.base_branch.as_deref(),
+    );
     let limit = query.limit.unwrap_or(50);
     Ok(Json(FileSearchResponse {
-        items: search_files_in_root(&root, &query.q, limit),
+        items: root.list_files(&query.q, limit),
     }))
 }
 
@@ -3724,7 +3747,11 @@ async fn search_project_files(
 /// against `q` (empty `q` = all files alphabetically up to `limit`), and returns
 /// paths relative to `root`. Shared by the conversation-scoped and
 /// directory-scoped search handlers.
-fn search_files_in_root(root: &std::path::Path, query: &str, limit: usize) -> Vec<FileSearchEntry> {
+pub(crate) fn search_files_in_root(
+    root: &std::path::Path,
+    query: &str,
+    limit: usize,
+) -> Vec<FileSearchEntry> {
     let q = query.to_lowercase();
 
     // Walk the directory tree with gitignore awareness
@@ -3804,7 +3831,7 @@ fn search_files_in_root(root: &std::path::Path, query: &str, limit: usize) -> Ve
 /// get the same +1000 bonus so nucleo's match quality alone determines the
 /// winner — an exact directory-name match (nucleo ≈ 244 → total 1244) beats
 /// a scattered-char match in a long UUID filename (nucleo ≈ 142 → total 1142).
-fn fuzzy_score_path(
+pub(crate) fn fuzzy_score_path(
     path: &str,
     query: &str,
     matcher: &mut nucleo_matcher::Matcher,
@@ -4003,7 +4030,7 @@ async fn list_conversation_skills(
 
     let cwd = std::path::PathBuf::from(&conversation.cwd);
     Ok(Json(SkillsResponse {
-        skills: skill_entries_for_cwd(&cwd),
+        skills: skill_entries_from_dir(&cwd, None),
     }))
 }
 
@@ -4019,21 +4046,41 @@ async fn list_project_skills(
     if !cwd.exists() || !cwd.is_dir() {
         return Err(AppError::BadRequest("Directory does not exist".to_string()));
     }
+    let root = crate::resolution_root::ResolutionRoot::for_create(
+        &query.cwd,
+        query.mode.as_deref().unwrap_or("direct"),
+        query.base_branch.as_deref(),
+    );
+    // The view owns a temp materialization for a GitTree root; it must outlive
+    // the discovery walk below. `strip` rewrites the temp paths back to
+    // ref-relative so we never hand the frontend an ephemeral filesystem path.
+    let view = root.skills_view();
+    let strip = match &root {
+        crate::resolution_root::ResolutionRoot::GitTree { .. } => Some(view.dir.as_path()),
+        crate::resolution_root::ResolutionRoot::WorkingDir(_) => None,
+    };
     Ok(Json(SkillsResponse {
-        skills: skill_entries_for_cwd(&cwd),
+        skills: skill_entries_from_dir(&view.dir, strip),
     }))
 }
 
-/// Discover skills available from `cwd` and map them to API entries.
+/// Discover skills available from `dir` and map them to API entries.
 ///
 /// Walks the user's skill catalog (`discover_skills`) and flattens each
 /// [`crate::system_prompt::SkillSource`] into a `(source, path)` pair for the
-/// frontend. Shared by the conversation-scoped and directory-scoped handlers.
-fn skill_entries_for_cwd(cwd: &std::path::Path) -> Vec<SkillEntry> {
-    crate::system_prompt::discover_skills(cwd)
+/// frontend. When `strip_prefix` is set (a GitTree materialization root),
+/// filesystem skill paths are rewritten relative to it so the frontend sees the
+/// ref-relative `SKILL.md` location instead of an ephemeral temp path; built-in
+/// skill paths (outside the prefix) are left absolute. Shared by the
+/// conversation-scoped and directory-scoped handlers.
+fn skill_entries_from_dir(
+    dir: &std::path::Path,
+    strip_prefix: Option<&std::path::Path>,
+) -> Vec<SkillEntry> {
+    crate::system_prompt::discover_skills(dir)
         .into_iter()
         .map(|s| {
-            let (source, path) = match &s.source {
+            let (source, mut path) = match &s.source {
                 crate::system_prompt::SkillSource::Filesystem { path, source_dir } => {
                     (source_dir.clone(), path.to_string_lossy().to_string())
                 }
@@ -4041,6 +4088,11 @@ fn skill_entries_for_cwd(cwd: &std::path::Path) -> Vec<SkillEntry> {
                     ("builtin".to_string(), path.to_string_lossy().to_string())
                 }
             };
+            if let Some(prefix) = strip_prefix {
+                if let Ok(rel) = std::path::Path::new(&path).strip_prefix(prefix) {
+                    path = rel.to_string_lossy().to_string();
+                }
+            }
             SkillEntry {
                 name: s.name,
                 description: s.description,
@@ -4980,6 +5032,8 @@ mod hard_delete_cascade_tests {
             cwd: cwd.to_string_lossy().to_string(),
             q: "project".to_string(),
             limit: Some(10),
+            mode: None,
+            base_branch: None,
         }))
         .await
         .expect("search");
@@ -4994,6 +5048,8 @@ mod hard_delete_cascade_tests {
             cwd: "/nonexistent/phoenix/test/dir".to_string(),
             q: String::new(),
             limit: None,
+            mode: None,
+            base_branch: None,
         }))
         .await
         .expect_err("missing dir rejected");

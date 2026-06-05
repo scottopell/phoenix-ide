@@ -9,6 +9,7 @@ mod chain_runtime;
 pub(crate) mod git_ops;
 mod llm;
 mod message_expander;
+mod resolution_root;
 mod runtime;
 mod system_prompt;
 mod title_generator;
