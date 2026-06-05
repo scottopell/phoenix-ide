@@ -7,7 +7,7 @@
 -- persistence (single Phoenix process lifetime).
 -- Includes: run lifecycle, wait_seconds semantics, peek/wait/kill handle
 --           operations, ring buffer, in-memory tombstone demotion on exit,
---           per-conversation handle cap, Phoenix startup subreaper +
+--           per-WorkScope handle cap, Phoenix startup subreaper +
 --           shutdown kill-tree, command safety checks (delegated to
 --           bash_check).
 -- Excludes:
@@ -18,10 +18,12 @@
 --     lives in design.md as a UI surface concern)
 --   - Landlock kernel mechanics (REQ-BASH-012/013 covered in design.md;
 --     here only the requires-clause for "Explore mode" gate is referenced)
---   - Cross-restart persistence: handles do NOT survive Phoenix restart
---     (see specs/tmux-integration/ for the persistent path)
+--   - Cross-restart persistence: handles survive a continuation boundary
+--     within a WorkScope but do NOT survive a Phoenix restart (see
+--     specs/tmux-integration/ for the persistent path)
 --
--- Requirement traceability: REQ-BASH-001 through REQ-BASH-015
+-- Requirement traceability: REQ-BASH-001 through REQ-BASH-015,
+--   REQ-BASH-WS-001, REQ-BASH-WS-002
 -- Dependencies: specs/bedrock/bedrock.allium
 
 use "../bedrock/bedrock.allium" as bedrock
@@ -30,10 +32,12 @@ use "../bedrock/bedrock.allium" as bedrock
 -- Actor Declarations
 ------------------------------------------------------------
 
--- The agent calling the bash tool. Identity is the conversation it runs in;
--- handle ownership is conversation-scoped, so an agent in conv A cannot
--- operate on a handle owned by conv B. This is enforced structurally by
--- looking up handles in conversation-keyed registries.
+-- The agent calling the bash tool. It runs in a conversation, which resolves
+-- to a WorkScope (ToolContext.work_scope). Handle ownership is WorkScope-
+-- scoped: an agent in one WorkScope cannot operate on a handle owned by
+-- another WorkScope, while conversations that resolve to the same WorkScope
+-- (a continuation chain) share one handle table. This is enforced
+-- structurally by looking up handles in WorkScope-keyed registries.
 actor LlmAgent {
     identified_by: bedrock/Conversation
 }
@@ -55,6 +59,17 @@ external entity ChildProcess {
 ------------------------------------------------------------
 -- Value Types
 ------------------------------------------------------------
+
+-- The durable-owner key for work-affine resources, shared with the terminal,
+-- browser, and tmux registries. Defined in
+-- crates/phoenix-ide/src/work_scope.rs. Variants carry the worktree path or
+-- the conversation id; stable_key() makes the namespaces disjoint. Two
+-- conversations that resolve to the same WorkScope (a continuation chain on
+-- one worktree) share a single handle table (REQ-BASH-WS-001).
+value WorkScope {
+    kind: WorkScopeKind
+    inner: String
+}
 
 -- A single line in the ring buffer or tombstone. The offset is monotonically
 -- increasing since spawn; line index 0 is the first line emitted by the
@@ -105,6 +120,16 @@ value ExitInformation {
 ------------------------------------------------------------
 -- Enumerations
 ------------------------------------------------------------
+
+-- Variants of WorkScope. Global is a singleton scope with no underlying
+-- worktree or conversation. Worktree carries a worktree path; Conversation
+-- carries a conversation id (Direct-mode conversations and sub-agents resolve
+-- to Conversation, behaviourally identical to per-conversation ownership).
+enum WorkScopeKind {
+    worktree
+    | conversation
+    | global
+}
 
 -- Handle lifecycle. running is initial; the three terminal states are
 -- exited, killed, and kill_pending_kernel.
@@ -174,13 +199,14 @@ enum KillOutcome {
 -- ring buffer is freed, and the handle is materialised as a Tombstone view
 -- with the same handle_id. Tombstones do not survive Phoenix restart.
 entity Handle {
-    -- Conversation that owns the handle. Cross-conversation lookups MUST
-    -- return handle_not_found.
-    conversation: bedrock/Conversation
+    -- WorkScope that owns the handle. Cross-WorkScope lookups MUST return
+    -- handle_not_found. Conversations that resolve to the same WorkScope
+    -- (a continuation chain) share the handle (REQ-BASH-WS-001).
+    work_scope: WorkScope
 
-    -- Stable identifier within a conversation. Format is implementation
+    -- Stable identifier within a work scope. Format is implementation
     -- detail (sequential "b-1", "b-2", ... is fine); Allium contract is
-    -- only that the pair (conversation, handle_id) is unique.
+    -- only that the pair (work_scope, handle_id) is unique.
     handle_id: String
 
     -- The command string as the agent supplied it. Stored verbatim for
@@ -270,7 +296,7 @@ config {
     -- 4 MB per-handle live ring buffer.
 
     live_handle_cap: Integer = 8
-    -- Per-conversation cap on handles with status = running.
+    -- Per-WorkScope cap on handles with status = running.
 
     kill_response_timeout_seconds: Integer = 30
     -- After the kill signal is sent, wait this long for the process to exit
@@ -345,17 +371,19 @@ rule PhoenixKillsLiveHandlesOnShutdown {
 rule HandleSpawned {
     when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
 
-    requires: count(Handle{conversation: conversation, status: running})
+    let work_scope = resolve_work_scope(conversation)
+
+    requires: count(Handle{work_scope: work_scope, status: running})
               < config.live_handle_cap
     requires: 0 <= wait_seconds
     requires: wait_seconds <= config.max_wait_seconds
     requires: bash_check_passes(cmd)
     requires: label = null or len(label) <= config.max_label_length
 
-    let h_id = next_handle_id(conversation)
+    let h_id = next_handle_id(work_scope)
 
     ensures: Handle.created(
-        conversation:     conversation,
+        work_scope:       work_scope,
         handle_id:        h_id,
         cmd:              cmd,
         label:            label,
@@ -364,7 +392,7 @@ rule HandleSpawned {
         ring_bytes_used:  0,
         next_line_offset: 0
     )
-    ensures: ChildProcessSpawned(conversation, h_id, cmd)
+    ensures: ChildProcessSpawned(work_scope, h_id, cmd)
 
     @guidance
         -- Run sequence (in src/tools/bash/operations.rs):
@@ -375,7 +403,7 @@ rule HandleSpawned {
         --      RunRejectedBySafety governs.
         --   3. Check live cap. On reject, return handle_cap_reached;
         --      RunRejectedByCap governs.
-        --   4. Allocate handle_id (next sequential within conversation).
+        --   4. Allocate handle_id (next sequential within work scope).
         --   5. Spawn child via Command::new("bash").args(["-c", cmd]) with
         --      pre_exec(setpgid(0,0)) so the child becomes its own process
         --      group leader. stdout and stderr piped, stdin null. Working
@@ -392,18 +420,21 @@ rule HandleSpawned {
         --      RunExceedsWait, depending on which event fires first.
 }
 
--- REQ-BASH-005: run rejected because the conversation is at its cap.
--- No handle is created.
+-- REQ-BASH-005, REQ-BASH-WS-001: run rejected because the work scope is at
+-- its cap. Both conversations of a continuation chain count against the one
+-- per-WorkScope cap. No handle is created.
 rule RunRejectedByCap {
     when: AgentCallsBashRun(conversation, cmd, wait_seconds, label)
 
-    requires: count(Handle{conversation: conversation, status: running})
+    let work_scope = resolve_work_scope(conversation)
+
+    requires: count(Handle{work_scope: work_scope, status: running})
               >= config.live_handle_cap
 
     ensures: AgentReceivesError(
         error: "handle_cap_reached",
         cap: config.live_handle_cap,
-        live_handles: live_handle_summary(conversation),
+        live_handles: live_handle_summary(work_scope),
         hint: "kill or wait on a handle before running more, or use the tmux tool for long-runners"
     )
 }
@@ -599,8 +630,9 @@ rule RingLineEvicted {
 rule HandlePeekedLive {
     when: AgentCallsBashPeek(conversation, handle_id, args)
 
-    requires: exists Handle{conversation: conversation, handle_id: handle_id}
-    let h = Handle{conversation: conversation, handle_id: handle_id}
+    let work_scope = resolve_work_scope(conversation)
+    requires: exists Handle{work_scope: work_scope, handle_id: handle_id}
+    let h = Handle{work_scope: work_scope, handle_id: handle_id}
     requires: h.status = running
     requires: not (args.lines != null and args.since != null)
 
@@ -621,8 +653,9 @@ rule HandlePeekedLive {
 rule HandlePeekedTombstoned {
     when: AgentCallsBashPeek(conversation, handle_id, args)
 
-    requires: exists Handle{conversation: conversation, handle_id: handle_id}
-    let h = Handle{conversation: conversation, handle_id: handle_id}
+    let work_scope = resolve_work_scope(conversation)
+    requires: exists Handle{work_scope: work_scope, handle_id: handle_id}
+    let h = Handle{work_scope: work_scope, handle_id: handle_id}
     requires: h.status in { exited, killed }
     requires: not (args.lines != null and args.since != null)
 
@@ -644,8 +677,9 @@ rule HandlePeekedTombstoned {
 rule HandlePeekedPendingKernel {
     when: AgentCallsBashPeek(conversation, handle_id, args)
 
-    requires: exists Handle{conversation: conversation, handle_id: handle_id}
-    let h = Handle{conversation: conversation, handle_id: handle_id}
+    let work_scope = resolve_work_scope(conversation)
+    requires: exists Handle{work_scope: work_scope, handle_id: handle_id}
+    let h = Handle{work_scope: work_scope, handle_id: handle_id}
     requires: h.status = kill_pending_kernel
     requires: not (args.lines != null and args.since != null)
 
@@ -670,11 +704,14 @@ rule HandlePeekArgsMutuallyExclusive {
     )
 }
 
--- REQ-BASH-003, REQ-BASH-014: handle id not found in this conversation.
+-- REQ-BASH-003, REQ-BASH-014, REQ-BASH-WS-001: handle id not found in this
+-- work scope. A handle id owned by another WorkScope is treated as
+-- nonexistent — no cross-scope leakage of handle existence.
 rule HandlePeekNotFound {
     when: AgentCallsBashPeek(conversation, handle_id, args)
 
-    requires: not exists Handle{conversation: conversation, handle_id: handle_id}
+    let work_scope = resolve_work_scope(conversation)
+    requires: not exists Handle{work_scope: work_scope, handle_id: handle_id}
 
     ensures: AgentReceivesError(
         error:     "handle_not_found",
@@ -729,8 +766,9 @@ rule HandleWaitedTimedOut {
 rule HandleWaitedAlreadyTerminal {
     when: AgentCallsBashWait(conversation, handle_id, args, wait_seconds)
 
-    requires: exists Handle{conversation: conversation, handle_id: handle_id}
-    let h = Handle{conversation: conversation, handle_id: handle_id}
+    let work_scope = resolve_work_scope(conversation)
+    requires: exists Handle{work_scope: work_scope, handle_id: handle_id}
+    let h = Handle{work_scope: work_scope, handle_id: handle_id}
     requires: h.status in { exited, killed }
     requires: not (args.lines != null and args.since != null)
 
@@ -745,11 +783,13 @@ rule HandleWaitedAlreadyTerminal {
     )
 }
 
--- REQ-BASH-014: wait on a foreign or unknown handle id.
+-- REQ-BASH-014, REQ-BASH-WS-001: wait on a foreign (other-WorkScope) or
+-- unknown handle id.
 rule HandleWaitNotFound {
     when: AgentCallsBashWait(conversation, handle_id, args, wait_seconds)
 
-    requires: not exists Handle{conversation: conversation, handle_id: handle_id}
+    let work_scope = resolve_work_scope(conversation)
+    requires: not exists Handle{work_scope: work_scope, handle_id: handle_id}
 
     ensures: AgentReceivesError(
         error:     "handle_not_found",
@@ -768,8 +808,9 @@ rule HandleWaitNotFound {
 rule HandleKilledByAgent {
     when: AgentCallsBashKill(conversation, handle_id, signal)
 
-    requires: exists Handle{conversation: conversation, handle_id: handle_id}
-    let h = Handle{conversation: conversation, handle_id: handle_id}
+    let work_scope = resolve_work_scope(conversation)
+    requires: exists Handle{work_scope: work_scope, handle_id: handle_id}
+    let h = Handle{work_scope: work_scope, handle_id: handle_id}
     requires: h.status = running
 
     ensures: SignalSentToGroup(h, signal)
@@ -868,8 +909,9 @@ rule HandleKillPendingKernel {
 rule HandleKillOnAlreadyTerminal {
     when: AgentCallsBashKill(conversation, handle_id, signal)
 
-    requires: exists Handle{conversation: conversation, handle_id: handle_id}
-    let h = Handle{conversation: conversation, handle_id: handle_id}
+    let work_scope = resolve_work_scope(conversation)
+    requires: exists Handle{work_scope: work_scope, handle_id: handle_id}
+    let h = Handle{work_scope: work_scope, handle_id: handle_id}
     requires: h.status in { exited, killed }
 
     ensures: AgentReceivesKillResponse(
@@ -890,19 +932,22 @@ rule HandleKillOnAlreadyTerminal {
 rule HandleKilledOnKillPendingKernel {
     when: AgentCallsBashKill(conversation, handle_id, signal)
 
-    requires: exists Handle{conversation: conversation, handle_id: handle_id}
-    let h = Handle{conversation: conversation, handle_id: handle_id}
+    let work_scope = resolve_work_scope(conversation)
+    requires: exists Handle{work_scope: work_scope, handle_id: handle_id}
+    let h = Handle{work_scope: work_scope, handle_id: handle_id}
     requires: h.status = kill_pending_kernel
 
     ensures: SignalSentToGroup(h, signal)
     ensures: KillResponseWindowOpened(h, signal, config.kill_response_timeout_seconds)
 }
 
--- REQ-BASH-014: kill on a foreign or unknown handle id.
+-- REQ-BASH-014, REQ-BASH-WS-001: kill on a foreign (other-WorkScope) or
+-- unknown handle id.
 rule HandleKillNotFound {
     when: AgentCallsBashKill(conversation, handle_id, signal)
 
-    requires: not exists Handle{conversation: conversation, handle_id: handle_id}
+    let work_scope = resolve_work_scope(conversation)
+    requires: not exists Handle{work_scope: work_scope, handle_id: handle_id}
 
     ensures: AgentReceivesError(
         error:     "handle_not_found",
@@ -914,23 +959,54 @@ rule HandleKillNotFound {
 -- Rules — conversation hard-delete cascade
 ------------------------------------------------------------
 
--- REQ-BASH-006: conversation hard-delete kills any live handles and removes
--- all tombstones (live or terminal) for that conversation.
-rule HandlesRemovedByConversationDelete {
-    when: ConversationHardDeleted(conversation)
+-- REQ-BASH-006, REQ-BASH-WS-002: conversation hard-delete tears down the
+-- WorkScope's handle table only when no surviving conversation inherits the
+-- same WorkScope. The cascade receives the deleted conversation's WorkScope
+-- (via resolve_work_scope) and the inheritor's WorkScope (if any) and tears
+-- down only when they differ — kills any live handles and drops every handle
+-- (live or tombstoned) in the table. Mirrors cascade_terminal_on_delete /
+-- cascade_browser_on_delete.
+rule HandlesTornDownWhenNoInheritor {
+    when: ConversationHardDeleted(conversation, inheritor_scope)
 
-    requires: exists Handle{conversation: conversation}
+    let work_scope = resolve_work_scope(conversation)
 
-    ensures: KillSignalSentForAllLiveHandles(conversation)
-        -- Composite: for every Handle h with conversation = conversation
-        -- and status in {running, kill_pending_kernel}, send SIGKILL to
-        -- h.pgid (no grace, no agent-visible response).
-    ensures: not exists Handle{conversation: conversation}
+    requires: inheritor_scope != Some(work_scope)
+    requires: exists Handle{work_scope: work_scope}
+
+    ensures: KillSignalSentForAllLiveHandles(work_scope)
+        -- Composite: for every Handle h with work_scope = work_scope and
+        -- status in {running, kill_pending_kernel}, send SIGKILL to h.pgid
+        -- (no grace, no agent-visible response).
+    ensures: not exists Handle{work_scope: work_scope}
 
     @guidance
         -- The conversation-delete path runs synchronously in the deletion
         -- transaction. Live processes are killed immediately (SIGKILL, no
         -- grace, since no agent is left to observe a graceful close).
+}
+
+-- REQ-BASH-WS-002: conversation hard-delete preserves the WorkScope's handle
+-- table when a surviving conversation (typically a continuation) inherits the
+-- same WorkScope. The inheritor keeps the running processes and tombstones;
+-- a handle spawned before the continuation boundary stays addressable. Scope
+-- equality subsumes per-kind analysis: a Direct continuation resolves to a
+-- distinct Conversation scope and falls through to teardown.
+rule HandlesPreservedOnScopeMatch {
+    when: ConversationHardDeleted(conversation, inheritor_scope)
+
+    let work_scope = resolve_work_scope(conversation)
+
+    requires: inheritor_scope = Some(work_scope)
+
+    ensures: not KillSignalSentForAllLiveHandles
+        -- The WorkScope's running processes are left alive for the inheritor.
+    ensures: exists Handle{work_scope: work_scope}
+        -- Handles and tombstones are left intact.
+
+    @guidance
+        -- The skip is observable only as a `debug` log line — the absence of
+        -- teardown is otherwise indistinguishable from "no handles existed."
 }
 
 ------------------------------------------------------------
@@ -962,16 +1038,20 @@ rule OpDiscriminatorRequired {
 -- Invariants
 ------------------------------------------------------------
 
--- REQ-BASH-005
+-- REQ-BASH-005, REQ-BASH-WS-001: the cap is per-WorkScope. Both
+-- conversations of a continuation chain count against the one scope's cap.
 invariant LiveHandleCapBound {
-    for c in bedrock/Conversation:
-        count(Handle{conversation: c, status: running}) <= config.live_handle_cap
+    for s in WorkScopes:
+        count(Handle{work_scope: s, status: running}) <= config.live_handle_cap
 }
 
--- REQ-BASH-014
-invariant HandleConversationScoped {
+-- REQ-BASH-014, REQ-BASH-WS-001: handles are reachable only within their
+-- owning WorkScope; a handle id presented under a different WorkScope is
+-- treated as nonexistent. Conversations that resolve to the same WorkScope
+-- (a continuation chain) share one handle table.
+invariant HandleWorkScopeScoped {
     for h in Handle:
-        h.conversation != null
+        h.work_scope != null
 }
 
 -- REQ-BASH-006
@@ -1021,34 +1101,40 @@ surface AgentBashAccess {
             when bash_check_passes(cmd)
             and 0 <= wait_seconds and wait_seconds <= config.max_wait_seconds
             and (label = null or len(label) <= config.max_label_length)
-            and count(Handle{conversation: conversation, status: running})
+            and count(Handle{work_scope: resolve_work_scope(conversation), status: running})
                 < config.live_handle_cap
 
         AgentCallsBashPeek(conversation, handle_id, args)
-            when exists Handle{conversation: conversation, handle_id: handle_id}
+            when exists Handle{work_scope: resolve_work_scope(conversation), handle_id: handle_id}
 
         AgentCallsBashWait(conversation, handle_id, args, wait_seconds)
-            when exists Handle{conversation: conversation, handle_id: handle_id}
+            when exists Handle{work_scope: resolve_work_scope(conversation), handle_id: handle_id}
             and 0 <= wait_seconds and wait_seconds <= config.max_wait_seconds
 
         AgentCallsBashKill(conversation, handle_id, signal)
-            when exists Handle{conversation: conversation, handle_id: handle_id}
+            when exists Handle{work_scope: resolve_work_scope(conversation), handle_id: handle_id}
 
     @guarantee HandleOwnership
         -- Every handle returned to the agent is owned by the agent's
-        -- conversation. The agent cannot inspect, peek, wait on, or kill
-        -- handles owned by other conversations even if it learns their
-        -- handle_id strings: the lookup is always conversation-keyed and
+        -- WorkScope. The agent cannot inspect, peek, wait on, or kill
+        -- handles owned by other WorkScopes even if it learns their
+        -- handle_id strings: the lookup is always WorkScope-keyed and
         -- HandlePeekNotFound / HandleWaitNotFound / HandleKillNotFound
-        -- treat foreign handles as nonexistent.
+        -- treat foreign handles as nonexistent. Conversations that resolve
+        -- to the same WorkScope (a continuation chain) share one handle
+        -- table, so a handle spawned before a continuation boundary stays
+        -- addressable after it.
 
     @guarantee NoSilentEviction
         -- Within a single Phoenix process lifetime, a handle handed to the
-        -- agent will remain peekable until either the conversation is hard-
-        -- deleted or the Phoenix process exits. The agent will never be
-        -- told a handle is gone without an explicit cause it can reason
-        -- about. Persistence across Phoenix restart is NOT guaranteed —
-        -- agents that need that should use the tmux tool.
+        -- agent will remain peekable until either the owning WorkScope is
+        -- torn down (a conversation in the scope is hard-deleted and no
+        -- surviving conversation inherits the scope) or the Phoenix process
+        -- exits. A handle survives a continuation boundary within its
+        -- WorkScope. The agent will never be told a handle is gone without
+        -- an explicit cause it can reason about. Persistence across Phoenix
+        -- restart is NOT guaranteed — agents that need that should use the
+        -- tmux tool.
 
     @guarantee NoAutoEscalation
         -- A kill call sends exactly the signal the agent requested, once.
@@ -1109,8 +1195,9 @@ deferred BashHandleCrossRestartPersistence
 --     POSIX-trained models default to the kill-on-timeout intuition
 --     otherwise.
 --   - Hard live-handle cap with structured failure (no LRU eviction).
---   - Demote-on-exit + tombstone retained until conversation hard-delete
---     OR Phoenix process exit (whichever comes first).
+--   - Demote-on-exit + tombstone retained until the owning WorkScope is
+--     torn down (hard-delete with no inheritor) OR Phoenix process exit
+--     (whichever comes first).
 --   - In-memory tombstones only; no SQLite shadow store, no
 --     lost_in_restart structured response. Agents that need persistence
 --     across Phoenix restart use the tmux tool.
@@ -1125,6 +1212,10 @@ deferred BashHandleCrossRestartPersistence
 --   - PR_SET_CHILD_SUBREAPER at startup + SIGKILL kill-tree at shutdown
 --     replaces the wrong assumption that SIGHUP cascade would clean up
 --     children of a dying Phoenix.
---   - Handle id format is implementation detail (sequential per
---     conversation, e.g. "b-1"); Allium contract is "unique within a
---     conversation."
+--   - Handle id format is implementation detail (sequential within a
+--     work scope, e.g. "b-1"); Allium contract is "unique within a
+--     WorkScope."
+--   - Handle registry keyed by WorkScope, matching the terminal, browser,
+--     and tmux registries: continuation conversations on one worktree share
+--     a handle table, and the hard-delete cascade skips teardown when an
+--     inheritor shares the scope (REQ-BASH-WS-001, REQ-BASH-WS-002).

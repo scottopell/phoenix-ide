@@ -23,10 +23,12 @@ or kill the process. The tool itself remains pipe-backed and non-interactive —
 PTY needs and "I want this to survive Phoenix restart" needs are served by the
 separate `tmux` tool (see `specs/tmux-integration/`).
 
-**Persistence boundary:** handles are in-memory only. They survive arbitrarily
-long within a single Phoenix process, but a Phoenix restart drops them — the
-agent will see `handle_not_found` on a previously-known handle. Persistence
-across Phoenix restart is what `tmux` is for.
+**Persistence boundary:** handles are in-memory only, owned by the `WorkScope`
+that spawned them (REQ-BASH-WS-001). They survive arbitrarily long within a
+single Phoenix process — including across a continuation boundary, because a
+continuation inherits its predecessor's `WorkScope` — but a Phoenix restart
+drops them: the agent will see `handle_not_found` on a previously-known handle.
+Persistence across Phoenix restart is what `tmux` is for.
 
 ## Requirements
 
@@ -238,19 +240,19 @@ to respond.
 
 ### REQ-BASH-005: Live Handle Cap
 
-WHEN agent calls `bash(cmd=<command>, ...)` AND the conversation has
+WHEN agent calls `bash(cmd=<command>, ...)` AND the work scope has
 `LIVE_HANDLE_CAP` (default 8) live handles (status `running`)
 THE SYSTEM SHALL reject the call with:
 - `error: "handle_cap_reached"`
 - `cap`: the configured value
 - `live_handles`: list of `{ handle, cmd, age_seconds, status }` for each live
-  handle in the conversation
+  handle in the work scope
 - `hint`: text directing the agent to kill or wait on a handle, or use the
   `tmux` tool for long-runners
 
 WHEN a handle transitions out of `running` (exit, kill, signal)
 THE SYSTEM SHALL decrement the live count
-AND a subsequent run from the same conversation MAY succeed if it brings the
+AND a subsequent run in the same work scope MAY succeed if it brings the
 live count under the cap
 
 **Rationale:** A hard refusal is the pit-of-success failure mode. LRU eviction
@@ -291,10 +293,16 @@ THE SYSTEM SHALL respond with the same `status: "tombstoned"` shape as
 peek/wait — no `already_terminal` flag is needed because the
 `tombstoned` status conveys it
 
-WHEN a conversation is hard-deleted
-THE SYSTEM SHALL kill any of that conversation's processes whose handles are
+WHEN a conversation is hard-deleted AND no surviving conversation inherits its
+`WorkScope`
+THE SYSTEM SHALL kill any of that `WorkScope`'s processes whose handles are
 still `running`
-AND remove all tombstone records for that conversation
+AND remove all tombstone records for that `WorkScope`
+
+WHEN a conversation is hard-deleted AND a continuation inherits the same
+`WorkScope`
+THE SYSTEM SHALL leave that `WorkScope`'s handles and tombstones intact for the
+inheritor (REQ-BASH-WS-002)
 
 WHEN Phoenix shuts down (gracefully or via crash)
 THE SYSTEM SHALL kill all live processes via the reaper machinery
@@ -618,33 +626,92 @@ AND the absence of Landlock SHALL NOT prevent Work mode from functioning
 
 ---
 
-### REQ-BASH-014: Stateless Tool with Per-Conversation Handle Registry
+### REQ-BASH-014: Stateless Tool with Per-WorkScope Handle Registry
 
 WHEN bash tool is invoked
 THE SYSTEM SHALL receive all execution context via a `ToolContext` parameter
 AND derive working directory from `ToolContext.working_dir`
 AND use `ToolContext.cancel` for cancellation handling
 AND access the bash handle registry via `ctx.bash_handles()`, which SHALL
-return `Result<Arc<RwLock<ConversationHandles>>, BashHandleError>` matching
+resolve the table for `ToolContext.work_scope` and return
+`Result<Arc<RwLock<WorkScopeHandles>>, BashHandleError>` matching
 the existing `ctx.browser()` accessor's `async + Result + Arc<RwLock<...>>`
 shape
 
 WHEN bash tool is constructed
-THE SYSTEM SHALL NOT store per-conversation state on the tool itself
-AND tool instance SHALL be reusable across conversations
+THE SYSTEM SHALL NOT store per-WorkScope state on the tool itself
+AND tool instance SHALL be reusable across conversations and work scopes
 
-THE handle registry SHALL be per-conversation; calls in one conversation cannot
-peek, wait, or kill handles owned by another conversation. A `handle_not_found`
-is the response if a handle ID from one conversation is presented in another.
+THE handle registry SHALL be keyed by `WorkScope`; calls in one work scope
+cannot peek, wait, or kill handles owned by another work scope. Conversations
+that resolve to the same `WorkScope` — a continuation chain on one worktree —
+share a single handle table. A `handle_not_found` is the response if a handle
+ID from one work scope is presented in another.
 
 **Rationale:** The bash tool itself remains stateless — instance reusable,
 context flows through `ToolContext`. The handle table is a shared service
 (like the browser session manager), reached through the context, scoped to the
-conversation. The accessor signature was aligned in revision 2 with the
-existing `browser()` shape so all per-conversation tool registries share one
-pattern (`async fn foo(&self) -> Result<Arc<RwLock<T>>, FooError>`); the
-earlier draft proposed an idiosyncratic lifetime-bound `BashHandleScope<'_>`
-that does not compose with `ToolContext: Clone`.
+`WorkScope`. The accessor signature matches the `browser()` shape so all
+`WorkScope`-keyed tool registries (browser, tmux, terminal, bash) share one
+pattern (`async fn foo(&self) -> Result<Arc<RwLock<T>>, FooError>`); a
+lifetime-bound `BashHandleScope<'_>` alternative does not compose with
+`ToolContext: Clone`.
+
+---
+
+### REQ-BASH-WS-001: Handle Registry Keyed by WorkScope
+
+THE handle registry SHALL key its per-scope handle tables by `WorkScope`, not
+by conversation id — matching the terminal, browser, and tmux registries
+(REQ-TERM-WS-001, REQ-BROWSER-WS-001).
+
+WHEN two conversations resolve to the same `WorkScope` (a continuation chain on
+one worktree)
+THE SYSTEM SHALL give them the same handle table, so a handle spawned before a
+continuation boundary remains addressable for peek/wait/kill after it
+AND count both conversations' live handles against the one per-`WorkScope`
+`LIVE_HANDLE_CAP` (REQ-BASH-005)
+
+WHEN a handle id owned by one `WorkScope` is presented in a call running under a
+different `WorkScope`
+THE SYSTEM SHALL return `error: "handle_not_found"` (no cross-scope leakage of
+handle existence)
+
+**Rationale:** A backgrounded process is a `WorkScope`-level resource, like the
+tmux server and browser session that share its worktree. Conversation-keying
+orphans a live process at every continuation boundary: the process keeps
+running but becomes unaddressable from the continuation, so the agent sees the
+runtime silently forget half its in-flight work. Keying by `WorkScope` makes
+bash symmetric with the other three runtime resources and makes "the work scope
+owns its processes" structural rather than conventional. Direct-mode
+conversations and sub-agents resolve to `WorkScope::Conversation(id)`, for which
+this is exactly one conversation's handles; only worktree-backed chains differ,
+and they differ toward survival.
+
+---
+
+### REQ-BASH-WS-002: Hard-Delete Cascade Respects Inheritor Scope
+
+WHEN a conversation is hard-deleted AND a surviving conversation (typically a
+continuation) inherits the same `WorkScope`
+THE SYSTEM SHALL NOT kill that `WorkScope`'s running processes or drop its
+tombstones — the inheritor keeps them
+
+WHEN a conversation is hard-deleted AND no surviving conversation inherits its
+`WorkScope`
+THE SYSTEM SHALL kill every running process in that `WorkScope`'s handle table
+AND drop the `WorkScope`'s handles and tombstones
+
+THE cascade SHALL receive the deleted conversation's `WorkScope` and the
+inheritor's `WorkScope` (if any) and SHALL skip teardown when they match,
+mirroring `cascade_terminal_on_delete` / `cascade_browser_on_delete`
+(REQ-TERM-WS-002, REQ-BROWSER-WS-002).
+
+**Rationale:** Without inheritor awareness, archiving the parent of a live
+continuation chain SIGKILLs processes the continuation still depends on while
+its tmux server and browser session survive — an asymmetry the agent
+experiences as the runtime randomly forgetting work. Scope-match-skip is the
+rule the other `WorkScope`-keyed resources already use.
 
 ---
 
@@ -691,7 +758,7 @@ operations so the UI has a sensible display for non-run calls.
 |---|---|---|
 | `MAX_WAIT_SECONDS` | 900 | Upper bound on `wait_seconds` per call |
 | `RING_BUFFER_BYTES` | 4 MB | Per-handle live ring buffer size |
-| `LIVE_HANDLE_CAP` | 8 | Per-conversation cap on `running` handles |
+| `LIVE_HANDLE_CAP` | 8 | Per-WorkScope cap on `running` handles |
 | `KILL_RESPONSE_TIMEOUT_SECONDS` | 30 | After signal sent, wait this long for exit before returning `kill_pending_kernel` |
 | `SHUTDOWN_KILL_GRACE_SECONDS` | 2 | Time Phoenix waits at shutdown for SIGKILL'd groups to exit |
 | `TOMBSTONE_TAIL_LINES` | 2000 | Lines retained in `final_tail` after exit demotion |

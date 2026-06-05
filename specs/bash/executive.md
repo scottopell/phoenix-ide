@@ -15,7 +15,7 @@ D-state-hang case). On process exit, the live ring is demoted to a compact
 in-memory tombstone retained until the conversation is hard-deleted or the
 Phoenix process exits.
 
-A per-conversation cap of 8 live handles is enforced with an explicit
+A per-WorkScope cap of 8 live handles is enforced with an explicit
 `handle_cap_reached` error listing existing handles — no silent eviction.
 Persistence across Phoenix or system restart belongs to the separate
 `tmux` tool (see `specs/tmux-integration/`); this tool is "cheap and
@@ -31,10 +31,11 @@ assumption that SIGHUP cascade would clean up children when Phoenix died.
 
 `BashTool` is a stateless `Tool` reached via `ToolContext.bash_handles()`,
 which mirrors the existing browser-session pattern: `async fn bash_handles(&self)
--> Result<Arc<RwLock<ConversationHandles>>, BashHandleError>`. The handle
-registry holds per-conversation maps of live handles and tombstones,
-in-memory only — no SQLite shadow store, no cross-restart persistence (the
-agent uses `tmux` for that).
+-> Result<Arc<RwLock<WorkScopeHandles>>, BashHandleError>`. The handle
+registry holds per-`WorkScope` maps of live handles and tombstones — keyed by
+`WorkScope` like the browser, tmux, and terminal registries, so a continuation
+chain on one worktree shares one table. In-memory only — no SQLite shadow
+store, no cross-restart persistence (the agent uses `tmux` for that).
 
 A live handle owns a 4MB byte-bounded ring buffer with monotonic per-line
 offsets; reader tasks split incoming pipe bytes on newlines and append to
@@ -81,22 +82,30 @@ unchanged from the prior revision; both run on the run path only.
 | **REQ-BASH-011:** Command Safety Checks | ✅ Carry-forward | `brush-parser` AST walk unchanged |
 | **REQ-BASH-012:** Landlock Enforcement | 🔄 Renumbered | Was REQ-BASH-008; behavior unchanged |
 | **REQ-BASH-013:** Graceful Degradation Without Landlock | 🔄 Renumbered | Was REQ-BASH-009; behavior unchanged |
-| **REQ-BASH-014:** Stateless Tool with Per-Conversation Handle Registry | 🔄 Rewrite | Was REQ-BASH-010; tool stays stateless, registry reached via `ctx.bash_handles()` matching browser pattern |
+| **REQ-BASH-014:** Stateless Tool with Per-WorkScope Handle Registry | 🔄 Rewrite | Was REQ-BASH-010; tool stays stateless, registry reached via `ctx.bash_handles()` matching browser pattern |
+| **REQ-BASH-WS-001:** Handle Registry Keyed by WorkScope | ❌ New | Registry keyed by `WorkScope`, not conversation id; handles survive the continuation boundary; symmetric with tmux/browser/terminal |
+| **REQ-BASH-WS-002:** Hard-Delete Cascade Respects Inheritor Scope | ❌ New | `cascade_bash_on_delete` consults inheritor `WorkScope` and skips teardown on scope match, like `cascade_terminal/browser_on_delete` |
 | **REQ-BASH-015:** Display Command Simplification | 🔄 Carry-forward + extension | Was REQ-BASH-011; new display labels for peek/wait/kill |
 
-**Progress:** 0 of 15 implemented under the new spec; this revision is a
+**Progress:** 0 of 17 implemented under the new spec; this revision is a
 greenfield rewrite of the runtime portion. Carry-forward items (REQ-BASH-011,
 -012, -013, -015) reuse the existing `bash_check.rs`, Landlock integration,
-and display simplification logic; rewrite items require new code.
+and display simplification logic; rewrite items require new code. The
+`WorkScope`-keying requirements (REQ-BASH-WS-001, -WS-002) re-key the registry
+from conversation id to `WorkScope` and bring the hard-delete cascade in line
+with the other `WorkScope`-keyed resources.
 
 ## Bedrock Dependency
 
 REQ-BASH-006's hard-delete cascade is wired through
 `cascade_bash_on_delete`, called directly from the bedrock hard-delete
-handler per REQ-BED-032. The cascade orchestrator runs as a sequence of
-direct function calls; there is no event-bus / subscriber-registration
-pattern. Implementing this requires REQ-BED-032 to be in place — which
-it is, as part of the same spec set under review.
+handler per REQ-BED-032. The cascade receives the deleted conversation's
+`WorkScope` and the inheritor's `WorkScope` (REQ-BASH-WS-002) and skips
+teardown on scope match — the same signature the terminal and browser
+cascades take. The orchestrator runs as a sequence of direct function calls;
+there is no event-bus / subscriber-registration pattern. Implementing this
+requires REQ-BED-032 to be in place — which it is, as part of the same spec
+set under review.
 
 ## Behavioural Specification
 
@@ -113,10 +122,10 @@ The corresponding Allium spec is `specs/bash/bash.allium`. It models:
 - Reaper rules: `PhoenixSetsSubreaperOnStartup` and
   `PhoenixKillsLiveHandlesOnShutdown` cover the new
   `PR_SET_CHILD_SUBREAPER` / kill-tree machinery.
-- Invariants: per-conversation live-handle cap, conversation-scoped handle
+- Invariants: per-`WorkScope` live-handle cap, `WorkScope`-scoped handle
   ownership, monotonic line offsets, kill_pending_kernel implies the
   process is alive (pid/pgid available for re-signalling).
-- Surface `AgentBashAccess` with structural conversation scoping and
+- Surface `AgentBashAccess` with structural `WorkScope` scoping and
   guarantees `HandleOwnership`, `NoSilentEviction`, and
   `NoAutoEscalation`.
 

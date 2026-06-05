@@ -12,7 +12,10 @@ process lifetime.
 
 Tmux-backed processes (TTY, persistence across Phoenix restart) are out of
 scope here; see `specs/tmux-integration/`. Handles in this spec are
-in-memory only — they do not survive Phoenix restart.
+in-memory only and owned by the spawning conversation's `WorkScope`: they
+survive arbitrarily long within a Phoenix process — including across a
+continuation boundary, since a continuation inherits its predecessor's
+`WorkScope` — but they do not survive Phoenix restart.
 
 ## Tool Surface (REQ-BASH-002, REQ-BASH-003, REQ-BASH-010)
 
@@ -184,21 +187,25 @@ pub struct ToolContext {
     pub cancel: CancellationToken,
     pub conversation_id: String,
     pub working_dir: PathBuf,
+    pub work_scope: WorkScope,
     browser_sessions: Arc<BrowserSessionManager>,
     bash_handles: Arc<BashHandleRegistry>,
 }
 
 impl ToolContext {
-    pub async fn bash_handles(&self) -> Result<Arc<RwLock<ConversationHandles>>, BashHandleError> {
-        self.bash_handles.get_or_create(&self.conversation_id).await
+    pub async fn bash_handles(&self) -> Result<Arc<RwLock<WorkScopeHandles>>, BashHandleError> {
+        self.bash_handles.get_or_create(&self.work_scope).await
     }
 }
 ```
 
-Returning `Arc<RwLock<...>>` rather than a lifetime-bound guard composes
-cleanly with `ToolContext: Clone` and matches the established pattern.
-Per-conversation handles never appear in two places: `get_or_create`
-returns the same `Arc` for the same conversation id.
+`work_scope` is resolved once at `ToolContext` construction
+(`WorkScope::resolve(conversation_id, worktree_path)`), exactly as the browser
+and tmux accessors already consume it. Returning `Arc<RwLock<...>>` rather than
+a lifetime-bound guard composes cleanly with `ToolContext: Clone` and matches
+the established pattern. Per-`WorkScope` handles never appear in two places:
+`get_or_create` returns the same `Arc` for the same `WorkScope`, so a
+continuation chain on one worktree shares one table.
 
 ## Child Process Reaper (REQ-BASH-007)
 
@@ -252,10 +259,10 @@ Phoenix waits for the kernel to deliver the exits before returning control.
 
 ```rust
 pub struct BashHandleRegistry {
-    inner: Arc<DashMap<ConversationId, Arc<RwLock<ConversationHandles>>>>,
+    inner: Arc<DashMap<WorkScope, Arc<RwLock<WorkScopeHandles>>>>,
 }
 
-pub struct ConversationHandles {
+pub struct WorkScopeHandles {
     next_id: u64,
     live: HashMap<HandleId, Arc<Handle>>,
     tombstones: HashMap<HandleId, Arc<Handle>>,
@@ -263,7 +270,7 @@ pub struct ConversationHandles {
 
 pub struct Handle {
     handle_id: HandleId,
-    conversation_id: ConversationId,
+    work_scope: WorkScope,
     cmd: String,
     started_at: SystemTime,
     state: RwLock<Arc<HandleState>>,
@@ -314,7 +321,7 @@ pub struct RingLine {
 ```
 
 `RwLock<Arc<HandleState>>` rather than `ArcSwap` is the deliberate choice:
-contention is bounded (per-conversation cap is 8 handles, peek is brief,
+contention is bounded (per-WorkScope cap is 8 handles, peek is brief,
 demotion is once-per-process), the existing browser pattern uses `RwLock`,
 and `ArcSwap`'s hazard-pointer model has surprising `Drop`-ordering
 behavior that doesn't pull its weight here.
@@ -338,8 +345,8 @@ agent → BashTool::run(input, ctx)
             ├─ bash_check::check(cmd) — REQ-BASH-011
             │     ┌─ reject → command_safety_rejected error
             │     └─ ok    → continue
-            ├─ ctx.bash_handles().await? → Arc<RwLock<ConversationHandles>>
-            ├─ ConversationHandles::reserve_slot()
+            ├─ ctx.bash_handles().await? → Arc<RwLock<WorkScopeHandles>>
+            ├─ WorkScopeHandles::reserve_slot()
             │     ┌─ count >= LIVE_HANDLE_CAP → handle_cap_reached error
             │     └─ slot reserved with handle_id allocation
             ├─ spawn child process (group leader)
@@ -572,8 +579,8 @@ async fn shape_response(&self, handle: Arc<Handle>, read_args: ReadArgs) -> Tool
 view.
 
 A handle that's not in the live or tombstone tables returns
-`handle_not_found` immediately. Cross-conversation handle ids return the
-same response — the lookup is conversation-keyed.
+`handle_not_found` immediately. Cross-scope handle ids return the
+same response — the lookup is `WorkScope`-keyed.
 
 ## Wait (REQ-BASH-003)
 
@@ -665,13 +672,24 @@ now-terminal state.
 just the bash that ran `bash -c "..."`. Combined with the subreaper bit
 set at startup, this catches escapees that reparent to Phoenix.
 
-## Hard-Delete Cascade (REQ-BASH-006)
+## Hard-Delete Cascade (REQ-BASH-006, REQ-BASH-WS-002)
 
-Wired into the bedrock conversation-hard-delete handler:
+Wired into the bedrock conversation-hard-delete handler, with the same
+`(work_scope, inheritor_scope)` signature the terminal and browser cascades
+take:
 
 ```rust
-async fn cascade_bash_on_delete(registry: &BashHandleRegistry, conv: &ConversationId) {
-    let Some(handles_arc) = registry.remove(conv) else { return; };
+async fn cascade_bash_on_delete(
+    registry: &BashHandleRegistry,
+    work_scope: &WorkScope,
+    inheritor_scope: Option<&WorkScope>,
+) {
+    // A continuation inheriting the same scope keeps the live processes and
+    // tombstones — they belong to the WorkScope, not the deleted conversation.
+    if inheritor_scope == Some(work_scope) {
+        return;
+    }
+    let Some(handles_arc) = registry.remove(work_scope) else { return; };
     let handles = handles_arc.write().await;
     for (_, handle) in handles.live.iter() {
         if let HandleState::Live(live) = handle.state.read().await.as_ref() {
@@ -682,10 +700,12 @@ async fn cascade_bash_on_delete(registry: &BashHandleRegistry, conv: &Conversati
 }
 ```
 
-The conversation-hard-delete handler runs this synchronously alongside
-the tmux server kill (`specs/tmux-integration/`) and any other per-
-conversation cleanup. There is no SQLite shadow store to clean up;
-in-memory tombstones are dropped along with the registry entry.
+The hard-delete handler runs this synchronously alongside the tmux server kill
+(`specs/tmux-integration/`) and the browser-session cascade, passing the same
+`inheritor_scope` to all three so a continuation chain on one worktree keeps
+its bash processes, tmux server, and browser session together. There is no
+SQLite shadow store to clean up; in-memory tombstones are dropped along with
+the registry entry when no inheritor survives.
 
 > **Bedrock dependency:** the hard-delete cascade integration is wired
 > through `cascade_bash_on_delete`, called directly from the bedrock
@@ -716,7 +736,7 @@ Error-specific fields (representative subset):
 // handle_cap_reached
 {
   "error": "handle_cap_reached",
-  "error_message": "this conversation has reached the cap of 8 live handles",
+  "error_message": "this work scope has reached the cap of 8 live handles",
   "cap": 8,
   "live_handles": [
     { "handle": "b-3", "cmd": "cargo test", "label": "tests", "age_seconds": 1820, "status": "running" }
@@ -755,7 +775,7 @@ Error-specific fields (representative subset):
 // handle_not_found — with hint about Phoenix restart
 {
   "error": "handle_not_found",
-  "error_message": "handle b-7 not found in this conversation",
+  "error_message": "handle b-7 not found in this work scope",
   "handle_id": "b-7",
   "hint": "if Phoenix restarted since this handle was created, the handle was lost — bash handles do not survive Phoenix restart. For processes that should survive Phoenix restart, use the tmux tool."
 }
@@ -858,14 +878,20 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
 - Late-arriving exit after `kill_pending_kernel`: handle transitions
   `kill_pending_kernel → killed` (or `→ exited`); subsequent peek/wait/
   kill observes the now-tombstoned state via `status: "tombstoned"`.
-- Hard-delete a conversation with live handles → processes killed,
-  in-memory entries gone.
+- Hard-delete a conversation with live handles AND no inheritor scope →
+  processes killed, in-memory entries gone.
+- Hard-delete a conversation whose continuation inherits the same `WorkScope`
+  (`inheritor_scope == work_scope`) → processes left running, handles and
+  tombstones still reachable from the continuation (REQ-BASH-WS-002).
+- Continuation across the boundary: a handle spawned in the parent conversation
+  is peekable/waitable/killable from the continuation that inherits its
+  `WorkScope` (REQ-BASH-WS-001).
 - Phoenix shutdown with live handles → kill-tree pass SIGKILLs all groups;
   reaper bit is set so escapees are caught.
 - Cap rejection: run while at cap returns `handle_cap_reached` with the
   full live-handles list.
-- Cross-conversation handle access: a handle id from conv A used in conv B
-  returns `handle_not_found` (does not leak existence).
+- Cross-scope handle access: a handle id owned by one `WorkScope` used under a
+  different `WorkScope` returns `handle_not_found` (does not leak existence).
 
 ### Property tests
 - `peek(since=end_offset)` after any sequence of writes never re-reads
@@ -893,7 +919,7 @@ src/tools/
 ├── bash/
 │   ├── handle.rs        # Handle, LiveData, Tombstone, RwLock<Arc<HandleState>> swap
 │   ├── ring.rs          # RingBuffer, RingLine, eviction
-│   ├── registry.rs      # BashHandleRegistry, ConversationHandles
+│   ├── registry.rs      # BashHandleRegistry, WorkScopeHandles
 │   ├── reader.rs        # stdout/stderr → ring tasks
 │   ├── waiter.rs        # Child::wait → demotion task; FinalCause discrimination
 │   ├── kill.rs          # signal sending; KILL_RESPONSE_TIMEOUT; kill_pending_kernel transition
@@ -955,8 +981,10 @@ updated to also accept `wait_seconds` and the operation modes.
 - `phoenix-client.py`: any client-side parsing of bash output.
 - `src/db/migrations/`: **no new migration** (we deliberately dropped the
   SQLite shadow store — see REQ-BASH-006 rationale).
-- `src/runtime/`: hard-delete cascade gains a bash-cleanup step (depends
-  on bedrock surfacing a hard-delete event; see Bedrock dependency above).
+- `src/runtime/`: hard-delete cascade gains a `WorkScope`-aware bash-cleanup
+  step that takes `inheritor_scope` and skips teardown on scope match, called
+  beside the tmux/browser cascades (depends on bedrock surfacing a hard-delete
+  event; see Bedrock dependency above).
 - Phoenix startup: `install_reaper()` call wired into the existing
   startup sequence.
 - Phoenix shutdown: `shutdown_kill_tree()` wired into the existing
