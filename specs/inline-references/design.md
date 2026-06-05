@@ -85,14 +85,24 @@ single type that answers "where do `@file` / `./path` / `/skill` resolve":
   `discover_skills` / `invoke_skill` run unchanged.
 
 A single constructor, `ResolutionRoot::for_create(cwd, mode, base_branch)`,
-builds the root from a conversation's creation parameters. **Both** the composer
-autocomplete endpoints and create-time `message_expander::expand` construct the
-root through it, so the candidate set offered to the user and the set the first
-message expands against cannot diverge. (This closes the failure mode where
-`cwd`-based discovery disagreed with worktree-based expansion: a file present in
-the working directory but absent from the branch's committed tree — uncommitted
-or untracked — is no longer offered, because it is not in the tree the worktree
-will check out.)
+builds the discovery root from a conversation's creation parameters. The pairing
+that guarantees a candidate resolves is:
+
+- **Discovery** (pre-create, no worktree yet) reads the branch's committed tree
+  via `GitTree` — the only thing that exists to resolve against.
+- **Create-time expansion** reads the conversation's worktree (`WorkingDir`),
+  which by then has been created as a *clean checkout of that same committed
+  tree*. A clean checkout has no untracked files, so its contents equal the tree
+  discovery listed — every offered candidate resolves. The worktree additionally
+  carries skill *companion* files and gives `/skill` invocations a durable base
+  directory, which a bare tree (or an ephemeral `SKILL.md`-only materialization)
+  cannot. For a branch a remote-only ref resolves via `origin/<branch>` so
+  discovery isn't empty before the local tracking branch is materialized.
+
+(This closes the failure mode where `cwd`-based discovery disagreed with
+worktree-based expansion: a file present in the live working directory but absent
+from the branch's committed tree — uncommitted or untracked — is no longer
+offered, because discovery now reads the committed tree, not the checkout.)
 
 Each discovery endpoint has two forms: a conversation-scoped form that reads the
 root from the conversation record (`WorkingDir(conversation.cwd)`), and a

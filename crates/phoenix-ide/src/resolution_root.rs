@@ -70,10 +70,13 @@ impl ResolutionRoot {
                 base_branch.filter(|b| !b.is_empty()),
                 crate::db::detect_git_repo_root(&cwd_path),
             ) {
-                return Self::GitTree {
-                    repo_root: PathBuf::from(repo_root),
-                    reference: branch.to_string(),
-                };
+                let repo_root = PathBuf::from(repo_root);
+                if let Some(reference) = resolve_tree_ref(&repo_root, branch) {
+                    return Self::GitTree {
+                        repo_root,
+                        reference,
+                    };
+                }
             }
         }
         Self::WorkingDir(cwd_path)
@@ -119,7 +122,11 @@ impl ResolutionRoot {
                     return FileResolution::NotFound;
                 }
                 let spec = format!("{reference}:{rel}");
-                match run_git_bytes(repo_root, &["cat-file", "-p", &spec]) {
+                // `cat-file blob` (not `-p`) refuses to dereference a tree: a
+                // directory reference like `@src` errors out and resolves to
+                // NotFound, matching the working-directory path (`fs::read` of a
+                // dir fails) rather than expanding a pretty-printed tree listing.
+                match run_git_bytes(repo_root, &["cat-file", "blob", &spec]) {
                     Ok(bytes) => bytes_to_resolution(bytes),
                     Err(_) => FileResolution::NotFound,
                 }
@@ -155,6 +162,24 @@ impl ResolutionRoot {
 pub struct SkillsView {
     pub dir: PathBuf,
     _temp: Option<TempDir>,
+}
+
+/// Resolve a branch name the composer selected to a commit-ish `git` can read
+/// before the conversation's worktree exists.
+///
+/// The branch picker offers remote-only branches by short name, before the
+/// local tracking branch is materialized. Prefer the local ref; fall back to
+/// `origin/<branch>` so discovery against a remote-only branch isn't empty.
+/// Returns `None` when neither resolves (e.g. a brand-new unfetched branch),
+/// leaving the caller to degrade to the working directory.
+fn resolve_tree_ref(repo_root: &Path, branch: &str) -> Option<String> {
+    for candidate in [branch.to_string(), format!("origin/{branch}")] {
+        let commitish = format!("{candidate}^{{commit}}");
+        if run_git(repo_root, &["rev-parse", "--verify", "--quiet", &commitish]).is_ok() {
+            return Some(candidate);
+        }
+    }
+    None
 }
 
 fn bytes_to_resolution(bytes: Vec<u8>) -> FileResolution {
@@ -420,5 +445,62 @@ mod tests {
         // resolvable repo root falls back to the working directory.
         let root = ResolutionRoot::for_create("/tmp", "branch", Some("main"));
         assert!(matches!(root, ResolutionRoot::WorkingDir(_)));
+    }
+
+    #[test]
+    fn git_tree_read_file_rejects_directory_reference() {
+        // A path-like reference to a directory (`@sub`) must NOT expand the git
+        // tree listing as text — it resolves to NotFound, same as the
+        // working-directory path where reading a dir fails.
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join("sub")).unwrap();
+        std::fs::write(repo.path().join("sub/inner.txt"), "leaf").unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        let root = ResolutionRoot::GitTree {
+            repo_root: repo.path().to_path_buf(),
+            reference: "main".to_string(),
+        };
+        assert!(
+            matches!(root.read_file("sub"), FileResolution::NotFound),
+            "a directory reference must be NotFound, not a tree listing"
+        );
+        match root.read_file("sub/inner.txt") {
+            FileResolution::Text(t) => assert_eq!(t, "leaf"),
+            _ => panic!("the blob under the dir should still resolve as text"),
+        }
+    }
+
+    #[test]
+    fn for_create_falls_back_to_remote_tracking_ref() {
+        // A remote-only branch (selected in the picker before its local tracking
+        // branch is materialized) resolves via `origin/<branch>`.
+        let upstream = TempDir::new().unwrap();
+        git(upstream.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(upstream.path().join("a.txt"), "x").unwrap();
+        git(upstream.path(), &["add", "."]);
+        git(upstream.path(), &["commit", "-qm", "init"]);
+        git(upstream.path(), &["branch", "feature"]);
+
+        let clone = TempDir::new().unwrap();
+        git(clone.path(), &["init", "-q", "-b", "main"]);
+        git(
+            clone.path(),
+            &["remote", "add", "origin", upstream.path().to_str().unwrap()],
+        );
+        git(clone.path(), &["fetch", "-q", "origin"]);
+
+        // `feature` exists only as refs/remotes/origin/feature in the clone.
+        assert_eq!(
+            resolve_tree_ref(clone.path(), "feature").as_deref(),
+            Some("origin/feature"),
+            "remote-only branch should resolve via origin/"
+        );
+        assert!(
+            resolve_tree_ref(clone.path(), "does-not-exist").is_none(),
+            "an unresolvable branch yields None"
+        );
     }
 }

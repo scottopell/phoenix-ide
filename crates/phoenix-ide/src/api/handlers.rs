@@ -1516,24 +1516,16 @@ async fn create_conversation_with_id(
     // dispatch in that case.
     if !(is_seeded && req.text.trim().is_empty() && req.images.is_empty() && req.files.is_empty()) {
         // Expand `@file`/`/skill` inline references before sending
-        // (REQ-IR-001, REQ-IR-007). Resolve against the SAME root the composer
-        // discovered candidates against: a branch/managed conversation expands
-        // against the chosen branch's committed tree (what its fresh worktree
-        // will contain), a Direct conversation against `cwd`.
-        let base_for_root = if resolved_mode == "managed" {
-            managed_base_branch.as_deref()
-        } else {
-            req.base_branch.as_deref()
-        };
-        let resolution_root = if matches!(resolved_mode, "branch" | "managed") {
-            crate::resolution_root::ResolutionRoot::for_create(
-                &req.cwd,
-                resolved_mode,
-                base_for_root,
-            )
-        } else {
-            crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd)
-        };
+        // (REQ-IR-001, REQ-IR-007). Resolve against the conversation's actual
+        // working directory: for a branch/managed conversation that is the
+        // freshly-created worktree (`effective_cwd`), a faithful checkout of the
+        // chosen branch. The composer discovered candidates against that same
+        // branch's committed tree, which the clean worktree mirrors exactly — so
+        // every candidate still resolves. Unlike a bare git tree, the worktree
+        // also carries skill companion files and gives `/skill` invocations a
+        // durable base directory (the temp tree materialization would be both
+        // incomplete and gone by the time the agent reads it).
+        let resolution_root = crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd);
         let expanded_initial = match crate::message_expander::expand(&req.text, &resolution_root) {
             Ok(expanded) => expanded,
             Err(e) => {

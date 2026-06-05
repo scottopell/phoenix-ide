@@ -209,9 +209,10 @@ rule SkillTokenPassThrough {
 -- against (the working directory for a Direct workflow, or a branch's committed
 -- tree for a branch/managed workflow). The same engine drives both the
 -- in-conversation composer and the new-conversation composer (which has a chosen
--- directory + workflow but no conversation yet). Discovery and the first
--- message's `expand` build the same root, so a suggestion always resolves at
--- send time.
+-- directory + workflow but no conversation yet). Pre-create discovery reads the
+-- branch's committed tree; the first message expands against the conversation's
+-- worktree, a clean checkout of that same tree — equivalent content, so a
+-- suggestion always resolves at send time.
 
 rule FileAutocompleteTriggered {
     when: UserTypes(input, character: "@")
