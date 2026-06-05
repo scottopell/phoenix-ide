@@ -36,6 +36,13 @@ tracing = "0.1"
 taskmd-core = ">=1.1,<2"
 
 [dev-dependencies]
+# Re-declared with test-support so phoenix-core's #[cfg(test)] domain
+# constructors (ContentBlock::tool_use, …) are visible when this crate's own
+# tests are built in isolation (`cargo test -p phoenix-state-machine`), not
+# only when workspace feature unification happens to pull the feature in via
+# phoenix-ide. Dev-only: production `cargo build` never enables it.
+phoenix-core = { path = "../phoenix-core", features = ["test-support"] }
+
 # Property-based tests for the reducer's invariants.
 proptest = "1"
 
