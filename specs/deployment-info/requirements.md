@@ -209,11 +209,9 @@ a redirection arranged by the launcher (a shell wrapper or systemd), not by the
 process. Reporting such a redirection path as "the log file" would be a comment
 that lies — the process cannot guarantee it. The reported sink is therefore
 derived from what the logger actually does, not from configuration the logger
-might ignore: the page shows a path only when the running logger genuinely
-writes to a file, and otherwise names the real sink (stdout). An authoritative
-process-owned log path is a separate capability the deployment can grow; until
-the logger honors it, the page reports stdout even if an intended path is
-present in the environment.
+might ignore: the page shows a path only when the logger genuinely writes to a
+file, and otherwise names the real sink (stdout). The reported sink and the
+logger's wiring share one source of truth, so they cannot disagree.
 
 ---
 

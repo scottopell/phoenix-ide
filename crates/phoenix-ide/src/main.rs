@@ -56,7 +56,7 @@ use db::Database;
 use llm::{LlmConfig, ModelRegistry};
 use std::future::IntoFuture;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tower_http::{
@@ -67,20 +67,6 @@ use tower_http::{
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 mod hot_restart;
-
-/// Make a path absolute for display without requiring it to exist or resolving
-/// symlinks: a relative path is joined onto the process's current directory —
-/// the same base the process resolves it against at startup. The deployment
-/// wire contract specifies absolute `path` values (specs/deployment-info/).
-fn absolutize(path: &Path) -> PathBuf {
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    }
-}
 
 /// Assemble the static deployment facts reported by `GET /api/deployment`.
 /// Resolves every path from the same logic the rest of the process uses so the
@@ -102,12 +88,12 @@ fn build_deployment_config(
             TlsInfo {
                 enabled: true,
                 mode: Some(loaded.mode.to_string()),
-                cert_path: Some(loaded.cert_path.display().to_string()),
-                key_path: Some(loaded.key_path.display().to_string()),
+                cert_path: Some(api::absolutize(&loaded.cert_path).display().to_string()),
+                key_path: Some(api::absolutize(&loaded.key_path).display().to_string()),
                 ca_cert_path: loaded
                     .ca_cert_path
                     .as_ref()
-                    .map(|p| p.display().to_string()),
+                    .map(|p| api::absolutize(p).display().to_string()),
                 hosts,
             }
         }
@@ -140,7 +126,7 @@ fn build_disk_locations(
 ) -> Vec<api::DiskLocation> {
     use api::{DiskLocation, MeasureMode};
 
-    let db_pb = absolutize(&PathBuf::from(db_path));
+    let db_pb = api::absolutize(&PathBuf::from(db_path));
     let data_dir = db_pb
         .parent()
         .map_or_else(|| db_pb.clone(), std::path::Path::to_path_buf);
@@ -207,17 +193,9 @@ fn build_disk_locations(
         });
     }
 
-    // The credential file the process actually loads from: Phoenix's own
-    // `~/.phoenix-ide/codex-auth.json`, or Codex CLI's `~/.codex/auth.json` in
-    // piggyback mode (OPENAI_USE_CODEX_AUTH). Falls back to the canonical
-    // Phoenix path (reported absent) when no credentials are present.
-    let codex_auth_path = llm::codex_credential::resolve_active_auth_path()
-        .unwrap_or_else(llm::codex_credential::default_phoenix_auth_path);
-    locations.push(DiskLocation {
-        label: "Codex credentials".to_string(),
-        path: codex_auth_path,
-        mode: MeasureMode::File,
-    });
+    // The codex credential row is NOT built here: the active credential source
+    // can change at runtime via the in-app login flow, so the handler resolves
+    // and measures it per request (see `active_codex_credentials_location`).
 
     // Attachments are stored inline in the database. This row is the stable home
     // for the file-based attachment directory once that storage mode is active.
@@ -247,7 +225,7 @@ fn build_disk_locations(
     // the wire contract specifies absolute `path` values so operators see where
     // bytes actually live, not `phoenix.db` or `.`.
     for loc in &mut locations {
-        loc.path = absolutize(&loc.path);
+        loc.path = api::absolutize(&loc.path);
     }
 
     locations
@@ -728,26 +706,6 @@ async fn reconcile_worktrees(db: &Database) {
 ///
 /// These run against an on-disk `SQLite` DB (tempdir) so the project/
 /// conversation foreign keys resolve correctly through migrations.
-#[cfg(test)]
-mod absolutize_tests {
-    use super::absolutize;
-    use std::path::{Path, PathBuf};
-
-    #[test]
-    fn absolute_path_is_unchanged() {
-        let p = "/var/lib/phoenix-ide/prod.db";
-        assert_eq!(absolutize(Path::new(p)), PathBuf::from(p));
-    }
-
-    #[test]
-    fn relative_path_is_joined_onto_cwd() {
-        let cwd = std::env::current_dir().unwrap();
-        let abs = absolutize(Path::new("phoenix.db"));
-        assert!(abs.is_absolute());
-        assert_eq!(abs, cwd.join("phoenix.db"));
-    }
-}
-
 #[cfg(test)]
 mod reconcile_worktrees_tests {
     use super::*;

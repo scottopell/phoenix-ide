@@ -198,7 +198,12 @@ pub async fn deployment_info(State(state): State<AppState>) -> impl IntoResponse
     };
 
     let resources = sample_resources().await;
-    let disk = cfg.locations.iter().map(measure_location).collect();
+    let mut disk: Vec<DiskEntry> = cfg.locations.iter().map(measure_location).collect();
+    // The codex credential file is resolved per request, not captured at
+    // startup: the in-app login flow can switch the active source at runtime
+    // (Phoenix's own file vs Codex CLI's in piggyback mode), so a static row
+    // would go stale after a credential switch.
+    disk.push(measure_location(&active_codex_credentials_location()));
 
     Json(DeploymentInfo {
         build,
@@ -208,6 +213,36 @@ pub async fn deployment_info(State(state): State<AppState>) -> impl IntoResponse
         log: cfg.log.clone(),
         sampled_at: Utc::now(),
     })
+}
+
+/// The codex credential location the process loads from right now: Phoenix's own
+/// `~/.phoenix-ide/codex-auth.json`, or Codex CLI's `~/.codex/auth.json` under
+/// `OPENAI_USE_CODEX_AUTH` piggyback mode; falls back to the canonical Phoenix
+/// path (reported absent) when no credentials are present.
+fn active_codex_credentials_location() -> DiskLocation {
+    let path = absolutize(
+        &crate::llm::codex_credential::resolve_active_auth_path()
+            .unwrap_or_else(crate::llm::codex_credential::default_phoenix_auth_path),
+    );
+    DiskLocation {
+        label: "Codex credentials".to_string(),
+        path,
+        mode: MeasureMode::File,
+    }
+}
+
+/// Make a path absolute for display without requiring it to exist or resolving
+/// symlinks: a relative path is joined onto the process's current directory —
+/// the same base the process resolves it against at startup. The deployment
+/// wire contract specifies absolute `path` values.
+pub fn absolutize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    }
 }
 
 /// Sample live process and system resource usage. Returns `None` for any metric
@@ -414,6 +449,20 @@ mod tests {
         ));
         assert_eq!(entry.size, DiskSize::InlineDb);
         assert_eq!(entry.path, "/does/not/exist/phoenix.db");
+    }
+
+    #[test]
+    fn absolutize_leaves_absolute_paths_unchanged() {
+        let p = "/var/lib/phoenix-ide/prod.db";
+        assert_eq!(absolutize(Path::new(p)), PathBuf::from(p));
+    }
+
+    #[test]
+    fn absolutize_joins_relative_paths_onto_cwd() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = absolutize(Path::new("phoenix.db"));
+        assert!(abs.is_absolute());
+        assert_eq!(abs, cwd.join("phoenix.db"));
     }
 
     #[tokio::test]

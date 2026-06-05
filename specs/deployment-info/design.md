@@ -108,25 +108,24 @@ field. It holds the static facts:
 - `tls: TlsInfo` — derived from the resolved `tls::ConfigSource`/`LoadedConfig`:
   disabled when the source is `None`; otherwise `mode`, `cert_path`, `key_path`,
   `ca_cert_path` from `LoadedConfig`, and `hosts` from `ConfigSource::Auto`.
-- `log: LogInfo` — the sink the logger actually writes to. The tracing layer
-  writes only to stdout, so this is `LogInfo::Stdout`; `LogInfo::File` becomes
-  reachable when the logger is wired to a process-owned file (REQ-DEPLOY-006).
-- `locations: Vec<DiskLocation>` — the on-disk layout. Each `DiskLocation`
-  carries a `label`, a resolved absolute `path`, and a `MeasureMode` dictating
-  how it is sized at request time. The rows are: the database file (`File`); the
-  data directory — recursed (`RecurseSmall`) only when it is Phoenix's own
-  dedicated `.phoenix-ide` directory, otherwise reported path-only (`NoMeasure`)
-  so a custom `PHOENIX_DB_PATH` cannot make a request walk `/tmp` or `$HOME`; the
-  TLS inputs — the managed directory in auto mode (`RecurseSmall`) or the
-  explicit certificate and key files in manual mode (`File` each); the built-in
-  skills directory (`RecurseSmall`); the active codex credential file (`File`) —
-  the one the process actually loads via `resolve_active_auth_path` (Phoenix's
-  own `~/.phoenix-ide/codex-auth.json`, or Codex CLI's `~/.codex/auth.json` under
-  `OPENAI_USE_CODEX_AUTH` piggyback mode); the attachment store (`InlineDb` while
-  attachments live in the database); the browser binary cache (`NoMeasure`); and
-  the per-scope browser profile glob (`Pattern`). Every path is resolved from the
-  same logic the rest of the process uses so the page reports the locations the
-  process actually uses.
+- `log: LogInfo` — the sink the logger writes to: a process-owned file path when
+  the logger writes to a file, otherwise stdout (REQ-DEPLOY-006).
+- `locations: Vec<DiskLocation>` — the static on-disk layout. Each `DiskLocation`
+  carries a `label`, an absolute `path`, and a `MeasureMode` dictating how it is
+  sized at request time. The rows are: the database file (`File`); the data
+  directory — recursed (`RecurseSmall`) only when it is a Phoenix-owned dedicated
+  directory (`.phoenix-ide` for user installs and dev worktrees, `phoenix-ide`
+  for the native `/var/lib/phoenix-ide` production root), otherwise reported
+  path-only (`NoMeasure`) so a custom `PHOENIX_DB_PATH` cannot make a request walk
+  `/tmp` or `$HOME`; the TLS inputs — the managed directory in auto mode
+  (`RecurseSmall`) or the explicit certificate and key files in manual mode
+  (`File` each); the built-in skills directory (`RecurseSmall`); the attachment
+  store (`InlineDb` while attachments live in the database); the browser binary
+  cache (`NoMeasure`); and the per-scope browser profile glob (`Pattern`). The
+  active codex credential file is *not* a static row — it is resolved per request
+  in the handler because the credential source can change at runtime (see below).
+  Every path is absolute, resolved from the same logic the rest of the process
+  uses, so the page reports the locations the process actually uses.
 
 To avoid generating the auto cert twice, `tls::load_config` is called once in
 `main`; its `LoadedConfig` feeds both the `TlsInfo` capture and the
@@ -164,11 +163,16 @@ Sampling steps:
    affinity/quota and would under-report under a cgroup limit. sysinfo is the
    cross-platform sampler that satisfies the macOS + Linux requirement without
    per-OS `/proc` scraping.
-3. **Disk:** one `DiskEntry` per configured `DiskLocation`, sized per its
+3. **Disk:** one `DiskEntry` per static `DiskLocation`, sized per its
    `MeasureMode` (see Config capture). `File`/`RecurseSmall` produce
    `DiskSize::measured`; `NoMeasure`/`Pattern` produce `DiskSize::not_measured`;
    a missing real path yields `DiskSize::absent`; the attachment store yields
-   `inline_db`.
+   `inline_db`. The handler then appends the active codex credential row,
+   resolved here rather than at startup via `resolve_active_auth_path` (Phoenix's
+   own `~/.phoenix-ide/codex-auth.json`, or Codex CLI's `~/.codex/auth.json` under
+   `OPENAI_USE_CODEX_AUTH` piggyback mode, falling back to the canonical Phoenix
+   path reported absent). Resolving per request keeps the row correct after the
+   in-app login flow switches the active credential source at runtime.
 4. **`sampled_at`:** `Utc::now()` at the moment the snapshot is assembled.
 
 The `dir_size` helper is bounded: it recurses only the directories the spec
@@ -211,13 +215,12 @@ request cannot trigger a multi-gigabyte walk (REQ-DEPLOY-005).
   and occasionally slow. `not_measured` states the omission explicitly instead of
   reporting a misleading `0`.
 - **The log sink reflects what the logger does, not configuration it ignores.**
-  The binary logs to stdout; any `.log` file is a launcher redirection the
-  process does not own. Reporting a path the logger does not write would be a
-  claim the process cannot keep, so `LogInfo` is derived from the logger's actual
-  sink — currently always stdout. Honoring an intended log-file path is a
-  separate capability the deployment can grow (it wires the logger and flips the
-  reported sink in one change); until then the page reports stdout even if such a
-  path is present in the environment.
+  `LogInfo` is derived from the sink the logger actually writes to — a file path
+  only when the logger writes to that file, otherwise stdout. A `.log` path that
+  is merely a launcher redirection (a shell wrapper or systemd), which the
+  process does not itself write, is never reported as the log file: that would be
+  a claim the process cannot keep. The reported sink and the logger's wiring are
+  the same source of truth, so they cannot diverge.
 - **Read-only, single snapshot, no streaming.** The operator question is "what is
   it now," answered by a snapshot plus refresh. A live-streaming gauge would add
   an SSE surface for no proportional benefit.

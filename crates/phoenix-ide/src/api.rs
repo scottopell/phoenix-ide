@@ -17,7 +17,7 @@ mod terminal_ws;
 mod types;
 pub(crate) mod wire;
 
-pub use deployment::{DeploymentConfig, DiskLocation, LogInfo, MeasureMode, TlsInfo};
+pub use deployment::{absolutize, DeploymentConfig, DiskLocation, LogInfo, MeasureMode, TlsInfo};
 pub use handlers::create_router;
 #[allow(unused_imports)] // Public API re-exports
 pub use types::*;
