@@ -87,6 +87,13 @@ function parseEventData(event: Event): unknown | null {
   }
 }
 
+// Bounded retry for a 404 on the initial snapshot. A freshly-spawned sub-agent
+// can 404 transiently (the parent card renders before RuntimeManager inserts
+// the child row); retry briefly to cover that race, then give up so a deleted
+// sub-agent doesn't loop forever. ~10 × 500ms ≈ 5s.
+const MAX_NOT_FOUND_RETRIES = 10;
+const NOT_FOUND_RETRY_MS = 500;
+
 // Single-live-stream slot: at most one *conversation* may be streamed live at
 // a time, but that conversation may legitimately have several concurrent
 // viewers (e.g. an expanded inline card and the docked panel for the same
@@ -183,6 +190,7 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
     if (!enabled) return;
     let cancelled = false;
     let source: EventSource | null = null;
+    let notFoundRetries = 0;
     let retryTimer: number | null = null;
 
     const closeSource = () => {
@@ -341,12 +349,16 @@ export function useConversationInlineStream(conversationId: string, enabled: boo
         })
         .catch((err) => {
           if (cancelled) return;
-          // Retry a 404 only for an explicitly-live stream, where it means a
-          // just-spawned sub-agent hasn't hit the DB yet (spawn race). For
-          // 'auto' (the docked viewer) a 404 means the sub-agent is gone —
-          // surface it as an error instead of retrying forever.
-          if (live === true && isNotFound(err)) {
-            retryTimer = window.setTimeout(loadSnapshot, 500);
+          // Spawn race: the parent card can render a sub-agent before
+          // RuntimeManager has inserted the freshly-spawned child row (the
+          // spawn request is enqueued on an async channel before the parent
+          // enters AwaitingSubAgents), so a 404 right after open is often
+          // transient. Retry briefly for any live-capable mode ('auto' and
+          // true), but bound it so a genuinely-missing / deleted sub-agent
+          // surfaces an error instead of looping forever.
+          if (live !== false && isNotFound(err) && notFoundRetries < MAX_NOT_FOUND_RETRIES) {
+            notFoundRetries += 1;
+            retryTimer = window.setTimeout(loadSnapshot, NOT_FOUND_RETRY_MS);
             return;
           }
           dispatch({ type: 'error', error: err instanceof Error ? err.message : 'Failed to load sub-agent' });
