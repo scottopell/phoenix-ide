@@ -112,6 +112,16 @@ fn build_deployment_config(
         .parent()
         .map_or_else(|| PathBuf::from("."), std::path::Path::to_path_buf);
 
+    // Only recurse the data directory when it is Phoenix's own dedicated
+    // `.phoenix-ide` dir. A custom PHOENIX_DB_PATH like `/tmp/phoenix.db` or
+    // `$HOME/phoenix.db` would otherwise make every request walk all of `/tmp`
+    // or the home directory — the opposite of a cheap diagnostic snapshot.
+    let data_dir_mode = if data_dir.file_name() == Some(std::ffi::OsStr::new(".phoenix-ide")) {
+        MeasureMode::RecurseSmall
+    } else {
+        MeasureMode::NoMeasure
+    };
+
     let mut locations = vec![
         DiskLocation {
             label: "Database".to_string(),
@@ -121,16 +131,33 @@ fn build_deployment_config(
         DiskLocation {
             label: "Data directory".to_string(),
             path: data_dir,
-            mode: MeasureMode::RecurseSmall,
+            mode: data_dir_mode,
         },
     ];
 
-    if let Some(tls::ConfigSource::Auto { dir, .. }) = tls_source {
-        locations.push(DiskLocation {
-            label: "TLS directory".to_string(),
-            path: dir.clone(),
-            mode: MeasureMode::RecurseSmall,
-        });
+    // TLS inputs the process reads on disk. Auto mode owns a small managed
+    // directory (cert, key, CA); manual mode points at explicit cert/key files.
+    match (tls_source, loaded_tls) {
+        (Some(tls::ConfigSource::Auto { dir, .. }), _) => {
+            locations.push(DiskLocation {
+                label: "TLS directory".to_string(),
+                path: dir.clone(),
+                mode: MeasureMode::RecurseSmall,
+            });
+        }
+        (Some(tls::ConfigSource::Manual(_)), Some(loaded)) => {
+            locations.push(DiskLocation {
+                label: "TLS certificate".to_string(),
+                path: loaded.cert_path.clone(),
+                mode: MeasureMode::File,
+            });
+            locations.push(DiskLocation {
+                label: "TLS key".to_string(),
+                path: loaded.key_path.clone(),
+                mode: MeasureMode::File,
+            });
+        }
+        _ => {}
     }
 
     if let Some(dir) = skills::builtin::default_extract_dir() {
@@ -141,9 +168,15 @@ fn build_deployment_config(
         });
     }
 
+    // The credential file the process actually loads from: Phoenix's own
+    // `~/.phoenix-ide/codex-auth.json`, or Codex CLI's `~/.codex/auth.json` in
+    // piggyback mode (OPENAI_USE_CODEX_AUTH). Falls back to the canonical
+    // Phoenix path (reported absent) when no credentials are present.
+    let codex_auth_path = llm::codex_credential::resolve_active_auth_path()
+        .unwrap_or_else(llm::codex_credential::default_phoenix_auth_path);
     locations.push(DiskLocation {
         label: "Codex credentials".to_string(),
-        path: llm::codex_credential::default_phoenix_auth_path(),
+        path: codex_auth_path,
         mode: MeasureMode::File,
     });
 

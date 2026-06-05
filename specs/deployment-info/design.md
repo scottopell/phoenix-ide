@@ -114,16 +114,19 @@ field. It holds the static facts:
 - `locations: Vec<DiskLocation>` — the on-disk layout. Each `DiskLocation`
   carries a `label`, a resolved absolute `path`, and a `MeasureMode` dictating
   how it is sized at request time. The rows are: the database file (`File`); the
-  data directory (`RecurseSmall`); the TLS directory in auto mode
-  (`RecurseSmall`); the built-in skills directory (`RecurseSmall`); the codex
-  credential file (`File`); the attachment store (`InlineDb` while attachments
-  live in the database); the browser binary cache (`NoMeasure`); and the
-  per-scope browser profile glob (`Pattern`). Every path is resolved from the
-  same logic the rest of the process uses (`PHOENIX_DB_PATH`,
-  `tls::ConfigSource::Auto`'s dir, `skills::builtin::default_extract_dir`, the
-  codex credential path, the browser fetcher cache dir, the browser
-  user-data-dir glob) so the page reports the locations the process actually
-  uses.
+  data directory — recursed (`RecurseSmall`) only when it is Phoenix's own
+  dedicated `.phoenix-ide` directory, otherwise reported path-only (`NoMeasure`)
+  so a custom `PHOENIX_DB_PATH` cannot make a request walk `/tmp` or `$HOME`; the
+  TLS inputs — the managed directory in auto mode (`RecurseSmall`) or the
+  explicit certificate and key files in manual mode (`File` each); the built-in
+  skills directory (`RecurseSmall`); the active codex credential file (`File`) —
+  the one the process actually loads via `resolve_active_auth_path` (Phoenix's
+  own `~/.phoenix-ide/codex-auth.json`, or Codex CLI's `~/.codex/auth.json` under
+  `OPENAI_USE_CODEX_AUTH` piggyback mode); the attachment store (`InlineDb` while
+  attachments live in the database); the browser binary cache (`NoMeasure`); and
+  the per-scope browser profile glob (`Pattern`). Every path is resolved from the
+  same logic the rest of the process uses so the page reports the locations the
+  process actually uses.
 
 To avoid generating the auto cert twice, `tls::load_config` is called once in
 `main`; its `LoadedConfig` feeds both the `TlsInfo` capture and the
