@@ -292,10 +292,14 @@ pub fn expand(text: &str, root: &ResolutionRoot) -> Result<ExpandedMessage, Expa
     }
 
     // --- File reference expansion (REQ-IR-001, REQ-IR-007) ---------------------
-    let mut llm_text = text.to_string();
-    let file_refs: Vec<_> = refs.iter().filter(|r| r.sigil == '@').collect();
-
-    for file_ref in file_refs {
+    // Collect (span, replacement) for each resolvable `@reference`, then splice
+    // them into the original text by span in reverse order. Splicing by the
+    // tokenizer's recorded spans — rather than a global string replace — means
+    // only the occurrences the tokenizer accepted are expanded: an identical
+    // literal sitting inside a masked code region (which the tokenizer skipped)
+    // is left untouched (`NoExpansionInsideCode`).
+    let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for file_ref in refs.iter().filter(|r| r.sigil == '@') {
         // ClassifyAtReference: only treat path-like tokens as file references.
         // Bare words (@username, @param) pass through as literal text.
         if !looks_like_file_path(&file_ref.token) {
@@ -316,10 +320,14 @@ pub fn expand(text: &str, root: &ResolutionRoot) -> Result<ExpandedMessage, Expa
             }
         };
 
-        // Replace `@ref_path` token with structured block
-        let token = format!("@{}", file_ref.token);
         let block = format!("<file path=\"{}\">\n{file_text}\n</file>", file_ref.token);
-        llm_text = llm_text.replace(&token, &block);
+        replacements.push((file_ref.span.clone(), block));
+    }
+
+    let mut llm_text = text.to_string();
+    // Reverse so each splice leaves earlier spans' byte offsets valid.
+    for (span, block) in replacements.into_iter().rev() {
+        llm_text.replace_range(span, &block);
     }
 
     Ok(ExpandedMessage {
@@ -585,6 +593,33 @@ mod tests {
         let result = expand("see @f.txt", &root(tmp.path())).unwrap();
         // display_text is exactly what the user typed
         assert_eq!(result.display_text, "see @f.txt");
+    }
+
+    #[test]
+    fn test_expand_leaves_same_ref_inside_code_fence_untouched() {
+        // A real `@hello.txt` reference plus the identical literal inside a
+        // fenced code block: only the real (tokenized) one expands; the masked
+        // copy must survive verbatim (NoExpansionInsideCode).
+        let tmp = make_tmp();
+        fs::write(tmp.path().join("hello.txt"), "REALCONTENT").unwrap();
+
+        let input = "see @hello.txt\n```\ntrace @hello.txt here\n```";
+        let result = expand(input, &root(tmp.path())).unwrap();
+
+        // Exactly one expansion (the reference outside the fence).
+        assert_eq!(
+            result.llm_text.matches("<file path=\"hello.txt\">").count(),
+            1,
+            "only the out-of-code reference should expand: {}",
+            result.llm_text
+        );
+        assert!(result.llm_text.contains("REALCONTENT"));
+        // The in-fence occurrence is preserved verbatim, not turned into a block.
+        assert!(
+            result.llm_text.contains("trace @hello.txt here"),
+            "fenced occurrence must survive: {}",
+            result.llm_text
+        );
     }
 
     // -------------------------------------------------------------------------

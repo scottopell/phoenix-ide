@@ -1,21 +1,28 @@
 //! The single source of truth for where a conversation's inline references
 //! (`@file`, `./path`, `/skill`) resolve.
 //!
-//! A conversation resolves references against exactly one root. For a Direct
-//! conversation that root is the live working directory; for a Branch/Managed
-//! conversation it is a fresh worktree of the chosen branch — i.e. that
-//! branch's *committed tree*. The composer's autocomplete (before the
-//! conversation exists) and the create-time first-message expansion both
-//! construct this same value via [`ResolutionRoot::for_create`] and consume it
-//! through the same methods, so the candidate set offered to the user and the
-//! set the first message expands against cannot diverge.
+//! `WorkingDir` reads a live filesystem directory; `GitTree` reads a branch's
+//! committed tree via `git ls-tree` / `git cat-file` with no worktree required.
 //!
-//! `WorkingDir` reads the filesystem directly. `GitTree` reads a branch's
-//! committed tree via `git ls-tree` / `git cat-file` — no worktree required,
-//! which is what lets the `/new` composer offer accurate suggestions for a
-//! branch workflow before any worktree has been created.
+//! The two cooperate so a candidate the composer offers always resolves when
+//! the first message expands:
+//!
+//! - **Pre-create discovery** has no worktree yet, so it reads the chosen
+//!   branch's committed tree through a `GitTree` built by
+//!   [`ResolutionRoot::for_create`] (resolving to the commit creation will
+//!   check out — see [`resolve_tree_ref`]). This is what lets the `/new`
+//!   composer offer accurate suggestions before any worktree exists.
+//! - **Create-time expansion** runs against the conversation's freshly-created
+//!   worktree (`WorkingDir`), a clean checkout of that same committed tree —
+//!   equivalent content (a clean checkout has no untracked files), plus the
+//!   companion files and durable skill base directory a bare tree can't give.
+//!
+//! Both therefore resolve against the same branch ref; neither trusts the live
+//! checkout, which is what closes the discovery-vs-expansion divergence.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use tempfile::TempDir;
 
@@ -164,22 +171,56 @@ pub struct SkillsView {
     _temp: Option<TempDir>,
 }
 
-/// Resolve a branch name the composer selected to a commit-ish `git` can read
-/// before the conversation's worktree exists.
+/// Resolve a branch name the composer selected to the commit-ish that
+/// conversation creation will actually check out — so discovery offers
+/// candidates from the same tree the first message expands against.
 ///
-/// The branch picker offers remote-only branches by short name, before the
-/// local tracking branch is materialized. Prefer the local ref; fall back to
-/// `origin/<branch>` so discovery against a remote-only branch isn't empty.
-/// Returns `None` when neither resolves (e.g. a brand-new unfetched branch),
-/// leaving the caller to degrade to the working directory.
+/// This mirrors `git_ops::materialize_branch`'s ref decision: creation fetches
+/// `origin/<branch>` and fast-forwards the local branch to the remote tip only
+/// when the local ref is an ancestor of it (i.e. local is behind), then makes
+/// the worktree. So:
+/// - both refs exist and local is behind → the remote tip (creation FFs to it);
+/// - both exist but diverged or local is ahead → the local ref (creation keeps it);
+/// - remote only → `origin/<branch>` (creation makes a local branch there);
+/// - local only → the local ref;
+/// - neither → `None`, leaving the caller to degrade to the working directory.
+///
+/// Discovery does not fetch (too costly per keystroke), so it sees `origin`
+/// as of the last fetch; the freshness gap that remains is inherent, but a
+/// locally-stale tracking branch no longer offers candidates from an old commit
+/// that creation would discard. The fast-forward-blocked-by-worktree exception
+/// in `materialize_branch` is not mirrored: a branch already checked out in a
+/// worktree cannot be used for a new branch-mode worktree anyway.
 fn resolve_tree_ref(repo_root: &Path, branch: &str) -> Option<String> {
-    for candidate in [branch.to_string(), format!("origin/{branch}")] {
-        let commitish = format!("{candidate}^{{commit}}");
-        if run_git(repo_root, &["rev-parse", "--verify", "--quiet", &commitish]).is_ok() {
-            return Some(candidate);
+    let remote = format!("origin/{branch}");
+    let has_local = verify_commit(repo_root, branch);
+    let has_remote = verify_commit(repo_root, &remote);
+    match (has_local, has_remote) {
+        (true, true) => {
+            if run_git(repo_root, &["merge-base", "--is-ancestor", branch, &remote]).is_ok() {
+                Some(remote)
+            } else {
+                Some(branch.to_string())
+            }
         }
+        (false, true) => Some(remote),
+        (true, false) => Some(branch.to_string()),
+        (false, false) => None,
     }
-    None
+}
+
+/// Whether `rev` resolves to a commit object in `repo_root`.
+fn verify_commit(repo_root: &Path, rev: &str) -> bool {
+    run_git(
+        repo_root,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ],
+    )
+    .is_ok()
 }
 
 fn bytes_to_resolution(bytes: Vec<u8>) -> FileResolution {
@@ -230,6 +271,52 @@ fn looks_textual(path: &str) -> bool {
     )
 }
 
+/// Process-global cache of a committed tree's full path listing, keyed by the
+/// resolved commit SHA. `git ls-tree -r` enumerates the entire tree, which for
+/// a large monorepo is expensive to run on every autocomplete keystroke; the
+/// listing for a given commit is immutable, so caching by SHA collapses
+/// repeated keystrokes (and the empty-query open) to a single enumeration per
+/// ref content.
+fn tree_listing_cache() -> &'static Mutex<HashMap<String, Arc<[String]>>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, Arc<[String]>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The committed tree's path listing for `reference`, cached by resolved SHA.
+///
+/// Keying on the SHA (not the branch name) means a moved branch key-misses and
+/// re-enumerates naturally, and two refs at the same commit share one entry.
+/// Memory is bounded by dropping the cache wholesale once it accumulates a
+/// handful of distinct trees — a session rarely discovers against many.
+fn tree_paths(repo_root: &Path, reference: &str) -> Arc<[String]> {
+    // Bound memory: drop the cache wholesale once it holds this many trees.
+    const MAX_CACHED_TREES: usize = 8;
+
+    let sha = run_git(
+        repo_root,
+        &["rev-parse", &format!("{reference}^{{commit}}")],
+    )
+    .map_or_else(|_| reference.to_string(), |s| s.trim().to_string());
+
+    if let Some(hit) = tree_listing_cache().lock().unwrap().get(&sha) {
+        return Arc::clone(hit);
+    }
+
+    let listing = run_git(repo_root, &["ls-tree", "-r", "--name-only", &sha]).unwrap_or_default();
+    let paths: Arc<[String]> = listing
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+
+    let mut cache = tree_listing_cache().lock().unwrap();
+    if cache.len() >= MAX_CACHED_TREES {
+        cache.clear();
+    }
+    cache.insert(sha, Arc::clone(&paths));
+    paths
+}
+
 /// List files in a branch's committed tree, fuzzy-scored against `query` with
 /// the same matcher the filesystem walk uses so ranking is identical.
 fn list_files_in_tree(
@@ -238,36 +325,38 @@ fn list_files_in_tree(
     query: &str,
     limit: usize,
 ) -> Vec<FileSearchEntry> {
-    let Ok(listing) = run_git(repo_root, &["ls-tree", "-r", "--name-only", reference]) else {
-        return Vec::new();
-    };
+    let paths = tree_paths(repo_root, reference);
     let q = query.to_lowercase();
+
+    // Empty query: take the first `limit` paths in tree order, no scoring/sort —
+    // the bounded fast path the filesystem walker also gets by stopping early.
+    if q.is_empty() {
+        return paths
+            .iter()
+            .take(limit)
+            .map(|p| FileSearchEntry {
+                path: p.clone(),
+                is_text_file: looks_textual(p),
+            })
+            .collect();
+    }
+
     let mut matcher = nucleo_matcher::Matcher::new(nucleo_matcher::Config::DEFAULT);
     let mut buf: Vec<char> = Vec::new();
     let mut items: Vec<(i32, FileSearchEntry)> = Vec::new();
-
-    for rel_path in listing.lines() {
-        if rel_path.is_empty() {
-            continue;
-        }
-        let entry = FileSearchEntry {
-            path: rel_path.to_string(),
-            is_text_file: looks_textual(rel_path),
-        };
-        if q.is_empty() {
-            items.push((0, entry));
-            if items.len() >= limit {
-                break;
-            }
-        } else if let Some(score) = fuzzy_score_path(rel_path, &q, &mut matcher, &mut buf) {
-            items.push((score, entry));
+    for rel_path in paths.iter() {
+        if let Some(score) = fuzzy_score_path(rel_path, &q, &mut matcher, &mut buf) {
+            items.push((
+                score,
+                FileSearchEntry {
+                    path: rel_path.clone(),
+                    is_text_file: looks_textual(rel_path),
+                },
+            ));
         }
     }
-
-    if !q.is_empty() {
-        items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
-        items.truncate(limit);
-    }
+    items.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.path.cmp(&b.1.path)));
+    items.truncate(limit);
     items.into_iter().map(|(_, e)| e).collect()
 }
 
@@ -286,26 +375,22 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
         };
     };
 
-    let listing = run_git(
-        repo_root,
-        &[
-            "ls-tree",
-            "-r",
-            "--name-only",
-            reference,
-            "--",
-            ".claude/skills",
-            ".agents/skills",
-        ],
-    )
-    .unwrap_or_default();
-
-    for rel_path in listing.lines() {
+    // Reuse the cached full tree listing and pick out `SKILL.md` files under a
+    // `.claude/skills` / `.agents/skills` directory at any depth. This matches
+    // `discover_skills`' scan scope against a real working directory — the repo
+    // root *and* immediate child projects (e.g. `service/.agents/skills/...`).
+    // Filtering in Rust avoids fragile pathspec-wildcard semantics; deeper
+    // matches that slip in are written but never surfaced, because
+    // `discover_skills` only scans depth-1 children of the materialized root.
+    for rel_path in tree_paths(repo_root, reference).iter() {
         if !rel_path.ends_with("SKILL.md") {
             continue;
         }
+        if !(rel_path.contains(".claude/skills/") || rel_path.contains(".agents/skills/")) {
+            continue;
+        }
         let spec = format!("{reference}:{rel_path}");
-        let Ok(bytes) = run_git_bytes(repo_root, &["cat-file", "-p", &spec]) else {
+        let Ok(bytes) = run_git_bytes(repo_root, &["cat-file", "blob", &spec]) else {
             continue;
         };
         let dest = temp.path().join(rel_path);
@@ -501,6 +586,79 @@ mod tests {
         assert!(
             resolve_tree_ref(clone.path(), "does-not-exist").is_none(),
             "an unresolvable branch yields None"
+        );
+    }
+
+    #[test]
+    fn resolve_tree_ref_prefers_remote_when_local_behind_else_keeps_local() {
+        // upstream advances main; a clone whose local main is behind origin/main
+        // should resolve to origin/main (creation fast-forwards to it). After a
+        // local-only commit (local ahead), it should keep the local ref.
+        let upstream = TempDir::new().unwrap();
+        git(upstream.path(), &["init", "-q", "-b", "main"]);
+        std::fs::write(upstream.path().join("a.txt"), "1").unwrap();
+        git(upstream.path(), &["add", "."]);
+        git(upstream.path(), &["commit", "-qm", "c1"]);
+
+        let clone = TempDir::new().unwrap();
+        git(
+            clone.path(),
+            &["clone", "-q", upstream.path().to_str().unwrap(), "."],
+        );
+        // Equal tips → already an ancestor → prefers the remote ref.
+        assert_eq!(
+            resolve_tree_ref(clone.path(), "main").as_deref(),
+            Some("origin/main")
+        );
+
+        // Advance upstream and fetch: local main is now strictly behind origin.
+        std::fs::write(upstream.path().join("b.txt"), "2").unwrap();
+        git(upstream.path(), &["add", "."]);
+        git(upstream.path(), &["commit", "-qm", "c2"]);
+        git(clone.path(), &["fetch", "-q", "origin"]);
+        assert_eq!(
+            resolve_tree_ref(clone.path(), "main").as_deref(),
+            Some("origin/main"),
+            "local behind origin → creation FFs to origin tip"
+        );
+
+        // Local-only commit makes local ahead of (diverged from) origin.
+        std::fs::write(clone.path().join("local.txt"), "x").unwrap();
+        git(clone.path(), &["add", "."]);
+        git(clone.path(), &["commit", "-qm", "local"]);
+        assert_eq!(
+            resolve_tree_ref(clone.path(), "main").as_deref(),
+            Some("main"),
+            "local ahead/diverged → creation keeps the local ref"
+        );
+    }
+
+    #[test]
+    fn git_tree_skills_view_materializes_child_project_skill() {
+        // discover_skills scans immediate child dirs (e.g. service/.agents/skills);
+        // the GitTree materialization must include those so the composer matches
+        // create-time worktree discovery.
+        let repo = TempDir::new().unwrap();
+        git(repo.path(), &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(repo.path().join("service/.agents/skills/review")).unwrap();
+        std::fs::write(
+            repo.path().join("service/.agents/skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review\n---\n\nbody",
+        )
+        .unwrap();
+        git(repo.path(), &["add", "."]);
+        git(repo.path(), &["commit", "-qm", "init"]);
+
+        let root = ResolutionRoot::GitTree {
+            repo_root: repo.path().to_path_buf(),
+            reference: "main".to_string(),
+        };
+        let view = root.skills_view();
+        assert!(
+            view.dir
+                .join("service/.agents/skills/review/SKILL.md")
+                .is_file(),
+            "child project skill must be materialized"
         );
     }
 }
