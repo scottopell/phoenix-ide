@@ -111,6 +111,15 @@ working directory rather than a conversation. Both the in-conversation composer
 directory they target; this is what makes inline references work in the
 new-conversation composer before any conversation exists.
 
+The new-conversation composer enables autocomplete only when the chosen
+directory is the root the first message will be expanded against. In a
+managed/branch workflow the backend creates a fresh worktree of the selected
+branch and expands against *that*, not the current checkout — so the composer
+suppresses autocomplete (passes `cwd: undefined` to the hook, leaving the
+textarea otherwise unchanged) unless the workflow is Direct or its target
+branch is the one already checked out. This keeps the dropdown from suggesting
+files/skills that may not exist where expansion runs.
+
 Both `@` and `./` triggers open the same `InlineAutocomplete` component. Trigger detection inspects the text around the cursor on each `onChange`:
 
 - `@<partial>` anywhere in the text → open in `expand` mode

@@ -31,14 +31,30 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Inline reference autocomplete (@file, ./path, /skill) scoped to the
-  // selected working directory — the same directory the first message is
-  // expanded against when the conversation is created. The composer renders
-  // both a desktop and a mobile textarea (one hidden by CSS); `inlineRefTextarea`
-  // tracks whichever is focused so trigger detection reads the right caret.
+  // Inline reference autocomplete (@file, ./path, /skill) is only offered when
+  // the selected directory IS the root the first message will be expanded
+  // against. In a managed/branch workflow the backend expands against a fresh
+  // worktree of the chosen branch, not the current checkout — so suggestions
+  // from `cwd` would point at files that may not exist there. Restrict
+  // autocomplete to Direct mode, or a branch workflow whose target branch is
+  // the one already checked out. The composer renders both a desktop and a
+  // mobile textarea (one hidden by CSS); `inlineRefTextarea` tracks whichever
+  // is focused so trigger detection reads the right caret.
+  const targetBranch =
+    conv.workflow.kind === 'continueBranch'
+      ? conv.workflow.branch
+      : conv.workflow.kind === 'planFromBranch' || conv.workflow.kind === 'planFromTask'
+        ? conv.workflow.baseBranch
+        : null;
+  const refsResolveAgainstCwd =
+    conv.workflow.kind === 'direct' ||
+    (conv.currentBranch !== null && targetBranch === conv.currentBranch);
   const inlineRefTextarea = useRef<HTMLTextAreaElement | null>(null);
   const ir = useInlineReferences({
-    cwd: conv.cwd,
+    // Disabling fetches (cwd undefined) keeps the dropdown empty without
+    // changing the textarea's behaviour; the inline create-error path still
+    // works regardless.
+    cwd: refsResolveAgainstCwd ? conv.cwd : undefined,
     // The new-conversation composer's identity is its directory: switching the
     // chosen directory resets the dropdown / inline error.
     scopeKey: conv.cwd,

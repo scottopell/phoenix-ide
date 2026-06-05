@@ -59,8 +59,11 @@ THE SYSTEM SHALL show the same inline autocomplete dropdown of files in the comp
 WHEN the user continues typing after either trigger
 THE SYSTEM SHALL filter suggestions by fuzzy match on file path
 
-WHEN the composer is the new-conversation composer, with a directory chosen but no conversation created yet
+WHEN the composer is the new-conversation composer, with a directory chosen but no conversation created yet, AND the first message will be expanded against that directory (a Direct workflow, or a branch workflow whose target branch is the one already checked out)
 THE SYSTEM SHALL resolve suggestions against that chosen directory, identically to an in-conversation composer
+
+WHEN the new-conversation composer's workflow expands the first message against a different root (a managed/branch workflow targeting a branch other than the current checkout, whose fresh worktree need not match the checkout)
+THE SYSTEM SHALL NOT offer file or skill autocomplete, rather than suggest candidates that may not exist where expansion runs
 
 WHEN the user selects a suggestion from the `@` trigger
 THE SYSTEM SHALL insert the completed `@path/to/file` reference at the cursor and dismiss the dropdown
@@ -83,7 +86,7 @@ THE SYSTEM SHALL show an inline autocomplete dropdown listing skills available i
 WHEN the user continues typing after `/`
 THE SYSTEM SHALL filter suggestions by fuzzy match on skill name
 
-WHEN the composer is the new-conversation composer, with a directory chosen but no conversation created yet
+WHEN the composer is the new-conversation composer, with a directory chosen but no conversation created yet, AND the first message will be expanded against that directory (per REQ-IR-004's workflow restriction)
 THE SYSTEM SHALL discover skills from that chosen directory, identically to an in-conversation composer
 
 WHEN a skill has an argument hint defined
