@@ -759,6 +759,51 @@ def _probe_phoenix_scheme(port: int) -> str | None:
     return None
 
 
+def _resolved_phoenix_env() -> dict[str, str]:
+    """Phoenix env with the same .env overrides start_phoenix applies, for
+    resolving TLS paths without starting the server."""
+    env = os.environ.copy()
+    _load_env_file(env)
+    _load_env_file(env, ".phoenix-ide.dev.env")
+    return env
+
+
+def phoenix_tls_cert_paths(env: dict[str, str] | None = None) -> tuple[Path, Path]:
+    """Cert/key files Phoenix's TLS uses, so Vite can serve the same identity.
+    Mirrors crates/phoenix-ide/src/tls.rs: explicit manual paths win; otherwise
+    the auto-managed leaf under the TLS dir (PHOENIX_TLS_DIR, else <db dir>/tls)."""
+    env = env or _resolved_phoenix_env()
+    cert = env.get("PHOENIX_TLS_CERT_PATH")
+    key = env.get("PHOENIX_TLS_KEY_PATH")
+    if cert and key:
+        return Path(cert), Path(key)
+    tls_dir_env = env.get("PHOENIX_TLS_DIR")
+    base = Path(tls_dir_env) if tls_dir_env else get_db_path().parent / "tls"
+    return base / "phoenix-local-server.pem", base / "phoenix-local-server-key.pem"
+
+
+def phoenix_tls_ca_path(env: dict[str, str] | None = None) -> Path | None:
+    """Path to the auto-managed local CA the browser must trust, or None when
+    TLS is configured with manual cert paths (caller-managed trust)."""
+    env = env or _resolved_phoenix_env()
+    if env.get("PHOENIX_TLS_CERT_PATH") and env.get("PHOENIX_TLS_KEY_PATH"):
+        return None
+    tls_dir_env = env.get("PHOENIX_TLS_DIR")
+    base = Path(tls_dir_env) if tls_dir_env else get_db_path().parent / "tls"
+    return base / "phoenix-local-ca.pem"
+
+
+def _wait_for_files(paths: list[Path], timeout: float = 8.0) -> bool:
+    """Poll until every path exists or the timeout elapses. Phoenix issues its
+    auto cert at startup, so Vite (started right after) must wait for it."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if all(p.exists() for p in paths):
+            return True
+        time.sleep(0.1)
+    return all(p.exists() for p in paths)
+
+
 def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     """Start the Phoenix server."""
     global _db_lock
@@ -839,15 +884,16 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     return phoenix_tls
 
 
-def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False):
-    """Start the Vite dev server."""
+def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
+    """Start the Vite dev server. Returns whether Vite serves over HTTPS (h2)."""
     scheme = "https" if phoenix_tls else "http"
     desired_proxy = f"{scheme}://localhost:{phoenix_port}"
+    cert_paths = phoenix_tls_cert_paths() if phoenix_tls else None
     if get_pid(VITE_PID_FILE):
         current_proxy = VITE_PROXY_FILE.read_text().strip() if VITE_PROXY_FILE.exists() else ""
         if current_proxy == desired_proxy:
             print("Vite dev server already running")
-            return
+            return bool(cert_paths and all(p.exists() for p in cert_paths))
         print("Restarting Vite dev server for API proxy change")
         stop_process(VITE_PID_FILE, "Vite")
 
@@ -856,10 +902,21 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False):
     env = node_env()
     # Pass Phoenix port to Vite for proxy configuration
     env["VITE_API_PORT"] = str(phoenix_port)
+    vite_tls = False
     if phoenix_tls:
         env["VITE_API_SCHEME"] = "https"
         env.setdefault("VITE_API_PROXY_SECURE", "false")
-    
+        # Serve Vite itself over the same cert so the browser↔Vite hop is HTTP/2
+        # (Vite 8 → http2 whenever server.https is set). Phoenix issues the cert
+        # at startup, so wait for it; fall back to HTTP/1.1 if it never appears.
+        cert, key = cert_paths
+        if _wait_for_files([cert, key]):
+            env["VITE_HTTPS_CERT"] = str(cert)
+            env["VITE_HTTPS_KEY"] = str(key)
+            vite_tls = True
+        else:
+            print(f"  ⚠ Vite HTTPS disabled: Phoenix TLS cert not found at {cert}")
+
     # Start Vite in background (bind to 0.0.0.0 for external access).
     # pnpm passes args after the script name directly — no `--` separator.
     proc = subprocess.Popen(
@@ -883,6 +940,9 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False):
     print(f"Started Vite dev server (PID {proc.pid}, port {port})")
     VITE_PROXY_FILE.write_text(desired_proxy + "\n")
     print(f"  Proxying /api to Phoenix at {desired_proxy}")
+    if vite_tls:
+        print("  Serving UI over HTTPS (HTTP/2)")
+    return vite_tls
 
 
 # =============================================================================
@@ -931,12 +991,17 @@ def cmd_up(
         print()
 
     phoenix_tls = start_phoenix(port=phoenix_port, tls=tls)
-    start_vite(port=vite_port, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
+    vite_tls = start_vite(port=vite_port, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
     api_scheme = "https" if phoenix_tls else "http"
+    ui_scheme = "https" if vite_tls else "http"
     print()
-    print(f"Ready! UI: http://localhost:{vite_port}")
+    print(f"Ready! UI: {ui_scheme}://localhost:{vite_port}")
     print(f"        API: {api_scheme}://localhost:{phoenix_port}")
     print(f"        Log: {LOG_FILE}")
+    if vite_tls:
+        ca = phoenix_tls_ca_path()
+        if ca:
+            print(f"        HTTP/2 enabled. If the browser warns, trust the local CA once: {ca}")
 
 
 # ---------------------------------------------------------------------------
@@ -2064,9 +2129,10 @@ def cmd_restart(phoenix_port: int | None = None, tls: bool = False):
     api_scheme = "https" if phoenix_tls else "http"
 
     if vite_was_running:
-        start_vite(port=vite_port, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
+        vite_tls = start_vite(port=vite_port, phoenix_port=phoenix_port, phoenix_tls=phoenix_tls)
+        ui_scheme = "https" if vite_tls else "http"
         print(f"Phoenix restarted. Vite ready for UI hot reload.")
-        print(f"  UI:  http://localhost:{vite_port}")
+        print(f"  UI:  {ui_scheme}://localhost:{vite_port}")
         print(f"  API: {api_scheme}://localhost:{phoenix_port}")
     else:
         print(f"Phoenix restarted. Vite not running (start with ./dev.py up).")
@@ -4995,8 +5061,11 @@ def main():
     up_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto from worktree hash)")
     up_parser.add_argument("--vite-port", type=int, default=None, help="Vite port (default: auto from worktree hash)")
     up_parser.add_argument("--no-seed", action="store_true", default=False, help="Skip auto-seeding the dev DB on startup")
-    up_parser.add_argument("--https", dest="https", action="store_true", default=False, help="Serve Phoenix over auto-managed HTTPS")
+    up_parser.add_argument("--https", dest="https", action="store_true", help="Serve dev over auto-managed HTTPS/HTTP2 (default)")
+    up_parser.add_argument("--no-https", dest="https", action="store_false", help="Serve dev over plain HTTP/1.1")
     up_parser.add_argument("--tls", dest="https", action="store_true", help=argparse.SUPPRESS)
+    up_parser.add_argument("--no-tls", dest="https", action="store_false", help=argparse.SUPPRESS)
+    up_parser.set_defaults(https=True)
 
     # down
     sub.add_parser("down", help="Stop all servers")
@@ -5007,8 +5076,11 @@ def main():
     # restart
     restart_parser = sub.add_parser("restart", help="Rebuild Rust and restart Phoenix")
     restart_parser.add_argument("--port", type=int, default=None, help="Phoenix port (default: auto from worktree hash)")
-    restart_parser.add_argument("--https", dest="https", action="store_true", default=False, help="Serve Phoenix over auto-managed HTTPS")
+    restart_parser.add_argument("--https", dest="https", action="store_true", help="Serve dev over auto-managed HTTPS/HTTP2 (default)")
+    restart_parser.add_argument("--no-https", dest="https", action="store_false", help="Serve dev over plain HTTP/1.1")
     restart_parser.add_argument("--tls", dest="https", action="store_true", help=argparse.SUPPRESS)
+    restart_parser.add_argument("--no-tls", dest="https", action="store_false", help=argparse.SUPPRESS)
+    restart_parser.set_defaults(https=True)
 
     # status
     sub.add_parser("status", help="Check what's running")
