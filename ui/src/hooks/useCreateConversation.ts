@@ -541,5 +541,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
     updateDraft,
     selectedConflictSlug,
     handleSend,
+    // The create-time mode + branch for the current workflow. Exposed so the
+    // composer's inline-reference discovery resolves against the SAME root the
+    // first message will expand against (one mapping, no drift).
+    submission: deriveSubmission(workflow),
   };
 }

@@ -604,6 +604,24 @@ export type CodexLoginStatus =
   | { kind: 'success'; account_id: string | null; auth_path: string }
   | { kind: 'error'; message: string };
 
+/**
+ * Selects the root that directory-scoped discovery (`@file` / `/skill`)
+ * resolves against, for the new-conversation composer. `mode`/`baseBranch`
+ * mirror the create-time submission: a branch/managed workflow discovers
+ * against the chosen branch's committed tree (what its worktree will hold),
+ * so suggestions match what create-time expansion can resolve. Omitted ⇒
+ * Direct (the working directory).
+ */
+export interface ProjectResolutionOpts {
+  mode?: 'direct' | 'managed' | 'branch';
+  baseBranch?: string | null;
+}
+
+function applyResolutionOpts(params: URLSearchParams, opts?: ProjectResolutionOpts): void {
+  if (opts?.mode) params.set('mode', opts.mode);
+  if (opts?.baseBranch) params.set('base_branch', opts.baseBranch);
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -1024,10 +1042,13 @@ export const api = {
    */
   async listProjectSkills(
     cwd: string,
+    opts?: ProjectResolutionOpts,
     signal?: AbortSignal,
   ): Promise<{ skills: SkillEntry[] }> {
+    const params = new URLSearchParams({ cwd });
+    applyResolutionOpts(params, opts);
     const resp = await fetch(
-      `/api/skills?cwd=${encodeURIComponent(cwd)}`,
+      `/api/skills?${params}`,
       signal ? { signal } : {},
     );
     if (!resp.ok) throw new Error('Failed to list skills');
@@ -1081,9 +1102,11 @@ export const api = {
     cwd: string,
     query: string,
     limit = 50,
+    opts?: ProjectResolutionOpts,
     signal?: AbortSignal,
   ): Promise<{ items: FileSearchEntry[] }> {
     const params = new URLSearchParams({ cwd, q: query, limit: String(limit) });
+    applyResolutionOpts(params, opts);
     const resp = await fetch(
       `/api/files/search?${params}`,
       signal ? { signal } : {},

@@ -37,6 +37,17 @@ export interface UseInlineReferencesParams {
    */
   cwd: string | undefined;
   /**
+   * Creation mode of the composer's workflow. With `baseBranch`, branch/managed
+   * modes discover candidates from the chosen branch's committed tree (what the
+   * conversation's worktree will hold) rather than the live `cwd`, so a
+   * suggestion always matches what create-time expansion can resolve. Omitted ⇒
+   * Direct (resolve against `cwd`). An in-conversation composer leaves this
+   * unset: its conversation already resolves against its own `cwd`.
+   */
+  mode?: 'direct' | 'managed' | 'branch';
+  /** Branch the conversation will be created on, for branch/managed modes. */
+  baseBranch?: string | null;
+  /**
    * Identity of the composer this engine belongs to: a conversation id for an
    * in-conversation composer, a stable key for the new-conversation composer.
    * Transient UI state (active trigger, in-flight results, expansion error,
@@ -79,11 +90,20 @@ export interface InlineReferences {
 
 export function useInlineReferences({
   cwd,
+  mode,
+  baseBranch,
   scopeKey,
   textareaRef,
   value,
   setValue,
 }: UseInlineReferencesParams): InlineReferences {
+  // Candidates depend on the directory AND the ref (branch/managed resolve
+  // against a branch's committed tree, not `cwd`). The skill cache and the
+  // in-flight staleness guards key on this composite so switching workflow or
+  // branch refetches against the new root. JSON-encoded so the component parts
+  // can't collide.
+  const discoveryOpts = useMemo(() => ({ mode, baseBranch }), [mode, baseBranch]);
+  const discoveryKey = cwd ? JSON.stringify([cwd, mode ?? 'direct', baseBranch ?? '']) : undefined;
   // Transient UI state is keyed on the composer identity (`scopeKey`) so it
   // resets when the composer switches conversations, even within one `cwd`.
   /** Active trigger state — null when no trigger is open. */
@@ -100,26 +120,26 @@ export function useInlineReferences({
   const [skillArgumentHint, setSkillArgumentHint] = useScopedState<string | null>(scopeKey, null);
   const [acSelectedIndex, setAcSelectedIndex] = useScopedState(scopeKey, 0);
 
-  // The skill catalog is a property of the directory, so it stays keyed on
-  // `cwd` and is shared across same-directory composers.
-  /** Cached skill list for the current directory (REQ-IR-005). */
-  const [skillItems, setSkillItems] = useScopedState<SkillEntry[]>(cwd, []);
+  // The skill catalog is a property of the resolution root (directory + ref),
+  // so it is keyed on `discoveryKey` and shared across composers on the same root.
+  /** Cached skill list for the current resolution root (REQ-IR-005). */
+  const [skillItems, setSkillItems] = useScopedState<SkillEntry[]>(discoveryKey, []);
 
   /** Aborts any in-flight file search request. */
   const searchAbortRef = useRef<AbortController | null>(null);
   /** Debounce timer for file search. */
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  /** Guards against duplicate in-flight skill fetches. Holds the `cwd` of the
-   *  in-flight request (undefined when idle) so a fetch for directory A does not
-   *  suppress the fetch for directory B after a switch. */
-  const fetchingSkillsCwdRef = useRef<string | undefined>(undefined);
+  /** Guards against duplicate in-flight skill fetches. Holds the `discoveryKey`
+   *  of the in-flight request (undefined when idle) so a fetch for root A does
+   *  not suppress the fetch for root B after a switch. */
+  const fetchingSkillsKeyRef = useRef<string | undefined>(undefined);
   /**
-   * Latest requested `cwd`. A fetch issued for directory A may resolve after
-   * the composer has switched to directory B; comparing against this ref lets
-   * the late response be discarded instead of populating B with A's results.
+   * Latest requested `discoveryKey`. A fetch issued for root A may resolve after
+   * the composer has switched to root B; comparing against this ref lets the
+   * late response be discarded instead of populating B with A's results.
    */
-  const latestCwdRef = useRef(cwd);
-  latestCwdRef.current = cwd;
+  const latestKeyRef = useRef(discoveryKey);
+  latestKeyRef.current = discoveryKey;
 
   /**
    * Autocomplete items to display, derived from the active trigger mode: skill
@@ -151,9 +171,9 @@ export function useInlineReferences({
       searchAbortRef.current = controller;
 
       try {
-        const result = await api.searchProjectFiles(cwd, query, 50, controller.signal);
-        // Drop the response if the directory changed while it was in flight.
-        if (latestCwdRef.current !== cwd) return;
+        const result = await api.searchProjectFiles(cwd, query, 50, discoveryOpts, controller.signal);
+        // Drop the response if the resolution root changed while it was in flight.
+        if (latestKeyRef.current !== discoveryKey) return;
         const items: AutocompleteItem[] = result.items.map((entry) => ({
           id: entry.path,
           label: entry.path,
@@ -167,26 +187,26 @@ export function useInlineReferences({
         setFileAcItems([]);
       }
     },
-    [cwd, setFileAcItems],
+    [cwd, discoveryKey, discoveryOpts, setFileAcItems],
   );
 
-  /** Fetch and cache available skills for this directory (once per scope). */
+  /** Fetch and cache available skills for this resolution root (once per key). */
   const fetchSkillItems = useCallback(async () => {
     if (!cwd) return;
-    if (fetchingSkillsCwdRef.current === cwd) return;
-    fetchingSkillsCwdRef.current = cwd;
+    if (fetchingSkillsKeyRef.current === discoveryKey) return;
+    fetchingSkillsKeyRef.current = discoveryKey;
     try {
-      const result = await api.listProjectSkills(cwd);
-      // Drop the response if the directory changed while it was in flight.
-      if (latestCwdRef.current !== cwd) return;
+      const result = await api.listProjectSkills(cwd, discoveryOpts);
+      // Drop the response if the resolution root changed while it was in flight.
+      if (latestKeyRef.current !== discoveryKey) return;
       setSkillItems(result.skills);
     } catch (err) {
       console.warn('Skill list failed:', err);
-      if (latestCwdRef.current === cwd) setSkillItems([]);
+      if (latestKeyRef.current === discoveryKey) setSkillItems([]);
     } finally {
-      if (fetchingSkillsCwdRef.current === cwd) fetchingSkillsCwdRef.current = undefined;
+      if (fetchingSkillsKeyRef.current === discoveryKey) fetchingSkillsKeyRef.current = undefined;
     }
-  }, [cwd, setSkillItems]);
+  }, [cwd, discoveryKey, discoveryOpts, setSkillItems]);
 
   // When autocomplete is disabled (no `cwd`), tear down any open dropdown and
   // stale file results so candidates fetched against a previous root can't stay

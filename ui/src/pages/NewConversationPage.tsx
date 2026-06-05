@@ -61,30 +61,20 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Inline reference autocomplete (@file, ./path, /skill) is only offered when
-  // the selected directory IS the root the first message will be expanded
-  // against. In a managed/branch workflow the backend expands against a fresh
-  // worktree of the chosen branch, not the current checkout — so suggestions
-  // from `cwd` would point at files that may not exist there. Restrict
-  // autocomplete to Direct mode, or a branch workflow whose target branch is
-  // the one already checked out. The composer renders both a desktop and a
-  // mobile textarea (one hidden by CSS); `inlineRefTextarea` tracks whichever
+  // Inline reference autocomplete (@file, ./path, /skill). Discovery resolves
+  // against the same root the first message will expand against: for a
+  // branch/managed workflow that is the chosen branch's committed tree (what
+  // the conversation's fresh worktree will hold), not the current checkout —
+  // so suggestions never point at uncommitted/untracked files that would 422 on
+  // send. `mode`/`baseBranch` come from the same `submission` mapping the create
+  // call uses, so the two cannot drift. The composer renders both a desktop and
+  // a mobile textarea (one hidden by CSS); `inlineRefTextarea` tracks whichever
   // is focused so trigger detection reads the right caret.
-  const targetBranch =
-    conv.workflow.kind === 'continueBranch'
-      ? conv.workflow.branch
-      : conv.workflow.kind === 'planFromBranch' || conv.workflow.kind === 'planFromTask'
-        ? conv.workflow.baseBranch
-        : null;
-  const refsResolveAgainstCwd =
-    conv.workflow.kind === 'direct' ||
-    (conv.currentBranch !== null && targetBranch === conv.currentBranch);
   const inlineRefTextarea = useRef<HTMLTextAreaElement | null>(null);
   const ir = useInlineReferences({
-    // Disabling fetches (cwd undefined) keeps the dropdown empty without
-    // changing the textarea's behaviour; the inline create-error path still
-    // works regardless.
-    cwd: refsResolveAgainstCwd ? conv.cwd : undefined,
+    cwd: conv.cwd,
+    mode: conv.submission.mode,
+    baseBranch: conv.submission.baseBranch,
     // The new-conversation composer's identity is its directory: switching the
     // chosen directory resets the dropdown / inline error.
     scopeKey: conv.cwd,
