@@ -79,6 +79,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_pr_feedback_baselines",
         sql: MIGRATION_013,
     },
+    Migration {
+        version: 14,
+        name: "backfill_user_content_files",
+        sql: MIGRATION_014,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -355,6 +360,13 @@ CREATE TABLE IF NOT EXISTS work_scope_pr_feedback_baselines (
 );
 ";
 
+const MIGRATION_014: &str = r"
+UPDATE messages
+SET content = json_set(content, '$.files', json('[]'))
+WHERE message_type IN ('user', 'skill')
+  AND json_type(content, '$.files') IS NULL;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -452,6 +464,20 @@ mod tests {
         .execute(pool)
         .await
         .unwrap();
+        sqlx::raw_sql(
+            "CREATE TABLE messages (\
+                id INTEGER PRIMARY KEY AUTOINCREMENT, \
+                message_id TEXT UNIQUE, \
+                conversation_id TEXT NOT NULL, \
+                message_type TEXT NOT NULL, \
+                content TEXT NOT NULL, \
+                sequence_id INTEGER NOT NULL DEFAULT 1, \
+                created_at TEXT NOT NULL DEFAULT '2025-01-01'\
+            )",
+        )
+        .execute(pool)
+        .await
+        .unwrap();
     }
 
     #[tokio::test]
@@ -460,7 +486,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 13);
+        assert_eq!(first, 14);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

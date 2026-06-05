@@ -48,8 +48,12 @@ ui/src/
 │   ├── MessageList.tsx           # Message display
 │   ├── MessageComponents.tsx     # Message rendering (markdown, tools)
 │   ├── InputArea.tsx             # Message composition
-│   ├── StateBar.tsx              # Bottom bar (slug, model, status)
-│   ├── BreadcrumbBar.tsx         # Agent activity trail
+│   ├── StateBar.tsx              # Bottom bar (slug, model, live agent status)
+│   ├── PillStrip.tsx             # Shared horizontal pill list primitive
+│   ├── BreadcrumbBar.tsx         # Step trail (SharePage)
+│   ├── ConversationNav.tsx       # Top-slot conversation chapter strip
+│   ├── ConversationNavStack.tsx  # Nav strip + MessageList coordination
+│   ├── DensityProvider.tsx       # Full|Compact density context provider
 │   ├── SettingsFields.tsx        # Directory/model pickers (reusable)
 │   ├── DirectoryPicker.tsx       # Directory selection with validation
 │   ├── NewConversationSheet.tsx  # Mobile bottom sheet
@@ -406,6 +410,101 @@ export function useAppMachine(): AppMachineHandle {
 After this: `appMachine.ts` is testable by importing `transition` and feeding events.
 No React, no DOM. One running implementation matching its spec.
 
+## One Slot, One Role (REQ-CONV-007, REQ-CONV-022, REQ-CONV-023)
+
+The conversation view exposes three places where the agent's activity could be
+surfaced. Each has a single fixed role, so no slot changes meaning between cold
+load and streaming:
+
+- **Top horizontal slot → Conversation Navigation, always (REQ-CONV-023).**
+  Occupied by `ConversationNav`, a whole-conversation chapter strip. Its role is
+  identical on cold load and while streaming; an in-flight turn simply appears as
+  the newest chapter once its prose crosses the significance threshold. This slot
+  is never a live-activity trail and never a per-turn step trail.
+- **Live "what is the agent doing right now" → the StateBar (REQ-CONV-007).**
+  `StateBar` owns the pulsing-dot activity indicator and the per-state label,
+  derived from `ConversationState` via `isAgentWorking`. There is exactly one
+  source for "is the agent working?".
+- **Per-turn tool detail → inline in the message list (REQ-CONV-022).**
+  In compact density, each completed turn's tool activity collapses into an
+  inline pill strip rendered by `MessageComponents`, never into the top slot or
+  the StateBar.
+
+`BreadcrumbBar` is a step-trail pill list retained for `SharePage`, which renders
+a static reconstructed trail of a finished conversation. It is not part of the
+live conversation view's top slot.
+
+### Shared `<PillStrip>` primitive
+
+`PillStrip` is the generic horizontal pill list — items joined by `→`
+separators, optional hover tooltip via a portal, and opt-in auto-scroll-to-end.
+Three surfaces consume it: the `BreadcrumbBar` step trail, the compact-mode
+inline tool strip, and `ConversationNav`. Each passes its own `pillClassName` /
+`arrowClassName` / `tooltipClassName` so the visual identity (tool vs sub-agent
+color, prompt vs prose styling) lives at the call site while the layout,
+tooltip, and scroll behavior live once in the primitive.
+
+### Significance threshold — one definition for both features
+
+`SIGNIFICANCE_THRESHOLD` (280 characters, in `useDensity.ts`) and its predicate
+`isSignificantText` are the single definition of "significant assistant prose".
+Compact density uses it to decide which assistant text blocks stay full versus
+fold into a faded one-liner (REQ-CONV-022); chapter derivation uses the *same*
+predicate to decide which assistant prose becomes a navigable chapter
+(REQ-CONV-023). One constant means a substantial finding is exactly the content
+the user can both skim past in compact mode and jump to from the nav strip.
+
+### Compact density (REQ-CONV-022)
+
+Density is a `'full' | 'compact'` preference held in `localStorage` under
+`phoenix-conv-density` (default `full`), provided through `DensityProvider` and
+read via `useDensity` so `MessageComponents` consumes it without prop-drilling
+(mirroring `useTheme`). `SettingsDropdown` exposes the control.
+
+Density is purely presentational: `buildRenderUnits` remains the single source of
+truth for which messages render and how they group. Density changes only how an
+already-built `agent_turn` and short text block *paint*. The compact tool strip
+is derived by `deriveToolStripItems` from the turn's own `ContentBlock[]`
+tool_use blocks paired with `toolResultsByUseId` — never from phase or breadcrumb
+state, so the strip reflects what the turn actually did. `think` blocks are
+excluded (model reasoning, already a self-collapsing aside). A streaming turn
+renders full regardless of density; compaction applies only once the turn is
+finalized.
+
+### Conversation navigation over a virtualized list (REQ-CONV-023)
+
+`buildConversationChapters` is a pure transform `HistoricalUnit[] → Chapter[]`, a
+sibling of `buildRenderUnits` that classifies which already-built render units
+are chapters (user prompts and assistant prose `≥ SIGNIFICANCE_THRESHOLD`)
+without changing what renders. Each `Chapter` carries `unitIndex` — its position
+in the same `historicalUnits` array `MessageList` feeds to react-virtuoso. Tail
+units always follow historical units, so a historical unit's index is identical
+in both coordinate spaces, making `unitIndex` a valid virtuoso `scrollToIndex`
+target.
+
+**Virtualization constraint.** A chapter pill must jump to a target that is
+typically *outside the rendered window*. react-virtuoso unmounts off-screen rows,
+so `document.querySelector('[data-sequence-id=…]')` returns null for them — a
+DOM-anchor jump only works when the target is already near the viewport. The jump
+therefore goes through `MessageListHandle.scrollToUnitIndex`, which calls
+`virtuosoRef.scrollToIndex({ index: unitIndex })` keyed by render-unit index, not
+by querying the DOM. The highlight pulse cannot be applied synchronously because
+the row does not exist at click time: `scrollToUnitIndex` stashes the target
+unit's `key`, and the pulse is applied *after the row mounts* by querying
+`[data-render-unit-key]` once the scroll settles (retried across a few ticks so a
+long smooth scroll still lands the pulse).
+
+`ConversationNavStack` owns the imperative `MessageListHandle` ref and wires the
+nav to the list: it receives chapters via `onChaptersChange`, computes the active
+chapter from virtuoso's visible range via `resolveActiveUnitIndex` (scroll-spy,
+table-of-contents semantics: the active chapter is the deepest one at or above
+the top of the viewport), and routes pill clicks to `scrollToUnitIndex`.
+
+The scroll-spy and jump lifecycle (states: idle / jumping / pulse-pending;
+transitions driven by `rangeChanged` and scroll settling) is a candidate for a
+future Allium spec should it accrete more states; the spEARS description here and
+in REQ-CONV-023 is the authoritative behavioural contract until then.
+
 ## Token Streaming Display (REQ-CONV-019, REQ-BED-025)
 
 ### StreamingState
@@ -673,11 +772,15 @@ The app machine coordinates:
 | `ConversationList` | List display, state indicators, selection | REQ-CONV-001, REQ-CONV-012 |
 | `NewConversationSheet` | Mobile bottom sheet | REQ-CONV-015 |
 | `NewConversationPage` | Full-page route serving all desktop entries (inline + root); satisfies REQ-CONV-017 + REQ-CONV-018 | REQ-CONV-017, REQ-CONV-018 |
-| `MessageList` | Message display, scroll memory, streaming | REQ-CONV-002, REQ-CONV-013, REQ-CONV-019 |
+| `MessageList` | Virtualized message display, streaming, `scrollToUnitIndex` jump handle | REQ-CONV-002, REQ-CONV-019, REQ-CONV-023 |
 | `StreamingMessage` | In-progress token display | REQ-CONV-019 |
 | `InputArea` | Composition, drafts, queue | REQ-CONV-003, REQ-CONV-004 |
-| `StateBar` | Connection status, context info, state label | REQ-CONV-005, REQ-CONV-007 |
-| `BreadcrumbBar` | Completed + in-progress step trail | REQ-CONV-007a |
+| `StateBar` | Connection status, context info, live agent-activity indicator | REQ-CONV-005, REQ-CONV-007 |
+| `PillStrip` | Shared horizontal pill list primitive (separators, tooltip, auto-scroll) | REQ-CONV-007, REQ-CONV-022, REQ-CONV-023 |
+| `ConversationNav` | Whole-conversation chapter strip in the top slot | REQ-CONV-023 |
+| `ConversationNavStack` | Nav strip ↔ `MessageList` coordination (chapters, scroll-spy, jump) | REQ-CONV-023 |
+| `DensityProvider` / `useDensity` | Full \| Compact density preference + significance threshold | REQ-CONV-022 |
+| `BreadcrumbBar` | Static step trail for a finished conversation (`SharePage`) | — |
 
 ---
 

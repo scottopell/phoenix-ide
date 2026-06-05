@@ -635,6 +635,7 @@ where
             text,
             llm_text,
             images,
+            files,
             message_id,
             user_agent,
             skill_invocation,
@@ -644,6 +645,7 @@ where
                 text,
                 llm_text,
                 images,
+                files,
                 message_id: message_id.clone(),
                 user_agent,
                 skill_invocation,
@@ -2439,7 +2441,13 @@ where
                 MessageContent::User(user_content) => {
                     // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
                     // the model sees the fully resolved form while the DB stores the shorthand.
-                    let text_for_llm = user_content.llm_text();
+                    let mut text_for_llm = user_content.llm_text().to_string();
+                    if !user_content.files.is_empty() {
+                        for file in &user_content.files {
+                            text_for_llm.push('\n');
+                            text_for_llm.push_str(&file.llm_context_tag());
+                        }
+                    }
                     let mut content = vec![ContentBlock::text(text_for_llm)];
 
                     // Add images (REQ-BED-013)
@@ -2491,9 +2499,14 @@ where
 
                 // Skill messages are delivered as user-role messages (REQ-SK-002)
                 MessageContent::Skill(skill_content) => {
+                    let mut body = skill_content.body.clone();
+                    for file in &skill_content.files {
+                        body.push('\n');
+                        body.push_str(&file.llm_context_tag());
+                    }
                     messages.push(LlmMessage {
                         role: MessageRole::User,
-                        content: vec![ContentBlock::text(&skill_content.body)],
+                        content: vec![ContentBlock::text(body)],
                     });
                 }
 
@@ -4666,6 +4679,7 @@ mod steer_drain_detector_tests {
             text: text.to_string(),
             llm_text: None,
             images: vec![],
+            files: vec![],
             message_id: id.to_string(),
             user_agent: None,
             skill_invocation: None,

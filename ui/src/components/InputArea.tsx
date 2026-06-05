@@ -8,12 +8,14 @@ import {
   KeyboardEvent,
   ClipboardEvent,
   ChangeEvent,
+  DragEvent,
+  type SetStateAction,
 } from 'react';
 // Icon buttons removed from action row -- file browse via sidebar, image attach via paste/drag
 import type { QueuedMessage } from '../hooks';
 import { useDraftActions, useDraftValue, useScopedState, useInlineReferences } from '../hooks';
-import type { ConversationState, ImageData } from '../api';
-import { ExpansionError } from '../api';
+import type { ConversationState, FileAttachment, ImageData } from '../api';
+import { api, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
 import { canCancelConversationState, isAgentWorking, isCancellingState } from '../utils';
 import { ImageAttachments } from './ImageAttachments';
 import { VoiceRecorder, isWebSpeechSupported } from './VoiceInput';
@@ -41,6 +43,8 @@ interface InputAreaProps {
   convState: ConversationState;
   images: ImageData[];
   setImages: (images: ImageData[]) => void;
+  files?: FileAttachment[];
+  setFiles?: (files: SetStateAction<FileAttachment[]>) => void;
   isOffline: boolean;
   /**
    * Messages whose POST was rejected. Rendered inline with retry/dismiss
@@ -69,10 +73,16 @@ interface InputAreaProps {
    * May reject with an expansion error (REQ-IR-007) — the component will
    * display the error inline without clearing the draft.
    */
-  onSend: (text: string, images: ImageData[]) => Promise<void> | void;
+  onSend: (text: string, images: ImageData[], files: FileAttachment[]) => Promise<void> | void;
   onCancel: () => void;
   onRetry: (localId: string) => void;
   onDismissError?: (localId: string) => void;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
 export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function InputArea({
@@ -81,6 +91,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   convState,
   images,
   setImages,
+  files = [],
+  setFiles = () => {},
   isOffline,
   failedMessages,
   convModeLabel,
@@ -103,6 +115,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   const clearDraft = useCallback(() => onDraftChange(''), [onDraftChange]);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  // `scopeKey` is the conversation id for this (always in-conversation) composer;
+  // attachment uploads target it, and this ref lets an in-flight upload detect a
+  // conversation switch and discard its late response.
+  const scopeKeyRef = useRef(scopeKey);
+  useEffect(() => { scopeKeyRef.current = scopeKey; }, [scopeKey]);
   const voiceSupported = isWebSpeechSupported();
 
   useImperativeHandle(ref, () => ({
@@ -147,6 +164,13 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     value: acValue,
     setValue: applyRefValue,
   });
+  // Inline expansion-error surface is shared between @ref/skill expansion and
+  // attachment-upload failures, so the file-drop handlers reuse it.
+  const { reset: resetRefs, setExpansionError, expansionError } = ir;
+
+  // File-attachment drag/drop state.
+  const [isDragOver, setIsDragOver] = useState(false);
+  const [isUploadingFiles, setIsUploadingFiles] = useState(false);
 
   // =========================================================================
   // Auto-resize
@@ -207,11 +231,97 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     setImages(images.filter((_, i) => i !== index));
   };
 
+  const handleRemoveFile = (index: number) => {
+    setFiles(files.filter((_, i) => i !== index));
+  };
+
+  const addDroppedFiles = async (dropped: File[]) => {
+    if (isUploadingFiles) {
+      setExpansionError('Wait for the current attachment upload to finish before adding more files.');
+      return;
+    }
+    if (!scopeKey) {
+      setExpansionError('Open a conversation before attaching files.');
+      return;
+    }
+
+    const uploadConversationId = scopeKey;
+
+    const unsupportedImage = dropped.find(file => file.type.startsWith('image/') && !SUPPORTED_IMAGE_TYPES.includes(file.type));
+    if (unsupportedImage) {
+      setExpansionError(`${unsupportedImage.name} is not a supported image attachment type.`);
+      return;
+    }
+    const imageFiles = dropped.filter(file => SUPPORTED_IMAGE_TYPES.includes(file.type));
+    const genericFiles = dropped.filter(file => !SUPPORTED_IMAGE_TYPES.includes(file.type));
+
+    const tooLarge = genericFiles.find(file => file.size > MAX_FILE_ATTACHMENT_SIZE);
+    if (tooLarge) {
+      setExpansionError(`${tooLarge.name} exceeds the 10 MB file attachment limit.`);
+      return;
+    }
+    if (files.length + genericFiles.length > MAX_FILE_ATTACHMENTS) {
+      setExpansionError(`A message can include at most ${MAX_FILE_ATTACHMENTS} files.`);
+      return;
+    }
+    const total = files.reduce((sum, file) => sum + file.size_bytes, 0)
+      + genericFiles.reduce((sum, file) => sum + file.size, 0);
+    if (total > MAX_TOTAL_FILE_ATTACHMENT_SIZE) {
+      setExpansionError('Attachments exceed the 25 MB total limit.');
+      return;
+    }
+
+    if (imageFiles.length > 0) await addImages(imageFiles);
+    if (genericFiles.length === 0) return;
+
+    setIsUploadingFiles(true);
+    setExpansionError(null);
+    try {
+      const uploaded = await api.uploadAttachments(uploadConversationId, genericFiles);
+      if (scopeKeyRef.current !== uploadConversationId) return;
+      setFiles(prev => [...prev, ...uploaded]);
+    } catch (err) {
+      setExpansionError(err instanceof Error ? err.message : 'Failed to upload attachments');
+    } finally {
+      setIsUploadingFiles(false);
+    }
+  };
+
+  const handleDragEnter = (e: DragEvent) => {
+    if (Array.from(e.dataTransfer.types).includes('Files')) {
+      e.preventDefault();
+      setIsDragOver(true);
+    }
+  };
+
+  const handleDragOver = (e: DragEvent) => {
+    if (Array.from(e.dataTransfer.types).includes('Files')) {
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'copy';
+    }
+  };
+
+  const handleDragLeave = (e: DragEvent) => {
+    if (!e.currentTarget.contains(e.relatedTarget as Node | null)) {
+      setIsDragOver(false);
+    }
+  };
+
+  const handleDrop = async (e: DragEvent) => {
+    if (!Array.from(e.dataTransfer.types).includes('Files')) return;
+    e.preventDefault();
+    setIsDragOver(false);
+    if (isUploadingFiles) {
+      setExpansionError('Wait for the current attachment upload to finish before adding more files.');
+      return;
+    }
+    const dropped = Array.from(e.dataTransfer.files);
+    if (dropped.length > 0) await addDroppedFiles(dropped);
+  };
+
   // =========================================================================
   // Send (with expansion error handling — REQ-IR-007)
   // =========================================================================
-
-  const { reset: resetRefs, setExpansionError, expansionError } = ir;
 
   const handleSend = useCallback(async () => {
     let text: string;
@@ -221,8 +331,8 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
       text = draft.trim();
     }
 
-    if (!text && images.length === 0) return;
-    if (blocksComposerSend) return;
+    if (!text && images.length === 0 && files.length === 0) return;
+    if (blocksComposerSend || isUploadingFiles) return;
     // The Send button is disabled while an expansion error is shown; gate the
     // keyboard (Enter) path too so a stale broken @reference isn't resubmitted
     // before it's corrected (REQ-IR-007).
@@ -233,7 +343,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     // Close autocomplete and ghost text on send
     resetRefs();
 
-    // Clear draft and images eagerly — the message is already queued and
+    // Clear draft and attachments eagerly — the message is already queued and
     // visible in the message list, so there's no reason to keep the text in
     // the input area while waiting for the network round-trip.  We only
     // restore the draft if an ExpansionError comes back (user must fix the
@@ -245,10 +355,11 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     }
     clearDraft();
     setImages([]);
+    setFiles([]);
     setExpansionError(null);
 
     try {
-      await onSend(text, images);
+      await onSend(text, images, files);
     } catch (err) {
       if (err instanceof ExpansionError) {
         // Surface expansion error inline and restore the draft (REQ-IR-007)
@@ -260,6 +371,7 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
           setDraft(text);
         }
         setImages(images);
+        setFiles(files);
       }
       // Non-expansion errors: draft is already cleared; the message queue
       // shows the failure with a retry button.
@@ -269,13 +381,16 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
     voiceInterim,
     draft,
     images,
+    files,
     blocksComposerSend,
     expansionError,
+    isUploadingFiles,
     onSend,
     clearDraft,
     resetRefs,
     setExpansionError,
     setImages,
+    setFiles,
     setVoiceBase,
     setVoiceInterim,
     setDraft,
@@ -352,9 +467,9 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // =========================================================================
 
   const displayedText = voiceBase !== null ? voiceBase : draft;
-  const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0;
-  const canSend = !blocksComposerSend;
-  const sendEnabled = canSend && hasContent && !ir.expansionError;
+  const hasContent = displayedText.trim().length > 0 || voiceInterim.trim().length > 0 || images.length > 0 || files.length > 0;
+  const canSend = !blocksComposerSend && !isUploadingFiles;
+  const sendEnabled = canSend && hasContent && !expansionError;
 
   // Cycle placeholder hint each time the input clears (e.g., after send).
   // Advances only when draft goes empty, not on a timer.
@@ -394,7 +509,14 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
   // =========================================================================
 
   return (
-    <footer id="input-area">
+    <footer
+      id="input-area"
+      className={isDragOver ? 'input-area--drag-over' : undefined}
+      onDragEnter={handleDragEnter}
+      onDragOver={handleDragOver}
+      onDragLeave={handleDragLeave}
+      onDrop={handleDrop}
+    >
       {failedMessages.length > 0 && (
         <div className="failed-messages">
           {failedMessages.map(msg => (
@@ -436,7 +558,34 @@ export const InputArea = forwardRef<InputAreaHandle, InputAreaProps>(function In
         </div>
       )}
 
+      {isDragOver && (
+        <div className="input-drop-affordance" aria-live="polite">
+          Drop files to attach
+        </div>
+      )}
+
       <ImageAttachments images={images} onRemove={handleRemoveImage} />
+      {files.length > 0 && (
+        <div className="file-attachments" aria-label="Attached files">
+          {files.map((file, index) => (
+            <div key={`${file.stored_path}-${index}`} className="file-attachment-chip">
+              <span className="file-attachment-icon">📎</span>
+              <span className="file-attachment-name" title={file.stored_path}>{file.original_name}</span>
+              <span className="file-attachment-size">{formatBytes(file.size_bytes)}</span>
+              <button
+                type="button"
+                className="file-attachment-remove"
+                onClick={() => handleRemoveFile(index)}
+                title="Remove attachment"
+                aria-label={`Remove attachment ${file.original_name}`}
+              >
+                x
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+      {isUploadingFiles && <div className="input-uploading-files">Uploading attachments...</div>}
 
       {/* Hidden file input for image attachments */}
       <input

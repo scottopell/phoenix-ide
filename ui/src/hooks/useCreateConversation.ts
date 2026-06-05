@@ -1,9 +1,9 @@
 import { useState, useEffect, useRef } from 'react';
-import { api, ExpansionError } from '../api';
+import { api, ExpansionError, MAX_FILE_ATTACHMENT_SIZE, MAX_FILE_ATTACHMENTS, MAX_TOTAL_FILE_ATTACHMENT_SIZE } from '../api';
 import { subscribeModels } from '../modelsPoller';
 import type { GitBranchEntry, ImageData, ModelsResponse, TaskEntry } from '../api';
 import type { DirStatus } from '../components/SettingsFields';
-import { processImageFiles } from '../utils/images';
+import { SUPPORTED_IMAGE_TYPES, processImageFiles } from '../utils/images';
 import { isWebSpeechSupported } from '../components/VoiceInput/VoiceRecorder';
 import { generateUUID } from '../utils/uuid';
 import { useCreateConversationWithStore } from '../conversation';
@@ -158,6 +158,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const [showAllModels, setShowAllModels] = useState(false);
   const [draft, setDraft] = useState(readNewConversationDraft);
   const [images, setImages] = useState<ImageData[]>([]);
+  const [files, setFiles] = useState<File[]>([]);
+  const [isDragOver, setIsDragOver] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
@@ -316,7 +318,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const selectedTaskConflict = selectedTask?.conversation_slug ?? null;
   const selectedConflictSlug = selectedTaskConflict ?? selectedBranchConflict;
   const hasWorkflowStartingPoint = workflow.kind === 'direct' || Boolean(workflowBranch(workflow));
-  const hasMessageContent = draft.trim().length > 0 || images.length > 0 || Boolean(selectedTask);
+  const hasMessageContent = draft.trim().length > 0 || images.length > 0 || files.length > 0 || Boolean(selectedTask);
   const taskWorkflowReady = workflow.kind !== 'planFromTask' || Boolean(selectedTask);
   const gitWorkflowReady = !workflowNeedsGit(workflow)
     || (isGitDir === true && !gitMetadataLoading && !branchSearchLoading && hasWorkflowStartingPoint && taskWorkflowReady);
@@ -339,6 +341,38 @@ export function useCreateConversation(navigate: (path: string) => void) {
 
   const removeImage = (index: number) => {
     setImages(prev => prev.filter((_, idx) => idx !== index));
+  };
+
+  const addFiles = async (dropped: File[]) => {
+    const unsupportedImage = dropped.find(file => file.type.startsWith('image/') && !SUPPORTED_IMAGE_TYPES.includes(file.type));
+    if (unsupportedImage) {
+      setError(`${unsupportedImage.name} is not a supported image attachment type.`);
+      return;
+    }
+    const genericFiles = dropped.filter(file => !SUPPORTED_IMAGE_TYPES.includes(file.type));
+    const imageFiles = dropped.filter(file => SUPPORTED_IMAGE_TYPES.includes(file.type));
+    if (imageFiles.length > 0) await addImages(imageFiles);
+    if (genericFiles.length === 0) return;
+    const tooLarge = genericFiles.find(file => file.size > MAX_FILE_ATTACHMENT_SIZE);
+    if (tooLarge) {
+      setError(`${tooLarge.name} exceeds the 10 MB file attachment limit.`);
+      return;
+    }
+    if (files.length + genericFiles.length > MAX_FILE_ATTACHMENTS) {
+      setError(`A message can include at most ${MAX_FILE_ATTACHMENTS} files.`);
+      return;
+    }
+    const total = files.reduce((sum, file) => sum + file.size, 0)
+      + genericFiles.reduce((sum, file) => sum + file.size, 0);
+    if (total > MAX_TOTAL_FILE_ATTACHMENT_SIZE) {
+      setError('Attachments exceed the 25 MB total limit.');
+      return;
+    }
+    setFiles(prev => [...prev, ...genericFiles]);
+  };
+
+  const removeFile = (index: number) => {
+    setFiles(prev => prev.filter((_, idx) => idx !== index));
   };
 
   const handleVoiceFinal = (text: string) => {
@@ -371,7 +405,7 @@ export function useCreateConversation(navigate: (path: string) => void) {
   const handleSend = async () => {
     const trimmed = draft.trim();
     const taskStartProvidesContent = Boolean(selectedTask);
-    if (!trimmed && images.length === 0 && !taskStartProvidesContent) return;
+    if (!trimmed && images.length === 0 && files.length === 0 && !taskStartProvidesContent) return;
     if (creating || dirStatus === 'invalid' || dirStatus === 'checking') return;
 
     setError(null);
@@ -418,13 +452,33 @@ export function useCreateConversation(navigate: (path: string) => void) {
       const submitText = selectedTask
         ? buildTaskStartPrompt(trimmedCwd, selectedTask, trimmed)
         : trimmed;
-      const conv = await createConversationWithStore(
-        trimmedCwd, submitText, messageId, selectedModel || undefined, images, submission.mode,
-        submission.baseBranch,
-      );
+      const conv = files.length > 0
+        ? await createConversationWithStore(
+            trimmedCwd,
+            submitText,
+            messageId,
+            selectedModel || undefined,
+            images,
+            submission.mode,
+            submission.baseBranch,
+            undefined,
+            undefined,
+            files,
+          )
+        : await createConversationWithStore(
+            trimmedCwd,
+            submitText,
+            messageId,
+            selectedModel || undefined,
+            images,
+            submission.mode,
+            submission.baseBranch,
+          );
       addRecentDir(trimmedCwd);
       setRecentDirs(getRecentDirs());
       setDraft('');
+      setImages([]);
+      setFiles([]);
       clearNewConversationDraft();
       navigate(`/c/${conv.slug}`);
     } catch (err) {
@@ -459,6 +513,9 @@ export function useCreateConversation(navigate: (path: string) => void) {
     draft,
     setDraft,
     images,
+    files,
+    isDragOver,
+    setIsDragOver,
     error,
     creating,
     canSend,
@@ -475,6 +532,8 @@ export function useCreateConversation(navigate: (path: string) => void) {
     recentDirs,
     addImages,
     removeImage,
+    addFiles,
+    removeFile,
     voiceSupported,
     handleVoiceFinal,
     handleVoiceInterim,

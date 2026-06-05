@@ -14,6 +14,9 @@ pub struct CreateConversationRequest {
     /// Optional image attachments
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
+    /// Non-image files already stored by the server-side attachment pipeline.
+    #[serde(default)]
+    pub files: Vec<FileAttachment>,
     /// Conversation mode: "managed" for Explore/Work lifecycle, omit or "direct" for full access.
     /// "managed" requires a git repository.
     #[serde(default)]
@@ -64,9 +67,37 @@ pub struct ChatRequest {
     pub message_id: String,
     #[serde(default)]
     pub images: Vec<ImageAttachment>,
+    #[serde(default)]
+    pub files: Vec<FileAttachment>,
     /// Browser user agent for display (e.g., show iPhone icon)
     #[serde(default)]
     pub user_agent: Option<String>,
+}
+
+/// Metadata for a non-image file attachment already written to server temp storage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAttachment {
+    pub original_name: String,
+    pub media_type: String,
+    pub size_bytes: u64,
+    pub stored_path: String,
+}
+
+impl From<FileAttachment> for phoenix_core::domain::db_schema::FileAttachment {
+    fn from(value: FileAttachment) -> Self {
+        Self {
+            original_name: value.original_name,
+            media_type: value.media_type,
+            size_bytes: value.size_bytes,
+            stored_path: value.stored_path,
+        }
+    }
+}
+
+/// Response for attachment upload.
+#[derive(Debug, Serialize)]
+pub struct AttachmentUploadResponse {
+    pub files: Vec<FileAttachment>,
 }
 
 /// Image attachment in a chat message

@@ -164,8 +164,14 @@ AND NOT show duplicate messages
 
 ### REQ-CONV-007: Agent Activity Indicators
 
+The live "is the agent working right now" indicator is owned by the StateBar
+and nothing else. The top horizontal slot above the message list is the
+Conversation Navigation strip (REQ-CONV-023), not a live-activity trail and not
+a per-turn step trail; it carries whole-conversation chapters whose role is
+fixed across cold load and streaming.
+
 WHEN agent is working
-THE SYSTEM SHALL show activity indicator (yellow pulsing dot)
+THE SYSTEM SHALL show the activity indicator (yellow pulsing dot) in the StateBar
 AND display current state description with an explicit label for every possible state
 AND NOT use a catch-all or generic label for unrecognized states
 
@@ -187,7 +193,7 @@ THE SYSTEM SHALL require an explicit display label before it can be rendered
 WHEN agent is idle, in error, or in a terminal state
 THE SYSTEM SHALL NOT show the activity indicator
 
-**Rationale:** Users need confidence the system is making progress (transparency questions 1-2). Exhaustive state labels prevent silent degradation when backend states evolve. The "is the agent working?" question must have exactly one unambiguous answer derived from one source.
+**Rationale:** Users need confidence the system is making progress (transparency questions 1-2). Exhaustive state labels prevent silent degradation when backend states evolve. The "is the agent working?" question must have exactly one unambiguous answer derived from one source. A slot that changes role between cold load and streaming blurs two visually-similar but semantically-distinct things; each concern therefore has a single fixed home — live activity in the StateBar, whole-conversation navigation in the top strip (REQ-CONV-023), and per-turn tool detail inline in the message list (REQ-CONV-022).
 
 
 ---
@@ -427,3 +433,77 @@ WHEN an authentication failure enters a persisted error state
 THE SYSTEM SHALL treat it as non-auto-retryable but user-resumable after credentials are refreshed or fixed
 
 **Rationale:** Runtime automatic retry safety and user-triggered resume are separate capabilities. Auth failures must not spin in an automatic retry loop, but users should not have to abandon a conversation after fixing credentials.
+
+---
+
+### REQ-CONV-022: Conversation View Density
+
+THE SYSTEM SHALL expose a conversation view-density preference with two values, `full` and `compact`, defaulting to `full`
+AND persist the chosen value across sessions and conversations
+AND apply the active density to the rendering of every conversation
+
+WHEN density is `full`
+THE SYSTEM SHALL render every message at full fidelity, identical to a conversation viewed with no density preference set
+
+WHEN density is `compact`
+THE SYSTEM SHALL collapse each completed agent turn's tool calls into a single inline pill strip, one pill per tool call in invocation order, reusing the conversation's pill styling and tool-type colors
+AND collapse each assistant text block below the significance threshold into a faded, expandable one-liner
+AND render user messages, and assistant prose at or above the significance threshold, at full fidelity
+
+WHEN a collapsed tool-call pill is clicked
+THE SYSTEM SHALL reveal the full detail for that tool call and bring it into view
+
+WHEN a collapsed assistant one-liner is activated
+THE SYSTEM SHALL expand it to the full rendered prose
+
+THE SYSTEM SHALL NOT hide any content without a visible click-to-expand affordance
+AND SHALL NOT discard any content as a result of the active density
+
+WHILE an agent turn is still streaming
+THE SYSTEM SHALL render it at full fidelity regardless of the active density, applying compaction only once the turn is finalized
+
+**Significance threshold:** "significant" assistant prose is a text block whose
+length is at or above a single named cutoff (`SIGNIFICANCE_THRESHOLD`,
+280 characters). The same cutoff governs which prose stays full in compact mode
+and which prose is a navigable chapter (REQ-CONV-023). Because compact mode
+collapses rather than hides, a block that falls just under the cutoff degrades
+only to a faded expandable one-liner — never to lost content.
+
+**Rationale:** Long conversations are dominated by tool calls; the user's
+prompts and the substantial assistant prose — findings, plans, summaries — get
+buried. Compact density makes the scrollback skimmable while guaranteeing no
+data loss: every collapsed element is one click from full fidelity, so a
+mis-classification is a minor inconvenience, not a transparency failure
+(transparency questions 8-10). Streaming turns render full so the live reading
+experience is never degraded mid-generation.
+
+---
+
+### REQ-CONV-023: Conversation Navigation
+
+THE SYSTEM SHALL display a persistent conversation navigation strip in the top horizontal slot above the message list
+AND populate it with whole-conversation chapters in conversation order
+AND assign the strip a single fixed role that does not change between cold load and streaming
+
+THE SYSTEM SHALL treat as a chapter every user prompt, and every assistant text block at or above the significance threshold (REQ-CONV-022)
+AND render each chapter as a type-styled pill distinguishing a user prompt from assistant prose
+AND label each pill with the truncated prompt or the first line of the prose
+
+WHEN a chapter pill is clicked
+THE SYSTEM SHALL scroll the message list to that chapter's message, including when the target is outside the rendered window
+AND briefly highlight the message once it is in view
+
+WHILE the user scrolls the conversation
+THE SYSTEM SHALL highlight the chapter currently in view (scroll-spy)
+
+WHILE an agent turn is streaming
+THE SYSTEM SHALL surface that turn as the newest chapter as its significant prose accumulates, without changing the strip's role
+
+**Rationale:** The whole-conversation chapter strip is the navigation aid for a
+long scrollback — it answers "what happened, and how do I get back to it"
+(transparency questions 4, 8, 11-12). Sharing the significance threshold with
+compact density (REQ-CONV-022) keeps a single definition of "significant," so a
+prompt or substantial finding is exactly the content the user can both skim to
+and jump to. A fixed role — navigation always, on cold load and while
+streaming — avoids the ambiguity of a slot that means different things at
+different moments; live activity is the StateBar's job (REQ-CONV-007).

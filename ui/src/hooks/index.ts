@@ -23,6 +23,8 @@ export { useAutoAuth } from './useAutoAuth';
 export { useConversationPrStatus } from './useConversationPrStatus';
 export type { ConversationPrStatusHandle, ConversationPrStatusState } from './useConversationPrStatus';
 export { useTheme } from './useTheme';
+export { useDensity, isSignificantText, SIGNIFICANCE_THRESHOLD } from './useDensity';
+export type { Density } from './useDensity';
 export { useScopedState } from './useScopedState';
 export { useInlineReferences } from './useInlineReferences';
 export type { UseInlineReferencesParams, InlineReferences } from './useInlineReferences';
