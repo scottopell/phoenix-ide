@@ -42,6 +42,23 @@ describe('ErrorBanner', () => {
     expect(screen.queryByText(/start a new conversation/i)).not.toBeInTheDocument();
   });
 
+  it('offers neither Retry nor Dismiss for a non-resumable error', () => {
+    render(
+      <ErrorBanner
+        message="Bad request"
+        error={getErrorPresentation('invalid_request')}
+        onRetry={vi.fn()}
+        onDismiss={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole('button', { name: /retry.*continue/i })).not.toBeInTheDocument();
+    // Dismiss -> Idle would reopen the resume path the policy denies, so it is
+    // not offered for non-resumable errors.
+    expect(screen.queryByRole('button', { name: /dismiss/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/start a new conversation/i)).toBeInTheDocument();
+  });
+
   it('still shows retry/continue affordance for transient errors', () => {
     render(
       <ErrorBanner

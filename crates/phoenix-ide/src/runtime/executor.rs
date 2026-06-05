@@ -983,8 +983,14 @@ where
             return None;
         }
 
-        let entering_idle =
-            !matches!(old_state, ConvState::Idle) && matches!(self.state, ConvState::Idle);
+        // Leaving `Error` for `Idle` happens only via `DismissError` (the
+        // error banner's Dismiss). That is the user clearing a banner, not a
+        // turn completing, so queued steers must NOT auto-drain here — they
+        // would silently start a fresh LLM request on dismiss. Steers wait for
+        // an explicit Retry/Send. (No other transition takes Error -> Idle, so
+        // excluding it is exactly equivalent to "don't drain on DismissError".)
+        let entering_idle = !matches!(old_state, ConvState::Idle | ConvState::Error { .. })
+            && matches!(self.state, ConvState::Idle);
         let entering_llm_requesting_from_tool_round =
             matches!(
                 old_state,

@@ -217,7 +217,10 @@ the `ConvState` column). The UI re-opens the prose reader on reconnect.
 There is no `AwaitingMergeApproval` state and no in-Phoenix squash-merge (REQ-PROJ-009
 was removed — see `requirements.md`). The two terminal actions are user-initiated HTTP
 calls (`POST /api/conversations/:id/mark-merged`, `POST /api/conversations/:id/abandon-task`)
-on a Work or Branch conversation that is `Idle` or `ContextExhausted`. Both reject with
+on a Work or Branch conversation that is `Idle`, `ContextExhausted`, or `Error`. An
+`Error`-state conversation is stuck but not running, so disposing of it is safe — and
+that is exactly when cleanup is wanted, since the user should not have to coax out a
+successful turn just to clean up work that is already done or abandoned. Both reject with
 409 if the conversation has been continued (`continued_in_conv_id` set — REQ-BED-031);
 the live conversation is the continuation, so terminal actions belong there. The handler
 performs the git cleanup in a `spawn_blocking` task, then routes through the state
@@ -226,7 +229,7 @@ machine via `Effect::ResolveTask`/`TaskResolved`, which moves the conversation t
 
 **Mark as merged:**
 
-1. Validate mode (Work or Branch), state (`Idle`/`ContextExhausted`), not continued,
+1. Validate mode (Work or Branch), state (`Idle`/`ContextExhausted`/`Error`), not continued,
    project-scoped.
 2. `git worktree remove {worktree_path} --force` (filesystem-rm + `worktree prune`
    fallback on failure).

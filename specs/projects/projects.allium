@@ -592,7 +592,14 @@ rule MarkAsMerged {
     let worktree = Worktree{conversation: conversation}
 
     -- Agent must not be running (no live tool execution, LLM call, etc.).
+    -- `idle` is the ordinary disposable state; `error` is a stuck,
+    -- non-running terminal-error state (e.g. a usage-limit window the
+    -- user merged around externally). An errored conversation is not
+    -- executing anything, so destructive cleanup is safe — the user must
+    -- not be forced to coax out a successful LLM turn just to dispose of
+    -- a conversation whose work is already merged.
     requires: conversation.core_status = idle
+           or conversation.core_status = error
     -- REQ-BED-031: permitted in normal idle (parent_status absent) and
     -- on a context-exhausted parent. Excludes awaiting_recovery /
     -- awaiting_task_approval / awaiting_user_response (those need
@@ -643,7 +650,14 @@ rule ConfirmAbandon {
     let worktree = Worktree{conversation: conversation}
 
     -- Agent must not be running (no live tool execution, LLM call, etc.).
+    -- `idle` is the ordinary disposable state; `error` is a stuck,
+    -- non-running terminal-error state (e.g. a usage-limit window the
+    -- user merged around externally). An errored conversation is not
+    -- executing anything, so destructive cleanup is safe — the user must
+    -- not be forced to coax out a successful LLM turn just to abandon a
+    -- conversation that is already stuck.
     requires: conversation.core_status = idle
+           or conversation.core_status = error
     -- REQ-BED-031: permitted in normal idle (parent_status absent) and
     -- on a context-exhausted parent. Excludes awaiting_recovery /
     -- awaiting_task_approval / awaiting_user_response (those need
@@ -1255,7 +1269,7 @@ surface ProjectManagement {
     facing: bedrock/User
 
     context conversation: bedrock/Conversation
-        where mode in { work, branch } and core_status = idle
+        where mode in { work, branch } and core_status in { idle, error }
 
     let worktree = Worktree{conversation: conversation}
 

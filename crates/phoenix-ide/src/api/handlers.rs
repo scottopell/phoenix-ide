@@ -2707,10 +2707,14 @@ async fn dismiss_question(
     Ok(Json(SuccessResponse { success: true }))
 }
 
-/// Dismiss a persisted `Error` state, returning the conversation to `Idle`.
-/// Server-authoritative counterpart to the error banner's "Dismiss" button:
-/// the client sends this instead of faking the idle phase locally, so the
-/// displayed state and the server state cannot diverge.
+/// Dismiss a persisted, user-resumable `Error` state, returning the
+/// conversation to `Idle`. Server-authoritative counterpart to the error
+/// banner's "Dismiss" button: the client sends this instead of faking the idle
+/// phase locally, so the displayed state and the server state cannot diverge.
+///
+/// Only user-resumable errors are dismissable — a non-resumable error is a dead
+/// end the policy says to abandon for a new conversation, and returning it to
+/// Idle would reopen the resume path the policy denies.
 async fn dismiss_error(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2722,11 +2726,20 @@ async fn dismiss_error(
         .await
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
-    if !matches!(conv.state, ConvState::Error { .. }) {
-        return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
-            "Conversation is not in an error state",
-            "wrong_state",
-        ))));
+    match &conv.state {
+        ConvState::Error { error_kind, .. } if error_kind.is_user_resumable() => {}
+        ConvState::Error { .. } => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "This error is not dismissable; start a new conversation to continue",
+                "non_resumable_error",
+            ))));
+        }
+        _ => {
+            return Err(AppError::Conflict(Box::new(ConflictErrorResponse::new(
+                "Conversation is not in an error state",
+                "wrong_state",
+            ))));
+        }
     }
 
     state

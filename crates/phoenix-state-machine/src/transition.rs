@@ -1736,15 +1736,22 @@ pub fn transition_parent(
         // banner. The conversation genuinely returns to Idle (persisted +
         // broadcast) rather than the client faking the phase locally, so the
         // displayed state and the server state cannot diverge.
+        //
+        // Restricted to user-resumable errors. A non-resumable error
+        // (invalid_request, content_filter, context-window) is a dead end the
+        // policy says to abandon for a new conversation; returning it to Idle
+        // would reopen the resume path (Idle accepts a UserMessage) that the
+        // policy explicitly denies. Non-resumable errors fall through to
+        // InvalidTransition.
         // ============================================================
         (
-            ParentState::Core(CoreState::Error { .. }),
+            ParentState::Core(CoreState::Error { error_kind, .. }),
             ParentEvent::Parent(ParentOnlyEvent::DismissError),
-        ) => Ok(
-            ParentTransitionResult::new(ParentState::Core(CoreState::Idle))
-                .with_effect(Effect::PersistState)
-                .with_effect(Effect::notify_state_change()),
-        ),
+        ) if error_kind.is_user_resumable() => Ok(ParentTransitionResult::new(ParentState::Core(
+            CoreState::Idle,
+        ))
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::notify_state_change())),
 
         // ============================================================
         // Task resolution: terminal cleanup (mark-merged / abandon) ->
@@ -4505,13 +4512,14 @@ mod tests {
     }
 
     #[test]
-    fn dismiss_error_from_error_returns_to_idle() {
+    fn dismiss_error_from_resumable_error_returns_to_idle() {
+        // UsageLimitReached is user-resumable — dismissable.
         let state = ConvState::Error {
             message: "boom".to_string(),
             error_kind: ErrorKind::UsageLimitReached,
         };
         let result = transition(&state, &test_context(), Event::DismissError)
-            .expect("DismissError must be accepted from Error");
+            .expect("DismissError must be accepted from a resumable Error");
 
         assert!(matches!(result.new_state, ConvState::Idle));
         assert!(
@@ -4522,6 +4530,25 @@ mod tests {
             "must persist the idle transition, got {:?}",
             result.effects
         );
+    }
+
+    #[test]
+    fn dismiss_error_from_non_resumable_error_is_invalid() {
+        // A non-resumable error (InvalidRequest) must NOT be dismissable to
+        // Idle — that would reopen the resume path the policy denies.
+        let state = ConvState::Error {
+            message: "bad request".to_string(),
+            error_kind: ErrorKind::InvalidRequest,
+        };
+        let err = transition(&state, &test_context(), Event::DismissError)
+            .expect_err("DismissError must be rejected for a non-resumable Error");
+        assert!(matches!(
+            err,
+            TransitionError::InvalidTransition {
+                event: "DismissError",
+                ..
+            }
+        ));
     }
 
     #[test]

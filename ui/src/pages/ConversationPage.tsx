@@ -1230,15 +1230,20 @@ function ConversationPageContent() {
           error={convStateForChildren.error}
           onRetry={() => handleSend('continue', [])}
           onDismiss={() => {
-            // Server-authoritative: ask the server to transition Error -> Idle
-            // so the displayed state and the server state cannot diverge (a
-            // local-only phase fake left the server in Error, which silently
-            // rejected mark-merged / abandon). The optimistic local idle keeps
-            // the banner from lingering; the server's state_change confirms it.
-            dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id });
-            void api.dismissError(conversation.id).catch((e) => {
-              showError(e instanceof Error ? e.message : 'Failed to dismiss error');
-            });
+            // Server-authoritative: the server transitions Error -> Idle and
+            // broadcasts the new state. Do NOT optimistically fake idle — on a
+            // failure (offline, 409, non-resumable rejection) that would leave
+            // the client showing Idle while the server stays in Error, the very
+            // divergence this path exists to remove. Move to idle only after
+            // the POST succeeds; on failure keep the error banner and surface
+            // the reason. (Dismiss is only rendered for resumable errors.)
+            void api.dismissError(conversation.id)
+              .then(() => {
+                dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id });
+              })
+              .catch((e) => {
+                showError(e instanceof Error ? e.message : 'Failed to dismiss error');
+              });
           }}
         />
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
