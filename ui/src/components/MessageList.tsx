@@ -24,6 +24,7 @@ import {
   buildConversationChapters,
   type Chapter,
 } from '../conversation/conversationChapters';
+import { ensureTargetTopVisible } from './jumpScroll';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -495,20 +496,31 @@ function MessageListImpl({
   const pendingPulseKeyRef = useRef<string | null>(null);
   const pulseTimersRef = useRef<number[]>([]);
 
-  const applyPendingPulse = useCallback(() => {
-    const key = pendingPulseKeyRef.current;
-    if (key === null) return;
+  const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
-    if (!scroller) return;
+    if (!scroller) return null;
     // CSS.escape may be absent (or throw on a pathological key) in some
     // environments; guard it so a missing escape degrades to "no pulse"
     // rather than throwing out of the timer callback (matches FileTree).
-    let row: Element | null = null;
     try {
-      row = scroller.querySelector(`[data-render-unit-key="${CSS.escape(key)}"]`);
+      return scroller.querySelector(`[data-render-unit-key="${CSS.escape(key)}"]`);
     } catch {
-      return;
+      return null;
     }
+  }, []);
+
+  const correctPendingJumpOffset = useCallback((key: string) => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const row = findRowByKey(key);
+    const target = row?.querySelector('.message') ?? row;
+    if (target) ensureTargetTopVisible(target, scroller);
+  }, [findRowByKey]);
+
+  const applyPendingPulse = useCallback(() => {
+    const key = pendingPulseKeyRef.current;
+    if (key === null) return;
+    const row = findRowByKey(key);
     // The pulse styling lives on `.message`; fall back to the row wrapper if a
     // unit kind renders without a `.message` element (skill/system don't, but
     // chapters only target user/agent units which do).
@@ -520,7 +532,7 @@ function MessageListImpl({
       target.classList.remove('breadcrumb-highlight');
     }, 1500);
     pulseTimersRef.current.push(t);
-  }, []);
+  }, [findRowByKey]);
 
   useEffect(() => {
     const timers = pulseTimersRef.current;
@@ -539,14 +551,16 @@ function MessageListImpl({
       behavior: 'smooth',
     });
     // The row mounts during the smooth scroll; querying immediately would miss
-    // it. Retry a few times so the pulse lands even on a long jump that takes
-    // a moment to settle. applyPendingPulse is a no-op once the pulse fires
-    // (it clears pendingPulseKeyRef), so the extra ticks are harmless.
+    // it. Retry as the scroll progresses so the pulse lands even on a long jump
+    // and the final mounted position is nudged below the nav strip if needed.
     [120, 320, 600].forEach((delay) => {
-      const t = window.setTimeout(applyPendingPulse, delay);
+      const t = window.setTimeout(() => {
+        correctPendingJumpOffset(unit.key);
+        applyPendingPulse();
+      }, delay);
       pulseTimersRef.current.push(t);
     });
-  }, [historicalUnits, applyPendingPulse]);
+  }, [historicalUnits, correctPendingJumpOffset, applyPendingPulse]);
 
   useImperativeHandle(ref, () => ({ scrollToUnitIndex }), [scrollToUnitIndex]);
 

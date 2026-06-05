@@ -2,6 +2,10 @@ import { useMemo } from 'react';
 import { PillStrip } from './PillStrip';
 import type { PillItem } from './PillStrip';
 import type { Breadcrumb } from '../types';
+import {
+  ensureTargetTopVisible,
+  findMessageScroller,
+} from './jumpScroll';
 
 const BREADCRUMB_TITLES: Record<string, string> = {
   user: 'Your message',
@@ -18,6 +22,11 @@ function jumpToBreadcrumb(b: Breadcrumb) {
   const el = document.querySelector(`[data-sequence-id="${b.sequenceId}"]`);
   if (el) {
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    const correctOffset = () => {
+      const scroller = findMessageScroller();
+      if (scroller) ensureTargetTopVisible(el, scroller);
+    };
+    [120, 320, 600].forEach((delay) => window.setTimeout(correctOffset, delay));
     // Add brief highlight
     el.classList.add('breadcrumb-highlight');
     setTimeout(() => el.classList.remove('breadcrumb-highlight'), 1500);

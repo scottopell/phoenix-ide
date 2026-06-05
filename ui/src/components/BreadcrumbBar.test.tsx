@@ -62,6 +62,70 @@ describe('BreadcrumbBar', () => {
     }
   });
 
+  it('keeps clicked breadcrumbs visible below the breadcrumb strip', () => {
+    vi.useFakeTimers();
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = vi.fn();
+    try {
+      const scroller = document.createElement('div');
+      scroller.id = 'messages';
+      scroller.scrollTop = 100;
+      scroller.getBoundingClientRect = () => ({
+        left: 0,
+        right: 800,
+        top: 36,
+        bottom: 600,
+        width: 800,
+        height: 564,
+        x: 0,
+        y: 36,
+        toJSON: () => ({}),
+      } as DOMRect);
+      document.body.append(scroller);
+
+      const target = document.createElement('div');
+      target.dataset['sequenceId'] = '2';
+      target.getBoundingClientRect = () => ({
+        left: 0,
+        right: 800,
+        top: 20 + (100 - scroller.scrollTop),
+        bottom: 80 + (100 - scroller.scrollTop),
+        width: 800,
+        height: 60,
+        x: 0,
+        y: 20 + (100 - scroller.scrollTop),
+        toJSON: () => ({}),
+      } as DOMRect);
+      scroller.append(target);
+
+      render(<BreadcrumbBar breadcrumbs={breadcrumbs} visible />);
+      const bar = document.querySelector<HTMLElement>('#breadcrumb-bar')!;
+      bar.getBoundingClientRect = () => ({
+        left: 0,
+        right: 800,
+        top: 0,
+        bottom: 36,
+        width: 800,
+        height: 36,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect);
+
+      fireEvent.click(screen.getByLabelText('bash: Running a tool'));
+      expect(target).toHaveClass('breadcrumb-highlight');
+      expect(Element.prototype.scrollIntoView).toHaveBeenCalledWith({ behavior: 'smooth', block: 'center' });
+
+      act(() => {
+        vi.advanceTimersByTime(120);
+      });
+      expect(scroller.scrollTop).toBe(76);
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+      vi.useRealTimers();
+    }
+  });
+
   it('positions tooltip above the breadcrumb and clamps to viewport margins', () => {
     const originalInnerWidth = window.innerWidth;
     Object.defineProperty(window, 'innerWidth', { configurable: true, value: 320 });
