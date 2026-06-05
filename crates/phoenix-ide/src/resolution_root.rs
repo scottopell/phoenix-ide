@@ -83,9 +83,10 @@ impl ResolutionRoot {
     pub fn list_files(&self, query: &str, limit: usize) -> Vec<FileSearchEntry> {
         match self {
             Self::WorkingDir(dir) => search_files_in_root(dir, query, limit),
-            Self::GitTree { repo_root, reference } => {
-                list_files_in_tree(repo_root, reference, query, limit)
-            }
+            Self::GitTree {
+                repo_root,
+                reference,
+            } => list_files_in_tree(repo_root, reference, query, limit),
         }
     }
 
@@ -95,7 +96,11 @@ impl ResolutionRoot {
         match self {
             Self::WorkingDir(dir) => {
                 let p = Path::new(rel);
-                let full = if p.is_absolute() { p.to_path_buf() } else { dir.join(p) };
+                let full = if p.is_absolute() {
+                    p.to_path_buf()
+                } else {
+                    dir.join(p)
+                };
                 if !full.exists() {
                     return FileResolution::NotFound;
                 }
@@ -104,7 +109,10 @@ impl ResolutionRoot {
                     Err(_) => FileResolution::NotFound,
                 }
             }
-            Self::GitTree { repo_root, reference } => {
+            Self::GitTree {
+                repo_root,
+                reference,
+            } => {
                 // Absolute paths have no meaning inside a tree; a ref-relative
                 // path is what `git cat-file` expects.
                 if Path::new(rel).is_absolute() {
@@ -130,10 +138,14 @@ impl ResolutionRoot {
     /// back from the same paths).
     pub fn skills_view(&self) -> SkillsView {
         match self {
-            Self::WorkingDir(dir) => SkillsView { dir: dir.clone(), _temp: None },
-            Self::GitTree { repo_root, reference } => {
-                materialize_skill_files(repo_root, reference)
-            }
+            Self::WorkingDir(dir) => SkillsView {
+                dir: dir.clone(),
+                _temp: None,
+            },
+            Self::GitTree {
+                repo_root,
+                reference,
+            } => materialize_skill_files(repo_root, reference),
         }
     }
 }
@@ -162,9 +174,33 @@ fn looks_textual(path: &str) -> bool {
     !matches!(
         Path::new(path).extension().and_then(|e| e.to_str()),
         Some(
-            "png" | "jpg" | "jpeg" | "gif" | "webp" | "ico" | "pdf" | "zip" | "gz" | "tar"
-                | "wasm" | "so" | "dylib" | "dll" | "exe" | "bin" | "o" | "a" | "class" | "jar"
-                | "mp3" | "mp4" | "mov" | "woff" | "woff2" | "ttf" | "otf"
+            "png"
+                | "jpg"
+                | "jpeg"
+                | "gif"
+                | "webp"
+                | "ico"
+                | "pdf"
+                | "zip"
+                | "gz"
+                | "tar"
+                | "wasm"
+                | "so"
+                | "dylib"
+                | "dll"
+                | "exe"
+                | "bin"
+                | "o"
+                | "a"
+                | "class"
+                | "jar"
+                | "mp3"
+                | "mp4"
+                | "mov"
+                | "woff"
+                | "woff2"
+                | "ttf"
+                | "otf"
         )
     )
 }
@@ -218,9 +254,11 @@ fn list_files_in_tree(
 fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
     // On any failure, fall back to an empty temp dir: discovery still surfaces
     // global (`$HOME`) and built-in skills, just no repo-local ones.
-    let temp = match TempDir::new() {
-        Ok(t) => t,
-        Err(_) => return SkillsView { dir: repo_root.to_path_buf(), _temp: None },
+    let Ok(temp) = TempDir::new() else {
+        return SkillsView {
+            dir: repo_root.to_path_buf(),
+            _temp: None,
+        };
     };
 
     let listing = run_git(
@@ -254,7 +292,10 @@ fn materialize_skill_files(repo_root: &Path, reference: &str) -> SkillsView {
         let _ = std::fs::write(&dest, bytes);
     }
 
-    SkillsView { dir: temp.path().to_path_buf(), _temp: Some(temp) }
+    SkillsView {
+        dir: temp.path().to_path_buf(),
+        _temp: Some(temp),
+    }
 }
 
 #[cfg(test)]
@@ -313,7 +354,10 @@ mod tests {
         };
         let files = root.list_files("txt", 50);
         let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
-        assert!(paths.contains(&"committed.txt"), "committed file should list: {paths:?}");
+        assert!(
+            paths.contains(&"committed.txt"),
+            "committed file should list: {paths:?}"
+        );
         assert!(
             !paths.contains(&"untracked.txt"),
             "untracked working-dir file must NOT list (it won't be in the worktree): {paths:?}"
@@ -356,7 +400,10 @@ mod tests {
         };
         let view = root.skills_view();
         let skill_md = view.dir.join(".claude/skills/greet/SKILL.md");
-        assert!(skill_md.is_file(), "SKILL.md should be materialized from the ref tree");
+        assert!(
+            skill_md.is_file(),
+            "SKILL.md should be materialized from the ref tree"
+        );
         let body = std::fs::read_to_string(&skill_md).unwrap();
         assert!(body.contains("name: greet"));
     }

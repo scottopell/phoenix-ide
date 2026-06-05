@@ -1534,23 +1534,18 @@ async fn create_conversation_with_id(
         } else {
             crate::resolution_root::ResolutionRoot::working_dir(&effective_cwd)
         };
-        let expanded_initial =
-            match crate::message_expander::expand(&req.text, &resolution_root) {
-                Ok(expanded) => expanded,
-                Err(e) => {
-                    rollback_created_conversation_after_attachment_failure(
-                        &state,
-                        &conversation,
-                        &id,
-                    )
+        let expanded_initial = match crate::message_expander::expand(&req.text, &resolution_root) {
+            Ok(expanded) => expanded,
+            Err(e) => {
+                rollback_created_conversation_after_attachment_failure(&state, &conversation, &id)
                     .await;
-                    return Err(AppError::UnprocessableEntity(ExpansionErrorResponse {
-                        error: e.to_string(),
-                        error_type: e.error_type().to_string(),
-                        reference: e.reference(),
-                    }));
-                }
-            };
+                return Err(AppError::UnprocessableEntity(ExpansionErrorResponse {
+                    error: e.to_string(),
+                    error_type: e.error_type().to_string(),
+                    reference: e.reference(),
+                }));
+            }
+        };
 
         // Convert images
         let images: Vec<ImageData> = req
@@ -4068,7 +4063,7 @@ async fn list_project_skills(
 ///
 /// Walks the user's skill catalog (`discover_skills`) and flattens each
 /// [`crate::system_prompt::SkillSource`] into a `(source, path)` pair for the
-/// frontend. When `strip_prefix` is set (a GitTree materialization root),
+/// frontend. When `strip_prefix` is set (a `GitTree` materialization root),
 /// filesystem skill paths are rewritten relative to it so the frontend sees the
 /// ref-relative `SKILL.md` location instead of an ephemeral temp path; built-in
 /// skill paths (outside the prefix) are left absolute. Shared by the

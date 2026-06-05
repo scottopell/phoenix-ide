@@ -613,8 +613,10 @@ export type CodexLoginStatus =
  * Direct (the working directory).
  */
 export interface ProjectResolutionOpts {
-  mode?: 'direct' | 'managed' | 'branch';
-  baseBranch?: string | null;
+  // Explicit `| undefined` so a caller can pass `{ mode: undefined }` under
+  // exactOptionalPropertyTypes (the in-conversation composer leaves these unset).
+  mode?: 'direct' | 'managed' | 'branch' | undefined;
+  baseBranch?: string | null | undefined;
 }
 
 function applyResolutionOpts(params: URLSearchParams, opts?: ProjectResolutionOpts): void {

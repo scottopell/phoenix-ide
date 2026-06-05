@@ -940,7 +940,11 @@ mod tests {
     #[test]
     fn test_bazel_label_passes_through() {
         let tmp = make_tmp();
-        let result = expand("build @+go_fast+go_fast//:go_fast.exe target", &root(tmp.path())).unwrap();
+        let result = expand(
+            "build @+go_fast+go_fast//:go_fast.exe target",
+            &root(tmp.path()),
+        )
+        .unwrap();
         assert_eq!(
             result.llm_text,
             "build @+go_fast+go_fast//:go_fast.exe target"
