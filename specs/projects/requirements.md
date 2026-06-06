@@ -598,10 +598,12 @@ Direct mode is the default for all new conversations, git-backed and non-git ali
 **Historical note — Standalone → Direct migration.** An earlier design
 split non-git directory conversations into a separate `Standalone` mode
 (see superseded REQ-PROJ-016 and the rationale in REQ-BED-027). In
-practice the two modes had identical runtime semantics (full tool suite,
-no `propose_task`, no worktree, no task file, no branch, no project
+practice the two modes had identical runtime semantics for a **non-git** directory
+(full tool suite, no `propose_task`, no worktree, no task file, no branch, no project
 association beyond `cwd`), so the split produced no behavioral difference
-— only type-level ceremony. `Standalone` was folded into `Direct` via DB
+— only type-level ceremony. (A **git-backed** Direct conversation, which Standalone never
+covered, additionally has a project association via its repo and provides `propose_task`
+as a fork proposal — REQ-PROJ-033/036.) `Standalone` was folded into `Direct` via DB
 migration 001 (`UPDATE conversations SET conv_mode = REPLACE(conv_mode,
 '"Standalone"', '"Direct"')`), and the `ConvMode::Standalone` enum
 variant was removed from the code. All references to Standalone in the
@@ -1151,7 +1153,11 @@ temp branch — not at the brief's original path. Explore's `patch` allowlist is
 `tasks/` (REQ-PROJ-003), so a plain brief that lived elsewhere (e.g. `docs/plan.md`) could
 not be revised in place; the refinement draft therefore always lands under `tasks/`, where
 the agent can edit it, and the refinement's own approval re-derives the final taskmd-vs-plain
-shape (REQ-PROJ-006)
+shape (REQ-PROJ-006). The draft path is **deterministic and collision-free**:
+`tasks/{refinement-id-prefix}-{sanitized-stem}.md`, where the refinement-id prefix (from the
+`(proposal_id, "promote")`-derived conversation id) guarantees the same path on a
+crash-retry (deterministic recovery) and that the write never overwrites a pre-existing
+tracked task file. The recorded `plain_brief_path` (for a plain brief) is that draft path
 AND seed the Explore agent's LLM context with the brief **body** plus the user's
 change-request note — and nothing else (it inherits none of the originating conversation's
 transcript; the brief and the requested changes are *in context*, not merely a file to

@@ -643,6 +643,26 @@ rule ForkProposalInvalid {
     -- No ForkProposalRecorded: an invalid proposal is never persisted.
 }
 
+-- REQ-PROJ-008/012/036: task management is the parent conversation's job, so propose_task is
+-- absent from a sub-agent's tool registry. If a malformed or stale sole `propose_task` call
+-- nonetheless reaches the handler from a SubAgent, it must be REJECTED with an explanation —
+-- not stalled. The Parent intercept arms (ProposeTaskIntercepted / ForkProposalIntercepted /
+-- ForkProposalInvalid) are all guarded `kind = Parent`, and LlmRespondsWithTools excludes a
+-- sole intercepted tool, so without this arm a sub-agent's sole propose_task matches no rule.
+rule SubAgentProposeTaskRejected {
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: conversation.kind = SubAgent
+    requires: tool_calls.count = 1
+    requires: tool_calls.first.name = "propose_task"
+    ensures: conversation.core_status = llm_requesting
+    ensures: conversation.retry_attempt = 1
+    ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)
+    ensures: ToolRoundCheckpointed(conversation)  -- propose_task gets ToolResult::error
+                                                  -- ("task management is the parent's job")
+    ensures: LlmRequestDispatched(conversation)
+}
+
 rule AskUserQuestionIntercepted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting

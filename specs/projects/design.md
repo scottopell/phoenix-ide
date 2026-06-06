@@ -476,7 +476,8 @@ The decoupling contract is "do not mutate or notify the origin," not "do not rea
 
 The review surface has a third action beside Approve / Dismiss: **Request Changes**, which
 takes a free-text note. The constraint that shapes the whole design: the proposer (a
-Work-mode origin) is decoupled and gone (REQ-PROJ-035), and a `pending` proposal has **no
+writing-mode origin — Work, Branch, or git-backed Direct) is decoupled and gone
+(REQ-PROJ-035), and a `pending` proposal has **no
 LLM attached** — so change-request messages cannot be delivered to the proposer. They need
 a *new* agent context. Rather than spawn the Work fork early and iterate there (which would
 commit a Work branch before the brief is settled), Request Changes promotes the snapshot

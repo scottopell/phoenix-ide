@@ -1669,14 +1669,14 @@ invariant OneWorktreePerConversation {
 -- from desired_base_branch or current HEAD, then stored in ConvMode::Work.
 -- No rule updates it after approval.)
 
--- A managed Explore→Work approval always yields a typed taskmd file, and so does a
--- *taskmd* fork approval (ForkProposalApproved sets Worktree.task_file). The single
--- exemption is a plain-brief fork (REQ-PROJ-034): Work mode, but seeded from a plain
--- markdown brief with no taskmd metadata, so its worktree carries `plain_brief_path`
--- instead. The exemption keys off that durable, fork-local marker — not the
--- origin-bound proposal row, which is removed when the origin is hard-deleted — so a
--- surviving plain-brief fork stays exempt while a taskmd fork that lost its task_file
--- (or any non-fork Work worktree) still violates this.
+-- A managed Work worktree carries EITHER a typed taskmd `task_file` OR a `plain_brief_path`,
+-- never neither. A *taskmd* brief (Explore→Work approval or taskmd fork) sets task_file; a
+-- *plain* markdown brief sets plain_brief_path instead, with no taskmd metadata — for BOTH a
+-- plain-brief fork (REQ-PROJ-034) and an ordinary Explore→Work plain approval (REQ-PROJ-006,
+-- TaskApprovalExecuted / TaskApprovalFreshHandoffExecuted). Keying off the durable
+-- plain_brief_path marker (not the origin-bound proposal row, which a hard delete removes)
+-- means a surviving plain-brief fork stays exempt, while a taskmd worktree that lost its
+-- task_file still violates this.
 invariant TaskFileExistsForManagedWorktrees {
     for w in Worktrees where w.conversation.mode = work:
         exists w.task_file or exists w.plain_brief_path
