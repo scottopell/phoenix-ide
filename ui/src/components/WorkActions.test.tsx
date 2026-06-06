@@ -120,6 +120,30 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     fireEvent.click(mark);
     expect(api.markMerged).toHaveBeenCalledWith('conv-1');
   });
+  it('exposes cleanup actions while the conversation is errored', async () => {
+    // A Work conversation stuck in error (e.g. a usage-limit window the user
+    // merged around) must still reach Mark-as-Merged / Abandon — the backend
+    // permits terminal cleanup from Error.
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="error"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
+      />
+    );
+
+    const abandon = screen.getByTestId('abandon-button') as HTMLButtonElement;
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    await waitFor(() => {
+      expect(abandon.disabled).toBe(false);
+      expect(mark.disabled).toBe(false);
+    });
+    fireEvent.click(mark);
+    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
+  });
+
   it('requires an explicit manual fallback click when gh is unavailable', async () => {
     renderWithProviders(
       <WorkControlBar

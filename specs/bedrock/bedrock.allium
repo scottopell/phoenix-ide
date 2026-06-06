@@ -121,6 +121,7 @@ entity Conversation {
     transitions core_status {
         idle -> llm_requesting
         error -> llm_requesting
+        error -> idle
         llm_requesting -> idle
         llm_requesting -> executing_tools
         llm_requesting -> error
@@ -465,6 +466,45 @@ rule RetryTimeoutFires {
     requires: conversation.core_status = llm_requesting
     requires: conversation.retry_attempt = attempt
     ensures: LlmRequestDispatched(conversation)
+}
+
+-- REQ-BED-006: User dismisses a persisted error, returning the conversation
+-- to idle without resuming the turn. This is the "Dismiss" affordance on the
+-- error banner, distinct from retry (error -> llm_requesting, realised by
+-- UserSendsMessage in CORE 1, which resends and resumes).
+--
+-- Restricted to user-resumable errors. The user-resume policy is defined in
+-- specs/llm/ (LlmError.user_resumable, derived from LlmErrorKind: auth,
+-- network, rate_limit, server_error, server_overloaded). It is a distinct
+-- axis from error_class (retryable | non_retryable), which governs automatic
+-- runtime retry, not user resumption. error_kind is the persisted error's
+-- LlmErrorKind discriminator, the same payload fact guarded by error_kind in
+-- AuthErrorWithActiveRecovery and BackendRejectsContextExhausted.
+--
+-- A non-resumable error (invalid_request, content_filter,
+-- context_window_exceeded) is a dead end: the resume policy says to abandon
+-- it for a fresh conversation. Returning it to idle would reopen the normal
+-- idle -> llm_requesting message path (UserSendsMessage) that the resume
+-- policy explicitly denies, so dismissal to idle is forbidden for those
+-- kinds and the error banner stays put.
+rule UserDismissesError {
+    when: UserDismissesError(conversation)
+    requires: conversation.core_status = error
+    requires: user_resumable(error_kind)
+    ensures: conversation.core_status = idle
+    ensures: ErrorDismissed(conversation)
+
+    @guidance
+        -- ErrorDismissed is a distinct lifecycle marker from AgentDone (turn
+        -- completion). Dismissal is the user clearing a banner, not a turn
+        -- ending, so it must NOT drain the steering queue: queued steers wait
+        -- for an explicit retry/send. The steering drain (DrainOnIdleEntry in
+        -- specs/steering-messages/) is scoped to exclude this edge — see its
+        -- guard on the dismissal marker. user_resumable(error_kind) mirrors
+        -- the derived LlmError.user_resumable in specs/llm/; bedrock reads the
+        -- persisted error's kind as a payload discriminator rather than
+        -- importing the taxonomy, consistent with the existing error_kind
+        -- guards.
 }
 
 -- ===========================================================
@@ -1111,6 +1151,8 @@ surface UserConversation {
     provides:
         UserSendsMessage(conversation, text, images?)
             when conversation.core_status in { idle, error }
+        UserDismissesError(conversation)
+            when conversation.core_status = error
         UserCancels(conversation)
             when conversation.is_busy
                  or conversation.parent_status in {

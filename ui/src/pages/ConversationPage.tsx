@@ -1225,27 +1225,40 @@ function ConversationPageContent() {
         </RenderProfiler>
         </>
       ) : convStateForChildren.type === 'error' ? (
+        <>
+        {conversationId && (
+          // Mark as Merged / Abandon must be reachable while errored — the
+          // backend and specs permit terminal cleanup from Error. The bar
+          // renders nothing for non-Work/Branch conversations.
+          <WorkControlBar
+            conversationId={conversationId}
+            convModeLabel={conversation.conv_mode_label}
+            phaseType={convStateForChildren.type}
+            continuedInConvId={conversation.continued_in_conv_id}
+            onSendMessage={(text) => handleSend(text, [])}
+            showError={showError}
+            prStatusHandle={prStatusHandle}
+          />
+        )}
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}
           onRetry={() => handleSend('continue', [])}
           onDismiss={() => {
-            // Server-authoritative: the server transitions Error -> Idle and
-            // broadcasts the new state. Do NOT optimistically fake idle — on a
-            // failure (offline, 409, non-resumable rejection) that would leave
-            // the client showing Idle while the server stays in Error, the very
-            // divergence this path exists to remove. Move to idle only after
-            // the POST succeeds; on failure keep the error banner and surface
-            // the reason. (Dismiss is only rendered for resumable errors.)
-            void api.dismissError(conversation.id)
-              .then(() => {
-                dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id });
-              })
-              .catch((e) => {
-                showError(e instanceof Error ? e.message : 'Failed to dismiss error');
-              });
+            // Server-authoritative, SSE-driven. The transition Error -> Idle is
+            // applied and broadcast by the executor; the resulting state_change
+            // SSE flips this view to idle. Do NOT dispatch a local phase change:
+            // `dismissError` resolves as soon as the event is enqueued, not when
+            // the transition is processed/persisted, so faking idle here could
+            // diverge if the executor rejects or races the event. Leave the
+            // banner up until the authoritative state_change arrives; surface
+            // failures. (Dismiss is only rendered for resumable errors.)
+            void api.dismissError(conversation.id).catch((e) => {
+              showError(e instanceof Error ? e.message : 'Failed to dismiss error');
+            });
           }}
         />
+        </>
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
           questions={convStateForChildren.questions}

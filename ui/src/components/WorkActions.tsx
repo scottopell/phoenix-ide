@@ -28,7 +28,13 @@ function deriveWorkLifecycleControls({
   manualFallbackEnabled: boolean;
   isLoading?: boolean;
 }) {
-  const visible = (convModeLabel === 'Work' || convModeLabel === 'Branch') && phaseType === 'idle';
+  // Cleanup is offered while idle and while errored: a Work/Branch
+  // conversation stuck in error (e.g. a usage-limit window the user merged
+  // around externally) must be disposable without first recovering an LLM
+  // turn. Other phases (running, awaiting) are transient and hide the bar.
+  const visible =
+    (convModeLabel === 'Work' || convModeLabel === 'Branch') &&
+    (phaseType === 'idle' || phaseType === 'error');
   const hasContinuation = !!continuedInConvId;
   const prChecking = prStatusState.status === 'loading';
   const prStatus = prStatusState.status === 'ready' ? prStatusState.prStatus : null;

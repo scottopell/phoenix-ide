@@ -1729,21 +1729,10 @@ pub fn transition_parent(
             )
         }
 
-        // ============================================================
-        // Error dismissal: Error + DismissError -> Idle.
-        //
-        // Server-authoritative path for the UI's "Dismiss" button on an error
-        // banner. The conversation genuinely returns to Idle (persisted +
-        // broadcast) rather than the client faking the phase locally, so the
-        // displayed state and the server state cannot diverge.
-        //
-        // Restricted to user-resumable errors. A non-resumable error
-        // (invalid_request, content_filter, context-window) is a dead end the
-        // policy says to abandon for a new conversation; returning it to Idle
-        // would reopen the resume path (Idle accepts a UserMessage) that the
-        // policy explicitly denies. Non-resumable errors fall through to
+        // Error dismissal: Error -> Idle, guarded to user-resumable errors.
+        // The resumable-only policy and its rationale live in the bedrock spec
+        // (core_status dismissal). Non-resumable errors fall through to
         // InvalidTransition.
-        // ============================================================
         (
             ParentState::Core(CoreState::Error { error_kind, .. }),
             ParentEvent::Parent(ParentOnlyEvent::DismissError),
