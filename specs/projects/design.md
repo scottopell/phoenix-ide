@@ -424,8 +424,14 @@ sub-agent spawn path — this is what makes the decoupling structural (there is 
    single-branch, best-effort (REQ-PROJ-022). The local `refs/heads/{main_ref}` is
    fast-forwarded only when it is not checked out in any worktree (owned-environments
    rule — `main_ref` is usually checked out in the user's main worktree).
-2. Allocate a new conversation id; create its worktree at
-   `.phoenix/worktrees/{fork-conv-id}/` off the **freshest non-mutating base commit** —
+2. Derive the fork conversation id **deterministically** from `(proposal_id, "spawn")` — NOT
+   a fresh random id — so the worktree path `.phoenix/worktrees/{fork-conv-id}/` is
+   recomputable on retry: if the flow crashes after creating the worktree/branch but before
+   the `spawned` resolution commits (step 4/5), re-driving recomputes the same id and adopts
+   the orphan rather than allocating a second one or rejecting on the existing branch
+   (idempotency keyed on `proposal_id`; matches the Allium recovery model). The `"spawn"`
+   namespace keeps this disjoint from Request Changes' `(proposal_id, "promote")` id. Create
+   its worktree off the **freshest non-mutating base commit** —
    `origin/{main_ref}` when the fetch succeeded, else local `refs/heads/{main_ref}` — so a
    checked-out (un-fast-forwarded) default branch still yields the latest tip without
    moving its ref (REQ-PROJ-005). Classify the
@@ -475,8 +481,12 @@ before Work — and reuses the existing REQ-PROJ-004 propose/feedback loop.
 On `Effect::PromoteForkToExplore` (executor, `spawn_blocking`, under `TASK_APPROVAL_MUTEX`,
 dispatched by `/proposals/:id/request-changes`):
 
-1. Allocate a fresh top-level conversation; create its worktree (REQ-PROJ-005) cut from
-   `main_ref` — the same independent base a direct approval uses.
+1. Derive the refinement conversation id **deterministically** from `(proposal_id, "promote")`
+   — disjoint from the `"spawn"` namespace approval uses — and create its worktree
+   (REQ-PROJ-005) cut from `main_ref` (the same independent base a direct approval uses, via
+   the same fetch / freshest-commit-ish selection). The deterministic id makes the promotion
+   re-drivable: a crash before the `promoted` commit is recovered by recomputing the same path
+   and adopting the orphan (idempotency keyed on `proposal_id`).
 2. Write the snapshot `body` as an **uncommitted draft under the tasks directory** on the
    Explore temp branch — *not* at the brief's original repo-relative path. Explore's `patch`
    allowlist is scoped to `tasks/` (REQ-PROJ-003), so a plain brief that lived at e.g.
