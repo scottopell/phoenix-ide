@@ -664,13 +664,15 @@ rule ForkProposalCreated {
 -- origin's `base_branch` or HEAD, uniformly for every origin mode — and the only
 -- link back to the origin is the provenance breadcrumb.
 --
--- Handles both accepted snapshot shapes through the input-agnostic `fork_task_id`
--- / `fork_branch_name` helpers, so a single rule covers taskmd files and plain
--- briefs without forward-referencing a missing taskmd id. TaskFile remains the
--- taskmd entity (plain briefs are not a distinct entity — see the TaskFile note);
--- the worktree's task_file is modelled as a TaskFile keyed by the derived task_id
--- (the stem, for a plain brief). The on-disk `...-in-progress--` status rename
--- applies to taskmd only; a plain brief has no status segment (see @guidance).
+-- Covers both accepted snapshot shapes. The input-agnostic `fork_task_id` /
+-- `fork_branch_name` helpers derive the id and branch (taskmd id+slug, or sanitized
+-- stem + fork-id-prefix) without forward-referencing a missing taskmd id. The
+-- worktree's committed brief, however, is NOT uniform: a taskmd snapshot carries a
+-- typed `TaskFile` (promoted to in-progress before commit, REQ-PROJ-006) and lands
+-- under the tasks directory; a plain brief carries NO typed task_file (it has no
+-- taskmd metadata or status segment) and is committed verbatim at its own
+-- repo-relative path (REQ-PROJ-034). The postconditions split on `is_taskmd_file`
+-- accordingly — TaskFile is the taskmd-only entity, never synthesized for a plain brief.
 rule ForkProposalApproved {
     when: UserApprovesForkProposal(proposal)
 
@@ -745,20 +747,31 @@ rule ForkProposalApproved {
     ensures: fork.working_dir = worktree_path(fork)
     ensures: fork.spawned_from_conversation_id = proposal.origin
 
-    -- Its own worktree, cut from the repository default branch.
+    -- Its own worktree, cut from the repository default branch. Created with no
+    -- task_file (as Explore/Branch worktrees are); the taskmd branch below sets the
+    -- typed file, the plain branch leaves it absent.
     ensures: Worktree.created(
         conversation: fork,
         project: proposal.origin.project,
         path: WorktreePath { absolute_path: worktree_path(fork) },
         branch_name: branch_name,
         base_branch: base,
-        task_file: TaskFile{task_id: task_id}
+        task_file: absent
     )
-    -- taskmd status promoted to in-progress before commit (REQ-PROJ-006), so a
-    -- ready/brainstorming snapshot never lands on a Work branch advertising a
-    -- non-work status.
-    ensures: Worktree{conversation: fork}.task_file.status = in_progress
-    ensures: TaskFileCommittedOnBranch(Worktree{conversation: fork}, task_id)
+    -- The committed brief splits by shape (REQ-PROJ-006/034) — TaskFile is never
+    -- synthesized for a plain brief:
+    ensures:
+        if is_taskmd_file(proposal.task_file):
+            -- taskmd: typed task file, status promoted to in-progress before commit
+            -- (REQ-PROJ-006) so a ready/brainstorming snapshot never lands on a Work
+            -- branch advertising a non-work status; committed under the tasks directory.
+            Worktree{conversation: fork}.task_file = TaskFile{task_id: task_id, status: in_progress}
+            and TaskFileCommittedOnBranch(Worktree{conversation: fork}, task_id)
+        else:
+            -- plain brief: no taskmd metadata and no status segment to promote; the
+            -- snapshot body is committed verbatim at its own repo-relative path and the
+            -- worktree carries no typed task_file.
+            BriefCommittedOnBranch(Worktree{conversation: fork}, proposal.task_file, proposal.body)
 
     -- Resolve the proposal. fork present iff spawned — so a pending proposal
     -- spawns exactly one fork (idempotency keyed on proposal.id).
@@ -823,6 +836,20 @@ rule ForkProposalsRetiredOnOriginTerminal {
     ensures:
         for p in ForkProposal where p.origin = origin and p.status = pending:
             p.status = dismissed
+}
+
+-- REQ-PROJ-035: a hard delete removes the origin row outright (bedrock's
+-- ConversationHardDeleted, not the terminal-transition event), so its proposals are
+-- removed *with the conversation* — not merely dismissed, since a dismissed proposal
+-- still references a now-nonexistent origin and would violate ForkProposalBoundToOrigin.
+-- This is the delete-side complement to ForkProposalsRetiredOnOriginTerminal and runs
+-- alongside WorktreeRemovedByConversationDelete on the same event.
+rule ForkProposalsRemovedOnOriginDelete {
+    when: ConversationHardDeleted(origin)
+
+    ensures:
+        for p in ForkProposal where p.origin = origin:
+            not exists p
 }
 
 -- ===========================================================
@@ -1410,10 +1437,16 @@ invariant OneWorktreePerConversation {
 -- from desired_base_branch or current HEAD, then stored in ConvMode::Work.
 -- No rule updates it after approval.)
 
--- Task file exists after approval (managed worktrees only)
+-- A managed Explore→Work approval always yields a typed taskmd file. A fork
+-- (REQ-PROJ-034) is the one exemption: it is Work mode but its brief may be a plain
+-- markdown file with no taskmd metadata, so its worktree legitimately has no
+-- task_file. Forks are identified structurally by the provenance breadcrumb
+-- (spawned_from_conversation_id), so the exemption can't be confused with a
+-- non-fork work worktree that simply forgot its task file.
 invariant TaskFileExistsForManagedWorktrees {
-    for w in Worktrees where w.conversation.mode = work:
-        w.conversation.mode = work implies exists w.task_file
+    for w in Worktrees where w.conversation.mode = work
+                         and w.conversation.spawned_from_conversation_id = absent:
+        exists w.task_file
 }
 
 -- REQ-PROJ-024: Branch mode worktrees never have task files
