@@ -85,7 +85,7 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-031:** Agent-Facing PR Context Baseline | ✅ Complete | Successful PR auto-fix context capture records work-scope/PR baseline with timestamp, PR updated_at, and feedback identities |
 | **REQ-PROJ-032:** Bounded PR Feedback Refresh | ✅ Complete | Routine PR status uses PR updated_at as the gate before fetching feedback surfaces; failures degrade to coarse advisory |
 | **REQ-PROJ-033:** Propose a Decoupled Task Fork from a Writing Mode | 📐 Spec only | Non-blocking `propose_task` in Work/Branch/Direct-in-git; snapshots the task and continues |
-| **REQ-PROJ-034:** Approve a Fork Proposal — Spawn an Independent Conversation | 📐 Spec only | Async approval spawns a fresh top-level Work conversation off the base branch |
+| **REQ-PROJ-034:** Approve a Fork Proposal — Spawn an Independent Conversation | 📐 Spec only | Async approval spawns a fresh top-level Work conversation cut from the repository default branch (`main_ref`), never the origin's `base_branch`/HEAD |
 | **REQ-PROJ-035:** Fork Provenance and Decoupling Guarantees | 📐 Spec only | `spawned_from_conversation_id` breadcrumb; no lifecycle notifications; proposal bound to origin |
 | **REQ-PROJ-036:** Fork-Eligible Mode Availability | 📐 Spec only | Writing-mode matrix; Direct gated on git repo; Explore keeps its parking gateway |
 

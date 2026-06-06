@@ -566,7 +566,12 @@ rule ForkProposalIntercepted {
     requires: conversation.kind = Parent
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
-    requires: conversation.mode in { work, branch, direct }
+    -- Writing modes only, and a Direct origin must be git-backed (REQ-PROJ-036):
+    -- the fork resolves its base from the origin's project main_ref, which a
+    -- non-git Direct conversation does not have. Work/Branch always own a worktree
+    -- (git-backed by construction).
+    requires: conversation.mode in { work, branch }
+           or (conversation.mode = direct and is_git_repository(conversation.working_dir))
     let proposal = parse_fork_proposal(tool_calls.first)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1

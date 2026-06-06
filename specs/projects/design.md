@@ -404,9 +404,14 @@ sub-agent spawn path — this is what makes the decoupling structural (there is 
 
 1. Resolve the fork base: the project's `main_ref` (the repository default branch —
    REQ-PROJ-034a), uniformly for every origin mode. `git fetch origin {main_ref}`
-   single-branch, best-effort (REQ-PROJ-022).
+   single-branch, best-effort (REQ-PROJ-022). The local `refs/heads/{main_ref}` is
+   fast-forwarded only when it is not checked out in any worktree (owned-environments
+   rule — `main_ref` is usually checked out in the user's main worktree).
 2. Allocate a new conversation id; create its worktree at
-   `.phoenix/worktrees/{fork-conv-id}/` off `{main_ref}` (REQ-PROJ-005). Classify the
+   `.phoenix/worktrees/{fork-conv-id}/` off the **freshest non-mutating base commit** —
+   `origin/{main_ref}` when the fetch succeeded, else local `refs/heads/{main_ref}` — so a
+   checked-out (un-fast-forwarded) default branch still yields the latest tip without
+   moving its ref (REQ-PROJ-005). Classify the
    snapshot via `TaskSource` (taskmd vs plain-markdown — REQ-PROJ-006); task branch =
    `task-{task_id}-{slug}` (taskmd) or `task-{sanitized-stem}-{fork-conv-id[..8]}` (plain —
    the *fork's* id prefix uniquifies).
