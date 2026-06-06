@@ -436,7 +436,7 @@ requiring every state variant to carry mode.
 
 | Tool | Explore | Work | Branch | Direct |
 |------|---------|------|--------|--------|
-| `patch` | Disabled | Enabled (worktree only) | Enabled (worktree only) | Enabled (cwd) |
+| `patch` | Allowed, scoped to the `tasks/` dir (REQ-PROJ-003) — draft/revise task files only | Enabled (worktree only) | Enabled (worktree only) | Enabled (cwd) |
 | `bash` | Allowed (read-only enforced) | Allowed (write in worktree) | Allowed (write in worktree) | Allowed (write in cwd) |
 | `propose_task` | Allowed — Explore→Work gateway, parks (intercepted, not executed) | Allowed — fork proposal, non-blocking (REQ-PROJ-033) | Allowed — fork proposal, non-blocking (REQ-PROJ-033) | Allowed **only when cwd is in a git repo** — fork proposal (REQ-PROJ-033/036); otherwise not provided |
 | `think`, `keyword_search`, `read_image`, `browser_*` | Allowed | Allowed | Allowed | Allowed |

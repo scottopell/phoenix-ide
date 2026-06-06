@@ -1005,13 +1005,17 @@ rule ForkProposalPromotedToExplore {
 -- approved, so they are dismissed rather than left as permanently-unreviewable
 -- pending records. Maintains PendingForkProposalRequiresLiveOrigin. Subscribes to
 -- bedrock's ConversationBecameTerminal (the same lifecycle event
--- ExploreWorktreeCleanupOnTerminal uses).
+-- ExploreWorktreeCleanupOnTerminal uses). Like UserDismissesForkProposal, this also
+-- clears any deterministic spawn/promote orphan left by an approve/promote that crashed
+-- before recording its resolution — auto-retirement removes the user's chance to dismiss
+-- through the cleanup path, so it must do the cleanup itself.
 rule ForkProposalsRetiredOnOriginTerminal {
     when: ConversationBecameTerminal(origin)
 
     ensures:
         for p in ForkProposal where p.origin = origin and p.status = pending:
             p.status = dismissed
+            and DeterministicForkOrphansCleaned(p)
 }
 
 -- REQ-PROJ-035: a hard delete removes the origin row outright (bedrock's
@@ -1325,7 +1329,9 @@ rule WorktreeTransferredOnContinuation {
 -- REQ-BED-030: Work-mode continuation also inherits the parent's task_id
 -- (and therefore its task file, since the task file lives on the
 -- transferred branch inside the transferred worktree). Ensures a new
--- task ID isn't minted for the same underlying task.
+-- task ID isn't minted for the same underlying task. task_title is inherited
+-- too — it is a mandatory mode=work field, so the continuation must carry the
+-- title approval set rather than drop it or leave the required field unset.
 rule WorkContinuationInheritsTaskId {
     when: UserStartsContinuationConversation(parent, new_conv)
 
@@ -1334,6 +1340,7 @@ rule WorkContinuationInheritsTaskId {
     requires: parent.continued_in_conv_id = absent
 
     ensures: new_conv.task_id = parent.task_id
+    ensures: new_conv.task_title = parent.task_title
 }
 
 -- REQ-BED-030: Direct parents have no worktree, so continuation
