@@ -934,10 +934,13 @@ THE SYSTEM SHALL intercept it at the LlmResponse handler (like the Explore-mode
 propose_task — REQ-PROJ-003)
 AND require it to be the only tool call in the response
 AND validate the `task_file` by the **same rules as REQ-PROJ-003**: it must be a regular
-`.md` file inside the worktree; a taskmd-pattern filename (`NNNNN-pX-status--slug.md`) is
-rejected unless it lives under the project's tasks directory and carries an open status
-(`ready` / `in-progress` / `brainstorming`) — a closed status such as `done` is rejected;
-any other `.md` file is accepted as a plain brief (REQ-PROJ-006). An invalid file is
+`.md` file inside the conversation's **resolved root** — the Phoenix worktree for a
+Work/Branch origin, or the conversation's working directory (the user-supplied cwd inside
+the git repo) for a Direct origin, which has no Phoenix-managed worktree; a taskmd-pattern
+filename (`NNNNN-pX-status--slug.md`) is rejected unless it lives under the project's tasks
+directory and carries an open status (`ready` / `in-progress` / `brainstorming`) — a closed
+status such as `done` is rejected; any other `.md` file is accepted as a plain brief
+(REQ-PROJ-006). An invalid file is
 rejected via a synthetic tool error (the conversation keeps running), never silently
 reclassified
 AND read the file and capture a **content snapshot** (the file bytes plus the display

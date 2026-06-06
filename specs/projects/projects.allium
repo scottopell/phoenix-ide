@@ -222,15 +222,15 @@ entity ForkProposal {
     priority: String
     body: String                        -- snapshotted file bytes — authoritative at spawn
     status: pending | spawned | dismissed | promoted
-    fork: bedrock/Conversation?         -- the spawned conversation, present iff status = spawned.
-                                        -- A non-live audit reference, NOT an FK-enforced edge:
+    fork: String?                       -- id of the spawned conversation, present iff status =
+                                        -- spawned. A RAW conversation id, NOT a Conversation FK:
                                         -- the fork is independent (REQ-PROJ-035) and may be
                                         -- hard-deleted while this (origin-bound) proposal lives,
-                                        -- so consumers tolerate a reference to a since-deleted
-                                        -- conversation rather than cascading or blocking its delete.
-    refinement: bedrock/Conversation?   -- REQ-PROJ-037: the Explore conversation a
+                                        -- so the audit link is a plain id that may dangle — no
+                                        -- cascade, no null-on-delete, no blocking its delete.
+    refinement: String?                 -- REQ-PROJ-037: id of the Explore conversation a
                                         -- `Request Changes` promotion created, present iff
-                                        -- status = promoted. Same non-live audit reference
+                                        -- status = promoted. Same raw-id, non-live audit
                                         -- semantics as `fork` — independent lifecycle.
 
     -- The fork base is NOT stored: it is always origin.project.main_ref (the
@@ -722,11 +722,12 @@ rule ForkProposalApproved {
     requires: proposal.origin.is_terminal = false
     requires: proposal.origin.mode in { work, branch, direct }
 
-    -- `fork` is the freshly-allocated successor conversation, bound from the field
-    -- this rule fills — the same post-state fixpoint idiom as
-    -- TaskApprovalFreshHandoffExecuted's `successor = conversation.continued_in_conv_id`
-    -- (`proposal.fork` is absent while pending and becomes present == spawned here).
-    let fork = proposal.fork
+    -- `fork` is the freshly-allocated successor conversation, identified by its DETERMINISTIC
+    -- id (from proposal.id, `spawn`) — the same id that anchors crash recovery below. Binding
+    -- the conversation by that id (rather than a Conversation field) lets `proposal.fork` stay
+    -- a raw id rather than an FK reference. proposal.fork is absent while pending and is set to
+    -- fork.id == spawned here.
+    let fork = Conversation{id: fork_conv_id(proposal)}
     let base = proposal.origin.project.main_ref
     -- Input-agnostic derivation covering both accepted shapes (REQ-PROJ-006/034):
     --   taskmd brief: task_id/slug parsed from the filename; branch task-{id}-{slug}.
@@ -825,9 +826,9 @@ rule ForkProposalApproved {
             Worktree{conversation: fork}.plain_brief_path = proposal.task_file
             and BriefCommittedOnBranch(Worktree{conversation: fork}, proposal.task_file, proposal.body)
 
-    -- Resolve the proposal. fork present iff spawned — so a pending proposal
+    -- Resolve the proposal. fork (the raw id) present iff spawned — so a pending proposal
     -- spawns exactly one fork (idempotency keyed on proposal.id).
-    ensures: proposal.fork = fork
+    ensures: proposal.fork = fork.id
     ensures: proposal.status = spawned
 
     -- Start the fork working immediately, like the fresh-handoff successor — a spawned fork
@@ -925,9 +926,10 @@ rule ForkProposalPromotedToExplore {
     -- has ended (Parent.is_terminal covers terminal, context_exhausted, handed_off).
     requires: proposal.origin.is_terminal = false
 
-    -- `refinement` is the freshly-allocated Explore successor — the same post-state fixpoint
-    -- idiom ForkProposalApproved uses for `fork` (absent while pending, present == promoted).
-    let refinement = proposal.refinement
+    -- `refinement` is the freshly-allocated Explore successor, identified by its DETERMINISTIC
+    -- id (from proposal.id, `promote`) — same approach as ForkProposalApproved's `fork`, so
+    -- `proposal.refinement` stays a raw id rather than a Conversation FK.
+    let refinement = Conversation{id: refinement_conv_id(proposal)}
     let base = proposal.origin.project.main_ref
 
     -- A fresh top-level Explore conversation, NOT a sub-agent — seeded with the brief and the
@@ -980,9 +982,9 @@ rule ForkProposalPromotedToExplore {
     ensures: TasksDirEnsured(Worktree{conversation: refinement})
     ensures: BriefDraftedUnderTasksDir(Worktree{conversation: refinement}, proposal.body, change_request)
 
-    -- Resolve the proposal. refinement present iff promoted — one pending proposal promotes
-    -- exactly once (idempotency keyed on proposal.id).
-    ensures: proposal.refinement = refinement
+    -- Resolve the proposal. refinement (the raw id) present iff promoted — one pending proposal
+    -- promotes exactly once (idempotency keyed on proposal.id).
+    ensures: proposal.refinement = refinement.id
     ensures: proposal.status = promoted
 
     -- Start the refinement agent immediately on the brief + change request, like a spawned
@@ -1031,6 +1033,19 @@ rule ForkProposalsRetiredOnOriginTerminal {
         for p in ForkProposal where p.origin = origin and p.status = pending:
             p.status = dismissed
             and DeterministicForkOrphansCleaned(p)
+
+    @guidance
+        -- Serialized with approvals: this retirement (and its DeterministicForkOrphansCleaned)
+        -- runs under the SAME process-global TASK_APPROVAL_MUTEX as ForkProposalApproved /
+        -- ForkProposalPromotedToExplore. Without that, a terminal transition arriving while an
+        -- approve/promote is mid-flight (deterministic worktree created, step-4/5 commit not yet
+        -- durable) would see the proposal still `pending` and could delete the worktree the
+        -- in-flight operation is about to adopt. Under the mutex the two are ordered: either the
+        -- approve/promote commits first (the proposal is no longer `pending`, so the pending
+        -- filter skips it and its now-live child is untouched), or retirement runs first
+        -- (dismisses + cleans the orphan, and the approve/promote then finds the proposal no
+        -- longer `pending` and aborts). The same mutex discipline applies to
+        -- UserDismissesForkProposal and ForkProposalsRemovedOnOriginDelete.
 }
 
 -- REQ-PROJ-035: a hard delete removes the origin row outright (bedrock's
@@ -1772,10 +1787,10 @@ invariant TerminalActionRequiresNoContinuation {
 -- rather than a dangling-deref violation.
 invariant ForkCarriesOnlyProvenanceLink {
     for p in ForkProposals:
-        p.status = spawned and exists p.fork and exists p.origin implies
-            p.fork.spawned_from_conversation_id = p.origin.id
-            and p.fork.kind = Parent
-            and p.origin.continued_in_conv_id != p.fork
+        p.status = spawned and exists Conversation{id: p.fork} and exists p.origin implies
+            Conversation{id: p.fork}.spawned_from_conversation_id = p.origin.id
+            and Conversation{id: p.fork}.kind = Parent
+            and p.origin.continued_in_conv_id != Conversation{id: p.fork}
 }
 
 -- REQ-PROJ-035: a fork proposal is an artifact of its origin (bound to origin),
