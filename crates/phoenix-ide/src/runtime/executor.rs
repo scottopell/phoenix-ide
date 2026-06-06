@@ -1221,28 +1221,26 @@ where
             Vec::with_capacity(input.tasks.len());
         for task in &input.tasks {
             let agent = if let Some(ref agent_type) = task.agent_type {
-                match phoenix_agents::find_agent(&agents, agent_type) {
-                    Some(a) => Some(a),
-                    None => {
-                        let available: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
-                        let result = ToolResult::error(
-                            tool_use_id.clone(),
-                            format!(
-                                "Unknown agent_type '{}'. Available: {}",
-                                agent_type,
-                                if available.is_empty() {
-                                    "none".to_string()
-                                } else {
-                                    available.join(", ")
-                                }
-                            ),
-                        );
-                        return Ok(Some(Event::ToolComplete {
-                            tool_use_id,
-                            result,
-                        }));
-                    }
-                }
+                let Some(found) = phoenix_agents::find_agent(&agents, agent_type) else {
+                    let available: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        format!(
+                            "Unknown agent_type '{}'. Available: {}",
+                            agent_type,
+                            if available.is_empty() {
+                                "none".to_string()
+                            } else {
+                                available.join(", ")
+                            }
+                        ),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                };
+                Some(found)
             } else {
                 None
             };
