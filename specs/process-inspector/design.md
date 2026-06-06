@@ -165,7 +165,10 @@ distinct concerns are involved at each layer:
 1. **Group membership** — which pids belong to the `pgid`:
    - Linux: scan `/proc/<pid>/stat` (or `/proc` entries) for processes whose
      process-group id equals `pgid`.
-   - macOS: `proc_listpgrppids(pgid, …)` (via `libc`) returns the group's pids.
+   - macOS: enumerate all pids via `proc_listallpids` and keep those whose
+     `proc_pidinfo(PROC_PIDTBSDINFO)` `pbi_pgid` equals `pgid` (via `libc`).
+     `proc_listpgrppids` is not used: it mis-sizes its null-buffer query and
+     omits live group members, so it cannot enumerate the group reliably.
 2. **Per-pid metrics**:
    - `cpu_pct` and `process_count`: `sysinfo` (already a dependency in
      `phoenix-ide`) enumerates processes and reports per-process CPU%; summing
@@ -348,10 +351,12 @@ is therefore untouched by this spec.
   `ts_rs` derives, referencing the existing `BashHandleState`
   (`work_scope_inventory`) and `BashRingWindow` (`tool_wire`).
 - `phoenix-tools`: an `assemble_inspection` function (parallel to
-  `work_scope_inventory::assemble_inventory`) plus the platform-specific
-  process-group sampler (Linux `/proc` + `smaps_rollup`, macOS
-  `proc_listpgrppids` + `proc_pid_rusage`), gated by `#[cfg(target_os = …)]`
-  with a null-returning fallback arm.
+  `work_scope_inventory::assemble_inventory`) that projects identity/state and
+  the output window from the registry.
+- `phoenix-ide`: the platform-specific process-group sampler (it owns the
+  `sysinfo` dependency, alongside `api/deployment.rs`): Linux `/proc` +
+  `smaps_rollup`, macOS `proc_listallpids`/`proc_pidinfo` + `proc_pid_rusage`,
+  gated by `#[cfg(target_os = …)]` with a null-returning fallback arm.
 - `ui/src/components/ProcessInspectorPanel.tsx` (+ its CSS) — the inspector
   viewer: poll loop, header, output pane, resource readout.
 

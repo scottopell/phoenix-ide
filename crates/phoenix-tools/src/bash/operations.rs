@@ -81,6 +81,18 @@ pub struct ReadArgs {
     pub since: Option<u64>,
 }
 
+impl ReadArgs {
+    /// Construct read args from an optional incremental `since` offset.
+    /// When `since` is absent, the read falls back to the default peek tail
+    /// (`DEFAULT_PEEK_LINES`). Used by the process inspector's output delta
+    /// (`specs/process-inspector/` REQ-PINSP-003), which exposes only the
+    /// `since` cursor — not the `lines` count.
+    #[must_use]
+    pub fn from_since(since: Option<u64>) -> Self {
+        Self { lines: None, since }
+    }
+}
+
 /// Parsed, validated request. The variants make "exactly one operation per
 /// call" structural — there is no shape representable that has both `cmd`
 /// and `peek`.
@@ -1280,12 +1292,12 @@ async fn terminal_or_panic_response(
 /// from `WindowView.lines` makes "complete lines" and "in-progress line"
 /// structurally distinct — the LLM peek may ignore the partial; the
 /// inspector renders it.
-struct RingRead {
-    view: WindowView,
-    partial: Option<String>,
+pub(crate) struct RingRead {
+    pub(crate) view: WindowView,
+    pub(crate) partial: Option<String>,
 }
 
-fn read_window_from_ring(ring: &super::ring::RingBuffer, args: &ReadArgs) -> RingRead {
+pub(crate) fn read_window_from_ring(ring: &super::ring::RingBuffer, args: &ReadArgs) -> RingRead {
     let view = if let Some(since) = args.since {
         ring.since(since)
     } else {
@@ -1302,7 +1314,10 @@ fn read_window_from_ring(ring: &super::ring::RingBuffer, args: &ReadArgs) -> Rin
 /// to a complete line on EOF before the tombstone was written, so it already
 /// lives in `final_tail`. Wrapping the `WindowView` in [`RingRead`] with
 /// `partial: None` keeps the wire shaping uniform with the live path.
-fn read_window_from_tombstone(tomb: &super::handle::Tombstone, args: &ReadArgs) -> WindowView {
+pub(crate) fn read_window_from_tombstone(
+    tomb: &super::handle::Tombstone,
+    args: &ReadArgs,
+) -> WindowView {
     let lines = &tomb.final_tail;
     let next_offset = tomb.next_offset_at_exit;
     let earliest_offset = lines.first().map_or(next_offset, |l| l.offset);
@@ -1348,7 +1363,7 @@ fn read_window_from_tombstone(tomb: &super::handle::Tombstone, args: &ReadArgs) 
     }
 }
 
-fn window_to_typed(view: &WindowView, partial: Option<String>) -> BashRingWindow {
+pub(crate) fn window_to_typed(view: &WindowView, partial: Option<String>) -> BashRingWindow {
     BashRingWindow {
         start_offset: view.start_offset,
         end_offset: view.end_offset,

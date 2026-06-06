@@ -12,6 +12,7 @@ mod git_handlers;
 pub(crate) mod handlers;
 mod lifecycle_handlers;
 mod pr_monitoring;
+mod process_sample;
 mod sse;
 mod terminal_ws;
 mod types;

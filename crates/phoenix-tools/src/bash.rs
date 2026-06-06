@@ -19,7 +19,7 @@
 
 // Foundation submodules (task 02693) — used by the operations dispatch below.
 pub mod handle;
-mod operations;
+pub(crate) mod operations;
 pub mod reaper;
 pub mod registry;
 pub mod ring;

@@ -9,6 +9,7 @@ pub mod browser;
 mod keyword_search;
 pub mod mcp;
 pub mod patch;
+pub mod process_inspection;
 mod propose_task;
 mod read_file;
 mod read_image;

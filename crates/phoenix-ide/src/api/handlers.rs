@@ -176,6 +176,14 @@ pub fn create_router(state: AppState) -> Router {
             "/api/work-scope/:scope_key/inventory",
             get(get_work_scope_inventory),
         )
+        // Process inspector: per-handle drill-down (identity/state, output
+        // delta, live resource sample). `:scope_key` is a
+        // `WorkScope::stable_key()`; `:handle_id` names a bash handle in that
+        // scope. See `specs/process-inspector/` REQ-PINSP-005.
+        .route(
+            "/api/work-scope/:scope_key/bash/:handle_id/inspect",
+            get(inspect_bash_handle),
+        )
         .route("/api/chains/:rootId", get(get_chain))
         .route("/api/chains/:rootId/qa", post(submit_chain_question))
         .route(
@@ -1845,6 +1853,51 @@ async fn get_work_scope_inventory(
     .await;
 
     Ok(Json(inventory))
+}
+
+/// Optional `since=K` incremental output cursor for the inspect endpoint.
+#[derive(serde::Deserialize)]
+struct InspectQuery {
+    since: Option<u64>,
+}
+
+/// `GET /api/work-scope/:scope_key/bash/:handle_id/inspect?since=K` — the
+/// per-handle drill-down snapshot (`specs/process-inspector/` REQ-PINSP-005).
+///
+/// Resolves `:scope_key` into a `WorkScope` (400 on a malformed key, like the
+/// inventory handler), looks up `:handle_id` in that scope's bash table (404
+/// when absent), reads the output window for the optional `since` cursor via
+/// the existing ring/tombstone read helpers, and attaches a request-time
+/// process-group resource sample iff the handle is live.
+async fn inspect_bash_handle(
+    State(state): State<AppState>,
+    Path((scope_key, handle_id)): Path<(String, String)>,
+    Query(query): Query<InspectQuery>,
+) -> Result<Json<phoenix_core::domain::process_inspection::BashHandleInspection>, AppError> {
+    let work_scope = crate::work_scope::WorkScope::from_stable_key(&scope_key)
+        .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
+
+    let mut assembly = phoenix_tools::process_inspection::assemble_inspection(
+        &work_scope,
+        &handle_id,
+        query.since,
+        state.runtime.bash_handles(),
+    )
+    .await
+    .ok_or_else(|| {
+        AppError::NotFound(format!(
+            "handle {handle_id} not found in work scope {scope_key}"
+        ))
+    })?;
+
+    // Sample resources only for a live handle (REQ-PINSP-004): a terminal
+    // handle has no process group, so `resources` stays `None`.
+    if let Some(pgid) = assembly.live_pgid {
+        assembly.inspection.resources =
+            Some(super::process_sample::sample_process_group(pgid).await);
+    }
+
+    Ok(Json(assembly.inspection))
 }
 
 async fn get_system_prompt(
@@ -5024,6 +5077,203 @@ mod hard_delete_cascade_tests {
             .await
             .expect_err("malformed key must be rejected");
         assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    // ----------------------------------------------------------------
+    // Process inspector endpoint (specs/process-inspector/ REQ-PINSP-*)
+    // ----------------------------------------------------------------
+
+    /// REQ-PINSP-001/002/003/004: a live handle's inspection reports identity
+    /// and state, an output window (with the appended line), and — on the host
+    /// platform — a non-null resource sample. The handle wraps a REAL spawned
+    /// child in its own process group so the macOS `proc_listpgrppids` /
+    /// `proc_pid_rusage` (and Linux `/proc`) reads find live members.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inspect_live_handle_reports_state_output_and_resources() {
+        use phoenix_core::domain::work_scope_inventory::BashHandleState;
+        use phoenix_tools::bash::handle::{Handle, HandleId, HandleState};
+        use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
+        use std::os::unix::process::CommandExt as _;
+        use std::process::Stdio;
+
+        let state = make_test_state().await;
+        let scope = crate::work_scope::WorkScope::Conversation("conv-inspect-live".to_string());
+
+        // Spawn a real, long-lived child as its own process-group leader so the
+        // sampler has a live group to read. setpgid(0,0) makes pgid == pid.
+        let mut cmd = std::process::Command::new("sleep");
+        cmd.arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = cmd.spawn().expect("spawn sleep");
+        let pid = child.id();
+        #[allow(clippy::cast_possible_wrap)]
+        let pgid = pid as i32;
+
+        let table = state.runtime.bash_handles().get_or_create(&scope).await;
+        let handle = Handle::new_live(
+            scope.clone(),
+            HandleId::new("b-1"),
+            "sleep 30".into(),
+            Some("sleeper".into()),
+            pgid,
+            pid,
+            RING_BUFFER_BYTES,
+        );
+        // Seed the ring with a line so the output window is non-empty.
+        if let HandleState::Live(live) = handle.state().await.as_ref() {
+            live.ring.lock().await.append(b"hello from inspector\n");
+        }
+        table.write().await.insert(handle);
+
+        let Json(inspection) = super::inspect_bash_handle(
+            State(state),
+            Path((scope.stable_key(), "b-1".to_string())),
+            Query(super::InspectQuery { since: None }),
+        )
+        .await
+        .expect("inspection");
+
+        assert_eq!(inspection.handle_id, "b-1");
+        assert_eq!(inspection.label.as_deref(), Some("sleeper"));
+        assert_eq!(inspection.state, BashHandleState::Running);
+        assert_eq!(inspection.pid, Some(pid));
+        assert_eq!(inspection.pgid, Some(pgid));
+        assert!(inspection.duration_ms.is_none());
+        // Output window carries the seeded line.
+        assert!(
+            inspection
+                .output
+                .lines
+                .iter()
+                .any(|l| l.bytes.contains("hello from inspector")),
+            "output window must include the seeded ring line"
+        );
+        // Resource sample present and populated on the host platform.
+        let resources = inspection
+            .resources
+            .expect("live handle must carry a resource sample");
+        assert!(
+            resources.process_count.is_some_and(|c| c >= 1),
+            "process_count must see the live group: {:?}",
+            resources.process_count
+        );
+        assert!(
+            resources.memory_bytes.is_some_and(|m| m > 0),
+            "memory_bytes must be a real proportional figure: {:?}",
+            resources.memory_bytes
+        );
+        assert!(
+            resources.cpu_pct.is_some(),
+            "cpu_pct must be a real (possibly 0.0) sample, not null"
+        );
+
+        // Clean up the spawned child.
+        unsafe {
+            let _ = libc::kill(-pgid, libc::SIGKILL);
+        }
+        let _ = child.wait();
+    }
+
+    /// REQ-PINSP-002/003/004: a terminal handle reports the exit cause and
+    /// duration, serves its output from the tombstone tail, and carries NO
+    /// resource sample (`resources: None`).
+    #[tokio::test]
+    async fn inspect_terminal_handle_has_no_resources_and_serves_tombstone_output() {
+        use phoenix_core::domain::work_scope_inventory::BashHandleState;
+        use phoenix_tools::bash::handle::{FinalCause, Handle, HandleId, HandleState};
+        use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
+
+        let state = make_test_state().await;
+        let scope = crate::work_scope::WorkScope::Conversation("conv-inspect-term".to_string());
+
+        let table = state.runtime.bash_handles().get_or_create(&scope).await;
+        let handle = Handle::new_live(
+            scope.clone(),
+            HandleId::new("b-1"),
+            "echo bye".into(),
+            None,
+            7,
+            7,
+            RING_BUFFER_BYTES,
+        );
+        // Seed output, then demote so the tombstone retains the tail.
+        if let HandleState::Live(live) = handle.state().await.as_ref() {
+            live.ring.lock().await.append(b"final line\n");
+        }
+        handle
+            .transition_to_terminal(
+                FinalCause::Exited { exit_code: Some(0) },
+                std::time::Duration::from_millis(21),
+                phoenix_tools::bash::handle::TOMBSTONE_TAIL_LINES,
+            )
+            .await;
+        table.write().await.insert(handle);
+
+        let Json(inspection) = super::inspect_bash_handle(
+            State(state),
+            Path((scope.stable_key(), "b-1".to_string())),
+            Query(super::InspectQuery { since: None }),
+        )
+        .await
+        .expect("inspection");
+
+        assert_eq!(inspection.state, BashHandleState::Tombstoned);
+        assert_eq!(inspection.exit_code, Some(0));
+        assert_eq!(inspection.duration_ms, Some(21));
+        assert!(inspection.pid.is_none());
+        assert!(inspection.pgid.is_none());
+        assert!(
+            inspection.resources.is_none(),
+            "a terminal handle has no process group — resources must be None"
+        );
+        assert!(
+            inspection
+                .output
+                .lines
+                .iter()
+                .any(|l| l.bytes.contains("final line")),
+            "tombstone output tail must include the final line"
+        );
+    }
+
+    #[tokio::test]
+    async fn inspect_rejects_malformed_scope_key() {
+        let state = make_test_state().await;
+        let err = super::inspect_bash_handle(
+            State(state),
+            Path(("bogus-no-namespace".to_string(), "b-1".to_string())),
+            Query(super::InspectQuery { since: None }),
+        )
+        .await
+        .expect_err("malformed key must be rejected");
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn inspect_unknown_handle_is_not_found() {
+        let state = make_test_state().await;
+        let scope = crate::work_scope::WorkScope::Conversation("conv-inspect-missing".to_string());
+        // Scope with a table but no such handle.
+        let _ = state.runtime.bash_handles().get_or_create(&scope).await;
+        let err = super::inspect_bash_handle(
+            State(state),
+            Path((scope.stable_key(), "b-404".to_string())),
+            Query(super::InspectQuery { since: None }),
+        )
+        .await
+        .expect_err("unknown handle must be not-found");
+        assert!(matches!(err, AppError::NotFound(_)));
     }
 
     /// REQ-WSUI-007 / REQ-WSUI-008: a work-scope change for a scope with a
