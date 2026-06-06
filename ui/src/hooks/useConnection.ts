@@ -22,6 +22,7 @@ import {
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
   SseRateLimitSnapshotDataSchema,
+  SseWorkScopeUpdateDataSchema,
 } from '../sseSchemas';
 import {
   ConnectionState,
@@ -501,6 +502,25 @@ export function useConnection({
               type: 'sse_browser_session_state',
               sequenceId: res.data.sequence_id,
               active: res.data.active,
+            });
+          });
+
+          // REQ-WSUI-007: full work-scope inventory snapshot, pushed when a
+          // bash handle or browser session in the scope crosses a state edge.
+          // The reducer replaces `workScope` wholesale (full-snapshot
+          // semantics — no delta to apply).
+          on('work_scope_update', (e) => {
+            const res = parseEvent(
+              SseWorkScopeUpdateDataSchema,
+              e,
+              'work_scope_update',
+              stampedDispatch,
+            );
+            if (!res.ok) return;
+            stampedDispatch({
+              type: 'sse_work_scope_update',
+              sequenceId: res.data.sequence_id,
+              inventory: res.data.inventory,
             });
           });
 

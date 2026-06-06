@@ -10281,12 +10281,20 @@ html * {
   font-size: 13px;
 }
 
+/* Main row: the two-column body plus the right-adjacent work-scope dock. */
+.chain-page-main {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 /* Two-column body — members on the left, Q&A on the right. */
 .chain-page-body {
   display: grid;
   grid-template-columns: minmax(220px, 320px) 1fr;
   gap: 0;
   flex: 1 1 auto;
+  min-width: 0;
   min-height: 0;
 }
 

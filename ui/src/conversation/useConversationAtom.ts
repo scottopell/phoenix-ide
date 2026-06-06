@@ -1,6 +1,7 @@
 import { useCallback, useContext, useEffect, useSyncExternalStore, useRef, type MutableRefObject, type Dispatch } from 'react';
 import type { ConversationAtom, SSEAction, StreamingBuffer } from './atom';
 import type { Conversation } from '../api';
+import type { WorkScopeInventory } from '../generated/sse';
 import { ConversationContext } from './ConversationContext';
 import { conversationListsEqual } from '../utils/conversationDiff';
 import { isAgentWorking } from '../utils';
@@ -232,6 +233,28 @@ export function useConversationSnapshot(slug: string | null): Conversation | nul
   );
   const getSnapshot = useCallback(
     () => (slug ? store.getSnapshot(slug).conversation ?? null : null),
+    [store, slug],
+  );
+
+  return useSyncExternalStore(subscribe, getSnapshot);
+}
+
+/**
+ * Subscribes to just the work-scope inventory (`workScope`) for `slug`
+ * (REQ-WSUI-010). Consumed by the `WorkScopePanel` dock so a resource-state
+ * push re-renders only the panel, not the transcript. The reducer replaces
+ * `workScope` by reference on each `sse_work_scope_update`, so `Object.is`
+ * elides the render when nothing changed.
+ */
+export function useWorkScope(slug: string | null): WorkScopeInventory | null {
+  const store = useConversationStore();
+
+  const subscribe = useCallback(
+    (listener: () => void) => (slug ? store.subscribe(slug, listener) : () => {}),
+    [store, slug],
+  );
+  const getSnapshot = useCallback(
+    () => (slug ? store.getSnapshot(slug).workScope : null),
     [store, slug],
   );
 

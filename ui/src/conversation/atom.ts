@@ -2,6 +2,7 @@ import * as v from 'valibot';
 import type { ConversationState, Message, Conversation, ToolResultContent } from '../api';
 import type { ErrorPresentation } from '../errorPresentation';
 import type { Breadcrumb } from '../types';
+import type { WorkScopeInventory } from '../generated/sse';
 import {
   SseTokenDataSchema,
   SseStateChangeDataSchema,
@@ -13,6 +14,7 @@ import {
   SseConversationUpdateDataSchema,
   SseBrowserSessionStateDataSchema,
   SseSteerMessageQueuedDataSchema,
+  SseWorkScopeUpdateDataSchema,
   SseErrorDataSchema,
 } from '../sseSchemas';
 import { parseConversationState } from '../utils';
@@ -117,6 +119,13 @@ export interface ConversationAtom {
    *  without inferring from event timing. Always stamped with the connection
    *  epoch (rejected if stale). */
   connectionState: 'connecting' | 'live' | 'reconnecting' | 'failed';
+  /** Full work-scope resource inventory (bash handles, tmux, browser) for the
+   *  scope this conversation resolves to (REQ-WSUI-010). `null` until the
+   *  initial `GET /api/work-scope/:scope_key/inventory` fetch or the first
+   *  `work_scope_update` SSE event lands. The push carries a complete snapshot
+   *  (REQ-WSUI-007), so the reducer replaces this field wholesale rather than
+   *  merging — there is no partial state to reconcile. */
+  workScope: WorkScopeInventory | null;
 }
 
 export interface InitPayload {
@@ -219,6 +228,17 @@ export type SSEAction =
     }
   | { type: 'sse_conversation_update'; sequenceId: number; updates: Partial<Conversation>; epoch?: number }
   | { type: 'sse_browser_session_state'; sequenceId: number; active: boolean; epoch?: number }
+  // REQ-WSUI-007 / REQ-WSUI-010: full-snapshot work-scope inventory push.
+  // The wire payload carries the complete `WorkScopeInventory` for the
+  // scope; the reducer replaces `workScope` wholesale (no delta merge).
+  // The initial pull (REQ-WSUI-006) is seeded as panel-local state, not
+  // through the atom, so the SSE push is the only writer of this field.
+  | {
+      type: 'sse_work_scope_update';
+      sequenceId: number;
+      inventory: WorkScopeInventory;
+      epoch?: number;
+    }
   // `sequenceId` is present when the error originated on the wire (server's
   // monotonic counter) and absent when it was synthesized client-side for a
   // schema / parse violation in useConnection.ts. Wire-originated errors are
@@ -301,6 +321,7 @@ export function createInitialAtom(): ConversationAtom {
     turnRetryContext: null,
     connectionEpoch: null,
     connectionState: 'connecting',
+    workScope: null,
   };
 }
 
@@ -638,6 +659,20 @@ function applyPendingEvent(atom: ConversationAtom, entry: unknown): Conversation
         type: 'sse_browser_session_state',
         sequenceId: res.output.sequence_id,
         active: res.output.active,
+      });
+    }
+    case 'work_scope_update': {
+      const res = v.safeParse(SseWorkScopeUpdateDataSchema, entry);
+      if (!res.success) {
+        if (import.meta.env.DEV) {
+          console.warn('[sse] dropping malformed pending work_scope_update entry', { issues: res.issues });
+        }
+        return atom;
+      }
+      return conversationReducer(atom, {
+        type: 'sse_work_scope_update',
+        sequenceId: res.output.sequence_id,
+        inventory: res.output.inventory,
       });
     }
     case 'steer_message_queued': {
@@ -1068,6 +1103,17 @@ export function conversationReducer(
           conversation: { ...a.conversation, browser_session_active: action.active },
         };
       });
+
+    case 'sse_work_scope_update':
+      // REQ-WSUI-007: the push carries a COMPLETE inventory snapshot, so we
+      // replace `workScope` wholesale — no delta application, no partial
+      // state to reconcile. Routed through `applyIfNewer` (the same total
+      // order as every other wire event) so a reconnect replay can't regress
+      // to a stale snapshot.
+      return applyIfNewer(atom, 'sse_work_scope_update', action.sequenceId, (a) => ({
+        ...a,
+        workScope: action.inventory,
+      }));
 
     case 'sse_error':
       // Wire-originated errors carry a sequenceId and route through the

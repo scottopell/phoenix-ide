@@ -46,6 +46,16 @@ export type { ChainPosition } from './generated/ChainPosition';
 export type { ChainQaRow } from './generated/ChainQaRow';
 export type { ChainQaStatus } from './generated/ChainQaStatus';
 export type { SubmitChainQaResponse } from './generated/SubmitChainQaResponse';
+export type {
+  WorkScopeInventory,
+  BashHandleInventory,
+  BashHandleState,
+  TmuxInventory,
+  TmuxServerStatus,
+  BrowserInventory,
+  BrowserSessionLiveness,
+} from './generated/sse';
+import type { WorkScopeInventory as WorkScopeInventoryType } from './generated/sse';
 
 export interface Conversation {
   id: string;
@@ -843,6 +853,14 @@ export const api = {
     if (resp.status === 404) return null;
     if (!resp.ok) throw new Error('Failed to resolve conversation slug');
     return (await resp.json()).slug as string;
+  },
+
+  /** Initial pull of a scope's work-affine resource inventory (REQ-WSUI-006).
+   *  The live `work_scope_update` SSE event keeps it fresh afterwards. */
+  async getWorkScopeInventory(scopeKey: string): Promise<WorkScopeInventoryType> {
+    const resp = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/inventory`);
+    if (!resp.ok) throw new Error('Failed to get work-scope inventory');
+    return resp.json();
   },
 
   async sendMessage(

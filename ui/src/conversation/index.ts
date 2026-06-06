@@ -10,6 +10,7 @@ export {
   useConversationSnapshot,
   useConversationsList,
   useConversationSelectors,
+  useWorkScope,
 } from './useConversationAtom';
 export type { ConversationPageView } from './useConversationAtom';
 export { conversationReducer, createInitialAtom, breadcrumbFromPhase } from './atom';

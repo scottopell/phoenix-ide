@@ -30,7 +30,7 @@
 // unfilled), which structurally communicates that the next question creates a
 // new pair rather than continuing a thread.
 
-import { useEffect, useMemo, useRef, useCallback } from 'react';
+import { useEffect, useMemo, useRef, useCallback, useState } from 'react';
 import type { FormEvent, KeyboardEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
@@ -44,8 +44,9 @@ import {
   type ChainSseEventData,
 } from '../api';
 import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
+import { WorkScopePanel } from '../components/WorkScopePanel';
 import { useChainAtom, type InflightQa } from '../chain';
-import { useScopedState } from '../hooks';
+import { useScopedState, useResizablePane } from '../hooks';
 
 // Markdown plugin set, hoisted so the array identity is stable across
 // renders (matches the pattern in StreamingMessage.tsx).
@@ -415,34 +416,40 @@ export function ChainPage() {
         }}
         onDelete={() => setDeleteConfirmOpen(true)}
       />
-      <div className="chain-page-body">
-        <ChainMembersColumn
-          members={chain.members}
-          onMemberClick={(member) => {
-            if (member.slug) {
-              navigate(`/c/${member.slug}`);
-            }
-          }}
-        />
-        <ChainQaColumn
-          chain={chain}
-          persisted={renderableQas.persisted}
-          inflight={renderableQas.inflightList}
-          draft={draft}
-          setDraft={setDraft}
-          submitting={submitting}
-          sseLost={sseLost}
-          onSubmit={handleSubmit}
-          onReask={handleReask}
-          activeTextareaRef={activeTextareaRef}
-          onRetryConnection={() => {
-            // Force the SSE effect to re-run by re-fetching first; the
-            // EventSource itself will already be auto-reconnecting under the
-            // hood, but this gives the user a clear "I tried" affordance.
-            dispatch({ type: 'SSE_RESTORED' });
-            if (rootConvId) void refresh(rootConvId);
-          }}
-        />
+      <div className="chain-page-main">
+        <div className="chain-page-body">
+          <ChainMembersColumn
+            members={chain.members}
+            onMemberClick={(member) => {
+              if (member.slug) {
+                navigate(`/c/${member.slug}`);
+              }
+            }}
+          />
+          <ChainQaColumn
+            chain={chain}
+            persisted={renderableQas.persisted}
+            inflight={renderableQas.inflightList}
+            draft={draft}
+            setDraft={setDraft}
+            submitting={submitting}
+            sseLost={sseLost}
+            onSubmit={handleSubmit}
+            onReask={handleReask}
+            activeTextareaRef={activeTextareaRef}
+            onRetryConnection={() => {
+              // Force the SSE effect to re-run by re-fetching first; the
+              // EventSource itself will already be auto-reconnecting under the
+              // hood, but this gives the user a clear "I tried" affordance.
+              dispatch({ type: 'SSE_RESTORED' });
+              if (rootConvId) void refresh(rootConvId);
+            }}
+          />
+        </div>
+        {/* REQ-WSUI-009: the same work-scope panel as the conversation page,
+            querying the ONE scope key for the chain root. No live SSE channel
+            here — the panel's own initial fetch is the data source. */}
+        <ChainWorkScopeDock rootConvId={chain.root_conv_id} />
       </div>
       <ChainDeleteConfirm
         visible={deleteConfirmOpen}
@@ -464,6 +471,56 @@ export function ChainPage() {
         onCancel={() => setDeleteConfirmOpen(false)}
       />
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Work-scope dock (REQ-WSUI-009)
+// ---------------------------------------------------------------------------
+
+/**
+ * Resolves the chain root's `work_scope_key` (one conversation GET) and
+ * renders the shared `WorkScopePanel`. The chain's members share one
+ * WorkScope, so this single scope key addresses every resource — no
+ * per-member aggregation. There is no per-conversation SSE push channel on
+ * the chain page, so the panel's own initial fetch is the data source;
+ * `liveInventory` is intentionally omitted.
+ */
+function ChainWorkScopeDock({ rootConvId }: { rootConvId: string }) {
+  const [scopeKey, setScopeKey] = useState<string | null>(null);
+  const [collapsed, setCollapsed] = useState(true);
+  const pane = useResizablePane({
+    key: 'chain-work-scope-width',
+    min: 200,
+    max: 480,
+    defaultSize: 260,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    setScopeKey(null);
+    api
+      .getConversation(rootConvId)
+      .then((res) => {
+        if (!cancelled) setScopeKey(res.conversation.work_scope_key);
+      })
+      .catch(() => {
+        // Root conversation unreadable — leave the dock unmounted rather
+        // than guessing a scope key.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [rootConvId]);
+
+  if (!scopeKey) return null;
+  return (
+    <WorkScopePanel
+      scopeKey={scopeKey}
+      collapsed={collapsed}
+      onToggle={() => setCollapsed((c) => !c)}
+      width={collapsed ? undefined : pane.size}
+    />
   );
 }
 
