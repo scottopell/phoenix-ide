@@ -95,6 +95,20 @@ pub trait MessageStore: Send + Sync {
         message_id: &str,
         content: &str,
     ) -> Result<(), String>;
+
+    /// Atomically persist a fork proposal together with the originating turn's
+    /// tool round (REQ-PROJ-033): the assistant message, each synthetic
+    /// tool-result message, and the `fork_proposals` row commit in a single
+    /// transaction. The caller pre-builds the message rows (seq-allocated and
+    /// content-mapped) so the broadcast seq ordering matches the persisted
+    /// rows.
+    async fn persist_fork_proposal_with_tool_round(
+        &self,
+        origin_conv_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        proposal: &crate::db::ForkProposal,
+    ) -> Result<(), String>;
 }
 
 /// Storage for conversation state
@@ -310,6 +324,23 @@ impl<T: MessageStore + ?Sized> MessageStore for Arc<T> {
     ) -> Result<(), String> {
         (**self)
             .update_tool_message_content(message_id, content)
+            .await
+    }
+
+    async fn persist_fork_proposal_with_tool_round(
+        &self,
+        origin_conv_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        proposal: &crate::db::ForkProposal,
+    ) -> Result<(), String> {
+        (**self)
+            .persist_fork_proposal_with_tool_round(
+                origin_conv_id,
+                assistant,
+                tool_results,
+                proposal,
+            )
             .await
     }
 }
@@ -547,6 +578,24 @@ impl MessageStore for DatabaseStorage {
     ) -> Result<(), String> {
         self.db
             .update_tool_message_content(message_id, content)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    async fn persist_fork_proposal_with_tool_round(
+        &self,
+        origin_conv_id: &str,
+        assistant: &crate::db::Message,
+        tool_results: &[crate::db::Message],
+        proposal: &crate::db::ForkProposal,
+    ) -> Result<(), String> {
+        self.db
+            .persist_fork_proposal_with_tool_round(
+                origin_conv_id,
+                assistant,
+                tool_results,
+                proposal,
+            )
             .await
             .map_err(|e| e.to_string())
     }

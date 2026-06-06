@@ -1812,22 +1812,15 @@ where
                 body,
                 checkpoint,
             } => {
-                // EXECUTOR CHUNK PLACEHOLDER — NOT YET IMPLEMENTED.
-                // The atomic persist (normalize task_file to repo-relative,
-                // insert the fork_proposals row, and commit the checkpoint in one
-                // transaction) belongs to the fork-executor chunk. This arm only
-                // exists to keep the exhaustive Effect match compiling; it
-                // deliberately drops the proposal and the checkpoint so no
-                // half-written state is produced. Visible in logs per the
-                // "capability gaps are logged" rule.
-                let _ = (&task_file, &title, &priority, &body, &checkpoint);
-                tracing::error!(
-                    proposal_id = %proposal_id,
-                    "Effect::PersistForkProposal reached the executor but the fork \
-                     persistence chunk is not implemented; dropping proposal and \
-                     checkpoint (no-op)"
-                );
-                Ok(None)
+                self.execute_persist_fork_proposal(
+                    proposal_id,
+                    task_file,
+                    title,
+                    priority,
+                    body,
+                    checkpoint,
+                )
+                .await
             }
 
             Effect::ClearSteeringQueueEntries { message_ids } => {
@@ -2432,6 +2425,111 @@ where
                 }
             }
         }
+        Ok(None)
+    }
+
+    /// Persist a decoupled fork proposal atomically with the originating turn's
+    /// tool round (REQ-PROJ-033). The assistant message, synthetic success ack,
+    /// and the `fork_proposals` row commit in one transaction; the ack and the
+    /// row that the review surface reads are never durable independently.
+    async fn execute_persist_fork_proposal(
+        &mut self,
+        proposal_id: String,
+        task_file: String,
+        title: String,
+        priority: phoenix_core::task_source::Priority,
+        body: String,
+        checkpoint: CheckpointData,
+    ) -> Result<Option<Event>, String> {
+        let CheckpointData::ToolRound {
+            assistant_message,
+            tool_results,
+        } = checkpoint;
+
+        // Repo-relative normalization (REQ-PROJ-033): `task_file` is relative to
+        // the conversation's working_dir. The stored path is relative to the
+        // repository root so the spawn/review surface resolves it regardless of
+        // which worktree or subdir the origin ran in.
+        let normalized_task_file =
+            normalize_task_file_repo_relative(&self.context.working_dir, &task_file, &proposal_id);
+
+        let conv_id = self.context.conversation_id.clone();
+
+        // Build the assistant message row with a seq strictly greater than any
+        // ephemeral event broadcast earlier (mirrors `persist_checkpoint`).
+        let agent_content = MessageContent::agent(assistant_message.content);
+        let agent_seq = self.broadcast_tx.next_seq();
+        let agent_msg = crate::db::Message {
+            message_id: assistant_message.message_id.clone(),
+            conversation_id: conv_id.clone(),
+            sequence_id: agent_seq,
+            message_type: agent_content.message_type(),
+            content: agent_content,
+            display_data: assistant_message.display_data.clone(),
+            usage_data: assistant_message.usage.clone(),
+            created_at: assistant_message.created_at,
+        };
+
+        // Build the synthetic tool-result rows. The success ack carries the
+        // `fork_proposal_id` in its display_data (UI-only) per the interception
+        // contract; `merge_duration_into_display_data` preserves it.
+        let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
+        for result in &tool_results {
+            let tool_content = MessageContent::tool_with_images(
+                &result.tool_use_id,
+                result.output(),
+                result.is_error(),
+                result.images().to_vec(),
+            );
+            let merged_display =
+                merge_duration_into_display_data(result.display_data(), result.duration_ms);
+            let tool_seq = self.broadcast_tx.next_seq();
+            tool_msgs.push(crate::db::Message {
+                message_id: tool_result_message_id(&result.tool_use_id),
+                conversation_id: conv_id.clone(),
+                sequence_id: tool_seq,
+                message_type: tool_content.message_type(),
+                content: tool_content,
+                display_data: merged_display,
+                usage_data: None,
+                created_at: Utc::now(),
+            });
+        }
+
+        let proposal = crate::db::ForkProposal {
+            id: proposal_id,
+            origin_conversation_id: conv_id.clone(),
+            task_file: normalized_task_file,
+            title,
+            priority: priority.as_str().to_string(),
+            body,
+            status: crate::db::ForkProposalStatus::Pending,
+            fork_conversation_id: None,
+            refinement_conversation_id: None,
+            created_at: Utc::now(),
+            resolved_at: None,
+        };
+
+        self.storage
+            .persist_fork_proposal_with_tool_round(&conv_id, &agent_msg, &tool_msgs, &proposal)
+            .await?;
+
+        // Broadcast the now-durable rows so connected clients render the
+        // assistant message and the success ack (matches `persist_checkpoint`).
+        let _ = self.broadcast_tx.send_message(agent_msg);
+        for (msg, result) in tool_msgs.into_iter().zip(tool_results.iter()) {
+            let _ = self.broadcast_tx.send_message(msg.clone());
+            if result.duration_ms.is_some() {
+                let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
+                    sequence_id: seq,
+                    message_id: msg.message_id.clone(),
+                    display_data: None,
+                    content: None,
+                    duration_ms: result.duration_ms,
+                });
+            }
+        }
+
         Ok(None)
     }
 
@@ -3212,6 +3310,50 @@ fn merge_duration_into_display_data(
             }
             Some(merged)
         }
+    }
+}
+
+/// Normalize a working-dir-relative `task_file` to repository-relative
+/// (REQ-PROJ-033). For a Work/Branch origin whose cwd is the worktree top this
+/// is `task_file` unchanged; for a Direct origin started in a repo subdir it
+/// gains the subdir offset.
+///
+/// Falls back to the raw `task_file` (logged at warn) if the repo root cannot
+/// be detected or the joined path does not sit under it — losing the proposal
+/// is worse than storing a working-dir-relative path.
+fn normalize_task_file_repo_relative(
+    working_dir: &std::path::Path,
+    task_file: &str,
+    proposal_id: &str,
+) -> String {
+    let absolute = working_dir.join(task_file);
+    let Some(repo_root) = crate::db::detect_git_repo_root(working_dir) else {
+        tracing::warn!(
+            proposal_id = %proposal_id,
+            working_dir = %working_dir.display(),
+            "fork proposal: no git repo root for working_dir; storing raw task_file"
+        );
+        return task_file.to_string();
+    };
+    let repo_root = std::path::Path::new(&repo_root);
+
+    // Canonicalize both sides so symlinked tmp roots (e.g. /var -> /private/var)
+    // and `.`/`..` components don't defeat the prefix strip.
+    let canon_abs = absolute.canonicalize().unwrap_or(absolute);
+    let canon_root = repo_root
+        .canonicalize()
+        .unwrap_or_else(|_| repo_root.to_path_buf());
+
+    if let Ok(rel) = canon_abs.strip_prefix(&canon_root) {
+        rel.to_string_lossy().into_owned()
+    } else {
+        tracing::warn!(
+            proposal_id = %proposal_id,
+            task_file = %task_file,
+            repo_root = %canon_root.display(),
+            "fork proposal: task_file not under repo root; storing raw task_file"
+        );
+        task_file.to_string()
     }
 }
 
@@ -5955,5 +6097,162 @@ mod tool_output_to_outcome_tests {
             }
             other => panic!("expected ToolOutcome::Error, got {other:?}"),
         }
+    }
+}
+
+// ============================================================
+// Decoupled fork-proposal persistence (REQ-PROJ-033)
+// ============================================================
+//
+// Distilled from specs/bedrock/bedrock.allium (ForkProposalIntercepted):
+// the synthetic success ack and the fork_proposals row must both be durable
+// after a successful persist, and the stored task_file is repository-relative.
+
+#[cfg(test)]
+mod fork_proposal_persist_tests {
+    use super::test_git_helpers::init_repo;
+    use super::*;
+    use crate::db::MessageContent;
+    use crate::llm::ModelRegistry;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::state::AssistantMessage;
+    use crate::state_machine::{CheckpointData, ConvContext};
+    use crate::tools::BrowserSessionManager;
+    use std::path::Path;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    fn runtime_in_dir(
+        conv_id: &str,
+        working_dir: &Path,
+    ) -> (
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
+        Arc<InMemoryStorage>,
+    ) {
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new(conv_id, working_dir.to_path_buf(), "test-model", 200_000);
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let broadcaster = SseBroadcaster::new(128, 0);
+        let rt = ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage.clone(),
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            broadcaster,
+        );
+        (rt, storage)
+    }
+
+    fn fork_effect(proposal_id: &str, task_file: &str) -> Effect {
+        let assistant = AssistantMessage::new(
+            "asst-fork".to_string(),
+            vec![crate::llm::ContentBlock::ToolUse {
+                id: "tool-fork-1".to_string(),
+                name: "propose_task".to_string(),
+                input: serde_json::json!({ "task_file": task_file }),
+            }],
+            None,
+            None,
+        );
+        let ack = ToolResult::success_with_display(
+            "tool-fork-1".to_string(),
+            "Fork proposal recorded — pending your review; continue your work".to_string(),
+            Some(serde_json::json!({ "fork_proposal_id": proposal_id })),
+        );
+        let checkpoint = CheckpointData::tool_round(assistant, vec![ack]).expect("tool_round");
+        Effect::PersistForkProposal {
+            proposal_id: proposal_id.to_string(),
+            task_file: task_file.to_string(),
+            title: "Fix the bug".to_string(),
+            priority: phoenix_core::task_source::Priority::P1,
+            body: "# Fix the bug\n\nplan body for the fork".to_string(),
+            checkpoint,
+        }
+    }
+
+    fn assert_round_persisted(storage: &InMemoryStorage, conv_id: &str, proposal_id: &str) {
+        let msgs = storage.get_all_messages(conv_id);
+        assert!(
+            msgs.iter().any(|m| m.message_id == "asst-fork"),
+            "assistant message must be persisted"
+        );
+        let ack = msgs
+            .iter()
+            .find(|m| m.message_id == tool_result_message_id("tool-fork-1"))
+            .expect("synthetic success ack must be persisted");
+        assert!(
+            matches!(&ack.content, MessageContent::Tool(tc) if !tc.is_error),
+            "ack must be a success tool result"
+        );
+        assert_eq!(
+            ack.display_data
+                .as_ref()
+                .and_then(|d| d.get("fork_proposal_id"))
+                .and_then(|v| v.as_str()),
+            Some(proposal_id),
+            "ack display_data must carry the fork_proposal_id handle"
+        );
+    }
+
+    /// Worktree-top origin: working_dir IS the repo root, so the stored
+    /// task_file equals the working-dir-relative path unchanged.
+    #[tokio::test]
+    async fn persist_at_repo_root_keeps_task_file() {
+        let (_tmp, root) = init_repo();
+        let (mut rt, storage) = runtime_in_dir("conv-fork-root", &root);
+
+        let task_file = "tasks/00042-p1-ready--fix-thing.md";
+        rt.execute_effect(fork_effect("fp-root", task_file))
+            .await
+            .expect("PersistForkProposal must succeed");
+
+        let proposals = storage.get_fork_proposals();
+        assert_eq!(proposals.len(), 1);
+        let p = &proposals[0];
+        assert_eq!(p.id, "fp-root");
+        assert_eq!(p.origin_conversation_id, "conv-fork-root");
+        assert_eq!(p.status, crate::db::ForkProposalStatus::Pending);
+        assert_eq!(p.task_file, task_file, "repo-root origin: path unchanged");
+        assert_eq!(p.title, "Fix the bug");
+        assert_eq!(p.priority, "p1");
+        assert!(p.body.contains("plan body for the fork"));
+        assert!(p.fork_conversation_id.is_none());
+        assert!(p.resolved_at.is_none());
+
+        assert_round_persisted(&storage, "conv-fork-root", "fp-root");
+    }
+
+    /// Direct-in-subdir origin: working_dir is a subdir of the repo root, so
+    /// the stored task_file is prefixed with the subdir offset.
+    #[tokio::test]
+    async fn persist_in_subdir_prefixes_offset() {
+        let (_tmp, root) = init_repo();
+        let subdir = root.join("crate-a");
+        std::fs::create_dir_all(&subdir).unwrap();
+        let (mut rt, storage) = runtime_in_dir("conv-fork-sub", &subdir);
+
+        let task_file = "tasks/00099-p2-ready--sub-thing.md";
+        rt.execute_effect(fork_effect("fp-sub", task_file))
+            .await
+            .expect("PersistForkProposal must succeed");
+
+        let proposals = storage.get_fork_proposals();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0].task_file,
+            format!("crate-a/{task_file}"),
+            "subdir origin: stored path gains the subdir offset"
+        );
+
+        assert_round_persisted(&storage, "conv-fork-sub", "fp-sub");
     }
 }

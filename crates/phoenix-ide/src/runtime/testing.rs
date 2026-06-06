@@ -306,6 +306,7 @@ pub struct InMemoryStorage {
     modes: Mutex<HashMap<String, crate::db::ConvMode>>,
     next_msg_id: Mutex<u64>,
     steering_queues: Mutex<HashMap<String, Vec<crate::state_machine::event::SteerEntry>>>,
+    fork_proposals: Mutex<Vec<crate::db::ForkProposal>>,
 }
 
 #[allow(dead_code)]
@@ -317,7 +318,13 @@ impl InMemoryStorage {
             modes: Mutex::new(HashMap::new()),
             next_msg_id: Mutex::new(1),
             steering_queues: Mutex::new(HashMap::new()),
+            fork_proposals: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Read back the persisted fork proposals (test-only).
+    pub fn get_fork_proposals(&self) -> Vec<crate::db::ForkProposal> {
+        self.fork_proposals.lock().unwrap().clone()
     }
 
     /// Read back the persisted steering queue for a conversation (test-only).
@@ -545,6 +552,25 @@ impl MessageStore for InMemoryStorage {
             }
         }
         Err(format!("Message not found: {message_id}"))
+    }
+
+    async fn persist_fork_proposal_with_tool_round(
+        &self,
+        origin_conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        proposal: &crate::db::ForkProposal,
+    ) -> Result<(), String> {
+        {
+            let mut messages = self.messages.lock().unwrap();
+            let bucket = messages.entry(origin_conv_id.to_string()).or_default();
+            bucket.push(assistant.clone());
+            for msg in tool_results {
+                bucket.push(msg.clone());
+            }
+        }
+        self.fork_proposals.lock().unwrap().push(proposal.clone());
+        Ok(())
     }
 }
 

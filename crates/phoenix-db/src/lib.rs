@@ -2099,25 +2099,51 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn insert_fork_proposal(&self, p: &ForkProposal) -> DbResult<()> {
-        sqlx::query(
-            "INSERT INTO fork_proposals (
-                id, origin_conv_id, task_file, title, priority, body, status,
-                fork_conv_id, refinement_conv_id, created_at, resolved_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-        )
-        .bind(&p.id)
-        .bind(&p.origin_conversation_id)
-        .bind(&p.task_file)
-        .bind(&p.title)
-        .bind(&p.priority)
-        .bind(&p.body)
-        .bind(p.status.as_str())
-        .bind(p.fork_conversation_id.as_deref())
-        .bind(p.refinement_conversation_id.as_deref())
-        .bind(p.created_at.to_rfc3339())
-        .bind(p.resolved_at.map(|t| t.to_rfc3339()))
-        .execute(&self.pool)
-        .await?;
+        let mut tx = self.pool.begin().await?;
+        insert_fork_proposal_tx(&mut tx, p).await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Atomically persist a fork proposal together with the originating turn's
+    /// tool round (REQ-PROJ-033): in a single transaction, write the assistant
+    /// message row, each synthetic tool-result row, and the `fork_proposals`
+    /// row. The synthetic success ack must never be durable without the
+    /// control-plane row the review/approve surface reads, so a crash between
+    /// the two is structurally impossible — either both commit or neither does.
+    ///
+    /// Message inserts use `INSERT OR IGNORE` on `message_id` so a crash-retry
+    /// that finds the assistant/tool rows already present is a no-op rather than
+    /// a UNIQUE failure; the proposal insert is keyed on its own `id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn persist_fork_proposal_with_tool_round(
+        &self,
+        origin_conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+        proposal: &ForkProposal,
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+
+        insert_message_tx(&mut tx, assistant).await?;
+        for msg in tool_results {
+            insert_message_tx(&mut tx, msg).await?;
+        }
+
+        // Mirror `add_message_with_seq`'s side-effect: bump the conversation's
+        // `updated_at` so list-ordering stays current.
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(Utc::now().to_rfc3339())
+            .bind(origin_conv_id)
+            .execute(&mut *tx)
+            .await?;
+
+        insert_fork_proposal_tx(&mut tx, proposal).await?;
+
+        tx.commit().await?;
         Ok(())
     }
 
@@ -3282,6 +3308,34 @@ async fn insert_message_tx(
     .bind(&display_str)
     .bind(&usage_str)
     .bind(msg.created_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Insert a `fork_proposals` row inside a transaction, reusing the same column
+/// mapping as [`Database::insert_fork_proposal`].
+async fn insert_fork_proposal_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    p: &ForkProposal,
+) -> DbResult<()> {
+    sqlx::query(
+        "INSERT INTO fork_proposals (
+            id, origin_conv_id, task_file, title, priority, body, status,
+            fork_conv_id, refinement_conv_id, created_at, resolved_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+    )
+    .bind(&p.id)
+    .bind(&p.origin_conversation_id)
+    .bind(&p.task_file)
+    .bind(&p.title)
+    .bind(&p.priority)
+    .bind(&p.body)
+    .bind(p.status.as_str())
+    .bind(p.fork_conversation_id.as_deref())
+    .bind(p.refinement_conversation_id.as_deref())
+    .bind(p.created_at.to_rfc3339())
+    .bind(p.resolved_at.map(|t| t.to_rfc3339()))
     .execute(&mut **tx)
     .await?;
     Ok(())
@@ -4972,6 +5026,68 @@ mod tests {
         assert!(got.resolved_at.is_none());
 
         assert!(db.get_fork_proposal("missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn persist_fork_proposal_with_tool_round_commits_both() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-tr", "otr", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let assistant = Message {
+            message_id: "asst-1".to_string(),
+            conversation_id: "origin-tr".to_string(),
+            sequence_id: 10,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let tool_result = Message {
+            message_id: "tool-1-result".to_string(),
+            conversation_id: "origin-tr".to_string(),
+            sequence_id: 11,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool("tool-1", "Fork proposal recorded", false),
+            display_data: Some(serde_json::json!({ "fork_proposal_id": "fp-tr" })),
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+
+        let proposal = fork_proposal_fixture("fp-tr", "origin-tr");
+        db.persist_fork_proposal_with_tool_round(
+            "origin-tr",
+            &assistant,
+            &[tool_result],
+            &proposal,
+        )
+        .await
+        .unwrap();
+
+        // The control-plane row committed.
+        let got = db.get_fork_proposal("fp-tr").await.unwrap().unwrap();
+        assert_eq!(got.status, ForkProposalStatus::Pending);
+
+        // The tool round committed in the same transaction.
+        let msgs = db.get_messages("origin-tr").await.unwrap();
+        assert!(
+            msgs.iter().any(|m| m.message_id == "asst-1"),
+            "assistant message must be durable"
+        );
+        let ack = msgs
+            .iter()
+            .find(|m| m.message_id == "tool-1-result")
+            .expect("synthetic ack must be durable");
+        assert_eq!(
+            ack.display_data
+                .as_ref()
+                .and_then(|d| d.get("fork_proposal_id"))
+                .and_then(|v| v.as_str()),
+            Some("fp-tr"),
+            "ack must carry the fork_proposal_id handle"
+        );
     }
 
     #[tokio::test]
