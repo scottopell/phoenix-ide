@@ -197,10 +197,13 @@ entity Worktree {
 -- here, bound to the originating conversation, and reviewed asynchronously.
 --
 -- Bound to origin: a ForkProposal exists only as an artifact of its origin
--- conversation and does not survive that conversation's termination. Its
--- resolution (pending -> spawned | dismissed) is control-plane state, never part
--- of the origin's LLM transcript (REQ-PROJ-035) — a resolution the origin's agent
--- could read would itself be a forbidden lifecycle notification.
+-- conversation and is removed with it on hard delete (ForkProposalsRemovedOnOriginDelete).
+-- The origin reaching a terminal state retires only the *unreviewed* case: a `pending`
+-- proposal is dismissed (ForkProposalsRetiredOnOriginTerminal), while a resolved
+-- `spawned`/`dismissed` resolution persists through ordinary terminal cleanup
+-- (mark-merged / abandon) as control-plane audit, removed only on hard delete. That
+-- resolution is never part of the origin's LLM transcript (REQ-PROJ-035) — a resolution
+-- the origin's agent could read would itself be a forbidden lifecycle notification.
 entity ForkProposal {
     id: String                          -- stable proposal id; the approve/dismiss surface
                                         -- and HTTP endpoints address a proposal by it, and

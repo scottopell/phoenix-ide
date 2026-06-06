@@ -356,7 +356,13 @@ The `LlmResponse` handler that detects `propose_task` is mode-aware:
   pending your review; continue your work"), and transition back to the normal running
   state. The conversation does **not** park.
 
-The fork proposal rides as a `CheckpointData::ToolRound` in the originating transcript:
+Only the synthetic ack rides in the originating transcript: the `CheckpointData::ToolRound`
+holds the assistant message plus the `ToolResult::success` ("…recorded — pending review")
+and **nothing else** — in particular not the snapshot `body`, which would otherwise be
+replayed into the origin agent's context on later turns and leak the shed work back to the
+spawner (REQ-PROJ-035). The full snapshot below is persisted separately as **control-plane
+proposal data** (the row the Review/approve surface reads); it is never part of the origin's
+replayed LLM context:
 
 ```
 ForkProposal {
@@ -428,9 +434,11 @@ sub-agent spawn path — this is what makes the decoupling structural (there is 
    segment and is committed as-is. `git add` + `git commit -m "task {task_id}: {title}"` on
    the task branch.
 4. Persist the fork conversation: `conv_mode = Work { worktree_path, branch_name,
-   base_branch: main_ref, task_id, task_title }` (the same fields also set on the
-   conversation row so callers reading mode/cwd directly resolve navigation, tool cwd, and
-   cleanup), `spawned_from_conversation_id = {origin id}`, and seed its LLM context with
+   base_branch: main_ref, task_id }` (the typed Work-mode shape carries `task_id`, not a
+   title — the display title stays on the `ForkProposal` snapshot for the review surface;
+   these fields are also set on the conversation row so callers reading mode/cwd directly
+   resolve navigation, tool cwd, and cleanup), `spawned_from_conversation_id = {origin id}`,
+   and seed its LLM context with
    the task brief itself — the snapshot `body`, plus a line naming the **resolved**
    `branch_name` (`task-{task_id}-{slug}` for taskmd, `task-{stem}-{fork-id[..8]}` for a
    plain brief — not a fixed template). The brief is *in context*, not merely a committed
@@ -641,7 +649,7 @@ Work/Branch). The full mode/cwd/model/turn validation lives in
 `ConvMode` is stored as a JSON `conv_mode` column on `conversations` (added by the
 projects migration; `Direct` is the default for new rows). Examples:
 `"Direct"`, `{"Explore":{"worktree_path":"/repo/.phoenix/worktrees/<id>"}}`,
-`{"Work":{"worktree_path":"...","branch_name":"task-YF042-fix-bug","base_branch":"main","task_id":"YF042","task_title":"Fix bug"}}`,
+`{"Work":{"worktree_path":"...","branch_name":"task-YF042-fix-bug","base_branch":"main","task_id":"YF042"}}`,
 `{"Branch":{"worktree_path":"...","branch_name":"my-pr","base_branch":"my-pr"}}`.
 `desired_base_branch` is a separate nullable column used between Managed-mode worktree
 creation and approval. There is **no `tasks` table** — querying conversations whose
@@ -652,10 +660,11 @@ task metadata lives in the task file's name on the task branch.
 (REQ-PROJ-034/035), pointing at the conversation whose agent proposed it. It is provenance
 only — a UI/audit breadcrumb — and is kept distinct from `parent_conversation_id`
 (sub-agent / fresh-handoff lifecycle) and `continued_in_conv_id` (chains) so no behavior
-can key off it. Because the fork is independent, the reference is **non-cascading**: if it
-is a foreign key it is `ON DELETE SET NULL` (otherwise no FK, just an id). Hard-deleting
-the origin nulls the breadcrumb on the fork — it never fails the delete and never cascades
-into deleting the independent fork. A fork proposal's resolution (`pending`/`spawned`/`dismissed`) is
+can key off it. It is a **non-live reference, not an FK-enforced edge**: a plain id column
+with no foreign key, so deleting the origin neither cascades into the independent fork nor
+clears the breadcrumb. Hard-deleting the origin leaves the (now-stale) id in place — the
+fork survives untouched and its provenance is preserved for audit; consumers tolerate a
+breadcrumb pointing at a since-deleted conversation rather than nulling it on delete. A fork proposal's resolution (`pending`/`spawned`/`dismissed`) is
 control-plane state bound to the originating conversation and is never part of the
 originator's LLM transcript (REQ-PROJ-035).
 
