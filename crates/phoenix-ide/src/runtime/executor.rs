@@ -1804,6 +1804,32 @@ where
                 Ok(None)
             }
 
+            Effect::PersistForkProposal {
+                proposal_id,
+                task_file,
+                title,
+                priority,
+                body,
+                checkpoint,
+            } => {
+                // EXECUTOR CHUNK PLACEHOLDER — NOT YET IMPLEMENTED.
+                // The atomic persist (normalize task_file to repo-relative,
+                // insert the fork_proposals row, and commit the checkpoint in one
+                // transaction) belongs to the fork-executor chunk. This arm only
+                // exists to keep the exhaustive Effect match compiling; it
+                // deliberately drops the proposal and the checkpoint so no
+                // half-written state is produced. Visible in logs per the
+                // "capability gaps are logged" rule.
+                let _ = (&task_file, &title, &priority, &body, &checkpoint);
+                tracing::error!(
+                    proposal_id = %proposal_id,
+                    "Effect::PersistForkProposal reached the executor but the fork \
+                     persistence chunk is not implemented; dropping proposal and \
+                     checkpoint (no-op)"
+                );
+                Ok(None)
+            }
+
             Effect::ClearSteeringQueueEntries { message_ids } => {
                 if let Err(e) = self
                     .storage

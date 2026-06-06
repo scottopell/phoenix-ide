@@ -211,6 +211,24 @@ pub enum Effect {
         priority: phoenix_core::task_source::Priority,
         plan: String,
     },
+    /// Atomically persist a decoupled fork proposal together with the
+    /// originating turn's tool round (REQ-PROJ-033). The synthetic success ack
+    /// in `checkpoint` and the `fork_proposals` row commit in a single
+    /// transaction: the ack ("recorded — pending review") must never be durable
+    /// without the row the review/approve surface reads. This replaces the
+    /// separate `PersistCheckpoint` on the fork path — the fork arm emits this
+    /// instead, never both.
+    ///
+    /// `task_file` is the working-dir-relative path from `resolve_task_file`;
+    /// the executor normalizes it to repository-relative before insert.
+    PersistForkProposal {
+        proposal_id: String,
+        task_file: String,
+        title: String,
+        priority: phoenix_core::task_source::Priority,
+        body: String,
+        checkpoint: CheckpointData,
+    },
     /// Task completed or abandoned: finalize conversation state, mode, and cwd.
     /// Executor calls `finalize_conversation`, injects system message, broadcasts SSE.
     ResolveTask {
