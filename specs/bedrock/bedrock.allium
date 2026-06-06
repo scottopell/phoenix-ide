@@ -598,6 +598,10 @@ rule ForkProposalIntercepted {
     -- reads; a crash between the two would otherwise promise a proposal that doesn't exist.
     -- (One postcondition, not two independently dispatchable effects.)
     ensures: ForkProposalPersisted(conversation, proposal)
+    -- Shed the brief: remove the agent's drafted file from the origin worktree as part of the
+    -- same interception, so the fork's (unrelated) task never folds into the origin's own
+    -- diff/PR (REQ-PROJ-033). The fork holds the authoritative copy in the snapshot body.
+    ensures: OriginDraftRemoved(conversation, proposal)
     ensures: LlmRequestDispatched(conversation)
 
     @guidance

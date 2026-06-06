@@ -946,6 +946,10 @@ repository-relative** — the agent's path is relative to its working directory,
 Direct origin started in a subdirectory is a repo subdirectory, so it is resolved against
 the repo root so the fork commits it at the correct location — and a stable `proposal_id`)
 into a fork-proposal record
+AND **remove the drafted file from the origin worktree** in the same atomic step that
+records the snapshot — the brief is being *shed* to the fork, so leaving the file in the
+origin's working tree would fold the unrelated task into the origin's own diff/PR (the very
+entanglement the fork exists to avoid)
 AND persist the assistant message and a synthetic tool result reporting that the
 proposal was recorded and is pending the user's review
 AND **return the conversation to its running state so the agent continues its own work**
@@ -954,8 +958,9 @@ AND **return the conversation to its running state so the agent continues its ow
 THE fork proposal is a content snapshot, not a live file reference: the fork runs in a
 fresh worktree off the **repository's default branch** (REQ-PROJ-034) that does not
 contain the originating worktree's file, so the bytes captured at propose time are
-authoritative. The file the agent drafted stays on the originating branch as an ordinary
-tracked task file; the fork gets its own committed copy.
+authoritative. The drafted file is removed from the origin worktree at snapshot time (so it
+never lands in the origin's commit); the fork gets its own committed copy from the snapshot
+`body`.
 
 WHEN `propose_task` is called in Explore mode
 THE SYSTEM SHALL keep the existing parking behavior (REQ-PROJ-003) — Explore's

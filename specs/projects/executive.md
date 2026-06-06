@@ -63,7 +63,7 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted. Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
 | **REQ-PROJ-010:** Abandon a Conversation | ✅ Complete | Worktree removed; Managed deletes the task branch, Branch keeps it; diff snapshot captured as a system message first; no task-file edit |
 | **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | ✅ Complete | PR badge replaces ahead/behind StateBar noise |
-| **REQ-PROJ-012:** Provide propose_task Tool to Agents | ✅ Complete | Same as REQ-PROJ-003 |
+| **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Explore gateway shipped; the writing-mode fork registry/interception path (REQ-PROJ-033/036) is spec-only |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
 | **REQ-PROJ-015:** Project Worktree Registry | Descoped | ConvMode::Work serves as de facto registry |
@@ -90,7 +90,8 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-036:** Fork-Eligible Mode Availability | 📐 Spec only | Writing-mode matrix; Direct gated on git repo; Explore keeps its parking gateway |
 | **REQ-PROJ-037:** Request Changes — Promote a Fork Proposal to an Explore Refinement | 📐 Spec only (not implemented yet) | Third review action promotes a pending proposal into a fresh Explore conversation seeded with the brief + change note; refinement runs via the Explore propose/feedback loop, decoupled from the origin |
 
-**Progress:** of 33 active requirements, 28 complete and 5 (REQ-PROJ-033..037,
+**Progress:** of 33 active requirements, 27 complete, 1 partial (REQ-PROJ-012 — its
+Explore gateway ships but the writing-mode fork path is spec-only), and 5 (REQ-PROJ-033..037,
 task forks + fork-proposal Request Changes) specified but not yet implemented.
 REQ-PROJ-009 and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by
 REQ-PROJ-018.

@@ -385,19 +385,21 @@ ForkProposal {
 The fork base is not snapshotted: it is always the project's `main_ref` (the repository
 default branch — REQ-PROJ-034a), resolved at approval time, never from the origin. The
 file bytes are snapshotted because the fork runs in a worktree off `main_ref` (below) that
-will not contain the originating worktree's copy of the file. The agent's drafted file
-stays on the originating branch as an ordinary tracked task file; the fork commits its own
-copy from `body`.
+will not contain the originating worktree's copy of the file. The agent's drafted file is
+**removed from the origin worktree** at snapshot time (atomically with recording the
+proposal), so the shed task never lands in the origin's own commit/PR; the fork commits its
+own copy from `body`.
 
 #### Proposal resolution is control-plane, never agent-facing
 
-A proposal has a resolution — `pending` → `spawned { fork_conv_id }` | `dismissed`. It is
+A proposal has a resolution — `pending` → `spawned { fork_conv_id }` | `dismissed` |
+`promoted { explore_conv_id }` (Request Changes — REQ-PROJ-037). It is
 tracked as control-plane state bound to the originating conversation (removed when the
 conversation is removed; **bound to origin** per REQ-PROJ-035), and is deliberately **not**
 appended to the conversation's LLM transcript: a resolution the originating agent could
 read would itself be a lifecycle notification, which REQ-PROJ-035 forbids. The UI renders
 the Review affordance on the proposal's tool output while the resolution is `pending` and
-removes it once spawned/dismissed; the agent's context is untouched throughout.
+removes it once resolved (`spawned`/`dismissed`/`promoted`); the agent's context is untouched throughout.
 
 #### Approval / dismissal
 

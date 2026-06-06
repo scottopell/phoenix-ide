@@ -25,7 +25,8 @@
 --   (see bedrock.allium task 02668 for spec alignment).
 --
 -- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-029
--- (2 descoped: REQ-PROJ-009, REQ-PROJ-015) plus REQ-PROJ-033..036 (task forks)
+-- (2 descoped: REQ-PROJ-009, REQ-PROJ-015) plus REQ-PROJ-033..037 (task forks +
+-- Request Changes promotion)
 
 use "./bedrock.allium" as bedrock
 
