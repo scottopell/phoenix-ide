@@ -81,8 +81,12 @@ add a "fork" approval outcome.
   proposal + return to `LlmRequesting` (continue); Explore mode -> existing
   `AwaitingTaskApproval` (unchanged).
 
-- **Approval-outcome enum.** Add the fork outcome to `TaskApprovalOutcome` and an
-  executor handler analogous to `execute_approve_task_fresh_handoff` but: no
+- **Proposal-specific approve path (NOT `TaskApprovalOutcome`).** A fork origin never
+  enters `AwaitingTaskApproval`, so fork approval must NOT be a new `TaskApprovalOutcome`
+  value (that routes through the parked Explore approval and would reject — origin isn't
+  awaiting — or mutate the origin). Instead add a dedicated async endpoint
+  (`/proposals/:id/approve`) dispatching `Effect::SpawnFork`, with an executor handler
+  analogous to `execute_approve_task_fresh_handoff` but: keyed on the proposal id, no
   chain/parent links, sets the `spawned_from` breadcrumb, and does NOT touch the
   originating conversation's state.
 

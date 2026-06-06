@@ -483,11 +483,12 @@ dispatched by `/proposals/:id/request-changes`):
    `docs/plan.md` could not be revised in place; the refinement draft therefore always lands
    under `tasks/`, where the agent can edit it. (The original path was the proposer's choice;
    the refinement's *own* approval re-derives the final taskmd-vs-plain shape via REQ-PROJ-006.)
-   Because the draft lands under the existing tasks dir, no nested parent directories from the
-   origin branch are needed.
+   The tasks dir is **created first if `main_ref` has none** (a project that only ever used
+   plain briefs may have no tasks dir), so the draft write can't fail on a missing parent; no
+   deeper nested directories from the origin branch are needed.
 3. Persist the conversation in `ConvMode::Explore`, set `spawned_from_conversation_id =
-   {origin id}` (same non-live audit breadcrumb as a spawned fork), and seed its LLM context
-   with the brief `body` + the user's change-request note — nothing else.
+   {origin id}` (same non-live audit breadcrumb — a raw id, not an FK — as a spawned fork), and
+   seed its LLM context with the brief `body` + the user's change-request note — nothing else.
 4. Record the proposal resolution `promoted { explore_conv_id }` — atomically with the ack,
    like the recording path (the proposal must never read `promoted` without the row that
    names the conversation it became).
@@ -712,9 +713,10 @@ can key off it. It is a **non-live reference, not an FK-enforced edge**: a plain
 with no foreign key, so deleting the origin neither cascades into the independent fork nor
 clears the breadcrumb. Hard-deleting the origin leaves the (now-stale) id in place — the
 fork survives untouched and its provenance is preserved for audit; consumers tolerate a
-breadcrumb pointing at a since-deleted conversation rather than nulling it on delete. A fork proposal's resolution (`pending`/`spawned`/`dismissed`) is
-control-plane state bound to the originating conversation and is never part of the
-originator's LLM transcript (REQ-PROJ-035).
+breadcrumb pointing at a since-deleted conversation rather than nulling it on delete. A fork
+proposal's resolution (`pending` → `spawned { fork }` | `dismissed` | `promoted { refinement }`
+— the last for Request Changes, REQ-PROJ-037) is control-plane state bound to the originating
+conversation and is never part of the originator's LLM transcript (REQ-PROJ-035).
 
 ### Crash recovery (worktree reconciliation)
 
