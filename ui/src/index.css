@@ -8083,6 +8083,21 @@ html * {
   border-color: var(--text-muted);
 }
 
+/* Live-count badge for the Work scope rail entry: filled green when one or
+ * more resources are running, matching the expanded section's .ws-count-badge. */
+.fe-collapsed-badge--active {
+  background: var(--accent-green);
+  border-color: var(--accent-green);
+  color: var(--bg-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+.fe-collapsed-badge--active:hover {
+  background: var(--accent-green);
+  border-color: var(--accent-green);
+  color: var(--bg-primary);
+}
+
 /* FileTree shares column height with the expanded sub-panels (task 13004):
  * flex-grow with min-height:0 so it can shrink below content and scroll
  * internally instead of being squeezed to 0 by stacked panel maxima. */

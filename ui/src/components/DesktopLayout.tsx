@@ -1,6 +1,5 @@
 import { useLocation } from 'react-router-dom';
 import { lazy, Suspense, useEffect } from 'react';
-import { useState } from 'react';
 import {
   useConversationsList,
   useConversationsRefresh,
@@ -10,7 +9,6 @@ import {
 import { useResizablePane, useIsDesktop } from '../hooks';
 import { Sidebar } from './Sidebar';
 import { FileExplorerPanel, FileExplorerProvider } from './FileExplorer';
-import { WorkScopePanel } from './WorkScopePanel';
 import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { SubAgentViewerProvider, useSubAgentViewer } from '../contexts/SubAgentViewerContext';
 // Code-split: the panel pulls MessageComponents (markdown + syntax highlighting),
@@ -67,42 +65,6 @@ function SubAgentViewerDock() {
           width={pane.size}
         />
       </Suspense>
-    </>
-  );
-}
-
-/**
- * Right-docked work-scope observability panel (REQ-WSUI-010). Collapsed by
- * default. Reads the conversation's live `workScope` (SSE-fed) from the atom
- * via `useWorkScope` and seeds the panel's first paint with a fetch keyed by
- * `work_scope_key`. Mounted only when there's an active conversation slug.
- */
-function WorkScopeDock({ slug, scopeKey }: { slug: string; scopeKey: string }) {
-  const [collapsed, setCollapsed] = useState(true);
-  const liveInventory = useWorkScope(slug);
-  const pane = useResizablePane({
-    key: 'work-scope-width',
-    min: 200,
-    max: 480,
-    defaultSize: 260,
-  });
-  return (
-    <>
-      {!collapsed && (
-        <PaneDivider
-          orientation="vertical"
-          title="Drag to resize • Double-click to collapse"
-          onPointerDown={(e) => pane.startDrag(e, 'x', true)}
-          onDoubleClick={() => setCollapsed(true)}
-        />
-      )}
-      <WorkScopePanel
-        scopeKey={scopeKey}
-        liveInventory={liveInventory}
-        collapsed={collapsed}
-        onToggle={() => setCollapsed((c) => !c)}
-        width={collapsed ? undefined : pane.size}
-      />
     </>
   );
 }
@@ -169,6 +131,11 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
   const activeSlug = slugMatch?.[1] ?? null;
   const activeConversation = useConversationSnapshot(activeSlug);
   const activeConversationId = activeConversation?.id;
+  // Live work-scope inventory (SSE-fed) for the active conversation, threaded
+  // into FileExplorerPanel's Work scope section + collapsed-rail badge
+  // (REQ-WSUI-010). Single-writer atom contract: only the SSE reducer writes
+  // `workScope`; the section's initial fetch seeds local state, not the atom.
+  const liveWorkScope = useWorkScope(activeSlug);
 
   useEffect(() => {
     if (activeConversationId) {
@@ -221,6 +188,8 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
             branchName={activeConversation?.branch_name}
             activeSlug={activeSlug}
             width={fileExplorerPane.collapsed ? undefined : fileExplorerPane.size}
+            workScopeKey={activeConversation?.work_scope_key}
+            liveWorkScope={liveWorkScope}
           />
         )}
         {isDesktop && activeSlug && (
@@ -236,9 +205,6 @@ export function DesktopLayout({ children }: DesktopLayoutProps) {
           {children}
         </div>
         {isDesktop && <SubAgentViewerDock />}
-        {isDesktop && activeSlug && activeConversation?.work_scope_key && (
-          <WorkScopeDock slug={activeSlug} scopeKey={activeConversation.work_scope_key} />
-        )}
         {isDesktop && <CommandPalette conversations={conversations} activeConversation={activeConversation} />}
         <Toast messages={toasts} onDismiss={dismissToast} />
       </div>

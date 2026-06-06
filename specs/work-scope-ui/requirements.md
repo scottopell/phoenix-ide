@@ -206,40 +206,56 @@ conversation→scope resolution the browser lifecycle bridge already performs
 ### REQ-WSUI-009: Chain Page Single-Scope Query
 
 WHEN the chain page renders the work-scope panel
-THE SYSTEM SHALL query the one `scope_key` for the chain root and render the
-identical panel component used on the conversation page
+THE SYSTEM SHALL query the one `scope_key` for the chain root and render a
+standalone right-adjacent dock that shares the per-resource row vocabulary of
+the conversation page's section (REQ-WSUI-010)
 AND SHALL NOT aggregate per-member inventories.
 
 **Rationale:** Because resources are `WorkScope`-keyed and a chain's members
 share one scope, a single inventory query is complete. A hypothetical
 conversation-keyed design would force the chain page to fan out one query per
 member and merge the results, with all the divergence risk that implies; the
-`WorkScope` key collapses that to one read.
+`WorkScope` key collapses that to one read. The chain page has no left
+file-explorer panel to host a section, so it uses a standalone collapsible
+dock; both surfaces render the same resource rows from shared code.
 
 ---
 
-### REQ-WSUI-010: Conversation Page Panel
+### REQ-WSUI-010: Conversation Page Section
 
 WHILE the conversation page is shown on a desktop viewport
-THE SYSTEM SHALL present a right-adjacent dock that, collapsed by default,
-shows a live-count badge of running resources, and when expanded shows
-per-resource rows with inline status glyphs, label, and elapsed time, with the
-bash ring-buffer tail available on demand.
+THE SYSTEM SHALL present the work scope as a section in the left file-explorer
+panel, stacked with the Files, MCP, Skills, and Tasks sections, always present
+whenever the conversation has a work scope so it is auto-visible without
+opening a separate dock.
 
-THE panel SHALL update from the `WorkScopeUpdate` SSE event without churning
+THE section SHALL carry its own collapse state and a live-count badge of
+running resources, and when expanded SHALL show per-resource rows with inline
+status glyphs, label, and elapsed time, with the bash ring-buffer tail
+available on demand.
+
+WHEN the left file-explorer panel is itself collapsed to its badge rail
+THE SYSTEM SHALL show a Work scope badge in that rail carrying the live count
+of running resources, and clicking it SHALL expand the panel like the other
+rail badges.
+
+THE section SHALL update from the `WorkScopeUpdate` SSE event without churning
 the rest of the conversation view.
 
 WHERE the browser section reports `state` `live` with an `idle_ms` past a
 frontend-chosen threshold
-THE panel MAY present the browser row as "idle" — a purely client-side
+THE section MAY present the browser row as "idle" — a purely client-side
 rendering derived from `idle_ms`, distinct from the wire `state` (REQ-WSUI-004).
 
-**Rationale:** Per the UI Design Philosophy (information density, inline
-status, progressive disclosure): the rail's badge answers "is anything
-running?" at a glance; the expanded rows answer "what, and for how long?";
-the tail is one disclosure deeper for "what is it doing?" Field-level
+**Rationale:** The right side of the layout is reserved for the meta viewer
+(prose/diff/browser); the work scope is an always-present resource view, so it
+belongs in the persistent left panel beside the other resource sections rather
+than in a separate right dock. Per the UI Design Philosophy (information
+density, inline status, progressive disclosure): the rail's badge answers "is
+anything running?" at a glance; the expanded rows answer "what, and for how
+long?"; the tail is one disclosure deeper for "what is it doing?" Field-level
 render isolation keeps a resource change from re-rendering the transcript. The
-"idle" presentation lives in the panel because it is a display threshold over
+"idle" presentation lives in the section because it is a display threshold over
 `idle_ms`, not authoritative session state.
 
 ---

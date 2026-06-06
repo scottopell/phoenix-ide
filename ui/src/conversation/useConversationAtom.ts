@@ -241,8 +241,8 @@ export function useConversationSnapshot(slug: string | null): Conversation | nul
 
 /**
  * Subscribes to just the work-scope inventory (`workScope`) for `slug`
- * (REQ-WSUI-010). Consumed by the `WorkScopePanel` dock so a resource-state
- * push re-renders only the panel, not the transcript. The reducer replaces
+ * (REQ-WSUI-010). Consumed by the `WorkScopeSection` in the left panel so a
+ * resource-state push re-renders only the section, not the transcript. The reducer replaces
  * `workScope` by reference on each `sse_work_scope_update`, so `Object.is`
  * elides the render when nothing changed.
  */

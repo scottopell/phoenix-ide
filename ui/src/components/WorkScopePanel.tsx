@@ -1,7 +1,13 @@
 /**
- * WorkScopePanel — right-adjacent dock surfacing the live runtime resources
- * a work scope owns: backgrounded bash handles, the tmux server, and the
- * browser session (specs/work-scope-ui/, REQ-WSUI-009 / REQ-WSUI-010).
+ * Work-scope observability surface for the live runtime resources a work
+ * scope owns: backgrounded bash handles, the tmux server, and the browser
+ * session (specs/work-scope-ui/, REQ-WSUI-009 / REQ-WSUI-010).
+ *
+ * Two surfaces share the row/badge rendering here:
+ *   - `WorkScopeSection` — a collapsible section in the conversation page's
+ *     left `FileExplorerPanel`, stacked with Files/Skills/Tasks (REQ-WSUI-010).
+ *   - `WorkScopePanel` — the standalone right-adjacent dock on the chain page,
+ *     which has no left explorer panel to host a section (REQ-WSUI-009).
  *
  * Data sources:
  *   - Conversation page: the live `liveInventory` prop (the conversation
@@ -26,6 +32,7 @@ import type {
   BashHandleInventory,
   BashHandleState,
 } from '../api';
+import { isLive, workScopeLiveCount } from './workScopeHelpers';
 import './WorkScopePanel.css';
 
 /** A `live` browser session whose last activity is older than this reads as
@@ -61,10 +68,6 @@ function bashGlyph(state: BashHandleState): { glyph: string; cls: string; title:
   }
 }
 
-function isLive(state: BashHandleState): boolean {
-  return state === 'running' || state === 'kill_pending_kernel';
-}
-
 /** Human-rounded elapsed string for a started/finished handle. For a live
  *  handle we show time since `started_at`; for a terminal handle we show its
  *  recorded `duration_ms`. */
@@ -89,16 +92,6 @@ function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-/** Count of resources that read as "running right now": live bash handles
- *  (running + kill_pending_kernel) plus a live (non-idle) browser session.
- *  Drives the collapsed-rail badge. */
-function liveCount(inv: WorkScopeInventory | null): number {
-  if (!inv) return 0;
-  const liveBash = inv.bash.filter((h) => isLive(h.state)).length;
-  const liveBrowser = inv.browser && inv.browser.state === 'live' ? 1 : 0;
-  return liveBash + liveBrowser;
 }
 
 function BashRow({ handle, now }: { handle: BashHandleInventory; now: number }) {
@@ -194,7 +187,21 @@ function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: nu
   );
 }
 
-export function WorkScopePanel({ scopeKey, liveInventory, collapsed, onToggle, width }: Props) {
+/**
+ * Resolves the inventory to render: the live SSE-fed `liveInventory` wins when
+ * present (it is at least as fresh as a fetch), otherwise the initial fetch
+ * keyed by `scopeKey` (REQ-WSUI-006). Keeps the single-writer atom contract —
+ * the fetch seeds only local state here, never the atom's `workScope`.
+ *
+ * `active` gates the per-second elapsed-time tick: callers pass `false` while
+ * the surface is collapsed so an off-screen panel doesn't re-render every
+ * second.
+ */
+function useWorkScopeInventory(
+  scopeKey: string,
+  liveInventory: WorkScopeInventory | null | undefined,
+  active: boolean,
+) {
   const [fetched, setFetched] = useState<WorkScopeInventory | null>(null);
   const [error, setError] = useState(false);
   // Tick once a second so live elapsed times advance without an SSE push.
@@ -217,14 +224,116 @@ export function WorkScopePanel({ scopeKey, liveInventory, collapsed, onToggle, w
   }, [loadInitial]);
 
   useEffect(() => {
-    if (collapsed) return;
+    if (!active) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [collapsed]);
+  }, [active]);
 
   // Live SSE-fed inventory wins; otherwise fall back to the initial fetch.
   const inventory = liveInventory ?? fetched;
-  const count = liveCount(inventory);
+  return { inventory, error, now, retry: loadInitial };
+}
+
+/**
+ * The dense resource body shared by both surfaces: bash handles, tmux, and
+ * browser sections. Pure presentation over a resolved inventory.
+ */
+function WorkScopeBody({
+  inventory,
+  error,
+  now,
+  onRetry,
+}: {
+  inventory: WorkScopeInventory | null;
+  error: boolean;
+  now: number;
+  onRetry: () => void;
+}) {
+  return (
+    <div className="ws-body">
+      {error && !inventory && (
+        <div className="ws-empty ws-empty--error">
+          inventory failed to load
+          <button className="ws-retry" onClick={onRetry}>
+            retry
+          </button>
+        </div>
+      )}
+      {!error && !inventory && <div className="ws-empty">loading&hellip;</div>}
+      {inventory && (
+        <>
+          <section className="ws-section">
+            <div className="ws-section-head">bash ({inventory.bash.length})</div>
+            {inventory.bash.length === 0 ? (
+              <div className="ws-empty">no handles</div>
+            ) : (
+              inventory.bash.map((h) => <BashRow key={h.handle_id} handle={h} now={now} />)
+            )}
+          </section>
+          <section className="ws-section">
+            <div className="ws-section-head">tmux</div>
+            {inventory.tmux ? (
+              <TmuxRow status={inventory.tmux.status} />
+            ) : (
+              <div className="ws-empty">no server</div>
+            )}
+          </section>
+          <section className="ws-section">
+            <div className="ws-section-head">browser</div>
+            {inventory.browser ? (
+              <BrowserRow state={inventory.browser.state} idleMs={inventory.browser.idle_ms} />
+            ) : (
+              <div className="ws-empty">no session</div>
+            )}
+          </section>
+        </>
+      )}
+    </div>
+  );
+}
+
+interface SectionProps {
+  /** The scope key to query (`work_scope_key` on the conversation). */
+  scopeKey: string;
+  /** Live inventory from the conversation atom (SSE-fed). When provided it
+   *  overrides the section's initial fetch — it is at least as fresh. */
+  liveInventory?: WorkScopeInventory | null | undefined;
+  expanded: boolean;
+  onToggleExpanded: (expanded: boolean) => void;
+}
+
+/**
+ * Work-scope as a collapsible section inside the conversation page's left
+ * `FileExplorerPanel`, stacked with Files/Skills/Tasks (REQ-WSUI-010). Mirrors
+ * the header + own-expand-state pattern of `SkillsPanel` / `TasksPanel`; the
+ * dense resource body is the shared `WorkScopeBody`.
+ */
+export function WorkScopeSection({ scopeKey, liveInventory, expanded, onToggleExpanded }: SectionProps) {
+  const { inventory, error, now, retry } = useWorkScopeInventory(scopeKey, liveInventory, expanded);
+  const count = workScopeLiveCount(inventory);
+
+  return (
+    <div className={`ws-section-panel${expanded ? ' is-expanded' : ''}`}>
+      <button className="ws-section-panel-header" onClick={() => onToggleExpanded(!expanded)}>
+        <span className={`ws-section-panel-chevron${expanded ? ' expanded' : ''}`}>&#9654;</span>
+        <span className="ws-section-panel-summary">Work scope</span>
+        <span className={`ws-count-badge${count > 0 ? ' ws-count-badge--active' : ''}`}>{count}</span>
+      </button>
+      {expanded && (
+        <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} />
+      )}
+    </div>
+  );
+}
+
+/**
+ * Standalone right-adjacent dock for the chain page (REQ-WSUI-009), which has
+ * no left explorer panel to host a section. Collapsed it is a single
+ * live-count badge rail; expanded it shows the shared resource body.
+ */
+export function WorkScopePanel({ scopeKey, liveInventory, collapsed, onToggle, width }: Props) {
+  const { inventory, error, now, retry } = useWorkScopeInventory(scopeKey, liveInventory, !collapsed);
+  const count = workScopeLiveCount(inventory);
   const browserGlyph = inventory?.browser?.state === 'live' ? '◉' : null;
   const tmuxLive = inventory?.tmux?.status === 'live';
 
@@ -269,45 +378,7 @@ export function WorkScopePanel({ scopeKey, liveInventory, collapsed, onToggle, w
         <span className="ws-title">Work scope</span>
         <span className={`ws-count-badge${count > 0 ? ' ws-count-badge--active' : ''}`}>{count}</span>
       </div>
-      <div className="ws-body">
-        {error && !inventory && (
-          <div className="ws-empty ws-empty--error">
-            inventory failed to load
-            <button className="ws-retry" onClick={() => void loadInitial()}>
-              retry
-            </button>
-          </div>
-        )}
-        {!error && !inventory && <div className="ws-empty">loading&hellip;</div>}
-        {inventory && (
-          <>
-            <section className="ws-section">
-              <div className="ws-section-head">bash ({inventory.bash.length})</div>
-              {inventory.bash.length === 0 ? (
-                <div className="ws-empty">no handles</div>
-              ) : (
-                inventory.bash.map((h) => <BashRow key={h.handle_id} handle={h} now={now} />)
-              )}
-            </section>
-            <section className="ws-section">
-              <div className="ws-section-head">tmux</div>
-              {inventory.tmux ? (
-                <TmuxRow status={inventory.tmux.status} />
-              ) : (
-                <div className="ws-empty">no server</div>
-              )}
-            </section>
-            <section className="ws-section">
-              <div className="ws-section-head">browser</div>
-              {inventory.browser ? (
-                <BrowserRow state={inventory.browser.state} idleMs={inventory.browser.idle_ms} />
-              ) : (
-                <div className="ws-empty">no session</div>
-              )}
-            </section>
-          </>
-        )}
-      </div>
+      <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} />
     </aside>
   );
 }

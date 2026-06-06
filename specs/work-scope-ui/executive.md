@@ -39,8 +39,10 @@ resolution the browser lifecycle bridge already performs, with scope caching on
 the runtime handle as a latency optimization. On the client, a `workScope` field
 is added to `ConversationAtom` with a reducer branch guarded by `applyIfNewer`
 (mirroring `sse_state_change`); `useConversationView` field-level isolation keeps
-inventory changes from churning the transcript. The dock mounts in
-`DesktopLayout` beside `SubAgentViewerDock` with a `useResizablePane` width.
+inventory changes from churning the transcript. On the conversation page the
+work scope is a section in the left `FileExplorerPanel`, stacked with
+Files/Skills/Tasks and always present; the chain page, which has no left panel,
+uses a standalone right-adjacent dock that shares the same resource rows.
 
 No Allium spec accompanies this spec: the feature is a read-projection plus a
 full-snapshot push over resource state whose lifecycles are already modeled by
@@ -60,8 +62,8 @@ correct weight (see `design.md`, "Why No Allium Spec").
 | **REQ-WSUI-006:** Inventory Pull Endpoint | Proposed | `GET /api/work-scope/:scope_key/inventory`; `get_conversation` shape |
 | **REQ-WSUI-007:** Inventory Push Event | Proposed | `WorkScopeUpdate` `SseWireEvent`; full snapshot, no deltas |
 | **REQ-WSUI-008:** Push Event Routing | Proposed | Single non-terminal conversation per scope (REQ-PROJ-025) |
-| **REQ-WSUI-009:** Chain Page Single-Scope Query | Proposed | One scope key; identical panel; no per-member fan-out |
-| **REQ-WSUI-010:** Conversation Page Panel | Proposed | Right dock beside `SubAgentViewerDock`; atom `workScope` field |
+| **REQ-WSUI-009:** Chain Page Single-Scope Query | Proposed | One scope key; standalone dock sharing the section's rows; no per-member fan-out |
+| **REQ-WSUI-010:** Conversation Page Section | Proposed | `WorkScopeSection` in left `FileExplorerPanel`, stacked with Files/Skills/Tasks; collapsed-rail badge; atom `workScope` field |
 | **REQ-WSUI-011:** CLI Client Not a Visualization Surface | Proposed | `phoenix-client.py` text-only; CLI subcommand is future work |
 
 **Progress:** 0 of 11 implemented.

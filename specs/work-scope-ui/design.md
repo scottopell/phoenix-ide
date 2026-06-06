@@ -20,7 +20,7 @@ The panel is a read-projection over three in-memory registries — the
                                                                     │
                                               ConversationAtom.workScope (reducer)
                                                                     │
-                                              WorkScopePanel dock (conversation + chain)
+                                       WorkScopeSection (left panel) + WorkScopePanel dock (chain)
 ```
 
 There is exactly one carrier of resource state at each layer: the registries
@@ -187,34 +187,45 @@ latency optimization over the same resolution.
 
 ## Frontend
 
-### Conversation page dock (REQ-WSUI-010)
+### Conversation page section (REQ-WSUI-010)
 
-A new right-adjacent dock in `DesktopLayout`, mounted beside
-`SubAgentViewerDock`, with width managed by `useResizablePane` (the same hook
-the sub-agent dock and file-explorer panel use). It is desktop-only and
-gated on an active slug, matching the other docks.
+`WorkScopeSection` is a collapsible section in the left `FileExplorerPanel`,
+stacked with the Files, MCP, Skills, and Tasks sections. It mirrors the
+header + own-expand-state pattern of `SkillsPanel` / `TasksPanel`: a header
+button with a chevron, a summary label, and a live-count badge, with the
+dense resource body below when expanded. It is always present whenever the
+conversation has a `work_scope_key`, so it is auto-visible without opening a
+separate dock — the right side of the layout is reserved for the meta viewer
+(prose/diff/browser).
+
+The right side hosts no work-scope surface on the conversation page;
+`DesktopLayout` threads the conversation's `work_scope_key` and the live
+`workScope` inventory into `FileExplorerPanel`, which renders the section and
+its collapsed-rail badge.
 
 Per the UI Design Philosophy:
 
-- **Collapsed (default):** a narrow rail showing a live-count badge — the
-  number of `running` resources across bash + browser. Answers "is anything
-  running?" without occupying width.
-- **Expanded:** per-resource rows. Each row shows an inline status glyph
+- **Section header (default-expanded):** a "Work scope" label with a
+  live-count badge — the number of `running` resources across bash + browser.
+  Answers "is anything running?" at a glance.
+- **Expanded body:** per-resource rows. Each row shows an inline status glyph
   (green `✓` running, yellow `+` spawning/`kill_pending_kernel`, muted glyph
   tombstoned/torn-down), the resource label, and elapsed time inline. The bash
   ring-buffer tail is a per-row on-demand disclosure, not shown by default.
+- **Left panel collapsed:** when the whole `FileExplorerPanel` is collapsed to
+  its badge rail, a Work scope badge in that rail carries the live count;
+  clicking it expands the panel like the Files/Skills/Tasks badges.
 
 ```
-Collapsed rail          Expanded panel
-┌────┐                  ┌──────────────────────────┐
-│ ⦿3 │                  │ Work scope               │
-│    │                  │ ✓ bash  npm test   1m12s │
-│    │                  │ + bash  build…     0m03s │
-│    │                  │ · bash  lint      (done) │
-│    │                  │ ✓ browser  live    8m    │
-│ [▶]│                  │ ✓ tmux  main (2 win)     │
-└────┘                  │                      [◀] │
-                        └──────────────────────────┘
+Expanded section (in left panel)
+┌──────────────────────────┐
+│ ▾ Work scope          ⦿3 │
+│ ✓ bash  npm test   1m12s │
+│ + bash  build…     0m03s │
+│ · bash  lint      (done) │
+│ ✓ browser  live    8m    │
+│ ✓ tmux  main (2 win)     │
+└──────────────────────────┘
 ```
 
 ### Atom integration (REQ-WSUI-010)
@@ -229,16 +240,22 @@ event replaces it wholesale on each change (full-snapshot semantics,
 REQ-WSUI-007).
 
 `useConversationView`'s field-level isolation means a `workScope` change
-re-renders only the panel subscribers, not the transcript (REQ-WSUI-010).
+re-renders only the section subscribers, not the transcript (REQ-WSUI-010).
+The section's initial fetch (REQ-WSUI-006) seeds only its local state; the
+atom's `workScope` remains written solely by the SSE reducer — a single-writer
+contract that keeps the live push authoritative.
 
 ### Chain page (REQ-WSUI-009)
 
-The chain page queries the one `scope_key` for the chain root via the pull
-endpoint and renders the identical `WorkScopePanel` component. No per-member
-aggregation: because resources are `WorkScope`-keyed and the chain's members
-share one scope, one query is complete. A conversation-keyed design would
-instead require one query per member and a client-side merge — the fan-out the
-`WorkScope` key eliminates.
+The chain page has no left `FileExplorerPanel` to host a section, so it queries
+the one `scope_key` for the chain root via the pull endpoint and renders the
+standalone right-adjacent `WorkScopePanel` dock (width via `useResizablePane`,
+collapsed by default). Both surfaces render the same per-resource rows from
+shared code in `WorkScopePanel.tsx`. No per-member aggregation: because
+resources are `WorkScope`-keyed and the chain's members share one scope, one
+query is complete. A conversation-keyed design would instead require one query
+per member and a client-side merge — the fan-out the `WorkScope` key
+eliminates.
 
 ## Wire-Shape Notes
 
@@ -269,8 +286,10 @@ instead require one query per member and a client-side merge — the fan-out the
   (e.g. `phoenix_core::domain::tool_wire`, per the layering note in
   `crates/phoenix-ide/src/api/wire.rs`), so the `tools` and `api` layers can
   depend *down* onto them.
-- `ui/src/components/WorkScopePanel.tsx` (+ collapsed rail, per-resource row,
-  ring-tail disclosure) and its CSS.
+- `ui/src/components/WorkScopePanel.tsx` (+ per-resource row, ring-tail
+  disclosure) and its CSS. Exports both `WorkScopeSection` (the left-panel
+  section for the conversation page) and `WorkScopePanel` (the standalone dock
+  for the chain page), which share the row vocabulary.
 
 ### Modified
 
@@ -285,8 +304,14 @@ instead require one query per member and a client-side merge — the fan-out the
 - `ui/src/sseSchemas.ts` — add `SseWorkScopeUpdateDataSchema`.
 - `ui/src/conversation/atom.ts` — add `workScope` field, `SSEAction` case, and
   reducer branch.
-- `ui/src/components/DesktopLayout.tsx` — mount the dock beside
-  `SubAgentViewerDock` with a `useResizablePane` width.
+- `ui/src/components/DesktopLayout.tsx` — thread the conversation's
+  `work_scope_key` and live `workScope` (via `useWorkScope`) into
+  `FileExplorerPanel`, which renders `WorkScopeSection`.
+- `ui/src/components/FileExplorer/FileExplorerPanel.tsx` — render
+  `WorkScopeSection` in the expanded section stack and a Work scope badge in
+  the collapsed badge rail.
+- `ui/src/pages/ChainPage.tsx` — `ChainWorkScopeDock` mounts the standalone
+  `WorkScopePanel` with a `useResizablePane` width.
 - `ui/src/generated/` — regenerated by `./dev.py codegen` (never hand-edited).
 
 ## Cross-Spec Touchpoints
