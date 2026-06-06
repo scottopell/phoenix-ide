@@ -1121,6 +1121,60 @@ branch to fork from, so it is excluded structurally rather than failing at spawn
 
 ---
 
+### REQ-PROJ-037: Request Changes — Promote a Fork Proposal to an Explore Refinement
+
+WHEN a `pending` fork proposal is under review (REQ-PROJ-034) AND the originating
+conversation is not terminal
+THE SYSTEM SHALL offer a third review action — **Request Changes** — alongside Approve and
+Dismiss, accepting a free-text change request from the user
+
+WHEN the user chooses Request Changes with a change-request note
+THE SYSTEM SHALL create a fresh top-level **Explore** conversation, in its own new worktree
+(REQ-PROJ-005) cut from the repository's default branch (`main_ref` — REQ-PROJ-034a), the
+*same independent base* a direct approval would use, so the task being shaped is never
+entangled with the originating conversation's in-progress work
+AND write the snapshot's bytes into that Explore worktree as an **uncommitted draft** on the
+temp branch (a taskmd file under the tasks directory, a plain brief at its own path —
+classified as in REQ-PROJ-006), so the agent can revise it in place with `patch`
+AND seed the Explore agent's LLM context with the brief **body** plus the user's
+change-request note — and nothing else (it inherits none of the originating conversation's
+transcript; the brief and the requested changes are *in context*, not merely a file to
+discover)
+AND record the proposal's resolution as **`promoted`** (referencing the new Explore
+conversation), idempotently — a `pending` proposal promotes exactly once; promoting an
+already-`spawned`/`dismissed`/`promoted` proposal is rejected
+AND leave the originating conversation unaffected and uninformed — the decoupling of
+REQ-PROJ-035 holds unchanged: the origin is the *proposer*, never the *iterator*
+
+THEREAFTER refinement proceeds entirely through the ordinary Explore propose / feedback /
+approve loop (REQ-PROJ-004): the agent revises the draft, the user sends annotation
+feedback, and the Explore agent's own `propose_task` re-enters AwaitingTaskApproval. The
+final managed Work conversation is produced by the **normal Explore→Work gateway**
+(in-place or fresh handoff — REQ-PROJ-006), not by fork-spawn. There is no second fork
+proposal and no path back to the original origin.
+
+THE promoted Explore conversation SHALL carry the same `spawned_from_conversation_id`
+provenance breadcrumb pointing at the original proposing conversation (REQ-PROJ-035) — a
+non-live audit reference, so provenance survives even though the origin is decoupled and
+may later be hard-deleted.
+
+A `promoted` resolution is **terminal for the proposal**, exactly like `spawned` /
+`dismissed`: it persists as control-plane audit through the origin's ordinary terminal
+cleanup (mark-merged / abandon) and is removed only on hard delete (REQ-PROJ-035). The
+promoted Explore conversation has an **independent lifecycle**: abandoning or deleting it
+does not alter the `promoted` record, and the record carries no behaviour back to it.
+
+**Rationale:** "Request changes" means *"not ready to commit to Work — let me shape this
+first,"* which is precisely Explore's purpose. Promoting to Explore reuses the existing
+propose/feedback loop and review surface rather than inventing a parallel one, keeps the
+task on a disposable scratch branch until it is actually ready (no premature Work branch to
+abandon), and preserves decoupling by construction — the messages land in a *new*
+conversation's transcript, never the decoupled proposer's. Approve and Request Changes are
+distinct intents: Approve commits the brief as-is to a Work fork; Request Changes opens an
+agent-assisted iteration before any such commitment.
+
+---
+
 ## WorkScope Resource Ownership
 
 ### REQ-PROJ-WS-001: WorkScope as Resource Owner

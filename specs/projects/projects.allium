@@ -220,13 +220,17 @@ entity ForkProposal {
     title: String
     priority: String
     body: String                        -- snapshotted file bytes — authoritative at spawn
-    status: pending | spawned | dismissed
+    status: pending | spawned | dismissed | promoted
     fork: bedrock/Conversation?         -- the spawned conversation, present iff status = spawned.
                                         -- A non-live audit reference, NOT an FK-enforced edge:
                                         -- the fork is independent (REQ-PROJ-035) and may be
                                         -- hard-deleted while this (origin-bound) proposal lives,
                                         -- so consumers tolerate a reference to a since-deleted
                                         -- conversation rather than cascading or blocking its delete.
+    refinement: bedrock/Conversation?   -- REQ-PROJ-037 (not implemented yet): the Explore
+                                        -- conversation a `Request Changes` promotion created,
+                                        -- present iff status = promoted. Same non-live audit
+                                        -- reference semantics as `fork` — independent lifecycle.
 
     -- The fork base is NOT stored: it is always origin.project.main_ref (the
     -- repository default branch), resolved at approval time (ForkProposalApproved).
@@ -234,7 +238,8 @@ entity ForkProposal {
     transitions status {
         pending -> spawned
         pending -> dismissed
-        terminal: spawned, dismissed
+        pending -> promoted
+        terminal: spawned, dismissed, promoted
     }
 }
 
@@ -840,6 +845,59 @@ rule ForkProposalDismissed {
 
     ensures: proposal.status = dismissed
     ensures: proposal.fork = absent
+}
+
+-- REQ-PROJ-037 (NOT IMPLEMENTED YET — tracked as a build task; see executive.md):
+-- "Request Changes" promotes a pending proposal into a fresh Explore conversation seeded
+-- with the brief + the user's change note, where refinement proceeds via the ordinary
+-- Explore propose/feedback loop (REQ-PROJ-004). The proposer is decoupled and has no
+-- attached LLM (REQ-PROJ-035), so the iteration must land in a NEW conversation, not the
+-- origin. The Explore worktree is cut from the same independent base (main_ref) a direct
+-- approval uses; nothing is committed (the draft sits on the temp branch for the agent to
+-- revise). The `promoted` resolution is terminal for the proposal and carries no behaviour
+-- back to the origin; the refinement conversation has an independent lifecycle.
+rule ForkProposalPromotedToExplore {
+    when: UserRequestsForkProposalChanges(proposal, change_request)
+
+    requires: proposal.status = pending
+    -- Bound to origin: a promotion, like an approval, is moot once the origin's lifecycle
+    -- has ended (Parent.is_terminal covers terminal, context_exhausted, handed_off).
+    requires: proposal.origin.is_terminal = false
+
+    -- `refinement` is the freshly-allocated Explore successor — the same post-state fixpoint
+    -- idiom ForkProposalApproved uses for `fork` (absent while pending, present == promoted).
+    let refinement = proposal.refinement
+    let base = proposal.origin.project.main_ref
+
+    -- A fresh top-level Explore conversation, NOT a sub-agent — seeded with the brief and the
+    -- change request, its worktree cut from the repository default branch.
+    ensures: ExploreRefinementCreated(proposal, refinement, change_request)
+    ensures: refinement.kind = Parent
+    ensures: refinement.mode = explore
+    ensures: refinement.spawned_from_conversation_id = proposal.origin
+    ensures: Worktree.created(
+        conversation: refinement,
+        project: proposal.origin.project,
+        path: WorktreePath { absolute_path: worktree_path(refinement) },
+        branch_name: explore_temp_branch(refinement),
+        base_branch: base,
+        task_file: absent
+    )
+    -- The draft brief is written uncommitted onto the temp branch for the agent to revise.
+    ensures: BriefDraftedUncommitted(Worktree{conversation: refinement}, proposal.task_file, proposal.body)
+
+    -- Resolve the proposal. refinement present iff promoted — one pending proposal promotes
+    -- exactly once (idempotency keyed on proposal.id).
+    ensures: proposal.refinement = refinement
+    ensures: proposal.status = promoted
+
+    @guidance
+        -- Dispatched by /proposals/:id/request-changes under TASK_APPROVAL_MUTEX, off the
+        -- originating conversation's state machine entirely (the origin never transitions).
+        -- The proposal-resolution write and the synthetic surface update commit atomically,
+        -- like ForkProposalApproved. Refinement continues via the Explore gateway
+        -- (TaskApprovalExecuted / TaskApprovalFreshHandoffExecuted) — there is no second fork
+        -- proposal and no link back to the origin.
 }
 
 -- REQ-PROJ-035: when the origin reaches a terminal state, its still-pending

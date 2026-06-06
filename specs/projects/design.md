@@ -453,11 +453,46 @@ and its id (for the breadcrumb). It never **mutates** the originating conversati
 never **notifies** it: no state transition, no message into its transcript or LLM context.
 The decoupling contract is "do not mutate or notify the origin," not "do not read it."
 
+### Request Changes → Explore refinement (REQ-PROJ-037, **not implemented yet**)
+
+The review surface has a third action beside Approve / Dismiss: **Request Changes**, which
+takes a free-text note. The constraint that shapes the whole design: the proposer (a
+Work-mode origin) is decoupled and gone (REQ-PROJ-035), and a `pending` proposal has **no
+LLM attached** — so change-request messages cannot be delivered to the proposer. They need
+a *new* agent context. Rather than spawn the Work fork early and iterate there (which would
+commit a Work branch before the brief is settled), Request Changes promotes the snapshot
+into a fresh **Explore** conversation — the mode whose entire purpose is shaping a task
+before Work — and reuses the existing REQ-PROJ-004 propose/feedback loop.
+
+On `Effect::PromoteForkToExplore` (executor, `spawn_blocking`, under `TASK_APPROVAL_MUTEX`,
+dispatched by `/proposals/:id/request-changes`):
+
+1. Allocate a fresh top-level conversation; create its worktree (REQ-PROJ-005) cut from
+   `main_ref` — the same independent base a direct approval uses.
+2. Write the snapshot `body` into the worktree at its repo-relative `task_file` path
+   (taskmd under the tasks dir, or plain brief at its own path — `TaskSource`, REQ-PROJ-006),
+   **uncommitted** on the Explore temp branch, so the agent revises it in place with `patch`.
+3. Persist the conversation in `ConvMode::Explore`, set `spawned_from_conversation_id =
+   {origin id}` (same non-live audit breadcrumb as a spawned fork), and seed its LLM context
+   with the brief `body` + the user's change-request note — nothing else.
+4. Record the proposal resolution `promoted { explore_conv_id }` — atomically with the ack,
+   like the recording path (the proposal must never read `promoted` without the row that
+   names the conversation it became).
+
+Refinement then runs entirely in that Explore conversation: agent revises, user gives
+annotation feedback (REQ-PROJ-004), and the Explore agent's own `propose_task` re-enters
+`AwaitingTaskApproval`. Approving there is the **ordinary Explore→Work gateway**
+(`Effect::ApproveTask` / `Effect::ApproveTaskFreshHandoff`) — no second fork proposal, no
+path back to the original origin. The origin is neither mutated nor notified (decoupling
+holds); the promoted Explore conversation has an independent lifecycle, so abandoning it
+never touches the `promoted` audit record.
+
 ## Executor-Layer Git Operations
 
 The git choreography is not modelled as fine-grained typed effects — the state machine
-emits a small set of coarse effects (`Effect::ApproveTask`, `Effect::ResolveTask`, and
-`Effect::SpawnFork` for fork approval — REQ-PROJ-034) and the corresponding handler runs
+emits a small set of coarse effects (`Effect::ApproveTask`, `Effect::ResolveTask`,
+`Effect::SpawnFork` for fork approval — REQ-PROJ-034, and `Effect::PromoteForkToExplore` for
+Request Changes — REQ-PROJ-037, not implemented yet) and the corresponding handler runs
 the `git` sequence directly in a `spawn_blocking` task, feeding back a single completion
 (or a `GitOperationFailed`-style error message). `Effect::SpawnFork` is dispatched not by
 a state-machine transition on the originating conversation but by the async

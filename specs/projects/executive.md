@@ -88,10 +88,12 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-034:** Approve a Fork Proposal — Spawn an Independent Conversation | 📐 Spec only | Async approval spawns a fresh top-level Work conversation cut from the repository default branch (`main_ref`), never the origin's `base_branch`/HEAD |
 | **REQ-PROJ-035:** Fork Provenance and Decoupling Guarantees | 📐 Spec only | `spawned_from_conversation_id` breadcrumb; no lifecycle notifications; proposal bound to origin |
 | **REQ-PROJ-036:** Fork-Eligible Mode Availability | 📐 Spec only | Writing-mode matrix; Direct gated on git repo; Explore keeps its parking gateway |
+| **REQ-PROJ-037:** Request Changes — Promote a Fork Proposal to an Explore Refinement | 📐 Spec only (not implemented yet) | Third review action promotes a pending proposal into a fresh Explore conversation seeded with the brief + change note; refinement runs via the Explore propose/feedback loop, decoupled from the origin |
 
-**Progress:** of 32 active requirements, 28 complete and 4 (REQ-PROJ-033..036,
-task forks) specified but not yet implemented. REQ-PROJ-009 and -023 removed;
-REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by REQ-PROJ-018.
+**Progress:** of 33 active requirements, 28 complete and 5 (REQ-PROJ-033..037,
+task forks + fork-proposal Request Changes) specified but not yet implemented.
+REQ-PROJ-009 and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by
+REQ-PROJ-018.
 
 ## Dependencies
 
