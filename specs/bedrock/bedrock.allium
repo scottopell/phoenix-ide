@@ -572,6 +572,12 @@ rule ForkProposalIntercepted {
     -- (git-backed by construction).
     requires: conversation.mode in { work, branch }
            or (conversation.mode = direct and is_git_repository(conversation.working_dir))
+    -- At the continuation threshold this rule does NOT fire: ContextThresholdReachedParent
+    -- (REQ-BED-019) takes the turn instead, parking into awaiting_continuation with the
+    -- propose_task call in rejected_tool_calls (replayed after continuation). Without this
+    -- guard the non-parking fork path would keep dispatching and grow the origin past the
+    -- threshold.
+    requires: not conversation.context_at_threshold
     let proposal = parse_fork_proposal(tool_calls.first)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1

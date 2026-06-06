@@ -1028,6 +1028,13 @@ branch at creation time). It is the same value regardless of origin mode; in par
 Branch-mode origin's `base_branch` equals the branch it is editing (REQ-PROJ-017), which
 is *not* an independent base, so the fork never uses it.
 
+`main_ref` SHALL be the *resolved* default branch, not a hardcoded literal. Before fork
+approval relies on it, existing project rows whose `main_ref` was defaulted (e.g. to a
+literal `main`) SHALL be backfilled/reconciled to the actual resolved default branch
+(repos whose default is `master`/`develop`/etc. must not be sent to `main`). This is a
+schema-evolution obligation owned by a migration or a startup reconciliation, per the
+repo's "schema evolution belongs in migrations" rule — not a serde/default shim.
+
 THE fork SHALL be independent by construction: branching off the repository default branch
 means its eventual diff contains only its own work, reviewable and mergeable on its own
 with no entanglement with the originating conversation's in-progress changes. A fork

@@ -73,6 +73,9 @@ Project {
                                // mandatory and immutable, resolved once at project creation
                                // (remote default when detectable, else the checked-out
                                // branch at creation). The canonical fork base (REQ-PROJ-034a).
+                               // Must be the RESOLVED default, not a hardcoded literal:
+                               // existing rows defaulted to "main" are backfilled by a
+                               // migration/startup reconciliation before fork approval uses it.
 }
 
 ConvMode {
