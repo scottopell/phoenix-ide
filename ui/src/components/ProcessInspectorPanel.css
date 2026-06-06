@@ -1,0 +1,199 @@
+/* Process inspector — per-handle live drill-down in the meta-viewer slot
+ * (specs/process-inspector/, REQ-PINSP-008). Dense, monospace, log-tailing.
+ * Shares the WorkScopePanel glyph palette (CSS vars) so the two surfaces read
+ * as one family. */
+
+.pinsp-panel {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+
+/* Overlay presentation (mobile / narrow desktop) — fill the viewport above
+ * app chrome, mirroring the diff/browser overlays. */
+.pinsp-panel:not(.pinsp-panel--inline) {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+}
+
+.pinsp-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-color);
+  flex: 0 0 auto;
+}
+
+.pinsp-title {
+  flex: 1 1 auto;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--text-primary);
+}
+
+.pinsp-close {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+}
+
+.pinsp-close:hover {
+  color: var(--text-primary);
+}
+
+.pinsp-glyph {
+  flex: 0 0 auto;
+  width: 12px;
+  text-align: center;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.pinsp-glyph--ok {
+  color: var(--accent-green);
+}
+
+.pinsp-glyph--warn {
+  color: var(--accent-yellow);
+}
+
+.pinsp-glyph--muted {
+  color: var(--text-muted);
+}
+
+.pinsp-empty {
+  padding: 8px 10px;
+  color: var(--text-muted);
+  font-style: italic;
+  font-size: 11px;
+}
+
+.pinsp-empty--error {
+  color: var(--accent-red);
+  font-style: normal;
+}
+
+.pinsp-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border-color);
+  flex: 0 0 auto;
+}
+
+.pinsp-id-line {
+  display: flex;
+  gap: 8px;
+  font-size: 11px;
+}
+
+.pinsp-id-key {
+  flex: 0 0 52px;
+  color: var(--text-muted);
+}
+
+.pinsp-id-val {
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pinsp-id-val--cmd {
+  font-family: var(--font-mono, monospace);
+  word-break: break-all;
+}
+
+.pinsp-resources {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 5px 10px;
+  border-bottom: 1px solid var(--border-color);
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.pinsp-res-item {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.pinsp-res-key {
+  color: var(--text-muted);
+}
+
+.pinsp-res-val {
+  color: var(--text-primary);
+  font-family: var(--font-mono, monospace);
+}
+
+.pinsp-res-item--muted {
+  color: var(--text-muted);
+  font-style: italic;
+  margin-left: auto;
+}
+
+.pinsp-output {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px 10px;
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  line-height: 1.45;
+  background: var(--bg-secondary, var(--bg-primary));
+}
+
+.pinsp-output-empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.pinsp-output-line {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: var(--text-primary);
+}
+
+.pinsp-output-gap {
+  color: var(--accent-yellow);
+  font-style: italic;
+  text-align: center;
+  padding: 2px 0;
+  border-top: 1px dashed var(--border-color);
+  border-bottom: 1px dashed var(--border-color);
+  margin: 2px 0;
+}
+
+.pinsp-follow-resume {
+  flex: 0 0 auto;
+  margin: 0;
+  padding: 4px 8px;
+  border: none;
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-tertiary, var(--bg-secondary));
+  color: var(--accent-blue, #3b82f6);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.pinsp-follow-resume:hover {
+  background: var(--bg-hover, var(--bg-tertiary));
+}

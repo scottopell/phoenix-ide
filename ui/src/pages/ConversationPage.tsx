@@ -64,6 +64,9 @@ const TerminalPanel = lazy(() =>
 const BrowserViewPanel = lazy(() =>
   import('../components/BrowserViewPanel').then((m) => ({ default: m.BrowserViewPanel })),
 );
+const ProcessInspectorPanel = lazy(() =>
+  import('../components/ProcessInspectorPanel').then((m) => ({ default: m.ProcessInspectorPanel })),
+);
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
@@ -143,8 +146,14 @@ function ConversationPageContent() {
   const fullscreenDiffOpen = diffPresentation === 'fullscreen';
   const paneDiffOpen = diffPresentation === 'pane';
   const browserOpen = slotKind === 'browser';
+  // Process inspector (specs/process-inspector/, REQ-PINSP-007): a fourth slot
+  // kind addressed by (scope_key, handle_id). Rendered alongside the prose /
+  // diff / browser viewers in each presentation branch below.
+  const inspectSlot = viewerSlot.slot.kind === 'inspect' ? viewerSlot.slot : null;
+  const inspectOpen = inspectSlot !== null;
   const handleCloseDiff = viewerSlot.close;
   const handleCloseBrowserView = viewerSlot.close;
+  const handleCloseInspector = viewerSlot.close;
   const handleOpenBrowserView = viewerSlot.openBrowser;
   // ConversationPage was previously snapshotting `isDesktop` at mount and
   // never resubscribing — a window resize across 1025px wouldn't update
@@ -918,6 +927,20 @@ function ConversationPageContent() {
         </div>
       );
     }
+    if (inspectSlot) {
+      return (
+        <div id="app">
+          <Suspense fallback={null}>
+            <ProcessInspectorPanel
+              scopeKey={inspectSlot.scopeKey}
+              handleId={inspectSlot.handleId}
+              onClose={handleCloseInspector}
+              inline
+            />
+          </Suspense>
+        </div>
+      );
+    }
   }
 
   // Terminal cleanup (Clean up merged PR / Abandon) for a Work/Branch
@@ -993,7 +1016,7 @@ function ConversationPageContent() {
   const showSplitPaneViewer =
     isDesktop
     && isWideDesktop
-    && (splitPanePrs !== null || paneDiffOpen || browserOpen);
+    && (splitPanePrs !== null || paneDiffOpen || browserOpen || inspectOpen);
 
   return (
     <div
@@ -1433,6 +1456,17 @@ function ConversationPageContent() {
           </div>
         </Suspense>
       )}
+      {/* Process inspector overlay: mobile, narrow desktop, or any case where
+          the split pane is unavailable (REQ-PINSP-007). */}
+      {inspectSlot && !showSplitPaneViewer && (
+        <Suspense fallback={null}>
+          <ProcessInspectorPanel
+            scopeKey={inspectSlot.scopeKey}
+            handleId={inspectSlot.handleId}
+            onClose={handleCloseInspector}
+          />
+        </Suspense>
+      )}
       {showSplitPaneViewer && (
         <>
           <div
@@ -1494,6 +1528,13 @@ function ConversationPageContent() {
                 <BrowserViewPanel
                   conversationId={conversationId}
                   onClose={handleCloseBrowserView}
+                  inline
+                />
+              ) : inspectSlot ? (
+                <ProcessInspectorPanel
+                  scopeKey={inspectSlot.scopeKey}
+                  handleId={inspectSlot.handleId}
+                  onClose={handleCloseInspector}
                   inline
                 />
               ) : null}

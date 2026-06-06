@@ -70,6 +70,54 @@ describe('ViewerSlot — open/close transitions', () => {
   });
 });
 
+describe('ViewerSlot — inspect kind (REQ-PINSP-007)', () => {
+  it('opens the inspector, encoding (scope, handle) in the URL', () => {
+    const h = renderSlot();
+    expect(h.get().slot.kind).toBe('none');
+
+    act(() => { h.get().openInspect('scope-1', 'b-7'); });
+    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-1', handleId: 'b-7' });
+    expect(h.search()).toContain('viewer=inspect');
+    expect(h.search()).toContain('scope=scope-1');
+    expect(h.search()).toContain('handle=b-7');
+
+    act(() => { h.get().close(); });
+    expect(h.get().slot.kind).toBe('none');
+    expect(h.search()).not.toContain('viewer=');
+  });
+
+  it('parses an inspect URL on cold entry (URL-as-source-of-truth)', () => {
+    const h = renderSlot('/c/conv-A?viewer=inspect&scope=scope-9&handle=b-3');
+    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-9', handleId: 'b-3' });
+  });
+
+  it('normalizes an inspect URL missing scope or handle to none', async () => {
+    const noHandle = renderSlot('/c/conv-A?viewer=inspect&scope=scope-1');
+    expect(noHandle.get().slot.kind).toBe('none');
+    await waitFor(() => { expect(noHandle.search()).not.toContain('viewer='); });
+
+    const noScope = renderSlot('/c/conv-A?viewer=inspect&handle=b-1');
+    expect(noScope.get().slot.kind).toBe('none');
+    await waitFor(() => { expect(noScope.search()).not.toContain('viewer='); });
+  });
+
+  it('clears inspect params when switching to another viewer kind', () => {
+    const h = renderSlot();
+    act(() => { h.get().openInspect('scope-1', 'b-7'); });
+    expect(h.search()).toContain('scope=scope-1');
+
+    act(() => { h.get().openProse('/repo/a.ts', '/repo'); });
+    expect(h.get().slot.kind).toBe('prose');
+    expect(h.search()).not.toContain('scope=');
+    expect(h.search()).not.toContain('handle=');
+
+    act(() => { h.get().openInspect('scope-2', 'b-9'); });
+    expect(h.search()).not.toContain('file=');
+    expect(h.search()).not.toContain('root=');
+    expect(h.get().slot).toEqual({ kind: 'inspect', scopeKey: 'scope-2', handleId: 'b-9' });
+  });
+});
+
 describe('ViewerSlot — structural single-slot mutex', () => {
   it('opening diff while prose is open removes the file/root params', () => {
     const h = renderSlot();

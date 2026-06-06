@@ -282,6 +282,22 @@
   word-break: break-all;
 }
 
+.ws-row-inspect {
+  align-self: flex-start;
+  margin-top: 2px;
+  padding: 1px 6px;
+  border: 1px solid var(--border-color);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--accent-blue, #3b82f6);
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.ws-row-inspect:hover {
+  background: var(--bg-hover, var(--bg-tertiary));
+}
+
 .ws-empty {
   padding: 4px 10px 6px;
   color: var(--text-muted);

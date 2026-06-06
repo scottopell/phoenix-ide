@@ -38,7 +38,8 @@ export type ViewerSlot =
   | { kind: 'none' }
   | { kind: 'prose'; file: ProseFile; patchContext: PatchContext | null }
   | { kind: 'diff'; presentation: DiffPresentation }
-  | { kind: 'browser' };
+  | { kind: 'browser' }
+  | { kind: 'inspect'; scopeKey: string; handleId: string };
 
 export interface ViewerSlotValue {
   slot: ViewerSlot;
@@ -49,6 +50,9 @@ export interface ViewerSlotValue {
   openDiff: (presentation: DiffPresentation) => void;
   openDiffFullscreen: () => void;
   openBrowser: () => void;
+  /** Open the process inspector on a single bash handle, addressed by its
+   *  `(scope_key, handle_id)` pair (REQ-PINSP-007). */
+  openInspect: (scopeKey: string, handleId: string) => void;
   close: () => void;
 }
 
@@ -59,6 +63,25 @@ const DIFF_PRESENTATION_PARAM = 'presentation';
 const FILE_PARAM = 'file';
 const ROOT_PARAM = 'root';
 const LINE_PARAM = 'line';
+const SCOPE_PARAM = 'scope';
+const HANDLE_PARAM = 'handle';
+
+/** The full set of slot-owned search params. Every transition clears all of
+ *  them and writes only the ones its kind needs, so a stale param from a prior
+ *  kind can never linger and produce a malformed cross-kind URL. */
+const SLOT_PARAMS = [
+  VIEWER_PARAM,
+  DIFF_PRESENTATION_PARAM,
+  FILE_PARAM,
+  ROOT_PARAM,
+  LINE_PARAM,
+  SCOPE_PARAM,
+  HANDLE_PARAM,
+] as const;
+
+function clearSlotParams(next: URLSearchParams) {
+  for (const p of SLOT_PARAMS) next.delete(p);
+}
 
 /** Sentinel for "no conversation entered yet" — distinct from any slug and from
  *  `undefined` (which is itself a valid scopeKey on the no-conversation route). */
@@ -98,6 +121,12 @@ function deriveSlot(
       return { slot: { kind: 'diff', presentation }, malformed: false };
     case 'browser':
       return { slot: { kind: 'browser' }, malformed: false };
+    case 'inspect': {
+      const scope = searchParams.get(SCOPE_PARAM);
+      const handle = searchParams.get(HANDLE_PARAM);
+      if (!scope || !handle) return { slot: { kind: 'none' }, malformed: true };
+      return { slot: { kind: 'inspect', scopeKey: scope, handleId: handle }, malformed: false };
+    }
     case null:
       return { slot: { kind: 'none' }, malformed: false };
     default:
@@ -158,13 +187,12 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
     (path: string, rootDir: string, options?: OpenFileOptions) => {
       setPatchContext(options?.kind === 'patch' ? options.patchContext : null);
       writeUrl((next) => {
+        clearSlotParams(next);
         next.set(VIEWER_PARAM, 'prose');
-        next.delete(DIFF_PRESENTATION_PARAM);
         next.set(FILE_PARAM, path);
         next.set(ROOT_PARAM, rootDir);
         const lineNumber = options?.kind === 'line' ? validFocusLine(options.lineNumber) : undefined;
         if (lineNumber !== undefined) next.set(LINE_PARAM, String(lineNumber));
-        else next.delete(LINE_PARAM);
       });
     },
     [setPatchContext, writeUrl],
@@ -173,11 +201,9 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   const openDiff = useCallback((presentation: DiffPresentation) => {
     setPatchContext(null);
     writeUrl((next) => {
+      clearSlotParams(next);
       next.set(VIEWER_PARAM, 'diff');
       next.set(DIFF_PRESENTATION_PARAM, presentation);
-      next.delete(FILE_PARAM);
-      next.delete(ROOT_PARAM);
-      next.delete(LINE_PARAM);
     });
   }, [setPatchContext, writeUrl]);
 
@@ -186,11 +212,18 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   const openBrowser = useCallback(() => {
     setPatchContext(null);
     writeUrl((next) => {
+      clearSlotParams(next);
       next.set(VIEWER_PARAM, 'browser');
-      next.delete(DIFF_PRESENTATION_PARAM);
-      next.delete(FILE_PARAM);
-      next.delete(ROOT_PARAM);
-      next.delete(LINE_PARAM);
+    });
+  }, [setPatchContext, writeUrl]);
+
+  const openInspect = useCallback((inspectScopeKey: string, handleId: string) => {
+    setPatchContext(null);
+    writeUrl((next) => {
+      clearSlotParams(next);
+      next.set(VIEWER_PARAM, 'inspect');
+      next.set(SCOPE_PARAM, inspectScopeKey);
+      next.set(HANDLE_PARAM, handleId);
     });
   }, [setPatchContext, writeUrl]);
 
@@ -201,13 +234,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   const clearSlot = useCallback(
     (clearStorage: boolean) => {
       setPatchContext(null);
-      writeUrl((next) => {
-        next.delete(VIEWER_PARAM);
-        next.delete(DIFF_PRESENTATION_PARAM);
-        next.delete(FILE_PARAM);
-        next.delete(ROOT_PARAM);
-        next.delete(LINE_PARAM);
-      });
+      writeUrl(clearSlotParams);
       if (clearStorage && scopeKey) clearLastViewer(scopeKey);
     },
     [setPatchContext, writeUrl, scopeKey],
@@ -219,13 +246,7 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   // file, or an unknown ?viewer= value).
   useEffect(() => {
     if (!malformed) return;
-    writeUrl((next) => {
-      next.delete(VIEWER_PARAM);
-      next.delete(DIFF_PRESENTATION_PARAM);
-      next.delete(FILE_PARAM);
-      next.delete(ROOT_PARAM);
-      next.delete(LINE_PARAM);
-    });
+    writeUrl(clearSlotParams);
   }, [malformed, writeUrl]);
 
   // REQ-VS-014: persist the current viewer URL for this conversation whenever
@@ -291,8 +312,8 @@ export function ViewerSlotProvider({ children, scopeKey, browserSessionActive }:
   }, [scopeKey, browserSessionActive, slotKind, openBrowser, clearSlot]);
 
   const value = useMemo<ViewerSlotValue>(
-    () => ({ slot, browserSessionActive, openProse, openDiff, openDiffFullscreen, openBrowser, close }),
-    [slot, browserSessionActive, openProse, openDiff, openDiffFullscreen, openBrowser, close],
+    () => ({ slot, browserSessionActive, openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, close }),
+    [slot, browserSessionActive, openProse, openDiff, openDiffFullscreen, openBrowser, openInspect, close],
   );
 
   return <ViewerSlotContext.Provider value={value}>{children}</ViewerSlotContext.Provider>;

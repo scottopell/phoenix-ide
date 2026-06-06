@@ -7,8 +7,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
+import { MemoryRouter, Routes, Route } from 'react-router-dom';
 import type { WorkScopeInventory, BashHandleInventory } from '../api';
 import { api } from '../api';
+import { ViewerSlotProvider } from '../contexts/ViewerSlotContext';
 import { hasRunningBash, hasLiveResource } from './workScopeHelpers';
 
 vi.mock('../api', async (importOriginal) => {
@@ -52,12 +54,23 @@ async function renderExpanded(liveInventory?: WorkScopeInventory | null) {
   let utils!: ReturnType<typeof render>;
   await act(async () => {
     utils = render(
-      <WorkScopeSection
-        scopeKey="ws-1"
-        liveInventory={liveInventory}
-        expanded={true}
-        onToggleExpanded={() => {}}
-      />,
+      <MemoryRouter initialEntries={['/c/conv-A']}>
+        <Routes>
+          <Route
+            path="/c/:slug"
+            element={
+              <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
+                <WorkScopeSection
+                  scopeKey="ws-1"
+                  liveInventory={liveInventory}
+                  expanded={true}
+                  onToggleExpanded={() => {}}
+                />
+              </ViewerSlotProvider>
+            }
+          />
+        </Routes>
+      </MemoryRouter>,
     );
   });
   return utils;

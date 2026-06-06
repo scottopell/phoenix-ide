@@ -1,0 +1,358 @@
+/**
+ * ProcessInspectorPanel — the per-handle live drill-down rendered in the
+ * meta-viewer slot's `inspect` kind (specs/process-inspector/, REQ-PINSP-007 /
+ * REQ-PINSP-008).
+ *
+ * Three sections, information-dense (AGENTS.md UI Design Philosophy):
+ *   - an identity/state header (cmd, label, state glyph, pid/pgid while live,
+ *     exit cause when terminal, started/elapsed);
+ *   - a live OUTPUT pane (monospace, line-buffered, autoscroll-with-pause,
+ *     truncation marker on `truncated_before`); and
+ *   - a compact RESOURCE readout (cpu %, proportional memory, process count),
+ *     rendering `—` for a null metric (capability gap) rather than a misleading 0.
+ *
+ * Transport (REQ-PINSP-005 / REQ-PINSP-006): a polling pull view. On open it
+ * seeds with a no-`since` fetch (a recent tail); each subsequent ~1s poll passes
+ * `since = last end_offset` and APPENDS the returned lines, advancing the tracked
+ * offset. Polling stops when the handle is terminal (`tombstoned`) — the final
+ * snapshot is rendered and nothing more can change — or on unmount. There is no
+ * push transport: the output is offset-shaped and the resource sample only makes
+ * sense while a viewer is open.
+ */
+
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { api } from '../api';
+import type { BashHandleInspection, BashHandleState } from '../api';
+import './ProcessInspectorPanel.css';
+
+/** Polling cadence while open on a live handle (REQ-PINSP-006). */
+const POLL_INTERVAL_MS = 1000;
+
+/** A rendered output entry: either a real ring line or a synthetic gap marker
+ *  inserted when a poll reports `truncated_before` (output evicted between
+ *  polls, REQ-PINSP-008). The marker is structurally distinct from a line so it
+ *  can never be confused for process output. */
+type OutputEntry =
+  | { kind: 'line'; offset: number; text: string }
+  | { kind: 'gap'; id: number };
+
+function bashGlyph(state: BashHandleState): { glyph: string; cls: string; title: string } {
+  switch (state) {
+    case 'running':
+      return { glyph: '✓', cls: 'pinsp-glyph--ok', title: 'running' };
+    case 'kill_pending_kernel':
+      return { glyph: '⏱', cls: 'pinsp-glyph--warn', title: 'kill pending (kernel)' };
+    case 'tombstoned':
+      return { glyph: '○', cls: 'pinsp-glyph--muted', title: 'tombstoned' };
+  }
+}
+
+function isTerminal(state: BashHandleState): boolean {
+  return state === 'tombstoned';
+}
+
+function formatDuration(ms: number): string {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ${s % 60}s`;
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+/** Mirror of WorkScopePanel's helper — proportional memory in human units. */
+function formatBytes(n: number): string {
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** A live resource metric rendered as unavailable when null/undefined — a real
+ *  capability gap, not a 0 sample (REQ-PINSP-004 / REQ-PINSP-008). */
+function metric(value: number | null | undefined, render: (v: number) => string): string {
+  return value == null ? '—' : render(value);
+}
+
+/**
+ * Polls one handle's inspection snapshot while open and not terminal.
+ *
+ * Returns the latest full snapshot (identity/state/resources) plus the
+ * accumulated output entries. Output is append-only across polls: the seed
+ * fetch (no `since`) establishes the tail, then each poll passes
+ * `since = end_offset` and appends only the new lines, inserting a gap marker
+ * when a poll reports `truncated_before`.
+ */
+function useHandleInspection(scopeKey: string, handleId: string) {
+  const [snapshot, setSnapshot] = useState<BashHandleInspection | null>(null);
+  const [entries, setEntries] = useState<OutputEntry[]>([]);
+  const [error, setError] = useState(false);
+
+  // Next `since` to request. `undefined` until the seed fetch lands, after
+  // which it tracks the last `end_offset`. Held in a ref so the poll callback
+  // reads the freshest cursor without being re-created each render.
+  const sinceRef = useRef<number | undefined>(undefined);
+  const gapIdRef = useRef(0);
+  // Once the snapshot reports terminal we never poll again (REQ-PINSP-006).
+  const terminalRef = useRef(false);
+
+  const applyResponse = useCallback((insp: BashHandleInspection) => {
+    setError(false);
+    setSnapshot(insp);
+    if (isTerminal(insp.state)) terminalRef.current = true;
+
+    const window = insp.output;
+    const newEntries: OutputEntry[] = [];
+    // A gap means lines were evicted between polls; surface it once, before the
+    // lines from this poll. Only meaningful after the seed (a seed tail
+    // naturally starts mid-stream and is not a gap in the user's view).
+    if (window.truncated_before && sinceRef.current !== undefined) {
+      newEntries.push({ kind: 'gap', id: gapIdRef.current++ });
+    }
+    for (const line of window.lines) {
+      newEntries.push({ kind: 'line', offset: line.offset, text: line.bytes });
+    }
+    sinceRef.current = window.end_offset;
+    if (newEntries.length > 0) {
+      setEntries((prev) => (prev.length === 0 ? newEntries : [...prev, ...newEntries]));
+    }
+  }, []);
+
+  // Seed + reset when the target handle changes.
+  useEffect(() => {
+    let cancelled = false;
+    sinceRef.current = undefined;
+    terminalRef.current = false;
+    gapIdRef.current = 0;
+    setSnapshot(null);
+    setEntries([]);
+    setError(false);
+
+    api
+      .getBashHandleInspection(scopeKey, handleId)
+      .then((insp) => {
+        if (!cancelled) applyResponse(insp);
+      })
+      .catch(() => {
+        if (!cancelled) setError(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [scopeKey, handleId, applyResponse]);
+
+  // Poll loop: ~1s while open and not terminal. Self-limiting — the interval is
+  // cleared on unmount, on handle change, and once the handle goes terminal.
+  // Gating on `snapshot` (re)starts it after the seed lands and lets the
+  // terminal check below short-circuit it.
+  const polling = snapshot != null && !isTerminal(snapshot.state);
+  useEffect(() => {
+    if (!polling) return;
+    let cancelled = false;
+    const id = window.setInterval(() => {
+      if (terminalRef.current) return;
+      api
+        .getBashHandleInspection(scopeKey, handleId, sinceRef.current)
+        .then((insp) => {
+          if (!cancelled) applyResponse(insp);
+        })
+        .catch(() => {
+          if (!cancelled) setError(true);
+        });
+    }, POLL_INTERVAL_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [polling, scopeKey, handleId, applyResponse]);
+
+  return { snapshot, entries, error };
+}
+
+interface ProcessInspectorPanelProps {
+  scopeKey: string;
+  handleId: string;
+  /** Close handler for the header button (REQ-PINSP-007). */
+  onClose?: () => void;
+  /** When true, render with the inline split-pane chrome (no overlay). */
+  inline?: boolean;
+}
+
+export function ProcessInspectorPanel({
+  scopeKey,
+  handleId,
+  onClose,
+  inline,
+}: ProcessInspectorPanelProps) {
+  const { snapshot, entries, error } = useHandleInspection(scopeKey, handleId);
+
+  // Tick once a second so a live handle's elapsed time advances between polls.
+  const [now, setNow] = useState(() => Date.now());
+  const live = snapshot != null && !isTerminal(snapshot.state);
+  useEffect(() => {
+    if (!live) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [live]);
+
+  // Autoscroll-with-pause (REQ-PINSP-008): follow the tail by default; pause
+  // when the user scrolls up; resume when they return to within a small slack
+  // of the bottom.
+  const outputRef = useRef<HTMLDivElement | null>(null);
+  const [following, setFollowing] = useState(true);
+  const followingRef = useRef(true);
+  followingRef.current = following;
+
+  const onScroll = useCallback(() => {
+    const el = outputRef.current;
+    if (!el) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
+    if (atBottom !== followingRef.current) setFollowing(atBottom);
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!following) return;
+    const el = outputRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [entries, following]);
+
+  const glyph = snapshot ? bashGlyph(snapshot.state) : null;
+  const label = snapshot?.label ?? null;
+  const cmd = snapshot?.cmd ?? '';
+  const terminal = snapshot != null && isTerminal(snapshot.state);
+
+  const elapsed = snapshot
+    ? snapshot.duration_ms != null
+      ? formatDuration(snapshot.duration_ms)
+      : formatDuration(Math.max(0, now - Date.parse(snapshot.started_at)))
+    : null;
+
+  const exitCause = (() => {
+    if (!snapshot || !terminal) return null;
+    if (snapshot.signal_number != null) return `signal ${snapshot.signal_number}`;
+    if (snapshot.exit_code != null) return `exit ${snapshot.exit_code}`;
+    return 'ended';
+  })();
+
+  const resources = snapshot?.resources;
+
+  return (
+    <div
+      className={`pinsp-panel${inline ? ' pinsp-panel--inline' : ''}`}
+      data-testid="process-inspector-panel"
+    >
+      <div className="pinsp-header">
+        {glyph && (
+          <span className={`pinsp-glyph ${glyph.cls}`} title={glyph.title} aria-label={glyph.title}>
+            {glyph.glyph}
+          </span>
+        )}
+        <span className="pinsp-title" title={cmd}>
+          {label ?? cmd ?? handleId}
+        </span>
+        {onClose && (
+          <button
+            type="button"
+            className="pinsp-close"
+            onClick={onClose}
+            aria-label="Close process inspector"
+          >
+            ×
+          </button>
+        )}
+      </div>
+
+      {error && !snapshot && (
+        <div className="pinsp-empty pinsp-empty--error">inspection failed to load</div>
+      )}
+      {!error && !snapshot && <div className="pinsp-empty">loading&hellip;</div>}
+
+      {snapshot && (
+        <>
+          <div className="pinsp-identity">
+            <div className="pinsp-id-line">
+              <span className="pinsp-id-key">cmd</span>
+              <span className="pinsp-id-val pinsp-id-val--cmd" title={cmd}>{cmd}</span>
+            </div>
+            {label && (
+              <div className="pinsp-id-line">
+                <span className="pinsp-id-key">label</span>
+                <span className="pinsp-id-val">{label}</span>
+              </div>
+            )}
+            <div className="pinsp-id-line">
+              <span className="pinsp-id-key">id</span>
+              <span className="pinsp-id-val">{snapshot.handle_id}</span>
+            </div>
+            {snapshot.pid != null && (
+              <div className="pinsp-id-line">
+                <span className="pinsp-id-key">pid</span>
+                <span className="pinsp-id-val">
+                  {snapshot.pid}
+                  {snapshot.pgid != null ? ` (pgid ${snapshot.pgid})` : ''}
+                </span>
+              </div>
+            )}
+            {terminal && exitCause && (
+              <div className="pinsp-id-line">
+                <span className="pinsp-id-key">exit</span>
+                <span className="pinsp-id-val">{exitCause}</span>
+              </div>
+            )}
+            <div className="pinsp-id-line">
+              <span className="pinsp-id-key">{terminal ? 'ran for' : 'elapsed'}</span>
+              <span className="pinsp-id-val">{elapsed}</span>
+            </div>
+          </div>
+
+          <div className="pinsp-resources" aria-label="Resource sample">
+            <span className="pinsp-res-item" title="Summed CPU over the process group">
+              <span className="pinsp-res-key">cpu</span>
+              <span className="pinsp-res-val">{metric(resources?.cpu_pct, (v) => `${v.toFixed(1)}%`)}</span>
+            </span>
+            <span className="pinsp-res-item" title="Proportional, shared-aware memory (PSS / phys_footprint)">
+              <span className="pinsp-res-key">mem</span>
+              <span className="pinsp-res-val">{metric(resources?.memory_bytes, formatBytes)}</span>
+            </span>
+            <span className="pinsp-res-item" title="Live processes in the group">
+              <span className="pinsp-res-key">procs</span>
+              <span className="pinsp-res-val">{metric(resources?.process_count, (v) => String(v))}</span>
+            </span>
+            {terminal && <span className="pinsp-res-item pinsp-res-item--muted">no process group</span>}
+          </div>
+
+          <div className="pinsp-output" ref={outputRef} onScroll={onScroll}>
+            {entries.length === 0 ? (
+              <div className="pinsp-output-empty">no output</div>
+            ) : (
+              entries.map((e) =>
+                e.kind === 'gap' ? (
+                  <div key={`gap-${e.id}`} className="pinsp-output-gap">
+                    … output truncated …
+                  </div>
+                ) : (
+                  <div key={`line-${e.offset}`} className="pinsp-output-line">
+                    {e.text}
+                  </div>
+                ),
+              )
+            )}
+          </div>
+          {!following && (
+            <button
+              type="button"
+              className="pinsp-follow-resume"
+              onClick={() => {
+                const el = outputRef.current;
+                if (el) el.scrollTop = el.scrollHeight;
+                setFollowing(true);
+              }}
+            >
+              ↓ Resume autoscroll
+            </button>
+          )}
+        </>
+      )}
+    </div>
+  );
+}

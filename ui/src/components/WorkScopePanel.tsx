@@ -32,6 +32,7 @@ import type {
   BashHandleInventory,
 } from '../api';
 import { isLive, hasLiveResource, workScopeLiveCount } from './workScopeHelpers';
+import { useViewerSlot } from '../contexts/ViewerSlotContext';
 import './WorkScopePanel.css';
 
 /** Cadence of the running-handle inventory poll. `output_bytes` grows
@@ -114,8 +115,19 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function BashRow({ handle, now }: { handle: BashHandleInventory; now: number }) {
+function BashRow({
+  handle,
+  now,
+  scopeKey,
+  inspectable,
+}: {
+  handle: BashHandleInventory;
+  now: number;
+  scopeKey: string;
+  inspectable: boolean;
+}) {
   const [open, setOpen] = useState(false);
+  const { openInspect } = useViewerSlot();
   const { glyph, cls, title } = bashGlyph(handle);
   const live = isLive(handle.state);
   const label = handle.label || handle.cmd;
@@ -157,6 +169,16 @@ function BashRow({ handle, now }: { handle: BashHandleInventory; now: number }) 
             <span className="ws-detail-key">output</span>
             <span className="ws-detail-val">{formatBytes(handle.output_bytes)}</span>
           </div>
+          {inspectable && (
+            <button
+              type="button"
+              className="ws-row-inspect"
+              onClick={() => openInspect(scopeKey, handle.handle_id)}
+              title="Open the process inspector for this handle"
+            >
+              inspect →
+            </button>
+          )}
         </div>
       )}
     </div>
@@ -352,11 +374,19 @@ function WorkScopeBody({
   error,
   now,
   onRetry,
+  scopeKey,
+  inspectable,
 }: {
   inventory: WorkScopeInventory | null;
   error: boolean;
   now: number;
   onRetry: () => void;
+  scopeKey: string;
+  /** Whether bash rows offer the "inspect" affordance. True only on the
+   *  conversation page, where the meta-viewer slot is rendered to host the
+   *  inspector; the chain-page dock has the slot context but no renderer, so
+   *  it omits the affordance rather than write a URL nothing displays. */
+  inspectable: boolean;
 }) {
   return (
     <div className="ws-body">
@@ -376,7 +406,9 @@ function WorkScopeBody({
             {inventory.bash.length === 0 ? (
               <div className="ws-empty">no handles</div>
             ) : (
-              inventory.bash.map((h) => <BashRow key={h.handle_id} handle={h} now={now} />)
+              inventory.bash.map((h) => (
+                <BashRow key={h.handle_id} handle={h} now={now} scopeKey={scopeKey} inspectable={inspectable} />
+              ))
             )}
           </section>
           <section className="ws-section">
@@ -429,7 +461,7 @@ export function WorkScopeSection({ scopeKey, liveInventory, expanded, onToggleEx
         <span className={`ws-count-badge${count > 0 ? ' ws-count-badge--active' : ''}`}>{count}</span>
       </button>
       {expanded && (
-        <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} />
+        <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} scopeKey={scopeKey} inspectable />
       )}
     </div>
   );
@@ -487,7 +519,7 @@ export function WorkScopePanel({ scopeKey, liveInventory, collapsed, onToggle, w
         <span className="ws-title">Work scope</span>
         <span className={`ws-count-badge${count > 0 ? ' ws-count-badge--active' : ''}`}>{count}</span>
       </div>
-      <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} />
+      <WorkScopeBody inventory={inventory} error={error} now={now} onRetry={() => void retry()} scopeKey={scopeKey} inspectable={false} />
     </aside>
   );
 }

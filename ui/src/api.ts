@@ -56,6 +56,11 @@ export type {
   BrowserSessionLiveness,
 } from './generated/sse';
 import type { WorkScopeInventory as WorkScopeInventoryType } from './generated/sse';
+export type { BashHandleInspection } from './generated/BashHandleInspection';
+export type { ResourceSample } from './generated/ResourceSample';
+export type { BashRingWindow } from './generated/BashRingWindow';
+export type { BashRingLine } from './generated/BashRingLine';
+import type { BashHandleInspection as BashHandleInspectionType } from './generated/BashHandleInspection';
 
 export interface Conversation {
   id: string;
@@ -891,6 +896,24 @@ export const api = {
   async getWorkScopeInventory(scopeKey: string): Promise<WorkScopeInventoryType> {
     const resp = await fetch(`/api/work-scope/${encodeURIComponent(scopeKey)}/inventory`);
     if (!resp.ok) throw new Error('Failed to get work-scope inventory');
+    return resp.json();
+  },
+
+  /** One handle's combined inspection snapshot — identity + state, an output
+   *  delta (the ring read), and a live resource sample (REQ-PINSP-005). The
+   *  optional `since` is the prior response's `end_offset`; omitting it returns
+   *  a recent tail (REQ-PINSP-003). The process inspector polls this while open
+   *  on a live handle (REQ-PINSP-006). */
+  async getBashHandleInspection(
+    scopeKey: string,
+    handleId: string,
+    since?: number,
+  ): Promise<BashHandleInspectionType> {
+    const query = since !== undefined ? `?since=${encodeURIComponent(since)}` : '';
+    const resp = await fetch(
+      `/api/work-scope/${encodeURIComponent(scopeKey)}/bash/${encodeURIComponent(handleId)}/inspect${query}`,
+    );
+    if (!resp.ok) throw new Error('Failed to get bash handle inspection');
     return resp.json();
   },
 
