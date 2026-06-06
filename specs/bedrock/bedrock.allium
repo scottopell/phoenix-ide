@@ -212,6 +212,11 @@ variant Parent : Conversation {
     -- top-level Parent, never a sub-agent" guarantee is correct-by-construction rather
     -- than convention. Distinct from `continued_in_conv_id` (chains) and SubAgent.parent
     -- (sub-agents); carries NO lifecycle/notification semantics — no rule keys off it.
+    -- A non-live audit reference, NOT an FK-enforced edge: the origin has an
+    -- independent lifecycle and may be hard-deleted while this fork lives on, so the
+    -- breadcrumb may point at a since-deleted conversation. Deleting the origin neither
+    -- cascades to nor clears this field (the fork survives untouched, REQ-PROJ-035);
+    -- consumers must tolerate a dangling target rather than enforce referential integrity.
     spawned_from_conversation_id: Conversation?
 
     proposal: TaskProposal when parent_status = awaiting_task_approval

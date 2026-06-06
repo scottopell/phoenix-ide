@@ -211,7 +211,12 @@ entity ForkProposal {
     priority: String
     body: String                        -- snapshotted file bytes — authoritative at spawn
     status: pending | spawned | dismissed
-    fork: bedrock/Conversation?         -- the spawned conversation, present iff status = spawned
+    fork: bedrock/Conversation?         -- the spawned conversation, present iff status = spawned.
+                                        -- A non-live audit reference, NOT an FK-enforced edge:
+                                        -- the fork is independent (REQ-PROJ-035) and may be
+                                        -- hard-deleted while this (origin-bound) proposal lives,
+                                        -- so consumers tolerate a reference to a since-deleted
+                                        -- conversation rather than cascading or blocking its delete.
 
     -- The fork base is NOT stored: it is always origin.project.main_ref (the
     -- repository default branch), resolved at approval time (ForkProposalApproved).
@@ -1437,16 +1442,17 @@ invariant OneWorktreePerConversation {
 -- from desired_base_branch or current HEAD, then stored in ConvMode::Work.
 -- No rule updates it after approval.)
 
--- A managed Explore→Work approval always yields a typed taskmd file. A fork
--- (REQ-PROJ-034) is the one exemption: it is Work mode but its brief may be a plain
--- markdown file with no taskmd metadata, so its worktree legitimately has no
--- task_file. Forks are identified structurally by the provenance breadcrumb
--- (spawned_from_conversation_id), so the exemption can't be confused with a
--- non-fork work worktree that simply forgot its task file.
+-- A managed Explore→Work approval always yields a typed taskmd file, and so does a
+-- *taskmd* fork approval (ForkProposalApproved sets Worktree.task_file). The single
+-- exemption is a plain-brief fork (REQ-PROJ-034): Work mode, but seeded from a plain
+-- markdown brief with no taskmd metadata, so its worktree legitimately has none. The
+-- exemption is scoped to exactly that case via `is_plain_brief_fork_worktree`, which
+-- holds iff w's conversation is the fork of a spawned proposal whose brief is not a
+-- taskmd file — so a taskmd fork that lost its task_file, or any non-fork Work
+-- worktree, still violates this.
 invariant TaskFileExistsForManagedWorktrees {
-    for w in Worktrees where w.conversation.mode = work
-                         and w.conversation.spawned_from_conversation_id = absent:
-        exists w.task_file
+    for w in Worktrees where w.conversation.mode = work:
+        exists w.task_file or is_plain_brief_fork_worktree(w)
 }
 
 -- REQ-PROJ-024: Branch mode worktrees never have task files
@@ -1537,9 +1543,15 @@ invariant TerminalActionRequiresNoContinuation {
 -- breadcrumb — never as a sub-agent (it is a top-level Parent) and never as a
 -- chain continuation (the origin's continued_in_conv_id does not point at it).
 -- The breadcrumb carries no behaviour; this invariant pins the decoupling.
+--
+-- Guarded on both rows existing: fork and origin have fully independent lifecycles
+-- (the whole point of the decoupling), so either may be hard-deleted while the other
+-- lives. The breadcrumb is a non-live audit reference (see `fork` / Parent
+-- `spawned_from_conversation_id`), so once a target is deleted this link is vacuous
+-- rather than a dangling-deref violation.
 invariant ForkCarriesOnlyProvenanceLink {
     for p in ForkProposals:
-        p.status = spawned implies
+        p.status = spawned and exists p.fork and exists p.origin implies
             p.fork.spawned_from_conversation_id = p.origin
             and p.fork.kind = Parent
             and p.origin.continued_in_conv_id != p.fork
@@ -1580,7 +1592,9 @@ surface ProjectManagement {
         worktree.base_branch
         conversation.mode
         worktree.is_clean
-        worktree.task_file.status when conversation.mode = work
+        -- Plain-brief forks are Work-mode with no typed task_file (REQ-PROJ-034), so
+        -- gate the status read on its presence — never deref an absent task_file.
+        worktree.task_file.status when conversation.mode = work and exists worktree.task_file
 
     provides:
         UserMarksAsMerged(conversation)

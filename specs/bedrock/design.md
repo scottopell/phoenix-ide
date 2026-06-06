@@ -494,11 +494,15 @@ are mutually exclusive on `mode`:
 LlmRequesting + LlmResponse(propose_task), mode = explore
     → AwaitingTaskApproval                (parks; see above)
 
-LlmRequesting + LlmResponse(propose_task), mode in { work, branch, direct }
+LlmRequesting + LlmResponse(propose_task),
+    mode = work | branch | (direct AND working_dir is inside a git repo)
     → LlmRequesting                       (does NOT park)
     Effects: PersistCheckpoint(ToolRound with a synthetic success ack),
              RecordForkProposal, LlmRequestDispatched
     Note: must be the only tool call; the conversation continues its own work.
+          Direct is admitted ONLY when git-backed (REQ-PROJ-036): a fork cuts from the
+          repository default branch, so propose_task is absent from a Direct-not-in-a-repo
+          tool registry and never reaches this arm (mirrors the Allium git guard).
 ```
 
 The fork proposal is a content snapshot (the drafted file's bytes plus display fields and
