@@ -480,7 +480,12 @@ async fn run_run(
             Ok((handle, child)) => {
                 let inserted = handles.insert(handle.clone());
                 drop(handles);
-                start_io_tasks(&inserted, child);
+                // Spawn edge: a new bash handle exists for this scope. Emit a
+                // work-scope state-transition signal (REQ-WSUI-007). The
+                // detached waiter started below carries the sink so it can
+                // emit the terminal edge off-thread.
+                registry.emit_lifecycle(&ctx.work_scope);
+                start_io_tasks(&inserted, child, registry.lifecycle_sink());
                 race_run_response(inserted, cmd, wait_seconds, read_args, ctx).await
             }
             Err(e) => {
@@ -566,7 +571,11 @@ fn spawn_child(
     Ok((handle, child))
 }
 
-fn start_io_tasks(handle: &Arc<Handle>, mut child: tokio::process::Child) {
+fn start_io_tasks(
+    handle: &Arc<Handle>,
+    mut child: tokio::process::Child,
+    lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
+) {
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
@@ -592,7 +601,7 @@ fn start_io_tasks(handle: &Arc<Handle>, mut child: tokio::process::Child) {
     // Waiter task: call wait(), drain readers, then demote the handle.
     let h = handle.clone();
     tokio::spawn(async move {
-        run_waiter(h, child, stdout_join, stderr_join).await;
+        run_waiter(h, child, stdout_join, stderr_join, lifecycle_sink).await;
     });
 }
 
@@ -643,6 +652,7 @@ async fn run_waiter(
     mut child: tokio::process::Child,
     stdout_join: Option<tokio::task::JoinHandle<()>>,
     stderr_join: Option<tokio::task::JoinHandle<()>>,
+    lifecycle_sink: Option<crate::bash::registry::BashLifecycleSink>,
 ) {
     let panic_guard = ExitWatchPanicGuard::new(handle.clone());
     let started_at = Instant::now();
@@ -677,6 +687,21 @@ async fn run_waiter(
         .await
     {
         handle.publish_exit(ExitState::Exited);
+        // Terminal edge: the handle just demoted to tombstoned. Emit the
+        // work-scope state-transition signal (REQ-WSUI-007). Guarded by the
+        // `transition_to_terminal` return so a redundant late transition does
+        // not double-emit. Best-effort: a closed sink is logged by the bridge.
+        if let Some(sink) = &lifecycle_sink {
+            if let Err(e) = sink.send(crate::bash::registry::BashLifecycleEvent {
+                work_scope: handle.work_scope.clone(),
+            }) {
+                tracing::debug!(
+                    work_scope = %handle.work_scope,
+                    error = %e,
+                    "dropping bash terminal lifecycle event — sink closed"
+                );
+            }
+        }
     }
     panic_guard.disarm();
 }
@@ -866,6 +891,10 @@ async fn run_kill(handle_id: &str, signal: KillSignal, ctx: &ToolContext) -> Too
             handle
                 .mark_kill_pending_kernel(signal, SystemTime::now())
                 .await;
+            // Kill edge: the handle moved running -> kill_pending_kernel, a
+            // state the inventory reflects (REQ-WSUI-007). Emit now; the
+            // later tombstone transition emits again from the waiter.
+            ctx.bash_handle_registry().emit_lifecycle(&ctx.work_scope);
             shape_handle_response(
                 &handle,
                 &ReadArgs::default(),

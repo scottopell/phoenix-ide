@@ -168,6 +168,23 @@ impl WorkScopeHandles {
     }
 }
 
+/// Signal published when a bash handle in a `WorkScope` changes state
+/// (spawned, transitioned to terminal, or killed). Mirrors the browser
+/// `BrowserSessionLifecycleEvent` shape: it carries only the affected
+/// `WorkScope`, leaving inventory assembly and conversation routing to the
+/// runtime's work-scope bridge. State transitions only — NOT per output line
+/// (REQ-WSUI-007).
+#[derive(Debug, Clone)]
+pub struct BashLifecycleEvent {
+    pub work_scope: WorkScope,
+}
+
+/// Sink the registry publishes [`BashLifecycleEvent`]s into. A bounded `mpsc`
+/// keeps the registry decoupled from per-conversation routing (the runtime
+/// owns that). `None` for tool-level tests that don't care about the push
+/// path.
+pub type BashLifecycleSink = tokio::sync::mpsc::UnboundedSender<BashLifecycleEvent>;
+
 /// Top-level registry: maps `WorkScope` -> per-`WorkScope` handle table.
 ///
 /// One registry instance per Phoenix process. Owned by the runtime layer
@@ -184,16 +201,36 @@ pub struct BashHandleRegistry {
     /// Per-`WorkScope` live-handle cap. Defaults to [`LIVE_HANDLE_CAP`];
     /// tests override to small values to exercise rejection.
     live_handle_cap: usize,
+    /// Optional sink for bash state-transition signals (spawn / terminal /
+    /// kill). Populated by `RuntimeManager::new` so transitions flow into the
+    /// work-scope push bridge; `None` for tool-level tests. Mirrors
+    /// `BrowserSessionManager::lifecycle_sink`.
+    lifecycle_sink: Option<BashLifecycleSink>,
 }
 
 impl BashHandleRegistry {
-    /// Create a registry with default caps.
+    /// Create a registry with default caps and no lifecycle sink.
     #[must_use]
     pub fn new() -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
             ring_bytes_cap: RING_BUFFER_BYTES,
             live_handle_cap: LIVE_HANDLE_CAP,
+            lifecycle_sink: None,
+        }
+    }
+
+    /// Create a registry that publishes bash state-transition signals into
+    /// `sink`. The runtime wires this to the work-scope push bridge, which
+    /// resolves the scope's conversation and broadcasts a `WorkScopeUpdate`.
+    /// Mirrors `BrowserSessionManager::with_lifecycle_sink`.
+    #[must_use]
+    pub fn with_lifecycle_sink(sink: Option<BashLifecycleSink>) -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            ring_bytes_cap: RING_BUFFER_BYTES,
+            live_handle_cap: LIVE_HANDLE_CAP,
+            lifecycle_sink: sink,
         }
     }
 
@@ -204,7 +241,36 @@ impl BashHandleRegistry {
             inner: RwLock::new(HashMap::new()),
             ring_bytes_cap,
             live_handle_cap,
+            lifecycle_sink: None,
         }
+    }
+
+    /// Publish a bash state-transition signal for `work_scope` if a sink is
+    /// wired. Best-effort: a dropped receiver / closed channel is logged at
+    /// `debug` (capability gap) and does not affect handle correctness.
+    /// Mirrors `BrowserSessionManager::emit_lifecycle`.
+    pub fn emit_lifecycle(&self, work_scope: &WorkScope) {
+        let Some(sink) = self.lifecycle_sink.as_ref() else {
+            return;
+        };
+        let event = BashLifecycleEvent {
+            work_scope: work_scope.clone(),
+        };
+        if let Err(e) = sink.send(event) {
+            tracing::debug!(
+                work_scope = %work_scope,
+                error = %e,
+                "dropping bash lifecycle event — sink closed"
+            );
+        }
+    }
+
+    /// Clone the lifecycle sink, if any. Used to hand the sink to the
+    /// detached waiter task so the transition-to-terminal edge (which fires
+    /// off-thread, long after the spawning tool call returns) can emit.
+    #[must_use]
+    pub fn lifecycle_sink(&self) -> Option<BashLifecycleSink> {
+        self.lifecycle_sink.clone()
     }
 
     /// Configured ring byte cap for live handles in this registry.
@@ -429,6 +495,33 @@ mod tests {
             12345,
             ring_bytes_cap,
         )
+    }
+
+    /// REQ-WSUI-007: `emit_lifecycle` publishes a `BashLifecycleEvent`
+    /// carrying the affected scope when a sink is wired, and is a no-op
+    /// (no panic, no phantom event) when it is not. Mirrors the browser
+    /// manager's `emit_lifecycle_round_trips_through_sink`.
+    #[tokio::test]
+    async fn emit_lifecycle_round_trips_through_sink() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = BashHandleRegistry::with_lifecycle_sink(Some(tx));
+        let a = scope("conv-A");
+        let b = scope("conv-B");
+        registry.emit_lifecycle(&a);
+        registry.emit_lifecycle(&b);
+
+        let e1 = rx.try_recv().expect("first event missing");
+        assert_eq!(e1.work_scope, a);
+        let e2 = rx.try_recv().expect("second event missing");
+        assert_eq!(e2.work_scope, b);
+        assert!(rx.try_recv().is_err(), "no more events expected");
+    }
+
+    #[tokio::test]
+    async fn emit_lifecycle_without_sink_is_no_op() {
+        let registry = BashHandleRegistry::new();
+        registry.emit_lifecycle(&scope("conv-X"));
+        assert!(registry.lifecycle_sink().is_none());
     }
 
     #[tokio::test]

@@ -385,6 +385,15 @@ pub enum SseWireEvent {
         sequence_id: i64,
         snapshot: crate::llm::QuotaDetails,
     },
+    /// A work-affine resource in this conversation's `WorkScope` changed
+    /// state. Carries the full refreshed `WorkScopeInventory` snapshot
+    /// (REQ-WSUI-007) — not a delta. `WorkScopeInventory` derives `ts_rs::TS`
+    /// in `phoenix-core`, so it is referenced directly here (like
+    /// `QuotaDetails` on `RateLimitSnapshot`) and emitted to the generated TS.
+    WorkScopeUpdate {
+        sequence_id: i64,
+        inventory: phoenix_core::domain::work_scope_inventory::WorkScopeInventory,
+    },
 }
 
 impl SseWireEvent {
@@ -407,6 +416,7 @@ impl SseWireEvent {
             SseWireEvent::BrowserSessionState { .. } => "browser_session_state",
             SseWireEvent::SteerMessageQueued { .. } => "steer_message_queued",
             SseWireEvent::RateLimitSnapshot { .. } => "rate_limit_snapshot",
+            SseWireEvent::WorkScopeUpdate { .. } => "work_scope_update",
         }
     }
 }
@@ -564,6 +574,13 @@ impl From<SseEvent> for SseWireEvent {
             } => SseWireEvent::RateLimitSnapshot {
                 sequence_id,
                 snapshot,
+            },
+            SseEvent::WorkScopeUpdate {
+                sequence_id,
+                inventory,
+            } => SseWireEvent::WorkScopeUpdate {
+                sequence_id,
+                inventory,
             },
         }
     }

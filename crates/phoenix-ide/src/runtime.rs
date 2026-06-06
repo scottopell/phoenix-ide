@@ -23,7 +23,10 @@ pub use traits::*;
 use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
 use crate::tools::browser::session::BrowserSessionLifecycleEvent;
-use crate::tools::{BashHandleRegistry, BrowserSessionManager, TmuxRegistry, ToolRegistry};
+use crate::tools::{
+    BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, TmuxRegistry, ToolRegistry,
+};
+use phoenix_core::work_scope::WorkScope;
 
 /// Type alias for production runtime with concrete implementations
 pub type ProductionRuntime =
@@ -139,6 +142,19 @@ pub struct RuntimeManager {
     /// task that resolves `conversation_id` to its `SseBroadcaster` and
     /// broadcasts [`SseEvent::BrowserSessionState`].
     browser_lifecycle_rx: RwLock<Option<mpsc::UnboundedReceiver<BrowserSessionLifecycleEvent>>>,
+    /// Receiver for bash state-transition signals (spawn / terminal / kill).
+    /// Taken once by [`RuntimeManager::start_work_scope_bridge`], which
+    /// assembles the affected scope's inventory and broadcasts
+    /// [`SseEvent::WorkScopeUpdate`] (REQ-WSUI-007).
+    bash_lifecycle_rx: RwLock<Option<mpsc::UnboundedReceiver<BashLifecycleEvent>>>,
+    /// Sender the browser lifecycle bridge forwards a `WorkScope` into after
+    /// it broadcasts a `BrowserSessionState` edge, so the work-scope bridge
+    /// also emits a `WorkScopeUpdate` for that scope (REQ-WSUI-007: a browser
+    /// liveness edge is a work-scope change). Reuses the browser bridge's
+    /// scope resolution rather than introducing a second mechanism.
+    work_scope_browser_tx: mpsc::UnboundedSender<WorkScope>,
+    /// Matching receiver, taken once by `start_work_scope_bridge`.
+    work_scope_browser_rx: RwLock<Option<mpsc::UnboundedReceiver<WorkScope>>>,
 }
 
 /// Handle to interact with a running conversation
@@ -882,6 +898,16 @@ pub enum SseEvent {
         sequence_id: i64,
         snapshot: crate::llm::QuotaDetails,
     },
+    /// A work-affine resource in this conversation's `WorkScope` changed
+    /// state (bash handle spawned / went terminal / was killed, or a browser
+    /// session crossed a liveness edge). Carries the full refreshed
+    /// `WorkScopeInventory` snapshot — not a delta (REQ-WSUI-007) — assembled
+    /// from the live registries by the work-scope bridge. The UI panel
+    /// updates from this without re-polling the pull endpoint.
+    WorkScopeUpdate {
+        sequence_id: i64,
+        inventory: phoenix_core::domain::work_scope_inventory::WorkScopeInventory,
+    },
 }
 
 /// Pick the tool registry for a sub-agent runtime on (re-)creation from
@@ -919,6 +945,14 @@ impl RuntimeManager {
         // drop edges and desync the UI's "session live" indicator. The
         // matching `Receiver` is consumed by `start_browser_lifecycle_bridge`.
         let (browser_lifecycle_tx, browser_lifecycle_rx) = mpsc::unbounded_channel();
+        // Bash state-transition channel (spawn / terminal / kill). Unbounded
+        // for the same reason as the browser channel: dropping an edge would
+        // desync the work-scope panel's view of the scope's resources.
+        let (bash_lifecycle_tx, bash_lifecycle_rx) = mpsc::unbounded_channel();
+        // Browser-edge → work-scope forward channel. The browser lifecycle
+        // bridge sends the affected scope here after broadcasting its own
+        // edge, so the work-scope bridge re-broadcasts a `WorkScopeUpdate`.
+        let (work_scope_browser_tx, work_scope_browser_rx) = mpsc::unbounded_channel();
         Self {
             db,
             llm_registry,
@@ -926,7 +960,9 @@ impl RuntimeManager {
             browser_sessions: BrowserSessionManager::with_lifecycle_sink(Some(
                 browser_lifecycle_tx,
             )),
-            bash_handles: Arc::new(BashHandleRegistry::new()),
+            bash_handles: Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(
+                bash_lifecycle_tx,
+            ))),
             tmux_registry: Arc::new(TmuxRegistry::new()),
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
@@ -941,6 +977,9 @@ impl RuntimeManager {
             handoff_rx: RwLock::new(Some(handoff_rx)),
             credential_helper,
             browser_lifecycle_rx: RwLock::new(Some(browser_lifecycle_rx)),
+            bash_lifecycle_rx: RwLock::new(Some(bash_lifecycle_rx)),
+            work_scope_browser_tx,
+            work_scope_browser_rx: RwLock::new(Some(work_scope_browser_rx)),
         }
     }
 
@@ -1049,9 +1088,115 @@ impl RuntimeManager {
                         "dropping browser session lifecycle event — no live runtime handle on scope"
                     );
                 }
+
+                // A browser liveness edge is also a work-scope change
+                // (REQ-WSUI-007). Forward the scope to the work-scope bridge
+                // so it re-broadcasts a `WorkScopeUpdate` carrying the full
+                // refreshed inventory. Reuses this bridge's scope resolution
+                // rather than re-deriving it. Best-effort: a closed channel
+                // (bridge not started) is logged at debug.
+                if let Err(e) = manager.work_scope_browser_tx.send(work_scope.clone()) {
+                    tracing::debug!(
+                        work_scope = %work_scope,
+                        error = %e,
+                        "dropping work-scope forward of browser edge — channel closed"
+                    );
+                }
             }
             tracing::info!("Browser lifecycle bridge stopped");
         });
+    }
+
+    /// Start the bridge that turns bash state-transition signals and
+    /// forwarded browser liveness edges into per-conversation
+    /// `WorkScopeUpdate` broadcasts (REQ-WSUI-007 / REQ-WSUI-008). Must be
+    /// called once after `RuntimeManager::new`; a double call is a no-op.
+    ///
+    /// On each signal for `WorkScope` W it assembles W's full inventory from
+    /// the three live registries (the same `assemble_inventory` the pull
+    /// endpoint uses) and broadcasts it to W's conversation(s) using the
+    /// identical scope-resolution the browser lifecycle bridge applies:
+    /// enumerate live runtime handles, resolve each conversation's scope via
+    /// `WorkScope::resolve`, match against W. REQ-PROJ-025 guarantees at most
+    /// one non-terminal conversation per scope, so this lands on the one live
+    /// member.
+    pub async fn start_work_scope_bridge(self: &Arc<Self>) {
+        let bash_rx = self.bash_lifecycle_rx.write().await.take();
+        let browser_rx = self.work_scope_browser_rx.write().await.take();
+        let (Some(mut bash_rx), Some(mut browser_rx)) = (bash_rx, browser_rx) else {
+            tracing::debug!("work-scope bridge already started; skipping");
+            return;
+        };
+        let manager = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                let work_scope = tokio::select! {
+                    Some(event) = bash_rx.recv() => event.work_scope,
+                    Some(scope) = browser_rx.recv() => scope,
+                    else => break,
+                };
+                manager.broadcast_work_scope_update(&work_scope).await;
+            }
+            tracing::info!("Work-scope bridge stopped");
+        });
+    }
+
+    /// Assemble `work_scope`'s inventory and broadcast a `WorkScopeUpdate` to
+    /// every live runtime handle whose conversation resolves to it. Factored
+    /// out of [`Self::start_work_scope_bridge`] so the bash and browser signal
+    /// arms share one routing path.
+    pub(crate) async fn broadcast_work_scope_update(self: &Arc<Self>, work_scope: &WorkScope) {
+        let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
+            work_scope,
+            self.bash_handles(),
+            self.tmux_registry(),
+            self.browser_sessions(),
+        )
+        .await;
+
+        // Same resolution as the browser lifecycle bridge: enumerate live
+        // runtime handles, resolve each conversation's scope, match.
+        let conv_ids: Vec<String> = {
+            let runtimes = self.runtimes.read().await;
+            runtimes.keys().cloned().collect()
+        };
+
+        let mut delivered = 0usize;
+        for conv_id in conv_ids {
+            let Ok(conv) = self.db().get_conversation(&conv_id).await else {
+                continue;
+            };
+            let conv_scope = crate::work_scope::WorkScope::resolve(
+                &conv.id,
+                conv.conv_mode.worktree_path().map(std::path::Path::new),
+            );
+            if &conv_scope != work_scope {
+                continue;
+            }
+            let broadcaster = {
+                let runtimes = self.runtimes.read().await;
+                runtimes.get(&conv_id).map(|h| h.broadcast_tx.clone())
+            };
+            let Some(broadcaster) = broadcaster else {
+                continue;
+            };
+            if broadcaster
+                .send_seq(|seq| SseEvent::WorkScopeUpdate {
+                    sequence_id: seq,
+                    inventory: inventory.clone(),
+                })
+                .is_ok()
+            {
+                delivered += 1;
+            }
+        }
+
+        if delivered == 0 {
+            tracing::debug!(
+                work_scope = %work_scope,
+                "dropping work-scope update — no live runtime handle on scope"
+            );
+        }
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests

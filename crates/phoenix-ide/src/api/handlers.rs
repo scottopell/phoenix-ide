@@ -4781,6 +4781,74 @@ mod hard_delete_cascade_tests {
         assert!(matches!(err, AppError::BadRequest(_)));
     }
 
+    /// REQ-WSUI-007 / REQ-WSUI-008: a work-scope change for a scope with a
+    /// live runtime handle broadcasts a `WorkScopeUpdate` carrying the full
+    /// refreshed inventory to that conversation's SSE stream. Mirrors
+    /// `broadcasts_hard_deleted_event_to_existing_subscribers` — exercises the
+    /// bridge's assemble + scope-routed broadcast directly via
+    /// `broadcast_work_scope_update`, the path both the bash and browser
+    /// signal arms funnel through.
+    #[tokio::test]
+    async fn work_scope_update_broadcast_carries_inventory_for_live_bash_handle() {
+        use phoenix_core::domain::work_scope_inventory::BashHandleState;
+        use phoenix_tools::bash::handle::{Handle, HandleId};
+        use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
+
+        let state = make_test_state().await;
+        state
+            .db
+            .create_conversation("c-ws", "test", "/tmp", true, None, None)
+            .await
+            .expect("create");
+
+        // A Direct-mode conversation resolves to WorkScope::Conversation(id).
+        let scope = crate::work_scope::WorkScope::Conversation("c-ws".to_string());
+
+        // Insert a live bash handle into the scope's registry table so the
+        // assembled inventory has something to report.
+        let table = state.runtime.bash_handles().get_or_create(&scope).await;
+        table.write().await.insert(Handle::new_live(
+            scope.clone(),
+            HandleId::new("b-1"),
+            "npm run dev".into(),
+            Some("dev".into()),
+            4321,
+            1234,
+            RING_BUFFER_BYTES,
+        ));
+
+        // Force a runtime handle (so a broadcaster exists) and subscribe
+        // before the bridge fires.
+        let mut rx = state.runtime.subscribe("c-ws").await.expect("subscribe");
+
+        state.runtime.broadcast_work_scope_update(&scope).await;
+
+        let mut saw_update = false;
+        while let Ok(event) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {
+            match event {
+                Ok(SseEvent::WorkScopeUpdate { inventory, .. }) => {
+                    assert_eq!(inventory.scope_key, scope.stable_key());
+                    assert_eq!(inventory.bash.len(), 1);
+                    let h = &inventory.bash[0];
+                    assert_eq!(h.handle_id, "b-1");
+                    assert_eq!(h.label.as_deref(), Some("dev"));
+                    assert_eq!(h.state, BashHandleState::Running);
+                    assert_eq!(h.pid, Some(1234));
+                    saw_update = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(
+            saw_update,
+            "WorkScopeUpdate SSE event must be broadcast to the scope's conversation"
+        );
+    }
+
     #[tokio::test]
     async fn sse_init_db_read_after_replay_snapshot_covers_persist_between_old_reads() {
         let state = make_test_state().await;

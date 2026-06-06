@@ -3,6 +3,7 @@ import type { ErrorPresentation } from "./ErrorPresentation";
 import type { LlmAttemptReason } from "./LlmAttemptReason";
 import type { QuotaDetails } from "./QuotaDetails";
 import type { SseBreadcrumb } from "./SseBreadcrumb";
+import type { WorkScopeInventory } from "./WorkScopeInventory";
 
 /**
  * Wire-format `SseEvent`. Single source of truth for what each variant looks
@@ -95,4 +96,4 @@ error: unknown, } | { "type": "conversation_hard_deleted", sequence_id: number, 
 /**
  * Zero-based position in the steering queue.
  */
-queue_position: number, } | { "type": "rate_limit_snapshot", sequence_id: number, snapshot: QuotaDetails, };
+queue_position: number, } | { "type": "rate_limit_snapshot", sequence_id: number, snapshot: QuotaDetails, } | { "type": "work_scope_update", sequence_id: number, inventory: WorkScopeInventory, };

@@ -302,6 +302,14 @@ mod tests {
                 "sequence_id": sequence_id,
                 "snapshot": snapshot,
             }),
+            SseEvent::WorkScopeUpdate {
+                sequence_id,
+                inventory,
+            } => json!({
+                "type": "work_scope_update",
+                "sequence_id": sequence_id,
+                "inventory": inventory,
+            }),
         }
     }
 
@@ -798,6 +806,38 @@ mod tests {
         assert_parity(&event);
         let typed = typed_sse_event_to_value(&event);
         assert_eq!(typed["active"], false);
+    }
+
+    #[test]
+    fn parity_work_scope_update() {
+        use phoenix_core::domain::work_scope_inventory::{
+            BashHandleInventory, BashHandleState, WorkScopeInventory,
+        };
+        let event = SseEvent::WorkScopeUpdate {
+            sequence_id: 31,
+            inventory: WorkScopeInventory {
+                scope_key: "conversation:conv-1".to_string(),
+                bash: vec![BashHandleInventory {
+                    handle_id: "b-1".to_string(),
+                    label: Some("dev".to_string()),
+                    cmd: "npm run dev".to_string(),
+                    state: BashHandleState::Running,
+                    pid: Some(1234),
+                    pgid: Some(4321),
+                    started_at: ts(),
+                    duration_ms: None,
+                    ring_bytes_used: Some(42),
+                }],
+                tmux: None,
+                browser: None,
+            },
+        };
+        assert_parity(&event);
+        let typed = typed_sse_event_to_value(&event);
+        assert_eq!(typed["type"], "work_scope_update");
+        assert_eq!(typed["sequence_id"], 31);
+        assert_eq!(typed["inventory"]["scope_key"], "conversation:conv-1");
+        assert_eq!(typed["inventory"]["bash"][0]["handle_id"], "b-1");
     }
 
     #[test]

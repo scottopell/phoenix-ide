@@ -42,6 +42,15 @@ export type { QuotaDetails } from './QuotaDetails';
 export type { RateLimitWindow } from './RateLimitWindow';
 export type { CreditsSnapshot } from './CreditsSnapshot';
 
+// Work-scope observability inventory types (REQ-WSUI-007).
+export type { WorkScopeInventory } from './WorkScopeInventory';
+export type { BashHandleInventory } from './BashHandleInventory';
+export type { BashHandleState } from './BashHandleState';
+export type { TmuxInventory } from './TmuxInventory';
+export type { TmuxServerStatus } from './TmuxServerStatus';
+export type { BrowserInventory } from './BrowserInventory';
+export type { BrowserSessionLiveness } from './BrowserSessionLiveness';
+
 import type { SseWireEvent } from './SseWireEvent';
 import type { ChainSseWireEvent } from './ChainSseWireEvent';
 
@@ -96,6 +105,10 @@ export type SseSteerMessageQueuedData = Omit<
 >;
 export type SseRateLimitSnapshotData = Omit<
   Extract<SseWireEvent, { type: 'rate_limit_snapshot' }>,
+  'type'
+>;
+export type SseWorkScopeUpdateData = Omit<
+  Extract<SseWireEvent, { type: 'work_scope_update' }>,
   'type'
 >;
 

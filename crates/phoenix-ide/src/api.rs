@@ -76,6 +76,7 @@ impl AppState {
         ));
         runtime.start_sub_agent_handler().await;
         runtime.start_browser_lifecycle_bridge().await;
+        runtime.start_work_scope_bridge().await;
         handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
         // Chain Q&A is constructed last so it can share the same `Database`

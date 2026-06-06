@@ -44,6 +44,8 @@ import type {
   SseSteerMessageQueuedData as WireSteerMessageQueuedData,
   ErrorPresentation as WireErrorPresentation,
   SseRateLimitSnapshotData as WireRateLimitSnapshotData,
+  SseWorkScopeUpdateData as WireWorkScopeUpdateData,
+  WorkScopeInventory as WireWorkScopeInventory,
   QuotaDetails as WireQuotaDetails,
   RateLimitWindow as WireRateLimitWindow,
   CreditsSnapshot as WireCreditsSnapshot,
@@ -413,6 +415,27 @@ export const SseRateLimitSnapshotDataSchema = v.looseObject({
   snapshot: QuotaDetailsSchema,
 }) satisfies v.GenericSchema<unknown, WireRateLimitSnapshotData>;
 
+/** `work_scope_update`: full refreshed `WorkScopeInventory` snapshot pushed
+ *  when a bash handle or browser session in the scope changes state
+ *  (REQ-WSUI-007). We validate the load-bearing `sequence_id` (the field the
+ *  reducer's `applyIfNewer` total order depends on) and carry the `inventory`
+ *  body through as trusted wire data — the Rust-side `WorkScopeInventory` is
+ *  the structural source of truth, mirrored by the generated TS type. The
+ *  `satisfies` binding still lights up a tsc error if the Rust event reshapes
+ *  its envelope. */
+export const SseWorkScopeUpdateDataSchema = v.pipe(
+  v.looseObject({
+    sequence_id: v.number(),
+    inventory: v.unknown(),
+  }),
+  v.transform(
+    (obj): WireWorkScopeUpdateData => ({
+      sequence_id: obj.sequence_id,
+      inventory: obj.inventory as WireWorkScopeInventory,
+    }),
+  ),
+) satisfies v.GenericSchema<unknown, WireWorkScopeUpdateData>;
+
 // ---------------------------------------------------------------------------
 // Chain Q&A wire-event schemas (Phoenix Chains v1, REQ-CHN-004 / 005).
 //
@@ -476,6 +499,7 @@ export type SseBrowserSessionStateData = v.InferOutput<
 >;
 export type SseSteerMessageQueuedData = v.InferOutput<typeof SseSteerMessageQueuedDataSchema>;
 export type SseRateLimitSnapshotData = v.InferOutput<typeof SseRateLimitSnapshotDataSchema>;
+export type SseWorkScopeUpdateData = v.InferOutput<typeof SseWorkScopeUpdateDataSchema>;
 export type QuotaDetails = v.InferOutput<typeof QuotaDetailsSchema>;
 export type RateLimitWindow = v.InferOutput<typeof RateLimitWindowSchema>;
 export type CreditsSnapshot = v.InferOutput<typeof CreditsSnapshotSchema>;
