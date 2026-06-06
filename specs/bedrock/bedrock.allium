@@ -176,6 +176,14 @@ entity Conversation {
     -- (see TerminalActionRequiresNoContinuation in projects).
     continued_in_conv_id: Conversation?
 
+    -- Provenance breadcrumb for a fork (projects/ ForkProposalApproved). Points
+    -- at the conversation whose agent proposed this one. Distinct from
+    -- `continued_in_conv_id` (chains) and from SubAgent.parent (sub-agents): it
+    -- carries NO lifecycle or notification semantics — no rule keys behaviour off
+    -- it — and exists only for UI/audit. A fork is a top-level Parent, never a
+    -- sub-agent or a continuation of its origin.
+    spawned_from_conversation_id: Conversation?
+
     -- True iff at least one SSE subscriber is currently listening.
     -- Pollers gate on this to avoid waking the runtime for nobody —
     -- behavioural, not just an optimisation: when no clients are
@@ -527,22 +535,53 @@ rule ParentLlmRespondsTextOnly {
     ensures: AgentDone(conversation)
 }
 
--- REQ-BED-028: propose_task interception (parent-only, managed mode only)
+-- REQ-BED-028, REQ-PROJ-003: propose_task interception in Explore — the
+-- in-place Explore->Work gateway. Parks the conversation for human review.
 rule ProposeTaskIntercepted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
-    requires: conversation.mode_kind = managed
+    requires: conversation.mode = explore
     let proposal = parse_task_proposal(tool_calls.first)
     ensures: conversation.parent_status = awaiting_task_approval
     ensures: conversation.proposal = proposal
     ensures: TaskApprovalRequested(conversation, proposal)
 
     @guidance
-        -- Mode guard: propose_task is rejected in Direct and Branch modes.
-        -- The tool registry should prevent it, but the transition function
-        -- guards defensively with mode_kind != managed -> Error.
+        -- Explore is the only mode whose propose_task parks: Explore exists to
+        -- become the proposed task. In the writing modes (work/branch/direct)
+        -- propose_task is a non-blocking fork instead (ForkProposalIntercepted).
+}
+
+-- REQ-PROJ-033/036: propose_task in a writing mode (Work, Branch, or
+-- Direct-in-a-git-repo) is a *fork proposal*. Unlike Explore, it does NOT park:
+-- the conversation records the proposal, gets a synthetic success ack, and
+-- continues its own work. The proposal's lifecycle (review, spawn, dismiss) is
+-- owned by projects/ and never feeds back into this conversation's context.
+rule ForkProposalIntercepted {
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: tool_calls.count = 1
+    requires: tool_calls.first.name = "propose_task"
+    requires: conversation.mode in { work, branch, direct }
+    let proposal = parse_fork_proposal(tool_calls.first)
+    ensures: conversation.core_status = llm_requesting
+    ensures: conversation.retry_attempt = 1
+    ensures: ToolRoundCheckpointed(conversation)
+    ensures: ForkProposalRecorded(conversation, proposal)
+    ensures: LlmRequestDispatched(conversation)
+
+    @guidance
+        -- Non-parking: parent_status is untouched; the conversation stays in its
+        -- ordinary core_status flow. The synthetic ToolResult is a success ack
+        -- ("Fork proposal recorded — pending review"), which is fine to feed the
+        -- model; the proposal's *resolution* (spawned/dismissed) is deliberately
+        -- never delivered here (projects/ ForkProposalApproved/Dismissed), so the
+        -- spawner learns nothing about what it spawned (REQ-PROJ-035).
+        -- Direct fires here only when the working dir is a git repo: tool
+        -- availability gates it (a fork needs a base branch), so propose_task is
+        -- absent from a Direct-not-in-a-repo registry and never reaches this rule.
 }
 
 rule AskUserQuestionIntercepted {
@@ -710,6 +749,13 @@ rule CancelDuringTaskApproval {
     ensures: conversation.core_status = idle
     ensures: AgentDone(conversation)
 }
+
+-- REQ-PROJ-034/035: a *fork* proposal (ForkProposalIntercepted) is resolved
+-- entirely in projects/ (ForkProposalApproved / ForkProposalDismissed) and
+-- produces NO transition on the originating conversation — bedrock has no
+-- resolution rule here. This is the structural difference from
+-- UserApprovesTaskFreshWorkConversation, which sets the predecessor to
+-- handed_off: the fork's origin keeps running, untouched, and is never notified.
 
 -- ===========================================================
 -- PARENT 6. USER QUESTION RESPONSE

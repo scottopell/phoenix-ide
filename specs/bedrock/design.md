@@ -438,7 +438,7 @@ requiring every state variant to carry mode.
 |------|---------|------|
 | `patch` | Disabled | Enabled (worktree only) |
 | `bash` | Allowed (read-only enforced) | Allowed (write in worktree) |
-| `propose_task` | Allowed (intercepted, not executed) | Disabled |
+| `propose_task` | Allowed — Explore→Work gateway, parks (intercepted, not executed) | Allowed — fork proposal, non-blocking (REQ-PROJ-033) |
 | `think`, `keyword_search`, `read_image`, `browser_*` | Allowed | Allowed |
 
 ## Task Approval State (REQ-BED-028, REQ-PROJ-003, REQ-PROJ-004)
@@ -483,6 +483,31 @@ AwaitingTaskApproval + Rejected → Idle (mode stays Explore)
 On server restart with a conversation in `AwaitingTaskApproval`: restore state from the
 serialized `ConvState` column; the UI re-opens the task-approval reader on reconnect
 from the conversation state payload (there is no dedicated SSE event).
+
+### Fork Proposal Interception — Non-Parking (REQ-PROJ-033)
+
+In a writing mode (Work, Branch, or Direct-in-a-git-repo) `propose_task` is intercepted
+as a **fork proposal** rather than the Explore parking gateway. The two interception arms
+are mutually exclusive on `mode`:
+
+```
+LlmRequesting + LlmResponse(propose_task), mode = explore
+    → AwaitingTaskApproval                (parks; see above)
+
+LlmRequesting + LlmResponse(propose_task), mode in { work, branch, direct }
+    → LlmRequesting                       (does NOT park)
+    Effects: PersistCheckpoint(ToolRound with a synthetic success ack),
+             RecordForkProposal, LlmRequestDispatched
+    Note: must be the only tool call; the conversation continues its own work.
+```
+
+The fork proposal is a content snapshot (the drafted file's bytes plus display fields and
+the resolved fork base), recorded for asynchronous review. Its lifecycle — review, spawn,
+dismiss — is owned by the projects layer (`specs/projects/` REQ-PROJ-034/035) and runs off
+the originating conversation's state machine entirely: there is no resolution transition
+here, and the resolution is never fed back into this conversation's LLM context. That
+absence is the decoupling — contrast the Explore fresh-handoff approval, which moves the
+predecessor to `HandedOff`. A fork's origin is untouched and uninformed by construction.
 
 ## Task Resolution: Mark as Merged and Abandon (REQ-BED-029, REQ-PROJ-010/026/027)
 

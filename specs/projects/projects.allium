@@ -8,6 +8,7 @@
 --           branch discovery, task approval, worktree lifecycle,
 --           task file lifecycle, mark-as-merged flow, abandon flow,
 --           write scoping, sub-agent worktree inheritance,
+--           task forks (decoupled spawn from a writing mode),
 --           server restart worktree reconciliation
 -- Excludes:
 --   - Conversation state machine (see bedrock.allium)
@@ -24,7 +25,7 @@
 --   (see bedrock.allium task 02668 for spec alignment).
 --
 -- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-029
--- (2 descoped: REQ-PROJ-009, REQ-PROJ-015)
+-- (2 descoped: REQ-PROJ-009, REQ-PROJ-015) plus REQ-PROJ-033..036 (task forks)
 
 use "./bedrock.allium" as bedrock
 
@@ -173,6 +174,34 @@ entity Worktree {
 
     -- Derived
     is_clean: git_status_clean(path)
+}
+
+-- A fork proposal: a writing-mode agent's hand-off of a self-contained unit of
+-- work to a new, independent conversation (REQ-PROJ-033). Created when bedrock
+-- intercepts propose_task in a writing mode (bedrock/ForkProposalIntercepted)
+-- emits ForkProposalRecorded — the agent keeps running; the proposal is recorded
+-- here, bound to the originating conversation, and reviewed asynchronously.
+--
+-- Bound to origin: a ForkProposal exists only as an artifact of its origin
+-- conversation and does not survive that conversation's termination. Its
+-- resolution (pending -> spawned | dismissed) is control-plane state, never part
+-- of the origin's LLM transcript (REQ-PROJ-035) — a resolution the origin's agent
+-- could read would itself be a forbidden lifecycle notification.
+entity ForkProposal {
+    origin: bedrock/Conversation        -- the conversation whose agent proposed it
+    task_file: String                   -- path the agent drafted (display / provenance)
+    title: String
+    priority: String
+    body: String                        -- snapshotted file bytes — authoritative at spawn
+    base_branch: String                 -- fork base: origin's base_branch, or repo default for direct
+    status: pending | spawned | dismissed
+    fork: bedrock/Conversation?         -- the spawned conversation, present iff status = spawned
+
+    transitions status {
+        pending -> spawned
+        pending -> dismissed
+        terminal: spawned, dismissed
+    }
 }
 
 ------------------------------------------------------------
@@ -571,6 +600,113 @@ rule TaskApprovalFreshHandoffExecuted {
 -- branch and the agent can revise it (UserProvidesFeedback) or the user
 -- can reject. This spec emits no rule for those events — bedrock handles
 -- the state transitions and there are no git side-effects.
+
+-- ===========================================================
+-- 3b. TASK FORKS (REQ-PROJ-033, 034, 035, 036)
+-- ===========================================================
+
+-- REQ-PROJ-033: bedrock intercepts propose_task in a writing mode (non-parking)
+-- and emits ForkProposalRecorded. This rule materialises the bound proposal in
+-- `pending`. No git operations yet — the spawn happens only on approval.
+rule ForkProposalCreated {
+    when: ForkProposalRecorded(origin, proposal)
+
+    ensures: ForkProposal.created(
+        origin: origin,
+        task_file: proposal.task_file,
+        title: proposal.title,
+        priority: proposal.priority,
+        body: proposal.body,
+        base_branch: proposal.base_branch,
+        status: pending,
+        fork: absent
+    )
+
+    @guidance
+        -- The originating conversation is unaffected: bedrock returned it to its
+        -- running flow. The proposal surfaces in that conversation's tool output
+        -- with a Review affordance while status = pending.
+}
+
+-- REQ-PROJ-034/035: user approves a pending fork proposal. A fresh top-level
+-- Work conversation is created in its own worktree off the base branch (NOT the
+-- origin's HEAD), the snapshot is written and committed on the fork's task
+-- branch, and the only link back to the origin is the provenance breadcrumb.
+-- The origin's row is neither read nor written.
+--
+-- Models the taskmd-filename case (the default). Plain-markdown briefs differ
+-- exactly as in TaskApprovalExecuted: branch `task-{sanitized-stem}-{fork-id-prefix}`
+-- (the *fork's* id uniquifies), no status rename, file committed at its own path,
+-- recorded task_id = the stem.
+rule ForkProposalApproved {
+    when: UserApprovesForkProposal(proposal)
+
+    requires: proposal.status = pending
+
+    let task_id = parse_task_id(proposal.task_file)
+    let slug = parse_slug(proposal.task_file)
+    let branch_name = "task-" + task_id + "-" + slug
+    let fork = proposal.fork
+
+    -- Single-branch fetch of the fork base, best-effort (REQ-PROJ-022).
+    ensures: BestEffortFetch(proposal.origin.project.repo, proposal.base_branch)
+
+    -- A fresh, independent conversation — created through the top-level
+    -- conversation path, never the sub-agent path (no parent event channel).
+    ensures: ForkConversationCreated(proposal, fork)
+    ensures: fork.kind = Parent
+    ensures: fork.mode = work
+    ensures: fork.task_id = task_id
+    ensures: fork.spawned_from_conversation_id = proposal.origin
+
+    -- Its own worktree, cut from the base branch (not the origin's HEAD).
+    ensures: Worktree.created(
+        conversation: fork,
+        project: proposal.origin.project,
+        path: WorktreePath { absolute_path: worktree_path(fork) },
+        branch_name: branch_name,
+        base_branch: proposal.base_branch,
+        task_file: TaskFile{task_id: task_id}
+    )
+    ensures: TaskFileCommittedOnBranch(Worktree{conversation: fork}, task_id)
+
+    -- Resolve the proposal.
+    ensures: proposal.fork = fork
+    ensures: proposal.status = spawned
+
+    @guidance
+        -- Sequence (under the same process-global approval mutex as
+        -- TaskApprovalExecuted, so concurrent spawns don't race on names):
+        --   1. Resolve fork base: origin.base_branch (work/branch) or the repo
+        --      default branch (direct-in-git). Single-branch best-effort fetch.
+        --   2. `git worktree add -b <branch> <fork-worktree> <base>` — a NEW
+        --      worktree at .phoenix/worktrees/{fork-id}, off the base branch.
+        --   3. Write proposal.body into the worktree (taskmd file under the tasks
+        --      dir; plain brief at its own path), `git add` + `git commit` on the
+        --      task branch (never on base).
+        --   4. Persist the fork as a top-level Work conversation: conv_mode Work,
+        --      spawned_from_conversation_id = origin, seed first message ("You are
+        --      working on task {title}. You are on branch task-{task_id}-{slug}.")
+        --      — it inherits none of the origin's transcript.
+        --   5. Mark the proposal spawned { fork }.
+        --
+        -- The origin's row is never touched: no continued_in_conv_id, no
+        -- parent_status change, no sub-agent linkage (contrast
+        -- TaskApprovalFreshHandoffExecuted, which sets handed_off and links
+        -- continued_in_conv_id). Branching off the base keeps the fork's diff
+        -- independent of the origin's in-progress work (REQ-PROJ-034).
+}
+
+-- REQ-PROJ-034: user dismisses a pending fork proposal. Nothing is spawned; the
+-- origin is unaffected.
+rule ForkProposalDismissed {
+    when: UserDismissesForkProposal(proposal)
+
+    requires: proposal.status = pending
+
+    ensures: proposal.status = dismissed
+    ensures: proposal.fork = absent
+}
 
 -- ===========================================================
 -- 4. TERMINAL ACTIONS (REQ-PROJ-026, REQ-PROJ-027)
@@ -1247,6 +1383,25 @@ invariant TerminalActionRequiresNoContinuation {
         UserMarksAsMerged(c) implies c.continued_in_conv_id = absent
 }
 
+-- REQ-PROJ-035: a spawned fork links to its origin only through the provenance
+-- breadcrumb — never as a sub-agent (it is a top-level Parent) and never as a
+-- chain continuation (the origin's continued_in_conv_id does not point at it).
+-- The breadcrumb carries no behaviour; this invariant pins the decoupling.
+invariant ForkCarriesOnlyProvenanceLink {
+    for p in ForkProposals:
+        p.status = spawned implies
+            p.fork.spawned_from_conversation_id = p.origin
+            and p.fork.kind = Parent
+            and p.origin.continued_in_conv_id != p.fork
+}
+
+-- REQ-PROJ-035: a fork proposal is an artifact of its origin (bound to origin),
+-- referencing a live conversation — not a free-floating queue item that outlives it.
+invariant ForkProposalBoundToOrigin {
+    for p in ForkProposals:
+        exists Conversation{id: p.origin.id}
+}
+
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
@@ -1273,6 +1428,33 @@ surface ProjectManagement {
     @guarantee NonFatalBookkeeping
         -- Task file status updates are best-effort. If they fail,
         -- the completion/abandonment still proceeds. Failures are logged.
+}
+
+-- REQ-PROJ-034: the asynchronous review of a pending fork proposal. Surfaced in
+-- the originating conversation's tool output; the user opens the same full-screen
+-- task-review interface as Explore approvals to read the snapshot and decide.
+surface ForkProposalReview {
+    facing: bedrock/User
+
+    context proposal: ForkProposal
+        where status = pending
+
+    exposes:
+        proposal.title
+        proposal.priority
+        proposal.body
+        proposal.base_branch
+        proposal.origin
+
+    provides:
+        UserApprovesForkProposal(proposal)
+        UserDismissesForkProposal(proposal)
+
+    @guarantee OriginUnaffectedByReview
+        -- Reviewing, approving, or dismissing a fork proposal never transitions
+        -- the originating conversation and is never delivered to its agent
+        -- (REQ-PROJ-035). Approval spawns an independent conversation; dismissal
+        -- spawns nothing. Either way the origin keeps running, uninformed.
 }
 
 surface BranchPicker {
