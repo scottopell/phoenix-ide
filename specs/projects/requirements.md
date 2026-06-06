@@ -990,9 +990,9 @@ approvals (REQ-PROJ-004) to read the snapshot and Approve or Dismiss it (address
 `proposal_id`)
 AND the user's decision arrives asynchronously — the originating conversation does not
 wait on it and is unaffected by it
-AND once the proposal is resolved (spawned or dismissed) the Review affordance is
-withdrawn — a resolved proposal is no longer surfaced for review (it cannot be
-re-approved; the resolution is recorded once, idempotently)
+AND once the proposal is resolved (`spawned`, `dismissed`, or `promoted` — REQ-PROJ-037)
+the Review affordance is withdrawn — a resolved proposal is no longer surfaced for review (it
+cannot be re-approved, re-dismissed, or re-promoted; the resolution is recorded once, idempotently)
 
 WHEN the originating conversation reaches any terminal state — `is_terminal` per the
 bedrock model, i.e. terminal (abandoned / merged), context-exhausted, or handed-off — with

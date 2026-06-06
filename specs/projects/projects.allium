@@ -818,13 +818,16 @@ rule ForkProposalApproved {
     @guidance
         -- Sequence (under the same process-global approval mutex as
         -- TaskApprovalExecuted, so concurrent spawns don't race on names):
-        --   0. Derive the fork conversation id DETERMINISTICALLY from proposal.id (the
-        --      DURABLE retry identity). Its worktree path .phoenix/worktrees/{fork-id} is
-        --      therefore recomputable, so after an interruption a retry recognises an
-        --      orphaned branch as this proposal's own — even for a taskmd fork whose branch
-        --      name is otherwise generic — WITHOUT writing the spawned-only `fork` field
-        --      early (the field stays present-iff-spawned; the in-flight identity is the
-        --      deterministic id, not an overloaded resolution field).
+        --   0. Derive the fork conversation id DETERMINISTICALLY from (proposal.id, `spawn`)
+        --      — namespaced by RESOLUTION KIND so the approval and Request-Changes promotion
+        --      recovery paths are disjoint: an interrupted promotion's orphan lives at the
+        --      `promote` namespace, so a later Approve on the still-`pending` proposal never
+        --      adopts an Explore refinement as a Work fork. Its worktree path
+        --      .phoenix/worktrees/{fork-id} is recomputable, so after an interruption a retry
+        --      recognises an orphaned branch as this proposal's own — even for a taskmd fork
+        --      whose branch name is otherwise generic — WITHOUT writing the spawned-only
+        --      `fork` field early (the field stays present-iff-spawned; the in-flight identity
+        --      is the deterministic id, not an overloaded resolution field).
         --   1. base = origin.project.main_ref (repository default branch, the same
         --      for every origin mode). Materialize it (cf. MaterializeBranch,
         --      REQ-PROJ-022): single-branch fetch, then fast-forward the local ref
@@ -905,6 +908,13 @@ rule ForkProposalPromotedToExplore {
     ensures: refinement.kind = Parent
     ensures: refinement.mode = explore
     ensures: refinement.spawned_from_conversation_id = proposal.origin
+    -- The Explore-mode worktree fields are set on the conversation row itself (not only on
+    -- the Worktree entity), as ForkProposalApproved does for the fork, so callers reading
+    -- conv mode/cwd directly run tools and navigate in the refinement's own worktree.
+    ensures: refinement.worktree_path = worktree_path(refinement)
+    ensures: refinement.branch_name = explore_temp_branch(refinement)
+    ensures: refinement.base_branch = base
+    ensures: refinement.working_dir = worktree_path(refinement)
     -- Materialize the default-branch base before the worktree add — mirrors
     -- ForkProposalApproved exactly (main_ref may be remote-only or stale locally, and the
     -- owned-environments rule forbids moving a refs/heads/* ref checked out in any worktree).
@@ -950,11 +960,15 @@ rule ForkProposalPromotedToExplore {
         -- proposal and no link back to the origin.
         --
         -- Crash recovery / "promotes exactly once": the refinement conversation id is
-        -- derived DETERMINISTICALLY from proposal.id, so its worktree path
-        -- .phoenix/worktrees/{refinement-id} is recomputable on retry without an early write
-        -- to the promoted-only `refinement` field. If a crash interrupts after the Explore
-        -- worktree is created but before `status = promoted` is persisted, re-driving under
-        -- the mutex recognises and ADOPTS the orphaned worktree at that deterministic path
+        -- derived DETERMINISTICALLY from (proposal.id, `promote`) — namespaced by RESOLUTION
+        -- KIND, disjoint from ForkProposalApproved's (proposal.id, `spawn`) namespace, so an
+        -- interrupted promotion (worktree created, status still `pending`) and a later Approve
+        -- can never recompute the same path: Approve looks under `spawn`, this orphan lives
+        -- under `promote`. Its worktree path .phoenix/worktrees/{refinement-id} is recomputable
+        -- on retry without an early write to the promoted-only `refinement` field. If a crash
+        -- interrupts after the Explore worktree is created but before `status = promoted` is
+        -- persisted, re-driving under the mutex recognises and ADOPTS the orphaned worktree at
+        -- that deterministic path
         -- rather than allocating a second refinement — converging on a single
         -- `promoted { refinement }` outcome. (Same durable-identity boundary as
         -- ForkProposalApproved; neither overloads the resolution field for in-flight state.)
@@ -1586,21 +1600,23 @@ invariant TaskFileExistsForManagedWorktrees {
         exists w.task_file or exists w.plain_brief_path
 }
 
--- plain_brief_path is not a free-floating flag: it exists ONLY on a plain-brief fork
--- worktree (Work mode, a fork — spawned_from set — with no taskmd task_file). Combined with
--- TaskFileExistsForManagedWorktrees (a Work worktree has task_file OR plain_brief_path), this
--- forces **exactly one** of the two on a Work worktree and makes the field unrepresentable
--- elsewhere — so it can't be sprinkled onto a taskmd worktree (which has a task_file) to
--- suppress its status, nor onto a Branch/Explore worktree.
+-- plain_brief_path is not a free-floating flag: it exists ONLY on a Work worktree whose
+-- brief is a plain (non-taskmd) markdown file — whether that worktree is a fork
+-- (ForkProposalApproved) or an ordinary Explore→Work plain-brief approval (REQ-PROJ-006),
+-- neither of which has a taskmd task_file. Combined with TaskFileExistsForManagedWorktrees
+-- (a Work worktree has task_file OR plain_brief_path), this forces **exactly one** of the
+-- two on a Work worktree and makes the field unrepresentable elsewhere — so it can't be
+-- sprinkled onto a taskmd worktree (which has a task_file) to suppress its status, nor onto
+-- a Branch/Explore-temp worktree. It deliberately does NOT require fork provenance, since a
+-- plain-brief Work conversation can arise without a fork.
 invariant PlainBriefPathIsExclusiveForkMarker {
     for w in Worktrees:
         exists w.plain_brief_path implies
             w.conversation.mode = work
             and not exists w.task_file
-            and w.conversation.spawned_from_conversation_id != absent
-            -- The marked path must itself be a *plain* (non-taskmd) brief, so a taskmd fork
-            -- that lost its typed task_file cannot point plain_brief_path at a taskmd path to
-            -- forge the exemption — the marker is structurally limited to genuine plain briefs.
+            -- The marked path must itself be a *plain* (non-taskmd) brief, so a taskmd Work
+            -- worktree that lost its typed task_file cannot point plain_brief_path at a taskmd
+            -- path to forge the exemption — structurally limited to genuine plain briefs.
             and not is_taskmd_file(w.plain_brief_path)
 }
 
