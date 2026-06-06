@@ -1,5 +1,5 @@
 import { act, fireEvent, render, screen, within } from '@testing-library/react';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { BreadcrumbBar } from './BreadcrumbBar';
 import { calcTooltipPosition } from './breadcrumbTooltipPosition';
 import type { Breadcrumb } from '../types';
@@ -16,6 +16,10 @@ const breadcrumbs: Breadcrumb[] = [
 ];
 
 describe('BreadcrumbBar', () => {
+  afterEach(() => {
+    document.querySelectorAll('#messages').forEach((el) => el.remove());
+  });
+
   it('uses accessible labels instead of native title tooltips', () => {
     render(<BreadcrumbBar breadcrumbs={breadcrumbs} visible />);
 
@@ -120,6 +124,87 @@ describe('BreadcrumbBar', () => {
         vi.advanceTimersByTime(120);
       });
       expect(scroller.scrollTop).toBe(76);
+    } finally {
+      Element.prototype.scrollIntoView = originalScrollIntoView;
+      vi.useRealTimers();
+    }
+  });
+
+  it('cancels stale breadcrumb offset retries after a newer click', () => {
+    vi.useFakeTimers();
+    const originalScrollIntoView = Element.prototype.scrollIntoView;
+    Element.prototype.scrollIntoView = vi.fn();
+    try {
+      const scroller = document.createElement('div');
+      scroller.id = 'messages';
+      scroller.scrollTop = 100;
+      scroller.getBoundingClientRect = () => ({
+        left: 0,
+        right: 800,
+        top: 36,
+        bottom: 600,
+        width: 800,
+        height: 564,
+        x: 0,
+        y: 36,
+        toJSON: () => ({}),
+      } as DOMRect);
+      document.body.append(scroller);
+
+      const firstTarget = document.createElement('div');
+      firstTarget.dataset['sequenceId'] = '1';
+      firstTarget.getBoundingClientRect = () => ({
+        left: 0,
+        right: 800,
+        top: 20 + (100 - scroller.scrollTop),
+        bottom: 80 + (100 - scroller.scrollTop),
+        width: 800,
+        height: 60,
+        x: 0,
+        y: 20 + (100 - scroller.scrollTop),
+        toJSON: () => ({}),
+      } as DOMRect);
+      scroller.append(firstTarget);
+
+      const secondTarget = document.createElement('div');
+      secondTarget.dataset['sequenceId'] = '2';
+      secondTarget.getBoundingClientRect = () => ({
+        left: 0,
+        right: 800,
+        top: 25 + (100 - scroller.scrollTop),
+        bottom: 85 + (100 - scroller.scrollTop),
+        width: 800,
+        height: 60,
+        x: 0,
+        y: 25 + (100 - scroller.scrollTop),
+        toJSON: () => ({}),
+      } as DOMRect);
+      scroller.append(secondTarget);
+
+      render(<BreadcrumbBar breadcrumbs={breadcrumbs} visible />);
+      const bar = document.querySelector<HTMLElement>('#breadcrumb-bar')!;
+      bar.getBoundingClientRect = () => ({
+        left: 0,
+        right: 800,
+        top: 0,
+        bottom: 36,
+        width: 800,
+        height: 36,
+        x: 0,
+        y: 0,
+        toJSON: () => ({}),
+      } as DOMRect);
+
+      fireEvent.click(screen.getByLabelText('User: Your message'));
+      act(() => {
+        vi.advanceTimersByTime(60);
+      });
+      fireEvent.click(screen.getByLabelText('bash: Running a tool'));
+
+      act(() => {
+        vi.advanceTimersByTime(601);
+      });
+      expect(scroller.scrollTop).toBe(81);
     } finally {
       Element.prototype.scrollIntoView = originalScrollIntoView;
       vi.useRealTimers();

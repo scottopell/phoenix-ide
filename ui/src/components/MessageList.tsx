@@ -494,7 +494,14 @@ function MessageListImpl({
   // row exists, after the scroll settles. `data-render-unit-key` is stamped on
   // every virtuoso row wrapper (see `itemContent`).
   const pendingPulseKeyRef = useRef<string | null>(null);
+  const activeJumpKeyRef = useRef<string | null>(null);
+  const jumpRetryTimersRef = useRef<number[]>([]);
   const pulseTimersRef = useRef<number[]>([]);
+
+  const clearJumpRetryTimers = useCallback(() => {
+    jumpRetryTimersRef.current.forEach((t) => clearTimeout(t));
+    jumpRetryTimersRef.current.length = 0;
+  }, []);
 
   const findRowByKey = useCallback((key: string): Element | null => {
     const scroller = scrollerRef.current;
@@ -535,15 +542,19 @@ function MessageListImpl({
   }, [findRowByKey]);
 
   useEffect(() => {
-    const timers = pulseTimersRef.current;
+    const pulseTimers = pulseTimersRef.current;
+    const jumpRetryTimers = jumpRetryTimersRef.current;
     return () => {
-      timers.forEach((t) => clearTimeout(t));
+      pulseTimers.forEach((t) => clearTimeout(t));
+      jumpRetryTimers.forEach((t) => clearTimeout(t));
     };
   }, []);
 
   const scrollToUnitIndex = useCallback((unitIndex: number) => {
     const unit = historicalUnits[unitIndex];
     if (!unit) return;
+    clearJumpRetryTimers();
+    activeJumpKeyRef.current = unit.key;
     pendingPulseKeyRef.current = unit.key;
     virtuosoRef.current?.scrollToIndex({
       index: unitIndex,
@@ -555,12 +566,13 @@ function MessageListImpl({
     // and the final mounted position is nudged below the nav strip if needed.
     [120, 320, 600].forEach((delay) => {
       const t = window.setTimeout(() => {
+        if (activeJumpKeyRef.current !== unit.key) return;
         correctPendingJumpOffset(unit.key);
         applyPendingPulse();
       }, delay);
-      pulseTimersRef.current.push(t);
+      jumpRetryTimersRef.current.push(t);
     });
-  }, [historicalUnits, correctPendingJumpOffset, applyPendingPulse]);
+  }, [historicalUnits, clearJumpRetryTimers, correctPendingJumpOffset, applyPendingPulse]);
 
   useImperativeHandle(ref, () => ({ scrollToUnitIndex }), [scrollToUnitIndex]);
 

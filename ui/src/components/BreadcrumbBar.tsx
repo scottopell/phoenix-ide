@@ -14,6 +14,15 @@ const BREADCRUMB_TITLES: Record<string, string> = {
   subagents: 'Running sub-agents in parallel',
 };
 
+const correctionDelays = [120, 320, 600] as const;
+let activeBreadcrumbTarget: Element | null = null;
+let breadcrumbCorrectionTimers: number[] = [];
+
+function clearBreadcrumbCorrectionTimers() {
+  breadcrumbCorrectionTimers.forEach((t) => clearTimeout(t));
+  breadcrumbCorrectionTimers = [];
+}
+
 // Module-level so it's a stable reference (not a useMemo dependency). Pure:
 // reads only the DOM and its argument.
 function jumpToBreadcrumb(b: Breadcrumb) {
@@ -21,12 +30,18 @@ function jumpToBreadcrumb(b: Breadcrumb) {
 
   const el = document.querySelector(`[data-sequence-id="${b.sequenceId}"]`);
   if (el) {
+    clearBreadcrumbCorrectionTimers();
+    activeBreadcrumbTarget = el;
     el.scrollIntoView({ behavior: 'smooth', block: 'center' });
     const correctOffset = () => {
+      if (activeBreadcrumbTarget !== el) return;
       const scroller = findMessageScroller();
       if (scroller) ensureTargetTopVisible(el, scroller);
     };
-    [120, 320, 600].forEach((delay) => window.setTimeout(correctOffset, delay));
+    correctionDelays.forEach((delay) => {
+      const t = window.setTimeout(correctOffset, delay);
+      breadcrumbCorrectionTimers.push(t);
+    });
     // Add brief highlight
     el.classList.add('breadcrumb-highlight');
     setTimeout(() => el.classList.remove('breadcrumb-highlight'), 1500);
