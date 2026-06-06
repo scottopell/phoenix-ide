@@ -385,10 +385,12 @@ ForkProposal {
 The fork base is not snapshotted: it is always the project's `main_ref` (the repository
 default branch — REQ-PROJ-034a), resolved at approval time, never from the origin. The
 file bytes are snapshotted because the fork runs in a worktree off `main_ref` (below) that
-will not contain the originating worktree's copy of the file. The agent's drafted file is
-**removed from the origin worktree** at snapshot time (atomically with recording the
-proposal), so the shed task never lands in the origin's own commit/PR; the fork commits its
-own copy from `body`.
+will not contain the originating worktree's copy of the file. If the agent's drafted file is an **untracked,
+newly-created draft**, it is removed from the origin worktree at snapshot time (atomically
+with recording the proposal) so the shed task never lands in the origin's own commit/PR; a
+**pre-existing tracked** file the agent proposed from is left untouched (deleting it would add
+a spurious unrelated deletion to the origin's branch). Either way the fork commits its own
+copy from `body`.
 
 #### Proposal resolution is control-plane, never agent-facing
 

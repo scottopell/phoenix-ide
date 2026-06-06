@@ -598,10 +598,15 @@ rule ForkProposalIntercepted {
     -- reads; a crash between the two would otherwise promise a proposal that doesn't exist.
     -- (One postcondition, not two independently dispatchable effects.)
     ensures: ForkProposalPersisted(conversation, proposal)
-    -- Shed the brief: remove the agent's drafted file from the origin worktree as part of the
-    -- same interception, so the fork's (unrelated) task never folds into the origin's own
-    -- diff/PR (REQ-PROJ-033). The fork holds the authoritative copy in the snapshot body.
-    ensures: OriginDraftRemoved(conversation, proposal)
+    -- Shed the brief, but only an UNTRACKED draft: if the referenced file is a newly-created
+    -- untracked draft, remove it from the origin worktree in the same interception so the
+    -- fork's (unrelated) task never folds into the origin's own diff/PR (REQ-PROJ-033). A
+    -- pre-existing tracked file the agent proposed from is left untouched — deleting it would
+    -- add a spurious unrelated deletion to the origin's branch. The fork holds the
+    -- authoritative copy in the snapshot body regardless.
+    ensures:
+        if origin_draft_is_untracked(conversation, proposal):
+            OriginDraftRemoved(conversation, proposal)
     ensures: LlmRequestDispatched(conversation)
 
     @guidance

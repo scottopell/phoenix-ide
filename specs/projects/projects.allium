@@ -566,18 +566,25 @@ rule TaskApprovalExecuted {
     -- holds `task_file` plus display copies of title/priority/body).
     -- For a taskmd filename, Phoenix allocates no ID — the metadata lives in
     -- the filename and the executor parses id/priority/status/slug back out.
-    let task_id = parse_task_id(conversation.proposal.task_file)
-    let slug = parse_slug(conversation.proposal.task_file)
-    let branch_name = "task-" + task_id + "-" + slug
+    -- Input-agnostic derivation (taskmd vs plain brief — REQ-PROJ-006), mirroring
+    -- ForkProposalApproved: taskmd parses id/slug and branches task-{id}-{slug}; a plain
+    -- brief uses the sanitized stem and branches task-{stem}-{conv-id-prefix}.
+    let task_id = approval_task_id(conversation.proposal.task_file)
+    let branch_name = approval_branch_name(conversation.proposal.task_file, conversation)
 
     -- Rename the temporary branch to the final task branch name (in place).
     ensures: worktree.branch_name = branch_name
 
-    -- The worktree now has a task file; its status is in-progress and it is
-    -- committed on the task branch (never on main / base_branch).
-    ensures: worktree.task_file = TaskFile{task_id: task_id}
-    ensures: worktree.task_file.status = in_progress
-    ensures: TaskFileCommittedOnBranch(worktree, task_id)
+    -- The committed brief splits by shape — TaskFile is the taskmd-only entity, never
+    -- synthesized for a plain brief, which records plain_brief_path instead (exactly as a
+    -- plain-brief fork does). Both land committed on the task branch (never on base).
+    ensures:
+        if is_taskmd_file(conversation.proposal.task_file):
+            worktree.task_file = TaskFile{task_id: task_id, status: in_progress}
+            and TaskFileCommittedOnBranch(worktree, task_id)
+        else:
+            worktree.plain_brief_path = conversation.proposal.task_file
+            and BriefCommittedOnBranch(worktree, conversation.proposal.task_file, conversation.proposal.body)
 
     -- Mode transition to Work
     ensures: conversation.branch_name = branch_name
@@ -629,13 +636,20 @@ rule TaskApprovalFreshHandoffExecuted {
     requires: decision = approved_start_fresh
 
     let worktree = Worktree{conversation: conversation}
-    let task_id = parse_task_id(conversation.proposal.task_file)
-    let slug = parse_slug(conversation.proposal.task_file)
-    let branch_name = "task-" + task_id + "-" + slug
+    let task_id = approval_task_id(conversation.proposal.task_file)
+    let branch_name = approval_branch_name(conversation.proposal.task_file, conversation)
     let successor = conversation.continued_in_conv_id
 
     ensures: worktree.branch_name = branch_name
-    ensures: TaskFileCommittedOnBranch(worktree, task_id)
+    -- Same taskmd-vs-plain split as TaskApprovalExecuted — TaskFile is never synthesized for
+    -- a plain brief; the successor's worktree records plain_brief_path instead.
+    ensures:
+        if is_taskmd_file(conversation.proposal.task_file):
+            worktree.task_file = TaskFile{task_id: task_id, status: in_progress}
+            and TaskFileCommittedOnBranch(worktree, task_id)
+        else:
+            worktree.plain_brief_path = conversation.proposal.task_file
+            and BriefCommittedOnBranch(worktree, conversation.proposal.task_file, conversation.proposal.body)
     ensures: FreshWorkConversationCreated(conversation, successor)
     ensures: successor.mode = work
     ensures: successor.worktree_path = conversation.worktree_path
@@ -878,6 +892,13 @@ rule ForkProposalDismissed {
 
     requires: proposal.status = pending
 
+    -- Defensive cleanup before terminally resolving: an earlier approve or Request-Changes
+    -- attempt on this still-`pending` proposal may have crashed after creating its
+    -- deterministic worktree/branch (.phoenix/worktrees/{proposal.id, spawn|promote}) but
+    -- before recording `spawned`/`promoted`. Dismiss removes any such orphan under both
+    -- resolution namespaces first, so a terminal `dismissed` can't leak a worktree/branch or
+    -- leave a deterministic path that later collides.
+    ensures: DeterministicForkOrphansCleaned(proposal)
     ensures: proposal.status = dismissed
     ensures: proposal.fork = absent
 }
@@ -932,6 +953,10 @@ rule ForkProposalPromotedToExplore {
         else if not exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
                 and not exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
             error("Fork base branch '" + base + "' not found locally or at origin")
+    -- Cut the temp branch from the freshest non-mutating base — origin/<base> when the fetch
+    -- succeeded, else the local refs/heads/<base> — exactly as ForkProposalApproved's
+    -- `git worktree add -b`, so a stale-but-checked-out local default never yields an older
+    -- refinement base. base_branch records the logical default-branch name.
     ensures: Worktree.created(
         conversation: refinement,
         project: proposal.origin.project,
