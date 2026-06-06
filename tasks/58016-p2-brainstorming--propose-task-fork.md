@@ -101,25 +101,27 @@ worktree/branch). The fork is managed even when its origin was not.
 
 ## Worktree / branch / base (decided)
 
-Uniform across all fork-eligible origin modes, there is really only one sensible
-shape:
+Uniform across all fork-eligible origin modes:
 
 - **Fresh worktree** for the spawned conversation (never shares the originator's
   worktree — that would break the one-writer invariant and entangle two unrelated
   changes).
-- **New branch created off the originator's current `HEAD`** (for Direct, the cwd
-  repo's `HEAD`). Branching off `HEAD` rather than the project base means the fork
-  structurally inherits the originator's in-progress state — which is the point:
-  the discovered work was found *in that context*.
+- **New branch cut from the default/base branch, NOT from the originator's
+  `HEAD`.** The fork is an independent unit of work: it diffs only its own
+  changes and is reviewable / mergeable on its own, with no entanglement with the
+  originator's in-progress (committed-but-unmerged or uncommitted) work. The base
+  of record equals the cut point — they are the same commit, so the eventual PR
+  diff is clean.
+  - Work / Branch origins: cut from the originator's `base_branch`.
+  - Direct-in-git origin: cut from the repo's default branch (the Direct origin
+    has no `base_branch` of its own).
+- Consequence (accepted): the fork does NOT inherit the originator's in-progress
+  state. The discovered work must be self-contained enough to stand on the base
+  branch; if it genuinely depended on the originator's uncommitted changes, this
+  hand-off would be the wrong tool.
 - Reuse the managed-conversation creation path (worktree, branch, task-file
-  commit) and respect "Git worktrees are owned environments" — the fork branches
-  off the originator's `HEAD` commit but must never move the originator's branch
-  ref.
-
-Sub-detail to resolve in design: what the fork records as its **base_branch** of
-record (what an eventual PR diffs against) given it branches off `HEAD` — e.g.
-the originator's own `base_branch` (diff includes the originator's WIP) vs. the
-`HEAD` commit it forked from. Pick the one that yields a sensible review diff.
+  commit) and respect "Git worktrees are owned environments" — never move the
+  originator's branch ref.
 
 ## Specs to update
 
