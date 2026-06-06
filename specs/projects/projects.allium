@@ -180,12 +180,15 @@ entity Worktree {
     base_branch: String            -- recorded at creation time
     task_file: TaskFile?           -- present only for managed (work mode) worktrees
     plain_brief_path: String?      -- repo-relative path of the committed *plain* (non-taskmd)
-                                   -- brief, for a plain-brief fork (REQ-PROJ-034). Absent for
-                                   -- taskmd worktrees. This is the durable, origin-independent
-                                   -- marker that a Work worktree legitimately has no task_file:
-                                   -- it lives on the fork (which outlives its origin), so the
-                                   -- exemption survives origin hard-delete. Exactly one of
-                                   -- task_file / plain_brief_path is set on a Work worktree.
+                                   -- brief on ANY plain-brief Work worktree — a plain-brief fork
+                                   -- (REQ-PROJ-034) OR an ordinary Explore→Work approval of a
+                                   -- plain markdown brief (REQ-PROJ-006, set by
+                                   -- TaskApprovalExecuted / TaskApprovalFreshHandoffExecuted).
+                                   -- Absent for taskmd worktrees. It is the durable marker that
+                                   -- a Work worktree legitimately has no task_file (and, on a
+                                   -- fork, outlives the origin so the exemption survives origin
+                                   -- hard-delete). Exactly one of task_file / plain_brief_path is
+                                   -- set on a Work worktree.
 
     -- Derived
     is_clean: git_status_clean(path)
@@ -931,6 +934,14 @@ rule ForkProposalPromotedToExplore {
     -- `proposal.refinement` stays a raw id rather than a Conversation FK.
     let refinement = Conversation{id: refinement_conv_id(proposal)}
     let base = proposal.origin.project.main_ref
+
+    -- Idempotent across interruption, exactly as ForkProposalApproved: the deterministic
+    -- Explore temp branch may already exist from an interrupted prior promotion of THIS
+    -- proposal. Admit it ONLY when it is checked out at this proposal's refinement worktree
+    -- (.phoenix/worktrees/{refinement-id}) — adopt-on-retry — and reject any other existing
+    -- ref with that name so a retry can't fail spuriously or adopt an unrelated branch.
+    requires: not exists git_ref(proposal.origin.project.repo, "refs/heads/" + explore_temp_branch(refinement))
+           or branch_checked_out_in_refinement_worktree(proposal, explore_temp_branch(refinement))
 
     -- A fresh top-level Explore conversation, NOT a sub-agent — seeded with the brief and the
     -- change request, its worktree cut from the repository default branch.

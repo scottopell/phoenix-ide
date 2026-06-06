@@ -447,20 +447,25 @@ sub-agent spawn path — this is what makes the decoupling structural (there is 
    land on a Work branch still advertising a non-work status); a plain brief has no status
    segment and is committed as-is. `git add` + `git commit -m "task {task_id}: {title}"` on
    the task branch.
-4. Persist the fork conversation: `conv_mode = Work { worktree_path, branch_name,
-   base_branch: main_ref, task_id, task_title }` — `task_title` is the snapshot's display
-   title (`ForkProposal.title`), threaded into `ConvMode::Work` exactly as the Explore
-   approval threads it (REQ-PROJ-004); these fields are also set on the conversation row so
-   callers reading mode/cwd directly resolve navigation, tool cwd, and cleanup),
-   `spawned_from_conversation_id = {origin id}`, and seed its LLM context with
-   the task brief itself — the snapshot `body`, plus a line naming the **resolved**
-   `branch_name` (`task-{task_id}-{slug}` for taskmd, `task-{stem}-{fork-id[..8]}` for a
-   plain brief — not a fixed template). The brief is *in context*, not merely a committed
-   file the agent must discover; it inherits none of the originator's transcript.
-5. Record the proposal resolution `spawned { fork_conv_id }`. Return — there is no parent to
-   notify (contrast `Effect::ApproveTaskFreshHandoff`, which sets the predecessor to
-   `HandedOff` and links `parent_conversation_id` + `continued_in_conv_id`; the fork sets
-   none of these).
+4. & 5. In **one DB transaction**: persist the fork conversation (`conv_mode = Work {
+   worktree_path, branch_name, base_branch: main_ref, task_id, task_title }` — `task_title` is
+   the snapshot's display title (`ForkProposal.title`), threaded into `ConvMode::Work` exactly
+   as the Explore approval threads it (REQ-PROJ-004); these fields are also set on the
+   conversation row so callers reading mode/cwd directly resolve navigation, tool cwd, and
+   cleanup; `spawned_from_conversation_id = {origin id}` as a raw id, and seed its LLM context
+   with the task brief itself — the snapshot `body`, plus a line naming the **resolved**
+   `branch_name` (`task-{task_id}-{slug}` for taskmd, `task-{stem}-{fork-id[..8]}` for a plain
+   brief — not a fixed template); the brief is *in context*, not merely a committed file the
+   agent must discover; it inherits none of the originator's transcript) **AND** record the
+   proposal resolution `spawned { fork_conv_id }`. Committing the child row and the resolution
+   together means there is never a live fork under a still-`pending` proposal (which the
+   pending-only orphan cleanup would tear down); before this commit only git worktree/branch
+   orphans exist (safely cleanable on retry). There is no parent to notify (contrast
+   `Effect::ApproveTaskFreshHandoff`, which sets the predecessor to `HandedOff` and links
+   `parent_conversation_id` + `continued_in_conv_id`; the fork sets none of these).
+6. **Dispatch the fork's first LLM turn** (`LlmRequestDispatched`) so the new Work conversation
+   starts the approved task immediately rather than sitting idle until manual intervention.
+   Return.
 
 This flow reads immutable origin metadata only — the origin's `project` (for `main_ref`)
 and its id (for the breadcrumb). It never **mutates** the originating conversation and
@@ -496,12 +501,17 @@ dispatched by `/proposals/:id/request-changes`):
    The tasks dir is **created first if `main_ref` has none** (a project that only ever used
    plain briefs may have no tasks dir), so the draft write can't fail on a missing parent; no
    deeper nested directories from the origin branch are needed.
-3. Persist the conversation in `ConvMode::Explore`, set `spawned_from_conversation_id =
-   {origin id}` (same non-live audit breadcrumb — a raw id, not an FK — as a spawned fork), and
-   seed its LLM context with the brief `body` + the user's change-request note — nothing else.
-4. Record the proposal resolution `promoted { explore_conv_id }` — atomically with the ack,
-   like the recording path (the proposal must never read `promoted` without the row that
-   names the conversation it became).
+3. & 4. In **one DB transaction**: persist the conversation in `ConvMode::Explore` (set
+   `spawned_from_conversation_id = {origin id}` — same non-live raw-id breadcrumb as a spawned
+   fork — and seed its LLM context with the brief `body` + the user's change-request note,
+   nothing else) **AND** record the proposal resolution `promoted { explore_conv_id }`.
+   Committing the refinement row and the resolution together means there is never a live
+   refinement under a still-`pending` proposal for the pending-only orphan cleanup to strand or
+   delete; before this commit only a git worktree/branch orphan exists (recomputable and
+   adoptable on retry from the deterministic id). The synthetic surface update commits in the
+   same transaction.
+5. **Dispatch the refinement's first LLM turn** (`LlmRequestDispatched`) so the Explore agent
+   begins iterating on the brief + change note immediately rather than sitting idle.
 
 Refinement then runs entirely in that Explore conversation: agent revises, user gives
 annotation feedback (REQ-PROJ-004), and the Explore agent's own `propose_task` re-enters
