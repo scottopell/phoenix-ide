@@ -261,7 +261,9 @@ never pushes or merges — `git push` is the agent's job via the bash tool.
 
 `propose_task` is a pure data carrier — its `run()` is an unreachable fallback. It is
 intercepted at the `LlmResponse` handler (same pattern as `submit_result`) and never
-enters `ToolExecuting`. Only available in Explore mode, rejected from sub-agents.
+enters `ToolExecuting`. It is provided in Explore (the parking Explore→Work gateway) and
+in the writing modes Work / Branch / Direct-in-a-git-repo (the non-blocking fork proposal —
+REQ-PROJ-033/036); it is withheld from Direct-not-in-a-repo and from sub-agents.
 
 Input: `{ task_file: string }` — a path (relative to the agent's cwd) to an existing
 markdown (`.md`) file inside the worktree. A taskmd 1.0 filename

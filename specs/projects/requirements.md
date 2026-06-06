@@ -395,13 +395,17 @@ rate-limit sensitive, so Phoenix fetches them only when they can change the advi
 ### REQ-PROJ-012: Provide propose_task Tool to Agents
 
 WHEN agent is in Explore mode
-THE SYSTEM SHALL provide the `propose_task` tool
+THE SYSTEM SHALL provide the `propose_task` tool (the Explore→Work gateway)
 WHICH accepts: `task_file` (required string) — a path, relative to the agent's working
   directory, to an existing markdown (`.md`) file inside the worktree. A taskmd 1.0
   filename (`NNNNN-pX-status--slug.md`, status one of `ready` / `in-progress` /
   `brainstorming`, **required to be under the project's tasks directory**) additionally
   derives id/priority/status/slug from the name; any other `.md` file is accepted as a
   plain task brief (REQ-PROJ-006, task 13009) and may live anywhere in the worktree
+
+WHEN agent is in a writing mode (Work, Branch, or Direct-in-a-git-repo)
+THE SYSTEM SHALL **also** provide `propose_task` (same `task_file` input), there serving
+as the non-blocking fork proposal of REQ-PROJ-033/036
 
 WHEN `propose_task` is called in a writing mode (Work, Branch, or Direct-in-a-git-repo)
 THE SYSTEM SHALL treat it as a fork proposal (REQ-PROJ-033/036) rather than the Explore
@@ -606,8 +610,10 @@ Direct.
 WHEN a conversation is created in Direct mode
 THE SYSTEM SHALL provide full tool access (bash, patch, all tools)
 AND set the working directory to the target directory (not a worktree)
-AND NOT include `propose_task` in the tool registry
-AND NOT create worktrees, branches, or task files
+AND include `propose_task` (the fork proposal — REQ-PROJ-033/036) **only** when the
+  working directory is inside a git repository; otherwise omit it
+AND NOT create worktrees, branches, or task files for the Direct conversation itself
+  (an approved fork is a separate managed conversation)
 
 THE SYSTEM SHALL visually distinguish Direct mode from Explore mode in the UI
 AND present the mode choice (Direct vs Managed) on the new conversation page
@@ -982,8 +988,9 @@ approvals (REQ-PROJ-004) to read the snapshot and Approve or Dismiss it (address
 AND the user's decision arrives asynchronously — the originating conversation does not
 wait on it and is unaffected by it
 
-WHEN the originating conversation reaches a terminal state (abandoned / merged) with a
-`pending` proposal still un-reviewed
+WHEN the originating conversation reaches any terminal state — `is_terminal` per the
+bedrock model, i.e. terminal (abandoned / merged), context-exhausted, or handed-off — with
+a `pending` proposal still un-reviewed
 THE SYSTEM SHALL make that proposal moot: the Review affordance is withdrawn and the
 proposal can no longer be approved (REQ-PROJ-035, bound to origin)
 
@@ -1056,8 +1063,9 @@ AND SHALL NOT inject it into the originating conversation's LLM context (a resol
 agent could read would itself be a lifecycle notification, which is forbidden above)
 
 A fork proposal is **bound to its origin**: it lives with the originating conversation's
-transcript and does not survive that conversation's termination. If the originating
-conversation is abandoned before the proposal is reviewed, the proposal is moot.
+transcript and does not survive that conversation reaching any terminal state (`is_terminal`
+— terminal/abandoned/merged, context-exhausted, or handed-off). If the origin becomes
+terminal before the proposal is reviewed, the proposal is moot.
 
 **Rationale:** The whole point is to shed mental load — so the spawner must learn nothing
 about what it spawned. The decoupling is structural: the fork is created through the

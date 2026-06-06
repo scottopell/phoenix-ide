@@ -692,17 +692,29 @@ rule ForkProposalApproved {
     let slug = parse_slug(proposal.task_file)
     let branch_name = "task-" + task_id + "-" + slug
 
-    -- Materialize the fork base before the worktree add — the same single-branch
-    -- fetch + local-ref resolution as MaterializeBranch (REQ-PROJ-022), since
-    -- main_ref may be remote-only (`origin/<name>`) with no local ref yet.
+    -- Materialize the fork base before the worktree add — single-branch fetch plus
+    -- local-ref resolution (cf. MaterializeBranch, REQ-PROJ-022), since main_ref may
+    -- be remote-only (`origin/<name>`) with no local ref yet. Owned-environments
+    -- rule ("Git worktrees are owned environments"): a refs/heads/* ref checked out
+    -- in any worktree is NOT moved — and main_ref is typically checked out in the
+    -- user's main worktree.
     ensures: BestEffortFetch(proposal.origin.project.repo, base)
     ensures:
-        if exists git_ref(proposal.origin.project.repo, "refs/heads/" + base):
+        if exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and not branch_checked_out_in_any_worktree(proposal.origin.project.repo, base):
+            -- Local ref present and not checked out anywhere: safe to fast-forward.
             FastForwardIfPossible(proposal.origin.project.repo, base)
-        else if exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
+        else if not exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
+            -- Remote-only: create the local tracking ref (a new ref — never checked out).
             CreateTrackingBranch(proposal.origin.project.repo, base, "origin/" + base)
-        else:
+        else if not exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and not exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
             error("Fork base branch '" + base + "' not found locally or at origin")
+        -- else: local ref exists but is checked out in a worktree — leave it
+        -- untouched. The fork's task branch is cut from the fetched origin/<base>
+        -- tip (below) and `git worktree add -b` creates a NEW branch, so
+        -- refs/heads/<base> is never moved.
 
     -- A fresh, independent conversation — created through the top-level
     -- conversation path, never the sub-agent path (no parent event channel).
@@ -743,12 +755,16 @@ rule ForkProposalApproved {
         -- Sequence (under the same process-global approval mutex as
         -- TaskApprovalExecuted, so concurrent spawns don't race on names):
         --   1. base = origin.project.main_ref (repository default branch, the same
-        --      for every origin mode). Materialize it like MaterializeBranch
-        --      (REQ-PROJ-022): single-branch fetch, then fast-forward the local ref
-        --      or create a local tracking branch from origin/<base> — so a
-        --      remote-only default branch has a local ref before the worktree add.
-        --   2. `git worktree add -b <branch> <fork-worktree> <base>` — a NEW
-        --      worktree at .phoenix/worktrees/{fork-id}, off the (now-local) base.
+        --      for every origin mode). Materialize it (cf. MaterializeBranch,
+        --      REQ-PROJ-022): single-branch fetch, then fast-forward the local ref
+        --      ONLY if it is not checked out in any worktree (owned-environments
+        --      rule), or create a local tracking branch from origin/<base> when the
+        --      default branch is remote-only.
+        --   2. `git worktree add -b <task-branch> <fork-worktree> <commit-ish>` — a
+        --      NEW worktree at .phoenix/worktrees/{fork-id}. The commit-ish is the
+        --      freshest non-mutating base: origin/<base> when it was fetched, else
+        --      the local refs/heads/<base>. `add -b` creates a NEW task branch and
+        --      never moves refs/heads/<base>, so a checked-out default branch is safe.
         --   3. Write proposal.body into the worktree at proposal.task_file (its
         --      repo-relative path; taskmd file under the tasks dir, promoted to
         --      ...-in-progress--<slug>.md; plain brief at its own path with no status
