@@ -457,7 +457,7 @@ and its id (for the breadcrumb). It never **mutates** the originating conversati
 never **notifies** it: no state transition, no message into its transcript or LLM context.
 The decoupling contract is "do not mutate or notify the origin," not "do not read it."
 
-### Request Changes → Explore refinement (REQ-PROJ-037, **not implemented yet**)
+### Request Changes → Explore refinement (REQ-PROJ-037)
 
 The review surface has a third action beside Approve / Dismiss: **Request Changes**, which
 takes a free-text note. The constraint that shapes the whole design: the proposer (a
@@ -496,7 +496,7 @@ never touches the `promoted` audit record.
 The git choreography is not modelled as fine-grained typed effects — the state machine
 emits a small set of coarse effects (`Effect::ApproveTask`, `Effect::ResolveTask`,
 `Effect::SpawnFork` for fork approval — REQ-PROJ-034, and `Effect::PromoteForkToExplore` for
-Request Changes — REQ-PROJ-037, not implemented yet) and the corresponding handler runs
+Request Changes — REQ-PROJ-037) and the corresponding handler runs
 the `git` sequence directly in a `spawn_blocking` task, feeding back a single completion
 (or a `GitOperationFailed`-style error message). `Effect::SpawnFork` is dispatched not by
 a state-machine transition on the originating conversation but by the async

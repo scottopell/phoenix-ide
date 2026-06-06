@@ -434,12 +434,17 @@ requiring every state variant to carry mode.
 
 **Tool registry configuration by mode:**
 
-| Tool | Explore | Work |
-|------|---------|------|
-| `patch` | Disabled | Enabled (worktree only) |
-| `bash` | Allowed (read-only enforced) | Allowed (write in worktree) |
-| `propose_task` | Allowed — Explore→Work gateway, parks (intercepted, not executed) | Allowed — fork proposal, non-blocking (REQ-PROJ-033) |
-| `think`, `keyword_search`, `read_image`, `browser_*` | Allowed | Allowed |
+| Tool | Explore | Work | Branch | Direct |
+|------|---------|------|--------|--------|
+| `patch` | Disabled | Enabled (worktree only) | Enabled (worktree only) | Enabled (cwd) |
+| `bash` | Allowed (read-only enforced) | Allowed (write in worktree) | Allowed (write in worktree) | Allowed (write in cwd) |
+| `propose_task` | Allowed — Explore→Work gateway, parks (intercepted, not executed) | Allowed — fork proposal, non-blocking (REQ-PROJ-033) | Allowed — fork proposal, non-blocking (REQ-PROJ-033) | Allowed **only when cwd is in a git repo** — fork proposal (REQ-PROJ-033/036); otherwise not provided |
+| `think`, `keyword_search`, `read_image`, `browser_*` | Allowed | Allowed | Allowed | Allowed |
+
+Branch and git-backed Direct configure `propose_task` exactly as Work does — a non-blocking
+fork proposal (REQ-PROJ-036) — so an implementer must enable the intercepted path for all
+three writing modes, not Work alone. Direct gates the tool on a git repository (no default
+branch to fork from otherwise).
 
 ## Task Approval State (REQ-BED-028, REQ-PROJ-003, REQ-PROJ-004)
 
