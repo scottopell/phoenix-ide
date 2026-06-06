@@ -1027,7 +1027,9 @@ the originating conversation's transcript; the brief is in context, not merely a
 agent must discover)
 AND record the resolution of the proposal as **spawned** (referencing the new
 conversation), idempotently: a `pending` proposal spawns exactly one fork; approving an
-already-`spawned` or `dismissed` proposal is rejected
+already-resolved proposal (`spawned`, `dismissed`, or `promoted` — REQ-PROJ-037) is rejected,
+so every resolution is single-use (a promoted proposal's snapshot already moved into an
+Explore refinement and must not also spawn a Work fork)
 
 WHEN the user dismisses a `pending` fork proposal
 THE SYSTEM SHALL spawn nothing

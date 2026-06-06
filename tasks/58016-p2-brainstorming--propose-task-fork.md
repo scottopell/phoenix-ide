@@ -87,8 +87,18 @@ add a "fork" approval outcome.
   awaiting — or mutate the origin). Instead add a dedicated async endpoint
   (`/proposals/:id/approve`) dispatching `Effect::SpawnFork`, with an executor handler
   analogous to `execute_approve_task_fresh_handoff` but: keyed on the proposal id, no
-  chain/parent links, sets the `spawned_from` breadcrumb, and does NOT touch the
-  originating conversation's state.
+  chain/parent links, sets the `spawned_from` breadcrumb (a raw conversation id, not an FK),
+  and does NOT touch the originating conversation's state.
+  - **Deterministic fork id (crash recovery).** Derive the fork conversation id from
+    `(proposal_id, "spawn")`, NOT a fresh random id, so the worktree path
+    `.phoenix/worktrees/{fork-id}` is recomputable: a crash after `git worktree add -b` but
+    before recording `spawned` is re-driven by recomputing the same id and adopting the
+    orphan (idempotency keyed on proposal id — essential because a taskmd branch name
+    `task-{id}-{slug}` is not fork-id-qualified and would otherwise collide on retry). The
+    `"spawn"` namespace is disjoint from Request Changes' `(proposal_id, "promote")`.
+  - **Atomic + dispatch.** Persist the fork conversation row and the `spawned { fork }`
+    resolution in one DB transaction (no live child under a still-pending proposal), then
+    `LlmRequestDispatched(fork)` so the fork starts the task immediately.
 
 ## Mode availability (decided)
 
