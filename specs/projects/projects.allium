@@ -1029,7 +1029,12 @@ rule ForkProposalsRemovedOnOriginDelete {
 
     ensures:
         for p in ForkProposal where p.origin = origin:
-            not exists p
+            -- Clean any deterministic spawn/promote orphan BEFORE removing the row: once the
+            -- proposal is gone its id can no longer recover the orphan at
+            -- .phoenix/worktrees/{proposal.id, spawn|promote}, so a crash-then-hard-delete
+            -- would otherwise leak the worktree/branch permanently (cf. dismiss/auto-retire).
+            DeterministicForkOrphansCleaned(p)
+            and not exists p
 }
 
 -- ===========================================================

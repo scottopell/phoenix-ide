@@ -39,8 +39,9 @@ shapes by mode: in Explore it is the blocking Explore→Work gateway; in the wri
 (Work, Branch, Direct-in-a-git-repo) it is a non-blocking **fork proposal** that spawns a
 fully decoupled top-level Work conversation off the repository default branch (REQ-PROJ-033
 through 036). It is withheld only from Direct-not-in-a-repo and from sub-agents. Tool
-registry is configured by mode: write tools disabled in Explore, enabled in Work and
-Branch. Push is a regular bash command with no
+registry is configured by mode: unscoped writes disabled in Explore, except `patch` scoped
+to the `tasks/` dir (so the agent can draft/revise a task file — REQ-PROJ-003, and the
+Request Changes refinement of REQ-PROJ-037); write tools enabled in Work and Branch. Push is a regular bash command with no
 lifecycle side effects. Phoenix can observe PR state through `gh` to guide the
 user-visible cleanup affordance, but does not push, merge, or run unattended
 cleanup. Terminal actions remain user-initiated: verified merged PR cleanup / manual
