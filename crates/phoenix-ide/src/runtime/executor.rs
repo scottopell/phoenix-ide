@@ -1220,8 +1220,8 @@ where
         let mut resolved_tasks: Vec<(Option<&phoenix_agents::AgentDefinition>, SubAgentMode)> =
             Vec::with_capacity(input.tasks.len());
         for task in &input.tasks {
-            let agent = match task.agent_type {
-                Some(ref agent_type) => match phoenix_agents::find_agent(&agents, agent_type) {
+            let agent = if let Some(ref agent_type) = task.agent_type {
+                match phoenix_agents::find_agent(&agents, agent_type) {
                     Some(a) => Some(a),
                     None => {
                         let available: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
@@ -1242,8 +1242,9 @@ where
                             result,
                         }));
                     }
-                },
-                None => None,
+                }
+            } else {
+                None
             };
             let mode = task
                 .mode
