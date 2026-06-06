@@ -98,6 +98,13 @@ enum RefKind { branch | tag }
 entity Project {
     repo: GitRepository
 
+    -- The repository default branch (e.g. "main"). Mandatory and immutable,
+    -- resolved once at project creation: repo.remote_default_branch when
+    -- detectable, else repo.current_branch at creation time. This is the
+    -- canonical, single source of truth for the fork base (ForkProposalApproved);
+    -- forks never use an origin conversation's base_branch.
+    main_ref: String
+
     -- ls-remote output cached for branch-picker typeahead.
     -- Refreshed on miss/expiry by SearchRemoteBranches.
     ls_remote_cache: LsRemoteCache?
@@ -188,14 +195,20 @@ entity Worktree {
 -- of the origin's LLM transcript (REQ-PROJ-035) — a resolution the origin's agent
 -- could read would itself be a forbidden lifecycle notification.
 entity ForkProposal {
+    id: String                          -- stable proposal id; the approve/dismiss surface
+                                        -- and HTTP endpoints address a proposal by it, and
+                                        -- it is the idempotency key (a pending proposal
+                                        -- spawns exactly one fork)
     origin: bedrock/Conversation        -- the conversation whose agent proposed it
     task_file: String                   -- path the agent drafted (display / provenance)
     title: String
     priority: String
     body: String                        -- snapshotted file bytes — authoritative at spawn
-    base_branch: String                 -- fork base: origin's base_branch, or repo default for direct
     status: pending | spawned | dismissed
     fork: bedrock/Conversation?         -- the spawned conversation, present iff status = spawned
+
+    -- The fork base is NOT stored: it is always origin.project.main_ref (the
+    -- repository default branch), resolved at approval time (ForkProposalApproved).
 
     transitions status {
         pending -> spawned
@@ -612,12 +625,12 @@ rule ForkProposalCreated {
     when: ForkProposalRecorded(origin, proposal)
 
     ensures: ForkProposal.created(
+        id: proposal.id,
         origin: origin,
         task_file: proposal.task_file,
         title: proposal.title,
         priority: proposal.priority,
         body: proposal.body,
-        base_branch: proposal.base_branch,
         status: pending,
         fork: absent
     )
@@ -625,31 +638,46 @@ rule ForkProposalCreated {
     @guidance
         -- The originating conversation is unaffected: bedrock returned it to its
         -- running flow. The proposal surfaces in that conversation's tool output
-        -- with a Review affordance while status = pending.
+        -- with a Review affordance while status = pending and the origin is live.
 }
 
--- REQ-PROJ-034/035: user approves a pending fork proposal. A fresh top-level
--- Work conversation is created in its own worktree off the base branch (NOT the
--- origin's HEAD), the snapshot is written and committed on the fork's task
--- branch, and the only link back to the origin is the provenance breadcrumb.
--- The origin's row is neither read nor written.
+-- REQ-PROJ-034/035: user approves a pending fork proposal whose origin is still
+-- live. `fork` is a fresh top-level conversation allocated by the approval action
+-- (the same shape as WorktreeTransferredOnContinuation receiving `new_conv`), so
+-- the rule never reads an id out of the still-pending proposal. The fork's worktree
+-- is cut from the repository default branch (origin.project.main_ref) — NEVER the
+-- origin's `base_branch` or HEAD, uniformly for every origin mode — and the only
+-- link back to the origin is the provenance breadcrumb.
 --
--- Models the taskmd-filename case (the default). Plain-markdown briefs differ
--- exactly as in TaskApprovalExecuted: branch `task-{sanitized-stem}-{fork-id-prefix}`
--- (the *fork's* id uniquifies), no status rename, file committed at its own path,
--- recorded task_id = the stem.
+-- Models the taskmd-filename case (the default), exactly as TaskApprovalExecuted
+-- does: TaskFile is the taskmd entity (plain-markdown briefs are not modelled as a
+-- distinct entity — see the TaskFile entity note), so a single rule captures the
+-- entity-level behaviour and the plain-markdown field differences live in @guidance.
+-- Plain brief: branch `task-{sanitized-stem}-{fork-id-prefix}` (the *fork's* id
+-- uniquifies), recorded task_id = the stem, committed at its own path, and there is
+-- no status segment to promote.
 rule ForkProposalApproved {
     when: UserApprovesForkProposal(proposal)
 
     requires: proposal.status = pending
+    -- Bound to origin: a terminated (abandoned/merged) origin makes the proposal
+    -- moot, so it cannot be spawned (REQ-PROJ-035). context_exhausted is NOT
+    -- terminal — its worktree is preserved — so such a proposal stays approvable.
+    requires: proposal.origin.parent_status != terminal
+    requires: proposal.origin.mode in { work, branch, direct }
 
+    -- `fork` is the freshly-allocated successor conversation, bound from the field
+    -- this rule fills — the same post-state fixpoint idiom as
+    -- TaskApprovalFreshHandoffExecuted's `successor = conversation.continued_in_conv_id`
+    -- (`proposal.fork` is absent while pending and becomes present == spawned here).
+    let fork = proposal.fork
+    let base = proposal.origin.project.main_ref
     let task_id = parse_task_id(proposal.task_file)
     let slug = parse_slug(proposal.task_file)
     let branch_name = "task-" + task_id + "-" + slug
-    let fork = proposal.fork
 
     -- Single-branch fetch of the fork base, best-effort (REQ-PROJ-022).
-    ensures: BestEffortFetch(proposal.origin.project.repo, proposal.base_branch)
+    ensures: BestEffortFetch(proposal.origin.project.repo, base)
 
     -- A fresh, independent conversation — created through the top-level
     -- conversation path, never the sub-agent path (no parent event channel).
@@ -657,44 +685,52 @@ rule ForkProposalApproved {
     ensures: fork.kind = Parent
     ensures: fork.mode = work
     ensures: fork.task_id = task_id
+    ensures: fork.base_branch = base
     ensures: fork.spawned_from_conversation_id = proposal.origin
 
-    -- Its own worktree, cut from the base branch (not the origin's HEAD).
+    -- Its own worktree, cut from the repository default branch.
     ensures: Worktree.created(
         conversation: fork,
         project: proposal.origin.project,
         path: WorktreePath { absolute_path: worktree_path(fork) },
         branch_name: branch_name,
-        base_branch: proposal.base_branch,
+        base_branch: base,
         task_file: TaskFile{task_id: task_id}
     )
+    -- taskmd status promoted to in-progress before commit (REQ-PROJ-006), so a
+    -- ready/brainstorming snapshot never lands on a Work branch advertising a
+    -- non-work status.
+    ensures: Worktree{conversation: fork}.task_file.status = in_progress
     ensures: TaskFileCommittedOnBranch(Worktree{conversation: fork}, task_id)
 
-    -- Resolve the proposal.
+    -- Resolve the proposal. fork present iff spawned — so a pending proposal
+    -- spawns exactly one fork (idempotency keyed on proposal.id).
     ensures: proposal.fork = fork
     ensures: proposal.status = spawned
 
     @guidance
         -- Sequence (under the same process-global approval mutex as
         -- TaskApprovalExecuted, so concurrent spawns don't race on names):
-        --   1. Resolve fork base: origin.base_branch (work/branch) or the repo
-        --      default branch (direct-in-git). Single-branch best-effort fetch.
+        --   1. base = origin.project.main_ref (repository default branch, the same
+        --      for every origin mode). Single-branch best-effort fetch.
         --   2. `git worktree add -b <branch> <fork-worktree> <base>` — a NEW
-        --      worktree at .phoenix/worktrees/{fork-id}, off the base branch.
+        --      worktree at .phoenix/worktrees/{fork-id}, off the default branch.
         --   3. Write proposal.body into the worktree (taskmd file under the tasks
-        --      dir; plain brief at its own path), `git add` + `git commit` on the
-        --      task branch (never on base).
+        --      dir, promoted to ...-in-progress--<slug>.md; plain brief at its own
+        --      path with no status rename), `git add` + `git commit` (never on base).
         --   4. Persist the fork as a top-level Work conversation: conv_mode Work,
-        --      spawned_from_conversation_id = origin, seed first message ("You are
-        --      working on task {title}. You are on branch task-{task_id}-{slug}.")
-        --      — it inherits none of the origin's transcript.
+        --      spawned_from_conversation_id = origin, and seed its LLM context with
+        --      the brief itself (proposal.body) plus a "you are on branch
+        --      task-{task_id}-{slug}" line — the brief is in context, not merely a
+        --      committed file to discover. It inherits none of the origin transcript.
         --   5. Mark the proposal spawned { fork }.
         --
-        -- The origin's row is never touched: no continued_in_conv_id, no
-        -- parent_status change, no sub-agent linkage (contrast
-        -- TaskApprovalFreshHandoffExecuted, which sets handed_off and links
-        -- continued_in_conv_id). Branching off the base keeps the fork's diff
-        -- independent of the origin's in-progress work (REQ-PROJ-034).
+        -- The origin is read for immutable metadata only (project -> main_ref, id ->
+        -- breadcrumb); it is never mutated or notified: no continued_in_conv_id, no
+        -- parent_status change, no sub-agent linkage, no message into its context
+        -- (contrast TaskApprovalFreshHandoffExecuted, which sets handed_off and links
+        -- continued_in_conv_id). Branching off the default branch keeps the fork's
+        -- diff independent of the origin's in-progress work (REQ-PROJ-034).
 }
 
 -- REQ-PROJ-034: user dismisses a pending fork proposal. Nothing is spawned; the
@@ -1436,14 +1472,17 @@ surface ProjectManagement {
 surface ForkProposalReview {
     facing: bedrock/User
 
+    -- Only a pending proposal whose origin is still live is reviewable. Once the
+    -- origin is terminal (abandoned/merged) the proposal is moot and withdrawn
+    -- (REQ-PROJ-035, bound to origin) — neither action is offered.
     context proposal: ForkProposal
-        where status = pending
+        where status = pending and origin.parent_status != terminal
 
     exposes:
+        proposal.id
         proposal.title
         proposal.priority
         proposal.body
-        proposal.base_branch
         proposal.origin
 
     provides:

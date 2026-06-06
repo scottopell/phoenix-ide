@@ -69,7 +69,10 @@ code. The plumbing is in place — only the bash execution wrapper is missing.
 ```
 Project {
   canonical_path: PathBuf,     // git repository root
-  main_ref: String,            // e.g. "main" or "master"
+  main_ref: String,            // the repository default branch (e.g. "main"/"master") —
+                               // mandatory and immutable, resolved once at project creation
+                               // (remote default when detectable, else the checked-out
+                               // branch at creation). The canonical fork base (REQ-PROJ-034a).
 }
 
 ConvMode {
@@ -352,19 +355,21 @@ The fork proposal rides as a `CheckpointData::ToolRound` in the originating tran
 
 ```
 ForkProposal {
-  proposal_id: String,     // stable id for the approve/dismiss endpoints
+  proposal_id: String,     // stable id; the approve/dismiss endpoints address a specific
+                           // proposal by it, and it is the idempotency key for spawning
   task_file:   String,     // path the agent drafted (for display / provenance)
   title:       String,     // display copy (H1 / filename stem)
   priority:    String,     // "p0".."p4" from a taskmd name; "p2" for a plain brief
   body:        String,     // the snapshotted file bytes — authoritative at spawn time
-  base_branch: String,     // resolved fork base (origin base_branch, or repo default for Direct)
 }
 ```
 
-The snapshot is taken at propose time because the fork runs in a worktree off the base
-branch (below) that will not contain the originating worktree's copy of the file. The
-agent's drafted file stays on the originating branch as an ordinary tracked task file; the
-fork commits its own copy from `body`.
+The fork base is not snapshotted: it is always the project's `main_ref` (the repository
+default branch — REQ-PROJ-034a), resolved at approval time, never from the origin. The
+file bytes are snapshotted because the fork runs in a worktree off `main_ref` (below) that
+will not contain the originating worktree's copy of the file. The agent's drafted file
+stays on the originating branch as an ordinary tracked task file; the fork commits its own
+copy from `body`.
 
 #### Proposal resolution is control-plane, never agent-facing
 
@@ -392,26 +397,33 @@ The fork is created through the **top-level managed-conversation creation path**
 sub-agent spawn path — this is what makes the decoupling structural (there is no
 `parent_event_tx` in scope to send a `SubAgentResult`, so none can leak):
 
-1. Resolve the fork base: the originating conversation's `base_branch` (Work/Branch) or the
-   project `main_ref` (Direct-in-git). `git fetch origin {base}` single-branch, best-effort
-   (REQ-PROJ-022).
+1. Resolve the fork base: the project's `main_ref` (the repository default branch —
+   REQ-PROJ-034a), uniformly for every origin mode. `git fetch origin {main_ref}`
+   single-branch, best-effort (REQ-PROJ-022).
 2. Allocate a new conversation id; create its worktree at
-   `.phoenix/worktrees/{fork-conv-id}/` off `{base}` (REQ-PROJ-005). Classify the snapshot
-   via `TaskSource` (taskmd vs plain-markdown — REQ-PROJ-006); task branch =
+   `.phoenix/worktrees/{fork-conv-id}/` off `{main_ref}` (REQ-PROJ-005). Classify the
+   snapshot via `TaskSource` (taskmd vs plain-markdown — REQ-PROJ-006); task branch =
    `task-{task_id}-{slug}` (taskmd) or `task-{sanitized-stem}-{fork-conv-id[..8]}` (plain —
    the *fork's* id prefix uniquifies).
 3. Write `body` into the worktree (taskmd file under the tasks dir; plain brief at its own
-   path), `git add` + `git commit -m "task {task_id}: {title}"` on the task branch.
+   path); for a taskmd file, promote its status to `in-progress` first (same as the Explore
+   approval in REQ-PROJ-006 — a `ready`/`brainstorming` snapshot must not land on a Work
+   branch still advertising a non-work status); a plain brief has no status segment and is
+   committed as-is. `git add` + `git commit -m "task {task_id}: {title}"` on the task branch.
 4. Persist the fork conversation: `conv_mode = Work { worktree_path, branch_name,
-   base_branch, task_id, task_title }`, `spawned_from_conversation_id = {origin id}`, and a
-   seed first message ("You are working on task {title}. You are on branch
-   task-{task_id}-{slug}.") — it inherits none of the originator's transcript.
+   base_branch: main_ref, task_id, task_title }`, `spawned_from_conversation_id = {origin
+   id}`, and seed its LLM context with the task brief itself — the snapshot `body`, plus a
+   "you are on branch task-{task_id}-{slug}" line. The brief is *in context*, not merely a
+   committed file the agent must discover; it inherits none of the originator's transcript.
 5. Record the proposal resolution `spawned { fork_conv_id }`. Return — there is no parent to
    notify (contrast `Effect::ApproveTaskFreshHandoff`, which sets the predecessor to
    `HandedOff` and links `parent_conversation_id` + `continued_in_conv_id`; the fork sets
    none of these).
 
-The originating conversation's state is never read or written by this flow.
+This flow reads immutable origin metadata only — the origin's `project` (for `main_ref`)
+and its id (for the breadcrumb). It never **mutates** the originating conversation and
+never **notifies** it: no state transition, no message into its transcript or LLM context.
+The decoupling contract is "do not mutate or notify the origin," not "do not read it."
 
 ## Executor-Layer Git Operations
 
@@ -447,7 +459,7 @@ the porcelain command fails.
 
 `propose_task` is also provided in Branch mode and in Direct mode when the working
 directory is inside a git repository — in all writing modes it is the fork proposal of
-REQ-PROJ-033/036. It is withheld only from Direct-not-in-a-repo (no base branch to fork
+REQ-PROJ-033/036. It is withheld only from Direct-not-in-a-repo (no repository default branch to cut
 from) and from sub-agents.
 
 ## Work Sub-Agent Mode Inheritance

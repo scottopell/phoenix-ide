@@ -540,6 +540,7 @@ rule ParentLlmRespondsTextOnly {
 rule ProposeTaskIntercepted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
+    requires: conversation.kind = Parent
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
     requires: conversation.mode = explore
@@ -562,6 +563,7 @@ rule ProposeTaskIntercepted {
 rule ForkProposalIntercepted {
     when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
     requires: conversation.core_status = llm_requesting
+    requires: conversation.kind = Parent
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
     requires: conversation.mode in { work, branch, direct }
