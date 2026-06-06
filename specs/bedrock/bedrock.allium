@@ -655,6 +655,10 @@ rule SubAgentProposeTaskRejected {
     requires: conversation.kind = SubAgent
     requires: tool_calls.count = 1
     requires: tool_calls.first.name = "propose_task"
+    -- At the threshold SubAgentContextExhausted wins (the sub-agent fails and reports to its
+    -- parent), so an over-threshold sub-agent can't loop forever feeding itself rejected
+    -- propose_task errors instead of completing — same exclusion the Parent arms use.
+    requires: not conversation.context_at_threshold
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)

@@ -1157,7 +1157,9 @@ shape (REQ-PROJ-006). The draft path is **deterministic and collision-free**:
 `tasks/{refinement-id-prefix}-{sanitized-stem}.md`, where the refinement-id prefix (from the
 `(proposal_id, "promote")`-derived conversation id) guarantees the same path on a
 crash-retry (deterministic recovery) and that the write never overwrites a pre-existing
-tracked task file. The recorded `plain_brief_path` (for a plain brief) is that draft path
+tracked task file. (The refinement is an **Explore** worktree, so it records neither a
+`task_file` nor a `plain_brief_path` — those are Work-mode markers; the draft is just an
+uncommitted scratch file the agent revises until its own Explore→Work approval.)
 AND seed the Explore agent's LLM context with the brief **body** plus the user's
 change-request note — and nothing else (it inherits none of the originating conversation's
 transcript; the brief and the requested changes are *in context*, not merely a file to

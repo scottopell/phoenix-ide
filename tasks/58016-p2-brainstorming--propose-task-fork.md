@@ -31,8 +31,10 @@ untouched.** The only new axis is "does the originating conversation keep going?
 Everything else (writing a task file, the full-screen approval UI, spawning a
 fresh Work conversation off base) is reused.
 
-Therefore this is NOT a new tool. Make `propose_task` available in Work mode and
-add a "fork" approval outcome.
+Therefore this is NOT a new tool. Make `propose_task` available in **all writing modes** —
+Work, Branch, and git-backed Direct (REQ-PROJ-033/036), not Work alone — and add the
+proposal-specific approve path (see below). Direct gates the tool on the cwd being inside a
+git repo; non-git Direct and sub-agents never get it.
 
 ## Key behaviors (decided)
 
