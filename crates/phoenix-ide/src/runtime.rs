@@ -1265,10 +1265,11 @@ impl RuntimeManager {
             SubAgentMode::Explore => ToolRegistry::for_subagent_explore(),
             SubAgentMode::Work => ToolRegistry::for_subagent_work(),
         };
+        // Sub-agents cannot spawn, so they carry an empty agent catalog.
         let tool_executor = ToolRegistryExecutor::with_mcp(
             registry,
             self.mcp_manager.clone(),
-            conv_context.working_dir.clone(),
+            Arc::from(Vec::new()),
         );
 
         // 6. Create runtime with parent notification
@@ -1524,40 +1525,51 @@ impl RuntimeManager {
         // conversations get the mode-appropriate registry. Both layers wrap
         // their registry with `with_mcp` so MCP tool defs resolve live from
         // the manager on every `definitions()` call.
+        // Freeze the named-agent catalog once per conversation so the
+        // spawn_agents schema and the executor's agent_type resolution share a
+        // single catalog instead of independently re-discovering the filesystem
+        // (REQ-AG-008). Sub-agents cannot spawn, so theirs is empty.
+        let agent_catalog: Arc<[phoenix_agents::AgentDefinition]> = if is_sub_agent {
+            Arc::from(Vec::new())
+        } else {
+            Arc::from(phoenix_agents::discover_agents(&context.working_dir))
+        };
         let tool_executor = if is_sub_agent {
             let registry = sub_agent_registry_for_conv_mode(&conv.conv_mode);
             ToolRegistryExecutor::with_mcp(
                 registry,
                 self.mcp_manager.clone(),
-                context.working_dir.clone(),
+                agent_catalog.clone(),
             )
         } else {
             use crate::db::ConvMode;
-            // Discover named agents for the parent's working directory so the
-            // spawn_agents tool can expose them as an agent_type enum
-            // (REQ-AG-004). Sub-agents never reach this branch.
-            let agents = phoenix_agents::discover_agents(&context.working_dir);
             let registry = match conv.conv_mode {
                 ConvMode::Explore { .. } => {
                     if self.platform.has_sandbox() {
-                        ToolRegistry::explore_with_sandbox(&context.tasks_dir_name, agents)
+                        ToolRegistry::explore_with_sandbox(
+                            &context.tasks_dir_name,
+                            agent_catalog.to_vec(),
+                        )
                     } else {
-                        ToolRegistry::explore_no_sandbox(&context.tasks_dir_name, agents)
+                        ToolRegistry::explore_no_sandbox(
+                            &context.tasks_dir_name,
+                            agent_catalog.to_vec(),
+                        )
                     }
                 }
                 ConvMode::Direct => {
                     // Full tool suite for Direct mode
-                    ToolRegistry::direct(agents)
+                    ToolRegistry::direct(agent_catalog.to_vec())
                 }
                 ConvMode::Work { .. } | ConvMode::Branch { .. } => {
                     // Full tool suite for Work/Branch mode (same as Direct)
-                    ToolRegistry::direct(agents)
+                    ToolRegistry::direct(agent_catalog.to_vec())
                 }
             };
             ToolRegistryExecutor::with_mcp(
                 registry,
                 self.mcp_manager.clone(),
-                context.working_dir.clone(),
+                agent_catalog.clone(),
             )
         };
 
@@ -1585,7 +1597,8 @@ impl RuntimeManager {
         .with_steering_queue(conv.steering_queue)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
-        .with_credential_helper(self.credential_helper.clone());
+        .with_credential_helper(self.credential_helper.clone())
+        .with_agent_catalog(agent_catalog);
 
         // If auto-continuing, inject a system message so the LLM knows a restart
         // happened. This also serves as the restart loop counter — recovery.rs
@@ -1963,7 +1976,7 @@ async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> Stri
 }
 
 /// Convert a database `ConvMode` into a `ModeContext` for the system prompt.
-fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
+pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
     match mode {
         ConvMode::Explore { .. } => ModeContext::Explore,
         ConvMode::Work {

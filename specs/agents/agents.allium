@@ -28,7 +28,7 @@
 -- agent_type rejection) are modelled in subagents.allium where the spawn
 -- validation and SubAgentSpec resolution live.
 
-use "./subagents.allium" as subagents
+use "../subagents/subagents.allium" as subagents
 
 ------------------------------------------------------------
 -- External Entities
@@ -175,6 +175,14 @@ rule InjectAgentTypeEnum {
         -- persona is for. No agent catalog is emitted into the system-prompt
         -- text — a single cache-bearing representation, not two (REQ-AG-004).
         -- Implementation: SpawnAgentsTool::with_agents(catalog).input_schema().
+        --
+        -- The catalog is discovered once at conversation start and frozen for
+        -- the conversation. The SAME frozen catalog renders this schema, is
+        -- reused when the registry is rebuilt on an Explore→Work upgrade, and
+        -- resolves agent_type at spawn time (subagents.allium
+        -- SubAgentSpecsResolved). Spawn-time resolution does not re-scan the
+        -- filesystem, so the advertised enum and the runtime resolution cannot
+        -- diverge if agent files change mid-conversation (REQ-AG-008).
 }
 
 -- When no agents are discovered, agent_type is omitted entirely, so the spawn

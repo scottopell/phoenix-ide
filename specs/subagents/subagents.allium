@@ -210,13 +210,14 @@ rule SpawnRejectedUnknownAgentType {
         reason: "Unknown agent_type in task spec")
 
     @guidance
-        -- any_task_has_unknown_agent_type(tasks, working_dir): black box —
-        -- true iff some task sets agent_type to a value not in
-        -- collect_agents(working_dir) (the agents-spec discovery). The error
-        -- message names the offending agent_type and lists available agent
-        -- names. collect_agents / find_agent are the agents.allium discovery
-        -- helpers; referenced here as black boxes to avoid a use-cycle with
-        -- agents.allium (which uses this spec).
+        -- any_task_has_unknown_agent_type(tasks, parent): black box — true iff
+        -- some task sets agent_type to a value absent from the parent
+        -- conversation's frozen agent catalog (the one that rendered the
+        -- spawn_agents schema; see agents.allium DiscoverAgentCatalog /
+        -- InjectAgentTypeEnum). Resolution reads the frozen catalog, not a fresh
+        -- filesystem scan, so an advertised agent_type cannot be rejected here
+        -- due to a mid-conversation file change (REQ-AG-008). The error message
+        -- names the offending agent_type and lists available agent names.
 }
 
 -- ===========================================================
@@ -303,9 +304,10 @@ rule SubAgentSpecsResolved {
         -- Per-task resolution (referenced as `resolve_*` helpers). When a task
         -- sets agent_type, the matching agent definition (see specs/agents/) is
         -- the middle precedence layer between the task's explicit fields and the
-        -- mode-based defaults. resolve_agent(t) = find_agent(
-        --   collect_agents(parent.working_dir), t.agent_type), or none when
-        -- agent_type is absent.
+        -- mode-based defaults. resolve_agent(t) = find_agent(frozen_catalog,
+        --   t.agent_type), or none when agent_type is absent. frozen_catalog is
+        -- the parent conversation's once-discovered catalog (the same one that
+        -- rendered the schema; agents.allium), not a fresh scan (REQ-AG-008).
         --
         --   resolve_mode(t):
         --     t.mode.present        => t.mode

@@ -155,6 +155,20 @@ request; REQ-AG-008 forbids that. The agent catalog is deliberately *not* also
 emitted into the system-prompt text (REQ-AG-004), so there is a single
 cache-bearing representation, not two.
 
+### One frozen catalog per conversation
+
+The catalog is discovered once at conversation start and frozen for the
+conversation's lifetime. The *same* catalog (shared by `Arc`) is used to render
+the `spawn_agents` schema, to resolve `agent_type` at spawn time, and to rebuild
+the registry on an Explore→Work upgrade. Resolution does not re-scan the
+filesystem: if it did, an agent file renamed, deleted, or edited mid-conversation
+would let the model select an `agent_type` the (frozen) schema advertised yet
+have resolution reject it, or silently swap the persona/model out from under the
+advertised description. Freezing both surfaces on one catalog keeps the
+advertised choice and the runtime resolution in lockstep (REQ-AG-008). The
+catalog lives on the conversation's tool executor; sub-agents (which cannot
+spawn) carry an empty one.
+
 ## Spawn-time resolution and precedence (REQ-AG-005)
 
 `SubAgentTask` (the LLM-supplied per-task shape, owned by `subagents.allium`)

@@ -1837,11 +1837,14 @@ async fn get_system_prompt(
     } else {
         None
     };
+    // Mirror the mode context the live request uses (worktree boundaries,
+    // Explore guidance) so the inspected prompt matches what the model sees.
+    let mode_context = crate::runtime::conv_mode_to_context(&conversation.conv_mode);
     let system_prompt = crate::system_prompt::build_system_prompt(
         &cwd,
         &tasks_dir_name,
         is_sub_agent,
-        None,
+        Some(&mode_context),
         conversation.llm_language,
         persona.as_deref(),
     );
