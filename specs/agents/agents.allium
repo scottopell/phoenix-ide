@@ -1,0 +1,270 @@
+-- allium: 3
+-- specs/agents/agents.allium
+--
+-- Named Agents: Behavioural Specification
+--
+-- Scope: Agent-definition discovery, frontmatter handling, the agent_type
+--        schema-enum surfaced on the spawn tool, and persona composition in
+--        the sub-agent system prompt.
+-- Includes:
+--   - AgentDefinition entity (one .md per agent) and discovery walk-up
+--   - Frontmatter stripping and required-field validation
+--   - agent_type enum injection on the spawn tool (present + omitted cases)
+--   - Deterministic, cache-stable catalog ordering
+--   - Persona-vs-default-preamble composition for spawned sub-agents
+-- Excludes:
+--   - Spawn lifecycle, fan-in, cancellation, timeout (see bedrock.allium)
+--   - Spawn-time resolution precedence (mode/model/persona) and the
+--     unknown-agent_type rejection — these thread through the existing
+--     spawn validation in subagents.allium (SubAgentSpecsResolved,
+--     SpawnRejectedUnknownAgentType).
+--   - Per-mode tool-registry selection: a named agent never changes the
+--     registry, which stays a pure function of mode (see subagents.allium
+--     ToolRegistryMatchesMode). The `tools` frontmatter field is preserved
+--     but inert (REQ-AG-009).
+--
+-- Requirement traceability: REQ-AG-001 .. REQ-AG-004, REQ-AG-006, REQ-AG-008,
+-- REQ-AG-009. REQ-AG-005 (resolution precedence) and REQ-AG-007 (unknown
+-- agent_type rejection) are modelled in subagents.allium where the spawn
+-- validation and SubAgentSpec resolution live.
+
+use "./subagents.allium" as subagents
+
+------------------------------------------------------------
+-- External Entities
+------------------------------------------------------------
+
+-- A named agent is a filesystem resource: a single Markdown file in an agents
+-- directory. The system reads agent files but never writes them.
+external entity AgentDefinition {
+    name: String          -- from frontmatter; the agent_type value
+    description: String   -- from frontmatter; shown on the agent_type enum choice
+    body: String          -- file content with frontmatter stripped (the persona)
+    path: String          -- absolute path to the agent .md file
+    source: String        -- scanning location: ".claude/agents" | ".agents/agents"
+    model: String?        -- from frontmatter; default model id (subagents.allium resolves)
+    mode: String?         -- from frontmatter; default mode: "explore" | "work"
+}
+
+-- Opaque cross-spec type referenced only in guidance; its resolution and the
+-- persona threading live in subagents.allium.
+--   subagents.SubAgentSpec: the resolved spec a sub-agent is spawned from;
+--     gains agent_name and persona fields for this feature.
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- Relative paths scanned at each directory level during discovery.
+    -- Order matters: first match for a given name wins within a level.
+    -- Default values: [".claude/agents", ".agents/agents"]. Defaults are
+    -- baked into the implementation rather than declared inline because
+    -- v3 grammar reserves bracket literals for set membership rather than
+    -- ordered lists (same treatment as skills.allium skill_scan_dirs).
+    agent_scan_dirs: List<String>
+}
+
+------------------------------------------------------------
+-- Rules: Discovery
+------------------------------------------------------------
+
+rule DiscoverAgentCatalog {
+    when: AgentCatalogRequested(working_dir)
+
+    ensures: catalog = collect_agents(working_dir)
+    -- collect_agents: black box returning List<AgentDefinition>, sorted by
+    -- name, fully deduplicated. The sort is contractual: it is what makes the
+    -- agent_type enum byte-stable across turns (REQ-AG-008).
+
+    @guidance
+        -- Collection order (determines name-collision winner) mirrors skills:
+        --   1. Walk from working_dir to root; at each level scan agent_scan_dirs.
+        --      working_dir is visited first so the most specific agent wins.
+        --   2. Scan immediate children of working_dir (projects-directory case).
+        --   3. Scan $HOME/agent_scan_dirs if $HOME was not visited in the walk.
+        --
+        -- Dedup: applied inline as each agent is discovered. An agent is
+        -- skipped if any of these match an already-collected agent:
+        --   a. Canonical path: same inode (symlinks).
+        --   b. Content hash: same file content (copies).
+        --   c. Name: same name (first = closer to CWD wins).
+        --
+        -- Unlike skills, agents are NOT namespaced into a sub-directory; there
+        -- is one flat level per agents directory (no `agent:subagent` names).
+        -- Implementation: discover_agents() in the phoenix-agents crate,
+        -- structurally reusing the phoenix-skills walk.
+}
+
+------------------------------------------------------------
+-- Rules: Frontmatter
+------------------------------------------------------------
+
+-- Supported frontmatter fields (parsed during discovery):
+--   name:        required String — agent identifier; the agent_type value
+--   description: required String — one-line description for the enum choice
+--   model:       optional String — default model id (resolved in subagents.allium)
+--   mode:        optional String — default sub-agent mode: "explore" | "work"
+--   tools:       optional List   — parsed and preserved, inert in v1 (REQ-AG-009)
+
+-- An agent file missing a required field registers no agent; discovery of the
+-- remaining files continues and no error is surfaced (REQ-AG-002).
+rule AgentFileSkippedMissingRequiredField {
+    when: AgentFileParsed(path)
+
+    let valid = frontmatter_has_required_fields(path)
+    -- frontmatter_has_required_fields: black box — true iff both `name` and
+    -- `description` are present and non-empty.
+
+    requires: not valid
+
+    ensures: AgentFileSkipped(path)
+}
+
+-- Frontmatter is stripped before the body is used as the persona (REQ-AG-003).
+rule StripAgentFrontmatter {
+    when: AgentFileRead(path, content)
+
+    let trimmed = trim_start(content)
+    -- trim_start: black box removing leading whitespace/newlines.
+
+    requires: starts_with(trimmed, "---\n")
+    -- starts_with: black box on String.
+
+    let body = after_frontmatter(trimmed)
+    -- after_frontmatter: black box stripping from the opening "---\n" through
+    -- the closing "\n---" delimiter and any following newlines, returning only
+    -- the body. If no closing delimiter is found, returns content unchanged.
+
+    ensures: AgentBodyAfterFrontmatter(path, body)
+
+    @guidance
+        -- Files without a leading "---\n" (after trimming) are delivered as
+        -- all-body; this rule's requires guard excludes them. The
+        -- AgentDefinition matching `path` has its `body` populated from `body`
+        -- during discovery (DiscoverAgentCatalog), constructed atomically with
+        -- frontmatter already stripped. Shares the skills strip_frontmatter
+        -- approach (REQ-SK-001 / specs/skills/skills.allium StripFrontmatter).
+}
+
+------------------------------------------------------------
+-- Rules: agent_type schema enum on the spawn tool
+------------------------------------------------------------
+
+-- Discovered agents are surfaced as a typed agent_type enum on the spawn
+-- tool's per-task schema, NOT as system-prompt prose (REQ-AG-004). This rides
+-- the model's trained prior for selecting a named sub-agent type.
+
+rule InjectAgentTypeEnum {
+    when: SpawnToolSchemaBuilt(working_dir)
+
+    let catalog = collect_agents(working_dir)
+
+    requires: catalog.count > 0
+
+    ensures: SpawnToolSchemaWithAgentType(working_dir,
+        agent_type_enum: agent_type_enum(catalog))
+    -- agent_type_enum: black box rendering the per-task `agent_type` property:
+    --   { type: "string", enum: <names sorted>, description: <name+desc lines> }
+    -- Iterates the already-sorted catalog so the rendered bytes are stable
+    -- turn-to-turn (REQ-AG-008).
+
+    @guidance
+        -- The enum carries each agent's name; the property description carries
+        -- one "name: description" line per agent so the model sees what each
+        -- persona is for. No agent catalog is emitted into the system-prompt
+        -- text — a single cache-bearing representation, not two (REQ-AG-004).
+        -- Implementation: SpawnAgentsTool::with_agents(catalog).input_schema().
+}
+
+-- When no agents are discovered, agent_type is omitted entirely, so the spawn
+-- tool keeps its agent-free shape — a strict subset of today's schema.
+rule AgentTypeEnumOmittedWhenNoAgents {
+    when: SpawnToolSchemaBuilt(working_dir)
+
+    let catalog = collect_agents(working_dir)
+
+    requires: catalog.count = 0
+
+    ensures: SpawnToolSchemaWithoutAgentType(working_dir)
+}
+
+------------------------------------------------------------
+-- Rules: Persona composition in the sub-agent system prompt
+------------------------------------------------------------
+
+-- When a sub-agent carries a persona (it was spawned from a named agent), the
+-- persona replaces the generic assistant preamble; environment grounding and
+-- the result-submission suffix are retained regardless (REQ-AG-006).
+rule ComposeSubAgentPersona {
+    when: SubAgentSystemPromptRequested(sub_agent)
+
+    requires: has_persona(sub_agent)
+    -- has_persona: black box — true iff subagents.SubAgentSpec.persona is set.
+
+    let persona = sub_agent_persona(sub_agent)
+    -- sub_agent_persona: black box returning SubAgentSpec.persona.
+
+    ensures: SubAgentSystemPrompt(sub_agent,
+        prompt: persona
+            + environment_grounding(sub_agent)
+            + submit_suffix(sub_agent))
+    -- environment_grounding: black box — working directory note, project
+    --   guidance, and mode context (the non-persona scaffolding).
+    -- submit_suffix: black box — the submit_result/submit_error instruction
+    --   appended to every sub-agent prompt.
+
+    @guidance
+        -- The persona stands in for the base preamble only; it does not remove
+        -- grounding or the terminal-tool suffix, both of which a sub-agent
+        -- needs to locate itself and complete its lifecycle. Implementation:
+        -- build_system_prompt() takes the persona from SubAgentSpec.persona.
+}
+
+-- No persona (anonymous spawn): the generic base preamble leads, exactly as
+-- today. Grounding and suffix are identical to the persona case.
+rule ComposeSubAgentDefaultPreamble {
+    when: SubAgentSystemPromptRequested(sub_agent)
+
+    requires: not has_persona(sub_agent)
+
+    ensures: SubAgentSystemPrompt(sub_agent,
+        prompt: base_preamble(sub_agent)
+            + environment_grounding(sub_agent)
+            + submit_suffix(sub_agent))
+    -- base_preamble: black box — the language-aware "helpful assistant" intro
+    --   from llm_language::base_prompt().
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- Agent names are unique across all agents visible in a given working
+-- directory. Dedup during discovery ensures no two distinct files reach the
+-- catalog with the same name.
+invariant AgentNamesUnique {
+    for a in AgentDefinitions:
+        for b in AgentDefinitions where b != a:
+            a.name != b.name
+}
+
+-- Frontmatter delimiters are never present at the start of a persona.
+invariant FrontmatterStrippedFromPersona {
+    for a in AgentDefinitions:
+        not starts_with(a.body, "---\n")
+}
+
+------------------------------------------------------------
+-- Design Decisions
+------------------------------------------------------------
+
+-- Per-agent tool allowlist (DEFERRED): tool capability stays a pure function
+-- of mode (subagents.allium ToolRegistryMatchesMode). An agent definition's
+-- `tools` field is parsed into AgentDefinition and preserved but not acted on,
+-- so a later capability-restriction pass needs no format change (REQ-AG-009).
+
+-- User-initiated agent invocation (OUT OF SCOPE): a named agent has no
+-- user-facing slash trigger (the analogue of /skill). Named agents are a
+-- spawn-time persona for the LLM's delegation only, keeping v1 to one
+-- invocation path with no delivery-format split (contrast REQ-SK-002).
