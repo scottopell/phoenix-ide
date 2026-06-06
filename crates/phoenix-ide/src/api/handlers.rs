@@ -1821,13 +1821,29 @@ async fn get_system_prompt(
     let tasks_dir_name = taskmd_core::discover::discover_or_default(&cwd)
         .to_string_lossy()
         .into_owned();
+    // Reflect the real prompt for named sub-agents: a sub-agent (one with a
+    // parent) gets the sub-agent suffix, and its persona replaces the base
+    // preamble (REQ-AG-006). Without this the inspection endpoint shows a
+    // generic prompt exactly for the named-agent feature.
+    let is_sub_agent = conversation.parent_conversation_id.is_some();
+    let persona = if is_sub_agent {
+        state
+            .runtime
+            .db()
+            .get_sub_agent_persona(&id)
+            .await
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
     let system_prompt = crate::system_prompt::build_system_prompt(
         &cwd,
         &tasks_dir_name,
-        false,
+        is_sub_agent,
         None,
         conversation.llm_language,
-        None,
+        persona.as_deref(),
     );
 
     Ok(Json(SystemPromptResponse { system_prompt }))

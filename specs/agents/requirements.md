@@ -198,11 +198,12 @@ THE SYSTEM SHALL derive a sub-agent's tool registry from its resolved mode
 WHEN an agent definition declares a `tools` field
 THE SYSTEM SHALL preserve it during parsing without acting on it
 
-**Rationale:** Tool capability is already governed correctly by the
-Explore/Work mode registries (`for_subagent_explore` / `for_subagent_work`).
-Letting an agent definition narrow the toolset is a coherent future capability,
-but folding it in now would mean a third registry-construction path before the
-persona layer has proven itself. Parsing and preserving the `tools` field keeps
-the on-disk format forward-compatible so a later capability-restriction pass is
-non-breaking; ignoring it in v1 keeps the registry story single-sourced in
-mode.
+**Rationale:** Tool capability is governed solely by the Explore/Work mode
+registries (`for_subagent_explore` / `for_subagent_work`); a named agent
+changes persona and defaults, never which tools exist. Keeping capability
+single-sourced in mode means there is exactly one registry-construction path to
+reason about. The `tools` field is part of the on-disk format and is parsed and
+preserved so the format can carry a capability declaration, but it is not part
+of this contract: the resolved registry is a function of mode alone. (A
+capability-restriction pass that consults `tools` is tracked as follow-up work,
+not described here.)

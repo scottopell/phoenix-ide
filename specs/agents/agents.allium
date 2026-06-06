@@ -105,7 +105,7 @@ rule DiscoverAgentCatalog {
 --   description: required String — one-line description for the enum choice
 --   model:       optional String — default model id (resolved in subagents.allium)
 --   mode:        optional String — default sub-agent mode: "explore" | "work"
---   tools:       optional List   — parsed and preserved, inert in v1 (REQ-AG-009)
+--   tools:       optional List   — parsed and preserved, not consulted (REQ-AG-009)
 
 -- An agent file missing a required field registers no agent; discovery of the
 -- remaining files continues and no error is surfaced (REQ-AG-002).
@@ -273,5 +273,5 @@ invariant FrontmatterStrippedFromPersona {
 
 -- User-initiated agent invocation (OUT OF SCOPE): a named agent has no
 -- user-facing slash trigger (the analogue of /skill). Named agents are a
--- spawn-time persona for the LLM's delegation only, keeping v1 to one
+-- spawn-time persona for the LLM's delegation only, keeping the design to one
 -- invocation path with no delivery-format split (contrast REQ-SK-002).

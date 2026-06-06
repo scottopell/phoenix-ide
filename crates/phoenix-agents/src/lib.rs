@@ -79,16 +79,16 @@ fn parse_agent_frontmatter(content: &str) -> Option<AgentFrontmatter> {
 
     for line in frontmatter.lines() {
         if let Some(val) = line.strip_prefix("name:") {
-            name = Some(val.trim().to_string());
+            name = Some(unquote_scalar(val));
         } else if let Some(val) = line.strip_prefix("description:") {
-            description = Some(val.trim().to_string());
+            description = Some(unquote_scalar(val));
         } else if let Some(val) = line.strip_prefix("model:") {
-            let m = val.trim().to_string();
+            let m = unquote_scalar(val);
             if !m.is_empty() {
                 model = Some(m);
             }
         } else if let Some(val) = line.strip_prefix("mode:") {
-            mode = parse_mode(val.trim());
+            mode = parse_mode(&unquote_scalar(val));
         } else if let Some(val) = line.strip_prefix("tools:") {
             tools = parse_tools(val.trim());
         }
@@ -105,6 +105,21 @@ fn parse_agent_frontmatter(content: &str) -> Option<AgentFrontmatter> {
         mode,
         tools,
     })
+}
+
+/// Strip a single layer of matching surrounding quotes from a YAML scalar,
+/// after trimming whitespace. `name: "security-reviewer"` and
+/// `name: security-reviewer` both yield `security-reviewer`. Without this the
+/// quotes become part of the `agent_type` enum value and the LLM's unquoted
+/// selection is rejected as unknown.
+fn unquote_scalar(value: &str) -> String {
+    let trimmed = value.trim();
+    for q in ['"', '\''] {
+        if let Some(inner) = trimmed.strip_prefix(q).and_then(|s| s.strip_suffix(q)) {
+            return inner.to_string();
+        }
+    }
+    trimmed.to_string()
 }
 
 /// Map a frontmatter `mode` string to a [`SubAgentMode`]; unknown values map
@@ -248,19 +263,26 @@ pub fn discover_agents_with_home(
         current = dir.parent().map(Path::to_path_buf);
     }
 
-    // 2. Immediate child directories (projects-directory case).
+    // 2. Immediate child directories (projects-directory case). Sort by path
+    //    so that when two sibling projects declare the same agent name the
+    //    first-wins dedup is deterministic across filesystems (REQ-AG-008),
+    //    mirroring the within-directory sort in collect_agents_from_dir.
     if let Ok(children) = std::fs::read_dir(working_dir) {
-        for child in children.flatten() {
-            if child.path().is_dir() {
-                scan_level(
-                    &child.path(),
-                    &mut agents,
-                    &mut seen_names,
-                    &mut seen_paths,
-                    &mut seen_content,
-                    &mut scanned_dirs,
-                );
-            }
+        let mut child_dirs: Vec<PathBuf> = children
+            .flatten()
+            .map(|c| c.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        child_dirs.sort();
+        for dir in &child_dirs {
+            scan_level(
+                dir,
+                &mut agents,
+                &mut seen_names,
+                &mut seen_paths,
+                &mut seen_content,
+                &mut scanned_dirs,
+            );
         }
     }
 
@@ -597,6 +619,49 @@ mod tests {
             dup[0].description, "from-a",
             "lexicographically-first path wins"
         );
+    }
+
+    #[test]
+    fn quoted_yaml_scalars_are_unquoted() {
+        // Valid YAML quoted scalars must not leak quotes into the agent_type
+        // value, or the LLM's unquoted selection would be rejected.
+        let fm = parse_agent_frontmatter(
+            "---\nname: \"security-reviewer\"\ndescription: 'Finds vulns'\nmodel: \"claude-sonnet-4-6\"\n---\n",
+        )
+        .unwrap();
+        assert_eq!(fm.name, "security-reviewer");
+        assert_eq!(fm.description, "Finds vulns");
+        assert_eq!(fm.model.as_deref(), Some("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn same_name_across_sibling_children_resolves_deterministically() {
+        // REQ-AG-008: in the projects-directory case, two sibling projects
+        // declaring the same agent name resolve to the lexicographically-first
+        // child path, regardless of read_dir order.
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a-proj");
+        let z = tmp.path().join("z-proj");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&z).unwrap();
+        write_agent(
+            &z,
+            ".claude/agents",
+            "r.md",
+            "name: dup\ndescription: from-z\n",
+            "z",
+        );
+        write_agent(
+            &a,
+            ".claude/agents",
+            "r.md",
+            "name: dup\ndescription: from-a\n",
+            "a",
+        );
+        let agents = discover_agents_with_home(tmp.path(), Some(tmp.path()));
+        let dup: Vec<&AgentDefinition> = agents.iter().filter(|x| x.name == "dup").collect();
+        assert_eq!(dup.len(), 1);
+        assert_eq!(dup[0].description, "from-a", "first child path wins");
     }
 
     #[test]

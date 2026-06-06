@@ -48,27 +48,26 @@ the persona into `SubAgentSpec`).
 
 ## Status Summary
 
-Specification only; no implementation exists yet.
-
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-AG-001:** Agent Definition Discovery | 📋 Planned | Mirrors skill discovery in a new `phoenix-agents` crate |
-| **REQ-AG-002:** Agent Definition Format | 📋 Planned | One `.md` per agent; `name`/`description` required |
-| **REQ-AG-003:** Frontmatter Separation | 📋 Planned | Reuses skill `strip_frontmatter` approach |
-| **REQ-AG-004:** Agent Type as Typed Spawn Choice | 📋 Planned | `agent_type` enum on `spawn_agents`; no system-prompt catalog |
-| **REQ-AG-005:** Spawn-Time Resolution and Precedence | 📋 Planned | Threads `agent_type` through `subagents.allium` resolution |
-| **REQ-AG-006:** Persona Composition | 📋 Planned | Persona replaces base preamble; grounding + suffix retained |
-| **REQ-AG-007:** Unknown Agent Type Rejected | 📋 Planned | `SpawnRejectedUnknownAgentType` in `subagents.allium` |
-| **REQ-AG-008:** Prompt-Cache Stability | 📋 Planned | Deterministic, name-sorted enum rendering |
-| **REQ-AG-009:** Capability from Mode, Not Definition | 📋 Planned | `tools` field preserved but inert in v1 |
+| **REQ-AG-001:** Agent Definition Discovery | ✅ Implemented | `phoenix_agents::discover_agents` (walk-up + children + `$HOME`, sorted, deduped) |
+| **REQ-AG-002:** Agent Definition Format | ✅ Implemented | One `.md` per agent; `parse_agent_frontmatter` requires `name`/`description` |
+| **REQ-AG-003:** Frontmatter Separation | ✅ Implemented | `phoenix_agents::strip_frontmatter` |
+| **REQ-AG-004:** Agent Type as Typed Spawn Choice | ✅ Implemented | `SpawnAgentsTool::with_agents` renders the `agent_type` enum in `input_schema` |
+| **REQ-AG-005:** Spawn-Time Resolution and Precedence | ✅ Implemented | `handle_spawn_agents_tool` resolves task → agent def → mode default |
+| **REQ-AG-006:** Persona Composition | ✅ Implemented | `build_system_prompt` persona arg; persisted in `sub_agent_personas` and restored on resume |
+| **REQ-AG-007:** Unknown Agent Type Rejected | ✅ Implemented | `handle_spawn_agents_tool` rejects an unmatched `agent_type` before spawning |
+| **REQ-AG-008:** Prompt-Cache Stability | ✅ Implemented | Discovery sorts by name and dir entries sort before dedup; schema byte-stable |
+| **REQ-AG-009:** Capability from Mode, Not Definition | ✅ Implemented | Registry selected by mode; `tools` frontmatter parsed and preserved, not consulted |
 
-**Progress:** 0 of 9 implemented (specification under review).
+**Progress:** 9 of 9 implemented.
 
 ## Deferred refinements
 
 - **Per-agent tool allowlist:** an agent definition could narrow the sub-agent's
-  toolset below its mode default. The `tools` frontmatter field is
-  parsed-and-preserved so this is a non-breaking future addition (REQ-AG-009).
+  toolset below its mode default. The `tools` frontmatter field is parsed and
+  preserved so this can be added without a format change. Tracked as follow-up
+  work, not part of the current contract.
 - **User-initiated agent invocation:** launching a named agent directly from the
   user (the analogue of `/skill`) is out of scope; named agents are a spawn-time
   persona for LLM delegation only.

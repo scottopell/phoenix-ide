@@ -54,7 +54,7 @@ pub struct AgentDefinition {
     pub source: String,          // ".claude/agents" | ".agents/agents"
     pub model: Option<String>,   // frontmatter `model` — default model id
     pub mode: Option<SubAgentMode>, // frontmatter `mode` — explore | work
-    // `tools` is parsed and preserved but inert in v1 (REQ-AG-009).
+    // `tools` is parsed and preserved but not consulted (REQ-AG-009).
 }
 
 /// Discover agents for a working directory. Result is sorted by name and
@@ -83,7 +83,7 @@ unvalidated input. Report findings with severity and a concrete fix.
 | `description` | yes | string | One-line description shown on the enum choice |
 | `model` | no | string | Default model id (must exist in the LLM registry) |
 | `mode` | no | `explore`\|`work` | Default sub-agent mode |
-| `tools` | no | list | Parsed and preserved, inert in v1 (REQ-AG-009) |
+| `tools` | no | list | Parsed and preserved, not consulted (REQ-AG-009) |
 
 Frontmatter stripping reuses the skill `strip_frontmatter` approach: everything
 after the closing `---` delimiter is the persona; a file without a leading
@@ -210,7 +210,7 @@ The sub-agent's tool registry is selected purely by resolved mode
 (`for_subagent_explore` / `for_subagent_work`), exactly as in `subagents.allium`
 `SubAgentRegistryOnFreshSpawn`. A named agent changes persona and defaults, not
 which tools exist. The `tools` frontmatter field is parsed into
-`AgentDefinition` and otherwise untouched, so a future capability-restriction
+`AgentDefinition` and otherwise untouched, so a capability-restriction
 pass can act on it without a format migration.
 
 ## Relationship to the sub-agents spec (the seam)
@@ -232,7 +232,7 @@ guidance references the precedence above. No other sub-agent behaviour changes.
 
 A user typing an agent name to launch it directly (the analogue of `/skill`) is
 deliberately out of scope. Named agents are a spawn-time persona for the LLM's
-delegation, not a user-facing slash command. This keeps v1 to a single
+delegation, not a user-facing slash command. This keeps the design to a single
 invocation path and avoids the delivery-format split skills carry (REQ-SK-002).
 
 ## Testing strategy
