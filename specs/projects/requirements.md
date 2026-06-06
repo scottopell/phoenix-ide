@@ -932,8 +932,11 @@ any other `.md` file is accepted as a plain brief (REQ-PROJ-006). An invalid fil
 rejected via a synthetic tool error (the conversation keeps running), never silently
 reclassified
 AND read the file and capture a **content snapshot** (the file bytes plus the display
-title/priority derived exactly as in REQ-PROJ-003, and a stable `proposal_id`) into a
-fork-proposal record
+title/priority derived exactly as in REQ-PROJ-003, the file path **normalized to
+repository-relative** — the agent's path is relative to its working directory, which for a
+Direct origin started in a subdirectory is a repo subdirectory, so it is resolved against
+the repo root so the fork commits it at the correct location — and a stable `proposal_id`)
+into a fork-proposal record
 AND persist the assistant message and a synthetic tool result reporting that the
 proposal was recorded and is pending the user's review
 AND **return the conversation to its running state so the agent continues its own work**

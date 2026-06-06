@@ -357,7 +357,10 @@ The fork proposal rides as a `CheckpointData::ToolRound` in the originating tran
 ForkProposal {
   proposal_id: String,     // stable id; the approve/dismiss endpoints address a specific
                            // proposal by it, and it is the idempotency key for spawning
-  task_file:   String,     // path the agent drafted (for display / provenance)
+  task_file:   String,     // drafted file's path, normalized to repo-relative at capture
+                           // (the agent's path is relative to its cwd, a possible repo
+                           // subdir) so the fork writes it at the right location
+
   title:       String,     // display copy (H1 / filename stem)
   priority:    String,     // "p0".."p4" from a taskmd name; "p2" for a plain brief
   body:        String,     // the snapshotted file bytes — authoritative at spawn time
@@ -405,8 +408,9 @@ sub-agent spawn path — this is what makes the decoupling structural (there is 
    snapshot via `TaskSource` (taskmd vs plain-markdown — REQ-PROJ-006); task branch =
    `task-{task_id}-{slug}` (taskmd) or `task-{sanitized-stem}-{fork-conv-id[..8]}` (plain —
    the *fork's* id prefix uniquifies).
-3. Write `body` into the worktree (taskmd file under the tasks dir; plain brief at its own
-   path); for a taskmd file, promote its status to `in-progress` first (same as the Explore
+3. Write `body` into the worktree at the snapshot's repo-relative `task_file` path (taskmd
+   file under the tasks dir; plain brief at its own repo-relative path); for a taskmd file,
+   promote its status to `in-progress` first (same as the Explore
    approval in REQ-PROJ-006 — a `ready`/`brainstorming` snapshot must not land on a Work
    branch still advertising a non-work status); a plain brief has no status segment and is
    committed as-is. `git add` + `git commit -m "task {task_id}: {title}"` on the task branch.

@@ -200,7 +200,13 @@ entity ForkProposal {
                                         -- it is the idempotency key (a pending proposal
                                         -- spawns exactly one fork)
     origin: bedrock/Conversation        -- the conversation whose agent proposed it
-    task_file: String                   -- path the agent drafted (display / provenance)
+    task_file: String                   -- the drafted file's path, normalized at capture
+                                        -- to **repository-relative** (the agent's path is
+                                        -- relative to origin.working_dir, which for a
+                                        -- Direct-in-subdir origin is a repo subdirectory).
+                                        -- The fork writes the body at this repo-relative
+                                        -- path so it lands in the same location regardless
+                                        -- of which subdir the origin ran in.
     title: String
     priority: String
     body: String                        -- snapshotted file bytes — authoritative at spawn
@@ -380,9 +386,12 @@ rule ManagedWorktreeOnFirstMessage {
         -- The agent has read-only tools in this worktree.
 }
 
--- REQ-PROJ-016/018: Non-git or Direct mode has no project features
--- (No propose_task tool, no worktrees, no task files)
--- Enforced by tool registry configuration, not by rules.
+-- REQ-PROJ-016/018: Non-git or Direct mode has no Managed project ceremony of its
+-- own (no Explore/Work worktree, no task file). Direct-in-a-git-repo is the one
+-- exception that still gets `propose_task` — as the non-blocking *fork proposal*
+-- of REQ-PROJ-033/036 (it spawns a managed fork; the Direct origin itself stays
+-- ceremony-free). Direct-not-in-a-repo gets no `propose_task` at all. Enforced by
+-- tool registry configuration, not by rules.
 
 -- ===========================================================
 -- 2. BRANCH DISCOVERY (REQ-PROJ-020, 021, 022)
@@ -666,10 +675,11 @@ rule ForkProposalApproved {
     when: UserApprovesForkProposal(proposal)
 
     requires: proposal.status = pending
-    -- Bound to origin: a terminated (abandoned/merged) origin makes the proposal
-    -- moot, so it cannot be spawned (REQ-PROJ-035). context_exhausted is NOT
-    -- terminal — its worktree is preserved — so such a proposal stays approvable.
-    requires: proposal.origin.parent_status != terminal
+    -- Bound to origin: the proposal is moot once the origin's lifecycle has ended.
+    -- Key off bedrock's own predicate (Parent.is_terminal covers terminal,
+    -- context_exhausted, AND handed_off) so a stale proposal can't be spawned after
+    -- the origin terminated or was continued away (REQ-PROJ-034/035).
+    requires: proposal.origin.is_terminal = false
     requires: proposal.origin.mode in { work, branch, direct }
 
     -- `fork` is the freshly-allocated successor conversation, bound from the field
@@ -682,8 +692,17 @@ rule ForkProposalApproved {
     let slug = parse_slug(proposal.task_file)
     let branch_name = "task-" + task_id + "-" + slug
 
-    -- Single-branch fetch of the fork base, best-effort (REQ-PROJ-022).
+    -- Materialize the fork base before the worktree add — the same single-branch
+    -- fetch + local-ref resolution as MaterializeBranch (REQ-PROJ-022), since
+    -- main_ref may be remote-only (`origin/<name>`) with no local ref yet.
     ensures: BestEffortFetch(proposal.origin.project.repo, base)
+    ensures:
+        if exists git_ref(proposal.origin.project.repo, "refs/heads/" + base):
+            FastForwardIfPossible(proposal.origin.project.repo, base)
+        else if exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
+            CreateTrackingBranch(proposal.origin.project.repo, base, "origin/" + base)
+        else:
+            error("Fork base branch '" + base + "' not found locally or at origin")
 
     -- A fresh, independent conversation — created through the top-level
     -- conversation path, never the sub-agent path (no parent event channel).
@@ -724,12 +743,16 @@ rule ForkProposalApproved {
         -- Sequence (under the same process-global approval mutex as
         -- TaskApprovalExecuted, so concurrent spawns don't race on names):
         --   1. base = origin.project.main_ref (repository default branch, the same
-        --      for every origin mode). Single-branch best-effort fetch.
+        --      for every origin mode). Materialize it like MaterializeBranch
+        --      (REQ-PROJ-022): single-branch fetch, then fast-forward the local ref
+        --      or create a local tracking branch from origin/<base> — so a
+        --      remote-only default branch has a local ref before the worktree add.
         --   2. `git worktree add -b <branch> <fork-worktree> <base>` — a NEW
-        --      worktree at .phoenix/worktrees/{fork-id}, off the default branch.
-        --   3. Write proposal.body into the worktree (taskmd file under the tasks
-        --      dir, promoted to ...-in-progress--<slug>.md; plain brief at its own
-        --      path with no status rename), `git add` + `git commit` (never on base).
+        --      worktree at .phoenix/worktrees/{fork-id}, off the (now-local) base.
+        --   3. Write proposal.body into the worktree at proposal.task_file (its
+        --      repo-relative path; taskmd file under the tasks dir, promoted to
+        --      ...-in-progress--<slug>.md; plain brief at its own path with no status
+        --      rename), `git add` + `git commit` (never on base).
         --   4. Persist the fork as a top-level Work conversation: conv_mode Work,
         --      spawned_from_conversation_id = origin, and seed its LLM context with
         --      the brief itself (proposal.body) plus a line naming the fork's
@@ -1487,10 +1510,11 @@ surface ForkProposalReview {
     facing: bedrock/User
 
     -- Only a pending proposal whose origin is still live is reviewable. Once the
-    -- origin is terminal (abandoned/merged) the proposal is moot and withdrawn
+    -- origin is terminal (Parent.is_terminal — terminal/abandoned/merged,
+    -- context_exhausted, or handed_off) the proposal is moot and withdrawn
     -- (REQ-PROJ-035, bound to origin) — neither action is offered.
     context proposal: ForkProposal
-        where status = pending and origin.parent_status != terminal
+        where status = pending and origin.is_terminal = false
 
     exposes:
         proposal.id
