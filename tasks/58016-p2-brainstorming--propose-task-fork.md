@@ -106,17 +106,18 @@ Uniform across all fork-eligible origin modes:
 - **Fresh worktree** for the spawned conversation (never shares the originator's
   worktree — that would break the one-writer invariant and entangle two unrelated
   changes).
-- **New branch cut from the default/base branch, NOT from the originator's
-  `HEAD`.** The fork is an independent unit of work: it diffs only its own
-  changes and is reviewable / mergeable on its own, with no entanglement with the
-  originator's in-progress (committed-but-unmerged or uncommitted) work. The base
-  of record equals the cut point — they are the same commit, so the eventual PR
-  diff is clean.
-  - Work / Branch origins: cut from the originator's `base_branch`.
-  - Direct-in-git origin: cut from the repo's default branch (the Direct origin
-    has no `base_branch` of its own).
+- **New branch cut from the repository's default branch, NOT from the originator's
+  `base_branch` or `HEAD`** — uniformly for every origin mode (Work, Branch,
+  Direct-in-git). The default branch is the project's mandatory, immutable
+  `main_ref` (resolved at project creation: remote default when detectable, else
+  the checked-out branch). The fork is an independent unit of work: it diffs only
+  its own changes and is reviewable / mergeable on its own, with no entanglement
+  with the originator's in-progress work.
+  - A Branch-mode origin's `base_branch` equals the branch it is editing, so it is
+    explicitly NOT used as the fork base — that would stack the fork on the
+    origin's unmerged PR branch.
 - Consequence (accepted): the fork does NOT inherit the originator's in-progress
-  state. The discovered work must be self-contained enough to stand on the base
+  state. The discovered work must be self-contained enough to stand on the default
   branch; if it genuinely depended on the originator's uncommitted changes, this
   hand-off would be the wrong tool.
 - Reuse the managed-conversation creation path (worktree, branch, task-file

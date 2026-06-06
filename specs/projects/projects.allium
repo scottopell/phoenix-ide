@@ -239,13 +239,19 @@ rule GitDirectoryDetected {
 
     requires: is_git_repository(directory)
 
+    let repo = git_repo_at(directory)
+
     ensures: Project.created(
-        repo: git_repo_at(directory)
+        repo: repo,
+        main_ref: repo.remote_default_branch or repo.current_branch
     )
 
     @guidance
         -- The project is associated with the git repository root,
         -- not the provided directory (which may be a subdirectory).
+        -- main_ref (the repository default branch and canonical fork base —
+        -- REQ-PROJ-034a) is bound once here: the remote default when detectable,
+        -- else the checked-out branch. It is mandatory and never rewritten.
 }
 
 -- REQ-PROJ-002/018: Default mode is Direct
@@ -681,11 +687,17 @@ rule ForkProposalApproved {
 
     -- A fresh, independent conversation — created through the top-level
     -- conversation path, never the sub-agent path (no parent event channel).
+    -- The Work-mode conversation fields are set on the fork row itself (not only
+    -- on the Worktree entity), so callers reading conv mode/cwd directly get the
+    -- branch/path needed for navigation, tool cwd, and cleanup.
     ensures: ForkConversationCreated(proposal, fork)
     ensures: fork.kind = Parent
     ensures: fork.mode = work
     ensures: fork.task_id = task_id
+    ensures: fork.branch_name = branch_name
     ensures: fork.base_branch = base
+    ensures: fork.worktree_path = worktree_path(fork)
+    ensures: fork.working_dir = worktree_path(fork)
     ensures: fork.spawned_from_conversation_id = proposal.origin
 
     -- Its own worktree, cut from the repository default branch.
@@ -720,9 +732,11 @@ rule ForkProposalApproved {
         --      path with no status rename), `git add` + `git commit` (never on base).
         --   4. Persist the fork as a top-level Work conversation: conv_mode Work,
         --      spawned_from_conversation_id = origin, and seed its LLM context with
-        --      the brief itself (proposal.body) plus a "you are on branch
-        --      task-{task_id}-{slug}" line — the brief is in context, not merely a
-        --      committed file to discover. It inherits none of the origin transcript.
+        --      the brief itself (proposal.body) plus a line naming the fork's
+        --      resolved `branch_name` (task-{id}-{slug} for taskmd, or
+        --      task-{stem}-{fork-id-prefix} for a plain brief — never a fixed
+        --      template) — the brief is in context, not merely a committed file to
+        --      discover. It inherits none of the origin transcript.
         --   5. Mark the proposal spawned { fork }.
         --
         -- The origin is read for immutable metadata only (project -> main_ref, id ->

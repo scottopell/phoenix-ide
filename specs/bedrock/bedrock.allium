@@ -570,20 +570,24 @@ rule ForkProposalIntercepted {
     let proposal = parse_fork_proposal(tool_calls.first)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
+    ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)
     ensures: ToolRoundCheckpointed(conversation)
     ensures: ForkProposalRecorded(conversation, proposal)
     ensures: LlmRequestDispatched(conversation)
 
     @guidance
         -- Non-parking: parent_status is untouched; the conversation stays in its
-        -- ordinary core_status flow. The synthetic ToolResult is a success ack
+        -- ordinary core_status flow. Usage is recorded like any other LLM response
+        -- (context_usage_ratio) so the continuation threshold still tracks the
+        -- origin across fork proposals. The synthetic ToolResult is a success ack
         -- ("Fork proposal recorded — pending review"), which is fine to feed the
         -- model; the proposal's *resolution* (spawned/dismissed) is deliberately
         -- never delivered here (projects/ ForkProposalApproved/Dismissed), so the
         -- spawner learns nothing about what it spawned (REQ-PROJ-035).
         -- Direct fires here only when the working dir is a git repo: tool
-        -- availability gates it (a fork needs a base branch), so propose_task is
-        -- absent from a Direct-not-in-a-repo registry and never reaches this rule.
+        -- availability gates it (a fork cuts from the repository default branch),
+        -- so propose_task is absent from a Direct-not-in-a-repo registry and never
+        -- reaches this rule.
 }
 
 rule AskUserQuestionIntercepted {

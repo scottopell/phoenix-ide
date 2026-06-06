@@ -411,10 +411,13 @@ sub-agent spawn path — this is what makes the decoupling structural (there is 
    branch still advertising a non-work status); a plain brief has no status segment and is
    committed as-is. `git add` + `git commit -m "task {task_id}: {title}"` on the task branch.
 4. Persist the fork conversation: `conv_mode = Work { worktree_path, branch_name,
-   base_branch: main_ref, task_id, task_title }`, `spawned_from_conversation_id = {origin
-   id}`, and seed its LLM context with the task brief itself — the snapshot `body`, plus a
-   "you are on branch task-{task_id}-{slug}" line. The brief is *in context*, not merely a
-   committed file the agent must discover; it inherits none of the originator's transcript.
+   base_branch: main_ref, task_id, task_title }` (the same fields also set on the
+   conversation row so callers reading mode/cwd directly resolve navigation, tool cwd, and
+   cleanup), `spawned_from_conversation_id = {origin id}`, and seed its LLM context with
+   the task brief itself — the snapshot `body`, plus a line naming the **resolved**
+   `branch_name` (`task-{task_id}-{slug}` for taskmd, `task-{stem}-{fork-id[..8]}` for a
+   plain brief — not a fixed template). The brief is *in context*, not merely a committed
+   file the agent must discover; it inherits none of the originator's transcript.
 5. Record the proposal resolution `spawned { fork_conv_id }`. Return — there is no parent to
    notify (contrast `Effect::ApproveTaskFreshHandoff`, which sets the predecessor to
    `HandedOff` and links `parent_conversation_id` + `continued_in_conv_id`; the fork sets
@@ -428,14 +431,17 @@ The decoupling contract is "do not mutate or notify the origin," not "do not rea
 ## Executor-Layer Git Operations
 
 The git choreography is not modelled as fine-grained typed effects — the state machine
-emits one of two coarse effects (`Effect::ApproveTask`, `Effect::ResolveTask`) and the
-corresponding handler runs the `git` sequence directly in a `spawn_blocking` task,
-feeding back a single completion (or a `GitOperationFailed`-style error message). A
-process-global `TASK_APPROVAL_MUTEX` serialises concurrent approvals so two of them
-can't race on the same branch/worktree name; there is no per-project main-checkout
-mutex because no terminal action touches the main checkout — mark-merged and abandon
-operate only on the conversation's own worktree (and, for Managed mode, delete its task
-branch). The concrete `git` commands are listed inline in the flows above.
+emits a small set of coarse effects (`Effect::ApproveTask`, `Effect::ResolveTask`, and
+`Effect::SpawnFork` for fork approval — REQ-PROJ-034) and the corresponding handler runs
+the `git` sequence directly in a `spawn_blocking` task, feeding back a single completion
+(or a `GitOperationFailed`-style error message). `Effect::SpawnFork` is dispatched not by
+a state-machine transition on the originating conversation but by the async
+`/proposals/:id/approve` endpoint (the origin never transitions); it runs under the same
+`TASK_APPROVAL_MUTEX`. That mutex serialises concurrent approvals so two of them can't
+race on the same branch/worktree name; there is no per-project main-checkout mutex because
+no terminal action touches the main checkout — mark-merged and abandon operate only on the
+conversation's own worktree (and, for Managed mode, delete its task branch). The concrete
+`git` commands are listed inline in the flows above.
 
 `git worktree remove --force` is used unconditionally on cleanup (the worktree may have
 uncommitted files), with a `std::fs::remove_dir_all` + `git worktree prune` fallback if

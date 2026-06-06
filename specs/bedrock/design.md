@@ -502,7 +502,10 @@ LlmRequesting + LlmResponse(propose_task), mode in { work, branch, direct }
 ```
 
 The fork proposal is a content snapshot (the drafted file's bytes plus display fields and
-the resolved fork base), recorded for asynchronous review. Its lifecycle — review, spawn,
+a stable `proposal_id`), recorded for asynchronous review. It does **not** snapshot the
+fork base: the base is always the project's `main_ref` (the repository default branch),
+resolved at approval time by the projects layer — so a proposal recorded earlier can never
+spawn from stale base data. Its lifecycle — review, spawn,
 dismiss — is owned by the projects layer (`specs/projects/` REQ-PROJ-034/035) and runs off
 the originating conversation's state machine entirely: there is no resolution transition
 here, and the resolution is never fed back into this conversation's LLM context. That

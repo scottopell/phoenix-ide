@@ -994,8 +994,10 @@ directory, a plain brief at its own path — classified as in REQ-PROJ-006); for
 file, promote its status to `in-progress` before committing exactly as REQ-PROJ-006 does
 on Explore approval; then commit the task file on the fork's task branch
 AND seed the fork's LLM context with the task brief — the snapshot **body** itself, plus
-a "you are on branch task-{ID}-{slug}" line — and nothing else (it inherits none of the
-originating conversation's transcript; the brief is in context, not merely a file the
+a line naming the fork's **resolved `branch_name`** (`task-{ID}-{slug}` for a taskmd file,
+`task-{stem}-{fork-id-prefix}` for a plain brief — never a fixed taskmd-shaped template,
+which would name a branch that was never created) — and nothing else (it inherits none of
+the originating conversation's transcript; the brief is in context, not merely a file the
 agent must discover)
 AND record the resolution of the proposal as **spawned** (referencing the new
 conversation), idempotently: a `pending` proposal spawns exactly one fork; approving an
