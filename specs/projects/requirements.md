@@ -982,7 +982,7 @@ conversation keeps going.
 
 ### REQ-PROJ-034: Approve a Fork Proposal — Spawn an Independent Conversation
 
-WHEN a fork proposal exists on a conversation AND the originating conversation is not
+WHEN a **`pending`** fork proposal exists on a conversation AND the originating conversation is not
 terminal
 THE SYSTEM SHALL surface it in that conversation's tool output with a Review affordance
 AND the user MAY open the same full-screen task-review interface used for Explore
@@ -990,6 +990,9 @@ approvals (REQ-PROJ-004) to read the snapshot and Approve or Dismiss it (address
 `proposal_id`)
 AND the user's decision arrives asynchronously — the originating conversation does not
 wait on it and is unaffected by it
+AND once the proposal is resolved (spawned or dismissed) the Review affordance is
+withdrawn — a resolved proposal is no longer surfaced for review (it cannot be
+re-approved; the resolution is recorded once, idempotently)
 
 WHEN the originating conversation reaches any terminal state — `is_terminal` per the
 bedrock model, i.e. terminal (abandoned / merged), context-exhausted, or handed-off — with
@@ -1073,9 +1076,14 @@ AND SHALL NOT inject it into the originating conversation's LLM context (a resol
 agent could read would itself be a lifecycle notification, which is forbidden above)
 
 A fork proposal is **bound to its origin**: it lives with the originating conversation's
-transcript and does not survive that conversation reaching any terminal state (`is_terminal`
-— terminal/abandoned/merged, context-exhausted, or handed-off). If the origin becomes
-terminal before the proposal is reviewed, the proposal is moot.
+transcript and is removed with that conversation when the conversation is hard-deleted.
+The terminal-state effect is narrower and applies only to the **unreviewed** case: a
+`pending` proposal does not survive the origin reaching any terminal state (`is_terminal`
+— terminal/abandoned/merged, context-exhausted, or handed-off) — it is retired (moot: the
+Review affordance is withdrawn and it can no longer be approved). A **resolved** resolution
+(`spawned` or `dismissed`) is control-plane audit state that *does* persist through the
+origin's terminal lifecycle and is removed only on hard delete, so ordinary terminal
+cleanup (mark-merged / abandon) never erases the decoupled fork's provenance.
 
 **Rationale:** The whole point is to shed mental load — so the spawner must learn nothing
 about what it spawned. The decoupling is structural: the fork is created through the

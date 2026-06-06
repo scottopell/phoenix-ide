@@ -584,6 +584,9 @@ rule ForkProposalIntercepted {
     -- threshold.
     requires: not conversation.context_at_threshold
     let proposal = parse_fork_proposal(tool_calls.first)
+    -- Only a *valid* proposal is recorded; an invalid task_file takes the error arm
+    -- below (ForkProposalInvalid), so the two are mutually exclusive on validity.
+    requires: fork_proposal_valid(proposal)
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)
@@ -604,6 +607,32 @@ rule ForkProposalIntercepted {
         -- availability gates it (a fork cuts from the repository default branch),
         -- so propose_task is absent from a Direct-not-in-a-repo registry and never
         -- reaches this rule.
+}
+
+-- REQ-PROJ-033: a fork propose_task whose task_file fails the shared validation
+-- (same rules as REQ-PROJ-003: not a regular .md under the worktree, a taskmd-pattern
+-- name outside the tasks directory, or a closed taskmd status such as `done`) is
+-- rejected with a synthetic tool error and the origin keeps running — NOTHING is
+-- recorded, so an invalid path can never become an approvable proposal. The error arm
+-- of ForkProposalIntercepted, mutually exclusive with it on `fork_proposal_valid`;
+-- mirrors InterceptedToolNotSole's error-result-fed-back shape.
+rule ForkProposalInvalid {
+    when: LlmResponds(conversation, content, tool_calls, end_turn, usage)
+    requires: conversation.core_status = llm_requesting
+    requires: conversation.kind = Parent
+    requires: tool_calls.count = 1
+    requires: tool_calls.first.name = "propose_task"
+    requires: conversation.mode in { work, branch }
+           or (conversation.mode = direct and is_git_repository(conversation.working_dir))
+    requires: not conversation.context_at_threshold
+    let proposal = parse_fork_proposal(tool_calls.first)
+    requires: not fork_proposal_valid(proposal)
+    ensures: conversation.core_status = llm_requesting
+    ensures: conversation.retry_attempt = 1
+    ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)
+    ensures: ToolRoundCheckpointed(conversation)  -- propose_task gets ToolResult::error(reason)
+    ensures: LlmRequestDispatched(conversation)
+    -- No ForkProposalRecorded: an invalid proposal is never persisted.
 }
 
 rule AskUserQuestionIntercepted {

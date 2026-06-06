@@ -178,6 +178,13 @@ entity Worktree {
     branch_name: String            -- task-{NNNN}-{slug} (managed) or existing branch (branch mode)
     base_branch: String            -- recorded at creation time
     task_file: TaskFile?           -- present only for managed (work mode) worktrees
+    plain_brief_path: String?      -- repo-relative path of the committed *plain* (non-taskmd)
+                                   -- brief, for a plain-brief fork (REQ-PROJ-034). Absent for
+                                   -- taskmd worktrees. This is the durable, origin-independent
+                                   -- marker that a Work worktree legitimately has no task_file:
+                                   -- it lives on the fork (which outlives its origin), so the
+                                   -- exemption survives origin hard-delete. Exactly one of
+                                   -- task_file / plain_brief_path is set on a Work worktree.
 
     -- Derived
     is_clean: git_status_clean(path)
@@ -775,8 +782,11 @@ rule ForkProposalApproved {
         else:
             -- plain brief: no taskmd metadata and no status segment to promote; the
             -- snapshot body is committed verbatim at its own repo-relative path and the
-            -- worktree carries no typed task_file.
-            BriefCommittedOnBranch(Worktree{conversation: fork}, proposal.task_file, proposal.body)
+            -- worktree carries no typed task_file. The path is recorded durably on the
+            -- worktree (plain_brief_path) so the no-task_file exemption survives the
+            -- origin's deletion without depending on the (origin-bound) proposal row.
+            Worktree{conversation: fork}.plain_brief_path = proposal.task_file
+            and BriefCommittedOnBranch(Worktree{conversation: fork}, proposal.task_file, proposal.body)
 
     -- Resolve the proposal. fork present iff spawned — so a pending proposal
     -- spawns exactly one fork (idempotency keyed on proposal.id).
@@ -1445,14 +1455,14 @@ invariant OneWorktreePerConversation {
 -- A managed Explore→Work approval always yields a typed taskmd file, and so does a
 -- *taskmd* fork approval (ForkProposalApproved sets Worktree.task_file). The single
 -- exemption is a plain-brief fork (REQ-PROJ-034): Work mode, but seeded from a plain
--- markdown brief with no taskmd metadata, so its worktree legitimately has none. The
--- exemption is scoped to exactly that case via `is_plain_brief_fork_worktree`, which
--- holds iff w's conversation is the fork of a spawned proposal whose brief is not a
--- taskmd file — so a taskmd fork that lost its task_file, or any non-fork Work
--- worktree, still violates this.
+-- markdown brief with no taskmd metadata, so its worktree carries `plain_brief_path`
+-- instead. The exemption keys off that durable, fork-local marker — not the
+-- origin-bound proposal row, which is removed when the origin is hard-deleted — so a
+-- surviving plain-brief fork stays exempt while a taskmd fork that lost its task_file
+-- (or any non-fork Work worktree) still violates this.
 invariant TaskFileExistsForManagedWorktrees {
     for w in Worktrees where w.conversation.mode = work:
-        exists w.task_file or is_plain_brief_fork_worktree(w)
+        exists w.task_file or exists w.plain_brief_path
 }
 
 -- REQ-PROJ-024: Branch mode worktrees never have task files
