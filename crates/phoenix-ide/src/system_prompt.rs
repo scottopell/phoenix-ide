@@ -425,7 +425,10 @@ mod tests {
             Some(persona),
         );
 
-        assert!(prompt.starts_with(persona), "persona should lead the prompt");
+        assert!(
+            prompt.starts_with(persona),
+            "persona should lead the prompt"
+        );
         assert!(
             !prompt.contains("helpful AI assistant"),
             "base preamble should be replaced by the persona"

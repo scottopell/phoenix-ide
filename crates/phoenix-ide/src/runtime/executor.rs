@@ -1224,8 +1224,7 @@ where
                 Some(ref agent_type) => match phoenix_agents::find_agent(&agents, agent_type) {
                     Some(a) => Some(a),
                     None => {
-                        let available: Vec<&str> =
-                            agents.iter().map(|a| a.name.as_str()).collect();
+                        let available: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
                         let result = ToolResult::error(
                             tool_use_id.clone(),
                             format!(
@@ -5412,7 +5411,10 @@ mod work_subagent_cwd_guard_tests {
 
         match result {
             Some(Event::ToolComplete { result, .. }) => {
-                assert!(result.is_error(), "unknown agent_type must surface as error");
+                assert!(
+                    result.is_error(),
+                    "unknown agent_type must surface as error"
+                );
                 let msg = tool_result_text(&result);
                 assert!(
                     msg.contains("Unknown agent_type 'ghost'"),

@@ -188,12 +188,14 @@ impl Tool for SpawnAgentsTool {
         // strict subset of the agent-free shape. The catalog is pre-sorted by
         // name, so the rendered enum is byte-stable turn-to-turn (REQ-AG-008).
         if !self.agents.is_empty() {
+            use std::fmt::Write as _;
             let names: Vec<&str> = self.agents.iter().map(|a| a.name.as_str()).collect();
-            let mut description =
-                String::from("Named agent persona to spawn. Supplies the sub-agent's persona \
-                              and its default model/mode. One of:");
+            let mut description = String::from(
+                "Named agent persona to spawn. Supplies the sub-agent's persona \
+                              and its default model/mode. One of:",
+            );
             for agent in &self.agents {
-                description.push_str(&format!("\n- {}: {}", agent.name, agent.description));
+                let _ = write!(description, "\n- {}: {}", agent.name, agent.description);
             }
             task_props["agent_type"] = json!({
                 "type": "string",
@@ -358,11 +360,8 @@ mod tests {
     #[test]
     fn schema_is_byte_stable_across_calls() {
         // REQ-AG-008: repeated input_schema() over the same catalog is identical.
-        let tool = SpawnAgentsTool::with_agents(vec![
-            agent("a", "A"),
-            agent("b", "B"),
-            agent("c", "C"),
-        ]);
+        let tool =
+            SpawnAgentsTool::with_agents(vec![agent("a", "A"), agent("b", "B"), agent("c", "C")]);
         assert_eq!(tool.input_schema(), tool.input_schema());
     }
 

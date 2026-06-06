@@ -123,9 +123,9 @@ fn parse_mode(value: &str) -> Option<SubAgentMode> {
 /// inert in v1 (REQ-AG-009); parsing it keeps the on-disk format
 /// forward-compatible. Returns `None` for an empty value.
 fn parse_tools(value: &str) -> Option<Vec<String>> {
-    let inner = value.strip_prefix('[').map_or(value, |rest| {
-        rest.strip_suffix(']').unwrap_or(rest)
-    });
+    let inner = value
+        .strip_prefix('[')
+        .map_or(value, |rest| rest.strip_suffix(']').unwrap_or(rest));
     let names: Vec<String> = inner
         .split([',', ' '])
         .map(str::trim)
@@ -343,20 +343,29 @@ mod tests {
 
     /// Write an agent file at `{base}/{agents_subdir}/{file_name}` with the
     /// given frontmatter and body.
-    fn write_agent(base: &Path, agents_subdir: &str, file_name: &str, frontmatter: &str, body: &str) {
+    fn write_agent(
+        base: &Path,
+        agents_subdir: &str,
+        file_name: &str,
+        frontmatter: &str,
+        body: &str,
+    ) {
         let dir = base.join(agents_subdir);
         fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(file_name), format!("---\n{frontmatter}---\n\n{body}")).unwrap();
+        fs::write(
+            dir.join(file_name),
+            format!("---\n{frontmatter}---\n\n{body}"),
+        )
+        .unwrap();
     }
 
     // ---- frontmatter parsing -------------------------------------------------
 
     #[test]
     fn parses_required_fields() {
-        let fm = parse_agent_frontmatter(
-            "---\nname: reviewer\ndescription: Reviews code\n---\n\nBody.",
-        )
-        .unwrap();
+        let fm =
+            parse_agent_frontmatter("---\nname: reviewer\ndescription: Reviews code\n---\n\nBody.")
+                .unwrap();
         assert_eq!(fm.name, "reviewer");
         assert_eq!(fm.description, "Reviews code");
         assert_eq!(fm.model, None);
@@ -420,8 +429,20 @@ mod tests {
     #[test]
     fn discovers_from_claude_and_agents_dirs() {
         let tmp = TempDir::new().unwrap();
-        write_agent(tmp.path(), ".claude/agents", "a.md", "name: a\ndescription: A\n", "Persona A");
-        write_agent(tmp.path(), ".agents/agents", "b.md", "name: b\ndescription: B\n", "Persona B");
+        write_agent(
+            tmp.path(),
+            ".claude/agents",
+            "a.md",
+            "name: a\ndescription: A\n",
+            "Persona A",
+        );
+        write_agent(
+            tmp.path(),
+            ".agents/agents",
+            "b.md",
+            "name: b\ndescription: B\n",
+            "Persona B",
+        );
         let agents = discover_agents_with_home(tmp.path(), Some(tmp.path()));
         assert_eq!(agents.len(), 2);
         assert_eq!(agents[0].name, "a");
@@ -448,8 +469,20 @@ mod tests {
     #[test]
     fn sorted_by_name() {
         let tmp = TempDir::new().unwrap();
-        write_agent(tmp.path(), ".claude/agents", "z.md", "name: zzz\ndescription: d\n", "z");
-        write_agent(tmp.path(), ".claude/agents", "a.md", "name: aaa\ndescription: d\n", "a");
+        write_agent(
+            tmp.path(),
+            ".claude/agents",
+            "z.md",
+            "name: zzz\ndescription: d\n",
+            "z",
+        );
+        write_agent(
+            tmp.path(),
+            ".claude/agents",
+            "a.md",
+            "name: aaa\ndescription: d\n",
+            "a",
+        );
         let agents = discover_agents_with_home(tmp.path(), Some(tmp.path()));
         assert_eq!(agents[0].name, "aaa");
         assert_eq!(agents[1].name, "zzz");
@@ -460,8 +493,20 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let child = tmp.path().join("project");
         fs::create_dir(&child).unwrap();
-        write_agent(tmp.path(), ".claude/agents", "r.md", "name: r\ndescription: parent\n", "p");
-        write_agent(&child, ".claude/agents", "r.md", "name: r\ndescription: child\n", "c");
+        write_agent(
+            tmp.path(),
+            ".claude/agents",
+            "r.md",
+            "name: r\ndescription: parent\n",
+            "p",
+        );
+        write_agent(
+            &child,
+            ".claude/agents",
+            "r.md",
+            "name: r\ndescription: child\n",
+            "c",
+        );
         let agents = discover_agents_with_home(&child, Some(tmp.path()));
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].description, "child");
@@ -506,7 +551,13 @@ mod tests {
     #[test]
     fn malformed_file_skipped_others_survive() {
         let tmp = TempDir::new().unwrap();
-        write_agent(tmp.path(), ".claude/agents", "good.md", "name: good\ndescription: d\n", "b");
+        write_agent(
+            tmp.path(),
+            ".claude/agents",
+            "good.md",
+            "name: good\ndescription: d\n",
+            "b",
+        );
         write_agent(tmp.path(), ".claude/agents", "bad.md", "name: bad\n", "b"); // no description
         let agents = discover_agents_with_home(tmp.path(), Some(tmp.path()));
         assert_eq!(agents.len(), 1);
@@ -516,7 +567,13 @@ mod tests {
     #[test]
     fn find_agent_by_name() {
         let tmp = TempDir::new().unwrap();
-        write_agent(tmp.path(), ".claude/agents", "r.md", "name: r\ndescription: d\n", "b");
+        write_agent(
+            tmp.path(),
+            ".claude/agents",
+            "r.md",
+            "name: r\ndescription: d\n",
+            "b",
+        );
         let agents = discover_agents_with_home(tmp.path(), Some(tmp.path()));
         assert!(find_agent(&agents, "r").is_some());
         assert!(find_agent(&agents, "nope").is_none());
