@@ -2796,10 +2796,11 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
 /// here leaves no partial state.
 ///
 /// The `WorkScope` is resolved once from `conv` and passed to every
-/// scope-keyed cascade (tmux, browser) so the orchestrator owns the single
-/// derivation point. Bash and projects retain conv-shaped APIs: bash keys
-/// per-conversation handles by conv id (no scope inheritance), and projects
-/// inspects `conv.conv_mode` for the branch/worktree mode discriminant.
+/// scope-keyed cascade (bash, tmux, terminal, browser) so the orchestrator
+/// owns the single derivation point and a continuation chain on one worktree
+/// keeps its bash handles, tmux server, terminal, and browser session
+/// together. Projects retains a conv-shaped API: it inspects `conv.conv_mode`
+/// for the branch/worktree mode discriminant.
 pub(super) async fn run_resource_cleanup_cascade(
     state: &AppState,
     conv: &crate::db::Conversation,
@@ -2838,10 +2839,14 @@ pub(super) async fn run_resource_cleanup_cascade(
             None
         };
 
-    // Step 2: bash handles.
-    let bash_report =
-        crate::tools::bash::registry::cascade_bash_on_delete(state.runtime.bash_handles(), id)
-            .await;
+    // Step 2: bash handles. Scope-equality preservation: skip teardown iff
+    // the continuation inherited the same scope (REQ-BASH-WS-002).
+    let bash_report = crate::tools::bash::registry::cascade_bash_on_delete(
+        state.runtime.bash_handles(),
+        &work_scope,
+        inheritor_scope.as_ref(),
+    )
+    .await;
     let had_live_handles = !bash_report.live_handle_pgids.is_empty();
     let had_kill_failures = !bash_report.kill_failures.is_empty();
     if had_kill_failures {
@@ -5147,7 +5152,13 @@ mod hard_delete_cascade_tests {
         // Pre-seed the bash registry with an entry for this conversation
         // (no actual handles — just the per-conv table). The cascade must
         // drop it.
-        let _ = state.runtime.bash_handles().get_or_create("c-2").await;
+        let _ = state
+            .runtime
+            .bash_handles()
+            .get_or_create(&crate::work_scope::WorkScope::Conversation(
+                "c-2".to_string(),
+            ))
+            .await;
 
         run_hard_delete_cascade(&state, "c-2")
             .await
@@ -5157,7 +5168,9 @@ mod hard_delete_cascade_tests {
             state
                 .runtime
                 .bash_handles()
-                .remove_conversation("c-2")
+                .remove(&crate::work_scope::WorkScope::Conversation(
+                    "c-2".to_string()
+                ))
                 .await
                 .is_none(),
             "bash registry entry must be removed by cascade"
@@ -5261,7 +5274,13 @@ mod hard_delete_cascade_tests {
             .create_conversation("c-6", "test", "/tmp", true, None, None)
             .await
             .expect("create");
-        let _ = state.runtime.bash_handles().get_or_create("c-6").await;
+        let _ = state
+            .runtime
+            .bash_handles()
+            .get_or_create(&crate::work_scope::WorkScope::Conversation(
+                "c-6".to_string(),
+            ))
+            .await;
 
         run_hard_delete_cascade(&state, "c-6")
             .await
@@ -5288,7 +5307,11 @@ mod hard_delete_cascade_tests {
                 .await
                 .expect("create");
             // Pre-seed both registries.
-            let _ = state.runtime.bash_handles().get_or_create(id).await;
+            let _ = state
+                .runtime
+                .bash_handles()
+                .get_or_create(&crate::work_scope::WorkScope::Conversation(id.to_string()))
+                .await;
         }
 
         for id in ids {
@@ -5300,7 +5323,7 @@ mod hard_delete_cascade_tests {
                 state
                     .runtime
                     .bash_handles()
-                    .remove_conversation(id)
+                    .remove(&crate::work_scope::WorkScope::Conversation(id.to_string()))
                     .await
                     .is_none(),
                 "bash registry leaked entry for {id}"
@@ -5492,7 +5515,13 @@ mod hard_delete_cascade_tests {
             .create_conversation("c-arc-2", "test", "/tmp", true, None, None)
             .await
             .expect("create");
-        let _ = state.runtime.bash_handles().get_or_create("c-arc-2").await;
+        let _ = state
+            .runtime
+            .bash_handles()
+            .get_or_create(&crate::work_scope::WorkScope::Conversation(
+                "c-arc-2".to_string(),
+            ))
+            .await;
 
         run_archive_cascade(&state, "c-arc-2")
             .await
@@ -5509,7 +5538,9 @@ mod hard_delete_cascade_tests {
             state
                 .runtime
                 .bash_handles()
-                .remove_conversation("c-arc-2")
+                .remove(&crate::work_scope::WorkScope::Conversation(
+                    "c-arc-2".to_string()
+                ))
                 .await
                 .is_none(),
             "bash registry entry must be dropped by archive cascade"
@@ -5523,7 +5554,11 @@ mod hard_delete_cascade_tests {
         let state = make_test_state().await;
         build_chain_for_test(&state, &["ca-a", "ca-b", "ca-c"]).await;
         for id in ["ca-a", "ca-b", "ca-c"] {
-            let _ = state.runtime.bash_handles().get_or_create(id).await;
+            let _ = state
+                .runtime
+                .bash_handles()
+                .get_or_create(&crate::work_scope::WorkScope::Conversation(id.to_string()))
+                .await;
         }
 
         let _ = crate::api::chains::archive_chain_handler(
@@ -5544,7 +5579,7 @@ mod hard_delete_cascade_tests {
                 state
                     .runtime
                     .bash_handles()
-                    .remove_conversation(id)
+                    .remove(&crate::work_scope::WorkScope::Conversation(id.to_string()))
                     .await
                     .is_none(),
                 "bash registry leaked entry for {id}"

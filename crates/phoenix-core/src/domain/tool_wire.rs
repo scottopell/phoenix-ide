@@ -579,7 +579,7 @@ mod bash_tmux_wire_tests {
     #[test]
     fn bash_error_handle_cap_reached_includes_live_handles() {
         let resp = BashErrorResponse::HandleCapReached {
-            error_message: "this conversation has reached the cap of 8 live bash handles".into(),
+            error_message: "this work scope has reached the cap of 8 live bash handles".into(),
             cap: 8,
             live_handles: vec![BashLiveHandleSummary {
                 handle: "b-1".into(),

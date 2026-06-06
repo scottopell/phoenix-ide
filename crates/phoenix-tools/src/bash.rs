@@ -25,7 +25,7 @@ pub mod registry;
 pub mod ring;
 
 pub use reaper::{install_reaper, shutdown_kill_tree};
-pub use registry::{BashHandleError, BashHandleRegistry, ConversationHandles};
+pub use registry::{BashHandleError, BashHandleRegistry, WorkScopeHandles};
 // `types` (BashOp, BashToolInput) moved to phoenix-core. Alias the module back
 // as `types` and re-export the items so existing paths resolve unchanged.
 pub use phoenix_core::domain::bash_types::{self as types, BashOp, BashToolInput};
@@ -550,8 +550,10 @@ mod tests {
 
         let bash_pid = {
             use crate::bash::handle::HandleId;
-            let conv = registry.get_or_create("test-conv").await;
-            let h = conv
+            use phoenix_core::work_scope::WorkScope;
+            let scope = WorkScope::Conversation("test-conv".to_string());
+            let table = registry.get_or_create(&scope).await;
+            let h = table
                 .read()
                 .await
                 .get(&HandleId::new(handle.clone()))

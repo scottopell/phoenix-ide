@@ -592,8 +592,8 @@ pub struct CascadeReport {
 
 /// Convenience function for the cleanup-cascade orchestrator. Equivalent
 /// to `registry.cascade_on_delete(…).await` — kept as a free function
-/// for symmetry with the bash registry's `remove_conversation` API and
-/// the new `cascade_browser_on_delete`.
+/// for symmetry with the bash registry's `cascade_bash_on_delete` API and
+/// `cascade_browser_on_delete`.
 pub async fn cascade_tmux_on_delete(
     registry: &Arc<TmuxRegistry>,
     work_scope: &WorkScope,

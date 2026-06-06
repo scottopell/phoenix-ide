@@ -27,7 +27,7 @@ use super::handle::{
     ExitState, ExitWatchPanicGuard, FinalCause, Handle, HandleId, HandleState, KillSignal,
     TOMBSTONE_TAIL_LINES,
 };
-use super::registry::{BashHandleError, ConversationHandles, LiveHandleSummary};
+use super::registry::{BashHandleError, LiveHandleSummary, WorkScopeHandles};
 use super::ring::{RingLine, WindowView};
 use super::types::{BashOp, BashToolInput};
 use crate::{ToolContext, ToolOutput};
@@ -146,7 +146,7 @@ impl BashError {
     fn into_tool_output(self) -> ToolOutput {
         let typed: BashErrorResponse = match self {
             BashError::HandleNotFound { handle_id } => BashErrorResponse::HandleNotFound {
-                error_message: format!("handle {handle_id} not found in this conversation"),
+                error_message: format!("handle {handle_id} not found in this work scope"),
                 handle_id,
                 hint: HANDLE_NOT_FOUND_HINT.to_string(),
             },
@@ -166,7 +166,7 @@ impl BashError {
                     .collect();
                 BashErrorResponse::HandleCapReached {
                     error_message: format!(
-                        "this conversation has reached the cap of {cap} live bash handles"
+                        "this work scope has reached the cap of {cap} live bash handles"
                     ),
                     cap,
                     live_handles: live,
@@ -555,7 +555,7 @@ fn spawn_child(
     let pgid = i32::try_from(pid).unwrap_or(0);
 
     let handle = Handle::new_live(
-        ctx.conversation_id.clone(),
+        ctx.work_scope.clone(),
         handle_id,
         cmd.to_string(),
         label,
@@ -898,7 +898,7 @@ fn send_signal_to_group(_pgid: i32, _signal: KillSignal) {
 // ---------------------------------------------------------------------------
 
 async fn lookup_handle(ctx: &ToolContext, handle_id: &str) -> Result<Arc<Handle>, BashError> {
-    let handles_arc: Arc<RwLock<ConversationHandles>> = ctx.bash_handles().await.map_err(|e| {
+    let handles_arc: Arc<RwLock<WorkScopeHandles>> = ctx.bash_handles().await.map_err(|e| {
         // The accessor is currently infallible (returns Ok), but if it
         // ever fails we surface as handle_not_found-shaped. Use the
         // BashHandleError debug for the message.

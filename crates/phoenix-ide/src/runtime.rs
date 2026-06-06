@@ -88,8 +88,9 @@ pub struct RuntimeManager {
     platform: PlatformCapability,
     browser_sessions: Arc<BrowserSessionManager>,
     /// Per-process bash handle registry. Shared by every conversation's
-    /// `ToolContext`; each conversation gets its own `ConversationHandles`
-    /// table inside (REQ-BASH-014).
+    /// `ToolContext`; each `WorkScope` gets its own `WorkScopeHandles`
+    /// table inside, so a continuation chain on one worktree shares one
+    /// table (REQ-BASH-014, REQ-BASH-WS-001).
     bash_handles: Arc<BashHandleRegistry>,
     /// Per-process tmux server registry. Shared by every conversation's
     /// `ToolContext`; each conversation gets its own `Arc<RwLock<TmuxServer>>`

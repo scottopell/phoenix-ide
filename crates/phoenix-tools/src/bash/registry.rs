@@ -1,31 +1,34 @@
 //! In-memory bash handle registry.
 //!
-//! REQ-BASH-005 (per-conversation cap), REQ-BASH-006 (in-memory tombstones,
-//! no `SQLite` shadow store), REQ-BASH-014 (per-conversation registry).
+//! REQ-BASH-005 (per-`WorkScope` cap), REQ-BASH-006 (in-memory tombstones,
+//! no `SQLite` shadow store), REQ-BASH-014 / REQ-BASH-WS-001 / REQ-BASH-WS-002
+//! (per-`WorkScope` registry — a continuation chain on one worktree shares
+//! its handle table because it resolves to the same `WorkScope`).
 //!
 //! Lifetime: registries live in process memory only. A Phoenix restart
 //! drops them and any handles they hold; agents see `handle_not_found` on
 //! a previously-known handle (matching the spec's "handles do NOT survive
 //! Phoenix restart" guarantee).
 //!
-//! Lock ordering for cap enforcement and spawn (consumed by task 02694's
-//! `BashTool::spawn`): acquire the registry's `RwLock<HashMap>` for read,
-//! then the conversation's `RwLock<ConversationHandles>` for write. The
-//! conversation lock holds for the duration of cap-check + handle insert
-//! to prevent two concurrent spawns from both observing
-//! `count == cap - 1` and racing past the cap.
+//! Lock ordering for cap enforcement and spawn (consumed by `BashTool::run`):
+//! acquire the registry's `RwLock<HashMap>` for read, then the
+//! `WorkScope`'s `RwLock<WorkScopeHandles>` for write. The per-scope lock
+//! holds for the duration of cap-check + handle insert to prevent two
+//! concurrent spawns from both observing `count == cap - 1` and racing past
+//! the cap.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+use phoenix_core::work_scope::WorkScope;
 use thiserror::Error;
 use tokio::sync::RwLock;
 
 use super::handle::{Handle, HandleId};
 use super::ring::RING_BUFFER_BYTES;
 
-/// Per-conversation cap on `running` handles (REQ-BASH-005:
+/// Per-`WorkScope` cap on `running` handles (REQ-BASH-005:
 /// `LIVE_HANDLE_CAP`).
 pub const LIVE_HANDLE_CAP: usize = 8;
 
@@ -33,9 +36,9 @@ pub const LIVE_HANDLE_CAP: usize = 8;
 /// stable error envelope on the agent's response.
 #[derive(Debug, Error)]
 pub enum BashHandleError {
-    /// REQ-BASH-005: spawn rejected because the conversation has hit
+    /// REQ-BASH-005: spawn rejected because the work scope has hit
     /// `LIVE_HANDLE_CAP` live handles.
-    #[error("conversation has reached the cap of {cap} live bash handles")]
+    #[error("this work scope has reached the cap of {cap} live bash handles")]
     HandleCapReached {
         cap: usize,
         live_handles: Vec<LiveHandleSummary>,
@@ -51,9 +54,10 @@ pub struct LiveHandleSummary {
     pub age_seconds: u64,
 }
 
-/// Per-conversation handle table. Tracks live handles (for cap enforcement
+/// Per-`WorkScope` handle table. Tracks live handles (for cap enforcement
 /// and lookup) and tombstones (so peek/wait/kill on an exited handle still
-/// resolves until the conversation is hard-deleted or Phoenix restarts).
+/// resolves until the scope is hard-deleted with no inheritor or Phoenix
+/// restarts).
 ///
 /// The unified `handles` map covers both live and tombstoned entries;
 /// the discrimination is made by inspecting the handle's `HandleState`.
@@ -61,14 +65,14 @@ pub struct LiveHandleSummary {
 /// from `Live` to `Tombstoned` is the SAME `Arc<Handle>` (its `state`
 /// field swaps), and lookup never has to "follow" between two maps.
 #[derive(Debug, Default)]
-pub struct ConversationHandles {
-    /// Next sequential handle index for this conversation (`b-1`, `b-2`, ...).
+pub struct WorkScopeHandles {
+    /// Next sequential handle index for this work scope (`b-1`, `b-2`, ...).
     next_id: u64,
     /// All handles, by id. Live and tombstoned alike.
     handles: HashMap<HandleId, Arc<Handle>>,
 }
 
-impl ConversationHandles {
+impl WorkScopeHandles {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
@@ -137,9 +141,9 @@ impl ConversationHandles {
     }
 
     /// Remove a handle entirely (live or tombstoned). Granular complement
-    /// to `BashHandleRegistry::remove_conversation`; not currently used
-    /// by the hard-delete cascade (which removes the whole conversation
-    /// table) but kept on the API surface for surgical removal flows.
+    /// to `BashHandleRegistry::remove`; not currently used by the
+    /// hard-delete cascade (which removes the whole `WorkScope` table) but
+    /// kept on the API surface for surgical removal flows.
     #[allow(dead_code)]
     pub fn remove(&mut self, id: &HandleId) -> Option<Arc<Handle>> {
         self.handles.remove(id)
@@ -164,17 +168,20 @@ impl ConversationHandles {
     }
 }
 
-/// Top-level registry: maps `conversation_id` -> per-conversation handle table.
+/// Top-level registry: maps `WorkScope` -> per-`WorkScope` handle table.
 ///
 /// One registry instance per Phoenix process. Owned by the runtime layer
-/// and reached by tools through `ToolContext::bash_handles()`.
+/// and reached by tools through `ToolContext::bash_handles()`. Keying by
+/// `WorkScope` (rather than `conversation_id`) is what lets a continuation
+/// chain on one worktree share its handle table — both members resolve to
+/// the same `WorkScope::Worktree(path)` (REQ-BASH-WS-001).
 #[derive(Debug, Default)]
 pub struct BashHandleRegistry {
-    inner: RwLock<HashMap<String, Arc<RwLock<ConversationHandles>>>>,
+    inner: RwLock<HashMap<WorkScope, Arc<RwLock<WorkScopeHandles>>>>,
     /// Per-handle ring byte cap. Defaults to [`RING_BUFFER_BYTES`]; tests
     /// override to small values to exercise eviction.
     ring_bytes_cap: usize,
-    /// Per-conversation live-handle cap. Defaults to [`LIVE_HANDLE_CAP`];
+    /// Per-`WorkScope` live-handle cap. Defaults to [`LIVE_HANDLE_CAP`];
     /// tests override to small values to exercise rejection.
     live_handle_cap: usize,
 }
@@ -210,40 +217,41 @@ impl BashHandleRegistry {
         self.live_handle_cap
     }
 
-    /// Get-or-create the per-conversation handle table. Matches the
+    /// Get-or-create the per-`WorkScope` handle table. Matches the
     /// `BrowserSessionManager::get_session` pattern — returns the same
-    /// `Arc<RwLock<ConversationHandles>>` for repeated calls with the
-    /// same conversation id.
-    pub async fn get_or_create(&self, conversation_id: &str) -> Arc<RwLock<ConversationHandles>> {
+    /// `Arc<RwLock<WorkScopeHandles>>` for repeated calls with the
+    /// same `WorkScope`, so a continuation chain on one worktree shares
+    /// one table (REQ-BASH-WS-001).
+    pub async fn get_or_create(&self, work_scope: &WorkScope) -> Arc<RwLock<WorkScopeHandles>> {
         // Fast path: read-lock and return existing entry.
         {
             let map = self.inner.read().await;
-            if let Some(entry) = map.get(conversation_id) {
+            if let Some(entry) = map.get(work_scope) {
                 return entry.clone();
             }
         }
         // Slow path: write-lock to create. Re-check under the lock to
         // avoid clobbering a concurrent creator.
         let mut map = self.inner.write().await;
-        if let Some(entry) = map.get(conversation_id) {
+        if let Some(entry) = map.get(work_scope) {
             return entry.clone();
         }
-        let entry = Arc::new(RwLock::new(ConversationHandles::new()));
-        map.insert(conversation_id.to_string(), entry.clone());
+        let entry = Arc::new(RwLock::new(WorkScopeHandles::new()));
+        map.insert(work_scope.clone(), entry.clone());
         entry
     }
 
-    /// Snapshot live process-group ids across ALL conversations, for the
+    /// Snapshot live process-group ids across ALL work scopes, for the
     /// shutdown kill-tree pass. Acquires read locks; callers must NOT
-    /// hold any conversation lock while invoking this.
+    /// hold any per-scope lock while invoking this.
     ///
     /// REQ-BASH-007: walks live handles for the `shutdown_kill_tree` pass.
     pub async fn snapshot_live_pgids(&self) -> Vec<i32> {
         let mut out = Vec::new();
         let map = self.inner.read().await;
         for entry in map.values() {
-            let convs = entry.read().await;
-            for h in convs.all() {
+            let scope_handles = entry.read().await;
+            for h in scope_handles.all() {
                 if let Some(pgid) = h.live_pgid().await {
                     out.push(pgid);
                 }
@@ -252,20 +260,17 @@ impl BashHandleRegistry {
         out
     }
 
-    /// Remove a conversation's handle table outright. Used by the
+    /// Remove a `WorkScope`'s handle table outright. Used by the
     /// hard-delete cascade (REQ-BASH-006). Returns the removed entry so
     /// the caller can SIGKILL its live process groups synchronously.
-    pub async fn remove_conversation(
-        &self,
-        conversation_id: &str,
-    ) -> Option<Arc<RwLock<ConversationHandles>>> {
+    pub async fn remove(&self, work_scope: &WorkScope) -> Option<Arc<RwLock<WorkScopeHandles>>> {
         let mut map = self.inner.write().await;
-        map.remove(conversation_id)
+        map.remove(work_scope)
     }
 
-    /// Number of conversations currently tracked. Test/diagnostic only.
+    /// Number of work scopes currently tracked. Test/diagnostic only.
     #[cfg(test)]
-    pub async fn conversation_count(&self) -> usize {
+    pub async fn scope_count(&self) -> usize {
         self.inner.read().await.len()
     }
 }
@@ -274,7 +279,7 @@ impl BashHandleRegistry {
 /// (REQ-BASH-006). Failure surfaces as a structured record the
 /// orchestrator logs at WARN; nothing here is fatal — the conversation
 /// row is removed regardless. The orchestrator already knows the
-/// `conv_id` (it's the path parameter), so it is not duplicated here.
+/// `WorkScope` (it's an argument), so it is not duplicated here.
 #[derive(Debug, Clone, Default)]
 pub struct CascadeBashReport {
     /// pids that were live at snapshot time (informational; kills target
@@ -292,41 +297,59 @@ pub struct CascadeBashReport {
     pub kill_failures: Vec<(i32, String)>,
 }
 
-/// Run the bash side of the hard-delete cascade for `conversation_id`
-/// (REQ-BASH-006). Atomically:
+/// Run the bash side of the hard-delete cascade for `work_scope`
+/// (REQ-BASH-006, REQ-BASH-WS-002). Mirrors the tmux/browser cascades'
+/// `(work_scope, inheritor_scope)` signature.
 ///
-///   1. Removes the conversation's handle table from the registry — any
-///      subsequent tool call for this conversation will see "no handle
+/// A continuation that inherits the same `WorkScope` keeps the live
+/// processes and tombstones — they belong to the `WorkScope`, not the
+/// deleted conversation. When `inheritor_scope == Some(work_scope)` the
+/// teardown is skipped entirely and the handle table is left in place
+/// (early return, empty report).
+///
+/// Otherwise, atomically:
+///
+///   1. Removes the scope's handle table from the registry — any
+///      subsequent tool call for this `WorkScope` will see "no handle
 ///      table" and produce `handle_not_found`, which is the correct
-///      behaviour for a deleted conversation.
+///      behaviour once no inheritor survives.
 ///   2. Snapshots live pgid / pid / `kill_pending_kernel` state across the
 ///      removed handles.
 ///   3. Sends `SIGKILL` to each live process group via
 ///      `kill(-pgid, SIGKILL)` (catches immediate descendants per
 ///      REQ-BASH-007's setpgid contract).
 ///
-/// The Allium `HandlesRemovedByConversationDelete` rule's post-condition
-/// (`not exists Handle{conversation: c}`) is satisfied by step 1 alone:
-/// the live handles drop with the registry entry. Step 3 satisfies the
-/// `KillSignalSentForAllLiveHandles` ensures clause; failures populate
-/// `kill_failures` for the orchestrator's WARN log but are not fatal —
-/// the spec's policy is "log and continue" (REQ-BED-032).
+/// Step 1 alone drops the live handles with the registry entry. Step 3
+/// satisfies the `KillSignalSentForAllLiveHandles` ensures clause; failures
+/// populate `kill_failures` for the orchestrator's WARN log but are not
+/// fatal — the spec's policy is "log and continue" (REQ-BED-032).
 ///
 /// SIGKILL rather than SIGTERM: hard-delete deletes the conversation
 /// outright, so no agent is left to observe a graceful close. Same
 /// rationale as `shutdown_kill_tree` in [`super::reaper`].
 pub async fn cascade_bash_on_delete(
     registry: &Arc<BashHandleRegistry>,
-    conversation_id: &str,
+    work_scope: &WorkScope,
+    inheritor_scope: Option<&WorkScope>,
 ) -> CascadeBashReport {
     let mut report = CascadeBashReport::default();
 
-    let Some(entry) = registry.remove_conversation(conversation_id).await else {
+    // A continuation inheriting the same scope keeps the live processes and
+    // tombstones — they belong to the WorkScope, not the deleted conversation.
+    if inheritor_scope == Some(work_scope) {
+        tracing::debug!(
+            work_scope = %work_scope,
+            "bash: skipping handle teardown — scope inherited by continuation"
+        );
+        return report;
+    }
+
+    let Some(entry) = registry.remove(work_scope).await else {
         return report;
     };
 
-    let convs = entry.read().await;
-    for h in convs.all() {
+    let scope_handles = entry.read().await;
+    for h in scope_handles.all() {
         let Some(group_id) = h.live_pgid().await else {
             continue;
         };
@@ -379,9 +402,13 @@ mod tests {
     use super::*;
     use crate::bash::handle::{FinalCause, Handle};
 
-    fn make_handle(conv: &str, id: &str, ring_bytes_cap: usize) -> Arc<Handle> {
+    fn scope(name: &str) -> WorkScope {
+        WorkScope::Conversation(name.to_string())
+    }
+
+    fn make_handle(scope_name: &str, id: &str, ring_bytes_cap: usize) -> Arc<Handle> {
         Handle::new_live(
-            conv.to_string(),
+            scope(scope_name),
             HandleId::new(id),
             format!("cmd for {id}"),
             None,
@@ -392,28 +419,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allocate_handle_id_is_sequential_per_conversation() {
-        let mut convs = ConversationHandles::new();
-        assert_eq!(convs.allocate_handle_id().as_str(), "b-1");
-        assert_eq!(convs.allocate_handle_id().as_str(), "b-2");
-        assert_eq!(convs.allocate_handle_id().as_str(), "b-3");
+    async fn allocate_handle_id_is_sequential_per_scope() {
+        let mut handles = WorkScopeHandles::new();
+        assert_eq!(handles.allocate_handle_id().as_str(), "b-1");
+        assert_eq!(handles.allocate_handle_id().as_str(), "b-2");
+        assert_eq!(handles.allocate_handle_id().as_str(), "b-3");
     }
 
     #[tokio::test]
-    async fn allocate_handle_id_independent_across_conversations() {
+    async fn allocate_handle_id_independent_across_scopes() {
         let registry = BashHandleRegistry::new();
-        let conv_a = registry.get_or_create("conv-a").await;
-        let conv_b = registry.get_or_create("conv-b").await;
-        assert_eq!(conv_a.write().await.allocate_handle_id().as_str(), "b-1");
-        assert_eq!(conv_b.write().await.allocate_handle_id().as_str(), "b-1");
-        assert_eq!(conv_a.write().await.allocate_handle_id().as_str(), "b-2");
+        let scope_a = registry.get_or_create(&scope("conv-a")).await;
+        let scope_b = registry.get_or_create(&scope("conv-b")).await;
+        assert_eq!(scope_a.write().await.allocate_handle_id().as_str(), "b-1");
+        assert_eq!(scope_b.write().await.allocate_handle_id().as_str(), "b-1");
+        assert_eq!(scope_a.write().await.allocate_handle_id().as_str(), "b-2");
     }
 
     #[tokio::test]
     async fn cap_rejects_when_live_count_at_cap() {
         let registry = BashHandleRegistry::with_caps(RING_BUFFER_BYTES, 2);
-        let convs = registry.get_or_create("conv-1").await;
-        let mut guard = convs.write().await;
+        let handles_arc = registry.get_or_create(&scope("conv-1")).await;
+        let mut guard = handles_arc.write().await;
         // Insert two live handles — at the cap.
         guard.insert(make_handle("conv-1", "b-1", RING_BUFFER_BYTES));
         guard.insert(make_handle("conv-1", "b-2", RING_BUFFER_BYTES));
@@ -435,8 +462,8 @@ mod tests {
     #[tokio::test]
     async fn cap_rejection_includes_cmd_and_age() {
         let registry = BashHandleRegistry::with_caps(RING_BUFFER_BYTES, 1);
-        let convs = registry.get_or_create("conv-1").await;
-        let mut guard = convs.write().await;
+        let handles_arc = registry.get_or_create(&scope("conv-1")).await;
+        let mut guard = handles_arc.write().await;
         guard.insert(make_handle("conv-1", "b-1", RING_BUFFER_BYTES));
         let err = guard.check_cap(1).await.unwrap_err();
         let BashHandleError::HandleCapReached { live_handles, .. } = err;
@@ -448,8 +475,8 @@ mod tests {
     #[tokio::test]
     async fn tombstoned_handle_does_not_count_against_cap() {
         let registry = BashHandleRegistry::with_caps(RING_BUFFER_BYTES, 1);
-        let convs = registry.get_or_create("conv-1").await;
-        let mut guard = convs.write().await;
+        let handles_arc = registry.get_or_create(&scope("conv-1")).await;
+        let mut guard = handles_arc.write().await;
         let h = guard.insert(make_handle("conv-1", "b-1", RING_BUFFER_BYTES));
 
         // Cap is 1; live_count == 1 right now → reject.
@@ -475,27 +502,44 @@ mod tests {
     #[tokio::test]
     async fn check_cap_passes_below_cap() {
         let registry = BashHandleRegistry::with_caps(RING_BUFFER_BYTES, 8);
-        let convs = registry.get_or_create("conv-1").await;
-        let guard = convs.read().await;
-        // Empty conversation: live_count = 0; cap = 8 → ok.
+        let handles_arc = registry.get_or_create(&scope("conv-1")).await;
+        let guard = handles_arc.read().await;
+        // Empty scope: live_count = 0; cap = 8 → ok.
         assert!(guard.check_cap(8).await.is_ok());
     }
 
     #[tokio::test]
-    async fn get_or_create_returns_same_arc_for_same_conversation() {
+    async fn get_or_create_returns_same_arc_for_same_scope() {
         let registry = BashHandleRegistry::new();
-        let a = registry.get_or_create("conv-1").await;
-        let b = registry.get_or_create("conv-1").await;
+        let a = registry.get_or_create(&scope("conv-1")).await;
+        let b = registry.get_or_create(&scope("conv-1")).await;
         assert!(Arc::ptr_eq(&a, &b));
     }
 
+    /// A worktree-backed continuation chain shares one handle table: both
+    /// members resolve to the same `WorkScope::Worktree(path)`, so
+    /// `get_or_create` hands back the same `Arc` (REQ-BASH-WS-001).
     #[tokio::test]
-    async fn snapshot_live_pgids_collects_across_conversations() {
+    async fn get_or_create_shares_table_across_worktree_scope() {
         let registry = BashHandleRegistry::new();
-        let conv_a = registry.get_or_create("conv-a").await;
-        let conv_b = registry.get_or_create("conv-b").await;
+        let wt = WorkScope::Worktree("/tmp/wt-shared".to_string());
+        let a = registry.get_or_create(&wt).await;
+        let b = registry.get_or_create(&wt).await;
+        assert!(Arc::ptr_eq(&a, &b));
+        // A different scope (Conversation with same inner string) is a
+        // disjoint table — no leakage across the namespace boundary.
+        let conv = WorkScope::Conversation("/tmp/wt-shared".to_string());
+        let c = registry.get_or_create(&conv).await;
+        assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    #[tokio::test]
+    async fn snapshot_live_pgids_collects_across_scopes() {
+        let registry = BashHandleRegistry::new();
+        let scope_a = registry.get_or_create(&scope("conv-a")).await;
+        let scope_b = registry.get_or_create(&scope("conv-b")).await;
         {
-            let mut g = conv_a.write().await;
+            let mut g = scope_a.write().await;
             let mut h = make_handle("conv-a", "b-1", RING_BUFFER_BYTES);
             // Override pgid via construction — we built it with 12345 in
             // make_handle. Just use that.
@@ -503,7 +547,7 @@ mod tests {
             g.insert(h);
         }
         {
-            let mut g = conv_b.write().await;
+            let mut g = scope_b.write().await;
             g.insert(make_handle("conv-b", "b-1", RING_BUFFER_BYTES));
         }
         let pgids = registry.snapshot_live_pgids().await;
@@ -515,9 +559,9 @@ mod tests {
     #[tokio::test]
     async fn snapshot_live_pgids_skips_tombstoned() {
         let registry = BashHandleRegistry::new();
-        let convs = registry.get_or_create("conv-1").await;
+        let handles_arc = registry.get_or_create(&scope("conv-1")).await;
         let h = {
-            let mut g = convs.write().await;
+            let mut g = handles_arc.write().await;
             g.insert(make_handle("conv-1", "b-1", RING_BUFFER_BYTES))
         };
         h.transition_to_terminal(
@@ -534,19 +578,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remove_conversation_returns_entry() {
+    async fn remove_returns_entry() {
         let registry = BashHandleRegistry::new();
-        let _ = registry.get_or_create("conv-1").await;
-        assert_eq!(registry.conversation_count().await, 1);
-        assert!(registry.remove_conversation("conv-1").await.is_some());
-        assert_eq!(registry.conversation_count().await, 0);
-        assert!(registry.remove_conversation("conv-1").await.is_none());
+        let _ = registry.get_or_create(&scope("conv-1")).await;
+        assert_eq!(registry.scope_count().await, 1);
+        assert!(registry.remove(&scope("conv-1")).await.is_some());
+        assert_eq!(registry.scope_count().await, 0);
+        assert!(registry.remove(&scope("conv-1")).await.is_none());
     }
 
     #[tokio::test]
     async fn cascade_bash_on_delete_no_entry_is_clean() {
         let registry = Arc::new(BashHandleRegistry::new());
-        let report = cascade_bash_on_delete(&registry, "never-existed").await;
+        let report = cascade_bash_on_delete(&registry, &scope("never-existed"), None).await;
         assert!(report.kill_failures.is_empty());
         assert!(report.live_handle_pgids.is_empty());
         assert!(report.live_handle_pids.is_empty());
@@ -556,9 +600,9 @@ mod tests {
     #[tokio::test]
     async fn cascade_bash_on_delete_tombstoned_only_is_clean() {
         let registry = Arc::new(BashHandleRegistry::new());
-        let convs = registry.get_or_create("conv-1").await;
+        let handles_arc = registry.get_or_create(&scope("conv-1")).await;
         let h = {
-            let mut g = convs.write().await;
+            let mut g = handles_arc.write().await;
             g.insert(make_handle("conv-1", "b-1", RING_BUFFER_BYTES))
         };
         // Demote so there are no live handles to kill.
@@ -569,11 +613,56 @@ mod tests {
         )
         .await;
 
-        let report = cascade_bash_on_delete(&registry, "conv-1").await;
+        let report = cascade_bash_on_delete(&registry, &scope("conv-1"), None).await;
         assert!(report.kill_failures.is_empty());
         assert!(report.live_handle_pgids.is_empty());
         // Registry entry is gone after cascade.
-        assert_eq!(registry.conversation_count().await, 0);
+        assert_eq!(registry.scope_count().await, 0);
+    }
+
+    /// REQ-BASH-WS-002: when the continuation inherits the SAME `WorkScope`,
+    /// the cascade is a no-op — the handle table and any live processes
+    /// survive for the inheritor to peek/wait/kill.
+    #[tokio::test]
+    async fn cascade_bash_on_delete_skips_when_inheritor_shares_scope() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let wt = WorkScope::Worktree("/tmp/wt-inherit".to_string());
+        let handles_arc = registry.get_or_create(&wt).await;
+        {
+            let mut g = handles_arc.write().await;
+            g.insert(Handle::new_live(
+                wt.clone(),
+                HandleId::new("b-1"),
+                "cmd for b-1".to_string(),
+                None,
+                12345,
+                12345,
+                RING_BUFFER_BYTES,
+            ));
+        }
+
+        // Inheritor resolves to the same scope → skip teardown.
+        let report = cascade_bash_on_delete(&registry, &wt, Some(&wt)).await;
+        assert!(report.live_handle_pgids.is_empty());
+        assert!(report.kill_failures.is_empty());
+        // The table is preserved and the handle is still reachable.
+        assert_eq!(registry.scope_count().await, 1);
+        let preserved = registry.get_or_create(&wt).await;
+        assert!(preserved.read().await.get(&HandleId::new("b-1")).is_some());
+    }
+
+    /// A continuation that resolves to a DIFFERENT scope does not preserve;
+    /// teardown proceeds exactly as the no-inheritor case.
+    #[tokio::test]
+    async fn cascade_bash_on_delete_tears_down_when_inheritor_differs() {
+        let registry = Arc::new(BashHandleRegistry::new());
+        let wt = WorkScope::Worktree("/tmp/wt-deleted".to_string());
+        let other = WorkScope::Conversation("conv-other".to_string());
+        let _ = registry.get_or_create(&wt).await;
+
+        let report = cascade_bash_on_delete(&registry, &wt, Some(&other)).await;
+        assert!(report.kill_failures.is_empty());
+        assert_eq!(registry.scope_count().await, 0);
     }
 
     #[tokio::test]
@@ -584,18 +673,18 @@ mod tests {
         // verifies the bookkeeping side: the pgid is recorded in the
         // report and the registry entry is removed.
         let registry = Arc::new(BashHandleRegistry::new());
-        let convs = registry.get_or_create("conv-1").await;
+        let handles_arc = registry.get_or_create(&scope("conv-1")).await;
         {
-            let mut g = convs.write().await;
+            let mut g = handles_arc.write().await;
             g.insert(make_handle("conv-1", "b-1", RING_BUFFER_BYTES));
             g.insert(make_handle("conv-1", "b-2", RING_BUFFER_BYTES));
         }
 
-        let report = cascade_bash_on_delete(&registry, "conv-1").await;
+        let report = cascade_bash_on_delete(&registry, &scope("conv-1"), None).await;
         assert_eq!(report.live_handle_pgids.len(), 2);
         assert!(report.live_handle_pgids.iter().all(|&p| p == 12345));
         assert!(report.kill_failures.is_empty(), "ESRCH must be swallowed");
-        assert_eq!(registry.conversation_count().await, 0);
+        assert_eq!(registry.scope_count().await, 0);
     }
 
     #[cfg(unix)]
@@ -643,11 +732,12 @@ mod tests {
         );
 
         let registry = Arc::new(BashHandleRegistry::new());
-        let convs = registry.get_or_create("conv-real").await;
+        let real_scope = scope("conv-real");
+        let handles_arc = registry.get_or_create(&real_scope).await;
         {
-            let mut g = convs.write().await;
+            let mut g = handles_arc.write().await;
             let h = Handle::new_live(
-                "conv-real".to_string(),
+                real_scope.clone(),
                 HandleId::new("b-1"),
                 "sleep 60".to_string(),
                 None,
@@ -658,10 +748,10 @@ mod tests {
             g.insert(h);
         }
 
-        let report = cascade_bash_on_delete(&registry, "conv-real").await;
+        let report = cascade_bash_on_delete(&registry, &real_scope, None).await;
         assert!(report.live_handle_pgids.contains(&pgid));
         assert!(report.kill_failures.is_empty());
-        assert_eq!(registry.conversation_count().await, 0);
+        assert_eq!(registry.scope_count().await, 0);
 
         // Wait briefly for the kernel to deliver SIGKILL, then reap the
         // child. The exit status's `signal()` should be `Some(SIGKILL)`.
