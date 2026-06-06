@@ -1878,12 +1878,22 @@ impl RuntimeManager {
                     }
                 }
                 ConvMode::Direct => {
-                    // Full tool suite for Direct mode
-                    ToolRegistry::direct(agent_catalog.to_vec())
+                    // Full tool suite for Direct mode. `propose_task` (the
+                    // fork proposal) is offered only when the working dir is
+                    // inside a git repo — a fork cuts from the repository's
+                    // default branch (REQ-PROJ-036).
+                    let registry = ToolRegistry::direct(agent_catalog.to_vec());
+                    if crate::db::detect_git_repo_root(&context.working_dir).is_some() {
+                        registry.with_propose_task()
+                    } else {
+                        registry
+                    }
                 }
                 ConvMode::Work { .. } | ConvMode::Branch { .. } => {
-                    // Full tool suite for Work/Branch mode (same as Direct)
-                    ToolRegistry::direct(agent_catalog.to_vec())
+                    // Full tool suite plus `propose_task` (non-blocking fork
+                    // proposal — REQ-PROJ-036). Work/Branch always sit on git
+                    // history, so the tool is always offered.
+                    ToolRegistry::direct(agent_catalog.to_vec()).with_propose_task()
                 }
             };
             ToolRegistryExecutor::with_mcp(

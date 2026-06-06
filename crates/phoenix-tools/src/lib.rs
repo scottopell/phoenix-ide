@@ -576,6 +576,16 @@ impl ToolRegistry {
         Self::new_with_options(false, agents)
     }
 
+    /// Add `propose_task` to a writing-mode registry (Work, Branch, or
+    /// Direct-in-a-git-repo), where it serves as the non-blocking fork
+    /// proposal (REQ-PROJ-033/036). Unlike Explore, the writing modes keep
+    /// their full unrestricted `patch`; `propose_task` is added on top.
+    #[must_use]
+    pub fn with_propose_task(mut self) -> Self {
+        self.tools.push(Arc::new(ProposeTaskTool));
+        self
+    }
+
     /// Tool registry for Explore-mode sub-agents (REQ-PROJ-008).
     /// Read-only tools + bash + `submit_result`/`submit_error`. No tmux, no
     /// patch, no spawn, no `ask_user`, no skill, no `propose_task`.
@@ -850,6 +860,15 @@ mod tests {
         assert!(!direct.contains("propose_task"));
         assert!(!direct.contains("submit_result"));
         assert!(!direct.contains("submit_error"));
+
+        // Direct + with_propose_task: the writing-mode fork seam (Work/Branch
+        // always, Direct-in-a-git-repo conditionally — REQ-PROJ-036). Adds
+        // propose_task on top of the full suite; the base `direct()` stays
+        // propose_task-free above.
+        let direct_fork = names(&ToolRegistry::direct(Vec::new()).with_propose_task());
+        assert!(direct_fork.contains("propose_task"));
+        assert!(direct_fork.contains("bash"));
+        assert!(direct_fork.contains("patch"));
 
         // Explore (sandbox): full suite + propose_task.
         let work = names(&ToolRegistry::explore_with_sandbox("tasks", Vec::new()));

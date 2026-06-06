@@ -2637,6 +2637,38 @@ pub fn transition_sub_agent(
                 };
             }
 
+            // REQ-PROJ-008 / REQ-PROJ-036 (SubAgentProposeTaskRejected): a
+            // sub-agent never gets `propose_task` in its registry, so a sole
+            // `propose_task` call here is a stale/replayed payload. Reject it in
+            // the state machine — task management belongs to the parent — rather
+            // than routing it through the executor's unreachable `run()`
+            // fallback. The context-exhaustion check above wins at the
+            // threshold, so an over-budget sub-agent fails instead of looping on
+            // rejected propose_task errors.
+            if tool_calls.len() == 1 && matches!(tool_calls[0].input, ToolInput::ProposeTask(_)) {
+                let err_msg =
+                    "propose_task is not available to sub-agents — task management is the \
+                     parent conversation's job."
+                        .to_string();
+                let display_data = compute_bash_display_data(&content, &context.working_dir);
+                let assistant_message = AssistantMessage::new(
+                    request_id.clone(),
+                    content,
+                    Some(usage_data),
+                    display_data,
+                );
+                let tool_result = ToolResult::error(tool_calls[0].id.clone(), err_msg);
+                let checkpoint = CheckpointData::tool_round(assistant_message, vec![tool_result])
+                    .expect("propose_task produces exactly one tool_use and one result");
+                return Ok(SubAgentTransitionResult::new(SubAgentState::Core(
+                    CoreState::LlmRequesting { attempt: 1 },
+                ))
+                .with_effect(Effect::PersistCheckpoint { data: checkpoint })
+                .with_effect(Effect::PersistState)
+                .with_effect(Effect::notify_state_change())
+                .with_effect(Effect::RequestLlm));
+            }
+
             // Normal tool execution -> delegate to core
             let core_event = CoreEvent::LlmResponse {
                 content,
@@ -3689,6 +3721,104 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::NotifyParent { .. })),
             "Sub-agent should notify parent on non-retryable LLM error"
+        );
+    }
+
+    /// REQ-PROJ-008 / REQ-PROJ-036 (SubAgentProposeTaskRejected): a sub-agent
+    /// never has `propose_task` in its registry, but a stale/replayed sole
+    /// `propose_task` call must be rejected in the state machine — surfaced as a
+    /// tool error and the LLM re-requested — not stalled or routed to the
+    /// executor's unreachable `run()` fallback.
+    #[test]
+    fn test_subagent_sole_propose_task_rejected_not_stalled() {
+        use crate::state::{ContextExhaustionBehavior, ProposeTaskInput, ToolInput};
+        use phoenix_core::domain::db_schema::ToolOutcome;
+        use phoenix_core::domain::llm_types::{ContentBlock, Usage};
+
+        let subagent_ctx = ConvContext {
+            mode_context: None,
+            conversation_id: "subagent-1".to_string(),
+            root_conversation_id: "test-root".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            model_id: "test-model".to_string(),
+            is_sub_agent: true,
+            context_window: 200_000,
+            context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+            max_turns: 0,
+            desired_base_branch: None,
+            mode: ModeKind::Managed,
+            tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
+        };
+
+        let propose_tool = ToolCall::new(
+            "tool-propose-1",
+            ToolInput::ProposeTask(ProposeTaskInput {
+                task_file: "tasks/12345-p1-ready--fix-the-bug.md".to_string(),
+            }),
+        );
+
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &subagent_ctx,
+            Event::LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "tool-propose-1".to_string(),
+                    name: "propose_task".to_string(),
+                    input: serde_json::json!({
+                        "task_file": "tasks/12345-p1-ready--fix-the-bug.md"
+                    }),
+                }],
+                tool_calls: vec![propose_tool],
+                end_turn: false,
+                usage: Usage::default(),
+                request_id: "test-req-id".to_string(),
+            },
+        )
+        .expect("sub-agent sole propose_task must produce Ok transition");
+
+        // Re-request the LLM, not stall and not complete/fail.
+        assert!(
+            matches!(result.new_state, ConvState::LlmRequesting { .. }),
+            "sub-agent sole propose_task must re-request the LLM, got {:?}",
+            result.new_state
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::RequestLlm)),
+            "should have RequestLlm to feed the rejection back"
+        );
+
+        // The checkpoint's tool result is an error explaining the parent owns
+        // task management — not the executor's "this is a bug" fallback.
+        let checkpoint = result
+            .effects
+            .iter()
+            .find_map(|e| match e {
+                Effect::PersistCheckpoint { data } => Some(data),
+                _ => None,
+            })
+            .expect("should persist a tool-round checkpoint with the rejection");
+        let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
+        assert_eq!(tool_results.len(), 1);
+        match &tool_results[0].outcome {
+            ToolOutcome::Error { output, .. } => {
+                assert!(
+                    output.contains("parent"),
+                    "rejection must explain task management is the parent's job, got: {output}"
+                );
+            }
+            other => panic!("expected an error tool result, got {other:?}"),
+        }
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::ExecuteTool { .. })),
+            "must not dispatch the propose_task tool to the executor"
         );
     }
 
