@@ -415,12 +415,15 @@ sub-agent spawn path — this is what makes the decoupling structural (there is 
    snapshot via `TaskSource` (taskmd vs plain-markdown — REQ-PROJ-006); task branch =
    `task-{task_id}-{slug}` (taskmd) or `task-{sanitized-stem}-{fork-conv-id[..8]}` (plain —
    the *fork's* id prefix uniquifies).
-3. Write `body` into the worktree at the snapshot's repo-relative `task_file` path (taskmd
-   file under the tasks dir; plain brief at its own repo-relative path); for a taskmd file,
-   promote its status to `in-progress` first (same as the Explore
-   approval in REQ-PROJ-006 — a `ready`/`brainstorming` snapshot must not land on a Work
-   branch still advertising a non-work status); a plain brief has no status segment and is
-   committed as-is. `git add` + `git commit -m "task {task_id}: {title}"` on the task branch.
+3. Write `body` into the worktree at the snapshot's repo-relative `task_file` path,
+   **creating any missing parent directories first** (the fresh worktree cut from
+   `main_ref` need not contain a nested path that existed only on the origin branch, so a
+   bare write would fail) — taskmd file under the tasks dir; plain brief at its own
+   repo-relative path. For a taskmd file, promote its status to `in-progress` first (same
+   as the Explore approval in REQ-PROJ-006 — a `ready`/`brainstorming` snapshot must not
+   land on a Work branch still advertising a non-work status); a plain brief has no status
+   segment and is committed as-is. `git add` + `git commit -m "task {task_id}: {title}"` on
+   the task branch.
 4. Persist the fork conversation: `conv_mode = Work { worktree_path, branch_name,
    base_branch: main_ref, task_id, task_title }` (the same fields also set on the
    conversation row so callers reading mode/cwd directly resolve navigation, tool cwd, and
@@ -646,7 +649,10 @@ task metadata lives in the task file's name on the task branch.
 (REQ-PROJ-034/035), pointing at the conversation whose agent proposed it. It is provenance
 only — a UI/audit breadcrumb — and is kept distinct from `parent_conversation_id`
 (sub-agent / fresh-handoff lifecycle) and `continued_in_conv_id` (chains) so no behavior
-can key off it. A fork proposal's resolution (`pending`/`spawned`/`dismissed`) is
+can key off it. Because the fork is independent, the reference is **non-cascading**: if it
+is a foreign key it is `ON DELETE SET NULL` (otherwise no FK, just an id). Hard-deleting
+the origin nulls the breadcrumb on the fork — it never fails the delete and never cascades
+into deleting the independent fork. A fork proposal's resolution (`pending`/`spawned`/`dismissed`) is
 control-plane state bound to the originating conversation and is never part of the
 originator's LLM transcript (REQ-PROJ-035).
 

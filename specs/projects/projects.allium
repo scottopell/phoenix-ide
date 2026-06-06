@@ -692,6 +692,13 @@ rule ForkProposalApproved {
     let slug = parse_slug(proposal.task_file)
     let branch_name = "task-" + task_id + "-" + slug
 
+    -- Reject a fork whose derived task branch already has an active worktree — e.g.
+    -- a Work origin proposing its OWN in-progress task file, which would recreate
+    -- its existing task-{id}-{slug} branch. Spawning would violate
+    -- OneBranchOneActiveWorktree and fail `git worktree add -b` on a checked-out
+    -- branch; the fork must name a distinct unit of work (REQ-PROJ-025).
+    requires: not exists active_worktree_on_branch(proposal.origin.project, branch_name)
+
     -- Materialize the fork base before the worktree add — single-branch fetch plus
     -- local-ref resolution (cf. MaterializeBranch, REQ-PROJ-022), since main_ref may
     -- be remote-only (`origin/<name>`) with no local ref yet. Owned-environments

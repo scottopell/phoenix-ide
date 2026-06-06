@@ -422,9 +422,12 @@ THE SYSTEM SHALL reject it
 
 `propose_task` is a pure data carrier — its `run()` is an unreachable fallback. It is
 intercepted at the LlmResponse handler (like submit_result for sub-agents) and never
-enters the tool executor; the file path and a display copy of its contents flow into
-the AwaitingTaskApproval state. The agent drafts the referenced file with the patch
-tool beforehand (or points at an existing task file).
+enters the tool executor. **In Explore mode** the file path and a display copy of its
+contents flow into the `AwaitingTaskApproval` state (the conversation parks). **In the
+writing modes** the interception is non-parking: it records a fork proposal and the
+conversation continues, never entering `AwaitingTaskApproval` (REQ-PROJ-033). The agent
+drafts the referenced file with the patch tool beforehand (or points at an existing task
+file).
 
 During Work mode, the agent updates the task file directly using the patch tool like
 any other file. No dedicated `update_task` tool is needed.

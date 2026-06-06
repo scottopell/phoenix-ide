@@ -48,9 +48,11 @@ add a "fork" approval outcome.
    on it.
 
 3. **Spawned conversation = fresh top-level Work conversation, new chain.**
-   Mirrors `StartFreshWorkConversation`: its own worktree off `base_branch`, its
-   own task branch, the approved task file committed. Appears as an independent
-   root in the conversation list (its own chain).
+   Like `StartFreshWorkConversation` but cut from the **repository default branch**
+   (the project's `main_ref`), NOT the origin's `base_branch` (which for a
+   Branch-mode origin is the PR branch it is editing). Its own worktree, its own
+   task branch, the approved task file committed. Appears as an independent root in
+   the conversation list (its own chain).
 
 4. **No lifecycle relationship.** Model the spawn on the Chain Q&A fire-and-forget
    pattern (`ChainQa::submit_question`): no `parent_event_tx`, no
