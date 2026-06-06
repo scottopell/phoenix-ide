@@ -25,15 +25,21 @@
  * long?"); the bash ring tail / pid detail is one disclosure deeper.
  */
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useRef } from 'react';
 import { api } from '../api';
 import type {
   WorkScopeInventory,
   BashHandleInventory,
   BashHandleState,
 } from '../api';
-import { isLive, workScopeLiveCount } from './workScopeHelpers';
+import { isLive, hasRunningBash, workScopeLiveCount } from './workScopeHelpers';
 import './WorkScopePanel.css';
+
+/** Cadence of the running-handle inventory poll. `ring_bytes_used` grows
+ *  continuously as a process emits output, but the `work_scope_update` SSE push
+ *  is edge-triggered on bash state transitions only — between transitions the
+ *  byte count would otherwise stay frozen. */
+const RUNNING_POLL_INTERVAL_MS = 2000;
 
 /** A `live` browser session whose last activity is older than this reads as
  *  "idle" — a purely client-side presentation over `idle_ms`, distinct from
@@ -188,40 +194,66 @@ function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: nu
 }
 
 /**
- * Resolves the inventory to render: the live SSE-fed `liveInventory` wins when
- * present (it is at least as fresh as a fetch), otherwise the initial fetch
- * keyed by `scopeKey` (REQ-WSUI-006). Keeps the single-writer atom contract —
- * the fetch seeds only local state here, never the atom's `workScope`.
+ * Resolves the inventory to render via last-arrival-wins over a single local
+ * snapshot fed by three sources, all of which are FULL inventory snapshots of
+ * the same scope key (REQ-WSUI-006):
  *
- * `active` gates the per-second elapsed-time tick: callers pass `false` while
- * the surface is collapsed so an off-screen panel doesn't re-render every
- * second.
+ *   1. the initial fetch keyed by `scopeKey`,
+ *   2. the SSE-fed `liveInventory` prop (the conversation atom's `workScope`,
+ *      pushed on bash state transitions), and
+ *   3. a poll while any bash handle is running.
+ *
+ * The SSE push is edge-triggered on state transitions, so `ring_bytes_used`
+ * (which grows continuously as a process emits output) stays frozen between
+ * transitions. The poll closes that gap: while at least one bash handle is
+ * `running` / `kill_pending_kernel` and the surface is active, it re-fetches
+ * every {@link RUNNING_POLL_INTERVAL_MS} so byte counts (and any other live
+ * fields) advance. It stops once nothing is running or the surface unmounts —
+ * self-limiting, no unbounded timers.
+ *
+ * Each source writes the same local `displayed` state; the most recent write
+ * wins. This keeps the single-writer atom contract — none of these paths touch
+ * the atom's `workScope`, which stays written only by the SSE reducer.
+ *
+ * `active` gates both the per-second elapsed-time tick and the running poll:
+ * callers pass `false` while the surface is collapsed so an off-screen panel
+ * does no background work.
  */
 function useWorkScopeInventory(
   scopeKey: string,
   liveInventory: WorkScopeInventory | null | undefined,
   active: boolean,
 ) {
-  const [fetched, setFetched] = useState<WorkScopeInventory | null>(null);
+  const [displayed, setDisplayed] = useState<WorkScopeInventory | null>(null);
   const [error, setError] = useState(false);
   // Tick once a second so live elapsed times advance without an SSE push.
   const [now, setNow] = useState(() => Date.now());
 
-  const loadInitial = useCallback(async () => {
+  // Latest scope key for the poll callback without re-creating it per render.
+  const scopeKeyRef = useRef(scopeKey);
+  scopeKeyRef.current = scopeKey;
+
+  const fetchSnapshot = useCallback(async () => {
     setError(false);
     try {
-      const inv = await api.getWorkScopeInventory(scopeKey);
-      setFetched(inv);
+      const inv = await api.getWorkScopeInventory(scopeKeyRef.current);
+      setDisplayed(inv);
     } catch {
       setError(true);
     }
-  }, [scopeKey]);
+  }, []);
 
-  // Initial pull (REQ-WSUI-006). Re-runs when the scope key changes.
+  // Initial pull (REQ-WSUI-006). Re-runs (and clears the stale snapshot) when
+  // the scope key changes.
   useEffect(() => {
-    setFetched(null);
-    void loadInitial();
-  }, [loadInitial]);
+    setDisplayed(null);
+    void fetchSnapshot();
+  }, [scopeKey, fetchSnapshot]);
+
+  // SSE push: a fresh full snapshot for this scope. Last-arrival-wins.
+  useEffect(() => {
+    if (liveInventory != null) setDisplayed(liveInventory);
+  }, [liveInventory]);
 
   useEffect(() => {
     if (!active) return;
@@ -229,9 +261,17 @@ function useWorkScopeInventory(
     return () => clearInterval(id);
   }, [active]);
 
-  // Live SSE-fed inventory wins; otherwise fall back to the initial fetch.
-  const inventory = liveInventory ?? fetched;
-  return { inventory, error, now, retry: loadInitial };
+  // Running-handle poll: only while a bash handle is actually running and the
+  // surface is active. Gated on `displayed` so it stops once everything is
+  // tombstoned and starts as soon as a handle spawns.
+  const pollRunning = active && hasRunningBash(displayed);
+  useEffect(() => {
+    if (!pollRunning) return;
+    const id = setInterval(() => void fetchSnapshot(), RUNNING_POLL_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [pollRunning, fetchSnapshot]);
+
+  return { inventory: displayed, error, now, retry: fetchSnapshot };
 }
 
 /**

@@ -12,6 +12,13 @@ export function isLive(state: BashHandleState): boolean {
   return state === 'running' || state === 'kill_pending_kernel';
 }
 
+/** Whether any bash handle reads as "running right now" (running or
+ *  kill_pending_kernel). Gates the running-handle inventory poll: byte counts
+ *  only grow while a handle is live, so once nothing is running the poll stops. */
+export function hasRunningBash(inv: WorkScopeInventory | null): boolean {
+  return inv != null && inv.bash.some((h) => isLive(h.state));
+}
+
 /** Count of resources that read as "running right now": live bash handles
  *  (running + kill_pending_kernel) plus a live (non-idle) browser session.
  *  Drives the collapsed-rail badge. */
