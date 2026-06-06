@@ -127,7 +127,7 @@ fn parse_tools(value: &str) -> Option<Vec<String>> {
         rest.strip_suffix(']').unwrap_or(rest)
     });
     let names: Vec<String> = inner
-        .split(|c| c == ',' || c == ' ')
+        .split([',', ' '])
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_string)
