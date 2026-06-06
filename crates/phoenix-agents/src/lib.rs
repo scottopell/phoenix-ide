@@ -158,8 +158,14 @@ fn collect_agents_from_dir(
     let Ok(entries) = std::fs::read_dir(agents_dir) else {
         return;
     };
-    for entry in entries.flatten() {
-        let path = entry.path();
+    // Sort by path before processing: `read_dir` order is filesystem-dependent,
+    // and name dedup is first-wins, so two same-`name` files in one directory
+    // would otherwise resolve nondeterministically across machines — breaking
+    // the cache-stable catalog guarantee (REQ-AG-008). Lexicographic path order
+    // makes the winner deterministic.
+    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort();
+    for path in paths {
         if !path.is_file() {
             continue;
         }
@@ -562,6 +568,35 @@ mod tests {
         let agents = discover_agents_with_home(tmp.path(), Some(tmp.path()));
         assert_eq!(agents.len(), 1);
         assert_eq!(agents[0].name, "good");
+    }
+
+    #[test]
+    fn same_name_in_one_dir_resolves_deterministically() {
+        // REQ-AG-008: when two files in the same directory declare the same
+        // name, the lexicographically-first path wins, regardless of read_dir
+        // order. "a-dup.md" sorts before "z-dup.md".
+        let tmp = TempDir::new().unwrap();
+        write_agent(
+            tmp.path(),
+            ".claude/agents",
+            "z-dup.md",
+            "name: dup\ndescription: from-z\n",
+            "z",
+        );
+        write_agent(
+            tmp.path(),
+            ".claude/agents",
+            "a-dup.md",
+            "name: dup\ndescription: from-a\n",
+            "a",
+        );
+        let agents = discover_agents_with_home(tmp.path(), Some(tmp.path()));
+        let dup: Vec<&AgentDefinition> = agents.iter().filter(|a| a.name == "dup").collect();
+        assert_eq!(dup.len(), 1, "name dedup keeps exactly one");
+        assert_eq!(
+            dup[0].description, "from-a",
+            "lexicographically-first path wins"
+        );
     }
 
     #[test]

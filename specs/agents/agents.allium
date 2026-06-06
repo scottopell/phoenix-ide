@@ -219,6 +219,13 @@ rule ComposeSubAgentPersona {
         -- grounding or the terminal-tool suffix, both of which a sub-agent
         -- needs to locate itself and complete its lifecycle. Implementation:
         -- build_system_prompt() takes the persona from SubAgentSpec.persona.
+        --
+        -- has_persona is true both for a fresh spawn (persona on the spawn-time
+        -- ConvContext) and for a runtime recreated mid-run: the persona is
+        -- persisted with the sub-agent conversation and re-read into ConvContext
+        -- on the resume path, so persona survives runtime recreation (the
+        -- registry is likewise recovered — see subagents.allium
+        -- SubAgentRegistryOnResume).
 }
 
 -- No persona (anonymous spawn): the generic base preamble leads, exactly as

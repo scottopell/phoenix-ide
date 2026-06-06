@@ -39,7 +39,10 @@ the persona into `SubAgentSpec`).
   `persona`; precedence is task field → agent definition → mode default.
 - **Persona composition** threads the persona into `build_system_prompt`, where
   it replaces the base preamble while grounding, mode context, and the
-  result-submission suffix are retained.
+  result-submission suffix are retained. The persona is persisted in a
+  dedicated `sub_agent_personas` table and restored when a sub-agent runtime is
+  recreated mid-run, so a model-upgrade eviction does not demote a named agent
+  to the generic prompt.
 - **Capability** stays single-sourced in the Explore/Work mode registries; the
   `tools` field is parsed-and-preserved for forward compatibility.
 

@@ -390,6 +390,12 @@ rule SubAgentRegistryOnResume {
         else:
             sub_agent.tool_registry = subagent_work
     ensures: sub_agent.mcp_enabled = true
+    -- A named agent's persona is likewise restored on this path: it is
+    -- persisted with the sub-agent conversation at spawn and re-read into the
+    -- rebuilt ConvContext here, so a runtime recreated mid-run keeps it (see
+    -- specs/agents/ ComposeSubAgentPersona, REQ-AG-006). Registry and persona
+    -- are the two pieces of sub-agent identity that a from-DB context rebuild
+    -- must recover.
 
     @guidance
         -- The persisted `conv_mode` encodes the explore/work distinction:

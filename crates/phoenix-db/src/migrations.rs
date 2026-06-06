@@ -84,6 +84,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "backfill_user_content_files",
         sql: MIGRATION_014,
     },
+    Migration {
+        version: 15,
+        name: "create_sub_agent_personas",
+        sql: MIGRATION_015,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -367,6 +372,20 @@ WHERE message_type IN ('user', 'skill')
   AND json_type(content, '$.files') IS NULL;
 ";
 
+/// Persist named-agent personas for sub-agent conversations so a sub-agent
+/// runtime recreated mid-run (e.g. model-upgrade eviction) keeps its persona
+/// instead of falling back to the generic sub-agent prompt (REQ-AG-006).
+/// Sub-agent-only metadata, kept in its own cascade-deleted table rather than
+/// widening the `conversations` row that the vast majority of conversations
+/// would leave NULL.
+const MIGRATION_015: &str = r"
+CREATE TABLE IF NOT EXISTS sub_agent_personas (
+    conversation_id TEXT PRIMARY KEY
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    persona TEXT NOT NULL
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -486,7 +505,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 14);
+        assert_eq!(first, 15);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

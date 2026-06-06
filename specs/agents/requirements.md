@@ -142,12 +142,20 @@ THE SYSTEM SHALL retain the environment grounding (working directory, project
 guidance, mode context) and the sub-agent result-submission suffix
 (`submit_result` / `submit_error`) regardless of persona
 
+WHEN a sub-agent's runtime is recreated during its run (for example, runtime
+eviction on a model upgrade)
+THE SYSTEM SHALL restore the persona so subsequent turns keep it rather than
+falling back to the generic preamble
+
 **Rationale:** A named agent's value is its persona *replacing* the default
 "helpful assistant" framing — that is what differentiates a "security reviewer"
 from a "docs writer." But the operational scaffolding a sub-agent needs to
 function (where it is, what mode it is in, how it terminates) is orthogonal to
 persona and must always be present, or the sub-agent cannot complete its
-lifecycle.
+lifecycle. The persona is resolved at spawn but a sub-agent's in-memory context
+is rebuilt when its runtime is recreated, so the persona is persisted with the
+sub-agent conversation and restored on that path — otherwise a model-upgrade
+eviction mid-run would silently demote a named agent to the generic prompt.
 
 ---
 

@@ -1184,6 +1184,21 @@ impl RuntimeManager {
             }
         };
 
+        // Persist the named-agent persona (REQ-AG-006) so a sub-agent runtime
+        // recreated mid-run (e.g. model-upgrade eviction) keeps it instead of
+        // falling back to the generic prompt. Best-effort: the live
+        // conv_context built below carries the persona regardless, so a write
+        // failure only degrades a subsequent resume — logged, not fatal.
+        if let Some(persona) = spec.persona.as_deref() {
+            if let Err(e) = self.db.set_sub_agent_persona(&conv.id, persona).await {
+                tracing::warn!(
+                    error = %e,
+                    conv_id = %conv.id,
+                    "Failed to persist sub-agent persona; a resumed runtime would fall back to the generic prompt"
+                );
+            }
+        }
+
         // 2. Insert initial task as synthetic user message
         let message_id = uuid::Uuid::new_v4().to_string();
         let content = crate::db::MessageContent::user(&spec.task);
@@ -1451,6 +1466,20 @@ impl RuntimeManager {
         // the system prompt and tool descriptions stay consistent across all
         // turns even if the global default changes mid-conversation.
         context.llm_language = conv.llm_language;
+        // Restore a named-agent persona (REQ-AG-006) on the resume path: it is
+        // set at spawn on the fresh ConvContext, but a runtime recreated mid-run
+        // (e.g. model-upgrade eviction) rebuilds the context from the DB, so the
+        // persona must be re-read here or remaining turns lose it.
+        if is_sub_agent {
+            match self.db.get_sub_agent_persona(conversation_id).await {
+                Ok(persona) => context.persona = persona,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    conv_id = %conversation_id,
+                    "Failed to read sub-agent persona on resume; falling back to the generic prompt"
+                ),
+            }
+        }
 
         let (event_tx, event_rx) = mpsc::channel(32);
         // Inherit the broadcaster from an eviction if available (e.g. model

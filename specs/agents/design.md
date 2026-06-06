@@ -190,6 +190,20 @@ persona while keeping every sub-agent operationally complete.
 The persona is threaded into `build_system_prompt` as an optional argument
 sourced from `SubAgentSpec.persona`; absent persona ⇒ the current base preamble.
 
+### Persona persistence across runtime recreation
+
+The persona is resolved at spawn and set on the fresh `ConvContext`. A
+sub-agent's runtime can be recreated mid-run (e.g. model-upgrade eviction),
+which rebuilds `ConvContext` from the database — where the persona would not
+otherwise exist, so remaining turns would fall back to the generic prompt. To
+prevent that silent demotion, the persona is persisted in a dedicated
+`sub_agent_personas` table (keyed by conversation id, `ON DELETE CASCADE`) at
+spawn and re-read into `ConvContext` on the resume path. A dedicated table —
+rather than columns on `conversations` — keeps this sub-agent-only metadata off
+the row that the overwhelming majority of conversations would leave NULL. The
+spawn-time write is best-effort: the live context already carries the persona,
+so a write failure only degrades a later resume and is logged.
+
 ## Capability from mode, not definition (REQ-AG-009)
 
 The sub-agent's tool registry is selected purely by resolved mode

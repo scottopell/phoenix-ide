@@ -714,6 +714,44 @@ impl Database {
             .await
     }
 
+    // ==================== Sub-Agent Personas ====================
+
+    /// Persist a named-agent persona for a sub-agent conversation so it
+    /// survives runtime recreation (REQ-AG-006). Upserts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn set_sub_agent_persona(
+        &self,
+        conversation_id: &str,
+        persona: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO sub_agent_personas (conversation_id, persona) VALUES (?1, ?2) \
+             ON CONFLICT(conversation_id) DO UPDATE SET persona = excluded.persona",
+        )
+        .bind(conversation_id)
+        .bind(persona)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Read a sub-agent conversation's persisted persona, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_sub_agent_persona(&self, conversation_id: &str) -> DbResult<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT persona FROM sub_agent_personas WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(p,)| p))
+    }
+
     // ==================== MCP Disabled Servers ====================
 
     /// Return the set of MCP server names that have been disabled.
@@ -3026,6 +3064,46 @@ mod tests {
 
         let fetched = db.get_conversation("test-id").await.unwrap();
         assert_eq!(fetched.id, conv.id);
+    }
+
+    #[tokio::test]
+    async fn sub_agent_persona_roundtrips_and_upserts() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("sub-1", "sub-slug", "/tmp", false, None, None)
+            .await
+            .unwrap();
+
+        // Absent until written.
+        assert_eq!(db.get_sub_agent_persona("sub-1").await.unwrap(), None);
+
+        db.set_sub_agent_persona("sub-1", "You are a reviewer.")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_sub_agent_persona("sub-1").await.unwrap(),
+            Some("You are a reviewer.".to_string())
+        );
+
+        // Upsert replaces.
+        db.set_sub_agent_persona("sub-1", "You are a docs writer.")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_sub_agent_persona("sub-1").await.unwrap(),
+            Some("You are a docs writer.".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_persona_cascade_deletes_with_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("sub-2", "sub-slug-2", "/tmp", false, None, None)
+            .await
+            .unwrap();
+        db.set_sub_agent_persona("sub-2", "persona").await.unwrap();
+
+        db.delete_conversation("sub-2").await.unwrap();
+        assert_eq!(db.get_sub_agent_persona("sub-2").await.unwrap(), None);
     }
 
     #[tokio::test]
