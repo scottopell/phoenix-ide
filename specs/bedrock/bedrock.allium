@@ -475,7 +475,8 @@ rule RetryTimeoutFires {
 --
 -- Restricted to user-resumable errors. The user-resume policy is defined in
 -- specs/llm/ (LlmError.user_resumable, derived from LlmErrorKind: auth,
--- network, rate_limit, server_error, server_overloaded). It is a distinct
+-- network, rate_limit, server_error, server_overloaded,
+-- usage_limit_reached). It is a distinct
 -- axis from error_class (retryable | non_retryable), which governs automatic
 -- runtime retry, not user resumption. error_kind is the persisted error's
 -- LlmErrorKind discriminator, the same payload fact guarded by error_kind in
@@ -500,11 +501,14 @@ rule UserDismissesError {
         -- ending, so it must NOT drain the steering queue: queued steers wait
         -- for an explicit retry/send. The steering drain (DrainOnIdleEntry in
         -- specs/steering-messages/) is scoped to exclude this edge — see its
-        -- guard on the dismissal marker. user_resumable(error_kind) mirrors
-        -- the derived LlmError.user_resumable in specs/llm/; bedrock reads the
-        -- persisted error's kind as a payload discriminator rather than
-        -- importing the taxonomy, consistent with the existing error_kind
-        -- guards.
+        -- guard on the dismissal marker. Dismissal persists a hidden marker
+        -- so a server restart does not auto-continue the dismissed turn: the
+        -- restart recovery heuristic treats the marker as a settled idle, the
+        -- same way it treats a dismissed user question. user_resumable(
+        -- error_kind) mirrors the derived LlmError.user_resumable in
+        -- specs/llm/; bedrock reads the persisted error's kind as a payload
+        -- discriminator rather than importing the taxonomy, consistent with
+        -- the existing error_kind guards.
 }
 
 -- ===========================================================
@@ -833,7 +837,24 @@ rule ContinuationNonRecoverableError {
 
 rule TaskResolved {
     when: TaskResolved(conversation, outcome)
+    -- A conversation may be terminalized from any disposable, non-running
+    -- condition. `idle` is the ordinary resting state; a *stuck*
+    -- conversation must be disposable too, so the user is never forced to
+    -- coax out a successful LLM turn just to dispose of work that has
+    -- already been merged or abandoned. Two stuck conditions qualify:
+    --   - core_status = error: a non-running terminal-error state (e.g. a
+    --     usage-limit window the user merged around externally).
+    --   - parent_status = context_exhausted: an orthogonal axis to
+    --     core_status; the turn could not complete and there is no edge out
+    --     of context_exhausted back into a running state.
+    -- This must stay consistent with the MarkAsMerged / ConfirmAbandon
+    -- gates in specs/projects/ (which permit core_status = idle or error
+    -- plus parent_status = absent or context_exhausted) and with the
+    -- UserDismissesError resume policy: a stuck conversation that is not
+    -- running is always disposable.
     requires: conversation.core_status = idle
+           or conversation.core_status = error
+           or conversation.parent_status = context_exhausted
     requires: conversation.mode in { work, branch }
     ensures: conversation.parent_status = terminal
     ensures: ConversationBecameTerminal(conversation)

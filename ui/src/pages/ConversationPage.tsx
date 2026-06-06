@@ -207,7 +207,6 @@ function ConversationPageContent() {
   // Context-full banner: summary expanded by default; user can collapse to
   // read the conversation above.
   const [contextExhaustedExpanded, setContextExhaustedExpanded] = useState(true);
-  const [abandoningContextExhausted, setAbandoningContextExhausted] = useState(false);
 
   // ---------------------------------------------------------------------------
   // Per-slug state reset (task 02703).
@@ -244,7 +243,6 @@ function ConversationPageContent() {
     setShowTaskApproval(false);
     setShowFirstTaskWelcome(false);
     setContextExhaustedExpanded(true);
-    setAbandoningContextExhausted(false);
     setFocusToken(0);
     // Ref resets — immediate, no re-render.
     sendingMessagesRef.current = new Set();
@@ -1112,43 +1110,25 @@ function ConversationPageContent() {
               >
                 Copy Summary
               </button>
-              {!conversation.continued_in_conv_id &&
-                (conversation.conv_mode_label === 'Work' ||
-                  conversation.conv_mode_label === 'Branch') && (
-                  // REQ-BED-031: abandon remains available on a context-exhausted
-                  // parent as long as no continuation exists. Once continued, the
-                  // abandon action belongs on the continuation. Only Work/Branch
-                  // mode have a worktree to tear down — `abandon-task` rejects
-                  // Explore/Direct with a 400, so the button only renders for
-                  // modes that the API accepts.
-                  <button
-                    type="button"
-                    className="context-exhausted-abandon"
-                    data-testid="context-exhausted-abandon"
-                    disabled={abandoningContextExhausted}
-                    onClick={async () => {
-                      if (!conversation?.id) return;
-                      const isBranch = conversation.conv_mode_label === 'Branch';
-                      const confirmed = window.confirm(
-                        isBranch
-                          ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
-                          : 'Abandon this task? The worktree and task branch will be deleted.',
-                      );
-                      if (!confirmed) return;
-                      setAbandoningContextExhausted(true);
-                      try {
-                        await api.abandonTask(conversation.id);
-                      } catch (err) {
-                        showInfo(err instanceof Error ? err.message : 'Failed to abandon task');
-                      } finally {
-                        setAbandoningContextExhausted(false);
-                      }
-                    }}
-                  >
-                    {abandoningContextExhausted ? 'Abandoning...' : 'Abandon'}
-                  </button>
-                )}
             </div>
+            {conversationId && (
+              // Terminal cleanup (Clean up merged PR / Abandon) is reachable
+              // while context-exhausted — the backend and specs permit
+              // TaskResolved from ContextExhausted. PR-aware, so an externally
+              // merged PR surfaces "Clean up merged PR". Renders nothing for
+              // non-Work/Branch conversations; once continued, the actions
+              // disable with an explanatory tooltip (terminal decisions belong
+              // on the continuation). No onSendMessage: a stuck conversation
+              // exposes only terminal cleanup, never a message-posting action.
+              <WorkControlBar
+                conversationId={conversationId}
+                convModeLabel={conversation.conv_mode_label}
+                phaseType={convStateForChildren.type}
+                continuedInConvId={conversation.continued_in_conv_id}
+                showError={showError}
+                prStatusHandle={prStatusHandle}
+              />
+            )}
             {contextExhaustedExpanded && (
               <pre className="context-exhausted-content">
                 {convStateForChildren.summary}

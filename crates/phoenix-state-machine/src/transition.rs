@@ -30,6 +30,14 @@ use thiserror::Error;
 /// distinguish deliberate dismissal from an interrupted tool turn.
 pub const USER_QUESTION_DISMISSED_MARKER: &str = "[ask-user-question-dismissed]";
 
+/// Stable marker persisted as a hidden system message when the user dismisses
+/// a persisted error (`DismissError`). Without it, a usage-limit error that
+/// occurred after a tool result would persist as `Idle` with a trailing tool
+/// result, and the restart recovery heuristic (`should_auto_continue`) would
+/// auto-continue the exact turn the user dismissed. The marker becomes the
+/// last message, so recovery sees a deliberate dismissal and stays `Idle`.
+pub const ERROR_DISMISSED_MARKER: &str = "[error-dismissed]";
+
 /// Statuses a task file may be in for `propose_task` to accept it.
 const ACCEPTABLE_PROPOSE_STATUSES: &[taskmd_core::constants::Status] = &[
     taskmd_core::constants::Status::Ready,
@@ -1739,6 +1747,13 @@ pub fn transition_parent(
         ) if error_kind.is_user_resumable() => Ok(ParentTransitionResult::new(ParentState::Core(
             CoreState::Idle,
         ))
+        // Persist a hidden dismissal marker as the last message so a restart's
+        // recovery heuristic does not auto-continue a turn the user dismissed
+        // (see ERROR_DISMISSED_MARKER).
+        .with_effect(Effect::PersistHiddenSystemMarker {
+            marker: ERROR_DISMISSED_MARKER,
+            message_id: uuid::Uuid::new_v4().to_string(),
+        })
         .with_effect(Effect::PersistState)
         .with_effect(Effect::notify_state_change())),
 

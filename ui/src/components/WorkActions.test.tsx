@@ -144,6 +144,26 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     expect(api.markMerged).toHaveBeenCalledWith('conv-1');
   });
 
+  it('exposes cleanup actions while context-exhausted', async () => {
+    // TaskResolved is permitted from ContextExhausted, so a Work conversation
+    // that filled context after its PR merged externally must reach cleanup.
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="context_exhausted"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: true, number: 12, display_state: 'merged' })}
+      />
+    );
+
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    await waitFor(() => expect(mark.disabled).toBe(false));
+    expect(mark.textContent).toMatch(/clean up merged pr/i);
+    fireEvent.click(mark);
+    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
+  });
+
   it('suppresses PR remediation while errored, even with an open PR', async () => {
     // "Address CI & comments" posts a normal UserMessage, which Error accepts;
     // surfacing it on an errored bar would reopen the error through a side
