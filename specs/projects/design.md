@@ -322,6 +322,97 @@ the worktree — no dedicated tool. Those commits live on the task branch and re
 when the user merges the PR (REQ-PROJ-027). The agent renames the file to `...-done--...`
 (or `...-wont-do--...`) itself when the work closes; Phoenix does not.
 
+## Task Forks (Decoupled Spawn)
+
+### REQ-PROJ-033 through REQ-PROJ-036 — `propose_task` as a fork in writing modes
+
+In a writing mode (Work, Branch, or Direct-in-a-git-repo) `propose_task` is a **fork
+proposal**: the agent hands a self-contained unit of work to a separate conversation and
+keeps going. This is the same tool and the same interception seam as Explore's
+propose_task; the difference is the empty cell of the (where the task runs) × (what
+happens to the originator) matrix — *fresh conversation + originator continues, untouched*:
+
+| | Originator continues | Originator stops |
+|---|---|---|
+| Task runs in *this* conversation | n/a | Explore→Work in place (`Effect::ApproveTask`) |
+| Task runs in a *fresh* conversation | **fork** (`Effect::SpawnFork`) | fresh handoff (`Effect::ApproveTaskFreshHandoff`) |
+
+#### Non-blocking interception
+
+The `LlmResponse` handler that detects `propose_task` is mode-aware:
+
+- **Explore:** unchanged — build display fields, persist the tool round, transition to
+  `AwaitingTaskApproval` (the conversation parks; see REQ-PROJ-003).
+- **Fork-eligible mode:** read the file, capture a **content snapshot**, persist the
+  assistant message and a synthetic `ToolResult::success` ("Fork proposal recorded —
+  pending your review; continue your work"), and transition back to the normal running
+  state. The conversation does **not** park.
+
+The fork proposal rides as a `CheckpointData::ToolRound` in the originating transcript:
+
+```
+ForkProposal {
+  proposal_id: String,     // stable id for the approve/dismiss endpoints
+  task_file:   String,     // path the agent drafted (for display / provenance)
+  title:       String,     // display copy (H1 / filename stem)
+  priority:    String,     // "p0".."p4" from a taskmd name; "p2" for a plain brief
+  body:        String,     // the snapshotted file bytes — authoritative at spawn time
+  base_branch: String,     // resolved fork base (origin base_branch, or repo default for Direct)
+}
+```
+
+The snapshot is taken at propose time because the fork runs in a worktree off the base
+branch (below) that will not contain the originating worktree's copy of the file. The
+agent's drafted file stays on the originating branch as an ordinary tracked task file; the
+fork commits its own copy from `body`.
+
+#### Proposal resolution is control-plane, never agent-facing
+
+A proposal has a resolution — `pending` → `spawned { fork_conv_id }` | `dismissed`. It is
+tracked as control-plane state bound to the originating conversation (removed when the
+conversation is removed; **bound to origin** per REQ-PROJ-035), and is deliberately **not**
+appended to the conversation's LLM transcript: a resolution the originating agent could
+read would itself be a lifecycle notification, which REQ-PROJ-035 forbids. The UI renders
+the Review affordance on the proposal's tool output while the resolution is `pending` and
+removes it once spawned/dismissed; the agent's context is untouched throughout.
+
+#### Approval / dismissal
+
+Async, user-initiated HTTP on the originating conversation (the proposal is bound to it):
+
+- `POST /api/conversations/:id/proposals/:proposal_id/approve`
+- `POST /api/conversations/:id/proposals/:proposal_id/dismiss`
+
+Approve is idempotent against a `pending` proposal only (a second approve, or approve of a
+dismissed proposal, is a 409) — this is what prevents a double spawn.
+
+#### Spawn flow (`Effect::SpawnFork`, executor, `spawn_blocking`)
+
+The fork is created through the **top-level managed-conversation creation path**, not the
+sub-agent spawn path — this is what makes the decoupling structural (there is no
+`parent_event_tx` in scope to send a `SubAgentResult`, so none can leak):
+
+1. Resolve the fork base: the originating conversation's `base_branch` (Work/Branch) or the
+   project `main_ref` (Direct-in-git). `git fetch origin {base}` single-branch, best-effort
+   (REQ-PROJ-022).
+2. Allocate a new conversation id; create its worktree at
+   `.phoenix/worktrees/{fork-conv-id}/` off `{base}` (REQ-PROJ-005). Classify the snapshot
+   via `TaskSource` (taskmd vs plain-markdown — REQ-PROJ-006); task branch =
+   `task-{task_id}-{slug}` (taskmd) or `task-{sanitized-stem}-{fork-conv-id[..8]}` (plain —
+   the *fork's* id prefix uniquifies).
+3. Write `body` into the worktree (taskmd file under the tasks dir; plain brief at its own
+   path), `git add` + `git commit -m "task {task_id}: {title}"` on the task branch.
+4. Persist the fork conversation: `conv_mode = Work { worktree_path, branch_name,
+   base_branch, task_id, task_title }`, `spawned_from_conversation_id = {origin id}`, and a
+   seed first message ("You are working on task {title}. You are on branch
+   task-{task_id}-{slug}.") — it inherits none of the originator's transcript.
+5. Record the proposal resolution `spawned { fork_conv_id }`. Return — there is no parent to
+   notify (contrast `Effect::ApproveTaskFreshHandoff`, which sets the predecessor to
+   `HandedOff` and links `parent_conversation_id` + `continued_in_conv_id`; the fork sets
+   none of these).
+
+The originating conversation's state is never read or written by this flow.
+
 ## Executor-Layer Git Operations
 
 The git choreography is not modelled as fine-grained typed effects — the state machine
@@ -350,9 +441,14 @@ the porcelain command fails.
 | `keyword_search` | Allowed | Allowed |
 | `read_image` | Allowed | Allowed |
 | `browser_*` | Allowed | Allowed |
-| `propose_task` | Allowed (intercepted, not executed) | Disabled |
+| `propose_task` | Allowed — in-place Explore→Work gateway, parks (intercepted, not executed) | Allowed — **fork proposal**, non-blocking (REQ-PROJ-033) |
 | `spawn_agents` | Allowed | Allowed |
 | `submit_result` | Sub-agents only | Sub-agents only |
+
+`propose_task` is also provided in Branch mode and in Direct mode when the working
+directory is inside a git repository — in all writing modes it is the fork proposal of
+REQ-PROJ-033/036. It is withheld only from Direct-not-in-a-repo (no base branch to fork
+from) and from sub-agents.
 
 ## Work Sub-Agent Mode Inheritance
 
@@ -516,6 +612,14 @@ projects migration; `Direct` is the default for new rows). Examples:
 creation and approval. There is **no `tasks` table** — querying conversations whose
 `conv_mode` is `Work` (or `Branch`) is the de-facto worktree registry (REQ-PROJ-015);
 task metadata lives in the task file's name on the task branch.
+
+`spawned_from_conversation_id` is a nullable column set on a fork conversation
+(REQ-PROJ-034/035), pointing at the conversation whose agent proposed it. It is provenance
+only — a UI/audit breadcrumb — and is kept distinct from `parent_conversation_id`
+(sub-agent / fresh-handoff lifecycle) and `continued_in_conv_id` (chains) so no behavior
+can key off it. A fork proposal's resolution (`pending`/`spawned`/`dismissed`) is
+control-plane state bound to the originating conversation and is never part of the
+originator's LLM transcript (REQ-PROJ-035).
 
 ### Crash recovery (worktree reconciliation)
 
