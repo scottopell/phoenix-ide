@@ -664,13 +664,13 @@ rule ForkProposalCreated {
 -- origin's `base_branch` or HEAD, uniformly for every origin mode — and the only
 -- link back to the origin is the provenance breadcrumb.
 --
--- Models the taskmd-filename case (the default), exactly as TaskApprovalExecuted
--- does: TaskFile is the taskmd entity (plain-markdown briefs are not modelled as a
--- distinct entity — see the TaskFile entity note), so a single rule captures the
--- entity-level behaviour and the plain-markdown field differences live in @guidance.
--- Plain brief: branch `task-{sanitized-stem}-{fork-id-prefix}` (the *fork's* id
--- uniquifies), recorded task_id = the stem, committed at its own path, and there is
--- no status segment to promote.
+-- Handles both accepted snapshot shapes through the input-agnostic `fork_task_id`
+-- / `fork_branch_name` helpers, so a single rule covers taskmd files and plain
+-- briefs without forward-referencing a missing taskmd id. TaskFile remains the
+-- taskmd entity (plain briefs are not a distinct entity — see the TaskFile note);
+-- the worktree's task_file is modelled as a TaskFile keyed by the derived task_id
+-- (the stem, for a plain brief). The on-disk `...-in-progress--` status rename
+-- applies to taskmd only; a plain brief has no status segment (see @guidance).
 rule ForkProposalApproved {
     when: UserApprovesForkProposal(proposal)
 
@@ -688,9 +688,14 @@ rule ForkProposalApproved {
     -- (`proposal.fork` is absent while pending and becomes present == spawned here).
     let fork = proposal.fork
     let base = proposal.origin.project.main_ref
-    let task_id = parse_task_id(proposal.task_file)
-    let slug = parse_slug(proposal.task_file)
-    let branch_name = "task-" + task_id + "-" + slug
+    -- Input-agnostic derivation covering both accepted shapes (REQ-PROJ-006/034):
+    --   taskmd brief: task_id/slug parsed from the filename; branch task-{id}-{slug}.
+    --   plain brief:  task_id = sanitized file stem; branch
+    --                 task-{stem}-{fork-id-prefix} (the *fork's* id uniquifies, so a
+    --                 plain-brief fork branch can never collide).
+    -- The helpers pick the shape; there is no parse_task_id on a plain brief.
+    let task_id = fork_task_id(proposal.task_file)
+    let branch_name = fork_branch_name(proposal.task_file, fork)
 
     -- Reject a fork whose derived task branch already exists locally — whether it is
     -- checked out (e.g. a Work origin proposing its OWN in-progress task, recreating
@@ -804,6 +809,20 @@ rule ForkProposalDismissed {
 
     ensures: proposal.status = dismissed
     ensures: proposal.fork = absent
+}
+
+-- REQ-PROJ-035: when the origin reaches a terminal state, its still-pending
+-- proposals are retired (bound to origin) — they can no longer be reviewed or
+-- approved, so they are dismissed rather than left as permanently-unreviewable
+-- pending records. Maintains PendingForkProposalRequiresLiveOrigin. Subscribes to
+-- bedrock's ConversationBecameTerminal (the same lifecycle event
+-- ExploreWorktreeCleanupOnTerminal uses).
+rule ForkProposalsRetiredOnOriginTerminal {
+    when: ConversationBecameTerminal(origin)
+
+    ensures:
+        for p in ForkProposal where p.origin = origin and p.status = pending:
+            p.status = dismissed
 }
 
 -- ===========================================================
@@ -1498,6 +1517,17 @@ invariant ForkCarriesOnlyProvenanceLink {
 invariant ForkProposalBoundToOrigin {
     for p in ForkProposals:
         exists Conversation{id: p.origin.id}
+}
+
+-- REQ-PROJ-035: a `pending` proposal does not survive its origin reaching any
+-- terminal state (Parent.is_terminal — terminal/abandoned/merged, context_exhausted,
+-- handed_off). It is retired (dismissed) on the terminal transition
+-- (ForkProposalsRetiredOnOriginTerminal), so no permanently-unreviewable pending
+-- record can linger. Together with the review-surface and approval is_terminal guards,
+-- this makes "moot once the origin ends" structural, not conventional.
+invariant PendingForkProposalRequiresLiveOrigin {
+    for p in ForkProposals:
+        p.status = pending implies p.origin.is_terminal = false
 }
 
 ------------------------------------------------------------

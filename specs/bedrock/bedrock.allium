@@ -176,14 +176,6 @@ entity Conversation {
     -- (see TerminalActionRequiresNoContinuation in projects).
     continued_in_conv_id: Conversation?
 
-    -- Provenance breadcrumb for a fork (projects/ ForkProposalApproved). Points
-    -- at the conversation whose agent proposed this one. Distinct from
-    -- `continued_in_conv_id` (chains) and from SubAgent.parent (sub-agents): it
-    -- carries NO lifecycle or notification semantics — no rule keys behaviour off
-    -- it — and exists only for UI/audit. A fork is a top-level Parent, never a
-    -- sub-agent or a continuation of its origin.
-    spawned_from_conversation_id: Conversation?
-
     -- True iff at least one SSE subscriber is currently listening.
     -- Pollers gate on this to avoid waking the runtime for nobody —
     -- behavioural, not just an optimisation: when no clients are
@@ -213,6 +205,14 @@ entity Conversation {
 variant Parent : Conversation {
     parent_status: awaiting_recovery | awaiting_task_approval
                   | awaiting_user_response | context_exhausted | handed_off | terminal
+
+    -- Provenance breadcrumb for a fork (projects/ ForkProposalApproved). Points at
+    -- the conversation whose agent proposed this one. Lives on Parent, not the shared
+    -- Conversation, so a SubAgent structurally cannot carry it — the "a fork is a
+    -- top-level Parent, never a sub-agent" guarantee is correct-by-construction rather
+    -- than convention. Distinct from `continued_in_conv_id` (chains) and SubAgent.parent
+    -- (sub-agents); carries NO lifecycle/notification semantics — no rule keys off it.
+    spawned_from_conversation_id: Conversation?
 
     proposal: TaskProposal when parent_status = awaiting_task_approval
     pending_questions: List<UserQuestion> when parent_status = awaiting_user_response
