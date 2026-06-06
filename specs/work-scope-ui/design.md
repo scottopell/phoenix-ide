@@ -69,9 +69,8 @@ BashHandleInventory {
 }
 
 TmuxInventory {
-    present: bool,
     status:  TmuxServerStatus,           // not_probed | live | gone
-}
+}                                        // presence encoded by Option<TmuxInventory>
 
 BrowserInventory {
     state:   BrowserSessionLiveness,     // live | torn_down
@@ -97,8 +96,10 @@ conversions from the registry types, which do not all hold a wire-ready value.
   the `Tombstone`.
 - **Tmux** (REQ-WSUI-003): the per-`WorkScope` tmux registry. The registry
   entry (`TmuxServer`) records `work_scope`, `socket_path`, and an in-memory
-  `status` (`NotProbed` | `Live` | `Gone`). The inventory reports `present`
-  and `status` from that entry — pure in-memory reads. It does not enumerate
+  `status` (`NotProbed` | `Live` | `Gone`). The inventory carries
+  `Some(TmuxInventory { status })` when an entry exists and `None` when it does
+  not — presence is the `Option`, never a separate flag — pure in-memory reads.
+  It does not enumerate
   sessions or windows: that requires a `tmux ls` socket probe (a process
   spawn) the inventory must not run on every assembly (see Non-Goals / Future
   Work).

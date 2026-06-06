@@ -166,6 +166,13 @@ pub fn create_router(state: AppState) -> Router {
         // Slug resolution (REQ-API-007)
         .route("/api/conversations/by-slug/:slug", get(get_by_slug))
         // Phoenix Chains v1 (REQ-CHN-003 / 004 / 005 / 007)
+        // Work-scope observability inventory (read-projection over the
+        // bash/tmux/browser registries). `:scope_key` is a
+        // `WorkScope::stable_key()` value.
+        .route(
+            "/api/work-scope/:scope_key/inventory",
+            get(get_work_scope_inventory),
+        )
         .route("/api/chains/:rootId", get(get_chain))
         .route("/api/chains/:rootId/qa", post(submit_chain_question))
         .route(
@@ -374,6 +381,14 @@ fn enrich_conversation(conv: &crate::db::Conversation) -> crate::runtime::Enrich
         // `upsertSnapshot` would otherwise regress an SSE-set `true`
         // back to `false` whenever a newer row landed.
         terminal_uses_tmux: false,
+        // Resolved from the same inputs as `browser_session_active`'s
+        // lookup (conversation id + worktree path). Computable without
+        // AppState, so every enrich path emits the correct key.
+        work_scope_key: crate::work_scope::WorkScope::resolve(
+            &conv.id,
+            conv.conv_mode.worktree_path().map(std::path::Path::new),
+        )
+        .stable_key(),
         inner: conv.clone(),
     }
 }
@@ -1792,6 +1807,30 @@ async fn get_conversation_slug(
         .map_err(|e| AppError::NotFound(e.to_string()))?;
 
     Ok(Json(serde_json::json!({ "slug": conversation.slug })))
+}
+
+/// `GET /api/work-scope/:scope_key/inventory` — read-projection over the
+/// three work-affine registries (bash handles, tmux, browser) for one
+/// `WorkScope` (REQ-WSUI-006). `:scope_key` is a `WorkScope::stable_key()`
+/// value; it is parsed back into a `WorkScope` to query the registries. The
+/// assembly is read-only — it never spawns a process or allocates a registry
+/// table for a scope that has none.
+async fn get_work_scope_inventory(
+    State(state): State<AppState>,
+    Path(scope_key): Path<String>,
+) -> Result<Json<phoenix_core::domain::work_scope_inventory::WorkScopeInventory>, AppError> {
+    let work_scope = crate::work_scope::WorkScope::from_stable_key(&scope_key)
+        .ok_or_else(|| AppError::BadRequest(format!("malformed work-scope key: {scope_key}")))?;
+
+    let inventory = phoenix_tools::work_scope_inventory::assemble_inventory(
+        &work_scope,
+        state.runtime.bash_handles(),
+        state.runtime.tmux_registry(),
+        state.runtime.browser_sessions(),
+    )
+    .await;
+
+    Ok(Json(inventory))
 }
 
 async fn get_system_prompt(
@@ -4682,6 +4721,64 @@ mod hard_delete_cascade_tests {
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
         }
+    }
+
+    #[tokio::test]
+    async fn work_scope_inventory_empty_scope_returns_empty_inventory() {
+        let state = make_test_state().await;
+        let scope = crate::work_scope::WorkScope::Conversation("conv-empty".to_string());
+        let Json(inv) = super::get_work_scope_inventory(State(state), Path(scope.stable_key()))
+            .await
+            .expect("inventory");
+        assert_eq!(inv.scope_key, scope.stable_key());
+        assert!(inv.bash.is_empty());
+        assert!(inv.tmux.is_none());
+        assert!(inv.browser.is_none());
+    }
+
+    #[tokio::test]
+    async fn work_scope_inventory_reports_a_live_bash_handle() {
+        use phoenix_core::domain::work_scope_inventory::BashHandleState;
+        use phoenix_tools::bash::handle::{Handle, HandleId};
+        use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
+
+        let state = make_test_state().await;
+        let scope = crate::work_scope::WorkScope::Conversation("conv-live".to_string());
+
+        // Insert a live handle directly into the WorkScope-keyed registry.
+        let table = state.runtime.bash_handles().get_or_create(&scope).await;
+        let handle = Handle::new_live(
+            scope.clone(),
+            HandleId::new("b-1"),
+            "npm run dev".into(),
+            Some("dev".into()),
+            4321,
+            1234,
+            RING_BUFFER_BYTES,
+        );
+        table.write().await.insert(handle);
+
+        let Json(inv) = super::get_work_scope_inventory(State(state), Path(scope.stable_key()))
+            .await
+            .expect("inventory");
+
+        assert_eq!(inv.bash.len(), 1);
+        let h = &inv.bash[0];
+        assert_eq!(h.handle_id, "b-1");
+        assert_eq!(h.label.as_deref(), Some("dev"));
+        assert_eq!(h.state, BashHandleState::Running);
+        assert_eq!(h.pid, Some(1234));
+        assert_eq!(h.pgid, Some(4321));
+        assert!(h.duration_ms.is_none());
+    }
+
+    #[tokio::test]
+    async fn work_scope_inventory_rejects_malformed_key() {
+        let state = make_test_state().await;
+        let err = super::get_work_scope_inventory(State(state), Path("bogus-no-namespace".into()))
+            .await
+            .expect_err("malformed key must be rejected");
+        assert!(matches!(err, AppError::BadRequest(_)));
     }
 
     #[tokio::test]

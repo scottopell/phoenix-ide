@@ -241,6 +241,19 @@ impl BashHandleRegistry {
         entry
     }
 
+    /// Look up a `WorkScope`'s handle table **without creating one**.
+    ///
+    /// Read-only counterpart to [`Self::get_or_create`], for observability
+    /// surfaces (the work-scope inventory endpoint) that must reflect the
+    /// registry as-is and must not allocate a table for a scope that has
+    /// never spawned a bash handle.
+    pub async fn get_existing(
+        &self,
+        work_scope: &WorkScope,
+    ) -> Option<Arc<RwLock<WorkScopeHandles>>> {
+        self.inner.read().await.get(work_scope).cloned()
+    }
+
     /// Snapshot live process-group ids across ALL work scopes, for the
     /// shutdown kill-tree pass. Acquires read locks; callers must NOT
     /// hold any per-scope lock while invoking this.

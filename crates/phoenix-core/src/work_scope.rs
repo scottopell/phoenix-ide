@@ -46,6 +46,29 @@ impl WorkScope {
             Self::Global => "global:".to_string(),
         }
     }
+
+    /// Inverse of [`Self::stable_key`]: parse a `stable_key()`-shaped string
+    /// back into a `WorkScope`. Used by surfaces that receive a scope key as
+    /// an opaque path segment (e.g. the work-scope inventory endpoint) and
+    /// must reconstruct the scope to query the in-memory registries.
+    ///
+    /// Returns `None` when the prefix is not one of the three known
+    /// namespaces. The inner value is taken verbatim after the first `:`,
+    /// so worktree paths or conversation ids containing a `:` round-trip
+    /// faithfully (the namespace prefix never collides with the body
+    /// because `stable_key` splits on the *first* colon).
+    #[must_use]
+    pub fn from_stable_key(key: &str) -> Option<Self> {
+        if let Some(path) = key.strip_prefix("worktree:") {
+            Some(Self::Worktree(path.to_string()))
+        } else if let Some(id) = key.strip_prefix("conversation:") {
+            Some(Self::Conversation(id.to_string()))
+        } else if key == "global:" {
+            Some(Self::Global)
+        } else {
+            None
+        }
+    }
 }
 
 impl fmt::Display for WorkScope {
@@ -86,6 +109,35 @@ mod tests {
         assert_eq!(conv.stable_key(), "conversation:/tmp/wt-x");
         assert_eq!(wt.stable_key(), "worktree:/tmp/wt-x");
         assert_eq!(WorkScope::Global.stable_key(), "global:");
+    }
+
+    #[test]
+    fn from_stable_key_round_trips_every_variant() {
+        let cases = [
+            WorkScope::Worktree("/tmp/wt-x".to_string()),
+            // A worktree path containing a colon must round-trip — the
+            // namespace split is on the FIRST colon only.
+            WorkScope::Worktree("/tmp/odd:path".to_string()),
+            WorkScope::Conversation("conv-1".to_string()),
+            WorkScope::Conversation("id:with:colons".to_string()),
+            WorkScope::Global,
+        ];
+        for scope in cases {
+            let key = scope.stable_key();
+            assert_eq!(
+                WorkScope::from_stable_key(&key),
+                Some(scope.clone()),
+                "round-trip failed for {scope:?} (key={key})"
+            );
+        }
+    }
+
+    #[test]
+    fn from_stable_key_rejects_unknown_namespace() {
+        assert_eq!(WorkScope::from_stable_key("bogus:foo"), None);
+        assert_eq!(WorkScope::from_stable_key(""), None);
+        // `global` without the trailing colon is not the singleton key.
+        assert_eq!(WorkScope::from_stable_key("global"), None);
     }
 
     #[test]

@@ -19,6 +19,7 @@ const makeConv = (
   message_count: 1,
   browser_session_active: false,
   terminal_uses_tmux: false,
+  work_scope_key: `conversation:${id}`,
   ...overrides,
 });
 

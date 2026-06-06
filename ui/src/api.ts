@@ -124,6 +124,12 @@ export interface Conversation {
    *  so the 5s poll's snapshot upsert never clobbers a true value back to
    *  false (regression history: PR #92). */
   terminal_uses_tmux: boolean;
+  /** `WorkScope::stable_key()` for this conversation's resolved work scope
+   *  (e.g. `worktree:/path`, `conversation:<id>`, `global:`). Used to build
+   *  the work-scope inventory URL `GET /api/work-scope/:scope_key/inventory`.
+   *  Server-resolved from the conversation id + worktree path; always
+   *  populated. */
+  work_scope_key: string;
 }
 
 export type PrUnavailableReason = 'gh_missing' | 'not_authenticated' | 'not_git_repo' | 'command_failed';

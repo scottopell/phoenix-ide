@@ -39,6 +39,7 @@ function conversation(overrides: Partial<Conversation> = {}): Conversation {
     message_count: 1,
     browser_session_active: false,
     terminal_uses_tmux: false,
+    work_scope_key: 'conversation:conv-1',
     state: { type: 'idle' },
     ...overrides,
   };

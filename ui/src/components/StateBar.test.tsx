@@ -67,6 +67,7 @@ function makeConversation(overrides: Partial<Conversation> = {}): Conversation {
     conv_mode_label: 'Work',
     browser_session_active: false,
     terminal_uses_tmux: false,
+    work_scope_key: 'worktree:/repo/.phoenix/worktrees/conv-1',
     ...overrides,
   };
 }

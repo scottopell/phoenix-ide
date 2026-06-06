@@ -19,6 +19,7 @@ mod terminal_command_history;
 mod terminal_last_command;
 mod think;
 pub mod tmux;
+pub mod work_scope_inventory;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{

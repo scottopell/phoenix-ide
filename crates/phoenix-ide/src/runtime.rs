@@ -650,6 +650,12 @@ pub struct EnrichedConversation {
     /// the full pane on follow-up. False when the PTY runs a direct
     /// `$SHELL`.
     pub terminal_uses_tmux: bool,
+    /// `WorkScope::stable_key()` for this conversation's resolved `WorkScope`.
+    /// The frontend uses it to build the work-scope inventory URL
+    /// (`GET /api/work-scope/:scope_key/inventory`). Resolved from the
+    /// conversation id + worktree path, the same inputs the
+    /// `browser_session_active` lookup uses.
+    pub work_scope_key: String,
 }
 
 /// Breadcrumb entry for showing LLM thought-process trail in the UI.

@@ -127,6 +127,7 @@ const makeConv = (id: string, slug: string, overrides: Partial<Conversation> = {
   conv_mode_label: 'EXPLORE',
   browser_session_active: false,
   terminal_uses_tmux: false,
+  work_scope_key: `conversation:${id}`,
   ...overrides,
 });
 

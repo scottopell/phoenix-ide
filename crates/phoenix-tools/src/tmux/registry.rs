@@ -447,6 +447,19 @@ impl TmuxRegistry {
         entry
     }
 
+    /// Look up a `WorkScope`'s tmux server entry **without creating one or
+    /// probing the socket**.
+    ///
+    /// Read-only counterpart to the `get_or_insert` + probe path in
+    /// [`Self::ensure_live`], for observability surfaces (the work-scope
+    /// inventory endpoint) that must report the in-memory `status` as-is.
+    /// It deliberately does NOT run `tmux ls`: a probe is a process spawn,
+    /// and the inventory must not spawn one on every assembly.
+    pub async fn get_existing(&self, work_scope: &WorkScope) -> Option<Arc<RwLock<TmuxServer>>> {
+        let key = work_scope.stable_key();
+        self.inner.read().await.get(&key).cloned()
+    }
+
     /// Best-effort tear-down of a `WorkScope`'s tmux server, called from
     /// the unified `run_resource_cleanup_cascade` (REQ-BED-032 —
     /// archive / abandon / mark-merged / hard-delete all share this

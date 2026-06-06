@@ -2631,6 +2631,7 @@ dependencies = [
  "base64",
  "brush-parser",
  "chromiumoxide",
+ "chrono",
  "futures",
  "globset",
  "ignore",

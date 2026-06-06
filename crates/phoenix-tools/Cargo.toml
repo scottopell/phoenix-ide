@@ -35,6 +35,10 @@ futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
+# Wall-clock timestamps for the work-scope inventory projection
+# (Handle.started_at: SystemTime -> DateTime<Utc> on the wire).
+chrono = { version = "0.4", features = ["serde"] }
+
 # Browser automation via Chrome DevTools Protocol.
 chromiumoxide = { version = "0.9", default-features = false, features = ["fetcher", "rustls", "zip0"] }
 
