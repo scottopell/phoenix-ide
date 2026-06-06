@@ -851,7 +851,20 @@ where
         // (or after) the LLM task reading the DB; if the in-flight LLM then
         // returned a no-tool response, the conversation would settle to Idle
         // with the steers persisted but unanswered.
-        if let Some(drain_event) = self.maybe_drain_steering_queue(&old_state) {
+        // An error dismissal (DismissError) enters Idle but is the user
+        // clearing a banner, not a turn completing, so it must not drain the
+        // steering queue. It is identified by the hidden marker it persists —
+        // keyed on that effect, not on the source state, so the exclusion stays
+        // correct if another `Error -> Idle` edge (that *should* drain) is ever
+        // added. Mirrors specs/steering-messages DrainOnIdleEntry's guard.
+        let is_error_dismissal = result.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::PersistHiddenSystemMarker { marker, .. }
+                    if *marker == crate::state_machine::transition::ERROR_DISMISSED_MARKER
+            )
+        });
+        if let Some(drain_event) = self.maybe_drain_steering_queue(&old_state, is_error_dismissal) {
             self.run_effects_with_inline_drain(result.effects, drain_event, &mut generated_events)
                 .await?;
         } else {
@@ -978,17 +991,24 @@ where
     /// - Entering `LlmRequesting` from `ToolExecuting`/`AwaitingSubAgents` (mid-
     ///   turn; the prior transition already dispatched `RequestLlm`, so steers
     ///   land in the NEXT LLM call, not the in-flight one).
-    fn maybe_drain_steering_queue(&mut self, old_state: &ConvState) -> Option<Event> {
+    fn maybe_drain_steering_queue(
+        &mut self,
+        old_state: &ConvState,
+        is_error_dismissal: bool,
+    ) -> Option<Event> {
         if self.context.is_sub_agent {
             return None;
         }
 
-        // Exclude `Error` as the prior state: the only `Error -> Idle`
-        // transition is `DismissError`, which the bedrock spec specifies must
-        // not drain queued steers (dismissal clears a banner; it is not a
-        // turn-end). Draining is reserved for turn-completion idle entries.
-        let entering_idle = !matches!(old_state, ConvState::Idle | ConvState::Error { .. })
-            && matches!(self.state, ConvState::Idle);
+        // An error dismissal enters Idle but is not a turn-end, so it must not
+        // drain (see the call site). Draining is reserved for turn-completion
+        // idle entries.
+        if is_error_dismissal {
+            return None;
+        }
+
+        let entering_idle =
+            !matches!(old_state, ConvState::Idle) && matches!(self.state, ConvState::Idle);
         let entering_llm_requesting_from_tool_round =
             matches!(
                 old_state,

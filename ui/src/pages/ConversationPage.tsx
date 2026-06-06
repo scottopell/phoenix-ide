@@ -910,6 +910,23 @@ function ConversationPageContent() {
   }
 
   const convStateForChildren = atom.phase;
+  // Terminal cleanup (Clean up merged PR / Abandon) for a Work/Branch
+  // conversation stuck in a disposable phase (error or context-exhausted): the
+  // backend and specs permit TaskResolved from those states. PR-aware; renders
+  // nothing for non-Work/Branch conversations; once continued the actions
+  // disable with a tooltip. Deliberately no onSendMessage — a stuck
+  // conversation exposes only terminal cleanup, never a message-posting action
+  // that would reopen the error. One definition, shared by both stuck branches.
+  const stuckCleanupBar = conversationId && (
+    <WorkControlBar
+      conversationId={conversationId}
+      convModeLabel={conversation.conv_mode_label}
+      phaseType={convStateForChildren.type}
+      continuedInConvId={conversation.continued_in_conv_id}
+      showError={showError}
+      prStatusHandle={prStatusHandle}
+    />
+  );
   const showTerminal =
     !!conversationId &&
     convStateForChildren.type !== 'terminal' &&
@@ -1111,24 +1128,7 @@ function ConversationPageContent() {
                 Copy Summary
               </button>
             </div>
-            {conversationId && (
-              // Terminal cleanup (Clean up merged PR / Abandon) is reachable
-              // while context-exhausted — the backend and specs permit
-              // TaskResolved from ContextExhausted. PR-aware, so an externally
-              // merged PR surfaces "Clean up merged PR". Renders nothing for
-              // non-Work/Branch conversations; once continued, the actions
-              // disable with an explanatory tooltip (terminal decisions belong
-              // on the continuation). No onSendMessage: a stuck conversation
-              // exposes only terminal cleanup, never a message-posting action.
-              <WorkControlBar
-                conversationId={conversationId}
-                convModeLabel={conversation.conv_mode_label}
-                phaseType={convStateForChildren.type}
-                continuedInConvId={conversation.continued_in_conv_id}
-                showError={showError}
-                prStatusHandle={prStatusHandle}
-              />
-            )}
+            {stuckCleanupBar}
             {contextExhaustedExpanded && (
               <pre className="context-exhausted-content">
                 {convStateForChildren.summary}
@@ -1206,35 +1206,15 @@ function ConversationPageContent() {
         </>
       ) : convStateForChildren.type === 'error' ? (
         <>
-        {conversationId && (
-          // Mark as Merged / Abandon must be reachable while errored — the
-          // backend and specs permit terminal cleanup from Error. The bar
-          // renders nothing for non-Work/Branch conversations. No
-          // onSendMessage here: while errored the bar must expose only
-          // terminal cleanup, never a message-posting side action that would
-          // reopen the error.
-          <WorkControlBar
-            conversationId={conversationId}
-            convModeLabel={conversation.conv_mode_label}
-            phaseType={convStateForChildren.type}
-            continuedInConvId={conversation.continued_in_conv_id}
-            showError={showError}
-            prStatusHandle={prStatusHandle}
-          />
-        )}
+        {stuckCleanupBar}
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}
           onRetry={() => handleSend('continue', [])}
           onDismiss={() => {
-            // Server-authoritative, SSE-driven. The transition Error -> Idle is
-            // applied and broadcast by the executor; the resulting state_change
-            // SSE flips this view to idle. Do NOT dispatch a local phase change:
-            // `dismissError` resolves as soon as the event is enqueued, not when
-            // the transition is processed/persisted, so faking idle here could
-            // diverge if the executor rejects or races the event. Leave the
-            // banner up until the authoritative state_change arrives; surface
-            // failures. (Dismiss is only rendered for resumable errors.)
+            // No optimistic idle: `dismissError` resolves on enqueue, not on
+            // persist, so faking idle could diverge if the executor races/
+            // rejects. The server-broadcast state_change SSE drives idle.
             void api.dismissError(conversation.id).catch((e) => {
               showError(e instanceof Error ? e.message : 'Failed to dismiss error');
             });
