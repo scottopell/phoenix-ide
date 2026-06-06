@@ -1827,6 +1827,7 @@ async fn get_system_prompt(
         false,
         None,
         conversation.llm_language,
+        None,
     );
 
     Ok(Json(SystemPromptResponse { system_prompt }))

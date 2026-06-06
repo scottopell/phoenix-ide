@@ -1231,6 +1231,9 @@ impl RuntimeManager {
                 .into_owned();
         // Sub-agents inherit their parent's LLM language.
         conv_context.llm_language = conv.llm_language;
+        // Named-agent persona (REQ-AG-006): replaces the base preamble in the
+        // sub-agent's system prompt. `None` for anonymous spawns.
+        conv_context.persona = spec.persona.clone();
 
         // 4. Create channels for the sub-agent runtime. The broadcaster
         // seeds its counter from the message we just inserted (sequence_id=1)
@@ -1247,7 +1250,11 @@ impl RuntimeManager {
             SubAgentMode::Explore => ToolRegistry::for_subagent_explore(),
             SubAgentMode::Work => ToolRegistry::for_subagent_work(),
         };
-        let tool_executor = ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone());
+        let tool_executor = ToolRegistryExecutor::with_mcp(
+            registry,
+            self.mcp_manager.clone(),
+            conv_context.working_dir.clone(),
+        );
 
         // 6. Create runtime with parent notification
         let runtime: ProductionRuntime = ConversationRuntime::new(
@@ -1490,27 +1497,39 @@ impl RuntimeManager {
         // the manager on every `definitions()` call.
         let tool_executor = if is_sub_agent {
             let registry = sub_agent_registry_for_conv_mode(&conv.conv_mode);
-            ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone())
+            ToolRegistryExecutor::with_mcp(
+                registry,
+                self.mcp_manager.clone(),
+                context.working_dir.clone(),
+            )
         } else {
             use crate::db::ConvMode;
+            // Discover named agents for the parent's working directory so the
+            // spawn_agents tool can expose them as an agent_type enum
+            // (REQ-AG-004). Sub-agents never reach this branch.
+            let agents = phoenix_agents::discover_agents(&context.working_dir);
             let registry = match conv.conv_mode {
                 ConvMode::Explore { .. } => {
                     if self.platform.has_sandbox() {
-                        ToolRegistry::explore_with_sandbox(&context.tasks_dir_name)
+                        ToolRegistry::explore_with_sandbox(&context.tasks_dir_name, agents)
                     } else {
-                        ToolRegistry::explore_no_sandbox(&context.tasks_dir_name)
+                        ToolRegistry::explore_no_sandbox(&context.tasks_dir_name, agents)
                     }
                 }
                 ConvMode::Direct => {
                     // Full tool suite for Direct mode
-                    ToolRegistry::direct()
+                    ToolRegistry::direct(agents)
                 }
                 ConvMode::Work { .. } | ConvMode::Branch { .. } => {
                     // Full tool suite for Work/Branch mode (same as Direct)
-                    ToolRegistry::direct()
+                    ToolRegistry::direct(agents)
                 }
             };
-            ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone())
+            ToolRegistryExecutor::with_mcp(
+                registry,
+                self.mcp_manager.clone(),
+                context.working_dir.clone(),
+            )
         };
 
         // Determine initial state: check if conversation needs auto-continuation

@@ -44,6 +44,11 @@ pub struct SubAgentTask {
     pub model: Option<String>,
     #[serde(default)]
     pub max_turns: Option<u32>,
+    /// Named agent persona to spawn (see `specs/agents/`). Must match a
+    /// discovered agent name; supplies the sub-agent's persona and its
+    /// default model/mode.
+    #[serde(default)]
+    pub agent_type: Option<String>,
 }
 
 /// Input for the `spawn_agents` tool (parent only)
@@ -1791,6 +1796,11 @@ pub struct SubAgentSpec {
     pub model_id: String,
     /// Maximum LLM turns before forced completion
     pub max_turns: u32,
+    /// Named agent that produced this spec, if any (see `specs/agents/`).
+    pub agent_name: Option<String>,
+    /// Resolved agent persona; replaces the base preamble in the sub-agent's
+    /// system prompt (REQ-AG-006). `None` for anonymous spawns.
+    pub persona: Option<String>,
 }
 
 /// How a conversation handles approaching context limits
@@ -1848,6 +1858,10 @@ pub struct ConvContext {
     /// LLM-facing prose language for this conversation. Drives the system
     /// prompt builder and tool description selection.
     pub llm_language: crate::llm_language::LlmLanguage,
+    /// Named-agent persona for this conversation, when spawned from a named
+    /// agent (see `specs/agents/`). Replaces the base preamble in the system
+    /// prompt (REQ-AG-006). Only ever set for sub-agents.
+    pub persona: Option<String>,
 }
 
 /// Default context window for unknown models (conservative)
@@ -1875,6 +1889,7 @@ impl ConvContext {
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: crate::llm_language::LlmLanguage::default(),
+            persona: None,
         }
     }
 
@@ -1900,6 +1915,7 @@ impl ConvContext {
             mode: ModeKind::Managed,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: crate::llm_language::LlmLanguage::default(),
+            persona: None,
         }
     }
 }

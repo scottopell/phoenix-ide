@@ -2532,6 +2532,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "phoenix-agents"
+version = "0.1.0"
+dependencies = [
+ "phoenix-core",
+ "tempfile",
+]
+
+[[package]]
 name = "phoenix-bash-display"
 version = "0.1.0"
 dependencies = [
@@ -2644,6 +2652,7 @@ dependencies = [
  "globset",
  "ignore",
  "libc",
+ "phoenix-agents",
  "phoenix-bash-display",
  "phoenix-core",
  "phoenix-skills",
@@ -2686,6 +2695,7 @@ dependencies = [
  "mime_guess",
  "nix 0.31.3",
  "nucleo-matcher",
+ "phoenix-agents",
  "phoenix-core",
  "phoenix-db",
  "phoenix-skills",

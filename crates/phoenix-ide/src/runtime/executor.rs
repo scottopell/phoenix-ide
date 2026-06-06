@@ -1211,6 +1211,48 @@ where
         // Bounded buffer: pre-allocate with capacity = sub-agent count (FM-6 prevention)
         self.sub_agent_result_buffer = Vec::with_capacity(input.tasks.len());
 
+        // --- Named-agent resolution (REQ-AG-005, REQ-AG-007) ---
+        // Discover named agents once, then resolve each task's agent (rejecting
+        // an unknown agent_type) and its effective mode (task field > agent
+        // default > Explore) up front, so the write-capability checks below run
+        // on the *resolved* mode.
+        let agents = phoenix_agents::discover_agents(&self.context.working_dir);
+        let mut resolved_tasks: Vec<(Option<&phoenix_agents::AgentDefinition>, SubAgentMode)> =
+            Vec::with_capacity(input.tasks.len());
+        for task in &input.tasks {
+            let agent = match task.agent_type {
+                Some(ref agent_type) => match phoenix_agents::find_agent(&agents, agent_type) {
+                    Some(a) => Some(a),
+                    None => {
+                        let available: Vec<&str> =
+                            agents.iter().map(|a| a.name.as_str()).collect();
+                        let result = ToolResult::error(
+                            tool_use_id.clone(),
+                            format!(
+                                "Unknown agent_type '{}'. Available: {}",
+                                agent_type,
+                                if available.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    available.join(", ")
+                                }
+                            ),
+                        );
+                        return Ok(Some(Event::ToolComplete {
+                            tool_use_id,
+                            result,
+                        }));
+                    }
+                },
+                None => None,
+            };
+            let mode = task
+                .mode
+                .or_else(|| agent.and_then(|a| a.mode))
+                .unwrap_or_default();
+            resolved_tasks.push((agent, mode));
+        }
+
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
         let parent_allows_work = match self.context.mode_context.as_ref() {
             Some(ModeContext::Work { .. } | ModeContext::Direct | ModeContext::Branch { .. }) => {
@@ -1220,8 +1262,7 @@ where
         };
 
         let mut work_count_in_batch = 0u32;
-        for task in &input.tasks {
-            let mode = task.mode.unwrap_or_default();
+        for &(_, mode) in &resolved_tasks {
             if mode == SubAgentMode::Work {
                 if !parent_allows_work {
                     let result = ToolResult::error(
@@ -1281,8 +1322,7 @@ where
             _ => None,
         };
         if let Some(worktree_root) = parent_worktree_path {
-            for task in &input.tasks {
-                let mode = task.mode.unwrap_or_default();
+            for (task, &(_, mode)) in input.tasks.iter().zip(&resolved_tasks) {
                 if mode != SubAgentMode::Work {
                     continue;
                 }
@@ -1310,14 +1350,19 @@ where
         let mut spawned = Vec::new();
         let parent_cwd = self.context.working_dir.to_string_lossy().to_string();
 
-        for task in &input.tasks {
+        for (task, &(agent, mode)) in input.tasks.iter().zip(&resolved_tasks) {
             let agent_id = uuid::Uuid::new_v4().to_string();
             let cwd = task.cwd.clone().unwrap_or_else(|| parent_cwd.clone());
-            let mode = task.mode.unwrap_or_default();
 
-            // Resolve model (REQ-PROJ-008)
-            let resolved_model = if let Some(ref model) = task.model {
-                if self.llm_registry.get(model).is_none() {
+            // Resolve model: task field > agent default > mode default
+            // (REQ-AG-005, REQ-PROJ-008). An explicit model from either the
+            // task or the agent definition must exist in the registry.
+            let explicit_model = task
+                .model
+                .clone()
+                .or_else(|| agent.and_then(|a| a.model.clone()));
+            let resolved_model = if let Some(model) = explicit_model {
+                if self.llm_registry.get(&model).is_none() {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
                         format!(
@@ -1331,7 +1376,7 @@ where
                         result,
                     }));
                 }
-                model.clone()
+                model
             } else {
                 match mode {
                     SubAgentMode::Explore => self
@@ -1363,6 +1408,8 @@ where
                     mode,
                     model_id: resolved_model,
                     max_turns,
+                    agent_name: agent.map(|a| a.name.clone()),
+                    persona: agent.map(|a| a.body.clone()),
                 };
                 let request = SubAgentSpawnRequest {
                     spec,
@@ -1816,6 +1863,7 @@ where
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
         let llm_language = self.context.llm_language;
+        let persona = self.context.persona.clone();
 
         // Token streaming channel (REQ-BED-025).
         //
@@ -1915,6 +1963,7 @@ where
                 is_sub_agent,
                 mode_context.as_ref(),
                 llm_language,
+                persona.as_deref(),
             );
 
             // Build request — normalize messages against current tool set
@@ -5316,6 +5365,7 @@ mod work_subagent_cwd_guard_tests {
                     mode: Some(SubAgentMode::Work),
                     model: None,
                     max_turns: None,
+                    agent_type: None,
                 }],
             }))
             .await
@@ -5328,6 +5378,45 @@ mod work_subagent_cwd_guard_tests {
                 assert!(
                     msg.contains("inside the parent's worktree"),
                     "error message should explain the cwd-scoping rule, got: {msg}"
+                );
+            }
+            other => panic!("expected ToolComplete with error, got {other:?}"),
+        }
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "rejected spawn must not increment active_work_subagents"
+        );
+    }
+
+    /// An `agent_type` that matches no discovered agent is rejected before any
+    /// sub-agent is spawned (REQ-AG-007). The empty worktree has no
+    /// `.claude/agents/`, so discovery returns nothing and the lookup fails.
+    #[tokio::test]
+    async fn rejects_unknown_agent_type() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let mut rt = runtime_in_work_mode(worktree.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "review".to_string(),
+                    cwd: None,
+                    mode: None,
+                    model: None,
+                    max_turns: None,
+                    agent_type: Some("ghost".to_string()),
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                assert!(result.is_error(), "unknown agent_type must surface as error");
+                let msg = tool_result_text(&result);
+                assert!(
+                    msg.contains("Unknown agent_type 'ghost'"),
+                    "error should name the unknown agent_type, got: {msg}"
                 );
             }
             other => panic!("expected ToolComplete with error, got {other:?}"),
@@ -5358,6 +5447,7 @@ mod work_subagent_cwd_guard_tests {
                     mode: Some(SubAgentMode::Work),
                     model: None,
                     max_turns: None,
+                    agent_type: None,
                 }],
             }))
             .await
@@ -5400,6 +5490,7 @@ mod work_subagent_cwd_guard_tests {
                     mode: Some(SubAgentMode::Work),
                     model: None,
                     max_turns: None,
+                    agent_type: None,
                 }],
             }))
             .await
@@ -5515,6 +5606,7 @@ mod work_subagent_cwd_guard_tests {
                     mode: Some(SubAgentMode::Work),
                     model: None,
                     max_turns: None,
+                    agent_type: None,
                 }],
             }))
             .await

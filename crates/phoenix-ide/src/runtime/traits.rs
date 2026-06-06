@@ -692,15 +692,20 @@ pub struct ToolRegistryExecutor {
     /// into the registry. This means enable/disable and reload take effect
     /// immediately across all conversations.
     mcp_manager: Option<Arc<crate::tools::mcp::McpClientManager>>,
+    /// The conversation's working directory, used to re-discover named agents
+    /// when upgrading Explore → Work so the Work registry's `spawn_agents`
+    /// tool keeps its `agent_type` enum (REQ-AG-004).
+    working_dir: std::path::PathBuf,
 }
 
 impl ToolRegistryExecutor {
     /// Create an executor with built-in tools only (no MCP).
     /// Used for sub-agents which have a restricted tool set.
-    pub fn builtin_only(registry: ToolRegistry) -> Self {
+    pub fn builtin_only(registry: ToolRegistry, working_dir: std::path::PathBuf) -> Self {
         Self {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: None,
+            working_dir,
         }
     }
 
@@ -710,10 +715,12 @@ impl ToolRegistryExecutor {
     pub fn with_mcp(
         registry: ToolRegistry,
         manager: Arc<crate::tools::mcp::McpClientManager>,
+        working_dir: std::path::PathBuf,
     ) -> Self {
         Self {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: Some(manager),
+            working_dir,
         }
     }
 
@@ -812,7 +819,8 @@ impl ToolExecutor for ToolRegistryExecutor {
     }
 
     fn upgrade_to_work_mode(&self) {
-        self.swap_registry(ToolRegistry::direct());
+        let agents = phoenix_agents::discover_agents(&self.working_dir);
+        self.swap_registry(ToolRegistry::direct(agents));
         tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
     }
 }

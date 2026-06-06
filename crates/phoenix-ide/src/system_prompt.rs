@@ -96,6 +96,7 @@ pub fn build_system_prompt(
     is_sub_agent: bool,
     mode: Option<&ModeContext>,
     language: LlmLanguage,
+    persona: Option<&str>,
 ) -> String {
     let builtin_dir = crate::skills::builtin::default_extract_dir();
     build_system_prompt_with_options(
@@ -106,6 +107,7 @@ pub fn build_system_prompt(
         None,
         builtin_dir.as_deref(),
         language,
+        persona,
     )
 }
 
@@ -122,8 +124,15 @@ pub fn build_system_prompt_with_options(
     home_override: Option<&Path>,
     builtin_dir: Option<&Path>,
     language: LlmLanguage,
+    persona: Option<&str>,
 ) -> String {
-    let mut prompt = String::from(llm_language::base_prompt(language));
+    // REQ-AG-006: a named agent's persona replaces the generic assistant
+    // preamble at the head of the prompt. Everything below (guidance, skills,
+    // mode context, sub-agent suffix) is appended regardless of persona.
+    let mut prompt = match persona {
+        Some(p) => String::from(p),
+        None => String::from(llm_language::base_prompt(language)),
+    };
 
     // Add guidance from discovered files
     let guidance_files = discover_guidance_files(working_dir);
@@ -297,6 +306,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
 
         assert!(prompt.contains("helpful AI assistant"));
@@ -315,6 +325,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::PhoenixNative,
+            None,
         );
         let caveman = build_system_prompt_with_options(
             temp.path(),
@@ -324,6 +335,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::Caveman,
+            None,
         );
         assert!(native.contains("helpful AI assistant"));
         assert!(caveman.contains("smart caveman"));
@@ -349,6 +361,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::Caveman,
+            None,
         );
         assert!(caveman.contains("work cave"));
         // Phoenix-native phrasing must not bleed through.
@@ -368,6 +381,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
 
         assert!(prompt.contains("<project_guidance>"));
@@ -387,10 +401,39 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
 
         assert!(prompt.contains("sub-agent"));
         assert!(prompt.contains("submit_result"));
+    }
+
+    #[test]
+    fn test_persona_replaces_base_preamble_but_keeps_suffix() {
+        // REQ-AG-006: persona stands in for the base preamble; the sub-agent
+        // result-submission suffix is retained regardless.
+        let temp = TempDir::new().unwrap();
+        let persona = "You are a meticulous security reviewer.";
+        let prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            true,
+            None,
+            Some(temp.path()),
+            None,
+            crate::llm_language::LlmLanguage::default(),
+            Some(persona),
+        );
+
+        assert!(prompt.starts_with(persona), "persona should lead the prompt");
+        assert!(
+            !prompt.contains("helpful AI assistant"),
+            "base preamble should be replaced by the persona"
+        );
+        assert!(
+            prompt.contains("submit_result"),
+            "sub-agent suffix must survive persona replacement"
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -434,6 +477,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
 
         assert!(prompt.contains("<available_skills>"));
@@ -454,6 +498,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
 
         assert!(!prompt.contains("<available_skills>"));
@@ -478,6 +523,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
 
         assert!(prompt.contains("Explore mode"));
@@ -508,6 +554,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
 
         assert!(prompt.contains("Explore mode"));
@@ -529,6 +576,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
         assert!(!prompt.contains("next available taskmd ID"));
     }
@@ -552,6 +600,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
 
         let expected_id = taskmd_core::ids::next_id(&tasks_dir);
@@ -575,6 +624,7 @@ mod tests {
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
 
         assert!(prompt.contains("Work mode"));
@@ -621,6 +671,7 @@ mod tests {
             Some(temp.path()),
             Some(&extract_dir),
             crate::llm_language::LlmLanguage::default(),
+            None,
         );
         assert!(prompt.contains("**spears**"));
         // Built-ins use the (built-in) marker rather than exposing the extract path
