@@ -184,13 +184,19 @@ export function WorkControlBar({ conversationId, convModeLabel, phaseType, conti
     <div className="work-actions-bar">
       <span className="work-actions-label">Done?</span>
       <WorkViewerActions />
-      <PrRemediationActions
-        conversationId={conversationId}
-        prStatus={lifecycle.prStatus}
-        onSendMessage={onSendMessage}
-        onRefreshPrStatus={prStatusHandle.refresh}
-        showError={showError}
-      />
+      {/* PR remediation ("Address CI & comments") posts a normal UserMessage,
+          which Error accepts — that would reopen even a non-resumable error
+          through a side action. While errored, expose only terminal cleanup
+          (Mark-as-Merged / Abandon below); remediation is idle-only. */}
+      {phaseType === 'idle' && (
+        <PrRemediationActions
+          conversationId={conversationId}
+          prStatus={lifecycle.prStatus}
+          onSendMessage={onSendMessage}
+          onRefreshPrStatus={prStatusHandle.refresh}
+          showError={showError}
+        />
+      )}
       <button
         className="work-actions-btn work-actions-complete"
         disabled={lifecycle.completeDisabled}

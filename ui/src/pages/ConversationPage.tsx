@@ -1229,13 +1229,15 @@ function ConversationPageContent() {
         {conversationId && (
           // Mark as Merged / Abandon must be reachable while errored — the
           // backend and specs permit terminal cleanup from Error. The bar
-          // renders nothing for non-Work/Branch conversations.
+          // renders nothing for non-Work/Branch conversations. No
+          // onSendMessage here: while errored the bar must expose only
+          // terminal cleanup, never a message-posting side action that would
+          // reopen the error.
           <WorkControlBar
             conversationId={conversationId}
             convModeLabel={conversation.conv_mode_label}
             phaseType={convStateForChildren.type}
             continuedInConvId={conversation.continued_in_conv_id}
-            onSendMessage={(text) => handleSend(text, [])}
             showError={showError}
             prStatusHandle={prStatusHandle}
           />

@@ -222,7 +222,9 @@ entity LlmError {
 
     -- User-triggered resume from a persisted conversation error. Auth is not
     -- auto-retryable, but is resumable after credentials are fixed.
-    user_resumable: kind = auth or kind = network or kind = rate_limit or kind = server_error or kind = server_overloaded
+    -- usage_limit_reached is never auto-retried, but its quota window resets
+    -- on a clock boundary, so the user can resume once the window clears.
+    user_resumable: kind = auth or kind = network or kind = rate_limit or kind = server_error or kind = server_overloaded or kind = usage_limit_reached
 }
 
 ------------------------------------------------------------
@@ -253,7 +255,7 @@ invariant AutoRetryablePartition {
 
 invariant UserResumablePartition {
     for e in LlmErrors:
-        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = rate_limit or e.kind = server_error or e.kind = server_overloaded)
+        e.user_resumable = (e.kind = auth or e.kind = network or e.kind = rate_limit or e.kind = server_error or e.kind = server_overloaded or e.kind = usage_limit_reached)
 }
 
 -- Token accounting is non-negative. Each count is an unsigned quantity
