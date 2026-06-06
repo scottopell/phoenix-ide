@@ -224,24 +224,51 @@ rule CascadePreservesOnScopeMatch {
         -- session existed." REQ-BROWSER-WS-004.
 }
 
--- REQ-BT-010: 30-minute idle cleanup. The manager's background task drops
--- live sessions whose last_activity timestamp is older than IDLE_TIMEOUT
--- and emits the down-edge of the lifecycle event using the scope stored
--- alongside the session in the map.
+-- REQ-BT-010: liveness-gated idle cleanup. The manager's background task
+-- tears down a live session only when it is BOTH idle past IDLE_TIMEOUT AND
+-- its scope owns no live conversation. Liveness is "does any non-terminal
+-- conversation resolve to this scope?" — the same scope resolution the
+-- lifecycle fan-out uses (resolve_work_scope, REQ-BROWSER-WS-002) against
+-- bedrock's is_terminal. The IDLE_TIMEOUT timer is a backstop for genuinely
+-- abandoned scopes, not a hard cap on live work: a conversation alive in the
+-- UI but quiet on browser tools keeps its session regardless of idle age.
+-- specs/projects/ REQ-PROJ-025 (OneBranchOneActiveWorktree) guarantees at
+-- most one non-terminal conversation per scope, so the liveness question has
+-- a single decisive answer. The gate mirrors the cascade path
+-- (CascadePreservesOnScopeMatch), which already preserves a session whose
+-- scope is inherited by a live continuation.
 rule IdleSessionCleanedUp {
     when: IdleCleanupTickFires()
 
-    requires: exists BrowserSession{status: live} where
-        (now - this.last_activity) > IDLE_TIMEOUT
+    for session in BrowserSession where session.status = live:
+        let scope_is_live = bedrock/Conversations.any(c =>
+            resolve_work_scope(c) = session.scope and not c.is_terminal)
 
-    ensures: BrowserSession.transitioned(
-        from: live,
-        to: torn_down
-    )
-    ensures: BrowserSessionLifecycleEvent.emitted(
-        work_scope: this.scope,
-        active: false
-    )
+        requires: (now - session.last_activity) > IDLE_TIMEOUT
+        requires: not scope_is_live
+
+        ensures: session.status = torn_down
+        ensures: BrowserSessionLifecycleEvent.emitted(
+            work_scope: session.scope,
+            active: false
+        )
+}
+
+-- REQ-BT-010: the skip path. An idle session whose scope is still live — a
+-- non-terminal conversation resolves to it — is NOT torn down on the idle
+-- tick. It is re-checked on the next interval. This is the standing
+-- guarantee that liveness preempts the idle timer.
+rule IdleSessionPreservedWhileScopeLive {
+    when: IdleCleanupTickFires()
+
+    for session in BrowserSession where session.status = live:
+        let scope_is_live = bedrock/Conversations.any(c =>
+            resolve_work_scope(c) = session.scope and not c.is_terminal)
+
+        requires: scope_is_live
+
+        ensures: session.status = live
+        ensures: not BrowserSessionLifecycleEvent.emitted
 }
 
 ------------------------------------------------------------

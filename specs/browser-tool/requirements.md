@@ -283,9 +283,16 @@ THE SYSTEM SHALL maintain browser state across tool calls within a `WorkScope`
 
 THE SYSTEM SHALL automatically start the browser on first browser tool call
 
-THE SYSTEM SHALL automatically close the browser after idle timeout (30 minutes)
+WHILE a `WorkScope` still owns a non-terminal conversation
+THE SYSTEM SHALL NOT reap that scope's browser session on idle timeout, regardless of idle age
+
+WHEN a `WorkScope`'s session has been idle past the timeout (30 minutes)
+AND no non-terminal conversation resolves to that scope
+THE SYSTEM SHALL automatically close the browser
 
 THE SYSTEM SHALL isolate browser state between different `WorkScope`s. Continuation members that resolve to the same `WorkScope` deliberately share a session — see REQ-BROWSER-WS-001 / REQ-BROWSER-WS-002.
+
+**Idle reaping is liveness-gated, not purely timer-driven.** The 30-minute timer is a backstop for genuinely abandoned scopes. Activity (`last_activity`) only advances on a browser tool-call guard drop, so a conversation alive in the UI but quiet on browser tools for 30 minutes would, under a purely age-based reap, lose its live page state, open tabs, console buffer, and any attached live-view stream (REQ-BT-018) mid-watch. Liveness is "does any non-terminal conversation resolve to this scope?" — the same scope resolution the lifecycle fan-out uses (REQ-BROWSER-WS-002), against `ConvState::is_terminal`. `specs/projects/` guarantees at most one non-terminal conversation per scope, so the question has a single decisive answer. When no liveness predicate is wired (tool-level tests, contexts with no runtime), reaping falls back to age alone. The gate is consistent with the cascade path (REQ-BROWSER-WS-003), which already preserves a session whose scope is inherited by a live continuation.
 
 WHEN browser tools receive `ToolContext`
 THE SYSTEM SHALL use `ctx.browser()` to obtain the session for `ctx.work_scope`

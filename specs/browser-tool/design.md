@@ -39,7 +39,7 @@ The browser tool follows an implicit session model for "pit of success" ergonomi
 - **Auto-initialization**: First browser tool call in a conversation starts Chrome
 - **State persistence**: Browser state (cookies, cache, page) persists across tool calls
 - **Conversation isolation**: Each conversation gets its own browser instance
-- **Auto-cleanup**: Browser closes after 30-minute idle timeout or conversation end
+- **Auto-cleanup**: Browser closes on conversation end, or on the 30-minute idle timeout once the scope owns no live conversation (the timer is a backstop for abandoned scopes, not a hard cap on live work — see "Idle Timeout" below)
 
 ### Lifecycle Flow
 
@@ -56,21 +56,21 @@ Chrome process launched (PID stored)
 Subsequent tool calls reuse browser (updates last_activity timestamp)
     |
     v
-[30 min idle OR conversation deleted OR server shutdown]
+[(30 min idle AND scope owns no non-terminal conversation) OR conversation deleted OR server shutdown]
     |
     v
-Chrome process terminated (SIGKILL to process group)
+Chrome process terminated
 ```
 
 ### Chrome Process Cleanup Strategy
 
 Chrome processes are heavyweight (~100MB+ RAM each), so robust cleanup is critical:
 
-**1. Idle Timeout (Primary)**
-- Global `BrowserSessionManager` holds `HashMap<ConversationId, BrowserSession>`
-- Each session tracks `last_activity: Instant` and `chrome_pid: u32`
-- Background task runs every 60 seconds, kills sessions idle > 30 minutes
-- Uses process group kill (`killpg`) to ensure all Chrome child processes die
+**1. Idle Timeout (Backstop)**
+- Global `BrowserSessionManager` keys sessions by `WorkScope::stable_key()`
+- Each session tracks `last_activity: Instant`, advanced on browser tool-call guard drop
+- Background task runs every 60 seconds, considering sessions idle > 30 minutes
+- A scope is reaped only when it owns no non-terminal conversation: the manager consults an injected scope-liveness predicate (set by the runtime alongside the lifecycle bridges, via a `Weak` so it cannot keep the runtime alive) that resolves live runtime handles to scopes the same way the lifecycle fan-out does (REQ-BROWSER-WS-002). A live scope is skipped and re-checked next interval; with no predicate wired (tool-level tests), reaping is age-only. This prevents force-closing Chrome under a conversation that is alive in the UI but has merely been quiet on browser tools
 
 **2. Explicit Cleanup Hooks**
 - `delete_conversation` API calls `BrowserSessionManager::kill_session(conv_id)`

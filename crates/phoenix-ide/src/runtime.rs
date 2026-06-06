@@ -1022,6 +1022,22 @@ impl RuntimeManager {
     /// `RuntimeManager::new`. If the receiver was already taken (double
     /// call) this is a no-op.
     pub async fn start_browser_lifecycle_bridge(self: &Arc<Self>) {
+        // Gate browser idle reaping on scope liveness: the cleanup task must
+        // not force-close Chrome while the scope still owns a non-terminal
+        // conversation. A `Weak` keeps the closure from holding the runtime
+        // alive; if the runtime is gone the scope is by definition not live.
+        let weak = Arc::downgrade(self);
+        self.browser_sessions()
+            .set_scope_liveness_hook(Arc::new(move |scope: WorkScope| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    match weak.upgrade() {
+                        Some(manager) => manager.scope_has_live_conversation(&scope).await,
+                        None => false,
+                    }
+                }) as futures::future::BoxFuture<'static, bool>
+            }));
+
         let rx = self.browser_lifecycle_rx.write().await.take();
         let Some(mut rx) = rx else {
             tracing::debug!("browser lifecycle bridge already started; skipping");
@@ -1197,6 +1213,41 @@ impl RuntimeManager {
                 "dropping work-scope update — no live runtime handle on scope"
             );
         }
+    }
+
+    /// Whether `work_scope` still owns a non-terminal conversation — the
+    /// "is this scope live?" question the browser idle-cleanup hook asks.
+    ///
+    /// Uses the identical scope resolution as the lifecycle / work-scope
+    /// bridges: enumerate live runtime handles, resolve each conversation's
+    /// scope via `WorkScope::resolve`, match against `work_scope`. A match
+    /// counts as live only when its conversation is not in a terminal state
+    /// (`ConvState::is_terminal`) — a runtime handle can linger for a
+    /// conversation that has gone terminal, and such a scope is genuinely
+    /// abandoned and must reap. REQ-PROJ-025 guarantees at most one
+    /// non-terminal conversation per scope, so the first match is decisive.
+    pub(crate) async fn scope_has_live_conversation(&self, work_scope: &WorkScope) -> bool {
+        let conv_ids: Vec<String> = {
+            let runtimes = self.runtimes.read().await;
+            runtimes.keys().cloned().collect()
+        };
+
+        for conv_id in conv_ids {
+            let Ok(conv) = self.db().get_conversation(&conv_id).await else {
+                continue;
+            };
+            if conv.state.is_terminal() {
+                continue;
+            }
+            let conv_scope = crate::work_scope::WorkScope::resolve(
+                &conv.id,
+                conv.conv_mode.worktree_path().map(std::path::Path::new),
+            );
+            if &conv_scope == work_scope {
+                return true;
+            }
+        }
+        false
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests

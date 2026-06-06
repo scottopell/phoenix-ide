@@ -831,6 +831,19 @@ pub struct BrowserSessionLifecycleEvent {
 pub type BrowserSessionLifecycleSink =
     tokio::sync::mpsc::UnboundedSender<BrowserSessionLifecycleEvent>;
 
+/// Predicate answering "does this `WorkScope` still own a live (non-terminal)
+/// conversation?". Injected by the runtime after construction (the manager is
+/// built inside `RuntimeManager::new`, before the runtime `Arc` exists, so the
+/// hook cannot be a constructor argument). Async because the only authoritative
+/// answer requires resolving live runtime handles against the conversation
+/// store — the same enumeration the work-scope / browser lifecycle bridges use.
+///
+/// When unset, idle cleanup reaps purely on `last_activity` age (the historical
+/// behavior), so tool-level tests and any caller that never wires a runtime are
+/// unaffected.
+pub type ScopeLivenessHook =
+    Arc<dyn Fn(WorkScope) -> futures::future::BoxFuture<'static, bool> + Send + Sync>;
+
 /// Map entry: the `WorkScope` (carried for idle-cleanup lifecycle emission)
 /// plus the live session arc.
 struct ScopedSession {
@@ -849,6 +862,11 @@ pub struct BrowserSessionManager {
     /// so session create/destroy edges flow into per-conversation SSE
     /// streams. Stays `None` for tool-level tests.
     lifecycle_sink: Option<BrowserSessionLifecycleSink>,
+    /// Set-once predicate gating idle reaping on `WorkScope` liveness. The
+    /// runtime installs it via [`Self::set_scope_liveness_hook`] when it wires
+    /// the lifecycle bridges. Unset (the test/default case) means idle cleanup
+    /// reaps on age alone.
+    scope_liveness_hook: std::sync::OnceLock<ScopeLivenessHook>,
 }
 
 impl BrowserSessionManager {
@@ -868,6 +886,7 @@ impl BrowserSessionManager {
             sessions: RwLock::new(HashMap::new()),
             cleanup_task: None,
             lifecycle_sink: sink,
+            scope_liveness_hook: std::sync::OnceLock::new(),
         });
 
         // Start background cleanup task with weak reference to avoid reference cycle
@@ -886,6 +905,18 @@ impl BrowserSessionManager {
         });
 
         manager
+    }
+
+    /// Install the predicate that gates idle reaping on `WorkScope` liveness.
+    ///
+    /// Set-once: a second call is a no-op (returns the supplied hook unused via
+    /// the `OnceLock` semantics — the first writer wins). The runtime calls
+    /// this exactly once, alongside starting the lifecycle bridges, with a
+    /// `Weak`-backed closure so the predicate does not keep the runtime alive.
+    pub fn set_scope_liveness_hook(&self, hook: ScopeLivenessHook) {
+        if self.scope_liveness_hook.set(hook).is_err() {
+            tracing::debug!("scope liveness hook already set; ignoring duplicate install");
+        }
     }
 
     /// Whether a live session currently exists for `work_scope`.
@@ -1087,10 +1118,44 @@ impl BrowserSessionManager {
         }
     }
 
-    /// Clean up sessions that have been idle too long
+    /// Of the idle `(key, scope)` candidates, return the keys that may be
+    /// reaped. A candidate is preserved (dropped from the result) when a
+    /// scope-liveness hook is installed and reports the scope live. With no
+    /// hook every idle candidate is reapable — the historical age-only
+    /// behavior. Factored out of [`Self::cleanup_idle_sessions`] so the
+    /// liveness gate is unit-testable without a live chromium process.
+    async fn filter_reapable(&self, idle_candidates: Vec<(String, WorkScope)>) -> Vec<String> {
+        let mut to_remove = Vec::new();
+        for (key, scope) in idle_candidates {
+            if let Some(hook) = self.scope_liveness_hook.get() {
+                if hook(scope.clone()).await {
+                    tracing::debug!(
+                        work_scope = %scope,
+                        "browser: skipping idle reap — scope still owns a live conversation"
+                    );
+                    continue;
+                }
+            }
+            to_remove.push(key);
+        }
+        to_remove
+    }
+
+    /// Clean up sessions that have been idle too long.
+    ///
+    /// Idle age (`last_activity` older than [`IDLE_TIMEOUT`]) is necessary but
+    /// not sufficient to reap: when a scope-liveness hook is installed, a scope
+    /// whose `WorkScope` still owns a non-terminal conversation is preserved
+    /// even past the timeout. `last_activity` only resets on a browser
+    /// tool-call guard drop, so a conversation that is alive in the UI but has
+    /// not issued a browser tool call in 30 minutes would otherwise lose its
+    /// live page state / open tabs / live-view stream. The timer remains the
+    /// backstop for scopes with no live conversation (or when no hook is
+    /// wired). Re-checked every [`CLEANUP_INTERVAL`], so a scope that goes
+    /// terminal is reaped on the next pass.
     async fn cleanup_idle_sessions(&self) {
         let now = Instant::now();
-        let mut to_remove = Vec::new();
+        let mut idle_candidates: Vec<(String, WorkScope)> = Vec::new();
 
         // Find idle sessions
         {
@@ -1098,11 +1163,16 @@ impl BrowserSessionManager {
             for (key, entry) in sessions.iter() {
                 if let Ok(guard) = entry.session.try_read() {
                     if now.duration_since(guard.last_activity) > IDLE_TIMEOUT {
-                        to_remove.push(key.clone());
+                        idle_candidates.push((key.clone(), entry.scope.clone()));
                     }
                 }
             }
         }
+
+        // Gate each idle candidate on scope liveness. A live scope (its
+        // `WorkScope` still owns a non-terminal conversation) is skipped — the
+        // timer re-checks it next interval. No hook means reap on age alone.
+        let to_remove = self.filter_reapable(idle_candidates).await;
 
         // Remove idle sessions
         if !to_remove.is_empty() {
@@ -1145,6 +1215,7 @@ impl Default for BrowserSessionManager {
             sessions: RwLock::new(HashMap::new()),
             cleanup_task: None,
             lifecycle_sink: None,
+            scope_liveness_hook: std::sync::OnceLock::new(),
         }
     }
 }
@@ -1276,6 +1347,72 @@ mod lifecycle_hook_tests {
     /// chrome-gated tests.
     #[allow(dead_code)]
     fn _phantom_uses(_b: Option<BrowserSession>, _r: Option<RwLock<()>>, _i: Option<Instant>) {}
+
+    /// With no scope-liveness hook installed, every idle candidate is
+    /// reapable — the historical age-only behavior must be preserved for the
+    /// default / tool-level-test constructors.
+    #[tokio::test]
+    async fn filter_reapable_without_hook_reaps_all() {
+        let manager = BrowserSessionManager::default();
+        let candidates = vec![
+            ("k1".to_string(), scope_conv("conv-1")),
+            ("k2".to_string(), scope_wt("/tmp/wt-2")),
+        ];
+        let reap = manager.filter_reapable(candidates).await;
+        assert_eq!(reap, vec!["k1".to_string(), "k2".to_string()]);
+    }
+
+    /// An idle session whose scope IS live is NOT reaped; an idle session
+    /// whose scope is NOT live IS reaped. The hook stands in for the runtime's
+    /// "does any non-terminal conversation resolve to this scope?" predicate.
+    #[tokio::test]
+    async fn filter_reapable_skips_live_scope_reaps_dead_scope() {
+        let manager = BrowserSessionManager::default();
+        let live = scope_conv("alive");
+        let dead = scope_conv("abandoned");
+
+        // Stub predicate: only `alive` is live.
+        let live_key = live.stable_key();
+        let hook: super::ScopeLivenessHook = Arc::new(move |scope: WorkScope| {
+            let is_live = scope.stable_key() == live_key;
+            Box::pin(async move { is_live }) as futures::future::BoxFuture<'static, bool>
+        });
+        manager.set_scope_liveness_hook(hook);
+
+        let candidates = vec![("k-alive".to_string(), live), ("k-dead".to_string(), dead)];
+        let reap = manager.filter_reapable(candidates).await;
+
+        // Live scope preserved, dead scope reaped.
+        assert_eq!(
+            reap,
+            vec!["k-dead".to_string()],
+            "live scope must be skipped, abandoned scope must be reaped"
+        );
+    }
+
+    /// `set_scope_liveness_hook` is set-once: the first install wins and a
+    /// second call is a silent no-op (does not panic, does not replace).
+    #[tokio::test]
+    async fn scope_liveness_hook_is_set_once() {
+        let manager = BrowserSessionManager::default();
+        // First hook: everything live (nothing reapable).
+        let first: super::ScopeLivenessHook = Arc::new(|_scope: WorkScope| {
+            Box::pin(async { true }) as futures::future::BoxFuture<'static, bool>
+        });
+        manager.set_scope_liveness_hook(first);
+        // Second hook would say nothing is live — must be ignored.
+        let second: super::ScopeLivenessHook = Arc::new(|_scope: WorkScope| {
+            Box::pin(async { false }) as futures::future::BoxFuture<'static, bool>
+        });
+        manager.set_scope_liveness_hook(second);
+
+        let candidates = vec![("k".to_string(), scope_conv("c"))];
+        let reap = manager.filter_reapable(candidates).await;
+        assert!(
+            reap.is_empty(),
+            "first hook (all-live) must win; second hook ignored"
+        );
+    }
 }
 
 #[cfg(test)]
