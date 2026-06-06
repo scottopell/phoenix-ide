@@ -161,6 +161,8 @@ entity Conversation {
     worktree_path: String when mode in { explore, work, branch }
     base_branch: String when mode in { explore, work, branch }
     task_id: String when mode = work
+    task_title: String when mode = work    -- human-readable title (for UI), set at approval;
+                                           -- ConvMode::Work persists it alongside task_id
 
     -- Filesystem cwd. For mode in { explore, work, branch } this equals
     -- worktree_path; for mode = direct it is the user-supplied directory.
@@ -590,8 +592,12 @@ rule ForkProposalIntercepted {
     ensures: conversation.core_status = llm_requesting
     ensures: conversation.retry_attempt = 1
     ensures: conversation.context_usage_ratio = usage_ratio(usage, conversation)
-    ensures: ToolRoundCheckpointed(conversation)
-    ensures: ForkProposalRecorded(conversation, proposal)
+    -- ONE atomic persist: the ToolRound (assistant message + synthetic success ack) and the
+    -- ForkProposal control-plane row commit in a single transaction. The ack says "recorded —
+    -- pending review", so it must never be durable without the row the review/approve surface
+    -- reads; a crash between the two would otherwise promise a proposal that doesn't exist.
+    -- (One postcondition, not two independently dispatchable effects.)
+    ensures: ForkProposalPersisted(conversation, proposal)
     ensures: LlmRequestDispatched(conversation)
 
     @guidance

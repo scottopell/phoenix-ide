@@ -498,8 +498,11 @@ AND record the worktree path and associated task ID in the mode field
 
 WHILE a conversation is in Direct mode
 THE SYSTEM SHALL configure the tool registry with full write access (equivalent to Work)
-AND SHALL NOT provide `propose_task` tool
 AND the mode SHALL NOT change for the lifetime of the conversation
+AND SHALL provide `propose_task` **only** when the working directory is inside a git
+  repository — there as a non-blocking **fork proposal** (REQ-PROJ-033/036), never the
+  Explore gateway. A Direct conversation whose working directory is not in a git repository
+  SHALL NOT provide the tool (no repository default branch to fork from)
 
 WHEN conversation mode changes (Explore to Work on task approval)
 THE SYSTEM SHALL persist the updated mode before resuming execution
@@ -521,12 +524,21 @@ without the managed (Explore/Work) ceremony — see REQ-PROJ-018 for the histori
 
 WHEN the LLM response contains a `propose_task` tool call (which must be the only tool
   call in the response, and references a task file the agent already wrote under the
-  project's tasks directory)
+  project's tasks directory) **WHILE the conversation is in Explore mode**
 THE SYSTEM SHALL intercept it at the LlmResponse handler (same pattern as submit_result)
 AND NOT route it through the tool executor
 AND read the referenced file and persist the assistant message and a synthetic tool
   result as a CheckpointData::ToolRound
-AND transition the conversation to AwaitingTaskApproval state
+AND transition the conversation to AwaitingTaskApproval state (the in-place Explore→Work
+  gateway)
+
+WHEN the same `propose_task` call occurs **while the conversation is in a writing mode**
+  (Work, Branch, or Direct-in-a-git-repo)
+THE SYSTEM SHALL instead treat it as a non-blocking **fork proposal** (REQ-PROJ-033/036):
+  record the proposal as control-plane state and continue the conversation's own work
+  WITHOUT parking — it does not enter AwaitingTaskApproval. The parking behavior of this
+  requirement is scoped to Explore; the writing-mode fork lifecycle (review, spawn, dismiss)
+  is owned by REQ-PROJ-033/034/035.
 
 THE AwaitingTaskApproval state SHALL carry: `task_file` (the path), plus a display copy
   of the title, priority, and body — all serializable; on approval the executor re-reads

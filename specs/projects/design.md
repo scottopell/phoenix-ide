@@ -356,13 +356,17 @@ The `LlmResponse` handler that detects `propose_task` is mode-aware:
   pending your review; continue your work"), and transition back to the normal running
   state. The conversation does **not** park.
 
-Only the synthetic ack rides in the originating transcript: the `CheckpointData::ToolRound`
-holds the assistant message plus the `ToolResult::success` ("…recorded — pending review")
-and **nothing else** — in particular not the snapshot `body`, which would otherwise be
+Only the synthetic ack — plus the bare `proposal_id` — rides in the originating transcript:
+the `CheckpointData::ToolRound` holds the assistant message and the `ToolResult::success`
+("…recorded — pending review") carrying the `proposal_id` in its result metadata, and
+**nothing else**. In particular it does not carry the snapshot `body` (which would be
 replayed into the origin agent's context on later turns and leak the shed work back to the
-spawner (REQ-PROJ-035). The full snapshot below is persisted separately as **control-plane
-proposal data** (the row the Review/approve surface reads); it is never part of the origin's
-replayed LLM context:
+spawner — REQ-PROJ-035). The `proposal_id` is safe to replay (an opaque handle, not task
+content) and is what the UI keys the Review affordance off: the front-end resolves it
+against the control-plane proposal store, so the button attaches to the exact tool output
+even when a conversation has several proposals. The full snapshot below is persisted
+separately as **control-plane proposal data** (the row the Review/approve surface reads),
+addressed by that same `proposal_id`; it is never part of the origin's replayed LLM context:
 
 ```
 ForkProposal {
@@ -434,11 +438,11 @@ sub-agent spawn path — this is what makes the decoupling structural (there is 
    segment and is committed as-is. `git add` + `git commit -m "task {task_id}: {title}"` on
    the task branch.
 4. Persist the fork conversation: `conv_mode = Work { worktree_path, branch_name,
-   base_branch: main_ref, task_id }` (the typed Work-mode shape carries `task_id`, not a
-   title — the display title stays on the `ForkProposal` snapshot for the review surface;
-   these fields are also set on the conversation row so callers reading mode/cwd directly
-   resolve navigation, tool cwd, and cleanup), `spawned_from_conversation_id = {origin id}`,
-   and seed its LLM context with
+   base_branch: main_ref, task_id, task_title }` — `task_title` is the snapshot's display
+   title (`ForkProposal.title`), threaded into `ConvMode::Work` exactly as the Explore
+   approval threads it (REQ-PROJ-004); these fields are also set on the conversation row so
+   callers reading mode/cwd directly resolve navigation, tool cwd, and cleanup),
+   `spawned_from_conversation_id = {origin id}`, and seed its LLM context with
    the task brief itself — the snapshot `body`, plus a line naming the **resolved**
    `branch_name` (`task-{task_id}-{slug}` for taskmd, `task-{stem}-{fork-id[..8]}` for a
    plain brief — not a fixed template). The brief is *in context*, not merely a committed
@@ -684,7 +688,7 @@ Work/Branch). The full mode/cwd/model/turn validation lives in
 `ConvMode` is stored as a JSON `conv_mode` column on `conversations` (added by the
 projects migration; `Direct` is the default for new rows). Examples:
 `"Direct"`, `{"Explore":{"worktree_path":"/repo/.phoenix/worktrees/<id>"}}`,
-`{"Work":{"worktree_path":"...","branch_name":"task-YF042-fix-bug","base_branch":"main","task_id":"YF042"}}`,
+`{"Work":{"worktree_path":"...","branch_name":"task-YF042-fix-bug","base_branch":"main","task_id":"YF042","task_title":"Fix bug"}}`,
 `{"Branch":{"worktree_path":"...","branch_name":"my-pr","base_branch":"my-pr"}}`.
 `desired_base_branch` is a separate nullable column used between Managed-mode worktree
 creation and approval. There is **no `tasks` table** — querying conversations whose
