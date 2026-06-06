@@ -75,20 +75,51 @@ add a "fork" approval outcome.
 
 - **Interception branch.** `propose_task` is intercepted in the state machine
   (`transition.rs` `handle_core_llm_response`, `resolve_task_file`). Add a
-  mode-aware path: Work mode -> record proposal + return to `LlmRequesting`
-  (continue); Explore mode -> existing `AwaitingTaskApproval` (unchanged).
+  mode-aware path: fork-eligible modes (Work / Branch / Direct-in-git) -> record
+  proposal + return to `LlmRequesting` (continue); Explore mode -> existing
+  `AwaitingTaskApproval` (unchanged).
 
 - **Approval-outcome enum.** Add the fork outcome to `TaskApprovalOutcome` and an
   executor handler analogous to `execute_approve_task_fresh_handoff` but: no
   chain/parent links, sets the `spawned_from` breadcrumb, and does NOT touch the
   originating conversation's state.
 
-- **Mode availability.** `propose_task` currently lives only in the `explore_*`
-  registries (`crates/phoenix-tools/src/lib.rs`). Add it to the Work registry;
-  decide whether Branch/Direct also get it.
+## Mode availability (decided)
 
-- **Worktree/branch creation off base** for the fork, reusing the
-  managed-conversation creation path (worktree, branch, task-file commit).
+`propose_task` currently lives only in the `explore_*` registries
+(`crates/phoenix-tools/src/lib.rs`). The fork form is available from:
+
+- **Work** — yes.
+- **Branch** — yes.
+- **Direct** — yes, but ONLY when the working directory is a git repository.
+  Direct-not-in-a-repo has no HEAD to branch from, so the tool is not offered.
+- **Explore** — unchanged (existing parking/handoff behavior; not the fork form).
+
+Direct origins are interesting because the *origin* has no worktree/branch
+ceremony, yet the *fork* is a managed-style conversation (it gets its own
+worktree/branch). The fork is managed even when its origin was not.
+
+## Worktree / branch / base (decided)
+
+Uniform across all fork-eligible origin modes, there is really only one sensible
+shape:
+
+- **Fresh worktree** for the spawned conversation (never shares the originator's
+  worktree — that would break the one-writer invariant and entangle two unrelated
+  changes).
+- **New branch created off the originator's current `HEAD`** (for Direct, the cwd
+  repo's `HEAD`). Branching off `HEAD` rather than the project base means the fork
+  structurally inherits the originator's in-progress state — which is the point:
+  the discovered work was found *in that context*.
+- Reuse the managed-conversation creation path (worktree, branch, task-file
+  commit) and respect "Git worktrees are owned environments" — the fork branches
+  off the originator's `HEAD` commit but must never move the originator's branch
+  ref.
+
+Sub-detail to resolve in design: what the fork records as its **base_branch** of
+record (what an eventual PR diffs against) given it branches off `HEAD` — e.g.
+the originator's own `base_branch` (diff includes the originator's WIP) vs. the
+`HEAD` commit it forked from. Pick the one that yields a sensible review diff.
 
 ## Specs to update
 
