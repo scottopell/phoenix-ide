@@ -473,9 +473,14 @@ dispatched by `/proposals/:id/request-changes`):
 
 1. Allocate a fresh top-level conversation; create its worktree (REQ-PROJ-005) cut from
    `main_ref` — the same independent base a direct approval uses.
-2. Write the snapshot `body` into the worktree at its repo-relative `task_file` path
-   (taskmd under the tasks dir, or plain brief at its own path — `TaskSource`, REQ-PROJ-006),
-   **uncommitted** on the Explore temp branch, so the agent revises it in place with `patch`.
+2. Write the snapshot `body` as an **uncommitted draft under the tasks directory** on the
+   Explore temp branch — *not* at the brief's original repo-relative path. Explore's `patch`
+   allowlist is scoped to `tasks/` (REQ-PROJ-003), so a plain brief that lived at e.g.
+   `docs/plan.md` could not be revised in place; the refinement draft therefore always lands
+   under `tasks/`, where the agent can edit it. (The original path was the proposer's choice;
+   the refinement's *own* approval re-derives the final taskmd-vs-plain shape via REQ-PROJ-006.)
+   Because the draft lands under the existing tasks dir, no nested parent directories from the
+   origin branch are needed.
 3. Persist the conversation in `ConvMode::Explore`, set `spawned_from_conversation_id =
    {origin id}` (same non-live audit breadcrumb as a spawned fork), and seed its LLM context
    with the brief `body` + the user's change-request note — nothing else.

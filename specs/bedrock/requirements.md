@@ -523,8 +523,10 @@ without the managed (Explore/Work) ceremony — see REQ-PROJ-018 for the histori
 ### REQ-BED-028: Task Approval State
 
 WHEN the LLM response contains a `propose_task` tool call (which must be the only tool
-  call in the response, and references a task file the agent already wrote under the
-  project's tasks directory) **WHILE the conversation is in Explore mode**
+  call in the response, and references a markdown file the agent already wrote inside the
+  worktree — a taskmd file under the project's tasks directory, or any other `.md` accepted
+  as a plain brief at its own path, classified by `TaskSource` per REQ-PROJ-006)
+  **WHILE the conversation is in Explore mode**
 THE SYSTEM SHALL intercept it at the LlmResponse handler (same pattern as submit_result)
 AND NOT route it through the tool executor
 AND read the referenced file and persist the assistant message and a synthetic tool

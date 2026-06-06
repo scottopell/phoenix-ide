@@ -1069,7 +1069,8 @@ conversation and the fork:
 - the originating conversation SHALL receive no notification of the fork's creation,
   progress, completion, or failure, through the agent's context or otherwise
 
-WHEN a fork proposal's resolution is recorded (spawned or dismissed — REQ-PROJ-034)
+WHEN a fork proposal's resolution is recorded (`spawned`, `dismissed`, or `promoted` —
+REQ-PROJ-034/037)
 THE SYSTEM SHALL track that resolution as control-plane state bound to the originating
 conversation's lifecycle (removed with the conversation)
 AND SHALL NOT inject it into the originating conversation's LLM context (a resolution the
@@ -1081,9 +1082,9 @@ The terminal-state effect is narrower and applies only to the **unreviewed** cas
 `pending` proposal does not survive the origin reaching any terminal state (`is_terminal`
 — terminal/abandoned/merged, context-exhausted, or handed-off) — it is retired (moot: the
 Review affordance is withdrawn and it can no longer be approved). A **resolved** resolution
-(`spawned` or `dismissed`) is control-plane audit state that *does* persist through the
-origin's terminal lifecycle and is removed only on hard delete, so ordinary terminal
-cleanup (mark-merged / abandon) never erases the decoupled fork's provenance.
+(`spawned`, `dismissed`, or `promoted`) is control-plane audit state that *does* persist
+through the origin's terminal lifecycle and is removed only on hard delete, so ordinary
+terminal cleanup (mark-merged / abandon) never erases the decoupled fork's provenance.
 
 **Rationale:** The whole point is to shed mental load — so the spawner must learn nothing
 about what it spawned. The decoupling is structural: the fork is created through the
@@ -1133,9 +1134,12 @@ THE SYSTEM SHALL create a fresh top-level **Explore** conversation, in its own n
 (REQ-PROJ-005) cut from the repository's default branch (`main_ref` — REQ-PROJ-034a), the
 *same independent base* a direct approval would use, so the task being shaped is never
 entangled with the originating conversation's in-progress work
-AND write the snapshot's bytes into that Explore worktree as an **uncommitted draft** on the
-temp branch (a taskmd file under the tasks directory, a plain brief at its own path —
-classified as in REQ-PROJ-006), so the agent can revise it in place with `patch`
+AND write the snapshot's bytes as an **uncommitted draft under the tasks directory** on the
+temp branch — not at the brief's original path. Explore's `patch` allowlist is scoped to
+`tasks/` (REQ-PROJ-003), so a plain brief that lived elsewhere (e.g. `docs/plan.md`) could
+not be revised in place; the refinement draft therefore always lands under `tasks/`, where
+the agent can edit it, and the refinement's own approval re-derives the final taskmd-vs-plain
+shape (REQ-PROJ-006)
 AND seed the Explore agent's LLM context with the brief **body** plus the user's
 change-request note — and nothing else (it inherits none of the originating conversation's
 transcript; the brief and the requested changes are *in context*, not merely a file to

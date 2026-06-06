@@ -227,10 +227,10 @@ entity ForkProposal {
                                         -- hard-deleted while this (origin-bound) proposal lives,
                                         -- so consumers tolerate a reference to a since-deleted
                                         -- conversation rather than cascading or blocking its delete.
-    refinement: bedrock/Conversation?   -- REQ-PROJ-037 (not implemented yet): the Explore
-                                        -- conversation a `Request Changes` promotion created,
-                                        -- present iff status = promoted. Same non-live audit
-                                        -- reference semantics as `fork` — independent lifecycle.
+    refinement: bedrock/Conversation?   -- REQ-PROJ-037: the Explore conversation a
+                                        -- `Request Changes` promotion created, present iff
+                                        -- status = promoted. Same non-live audit reference
+                                        -- semantics as `fork` — independent lifecycle.
 
     -- The fork base is NOT stored: it is always origin.project.main_ref (the
     -- repository default branch), resolved at approval time (ForkProposalApproved).
@@ -730,13 +730,14 @@ rule ForkProposalApproved {
     -- distinct unit of work (REQ-PROJ-025). (Plain briefs can't collide — their
     -- branch carries the fork's unique id prefix.)
     --
-    -- Idempotent across interruption: the durable retry identity is the proposal's
-    -- allocated `fork` conversation, persisted BEFORE any git effect (see the @guidance
-    -- recovery note), whose worktree lives at the deterministic path .phoenix/worktrees/
-    -- {fork-id}. A colliding branch is ADOPTED on retry iff it is checked out in *that*
-    -- worktree — knowable even for a taskmd fork whose branch name (task-{id}-{slug}) is
-    -- otherwise indistinguishable from an unrelated branch. Any other existing branch — a
-    -- different unit of work, or the origin's own in-progress task branch — is rejected.
+    -- Idempotent across interruption: the durable retry identity is the fork conversation
+    -- id, DERIVED DETERMINISTICALLY from proposal.id (see the @guidance recovery note), so its
+    -- worktree path .phoenix/worktrees/{fork-id} is recomputable on retry WITHOUT writing the
+    -- spawned-only `fork` field early (which would violate its present-iff-spawned contract).
+    -- A colliding branch is ADOPTED on retry iff it is checked out in *that* worktree —
+    -- knowable even for a taskmd fork whose branch name (task-{id}-{slug}) is otherwise
+    -- indistinguishable from an unrelated branch. Any other existing branch — a different
+    -- unit of work, or the origin's own in-progress task branch — is rejected.
     requires: not exists git_ref(proposal.origin.project.repo, "refs/heads/" + branch_name)
            or branch_checked_out_in_fork_worktree(proposal, branch_name)
 
@@ -817,11 +818,13 @@ rule ForkProposalApproved {
     @guidance
         -- Sequence (under the same process-global approval mutex as
         -- TaskApprovalExecuted, so concurrent spawns don't race on names):
-        --   0. Allocate the fork conversation id and persist it on the proposal (the
-        --      DURABLE retry identity) before any git effect. Its worktree path
-        --      .phoenix/worktrees/{fork-id} is deterministic, so after an interruption a
-        --      retry can recognise an orphaned branch as this proposal's own even for a
-        --      taskmd fork whose branch name is otherwise generic.
+        --   0. Derive the fork conversation id DETERMINISTICALLY from proposal.id (the
+        --      DURABLE retry identity). Its worktree path .phoenix/worktrees/{fork-id} is
+        --      therefore recomputable, so after an interruption a retry recognises an
+        --      orphaned branch as this proposal's own — even for a taskmd fork whose branch
+        --      name is otherwise generic — WITHOUT writing the spawned-only `fork` field
+        --      early (the field stays present-iff-spawned; the in-flight identity is the
+        --      deterministic id, not an overloaded resolution field).
         --   1. base = origin.project.main_ref (repository default branch, the same
         --      for every origin mode). Materialize it (cf. MaterializeBranch,
         --      REQ-PROJ-022): single-branch fetch, then fast-forward the local ref
@@ -846,15 +849,15 @@ rule ForkProposalApproved {
         --      discover. It inherits none of the origin transcript.
         --   5. Mark the proposal spawned { fork }.
         --
-        -- Crash recovery / idempotency: because the fork id is persisted first (step 0),
-        -- the irreversible git effects (2-3) can never strand the proposal as `pending`
-        -- with an UNidentifiable orphaned worktree/branch. The whole sequence runs under
-        -- the approval mutex and is safe to RE-DRIVE: on retry the orphaned worktree/branch
-        -- at .phoenix/worktrees/{fork-id} is recognised as this proposal's own (the
-        -- collision check above admits exactly that branch) and adopted rather than
-        -- recreated, and the resolution completed — converging on a single
-        -- `spawned { fork }` outcome (idempotency keyed on proposal.id). The boundary is
-        -- always recoverable, never terminal.
+        -- Crash recovery / idempotency: because the fork id is deterministic (step 0), the
+        -- irreversible git effects (2-3) can never strand the proposal as `pending` with an
+        -- UNidentifiable orphaned worktree/branch. The whole sequence runs under the approval
+        -- mutex and is safe to RE-DRIVE: on retry the orphaned worktree/branch at
+        -- .phoenix/worktrees/{fork-id} is recomputed and recognised as this proposal's own
+        -- (the collision check above admits exactly that branch) and adopted rather than
+        -- recreated, and the resolution completed — converging on a single `spawned { fork }`
+        -- outcome (idempotency keyed on proposal.id). The boundary is always recoverable,
+        -- never terminal.
         --
         -- The origin is read for immutable metadata only (project -> main_ref, id ->
         -- breadcrumb); it is never mutated or notified: no continued_in_conv_id, no
@@ -902,12 +905,22 @@ rule ForkProposalPromotedToExplore {
     ensures: refinement.kind = Parent
     ensures: refinement.mode = explore
     ensures: refinement.spawned_from_conversation_id = proposal.origin
-    -- Materialize the base before the worktree add, exactly as ForkProposalApproved does —
-    -- main_ref may be remote-only (origin/<name>) or stale locally, and the owned-environments
-    -- rule forbids moving a refs/heads/* ref checked out in any worktree. Without this the
-    -- promotion could fail to create the worktree or cut it from an older local ref, breaking
-    -- REQ-PROJ-037's promise of the same independent default-branch base as a direct approval.
+    -- Materialize the default-branch base before the worktree add — mirrors
+    -- ForkProposalApproved exactly (main_ref may be remote-only or stale locally, and the
+    -- owned-environments rule forbids moving a refs/heads/* ref checked out in any worktree).
+    -- Without it the promotion could fail for a remote-only default or cut the refinement
+    -- from an older local ref, breaking REQ-PROJ-037's same-independent-base promise.
     ensures: BestEffortFetch(proposal.origin.project.repo, base)
+    ensures:
+        if exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and not branch_checked_out_in_any_worktree(proposal.origin.project.repo, base):
+            FastForwardIfPossible(proposal.origin.project.repo, base)
+        else if not exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
+            CreateTrackingBranch(proposal.origin.project.repo, base, "origin/" + base)
+        else if not exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and not exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
+            error("Fork base branch '" + base + "' not found locally or at origin")
     ensures: Worktree.created(
         conversation: refinement,
         project: proposal.origin.project,
@@ -916,8 +929,12 @@ rule ForkProposalPromotedToExplore {
         base_branch: base,
         task_file: absent
     )
-    -- The draft brief is written uncommitted onto the temp branch for the agent to revise.
-    ensures: BriefDraftedUncommitted(Worktree{conversation: refinement}, proposal.task_file, proposal.body)
+    -- The brief body seeds the agent's context AND is written as an uncommitted DRAFT under
+    -- the tasks directory (Explore's patch allowlist — REQ-PROJ-003), never at the brief's
+    -- original path: a plain brief that lived at e.g. docs/plan.md could not be revised in a
+    -- tasks-scoped Explore worktree. The tasks dir already exists, so no nested origin-branch
+    -- parent directories are needed.
+    ensures: BriefDraftedUnderTasksDir(Worktree{conversation: refinement}, proposal.body, change_request)
 
     -- Resolve the proposal. refinement present iff promoted — one pending proposal promotes
     -- exactly once (idempotency keyed on proposal.id).
@@ -931,6 +948,16 @@ rule ForkProposalPromotedToExplore {
         -- like ForkProposalApproved. Refinement continues via the Explore gateway
         -- (TaskApprovalExecuted / TaskApprovalFreshHandoffExecuted) — there is no second fork
         -- proposal and no link back to the origin.
+        --
+        -- Crash recovery / "promotes exactly once": the refinement conversation id is
+        -- derived DETERMINISTICALLY from proposal.id, so its worktree path
+        -- .phoenix/worktrees/{refinement-id} is recomputable on retry without an early write
+        -- to the promoted-only `refinement` field. If a crash interrupts after the Explore
+        -- worktree is created but before `status = promoted` is persisted, re-driving under
+        -- the mutex recognises and ADOPTS the orphaned worktree at that deterministic path
+        -- rather than allocating a second refinement — converging on a single
+        -- `promoted { refinement }` outcome. (Same durable-identity boundary as
+        -- ForkProposalApproved; neither overloads the resolution field for in-flight state.)
 }
 
 -- REQ-PROJ-035: when the origin reaches a terminal state, its still-pending
