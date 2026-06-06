@@ -72,7 +72,7 @@ async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
             } else {
                 BashHandleState::Running
             };
-            let ring_bytes_used = u64::try_from(live.ring.lock().await.bytes_used()).ok();
+            let output_bytes = live.ring.lock().await.output_bytes();
             BashHandleInventory {
                 handle_id: handle.handle_id.to_string(),
                 label: handle.label.clone(),
@@ -82,7 +82,7 @@ async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
                 pgid: Some(live.pgid),
                 started_at,
                 duration_ms: None,
-                ring_bytes_used,
+                output_bytes,
             }
         }
         HandleState::Tombstoned(tomb) => BashHandleInventory {
@@ -94,7 +94,7 @@ async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
             pgid: None,
             started_at,
             duration_ms: Some(tomb.duration_ms),
-            ring_bytes_used: None,
+            output_bytes: tomb.output_bytes,
         },
     }
 }
@@ -192,7 +192,8 @@ mod tests {
         assert_eq!(h.pid, Some(1234));
         assert_eq!(h.pgid, Some(4321));
         assert!(h.duration_ms.is_none());
-        assert!(h.ring_bytes_used.is_some());
+        // output_bytes is always present (0 at spawn, no output written yet).
+        assert_eq!(h.output_bytes, 0);
     }
 
     #[tokio::test]
@@ -252,6 +253,8 @@ mod tests {
         assert_eq!(h.state, BashHandleState::Tombstoned);
         assert_eq!(h.duration_ms, Some(7));
         assert!(h.pid.is_none());
-        assert!(h.ring_bytes_used.is_none());
+        // output_bytes persists into the tombstone; no output was written
+        // here, so the snapshotted total is 0 (present, not absent).
+        assert_eq!(h.output_bytes, 0);
     }
 }

@@ -4,9 +4,11 @@ import type { BashHandleState } from "./BashHandleState";
 /**
  * One bash handle's observability projection.
  *
- * `pid`, `pgid`, and `ring_bytes_used` exist only while the handle is live;
- * `duration_ms` exists only once it is terminal. Each is skipped on the wire
- * when absent so the TS side sees an optional field.
+ * `pid` and `pgid` exist only while the handle is live; `duration_ms` exists
+ * only once it is terminal. Each is skipped on the wire when absent so the
+ * TS side sees an optional field. `output_bytes` is ALWAYS present — total
+ * bytes the process has written is defined in every state (0 at spawn), and
+ * it survives the tombstone transition (snapshotted at demotion).
  */
 export type BashHandleInventory = { 
 /**
@@ -38,6 +40,8 @@ started_at: string,
  */
 duration_ms?: number, 
 /**
- * Bytes currently held in the output ring; present while live.
+ * Total bytes the process has written (monotonic, partial-inclusive).
+ * Always present: defined as 0 at spawn, grows as output is produced,
+ * and persisted into the tombstone so terminal handles report it too.
  */
-ring_bytes_used?: number, };
+output_bytes: number, };

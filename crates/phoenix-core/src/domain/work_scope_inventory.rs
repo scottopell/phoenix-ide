@@ -56,9 +56,11 @@ pub enum BashHandleState {
 
 /// One bash handle's observability projection.
 ///
-/// `pid`, `pgid`, and `ring_bytes_used` exist only while the handle is live;
-/// `duration_ms` exists only once it is terminal. Each is skipped on the wire
-/// when absent so the TS side sees an optional field.
+/// `pid` and `pgid` exist only while the handle is live; `duration_ms` exists
+/// only once it is terminal. Each is skipped on the wire when absent so the
+/// TS side sees an optional field. `output_bytes` is ALWAYS present — total
+/// bytes the process has written is defined in every state (0 at spawn), and
+/// it survives the tombstone transition (snapshotted at demotion).
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashHandleInventory {
@@ -85,10 +87,10 @@ pub struct BashHandleInventory {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub duration_ms: Option<u64>,
-    /// Bytes currently held in the output ring; present while live.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
-    pub ring_bytes_used: Option<u64>,
+    /// Total bytes the process has written (monotonic, partial-inclusive).
+    /// Always present: defined as 0 at spawn, grows as output is produced,
+    /// and persisted into the tombstone so terminal handles report it too.
+    pub output_bytes: u64,
 }
 
 /// In-memory probe status of a per-scope tmux server, projected from the
@@ -192,12 +194,12 @@ mod tests {
             pgid: Some(123),
             started_at: Utc::now(),
             duration_ms: None,
-            ring_bytes_used: Some(4096),
+            output_bytes: 4096,
         };
         let v = serde_json::to_value(&inv).unwrap();
         assert_eq!(v["state"], "running");
         assert_eq!(v["pid"], 123);
-        assert_eq!(v["ring_bytes_used"], 4096);
+        assert_eq!(v["output_bytes"], 4096);
         assert!(v.get("duration_ms").is_none());
     }
 
@@ -212,14 +214,15 @@ mod tests {
             pgid: None,
             started_at: Utc::now(),
             duration_ms: Some(42),
-            ring_bytes_used: None,
+            output_bytes: 512,
         };
         let v = serde_json::to_value(&inv).unwrap();
         assert_eq!(v["state"], "tombstoned");
         assert_eq!(v["duration_ms"], 42);
         assert!(v.get("pid").is_none());
         assert!(v.get("pgid").is_none());
-        assert!(v.get("ring_bytes_used").is_none());
+        // output_bytes is always present, including on terminal handles.
+        assert_eq!(v["output_bytes"], 512);
         assert!(v.get("label").is_none());
     }
 }

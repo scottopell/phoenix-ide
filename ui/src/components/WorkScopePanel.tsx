@@ -35,7 +35,7 @@ import type {
 import { isLive, hasRunningBash, workScopeLiveCount } from './workScopeHelpers';
 import './WorkScopePanel.css';
 
-/** Cadence of the running-handle inventory poll. `ring_bytes_used` grows
+/** Cadence of the running-handle inventory poll. `output_bytes` grows
  *  continuously as a process emits output, but the `work_scope_update` SSE push
  *  is edge-triggered on bash state transitions only — between transitions the
  *  byte count would otherwise stay frozen. */
@@ -139,12 +139,10 @@ function BashRow({ handle, now }: { handle: BashHandleInventory; now: number }) 
               </span>
             </div>
           )}
-          {handle.ring_bytes_used != null && (
-            <div className="ws-detail-line">
-              <span className="ws-detail-key">output</span>
-              <span className="ws-detail-val">{formatBytes(handle.ring_bytes_used)}</span>
-            </div>
-          )}
+          <div className="ws-detail-line">
+            <span className="ws-detail-key">output</span>
+            <span className="ws-detail-val">{formatBytes(handle.output_bytes)}</span>
+          </div>
         </div>
       )}
     </div>
@@ -203,7 +201,7 @@ function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: nu
  *      pushed on bash state transitions), and
  *   3. a poll while any bash handle is running.
  *
- * The SSE push is edge-triggered on state transitions, so `ring_bytes_used`
+ * The SSE push is edge-triggered on state transitions, so `output_bytes`
  * (which grows continuously as a process emits output) stays frozen between
  * transitions. The poll closes that gap: while at least one bash handle is
  * `running` / `kill_pending_kernel` and the surface is active, it re-fetches

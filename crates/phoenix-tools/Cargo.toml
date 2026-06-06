@@ -80,6 +80,9 @@ tracing = "0.1"
 proptest = "1"
 tempfile = "3"
 futures = "0.3"
+# test-util enables tokio::time::{pause, advance} and #[tokio::test(start_paused)]
+# for deterministic timer tests (e.g. the bash reader idle-flush timeout).
+tokio = { version = "1", features = ["full", "test-util"] }
 
 [lints]
 workspace = true

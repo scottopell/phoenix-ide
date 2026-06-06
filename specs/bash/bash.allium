@@ -90,6 +90,15 @@ value ReadWindow {
     end_offset:        Integer
     truncated_before:  Boolean
     lines:             List<RingLine>
+    partial:           String?
+        -- The live trailing partial (un-newlined) line, when the ring holds
+        -- one. Structurally distinct from `lines` (complete lines only):
+        -- this is the in-progress final line the process has emitted but not
+        -- yet terminated with a newline. Present only on live reads; null on
+        -- tombstone reads, where the partial was flushed to a complete line
+        -- on EOF before demotion. A complete-line consumer (the LLM peek)
+        -- may ignore it; a live-output consumer (the process inspector)
+        -- renders it.
 }
 
 -- Read-mode arguments the agent may supply on peek/wait. lines and since are
@@ -252,7 +261,24 @@ entity Handle {
     -- accumulate output until the process actually exits.
     ring_lines:       List<RingLine>    when status in { running, kill_pending_kernel }
     ring_bytes_used:  Integer           when status in { running, kill_pending_kernel }
+        -- Sum of retained complete-line content bytes. Drives eviction ONLY
+        -- (rises on append, falls on eviction). NOT the reported output size
+        -- — that is output_bytes below. Two distinct values: this bounds
+        -- memory; output_bytes answers "how much has the process produced".
     next_line_offset: Integer           when status in { running, kill_pending_kernel }
+    partial:          String?           when status in { running, kill_pending_kernel }
+        -- The trailing un-newlined fragment the process has emitted but not
+        -- yet terminated. Bounded by config.max_partial_bytes (flushed as a
+        -- complete line when an append would exceed it) and flushed after
+        -- config.partial_idle_flush_seconds of reader idle. Null when the
+        -- process has emitted nothing since its last newline.
+
+    -- Total bytes the process has ever written: monotonic, partial-inclusive,
+    -- never decremented by eviction. Defined in EVERY state (0 at spawn),
+    -- which is why it is not status-guarded — it is the reported output size
+    -- surfaced on the observability inventory and process-inspection wire as
+    -- `output_bytes`, and it is preserved across the tombstone transition.
+    output_bytes:     Integer
 
     -- Tombstone fields. Populated on transition to a fully terminal state
     -- (exited or killed). final_tail holds the last TOMBSTONE_TAIL_LINES
@@ -293,7 +319,19 @@ config {
     -- Upper bound. wait_seconds > this is rejected.
 
     ring_buffer_bytes: Integer = 4194304
-    -- 4 MB per-handle live ring buffer.
+    -- 4 MB per-handle live ring buffer. Bounds retained complete-line bytes
+    -- (ring_bytes_used), not the monotonic output_bytes total.
+
+    max_partial_bytes: Integer = 65536
+    -- 64 KiB bound on the trailing un-newlined partial line. An append that
+    -- would grow the partial past this flushes it as a complete line, so a
+    -- process that never emits a newline cannot grow the partial unbounded
+    -- (the eviction cap governs complete lines only).
+
+    partial_idle_flush_seconds: Integer = 10
+    -- Reader idle interval after which a non-empty partial line is flushed as
+    -- a complete line, so output emitted without a trailing newline becomes
+    -- visible to since/lines reads rather than waiting for EOF.
 
     live_handle_cap: Integer = 8
     -- Per-WorkScope cap on handles with status = running.
@@ -545,6 +583,12 @@ rule HandleProcessExited {
     ensures: handle.finished_at = now()
     ensures: handle.final_tail = last_n_lines(handle.ring_lines, config.tombstone_tail_lines)
     ensures: handle.next_offset_at_exit = handle.next_line_offset
+    ensures: handle.output_bytes = handle.output_bytes
+        -- output_bytes is preserved verbatim across demotion: the reported
+        -- output size of a terminal handle is the same total a final live
+        -- read would have returned. (It is unguarded by status, so it
+        -- survives the live-to-terminal transition; stated explicitly here
+        -- because it is the load-bearing "persisted in the tombstone" fact.)
 
     @guidance
         -- The wait-for-exit task observes the process via tokio's
@@ -589,6 +633,8 @@ rule HandleProcessKilled {
     ensures: handle.finished_at = now()
     ensures: handle.final_tail = last_n_lines(handle.ring_lines, config.tombstone_tail_lines)
     ensures: handle.next_offset_at_exit = handle.next_line_offset
+    ensures: handle.output_bytes = handle.output_bytes
+        -- Preserved across demotion (see HandleProcessExited).
 }
 
 -- REQ-BASH-004: ring buffer accumulates a line emitted by the child.
@@ -605,6 +651,15 @@ rule RingLineAppended {
     ensures: handle.ring_lines = append(handle.ring_lines, line)
     ensures: handle.next_line_offset = handle.next_line_offset + 1
     ensures: handle.ring_bytes_used = handle.ring_bytes_used + len(line_bytes)
+    ensures: handle.output_bytes = handle.output_bytes + len(line_bytes) + 1
+        -- The monotonic output total counts the line content plus its
+        -- terminating newline. output_bytes is never decremented (eviction
+        -- leaves it untouched — see RingLineEvicted). The byte-level
+        -- accounting of an un-newlined partial fragment (max_partial_bytes
+        -- bound, partial_idle_flush_seconds) is below this line-oriented
+        -- abstraction; in the implementation a partial's bytes are added to
+        -- output_bytes the moment they arrive, before any newline, but at
+        -- this model's granularity output is a sequence of complete lines.
 }
 
 -- REQ-BASH-004: oldest line evicted because ring_bytes_used exceeded the
@@ -620,6 +675,34 @@ rule RingLineEvicted {
 
     ensures: handle.ring_lines = drop_first(handle.ring_lines)
     ensures: handle.ring_bytes_used = handle.ring_bytes_used - len(oldest.bytes)
+    -- output_bytes is deliberately NOT decremented here: it is the monotonic
+    -- total of everything the process ever wrote, and eviction discarding a
+    -- retained line does not un-write it.
+}
+
+-- REQ-BASH-004: a non-empty partial line is flushed to a complete line when
+-- the reader idles for partial_idle_flush_seconds with output the process
+-- emitted but did not terminate with a newline. The flushed line receives
+-- the next monotonic offset like any other line; output_bytes is unchanged
+-- (the partial's bytes were counted into output_bytes when they arrived).
+-- The size-cap flush (an append that would exceed max_partial_bytes) is not
+-- a separate rule: it produces an ordinary complete line and is covered by
+-- RingLineAppended.
+rule PartialLineIdleFlushed {
+    when: ReaderIdleWithPartial(handle, config.partial_idle_flush_seconds)
+
+    requires: handle.status in { running, kill_pending_kernel }
+    requires: handle.partial != null
+
+    let line = RingLine{
+        offset: handle.next_line_offset,
+        bytes:  handle.partial
+    }
+
+    ensures: handle.ring_lines = append(handle.ring_lines, line)
+    ensures: handle.next_line_offset = handle.next_line_offset + 1
+    ensures: handle.ring_bytes_used = handle.ring_bytes_used + len(handle.partial)
+    ensures: handle.partial = null
 }
 
 ------------------------------------------------------------

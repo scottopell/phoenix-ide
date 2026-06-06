@@ -1,5 +1,5 @@
 // The `work_scope_update` SSE push is edge-triggered on bash state
-// transitions, so `ring_bytes_used` (which grows continuously as a process
+// transitions, so `output_bytes` (which grows continuously as a process
 // emits output) stays frozen between transitions. `WorkScopeSection` closes
 // that gap by polling the inventory endpoint while any bash handle is running,
 // merged into a single last-arrival-wins displayed snapshot alongside the
@@ -29,7 +29,7 @@ function bash(over: Partial<BashHandleInventory> = {}): BashHandleInventory {
     cmd: 'sleep 100',
     state: 'running',
     started_at: new Date().toISOString(),
-    ring_bytes_used: 0,
+    output_bytes: 0,
     ...over,
   };
 }
@@ -81,8 +81,8 @@ describe('hasRunningBash', () => {
 describe('WorkScopeSection running-handle poll', () => {
   it('polls every 2s while a handle runs, advancing the displayed byte count', async () => {
     getInv
-      .mockResolvedValueOnce(inv([bash({ ring_bytes_used: 0 })]))
-      .mockResolvedValueOnce(inv([bash({ ring_bytes_used: 4096 })]));
+      .mockResolvedValueOnce(inv([bash({ output_bytes: 0 })]))
+      .mockResolvedValueOnce(inv([bash({ output_bytes: 4096 })]));
 
     await renderExpanded();
     openBashDetail();
@@ -136,8 +136,8 @@ describe('WorkScopeSection running-handle poll', () => {
   it('last-arrival-wins: a poll refreshes bytes even when liveInventory (SSE) is present', async () => {
     // SSE snapshot is fresh on transitions but carries stale bytes between them;
     // the running-handle poll must still advance the displayed byte count.
-    const sse = inv([bash({ ring_bytes_used: 0 })]);
-    getInv.mockResolvedValue(inv([bash({ ring_bytes_used: 8192 })]));
+    const sse = inv([bash({ output_bytes: 0 })]);
+    getInv.mockResolvedValue(inv([bash({ output_bytes: 8192 })]));
 
     await renderExpanded(sse);
     openBashDetail();

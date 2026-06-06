@@ -20,6 +20,20 @@ use std::collections::VecDeque;
 /// Default per-handle ring buffer cap (REQ-BASH-004: `RING_BUFFER_BYTES`).
 pub const RING_BUFFER_BYTES: usize = 4 * 1024 * 1024;
 
+/// Cap on the trailing partial (un-newlined) buffer before it is flushed as
+/// a complete line (REQ-BASH-004: `MAX_PARTIAL_BYTES`). A process that emits
+/// without ever writing a `\n` would otherwise grow `partial` without bound,
+/// because the eviction cap only governs complete lines. Flushing at this
+/// size makes "partial cannot exceed the cap" a structural guarantee.
+pub const MAX_PARTIAL_BYTES: usize = 64 * 1024;
+
+/// Idle interval after which a non-empty `partial` is flushed as a line by
+/// the reader loop (REQ-BASH-004: `PARTIAL_IDLE_FLUSH_SECONDS`). A process
+/// that emits a prompt or progress fragment without a trailing newline and
+/// then goes quiet would otherwise keep those bytes invisible to `since`/
+/// `tail` reads (which return complete lines only) until EOF.
+pub const PARTIAL_IDLE_FLUSH_SECONDS: u64 = 10;
+
 /// One line in the ring buffer or tombstone tail.
 ///
 /// `bytes` holds the line content WITHOUT the trailing `\n`. Lossy UTF-8
@@ -47,7 +61,19 @@ pub struct RingBuffer {
     /// bytes, which matches the spec's "per-handle live ring buffer
     /// bounded by `RING_BUFFER_BYTES`" intent (the cap is on captured
     /// content, not on framing).
+    ///
+    /// This is the *retained* byte count and exists ONLY to drive eviction.
+    /// It is NOT the reported output size — that is [`Self::output_bytes`],
+    /// which is monotonic and partial-inclusive. Keeping the two distinct
+    /// makes "retained for eviction" and "ever written by the process"
+    /// structurally separate values rather than one field doing two jobs.
     bytes_used: usize,
+    /// Monotonic total of every byte ever appended to the ring, INCLUDING
+    /// bytes currently sitting in `partial` and bytes that have since been
+    /// evicted from `lines`. Never decremented. This is the reported
+    /// "output size" the inventory/inspection wire surfaces — a no-newline
+    /// emitter and a heavily-evicted ring both report a truthful total.
+    total_bytes_appended: u64,
     /// Cap on `bytes_used` before eviction triggers.
     bytes_cap: usize,
     /// Offset of the oldest still-retained line, or the offset that the
@@ -65,16 +91,45 @@ impl RingBuffer {
             lines: VecDeque::new(),
             partial: Vec::new(),
             bytes_used: 0,
+            total_bytes_appended: 0,
             bytes_cap,
             start_offset: 0,
             next_offset: 0,
         }
     }
 
-    /// Total bytes currently retained in `lines`.
+    /// Total bytes currently retained in `lines`. Drives eviction only — NOT
+    /// the reported output size (see [`Self::output_bytes`]).
     #[must_use]
     pub fn bytes_used(&self) -> usize {
         self.bytes_used
+    }
+
+    /// Total bytes ever written by the process: monotonic, partial-inclusive,
+    /// never decremented by eviction. This is the reported "output size".
+    #[must_use]
+    pub fn output_bytes(&self) -> u64 {
+        self.total_bytes_appended
+    }
+
+    /// The current trailing partial (un-newlined) bytes as a lossy-UTF-8
+    /// string, or `None` when there are none. Distinct from the complete
+    /// lines exposed by [`Self::since`]/[`Self::tail`]: this is the
+    /// in-progress final line a process has emitted but not yet terminated.
+    #[must_use]
+    pub fn partial_str(&self) -> Option<String> {
+        if self.partial.is_empty() {
+            None
+        } else {
+            Some(String::from_utf8_lossy(&self.partial).into_owned())
+        }
+    }
+
+    /// True when a non-empty partial line is held. Used by the reader loop's
+    /// idle-flush decision.
+    #[must_use]
+    pub fn has_partial(&self) -> bool {
+        !self.partial.is_empty()
     }
 
     /// Offset of the oldest retained line. If the ring is empty, the
@@ -119,6 +174,10 @@ impl RingBuffer {
     /// `start_offset` advanced past every prior line). This matches
     /// `RingLineEvicted`'s `count(handle.ring_lines) > 1` guard.
     pub fn append(&mut self, mut data: &[u8]) {
+        // Monotonic output total counts every byte the process wrote,
+        // independent of line framing, eviction, or partial buffering.
+        self.total_bytes_appended = self.total_bytes_appended.saturating_add(data.len() as u64);
+
         while let Some(nl) = memchr(b'\n', data) {
             let (head, rest) = data.split_at(nl);
             // head ... = bytes before '\n', no '\n' at end
@@ -130,6 +189,13 @@ impl RingBuffer {
         }
         if !data.is_empty() {
             self.partial.extend_from_slice(data);
+            // Structural bound: a process emitting without a newline cannot
+            // grow `partial` past the cap. Flush it as an ordinary line
+            // (monotonic offset preserved) so the eviction cap reclaims it.
+            if self.partial.len() > MAX_PARTIAL_BYTES {
+                let line_bytes = std::mem::take(&mut self.partial);
+                self.push_line(line_bytes);
+            }
         }
         self.evict_to_cap();
     }
@@ -412,6 +478,84 @@ mod tests {
         assert!(v.lines.is_empty());
         assert!(!v.truncated_before);
         assert_eq!(v.start_offset, v.end_offset);
+    }
+
+    #[test]
+    fn output_bytes_is_monotonic_and_partial_inclusive() {
+        let mut r = RingBuffer::new(1024);
+        assert_eq!(r.output_bytes(), 0);
+        // Complete line: 5 content bytes + 1 newline = 6 appended bytes.
+        r.append(b"alpha\n");
+        assert_eq!(r.output_bytes(), 6);
+        // Un-newlined partial bytes count toward the total immediately.
+        r.append(b"beta");
+        assert_eq!(r.output_bytes(), 10);
+        // Flushing the partial does NOT double-count (already counted on append).
+        r.flush_partial();
+        assert_eq!(r.output_bytes(), 10);
+    }
+
+    #[test]
+    fn output_bytes_not_decremented_by_eviction() {
+        // 8-byte retain cap; write far more so eviction runs repeatedly.
+        let mut r = RingBuffer::new(8);
+        let mut expected: u64 = 0;
+        for i in 0..50_u64 {
+            let chunk = format!("line-{i}\n");
+            expected += chunk.len() as u64;
+            r.append(chunk.as_bytes());
+        }
+        // Retained bytes are bounded by the cap...
+        assert!(r.bytes_used() <= 8);
+        // ...but the reported output total reflects everything ever written.
+        assert_eq!(r.output_bytes(), expected);
+    }
+
+    #[test]
+    fn no_newline_emitter_reports_nonzero_output_bytes() {
+        // The bug this guards: a process that never emits '\n' shows 0
+        // complete lines but its output size must still be truthful.
+        let mut r = RingBuffer::new(1024);
+        r.append(b"no-newline-ever");
+        assert_eq!(r.len(), 0, "no complete line yet");
+        assert_eq!(r.output_bytes(), 15);
+    }
+
+    #[test]
+    fn partial_size_cap_flushes_as_line_and_bounds_partial() {
+        let mut r = RingBuffer::new(RING_BUFFER_BYTES);
+        // One chunk just over the partial cap, no newline.
+        let big = vec![b'X'; MAX_PARTIAL_BYTES + 1];
+        r.append(&big);
+        // The over-cap partial was flushed to a complete line...
+        assert_eq!(r.len(), 1);
+        // ...so the held partial is now empty (structurally bounded).
+        assert!(r.partial_str().is_none());
+        assert_eq!(r.output_bytes(), (MAX_PARTIAL_BYTES + 1) as u64);
+
+        // Accumulating across appends also trips the cap.
+        let mut r = RingBuffer::new(RING_BUFFER_BYTES);
+        let half = vec![b'Y'; MAX_PARTIAL_BYTES / 2 + 1];
+        r.append(&half);
+        assert_eq!(r.len(), 0, "still under cap");
+        r.append(&half);
+        assert_eq!(r.len(), 1, "second append crosses the cap and flushes");
+        assert!(r.partial_str().is_none());
+    }
+
+    #[test]
+    fn partial_str_exposes_trailing_unterminated_bytes() {
+        let mut r = RingBuffer::new(1024);
+        assert!(r.partial_str().is_none());
+        r.append(b"complete\npart");
+        assert_eq!(r.len(), 1);
+        assert_eq!(r.partial_str().as_deref(), Some("part"));
+        assert!(r.has_partial());
+        // Newline terminates the partial; it folds into a line and clears.
+        r.append(b"ial\n");
+        assert!(r.partial_str().is_none());
+        assert!(!r.has_partial());
+        assert_eq!(r.len(), 2);
     }
 
     #[test]

@@ -124,6 +124,11 @@ pub struct Tombstone {
     /// `next_offset` at the moment of demotion. Lets `truncated_before`
     /// be computed for tombstone reads.
     pub next_offset_at_exit: u64,
+    /// Total bytes the process ever wrote (monotonic, partial-inclusive),
+    /// snapshotted from the live ring at demotion. The reported output size
+    /// survives the tombstone transition — a terminal handle reports the
+    /// same truthful count a final live peek would have.
+    pub output_bytes: u64,
     /// If a kill was attempted before this terminal state was reached,
     /// these record the last attempt that landed.
     pub kill_signal_sent: Option<KillSignal>,
@@ -347,6 +352,7 @@ impl Handle {
                 let ring = live.ring.lock().await;
                 let final_tail = ring.snapshot_tail(tombstone_tail_lines);
                 let next_offset_at_exit = ring.next_offset();
+                let output_bytes = ring.output_bytes();
                 drop(ring);
 
                 // Pull the most recent kill attempt (if any) — Copy type,
@@ -370,6 +376,7 @@ impl Handle {
                     finished_at: SystemTime::now(),
                     final_tail,
                     next_offset_at_exit,
+                    output_bytes,
                     kill_signal_sent,
                     kill_attempted_at,
                 };
@@ -499,6 +506,36 @@ mod tests {
                 assert_eq!(t.exit_code, Some(0));
                 assert_eq!(t.duration_ms, 42);
                 assert!(matches!(t.final_cause, FinalCause::Exited { .. }));
+            }
+            HandleState::Live(_) => panic!("expected tombstone"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tombstone_carries_final_output_bytes() {
+        let h = live_handle();
+        // Write some output (a complete line + an un-newlined partial) before exit.
+        {
+            let state = h.state().await;
+            let HandleState::Live(live) = state.as_ref() else {
+                panic!("expected live");
+            };
+            let mut ring = live.ring.lock().await;
+            ring.append(b"hello\nworld"); // 6 + 5 = 11 bytes, no trailing nl
+        }
+        assert!(
+            h.transition_to_terminal(
+                FinalCause::Exited { exit_code: Some(0) },
+                Duration::from_millis(3),
+                TOMBSTONE_TAIL_LINES,
+            )
+            .await
+        );
+        let state = h.state().await;
+        match state.as_ref() {
+            HandleState::Tombstoned(t) => {
+                // Partial-inclusive: the unterminated "world" bytes count.
+                assert_eq!(t.output_bytes, 11);
             }
             HandleState::Live(_) => panic!("expected tombstone"),
         }

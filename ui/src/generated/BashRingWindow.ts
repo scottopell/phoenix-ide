@@ -5,4 +5,13 @@ import type { BashRingLine } from "./BashRingLine";
  * Common ring-buffer view returned alongside any handle response
  * (REQ-BASH-004).
  */
-export type BashRingWindow = { start_offset: number, end_offset: number, truncated_before: boolean, lines: Array<BashRingLine>, };
+export type BashRingWindow = { start_offset: number, end_offset: number, truncated_before: boolean, lines: Array<BashRingLine>, 
+/**
+ * The current trailing partial (un-newlined) line as lossy UTF-8, when
+ * the live ring holds one. Structurally distinct from `lines` (complete
+ * lines): this is the in-progress final line the process has emitted but
+ * not yet terminated with `\n`. Present only on live reads; `None` for
+ * tombstone reads (the partial was flushed to a line on EOF). The LLM
+ * `peek` may ignore it; the process inspector renders it.
+ */
+partial?: string, };

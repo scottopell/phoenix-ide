@@ -10,4 +10,13 @@ export type BashRunTombstonePayload = { handle: string, cmd: string,
 /**
  * Optional handle label set on the run call (REQ-BASH-002).
  */
-label?: string | null, final_cause: string, exit_code: number | null, signal_number?: number | null, duration_ms: number, finished_at: string, kill_signal_sent?: string | null, kill_attempted_at?: string | null, start_offset: number, end_offset: number, truncated_before: boolean, lines: Array<BashRingLine>, };
+label?: string | null, final_cause: string, exit_code: number | null, signal_number?: number | null, duration_ms: number, finished_at: string, kill_signal_sent?: string | null, kill_attempted_at?: string | null, start_offset: number, end_offset: number, truncated_before: boolean, lines: Array<BashRingLine>, 
+/**
+ * The current trailing partial (un-newlined) line as lossy UTF-8, when
+ * the live ring holds one. Structurally distinct from `lines` (complete
+ * lines): this is the in-progress final line the process has emitted but
+ * not yet terminated with `\n`. Present only on live reads; `None` for
+ * tombstone reads (the partial was flushed to a line on EOF). The LLM
+ * `peek` may ignore it; the process inspector renders it.
+ */
+partial?: string, };

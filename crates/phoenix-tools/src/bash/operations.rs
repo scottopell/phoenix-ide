@@ -611,8 +611,29 @@ where
 {
     use tokio::io::AsyncReadExt;
     let mut buf = vec![0u8; 4096];
+    let idle_flush = Duration::from_secs(super::ring::PARTIAL_IDLE_FLUSH_SECONDS);
     loop {
-        match pipe.read(&mut buf).await {
+        // Race the pipe read against an idle timer. When the process emits a
+        // fragment without a trailing newline and then goes quiet, the timer
+        // wins and we flush the held partial as an ordinary line so `since`/
+        // `tail` reads (which return complete lines only) can observe it.
+        // This reuses the existing reader task — no per-handle timer thread.
+        let read_result = tokio::select! {
+            r = pipe.read(&mut buf) => Some(r),
+            () = tokio::time::sleep(idle_flush) => None,
+        };
+        let Some(read_result) = read_result else {
+            // Idle timeout: flush a held partial, then keep reading.
+            let state = handle.state().await;
+            if let HandleState::Live(live) = state.as_ref() {
+                let mut ring = live.ring.lock().await;
+                if ring.has_partial() {
+                    ring.flush_partial();
+                }
+            }
+            continue;
+        };
+        match read_result {
             Ok(0) => break,
             Ok(n) => {
                 // Append to ring under the live mutex. If the handle has
@@ -983,8 +1004,8 @@ async fn shape_handle_response(
             let kill_attempt = handle.kill_attempt().await;
             let is_kill_pending_kernel = kill_attempt.is_some();
             let ring = live.ring.lock().await;
-            let view = read_window_from_ring(&ring, read_args);
-            let window = window_to_typed(&view);
+            let read = read_window_from_ring(&ring, read_args);
+            let window = window_to_typed(&read.view, read.partial);
             drop(ring);
 
             let (kill_signal_str, kill_attempted_str) = match &kill_attempt {
@@ -1077,7 +1098,7 @@ async fn shape_handle_response(
         }
         HandleState::Tombstoned(t) => {
             let view = read_window_from_tombstone(t, read_args);
-            let window = window_to_typed(&view);
+            let window = window_to_typed(&view, None);
             let display_field = match kind {
                 ResponseKind::Kill { .. } => Some(display),
                 ResponseKind::Peek | ResponseKind::Wait => None,
@@ -1120,14 +1141,15 @@ async fn still_running_response(
 
     let window = if let HandleState::Live(live) = state.as_ref() {
         let ring = live.ring.lock().await;
-        let view = read_window_from_ring(&ring, read_args);
-        window_to_typed(&view)
+        let read = read_window_from_ring(&ring, read_args);
+        window_to_typed(&read.view, read.partial)
     } else {
         BashRingWindow {
             start_offset: 0,
             end_offset: 0,
             truncated_before: false,
             lines: vec![],
+            partial: None,
         }
     };
 
@@ -1189,7 +1211,7 @@ async fn terminal_or_panic_response(
         HandleState::Tombstoned(t) => {
             let cmd = cmd_override.unwrap_or(handle.cmd.as_str()).to_string();
             let view = read_window_from_tombstone(t, read_args);
-            let window = window_to_typed(&view);
+            let window = window_to_typed(&view, None);
 
             let typed = if run_path {
                 let payload = BashRunTombstonePayload {
@@ -1251,15 +1273,35 @@ async fn terminal_or_panic_response(
     }
 }
 
-fn read_window_from_ring(ring: &super::ring::RingBuffer, args: &ReadArgs) -> WindowView {
-    if let Some(since) = args.since {
+/// A read window over the live ring or a tombstone, plus the live trailing
+/// partial line. `partial` is `Some` only for live reads that have an
+/// un-newlined trailing fragment; tombstone reads always carry `None`
+/// (the partial was flushed to a line on EOF). Keeping `partial` separate
+/// from `WindowView.lines` makes "complete lines" and "in-progress line"
+/// structurally distinct — the LLM peek may ignore the partial; the
+/// inspector renders it.
+struct RingRead {
+    view: WindowView,
+    partial: Option<String>,
+}
+
+fn read_window_from_ring(ring: &super::ring::RingBuffer, args: &ReadArgs) -> RingRead {
+    let view = if let Some(since) = args.since {
         ring.since(since)
     } else {
         let n = args.lines.unwrap_or(DEFAULT_PEEK_LINES);
         ring.tail(n)
+    };
+    RingRead {
+        view,
+        partial: ring.partial_str(),
     }
 }
 
+/// Tombstone reads carry no live partial — the trailing partial was flushed
+/// to a complete line on EOF before the tombstone was written, so it already
+/// lives in `final_tail`. Wrapping the `WindowView` in [`RingRead`] with
+/// `partial: None` keeps the wire shaping uniform with the live path.
 fn read_window_from_tombstone(tomb: &super::handle::Tombstone, args: &ReadArgs) -> WindowView {
     let lines = &tomb.final_tail;
     let next_offset = tomb.next_offset_at_exit;
@@ -1306,7 +1348,7 @@ fn read_window_from_tombstone(tomb: &super::handle::Tombstone, args: &ReadArgs) 
     }
 }
 
-fn window_to_typed(view: &WindowView) -> BashRingWindow {
+fn window_to_typed(view: &WindowView, partial: Option<String>) -> BashRingWindow {
     BashRingWindow {
         start_offset: view.start_offset,
         end_offset: view.end_offset,
@@ -1319,6 +1361,7 @@ fn window_to_typed(view: &WindowView) -> BashRingWindow {
                 bytes: String::from_utf8_lossy(&l.bytes).into_owned(),
             })
             .collect(),
+        partial,
     }
 }
 
@@ -1353,5 +1396,145 @@ fn display_label(handle: &Arc<Handle>, kind: ResponseKind) -> String {
         ResponseKind::Kill {
             signal_sent: None, ..
         } => format!("kill {} (already terminal)", handle.handle_id),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bash::handle::{Handle, HandleId};
+    use crate::bash::ring::{RingBuffer, PARTIAL_IDLE_FLUSH_SECONDS, RING_BUFFER_BYTES};
+    use phoenix_core::work_scope::WorkScope;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, ReadBuf};
+
+    fn live_handle() -> Arc<Handle> {
+        Handle::new_live(
+            WorkScope::Conversation("conv-ops".into()),
+            HandleId::new("b-1"),
+            "emitter".into(),
+            None,
+            1234,
+            1234,
+            RING_BUFFER_BYTES,
+        )
+    }
+
+    #[test]
+    fn read_window_from_ring_exposes_live_partial() {
+        let mut ring = RingBuffer::new(RING_BUFFER_BYTES);
+        ring.append(b"done\nin-progress");
+        let read = read_window_from_ring(&ring, &ReadArgs::default());
+        // Complete line is in `view.lines`; the un-newlined tail is `partial`.
+        assert_eq!(read.view.lines.len(), 1);
+        assert_eq!(read.partial.as_deref(), Some("in-progress"));
+        // window_to_typed threads the partial onto the wire window.
+        let window = window_to_typed(&read.view, read.partial);
+        assert_eq!(window.partial.as_deref(), Some("in-progress"));
+        assert_eq!(window.lines.len(), 1);
+    }
+
+    #[test]
+    fn read_window_from_ring_partial_none_when_no_trailing_fragment() {
+        let mut ring = RingBuffer::new(RING_BUFFER_BYTES);
+        ring.append(b"complete\n");
+        let read = read_window_from_ring(&ring, &ReadArgs::default());
+        assert!(read.partial.is_none());
+    }
+
+    #[tokio::test]
+    async fn tombstone_read_window_has_no_partial() {
+        // EOF flushes the partial to a complete line before the tombstone is
+        // written, so a tombstone read carries partial: None.
+        let h = live_handle();
+        {
+            let state = h.state().await;
+            let HandleState::Live(live) = state.as_ref() else {
+                panic!("live");
+            };
+            let mut ring = live.ring.lock().await;
+            ring.append(b"line\nno-nl");
+            ring.flush_partial(); // simulate EOF flush
+        }
+        h.transition_to_terminal(
+            FinalCause::Exited { exit_code: Some(0) },
+            Duration::from_millis(1),
+            crate::bash::handle::TOMBSTONE_TAIL_LINES,
+        )
+        .await;
+        let state = h.state().await;
+        let HandleState::Tombstoned(t) = state.as_ref() else {
+            panic!("tombstoned");
+        };
+        let view = read_window_from_tombstone(t, &ReadArgs::default());
+        let window = window_to_typed(&view, None);
+        assert!(window.partial.is_none());
+        // The flushed "no-nl" fragment is now a complete line in the tail.
+        assert!(window.lines.iter().any(|l| l.bytes == "no-nl"));
+    }
+
+    /// A reader that yields one chunk, then stalls forever (Poll::Pending).
+    /// Models a process that emits an un-newlined fragment and goes quiet.
+    struct OneChunkThenStall {
+        chunk: Option<Vec<u8>>,
+    }
+
+    impl AsyncRead for OneChunkThenStall {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            if let Some(chunk) = self.chunk.take() {
+                buf.put_slice(&chunk);
+                Poll::Ready(Ok(()))
+            } else {
+                // Never wakes — the only thing that can fire now is the
+                // reader loop's idle-flush timer.
+                Poll::Pending
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_flush_emits_partial_as_line_via_reader_timeout() {
+        let h = live_handle();
+        let reader = OneChunkThenStall {
+            chunk: Some(b"stuck-no-newline".to_vec()),
+        };
+        let h2 = h.clone();
+        let task = tokio::spawn(async move {
+            read_pipe_to_ring(reader, h2, "stdout").await;
+        });
+
+        // Let the chunk land in `partial` before any timer fires.
+        tokio::task::yield_now().await;
+        {
+            let state = h.state().await;
+            let HandleState::Live(live) = state.as_ref() else {
+                panic!("live");
+            };
+            let ring = live.ring.lock().await;
+            assert_eq!(ring.len(), 0, "no complete line yet — held as partial");
+            assert!(ring.has_partial());
+        }
+
+        // Advance past the idle-flush threshold; the select! timer wins.
+        tokio::time::advance(Duration::from_secs(PARTIAL_IDLE_FLUSH_SECONDS + 1)).await;
+        tokio::task::yield_now().await;
+
+        {
+            let state = h.state().await;
+            let HandleState::Live(live) = state.as_ref() else {
+                panic!("live");
+            };
+            let ring = live.ring.lock().await;
+            assert_eq!(ring.len(), 1, "idle timer flushed the partial as a line");
+            assert!(!ring.has_partial());
+            assert_eq!(ring.since(0).lines[0].bytes, b"stuck-no-newline");
+        }
+
+        task.abort();
     }
 }

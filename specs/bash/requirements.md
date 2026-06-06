@@ -203,9 +203,38 @@ THE SYSTEM SHALL append the bytes to a per-handle ring buffer bounded by
 AND split incoming bytes on newline boundaries to assign each complete line a
 monotonically increasing offset (line 0, 1, 2, ... since spawn)
 
-WHEN the ring buffer reaches `RING_BUFFER_BYTES` and new content arrives
+WHEN the ring buffer's retained complete-line bytes reach `RING_BUFFER_BYTES`
+and new content arrives
 THE SYSTEM SHALL evict the oldest lines until the new content fits
 AND advance `start_offset` to the offset of the oldest still-retained line
+
+THE SYSTEM SHALL track a monotonic count of total bytes the process has
+written — incremented on every append, inclusive of bytes currently held as
+an un-newlined trailing partial, and never decremented by eviction. This
+count is the reported output size (`output_bytes`), distinct from the
+retained-byte count that drives eviction. It is defined in every state
+(0 at spawn), surfaced on the observability inventory and process-inspection
+wire as `output_bytes`, and persisted into the tombstone so a terminal handle
+reports the same total a final live read would have.
+
+WHEN incoming bytes have no trailing newline
+THE SYSTEM SHALL hold them as a partial line bounded by `MAX_PARTIAL_BYTES`
+(default 64 KiB): when an append would grow the partial past that bound, the
+partial is flushed immediately as a complete line (receiving the next
+monotonic offset) so a process that never emits a newline cannot grow the
+partial without bound
+
+WHEN a handle's reader idles with a non-empty partial line for
+`PARTIAL_IDLE_FLUSH_SECONDS` (default 10)
+THE SYSTEM SHALL flush the partial as a complete line so output a process
+emitted without a trailing newline and then stopped producing becomes
+visible to `since`/`lines` reads (which return complete lines only) rather
+than staying invisible until EOF
+
+THE read window returned on a live peek/wait/run response SHALL carry the
+current trailing partial line (lossy UTF-8) as a `partial` field, structurally
+distinct from the complete `lines`. A tombstone read carries no `partial`
+(the partial was flushed to a complete line on EOF before demotion).
 
 WHEN agent supplies `peek=<handle>` with `lines=N`
 THE SYSTEM SHALL return the last N lines of the ring buffer (or all lines if
@@ -235,6 +264,27 @@ cursors — a dropped network response, a re-asking agent, or a UI peeker do not
 race each other. `truncated_before` makes information loss explicit rather than
 silent: the agent can detect when content fell out of the window and decide how
 to respond.
+
+The reported output size is a monotonic total of bytes written, not the
+retained-line byte count. These are two different values doing two different
+jobs: the retained count bounds memory (it falls as lines evict), while the
+output total answers "how much has this process produced" (it only rises). A
+single field cannot honestly serve both — a no-newline emitter would report
+0 forever under a retained-line count, and a heavily-evicted ring would
+under-report. The total is partial-inclusive so output a process is mid-way
+through emitting still counts, and it is persisted into the tombstone so the
+count survives the live-to-terminal transition rather than vanishing.
+
+The partial line is bounded structurally (`MAX_PARTIAL_BYTES`) rather than by
+convention: the eviction cap governs complete lines only, so without a partial
+bound a process that never emits `\n` is an unbounded memory leak. The idle
+flush (`PARTIAL_IDLE_FLUSH_SECONDS`) exists because `since`/`lines` reads
+return complete lines only — a prompt or progress fragment emitted without a
+newline would otherwise be invisible to the agent until the process exits. The
+read window exposes the partial as a field distinct from `lines` so a consumer
+that wants the in-progress line (the process inspector) can render it while the
+LLM peek, which reasons over complete lines, can ignore it; folding it into
+`lines` would give it a fake offset and blur "complete" against "in progress."
 
 ---
 
@@ -757,7 +807,9 @@ operations so the UI has a sensible display for non-run calls.
 | Name | Default | Description |
 |---|---|---|
 | `MAX_WAIT_SECONDS` | 900 | Upper bound on `wait_seconds` per call |
-| `RING_BUFFER_BYTES` | 4 MB | Per-handle live ring buffer size |
+| `RING_BUFFER_BYTES` | 4 MB | Per-handle live ring buffer size (bounds retained complete-line bytes, not the reported `output_bytes` total) |
+| `MAX_PARTIAL_BYTES` | 64 KiB | Bound on the trailing un-newlined partial line; an append that would exceed it flushes the partial as a complete line |
+| `PARTIAL_IDLE_FLUSH_SECONDS` | 10 | Reader idle interval after which a non-empty partial line is flushed as a complete line |
 | `LIVE_HANDLE_CAP` | 8 | Per-WorkScope cap on `running` handles |
 | `KILL_RESPONSE_TIMEOUT_SECONDS` | 30 | After signal sent, wait this long for exit before returning `kill_pending_kernel` |
 | `SHUTDOWN_KILL_GRACE_SECONDS` | 2 | Time Phoenix waits at shutdown for SIGKILL'd groups to exit |

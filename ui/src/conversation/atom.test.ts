@@ -1128,6 +1128,7 @@ describe('conversationReducer', () => {
         cmd: `cmd ${id}`,
         state: 'running' as const,
         started_at: '2024-01-01T00:00:00Z',
+        output_bytes: 0,
       })),
       tmux: null,
       browser: null,

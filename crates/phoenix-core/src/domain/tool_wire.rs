@@ -68,6 +68,15 @@ pub struct BashRingWindow {
     pub end_offset: u64,
     pub truncated_before: bool,
     pub lines: Vec<BashRingLine>,
+    /// The current trailing partial (un-newlined) line as lossy UTF-8, when
+    /// the live ring holds one. Structurally distinct from `lines` (complete
+    /// lines): this is the in-progress final line the process has emitted but
+    /// not yet terminated with `\n`. Present only on live reads; `None` for
+    /// tombstone reads (the partial was flushed to a line on EOF). The LLM
+    /// `peek` may ignore it; the process inspector renders it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    #[ts(optional)]
+    pub partial: Option<String>,
 }
 
 /// Single ring line; `bytes` is the line contents as a (lossy) UTF-8
@@ -351,6 +360,7 @@ mod bash_tmux_wire_tests {
                     offset: 0,
                     bytes: "hello".into(),
                 }],
+                partial: None,
             },
             kill_signal_sent: None,
             kill_attempted_at: None,
@@ -382,6 +392,7 @@ mod bash_tmux_wire_tests {
                 end_offset: 0,
                 truncated_before: false,
                 lines: vec![],
+                partial: None,
             },
             kill_signal_sent: None,
             kill_attempted_at: None,
@@ -410,6 +421,7 @@ mod bash_tmux_wire_tests {
                 end_offset: 0,
                 truncated_before: false,
                 lines: vec![],
+                partial: None,
             },
             display: Some("kill b-2 (TERM)".into()),
             signal_sent: Some("TERM".into()),
@@ -444,6 +456,7 @@ mod bash_tmux_wire_tests {
                     offset: 0,
                     bytes: "hi".into(),
                 }],
+                partial: None,
             },
         });
         let v = serde_json::to_value(&resp).unwrap();
@@ -460,6 +473,7 @@ mod bash_tmux_wire_tests {
             end_offset: 0,
             truncated_before: false,
             lines: vec![],
+            partial: None,
         }
     }
 

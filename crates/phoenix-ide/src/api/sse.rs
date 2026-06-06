@@ -826,7 +826,7 @@ mod tests {
                     pgid: Some(4321),
                     started_at: ts(),
                     duration_ms: None,
-                    ring_bytes_used: Some(42),
+                    output_bytes: 42,
                 }],
                 tmux: None,
                 browser: None,

@@ -528,6 +528,9 @@ const BashRingWindowFieldsSchema = {
   end_offset: v.number(),
   truncated_before: v.boolean(),
   lines: v.array(BashRingLineSchema),
+  // The live trailing partial (un-newlined) line; absent on tombstone reads
+  // and when there is no in-progress line (skip_serializing_if on the wire).
+  partial: v.exactOptional(v.string()),
 } as const;
 
 const BashRunningPayloadSchema = v.looseObject({
