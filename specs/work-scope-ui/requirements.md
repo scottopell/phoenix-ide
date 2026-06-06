@@ -173,10 +173,16 @@ also the natural surface for any future non-UI client (REQ-WSUI-011).
 ### REQ-WSUI-007: Inventory Push Event
 
 WHEN a bash handle in a scope is spawned, transitions to a terminal state, or
-is killed, OR a browser session for the scope crosses a liveness edge (up or
-down)
+is killed, OR the scope's tmux registry entry changes — the entry is created
+(first `ensure_live` materialization, e.g. when the conversation's terminal
+panel attaches), its `ServerStatus` transitions (`not_probed`→`live`, →`gone`),
+or it is removed by the cleanup cascade — OR a browser session for the scope
+crosses a liveness edge (up or down)
 THE SYSTEM SHALL emit a `WorkScopeUpdate` SSE event carrying a `sequence_id`
 and the full refreshed `WorkScopeInventory` for that scope.
+
+THE `WorkScopeUpdate` event SHALL be emitted only on an actual state change,
+not on a read or a probe that leaves state unchanged.
 
 THE `WorkScopeUpdate` event SHALL carry a complete inventory snapshot, not a
 delta.
@@ -185,7 +191,11 @@ delta.
 poll. Inventory payloads are small (a handful of handles plus two small
 sections), so a full snapshot per change is simpler and removes any
 delta-application bug class — there is no partial state to reconcile on the
-client.
+client. The tmux trigger closes a coverage gap: opening a conversation's
+terminal panel materializes a tmux entry (the terminal runs `tmux attach`),
+and without a tmux-side emission that entry would never reach the panel — the
+bash and browser triggers alone leave a terminal-only scope showing its
+on-mount snapshot indefinitely.
 
 ---
 

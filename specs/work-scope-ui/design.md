@@ -156,12 +156,25 @@ pattern in `wire.rs` and `sseSchemas.ts`.
 
 ### Emission
 
-The bash registry emits on spawn / transition-to-terminal / kill; the browser
-manager already publishes liveness edges via its `BrowserSessionLifecycleSink`.
-Each emission resolves the scope's target conversation (next section) and sends
-a `WorkScopeUpdate` carrying a freshly-assembled inventory through that
-conversation's `SseBroadcaster::send_seq`, the same allocator every other
-per-conversation event uses.
+Three registries publish scope-change signals into one work-scope bridge, each
+through its own lifecycle sink (`Option<UnboundedSender<…Event>>`, `None` for
+tool-level tests so existing constructors are unaffected):
+
+- The bash registry emits on spawn / transition-to-terminal / kill.
+- The tmux registry emits on entry creation (first `ensure_live`
+  materialization), `ServerStatus` transition (`not_probed`→`live`, →`gone`),
+  and cascade removal — only on an actual state change, never on a probe-noop
+  against an already-`live` server.
+- The browser manager publishes liveness edges via its
+  `BrowserSessionLifecycleSink`.
+
+The runtime feeds all three into a single `tokio::select!` loop in the
+work-scope bridge; each arm yields the affected `WorkScope`, and the loop calls
+one shared routing path (`broadcast_work_scope_update`) that assembles the full
+inventory and sends a `WorkScopeUpdate` through the target conversation's
+`SseBroadcaster::send_seq`, the same allocator every other per-conversation
+event uses. Routing the three signal kinds through one path (rather than three
+parallel mechanisms) keeps the assembly-and-resolve logic single-source.
 
 ## Push Event Routing (REQ-WSUI-008)
 
@@ -245,6 +258,26 @@ The section's initial fetch (REQ-WSUI-006) seeds only its local state; the
 atom's `workScope` remains written solely by the SSE reducer — a single-writer
 contract that keeps the live push authoritative.
 
+### Live-resource poll
+
+The `WorkScopeUpdate` push is edge-triggered on state transitions, so fields
+that drift continuously between transitions stay frozen — a live bash handle's
+`output_bytes` grows as the process emits output, and a `live` browser
+session's `idle_ms` advances every second with no dedicated edge. To close that
+gap, the panel re-fetches the pull endpoint on a fixed cadence (~2s) while the
+surface is active **and** the scope owns any live resource, merging the result
+into its local displayed snapshot (last-arrival-wins).
+
+The poll gate is "any live resource", not "a running bash handle": it is true
+when any bash handle is running / `kill_pending_kernel`, OR a tmux entry exists
+and is `live` or `not_probed` (a `gone` entry is terminal), OR a browser
+session is `live`. The broader gate is defense in depth — it keeps the panel
+refreshing for values with no dedicated emit (browser `idle_ms`) and is
+belt-and-suspenders for tmux, whose entry can be created off the conversation's
+own SSE channel (the terminal panel's `tmux attach`). It is self-limiting: once
+nothing is live, or the surface unmounts / collapses, the poll stops, so there
+are no unbounded background timers.
+
 ### Chain page (REQ-WSUI-009)
 
 The chain page has no left `FileExplorerPanel` to host a section, so it queries
@@ -301,6 +334,8 @@ eliminates.
 - `crates/phoenix-ide/src/api/handlers.rs` — add the
   `GET /api/work-scope/:scope_key/inventory` route and handler.
 - The bash handle registry — emit on spawn / terminal / kill.
+- The tmux registry — emit on entry creation / `ServerStatus` transition /
+  cascade removal, via the same lifecycle-sink shape.
 - `ui/src/sseSchemas.ts` — add `SseWorkScopeUpdateDataSchema`.
 - `ui/src/conversation/atom.ts` — add `workScope` field, `SSEAction` case, and
   reducer branch.

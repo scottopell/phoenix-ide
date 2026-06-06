@@ -24,7 +24,8 @@ use crate::platform::PlatformCapability;
 use crate::state_machine::state::{ModeKind, SubAgentMode, SubAgentOutcome, SubAgentSpec};
 use crate::tools::browser::session::BrowserSessionLifecycleEvent;
 use crate::tools::{
-    BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, TmuxRegistry, ToolRegistry,
+    BashHandleRegistry, BashLifecycleEvent, BrowserSessionManager, TmuxLifecycleEvent,
+    TmuxRegistry, ToolRegistry,
 };
 use phoenix_core::work_scope::WorkScope;
 
@@ -147,6 +148,14 @@ pub struct RuntimeManager {
     /// assembles the affected scope's inventory and broadcasts
     /// [`SseEvent::WorkScopeUpdate`] (REQ-WSUI-007).
     bash_lifecycle_rx: RwLock<Option<mpsc::UnboundedReceiver<BashLifecycleEvent>>>,
+    /// Receiver for tmux state-transition signals (entry created / status
+    /// change / cascade removal). Taken once by
+    /// [`RuntimeManager::start_work_scope_bridge`], which assembles the
+    /// affected scope's inventory and broadcasts [`SseEvent::WorkScopeUpdate`].
+    /// Opening a conversation's terminal panel materializes a tmux entry via
+    /// `ensure_live`; this is the edge that pushes it to the work-scope panel
+    /// (REQ-WSUI-007).
+    tmux_lifecycle_rx: RwLock<Option<mpsc::UnboundedReceiver<TmuxLifecycleEvent>>>,
     /// Sender the browser lifecycle bridge forwards a `WorkScope` into after
     /// it broadcasts a `BrowserSessionState` edge, so the work-scope bridge
     /// also emits a `WorkScopeUpdate` for that scope (REQ-WSUI-007: a browser
@@ -949,6 +958,12 @@ impl RuntimeManager {
         // for the same reason as the browser channel: dropping an edge would
         // desync the work-scope panel's view of the scope's resources.
         let (bash_lifecycle_tx, bash_lifecycle_rx) = mpsc::unbounded_channel();
+        // Tmux state-transition channel (entry created / status change /
+        // cascade removal). Unbounded for the same reason as the bash
+        // channel: dropping an edge would leave the work-scope panel showing
+        // a stale tmux row (notably: a terminal-only conversation whose
+        // tmux entry never reaches the panel).
+        let (tmux_lifecycle_tx, tmux_lifecycle_rx) = mpsc::unbounded_channel();
         // Browser-edge → work-scope forward channel. The browser lifecycle
         // bridge sends the affected scope here after broadcasting its own
         // edge, so the work-scope bridge re-broadcasts a `WorkScopeUpdate`.
@@ -963,7 +978,7 @@ impl RuntimeManager {
             bash_handles: Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(
                 bash_lifecycle_tx,
             ))),
-            tmux_registry: Arc::new(TmuxRegistry::new()),
+            tmux_registry: Arc::new(TmuxRegistry::with_lifecycle_sink(Some(tmux_lifecycle_tx))),
             mcp_manager,
             terminals: crate::terminal::ActiveTerminals::new(),
             runtimes: RwLock::new(HashMap::new()),
@@ -978,6 +993,7 @@ impl RuntimeManager {
             credential_helper,
             browser_lifecycle_rx: RwLock::new(Some(browser_lifecycle_rx)),
             bash_lifecycle_rx: RwLock::new(Some(bash_lifecycle_rx)),
+            tmux_lifecycle_rx: RwLock::new(Some(tmux_lifecycle_rx)),
             work_scope_browser_tx,
             work_scope_browser_rx: RwLock::new(Some(work_scope_browser_rx)),
         }
@@ -1123,10 +1139,11 @@ impl RuntimeManager {
         });
     }
 
-    /// Start the bridge that turns bash state-transition signals and
-    /// forwarded browser liveness edges into per-conversation
-    /// `WorkScopeUpdate` broadcasts (REQ-WSUI-007 / REQ-WSUI-008). Must be
-    /// called once after `RuntimeManager::new`; a double call is a no-op.
+    /// Start the bridge that turns bash state-transition signals, tmux
+    /// state-transition signals, and forwarded browser liveness edges into
+    /// per-conversation `WorkScopeUpdate` broadcasts (REQ-WSUI-007 /
+    /// REQ-WSUI-008). Must be called once after `RuntimeManager::new`; a
+    /// double call is a no-op.
     ///
     /// On each signal for `WorkScope` W it assembles W's full inventory from
     /// the three live registries (the same `assemble_inventory` the pull
@@ -1138,8 +1155,11 @@ impl RuntimeManager {
     /// member.
     pub async fn start_work_scope_bridge(self: &Arc<Self>) {
         let bash_rx = self.bash_lifecycle_rx.write().await.take();
+        let tmux_rx = self.tmux_lifecycle_rx.write().await.take();
         let browser_rx = self.work_scope_browser_rx.write().await.take();
-        let (Some(mut bash_rx), Some(mut browser_rx)) = (bash_rx, browser_rx) else {
+        let (Some(mut bash_rx), Some(mut tmux_rx), Some(mut browser_rx)) =
+            (bash_rx, tmux_rx, browser_rx)
+        else {
             tracing::debug!("work-scope bridge already started; skipping");
             return;
         };
@@ -1148,6 +1168,7 @@ impl RuntimeManager {
             loop {
                 let work_scope = tokio::select! {
                     Some(event) = bash_rx.recv() => event.work_scope,
+                    Some(event) = tmux_rx.recv() => event.work_scope,
                     Some(scope) = browser_rx.recv() => scope,
                     else => break,
                 };

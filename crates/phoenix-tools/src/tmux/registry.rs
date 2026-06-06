@@ -185,6 +185,24 @@ pub fn socket_path_for_global(socket_dir: &Path) -> PathBuf {
     socket_dir.join("global.sock")
 }
 
+/// Signal published when a `TmuxServer` in a `WorkScope` changes state
+/// (entry created, status transition `NotProbed`→`Live` / →`Gone`, or
+/// removal during the hard-delete cascade). Mirrors the bash
+/// `BashLifecycleEvent` shape: it carries only the affected `WorkScope`,
+/// leaving inventory assembly and conversation routing to the runtime's
+/// work-scope bridge. State transitions only — NOT per-probe noops
+/// (REQ-WSUI-007).
+#[derive(Debug, Clone)]
+pub struct TmuxLifecycleEvent {
+    pub work_scope: WorkScope,
+}
+
+/// Sink the registry publishes [`TmuxLifecycleEvent`]s into. A `mpsc`
+/// keeps the registry decoupled from per-conversation routing (the runtime
+/// owns that). `None` for tool-level tests that don't care about the push
+/// path. Mirrors [`super::super::bash::registry::BashLifecycleSink`].
+pub type TmuxLifecycleSink = tokio::sync::mpsc::UnboundedSender<TmuxLifecycleEvent>;
+
 /// Top-level registry: maps `WorkScope::stable_key()` → per-scope tmux
 /// server. One registry instance per Phoenix process.
 #[derive(Debug)]
@@ -201,6 +219,11 @@ pub struct TmuxRegistry {
     /// `OnceCell::get_or_try_init` retries on failure so a transient
     /// disk error doesn't permanently brick the registry.
     runtime_assets: OnceCell<()>,
+    /// Optional sink for tmux state-transition signals (entry created /
+    /// status change / cascade removal). Populated by `RuntimeManager::new`
+    /// so transitions flow into the work-scope push bridge; `None` for
+    /// tool-level tests. Mirrors `BashHandleRegistry::lifecycle_sink`.
+    lifecycle_sink: Option<TmuxLifecycleSink>,
 }
 
 impl TmuxRegistry {
@@ -225,6 +248,39 @@ impl TmuxRegistry {
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
+            lifecycle_sink: None,
+        }
+    }
+
+    /// Construct a registry (default socket dir) that publishes tmux
+    /// state-transition signals into `sink`. The runtime wires this to the
+    /// work-scope push bridge, which resolves the scope's conversation and
+    /// broadcasts a `WorkScopeUpdate`. Mirrors
+    /// `BashHandleRegistry::with_lifecycle_sink`.
+    #[must_use]
+    pub fn with_lifecycle_sink(sink: Option<TmuxLifecycleSink>) -> Self {
+        let mut reg = Self::with_socket_dir(default_socket_dir());
+        reg.lifecycle_sink = sink;
+        reg
+    }
+
+    /// Publish a tmux state-transition signal for `work_scope` if a sink is
+    /// wired. Best-effort: a dropped receiver / closed channel is logged at
+    /// `debug` (capability gap) and does not affect registry correctness.
+    /// Mirrors `BashHandleRegistry::emit_lifecycle`.
+    fn emit_lifecycle(&self, work_scope: &WorkScope) {
+        let Some(sink) = self.lifecycle_sink.as_ref() else {
+            return;
+        };
+        let event = TmuxLifecycleEvent {
+            work_scope: work_scope.clone(),
+        };
+        if let Err(e) = sink.send(event) {
+            tracing::debug!(
+                work_scope = %work_scope,
+                error = %e,
+                "dropping tmux lifecycle event — sink closed"
+            );
         }
     }
 
@@ -240,6 +296,26 @@ impl TmuxRegistry {
             socket_dir,
             binary_available,
             runtime_assets: OnceCell::new(),
+            lifecycle_sink: None,
+        }
+    }
+
+    /// Test-only constructor combining a caller-supplied socket directory,
+    /// forced `binary_available`, and a lifecycle sink — used to assert that
+    /// status transitions and cascade removal round-trip through the sink
+    /// without requiring a real tmux server.
+    #[cfg(test)]
+    pub fn with_socket_dir_binary_and_sink(
+        socket_dir: PathBuf,
+        binary_available: bool,
+        sink: Option<TmuxLifecycleSink>,
+    ) -> Self {
+        Self {
+            inner: RwLock::new(HashMap::new()),
+            socket_dir,
+            binary_available,
+            runtime_assets: OnceCell::new(),
+            lifecycle_sink: sink,
         }
     }
 
@@ -377,9 +453,18 @@ impl TmuxRegistry {
             WorkScope::Global => socket_path_for_global(&self.socket_dir),
         };
 
-        let server_arc = self.get_or_insert(work_scope, socket_path).await;
+        let (server_arc, created) = self.get_or_insert(work_scope, socket_path).await;
+        // Entry CREATED edge: a scope that has never performed a tmux
+        // operation now has a registry entry, so it appears in the
+        // work-scope inventory (status=not_probed until the probe below
+        // promotes it). Emit before the probe so the panel can reflect the
+        // new server even if the probe/spawn is slow.
+        if created {
+            self.emit_lifecycle(work_scope);
+        }
 
         let mut server = server_arc.write().await;
+        let prev_status = server.status;
         // Probe under the per-scope entry write lock — the only
         // authoritative point of decision. An earlier outer-lock probe
         // was an unsound shortcut: if the server died (or the outer
@@ -416,35 +501,49 @@ impl TmuxRegistry {
                 server.status = ServerStatus::Live;
             }
         }
+        let status_changed = server.status != prev_status;
         drop(server);
+        // STATUS-change edge (e.g. NotProbed→Live on first materialization).
+        // Only on an actual transition — a probe-noop on an already-Live
+        // server does not re-emit (REQ-WSUI-007: state transitions only).
+        // Skipped when `created` already emitted on this same call to avoid
+        // a redundant double event for the create→Live path.
+        if status_changed && !created {
+            self.emit_lifecycle(work_scope);
+        }
         Ok(server_arc)
     }
 
     /// Get-or-create the entry without driving probe/spawn. Internal
     /// helper for `ensure_live`; not exposed because callers should
     /// always go through the probe-and-act sequence.
+    ///
+    /// Returns `(entry, created)` where `created` is `true` iff this call
+    /// inserted a fresh entry — so the caller can emit the entry-CREATED
+    /// lifecycle edge exactly once, even under a concurrent-creator race
+    /// (the loser observes the existing entry and gets `false`).
     async fn get_or_insert(
         &self,
         work_scope: &WorkScope,
         socket_path: PathBuf,
-    ) -> Arc<RwLock<TmuxServer>> {
+    ) -> (Arc<RwLock<TmuxServer>>, bool) {
         let key = work_scope.stable_key();
         {
             let map = self.inner.read().await;
             if let Some(entry) = map.get(&key) {
-                return entry.clone();
+                return (entry.clone(), false);
             }
         }
         let mut map = self.inner.write().await;
         if let Some(entry) = map.get(&key) {
-            return entry.clone();
+            return (entry.clone(), false);
         }
         let entry = Arc::new(RwLock::new(TmuxServer::new(
             work_scope.clone(),
             socket_path,
         )));
         map.insert(key, entry.clone());
-        entry
+        (entry, true)
     }
 
     /// Look up a `WorkScope`'s tmux server entry **without creating one or
@@ -500,6 +599,7 @@ impl TmuxRegistry {
             let mut map = self.inner.write().await;
             map.remove(&key)
         };
+        let had_entry = entry.is_some();
 
         let socket_path = if let Some(arc) = entry {
             let server = arc.read().await;
@@ -573,6 +673,14 @@ impl TmuxRegistry {
             Err(e) => {
                 report.unlink_error = Some(e.to_string());
             }
+        }
+
+        // REMOVAL edge: an entry existed and was torn down, so the server
+        // disappears from the work-scope inventory. Emit only when the
+        // registry actually held an entry — an orphan-socket-only cleanup
+        // (no in-memory entry) does not change the inventory.
+        if had_entry {
+            self.emit_lifecycle(work_scope);
         }
 
         report
@@ -796,6 +904,79 @@ mod tests {
         let a = socket_path_for(&dir, "z");
         let b = socket_path_for(&dir, "z");
         assert_eq!(a, b);
+    }
+
+    /// REQ-WSUI-007: cascade removal of a registry-held entry publishes a
+    /// `TmuxLifecycleEvent` carrying the affected scope when a sink is wired.
+    /// Mirrors the bash registry's `emit_lifecycle_round_trips_through_sink`.
+    /// `binary_available = false` so no real tmux process is touched.
+    #[tokio::test]
+    async fn cascade_removal_round_trips_through_sink() {
+        let tmp = TempDir::new().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reg = TmuxRegistry::with_socket_dir_binary_and_sink(
+            tmp.path().to_path_buf(),
+            false,
+            Some(tx),
+        );
+
+        let scope = WorkScope::Conversation("conv-A".to_string());
+        let sock = socket_path_for(tmp.path(), "conv-A");
+        let (_arc, created) = reg.get_or_insert(&scope, sock).await;
+        assert!(created, "first insert must report created");
+
+        // Tearing down a held entry emits exactly one removal edge.
+        let _ = reg.cascade_on_delete(&scope, None).await;
+        let e = rx.try_recv().expect("removal event missing");
+        assert_eq!(e.work_scope, scope);
+        assert!(rx.try_recv().is_err(), "no more events expected");
+    }
+
+    /// Cascade on a scope with no registry entry (orphan-socket-only path)
+    /// does not change the inventory, so it must not emit.
+    #[tokio::test]
+    async fn cascade_no_entry_does_not_emit() {
+        let tmp = TempDir::new().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reg = TmuxRegistry::with_socket_dir_binary_and_sink(
+            tmp.path().to_path_buf(),
+            false,
+            Some(tx),
+        );
+        let scope = WorkScope::Conversation("never-existed".to_string());
+        let _ = reg.cascade_on_delete(&scope, None).await;
+        assert!(rx.try_recv().is_err(), "no entry → no removal event");
+    }
+
+    /// Preservation (continuation inherits the same scope) leaves the entry
+    /// in place, so it must not emit a removal edge.
+    #[tokio::test]
+    async fn cascade_preserve_does_not_emit() {
+        let tmp = TempDir::new().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reg = TmuxRegistry::with_socket_dir_binary_and_sink(
+            tmp.path().to_path_buf(),
+            false,
+            Some(tx),
+        );
+        let wt = WorkScope::Worktree("/tmp/phoenix-tmux-preserve-emit".to_string());
+        let sock =
+            socket_path_for_worktree(tmp.path(), Path::new("/tmp/phoenix-tmux-preserve-emit"));
+        let _ = reg.get_or_insert(&wt, sock).await;
+        let _ = reg.cascade_on_delete(&wt, Some(&wt)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "preserved entry must not emit a removal edge"
+        );
+    }
+
+    /// `emit_lifecycle` with no sink wired is a no-op (no panic). Mirrors the
+    /// bash registry's `emit_lifecycle_without_sink_is_no_op`.
+    #[tokio::test]
+    async fn emit_lifecycle_without_sink_is_no_op() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        reg.emit_lifecycle(&WorkScope::Conversation("conv-X".to_string()));
     }
 
     #[tokio::test]

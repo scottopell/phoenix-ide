@@ -32,7 +32,7 @@ import type {
   BashHandleInventory,
   BashHandleState,
 } from '../api';
-import { isLive, hasRunningBash, workScopeLiveCount } from './workScopeHelpers';
+import { isLive, hasLiveResource, workScopeLiveCount } from './workScopeHelpers';
 import './WorkScopePanel.css';
 
 /** Cadence of the running-handle inventory poll. `output_bytes` grows
@@ -198,16 +198,16 @@ function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: nu
  *
  *   1. the initial fetch keyed by `scopeKey`,
  *   2. the SSE-fed `liveInventory` prop (the conversation atom's `workScope`,
- *      pushed on bash state transitions), and
- *   3. a poll while any bash handle is running.
+ *      pushed on bash / tmux / browser state transitions), and
+ *   3. a poll while the scope owns any live resource.
  *
- * The SSE push is edge-triggered on state transitions, so `output_bytes`
- * (which grows continuously as a process emits output) stays frozen between
- * transitions. The poll closes that gap: while at least one bash handle is
- * `running` / `kill_pending_kernel` and the surface is active, it re-fetches
- * every {@link RUNNING_POLL_INTERVAL_MS} so byte counts (and any other live
- * fields) advance. It stops once nothing is running or the surface unmounts —
- * self-limiting, no unbounded timers.
+ * The SSE push is edge-triggered on state transitions, so continuously-drifting
+ * fields (`output_bytes` as a process emits output; a browser session's
+ * `idle_ms`) stay frozen between transitions. The poll closes that gap: while
+ * the scope owns any live resource (a running bash handle, a tmux server entry,
+ * or a live browser session) and the surface is active, it re-fetches every
+ * {@link RUNNING_POLL_INTERVAL_MS} so those fields advance. It stops once
+ * nothing is live or the surface unmounts — self-limiting, no unbounded timers.
  *
  * Each source writes the same local `displayed` state; the most recent write
  * wins. This keeps the single-writer atom contract — none of these paths touch
@@ -259,10 +259,13 @@ function useWorkScopeInventory(
     return () => clearInterval(id);
   }, [active]);
 
-  // Running-handle poll: only while a bash handle is actually running and the
-  // surface is active. Gated on `displayed` so it stops once everything is
-  // tombstoned and starts as soon as a handle spawns.
-  const pollRunning = active && hasRunningBash(displayed);
+  // Live-resource poll: while the surface is active and the scope owns ANY
+  // live resource — a running bash handle, a tmux server entry, or a live
+  // browser session. Gated on `displayed` so it stops once everything is
+  // terminal and starts as soon as any resource appears. Covers values with
+  // no dedicated push edge (browser `idle_ms`) and is belt-and-suspenders for
+  // tmux, whose entry can be created off the conversation's own SSE channel.
+  const pollRunning = active && hasLiveResource(displayed);
   useEffect(() => {
     if (!pollRunning) return;
     const id = setInterval(() => void fetchSnapshot(), RUNNING_POLL_INTERVAL_MS);

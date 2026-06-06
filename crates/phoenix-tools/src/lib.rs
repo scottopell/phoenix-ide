@@ -43,7 +43,10 @@ pub use subagent::{SpawnAgentsTool, SubmitErrorTool, SubmitResultTool};
 pub use terminal_command_history::TerminalCommandHistoryTool;
 pub use terminal_last_command::TerminalLastCommandTool;
 pub use think::ThinkTool;
-pub use tmux::{TmuxError, TmuxRegistry, TmuxRunTool, TmuxServer, TmuxTool};
+pub use tmux::{
+    TmuxError, TmuxLifecycleEvent, TmuxLifecycleSink, TmuxRegistry, TmuxRunTool, TmuxServer,
+    TmuxTool,
+};
 
 use async_trait::async_trait;
 use serde_json::Value;

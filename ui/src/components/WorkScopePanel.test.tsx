@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import type { WorkScopeInventory, BashHandleInventory } from '../api';
 import { api } from '../api';
-import { hasRunningBash } from './workScopeHelpers';
+import { hasRunningBash, hasLiveResource } from './workScopeHelpers';
 
 vi.mock('../api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../api')>();
@@ -34,8 +34,11 @@ function bash(over: Partial<BashHandleInventory> = {}): BashHandleInventory {
   };
 }
 
-function inv(bashes: BashHandleInventory[]): WorkScopeInventory {
-  return { scope_key: 'ws-1', bash: bashes, tmux: null, browser: null };
+function inv(
+  bashes: BashHandleInventory[],
+  over: Partial<Pick<WorkScopeInventory, 'tmux' | 'browser'>> = {},
+): WorkScopeInventory {
+  return { scope_key: 'ws-1', bash: bashes, tmux: null, browser: null, ...over };
 }
 
 /** Render the expanded section, flushing the initial fetch microtask. */
@@ -78,6 +81,30 @@ describe('hasRunningBash', () => {
   });
 });
 
+describe('hasLiveResource', () => {
+  it('is false for null / empty / all-terminal resources', () => {
+    expect(hasLiveResource(null)).toBe(false);
+    expect(hasLiveResource(inv([]))).toBe(false);
+    expect(hasLiveResource(inv([bash({ state: 'tombstoned' })]))).toBe(false);
+    expect(hasLiveResource(inv([], { tmux: { status: 'gone' } }))).toBe(false);
+    expect(hasLiveResource(inv([], { browser: { state: 'torn_down', idle_ms: 0 } }))).toBe(false);
+  });
+
+  it('is true for a running bash handle (bash-only)', () => {
+    expect(hasLiveResource(inv([bash({ state: 'running' })]))).toBe(true);
+    expect(hasLiveResource(inv([bash({ state: 'kill_pending_kernel' })]))).toBe(true);
+  });
+
+  it('is true for a tmux entry that exists — live or not_probed (tmux-only)', () => {
+    expect(hasLiveResource(inv([], { tmux: { status: 'live' } }))).toBe(true);
+    expect(hasLiveResource(inv([], { tmux: { status: 'not_probed' } }))).toBe(true);
+  });
+
+  it('is true for a live browser session (browser-only)', () => {
+    expect(hasLiveResource(inv([], { browser: { state: 'live', idle_ms: 120_000 } }))).toBe(true);
+  });
+});
+
 describe('WorkScopeSection running-handle poll', () => {
   it('polls every 2s while a handle runs, advancing the displayed byte count', async () => {
     getInv
@@ -117,6 +144,22 @@ describe('WorkScopeSection running-handle poll', () => {
       vi.advanceTimersByTime(10_000);
       await Promise.resolve();
     });
+    expect(getInv).toHaveBeenCalledTimes(2);
+  });
+
+  it('polls with a tmux-only inventory (no running bash), so a terminal-only scope refreshes', async () => {
+    // The terminal panel opens a tmux server but spawns no bash handle. The
+    // old `hasRunningBash` gate left this scope un-polled; `hasLiveResource`
+    // keeps it polling so a status change (not_probed → live) is picked up.
+    getInv.mockResolvedValue(inv([], { tmux: { status: 'not_probed' } }));
+
+    await renderExpanded();
+
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+      await Promise.resolve();
+    });
+    // Initial fetch + one poll, despite there being no bash handle at all.
     expect(getInv).toHaveBeenCalledTimes(2);
   });
 
