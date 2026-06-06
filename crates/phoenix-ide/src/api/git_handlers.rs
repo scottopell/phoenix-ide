@@ -778,6 +778,7 @@ mod tests {
             chain_name: None,
             steering_queue: Vec::new(),
             llm_language: Default::default(),
+            spawned_from_conversation_id: None,
         }
     }
 

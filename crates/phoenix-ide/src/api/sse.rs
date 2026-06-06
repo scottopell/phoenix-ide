@@ -368,6 +368,7 @@ mod tests {
             chain_name: None,
             steering_queue: vec![],
             llm_language: crate::llm_language::LlmLanguage::default(),
+            spawned_from_conversation_id: None,
         }
     }
 

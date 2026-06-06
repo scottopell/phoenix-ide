@@ -71,6 +71,11 @@ pub enum DbError {
     SlugExists(String),
     #[error("Serialization error: {0}")]
     Serialization(String),
+    /// A fork-proposal resolution was attempted but the proposal is already
+    /// resolved to a different state or child id (REQ-PROJ-034/037). Distinct
+    /// from the idempotent no-op case (same child id), which returns `Ok`.
+    #[error("Fork proposal conflict: {0}")]
+    ForkProposalConflict(String),
 }
 
 pub type DbResult<T> = Result<T, DbError>;
@@ -963,6 +968,27 @@ impl Database {
         Ok(rows)
     }
 
+    /// Update a project's `main_ref` to the resolved default branch
+    /// (REQ-PROJ-034a). Used by startup reconciliation to backfill rows whose
+    /// `main_ref` was defaulted to a literal.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn update_project_main_ref(&self, project_id: &str, main_ref: &str) -> DbResult<()> {
+        let result = sqlx::query("UPDATE projects SET main_ref = ?1 WHERE id = ?2")
+            .bind(main_ref)
+            .bind(project_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::ConversationNotFound(format!(
+                "project {project_id}"
+            )));
+        }
+        Ok(())
+    }
+
     // ==================== Conversation Operations ====================
 
     /// Create a conversation with explore-mode defaults — a test convenience
@@ -1099,6 +1125,7 @@ impl Database {
             chain_name: None,
             steering_queue: vec![],
             llm_language,
+            spawned_from_conversation_id: None,
         })
     }
 
@@ -1112,7 +1139,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.id = ?1",
         )
@@ -1139,7 +1166,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c WHERE c.slug = ?1",
         )
@@ -1166,7 +1193,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0 AND c.user_initiated = 1
@@ -1189,7 +1216,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 1 AND c.user_initiated = 1
@@ -1632,6 +1659,7 @@ impl Database {
             chain_name: None,
             steering_queue: vec![],
             llm_language: parent.llm_language,
+            spawned_from_conversation_id: None,
         })
     }
 
@@ -1825,6 +1853,7 @@ impl Database {
             // Inherit language from the parent so the whole chain speaks the
             // same way.
             llm_language: parent.llm_language,
+            spawned_from_conversation_id: None,
         };
         Ok(ContinueOutcome::Created(new_conversation))
     }
@@ -2062,6 +2091,264 @@ impl Database {
         Ok(usize::try_from(result.rows_affected()).unwrap_or(0))
     }
 
+    // ==================== Fork Proposal Operations ====================
+
+    /// Insert a new fork proposal (REQ-PROJ-033).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn insert_fork_proposal(&self, p: &ForkProposal) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO fork_proposals (
+                id, origin_conv_id, task_file, title, priority, body, status,
+                fork_conv_id, refinement_conv_id, created_at, resolved_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        )
+        .bind(&p.id)
+        .bind(&p.origin_conversation_id)
+        .bind(&p.task_file)
+        .bind(&p.title)
+        .bind(&p.priority)
+        .bind(&p.body)
+        .bind(p.status.as_str())
+        .bind(p.fork_conversation_id.as_deref())
+        .bind(p.refinement_conversation_id.as_deref())
+        .bind(p.created_at.to_rfc3339())
+        .bind(p.resolved_at.map(|t| t.to_rfc3339()))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Fetch a fork proposal by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_fork_proposal(&self, id: &str) -> DbResult<Option<ForkProposal>> {
+        let row = sqlx::query(FORK_PROPOSAL_SELECT_COLUMNS)
+            .bind(id)
+            .try_map(parse_fork_proposal_row)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
+    /// List all fork proposals for an origin conversation, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn list_fork_proposals_for_origin(
+        &self,
+        origin_conv_id: &str,
+    ) -> DbResult<Vec<ForkProposal>> {
+        let rows = sqlx::query(
+            "SELECT id, origin_conv_id, task_file, title, priority, body, status,
+                    fork_conv_id, refinement_conv_id, created_at, resolved_at
+             FROM fork_proposals
+             WHERE origin_conv_id = ?1
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(origin_conv_id)
+        .try_map(parse_fork_proposal_row)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Dismiss a pending fork proposal (REQ-PROJ-034). Idempotent: returns
+    /// `true` iff a pending row was transitioned to `dismissed`; a second
+    /// call (or dismissing an already-resolved proposal) updates nothing and
+    /// returns `false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn dismiss_fork_proposal(&self, id: &str) -> DbResult<bool> {
+        let now = Utc::now();
+        let result = sqlx::query(
+            "UPDATE fork_proposals
+             SET status = ?1, resolved_at = ?2
+             WHERE id = ?3 AND status = ?4",
+        )
+        .bind(ForkProposalStatus::Dismissed.as_str())
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .bind(ForkProposalStatus::Pending.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Retire every still-`pending` proposal for an origin conversation by
+    /// transitioning it to `dismissed` (REQ-PROJ-035 retire-on-terminal).
+    /// Already-resolved proposals are untouched.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn retire_pending_fork_proposals_for_origin(
+        &self,
+        origin_conv_id: &str,
+    ) -> DbResult<()> {
+        let now = Utc::now();
+        sqlx::query(
+            "UPDATE fork_proposals
+             SET status = ?1, resolved_at = ?2
+             WHERE origin_conv_id = ?3 AND status = ?4",
+        )
+        .bind(ForkProposalStatus::Dismissed.as_str())
+        .bind(now.to_rfc3339())
+        .bind(origin_conv_id)
+        .bind(ForkProposalStatus::Pending.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Atomically resolve a pending proposal as `spawned` (REQ-PROJ-034): in a
+    /// single transaction, persist the fork `Conversation` and its `seed`
+    /// messages, then record the `spawned { fork_conv_id }` resolution.
+    ///
+    /// Idempotent on crash-retry: the fork conversation id is deterministic, so
+    /// a retry may find the child row and/or the resolution already present. If
+    /// the proposal is already `spawned` to the **same** `fork.id`, this is a
+    /// no-op returning `Ok(())`. If it is resolved to a different state or id,
+    /// returns [`DbError::ForkProposalConflict`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ForkProposalConflict`] on a divergent prior
+    /// resolution, or a [`DbError`] for an underlying database failure.
+    pub async fn resolve_fork_proposal_spawned(
+        &self,
+        proposal_id: &str,
+        fork: &Conversation,
+        seed_messages: &[Message],
+    ) -> DbResult<()> {
+        self.resolve_fork_proposal(
+            proposal_id,
+            fork,
+            seed_messages,
+            ForkProposalStatus::Spawned,
+        )
+        .await
+    }
+
+    /// Atomically resolve a pending proposal as `promoted` (REQ-PROJ-037): in a
+    /// single transaction, persist the Explore refinement `Conversation` and
+    /// its `seed` messages, then record the `promoted { refinement_conv_id }`
+    /// resolution. Same idempotency / conflict semantics as
+    /// [`Database::resolve_fork_proposal_spawned`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DbError::ForkProposalConflict`] on a divergent prior
+    /// resolution, or a [`DbError`] for an underlying database failure.
+    pub async fn resolve_fork_proposal_promoted(
+        &self,
+        proposal_id: &str,
+        refinement: &Conversation,
+        seed_messages: &[Message],
+    ) -> DbResult<()> {
+        self.resolve_fork_proposal(
+            proposal_id,
+            refinement,
+            seed_messages,
+            ForkProposalStatus::Promoted,
+        )
+        .await
+    }
+
+    /// Shared body for the two atomic resolve paths. `terminal_status` is
+    /// `Spawned` or `Promoted`; the corresponding `fork_conv_id` /
+    /// `refinement_conv_id` column is set from `child.id` while the other stays
+    /// NULL.
+    async fn resolve_fork_proposal(
+        &self,
+        proposal_id: &str,
+        child: &Conversation,
+        seed_messages: &[Message],
+        terminal_status: ForkProposalStatus,
+    ) -> DbResult<()> {
+        debug_assert!(matches!(
+            terminal_status,
+            ForkProposalStatus::Spawned | ForkProposalStatus::Promoted
+        ));
+
+        // Idempotent short-circuit: a prior identical resolution converges to a
+        // no-op; a divergent one is a conflict.
+        let Some(existing) = self.get_fork_proposal(proposal_id).await? else {
+            return Err(DbError::ConversationNotFound(format!(
+                "fork proposal {proposal_id}"
+            )));
+        };
+        if existing.status != ForkProposalStatus::Pending {
+            // Already resolved: an identical prior resolution (same terminal
+            // state + same child id) converges to a no-op; anything else is a
+            // conflict.
+            if existing.status == terminal_status
+                && resolution_child_id(&existing) == Some(child.id.as_str())
+            {
+                return Ok(());
+            }
+            return Err(DbError::ForkProposalConflict(format!(
+                "proposal {proposal_id} already resolved as {}",
+                existing.status.as_str()
+            )));
+        }
+
+        let now = Utc::now();
+        let (fork_conv_id, refinement_conv_id) = match terminal_status {
+            ForkProposalStatus::Spawned => (Some(child.id.as_str()), None),
+            ForkProposalStatus::Promoted => (None, Some(child.id.as_str())),
+            ForkProposalStatus::Pending | ForkProposalStatus::Dismissed => {
+                // Excluded by the debug_assert at the top of this fn; treat as
+                // a programmer error rather than silently mis-binding columns.
+                return Err(DbError::ForkProposalConflict(format!(
+                    "invalid terminal status {} for resolve",
+                    terminal_status.as_str()
+                )));
+            }
+        };
+
+        let mut tx = self.pool.begin().await?;
+
+        insert_conversation_tx(&mut tx, child).await?;
+        for msg in seed_messages {
+            insert_message_tx(&mut tx, msg).await?;
+        }
+
+        // Guard the resolution on the pending state so a concurrent resolver
+        // cannot double-resolve; the idempotent short-circuit above already
+        // handled the same-id retry.
+        let updated = sqlx::query(
+            "UPDATE fork_proposals
+             SET status = ?1, fork_conv_id = ?2, refinement_conv_id = ?3, resolved_at = ?4
+             WHERE id = ?5 AND status = ?6",
+        )
+        .bind(terminal_status.as_str())
+        .bind(fork_conv_id)
+        .bind(refinement_conv_id)
+        .bind(now.to_rfc3339())
+        .bind(proposal_id)
+        .bind(ForkProposalStatus::Pending.as_str())
+        .execute(&mut *tx)
+        .await?;
+
+        if updated.rows_affected() == 0 {
+            tx.rollback().await?;
+            return Err(DbError::ForkProposalConflict(format!(
+                "proposal {proposal_id} was resolved concurrently"
+            )));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Update the model for a conversation (e.g., upgrading from 200k to 1M context).
     ///
     /// # Errors
@@ -2092,7 +2379,7 @@ impl Database {
             "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
                     c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
                     c.project_id, c.conv_mode, c.desired_base_branch,
-                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language, c.spawned_from_conversation_id,
                     (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
              FROM conversations c
              WHERE c.archived = 0
@@ -2796,6 +3083,9 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
     let chain_name: Option<String> = row
         .try_get::<Option<String>, _>("chain_name")
         .unwrap_or(None);
+    let spawned_from_conversation_id: Option<String> = row
+        .try_get::<Option<String>, _>("spawned_from_conversation_id")
+        .unwrap_or(None);
 
     let llm_language = row
         .try_get::<Option<String>, _>("llm_language")
@@ -2836,6 +3126,7 @@ fn parse_conversation_row(row: SqliteRow) -> Result<Conversation, sqlx::Error> {
         chain_name,
         steering_queue,
         llm_language,
+        spawned_from_conversation_id,
     })
 }
 
@@ -2863,6 +3154,137 @@ fn parse_chain_qa_row(row: SqliteRow) -> Result<ChainQaRow, sqlx::Error> {
         created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
         completed_at: completed_at.as_deref().map(parse_datetime),
     })
+}
+
+/// Single-row SELECT for a fork proposal addressed by `?1` = id.
+const FORK_PROPOSAL_SELECT_COLUMNS: &str =
+    "SELECT id, origin_conv_id, task_file, title, priority, body, status, \
+     fork_conv_id, refinement_conv_id, created_at, resolved_at \
+     FROM fork_proposals WHERE id = ?1";
+
+/// The raw child conversation id a resolved proposal points at: `fork_conv_id`
+/// for `spawned`, `refinement_conv_id` for `promoted`, `None` otherwise.
+fn resolution_child_id(p: &ForkProposal) -> Option<&str> {
+    match p.status {
+        ForkProposalStatus::Spawned => p.fork_conversation_id.as_deref(),
+        ForkProposalStatus::Promoted => p.refinement_conversation_id.as_deref(),
+        ForkProposalStatus::Pending | ForkProposalStatus::Dismissed => None,
+    }
+}
+
+/// Parse a fork-proposal row. Unknown `status` values surface as a typed
+/// decode error rather than being silently coerced.
+#[allow(clippy::needless_pass_by_value)] // sqlx try_map passes rows by value
+fn parse_fork_proposal_row(row: SqliteRow) -> Result<ForkProposal, sqlx::Error> {
+    let status_str: String = row.try_get("status")?;
+    let status = ForkProposalStatus::from_db_str(&status_str).ok_or_else(|| {
+        sqlx::Error::Decode(format!("unknown fork_proposals.status value: {status_str:?}").into())
+    })?;
+    let resolved_at: Option<String> = row.try_get("resolved_at")?;
+    Ok(ForkProposal {
+        id: row.try_get("id")?,
+        origin_conversation_id: row.try_get("origin_conv_id")?,
+        task_file: row.try_get("task_file")?,
+        title: row.try_get("title")?,
+        priority: row.try_get("priority")?,
+        body: row.try_get("body")?,
+        status,
+        fork_conversation_id: row.try_get("fork_conv_id")?,
+        refinement_conversation_id: row.try_get("refinement_conv_id")?,
+        created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
+        resolved_at: resolved_at.as_deref().map(parse_datetime),
+    })
+}
+
+/// Insert a fully-formed `Conversation` row inside a transaction, writing every
+/// persisted column (including `spawned_from_conversation_id`). Idempotent on
+/// the primary key via `INSERT OR IGNORE`, so a crash-retry that finds the
+/// deterministic child id already present is a no-op rather than a UNIQUE
+/// failure (REQ-PROJ-034 recovery model). The caller owns id/slug uniqueness.
+async fn insert_conversation_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    conv: &Conversation,
+) -> DbResult<()> {
+    let state_json =
+        serde_json::to_string(&conv.state).map_err(|e| DbError::Serialization(e.to_string()))?;
+    let conv_mode_json = serde_json::to_string(&conv.conv_mode)
+        .map_err(|e| DbError::Serialization(e.to_string()))?;
+    let steering_json = serde_json::to_string(&conv.steering_queue)
+        .map_err(|e| DbError::Serialization(e.to_string()))?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO conversations (
+            id, slug, title, cwd, parent_conversation_id, user_initiated, state,
+            state_updated_at, created_at, updated_at, archived, model, project_id,
+            conv_mode, desired_base_branch, seed_parent_id, seed_label,
+            continued_in_conv_id, chain_name, steering_queue, llm_language,
+            spawned_from_conversation_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+    )
+    .bind(&conv.id)
+    .bind(&conv.slug)
+    .bind(&conv.title)
+    .bind(&conv.cwd)
+    .bind(&conv.parent_conversation_id)
+    .bind(conv.user_initiated)
+    .bind(&state_json)
+    .bind(conv.state_updated_at.to_rfc3339())
+    .bind(conv.created_at.to_rfc3339())
+    .bind(conv.updated_at.to_rfc3339())
+    .bind(conv.archived)
+    .bind(&conv.model)
+    .bind(&conv.project_id)
+    .bind(&conv_mode_json)
+    .bind(&conv.desired_base_branch)
+    .bind(&conv.seed_parent_id)
+    .bind(&conv.seed_label)
+    .bind(&conv.continued_in_conv_id)
+    .bind(&conv.chain_name)
+    .bind(&steering_json)
+    .bind(conv.llm_language.as_str())
+    .bind(&conv.spawned_from_conversation_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Insert a seed `Message` row inside a transaction, reusing the same column
+/// mapping as [`Database::add_message_with_seq`]. `INSERT OR IGNORE` keyed on
+/// `message_id` makes a crash-retry a no-op rather than a duplicate.
+async fn insert_message_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    msg: &Message,
+) -> DbResult<()> {
+    let content_str = serde_json::to_string(&msg.content.to_json())
+        .map_err(|e| DbError::Serialization(e.to_string()))?;
+    let display_str = msg
+        .display_data
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| DbError::Serialization(e.to_string()))?;
+    let usage_str = msg
+        .usage_data
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| DbError::Serialization(e.to_string()))?;
+
+    sqlx::query(
+        "INSERT OR IGNORE INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+    )
+    .bind(&msg.message_id)
+    .bind(&msg.conversation_id)
+    .bind(msg.sequence_id)
+    .bind(msg.message_type.to_string())
+    .bind(&content_str)
+    .bind(&display_str)
+    .bind(&usage_str)
+    .bind(msg.created_at.to_rfc3339())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 /// Parse a project row from the database
@@ -4482,6 +4904,306 @@ mod tests {
         // Missing conversation surfaces as a typed error, not silent no-op.
         let err = db.set_chain_name("ghost", Some("x")).await.unwrap_err();
         matches!(err, DbError::ConversationNotFound(_));
+    }
+
+    // ==================== Fork Proposal Tests ====================
+
+    fn fork_proposal_fixture(id: &str, origin: &str) -> ForkProposal {
+        ForkProposal {
+            id: id.to_string(),
+            origin_conversation_id: origin.to_string(),
+            task_file: "tasks/00042-p1-ready--fix-thing.md".to_string(),
+            title: "Fix Thing".to_string(),
+            priority: "p1".to_string(),
+            body: "# Fix Thing\n\nDo the thing.".to_string(),
+            status: ForkProposalStatus::Pending,
+            fork_conversation_id: None,
+            refinement_conversation_id: None,
+            created_at: Utc::now(),
+            resolved_at: None,
+        }
+    }
+
+    /// Build a child fork/refinement `Conversation` carrying the breadcrumb.
+    async fn child_conv_fixture(db: &Database, id: &str, spawned_from: &str) -> Conversation {
+        // Persist + read a base row, then mutate into the child shape.
+        let base = db
+            .create_conversation(id, &format!("slug-{id}"), "/tmp/fork", true, None, None)
+            .await
+            .unwrap();
+        // Remove it so the resolve path inserts it fresh inside its own tx.
+        db.delete_conversation(id).await.unwrap();
+        Conversation {
+            spawned_from_conversation_id: Some(spawned_from.to_string()),
+            ..base
+        }
+    }
+
+    fn seed_msg(conv_id: &str) -> Message {
+        Message {
+            message_id: format!("seed-{conv_id}"),
+            conversation_id: conv_id.to_string(),
+            sequence_id: 1,
+            message_type: MessageType::User,
+            content: MessageContent::user("seed brief body"),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn fork_proposal_insert_get_roundtrip() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-1", "o1", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let p = fork_proposal_fixture("fp-1", "origin-1");
+        db.insert_fork_proposal(&p).await.unwrap();
+
+        let got = db.get_fork_proposal("fp-1").await.unwrap().unwrap();
+        assert_eq!(got.id, "fp-1");
+        assert_eq!(got.origin_conversation_id, "origin-1");
+        assert_eq!(got.status, ForkProposalStatus::Pending);
+        assert_eq!(got.task_file, p.task_file);
+        assert_eq!(got.body, p.body);
+        assert_eq!(got.fork_conversation_id, None);
+        assert!(got.resolved_at.is_none());
+
+        assert!(db.get_fork_proposal("missing").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn fork_proposal_list_for_origin_ordered() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-2", "o2", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.create_conversation("origin-3", "o3", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let mut a = fork_proposal_fixture("fp-a", "origin-2");
+        a.created_at = Utc::now() - chrono::Duration::seconds(10);
+        let b = fork_proposal_fixture("fp-b", "origin-2");
+        let other = fork_proposal_fixture("fp-c", "origin-3");
+        db.insert_fork_proposal(&a).await.unwrap();
+        db.insert_fork_proposal(&b).await.unwrap();
+        db.insert_fork_proposal(&other).await.unwrap();
+
+        let list = db.list_fork_proposals_for_origin("origin-2").await.unwrap();
+        assert_eq!(
+            list.iter().map(|p| p.id.as_str()).collect::<Vec<_>>(),
+            vec!["fp-a", "fp-b"]
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_proposal_dismiss_is_idempotent() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-4", "o4", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-d", "origin-4"))
+            .await
+            .unwrap();
+
+        assert!(db.dismiss_fork_proposal("fp-d").await.unwrap());
+        let got = db.get_fork_proposal("fp-d").await.unwrap().unwrap();
+        assert_eq!(got.status, ForkProposalStatus::Dismissed);
+        assert!(got.resolved_at.is_some());
+
+        // Second dismiss updates nothing.
+        assert!(!db.dismiss_fork_proposal("fp-d").await.unwrap());
+        // Dismissing an unknown id is also false (no row updated).
+        assert!(!db.dismiss_fork_proposal("ghost").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn fork_proposal_retire_pending_only() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-5", "o5", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-p1", "origin-5"))
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-p2", "origin-5"))
+            .await
+            .unwrap();
+        // Resolve one to spawned so retire must leave it alone.
+        let child = child_conv_fixture(&db, "fork-x", "origin-5").await;
+        db.resolve_fork_proposal_spawned("fp-p2", &child, &[seed_msg("fork-x")])
+            .await
+            .unwrap();
+
+        db.retire_pending_fork_proposals_for_origin("origin-5")
+            .await
+            .unwrap();
+
+        let p1 = db.get_fork_proposal("fp-p1").await.unwrap().unwrap();
+        let p2 = db.get_fork_proposal("fp-p2").await.unwrap().unwrap();
+        assert_eq!(p1.status, ForkProposalStatus::Dismissed);
+        assert_eq!(p2.status, ForkProposalStatus::Spawned);
+    }
+
+    #[tokio::test]
+    async fn fork_proposal_cascade_deletes_with_origin() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-6", "o6", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-cas", "origin-6"))
+            .await
+            .unwrap();
+
+        db.delete_conversation("origin-6").await.unwrap();
+        assert!(db.get_fork_proposal("fp-cas").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_spawned_happy_path_and_idempotent_retry() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-7", "o7", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-s", "origin-7"))
+            .await
+            .unwrap();
+        let child = child_conv_fixture(&db, "fork-7", "origin-7").await;
+        let seeds = vec![seed_msg("fork-7")];
+
+        db.resolve_fork_proposal_spawned("fp-s", &child, &seeds)
+            .await
+            .unwrap();
+
+        let p = db.get_fork_proposal("fp-s").await.unwrap().unwrap();
+        assert_eq!(p.status, ForkProposalStatus::Spawned);
+        assert_eq!(p.fork_conversation_id.as_deref(), Some("fork-7"));
+        assert!(p.refinement_conversation_id.is_none());
+        assert!(p.resolved_at.is_some());
+
+        // Child + breadcrumb + seed message present.
+        let fork = db.get_conversation("fork-7").await.unwrap();
+        assert_eq!(
+            fork.spawned_from_conversation_id.as_deref(),
+            Some("origin-7")
+        );
+        let msgs = db.get_messages("fork-7").await.unwrap();
+        assert_eq!(msgs.len(), 1);
+
+        // Idempotent re-run: same id, no duplicate rows, still one spawned.
+        db.resolve_fork_proposal_spawned("fp-s", &child, &seeds)
+            .await
+            .unwrap();
+        let p2 = db.get_fork_proposal("fp-s").await.unwrap().unwrap();
+        assert_eq!(p2.status, ForkProposalStatus::Spawned);
+        assert_eq!(db.get_messages("fork-7").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_promoted_happy_path_and_idempotent_retry() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-8", "o8", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-pr", "origin-8"))
+            .await
+            .unwrap();
+        let child = child_conv_fixture(&db, "refine-8", "origin-8").await;
+        let seeds = vec![seed_msg("refine-8")];
+
+        db.resolve_fork_proposal_promoted("fp-pr", &child, &seeds)
+            .await
+            .unwrap();
+
+        let p = db.get_fork_proposal("fp-pr").await.unwrap().unwrap();
+        assert_eq!(p.status, ForkProposalStatus::Promoted);
+        assert_eq!(p.refinement_conversation_id.as_deref(), Some("refine-8"));
+        assert!(p.fork_conversation_id.is_none());
+
+        // Idempotent re-run.
+        db.resolve_fork_proposal_promoted("fp-pr", &child, &seeds)
+            .await
+            .unwrap();
+        assert_eq!(db.get_messages("refine-8").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn resolve_conflicts_on_divergent_prior_resolution() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-9", "o9", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-cf", "origin-9"))
+            .await
+            .unwrap();
+        let child = child_conv_fixture(&db, "fork-9", "origin-9").await;
+        db.resolve_fork_proposal_spawned("fp-cf", &child, &[seed_msg("fork-9")])
+            .await
+            .unwrap();
+
+        // Re-resolving spawned to a DIFFERENT id is a conflict.
+        let other = child_conv_fixture(&db, "fork-9b", "origin-9").await;
+        let err = db
+            .resolve_fork_proposal_spawned("fp-cf", &other, &[seed_msg("fork-9b")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::ForkProposalConflict(_)));
+
+        // Promoting an already-spawned proposal is a conflict.
+        let err = db
+            .resolve_fork_proposal_promoted("fp-cf", &other, &[seed_msg("fork-9b")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::ForkProposalConflict(_)));
+    }
+
+    #[tokio::test]
+    async fn dangling_breadcrumb_and_fork_id_tolerated() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-10", "o10", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-dang", "origin-10"))
+            .await
+            .unwrap();
+        let child = child_conv_fixture(&db, "fork-10", "origin-10").await;
+        db.resolve_fork_proposal_spawned("fp-dang", &child, &[seed_msg("fork-10")])
+            .await
+            .unwrap();
+
+        // Hard-delete the fork: its raw id on the proposal must dangle (no FK
+        // error), the proposal survives, and the origin breadcrumb pointing at a
+        // (here also deletable) conversation is non-FK.
+        db.delete_conversation("fork-10").await.unwrap();
+        let p = db.get_fork_proposal("fp-dang").await.unwrap().unwrap();
+        assert_eq!(p.status, ForkProposalStatus::Spawned);
+        assert_eq!(p.fork_conversation_id.as_deref(), Some("fork-10"));
+        assert!(db.get_conversation("fork-10").await.is_err());
+
+        // A conversation whose breadcrumb points at a since-deleted origin
+        // persists and reads back.
+        db.create_conversation("late-fork", "lf", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.delete_conversation("origin-10").await.unwrap();
+        // Breadcrumb to the now-gone origin is a raw, dangle-tolerant id.
+        let standalone = Conversation {
+            id: "dangle-conv".to_string(),
+            slug: Some("dangle-conv".to_string()),
+            spawned_from_conversation_id: Some("origin-10".to_string()),
+            ..db.get_conversation("late-fork").await.unwrap()
+        };
+        let mut tx = db.pool.begin().await.unwrap();
+        insert_conversation_tx(&mut tx, &standalone).await.unwrap();
+        tx.commit().await.unwrap();
+        let got = db.get_conversation("dangle-conv").await.unwrap();
+        assert_eq!(
+            got.spawned_from_conversation_id.as_deref(),
+            Some("origin-10")
+        );
     }
 
     /// Task 02667: a fresh DB's `conversations` table must not carry the

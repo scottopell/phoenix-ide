@@ -89,6 +89,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_sub_agent_personas",
         sql: MIGRATION_015,
     },
+    Migration {
+        version: 16,
+        name: "create_fork_proposals",
+        sql: MIGRATION_016,
+    },
+    Migration {
+        version: 17,
+        name: "add_spawned_from_conversation_id",
+        sql: MIGRATION_017,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -386,6 +396,43 @@ CREATE TABLE IF NOT EXISTS sub_agent_personas (
 );
 ";
 
+/// Decoupled task fork proposals (REQ-PROJ-033/034/035/037).
+///
+/// `status` is application-enforced across `pending | spawned | dismissed |
+/// promoted`. The `origin_conv_id` FK cascade-deletes proposals with their
+/// originating conversation (proposals are bound to origin — REQ-PROJ-035).
+/// `fork_conv_id` and `refinement_conv_id` carry NO foreign key: the spawned
+/// fork / promoted refinement has an independent lifecycle and may be
+/// hard-deleted while this origin-bound proposal lives, so the audit link is a
+/// raw id that may dangle (no cascade, no null-on-delete). Index on
+/// `(origin_conv_id, status)` serves the per-origin pending lookup.
+const MIGRATION_016: &str = r"
+CREATE TABLE IF NOT EXISTS fork_proposals (
+    id TEXT PRIMARY KEY,
+    origin_conv_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    task_file TEXT NOT NULL,
+    title TEXT NOT NULL,
+    priority TEXT NOT NULL,
+    body TEXT NOT NULL,
+    status TEXT NOT NULL,
+    fork_conv_id TEXT,
+    refinement_conv_id TEXT,
+    created_at DATETIME NOT NULL,
+    resolved_at DATETIME
+);
+
+CREATE INDEX IF NOT EXISTS idx_fork_proposals_origin ON fork_proposals(origin_conv_id, status);
+";
+
+/// Add the `spawned_from_conversation_id` column to `conversations`
+/// (REQ-PROJ-035). A nullable, non-FK provenance breadcrumb pointing at the
+/// conversation that proposed a fork; existing rows default to NULL. No
+/// `REFERENCES` clause — the breadcrumb may dangle (the origin is decoupled and
+/// may be hard-deleted), so there is no cascade and no null-on-delete.
+const MIGRATION_017: &str = r"
+ALTER TABLE conversations ADD COLUMN spawned_from_conversation_id TEXT;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -505,7 +552,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 15);
+        assert_eq!(first, 17);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

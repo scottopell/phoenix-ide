@@ -542,6 +542,14 @@ pub struct Conversation {
     /// `#[serde(default)]` handles old DB rows that predate this column.
     #[serde(default)]
     pub llm_language: crate::llm_language::LlmLanguage,
+    /// Provenance breadcrumb for a decoupled task fork (REQ-PROJ-035): the
+    /// originating conversation that proposed the fork. A raw, non-FK id that
+    /// may dangle — distinct from `parent_conversation_id` (sub-agent parentage)
+    /// and `continued_in_conv_id` (chain continuation), and never traversed by
+    /// runtime logic. `#[serde(default)]` handles old DB rows that predate this
+    /// column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spawned_from_conversation_id: Option<String>,
 }
 
 /// Derive a human-readable title from a kebab-case slug.
@@ -575,6 +583,75 @@ impl Conversation {
     pub fn file_root(&self) -> &str {
         self.conv_mode.worktree_path().unwrap_or(&self.cwd)
     }
+}
+
+/// Resolution status of a fork proposal (REQ-PROJ-034/037).
+///
+/// Stored as a `snake_case` TEXT column; the enum is the authoritative shape on
+/// the Rust side. `pending` is the only non-terminal state; the three resolved
+/// states are terminal and single-use.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkProposalStatus {
+    Pending,
+    Spawned,
+    Dismissed,
+    Promoted,
+}
+
+impl ForkProposalStatus {
+    /// Persisted (`snake_case`) string representation. Stable across releases —
+    /// changing this breaks rows in the `fork_proposals` table.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Spawned => "spawned",
+            Self::Dismissed => "dismissed",
+            Self::Promoted => "promoted",
+        }
+    }
+
+    /// Parse the persisted string back into the enum. Returns `None` for
+    /// unknown values so callers surface a typed error rather than silently
+    /// defaulting.
+    #[must_use]
+    pub fn from_db_str(s: &str) -> Option<Self> {
+        Some(match s {
+            "pending" => Self::Pending,
+            "spawned" => Self::Spawned,
+            "dismissed" => Self::Dismissed,
+            "promoted" => Self::Promoted,
+            _ => return None,
+        })
+    }
+}
+
+/// A decoupled task fork proposal (REQ-PROJ-033/034/035/037).
+///
+/// Control-plane state bound to the originating conversation: a content snapshot
+/// of a brief the origin agent shed via `propose_task`, addressed by its `id`.
+/// `fork_conversation_id` and `refinement_conversation_id` are raw, non-FK ids
+/// that may dangle — the spawned fork / promoted refinement has an independent
+/// lifecycle and may be hard-deleted while this origin-bound proposal lives.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkProposal {
+    pub id: String,
+    pub origin_conversation_id: String,
+    /// The drafted file's path, normalized to repository-relative at capture.
+    pub task_file: String,
+    pub title: String,
+    pub priority: String,
+    /// Snapshotted file bytes — authoritative at spawn time.
+    pub body: String,
+    pub status: ForkProposalStatus,
+    /// Raw id of the spawned conversation, present iff `status == Spawned`.
+    pub fork_conversation_id: Option<String>,
+    /// Raw id of the Explore refinement conversation, present iff
+    /// `status == Promoted`.
+    pub refinement_conversation_id: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub resolved_at: Option<DateTime<Utc>>,
 }
 
 /// Error classification for UI display.
@@ -1641,6 +1718,7 @@ mod conversation_serde_tests {
             chain_name: None,
             steering_queue: vec![],
             llm_language: crate::llm_language::LlmLanguage::default(),
+            spawned_from_conversation_id: None,
         }
     }
 
