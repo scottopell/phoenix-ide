@@ -3708,7 +3708,7 @@ pub(crate) use crate::git_ops::{ensure_gitignore_has_phoenix, run_git};
 /// Returns the final filename (unchanged if no rename was needed). The file
 /// is renamed in place via `taskmd_core::tasks::update_task`, which is a
 /// single `std::fs::rename` on the filename — the body is untouched.
-fn promote_task_status_to_in_progress(
+pub(crate) fn promote_task_status_to_in_progress(
     tasks_dir: &std::path::Path,
     task_id: &str,
     current_status: taskmd_core::constants::Status,
@@ -3734,7 +3734,7 @@ fn promote_task_status_to_in_progress(
 
 /// Global mutex serializing the scan-tasks + write + commit sequence.
 /// Task approval is rare; a single mutex is sufficient.
-static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) static TASK_APPROVAL_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Resolve the base branch to record on the Work-mode conversation a task
 /// approval produces, and single-branch-fetch it (REQ-PROJ-022, best-effort).

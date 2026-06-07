@@ -3,10 +3,12 @@
 
 use super::handlers::{run_resource_cleanup_cascade, AppError};
 use super::types::{
-    ConflictErrorResponse, SuccessResponse, TaskApprovalRequest, TaskApprovalResponse,
-    TaskFeedbackRequest,
+    ConflictErrorResponse, ForkDismissResponse, ForkProposalListResponse, ForkProposalSummary,
+    ForkPromoteResponse, ForkSpawnResponse, RequestChangesRequest, SuccessResponse,
+    TaskApprovalRequest, TaskApprovalResponse, TaskFeedbackRequest,
 };
 use super::AppState;
+use crate::runtime::fork_resolve::ForkResolveError;
 use crate::db::{ConvMode, Conversation, MessageContent};
 use crate::git_ops::capture_branch_diff;
 use crate::state_machine::state::TaskApprovalOutcome;
@@ -166,6 +168,124 @@ pub(crate) async fn task_feedback(
         .map_err(AppError::BadRequest)?;
 
     Ok(Json(SuccessResponse { success: true }))
+}
+
+// ============================================================
+// Fork proposal resolution (REQ-PROJ-034 / 037)
+// ============================================================
+
+/// Map a typed fork-resolve failure to the matching HTTP status. A non-pending
+/// proposal / terminal origin / branch collision is a 409; an unknown proposal
+/// is a 404; everything else is a 500-class internal error.
+fn fork_resolve_app_error(e: ForkResolveError) -> AppError {
+    match e {
+        ForkResolveError::NotFound(m) => AppError::NotFound(m),
+        ForkResolveError::Conflict(m) => AppError::Conflict(Box::new(ConflictErrorResponse::new(
+            m,
+            "fork_proposal_conflict",
+        ))),
+        ForkResolveError::Internal(m) => AppError::Internal(m),
+    }
+}
+
+/// Validate that `proposal_id` belongs to `conv_id`, returning 404 when the
+/// proposal is unknown and 400 when it belongs to a different conversation.
+async fn require_proposal_for_conversation(
+    state: &AppState,
+    conv_id: &str,
+    proposal_id: &str,
+) -> Result<(), AppError> {
+    let proposal = state
+        .db
+        .get_fork_proposal(proposal_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound(format!("fork proposal {proposal_id}")))?;
+    if proposal.origin_conversation_id != conv_id {
+        return Err(AppError::BadRequest(format!(
+            "fork proposal {proposal_id} does not belong to conversation {conv_id}"
+        )));
+    }
+    Ok(())
+}
+
+/// `POST /api/conversations/:id/proposals/:proposal_id/approve` — spawn a Work
+/// fork (REQ-PROJ-034).
+pub(crate) async fn approve_fork_proposal(
+    State(state): State<AppState>,
+    Path((id, proposal_id)): Path<(String, String)>,
+) -> Result<Json<ForkSpawnResponse>, AppError> {
+    require_proposal_for_conversation(&state, &id, &proposal_id).await?;
+    let fork_conversation_id = state
+        .runtime
+        .approve_fork_proposal(&proposal_id)
+        .await
+        .map_err(fork_resolve_app_error)?;
+    Ok(Json(ForkSpawnResponse {
+        fork_conversation_id,
+    }))
+}
+
+/// `POST /api/conversations/:id/proposals/:proposal_id/dismiss` — record the
+/// proposal as dismissed (REQ-PROJ-034). Idempotent.
+pub(crate) async fn dismiss_fork_proposal(
+    State(state): State<AppState>,
+    Path((id, proposal_id)): Path<(String, String)>,
+) -> Result<Json<ForkDismissResponse>, AppError> {
+    require_proposal_for_conversation(&state, &id, &proposal_id).await?;
+    let transitioned = state
+        .db
+        .dismiss_fork_proposal(&proposal_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    Ok(Json(ForkDismissResponse {
+        success: true,
+        no_op: !transitioned,
+    }))
+}
+
+/// `POST /api/conversations/:id/proposals/:proposal_id/request-changes` —
+/// promote the proposal to an Explore refinement (REQ-PROJ-037).
+pub(crate) async fn request_changes_on_fork_proposal(
+    State(state): State<AppState>,
+    Path((id, proposal_id)): Path<(String, String)>,
+    Json(req): Json<RequestChangesRequest>,
+) -> Result<Json<ForkPromoteResponse>, AppError> {
+    require_proposal_for_conversation(&state, &id, &proposal_id).await?;
+    let refinement_conversation_id = state
+        .runtime
+        .request_changes_on_fork_proposal(&proposal_id, req.note)
+        .await
+        .map_err(fork_resolve_app_error)?;
+    Ok(Json(ForkPromoteResponse {
+        refinement_conversation_id,
+    }))
+}
+
+/// `GET /api/conversations/:id/proposals` — list this conversation's fork
+/// proposals so the UI can render / withdraw the Review affordance.
+pub(crate) async fn list_fork_proposals(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<ForkProposalListResponse>, AppError> {
+    let rows = state
+        .db
+        .list_fork_proposals_for_origin(&id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let proposals = rows
+        .into_iter()
+        .map(|p| ForkProposalSummary {
+            id: p.id,
+            status: p.status.as_str().to_string(),
+            title: p.title,
+            priority: p.priority,
+            task_file: p.task_file,
+            fork_conversation_id: p.fork_conversation_id,
+            refinement_conversation_id: p.refinement_conversation_id,
+        })
+        .collect();
+    Ok(Json(ForkProposalListResponse { proposals }))
 }
 
 // ============================================================

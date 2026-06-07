@@ -11,6 +11,7 @@
 //! REQ-BED-009: Sub-Agent Isolation
 
 pub(crate) mod executor;
+pub(crate) mod fork_resolve;
 mod recovery;
 pub mod traits;
 pub mod user_facing_error;

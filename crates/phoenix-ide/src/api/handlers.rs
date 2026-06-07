@@ -13,7 +13,8 @@ use super::git_handlers::{
     list_git_branches, record_pr_auto_fix_context_baseline,
 };
 use super::lifecycle_handlers::{
-    abandon_task, approve_task, mark_merged, reject_task, task_feedback,
+    abandon_task, approve_fork_proposal, approve_task, dismiss_fork_proposal, list_fork_proposals,
+    mark_merged, reject_task, request_changes_on_fork_proposal, task_feedback,
 };
 use super::sse::sse_stream;
 use super::types::{
@@ -137,6 +138,23 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/approve-task", post(approve_task))
         .route("/api/conversations/:id/reject-task", post(reject_task))
         .route("/api/conversations/:id/task-feedback", post(task_feedback))
+        // Fork proposal resolution (REQ-PROJ-034 / 037)
+        .route(
+            "/api/conversations/:id/proposals",
+            get(list_fork_proposals),
+        )
+        .route(
+            "/api/conversations/:id/proposals/:proposal_id/approve",
+            post(approve_fork_proposal),
+        )
+        .route(
+            "/api/conversations/:id/proposals/:proposal_id/dismiss",
+            post(dismiss_fork_proposal),
+        )
+        .route(
+            "/api/conversations/:id/proposals/:proposal_id/request-changes",
+            post(request_changes_on_fork_proposal),
+        )
         // User question response (REQ-AUQ-003)
         .route("/api/conversations/:id/respond", post(respond_to_question))
         .route(
