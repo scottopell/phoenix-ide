@@ -157,10 +157,14 @@ WHEN indexing a message
 THE SYSTEM SHALL extract human-readable text from the message's typed
 `MessageContent`, not index the raw stored JSON
 
-THE extraction SHALL cover every `MessageContent` variant; a variant
-whose body is not natural-language prose (e.g. a tool result) SHALL be
-reduced to a compact, low-noise representation rather than indexed
-verbatim or silently dropped
+THE extraction SHALL cover every `MessageContent` variant. A variant
+whose body is machine output (e.g. a tool result) SHALL be reduced to a
+**bounded searchable excerpt** — a size-capped slice of its actual
+content (not merely a `(tool result: N chars)` marker) — so that terms
+appearing only in build logs, command output, sub-agent output, or file
+paths remain retrievable, while a single huge result cannot dominate the
+index. It SHALL NOT be indexed verbatim-unbounded, and SHALL NOT be
+silently dropped to a content-free marker.
 
 THE text extraction used for indexing SHALL be the same logic used to
 render the compact conversation transcript for model orientation, so the
@@ -176,10 +180,15 @@ size by paging, REQ-RET-008, not by folding.)
 
 **Rationale:** Indexing raw JSON pollutes the index with structural
 tokens (`"role"`, `"type"`, braces) that match queries spuriously and
-crowd out content. Tool results are mostly machine output; indexing
-them verbatim drowns the *ranking* signal, but dropping them silently is
-data loss indistinguishable from a bug — a compact marker is the correct
-middle for the index. Reading is different from ranking: once an agent
+crowd out content. Tool results are machine output, but they are
+*content* — the answer to a recall question is often a term that appears
+only in a build log, grep output, or a file path. Indexing them
+unbounded would let one giant result dominate the FTS table; indexing
+only a `(tool result: N chars)` marker would make those terms
+unretrievable (and the full read tool cannot help until *after* search
+has found the conversation). A size-capped excerpt is the correct
+middle: searchable leading content, bounded cost. Reading is different
+from ranking: once an agent
 has decided a conversation is relevant, it must be able to read the
 actual tool output, build log, or sub-agent result that holds the
 answer, so the read path returns full content (paged) rather than the

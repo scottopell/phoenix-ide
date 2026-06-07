@@ -48,12 +48,15 @@ behind it without changing any caller. Scope is an enum
 extension points), applied as a query predicate rather than a
 post-filter so `top_k` is honored after scoping.
 
-Chain Q&A consumes this primitive in place of bundling per-member
-continuation summaries: the chain's members are resolved to ids, the
-retriever returns the chunks relevant to the question across those
-members, and those chunks — with a lightweight chain skeleton for
-orientation — form the model context. Because retrieval runs against
-the live index, answers reflect the chain's current state by
+Chain Q&A consumes this primitive as a **read-only agent loop**, not a
+one-shot bundle: the agent is given a search tool (this primitive, scoped
+to the chain) and a scope-bound full-content read tool, plus a
+lightweight chain skeleton for orientation, and it iterates —
+search, read promising members in full, search again — until it can
+answer, then streams the answer. A first-pass retrieval miss is therefore
+recoverable, and the agent can inspect any member's full content on
+demand. Because every search and read runs against the live index and
+live messages, answers reflect the chain's current state by
 construction.
 
 ## Status Summary
