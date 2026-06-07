@@ -524,6 +524,31 @@ export class NotFoundError extends Error {
   }
 }
 
+/** Lifecycle status of a decoupled task fork proposal (REQ-PROJ-034 / 037).
+ *  `pending` is the only reviewable state; the other three are terminal
+ *  resolutions and withdraw the Review affordance. Mirrors the Rust
+ *  `ForkProposalStatus` serialization. */
+export type ForkProposalStatus = 'pending' | 'spawned' | 'dismissed' | 'promoted';
+
+/** One fork proposal as rendered to the review surface (REQ-PROJ-034).
+ *  Hand-written to mirror the plain-`Serialize` Rust `ForkProposalSummary`
+ *  — that module carries no `ts_rs::TS` derives, so there is no generated
+ *  type to import (matches the rest of this client). */
+export interface ForkProposalSummary {
+  id: string;
+  status: ForkProposalStatus;
+  title: string;
+  priority: string;
+  task_file: string;
+  /** Snapshotted brief body. The snapshot is not in the transcript, so the
+   *  review modal renders the brief from here, keyed by proposal id. */
+  body: string;
+  /** Set once a proposal is `spawned` — the Work fork's conversation id. */
+  fork_conversation_id?: string;
+  /** Set once a proposal is `promoted` — the Explore refinement's id. */
+  refinement_conversation_id?: string;
+}
+
 export interface McpServerStatus {
   name: string;
   tool_count: number;
@@ -1488,6 +1513,89 @@ export const api = {
       }
       throw new Error(err.error || 'Failed to delete chain');
     }
+  },
+
+  // -----------------------------------------------------------------
+  // Decoupled task fork proposals (REQ-PROJ-034 / 037)
+  //
+  // The proposal id rides the existing tool-result `display_data`
+  // (`fork_proposal_id`); these endpoints anchor the Review affordance and
+  // its three actions to a specific proposal. A 409 means the proposal was
+  // already resolved (e.g. another tab acted) — callers refetch the list and
+  // let the affordance withdraw.
+  // -----------------------------------------------------------------
+
+  /** GET /api/conversations/:id/proposals — the conversation's fork proposals.
+   *  The Review affordance cross-references this by `display_data.fork_proposal_id`
+   *  to read each proposal's current `status`. */
+  async listForkProposals(convId: string): Promise<ForkProposalSummary[]> {
+    const resp = await fetch(`/api/conversations/${encodeURIComponent(convId)}/proposals`);
+    if (!resp.ok) {
+      if (resp.status === 404) throw new Error('Conversation not found');
+      throw new Error('Failed to list fork proposals');
+    }
+    return (await resp.json()).proposals as ForkProposalSummary[];
+  },
+
+  /** POST /proposals/:proposalId/approve — spawn the Work fork (REQ-PROJ-034).
+   *  Returns the new fork conversation's id. 409 ⇒ already resolved. */
+  async approveForkProposal(
+    convId: string,
+    proposalId: string,
+  ): Promise<{ fork_conversation_id: string }> {
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(convId)}/proposals/${encodeURIComponent(proposalId)}/approve`,
+      { method: 'POST' },
+    );
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      if (resp.status === 409) throw new ConflictError(err as ConflictErrorDetail);
+      throw new Error(err.error || 'Failed to approve proposal');
+    }
+    return resp.json();
+  },
+
+  /** POST /proposals/:proposalId/dismiss — record a `dismissed` resolution
+   *  (REQ-PROJ-034). Idempotent: `no_op` is true when already resolved. */
+  async dismissForkProposal(
+    convId: string,
+    proposalId: string,
+  ): Promise<{ success: boolean; no_op?: boolean }> {
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(convId)}/proposals/${encodeURIComponent(proposalId)}/dismiss`,
+      { method: 'POST' },
+    );
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      if (resp.status === 409) throw new ConflictError(err as ConflictErrorDetail);
+      throw new Error(err.error || 'Failed to dismiss proposal');
+    }
+    return resp.json();
+  },
+
+  /** POST /proposals/:proposalId/request-changes — promote the proposal to a
+   *  fresh Explore refinement carrying the user's change-request note
+   *  (REQ-PROJ-037). Returns the refinement conversation's id. 409 ⇒ already
+   *  resolved. */
+  async requestChangesForkProposal(
+    convId: string,
+    proposalId: string,
+    note: string,
+  ): Promise<{ refinement_conversation_id: string }> {
+    const resp = await fetch(
+      `/api/conversations/${encodeURIComponent(convId)}/proposals/${encodeURIComponent(proposalId)}/request-changes`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ note }),
+      },
+    );
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      if (resp.status === 409) throw new ConflictError(err as ConflictErrorDetail);
+      throw new Error(err.error || 'Failed to request changes');
+    }
+    return resp.json();
   },
 
 };

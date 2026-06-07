@@ -281,6 +281,7 @@ pub(crate) async fn list_fork_proposals(
             title: p.title,
             priority: p.priority,
             task_file: p.task_file,
+            body: p.body,
             fork_conversation_id: p.fork_conversation_id,
             refinement_conversation_id: p.refinement_conversation_id,
         })

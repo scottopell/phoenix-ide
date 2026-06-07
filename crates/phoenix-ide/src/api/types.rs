@@ -542,6 +542,9 @@ pub struct ForkProposalSummary {
     pub title: String,
     pub priority: String,
     pub task_file: String,
+    /// Snapshotted brief body — the snapshot is not in the transcript, so the
+    /// review modal renders it from here keyed by proposal id.
+    pub body: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fork_conversation_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

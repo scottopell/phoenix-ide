@@ -34,6 +34,7 @@ import { PatchFileSummary, containsUnifiedDiff } from './PatchFileSummary';
 import { BrowserProfileResponseView, STRUCTURED_PROFILE_ACTIONS } from './BrowserProfileResponseView';
 import { PillStrip, type PillItem } from './PillStrip';
 import { deriveToolStripItems, type ToolStripItem } from './agentTurnToolStrip';
+import { ForkProposalAffordance } from './ForkProposalAffordance';
 
 const CheckIcon = () => (
   <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -1615,6 +1616,17 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
   const isShortOutput = resultLength < OUTPUT_AUTO_EXPAND_THRESHOLD;
   const isSubAgentResult = !!(result?.display_data && isSubAgentSummaryData(result.display_data));
 
+  // Decoupled task fork proposal (REQ-PROJ-034): a writing-mode `propose_task`
+  // records its proposal id on the synthetic success tool-result's
+  // `display_data.fork_proposal_id`. That id anchors the inline Review
+  // affordance (which cross-references the proposal's status from the
+  // ForkProposals store and withdraws once resolved).
+  const forkProposalId: string | undefined = (() => {
+    const dd = result?.display_data as Record<string, unknown> | undefined;
+    const v = dd?.['fork_proposal_id'];
+    return typeof v === 'string' && v.length > 0 ? v : undefined;
+  })();
+
   // Get the raw input for copying (not the formatted display)
   const rawInput = name === 'bash' ? bashInputCopyText(input as Record<string, unknown>) :
                    name === 'think' ? String(input['thoughts'] || '') :
@@ -1759,6 +1771,9 @@ function ToolUseBlockImpl({ block, result, onOpenFile, toolStartedAtMs }: ToolUs
       {result?.display_data && isSubAgentSummaryData(result.display_data) && (
         <SubAgentSummary results={result.display_data.results} />
       )}
+
+      {/* Fork proposal Review affordance (REQ-PROJ-034 / 037) */}
+      {forkProposalId && <ForkProposalAffordance proposalId={forkProposalId} />}
     </div>
   );
 }

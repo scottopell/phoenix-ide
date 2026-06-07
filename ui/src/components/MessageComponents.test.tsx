@@ -5,8 +5,9 @@ import { SubAgentStatus, AgentMessage } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
-import { api, type ConversationState, type Message } from '../api';
+import { api, type ConversationState, type Message, type ForkProposalSummary } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
+import { ForkProposalsProvider } from '../contexts/ForkProposalsContext';
 
 vi.mock('../utils/clipboard', () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
@@ -20,6 +21,7 @@ vi.mock('../api', async (importOriginal) => {
       ...actual.api,
       getConversation: vi.fn(),
       getConversationSlug: vi.fn(),
+      listForkProposals: vi.fn(),
     },
   };
 });
@@ -671,5 +673,78 @@ describe('SubAgentStatus inline activity', () => {
 
     expect(screen.getByText('timed out')).toBeInTheDocument();
     expect(screen.getByText(/exceeded its time limit/)).toBeInTheDocument();
+  });
+});
+
+describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function forkToolResult(proposalId: string): Message {
+    return {
+      message_id: 'tool-fork',
+      sequence_id: 2,
+      conversation_id: 'agent-1',
+      message_type: 'tool',
+      content: {
+        tool_use_id: 'tool-fork',
+        content: 'Fork proposal recorded; pending review.',
+        is_error: false,
+      },
+      // The proposal id rides the tool-result display_data (REQ-PROJ-034).
+      display_data: { fork_proposal_id: proposalId },
+      created_at: '2026-01-01T00:00:01Z',
+    };
+  }
+
+  function proposal(overrides: Partial<ForkProposalSummary>): ForkProposalSummary {
+    return {
+      id: 'prop-1',
+      status: 'pending',
+      title: 'Fix the parser bug',
+      priority: 'p2',
+      task_file: 'tasks/00042-p2-ready--fix-parser.md',
+      body: '# Fix the parser bug\n\nThe tokenizer drops trailing commas.',
+      ...overrides,
+    };
+  }
+
+  function renderTranscript(proposals: ForkProposalSummary[]) {
+    (api.listForkProposals as ReturnType<typeof vi.fn>).mockResolvedValue(proposals);
+    const message = agentMessage('agent-msg-fork', [
+      { type: 'tool_use', id: 'tool-fork', name: 'propose_task', input: { task_file: 'tasks/00042-p2-ready--fix-parser.md' } },
+    ]);
+    return render(
+      <MemoryRouter>
+        <ForkProposalsProvider conversationId="agent-1">
+          <AgentMessage
+            message={message}
+            toolResults={new Map([['tool-fork', forkToolResult('prop-1')]])}
+            onOpenFile={undefined}
+          />
+        </ForkProposalsProvider>
+      </MemoryRouter>,
+    );
+  }
+
+  it('shows a Review button while the proposal is pending', async () => {
+    renderTranscript([proposal({ status: 'pending' })]);
+    expect(await screen.findByRole('button', { name: 'Review' })).toBeInTheDocument();
+  });
+
+  it('withdraws the Review button and shows a terminal status once spawned', async () => {
+    renderTranscript([
+      proposal({ status: 'spawned', fork_conversation_id: 'fork-conv-9' }),
+    ]);
+    // Terminal status replaces the Review affordance.
+    expect(await screen.findByRole('button', { name: 'Forked' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review' })).not.toBeInTheDocument();
+  });
+
+  it('shows a dismissed terminal status with no Review action', async () => {
+    renderTranscript([proposal({ status: 'dismissed' })]);
+    expect(await screen.findByText('Dismissed')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review' })).not.toBeInTheDocument();
   });
 });

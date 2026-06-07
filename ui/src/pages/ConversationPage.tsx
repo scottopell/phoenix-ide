@@ -70,6 +70,15 @@ const ProcessInspectorPanel = lazy(() =>
 
 import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import {
+  ForkProposalsProvider,
+  useForkProposals,
+  type ForkActionOutcome,
+} from '../contexts/ForkProposalsContext';
+
+const ForkProposalReview = lazy(() =>
+  import('../components/ForkProposalReview').then((m) => ({ default: m.ForkProposalReview })),
+);
 
 const TERMINAL_COLLAPSED_PX = 32;
 const terminalPaneMax = () => Math.min(800, Math.floor(window.innerHeight * 0.75));
@@ -618,6 +627,37 @@ function ConversationPageContent() {
     }
   }, [conversationId, dismiss]);
 
+  // Fork proposal review outcomes (REQ-PROJ-034 / 037): navigate to the new
+  // fork / refinement conversation, or toast a terminal/conflict result.
+  const handleForkOutcome = useCallback(
+    (outcome: ForkActionOutcome) => {
+      switch (outcome.kind) {
+        case 'spawned':
+        case 'promoted':
+          if (outcome.conversationId) {
+            const label = outcome.kind === 'spawned' ? 'fork' : 'refinement';
+            api
+              .getConversationSlug(outcome.conversationId)
+              .then((s) => {
+                if (s) navigate(`/c/${s}`);
+                else showInfo(`Created ${label} conversation.`);
+              })
+              .catch(() => showInfo(`Created ${label} conversation.`));
+          }
+          break;
+        case 'dismissed':
+          showInfo('Proposal dismissed.');
+          break;
+        case 'already_resolved':
+          showInfo('This proposal was already resolved.');
+          break;
+        default:
+          outcome.kind satisfies never;
+      }
+    },
+    [navigate, showInfo],
+  );
+
   const handleTriggerContinuation = useCallback(async () => {
     if (!conversationId) return;
 
@@ -1019,6 +1059,11 @@ function ConversationPageContent() {
     && (splitPanePrs !== null || paneDiffOpen || browserOpen || inspectOpen);
 
   return (
+    <ForkProposalsProvider
+      conversationId={conversationId}
+      onOutcome={handleForkOutcome}
+      onError={showError}
+    >
     <div
       id="app"
       className={showSplitPaneViewer ? 'app-split-pane' : undefined}
@@ -1543,5 +1588,32 @@ function ConversationPageContent() {
         </>
       )}
     </div>
+    {/* Fork proposal review modal — full-screen, driven by the ForkProposals
+        store's openProposalId (REQ-PROJ-034 / 037). */}
+    <ForkReviewOverlay />
+    </ForkProposalsProvider>
+  );
+}
+
+/** Mounts the fork-proposal review modal when the store has an open proposal.
+ *  Lives inside <ForkProposalsProvider> so it can read the open id + actions. */
+function ForkReviewOverlay() {
+  const fork = useForkProposals();
+  if (!fork || !fork.openProposalId) return null;
+  const proposal = fork.getProposal(fork.openProposalId);
+  // Only `pending` proposals are reviewable; a resolved one (e.g. another tab
+  // acted, then the list refetched) withdraws the modal.
+  if (!proposal || proposal.status !== 'pending') return null;
+  const proposalId = proposal.id;
+  return (
+    <Suspense fallback={null}>
+      <ForkProposalReview
+        proposal={proposal}
+        onApprove={() => fork.approve(proposalId)}
+        onDismiss={() => fork.dismiss(proposalId)}
+        onRequestChanges={(note) => fork.requestChanges(proposalId, note)}
+        onClose={fork.closeReview}
+      />
+    </Suspense>
   );
 }
