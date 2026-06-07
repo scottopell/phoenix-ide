@@ -35,7 +35,8 @@ use crate::db::{
     NotificationSettings,
 };
 use crate::git_ops::{
-    check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict, GitOpError,
+    check_branch_conflict, create_worktree, materialize_branch, run_git, BranchConflict,
+    GitOpError, PhoenixIgnoreStrategy,
 };
 use crate::llm::{ContentBlock, GatewayStatus};
 use crate::runtime::SseEvent;
@@ -1711,11 +1712,17 @@ fn create_branch_worktree_blocking(
         }
     }
 
-    let worktree_path_str =
-        create_worktree(cwd, conv_id, branch_name, None).map_err(|e| match e {
-            GitOpError::Io(msg) | GitOpError::Git(msg) => BranchWorktreeError::Git(msg),
-            other @ GitOpError::BranchNotFound(_) => BranchWorktreeError::Git(other.to_string()),
-        })?;
+    let worktree_path_str = create_worktree(
+        cwd,
+        conv_id,
+        branch_name,
+        None,
+        PhoenixIgnoreStrategy::StageGitignore,
+    )
+    .map_err(|e| match e {
+        GitOpError::Io(msg) | GitOpError::Git(msg) => BranchWorktreeError::Git(msg),
+        other @ GitOpError::BranchNotFound(_) => BranchWorktreeError::Git(other.to_string()),
+    })?;
 
     tracing::info!(
         branch = %branch_name,
@@ -1764,12 +1771,18 @@ fn create_managed_explore_worktree_blocking(
     let id_prefix: String = conv_id.chars().take(8).collect();
     let temp_branch = format!("task-pending-{id_prefix}");
 
-    let worktree_path_str = create_worktree(cwd, conv_id, &temp_branch, Some(base_branch))
-        .map_err(|e| {
-            ManagedWorktreeError::Git(format!(
-                "Failed to create early worktree from '{base_branch}': {e}",
-            ))
-        })?;
+    let worktree_path_str = create_worktree(
+        cwd,
+        conv_id,
+        &temp_branch,
+        Some(base_branch),
+        PhoenixIgnoreStrategy::StageGitignore,
+    )
+    .map_err(|e| {
+        ManagedWorktreeError::Git(format!(
+            "Failed to create early worktree from '{base_branch}': {e}",
+        ))
+    })?;
 
     tracing::info!(
         conv_id = %conv_id,

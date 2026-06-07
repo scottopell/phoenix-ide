@@ -511,16 +511,39 @@ fn prepare_temp_index(worktree: &Path) -> Option<TempPath> {
     Some(TempPath(temp))
 }
 
+/// How a worktree-create call makes `.phoenix/` ignored in the repo it cuts the
+/// worktree from.
+///
+/// The two strategies are not interchangeable: one mutates and stages a tracked
+/// file, the other writes a local untracked file. Which one is correct depends
+/// on whether the caller is allowed to dirty the origin checkout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PhoenixIgnoreStrategy {
+    /// Append `.phoenix/` to the tracked `.gitignore` and `git add` it. Used by
+    /// Branch / Managed / Explore-gateway worktree creation, where staging the
+    /// ignore rule is the intended, durable behavior.
+    StageGitignore,
+    /// Append `.phoenix/` to the repo's local untracked exclude file
+    /// (`.git/info/exclude`), staging nothing. Used by fork resolution, which
+    /// MUST leave the originating checkout's index and tracked `.gitignore`
+    /// unaffected (REQ-PROJ-035).
+    LocalExclude,
+}
+
 /// Create a git worktree at `.phoenix/worktrees/{conv_id}`.
 ///
 /// If `create_branch` is `Some((new_branch, start_point))`, creates a new branch
 /// (`git worktree add -b <new_branch> <path> <start_point>`).
 /// If `None`, checks out the existing `branch_name` (`git worktree add <path> <branch>`).
+///
+/// `ignore_strategy` selects how `.phoenix/` is made ignored in `cwd`'s repo —
+/// see [`PhoenixIgnoreStrategy`].
 pub(crate) fn create_worktree(
     cwd: &Path,
     conv_id: &str,
     branch_name: &str,
     create_branch: Option<&str>, // start_point for -b mode
+    ignore_strategy: PhoenixIgnoreStrategy,
 ) -> Result<String, GitOpError> {
     // 1. Create .phoenix/worktrees/ directory
     let phoenix_dir = cwd.join(".phoenix").join("worktrees");
@@ -563,9 +586,13 @@ pub(crate) fn create_worktree(
         })?;
     }
 
-    // 3. Ensure .phoenix/ is in .gitignore at the repo root
-    if let Err(e) = ensure_gitignore_has_phoenix(cwd) {
-        tracing::warn!(error = %e, "Failed to update .gitignore (non-fatal)");
+    // 3. Ensure .phoenix/ is ignored in `cwd`'s repo per the caller's strategy.
+    let ignore_result = match ignore_strategy {
+        PhoenixIgnoreStrategy::StageGitignore => ensure_gitignore_has_phoenix(cwd),
+        PhoenixIgnoreStrategy::LocalExclude => ensure_local_exclude_has_phoenix(cwd),
+    };
+    if let Err(e) = ignore_result {
+        tracing::warn!(error = %e, "Failed to ignore .phoenix/ (non-fatal)");
     }
 
     Ok(worktree_path_str)
@@ -749,6 +776,61 @@ pub(crate) fn ensure_gitignore_has_phoenix(dir: &Path) -> Result<(), String> {
         run_git(dir, &["add", ".gitignore"])?;
         tracing::info!(dir = %dir.display(), "Added .phoenix/ to .gitignore");
     }
+
+    Ok(())
+}
+
+/// Ensure `.phoenix/` is ignored via the repo's LOCAL untracked exclude file
+/// (`<git-common-dir>/info/exclude`), staging nothing and never touching the
+/// tracked `.gitignore`. Used by fork resolution so cutting a fork's worktree
+/// leaves the originating checkout's index and tracked files unaffected
+/// (REQ-PROJ-035).
+///
+/// `dir` may be the main checkout or a linked worktree; the exclude file lives
+/// in the MAIN repository's git dir, so the real common dir is resolved via
+/// `git rev-parse --git-common-dir` rather than assuming `dir/.git` is a
+/// directory (in a linked worktree `.git` is a file pointing elsewhere).
+pub(crate) fn ensure_local_exclude_has_phoenix(dir: &Path) -> Result<(), String> {
+    use std::io::Write as _;
+
+    let common_dir = run_git(dir, &["rev-parse", "--git-common-dir"])?;
+    let common_dir = {
+        let p = Path::new(common_dir.trim());
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            dir.join(p)
+        }
+    };
+
+    let info_dir = common_dir.join("info");
+    let exclude_path = info_dir.join("exclude");
+
+    let already_present = exclude_path.exists()
+        && std::fs::read_to_string(&exclude_path)
+            .map_err(|e| format!("Failed to read git exclude file: {e}"))?
+            .lines()
+            .any(|line| line.trim() == ".phoenix/");
+    if already_present {
+        return Ok(());
+    }
+
+    std::fs::create_dir_all(&info_dir)
+        .map_err(|e| format!("Failed to create git info dir: {e}"))?;
+    let needs_leading_newline = exclude_path.exists()
+        && std::fs::read(&exclude_path)
+            .ok()
+            .is_some_and(|bytes| !bytes.is_empty() && !bytes.ends_with(b"\n"));
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&exclude_path)
+        .map_err(|e| format!("Failed to open git exclude file: {e}"))?;
+    if needs_leading_newline {
+        writeln!(f).map_err(|e| format!("Failed to write git exclude file: {e}"))?;
+    }
+    writeln!(f, ".phoenix/").map_err(|e| format!("Failed to write git exclude file: {e}"))?;
+    tracing::info!(dir = %dir.display(), "Added .phoenix/ to .git/info/exclude");
 
     Ok(())
 }
@@ -1059,7 +1141,13 @@ mod tests {
         std::fs::create_dir_all(&target).unwrap();
         std::fs::write(target.join("squatter"), "blocks the add\n").unwrap();
 
-        let res = create_worktree(tmp.path(), conv_id, "task-pending-feedface", Some("main"));
+        let res = create_worktree(
+            tmp.path(),
+            conv_id,
+            "task-pending-feedface",
+            Some("main"),
+            PhoenixIgnoreStrategy::StageGitignore,
+        );
         assert!(res.is_err(), "add into a non-empty dir should fail");
 
         let branches = run_git(tmp.path(), &["branch", "--list", "task-pending-*"]).unwrap();

@@ -21,8 +21,8 @@ use crate::db::{
     MessageContent, MessageType, NonEmptyString, UserContent,
 };
 use crate::git_ops::{
-    create_worktree, ensure_gitignore_has_phoenix, find_branch_in_worktree_list,
-    materialize_branch, run_git, GitOpError,
+    create_worktree, ensure_gitignore_has_phoenix, ensure_local_exclude_has_phoenix,
+    find_branch_in_worktree_list, materialize_branch, run_git, GitOpError, PhoenixIgnoreStrategy,
 };
 use crate::runtime::executor::{promote_task_status_to_in_progress, TASK_APPROVAL_MUTEX};
 use crate::runtime::RuntimeManager;
@@ -480,26 +480,32 @@ async fn fork_origin_repo_root(
     )
 }
 
+/// The deterministic worktree path for a fork/refinement conversation id:
+/// `{repo_root}/.phoenix/worktrees/{conv_id}`. The single source of truth for
+/// where an approve/promote cuts its worktree, so orphan-cleanup path comparisons
+/// can't drift from `create_worktree`'s layout.
+fn worktree_path(repo_root: &Path, conv_id: &str) -> std::path::PathBuf {
+    repo_root.join(".phoenix/worktrees").join(conv_id)
+}
+
 /// Remove one deterministic orphan worktree (`.phoenix/worktrees/{conv_id}`) and
 /// its branch, if present. Best-effort — every step is non-fatal.
 ///
 /// `candidate_branch` is the deterministic branch name the crashed attempt would
-/// have created (see [`deterministic_fork_branch_name`]). It covers the
-/// BRANCH-ONLY orphan: `git worktree add -b` creates the branch ref before the
-/// worktree dir, so a kill in between leaves the branch with no usable dir. When
-/// the worktree dir is absent we still delete that branch — provided it exists
-/// and is NOT checked out in any live worktree — otherwise the still-`pending`
-/// proposal stays unapprovable (`classify_branch_collision` rejects a branch that
-/// exists but isn't checked out in its own deterministic worktree).
+/// have created (see [`deterministic_fork_branch_name`]). It is deleted ONLY when
+/// it is PROVABLY this proposal's fork orphan — i.e. a worktree admin entry for
+/// the deterministic path exists/existed on it (see [`delete_branch_if_unused`]).
+/// A standalone branch with the same derived name but no deterministic-worktree
+/// association is indistinguishable from user work and is left in place.
 fn clean_one_orphan(repo_root: Option<&Path>, conv_id: &str, candidate_branch: Option<&str>) {
     let Some(repo_root) = repo_root else {
         return;
     };
-    let worktree_path = repo_root.join(".phoenix/worktrees").join(conv_id);
+    let worktree_path = worktree_path(repo_root, conv_id);
     if !worktree_path.exists() {
-        // Branch-only orphan: no worktree dir, but the crashed `worktree add -b`
-        // may have left the deterministic branch ref. Delete it iff it exists and
-        // is not checked out anywhere (so we never touch a live fork's branch).
+        // No worktree dir. The branch is cleanable only if a stale admin entry
+        // still ties it to THIS deterministic path; a standalone branch with the
+        // derived name (user work) must never be force-deleted.
         if let Some(branch) = candidate_branch {
             delete_branch_if_unused(repo_root, conv_id, branch);
         }
@@ -546,10 +552,21 @@ fn clean_one_orphan(repo_root: Option<&Path>, conv_id: &str, candidate_branch: O
     }
 }
 
-/// Delete a branch-only deterministic orphan's branch ref: `git branch -D` it
-/// iff it exists AND is not checked out in any live worktree. A branch that IS
-/// checked out somewhere belongs to a live fork and must never be force-deleted;
-/// a non-existent branch is a no-op. Best-effort — failures are logged at WARN.
+/// Delete the deterministic orphan's branch ref, but ONLY when it is provably
+/// THIS proposal's fork orphan: a worktree admin entry for the deterministic path
+/// `worktree_path(conv_id)` is checked out on it. That entry is what a crashed
+/// `git worktree add -b` leaves once it has registered the worktree (even if the
+/// checkout dir was later removed), so its presence proves the branch is the
+/// fork's own. In that case the (now dir-less) worktree entry is pruned and the
+/// branch deleted.
+///
+/// A branch with this derived name that is checked out at a DIFFERENT path, or
+/// has NO worktree entry at all (a standalone `git branch` ref — indistinguishable
+/// from unrelated user work), is left untouched. Consequence: the ultra-rare crash
+/// that created the branch ref before any worktree admin entry leaves the branch in
+/// place and the proposal unapprovable until the user removes it — the correct
+/// safety trade-off versus deleting user branches. Best-effort — failures are
+/// logged at WARN.
 fn delete_branch_if_unused(repo_root: &Path, conv_id: &str, branch: &str) {
     let branch_ref = format!("refs/heads/{branch}");
     let exists = run_git(
@@ -560,16 +577,23 @@ fn delete_branch_if_unused(repo_root: &Path, conv_id: &str, branch: &str) {
     if !exists {
         return;
     }
-    if find_branch_in_worktree_list(repo_root, branch).is_some() {
-        // Checked out in a live worktree — a real unit of work, not an orphan.
+    let deterministic_path = worktree_path(repo_root, conv_id);
+    let is_deterministic_orphan = find_branch_in_worktree_list(repo_root, branch)
+        .is_some_and(|p| Path::new(&p) == deterministic_path);
+    if !is_deterministic_orphan {
+        // Not tied to this fork's deterministic worktree path — could be user work
+        // that merely collides on the derived name. Never force-delete it.
         return;
     }
+    // Prune the stale (dir-less) deterministic worktree entry so the branch is no
+    // longer referenced, then delete it.
+    let _ = run_git(repo_root, &["worktree", "prune"]);
     if let Err(e) = run_git(repo_root, &["branch", "-D", branch]) {
         tracing::warn!(
             conv_id = %conv_id,
             branch = %branch,
             error = %e,
-            "fork orphan cleanup: branch-only orphan delete failed (non-fatal)"
+            "fork orphan cleanup: deterministic-orphan branch delete failed (non-fatal)"
         );
     }
 }
@@ -578,7 +602,7 @@ fn delete_branch_if_unused(repo_root: &Path, conv_id: &str, branch: &str) {
 /// the worktree path in `git worktree list` BEFORE removal. Returns `None` when
 /// the worktree is already gone or had no branch (detached).
 fn orphan_branch_name(repo_root: &Path, conv_id: &str) -> Option<String> {
-    let worktree_path = repo_root.join(".phoenix/worktrees").join(conv_id);
+    let worktree_path = worktree_path(repo_root, conv_id);
     let listing = run_git(repo_root, &["worktree", "list", "--porcelain"]).ok()?;
     let mut current_path: Option<&str> = None;
     for line in listing.lines() {
@@ -949,21 +973,30 @@ fn seeded_state(seed: &Message) -> ConvState {
     }
 }
 
-/// Write + promote + commit the fork's task file into `worktree_path`:
+/// Write + promote + commit the fork's task file into `worktree_path`, driving
+/// the worktree to the target state regardless of which crash point a retry hit:
+/// the in-progress task file (taskmd) or plain brief is COMMITTED on the branch.
 ///
 /// - taskmd: promote status to in-progress (rename) before committing; the file
 ///   is staged at its (possibly renamed) tasks-dir path.
 /// - plain brief: no status segment, committed verbatim at its own path.
 ///
-/// ADOPTED-worktree idempotency: a prior approve may have crashed AFTER the git
-/// commit but BEFORE the DB `spawned` resolution, leaving the deterministic
-/// worktree with the taskmd file ALREADY renamed + committed as
-/// `...-in-progress--{slug}.md`. On that retry, re-writing the original
-/// `...-ready--{slug}.md` path would resurrect a duplicate `ready` file beside
-/// the committed `in-progress` one (and the promote would collide on the id). So
-/// when `adopt` is set and the promoted file is already present, the whole
-/// write/promote/commit is skipped — the worktree already holds the single
-/// committed in-progress task file.
+/// ADOPTED-worktree idempotency: a prior approve may have crashed at ANY point —
+/// after the rename but before `git add`/`commit`, or after the commit but before
+/// the DB `spawned` resolution. "Exists on disk" is NOT "committed": a retry that
+/// merely saw the in-progress filename and skipped would leave a renamed-but-
+/// uncommitted file, violating the "approved task is committed on the fork branch"
+/// invariant. So when adopting with the file already at the in-progress name, the
+/// body-WRITE and the PROMOTE are skipped (the file is already renamed on disk),
+/// but `git add` of the in-progress path (and staging removal of any leftover
+/// `...-ready--{slug}.md`) STILL runs, followed by a commit GUARDED by
+/// `git diff --cached --quiet` so it is a no-op when nothing is staged. This
+/// converges every crash point to a single committed in-progress task file:
+///
+/// - no task file on disk → write body, promote, add, commit;
+/// - ready on disk, uncommitted → promote, add, commit;
+/// - in-progress on disk, uncommitted → add, commit;
+/// - in-progress committed → add (no-op), `diff --cached --quiet` true → skip commit.
 fn materialize_fork_task_file(
     worktree_path: &Path,
     proposal: &ForkProposal,
@@ -980,7 +1013,11 @@ fn materialize_fork_task_file(
     let tasks_dir =
         parent_rel.map_or_else(|| worktree_path.join("tasks"), |p| worktree_path.join(p));
 
-    let already_promoted = match source {
+    // Adopt-with-already-renamed: a prior attempt renamed the taskmd file to its
+    // in-progress name on disk; skip re-writing the body and re-promoting (which
+    // would resurrect a duplicate ready file / collide on the id), but still stage
+    // + commit below so a rename that was never committed still gets committed.
+    let already_renamed_in_progress = match source {
         TaskSource::Taskmd {
             id, priority, slug, ..
         } if adopt => {
@@ -990,27 +1027,30 @@ fn materialize_fork_task_file(
                 taskmd_core::constants::Status::InProgress,
                 slug,
             );
-            tasks_dir.join(&in_progress_filename).exists()
+            tasks_dir
+                .join(&in_progress_filename)
+                .exists()
+                .then(|| rebuild_rel(&in_progress_filename))
         }
-        _ => false,
+        _ => None,
     };
-    if already_promoted {
-        return Ok(());
-    }
 
-    write_body_to_worktree(worktree_path, &proposal.task_file, &proposal.body)?;
-
-    let committed_path = match source {
-        TaskSource::Taskmd { id, status, .. } => {
+    let committed_path = match (&already_renamed_in_progress, source) {
+        (Some(in_progress_rel), _) => in_progress_rel.clone(),
+        (None, TaskSource::Taskmd { id, status, .. }) => {
+            write_body_to_worktree(worktree_path, &proposal.task_file, &proposal.body)?;
             let final_filename =
                 promote_task_status_to_in_progress(&tasks_dir, id, *status, filename)
                     .map_err(ForkResolveError::Internal)?;
             rebuild_rel(&final_filename)
         }
-        TaskSource::PlainMarkdown { .. } => proposal.task_file.clone(),
+        (None, TaskSource::PlainMarkdown { .. }) => {
+            write_body_to_worktree(worktree_path, &proposal.task_file, &proposal.body)?;
+            proposal.task_file.clone()
+        }
     };
 
-    ensure_gitignore_has_phoenix(worktree_path).map_err(ForkResolveError::Internal)?;
+    ensure_local_exclude_has_phoenix(worktree_path).map_err(ForkResolveError::Internal)?;
 
     // If a taskmd rename happened, stage the old name's deletion too so the
     // commit is a rename, not a duplicate id.
@@ -1062,10 +1102,16 @@ fn prepare_spawn_blocking(
 
     let start_point = resolve_fork_start_point(repo_root, base)?;
 
-    let worktree_path = repo_root.join(".phoenix/worktrees").join(fork_conv_id);
+    let worktree_path = worktree_path(repo_root, fork_conv_id);
     let adopt = classify_branch_collision(repo_root, &worktree_path, &branch_name)?;
     if !adopt {
-        create_worktree(repo_root, fork_conv_id, &branch_name, Some(&start_point))?;
+        create_worktree(
+            repo_root,
+            fork_conv_id,
+            &branch_name,
+            Some(&start_point),
+            PhoenixIgnoreStrategy::LocalExclude,
+        )?;
     }
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
@@ -1123,9 +1169,7 @@ fn prepare_promote_blocking(
 
     let start_point = resolve_fork_start_point(repo_root, base)?;
 
-    let worktree_path = repo_root
-        .join(".phoenix/worktrees")
-        .join(refinement_conv_id);
+    let worktree_path = worktree_path(repo_root, refinement_conv_id);
     let adopt = classify_branch_collision(repo_root, &worktree_path, &temp_branch)?;
     if !adopt {
         create_worktree(
@@ -1133,6 +1177,7 @@ fn prepare_promote_blocking(
             refinement_conv_id,
             &temp_branch,
             Some(&start_point),
+            PhoenixIgnoreStrategy::LocalExclude,
         )?;
     }
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
@@ -1436,6 +1481,58 @@ mod tests {
         assert_eq!(db.get_messages(&origin).await.unwrap().len(), 0);
     }
 
+    /// Bug 3: cutting a fork's worktree must NOT dirty or stage the ORIGIN
+    /// checkout's tracked `.gitignore`. In a repo whose `.gitignore` does not list
+    /// `.phoenix/`, a fork spawn ignores `.phoenix/` via the repo's local untracked
+    /// `.git/info/exclude` — so the origin's index/working tree is unaffected and
+    /// `.phoenix/` does not show as untracked.
+    #[tokio::test]
+    async fn fork_spawn_does_not_stage_or_modify_origin_gitignore() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        // Precondition: the origin checkout is clean and `.gitignore` (if any) does
+        // not already list `.phoenix/`.
+        assert_eq!(
+            git(&repo, &["status", "--porcelain"]),
+            "",
+            "origin must start clean"
+        );
+        let pid = insert_pending(
+            &db,
+            &origin,
+            "tasks/12345-p1-ready--fix-thing.md",
+            "# Fix the thing\n",
+        )
+        .await;
+        let rt = make_runtime(db.clone()).await;
+
+        rt.approve_fork_proposal(&pid).await.unwrap();
+
+        // The origin checkout shows NO staged or modified `.gitignore`, and
+        // `.phoenix/` is not surfaced as untracked.
+        let status = git(&repo, &["status", "--porcelain"]);
+        assert!(
+            !status.contains(".gitignore"),
+            "fork spawn must not touch the origin's .gitignore: {status:?}"
+        );
+        assert!(
+            !status.contains(".phoenix"),
+            "fork's .phoenix/ dir must be ignored in the origin, not shown untracked: {status:?}"
+        );
+        assert_eq!(
+            git(&repo, &["diff", "--cached", "--name-only"]),
+            "",
+            "nothing may be staged in the origin index"
+        );
+        // The exclude rule is what makes `.phoenix/` ignored — confirm it landed.
+        let exclude = std::fs::read_to_string(repo.join(".git/info/exclude")).unwrap();
+        assert!(
+            exclude.lines().any(|l| l.trim() == ".phoenix/"),
+            "`.phoenix/` must be added to .git/info/exclude: {exclude:?}"
+        );
+    }
+
     #[tokio::test]
     async fn approve_plain_brief_branches_with_fork_id_prefix_no_status_promotion() {
         let (_tmp, repo) = init_repo();
@@ -1645,6 +1742,83 @@ mod tests {
         assert_eq!(resolved.status, ForkProposalStatus::Spawned);
     }
 
+    /// Bug 1: an approve that crashed AFTER `promote_task_status_to_in_progress`
+    /// renamed the taskmd file to `...-in-progress--{slug}.md` but BEFORE the
+    /// `git add`/`git commit` leaves the deterministic worktree with the file
+    /// renamed-on-disk but UNCOMMITTED. "Exists on disk" is not "committed": the
+    /// retry must NOT early-return on the in-progress filename — it must still
+    /// stage + commit so the approved task is committed on the fork branch.
+    #[tokio::test]
+    async fn approve_adopts_worktree_with_renamed_but_uncommitted_taskmd_commits_it() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let body = "# Fix the thing\n\n## Plan\nDo it.\n";
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", body).await;
+
+        // Simulate a crash AFTER the rename, BEFORE the commit: the deterministic
+        // worktree + branch exist and the file is renamed to its in-progress name
+        // on disk, but it was NEVER committed (no `git add`/`git commit`).
+        let fork_id = derive_conv_id(&pid, ResolutionKind::Spawn);
+        let wt = repo.join(".phoenix/worktrees").join(&fork_id);
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "task-12345-fix-thing",
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        // Renamed-on-disk in-progress file, left UNCOMMITTED on the branch.
+        std::fs::write(wt.join("tasks/12345-p1-in-progress--fix-thing.md"), body).unwrap();
+        // Confirm the precondition: the file is on disk but not committed.
+        let status_before = git(&wt, &["status", "--porcelain"]);
+        assert!(
+            status_before.contains("12345-p1-in-progress--fix-thing.md"),
+            "precondition: in-progress file must be present-but-uncommitted: {status_before}"
+        );
+
+        let rt = make_runtime(db.clone()).await;
+        let got = rt.approve_fork_proposal(&pid).await.unwrap();
+        assert_eq!(got, fork_id, "adopted the orphan, no new id");
+
+        // The in-progress file is now COMMITTED on the branch and the worktree is
+        // clean — the renamed-but-uncommitted change was driven to committed.
+        let tracked = git(&wt, &["ls-files", "tasks/"]);
+        let task_files: Vec<&str> = tracked.lines().filter(|l| l.contains("12345")).collect();
+        assert_eq!(
+            task_files,
+            vec!["tasks/12345-p1-in-progress--fix-thing.md"],
+            "exactly one committed in-progress task file: {tracked}"
+        );
+        let log = git(
+            &wt,
+            &[
+                "log",
+                "-1",
+                "--name-only",
+                "--pretty=format:",
+                "task-12345-fix-thing",
+            ],
+        );
+        assert!(
+            log.contains("12345-p1-in-progress--fix-thing.md"),
+            "the in-progress file must appear in the latest commit: {log}"
+        );
+        assert_eq!(
+            git(&wt, &["status", "--porcelain"]),
+            "",
+            "worktree must be clean after the commit"
+        );
+
+        let resolved = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(resolved.status, ForkProposalStatus::Spawned);
+    }
+
     #[tokio::test]
     async fn approve_non_pending_is_rejected() {
         let (_tmp, repo) = init_repo();
@@ -1723,15 +1897,33 @@ mod tests {
         );
     }
 
-    /// N6: `git worktree add -b <branch> <path> <start>` creates the BRANCH ref
-    /// first, then checks out the dir; killed in between it leaves the
-    /// deterministic branch with NO usable worktree dir. The deterministic-orphan
-    /// cleanup must still delete that branch-only orphan (it is not checked out in
-    /// any live worktree), otherwise `classify_branch_collision` rejects the
-    /// branch as a real collision and the still-`pending` proposal becomes
-    /// permanently unapprovable. After cleanup, a subsequent approve succeeds.
+    /// Build a dir-less deterministic worktree orphan: `git worktree add -b` then
+    /// `rm -rf` the checkout dir, leaving git's worktree ADMIN entry (and the
+    /// branch) pointing at the deterministic path with no usable dir. This is what
+    /// a crashed `git worktree add -b` leaves once the admin entry is registered —
+    /// `git worktree list --porcelain` still ties the branch to the deterministic
+    /// path, so the orphan is PROVABLY this fork's. Returns the orphan conv id.
+    fn make_dirless_deterministic_orphan(
+        repo: &Path,
+        pid: &str,
+        kind: ResolutionKind,
+        branch: &str,
+    ) -> String {
+        let conv_id = make_deterministic_orphan(repo, pid, kind, branch);
+        let wt = repo.join(".phoenix/worktrees").join(&conv_id);
+        std::fs::remove_dir_all(&wt).unwrap();
+        assert!(!wt.exists(), "checkout dir removed, admin entry retained");
+        conv_id
+    }
+
+    /// N6: a crashed `git worktree add -b` can leave a deterministic worktree admin
+    /// entry tied to the branch with the checkout dir gone. The deterministic-orphan
+    /// cleanup must remove that PROVABLE orphan (entry pruned, branch deleted),
+    /// otherwise `classify_branch_collision` rejects the branch as a real collision
+    /// and the still-`pending` proposal becomes permanently unapprovable. After
+    /// cleanup, a subsequent approve succeeds.
     #[tokio::test]
-    async fn branch_only_orphan_is_cleaned_and_approve_then_succeeds() {
+    async fn dirless_deterministic_orphan_is_cleaned_and_approve_then_succeeds() {
         let (_tmp, repo) = init_repo();
         let db = Database::open_in_memory().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
@@ -1743,24 +1935,24 @@ mod tests {
         )
         .await;
 
-        // Simulate the crash-between-ref-and-checkout: create ONLY the
-        // deterministic fork branch ref, no worktree dir.
-        let fork_id = derive_conv_id(&pid, ResolutionKind::Spawn);
-        let wt = repo.join(".phoenix/worktrees").join(&fork_id);
-        git(&repo, &["branch", "task-12345-fix-thing", "main"]);
-        assert!(!wt.exists(), "no worktree dir for a branch-only orphan");
+        let fork_id = make_dirless_deterministic_orphan(
+            &repo,
+            &pid,
+            ResolutionKind::Spawn,
+            "task-12345-fix-thing",
+        );
         assert!(
             !git(&repo, &["branch", "--list", "task-12345-fix-thing"]).is_empty(),
-            "the branch-only orphan must exist before cleanup"
+            "the deterministic orphan branch must exist before cleanup"
         );
 
         // Run the deterministic-orphan cleanup directly (leaves the proposal
-        // pending, unlike dismiss): it must delete the branch-only orphan.
+        // pending, unlike dismiss): it must delete the provable orphan.
         let proposal = db.get_fork_proposal(&pid).await.unwrap().unwrap();
         clean_deterministic_fork_orphans(Some(&repo), &proposal);
         assert!(
             git(&repo, &["branch", "--list", "task-12345-fix-thing"]).is_empty(),
-            "cleanup must delete the branch-only deterministic orphan"
+            "cleanup must delete the dir-less deterministic orphan branch"
         );
 
         // The proposal is still pending; a subsequent approve now succeeds because
@@ -1772,22 +1964,74 @@ mod tests {
         assert_eq!(resolved.status, ForkProposalStatus::Spawned);
     }
 
-    /// N6 via dismiss: a branch-only orphan (no worktree dir, just the branch ref)
-    /// is also removed by the dismiss cleanup path.
+    /// N6 via dismiss: a dir-less deterministic orphan (worktree admin entry tied
+    /// to the deterministic path, checkout dir gone) is also removed by the dismiss
+    /// cleanup path.
     #[tokio::test]
-    async fn dismiss_cleans_branch_only_deterministic_orphan() {
+    async fn dismiss_cleans_dirless_deterministic_orphan() {
         let (_tmp, repo) = init_repo();
         let db = Database::open_in_memory().await.unwrap();
         let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
         let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
-        // Branch-only orphan: the deterministic fork branch ref with no worktree.
-        git(&repo, &["branch", "task-12345-x", "main"]);
+        make_dirless_deterministic_orphan(&repo, &pid, ResolutionKind::Spawn, "task-12345-x");
         let rt = make_runtime(db.clone()).await;
 
         assert!(rt.dismiss_fork_proposal(&pid).await.unwrap());
         assert!(
             git(&repo, &["branch", "--list", "task-12345-x"]).is_empty(),
-            "dismiss must delete the branch-only orphan"
+            "dismiss must delete the dir-less deterministic orphan branch"
+        );
+    }
+
+    /// Bug 2 safety: a STANDALONE user branch whose name happens to collide with
+    /// the fork's derived branch name — but which is NOT associated with the
+    /// deterministic worktree path — must NEVER be force-deleted by dismiss/retire
+    /// cleanup. Deleting it would be silent user data loss. (The "branch ref but no
+    /// worktree admin entry ever existed" crash is indistinguishable from this, so
+    /// it is accepted as leaving the branch in place.)
+    #[tokio::test]
+    async fn standalone_colliding_user_branch_is_not_deleted_by_cleanup() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", "# x\n").await;
+
+        // The user has a local branch whose name collides with the fork's derived
+        // name `task-12345-fix-thing`, created independently (plain `git branch`,
+        // no worktree) — real work, not a fork orphan.
+        git(&repo, &["branch", "task-12345-fix-thing", "main"]);
+
+        // Dismiss cleanup must leave it intact.
+        let rt = make_runtime(db.clone()).await;
+        assert!(rt.dismiss_fork_proposal(&pid).await.unwrap());
+        assert!(
+            !git(&repo, &["branch", "--list", "task-12345-fix-thing"]).is_empty(),
+            "a standalone user branch colliding on the derived name must NOT be deleted"
+        );
+    }
+
+    /// Bug 2 companion: a genuine deterministic-worktree orphan (worktree admin
+    /// entry on the deterministic path) IS still cleaned, even when the checkout
+    /// dir is gone — proving the safety guard does not over-correct into leaving
+    /// real orphans behind.
+    #[tokio::test]
+    async fn genuine_deterministic_orphan_still_cleaned_by_dismiss() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", "# x\n").await;
+        make_dirless_deterministic_orphan(
+            &repo,
+            &pid,
+            ResolutionKind::Spawn,
+            "task-12345-fix-thing",
+        );
+
+        let rt = make_runtime(db.clone()).await;
+        assert!(rt.dismiss_fork_proposal(&pid).await.unwrap());
+        assert!(
+            git(&repo, &["branch", "--list", "task-12345-fix-thing"]).is_empty(),
+            "a genuine deterministic-worktree orphan must still be cleaned"
         );
     }
 
