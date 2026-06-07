@@ -49,8 +49,14 @@ use a mid-tier model balanced for cost and accuracy.
 | **REQ-CHN-005:** Q&A History Persists Per Chain | ✅ Complete | `chain_qa` table CRUD at `db.rs:2909-3008`; status enum + snapshot counters at `chain_qa.rs:145,323,520`; startup sweep `db.rs:1014` |
 | **REQ-CHN-006:** Consistent Quality As Q&A Accumulates | ✅ Complete | Stateless per-question invocation `chain_qa.rs:29,38,384`; `chain_qa_id` demux `chain_runtime.rs:8`, `api/chains.rs:119`, `api/wire.rs:463` |
 | **REQ-CHN-007:** Chain Has a User-Editable Name | ✅ Complete | Nullable `chain_name` column (`db.rs:2737`, `db.rs:3041`); whitespace clears the name (`api/chains.rs:182`) |
+| **REQ-CHN-008:** Chain Page Surfaces the Work Scope | Planned | Surface worktree/branch/task/PR (`work_scope_pr_associations`, `ConvMode` git metadata) above the member list |
+| **REQ-CHN-009:** Chain Q&A Is a Read-Only Agentic Loop | Planned | Scope-bound search + read tools over `specs/conversation-retrieval/`; supersedes summaries bundling and REQ-CHN-005 snapshot staleness |
 
-**Progress:** 7 of 7 complete. v1 shipped.
+**Progress:** v1 (REQ-CHN-001…007) shipped. REQ-CHN-008 (work-scope
+panel) and REQ-CHN-009 (read-only agentic Q&A) are the redesign,
+planned. REQ-CHN-009 depends on the new
+`specs/conversation-retrieval/` primitive, exposed to the Q&A agent as
+scope-bound tools.
 
 The "out of scope" list below remains accurate — the deferred Allium spec for the Q&A lifecycle is recommended now that the actual transitions are observable in production.
 
@@ -78,10 +84,10 @@ under `tasks/`.
   preserving REQ-CHN-006's stateless contract.
 - Cross-chain linking.
 - Project-level summary or steering doc.
-- Retrieval-backed Q&A architecture. Named future direction; trigger
-  to pivot is bundling cost becoming painful at observed chain sizes
-  or a product-level decision to introduce ambient memory across
-  non-chain conversations.
+- Retrieval-backed Q&A architecture. Now specified (REQ-CHN-009 +
+  `specs/conversation-retrieval/`) with a lexical FTS5/BM25 MVP backend.
+  Still out of scope: the vector/hybrid backend behind the retriever
+  seam, and the application-wide Q&A surface the `Global` scope serves.
 - Allium behavioral spec for chain Q&A lifecycle (`in_flight` /
   streaming / `completed` / `failed` / `abandoned`, snapshot
   computation, concurrent Q&A across tabs). The lifecycle has enough
