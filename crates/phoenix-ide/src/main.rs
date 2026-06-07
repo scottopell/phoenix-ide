@@ -241,9 +241,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // (chromiumoxide, hyper-rustls). Without this call the first
     // `ServerConfig::builder()` call panics on startup.
     //
-    // Preference: install `ring` when no provider is already set. ring
-    // matches the feature flag on our direct rustls dep and stays
-    // consistent with our existing TLS code paths.
+    // Install `aws_lc_rs` when no provider is already set — matches the
+    // feature flag on our direct rustls dep.
     //
     // `install_default()` returns `Err(existing)` if a provider was
     // already installed earlier in the process — typically benign
@@ -251,7 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // accept whichever provider is in place rather than crashing on
     // that race; the panic we're trying to prevent only occurs when
     // NO provider is installed at all.
-    if rustls::crypto::ring::default_provider()
+    if rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .is_err()
     {

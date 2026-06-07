@@ -21,9 +21,9 @@ axum = { version = "0.7", features = ["macros", "ws", "multipart"] }
 axum-extra = { version = "0.9", features = ["typed-header"] }
 hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "server-graceful", "service", "tokio"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 rustls-pki-types = "1"
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs", "tls12"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs", "compression-br", "compression-gzip", "trace"] }
 
@@ -61,7 +61,7 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 
 # HTTP client
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 
 # Socket configuration
 socket2 = "0.6"
