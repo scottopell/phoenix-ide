@@ -24,6 +24,12 @@ jobs:
       # instead of auto-skipping. (dev.py probes and would skip on failure;
       # leaving this unset keeps the probe authoritative.)
       CARGO_TERM_COLOR: always
+      # sccache wraps rustc and content-addresses every compilation, so a PR
+      # reuses object files for any crate whose source is unchanged vs the
+      # cached build — including across Cargo.lock changes that defeat the
+      # rust-cache target/ snapshot. Backs up the Cache Cargo step below.
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
 
     steps:
       - uses: actions/checkout@v4
@@ -42,16 +48,28 @@ jobs:
         with:
           # Keep ~/.cargo/bin (cargo-nextest, allium) across runs.
           cache-bin: true
-          # rust-cache's default key hashes Cargo.lock + rustc only, not
-          # Cargo.toml. Profile edits (e.g. `debug = "line-tables-only"`)
-          # then produce stale-hit caches: target/ restores but cargo
-          # detects the fingerprint mismatch and rebuilds everything from
-          # scratch, while the post-step skips save ("Cache up-to-date")
-          # because the key already exists. Net: every PR pays a full
-          # cold compile on every run, persistently. Hashing Cargo.toml
-          # into the key gives profile changes their own cache bucket
-          # that fills cleanly on first run and warms thereafter.
-          key: profile-${{ hashFiles('Cargo.toml') }}
+          # One bucket shared by main + every PR (no per-branch key). A PR
+          # whose Cargo.lock differs from main misses the exact key but hits
+          # rust-cache's restore-key prefix and warm-starts from main's
+          # dependency artifacts, recompiling only what actually changed.
+          # (An earlier `key: profile-${hashFiles('Cargo.toml')}` exiled every
+          # branch with any Cargo.toml delta to its own cold bucket that the
+          # post-step never re-saved — persistent full cold compiles.)
+          shared-key: check
+          # Only main writes the bucket; PRs restore it read-only, so one
+          # continuously-warm cache survives instead of PR branches evicting
+          # main's under the 10 GB limit.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          # Bump to force a cold rebuild after a [profile] edit (the only
+          # change that silently invalidates a restored target/).
+          prefix-key: v1-rust
+
+      # Installs the sccache binary and wires up the GitHub Actions cache
+      # backend it writes to. RUSTC_WRAPPER / SCCACHE_GHA_ENABLED are set at
+      # the job level so every cargo invocation (including dev.py's) routes
+      # rustc through sccache.
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -124,3 +142,55 @@ jobs:
 
       - name: ./dev.py check
         run: ./dev.py check
+
+  # A failed `check` on main would otherwise be silent. Track it as a single
+  # deduplicated issue: open (or comment on) it on failure, close it on the
+  # next green push. PR failures are visible on the PR itself, so these only
+  # fire for pushes to main.
+  notify-main-failure:
+    name: Open issue on main CI failure
+    needs: check
+    if: ${{ failure() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open or update the CI-failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="CI failing on main"
+          number=$(gh issue list --repo "$REPO" --state open --search "$title in:title" \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$REPO" \
+              --body "Still failing at \`$SHA\` — $RUN_URL"
+          else
+            body=$(printf 'CI is failing on `main`.\n\nFirst seen at `%s`\nRun: %s' "$SHA" "$RUN_URL")
+            gh issue create --repo "$REPO" --title "$title" --body "$body"
+          fi
+
+  close-main-failure:
+    name: Close CI-failure issue on green
+    needs: check
+    if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Close the open CI-failure issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          title="CI failing on main"
+          number=$(gh issue list --repo "$REPO" --state open --search "$title in:title" \
+            --json number,title --jq "map(select(.title == \"$title\")) | .[0].number // empty")
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$REPO" --body "Green again at \`$SHA\`. Closing."
+            gh issue close "$number" --repo "$REPO"
+          fi
