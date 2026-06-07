@@ -2720,7 +2720,7 @@ def cmd_check(gate: bool = True):
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
-        """Rust lane: clippy → [musl smoke check] → test compile → test run.
+        """Rust lane: test compile → test run → [musl smoke check] → clippy.
 
         The musl smoke check is **macOS-only and conditional** on the
         `x86_64-linux-musl-gcc` cross toolchain being on PATH; it never
@@ -2753,26 +2753,33 @@ def cmd_check(gate: bool = True):
         coverage. `compile_cmd`/`test_cmd`/the thread cap are computed once in
         cmd_check and closed over here.
         """
-        # Scope clippy to the changed crate(s)+rdeps when gating narrowed it;
-        # otherwise lint the whole workspace. `-p` flags go before `--`.
-        run_step("cargo clippy",
-                 ["cargo", "clippy", *_pflags(), "--", "-D", "warnings"])
+        # Order matters for cache reuse. The serial codegen pre-step in
+        # cmd_check compiled the workspace test binaries with normal rustc.
+        # `cargo clippy` sets RUSTC_WORKSPACE_WRAPPER=clippy-driver, which
+        # rewrites every workspace crate's fingerprint — so running clippy
+        # before the test build forces `cargo test compile` to rebuild the
+        # whole workspace codegen just produced. Building tests first reuses
+        # codegen's artifacts (near-total cache hit); clippy then runs last so
+        # its wrapper churn lands on nothing downstream.
+        run_step("cargo test compile", compile_cmd)
+        run_step("cargo test", test_cmd)
         if sys.platform == "darwin":
             # macOS prod deploy uses native target (launchd_prod_deploy → prod_build target=None),
             # so the musl smoke check is opt-in: skip cleanly if the cross toolchain isn't installed.
             # See task 60001 for installing musl-cross-make on this machine.
+            # (--target musl has its own fingerprint namespace, so it neither
+            # disturbs nor is disturbed by the host-target steps around it.)
             if shutil.which("x86_64-linux-musl-gcc"):
                 run_step("cargo check musl", [
                     "cargo", "check", "--target", "x86_64-unknown-linux-musl",
                 ])
             else:
                 print("  i  cargo check musl: skipped (x86_64-linux-musl-gcc not on PATH; see task 60001)")
-        # Linux hosts: the prior fallback was a plain `cargo check`, which is
-        # strictly redundant with `cargo clippy` above (clippy implies check).
-        # Drop it — musl validation belongs on the CI/macOS path that has the
-        # cross toolchain installed.
-        run_step("cargo test compile", compile_cmd)
-        run_step("cargo test", test_cmd)
+        # Scope clippy to the changed crate(s)+rdeps when gating narrowed it;
+        # otherwise lint the whole workspace. `-p` flags go before `--`. Runs
+        # last by design — see the ordering note above.
+        run_step("cargo clippy",
+                 ["cargo", "clippy", *_pflags(), "--", "-D", "warnings"])
 
     def lane_ui_lint():
         """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
