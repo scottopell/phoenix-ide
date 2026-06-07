@@ -15,7 +15,7 @@
  * yellow + / red ✗); no heavy panel.
  */
 
-import { useCallback } from 'react';
+import { useCallback, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { ClipboardCheck, Check, X, ArrowRight, Loader2 } from 'lucide-react';
 import { api } from '../api';
@@ -44,13 +44,33 @@ export function ForkProposalAffordance({ proposalId }: ForkProposalAffordancePro
     [navigate],
   );
 
-  if (!fork) return null;
+  // Ids we've already asked the store to refetch for, so a proposal that's
+  // still missing after a refetch doesn't drive an infinite refetch loop.
+  const requestedRef = useRef<Set<string>>(new Set());
 
-  const proposal = fork.getProposal(proposalId);
+  const proposal = fork?.getProposal(proposalId);
+  const loaded = fork?.loaded ?? false;
+  const refetch = fork?.refetch;
+
+  // A proposal created after the initial list fetch (live conversation) isn't
+  // in the store yet. Once the list has loaded and the id is still missing,
+  // refetch once to pull in the just-streamed proposal so its Review affordance
+  // appears without a page reload.
+  useEffect(() => {
+    if (!refetch || proposal || !loaded) return;
+    if (requestedRef.current.has(proposalId)) return;
+    requestedRef.current.add(proposalId);
+    refetch();
+  }, [refetch, proposal, loaded, proposalId]);
+
+  if (!fork) return null;
 
   // List not loaded yet, or the proposal isn't in this conversation's set.
   if (!proposal) {
-    if (!fork.loaded) {
+    // Either the first list fetch is still in flight, or we've triggered a
+    // refetch for a newly-streamed id and are waiting on it. Both read as
+    // "loading" so the affordance doesn't flash empty before the proposal lands.
+    if (!fork.loaded || requestedRef.current.has(proposalId)) {
       return (
         <div className="fork-proposal-affordance fork-proposal-affordance--loading">
           <Loader2 size={13} className="spinning" />

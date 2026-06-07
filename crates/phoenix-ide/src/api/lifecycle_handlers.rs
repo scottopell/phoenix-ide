@@ -234,10 +234,10 @@ pub(crate) async fn dismiss_fork_proposal(
 ) -> Result<Json<ForkDismissResponse>, AppError> {
     require_proposal_for_conversation(&state, &id, &proposal_id).await?;
     let transitioned = state
-        .db
+        .runtime
         .dismiss_fork_proposal(&proposal_id)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(fork_resolve_app_error)?;
     Ok(Json(ForkDismissResponse {
         success: true,
         no_op: !transitioned,

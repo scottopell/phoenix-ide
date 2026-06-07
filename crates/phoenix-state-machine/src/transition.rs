@@ -57,7 +57,13 @@ struct TaskFileSnapshot {
     task_file: String,
     title: String,
     priority: phoenix_core::task_source::Priority,
+    /// Display copy of the brief: the file body trimmed of surrounding
+    /// whitespace, for the approval reader.
     plan: String,
+    /// The authoritative file bytes, exactly as read from disk (untrimmed).
+    /// A fork commits this verbatim, so it must equal the reviewed file
+    /// byte-for-byte (REQ-PROJ-033).
+    body_raw: String,
 }
 
 /// Read and validate a task file referenced by `propose_task`.
@@ -187,6 +193,7 @@ fn resolve_task_file(
         title,
         priority,
         plan,
+        body_raw: body,
     })
 }
 
@@ -2107,7 +2114,7 @@ pub fn transition_parent(
                     task_file: snapshot.task_file.clone(),
                     title: snapshot.title.clone(),
                     priority: snapshot.priority,
-                    body: snapshot.plan.clone(),
+                    body: snapshot.body_raw.clone(),
                     checkpoint,
                 })
                 .with_effect(Effect::PersistState)
@@ -5117,6 +5124,49 @@ mod tests {
             assert!(
                 fork_proposal_effect(&result.effects).is_some(),
                 "Direct-in-git records a fork proposal"
+            );
+        }
+
+        /// REQ-PROJ-033: the fork snapshot is the authoritative file BYTES. A
+        /// brief with significant leading/trailing whitespace and a trailing
+        /// newline must reach `Effect::PersistForkProposal { body }` unaltered —
+        /// it is the verbatim source for the fork's committed file, NOT the
+        /// trimmed display plan.
+        #[test]
+        fn fork_body_preserves_raw_file_bytes() {
+            let tmp = TempDir::new().unwrap();
+            std::fs::create_dir(tmp.path().join("tasks")).unwrap();
+            let rel = "tasks/12345-p1-ready--fix-the-bug.md".to_string();
+            let raw = "\n\n  # Fix the bug\n\nplan body for the fork\n\n  \n";
+            std::fs::write(tmp.path().join(&rel), raw).unwrap();
+
+            let ctx = ctx_for(
+                &tmp,
+                ModeKind::Managed,
+                Some(ModeContext::Work {
+                    branch_name: "task-12345".to_string(),
+                    base_branch: "main".to_string(),
+                    worktree_path: tmp.path().display().to_string(),
+                }),
+            );
+
+            let result = transition(
+                &ConvState::LlmRequesting { attempt: 1 },
+                &ctx,
+                propose_event(&rel),
+            )
+            .expect("transition must succeed");
+
+            let (_, _, _, _, body) =
+                fork_proposal_effect(&result.effects).expect("must emit PersistForkProposal");
+            assert_eq!(
+                body, raw,
+                "fork body must be the raw file bytes, not the trimmed plan"
+            );
+            assert_ne!(
+                body,
+                &raw.trim().to_string(),
+                "fork body must NOT be the trimmed display plan"
             );
         }
 

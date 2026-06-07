@@ -41,8 +41,10 @@ interface ForkProposalsValue {
   /** True until the first list fetch settles. */
   loaded: boolean;
   /** Re-fetch the proposal list (after an action, or when a new proposal id
-   *  appears in the transcript). */
-  refetch: () => void;
+   *  appears in the transcript). Resolves once the fetch settles (success or
+   *  failure), so a caller awaiting a newly-streamed id can tell when the
+   *  store has had its chance to learn about it. */
+  refetch: () => Promise<void>;
   /** The proposal whose review modal is open, if any. */
   openProposalId: string | null;
   openReview: (proposalId: string) => void;
@@ -81,39 +83,48 @@ export function ForkProposalsProvider({
   const convIdRef = useRef<string | undefined>(conversationId);
   convIdRef.current = conversationId;
 
-  const refetch = useCallback(() => {
+  const refetch = useCallback(async () => {
     const id = convIdRef.current;
     if (!id) {
       setProposals([]);
       setLoaded(true);
       return;
     }
+    try {
+      const list = await api.listForkProposals(id);
+      setProposals(list);
+    } catch {
+      // A failed list fetch leaves the prior state in place; the affordance
+      // degrades to its last-known status rather than vanishing.
+    } finally {
+      setLoaded(true);
+    }
+  }, []);
+
+  // Initial load + reload whenever the conversation changes. Guard against a
+  // stale fetch from a previous conversation landing after this one switched.
+  useEffect(() => {
     let cancelled = false;
+    setProposals([]);
+    setLoaded(false);
+    const id = conversationId;
+    if (!id) {
+      setLoaded(true);
+      return;
+    }
     api
       .listForkProposals(id)
       .then((list) => {
-        if (!cancelled) {
-          setProposals(list);
-          setLoaded(true);
-        }
+        if (!cancelled) setProposals(list);
       })
-      .catch(() => {
-        // A failed list fetch leaves the prior state in place; the affordance
-        // degrades to its last-known status rather than vanishing.
+      .catch(() => {})
+      .finally(() => {
         if (!cancelled) setLoaded(true);
       });
     return () => {
       cancelled = true;
     };
-  }, []);
-
-  // Initial load + reload whenever the conversation changes.
-  useEffect(() => {
-    setProposals([]);
-    setLoaded(false);
-    const cleanup = refetch();
-    return cleanup;
-  }, [conversationId, refetch]);
+  }, [conversationId]);
 
   const byId = useMemo(() => {
     const m = new Map<string, ForkProposalSummary>();
@@ -171,10 +182,17 @@ export function ForkProposalsProvider({
       const id = convIdRef.current;
       if (!id) return;
       try {
-        await api.dismissForkProposal(id, proposalId);
-        markResolved(proposalId, { status: 'dismissed' });
+        const { no_op } = await api.dismissForkProposal(id, proposalId);
         setOpenProposalId(null);
-        onOutcome?.({ kind: 'dismissed' });
+        if (no_op) {
+          // Another tab already resolved (spawned/promoted) this proposal. Do
+          // not force a local `dismissed` status — the refetch in `finally`
+          // reconciles the store to the true status and its fork/refinement id.
+          onOutcome?.({ kind: 'already_resolved' });
+        } else {
+          markResolved(proposalId, { status: 'dismissed' });
+          onOutcome?.({ kind: 'dismissed' });
+        }
       } catch (e) {
         if (e instanceof ConflictError) {
           setOpenProposalId(null);

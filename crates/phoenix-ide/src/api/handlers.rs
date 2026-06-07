@@ -3489,12 +3489,18 @@ async fn cascade_projects_on_delete(
 /// themselves are removed by the `fork_proposals.origin_conv_id` ON DELETE
 /// CASCADE when the conversation row is deleted, so this does NOT touch the DB.
 ///
-/// Runs under the process-global `TASK_APPROVAL_MUTEX` so it serialises with
-/// approve/promote: either the resolve commits first (the proposal is no longer
-/// pending, so it is skipped and its live child untouched) or this cleanup runs
-/// first (clearing the orphan; the in-flight approve then finds the row gone /
-/// non-pending and aborts).
+/// Runs under the process-global async `FORK_RESOLVE_MUTEX` so it serialises with
+/// approve/promote across their whole critical section: either the resolve commits
+/// first (the proposal is no longer pending, so the re-read-under-lock filter skips
+/// it and its live child untouched) or this cleanup runs first (clearing the orphan;
+/// the in-flight approve then finds the row gone / non-pending and aborts). The
+/// status is re-read under the lock — never a pre-lock stale list — so the read is
+/// authoritative.
 async fn cleanup_pending_fork_orphans_on_delete(state: &AppState, conv: &crate::db::Conversation) {
+    let _resolve_guard = crate::runtime::fork_resolve::FORK_RESOLVE_MUTEX
+        .lock()
+        .await;
+
     let proposals = match state
         .runtime
         .db()
@@ -3543,6 +3549,8 @@ async fn cleanup_pending_fork_orphans_on_delete(state: &AppState, conv: &crate::
 
     let _ = tokio::task::spawn_blocking(move || {
         use crate::runtime::executor::TASK_APPROVAL_MUTEX;
+        // Lock ordering invariant: async FORK_RESOLVE_MUTEX (held above) OUTER,
+        // std TASK_APPROVAL_MUTEX INNER.
         let _guard = TASK_APPROVAL_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);

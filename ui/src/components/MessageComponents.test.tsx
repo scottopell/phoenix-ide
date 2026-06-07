@@ -7,7 +7,8 @@ import { MessageContextMenu } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
 import { api, type ConversationState, type Message, type ForkProposalSummary } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
-import { ForkProposalsProvider } from '../contexts/ForkProposalsContext';
+import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposalsContext';
+import { ForkProposalReview } from './ForkProposalReview';
 
 vi.mock('../utils/clipboard', () => ({
   copyToClipboard: vi.fn().mockResolvedValue(true),
@@ -22,6 +23,9 @@ vi.mock('../api', async (importOriginal) => {
       getConversation: vi.fn(),
       getConversationSlug: vi.fn(),
       listForkProposals: vi.fn(),
+      approveForkProposal: vi.fn(),
+      dismissForkProposal: vi.fn(),
+      requestChangesForkProposal: vi.fn(),
     },
   };
 });
@@ -746,5 +750,118 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     renderTranscript([proposal({ status: 'dismissed' })]);
     expect(await screen.findByText('Dismissed')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Review' })).not.toBeInTheDocument();
+  });
+
+  // Bug 1: a non-conflict action failure must leave the modal interactive so the
+  // user can retry or Escape out, rather than stranding it permanently busy.
+  // The provider catches the failure and resolves its action promise WITHOUT
+  // closing the modal (no onOutcome → ForkReviewOverlay stays mounted); the
+  // modal must still clear `busy`.
+  it('re-enables the review modal after a failed action settles (so Escape/retry work)', async () => {
+    // Models the provider's caught-error path: promise resolves, modal not unmounted.
+    const onApprove = vi.fn().mockResolvedValue(undefined);
+    const onClose = vi.fn();
+    render(
+      <ForkProposalReview
+        proposal={proposal({ status: 'pending' })}
+        onApprove={onApprove}
+        onDismiss={vi.fn()}
+        onRequestChanges={vi.fn()}
+        onClose={onClose}
+      />,
+    );
+
+    const approveBtn = screen.getByRole('button', { name: /Approve/ });
+    await act(async () => {
+      fireEvent.click(approveBtn);
+    });
+
+    // The action rejected; the modal must not be stuck disabled.
+    await waitFor(() => {
+      expect(screen.getByRole('button', { name: 'Dismiss' })).not.toBeDisabled();
+      expect(screen.getByRole('button', { name: /Approve/ })).not.toBeDisabled();
+    });
+
+    // Escape is honored again now that busy is cleared.
+    fireEvent.keyDown(window, { key: 'Escape' });
+    expect(onClose).toHaveBeenCalled();
+  });
+
+  // Bug 2: a proposal id that arrives after the initial list fetch (live
+  // conversation) must trigger a refetch so its Review affordance appears.
+  it('refetches for an id missing from the initial list, then renders Review', async () => {
+    const listMock = api.listForkProposals as ReturnType<typeof vi.fn>;
+    // First fetch returns no proposals; the streamed id isn't known yet.
+    listMock.mockResolvedValueOnce([]);
+    // The triggered refetch now learns about the proposal.
+    listMock.mockResolvedValueOnce([proposal({ status: 'pending' })]);
+
+    const message = agentMessage('agent-msg-fork', [
+      { type: 'tool_use', id: 'tool-fork', name: 'propose_task', input: { task_file: 'tasks/00042-p2-ready--fix-parser.md' } },
+    ]);
+    render(
+      <MemoryRouter>
+        <ForkProposalsProvider conversationId="agent-1">
+          <AgentMessage
+            message={message}
+            toolResults={new Map([['tool-fork', forkToolResult('prop-1')]])}
+            onOpenFile={undefined}
+          />
+        </ForkProposalsProvider>
+      </MemoryRouter>,
+    );
+
+    // After the second (refetch) fetch lands, the Review affordance shows.
+    expect(await screen.findByRole('button', { name: 'Review' })).toBeInTheDocument();
+    expect(listMock).toHaveBeenCalledTimes(2);
+  });
+
+  // Bug 3: a dismiss that returns no_op (resolved in another tab) must NOT show a
+  // local "dismissed" terminal state; it refetches and surfaces already_resolved.
+  it('honors a no_op dismiss: no local dismissed state, refetches true status', async () => {
+    const onOutcome = vi.fn();
+    (api.dismissForkProposal as ReturnType<typeof vi.fn>).mockResolvedValue({
+      success: true,
+      no_op: true,
+    });
+    const listMock = api.listForkProposals as ReturnType<typeof vi.fn>;
+    // Initial list: pending. Post-dismiss refetch: the real resolution (spawned).
+    listMock.mockResolvedValueOnce([proposal({ status: 'pending' })]);
+    listMock.mockResolvedValueOnce([
+      proposal({ status: 'spawned', fork_conversation_id: 'fork-conv-9' }),
+    ]);
+
+    function DismissHarness() {
+      const fork = useForkProposals();
+      if (!fork) return null;
+      return (
+        <button type="button" onClick={() => void fork.dismiss('prop-1')}>
+          trigger-dismiss
+        </button>
+      );
+    }
+
+    render(
+      <MemoryRouter>
+        <ForkProposalsProvider conversationId="agent-1" onOutcome={onOutcome}>
+          <DismissHarness />
+        </ForkProposalsProvider>
+      </MemoryRouter>,
+    );
+
+    // Wait for the initial list fetch to settle.
+    await waitFor(() => expect(listMock).toHaveBeenCalledTimes(1));
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('trigger-dismiss'));
+    });
+
+    await waitFor(() => {
+      expect(onOutcome).toHaveBeenCalledWith({ kind: 'already_resolved' });
+    });
+    // A no_op dismiss never reports a 'dismissed' outcome...
+    expect(onOutcome).not.toHaveBeenCalledWith({ kind: 'dismissed' });
+    // ...and it refetches to reconcile the true status.
+    await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
   });
 });

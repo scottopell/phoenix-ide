@@ -59,20 +59,37 @@ export function ForkProposalReview({
     return () => window.removeEventListener('keydown', handleKeyDown, true);
   }, [busy, onClose]);
 
+  // Reset `busy` after every action settles. On success/conflict the provider
+  // closes the modal (this component unmounts), but on a non-conflict failure
+  // the modal stays mounted — without this the actions would stay disabled and
+  // Escape ignored, stranding the user. The provider owns error surfacing; we
+  // only clear local busy state.
   const handleApprove = useCallback(async () => {
     setBusy('approve');
-    await onApprove();
+    try {
+      await onApprove();
+    } finally {
+      setBusy(null);
+    }
   }, [onApprove]);
 
   const handleDismiss = useCallback(async () => {
     setBusy('dismiss');
-    await onDismiss();
+    try {
+      await onDismiss();
+    } finally {
+      setBusy(null);
+    }
   }, [onDismiss]);
 
   const handleSubmitNote = useCallback(async () => {
     if (!note.trim()) return;
     setBusy('request-changes');
-    await onRequestChanges(note.trim());
+    try {
+      await onRequestChanges(note.trim());
+    } finally {
+      setBusy(null);
+    }
   }, [note, onRequestChanges]);
 
   const renderBody = useMemo(

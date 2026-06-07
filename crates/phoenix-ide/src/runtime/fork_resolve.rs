@@ -27,6 +27,16 @@ use crate::runtime::executor::{promote_task_status_to_in_progress, TASK_APPROVAL
 use crate::runtime::RuntimeManager;
 use phoenix_core::task_source::TaskSource;
 
+/// Serializes a fork resolution's whole critical section (precondition check,
+/// git phase, AND the DB resolve commit) against orphan cleanup
+/// (retire-on-terminal, hard-delete) so cleanup never deletes a just-created
+/// live fork's worktree in the window before its resolution commits.
+///
+/// Lock ordering is invariant: async `FORK_RESOLVE_MUTEX` OUTER, std
+/// [`TASK_APPROVAL_MUTEX`] INNER (the inner one guards only the synchronous git
+/// phase). Held across `.await`, which is why it is an async mutex.
+pub(crate) static FORK_RESOLVE_MUTEX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Fixed namespace for deterministic fork/refinement conversation ids. A v5
 /// UUID over `{proposal_id}:{kind}` under this namespace is stable across
 /// retries (so a crashed approve/promote re-derives the same id and adopts its
@@ -72,9 +82,14 @@ pub(crate) fn derive_conv_id(proposal_id: &str, kind: ResolutionKind) -> String 
 /// and `{derive_conv_id(id, Promote)}` — for a proposal whose resolution was
 /// never recorded (so it is still `pending`).
 ///
-/// Callers MUST hold [`TASK_APPROVAL_MUTEX`] so this serialises with
-/// approve/promote: a terminal transition or hard-delete arriving mid-approve
-/// can't delete a worktree the in-flight approve is about to adopt. Guard to
+/// Serialisation against approve/promote is provided by the async
+/// [`FORK_RESOLVE_MUTEX`], held by every caller (resolve, retire-on-terminal,
+/// dismiss, hard-delete) across its whole critical section: a terminal
+/// transition or hard-delete arriving mid-approve can't delete a worktree the
+/// in-flight approve is about to adopt, and the `pending` re-read under that
+/// lock is authoritative. The inner synchronous git work additionally takes
+/// [`TASK_APPROVAL_MUTEX`] (outer async, inner std — invariant lock order) to
+/// serialise branch-name races with the Explore-approval path. Guard to
 /// `pending` proposals only at the call site — for a `spawned`/`promoted`
 /// proposal these paths are the LIVE decoupled fork/refinement, which must not
 /// be touched.
@@ -96,17 +111,24 @@ pub(crate) fn clean_deterministic_fork_orphans(repo_root: Option<&Path>, proposa
 /// (`spawned`/`dismissed`/`promoted`) proposals are untouched — they persist as
 /// audit and their deterministic path is the LIVE decoupled fork/refinement.
 ///
-/// The git orphan cleanup runs under the process-global `TASK_APPROVAL_MUTEX`
-/// so it serialises with approve/promote: a terminal transition arriving
-/// mid-approve either runs after the resolve commits (the proposal is no longer
-/// pending, so it is skipped and its live child untouched) or before it (the
-/// proposal is dismissed + its orphan cleaned, and the in-flight approve then
-/// finds it no longer pending and aborts). Best-effort: a failure to list /
-/// clean / dismiss is logged at WARN and never blocks the terminal transition.
+/// The whole retirement (status re-read, git orphan cleanup, and dismiss) runs
+/// under the process-global async [`FORK_RESOLVE_MUTEX`] so it serialises with
+/// approve/promote: a terminal transition arriving mid-approve either runs after
+/// the resolve commits (the proposal is no longer pending, so it is skipped and
+/// its live child untouched) or before it (the proposal is dismissed + its orphan
+/// cleaned, and the in-flight approve then finds it no longer pending and aborts).
+/// Because resolve holds this same mutex across its commit, the status re-read
+/// here is authoritative — no resolve is mid-flight while we hold the lock, so a
+/// committed `spawned`/`promoted` proposal is correctly skipped and a still-`pending`
+/// one is genuinely an orphan to clean. Best-effort: a failure to list / clean /
+/// dismiss is logged at WARN and never blocks the terminal transition.
 pub(crate) async fn retire_fork_proposals_for_terminal_origin(
     db: &crate::db::Database,
     origin_id: &str,
 ) {
+    let _resolve_guard = FORK_RESOLVE_MUTEX.lock().await;
+
+    // Re-read CURRENT status under the lock — never a pre-lock stale id list.
     let pending_ids = match db.list_fork_proposals_for_origin(origin_id).await {
         Ok(proposals) => proposals
             .into_iter()
@@ -127,14 +149,14 @@ pub(crate) async fn retire_fork_proposals_for_terminal_origin(
     }
 
     let repo_root = fork_origin_repo_root(db, origin_id).await;
-    let repo_root_for_blocking = repo_root.clone();
-    let ids_for_blocking = pending_ids.clone();
     let _ = tokio::task::spawn_blocking(move || {
+        // Lock ordering invariant: async FORK_RESOLVE_MUTEX (held by the caller)
+        // OUTER, std TASK_APPROVAL_MUTEX INNER.
         let _guard = TASK_APPROVAL_MUTEX
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for pid in &ids_for_blocking {
-            clean_deterministic_fork_orphans(repo_root_for_blocking.as_deref(), pid);
+        for pid in &pending_ids {
+            clean_deterministic_fork_orphans(repo_root.as_deref(), pid);
         }
     })
     .await;
@@ -378,6 +400,11 @@ impl RuntimeManager {
         self: &std::sync::Arc<Self>,
         proposal_id: &str,
     ) -> Result<String, ForkResolveError> {
+        // Hold the async resolve mutex across the WHOLE critical section
+        // (precondition check + git phase + DB resolve) so concurrent orphan
+        // cleanup can't tear down the just-created worktree before it commits.
+        let _resolve_guard = FORK_RESOLVE_MUTEX.lock().await;
+
         let ctx = self.load_resolvable_proposal(proposal_id).await?;
         let fork_conv_id = derive_conv_id(proposal_id, ResolutionKind::Spawn);
 
@@ -417,6 +444,11 @@ impl RuntimeManager {
         proposal_id: &str,
         change_request: String,
     ) -> Result<String, ForkResolveError> {
+        // Hold the async resolve mutex across the WHOLE critical section
+        // (precondition check + git phase + DB resolve) so concurrent orphan
+        // cleanup can't tear down the just-created worktree before it commits.
+        let _resolve_guard = FORK_RESOLVE_MUTEX.lock().await;
+
         let ctx = self.load_resolvable_proposal(proposal_id).await?;
         let refinement_conv_id = derive_conv_id(proposal_id, ResolutionKind::Promote);
 
@@ -438,6 +470,59 @@ impl RuntimeManager {
             .await
             .map_err(ForkResolveError::Internal)?;
         Ok(refinement_conv_id)
+    }
+
+    /// Dismiss a fork proposal (`ForkProposalDismissed`): clean any deterministic
+    /// spawn/promote git orphan a crashed approve/promote left behind for a
+    /// still-`pending` proposal (`DeterministicForkOrphansCleaned` BEFORE
+    /// `status = dismissed`), then record the dismissal. Without this, an orphan
+    /// left under a proposal that is then dismissed leaks forever — the
+    /// terminal/hard-delete cleanup paths only consider `pending` proposals.
+    ///
+    /// Runs under [`FORK_RESOLVE_MUTEX`] so the `pending` re-read is authoritative
+    /// against a concurrent approve/promote. Idempotent: dismissing an
+    /// already-resolved (`spawned`/`promoted`/`dismissed`) proposal cleans nothing
+    /// — its deterministic path is the LIVE decoupled child — and is a no-op.
+    ///
+    /// Returns `true` when the row transitioned `pending -> dismissed`, `false`
+    /// when it was already resolved (the endpoint reports the latter as `no_op`).
+    ///
+    /// # Errors
+    ///
+    /// [`ForkResolveError::Internal`] for a DB failure reading or updating the row.
+    pub(crate) async fn dismiss_fork_proposal(
+        &self,
+        proposal_id: &str,
+    ) -> Result<bool, ForkResolveError> {
+        let _resolve_guard = FORK_RESOLVE_MUTEX.lock().await;
+
+        let proposal = self
+            .db
+            .get_fork_proposal(proposal_id)
+            .await
+            .map_err(|e| ForkResolveError::Internal(e.to_string()))?
+            .ok_or_else(|| ForkResolveError::NotFound(format!("fork proposal {proposal_id}")))?;
+
+        if proposal.status != ForkProposalStatus::Pending {
+            return Ok(false);
+        }
+
+        let repo_root = fork_origin_repo_root(&self.db, &proposal.origin_conversation_id).await;
+        let pid = proposal_id.to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            // Lock ordering invariant: async FORK_RESOLVE_MUTEX (held by the
+            // caller) OUTER, std TASK_APPROVAL_MUTEX INNER.
+            let _guard = TASK_APPROVAL_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            clean_deterministic_fork_orphans(repo_root.as_deref(), &pid);
+        })
+        .await;
+
+        self.db
+            .dismiss_fork_proposal(proposal_id)
+            .await
+            .map_err(|e| ForkResolveError::Internal(e.to_string()))
     }
 
     /// Load a proposal and validate the shared resolve preconditions: it exists,
@@ -1116,6 +1201,69 @@ mod tests {
         // No worktree created.
         let fork_id = derive_conv_id(&pid, ResolutionKind::Spawn);
         assert!(!repo.join(".phoenix/worktrees").join(&fork_id).exists());
+    }
+
+    /// `ForkProposalDismissed`: dismissing a still-`pending` proposal that has a
+    /// deterministic worktree/branch left by a crashed approve MUST clean that
+    /// orphan (`DeterministicForkOrphansCleaned` before `status = dismissed`),
+    /// else it leaks forever — later terminal/delete cleanup only considers
+    /// `pending` proposals, and this one is now `dismissed`.
+    #[tokio::test]
+    async fn dismiss_cleans_deterministic_orphan_then_marks_dismissed() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
+        // Simulate a crashed approve: the deterministic spawn worktree + branch
+        // exist but no resolution was recorded (proposal still pending).
+        let orphan_id =
+            make_deterministic_orphan(&repo, &pid, ResolutionKind::Spawn, "task-12345-x");
+        let orphan_wt = repo.join(".phoenix/worktrees").join(&orphan_id);
+        assert!(orphan_wt.is_dir());
+        let rt = make_runtime(db.clone()).await;
+
+        let transitioned = rt.dismiss_fork_proposal(&pid).await.unwrap();
+        assert!(
+            transitioned,
+            "pending -> dismissed must report transitioned"
+        );
+
+        let resolved = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(resolved.status, ForkProposalStatus::Dismissed);
+        assert!(
+            !orphan_wt.exists(),
+            "dismiss must clean the crashed-approve orphan worktree"
+        );
+        // The orphan branch is gone too.
+        let branches = git(&repo, &["branch", "--list", "task-12345-x"]);
+        assert!(
+            branches.is_empty(),
+            "dismiss must delete the orphan branch, got: {branches}"
+        );
+    }
+
+    /// Dismissing an already-`spawned` proposal is a no-op and MUST NOT touch the
+    /// live fork's worktree (its deterministic path is the live decoupled child).
+    #[tokio::test]
+    async fn dismiss_is_noop_on_spawned_and_leaves_live_fork() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
+        let rt = make_runtime(db.clone()).await;
+        let fork_id = rt.approve_fork_proposal(&pid).await.unwrap();
+        let fork_wt = repo.join(".phoenix/worktrees").join(&fork_id);
+        assert!(fork_wt.is_dir());
+
+        let transitioned = rt.dismiss_fork_proposal(&pid).await.unwrap();
+        assert!(!transitioned, "dismiss of a spawned proposal is a no-op");
+
+        let after = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(after.status, ForkProposalStatus::Spawned);
+        assert!(
+            fork_wt.is_dir(),
+            "dismiss must NOT touch a spawned proposal's live fork worktree"
+        );
     }
 
     #[tokio::test]
