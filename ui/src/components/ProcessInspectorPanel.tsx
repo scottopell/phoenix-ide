@@ -322,20 +322,35 @@ export function ProcessInspectorPanel({
           </div>
 
           <div className="pinsp-output" ref={outputRef} onScroll={onScroll}>
-            {entries.length === 0 ? (
+            {entries.length === 0 && !snapshot?.output.partial ? (
               <div className="pinsp-output-empty">no output</div>
             ) : (
-              entries.map((e) =>
-                e.kind === 'gap' ? (
-                  <div key={`gap-${e.id}`} className="pinsp-output-gap">
-                    … output truncated …
+              <>
+                {entries.map((e) =>
+                  e.kind === 'gap' ? (
+                    <div key={`gap-${e.id}`} className="pinsp-output-gap">
+                      … output truncated …
+                    </div>
+                  ) : (
+                    <div key={`line-${e.offset}`} className="pinsp-output-line">
+                      {e.text}
+                    </div>
+                  ),
+                )}
+                {/* The live trailing partial — bytes written since the last
+                    newline. Transient (replaced each poll, never appended to
+                    the offset-keyed entries); rendered as an in-progress line
+                    so un-newlined output is visible without waiting for a
+                    flush (REQ-PINSP-003). */}
+                {snapshot?.output.partial && (
+                  <div
+                    className="pinsp-output-line pinsp-output-line--partial"
+                    title="in-progress line (no newline yet)"
+                  >
+                    {snapshot.output.partial}
                   </div>
-                ) : (
-                  <div key={`line-${e.offset}`} className="pinsp-output-line">
-                    {e.text}
-                  </div>
-                ),
-              )
+                )}
+              </>
             )}
           </div>
           {!following && (

@@ -82,6 +82,32 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     expect(screen.getByText('third')).toBeTruthy();
   });
 
+  it('renders the live partial as a trailing in-progress line, replaced (not appended) each poll', async () => {
+    getInsp
+      .mockResolvedValueOnce(
+        snap({ output: { start_offset: 0, end_offset: 1, truncated_before: false, lines: lines([0, 'done']), partial: 'in-progr' } }),
+      )
+      .mockResolvedValueOnce(
+        snap({ output: { start_offset: 1, end_offset: 1, truncated_before: false, lines: [], partial: 'in-progress now' } }),
+      );
+
+    await renderPanel();
+    expect(screen.getByText('done')).toBeTruthy();
+    const partialEl = screen.getByText('in-progr');
+    expect(partialEl.className).toContain('pinsp-output-line--partial');
+
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+
+    // Partial is transient: the prior value is gone, replaced by the latest.
+    expect(screen.queryByText('in-progr')).toBeNull();
+    expect(screen.getByText('in-progress now')).toBeTruthy();
+    // The completed line stays (offset-keyed entries are append-only).
+    expect(screen.getByText('done')).toBeTruthy();
+  });
+
   it('renders a truncation marker when a poll reports truncated_before', async () => {
     getInsp
       .mockResolvedValueOnce(

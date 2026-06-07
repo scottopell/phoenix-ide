@@ -172,6 +172,19 @@
   color: var(--text-primary);
 }
 
+/* The live trailing partial line — un-newlined output, still being written.
+   Muted + a trailing cursor glyph so it reads as in-progress, distinct from
+   the completed lines above it. */
+.pinsp-output-line--partial {
+  color: var(--text-secondary);
+}
+
+.pinsp-output-line--partial::after {
+  content: '▌';
+  color: var(--accent-green);
+  opacity: 0.7;
+}
+
 .pinsp-output-gap {
   color: var(--accent-yellow);
   font-style: italic;

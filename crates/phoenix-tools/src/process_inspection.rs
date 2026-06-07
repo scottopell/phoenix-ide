@@ -24,7 +24,7 @@ use phoenix_core::work_scope::WorkScope;
 
 use crate::bash::handle::{Handle, HandleId, HandleState};
 use crate::bash::operations::{
-    read_window_from_ring, read_window_from_tombstone, window_to_typed, ReadArgs,
+    read_window_from_ring, read_window_from_tombstone, window_to_typed, ReadArgs, RingRead,
 };
 use crate::bash::registry::BashHandleRegistry;
 
@@ -83,7 +83,8 @@ async fn project_inspection(handle: &Arc<Handle>, since: Option<u64>) -> Inspect
             };
             let output = {
                 let ring = live.ring.lock().await;
-                window_to_typed(&read_window_from_ring(&ring, &read_args))
+                let RingRead { view, partial } = read_window_from_ring(&ring, &read_args);
+                window_to_typed(&view, partial)
             };
             InspectionAssembly {
                 inspection: BashHandleInspection {
@@ -105,7 +106,7 @@ async fn project_inspection(handle: &Arc<Handle>, since: Option<u64>) -> Inspect
             }
         }
         HandleState::Tombstoned(tomb) => {
-            let output = window_to_typed(&read_window_from_tombstone(tomb, &read_args));
+            let output = window_to_typed(&read_window_from_tombstone(tomb, &read_args), None);
             InspectionAssembly {
                 inspection: BashHandleInspection {
                     handle_id: handle.handle_id.to_string(),

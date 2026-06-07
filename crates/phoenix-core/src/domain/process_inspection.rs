@@ -111,6 +111,7 @@ mod tests {
             end_offset: 0,
             truncated_before: false,
             lines: vec![],
+            partial: None,
         }
     }
 

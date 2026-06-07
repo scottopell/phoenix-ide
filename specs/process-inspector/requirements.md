@@ -107,8 +107,10 @@ re-reading the transcript.
 
 WHEN a client requests the inspection snapshot with `since=K`
 THE SYSTEM SHALL report the output as `lines` (complete lines whose offset is
-in `[max(K, start_offset), end_offset)`), `end_offset`, and `truncated_before`,
-delegating to the existing ring read semantics (`specs/bash/` REQ-BASH-004).
+in `[max(K, start_offset), end_offset)`), `end_offset`, `truncated_before`, and
+the live trailing `partial` (the un-newlined bytes written since the last
+newline, or `None` when there is none / for a terminal handle), delegating to
+the existing ring read semantics (`specs/bash/` REQ-BASH-004).
 
 WHEN a client requests the inspection snapshot with no `since`
 THE SYSTEM SHALL return a recent tail of the output bounded by the default peek
@@ -259,6 +261,11 @@ THE output pane SHALL render in a monospace font, append new lines as polls
 arrive, and autoscroll to the newest line WHILE the user has not scrolled up;
 WHEN the user scrolls up the pane SHALL pause autoscroll until the user returns
 to the bottom.
+
+WHEN the snapshot carries a live `partial`
+THE output pane SHALL render it as a trailing in-progress line, visually
+distinct from the completed lines and replaced (not appended) on each poll, so
+un-newlined output is visible without waiting for a newline or a flush.
 
 THE resource readout SHALL update on each poll (about once per second), and
 WHERE a trio metric is null the readout SHALL render it as unavailable rather
