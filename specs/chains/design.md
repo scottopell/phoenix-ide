@@ -104,18 +104,29 @@ that scope:
 - worktree path, branch, and base branch (from the members' `ConvMode`
   git metadata);
 - the task (id + title) when the chain is doing Managed work;
-- the associated pull request when one exists — its `display_state`
-  (open / draft / merged / closed), checks, and feedback-freshness
-  marker, read from `work_scope_pr_associations` (the same per-work-scope
-  PR data the StateBar uses, `specs/projects/` REQ-PROJ-011/030).
+- the associated pull request when one exists — its identity and
+  `display_state` (open / draft / merged / closed) from
+  `work_scope_pr_associations`, **plus** its checks and feedback-freshness
+  marker.
+
+The panel SHALL source PR data through the **same PR-status / feedback
+pipeline the StateBar uses** (`specs/projects/` REQ-PROJ-011/030/031),
+not from `work_scope_pr_associations` alone. That table persists only PR
+identity and state; **checks** come from the live PR-status path (e.g.
+`gh pr checks`) and **feedback freshness** is derived from
+`work_scope_pr_feedback_baselines` compared against current feedback in
+that same path. Reading associations alone would silently omit checks and
+stale the freshness marker, so the panel reuses the existing pipeline
+(keyed by the chain's `WorkScope`) rather than re-deriving from the
+association row.
 
 When the chain touches more than one work scope (a member diverged onto
 another worktree, or a member is Direct/conversation-scoped), the panel
 shows the set rather than collapsing to one arbitrary scope. When there
 is no managed work scope at all (e.g. a chain of Direct conversations
 with no worktree), the panel says so rather than rendering empty
-worktree/branch/PR fields. The panel reads existing data only; it
-introduces no new persistence.
+worktree/branch/PR fields. The panel adds no new persistence; it reuses
+existing git metadata and the existing PR-status/feedback pipeline.
 
 **Layout (two-column):**
 
@@ -220,7 +231,7 @@ is a property of the toolset, not a runtime flag. Both tools are bound to
 the chain by the host; the model supplies only a query (or a
 target conversation already in scope) and cannot widen beyond the chain
 (REQ-RET-008). This is the same agent that, bound to the `Global` scope,
-would serve a future application-wide Q&A — only the bound scope differs.
+would serve an application-wide Q&A surface — only the bound scope differs.
 
 **No prior Q&A in context (REQ-CHN-006).** Each question is a fresh agent
 run; it sees none of the chain's prior questions or answers. The run may
