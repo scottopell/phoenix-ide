@@ -3233,9 +3233,14 @@ fn parse_fork_proposal_row(row: SqliteRow) -> Result<ForkProposal, sqlx::Error> 
 
 /// Insert a fully-formed `Conversation` row inside a transaction, writing every
 /// persisted column (including `spawned_from_conversation_id`). Idempotent on
-/// the primary key via `INSERT OR IGNORE`, so a crash-retry that finds the
-/// deterministic child id already present is a no-op rather than a UNIQUE
-/// failure (REQ-PROJ-034 recovery model). The caller owns id/slug uniqueness.
+/// the PRIMARY KEY ONLY via `ON CONFLICT(id) DO NOTHING`, so a crash-retry that
+/// finds the deterministic child id already present is a no-op (REQ-PROJ-034
+/// recovery model) — but a UNIQUE `slug` collision with a DIFFERENT conversation
+/// is NOT swallowed; it surfaces as an error rather than silently skipping the
+/// insert (which would FK-fail the following seed-message insert and roll back
+/// the whole resolve). The caller owns id uniqueness; the fork slug is derived
+/// from the deterministic conv id (see `build_child_conversation`) so it cannot
+/// realistically clash with a distinct conversation.
 async fn insert_conversation_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     conv: &Conversation,
@@ -3248,13 +3253,14 @@ async fn insert_conversation_tx(
         .map_err(|e| DbError::Serialization(e.to_string()))?;
 
     sqlx::query(
-        "INSERT OR IGNORE INTO conversations (
+        "INSERT INTO conversations (
             id, slug, title, cwd, parent_conversation_id, user_initiated, state,
             state_updated_at, created_at, updated_at, archived, model, project_id,
             conv_mode, desired_base_branch, seed_parent_id, seed_label,
             continued_in_conv_id, chain_name, steering_queue, llm_language,
             spawned_from_conversation_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)
+        ON CONFLICT(id) DO NOTHING",
     )
     .bind(&conv.id)
     .bind(&conv.slug)
@@ -5253,6 +5259,55 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(db.get_messages("refine-8").await.unwrap().len(), 1);
+    }
+
+    /// N7: `insert_conversation_tx` is idempotent on the PRIMARY KEY ONLY
+    /// (`ON CONFLICT(id) DO NOTHING`). A same-id crash-retry is a no-op (one row),
+    /// but a UNIQUE `slug` collision with a DIFFERENT conversation is NOT silently
+    /// swallowed — it surfaces as an error rather than skipping the insert (which
+    /// would FK-fail the following seed-message insert and roll the whole resolve
+    /// back into a permanently-stuck retry loop).
+    #[tokio::test]
+    async fn insert_conversation_tx_is_pk_only_idempotent_not_slug_swallowing() {
+        let db = Database::open_in_memory().await.unwrap();
+
+        // An existing distinct conversation owns a slug.
+        db.create_conversation("conv-existing", "fork-collide", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        // Same-id retry of an already-present row is a no-op (PK idempotency).
+        db.create_conversation("conv-a", "slug-a", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        let conv_a = db.get_conversation("conv-a").await.unwrap();
+        {
+            let mut tx = db.pool.begin().await.unwrap();
+            insert_conversation_tx(&mut tx, &conv_a).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+        // Still exactly one row, slug unchanged.
+        let again = db.get_conversation("conv-a").await.unwrap();
+        assert_eq!(again.slug.as_deref(), Some("slug-a"));
+
+        // A DIFFERENT-id conversation reusing an existing slug must NOT be silently
+        // skipped: the insert raises rather than swallowing the UNIQUE violation.
+        let colliding = Conversation {
+            id: "conv-b".to_string(),
+            slug: Some("fork-collide".to_string()),
+            ..conv_a
+        };
+        let mut tx = db.pool.begin().await.unwrap();
+        let err = insert_conversation_tx(&mut tx, &colliding)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, DbError::Sqlx(_)),
+            "a distinct-conversation slug collision must surface as an error, got {err:?}"
+        );
+        drop(tx);
+        // The colliding insert did not create a row.
+        assert!(db.get_conversation("conv-b").await.is_err());
     }
 
     #[tokio::test]
