@@ -139,10 +139,7 @@ pub fn create_router(state: AppState) -> Router {
         .route("/api/conversations/:id/reject-task", post(reject_task))
         .route("/api/conversations/:id/task-feedback", post(task_feedback))
         // Fork proposal resolution (REQ-PROJ-034 / 037)
-        .route(
-            "/api/conversations/:id/proposals",
-            get(list_fork_proposals),
-        )
+        .route("/api/conversations/:id/proposals", get(list_fork_proposals))
         .route(
             "/api/conversations/:id/proposals/:proposal_id/approve",
             post(approve_fork_proposal),
@@ -3235,6 +3232,15 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // identical.
     run_resource_cleanup_cascade(state, &conv).await?;
 
+    // ForkProposalsRemovedOnOriginDelete (REQ-PROJ-035): clean deterministic
+    // spawn/promote git orphans for STILL-PENDING proposals only — a pending
+    // proposal's deterministic path can only be a crashed-approve orphan; for a
+    // spawned/promoted proposal that same path is the LIVE decoupled
+    // fork/refinement, which survives origin deletion and must NOT be touched.
+    // The proposal ROWS are removed by the fork_proposals.origin_conv_id
+    // ON DELETE CASCADE on the row deletion below — not duplicated here.
+    cleanup_pending_fork_orphans_on_delete(state, &conv).await;
+
     // Step 5: row deletion. SQLite ON DELETE CASCADE removes dependent
     // rows. This is the only step whose failure is fatal to the request
     // — partial cleanup above is non-fatal but a missing row deletion
@@ -3473,6 +3479,81 @@ async fn cascade_projects_on_delete(
     }
 
     report
+}
+
+/// `ForkProposalsRemovedOnOriginDelete` (REQ-PROJ-035): on hard-delete of a fork
+/// origin, best-effort removal of any deterministic spawn/promote git orphan a
+/// crashed approve/promote left behind — guarded to STILL-PENDING proposals,
+/// since a spawned/promoted proposal's deterministic path is the LIVE decoupled
+/// fork/refinement (which must survive origin deletion). The proposal rows
+/// themselves are removed by the `fork_proposals.origin_conv_id` ON DELETE
+/// CASCADE when the conversation row is deleted, so this does NOT touch the DB.
+///
+/// Runs under the process-global `TASK_APPROVAL_MUTEX` so it serialises with
+/// approve/promote: either the resolve commits first (the proposal is no longer
+/// pending, so it is skipped and its live child untouched) or this cleanup runs
+/// first (clearing the orphan; the in-flight approve then finds the row gone /
+/// non-pending and aborts).
+async fn cleanup_pending_fork_orphans_on_delete(state: &AppState, conv: &crate::db::Conversation) {
+    let proposals = match state
+        .runtime
+        .db()
+        .list_fork_proposals_for_origin(&conv.id)
+        .await
+    {
+        Ok(proposals) => proposals,
+        Err(e) => {
+            tracing::warn!(
+                conv_id = %conv.id,
+                error = %e,
+                "fork orphan cleanup on delete: failed to list proposals; orphans may remain"
+            );
+            return;
+        }
+    };
+    let pending_ids: Vec<String> = proposals
+        .into_iter()
+        .filter(|p| p.status == crate::db::ForkProposalStatus::Pending)
+        .map(|p| p.id)
+        .collect();
+    if pending_ids.is_empty() {
+        return;
+    }
+
+    // Resolve the origin's repo root from its project for the git cleanup.
+    let repo_root: Option<PathBuf> = if let Some(project_id) = conv.project_id.as_deref() {
+        match state.runtime.db().get_project(project_id).await {
+            Ok(project) => Some(
+                crate::db::detect_git_repo_root(std::path::Path::new(&project.canonical_path))
+                    .map_or_else(|| PathBuf::from(&project.canonical_path), PathBuf::from),
+            ),
+            Err(e) => {
+                tracing::debug!(
+                    conv_id = %conv.id,
+                    project_id = %project_id,
+                    error = %e,
+                    "fork orphan cleanup on delete: project lookup failed; fs-only cleanup"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let _ = tokio::task::spawn_blocking(move || {
+        use crate::runtime::executor::TASK_APPROVAL_MUTEX;
+        let _guard = TASK_APPROVAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for pid in &pending_ids {
+            crate::runtime::fork_resolve::clean_deterministic_fork_orphans(
+                repo_root.as_deref(),
+                pid,
+            );
+        }
+    })
+    .await;
 }
 
 async fn rename_conversation(

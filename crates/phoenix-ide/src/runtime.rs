@@ -1931,6 +1931,15 @@ impl RuntimeManager {
         .with_credential_helper(self.credential_helper.clone())
         .with_agent_catalog(agent_catalog);
 
+        // Fork proposals are bound to top-level (parent) origins; sub-agents
+        // never hold any. Give parent runtimes the DB handle so a terminal
+        // transition retires their still-pending proposals (REQ-PROJ-035).
+        let runtime = if is_sub_agent {
+            runtime
+        } else {
+            runtime.with_fork_proposal_db(self.db.clone())
+        };
+
         // If auto-continuing, inject a system message so the LLM knows a restart
         // happened. This also serves as the restart loop counter — recovery.rs
         // counts consecutive restart system messages at the tail of the history.

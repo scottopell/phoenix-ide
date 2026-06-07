@@ -479,6 +479,46 @@ pub fn detect_git_repo_root(path: &Path) -> Option<String> {
     }
 }
 
+/// Resolve a repository's default branch — the project's `main_ref` and the
+/// canonical fork base (REQ-PROJ-034a, Allium `GitDirectoryDetected`).
+///
+/// The remote's default branch (cached `refs/remotes/origin/HEAD`, no network)
+/// when detectable, else the repository's checked-out branch. Returns `None`
+/// when neither can be determined (e.g. `path` is not a git repository, or HEAD
+/// is detached with no remote default) so the caller can decide its own
+/// fallback.
+#[must_use]
+pub fn resolve_default_branch(path: &Path) -> Option<String> {
+    let git = |args: &[&str]| -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .output()
+            .ok()?;
+        if output.status.success() {
+            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            None
+        }
+    };
+
+    // Remote default branch via the cached symbolic ref (no network).
+    if let Some(remote) = git(&["symbolic-ref", "refs/remotes/origin/HEAD"]) {
+        if let Some(branch) = remote.strip_prefix("refs/remotes/origin/") {
+            if !branch.is_empty() {
+                return Some(branch.to_string());
+            }
+        }
+    }
+
+    // Else the checked-out branch. A detached HEAD reports the literal "HEAD",
+    // which is not a real branch name.
+    match git(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+        Some(current) if current != "HEAD" && !current.is_empty() => Some(current),
+        _ => None,
+    }
+}
+
 /// Conversation record
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Conversation {

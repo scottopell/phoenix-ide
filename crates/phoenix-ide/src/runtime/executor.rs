@@ -241,6 +241,14 @@ where
     /// runtime resolution never diverge mid-conversation (REQ-AG-004/008).
     /// Empty for sub-agents (which cannot spawn).
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
+    /// Database handle used solely to retire this conversation's still-pending
+    /// fork proposals when it reaches a terminal state
+    /// (`ForkProposalsRetiredOnOriginTerminal`, REQ-PROJ-035). Set by the
+    /// runtime manager for parent conversations that can propose forks; `None`
+    /// for sub-agents and in tests that don't exercise the terminal-retirement
+    /// path. The `Storage` trait is intentionally not widened for this — the
+    /// retirement is a control-plane concern on a different table.
+    fork_proposal_db: Option<crate::db::Database>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -304,7 +312,16 @@ where
             outcome_rx,
             credential_helper: None,
             agent_catalog: Arc::from(Vec::new()),
+            fork_proposal_db: None,
         }
+    }
+
+    /// Provide the database handle used to retire still-pending fork proposals
+    /// when this conversation reaches a terminal state (REQ-PROJ-035). Set by
+    /// the runtime manager for fork-proposing parent conversations.
+    pub fn with_fork_proposal_db(mut self, db: crate::db::Database) -> Self {
+        self.fork_proposal_db = Some(db);
+        self
     }
 
     /// Set the credential helper for recovery settlement (REQ-BED-030).
@@ -458,7 +475,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event();
+                        self.emit_terminal_lifecycle_event().await;
                         return;
                     }
                 }
@@ -473,7 +490,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event();
+                        self.emit_terminal_lifecycle_event().await;
                         return;
                     }
                 }
@@ -492,7 +509,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event();
+                        self.emit_terminal_lifecycle_event().await;
                         return;
                     }
                 }
@@ -510,7 +527,7 @@ where
                             ?outcome,
                             "Conversation reached terminal state, exiting executor loop"
                         );
-                        self.emit_terminal_lifecycle_event();
+                        self.emit_terminal_lifecycle_event().await;
                         return;
                     }
                 }
@@ -545,15 +562,35 @@ where
         }
     }
 
-    /// Broadcast `ConversationBecameTerminal` to all SSE subscribers and clean
-    /// up any lingering worktree.
+    /// Broadcast `ConversationBecameTerminal` to all SSE subscribers, clean up
+    /// any lingering worktree, and retire this conversation's still-pending fork
+    /// proposals (REQ-PROJ-035).
     ///
     /// Send errors (no active receivers) are intentionally ignored.
-    fn emit_terminal_lifecycle_event(&self) {
+    async fn emit_terminal_lifecycle_event(&self) {
         self.cleanup_worktree_if_present();
+        self.retire_fork_proposals_on_terminal().await;
         let _ = self
             .broadcast_tx
             .send_seq(|seq| SseEvent::ConversationBecameTerminal { sequence_id: seq });
+    }
+
+    /// `ForkProposalsRetiredOnOriginTerminal` (REQ-PROJ-035): when this origin
+    /// conversation becomes terminal, dismiss its still-pending fork proposals
+    /// and clean any deterministic spawn/promote orphan a crashed approve/promote
+    /// left behind. Delegates to
+    /// [`crate::runtime::fork_resolve::retire_fork_proposals_for_terminal_origin`],
+    /// which serialises with approve/promote on `TASK_APPROVAL_MUTEX`. No-op
+    /// when this runtime has no fork-proposal DB handle (sub-agents).
+    async fn retire_fork_proposals_on_terminal(&self) {
+        let Some(db) = self.fork_proposal_db.as_ref() else {
+            return;
+        };
+        crate::runtime::fork_resolve::retire_fork_proposals_for_terminal_origin(
+            db,
+            &self.context.conversation_id,
+        )
+        .await;
     }
 
     /// Remove the conversation's worktree if it still exists on disk.
@@ -4536,7 +4573,7 @@ mod context_exhausted_preserves_worktree_tests {
 
         // Fire the exact lifecycle hook the executor's `run()` loop calls
         // when it observes a terminal state.
-        rt.emit_terminal_lifecycle_event();
+        rt.emit_terminal_lifecycle_event().await;
 
         assert!(
             Path::new(&wt_path).exists(),
@@ -4569,7 +4606,7 @@ mod context_exhausted_preserves_worktree_tests {
             ConvState::Terminal,
         );
 
-        rt.emit_terminal_lifecycle_event();
+        rt.emit_terminal_lifecycle_event().await;
 
         assert!(
             !Path::new(&wt_path).exists(),

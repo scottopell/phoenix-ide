@@ -908,15 +908,24 @@ impl Database {
             return Ok(project);
         }
 
-        // Create new project
+        // Create new project. main_ref is the resolved default branch
+        // (REQ-PROJ-034a / Allium GitDirectoryDetected: the remote default when
+        // detectable, else the checked-out branch), not a hardcoded literal — a
+        // repo whose default is `master`/`develop` must not be sent to `main`.
+        // `main` is the fallback only when neither can be resolved (e.g. a
+        // detached HEAD with no remote), and startup reconciliation corrects it
+        // later if the repo becomes resolvable.
         let id = uuid::Uuid::new_v4().to_string();
         let now = Utc::now();
+        let main_ref = schema::resolve_default_branch(std::path::Path::new(canonical_path))
+            .unwrap_or_else(|| "main".to_string());
 
         sqlx::query(
-            "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES (?1, ?2, 'main', ?3)",
+            "INSERT INTO projects (id, canonical_path, main_ref, created_at) VALUES (?1, ?2, ?3, ?4)",
         )
         .bind(&id)
         .bind(canonical_path)
+        .bind(&main_ref)
         .bind(now.to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -924,7 +933,7 @@ impl Database {
         Ok(Project {
             id,
             canonical_path: canonical_path.to_string(),
-            main_ref: "main".to_string(),
+            main_ref,
             created_at: now,
             conversation_count: 0,
         })

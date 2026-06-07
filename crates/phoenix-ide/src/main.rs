@@ -325,6 +325,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Reconcile worktrees: revert Work conversations whose worktree is missing
     reconcile_worktrees(&db).await;
 
+    // Reconcile project main_ref to the resolved default branch (REQ-PROJ-034a):
+    // rows whose main_ref was defaulted to a literal `main` are corrected before
+    // forks (cut from main_ref) rely on them.
+    reconcile_project_main_refs(&db).await;
+
     // REQ-CHN-005 startup sweep: any chain_qa row left in_flight from a
     // previous process has no live stream behind it; flip it to abandoned
     // so the UI shows a re-ask affordance instead of an indefinite spinner.
@@ -681,6 +686,75 @@ async fn reconcile_worktrees(db: &Database) {
     }
 }
 
+/// REQ-PROJ-034a: reconcile every project's `main_ref` to the *resolved* default
+/// branch (the fork base). Projects created before resolution-at-creation, or by
+/// a path that defaulted `main_ref` to the literal `main`, may point at a branch
+/// that does not exist in repos whose default is `master`/`develop`/etc. Forks
+/// are cut from `main_ref`, so it must be corrected before forks rely on it.
+///
+/// Re-resolves the default branch with the SAME logic project creation uses
+/// (`schema::resolve_default_branch`: remote default via cached
+/// `refs/remotes/origin/HEAD`, else the checked-out branch). Updates the row
+/// only when the resolved value differs from the stored one.
+///
+/// Best-effort and idempotent: a project whose repo is missing or unresolvable
+/// on disk is logged at WARN and skipped — never fatal to startup — and a
+/// re-run over already-correct rows writes nothing. This only updates a DB
+/// string; it never moves a git ref, so the "owned environments" rule is not
+/// engaged.
+async fn reconcile_project_main_refs(db: &Database) {
+    let projects = match db.list_projects().await {
+        Ok(projects) => projects,
+        Err(e) => {
+            tracing::warn!(error = %e, "Failed to list projects for main_ref reconciliation");
+            return;
+        }
+    };
+
+    let mut updated = 0usize;
+    for project in &projects {
+        let repo_path = std::path::Path::new(&project.canonical_path);
+        let Some(resolved) = db::resolve_default_branch(repo_path) else {
+            tracing::warn!(
+                project_id = %project.id,
+                canonical_path = %project.canonical_path,
+                stored_main_ref = %project.main_ref,
+                "skipping main_ref reconciliation: repo missing or default branch unresolvable"
+            );
+            continue;
+        };
+
+        if resolved == project.main_ref {
+            continue;
+        }
+
+        match db.update_project_main_ref(&project.id, &resolved).await {
+            Ok(()) => {
+                tracing::info!(
+                    project_id = %project.id,
+                    old_main_ref = %project.main_ref,
+                    new_main_ref = %resolved,
+                    "Reconciled project main_ref to resolved default branch"
+                );
+                updated += 1;
+            }
+            Err(e) => tracing::warn!(
+                project_id = %project.id,
+                error = %e,
+                "Failed to update reconciled main_ref"
+            ),
+        }
+    }
+
+    if updated > 0 {
+        tracing::info!(
+            total_projects = projects.len(),
+            updated,
+            "Project main_ref reconciliation complete"
+        );
+    }
+}
+
 /// Reconcile tests — REQ-BED-031 gate behaviour (task 24696 Phase 3).
 ///
 /// Exercises the three shapes of a Work conversation with a missing on-disk
@@ -961,5 +1035,126 @@ mod reconcile_worktrees_tests {
         );
         assert_eq!(after.conv_mode.worktree_path(), Some(wt_path.as_str()));
         assert_eq!(after.cwd, wt_path);
+    }
+}
+
+/// REQ-PROJ-034a: `reconcile_project_main_refs` backfills `main_ref` to the
+/// resolved default branch.
+#[cfg(test)]
+mod reconcile_main_ref_tests {
+    use super::*;
+
+    /// Initialise a git repo on `initial_branch` with one commit.
+    fn init_repo_on(initial_branch: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        for args in [
+            &["init", "-q", "-b", initial_branch][..],
+            &[
+                "-c",
+                "user.email=t@example.com",
+                "-c",
+                "user.name=t",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-m",
+                "init",
+                "-q",
+            ][..],
+        ] {
+            let status = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&root)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        }
+        (tmp, root)
+    }
+
+    /// Directly force a project row's `main_ref` to a literal, simulating a row
+    /// created before resolution-at-creation existed.
+    async fn force_main_ref(db: &Database, project_id: &str, value: &str) {
+        db.update_project_main_ref(project_id, value).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reconciles_literal_main_to_real_default_master() {
+        let (_tmp, repo) = init_repo_on("master");
+        let db = Database::open_in_memory().await.unwrap();
+        let project = db
+            .find_or_create_project(repo.to_str().unwrap())
+            .await
+            .unwrap();
+        // Simulate a legacy row whose main_ref was defaulted to the literal.
+        force_main_ref(&db, &project.id, "main").await;
+
+        reconcile_project_main_refs(&db).await;
+
+        let after = db.get_project(&project.id).await.unwrap();
+        assert_eq!(
+            after.main_ref, "master",
+            "main_ref must be reconciled to the repo's real default branch"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_is_idempotent() {
+        let (_tmp, repo) = init_repo_on("master");
+        let db = Database::open_in_memory().await.unwrap();
+        let project = db
+            .find_or_create_project(repo.to_str().unwrap())
+            .await
+            .unwrap();
+        force_main_ref(&db, &project.id, "main").await;
+
+        reconcile_project_main_refs(&db).await;
+        let first = db.get_project(&project.id).await.unwrap();
+        // A second run over an already-correct row writes nothing and changes
+        // nothing.
+        reconcile_project_main_refs(&db).await;
+        let second = db.get_project(&project.id).await.unwrap();
+
+        assert_eq!(first.main_ref, "master");
+        assert_eq!(second.main_ref, "master");
+    }
+
+    #[tokio::test]
+    async fn missing_repo_is_skipped_without_error() {
+        let db = Database::open_in_memory().await.unwrap();
+        // Create a project against a real repo so creation succeeds, then point
+        // its canonical_path at a now-gone directory.
+        let (tmp, repo) = init_repo_on("master");
+        let project = db
+            .find_or_create_project(repo.to_str().unwrap())
+            .await
+            .unwrap();
+        force_main_ref(&db, &project.id, "main").await;
+        drop(tmp); // repo directory removed from disk
+
+        // Must not panic / error; the unresolvable row is left untouched.
+        reconcile_project_main_refs(&db).await;
+
+        let after = db.get_project(&project.id).await.unwrap();
+        assert_eq!(
+            after.main_ref, "main",
+            "an unresolvable repo is skipped, leaving the stored value as-is"
+        );
+    }
+
+    #[tokio::test]
+    async fn find_or_create_resolves_default_at_creation() {
+        let (_tmp, repo) = init_repo_on("develop");
+        let db = Database::open_in_memory().await.unwrap();
+        let project = db
+            .find_or_create_project(repo.to_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            project.main_ref, "develop",
+            "a newly-created project must resolve its real default at creation"
+        );
     }
 }

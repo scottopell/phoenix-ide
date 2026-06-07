@@ -16,7 +16,7 @@ use std::path::Path;
 use chrono::Utc;
 
 use crate::db::{
-    Conversation, ConvMode, ConvState, DbError, ForkProposal, ForkProposalStatus, Message,
+    ConvMode, ConvState, Conversation, DbError, ForkProposal, ForkProposalStatus, Message,
     MessageContent, MessageType, NonEmptyString, UserContent,
 };
 use crate::git_ops::{
@@ -42,7 +42,7 @@ const FORK_ID_NAMESPACE: uuid::Uuid = uuid::Uuid::from_bytes([
 /// different deterministic path than a later `Spawn`, so a crash-recovery retry
 /// of one never adopts the other's worktree.
 #[derive(Debug, Clone, Copy)]
-enum ResolutionKind {
+pub(crate) enum ResolutionKind {
     Spawn,
     Promote,
 }
@@ -61,9 +61,181 @@ impl ResolutionKind {
 /// Anchors crash recovery: the worktree path `.phoenix/worktrees/{id}` is
 /// recomputable on retry without writing the spawned/promoted-only resolution
 /// field early.
-fn derive_conv_id(proposal_id: &str, kind: ResolutionKind) -> String {
+pub(crate) fn derive_conv_id(proposal_id: &str, kind: ResolutionKind) -> String {
     let name = format!("{proposal_id}:{}", kind.as_str());
     uuid::Uuid::new_v5(&FORK_ID_NAMESPACE, name.as_bytes()).to_string()
+}
+
+/// `DeterministicForkOrphansCleaned(proposal)` (Allium): best-effort removal of
+/// any orphaned worktree + branch a crashed approve/promote may have left at
+/// EITHER deterministic path — `.phoenix/worktrees/{derive_conv_id(id, Spawn)}`
+/// and `{derive_conv_id(id, Promote)}` — for a proposal whose resolution was
+/// never recorded (so it is still `pending`).
+///
+/// Callers MUST hold [`TASK_APPROVAL_MUTEX`] so this serialises with
+/// approve/promote: a terminal transition or hard-delete arriving mid-approve
+/// can't delete a worktree the in-flight approve is about to adopt. Guard to
+/// `pending` proposals only at the call site — for a `spawned`/`promoted`
+/// proposal these paths are the LIVE decoupled fork/refinement, which must not
+/// be touched.
+///
+/// Each git step is non-fatal and logged at WARN: `worktree remove --force`
+/// with an `rm -rf` + `worktree prune` filesystem fallback, then `branch -D`.
+/// A `None` `repo_root` (no project / unresolvable repo) falls back to a
+/// filesystem-only directory removal.
+pub(crate) fn clean_deterministic_fork_orphans(repo_root: Option<&Path>, proposal_id: &str) {
+    for kind in [ResolutionKind::Spawn, ResolutionKind::Promote] {
+        let conv_id = derive_conv_id(proposal_id, kind);
+        clean_one_orphan(repo_root, &conv_id);
+    }
+}
+
+/// `ForkProposalsRetiredOnOriginTerminal` (REQ-PROJ-035): dismiss every
+/// still-`pending` fork proposal bound to `origin_id` and clean any deterministic
+/// spawn/promote git orphan a crashed approve/promote left behind. Resolved
+/// (`spawned`/`dismissed`/`promoted`) proposals are untouched — they persist as
+/// audit and their deterministic path is the LIVE decoupled fork/refinement.
+///
+/// The git orphan cleanup runs under the process-global `TASK_APPROVAL_MUTEX`
+/// so it serialises with approve/promote: a terminal transition arriving
+/// mid-approve either runs after the resolve commits (the proposal is no longer
+/// pending, so it is skipped and its live child untouched) or before it (the
+/// proposal is dismissed + its orphan cleaned, and the in-flight approve then
+/// finds it no longer pending and aborts). Best-effort: a failure to list /
+/// clean / dismiss is logged at WARN and never blocks the terminal transition.
+pub(crate) async fn retire_fork_proposals_for_terminal_origin(
+    db: &crate::db::Database,
+    origin_id: &str,
+) {
+    let pending_ids = match db.list_fork_proposals_for_origin(origin_id).await {
+        Ok(proposals) => proposals
+            .into_iter()
+            .filter(|p| p.status == ForkProposalStatus::Pending)
+            .map(|p| p.id)
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(
+                conv_id = %origin_id,
+                error = %e,
+                "fork retirement: failed to list proposals; pending proposals may linger"
+            );
+            return;
+        }
+    };
+    if pending_ids.is_empty() {
+        return;
+    }
+
+    let repo_root = fork_origin_repo_root(db, origin_id).await;
+    let repo_root_for_blocking = repo_root.clone();
+    let ids_for_blocking = pending_ids.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let _guard = TASK_APPROVAL_MUTEX
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for pid in &ids_for_blocking {
+            clean_deterministic_fork_orphans(repo_root_for_blocking.as_deref(), pid);
+        }
+    })
+    .await;
+
+    if let Err(e) = db.retire_pending_fork_proposals_for_origin(origin_id).await {
+        tracing::warn!(
+            conv_id = %origin_id,
+            error = %e,
+            "fork retirement: failed to dismiss pending proposals"
+        );
+    }
+}
+
+/// Resolve the repo root for a fork origin's project, for orphan cleanup.
+/// `None` when the conversation is not project-scoped or the project can't be
+/// loaded; otherwise the git toplevel (falling back to the project's canonical
+/// path when the repo can't be detected on disk).
+async fn fork_origin_repo_root(
+    db: &crate::db::Database,
+    origin_id: &str,
+) -> Option<std::path::PathBuf> {
+    let conv = db.get_conversation(origin_id).await.ok()?;
+    let project_id = conv.project_id.as_deref()?;
+    let project = db.get_project(project_id).await.ok()?;
+    Some(
+        phoenix_core::domain::db_schema::detect_git_repo_root(Path::new(&project.canonical_path))
+            .map_or_else(
+                || std::path::PathBuf::from(&project.canonical_path),
+                std::path::PathBuf::from,
+            ),
+    )
+}
+
+/// Remove one deterministic orphan worktree (`.phoenix/worktrees/{conv_id}`) and
+/// its branch, if present. Best-effort — every step is non-fatal.
+fn clean_one_orphan(repo_root: Option<&Path>, conv_id: &str) {
+    let Some(repo_root) = repo_root else {
+        return;
+    };
+    let worktree_path = repo_root.join(".phoenix/worktrees").join(conv_id);
+    if !worktree_path.exists() {
+        return;
+    }
+    let worktree_str = worktree_path.to_string_lossy().to_string();
+
+    // Capture the branch BEFORE removal — once the worktree is gone `git
+    // worktree list` no longer associates the branch with this path.
+    let branch = orphan_branch_name(repo_root, conv_id);
+
+    if let Err(e) = run_git(repo_root, &["worktree", "remove", &worktree_str, "--force"]) {
+        tracing::warn!(
+            conv_id = %conv_id,
+            worktree = %worktree_str,
+            error = %e,
+            "fork orphan cleanup: git worktree remove failed; trying filesystem fallback"
+        );
+        if worktree_path.exists() {
+            if let Err(rm_err) = std::fs::remove_dir_all(&worktree_path) {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    worktree = %worktree_str,
+                    error = %rm_err,
+                    "fork orphan cleanup: filesystem fallback failed; orphan may remain"
+                );
+            }
+        }
+        let _ = run_git(repo_root, &["worktree", "prune"]);
+    }
+
+    // The deterministic orphan's branch is a fork task branch or an Explore
+    // temp branch created by the crashed attempt — never the user's PR branch,
+    // so deleting it is safe.
+    if let Some(branch) = branch {
+        if let Err(e) = run_git(repo_root, &["branch", "-D", &branch]) {
+            tracing::warn!(
+                conv_id = %conv_id,
+                branch = %branch,
+                error = %e,
+                "fork orphan cleanup: branch delete failed (non-fatal)"
+            );
+        }
+    }
+}
+
+/// Resolve the branch name an orphaned deterministic worktree had, by matching
+/// the worktree path in `git worktree list` BEFORE removal. Returns `None` when
+/// the worktree is already gone or had no branch (detached).
+fn orphan_branch_name(repo_root: &Path, conv_id: &str) -> Option<String> {
+    let worktree_path = repo_root.join(".phoenix/worktrees").join(conv_id);
+    let listing = run_git(repo_root, &["worktree", "list", "--porcelain"]).ok()?;
+    let mut current_path: Option<&str> = None;
+    for line in listing.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current_path = Some(p);
+        } else if let Some(b) = line.strip_prefix("branch ") {
+            if current_path == Some(worktree_path.to_string_lossy().as_ref()) {
+                return b.strip_prefix("refs/heads/").map(String::from);
+            }
+        }
+    }
+    None
 }
 
 /// Typed failure for the resolve paths. Maps to HTTP status at the handler.
@@ -144,7 +316,11 @@ fn classify_branch_collision(
     branch_name: &str,
 ) -> Result<bool, ForkResolveError> {
     let branch_ref = format!("refs/heads/{branch_name}");
-    let exists = run_git(repo_root, &["rev-parse", "--verify", "--quiet", &branch_ref]).is_ok();
+    let exists = run_git(
+        repo_root,
+        &["rev-parse", "--verify", "--quiet", &branch_ref],
+    )
+    .is_ok();
     if !exists {
         return Ok(false);
     }
@@ -420,13 +596,9 @@ fn prepare_spawn_blocking(
             let tasks_dir = Path::new(&proposal.task_file)
                 .parent()
                 .map_or_else(|| repo_root.join("tasks"), |p| worktree_path.join(p));
-            let final_filename = promote_task_status_to_in_progress(
-                &tasks_dir,
-                id,
-                *status,
-                filename,
-            )
-            .map_err(ForkResolveError::Internal)?;
+            let final_filename =
+                promote_task_status_to_in_progress(&tasks_dir, id, *status, filename)
+                    .map_err(ForkResolveError::Internal)?;
             // Rebuild the repo-relative path with the (possibly new) filename.
             let parent = Path::new(&proposal.task_file).parent();
             match parent {
@@ -446,8 +618,7 @@ fn prepare_spawn_blocking(
     if committed_path != proposal.task_file {
         let _ = run_git(&worktree_path, &["add", "--", &proposal.task_file]);
     }
-    run_git(&worktree_path, &["add", "--", &committed_path])
-        .map_err(ForkResolveError::Internal)?;
+    run_git(&worktree_path, &["add", "--", &committed_path]).map_err(ForkResolveError::Internal)?;
     let commit_msg = format!("task {task_id}: {}", proposal.title);
     if run_git(&worktree_path, &["diff", "--cached", "--quiet"]).is_err() {
         run_git(&worktree_path, &["commit", "-m", &commit_msg])
@@ -506,10 +677,17 @@ fn prepare_promote_blocking(
 
     let start_point = resolve_fork_start_point(repo_root, base)?;
 
-    let worktree_path = repo_root.join(".phoenix/worktrees").join(refinement_conv_id);
+    let worktree_path = repo_root
+        .join(".phoenix/worktrees")
+        .join(refinement_conv_id);
     let adopt = classify_branch_collision(repo_root, &worktree_path, &temp_branch)?;
     if !adopt {
-        create_worktree(repo_root, refinement_conv_id, &temp_branch, Some(&start_point))?;
+        create_worktree(
+            repo_root,
+            refinement_conv_id,
+            &temp_branch,
+            Some(&start_point),
+        )?;
     }
     let worktree_path_str = worktree_path.to_string_lossy().to_string();
 
@@ -775,7 +953,13 @@ mod tests {
         assert!(wt.is_dir());
         let committed = git(
             &wt,
-            &["log", "-1", "--name-only", "--pretty=format:", "task-12345-fix-thing"],
+            &[
+                "log",
+                "-1",
+                "--name-only",
+                "--pretty=format:",
+                "task-12345-fix-thing",
+            ],
         );
         assert!(
             committed.contains("12345-p1-in-progress--fix-thing.md"),
@@ -785,7 +969,10 @@ mod tests {
         // Proposal resolved as spawned with the fork id.
         let resolved = db.get_fork_proposal(&pid).await.unwrap().unwrap();
         assert_eq!(resolved.status, ForkProposalStatus::Spawned);
-        assert_eq!(resolved.fork_conversation_id.as_deref(), Some(fork_id.as_str()));
+        assert_eq!(
+            resolved.fork_conversation_id.as_deref(),
+            Some(fork_id.as_str())
+        );
 
         // Origin is UNCHANGED: no continuation, no handoff, no new transcript msg.
         let origin_conv = db.get_conversation(&origin).await.unwrap();
@@ -814,9 +1001,15 @@ mod tests {
         }
         // The plain brief is committed verbatim at its own path.
         let wt = repo.join(".phoenix/worktrees").join(&fork_id);
-        assert_eq!(std::fs::read_to_string(wt.join("docs/plan.md")).unwrap(), body);
+        assert_eq!(
+            std::fs::read_to_string(wt.join("docs/plan.md")).unwrap(),
+            body
+        );
         let log = git(&wt, &["log", "-1", "--name-only", "--pretty=format:"]);
-        assert!(log.contains("docs/plan.md"), "expected committed plan: {log}");
+        assert!(
+            log.contains("docs/plan.md"),
+            "expected committed plan: {log}"
+        );
     }
 
     #[tokio::test]
@@ -844,7 +1037,10 @@ mod tests {
 
         let resolved = db.get_fork_proposal(&pid).await.unwrap().unwrap();
         assert_eq!(resolved.status, ForkProposalStatus::Spawned);
-        assert_eq!(resolved.fork_conversation_id.as_deref(), Some(first.as_str()));
+        assert_eq!(
+            resolved.fork_conversation_id.as_deref(),
+            Some(first.as_str())
+        );
     }
 
     #[tokio::test]
@@ -1019,5 +1215,134 @@ mod tests {
         let rt = make_runtime(db.clone()).await;
         let err = rt.approve_fork_proposal("no-such-id").await.unwrap_err();
         assert!(matches!(err, ForkResolveError::NotFound(_)), "got {err:?}");
+    }
+
+    // ---- REQ-PROJ-035: retire-on-terminal + hard-delete orphan cleanup ----
+
+    /// Simulate a crashed approve/promote: create the deterministic worktree +
+    /// branch at `.phoenix/worktrees/{derive_conv_id(pid, kind)}` off main with
+    /// no resolution recorded. Returns the orphan's conversation id.
+    fn make_deterministic_orphan(
+        repo: &Path,
+        pid: &str,
+        kind: ResolutionKind,
+        branch: &str,
+    ) -> String {
+        let conv_id = derive_conv_id(pid, kind);
+        let wt = repo.join(".phoenix/worktrees").join(&conv_id);
+        std::fs::create_dir_all(wt.parent().unwrap()).unwrap();
+        git(
+            repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                wt.to_str().unwrap(),
+                "main",
+            ],
+        );
+        conv_id
+    }
+
+    #[tokio::test]
+    async fn retire_on_terminal_dismisses_pending_and_cleans_orphan() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
+        // A crashed approve left a deterministic spawn orphan for this pending proposal.
+        let orphan_id =
+            make_deterministic_orphan(&repo, &pid, ResolutionKind::Spawn, "task-12345-x");
+        let orphan_wt = repo.join(".phoenix/worktrees").join(&orphan_id);
+        assert!(orphan_wt.is_dir());
+
+        retire_fork_proposals_for_terminal_origin(&db, &origin).await;
+
+        // Pending proposal is now dismissed.
+        let resolved = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(resolved.status, ForkProposalStatus::Dismissed);
+        // The deterministic orphan worktree was cleaned up.
+        assert!(
+            !orphan_wt.exists(),
+            "pending proposal's crashed-approve orphan must be removed on terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn retire_on_terminal_leaves_spawned_untouched() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let body = "# Fix the thing\n";
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--fix-thing.md", body).await;
+        let rt = make_runtime(db.clone()).await;
+        // Actually spawn a live fork — its worktree is the LIVE decoupled child.
+        let fork_id = rt.approve_fork_proposal(&pid).await.unwrap();
+        let fork_wt = repo.join(".phoenix/worktrees").join(&fork_id);
+        assert!(fork_wt.is_dir());
+
+        retire_fork_proposals_for_terminal_origin(&db, &origin).await;
+
+        // The spawned proposal is still spawned — NOT dismissed.
+        let after = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(after.status, ForkProposalStatus::Spawned);
+        assert_eq!(
+            after.fork_conversation_id.as_deref(),
+            Some(fork_id.as_str())
+        );
+        // The live fork conversation + its worktree survive.
+        assert!(db.get_conversation(&fork_id).await.is_ok());
+        assert!(
+            fork_wt.is_dir(),
+            "a spawned proposal's live fork worktree must NOT be touched on terminal"
+        );
+    }
+
+    #[tokio::test]
+    async fn hard_delete_cleanup_removes_pending_orphan_only() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+
+        // Proposal A: still pending, with a crashed-approve deterministic orphan.
+        let pid_a = insert_pending(&db, &origin, "tasks/11111-p1-ready--a.md", "# a\n").await;
+        let orphan_id =
+            make_deterministic_orphan(&repo, &pid_a, ResolutionKind::Spawn, "task-11111-a");
+        let orphan_wt = repo.join(".phoenix/worktrees").join(&orphan_id);
+
+        // Proposal B: spawned — its deterministic path is the LIVE fork worktree.
+        let pid_b = insert_pending(&db, &origin, "tasks/22222-p1-ready--b.md", "# b\n").await;
+        let rt = make_runtime(db.clone()).await;
+        let fork_id = rt.approve_fork_proposal(&pid_b).await.unwrap();
+        let fork_wt = repo.join(".phoenix/worktrees").join(&fork_id);
+
+        assert!(orphan_wt.is_dir());
+        assert!(fork_wt.is_dir());
+
+        // Mirror cleanup_pending_fork_orphans_on_delete: pending-only orphan cleanup.
+        let repo_root = repo.clone();
+        let pending_ids: Vec<String> = db
+            .list_fork_proposals_for_origin(&origin)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|p| p.status == ForkProposalStatus::Pending)
+            .map(|p| p.id)
+            .collect();
+        assert_eq!(pending_ids, vec![pid_a.clone()], "only A is pending");
+        for pid in &pending_ids {
+            clean_deterministic_fork_orphans(Some(&repo_root), pid);
+        }
+
+        // Pending proposal's orphan removed; spawned proposal's live fork intact.
+        assert!(
+            !orphan_wt.exists(),
+            "pending proposal's crashed orphan must be cleaned on hard delete"
+        );
+        assert!(
+            fork_wt.is_dir(),
+            "spawned proposal's LIVE fork worktree must NOT be touched on hard delete"
+        );
     }
 }
