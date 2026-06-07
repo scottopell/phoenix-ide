@@ -388,6 +388,76 @@ describe('WorkScopeSection SSE-generation guard (same-scope time ordering)', () 
   });
 });
 
+describe('WorkScopeSection pull-sequence guard (same-scope pull-vs-pull ordering)', () => {
+  it('an earlier-issued pull resolving LAST does NOT overwrite a later pull for the same scope', async () => {
+    // Two pulls for the SAME scope can be in flight at once (the 2s running
+    // poll re-fires while the prior poll is still pending). If a slower EARLIER
+    // pull resolves AFTER a faster later pull — with no scope change and no
+    // intervening SSE — the older snapshot must NOT clobber the newer one.
+    //
+    // SSE seeds a live handle so the running poll starts. Then:
+    //   Poll A (issued first):  deferred, resolves LAST, reports 0 B / empty.
+    //   Poll B (issued second): resolves FIRST, reports 8 KB / a live handle.
+    // Displayed must settle on poll B's result, not poll A's stale empty one.
+    let resolvePollA!: (v: WorkScopeInventory) => void;
+    const pollAPending = new Promise<WorkScopeInventory>((r) => {
+      resolvePollA = r;
+    });
+    const earlierStale = inv([
+      bash({ cmd: 'live-cmd', state: 'tombstoned', duration_ms: 1, output_bytes: 0 }),
+    ]);
+    const laterFresh = inv([bash({ cmd: 'live-cmd', state: 'running', output_bytes: 8192 })]);
+
+    // SSE-seeded live handle so `hasLiveResource(displayed)` is true and the
+    // poll runs. The initial fetch shares this resolution and is unremarkable.
+    const seed = inv([bash({ cmd: 'live-cmd', state: 'running', output_bytes: 0 })]);
+    getInv.mockResolvedValue(seed);
+
+    const utils = await renderExpanded(seed);
+    openBashDetail();
+    expect(screen.getByText('0 B')).toBeTruthy();
+    const callsAfterSeed = getInv.mock.calls.length;
+
+    // Poll A fires (issued first), held open.
+    getInv.mockReturnValueOnce(pollAPending);
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+      await Promise.resolve();
+    });
+    expect(getInv).toHaveBeenCalledTimes(callsAfterSeed + 1);
+
+    // Poll B fires (issued second), resolves FIRST with the fresh result.
+    // Re-rendering with the same SSE keeps `liveInventory` stable (no gen bump,
+    // useEffect dep unchanged) so only the pull sequence differs between A & B.
+    getInv.mockResolvedValueOnce(laterFresh);
+    await act(async () => {
+      utils.rerender(
+        <WorkScopeSection
+          scopeKey="ws-1"
+          liveInventory={seed}
+          expanded={true}
+          onToggleExpanded={() => {}}
+        />,
+      );
+      vi.advanceTimersByTime(2000);
+      await Promise.resolve();
+    });
+    expect(getInv).toHaveBeenCalledTimes(callsAfterSeed + 2);
+    expect(screen.getByText('8.0 KB')).toBeTruthy();
+
+    // Poll A (the EARLIER pull) now resolves LAST with the stale empty snapshot.
+    // Its captured pull-sequence is no longer the latest issued → dropped.
+    await act(async () => {
+      resolvePollA(earlierStale);
+      await Promise.resolve();
+    });
+
+    // Displayed stays on poll B's fresh result, not poll A's stale one.
+    expect(screen.getByText('8.0 KB')).toBeTruthy();
+    expect(screen.queryByText('0 B')).toBeNull();
+  });
+});
+
 describe('useSeededLiveCount (collapsed-badge seed)', () => {
   // A tiny harness that renders the hook's result as text.
   function Harness({

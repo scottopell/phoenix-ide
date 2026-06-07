@@ -259,22 +259,45 @@ function useWorkScopeInventory(
   // result would clobber a fresher snapshot for the same scope.
   const sseGenRef = useRef(0);
 
+  // Monotonic pull-sequence counter, bumped at the START of every
+  // `fetchSnapshot`. Each invocation captures its own sequence; on resolve it
+  // writes `displayed` only if no later pull has been issued since. The 2s
+  // running poll can have two pulls in flight at once, and if a slower EARLIER
+  // pull resolves AFTER a faster later pull, the earlier result is stale even
+  // though the scope key and SSE generation are unchanged. This guard is the
+  // PULL-vs-PULL ordering counterpart to the scope-key (scope CHANGE) and
+  // SSE-generation (intervening push) guards: only the most-recently-issued
+  // pull may write `displayed`.
+  const pullSeqRef = useRef(0);
+
   // Stale-pull guard: a fetch (initial pull or poll) can resolve after the
-  // scope key changes OR after a newer SSE push lands. Capturing the scope key
-  // and SSE generation at request time and re-checking both at resolve time
+  // scope key changes, after a newer SSE push lands, OR after a later pull for
+  // the same scope was issued. Capturing the scope key, SSE generation, and
+  // pull sequence at request time and re-checking all three at resolve time
   // rejects a stale result so it never overwrites a fresher snapshot — while
   // leaving the byte-advancing pull merge for the SAME scope with no
   // intervening SSE intact.
   const fetchSnapshot = useCallback(async () => {
     const requestedKey = scopeKeyRef.current;
     const requestedGen = sseGenRef.current;
+    const requestedSeq = (pullSeqRef.current += 1);
     setError(false);
     try {
       const inv = await api.getWorkScopeInventory(requestedKey);
-      if (scopeKeyRef.current !== requestedKey || sseGenRef.current !== requestedGen) return;
+      if (
+        scopeKeyRef.current !== requestedKey ||
+        sseGenRef.current !== requestedGen ||
+        pullSeqRef.current !== requestedSeq
+      )
+        return;
       setDisplayed(inv);
     } catch {
-      if (scopeKeyRef.current !== requestedKey || sseGenRef.current !== requestedGen) return;
+      if (
+        scopeKeyRef.current !== requestedKey ||
+        sseGenRef.current !== requestedGen ||
+        pullSeqRef.current !== requestedSeq
+      )
+        return;
       setError(true);
     }
   }, []);

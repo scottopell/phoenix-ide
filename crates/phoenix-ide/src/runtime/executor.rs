@@ -2782,6 +2782,18 @@ where
                     worktree_path: approval_result.worktree_path.clone(),
                 });
 
+                // Refresh the cached scope-defining worktree so in-runtime tool
+                // calls (bash/tmux/browser) key resources under the same
+                // `WorkScope` the DB-facing inventory/cleanup resolve. Approval
+                // promotes Explore (no worktree -> `WorkScope::Conversation`) to
+                // Work (owns a worktree -> `WorkScope::Worktree`); leaving the
+                // cached value stale would split the two sides until restart.
+                // The post-approval `conv_mode` is Work, whose
+                // `worktree_path()` is the path just created, mirroring how
+                // construction seeds this from `conv_mode.worktree_path()`.
+                self.context.work_scope_worktree =
+                    Some(std::path::PathBuf::from(&approval_result.worktree_path));
+
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
                 self.tool_executor.upgrade_to_work_mode();
@@ -4592,6 +4604,10 @@ mod approve_task_refreshes_mode_context_tests {
         let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
         context.mode_context = Some(ModeContext::Explore);
         context.desired_base_branch = Some(base_branch.to_string());
+        // Pre-approval Explore owns no scope-defining worktree (the
+        // sub-agent-Explore shape that keys tool resources under
+        // `WorkScope::Conversation`). Approval must refresh this cache.
+        context.work_scope_worktree = None;
 
         let (_event_tx, event_rx) = mpsc::channel(32);
         let event_tx_dup = mpsc::channel::<Event>(1).0;
@@ -4650,6 +4666,16 @@ mod approve_task_refreshes_mode_context_tests {
                  mode: \"work\" sub-agents because parent_allows_work is false."
             ),
         }
+
+        // The cached scope-defining worktree must follow the promotion: a
+        // stale `None` would key in-runtime tool resources under
+        // `WorkScope::Conversation` while DB-facing cleanup resolves
+        // `WorkScope::Worktree`, splitting the panel/cleanup until restart.
+        assert_eq!(
+            rt.context.work_scope_worktree.as_deref(),
+            Some(explore_wt.as_path()),
+            "work_scope_worktree must be refreshed to the post-approval Work worktree"
+        );
     }
 }
 

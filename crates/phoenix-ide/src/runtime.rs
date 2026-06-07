@@ -1291,7 +1291,19 @@ impl RuntimeManager {
                 }
                 match self.db().get_conversation(id).await {
                     Ok(conv) => vec![conv],
-                    Err(_) => return false,
+                    // Fail closed, mirroring the worktree branch: only a
+                    // genuinely absent row means "not live". A transient DB
+                    // error (lock contention during browser idle cleanup) must
+                    // preserve the scope, not reap a still-live session.
+                    Err(crate::db::DbError::ConversationNotFound(_)) => return false,
+                    Err(e) => {
+                        tracing::warn!(
+                            work_scope = %work_scope,
+                            error = %e,
+                            "scope liveness query failed; treating scope as live to avoid premature teardown"
+                        );
+                        return true;
+                    }
                 }
             }
             WorkScope::Worktree(path) => {
@@ -3060,6 +3072,22 @@ mod scope_liveness_tests {
             !mgr.scope_has_live_conversation_excluding(&scope, "leaf")
                 .await,
             "a live conversation on a different worktree does not own this scope"
+        );
+    }
+
+    /// A `WorkScope::Conversation(id)` whose row is genuinely absent
+    /// (`DbError::ConversationNotFound`) is not live — the only DB outcome
+    /// that returns false in the Conversation branch. A non-NotFound error
+    /// fails closed instead (returns true), but that path needs DB fault
+    /// injection the in-memory test DB does not expose, so it is exercised
+    /// by inspection of the match arm rather than a unit test.
+    #[tokio::test]
+    async fn missing_conversation_scope_is_not_live() {
+        let mgr = test_manager().await;
+        let scope = crate::work_scope::WorkScope::Conversation("does-not-exist".to_string());
+        assert!(
+            !mgr.scope_has_live_conversation(&scope).await,
+            "an absent conversation row resolves to not-live"
         );
     }
 }
