@@ -733,10 +733,16 @@ orphans a live process at every continuation boundary: the process keeps
 running but becomes unaddressable from the continuation, so the agent sees the
 runtime silently forget half its in-flight work. Keying by `WorkScope` makes
 bash symmetric with the other three runtime resources and makes "the work scope
-owns its processes" structural rather than conventional. Direct-mode
-conversations and sub-agents resolve to `WorkScope::Conversation(id)`, for which
-this is exactly one conversation's handles; only worktree-backed chains differ,
-and they differ toward survival.
+owns its processes" structural rather than conventional. The scope is derived
+from the persisted `ConvMode::worktree_path()`, the single authority every
+DB-facing path (inventory, hard-delete cascade, work-scope SSE routing) also
+resolves from — so the handle-table keying and the inventory/cleanup keying
+cannot diverge. Direct-mode conversations and Explore sub-agents (which persist
+`worktree_path: None`) resolve to `WorkScope::Conversation(id)`, for which this
+is exactly one conversation's handles; worktree-backed chains and Work-mode
+sub-agents (which inherit the parent's worktree-bearing `conv_mode`) resolve to
+`WorkScope::Worktree(path)` and so share one table — the former across a
+continuation boundary, the latter with the live parent, both toward survival.
 
 ---
 
@@ -763,6 +769,13 @@ THE preservation signal SHALL exclude the conversation being deleted when
 enumerating live owners. The cascade runs before the deleted conversation's
 terminal-state write, so it still reads non-terminal; excluding it is what lets
 the scope tear down when it is the last live owner.
+
+A live owner is a conversation that is BOTH non-terminal in state AND not
+`archived`. An archived conversation SHALL NOT count as a live owner even
+while its state row still reads non-terminal: archiving a chain archives its
+earlier members before the leaf's cleanup cascade runs, and an archived
+member's runtime handle can linger, so counting it as live would preserve the
+shared `WorkScope` and leak its processes and tombstones.
 
 **Rationale:** A continuation is not the only way a scope outlives one
 conversation. A Work-mode sub-agent inherits its parent's `conv_mode` and so

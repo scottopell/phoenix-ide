@@ -1825,6 +1825,15 @@ pub struct ConvContext {
     pub desired_base_branch: Option<String>,
     /// Mode category for transition-level guards (defense-in-depth behind tool registry)
     pub mode: ModeKind,
+    /// The worktree path that defines this conversation's `WorkScope`, taken
+    /// verbatim from the persisted `ConvMode::worktree_path()`. `Some` for
+    /// Work/Branch and top-level Explore conversations (which own a worktree),
+    /// `None` for Direct conversations and sub-agent Explore conversations
+    /// (which share the parent's working directory but have no worktree of
+    /// their own). The executor resolves `ToolContext.work_scope` from this so
+    /// the scope keying matches every DB-facing path that derives scope from
+    /// `WorkScope::resolve(conv.id, conv.conv_mode.worktree_path())`.
+    pub work_scope_worktree: Option<PathBuf>,
     /// Relative name of the project's tasks directory (e.g. `"tasks"` or
     /// `"taskmds"`). Discovered at conversation startup via
     /// `taskmd_core::discover::discover_or_default` and cached here so the
@@ -1860,6 +1869,7 @@ impl ConvContext {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
+            work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: crate::llm_language::LlmLanguage::default(),
         }
@@ -1885,6 +1895,7 @@ impl ConvContext {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
+            work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: crate::llm_language::LlmLanguage::default(),
         }

@@ -704,9 +704,13 @@ The hard-delete handler runs this synchronously alongside the tmux server kill
 (`specs/tmux-integration/`) and the browser-session cascade, passing the same
 `inheritor_scope` to all three so resources on one scope stay together. The
 handler computes `inheritor_scope = Some(work_scope)` iff the scope is still
-owned by a live (non-terminal) conversation OTHER THAN the one being deleted —
-either a continuation that inherits it, or a live sibling such as a Work-mode
-sub-agent that shares its parent's scope. The deleted conversation is excluded
+owned by a live conversation OTHER THAN the one being deleted — either a
+continuation that inherits it, or a live sibling such as a Work-mode sub-agent
+that shares its parent's scope. A live conversation is one that is BOTH
+non-terminal in state AND not `archived`; an archived conversation does not
+count as a live owner even while its state row still reads non-terminal,
+because archiving a chain archives earlier members before the leaf's cascade
+runs and their runtime handles can linger. The deleted conversation is excluded
 from that live-owner enumeration: the cascade runs before its terminal-state
 write, so it still reads non-terminal, and excluding it is what lets the scope
 tear down when it is the last live owner. There is no SQLite shadow store to

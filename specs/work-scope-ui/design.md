@@ -165,10 +165,14 @@ through its own lifecycle sink (`Option<UnboundedSender<…Event>>`, `None` for
 tool-level tests so existing constructors are unaffected):
 
 - The bash registry emits on spawn / transition-to-terminal / kill.
-- The tmux registry emits on entry creation (first `ensure_live`
-  materialization), `ServerStatus` transition (`not_probed`→`live`, →`gone`),
-  and cascade removal — only on an actual state change, never on a probe-noop
-  against an already-`live` server.
+- The tmux registry emits on first materialization (the first `ensure_live`
+  for a scope), on a later `ServerStatus` transition, and on cascade
+  removal — only on an actual state change, never on a probe-noop against an
+  already-`live` server. The first-materialization emit fires *after* the
+  probe/spawn settles the status, so it carries the settled `live`/`gone`
+  status rather than the transient `not_probed` insertion state, and it fires
+  exactly once for the create→settled path (not once at `not_probed` then
+  again at the transition).
 - The browser manager publishes liveness edges via its
   `BrowserSessionLifecycleSink`.
 

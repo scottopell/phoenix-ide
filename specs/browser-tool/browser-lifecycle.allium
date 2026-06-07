@@ -174,14 +174,18 @@ rule ContinuationReusesSession {
 
 -- REQ-BROWSER-WS-003: cleanup-cascade tear-down when no live conversation
 -- other than the one being deleted still owns the scope. The orchestrator
--- sets `inheritor_scope` to Some(work_scope) iff a non-terminal conversation
+-- sets `inheritor_scope` to Some(work_scope) iff a live conversation
 -- OTHER THAN the deleted one resolves to that scope (a continuation that
 -- inherits it, or a live sibling such as a Work-mode sub-agent sharing its
--- parent's scope), and None otherwise. The deleted conversation is excluded
--- from that enumeration: the cascade runs before its terminal-state write, so
--- it still reads non-terminal, and excluding it is what makes this rule
--- reachable when it is the last live owner. Preservation is the complementary
--- case — see CascadePreservesOnScopeMatch below.
+-- parent's scope), and None otherwise. A live conversation is one that is BOTH
+-- non-terminal in state AND not archived: an archived conversation does not
+-- count as a live owner even while non-terminal, because archiving a chain
+-- archives earlier members before the leaf's cascade runs and their runtime
+-- handles can linger. The deleted conversation is excluded from that
+-- enumeration: the cascade runs before its terminal-state write, so it still
+-- reads non-terminal, and excluding it is what makes this rule reachable when
+-- it is the last live owner. Preservation is the complementary case — see
+-- CascadePreservesOnScopeMatch below.
 rule CascadeTearsDownWhenNoInheritor {
     when: CleanupCascadeRunFor(conversation, inheritor_scope)
 
@@ -234,10 +238,12 @@ rule CascadePreservesOnScopeMatch {
 
 -- REQ-BT-010: liveness-gated idle cleanup. The manager's background task
 -- tears down a live session only when it is BOTH idle past IDLE_TIMEOUT AND
--- its scope owns no live conversation. Liveness is "does any non-terminal
--- conversation resolve to this scope?" — the same scope resolution the
+-- its scope owns no live conversation. Liveness is "does any live conversation
+-- resolve to this scope?" — where a live conversation is one that is BOTH
+-- non-terminal in state AND not archived — using the same scope resolution the
 -- lifecycle fan-out uses (resolve_work_scope, REQ-BROWSER-WS-002) against
--- bedrock's is_terminal. The IDLE_TIMEOUT timer is a backstop for genuinely
+-- bedrock's is_terminal and the archived flag. The IDLE_TIMEOUT timer is a
+-- backstop for genuinely
 -- abandoned scopes, not a hard cap on live work: a conversation alive in the
 -- UI but quiet on browser tools keeps its session regardless of idle age.
 -- specs/projects/ REQ-PROJ-025 (OneBranchOneActiveWorktree) guarantees at
@@ -251,7 +257,7 @@ rule IdleSessionCleanedUp {
 
     for session in BrowserSession where session.status = live:
         let scope_is_live = bedrock/Conversations.any(c =>
-            resolve_work_scope(c) = session.scope and not c.is_terminal)
+            resolve_work_scope(c) = session.scope and not c.is_terminal and not c.archived)
 
         requires: (now - session.last_activity) > IDLE_TIMEOUT
         requires: not scope_is_live
@@ -264,7 +270,7 @@ rule IdleSessionCleanedUp {
 }
 
 -- REQ-BT-010: the skip path. An idle session whose scope is still live — a
--- non-terminal conversation resolves to it — is NOT torn down on the idle
+-- non-terminal, non-archived conversation resolves to it — is NOT torn down on the idle
 -- tick. It is re-checked on the next interval. This is the standing
 -- guarantee that liveness preempts the idle timer.
 rule IdleSessionPreservedWhileScopeLive {
@@ -272,7 +278,7 @@ rule IdleSessionPreservedWhileScopeLive {
 
     for session in BrowserSession where session.status = live:
         let scope_is_live = bedrock/Conversations.any(c =>
-            resolve_work_scope(c) = session.scope and not c.is_terminal)
+            resolve_work_scope(c) = session.scope and not c.is_terminal and not c.archived)
 
         requires: scope_is_live
 

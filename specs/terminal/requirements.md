@@ -528,10 +528,14 @@ existing terminal rather than spawn a new one.
 The cleanup cascade MUST decide preservation by whether the scope is
 still owned by a live conversation other than the one being torn down:
 skip the teardown iff `inheritor_scope == Some(work_scope)`, where
-`inheritor_scope` is `Some(work_scope)` iff a non-terminal conversation
+`inheritor_scope` is `Some(work_scope)` iff a live conversation
 other than the deleted one resolves to that scope — a continuation that
 inherits it, or a live sibling such as a Work-mode sub-agent that shares
-its parent's scope. The deleted conversation is excluded from that
+its parent's scope. A live conversation is one that is BOTH non-terminal
+in state AND not `archived`; an archived conversation does not count as a
+live owner even while non-terminal, because archiving a chain archives
+earlier members before the leaf's cascade runs and their runtime handles
+can linger. The deleted conversation is excluded from that
 enumeration: the cascade runs before its terminal-state write, so it
 still reads non-terminal, and excluding it is what lets the terminal
 tear down when it is the last live owner. This mirrors REQ-TMUX-WS-001 /

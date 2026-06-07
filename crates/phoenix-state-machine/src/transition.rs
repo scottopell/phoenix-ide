@@ -3149,6 +3149,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
+            work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
         };
@@ -3270,6 +3271,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
+            work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
         };
@@ -3375,6 +3377,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
+            work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
         };
@@ -3426,6 +3429,7 @@ mod tests {
             max_turns: 0,
             desired_base_branch: None,
             mode: ModeKind::Managed,
+            work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
         };

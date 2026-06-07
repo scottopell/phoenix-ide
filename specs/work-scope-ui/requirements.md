@@ -182,13 +182,19 @@ also the natural surface for any future non-UI client (REQ-WSUI-011).
 ### REQ-WSUI-007: Inventory Push Event
 
 WHEN a bash handle in a scope is spawned, transitions to a terminal state, or
-is killed, OR the scope's tmux registry entry changes — the entry is created
-(first `ensure_live` materialization, e.g. when the conversation's terminal
-panel attaches), its `ServerStatus` transitions (`not_probed`→`live`, →`gone`),
-or it is removed by the cleanup cascade — OR a browser session for the scope
-crosses a liveness edge (up or down)
+is killed, OR the scope's tmux registry entry changes — the entry is first
+materialized (the first `ensure_live` for the scope, e.g. when the
+conversation's terminal panel attaches), its `ServerStatus` transitions on a
+later `ensure_live` (`live`→`gone` and back), or it is removed by the cleanup
+cascade — OR a browser session for the scope crosses a liveness edge (up or
+down)
 THE SYSTEM SHALL emit a `WorkScopeUpdate` SSE event carrying a `sequence_id`
 and the full refreshed `WorkScopeInventory` for that scope.
+
+THE first-materialization emission SHALL carry the tmux entry's status as
+settled by the probe/spawn (`live` or `gone`) — never the transient
+`not_probed` insertion state — and SHALL fire exactly once, not once at
+`not_probed` and again at the settled status.
 
 THE `WorkScopeUpdate` event SHALL be emitted only on an actual state change,
 not on a read or a probe that leaves state unchanged.

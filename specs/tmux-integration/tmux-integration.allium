@@ -72,7 +72,7 @@ external entity TmuxBinary {
 }
 
 -- The Unix-domain socket the tmux server binds. Filesystem path is
--- keyed to the worktree path for Work/Branch/managed-Explore conversations
+-- keyed to the worktree path for Work/Branch/top-level-Explore conversations
 -- (~/.phoenix-ide/tmux-sockets/wt-{hash}.sock, task 03001) and to
 -- conversation_id for Direct mode (conv-<id>.sock). Phoenix's role is
 -- creating the directory, unlinking stale files on detection, and deleting
@@ -453,8 +453,12 @@ rule TmuxRunToolCalled {
 
     @guidance
         -- Effective file root:
-        --   Work/Branch/managed-Explore: ToolContext.worktree_path.
-        --   Direct: ToolContext.working_dir.
+        --   Owns a worktree (Work/Branch/top-level Explore):
+        --     ToolContext.worktree_path.
+        --   No own worktree (Direct, sub-agent Explore):
+        --     ToolContext.working_dir.
+        -- ToolContext.worktree_path is the persisted ConvMode.worktree_path(),
+        -- so a sub-agent Explore (worktree_path: None) uses working_dir.
         -- The helper passes `-t main -c <file_root>` on new-window even if
         -- another session exists or was used most recently.
         --
@@ -617,13 +621,18 @@ rule UserOpensTerminalWithoutTmux {
 -- REQ-TMUX-007, REQ-TMUX-WS-002: conversation hard-delete cascades to the
 -- tmux server. The orchestrator resolves the deleted conversation's WorkScope
 -- and passes a preservation signal `inheritor_scope` — Some(work_scope) iff a
--- non-terminal conversation OTHER THAN the deleted one resolves to that scope
+-- live conversation OTHER THAN the deleted one resolves to that scope
 -- (a continuation that inherits it, or a live sibling such as a Work-mode
--- sub-agent sharing its parent's scope), None otherwise. The deleted
--- conversation is excluded from that enumeration: the cascade runs before its
--- terminal-state write, so it still reads non-terminal, and excluding it is
--- what makes teardown reachable when it is the last live owner. Tear down only
--- when the signal is absent — kill, unlink, and drop the entry.
+-- sub-agent sharing its parent's scope), None otherwise. A live conversation
+-- is one that is BOTH non-terminal in state AND not archived: an archived
+-- conversation does not count as a live owner even while its state row still
+-- reads non-terminal, because archiving a chain archives earlier members
+-- before the leaf's cascade runs and their runtime handles can linger. The
+-- deleted conversation is excluded from that enumeration: the cascade runs
+-- before its terminal-state write, so it still reads non-terminal, and
+-- excluding it is what makes teardown reachable when it is the last live
+-- owner. Tear down only when the signal is absent — kill, unlink, and drop the
+-- entry.
 rule ServerKilledByConversationDelete {
     when: CleanupCascadeRunFor(conversation, inheritor_scope)
 
@@ -653,24 +662,31 @@ rule ServerKilledByConversationDelete {
 -- REQ-TMUX-WS-002: when the scope is still owned by a live conversation other
 -- than the one being deleted — a continuation that inherits it, or a live
 -- sibling such as a Work-mode sub-agent sharing its parent's scope — the
--- hard-delete only removes this conversation's registry entry; the tmux server
--- and socket file are left intact for the surviving owner to use.
+-- hard-delete leaves the tmux server, its socket file, AND the shared registry
+-- entry intact for the surviving owner to use.
 rule ServerPreservedForLiveOwner {
     when: CleanupCascadeRunFor(conversation, inheritor_scope)
 
     let work_scope = resolve_work_scope(conversation)
 
     requires: inheritor_scope = Some(work_scope)
+    requires: exists TmuxServer{conversation: conversation}
+    let server = TmuxServer{conversation: conversation}
 
-    ensures: not exists TmuxServer{conversation: conversation}
-    -- TmuxServerKilled and SocketFileUnlinked are NOT ensured.
-    --
-    -- Note: this rule fires whether or not a TmuxServer entry currently
-    -- exists for the conversation. If no entry exists (e.g., conversation
-    -- never used tmux), the post-condition is vacuously satisfied. The
-    -- code's skip-kill behaviour matches: it short-circuits on the
-    -- preservation signal BEFORE looking at the registry entry, so the
-    -- absence of an entry doesn't change the outcome.
+    ensures: not TmuxServerKilled(server.socket_path)
+        -- The server keeps running for the surviving owner; the socket file
+        -- is not unlinked.
+    ensures: exists TmuxServer{conversation: conversation}
+        -- The shared registry entry is left intact. The work-scope inventory
+        -- must keep reporting the still-live server — dropping the entry would
+        -- show "no tmux server" for a running session until a later
+        -- ensure_live recreated it.
+
+    @guidance
+        -- The code short-circuits on the preservation signal BEFORE removing
+        -- the registry entry, so the shared entry is preserved by
+        -- construction. A conversation that never used tmux has no entry, and
+        -- preservation is then vacuous.
 }
 
 -- REQ-TMUX-008 (soft-state preservation contract): expressed as a
@@ -690,8 +706,13 @@ rule ServerPreservedForLiveOwner {
 -- REQ-TMUX-001
 invariant SocketPathDeterministic {
     for s in TmuxServer:
-        -- Work/Branch/managed-Explore: socket_path = wt-{hash(worktree_path)}.sock
-        -- Direct: socket_path = conv-{conversation_id}.sock
+        -- Owns a worktree (Work/Branch/top-level Explore):
+        --   socket_path = wt-{hash(worktree_path)}.sock
+        -- No own worktree (Direct, sub-agent Explore):
+        --   socket_path = conv-{conversation_id}.sock
+        -- The split is on the persisted ConvMode.worktree_path(), not on
+        -- "managed vs Direct": a sub-agent Explore is managed but has no
+        -- worktree of its own, so it keys to its conversation scope.
         s.socket_path = socket_path_for(s.conversation)
 }
 

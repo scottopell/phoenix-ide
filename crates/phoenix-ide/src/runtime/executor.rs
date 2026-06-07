@@ -19,7 +19,6 @@ use crate::llm::{
     ContentBlock, LlmMessage, LlmRequest, MessageRole, ModelRegistry, PromptCacheKey, SystemContent,
 };
 use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
-use crate::state_machine::state::ModeKind;
 use crate::state_machine::state::{
     SubAgentMode, SubAgentOutcome, SubAgentResult, ToolCall, ToolInput,
 };
@@ -2135,11 +2134,17 @@ where
         self.tool_cancel_token = Some(cancel_token.clone());
         let cancel_token_check = cancel_token.clone();
 
-        // Create ToolContext for this invocation
-        // worktree_path: Some for Managed/Branch (working_dir IS the worktree),
-        // None for Direct (no worktree — socket keyed to conv_id). Task 03001.
-        let tmux_worktree =
-            (self.context.mode != ModeKind::Direct).then(|| self.context.working_dir.clone());
+        // Create ToolContext for this invocation. The scope-defining worktree
+        // path is the persisted `conv_mode.worktree_path()`, cached on the
+        // context at construction (`work_scope_worktree`). It is `Some` for
+        // Work/Branch and top-level Explore (which own a worktree) and `None`
+        // for Direct and sub-agent Explore (no worktree of their own). Using
+        // this — rather than `mode != Direct → working_dir` — keeps
+        // `ToolContext.work_scope` in lock-step with the DB-facing scope
+        // derivations: a sub-agent Explore resolves to
+        // `WorkScope::Conversation(id)` on both sides instead of diverging to
+        // `WorkScope::Worktree(cwd)` on the tool side only.
+        let scope_worktree = self.context.work_scope_worktree.clone();
         let tool_ctx = ToolContext::new(
             cancel_token,
             self.context.conversation_id.clone(),
@@ -2149,7 +2154,7 @@ where
             self.llm_registry.clone(),
             self.terminals.clone(),
             self.tmux_registry.clone(),
-            tmux_worktree,
+            scope_worktree,
         );
 
         let conv_id = self.context.conversation_id.clone();

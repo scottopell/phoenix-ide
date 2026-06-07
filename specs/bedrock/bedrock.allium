@@ -117,6 +117,14 @@ entity Conversation {
     context_usage_ratio: Decimal
     model_context_window: Integer
 
+    -- Soft-state archive flag (orthogonal to core_status). Set when a
+    -- conversation is archived; the row's core_status may still read
+    -- non-terminal. Resource-liveness predicates (work-scope cascades, idle
+    -- reaping) treat an archived conversation as NOT a live owner even while
+    -- non-terminal, so archiving a chain does not leak the shared scope's
+    -- resources.
+    archived: Boolean = false
+
     -- Core status transitions (shared)
     transitions core_status {
         idle -> llm_requesting

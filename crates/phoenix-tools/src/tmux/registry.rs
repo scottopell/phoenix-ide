@@ -454,14 +454,6 @@ impl TmuxRegistry {
         };
 
         let (server_arc, created) = self.get_or_insert(work_scope, socket_path).await;
-        // Entry CREATED edge: a scope that has never performed a tmux
-        // operation now has a registry entry, so it appears in the
-        // work-scope inventory (status=not_probed until the probe below
-        // promotes it). Emit before the probe so the panel can reflect the
-        // new server even if the probe/spawn is slow.
-        if created {
-            self.emit_lifecycle(work_scope);
-        }
 
         let mut server = server_arc.write().await;
         let prev_status = server.status;
@@ -503,12 +495,17 @@ impl TmuxRegistry {
         }
         let status_changed = server.status != prev_status;
         drop(server);
-        // STATUS-change edge (e.g. NotProbed→Live on first materialization).
-        // Only on an actual transition — a probe-noop on an already-Live
-        // server does not re-emit (REQ-WSUI-007: state transitions only).
-        // Skipped when `created` already emitted on this same call to avoid
-        // a redundant double event for the create→Live path.
-        if status_changed && !created {
+        // Emit on the work-scope inventory edge once the status has
+        // SETTLED. Two cases collapse to the same rule:
+        //   - First materialization (`created`): the freshly inserted entry
+        //     starts `not_probed` and the probe/spawn above resolves it to
+        //     its real status (`live`/`gone`). Emit so the panel reflects
+        //     the settled status — never the transient `not_probed`.
+        //   - Later status transition on an existing entry (`status_changed`):
+        //     a real edge the inventory must learn about.
+        // A probe-noop on an already-`live` entry (neither created nor
+        // changed) does not re-emit (REQ-WSUI-007: state transitions only).
+        if created || status_changed {
             self.emit_lifecycle(work_scope);
         }
         Ok(server_arc)
@@ -559,6 +556,20 @@ impl TmuxRegistry {
         self.inner.read().await.get(&key).cloned()
     }
 
+    /// Deterministic socket path for a `WorkScope`, derived the same way
+    /// `ensure_live` derives it on insertion. Used by the cascade when no
+    /// registry entry is present (orphan-socket cleanup) and on the
+    /// preserved path where the entry is intentionally left intact.
+    fn derived_socket_path(&self, work_scope: &WorkScope) -> PathBuf {
+        match work_scope {
+            WorkScope::Worktree(path) => {
+                socket_path_for_worktree(&self.socket_dir, Path::new(path))
+            }
+            WorkScope::Conversation(id) => socket_path_for(&self.socket_dir, id),
+            WorkScope::Global => socket_path_for_global(&self.socket_dir),
+        }
+    }
+
     /// Best-effort tear-down of a `WorkScope`'s tmux server, called from
     /// the unified `run_resource_cleanup_cascade` (REQ-BED-032 —
     /// archive / abandon / mark-merged / hard-delete all share this
@@ -594,6 +605,33 @@ impl TmuxRegistry {
         work_scope: &WorkScope,
         inheritor_scope: Option<&WorkScope>,
     ) -> CascadeReport {
+        // Preservation by scope equality: the inheritor (continuation) is
+        // still driving the same tmux server iff it resolves to the same
+        // WorkScope. Falls out structurally — Direct continuations
+        // resolve to Conversation(<their own id>), which is never equal
+        // to the parent's Conversation(<parent id>), so they take the
+        // kill+unlink path automatically.
+        //
+        // This check precedes the registry removal: when the scope is
+        // preserved the tmux server keeps running, so its registry entry
+        // must survive too — otherwise the inventory would report "no tmux
+        // server" for a still-live session until a later `ensure_live`
+        // recreated the entry. (Mirrors `cascade_bash_on_delete`, which
+        // also short-circuits before its `registry.remove`.)
+        if inheritor_scope == Some(work_scope) {
+            let socket_path = self.derived_socket_path(work_scope);
+            tracing::debug!(
+                work_scope = %work_scope,
+                socket = %socket_path.display(),
+                "tmux: skipping server kill — scope inherited by continuation"
+            );
+            return CascadeReport {
+                socket_path,
+                kill_server_error: None,
+                unlink_error: None,
+            };
+        }
+
         let key = work_scope.stable_key();
         let entry = {
             let mut map = self.inner.write().await;
@@ -607,34 +645,9 @@ impl TmuxRegistry {
         } else {
             // No registry entry — fall back to the deterministic path so
             // we still attempt cleanup of any orphaned socket from a
-            // prior process. Path derivation matches `ensure_live`.
-            match work_scope {
-                WorkScope::Worktree(path) => {
-                    socket_path_for_worktree(&self.socket_dir, Path::new(path))
-                }
-                WorkScope::Conversation(id) => socket_path_for(&self.socket_dir, id),
-                WorkScope::Global => socket_path_for_global(&self.socket_dir),
-            }
+            // prior process.
+            self.derived_socket_path(work_scope)
         };
-
-        // Preservation by scope equality: the inheritor (continuation) is
-        // still driving the same tmux server iff it resolves to the same
-        // WorkScope. Falls out structurally — Direct continuations
-        // resolve to Conversation(<their own id>), which is never equal
-        // to the parent's Conversation(<parent id>), so they take the
-        // kill+unlink path automatically.
-        if inheritor_scope == Some(work_scope) {
-            tracing::debug!(
-                work_scope = %work_scope,
-                socket = %socket_path.display(),
-                "tmux: skipping server kill — scope inherited by continuation"
-            );
-            return CascadeReport {
-                socket_path,
-                kill_server_error: None,
-                unlink_error: None,
-            };
-        }
 
         let mut report = CascadeReport {
             socket_path: socket_path.clone(),
@@ -968,6 +981,96 @@ mod tests {
             rx.try_recv().is_err(),
             "preserved entry must not emit a removal edge"
         );
+    }
+
+    /// Preservation must leave the registry entry intact: when a sibling
+    /// continuation still owns the scope, the tmux server keeps running, so
+    /// the inventory must continue to see its entry. (Regression for the
+    /// remove-before-preserve-check ordering bug, where the preserved path
+    /// dropped the map entry and the inventory reported "no tmux server"
+    /// for a live session until a later `ensure_live` recreated it.)
+    #[tokio::test]
+    async fn cascade_preserve_leaves_registry_entry_intact() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let wt = WorkScope::Worktree("/tmp/phoenix-tmux-preserve-entry".to_string());
+        let sock =
+            socket_path_for_worktree(tmp.path(), Path::new("/tmp/phoenix-tmux-preserve-entry"));
+        let _ = reg.get_or_insert(&wt, sock).await;
+        assert_eq!(
+            reg.conversation_count().await,
+            1,
+            "precondition: entry held"
+        );
+
+        // Sibling continuation inherits the same scope → preserved path.
+        let _ = reg.cascade_on_delete(&wt, Some(&wt)).await;
+
+        assert_eq!(
+            reg.conversation_count().await,
+            1,
+            "preserved cascade must leave the registry entry in place"
+        );
+        assert!(
+            reg.get_existing(&wt).await.is_some(),
+            "preserved scope must still resolve to its entry"
+        );
+    }
+
+    /// First `ensure_live` for a scope must emit a work-scope update whose
+    /// status reflects the SETTLED state after probe/spawn (`live`), never
+    /// the transient `not_probed` seen at insertion. (Regression for the
+    /// emit-on-create ordering, where the create emit fired at `not_probed`
+    /// and the later create→live transition was suppressed, stranding the
+    /// inventory at `not_probed` until a manual refresh.) Requires a real
+    /// tmux binary to drive the spawn; skipped otherwise.
+    #[tokio::test]
+    async fn first_ensure_live_emits_settled_live_status() {
+        if which::which("tmux").is_err() {
+            return;
+        }
+        let tmp = TempDir::new().unwrap();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let reg =
+            TmuxRegistry::with_socket_dir_binary_and_sink(tmp.path().to_path_buf(), true, Some(tx));
+
+        let scope = WorkScope::Conversation("conv-first-ensure".to_string());
+        let arc = reg
+            .ensure_live(&scope, tmp.path())
+            .await
+            .expect("first ensure_live should materialize a live server");
+
+        // Exactly one emit on first materialization, carrying the settled
+        // status — Live, not the transient NotProbed insert state.
+        let e = rx.try_recv().expect("first ensure_live must emit");
+        assert_eq!(e.work_scope, scope);
+        assert!(
+            rx.try_recv().is_err(),
+            "first ensure_live must emit exactly once (no not_probed + live double-emit)"
+        );
+        assert_eq!(
+            arc.read().await.status,
+            ServerStatus::Live,
+            "settled status must be Live before/at the emit"
+        );
+
+        // A second ensure_live on an already-live server is a probe-noop:
+        // no status change → no spurious re-emit.
+        let _ = reg.ensure_live(&scope, tmp.path()).await.expect("noop");
+        assert!(
+            rx.try_recv().is_err(),
+            "probe-noop on a live server must not re-emit"
+        );
+
+        kill_socket(&socket_path_for(tmp.path(), "conv-first-ensure")).await;
+    }
+
+    async fn kill_socket(socket_path: &Path) {
+        let _ = tokio::process::Command::new("tmux")
+            .args(["-S", &socket_path.to_string_lossy(), "kill-server"])
+            .env_remove("TMUX")
+            .status()
+            .await;
     }
 
     /// `emit_lifecycle` with no sink wired is a no-op (no panic). Mirrors the

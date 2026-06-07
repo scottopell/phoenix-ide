@@ -132,8 +132,13 @@ value ExitInformation {
 
 -- Variants of WorkScope. Global is a singleton scope with no underlying
 -- worktree or conversation. Worktree carries a worktree path; Conversation
--- carries a conversation id (Direct-mode conversations and sub-agents resolve
--- to Conversation, behaviourally identical to per-conversation ownership).
+-- carries a conversation id. The variant is derived from the persisted
+-- ConvMode.worktree_path(): conversations that own a worktree (Work, Branch,
+-- top-level Explore, and Work-mode sub-agents that inherit the parent's
+-- worktree-bearing conv_mode) resolve to Worktree; conversations without
+-- one (Direct-mode, and Explore sub-agents that persist worktree_path: None)
+-- resolve to Conversation, behaviourally identical to per-conversation
+-- ownership.
 enum WorkScopeKind {
     worktree
     | conversation
@@ -1046,13 +1051,17 @@ rule HandleKillNotFound {
 -- WorkScope's handle table only when no live conversation OTHER THAN the one
 -- being deleted still owns the same WorkScope. The cascade receives the
 -- deleted conversation's WorkScope (via resolve_work_scope) and a preservation
--- signal `inheritor_scope` — Some(work_scope) iff a non-terminal conversation
+-- signal `inheritor_scope` — Some(work_scope) iff a live conversation
 -- other than the deleted one resolves to that scope (a continuation that
 -- inherits it, or a live sibling such as a Work-mode sub-agent sharing its
--- parent's scope). The deleted conversation is excluded from that enumeration:
--- the cascade runs before its terminal-state write, so it still reads
--- non-terminal, and excluding it is what lets the scope tear down when it is
--- the last live owner. The cascade tears down only when the signal is absent —
+-- parent's scope). A live conversation here is one that is BOTH non-terminal
+-- in state AND not archived: an archived conversation does not count as a live
+-- owner even while its state row still reads non-terminal, because archiving a
+-- chain archives earlier members before the leaf's cascade runs and their
+-- runtime handles can linger. The deleted conversation is excluded from that
+-- enumeration: the cascade runs before its terminal-state write, so it still
+-- reads non-terminal, and excluding it is what lets the scope tear down when it
+-- is the last live owner. The cascade tears down only when the signal is absent —
 -- kills any live handles and drops every handle (live or tombstoned) in the
 -- table. Mirrors cascade_terminal_on_delete / cascade_browser_on_delete.
 rule HandlesTornDownWhenNoInheritor {
