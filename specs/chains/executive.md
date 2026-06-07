@@ -50,7 +50,7 @@ use a mid-tier model balanced for cost and accuracy.
 | **REQ-CHN-006:** Consistent Quality As Q&A Accumulates | ✅ Complete | Stateless per-question invocation `chain_qa.rs:29,38,384`; `chain_qa_id` demux `chain_runtime.rs:8`, `api/chains.rs:119`, `api/wire.rs:463` |
 | **REQ-CHN-007:** Chain Has a User-Editable Name | ✅ Complete | Nullable `chain_name` column (`db.rs:2737`, `db.rs:3041`); whitespace clears the name (`api/chains.rs:182`) |
 | **REQ-CHN-008:** Chain Page Surfaces the Work Scope | Planned | Surface worktree/branch/task/PR (`work_scope_pr_associations`, `ConvMode` git metadata) above the member list |
-| **REQ-CHN-009:** Chain Q&A Is a Read-Only Agentic Loop | Planned | Scope-bound search + read tools over `specs/conversation-retrieval/`; supersedes summaries bundling and REQ-CHN-005 snapshot staleness |
+| **REQ-CHN-009:** Chain Q&A Is a Read-Only Agentic Loop | Planned | Scope-bound search + read tools over `specs/conversation-retrieval/`; replaces summaries bundling; reframes REQ-CHN-005 staleness as an age-of-answer freshness tag |
 
 **Progress:** v1 (REQ-CHN-001…007) shipped. REQ-CHN-008 (work-scope
 panel) and REQ-CHN-009 (read-only agentic Q&A) are the redesign,
