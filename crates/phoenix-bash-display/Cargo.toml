@@ -12,5 +12,8 @@ path = "src/lib.rs"
 # Bash AST parsing for semantic `cd`-prefix stripping (&& vs || vs ;).
 brush-parser = "0.4"
 
+[dev-dependencies]
+proptest = "1"
+
 [lints]
 workspace = true

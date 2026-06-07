@@ -2127,6 +2127,7 @@ name = "phoenix-bash-display"
 version = "0.1.0"
 dependencies = [
  "brush-parser",
+ "proptest",
 ]
 
 [[package]]

@@ -265,6 +265,9 @@ fn paths_match(target: &str, cwd: &str) -> bool {
 }
 
 #[cfg(test)]
+mod proptests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
