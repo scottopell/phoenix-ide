@@ -34,6 +34,11 @@ function bash(over: Partial<BashHandleInventory> = {}): BashHandleInventory {
   };
 }
 
+/** A clean-exit tombstone: exit 0, no signal. */
+function tombSuccess(over: Partial<BashHandleInventory> = {}): BashHandleInventory {
+  return bash({ state: 'tombstoned', duration_ms: 10, exit_code: 0, ...over });
+}
+
 function inv(
   bashes: BashHandleInventory[],
   over: Partial<Pick<WorkScopeInventory, 'tmux' | 'browser'>> = {},
@@ -102,6 +107,58 @@ describe('hasLiveResource', () => {
 
   it('is true for a live browser session (browser-only)', () => {
     expect(hasLiveResource(inv([], { browser: { state: 'live', idle_ms: 120_000 } }))).toBe(true);
+  });
+});
+
+describe('bash glyph: liveness vs outcome', () => {
+  // The glyph separates LIVENESS (a running handle is "alive", a live dot)
+  // from OUTCOME (a terminal handle is ✓/✗ by exit status). A running handle
+  // must NOT read as a success check.
+  function glyphEl() {
+    const label = screen.getByText('sleep 100');
+    const row = label.closest('.ws-row');
+    if (!row) throw new Error('bash row not found');
+    const g = row.querySelector('.ws-glyph');
+    if (!g) throw new Error('glyph not found');
+    return g;
+  }
+
+  it('running → green live dot (●, ws-glyph--live), not a check', async () => {
+    getInv.mockResolvedValue(inv([bash({ state: 'running' })]));
+    await renderExpanded();
+    const g = glyphEl();
+    expect(g.textContent).toBe('●');
+    expect(g.classList.contains('ws-glyph--live')).toBe(true);
+    expect(g.classList.contains('ws-glyph--ok')).toBe(false);
+  });
+
+  it('tombstoned exit 0 → green check (✓, ws-glyph--ok)', async () => {
+    getInv.mockResolvedValue(inv([tombSuccess()]));
+    await renderExpanded();
+    const g = glyphEl();
+    expect(g.textContent).toBe('✓');
+    expect(g.classList.contains('ws-glyph--ok')).toBe(true);
+  });
+
+  it('tombstoned non-zero exit → red ✗ (ws-glyph--err) with the code in the title', async () => {
+    getInv.mockResolvedValue(inv([tombSuccess({ exit_code: 3 })]));
+    await renderExpanded();
+    const g = glyphEl();
+    expect(g.textContent).toBe('✗');
+    expect(g.classList.contains('ws-glyph--err')).toBe(true);
+    expect(g.getAttribute('title')).toBe('exited 3');
+  });
+
+  it('tombstoned killed by signal → red ✗ (ws-glyph--err) with the signal in the title', async () => {
+    // Killed-by-signal tombstone: a signal, no exit code.
+    getInv.mockResolvedValue(
+      inv([bash({ state: 'tombstoned', duration_ms: 10, signal_number: 9 })]),
+    );
+    await renderExpanded();
+    const g = glyphEl();
+    expect(g.textContent).toBe('✗');
+    expect(g.classList.contains('ws-glyph--err')).toBe(true);
+    expect(g.getAttribute('title')).toBe('killed (signal 9)');
   });
 });
 

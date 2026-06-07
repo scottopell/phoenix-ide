@@ -30,7 +30,6 @@ import { api } from '../api';
 import type {
   WorkScopeInventory,
   BashHandleInventory,
-  BashHandleState,
 } from '../api';
 import { isLive, hasLiveResource, workScopeLiveCount } from './workScopeHelpers';
 import './WorkScopePanel.css';
@@ -61,16 +60,31 @@ interface Props {
   width?: number | undefined;
 }
 
-/** Inline status glyph + class per bash handle state, following the
- *  Valid/Will-create/Invalid/Loading feedback conventions (AGENTS.md). */
-function bashGlyph(state: BashHandleState): { glyph: string; cls: string; title: string } {
-  switch (state) {
+/** Inline status glyph + class per bash handle (REQ-WSUI-010). Liveness and
+ *  outcome are kept distinct: a *running* handle reads as a green live dot
+ *  ("alive", not "succeeded"); a *terminal* handle reads as its exit outcome —
+ *  a green ✓ when it exited 0, a red ✗ when it exited non-zero or was killed
+ *  by a signal. The check therefore means "completed successfully," never
+ *  "still running." */
+function bashGlyph(handle: BashHandleInventory): { glyph: string; cls: string; title: string } {
+  switch (handle.state) {
     case 'running':
-      return { glyph: '✓', cls: 'ws-glyph--ok', title: 'running' };
+      return { glyph: '●', cls: 'ws-glyph--live', title: 'running' };
     case 'kill_pending_kernel':
       return { glyph: '⏱', cls: 'ws-glyph--warn', title: 'kill pending (kernel)' };
-    case 'tombstoned':
-      return { glyph: '○', cls: 'ws-glyph--muted', title: 'tombstoned' };
+    case 'tombstoned': {
+      const success = handle.exit_code === 0 && handle.signal_number == null;
+      if (success) {
+        return { glyph: '✓', cls: 'ws-glyph--ok', title: 'exited 0' };
+      }
+      const title =
+        handle.signal_number != null
+          ? `killed (signal ${handle.signal_number})`
+          : handle.exit_code != null
+            ? `exited ${handle.exit_code}`
+            : 'exited (unknown status)';
+      return { glyph: '✗', cls: 'ws-glyph--err', title };
+    }
   }
 }
 
@@ -102,7 +116,7 @@ function formatBytes(n: number): string {
 
 function BashRow({ handle, now }: { handle: BashHandleInventory; now: number }) {
   const [open, setOpen] = useState(false);
-  const { glyph, cls, title } = bashGlyph(handle.state);
+  const { glyph, cls, title } = bashGlyph(handle);
   const live = isLive(handle.state);
   const label = handle.label || handle.cmd;
   return (
@@ -151,7 +165,8 @@ function BashRow({ handle, now }: { handle: BashHandleInventory; now: number }) 
 
 function TmuxRow({ status }: { status: 'not_probed' | 'live' | 'gone' }) {
   const map = {
-    live: { glyph: '✓', cls: 'ws-glyph--ok', text: 'live' },
+    // A reachable server is alive — a live dot, not a success check.
+    live: { glyph: '●', cls: 'ws-glyph--live', text: 'live' },
     gone: { glyph: '✗', cls: 'ws-glyph--err', text: 'gone' },
     not_probed: { glyph: '—', cls: 'ws-glyph--muted', text: 'not probed' },
   } as const;
@@ -177,7 +192,7 @@ function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: nu
       ? { glyph: '○', cls: 'ws-glyph--muted', text: 'torn down' }
       : idle
         ? { glyph: '○', cls: 'ws-glyph--warn', text: `idle ${formatDuration(idleMs)}` }
-        : { glyph: '✓', cls: 'ws-glyph--ok', text: 'live' };
+        : { glyph: '●', cls: 'ws-glyph--live', text: 'live' };
   return (
     <div className={`ws-row${state === 'torn_down' ? ' ws-row--dead' : ''}`}>
       <div className="ws-row-main ws-row-main--static">

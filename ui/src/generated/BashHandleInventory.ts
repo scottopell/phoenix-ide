@@ -4,11 +4,19 @@ import type { BashHandleState } from "./BashHandleState";
 /**
  * One bash handle's observability projection.
  *
- * `pid` and `pgid` exist only while the handle is live; `duration_ms` exists
- * only once it is terminal. Each is skipped on the wire when absent so the
- * TS side sees an optional field. `output_bytes` is ALWAYS present — total
- * bytes the process has written is defined in every state (0 at spawn), and
- * it survives the tombstone transition (snapshotted at demotion).
+ * `pid` and `pgid` exist only while the handle is live; `duration_ms`,
+ * `exit_code`, and `signal_number` exist only once it is terminal. Each is
+ * skipped on the wire when absent so the TS side sees an optional field.
+ * `output_bytes` is ALWAYS present — total bytes the process has written is
+ * defined in every state (0 at spawn), and it survives the tombstone
+ * transition (snapshotted at demotion).
+ *
+ * The terminal outcome is carried as the raw `exit_code` / `signal_number`
+ * pair from the tombstone rather than a derived enum: a handle exited
+ * successfully exactly when `exit_code == Some(0)` and `signal_number ==
+ * None`; any non-zero code or a recorded signal is a failure/kill. Surfacing
+ * the raw pair keeps the wire a thin projection of the tombstone and lets the
+ * UI build a precise label (`exited 3`, `killed (signal 9)`).
  */
 export type BashHandleInventory = { 
 /**
@@ -39,6 +47,17 @@ started_at: string,
  * Wall time the handle ran for; present only when terminal.
  */
 duration_ms?: number, 
+/**
+ * Process exit code; present only when terminal and the process exited
+ * (rather than being killed by an uncaught signal). `Some(0)` with no
+ * `signal_number` is the success outcome.
+ */
+exit_code?: number, 
+/**
+ * Terminating signal number; present only when terminal and the process
+ * was killed by a signal. Its presence marks a non-success outcome.
+ */
+signal_number?: number, 
 /**
  * Total bytes the process has written (monotonic, partial-inclusive).
  * Always present: defined as 0 at spawn, grows as output is produced,

@@ -216,6 +216,15 @@
   color: var(--accent-green);
 }
 
+/* Liveness, distinct from the ✓ success outcome: a static green dot for a
+ * running/live resource. Static, not pulsing — per the UI philosophy this is a
+ * professional tool with no playful/attention-grabbing motion. Shares the
+ * green accent var with --ok so "alive" and "succeeded" read as the same hue,
+ * differentiated only by glyph (● vs ✓). */
+.ws-glyph--live {
+  color: var(--accent-green);
+}
+
 .ws-glyph--warn {
   color: var(--accent-yellow);
 }

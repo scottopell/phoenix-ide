@@ -826,6 +826,8 @@ mod tests {
                     pgid: Some(4321),
                     started_at: ts(),
                     duration_ms: None,
+                    exit_code: None,
+                    signal_number: None,
                     output_bytes: 42,
                 }],
                 tmux: None,

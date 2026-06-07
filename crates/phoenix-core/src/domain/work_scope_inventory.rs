@@ -56,11 +56,19 @@ pub enum BashHandleState {
 
 /// One bash handle's observability projection.
 ///
-/// `pid` and `pgid` exist only while the handle is live; `duration_ms` exists
-/// only once it is terminal. Each is skipped on the wire when absent so the
-/// TS side sees an optional field. `output_bytes` is ALWAYS present — total
-/// bytes the process has written is defined in every state (0 at spawn), and
-/// it survives the tombstone transition (snapshotted at demotion).
+/// `pid` and `pgid` exist only while the handle is live; `duration_ms`,
+/// `exit_code`, and `signal_number` exist only once it is terminal. Each is
+/// skipped on the wire when absent so the TS side sees an optional field.
+/// `output_bytes` is ALWAYS present — total bytes the process has written is
+/// defined in every state (0 at spawn), and it survives the tombstone
+/// transition (snapshotted at demotion).
+///
+/// The terminal outcome is carried as the raw `exit_code` / `signal_number`
+/// pair from the tombstone rather than a derived enum: a handle exited
+/// successfully exactly when `exit_code == Some(0)` and `signal_number ==
+/// None`; any non-zero code or a recorded signal is a failure/kill. Surfacing
+/// the raw pair keeps the wire a thin projection of the tombstone and lets the
+/// UI build a precise label (`exited 3`, `killed (signal 9)`).
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct BashHandleInventory {
@@ -87,6 +95,17 @@ pub struct BashHandleInventory {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[ts(optional)]
     pub duration_ms: Option<u64>,
+    /// Process exit code; present only when terminal and the process exited
+    /// (rather than being killed by an uncaught signal). `Some(0)` with no
+    /// `signal_number` is the success outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub exit_code: Option<i32>,
+    /// Terminating signal number; present only when terminal and the process
+    /// was killed by a signal. Its presence marks a non-success outcome.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    pub signal_number: Option<i32>,
     /// Total bytes the process has written (monotonic, partial-inclusive).
     /// Always present: defined as 0 at spawn, grows as output is produced,
     /// and persisted into the tombstone so terminal handles report it too.
@@ -194,6 +213,8 @@ mod tests {
             pgid: Some(123),
             started_at: Utc::now(),
             duration_ms: None,
+            exit_code: None,
+            signal_number: None,
             output_bytes: 4096,
         };
         let v = serde_json::to_value(&inv).unwrap();
@@ -201,6 +222,8 @@ mod tests {
         assert_eq!(v["pid"], 123);
         assert_eq!(v["output_bytes"], 4096);
         assert!(v.get("duration_ms").is_none());
+        assert!(v.get("exit_code").is_none());
+        assert!(v.get("signal_number").is_none());
     }
 
     #[test]
@@ -214,11 +237,15 @@ mod tests {
             pgid: None,
             started_at: Utc::now(),
             duration_ms: Some(42),
+            exit_code: Some(0),
+            signal_number: None,
             output_bytes: 512,
         };
         let v = serde_json::to_value(&inv).unwrap();
         assert_eq!(v["state"], "tombstoned");
         assert_eq!(v["duration_ms"], 42);
+        assert_eq!(v["exit_code"], 0);
+        assert!(v.get("signal_number").is_none());
         assert!(v.get("pid").is_none());
         assert!(v.get("pgid").is_none());
         // output_bytes is always present, including on terminal handles.

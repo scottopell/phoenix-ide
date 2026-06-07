@@ -65,7 +65,9 @@ BashHandleInventory {
     pgid:            Option<i32>,   // present while live
     started_at:      DateTime<Utc>, // RFC3339 on the wire
     duration_ms:     Option<u64>,   // present only when terminal
-    ring_bytes_used: Option<u64>,   // present while live
+    exit_code:       Option<i32>,   // terminal outcome; present only when terminal
+    signal_number:   Option<i32>,   // terminal outcome; present only when killed by a signal
+    output_bytes:    u64,           // total bytes written; always present, persisted in tombstone
 }
 
 TmuxInventory {
@@ -91,9 +93,11 @@ conversions from the registry types, which do not all hold a wire-ready value.
   (`specs/bash/` REQ-BASH-WS-001). For each handle: `handle_id`, `label`,
   `cmd`, and `started_at` are fields on `Handle`; `state` discriminates
   `HandleState::Live` (further split into `running` vs `kill_pending_kernel`
-  by the presence of a `KillAttempt`) from `HandleState::Tombstoned`; `pid`,
-  `pgid`, and `ring_bytes_used` come from `LiveData`; `duration_ms` comes from
-  the `Tombstone`.
+  by the presence of a `KillAttempt`) from `HandleState::Tombstoned`; `pid`
+  and `pgid` come from `LiveData`; `duration_ms`, `exit_code`, and
+  `signal_number` come from the `Tombstone`; `output_bytes` is the ring's
+  monotonic total (`RingBuffer::output_bytes` while live, the `Tombstone`'s
+  snapshotted final total once terminal).
 - **Tmux** (REQ-WSUI-003): the per-`WorkScope` tmux registry. The registry
   entry (`TmuxServer`) records `work_scope`, `socket_path`, and an in-memory
   `status` (`NotProbed` | `Live` | `Gone`). The inventory carries
@@ -221,10 +225,17 @@ Per the UI Design Philosophy:
 - **Section header (default-expanded):** a "Work scope" label with a
   live-count badge — the number of `running` resources across bash + browser.
   Answers "is anything running?" at a glance.
-- **Expanded body:** per-resource rows. Each row shows an inline status glyph
-  (green `✓` running, yellow `+` spawning/`kill_pending_kernel`, muted glyph
-  tombstoned/torn-down), the resource label, and elapsed time inline. The bash
-  ring-buffer tail is a per-row on-demand disclosure, not shown by default.
+- **Expanded body:** per-resource rows. Each row shows an inline status glyph,
+  the resource label, and elapsed time inline. The glyph separates liveness
+  from outcome: a live resource (running bash handle, reachable tmux server,
+  live browser session) is a green live dot `●` ("alive"); a
+  `kill_pending_kernel` handle is a yellow `⏱` (terminating); a terminal bash
+  handle is its outcome — a green `✓` when it exited `0`, a red `✗` when it
+  exited non-zero or was killed by a signal (the title carries the precise
+  status, e.g. `exited 3` / `killed (signal 9)`); a torn-down browser is a
+  muted `○`. The check thus means "completed successfully," never "running."
+  The bash ring-buffer tail is a per-row on-demand disclosure, not shown by
+  default.
 - **Left panel collapsed:** when the whole `FileExplorerPanel` is collapsed to
   its badge rail, a Work scope badge in that rail carries the live count;
   clicking it expands the panel like the Files/Skills/Tasks badges.
@@ -233,11 +244,12 @@ Per the UI Design Philosophy:
 Expanded section (in left panel)
 ┌──────────────────────────┐
 │ ▾ Work scope          ⦿3 │
-│ ✓ bash  npm test   1m12s │
-│ + bash  build…     0m03s │
-│ · bash  lint      (done) │
-│ ✓ browser  live    8m    │
-│ ✓ tmux  main (2 win)     │
+│ ● bash  npm test   1m12s │
+│ ⏱ bash  build…     0m03s │
+│ ✓ bash  lint      (done) │
+│ ✗ bash  test      (fail) │
+│ ● browser  live    8m    │
+│ ● tmux  main (2 win)     │
 └──────────────────────────┘
 ```
 
@@ -303,10 +315,13 @@ eliminates.
   the other `*_ms` fields. There is deliberately no wall-clock `last_activity`
   on the wire; reconstructing one from a monotonic clock would invent precision
   the source does not have.
-- **`ring_bytes_used` / `pid` / `pgid` are `Option`.** They exist only while
-  the handle is `Live`; a tombstoned handle reports them absent. Skipping the
-  field via `skip_serializing_if = "Option::is_none"` renders it `undefined`
-  on the TS side, which the schema treats as optional.
+- **`pid` / `pgid` / `exit_code` / `signal_number` / `duration_ms` are `Option`.**
+  `pid`/`pgid` exist only while `Live`; `exit_code`/`signal_number`/`duration_ms`
+  only once `Tombstoned`. Skipping the field via
+  `skip_serializing_if = "Option::is_none"` renders it `undefined` on the TS
+  side, which the schema treats as optional. **`output_bytes` is NOT `Option`** —
+  total output is defined in every state (0 at spawn) and is persisted into the
+  tombstone, so it is always present.
 - **`duration_ms` is `Option<u64>`**, present only for terminal handles, the
   same shape `MessageUpdated.duration_ms` uses in `wire.rs`.
 

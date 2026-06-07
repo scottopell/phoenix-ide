@@ -65,15 +65,24 @@ WHEN the inventory includes a bash handle
 THE SYSTEM SHALL report, per handle: `handle_id`, `label`, a
 display-simplified `cmd`, `state` (one of `running`, `kill_pending_kernel`,
 `tombstoned`), `pid`, `pgid`, `started_at`, `duration_ms` (present only when
-the handle is terminal), and `ring_bytes_used`.
+the handle is terminal), `output_bytes`, and — for a terminal handle — the
+terminal outcome `exit_code` / `signal_number`.
 
 WHEN a handle is live (status `running` or `kill_pending_kernel`)
-THE SYSTEM SHALL source `pid`, `pgid`, and `ring_bytes_used` from the handle's
-live data.
+THE SYSTEM SHALL source `pid` and `pgid` from the handle's live data; both are
+absent once the handle is terminal.
+
+THE SYSTEM SHALL report `output_bytes` in every state — the total bytes the
+process has written (monotonic, partial-inclusive, never decremented by ring
+eviction). It is snapshotted into the tombstone at exit, so a terminal handle
+still reports its final total (`specs/bash/` REQ-BASH-004).
 
 WHEN a handle is tombstoned
-THE SYSTEM SHALL report `duration_ms` from the tombstone and SHALL NOT report a
-live `ring_bytes_used` (the live ring no longer exists).
+THE SYSTEM SHALL report `duration_ms`, `exit_code`, and `signal_number` from the
+tombstone. `exit_code` and `signal_number` are the raw terminal outcome: a
+handle completed successfully exactly when `exit_code` is `0` and no
+`signal_number` is present; a non-zero `exit_code` or any `signal_number` is a
+failure or kill. They are absent while the handle is live.
 
 THE bash inventory SHALL be sourced from the `WorkScope`-keyed bash handle
 registry (`specs/bash/` REQ-BASH-WS-001), covering both live and tombstoned
@@ -85,7 +94,7 @@ directly, with no conversation-to-handle join.
 already tracks. Because the registry is `WorkScope`-keyed (`specs/bash/`
 REQ-BASH-WS-001), the inventory reads one scope's handles by key rather than
 reconstructing the set from conversation membership. Reporting `pid`/`pgid`
-makes a runaway process actionable; `ring_bytes_used` signals an output-heavy
+makes a runaway process actionable; `output_bytes` signals an output-heavy
 command before the operator opens the tail.
 
 ---
@@ -243,6 +252,15 @@ THE section SHALL carry its own collapse state and a live-count badge of
 running resources, and when expanded SHALL show per-resource rows with inline
 status glyphs, label, and elapsed time, with the bash ring-buffer tail
 available on demand.
+
+THE per-resource status glyph SHALL distinguish liveness from outcome. A
+running or otherwise live resource (a running bash handle, a reachable tmux
+server, a live browser session) SHALL read as a live indicator — a filled dot
+meaning "alive" — never as a success check. A terminal bash handle SHALL read
+as its exit outcome: a success check WHEN it exited `0` with no terminating
+signal, and a failure mark WHEN it exited non-zero or was killed by a signal.
+The check therefore denotes a successful completion, never an in-progress
+resource.
 
 WHEN the left file-explorer panel is itself collapsed to its badge rail
 THE SYSTEM SHALL show a Work scope badge in that rail carrying the live count

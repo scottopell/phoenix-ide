@@ -82,6 +82,8 @@ async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
                 pgid: Some(live.pgid),
                 started_at,
                 duration_ms: None,
+                exit_code: None,
+                signal_number: None,
                 output_bytes,
             }
         }
@@ -94,6 +96,10 @@ async fn project_handle(handle: &Arc<Handle>) -> BashHandleInventory {
             pgid: None,
             started_at,
             duration_ms: Some(tomb.duration_ms),
+            // Raw outcome from the tombstone: success is `exit_code == Some(0)`
+            // with no `signal_number`; the UI derives the ✓/✗ glyph from this.
+            exit_code: tomb.exit_code,
+            signal_number: tomb.signal_number,
             output_bytes: tomb.output_bytes,
         },
     }
@@ -253,8 +259,49 @@ mod tests {
         assert_eq!(h.state, BashHandleState::Tombstoned);
         assert_eq!(h.duration_ms, Some(7));
         assert!(h.pid.is_none());
+        // A clean exit projects the success outcome: exit_code 0, no signal.
+        assert_eq!(h.exit_code, Some(0));
+        assert!(h.signal_number.is_none());
         // output_bytes persists into the tombstone; no output was written
         // here, so the snapshotted total is 0 (present, not absent).
         assert_eq!(h.output_bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn tombstoned_killed_handle_projects_signal_outcome() {
+        let bash = Arc::new(BashHandleRegistry::new());
+        let table = bash.get_or_create(&scope()).await;
+        let handle = Handle::new_live(
+            scope(),
+            HandleId::new("b-1"),
+            "sleep 99".into(),
+            None,
+            1,
+            1,
+            RING_BUFFER_BYTES,
+        );
+        handle
+            .transition_to_terminal(
+                crate::bash::handle::FinalCause::Killed {
+                    exit_code: None,
+                    signal_number: Some(9),
+                },
+                std::time::Duration::from_millis(3),
+                crate::bash::handle::TOMBSTONE_TAIL_LINES,
+            )
+            .await;
+        table.write().await.insert(handle);
+
+        let tmux = Arc::new(TmuxRegistry::with_socket_dir(
+            "/tmp/phoenix-inv-test".into(),
+        ));
+        let browser = BrowserSessionManager::new();
+        let inv = assemble_inventory(&scope(), &bash, &tmux, &browser).await;
+        let h = &inv.bash[0];
+        assert_eq!(h.state, BashHandleState::Tombstoned);
+        // A signal kill projects the failure outcome: a recorded signal, no
+        // success exit code.
+        assert_eq!(h.signal_number, Some(9));
+        assert!(h.exit_code.is_none());
     }
 }
