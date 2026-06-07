@@ -11,7 +11,7 @@ import { SkillViewer } from '../SkillViewer';
 import { TasksPanel } from '../TasksPanel';
 import { TaskViewer } from '../TaskViewer';
 import { WorkScopeSection } from '../WorkScopePanel';
-import { workScopeLiveCount } from '../workScopeHelpers';
+import { useSeededLiveCount } from '../useWorkScopeSeed';
 import { useFileExplorer } from '../../hooks/useFileExplorer';
 import type { SkillEntry, TaskEntry, WorkScopeInventory } from '../../api';
 
@@ -63,6 +63,13 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
 
   const currentTaskId = extractTaskId(branchName);
 
+  // Seed the work-scope live count from the inventory endpoint even while
+  // collapsed: the collapsed rail does not mount `WorkScopeSection`, so without
+  // this the badge is driven solely by the SSE-fed `liveWorkScope` and reads 0
+  // forever when the spawn `work_scope_update` fell outside the replay window.
+  // One fetch per scope (no poll); SSE stays authoritative once it arrives.
+  const workScopeCount = useSeededLiveCount(workScopeKey, liveWorkScope);
+
   const handleFileSelect = (filePath: string, rootDir: string) => {
     openFile(filePath, rootDir);
   };
@@ -88,11 +95,11 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
           </button>
           {workScopeKey && (
             <button
-              className={`fe-collapsed-badge${workScopeLiveCount(liveWorkScope ?? null) > 0 ? ' fe-collapsed-badge--active' : ''}`}
+              className={`fe-collapsed-badge${workScopeCount > 0 ? ' fe-collapsed-badge--active' : ''}`}
               onClick={onToggle}
-              title={`Work scope · ${workScopeLiveCount(liveWorkScope ?? null)} running`}
+              title={`Work scope · ${workScopeCount} running`}
             >
-              {workScopeLiveCount(liveWorkScope ?? null)}
+              {workScopeCount}
             </button>
           )}
         </div>

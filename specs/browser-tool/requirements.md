@@ -292,7 +292,7 @@ THE SYSTEM SHALL automatically close the browser
 
 THE SYSTEM SHALL isolate browser state between different `WorkScope`s. Continuation members that resolve to the same `WorkScope` deliberately share a session — see REQ-BROWSER-WS-001 / REQ-BROWSER-WS-002.
 
-**Idle reaping is liveness-gated, not purely timer-driven.** The 30-minute timer is a backstop for genuinely abandoned scopes. Activity (`last_activity`) only advances on a browser tool-call guard drop, so a conversation alive in the UI but quiet on browser tools for 30 minutes would, under a purely age-based reap, lose its live page state, open tabs, console buffer, and any attached live-view stream (REQ-BT-018) mid-watch. Liveness is "does any non-terminal conversation resolve to this scope?" — the same scope resolution the lifecycle fan-out uses (REQ-BROWSER-WS-002), against `ConvState::is_terminal`. `specs/projects/` guarantees at most one non-terminal conversation per scope, so the question has a single decisive answer. When no liveness predicate is wired (tool-level tests, contexts with no runtime), reaping falls back to age alone. The gate is consistent with the cascade path (REQ-BROWSER-WS-003), which already preserves a session whose scope is inherited by a live continuation.
+**Idle reaping is liveness-gated, not purely timer-driven.** The 30-minute timer is a backstop for genuinely abandoned scopes. Activity (`last_activity`) only advances on a browser tool-call guard drop, so a conversation alive in the UI but quiet on browser tools for 30 minutes would, under a purely age-based reap, lose its live page state, open tabs, console buffer, and any attached live-view stream (REQ-BT-018) mid-watch. Liveness is "does any non-terminal conversation resolve to this scope?" — the same scope resolution the lifecycle fan-out uses (REQ-BROWSER-WS-002), against `ConvState::is_terminal`. `specs/projects/` guarantees at most one non-terminal conversation per scope, so the question has a single decisive answer. When no liveness predicate is wired (tool-level tests, contexts with no runtime), reaping falls back to age alone. The gate is consistent with the cascade path (REQ-BROWSER-WS-003), which preserves a session whose scope is still owned by any live conversation — a continuation or a live sibling such as a Work-mode sub-agent sharing its parent's scope.
 
 WHEN browser tools receive `ToolContext`
 THE SYSTEM SHALL use `ctx.browser()` to obtain the session for `ctx.work_scope`
@@ -391,19 +391,20 @@ THE SYSTEM SHALL derive `browser_session_active` from `is_active(&WorkScope)` of
 
 WHEN the resource-cleanup cascade runs (archive / abandon / mark-merged / hard-delete)
 THE SYSTEM SHALL invoke `cascade_browser_on_delete(manager, &WorkScope, inheritor_scope)`
-AND `inheritor_scope` SHALL be the continuation's resolved `WorkScope`, or `None` if there is no continuation
+AND `inheritor_scope` SHALL be `Some(work_scope)` iff a non-terminal conversation other than the one being deleted resolves to that scope — a continuation that inherits it, or a live sibling such as a Work-mode sub-agent that shares its parent's scope — and `None` otherwise
+AND the deleted conversation SHALL be excluded from that live-owner enumeration, because the cascade runs before its terminal-state write so it still reads non-terminal
 AND failures SHALL log WARN and continue
     (consistent with the bash / tmux / projects cascade error policy)
 
-WHEN `inheritor_scope == Some(work_scope)` (scope equality holds)
+WHEN `inheritor_scope == Some(work_scope)` (the scope is still owned by a live conversation other than the deleted one)
 THE SYSTEM SHALL skip the session kill
-    (the inheritor is still driving the same Chrome window)
+    (the surviving owner is still driving the same Chrome window)
 
-WHEN `inheritor_scope` is `None` OR differs from `work_scope`
+WHEN `inheritor_scope` is `None`
 THE SYSTEM SHALL tear the session down
-    (Direct continuations always fall here — their `Conversation(<child_id>)` scope is never equal to the parent's `Conversation(<parent_id>)` scope, so the equality rule subsumes the per-kind case-analysis)
+    (the deleted conversation was the last live owner — excluding it from the enumeration is what makes this reachable; Direct conversations also fall here, having no shared worktree scope)
 
-**Rationale:** Before this requirement, archive/abandon killed bash + tmux but leaked Chrome until Phoenix restart. Scope-equality preservation is correct by construction — it asks "are my resources still owned by someone live?" rather than relying on the implicit invariant "Worktree continuations always inherit the same worktree." The same shape applies to tmux (REQ-TMUX-WS-002).
+**Rationale:** Before this requirement, archive/abandon killed bash + tmux but leaked Chrome until Phoenix restart. The preservation signal is correct by construction — it asks "are my resources still owned by someone live other than me?" rather than relying on the implicit invariant "Worktree continuations always inherit the same worktree." Continuation is one way a scope outlives a conversation; a live sibling such as a Work-mode sub-agent sharing its parent's scope is another. The same shape applies to tmux (REQ-TMUX-WS-002) and the terminal (REQ-TERM-WS-001).
 
 **User Stories:** US-2, US-3
 
@@ -414,8 +415,8 @@ THE SYSTEM SHALL tear the session down
 WHEN `BrowserSessionManager::get_existing` returns `None`
 THE SYSTEM SHALL log at `debug` level with the queried `WorkScope`
 
-WHEN `cascade_browser_on_delete` skips a kill because the worktree is shared with a continuation
-THE SYSTEM SHALL log at `debug` level with the work scope and the continuation id
+WHEN `cascade_browser_on_delete` skips a kill because the scope is still owned by a live conversation other than the deleted one
+THE SYSTEM SHALL log at `debug` level with the work scope
 
 WHEN `BrowserSessionLifecycleEvent` cannot be delivered (sink closed)
 THE SYSTEM SHALL log at `debug` level

@@ -14,8 +14,9 @@
 --           augmentation, independent multi-contract semantics,
 --           four terminal causes (Fired / Expired / Cancelled /
 --           Forgotten), restart resync, lifecycle-cascade
---           interaction, continuation inheritance (all handle
---           kinds transfer across the boundary).
+--           interaction, continuation inheritance (WorkScope-keyed
+--           handles transfer across the boundary; subagent handles
+--           are keyed by agent id, independent of WorkScope).
 -- Excludes:
 --   - Condition kinds beyond HandleTerminal (deferred)
 --   - Cross-conversation wake
@@ -126,11 +127,13 @@ entity Contract {
     id: String
 
     -- The conversation that this contract delivers into on
-    -- resolution. Every handle kind a contract can watch (bash,
-    -- tmux, subagent) is WorkScope-keyed, so on a
-    -- continuation that inherits the WorkScope the watched handle
-    -- transfers to the child and this field is re-keyed to the
-    -- child conversation. No handle kind forgets at the boundary.
+    -- resolution. For a WorkScope-keyed handle (bash, tmux), a
+    -- continuation that inherits the WorkScope transfers the watched
+    -- handle to the child and this field is re-keyed to the child
+    -- conversation. A subagent handle is keyed by the sub-agent's own
+    -- agent / child-conversation id (per specs/subagents/), not by
+    -- WorkScope, so a subagent-keyed contract is not re-keyed by
+    -- WorkScope inheritance.
     conversation: bedrock/Conversation
 
     -- The condition the contract is waiting on.
@@ -189,6 +192,16 @@ config {
     -- restart, every pending contract referencing one of these kinds
     -- fires forgotten with reason = "phoenix_restart". tmux_pane and
     -- subagent are durable; bash handles are in-memory and are not.
+
+    workscope_keyed_kinds: Set<HandleKind> = {bash, tmux_pane}
+    -- HandleKinds whose handles are WorkScope-level resources and so
+    -- transfer to a continuation that inherits the WorkScope. A
+    -- contract on one of these kinds re-keys its conversation to the
+    -- successor at the continuation boundary (REQ-WAKE-012). subagent
+    -- is excluded: a sub-agent is tracked by its own agent /
+    -- child-conversation id (per specs/subagents/), independent of
+    -- the parent's WorkScope, so a subagent-keyed contract is not
+    -- re-keyed by WorkScope inheritance.
 }
 
 ------------------------------------------------------------
@@ -383,25 +396,38 @@ rule LifecycleCascadeCancelsContracts {
         -- deliver if conv is still queryable.
 }
 
--- REQ-WAKE-012: continuation that inherits the WorkScope transfers
--- every pending contract to the child by re-keying its conv_id.
+-- REQ-WAKE-012: a continuation that inherits the WorkScope transfers
+-- the contracts whose watched handle is WorkScope-keyed by re-keying
+-- their conversation to the child. subagent-keyed contracts are NOT
+-- re-keyed by WorkScope inheritance.
 rule ContinuationBoundaryHandlesContracts {
     when: ConversationContinuationBoundaryReached(parent, child)
 
-    ensures: ForEveryPendingContractOnParent(
-        ContractReKeyedToChild(contract, child)
-    )
+    ensures:
+        for contract in pending_contracts_on(parent)
+            where contract.condition.handle?.kind in config.workscope_keyed_kinds:
+            ContractReKeyedToChild(contract, child)
 
     @guidance
-        -- Every handle kind a contract can watch (bash, tmux,
-        -- subagent) is WorkScope-keyed, so when the child
-        -- inherits the same WorkScope the watched handle transfers
-        -- to it (bash per specs/bash/ REQ-BASH-WS-001; the others
-        -- per the WorkScope foundation). Each pending contract
-        -- transfers with its handle: its conv_id is re-keyed to the
-        -- child and subsequent fires deliver into the child
-        -- transcript. registered_at, expires_at, condition all
-        -- preserved. No handle kind forgets at the boundary.
+        -- A bash or tmux handle is a WorkScope-level resource (bash
+        -- per specs/bash/ REQ-BASH-WS-001), so when the child inherits
+        -- the same WorkScope the watched handle transfers to it and
+        -- its contract transfers with it: conversation re-keyed to the
+        -- child, subsequent fires deliver into the child transcript,
+        -- registered_at / expires_at / condition all preserved.
+        --
+        -- A subagent handle is keyed by the sub-agent's own agent /
+        -- child-conversation id (per specs/subagents/), not by the
+        -- parent's WorkScope. A WorkScope-inheriting continuation does
+        -- not make an already-spawned sub-agent a WorkScope-owned
+        -- resource of the successor, so a subagent-keyed contract is
+        -- not re-keyed here; its completion wake stays keyed to the
+        -- sub-agent id it was registered against.
+        --
+        -- Neither case forgets at the boundary: forgotten is reserved
+        -- for a genuinely destroyed handle (WorkScope torn down with
+        -- no inheritor, or a Phoenix restart dropping an in-memory
+        -- bash handle).
 }
 
 -- REQ-WAKE-002 + REQ-WAKE-011: restart resync. Pending contracts on

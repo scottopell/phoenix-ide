@@ -246,12 +246,20 @@ function useWorkScopeInventory(
   const scopeKeyRef = useRef(scopeKey);
   scopeKeyRef.current = scopeKey;
 
+  // Stale-scope guard: a fetch (initial pull or poll) for the previous scope
+  // can resolve after `scopeKey` changes. Capturing the key at request time and
+  // re-checking it against the live ref at resolve time rejects that stale
+  // result so it never overwrites the new scope's snapshot — while leaving the
+  // last-arrival-wins merge among fetch / SSE / poll for the SAME scope intact.
   const fetchSnapshot = useCallback(async () => {
+    const requestedKey = scopeKeyRef.current;
     setError(false);
     try {
-      const inv = await api.getWorkScopeInventory(scopeKeyRef.current);
+      const inv = await api.getWorkScopeInventory(requestedKey);
+      if (scopeKeyRef.current !== requestedKey) return;
       setDisplayed(inv);
     } catch {
+      if (scopeKeyRef.current !== requestedKey) return;
       setError(true);
     }
   }, []);

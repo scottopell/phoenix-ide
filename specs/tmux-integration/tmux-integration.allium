@@ -614,18 +614,25 @@ rule UserOpensTerminalWithoutTmux {
 -- Rules — hard-delete cascade and soft-state no-ops
 ------------------------------------------------------------
 
--- REQ-TMUX-007: conversation hard-delete cascades to tmux server.
--- Exception: if the conversation's worktree was transferred to a
--- continuation (continued_in_conv_id is set), the tmux session is still
--- live for that continuation — skip kill and unlink. The registry entry
--- is still removed. (task 03001)
+-- REQ-TMUX-007, REQ-TMUX-WS-002: conversation hard-delete cascades to the
+-- tmux server. The orchestrator resolves the deleted conversation's WorkScope
+-- and passes a preservation signal `inheritor_scope` — Some(work_scope) iff a
+-- non-terminal conversation OTHER THAN the deleted one resolves to that scope
+-- (a continuation that inherits it, or a live sibling such as a Work-mode
+-- sub-agent sharing its parent's scope), None otherwise. The deleted
+-- conversation is excluded from that enumeration: the cascade runs before its
+-- terminal-state write, so it still reads non-terminal, and excluding it is
+-- what makes teardown reachable when it is the last live owner. Tear down only
+-- when the signal is absent — kill, unlink, and drop the entry.
 rule ServerKilledByConversationDelete {
-    when: ConversationHardDeleted(conversation)
+    when: CleanupCascadeRunFor(conversation, inheritor_scope)
 
+    let work_scope = resolve_work_scope(conversation)
+
+    requires: inheritor_scope != Some(work_scope)
     requires: exists TmuxServer{conversation: conversation}
     let server = TmuxServer{conversation: conversation}
     requires: server.status != gone
-    requires: conversation.continued_in_conv_id = null
 
     ensures: TmuxServerKilled(server.socket_path)
     ensures: SocketFileUnlinked(server.socket_path)
@@ -643,13 +650,17 @@ rule ServerKilledByConversationDelete {
         -- failure.
 }
 
--- When a conversation's worktree was transferred to a continuation, the
--- hard-delete only removes the registry entry; the tmux server and socket
--- file are left intact for the continuation to use. (task 03001)
-rule ServerPreservedForContinuation {
-    when: ConversationHardDeleted(conversation)
+-- REQ-TMUX-WS-002: when the scope is still owned by a live conversation other
+-- than the one being deleted — a continuation that inherits it, or a live
+-- sibling such as a Work-mode sub-agent sharing its parent's scope — the
+-- hard-delete only removes this conversation's registry entry; the tmux server
+-- and socket file are left intact for the surviving owner to use.
+rule ServerPreservedForLiveOwner {
+    when: CleanupCascadeRunFor(conversation, inheritor_scope)
 
-    requires: conversation.continued_in_conv_id != null
+    let work_scope = resolve_work_scope(conversation)
+
+    requires: inheritor_scope = Some(work_scope)
 
     ensures: not exists TmuxServer{conversation: conversation}
     -- TmuxServerKilled and SocketFileUnlinked are NOT ensured.
@@ -657,8 +668,8 @@ rule ServerPreservedForContinuation {
     -- Note: this rule fires whether or not a TmuxServer entry currently
     -- exists for the conversation. If no entry exists (e.g., conversation
     -- never used tmux), the post-condition is vacuously satisfied. The
-    -- code's skip-kill behaviour matches: it short-circuits on
-    -- continued_in_conv_id BEFORE looking at the registry entry, so the
+    -- code's skip-kill behaviour matches: it short-circuits on the
+    -- preservation signal BEFORE looking at the registry entry, so the
     -- absence of an entry doesn't change the outcome.
 }
 

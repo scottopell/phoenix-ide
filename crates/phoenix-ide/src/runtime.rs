@@ -1248,12 +1248,41 @@ impl RuntimeManager {
     /// abandoned and must reap. REQ-PROJ-025 guarantees at most one
     /// non-terminal conversation per scope, so the first match is decisive.
     pub(crate) async fn scope_has_live_conversation(&self, work_scope: &WorkScope) -> bool {
+        self.scope_has_live_conversation_inner(work_scope, None)
+            .await
+    }
+
+    /// Like [`scope_has_live_conversation`] but skips `excluded_conv_id` when
+    /// enumerating. Used by the resource-cleanup cascade to ask "does a live
+    /// conversation OTHER THAN the one being deleted still own this scope?"
+    ///
+    /// Exclusion is load-bearing: the cascade runs BEFORE the terminal-state
+    /// write, so the conversation being deleted/archived still reads
+    /// non-terminal in the DB. Without excluding it, the scope would always
+    /// look live and never tear down.
+    pub(crate) async fn scope_has_live_conversation_excluding(
+        &self,
+        work_scope: &WorkScope,
+        excluded_conv_id: &str,
+    ) -> bool {
+        self.scope_has_live_conversation_inner(work_scope, Some(excluded_conv_id))
+            .await
+    }
+
+    async fn scope_has_live_conversation_inner(
+        &self,
+        work_scope: &WorkScope,
+        excluded_conv_id: Option<&str>,
+    ) -> bool {
         let conv_ids: Vec<String> = {
             let runtimes = self.runtimes.read().await;
             runtimes.keys().cloned().collect()
         };
 
         for conv_id in conv_ids {
+            if excluded_conv_id == Some(conv_id.as_str()) {
+                continue;
+            }
             let Ok(conv) = self.db().get_conversation(&conv_id).await else {
                 continue;
             };

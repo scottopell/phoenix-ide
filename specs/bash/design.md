@@ -684,7 +684,7 @@ async fn cascade_bash_on_delete(
     work_scope: &WorkScope,
     inheritor_scope: Option<&WorkScope>,
 ) {
-    // A continuation inheriting the same scope keeps the live processes and
+    // A scope still owned by a live conversation keeps the live processes and
     // tombstones — they belong to the WorkScope, not the deleted conversation.
     if inheritor_scope == Some(work_scope) {
         return;
@@ -702,10 +702,16 @@ async fn cascade_bash_on_delete(
 
 The hard-delete handler runs this synchronously alongside the tmux server kill
 (`specs/tmux-integration/`) and the browser-session cascade, passing the same
-`inheritor_scope` to all three so a continuation chain on one worktree keeps
-its bash processes, tmux server, and browser session together. There is no
-SQLite shadow store to clean up; in-memory tombstones are dropped along with
-the registry entry when no inheritor survives.
+`inheritor_scope` to all three so resources on one scope stay together. The
+handler computes `inheritor_scope = Some(work_scope)` iff the scope is still
+owned by a live (non-terminal) conversation OTHER THAN the one being deleted —
+either a continuation that inherits it, or a live sibling such as a Work-mode
+sub-agent that shares its parent's scope. The deleted conversation is excluded
+from that live-owner enumeration: the cascade runs before its terminal-state
+write, so it still reads non-terminal, and excluding it is what lets the scope
+tear down when it is the last live owner. There is no SQLite shadow store to
+clean up; in-memory tombstones are dropped along with the registry entry when
+no live owner survives.
 
 > **Bedrock dependency:** the hard-delete cascade integration is wired
 > through `cascade_bash_on_delete`, called directly from the bedrock
@@ -878,11 +884,14 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
 - Late-arriving exit after `kill_pending_kernel`: handle transitions
   `kill_pending_kernel → killed` (or `→ exited`); subsequent peek/wait/
   kill observes the now-tombstoned state via `status: "tombstoned"`.
-- Hard-delete a conversation with live handles AND no inheritor scope →
-  processes killed, in-memory entries gone.
+- Hard-delete the last live conversation on a `WorkScope` (no continuation, no
+  live sibling) with live handles → processes killed, in-memory entries gone.
 - Hard-delete a conversation whose continuation inherits the same `WorkScope`
-  (`inheritor_scope == work_scope`) → processes left running, handles and
-  tombstones still reachable from the continuation (REQ-BASH-WS-002).
+  → processes left running, handles and tombstones still reachable from the
+  continuation (REQ-BASH-WS-002).
+- Hard-delete a Work-mode sub-agent that shares its still-live parent's
+  `WorkScope` (no continuation of its own) → parent's processes left running,
+  handles and tombstones still reachable from the parent (REQ-BASH-WS-002).
 - Continuation across the boundary: a handle spawned in the parent conversation
   is peekable/waitable/killable from the continuation that inherits its
   `WorkScope` (REQ-BASH-WS-001).

@@ -740,28 +740,39 @@ and they differ toward survival.
 
 ---
 
-### REQ-BASH-WS-002: Hard-Delete Cascade Respects Inheritor Scope
+### REQ-BASH-WS-002: Hard-Delete Cascade Preserves a Scope Still Owned by a Live Conversation
 
-WHEN a conversation is hard-deleted AND a surviving conversation (typically a
-continuation) inherits the same `WorkScope`
+WHEN a conversation is hard-deleted AND a non-terminal conversation OTHER THAN
+the one being deleted resolves to the same `WorkScope` — whether a continuation
+that inherits it, or a sibling such as a Work-mode sub-agent that shares its
+parent's scope
 THE SYSTEM SHALL NOT kill that `WorkScope`'s running processes or drop its
-tombstones — the inheritor keeps them
+tombstones — the surviving owner keeps them
 
-WHEN a conversation is hard-deleted AND no surviving conversation inherits its
-`WorkScope`
+WHEN a conversation is hard-deleted AND no non-terminal conversation other than
+the one being deleted resolves to its `WorkScope`
 THE SYSTEM SHALL kill every running process in that `WorkScope`'s handle table
 AND drop the `WorkScope`'s handles and tombstones
 
-THE cascade SHALL receive the deleted conversation's `WorkScope` and the
-inheritor's `WorkScope` (if any) and SHALL skip teardown when they match,
-mirroring `cascade_terminal_on_delete` / `cascade_browser_on_delete`
-(REQ-TERM-WS-002, REQ-BROWSER-WS-002).
+THE cascade SHALL receive the deleted conversation's `WorkScope` and a
+preservation signal that is true iff the scope is still owned, and SHALL skip
+teardown when the signal is true, mirroring `cascade_terminal_on_delete` /
+`cascade_browser_on_delete` (REQ-TERM-WS-002, REQ-BROWSER-WS-002).
 
-**Rationale:** Without inheritor awareness, archiving the parent of a live
-continuation chain SIGKILLs processes the continuation still depends on while
-its tmux server and browser session survive — an asymmetry the agent
-experiences as the runtime randomly forgetting work. Scope-match-skip is the
-rule the other `WorkScope`-keyed resources already use.
+THE preservation signal SHALL exclude the conversation being deleted when
+enumerating live owners. The cascade runs before the deleted conversation's
+terminal-state write, so it still reads non-terminal; excluding it is what lets
+the scope tear down when it is the last live owner.
+
+**Rationale:** A continuation is not the only way a scope outlives one
+conversation. A Work-mode sub-agent inherits its parent's `conv_mode` and so
+resolves to the parent's `WorkScope`, but has no continuation. Preserving only
+on a continuation SIGKILLs the still-open parent's processes (and tears down its
+tmux server, terminal, and browser session, which share the call site) the
+instant the sub-agent is deleted — an asymmetry the agent experiences as the
+runtime randomly forgetting work. The correct signal is "is the scope still
+owned by a live conversation other than this one," which a continuation
+satisfies as one case among several.
 
 ---
 

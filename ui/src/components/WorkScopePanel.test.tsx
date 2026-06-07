@@ -20,6 +20,7 @@ vi.mock('../api', async (importOriginal) => {
 });
 
 import { WorkScopeSection } from './WorkScopePanel';
+import { useSeededLiveCount } from './useWorkScopeSeed';
 
 const getInv = vi.mocked(api.getWorkScopeInventory);
 
@@ -250,5 +251,107 @@ describe('WorkScopeSection running-handle poll', () => {
     // Poll arrived after SSE → its byte count wins, despite liveInventory being set.
     expect(getInv).toHaveBeenCalled();
     expect(screen.getByText('8.0 KB')).toBeTruthy();
+  });
+});
+
+describe('WorkScopeSection stale-scope guard', () => {
+  it('a fetch for an old scopeKey resolving after the key changed does NOT overwrite the new scope', async () => {
+    // Defer the OLD scope's fetch so it resolves last, after scopeKey flips.
+    let resolveOld!: (v: WorkScopeInventory) => void;
+    const oldPending = new Promise<WorkScopeInventory>((r) => {
+      resolveOld = r;
+    });
+    const oldInv = inv([bash({ cmd: 'OLD-SCOPE-CMD', state: 'tombstoned', duration_ms: 1 })]);
+    const newInv = inv([bash({ cmd: 'NEW-SCOPE-CMD', state: 'tombstoned', duration_ms: 1 })]);
+
+    getInv.mockImplementation((key: string) =>
+      key === 'ws-old' ? oldPending : Promise.resolve(newInv),
+    );
+
+    let utils!: ReturnType<typeof render>;
+    await act(async () => {
+      utils = render(
+        <WorkScopeSection
+          scopeKey="ws-old"
+          liveInventory={null}
+          expanded={true}
+          onToggleExpanded={() => {}}
+        />,
+      );
+    });
+
+    // Switch to the new scope; its fetch resolves immediately.
+    await act(async () => {
+      utils.rerender(
+        <WorkScopeSection
+          scopeKey="ws-new"
+          liveInventory={null}
+          expanded={true}
+          onToggleExpanded={() => {}}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(screen.getByText('NEW-SCOPE-CMD')).toBeTruthy();
+
+    // The stale OLD fetch resolves LAST — it must be rejected by the guard.
+    await act(async () => {
+      resolveOld(oldInv);
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('NEW-SCOPE-CMD')).toBeTruthy();
+    expect(screen.queryByText('OLD-SCOPE-CMD')).toBeNull();
+  });
+});
+
+describe('useSeededLiveCount (collapsed-badge seed)', () => {
+  // A tiny harness that renders the hook's result as text.
+  function Harness({
+    scopeKey,
+    live,
+  }: {
+    scopeKey: string | null | undefined;
+    live: WorkScopeInventory | null | undefined;
+  }) {
+    const count = useSeededLiveCount(scopeKey, live);
+    return <span data-testid="count">{count}</span>;
+  }
+
+  it('seeds the count from the inventory endpoint when no SSE value is present', async () => {
+    getInv.mockResolvedValue(inv([bash({ state: 'running' })]));
+
+    await act(async () => {
+      render(<Harness scopeKey="ws-1" live={null} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(getInv).toHaveBeenCalledWith('ws-1');
+    expect(screen.getByTestId('count').textContent).toBe('1');
+  });
+
+  it('does not fetch when there is no scopeKey, and reports 0', async () => {
+    await act(async () => {
+      render(<Harness scopeKey={null} live={null} />);
+    });
+    expect(getInv).not.toHaveBeenCalled();
+    expect(screen.getByTestId('count').textContent).toBe('0');
+  });
+
+  it('SSE value is authoritative over the seed once present', async () => {
+    // Seed reports two live; SSE reports one live → SSE wins.
+    getInv.mockResolvedValue(inv([bash({ state: 'running' }), bash({ state: 'running' })]));
+    const sse = inv([bash({ state: 'running' })]);
+
+    await act(async () => {
+      render(<Harness scopeKey="ws-1" live={sse} />);
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId('count').textContent).toBe('1');
   });
 });

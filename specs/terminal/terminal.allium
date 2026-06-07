@@ -597,8 +597,11 @@ rule TerminalAbandonedWithConversation {
 -- REQ-TERM-WS-001 / REQ-TERM-012: Worktree-scoped terminal tears down on
 -- the same cleanup events that destroy the worktree-scoped tmux server
 -- (REQ-TMUX-WS-002): archive, abandon, mark-merged, hard-delete. The
--- preservation rule inherits from tmux — if a continuation conversation
--- resolves to the same WorkScope, the terminal is preserved.
+-- preservation rule inherits from tmux — if any non-terminal conversation
+-- other than the one being deleted still resolves to the same WorkScope (a
+-- continuation that inherits it, or a live sibling such as a Work-mode
+-- sub-agent sharing its parent's scope), the terminal is preserved; teardown
+-- fires only when the last live owner is gone.
 --
 -- Trigger params: `terminal` is the affected entity; `scope` is the
 -- WorkScope whose lifecycle hook fired. Mirrors

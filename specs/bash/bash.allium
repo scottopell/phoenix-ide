@@ -1043,12 +1043,18 @@ rule HandleKillNotFound {
 ------------------------------------------------------------
 
 -- REQ-BASH-006, REQ-BASH-WS-002: conversation hard-delete tears down the
--- WorkScope's handle table only when no surviving conversation inherits the
--- same WorkScope. The cascade receives the deleted conversation's WorkScope
--- (via resolve_work_scope) and the inheritor's WorkScope (if any) and tears
--- down only when they differ — kills any live handles and drops every handle
--- (live or tombstoned) in the table. Mirrors cascade_terminal_on_delete /
--- cascade_browser_on_delete.
+-- WorkScope's handle table only when no live conversation OTHER THAN the one
+-- being deleted still owns the same WorkScope. The cascade receives the
+-- deleted conversation's WorkScope (via resolve_work_scope) and a preservation
+-- signal `inheritor_scope` — Some(work_scope) iff a non-terminal conversation
+-- other than the deleted one resolves to that scope (a continuation that
+-- inherits it, or a live sibling such as a Work-mode sub-agent sharing its
+-- parent's scope). The deleted conversation is excluded from that enumeration:
+-- the cascade runs before its terminal-state write, so it still reads
+-- non-terminal, and excluding it is what lets the scope tear down when it is
+-- the last live owner. The cascade tears down only when the signal is absent —
+-- kills any live handles and drops every handle (live or tombstoned) in the
+-- table. Mirrors cascade_terminal_on_delete / cascade_browser_on_delete.
 rule HandlesTornDownWhenNoInheritor {
     when: ConversationHardDeleted(conversation, inheritor_scope)
 
@@ -1070,11 +1076,13 @@ rule HandlesTornDownWhenNoInheritor {
 }
 
 -- REQ-BASH-WS-002: conversation hard-delete preserves the WorkScope's handle
--- table when a surviving conversation (typically a continuation) inherits the
--- same WorkScope. The inheritor keeps the running processes and tombstones;
--- a handle spawned before the continuation boundary stays addressable. Scope
--- equality subsumes per-kind analysis: a Direct continuation resolves to a
--- distinct Conversation scope and falls through to teardown.
+-- table when a non-terminal conversation other than the one being deleted
+-- still owns the same WorkScope — a continuation that inherits it, or a live
+-- sibling such as a Work-mode sub-agent sharing its parent's scope. The
+-- surviving owner keeps the running processes and tombstones; a handle spawned
+-- before the boundary stays addressable. Scope equality subsumes per-kind
+-- analysis: a Direct continuation resolves to a distinct Conversation scope
+-- and falls through to teardown.
 rule HandlesPreservedOnScopeMatch {
     when: ConversationHardDeleted(conversation, inheritor_scope)
 
@@ -1299,6 +1307,7 @@ deferred BashHandleCrossRestartPersistence
 --     work scope, e.g. "b-1"); Allium contract is "unique within a
 --     WorkScope."
 --   - Handle registry keyed by WorkScope, matching the terminal, browser,
---     and tmux registries: continuation conversations on one worktree share
---     a handle table, and the hard-delete cascade skips teardown when an
---     inheritor shares the scope (REQ-BASH-WS-001, REQ-BASH-WS-002).
+--     and tmux registries: conversations on one worktree share a handle
+--     table, and the hard-delete cascade skips teardown when a live
+--     conversation other than the deleted one still owns the scope
+--     (REQ-BASH-WS-001, REQ-BASH-WS-002).

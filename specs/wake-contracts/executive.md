@@ -52,11 +52,15 @@ just zero intervening turns.
 
 Wake contracts are conversation-scoped, not WorkScope-scoped: a contract is
 owned by one conversation and delivers its synthetic result there. The handles
-it can watch, however, are all WorkScope-keyed (bash, tmux, subagent).
-So when a conversation continues into a successor that inherits the same
-WorkScope, every pending contract re-keys its `conv_id` to the successor along
-with the handle it watches — no contract fires `Forgotten` at the continuation
-boundary.
+it can watch fall into two keying classes. Bash and tmux handles are
+WorkScope-keyed: when a conversation continues into a successor that inherits
+the same WorkScope, the handle transfers to the successor and a pending contract
+on it re-keys its `conv_id` along with it. A subagent handle is keyed by the
+sub-agent's own agent / child-conversation id (not by WorkScope), so a
+subagent-keyed contract is not transferred by WorkScope inheritance. A contract
+fires `Forgotten` only when its watched handle is genuinely destroyed (a Phoenix
+restart, or a hard-delete with no inheriting scope), not as a routine
+consequence of continuation.
 
 Mandatory `expires_at` (default 600s, cap 1800s) prevents unbounded
 commitments. Restart resync re-registers non-fired contracts; any
@@ -86,14 +90,13 @@ land separately.
 | REQ-WAKE-009 Conv-Scoped | Proposed | Not WorkScope-scoped; explicit deconfliction |
 | REQ-WAKE-010 Independent Contracts | Proposed | No auto-cancel on sibling fire |
 | REQ-WAKE-011 Terminal Cause | Proposed | Fired / Expired / Cancelled / Forgotten |
-| REQ-WAKE-012 Continuation Inheritance | Proposed | All handle kinds (incl. bash) transfer; no continuation-boundary forget |
+| REQ-WAKE-012 Continuation Inheritance | Proposed | WorkScope-keyed handles (bash, tmux) transfer; subagent is agent-id-keyed |
 | REQ-WAKE-013 User Messages | Proposed | Conv stays Idle; user messages just work |
 | REQ-WAKE-014 Tool Description | Proposed | Explicit cost model + when-to-use guidance |
 | REQ-WAKE-015 Cost Observability | Proposed | Metrics on registration / fire / forgotten breakdown |
 | REQ-WAKE-016 Unified Tool Surface | Proposed | Single `wait_until` tool, tagged-enum handle discriminator |
 
-**Progress:** 0 of 16 implemented. **All open questions resolved**
-per `/asking-questions` session 2026-05-24.
+**Progress:** 0 of 16 implemented.
 
 ## Dependencies
 
@@ -108,14 +111,14 @@ per `/asking-questions` session 2026-05-24.
 
 - **`specs/bash/` REQ-BASH-WS-001 / -WS-002** — bash handles are
   WorkScope-keyed and inherit across a scope-sharing continuation, so
-  REQ-WAKE-012 transfers every handle kind (bash included) to the child
-- **WorkScope foundation** (PRs #136, #143, #139, merged) —
-  established the resource-cleanup cascade infrastructure this spec
-  extends with cancel-on-lifecycle (REQ-WAKE-004 join)
-- **Persona panel review** (`/persona-panel` session 2026-05-24) —
-  4 reviewers (correct-by-construction, LLM-cognitive-load, failure-
-  mode, token-economics) converged on "no wake primitive" as the
-  single root cause behind 6+ distinct surface complaints
+  REQ-WAKE-012 transfers a bash-keyed contract to the child along with
+  its handle
+- **`specs/subagents/`** — a sub-agent is tracked by its own agent /
+  child-conversation id, so a subagent-keyed contract is keyed
+  independently of the parent's WorkScope (REQ-WAKE-012)
+- **WorkScope foundation** — the resource-cleanup cascade
+  infrastructure this spec extends with cancel-on-lifecycle
+  (REQ-WAKE-004 join)
 
 ## Why This Spec Exists
 

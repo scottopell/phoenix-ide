@@ -57,12 +57,17 @@ durability does not depend on the underlying handle's durability.
 
 **Scope:** wake contracts are conversation-scoped, not WorkScope-scoped.
 A contract belongs to the conversation that registered it; resolution
-delivers a synthetic tool result into that conversation. Every handle a
-contract can watch — bash, tmux, subagent — is WorkScope-keyed, so
-when a conversation continues into a successor that inherits the same
-WorkScope, the underlying handle transfers to the successor and the contract
-transfers with it: its `conv_id` is re-keyed to the child and subsequent fires
-deliver there. No contract fires `forgotten` at the continuation boundary.
+delivers a synthetic tool result into that conversation. The handles a
+contract can watch fall into two keying classes. Bash and tmux handles
+are WorkScope-keyed: when a conversation continues into a successor that
+inherits the same WorkScope, the underlying handle transfers to the
+successor and a pending contract on it re-keys its `conv_id` to the child,
+so subsequent fires deliver there. A subagent handle is keyed by the
+sub-agent's own agent / child-conversation id (per `specs/subagents/`),
+independent of the parent's WorkScope; a subagent-keyed contract is not
+transferred by WorkScope inheritance. A contract fires `forgotten` only
+when its watched handle is genuinely destroyed, not at a routine
+continuation boundary.
 
 ## Requirements
 
@@ -274,12 +279,11 @@ LLM cares about. There is no reason to cancel a still-relevant
 `cargo build` watch just because an unrelated `subagent` finished
 first. The LLM consumes the first fire, makes whatever decisions, and
 either lets the other contracts continue to fire on their own
-schedule or cancels them explicitly via the cancel endpoint. This is
-a change from the earlier "first-fire-wins-cancel-siblings" draft;
-that semantics only made sense in a model where the conv was in a
-single-contract-bound `AwaitingWake` state. With contracts as
-free-standing rows the more honest semantics is "each fires
-independently."
+schedule or cancels them explicitly via the cancel endpoint. The
+rejected "first-fire-wins-cancel-siblings" semantics only makes sense
+in a model where the conv is in a single-contract-bound `AwaitingWake`
+state; with contracts as free-standing rows, independent firing is the
+honest semantics.
 
 ---
 
@@ -304,22 +308,35 @@ took too long."
 
 ### REQ-WAKE-012: Continuation Chain Inheritance
 
-WHEN a conversation has registered wake contracts AND continues into
-a child conversation that inherits the same `WorkScope`
-THE SYSTEM SHALL re-key each pending contract's `conv_id` to the child
-conversation, so subsequent fires deliver into the child — the underlying
-handle (bash, tmux, or subagent) is WorkScope-keyed and transfers to
-the child along with the contract
+WHEN a conversation has a pending wake contract whose watched handle is
+WorkScope-keyed (a bash or tmux handle) AND continues into a child
+conversation that inherits the same `WorkScope`
+THE SYSTEM SHALL re-key that contract's `conv_id` to the child
+conversation, so subsequent fires deliver into the child — the
+WorkScope-keyed handle transfers to the child along with the contract
 
-WHEN no successor inherits the `WorkScope` (the handle is therefore torn down)
+WHEN a WorkScope-keyed handle's `WorkScope` is torn down with no
+inheriting successor (the handle is therefore destroyed)
 THE SYSTEM SHALL fire the contract with cause `Forgotten`
 
-**Rationale:** Every handle kind a contract can watch is WorkScope-keyed
-(bash per `specs/bash/` REQ-BASH-WS-001), so all of them transfer across a
-continuation that inherits the scope, and their contracts transfer with them.
-A contract reaches `Forgotten` only when its handle is genuinely destroyed — a
-scope torn down with no inheritor, or a Phoenix restart (REQ-WAKE-002) — not as
-a routine consequence of continuation.
+A wake contract whose watched handle is a subagent handle is keyed by
+the sub-agent's own agent / child-conversation id (per
+`specs/subagents/`), not by the parent conversation's `WorkScope`. A
+WorkScope-inheriting continuation does not make an already-spawned
+sub-agent a WorkScope-owned resource of the successor, so such a
+contract is NOT re-keyed by WorkScope inheritance: its completion wake
+remains keyed to the sub-agent id that the contract was registered
+against.
+
+**Rationale:** Bash and tmux handles are WorkScope-level resources
+(bash per `specs/bash/` REQ-BASH-WS-001), so they transfer across a
+continuation that inherits the scope and their contracts transfer with
+them. A sub-agent, by contrast, is tracked by agent id — re-keying a
+sub-agent's completion wake by WorkScope would re-point it at the wrong
+conversation. A contract reaches `Forgotten` only when its handle is
+genuinely destroyed — a WorkScope torn down with no inheritor, or a
+Phoenix restart that drops an in-memory bash handle (REQ-WAKE-002) —
+not as a routine consequence of continuation.
 
 ---
 
@@ -331,7 +348,7 @@ THE SYSTEM SHALL accept the user message normally (conv stays in
 Idle and accepts the message; the contract continues to be evaluated;
 both events append to the message log in the order they arrive)
 
-**Rationale:** Resolved. Because the conv is in `Idle` while waiting
+**Rationale:** Because the conv is in `Idle` while waiting
 (REQ-WAKE-004 is the only sticky aspect, and it does not block user
 input), user messages and wake fires are both just events that
 append to the message log. Ordering is by arrival; the next LLM
@@ -370,9 +387,9 @@ THE SYSTEM SHALL emit metrics on:
 **Rationale:** A wake contract is a Phoenix-side commitment to spend
 money. Operators must be able to see "how much wake is happening"
 and "how often is wake the right primitive vs the wrong one."
-Metrics also gate v2 condition kinds — we will not ship
-`RegexInTmuxPane` until v1 metrics show the abstraction is being
-used as intended.
+Metrics also gate additional condition kinds: a kind such as
+`RegexInTmuxPane` is justified only once these metrics show the
+abstraction is used as intended.
 
 ---
 
@@ -385,16 +402,14 @@ max_wait_seconds }`
 THE tool SHALL NOT be split per substrate (no `bash_wait_until`,
 `tmux_wait_until`, `subagent_wait_until`)
 
-**Rationale:** Resolved per Q3 (asking-questions session 2026-05-24).
-Single tool means one description re-fed per turn instead of three,
-which compounds with the description-tax point Henrik panel
-flagged. The unified shape also forward-aligns with the eventual
-`WorkHandle` trait Voss + Marin both recommended — when that trait
-lands, the tool surface stays the same; only the runtime dispatch
+**Rationale:** A single tool means one description re-fed per turn
+instead of three, bounding the tool-description tax. The unified shape
+also forward-aligns with a unified `WorkHandle` trait — when that trait
+lands, the tool surface stays the same and only the runtime dispatch
 changes. The handle discriminator (`kind` + `id`) is structurally
-explicit and validated at deserialization (per Voss panel: use a
-tagged enum, not flat-Option-soup, to make `{ kind: Bash, id: "t-3" }`
-fail to parse when there is no bash handle named `t-3`).
+explicit and validated at deserialization: a tagged enum, not
+flat-Option-soup, makes `{ kind: Bash, id: "t-3" }` fail to parse when
+there is no bash handle named `t-3`.
 
 ---
 
@@ -413,14 +428,13 @@ fail to parse when there is no bash handle named `t-3`).
 | REQ-WAKE-009 | Proposed | Conv-scoped (not WorkScope) |
 | REQ-WAKE-010 | Proposed | Independent contracts, no auto-cancel-on-fire |
 | REQ-WAKE-011 | Proposed | Terminal cause discriminator |
-| REQ-WAKE-012 | Proposed | Continuation: all handle kinds (incl. bash) transfer; no continuation-boundary forget |
+| REQ-WAKE-012 | Proposed | Continuation: WorkScope-keyed (bash, tmux) transfer; subagent is agent-id-keyed |
 | REQ-WAKE-013 | Proposed | User messages just work (conv stays Idle) |
 | REQ-WAKE-014 | Proposed | Tool description discipline |
 | REQ-WAKE-015 | Proposed | Cost observability metrics |
 | REQ-WAKE-016 | Proposed | Unified `wait_until` tool, not per-substrate |
 
-**Progress:** 0 of 16 implemented. **All open questions resolved**
-(per `/asking-questions` session 2026-05-24).
+**Progress:** 0 of 16 implemented.
 
 ## Dependencies
 
@@ -435,4 +449,7 @@ fail to parse when there is no bash handle named `t-3`).
 
 - `specs/bash/` REQ-BASH-WS-001 / -WS-002 — bash handles are WorkScope-keyed
   and inherit across a continuation that shares the scope, so REQ-WAKE-012
-  transfers bash contracts to the child like every other handle kind
+  transfers a bash-keyed contract to the child along with its handle
+- `specs/subagents/` — a sub-agent is tracked by its own agent /
+  child-conversation id, so a subagent-keyed contract is keyed independently
+  of the parent's WorkScope (REQ-WAKE-012)

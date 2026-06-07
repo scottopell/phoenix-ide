@@ -2813,6 +2813,65 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
     Ok(())
 }
 
+/// Decide whether `work_scope` is still owned by a live conversation OTHER
+/// THAN `conv` once `conv` goes away — the preservation signal shared by every
+/// scope-keyed cascade (bash, tmux, terminal, browser). True when EITHER a
+/// continuation inherits the same scope OR a live sibling resolves to it.
+///
+/// A Work-mode sub-agent inherits its parent's `conv_mode`, so it resolves to
+/// the parent's `WorkScope` but has no continuation. The continuation check
+/// alone would yield `false` and SIGKILL the still-open parent's resources;
+/// the live-sibling check is what preserves them.
+///
+/// The deleted conversation is EXCLUDED from the live-owner enumeration: the
+/// cascade runs before the terminal-state write, so `conv` still reads
+/// non-terminal in the DB — without excluding it the scope would always look
+/// owned and never tear down.
+///
+/// Returns `Err` only when a set `continued_in_conv_id` cannot be resolved
+/// (DB error). Without the continuation's scope the preservation decision
+/// can't be made, so the cascade is refused; the caller retries once the DB
+/// is healthy. This runs BEFORE any cleanup side effect, so an early return
+/// leaves no partial state.
+async fn scope_still_owned_after_delete(
+    state: &AppState,
+    conv: &crate::db::Conversation,
+    work_scope: &crate::work_scope::WorkScope,
+) -> Result<bool, AppError> {
+    let id = conv.id.as_str();
+
+    let continuation_inherits_scope = if let Some(cont_id) = conv.continued_in_conv_id.as_deref() {
+        match state.runtime.db().get_conversation(cont_id).await {
+            Ok(continuation) => {
+                let cont_scope = crate::work_scope::WorkScope::resolve(
+                    &continuation.id,
+                    continuation
+                        .conv_mode
+                        .worktree_path()
+                        .map(std::path::Path::new),
+                );
+                &cont_scope == work_scope
+            }
+            Err(e) => {
+                return Err(AppError::Internal(format!(
+                    "cleanup cascade refused: continuation lookup failed for \
+                     conv={id} continuation={cont_id}: {e} \
+                     (preservation decision requires the inheritor's scope; \
+                     retry once the DB is healthy)"
+                )));
+            }
+        }
+    } else {
+        false
+    };
+
+    Ok(continuation_inherits_scope
+        || state
+            .runtime
+            .scope_has_live_conversation_excluding(work_scope, id)
+            .await)
+}
+
 /// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
 /// factored out so hard-delete, archive, abandon, and mark-merged share the
 /// exact same resource teardown. Authoritative failures (worktree-removal,
@@ -2826,20 +2885,21 @@ pub(super) async fn run_archive_cascade(state: &AppState, id: &str) -> Result<()
 /// Returns `Err` only when the continuation `WorkScope` cannot be
 /// resolved (DB error on `get_conversation`) and `continued_in_conv_id`
 /// was set. Without a known inheritor scope, the cascade cannot make
-/// the preservation decision: treating the missing inheritor as "no
-/// inheritor" would tear down resources the continuation may still
-/// need; treating it as "same scope" would over-preserve and leak. The
-/// only defensible response is to refuse the cascade entirely so the
-/// caller can retry once the DB is healthy. All cleanup side effects
-/// (kill, unlink, fs remove) run AFTER this lookup, so an early return
-/// here leaves no partial state.
+/// the preservation decision, so the only defensible response is to
+/// refuse the cascade entirely so the caller can retry once the DB is
+/// healthy. All cleanup side effects (kill, unlink, fs remove) run AFTER
+/// this lookup, so an early return here leaves no partial state.
 ///
 /// The `WorkScope` is resolved once from `conv` and passed to every
 /// scope-keyed cascade (bash, tmux, terminal, browser) so the orchestrator
-/// owns the single derivation point and a continuation chain on one worktree
-/// keeps its bash handles, tmux server, terminal, and browser session
-/// together. Projects retains a conv-shaped API: it inspects `conv.conv_mode`
-/// for the branch/worktree mode discriminant.
+/// owns the single derivation point. Preservation passes
+/// `inheritor_scope = Some(work_scope)` iff the scope is still owned by a
+/// live (non-terminal) conversation OTHER THAN `conv` — either a
+/// continuation that inherits the same scope, or a live sibling (e.g. a
+/// Work-mode sub-agent sharing its parent's scope, or vice versa). When the
+/// last live conversation on the scope is the one being deleted, every
+/// cascade tears down. Projects retains a conv-shaped API: it inspects
+/// `conv.conv_mode` for the branch/worktree mode discriminant.
 pub(super) async fn run_resource_cleanup_cascade(
     state: &AppState,
     conv: &crate::db::Conversation,
@@ -2850,40 +2910,19 @@ pub(super) async fn run_resource_cleanup_cascade(
         conv.conv_mode.worktree_path().map(std::path::Path::new),
     );
 
-    // Resolve the continuation's `WorkScope` (if any) so the scope-keyed
-    // cascades can check inheritance via scope equality. Resolve BEFORE
-    // any cleanup side effect runs — if the DB lookup fails we refuse
-    // the whole cascade rather than guess wrong about whether the
-    // inheritor still owns the resources we're about to release.
-    let inheritor_scope: Option<crate::work_scope::WorkScope> =
-        if let Some(cont_id) = conv.continued_in_conv_id.as_deref() {
-            match state.runtime.db().get_conversation(cont_id).await {
-                Ok(continuation) => Some(crate::work_scope::WorkScope::resolve(
-                    &continuation.id,
-                    continuation
-                        .conv_mode
-                        .worktree_path()
-                        .map(std::path::Path::new),
-                )),
-                Err(e) => {
-                    return Err(AppError::Internal(format!(
-                        "cleanup cascade refused: continuation lookup failed for \
-                         conv={id} continuation={cont_id}: {e} \
-                         (preservation decision requires the inheritor's scope; \
-                         retry once the DB is healthy)"
-                    )));
-                }
-            }
-        } else {
-            None
-        };
+    // `inheritor_scope = Some(work_scope)` means "preserve"; `None` means
+    // "tear down". Threaded to every scope-keyed cascade (bash, tmux,
+    // terminal, browser) so they all honor the same any-live-owner signal.
+    let scope_still_owned = scope_still_owned_after_delete(state, conv, &work_scope).await?;
+    let inheritor_scope: Option<&crate::work_scope::WorkScope> =
+        scope_still_owned.then_some(&work_scope);
 
-    // Step 2: bash handles. Scope-equality preservation: skip teardown iff
-    // the continuation inherited the same scope (REQ-BASH-WS-002).
+    // Step 2: bash handles. Preserve iff the scope is still owned by a live
+    // conversation other than this one (REQ-BASH-WS-002).
     let bash_report = crate::tools::bash::registry::cascade_bash_on_delete(
         state.runtime.bash_handles(),
         &work_scope,
-        inheritor_scope.as_ref(),
+        inheritor_scope,
     )
     .await;
     let had_live_handles = !bash_report.live_handle_pgids.is_empty();
@@ -2907,12 +2946,12 @@ pub(super) async fn run_resource_cleanup_cascade(
         );
     }
 
-    // Step 3: tmux server. Scope-equality preservation: skip kill iff the
-    // continuation inherited the same scope (REQ-TMUX-WS-002).
+    // Step 3: tmux server. Preserve iff the scope is still owned by a live
+    // conversation other than this one (REQ-TMUX-WS-002).
     let tmux_report = crate::tools::tmux::registry::cascade_tmux_on_delete(
         state.runtime.tmux_registry(),
         &work_scope,
-        inheritor_scope.as_ref(),
+        inheritor_scope,
     )
     .await;
     if tmux_report.kill_server_error.is_some() || tmux_report.unlink_error.is_some() {
@@ -2926,16 +2965,12 @@ pub(super) async fn run_resource_cleanup_cascade(
         );
     }
 
-    // Step 4: terminal PTY. Same scope-equality preservation rule
+    // Step 4: terminal PTY. Same any-live-owner preservation rule
     // (REQ-TERM-WS-001, REQ-TERM-012). Sub-agent / no-terminal scopes
     // hit the no-op fast path inside the cascade — registry miss is the
     // common case during conversation cleanup.
-    crate::terminal::cascade_terminal_on_delete(
-        &state.terminals,
-        &work_scope,
-        inheritor_scope.as_ref(),
-    )
-    .await;
+    crate::terminal::cascade_terminal_on_delete(&state.terminals, &work_scope, inheritor_scope)
+        .await;
 
     // Step 5: project worktree.
     let project_report = cascade_projects_on_delete(state, conv).await;
@@ -2949,12 +2984,12 @@ pub(super) async fn run_resource_cleanup_cascade(
         );
     }
 
-    // Step 6: browser session. Same scope-equality rule as tmux
+    // Step 6: browser session. Same any-live-owner rule as tmux
     // (REQ-BROWSER-WS-002, REQ-BROWSER-WS-003).
     crate::tools::browser::session::cascade_browser_on_delete(
         state.runtime.browser_sessions(),
         &work_scope,
-        inheritor_scope.as_ref(),
+        inheritor_scope,
     )
     .await;
 
@@ -5983,6 +6018,180 @@ mod hard_delete_cascade_tests {
         assert!(
             worktree.exists(),
             "worktree must remain intact after non-leaf cascade"
+        );
+    }
+
+    /// Create a single Work-mode conversation bound to `worktree`, so it
+    /// resolves to `WorkScope::Worktree(worktree)`. No continuation, no
+    /// parent — the caller wires those up as the scenario needs. Returns
+    /// once the row exists.
+    async fn create_workmode_conv_on_worktree(
+        state: &AppState,
+        id: &str,
+        worktree: &std::path::Path,
+        branch: &str,
+        project_id: &str,
+        parent_conversation_id: Option<&str>,
+    ) {
+        let mode = crate::db::ConvMode::Work {
+            branch_name: crate::db::NonEmptyString::new(branch.to_string()).unwrap(),
+            worktree_path: crate::db::NonEmptyString::new(worktree.to_string_lossy().to_string())
+                .unwrap(),
+            base_branch: crate::db::NonEmptyString::new("main").unwrap(),
+            task_id: crate::db::NonEmptyString::new("00001").unwrap(),
+            task_title: crate::db::NonEmptyString::new("scope-sharing test").unwrap(),
+        };
+        state
+            .db
+            .create_conversation_with_project(
+                id,
+                &format!("slug-{id}"),
+                worktree.to_str().unwrap(),
+                true,
+                parent_conversation_id,
+                None,
+                Some(project_id),
+                &mode,
+                None,
+                None,
+                None,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create conv");
+    }
+
+    /// Seed a live bash handle on `scope` so cascade teardown vs preservation
+    /// is observable: after a teardown `registry.remove(scope)` returns
+    /// `None` (the cascade consumed the table); after preservation it
+    /// returns `Some` (the table is left in place).
+    async fn seed_live_bash_handle(state: &AppState, scope: &crate::work_scope::WorkScope) {
+        use phoenix_tools::bash::handle::{Handle, HandleId};
+        use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
+
+        let table = state.runtime.bash_handles().get_or_create(scope).await;
+        let handle = Handle::new_live(
+            scope.clone(),
+            HandleId::new("b-parent"),
+            "npm run dev".into(),
+            Some("dev".into()),
+            4321,
+            1234,
+            RING_BUFFER_BYTES,
+        );
+        table.write().await.insert(handle);
+    }
+
+    /// REQ-BASH-WS-002: deleting a Work-mode sub-agent that shares its
+    /// parent's `WorkScope` (no continuation of its own) must PRESERVE the
+    /// still-live parent's bash handles. The parent has a live runtime
+    /// handle and is non-terminal, so it is a live owner of the scope; the
+    /// any-live-owner preservation signal keeps the handle table intact.
+    ///
+    /// Regression guard for the P1 where the continuation-only signal
+    /// resolved `inheritor_scope = None` for a sub-agent and SIGKILL'd the
+    /// parent's b-* handles.
+    #[tokio::test]
+    async fn delete_subagent_sharing_parent_scope_preserves_parent_bash() {
+        let state = make_test_state().await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        let project = state
+            .db
+            .find_or_create_project(worktree.to_str().unwrap())
+            .await
+            .expect("project");
+
+        // Parent + sub-agent, both Work-mode on the same worktree → same
+        // WorkScope. Neither has a continuation; the sub-agent points at
+        // the parent via parent_conversation_id.
+        create_workmode_conv_on_worktree(
+            &state,
+            "sa-parent",
+            &worktree,
+            "task-sa",
+            &project.id,
+            None,
+        )
+        .await;
+        create_workmode_conv_on_worktree(
+            &state,
+            "sa-child",
+            &worktree,
+            "task-sa",
+            &project.id,
+            Some("sa-parent"),
+        )
+        .await;
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string_lossy().into_owned());
+        seed_live_bash_handle(&state, &scope).await;
+
+        // Register a live runtime handle for the parent so it counts as a
+        // live owner of the scope during the sub-agent's cascade.
+        let _parent_rx = state
+            .runtime
+            .subscribe("sa-parent")
+            .await
+            .expect("subscribe");
+
+        // Delete the sub-agent. Its cascade resolves the shared scope; the
+        // parent is a live sibling, so the scope is still owned → preserve.
+        run_hard_delete_cascade(&state, "sa-child")
+            .await
+            .expect("delete sub-agent");
+
+        assert!(
+            state.runtime.bash_handles().remove(&scope).await.is_some(),
+            "parent's bash handle table must survive the sub-agent's deletion \
+             (scope still owned by the live parent)"
+        );
+        assert!(
+            state.db.get_conversation("sa-child").await.is_err(),
+            "sub-agent row must be gone"
+        );
+        assert!(
+            state.db.get_conversation("sa-parent").await.is_ok(),
+            "parent row must remain"
+        );
+    }
+
+    /// Counterpart: when the conversation being deleted is the LAST live
+    /// conversation on its scope (no continuation, no live sibling), the
+    /// cascade must tear the scope down — the deleted conv reads
+    /// non-terminal in the DB at cascade time, so excluding it from the
+    /// live-owner enumeration is what lets teardown fire.
+    #[tokio::test]
+    async fn delete_last_live_conv_on_scope_tears_down_bash() {
+        let state = make_test_state().await;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let worktree = tmp.path().join("worktree");
+        std::fs::create_dir_all(&worktree).expect("worktree dir");
+        let project = state
+            .db
+            .find_or_create_project(worktree.to_str().unwrap())
+            .await
+            .expect("project");
+
+        create_workmode_conv_on_worktree(&state, "solo", &worktree, "task-solo", &project.id, None)
+            .await;
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string_lossy().into_owned());
+        seed_live_bash_handle(&state, &scope).await;
+
+        // The conversation being deleted is the only live owner. It still
+        // reads non-terminal in the DB at cascade time, but it is excluded
+        // from the enumeration, so the scope is NOT still owned → tear down.
+        run_hard_delete_cascade(&state, "solo")
+            .await
+            .expect("delete");
+
+        assert!(
+            state.runtime.bash_handles().remove(&scope).await.is_none(),
+            "scope must be torn down when its last live conversation is deleted"
         );
     }
 }

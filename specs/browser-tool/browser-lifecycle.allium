@@ -172,10 +172,16 @@ rule ContinuationReusesSession {
     ensures: not BrowserSessionLifecycleEvent.emitted
 }
 
--- REQ-BROWSER-WS-003: cleanup-cascade tear-down when no continuation
--- inherits the scope. The orchestrator resolves the continuation's scope
--- (if any) and passes it as `inheritor_scope`. Preservation is purely
--- scope equality — see CascadePreservesOnScopeMatch below.
+-- REQ-BROWSER-WS-003: cleanup-cascade tear-down when no live conversation
+-- other than the one being deleted still owns the scope. The orchestrator
+-- sets `inheritor_scope` to Some(work_scope) iff a non-terminal conversation
+-- OTHER THAN the deleted one resolves to that scope (a continuation that
+-- inherits it, or a live sibling such as a Work-mode sub-agent sharing its
+-- parent's scope), and None otherwise. The deleted conversation is excluded
+-- from that enumeration: the cascade runs before its terminal-state write, so
+-- it still reads non-terminal, and excluding it is what makes this rule
+-- reachable when it is the last live owner. Preservation is the complementary
+-- case — see CascadePreservesOnScopeMatch below.
 rule CascadeTearsDownWhenNoInheritor {
     when: CleanupCascadeRunFor(conversation, inheritor_scope)
 
@@ -202,11 +208,13 @@ rule CascadeTearsDownWhenNoInheritor {
         -- is released first.
 }
 
--- REQ-BROWSER-WS-003: cleanup-cascade preservation when the continuation
--- inherits the scope. Scope-equality subsumes per-kind case-analysis:
--- Direct continuations always resolve to Conversation(<child_id>) which
--- is never equal to the parent's Conversation(<parent_id>), so they fall
--- through to CascadeTearsDownWhenNoInheritor automatically.
+-- REQ-BROWSER-WS-003: cleanup-cascade preservation when a live conversation
+-- other than the one being deleted still owns the scope — a continuation
+-- that inherits it, or a live sibling such as a Work-mode sub-agent sharing
+-- its parent's scope. Scope-equality subsumes per-kind case-analysis: Direct
+-- continuations always resolve to Conversation(<child_id>) which is never
+-- equal to the parent's Conversation(<parent_id>), so they fall through to
+-- CascadeTearsDownWhenNoInheritor automatically.
 rule CascadePreservesOnScopeMatch {
     when: CleanupCascadeRunFor(conversation, inheritor_scope)
 
@@ -235,8 +243,9 @@ rule CascadePreservesOnScopeMatch {
 -- specs/projects/ REQ-PROJ-025 (OneBranchOneActiveWorktree) guarantees at
 -- most one non-terminal conversation per scope, so the liveness question has
 -- a single decisive answer. The gate mirrors the cascade path
--- (CascadePreservesOnScopeMatch), which already preserves a session whose
--- scope is inherited by a live continuation.
+-- (CascadePreservesOnScopeMatch), which preserves a session whose scope is
+-- still owned by any live conversation — a continuation or a live sibling
+-- such as a Work-mode sub-agent sharing its parent's scope.
 rule IdleSessionCleanedUp {
     when: IdleCleanupTickFires()
 
