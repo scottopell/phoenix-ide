@@ -5331,6 +5331,156 @@ mod tests {
         );
     }
 
+    /// Transition-graph negative edges out of the `dismissed` terminal
+    /// (REQ-PROJ-034, ForkProposal `transitions status`): once a proposal is
+    /// `dismissed` it has no outbound resolution edge, so resolving it as
+    /// `spawned` or `promoted` is a conflict, and a second `dismiss` is a no-op.
+    /// `resolve_conflicts_on_divergent_prior_resolution` only exercises edges out
+    /// of `spawned`; this covers the `dismissed` source row.
+    #[tokio::test]
+    async fn resolve_out_of_dismissed_terminal_is_rejected() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-dt", "odt", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-dt", "origin-dt"))
+            .await
+            .unwrap();
+        assert!(db.dismiss_fork_proposal("fp-dt").await.unwrap());
+
+        let child = child_conv_fixture(&db, "fork-dt", "origin-dt").await;
+        // dismissed -> spawned: undeclared edge, rejected.
+        let err = db
+            .resolve_fork_proposal_spawned("fp-dt", &child, &[seed_msg("fork-dt")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::ForkProposalConflict(_)), "{err:?}");
+        // dismissed -> promoted: undeclared edge, rejected.
+        let err = db
+            .resolve_fork_proposal_promoted("fp-dt", &child, &[seed_msg("fork-dt")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::ForkProposalConflict(_)), "{err:?}");
+        // dismissed -> dismissed: terminal self-edge is a no-op (no row updated).
+        assert!(!db.dismiss_fork_proposal("fp-dt").await.unwrap());
+
+        // The proposal is unchanged: still dismissed, both resolution ids absent.
+        let p = db.get_fork_proposal("fp-dt").await.unwrap().unwrap();
+        assert_eq!(p.status, ForkProposalStatus::Dismissed);
+        assert!(p.fork_conversation_id.is_none());
+        assert!(p.refinement_conversation_id.is_none());
+    }
+
+    /// Transition-graph negative edges out of the `promoted` terminal
+    /// (REQ-PROJ-037, ForkProposal `transitions status`): `promoted` is terminal,
+    /// so a second `promote` to a different id, a cross-resolution to `spawned`,
+    /// and a `dismiss` are all rejected / no-ops. Complements
+    /// `resolve_conflicts_on_divergent_prior_resolution` (spawned source) and
+    /// `resolve_out_of_dismissed_terminal_is_rejected` (dismissed source).
+    #[tokio::test]
+    async fn resolve_out_of_promoted_terminal_is_rejected() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-pt", "opt", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-pt", "origin-pt"))
+            .await
+            .unwrap();
+        let child = child_conv_fixture(&db, "refine-pt", "origin-pt").await;
+        db.resolve_fork_proposal_promoted("fp-pt", &child, &[seed_msg("refine-pt")])
+            .await
+            .unwrap();
+
+        let other = child_conv_fixture(&db, "refine-pt-b", "origin-pt").await;
+        // promoted -> promoted (different id): conflict.
+        let err = db
+            .resolve_fork_proposal_promoted("fp-pt", &other, &[seed_msg("refine-pt-b")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::ForkProposalConflict(_)), "{err:?}");
+        // promoted -> spawned: undeclared cross-resolution edge, rejected.
+        let err = db
+            .resolve_fork_proposal_spawned("fp-pt", &other, &[seed_msg("refine-pt-b")])
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DbError::ForkProposalConflict(_)), "{err:?}");
+        // promoted -> dismissed: terminal, dismiss is a no-op.
+        assert!(!db.dismiss_fork_proposal("fp-pt").await.unwrap());
+
+        // Field invariant: a `promoted` proposal has refinement present, fork absent.
+        let p = db.get_fork_proposal("fp-pt").await.unwrap().unwrap();
+        assert_eq!(p.status, ForkProposalStatus::Promoted);
+        assert_eq!(p.refinement_conversation_id.as_deref(), Some("refine-pt"));
+        assert!(p.fork_conversation_id.is_none());
+    }
+
+    /// `spawned -> dismissed` is an undeclared edge: `dismiss_fork_proposal` is
+    /// guarded `WHERE status = pending`, so dismissing an already-`spawned`
+    /// proposal updates nothing and leaves the spawned resolution intact. The
+    /// fork conversation id survives (the live, decoupled child).
+    #[tokio::test]
+    async fn dismiss_after_spawned_is_a_noop() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-sd", "osd", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-sd", "origin-sd"))
+            .await
+            .unwrap();
+        let child = child_conv_fixture(&db, "fork-sd", "origin-sd").await;
+        db.resolve_fork_proposal_spawned("fp-sd", &child, &[seed_msg("fork-sd")])
+            .await
+            .unwrap();
+
+        assert!(!db.dismiss_fork_proposal("fp-sd").await.unwrap());
+        let p = db.get_fork_proposal("fp-sd").await.unwrap().unwrap();
+        assert_eq!(p.status, ForkProposalStatus::Spawned);
+        assert_eq!(p.fork_conversation_id.as_deref(), Some("fork-sd"));
+        assert!(p.refinement_conversation_id.is_none());
+    }
+
+    /// State-dependent field invariant (ForkProposal entity): the resolution
+    /// fields are present iff in their matching terminal state. A freshly
+    /// inserted `pending` proposal carries BOTH `fork` and `refinement` absent.
+    /// `fork_proposal_insert_get_roundtrip` asserts `fork` is absent; this also
+    /// pins `refinement` absent while pending.
+    #[tokio::test]
+    async fn pending_proposal_has_no_resolution_fields() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-pp", "opp", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-pp", "origin-pp"))
+            .await
+            .unwrap();
+
+        let p = db.get_fork_proposal("fp-pp").await.unwrap().unwrap();
+        assert_eq!(p.status, ForkProposalStatus::Pending);
+        assert!(p.fork_conversation_id.is_none());
+        assert!(p.refinement_conversation_id.is_none());
+    }
+
+    /// State-dependent field invariant: a `dismissed` proposal has BOTH `fork`
+    /// and `refinement` absent (the resolution spawned/promoted nothing).
+    /// `fork_proposal_dismiss_is_idempotent` checks the status; this pins the
+    /// field absence the entity's present-iff-terminal contract requires.
+    #[tokio::test]
+    async fn dismissed_proposal_has_no_resolution_fields() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("origin-df", "odf", "/tmp", true, None, None)
+            .await
+            .unwrap();
+        db.insert_fork_proposal(&fork_proposal_fixture("fp-df", "origin-df"))
+            .await
+            .unwrap();
+        assert!(db.dismiss_fork_proposal("fp-df").await.unwrap());
+
+        let p = db.get_fork_proposal("fp-df").await.unwrap().unwrap();
+        assert_eq!(p.status, ForkProposalStatus::Dismissed);
+        assert!(p.fork_conversation_id.is_none());
+        assert!(p.refinement_conversation_id.is_none());
+    }
+
     /// Task 02667: a fresh DB's `conversations` table must not carry the
     /// dead `state_data` column (SCHEMA no longer creates it).
     #[tokio::test]

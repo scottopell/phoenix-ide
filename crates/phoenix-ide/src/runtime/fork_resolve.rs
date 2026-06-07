@@ -1194,6 +1194,64 @@ mod tests {
         assert!(matches!(err, ForkResolveError::Conflict(_)), "got {err:?}");
     }
 
+    /// Transition-graph: `promoted` is terminal (REQ-PROJ-037), so a SECOND
+    /// `request-changes` on an already-`promoted` proposal is rejected — one
+    /// pending proposal promotes exactly once.
+    /// `spawn_and_promote_namespaces_are_disjoint` covers the spawned↔promoted
+    /// cross edges; this pins the promoted-source self edge.
+    #[tokio::test]
+    async fn second_request_changes_after_promote_is_rejected() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_p, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
+        let rt = make_runtime(db.clone()).await;
+
+        let refinement = rt
+            .request_changes_on_fork_proposal(&pid, "first note".to_string())
+            .await
+            .unwrap();
+        let second = rt
+            .request_changes_on_fork_proposal(&pid, "second note".to_string())
+            .await;
+        assert!(
+            matches!(second, Err(ForkResolveError::Conflict(_))),
+            "re-promote of a promoted proposal must be rejected, got {second:?}"
+        );
+
+        let resolved = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(resolved.status, ForkProposalStatus::Promoted);
+        assert_eq!(
+            resolved.refinement_conversation_id.as_deref(),
+            Some(refinement.as_str())
+        );
+        assert!(resolved.fork_conversation_id.is_none());
+    }
+
+    /// Transition-graph: `dismissed` is terminal with no outbound edge, so
+    /// `request-changes` (the promote edge) on a `dismissed` proposal is rejected.
+    /// `approve_non_pending_is_rejected` covers the dismissed -> spawned edge;
+    /// this covers the dismissed -> promoted edge through the runtime path.
+    #[tokio::test]
+    async fn request_changes_on_dismissed_is_rejected() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_p, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
+        assert!(db.dismiss_fork_proposal(&pid).await.unwrap());
+        let rt = make_runtime(db.clone()).await;
+
+        let err = rt
+            .request_changes_on_fork_proposal(&pid, "note".to_string())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ForkResolveError::Conflict(_)), "got {err:?}");
+
+        let resolved = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(resolved.status, ForkProposalStatus::Dismissed);
+        assert!(resolved.refinement_conversation_id.is_none());
+    }
+
     #[tokio::test]
     async fn resolve_rejected_when_origin_terminal() {
         let (_tmp, repo) = init_repo();
