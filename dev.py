@@ -2336,6 +2336,7 @@ def _classify_network_env() -> None:
 # (rustfmt, task validation, lockfile tripwire).
 _LANE_INPUTS = {
     "rust": {"RUST"},
+    "clippy": {"RUST"},
     "tsc": {"UI"},
     "ui-lint": {"UI"},
     "vitest": {"UI"},
@@ -2636,7 +2637,7 @@ def cmd_check(gate: bool = True):
             out += ["-p", c]
         return out
 
-    def run_step(name, cmd, cwd=ROOT):
+    def run_step(name, cmd, cwd=ROOT, env_extra=None):
         # Stream stdout+stderr line-by-line into a bounded buffer so that on
         # timeout we keep the last N lines of output instead of throwing it
         # away. Process is launched in its own session so SIGKILL can target
@@ -2658,6 +2659,8 @@ def cmd_check(gate: bool = True):
         env["NO_COLOR"] = "1"
         env.pop("FORCE_COLOR", None)
         env.pop("CLICOLOR_FORCE", None)
+        if env_extra:
+            env.update(env_extra)
         buf: deque[str] = deque(maxlen=TAIL_LINES)
         truncated = False
 
@@ -2720,7 +2723,7 @@ def cmd_check(gate: bool = True):
             print(f"  {ok} {name:<18s} ({elapsed:.1f}s)")
 
     def lane_rust():
-        """Rust lane: test compile → test run → [musl smoke check] → clippy.
+        """Rust lane: test compile → test run → [musl smoke check].
 
         The musl smoke check is **macOS-only and conditional** on the
         `x86_64-linux-musl-gcc` cross toolchain being on PATH; it never
@@ -2753,14 +2756,12 @@ def cmd_check(gate: bool = True):
         coverage. `compile_cmd`/`test_cmd`/the thread cap are computed once in
         cmd_check and closed over here.
         """
-        # Order matters for cache reuse. The serial codegen pre-step in
-        # cmd_check compiled the workspace test binaries with normal rustc.
-        # `cargo clippy` sets RUSTC_WORKSPACE_WRAPPER=clippy-driver, which
-        # rewrites every workspace crate's fingerprint — so running clippy
-        # before the test build forces `cargo test compile` to rebuild the
-        # whole workspace codegen just produced. Building tests first reuses
-        # codegen's artifacts (near-total cache hit); clippy then runs last so
-        # its wrapper churn lands on nothing downstream.
+        # The serial codegen pre-step compiled the workspace test binaries with
+        # normal rustc; this step reuses them (near-total cache hit). clippy is
+        # NOT in this lane — it runs in lane_clippy with its own target dir, so
+        # its RUSTC_WORKSPACE_WRAPPER=clippy-driver fingerprint churn can never
+        # invalidate this dir's build (and the two builds don't contend on the
+        # shared target lock).
         run_step("cargo test compile", compile_cmd)
         run_step("cargo test", test_cmd)
         if sys.platform == "darwin":
@@ -2775,11 +2776,25 @@ def cmd_check(gate: bool = True):
                 ])
             else:
                 print("  i  cargo check musl: skipped (x86_64-linux-musl-gcc not on PATH; see task 60001)")
-        # Scope clippy to the changed crate(s)+rdeps when gating narrowed it;
-        # otherwise lint the whole workspace. `-p` flags go before `--`. Runs
-        # last by design — see the ordering note above.
+
+    def lane_clippy():
+        """Clippy in its own target dir so it runs fully parallel to lane_rust.
+
+        `cargo clippy` builds workspace crates through clippy-driver
+        (RUSTC_WORKSPACE_WRAPPER), which carries a different fingerprint than the
+        normal-rustc build lane_rust/codegen produce. Sharing one target dir
+        would (a) make the two builds thrash each other's workspace fingerprints
+        and (b) serialize them on cargo's exclusive target lock. A dedicated
+        CARGO_TARGET_DIR sidesteps both, so clippy overlaps the test build/run
+        instead of tailing it. Dependency compiles in the fresh dir are served
+        by sccache (CI); the workspace check itself is cheap and rebuilds each
+        run (this dir is outside rust-cache's saved target/).
+        """
+        # Scope to the changed crate(s)+rdeps when gating narrowed it; otherwise
+        # lint the whole workspace. `-p` flags go before `--`.
         run_step("cargo clippy",
-                 ["cargo", "clippy", *_pflags(), "--", "-D", "warnings"])
+                 ["cargo", "clippy", *_pflags(), "--", "-D", "warnings"],
+                 env_extra={"CARGO_TARGET_DIR": str(ROOT / "target" / "clippy")})
 
     def lane_ui_lint():
         """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
@@ -2829,9 +2844,9 @@ def cmd_check(gate: bool = True):
         `cargo test` fallback (no nextest installed) the run phase holds the
         lock end-to-end, so this build serializes after it and adds a full
         bin codegen to the tail of the critical path — the fallback is slower
-        by design, not broken. lane_rust hoists its lock-free probe/sizing
-        ahead of clippy so this build cannot wedge between clippy and
-        test-compile.
+        by design, not broken. clippy no longer contends here: it runs in
+        lane_clippy with its own CARGO_TARGET_DIR, so the only builds on the
+        shared workspace lock are lane_rust's test compile and this bin build.
         """
         run_step("e2e", ["uv", "run", "tests/e2e/run.py"])
 
@@ -3206,6 +3221,7 @@ def cmd_check(gate: bool = True):
     # Threads carry the lane name so a hung-thread report names the lane.
     _all_threads = [
         threading.Thread(target=lane_rust, name="rust"),
+        threading.Thread(target=lane_clippy, name="clippy"),
         # Use the `typecheck` script so contributors running `pnpm typecheck`
         # locally exercise the same `tsc -b --noEmit` invocation this lane
         # uses. Project references + exactOptionalPropertyTypes only fire
