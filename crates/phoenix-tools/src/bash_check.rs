@@ -541,3 +541,146 @@ mod tests {
         assert!(check("# this is a comment").is_ok());
     }
 }
+
+#[cfg(test)]
+mod proptests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Known-blocked command cores. Each, on its own, makes `check` return Err.
+    const BLOCKED_CORES: &[&str] = &[
+        "git add -A",
+        "git add --all",
+        "git add .",
+        "git add *",
+        "git push --force",
+        "git push -f",
+        "rm -rf /",
+        "rm -rf ~",
+        "rm -rf .git",
+        "rm -rf *",
+    ];
+
+    /// Generate runs of horizontal whitespace (spaces/tabs), 1..=4 chars.
+    fn arb_ws() -> impl Strategy<Value = String> {
+        "[ \t]{1,4}"
+    }
+
+    fn arb_blocked_core() -> impl Strategy<Value = &'static str> {
+        prop::sample::select(BLOCKED_CORES)
+    }
+
+    proptest! {
+        // Property 1: WHITESPACE INVARIANCE — arbitrary horizontal whitespace
+        // between tokens of a blocked command keeps it blocked.
+
+        #[test]
+        fn prop_git_add_whitespace_invariant(ws1 in arb_ws(), ws2 in arb_ws()) {
+            let script = format!("git{ws1}add{ws2}-A");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        #[test]
+        fn prop_git_push_whitespace_invariant(ws1 in arb_ws(), ws2 in arb_ws()) {
+            let script = format!("git{ws1}push{ws2}--force");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        #[test]
+        fn prop_rm_whitespace_invariant(ws1 in arb_ws(), ws2 in arb_ws()) {
+            let script = format!("rm{ws1}-rf{ws2}/");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        // Property 2: SUDO PREFIX — prepending `sudo ` keeps a blocked command blocked.
+
+        #[test]
+        fn prop_sudo_prefix_keeps_blocked(core in arb_blocked_core()) {
+            let script = format!("sudo {core}");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        // Property 3: CONTEXT-POSITION INVARIANCE — wrapping a blocked core in
+        // benign sequencing / pipeline / subshell / if-body keeps it blocked.
+
+        #[test]
+        fn prop_context_and(core in arb_blocked_core()) {
+            let script = format!("echo ok && {core}");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        #[test]
+        fn prop_context_seq(core in arb_blocked_core()) {
+            let script = format!("echo ok ; {core}");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        #[test]
+        fn prop_context_pipe(core in arb_blocked_core()) {
+            let script = format!("{core} | cat");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        #[test]
+        fn prop_context_or(core in arb_blocked_core()) {
+            let script = format!("echo ok || {core}");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        #[test]
+        fn prop_context_subshell(core in arb_blocked_core()) {
+            let script = format!("( {core} )");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        #[test]
+        fn prop_context_if_body(core in arb_blocked_core()) {
+            let script = format!("if true; then {core}; fi");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        // Property 4: GIT-ADD BAD-ARG ENUMERATION — each bad arg blocks, even
+        // with benign explicit filenames interspersed.
+
+        #[test]
+        fn prop_git_add_bad_arg_with_benign(
+            bad in prop::sample::select(&["-A", "--all", ".", "*"][..]),
+            lead in "[a-z]{1,10}",
+            trail in "[a-z]{1,10}",
+        ) {
+            let script = format!("git add {lead} {bad} {trail}");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        // Property 5: RM FLAG-PERMUTATION INVARIANCE — any spelling of
+        // recursive+force against a dangerous path blocks.
+
+        #[test]
+        fn prop_rm_flag_permutation(
+            flags in prop::sample::select(
+                &["-rf", "-fr", "-r -f", "-f -r", "--recursive --force", "-Rf"][..]
+            ),
+            path in prop::sample::select(&["/", ".git"][..]),
+        ) {
+            let script = format!("rm {flags} {path}");
+            prop_assert!(check(&script).is_err(), "should block: {:?}", script);
+        }
+
+        // Property 6: TRUE-NEGATIVE / NO OVER-BLOCK — allowed commands stay
+        // allowed, including under benign wrapping.
+
+        #[test]
+        fn prop_force_with_lease_allowed(suffix in prop::sample::select(&["", "=origin/main"][..])) {
+            let script = format!("git push --force-with-lease{suffix}");
+            prop_assert!(check(&script).is_ok(), "should allow: {:?}", script);
+            let wrapped = format!("echo ok && {script}");
+            prop_assert!(check(&wrapped).is_ok(), "should allow: {:?}", wrapped);
+        }
+
+        #[test]
+        fn prop_git_add_explicit_file_allowed(name in "[a-z]{1,10}") {
+            let script = format!("git add {name}");
+            prop_assert!(check(&script).is_ok(), "should allow: {:?}", script);
+        }
+    }
+}
