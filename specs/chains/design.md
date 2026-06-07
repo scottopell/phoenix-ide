@@ -21,10 +21,11 @@ The agent's scope is bound to the chain (it cannot read outside it) and
 it has no state-mutating tools. Each question is a fresh run with no
 memory of prior Q&A (REQ-CHN-006). Q&A history persists in `chain_qa`.
 
-The chain page also surfaces the chain's **work scope** —
-worktree/branch/task/PR — above the member list (REQ-CHN-008), so the
-page shows not just which conversations the chain contains but what unit
-of work they share.
+The chain page also carries the work-scope dock (`specs/work-scope-ui/`
+REQ-WSUI-009), to which REQ-CHN-008 adds the chain's **work identity** —
+worktree/branch/task and PR health — alongside the dock's runtime-resource
+rows, so the page shows not just which conversations the chain contains
+but what unit of work they share and its PR status.
 
 ## Chain Identity and Membership (REQ-CHN-002)
 
@@ -92,41 +93,47 @@ browser back/forward, and survives refresh.
 the current name); Enter or blur commits via an API call that updates
 `conversations.chain_name` on the root conversation; Esc cancels.
 
-**Work-scope panel (REQ-CHN-008).** Above the two columns, the page
-shows the chain's work scope — the unit of work its members share. Chain
-membership (continuation lineage) and work scope
-(`crate::work_scope::WorkScope`, resource ownership) are distinct, but a
-managed/branch chain's members preserve their worktree across
-context-exhaustion continuations and the Explore→Work handoff, so the
-chain almost always maps to a single work scope. The panel surfaces, for
-that scope:
+**Work identity on the work-scope dock (REQ-CHN-008).** The chain page
+already hosts a **work-scope dock** (`specs/work-scope-ui/` REQ-WSUI-009):
+`ChainWorkScopeDock` resolves the chain root's `work_scope_key` (one
+`get_conversation`) and renders the shared `WorkScopePanel`, showing the
+scope's live runtime resources (bash / tmux / browser) from
+`WorkScopeInventory`. That dock answers "what is *running* on this work."
+REQ-CHN-008 adds the complementary "what *unit of work* is this" facet to
+the same surface, addressed by the **same single `work_scope_key`** (a
+chain's members share one scope; at most one is non-terminal, `specs/projects/`
+REQ-PROJ-025 — so no per-member fan-out):
 
-- worktree path, branch, and base branch (from the members' `ConvMode`
-  git metadata);
-- the task (id + title) when the chain is doing Managed work;
-- the associated pull request when one exists — its identity and
-  `display_state` (open / draft / merged / closed) from
-  `work_scope_pr_associations`, **plus** its checks and feedback-freshness
-  marker.
+- **Work identity** — worktree path, branch, base branch, and the task
+  (id + title) for Managed work — from the members' `ConvMode` git
+  metadata.
+- **PR health** — `display_state` (open / draft / merged / closed),
+  checks, and feedback-freshness — from the existing **PR-status /
+  feedback pipeline** that drives the StateBar (`specs/projects/`
+  REQ-PROJ-011/030/031). `work_scope_pr_associations` carries PR identity
+  and state only; checks come from the live PR-status path (e.g.
+  `gh pr checks`) and freshness from `work_scope_pr_feedback_baselines`
+  compared against current feedback. Reading the association row alone
+  would omit checks and stale the freshness marker.
 
-The panel SHALL source PR data through the **same PR-status / feedback
-pipeline the StateBar uses** (`specs/projects/` REQ-PROJ-011/030/031),
-not from `work_scope_pr_associations` alone. That table persists only PR
-identity and state; **checks** come from the live PR-status path (e.g.
-`gh pr checks`) and **feedback freshness** is derived from
-`work_scope_pr_feedback_baselines` compared against current feedback in
-that same path. Reading associations alone would silently omit checks and
-stale the freshness marker, so the panel reuses the existing pipeline
-(keyed by the chain's `WorkScope`) rather than re-deriving from the
-association row.
+**Not part of `WorkScopeInventory`.** This facet is deliberately *not*
+folded into the inventory snapshot. `WorkScopeInventory` is a
+full-snapshot read-projection over the in-memory runtime registries,
+re-broadcast on a registry state change (`specs/work-scope-ui/`
+REQ-WSUI-001/-007). Externally-polled PR state and durable git metadata
+have a different freshness model (a PR transition is not a registry
+event), so they ride the PR-status pipeline and `ConvMode`, rendered as
+an additional block on the dock rather than as inventory fields.
 
-When the chain touches more than one work scope (a member diverged onto
-another worktree, or a member is Direct/conversation-scoped), the panel
-shows the set rather than collapsing to one arbitrary scope. When there
-is no managed work scope at all (e.g. a chain of Direct conversations
-with no worktree), the panel says so rather than rendering empty
-worktree/branch/PR fields. The panel adds no new persistence; it reuses
-existing git metadata and the existing PR-status/feedback pipeline.
+When the chain has no managed work scope (e.g. a chain of Direct
+conversations with no worktree), the identity block says so rather than
+rendering empty worktree/branch/PR fields. No new persistence: the facet
+reuses existing git metadata and the existing PR-status/feedback pipeline.
+
+**Placement** of the dock on the chain page (REQ-WSUI-009 notes its
+standalone right-adjacent placement as provisional pending a layout
+reconciliation) is owned by `specs/work-scope-ui/`; REQ-CHN-008 governs
+the *content* of the identity facet, not where the dock sits.
 
 **Layout (two-column):**
 
@@ -409,21 +416,31 @@ addition to the user-visible non-requirements listed in
   Direction).
 - **No follow-up Q&A context layering.** REQ-CHN-006 prohibits prior
   Q&A in the model's context.
-- **No new work-scope persistence (REQ-CHN-008).** The work-scope panel
-  reads existing `ConvMode` git metadata and `work_scope_pr_associations`;
-  it adds no table or column.
+- **No new work-scope persistence or projection (REQ-CHN-008).** The work
+  identity facet reads existing `ConvMode` git metadata and the existing
+  PR-status/feedback pipeline; it adds no table, no column, and no field
+  to `WorkScopeInventory`. It reuses the chain dock and `work_scope_key`
+  that `specs/work-scope-ui/` already provides.
 
 ## Cross-Spec References
 
 - `specs/conversation-retrieval/` — owns the scope-filtered message
   retrieval primitive and the scope-bound search/read tools that the
   chain Q&A agent drives (REQ-CHN-009)
+- `specs/work-scope-ui/` — owns the chain page's work-scope dock
+  (`ChainWorkScopeDock` / `WorkScopePanel`, REQ-WSUI-009), the
+  `work_scope_key` resolution, and `WorkScopeInventory` (runtime
+  resources). REQ-CHN-008 adds the work-identity + PR-health facet to that
+  same dock; `specs/wake-contracts/` is the agent-facing twin of the same
+  per-scope state
 - `specs/bedrock/` — owns `MessageType::Continuation` and the
   conversation state machine; chains consume continuation summary
   messages for the orientation skeleton and as continuation edges
-- `specs/projects/` — owns `project_id` scoping and the per-work-scope
-  PR association (`work_scope_pr_associations`) the work-scope panel
-  reads (REQ-CHN-008); chain membership extends projects' conversation
-  grouping with continuation-aware collapsibility
+- `specs/projects/` — owns `project_id` scoping, the one-non-terminal-
+  conversation-per-scope invariant (REQ-PROJ-025) the single-scope-key
+  query relies on, and the PR-status/feedback pipeline
+  (REQ-PROJ-011/030/031) the work-identity facet reads (REQ-CHN-008);
+  chain membership extends projects' conversation grouping with
+  continuation-aware collapsibility
 - `specs/sse_wire/` — owns the SSE streaming infrastructure used for
   Q&A token streaming

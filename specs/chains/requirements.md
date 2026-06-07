@@ -223,54 +223,62 @@ configurable object.
 
 ---
 
-### REQ-CHN-008: Chain Page Surfaces the Work Scope
+### REQ-CHN-008: Chain Page Surfaces the Work Identity Alongside Runtime Resources
 
-A chain's members are linked by continuation, but the thing they are
-all *working on* — the worktree, the branch, the task, the pull request
-— is shared across the chain and is the chain's real subject. Managed
-and Branch work preserve their worktree across context-exhaustion
-continuations and across the Explore→Work handoff, so a chain's members
-overwhelmingly share one work scope (`crate::work_scope::WorkScope`),
-even though chain membership (continuation lineage) and work scope
-(resource ownership) are distinct concepts that can in principle
-diverge.
+The chain page already carries a **work-scope dock** showing the live
+runtime resources of the chain's scope — backgrounded bash, tmux, browser
+(`specs/work-scope-ui/` REQ-WSUI-009, keyed by the chain root's single
+`work_scope_key`). That dock answers "what is *running* on this work right
+now." It does not answer "what *unit of work* is this" — the worktree,
+branch, task, and pull request the chain is driving. REQ-CHN-008 adds
+that second, complementary facet to the chain page's work-scope surface.
+The two are different views of one `WorkScope`: runtime resources (the
+existing dock) and work identity + PR health (this requirement).
 
 WHEN the chain page is displayed
-THE SYSTEM SHALL surface the chain's work scope above the member list:
-the worktree path, the branch and base branch, the task (id and title)
-when the chain is doing Managed work, and the associated pull request
-when one exists — its `display_state` (open / draft / merged / closed),
-its checks, and its feedback-freshness signal
+THE SYSTEM SHALL surface, for the chain's work scope, its **work
+identity** — worktree path, branch, base branch, and the task (id and
+title) when the chain is doing Managed work — and its **pull-request
+health** when an associated PR exists: `display_state` (open / draft /
+merged / closed), checks, and feedback-freshness signal
 
-THE PR checks and feedback-freshness signal SHALL be obtained through the
-existing PR-status / feedback pipeline (the same one that drives the
-StateBar, `specs/projects/` REQ-PROJ-011/030/031), not from the PR
-association record alone — that record carries PR identity and state, but
-checks and feedback freshness are derived live by that pipeline
+THE SYSTEM SHALL address this through the **same single `work_scope_key`**
+the runtime-resource dock uses (the chain root's scope; `specs/work-scope-ui/`
+REQ-WSUI-009), not by fanning out per member — a chain's members share one
+work scope, and at most one is non-terminal (`specs/projects/`
+REQ-PROJ-025), so one scope key is complete
 
-WHEN the chain spans more than one work scope (a member diverged onto a
-different worktree, or a member is Direct/conversation-scoped)
-THE SYSTEM SHALL represent that honestly rather than collapsing the
-chain to a single arbitrary scope — the panel reflects the actual set
-of scopes the chain touches
+THE work identity SHALL be sourced from the members' `ConvMode` git
+metadata, and the PR `display_state` / checks / feedback-freshness SHALL
+be sourced from the existing **PR-status / feedback pipeline** that drives
+the StateBar (`specs/projects/` REQ-PROJ-011/030/031) — not from the PR
+association record alone (which carries PR identity and state but not live
+checks or freshness). This facet SHALL NOT be folded into
+`WorkScopeInventory`, whose contract is a full-snapshot read-projection
+over the in-memory runtime registries (`specs/work-scope-ui/`
+REQ-WSUI-001); externally-polled PR state and durable git metadata do not
+belong in that registry snapshot.
 
-WHEN the chain has no work scope beyond conversation identity (e.g. a
-chain of Direct conversations with no worktree)
-THE SYSTEM SHALL indicate the absence of a managed work scope rather
-than showing empty worktree/branch/PR fields
+WHEN the chain has no managed work scope (e.g. a chain of Direct
+conversations with no worktree)
+THE SYSTEM SHALL indicate the absence of a managed work scope rather than
+rendering empty worktree/branch/PR fields
 
-**Rationale:** The member list answers "what conversations happened";
-it does not answer "what is this chain *for*." The worktree / branch /
-task / PR is the through-line that makes the chain a unit of work rather
-than a list of transcripts, and it is information Phoenix already tracks
-per work scope (`work_scope_pr_associations`, the `ConvMode` git
-metadata) but the chain page omits. Surfacing it satisfies the
-Transparency Contract's "what work does this chain represent" question.
-Keeping the chain concept while adding this panel — rather than
-renaming the chain to a "work scope" — is deliberate: continuation
-lineage and resource ownership are not the same thing, and the
-near-1:1 correspondence is a strong default, not an invariant to
-hard-code.
+**Rationale:** The member list answers "what conversations happened"; the
+runtime-resource dock answers "what is running"; neither answers "what is
+this chain *for*." The worktree / branch / task / PR is the through-line
+that makes the chain a unit of work rather than a list of transcripts.
+Reusing the dock's single-scope-key model (rather than inventing a
+per-member aggregation) keeps the chain page's two work-scope facets
+addressed the same way and avoids the divergence a fan-out would invite.
+Keeping PR/git data out of `WorkScopeInventory` respects that
+projection's deliberate scope (in-memory registries, full-snapshot push
+on registry change) — PR state changes are not registry events, so they
+ride the PR-status pipeline that already models them. Keeping the chain
+concept while surfacing its work identity — rather than renaming the
+chain to a "work scope" — is deliberate: continuation lineage and
+resource ownership are distinct, and their near-1:1 correspondence is a
+strong default, not an invariant to hard-code.
 
 ---
 
