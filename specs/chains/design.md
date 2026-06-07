@@ -11,22 +11,20 @@ the user-set name on chain root conversations. One new persistence
 table: `chain_qa` for Q&A history. No `chains` table; membership is
 computed by walking the continuation chain.
 
-The Q&A surface is a single per-chain persistent UI history with
-stateless per-question invocations of a mid-tier model. Q&A scope is
-all members of the chain (root → leaf). Bundling architecture: each
-member contributes one context block (continuation summary for
-non-leaf members; transcript or in-process summary for the leaf).
+The Q&A surface is a single per-chain persistent UI history. Each
+question is answered by a **read-only agentic loop**: a fresh agent,
+given the chain's content through the product-wide retrieval primitive
+(`specs/conversation-retrieval/`) as a scope-bound search tool plus a
+scope-bound paged read tool, iterates — search, read promising members
+in full, search again — until it can answer, then streams the answer.
+The agent's scope is bound to the chain (it cannot read outside it) and
+it has no state-mutating tools. Each question is a fresh run with no
+memory of prior Q&A (REQ-CHN-006). Q&A history persists in `chain_qa`.
 
-> **Redesign in progress (REQ-CHN-008, REQ-CHN-009).** The
-> summaries-bundling Q&A described in this section is the shipped v1.
-> The redesign replaces it with a read-only **agentic** Q&A that drives
-> the product-wide retrieval primitive (`specs/conversation-retrieval/`)
-> as a scope-bound tool and reads full member content on demand, and
-> adds a work-scope panel (worktree/branch/task/PR) above the member
-> list. Where this design document still describes the bundling path,
-> the snapshot-staleness counters, and the in-process leaf summary,
-> those are the superseded v1 design; REQ-CHN-009 and the
-> conversation-retrieval design are authoritative for the redesign.
+The chain page also surfaces the chain's **work scope** —
+worktree/branch/task/PR — above the member list (REQ-CHN-008), so the
+page shows not just which conversations the chain contains but what unit
+of work they share.
 
 ## Chain Identity and Membership (REQ-CHN-002)
 
@@ -94,6 +92,31 @@ browser back/forward, and survives refresh.
 the current name); Enter or blur commits via an API call that updates
 `conversations.chain_name` on the root conversation; Esc cancels.
 
+**Work-scope panel (REQ-CHN-008).** Above the two columns, the page
+shows the chain's work scope — the unit of work its members share. Chain
+membership (continuation lineage) and work scope
+(`crate::work_scope::WorkScope`, resource ownership) are distinct, but a
+managed/branch chain's members preserve their worktree across
+context-exhaustion continuations and the Explore→Work handoff, so the
+chain almost always maps to a single work scope. The panel surfaces, for
+that scope:
+
+- worktree path, branch, and base branch (from the members' `ConvMode`
+  git metadata);
+- the task (id + title) when the chain is doing Managed work;
+- the associated pull request when one exists — its `display_state`
+  (open / draft / merged / closed), checks, and feedback-freshness
+  marker, read from `work_scope_pr_associations` (the same per-work-scope
+  PR data the StateBar uses, `specs/projects/` REQ-PROJ-011/030).
+
+When the chain touches more than one work scope (a member diverged onto
+another worktree, or a member is Direct/conversation-scoped), the panel
+shows the set rather than collapsing to one arbitrary scope. When there
+is no managed work scope at all (e.g. a chain of Direct conversations
+with no worktree), the panel says so rather than rendering empty
+worktree/branch/PR fields. The panel reads existing data only; it
+introduces no new persistence.
+
 **Layout (two-column):**
 
 - **Left:** member conversations rendered as cards in chain order
@@ -131,14 +154,20 @@ the current name); Enter or blur commits via an API call that updates
   always empty after submission; it does not preserve drafts and does
   not "thread" into the previous answer.
 
-  **Q&A snapshot indicator (REQ-CHN-005).** Each Q&A card displays a
-  subtle inline tag indicating chain state at answer time when it
-  differs from current state — e.g., "answered when chain had 3
-  conversations (now 5)" or "answered when 18 messages had been
-  written (now 27)". Computed from two integer columns on the Q&A
-  row (`snapshot_member_count`, `snapshot_total_messages`) compared
-  against current chain state. No JSON parallel representation, no
-  per-member walk on render.
+  **Q&A freshness indicator (REQ-CHN-005).** Each answer is generated
+  against the chain's live content at submission time (the agent reads
+  the current index and messages — there is no during-answer snapshot to
+  be stale against). But a *stored* answer in the history can still
+  predate later chain activity, and the user needs to see that at a
+  glance. So each Q&A card displays a subtle inline freshness tag when
+  the chain has advanced since the answer was produced — e.g., "chain has
+  grown since this answer: 3 → 5 conversations" or "27 messages now, 18
+  when answered". It is computed from two cheap integers recorded on the
+  Q&A row at answer time (`chain_members_at_answer`,
+  `chain_messages_at_answer`) compared against current chain state. This
+  is an *age-of-answer* signal, not a correctness-snapshot the answer was
+  computed against; no JSON parallel representation, no per-member walk on
+  render.
 
 ## Chain Name Storage (REQ-CHN-007)
 
@@ -164,46 +193,56 @@ For non-root conversations (continuation members), `chain_name` is
 ignored at read time. Setting it on a non-root conversation has no UI
 effect; the API enforces `chain_name` writes only on the chain root.
 
-## Q&A Backend (REQ-CHN-001, REQ-CHN-004, REQ-CHN-006)
+## Q&A Backend (REQ-CHN-001, REQ-CHN-004, REQ-CHN-006, REQ-CHN-009)
 
-**Per-question model invocation receives:**
+**A read-only agentic loop.** Each question runs a fresh agent whose
+toolset is two scope-bound tools from `specs/conversation-retrieval/`:
 
-1. The chain's bundled context (defined below)
-2. The user's current question
-3. An instructional system prompt directing the model to answer from
-   the provided context only and to indicate uncertainty when the
-   context does not support a confident answer
+- `search_conversations { query }` — ranked retrieval scoped to the
+  chain (the host binds the chain; the scope resolves the chain's members
+  live per call, REQ-RET-008);
+- `read_conversation { conversation_id, cursor?, max_bytes? }` —
+  byte-budgeted, paged full-content read of a chain member, including
+  full tool-result bodies (REQ-RET-008).
 
-The invocation does **not** receive prior Q&A history from the same
-chain. This is what makes REQ-CHN-006's user-visible property hold:
-each question is answered against the canonical chain content, not
-against the model's own prior answers.
+The agent is seeded with the question, a short instructional system
+prompt (answer from chain content; say so when the content does not
+support a confident answer), and a cheap **chain skeleton** (member
+titles + trailing continuation summaries) for orientation — *not* the
+full bundled transcript. It then iterates: search → page through
+promising members in full → search again → answer. A first-pass
+retrieval miss is recoverable because the agent can search again or read
+more, rather than being capped by a single up-front context guess.
 
-**Context bundling.** For a chain of members `M₁ → M₂ → … → Mₙ`:
+**Read-only and scope-bound by construction.** The agent is given no
+state-mutating tool (no bash, patch, or worktree access), so "read-only"
+is a property of the toolset, not a runtime flag. Both tools are bound to
+the chain by the host; the model supplies only a query (or a
+target conversation already in scope) and cannot widen beyond the chain
+(REQ-RET-008). This is the same agent that, bound to the `Global` scope,
+would serve a future application-wide Q&A — only the bound scope differs.
 
-| Member kind | Context source |
-|---|---|
-| **Non-leaf** (`Mᵢ` where `i < n`, continued into a successor) | The trailing `MessageType::Continuation` message at the end of `Mᵢ` itself. For context continuation this is persisted by `Effect::persist_continuation_message` during the `AwaitingContinuation → ContextExhausted` transition; for approved-task fresh handoff this is the approved-plan handoff summary persisted when the Explore predecessor becomes `HandedOff`. Its payload describes the work or approved plan represented by `Mᵢ`. |
-| **Leaf** (`Mₙ`, never continued) | Transcript sent directly when the leaf has ≤ 20 messages and approximate token count ≤ 4000; otherwise an on-demand summary generated **in-process** by the same mid-tier model in a pre-step before the main answer call. |
+**No prior Q&A in context (REQ-CHN-006).** Each question is a fresh agent
+run; it sees none of the chain's prior questions or answers. The run may
+iterate internally, but it carries no cross-question memory, so the tenth
+question is answered against the chain's live content exactly as the
+first was — no drift from the model's own earlier answers. Cost and
+latency now scale with a question's difficulty (how much the agent must
+search/read) rather than with chain size, bounded by a fixed **turn
+cap**: the loop performs at most N tool iterations before it must answer
+with what it has.
 
-Every non-leaf member carries its own summary on its own tail because
-each was continued, and that act generated the summary. The leaf has
-no such summary because it was never continued from. The leaf-summary
-thresholds are pinned to single shared values across all Q&A
-invocations to avoid behavior drift between identical questions.
-
-**Leaf summarization is in-process, not persisted.** When the leaf
-requires summarization, the result is held in process memory for the
-duration of the Q&A request and discarded after. Subsequent questions
-re-summarize. An earlier draft of this design persisted leaf summaries
-to a `chain_leaf_summary` table keyed by `(leaf_conv_id,
-message_count)`; the persistence was rejected because (a) the
-`message_count` cache key cannot detect in-place message mutations
-(rewrites, tool-result patches, rolled-back turns), risking
-silently-stale cache hits that produce confidently-wrong answers, and
-(b) the cross-restart durability benefit is small in a single-user
-single-server Phoenix. Re-summarizing per-request is operationally
-cheap and never diverges from source-of-truth.
+**Implementation: a bespoke bounded loop, not the conversation runtime.**
+The loop lives in the Q&A module and calls `LlmService::complete_streaming`
+with the two tools; on a tool-use response it executes the (pure
+read-only DB) tools, appends results, and calls again; on a final text
+answer or the turn cap it finalizes. It does **not** reuse the main
+conversation runtime: `chain_qa` already owns its lifecycle, streaming,
+and persistence (below); the tools are pure reads needing none of the
+runtime's sandbox/worktree/state-machine/sub-agent machinery; and the
+Q&A is not a `Conversation` (it spans a chain, has no worktree, persists
+to `chain_qa`). See `specs/conversation-retrieval/` design for the full
+rationale.
 
 **Model.** A mid-tier model balanced for cost and accuracy (Claude
 Sonnet-class as of this writing). The model identifier is set at the
@@ -218,6 +257,16 @@ carries the per-question `chain_qa.id` as a request discriminator so
 multiple subscribers (e.g., the same chain page open in two tabs) can
 demultiplex concurrent Q&As — a subscriber that submitted question A
 does not render tokens from a sibling-tab's question B.
+
+**Streaming discipline: only the final answer turn is published.** The
+agentic loop's intermediate turns can emit text deltas (the model
+narrating "I'll search for…") alongside their tool calls. Those deltas
+are consumed by the loop but **not** broadcast — during tool iterations
+subscribers see the pre-token indicator, not scratch narration. Only the
+final answer turn (a text response with no tool-use) streams to the
+broadcaster and is persisted, so from the user's side the visible
+behavior is identical to a one-shot answer: "working…", then the answer
+streams once the agent commits to it.
 
 **Chain broadcaster lifecycle.** The chain broadcaster is owned by a
 chain-runtime registry (analogous to the existing conversation-runtime
@@ -249,8 +298,8 @@ New table `chain_qa`:
 | `answer` | TEXT NULL | Final assembled answer once the stream completes; may contain a partial string for `failed` rows; NULL for `in_flight` and `abandoned` |
 | `model` | TEXT NOT NULL | Model identifier used for the answer |
 | `status` | TEXT NOT NULL | One of `in_flight`, `completed`, `failed`, `abandoned` |
-| `snapshot_member_count` | INTEGER NOT NULL | Number of chain members at question submission time |
-| `snapshot_total_messages` | INTEGER NOT NULL | Total message count across all chain members at question submission time (computed at submit; see Snapshot computation below) |
+| `chain_members_at_answer` | INTEGER NOT NULL | Number of chain members when this question was answered (for the age-of-answer freshness tag; see Freshness computation below) |
+| `chain_messages_at_answer` | INTEGER NOT NULL | Total message count across all chain members when this question was answered |
 | `created_at` | DATETIME NOT NULL | UTC; set when the question was submitted |
 | `completed_at` | DATETIME NULL | UTC; set when status transitions to `completed` |
 
@@ -273,7 +322,7 @@ so the per-chain lookup query is index-served.
 
 **Persistence point.** The row is INSERTed at question submission time
 with `status = 'in_flight'`, `answer = NULL`, `completed_at = NULL`,
-and the snapshot counters captured. On stream completion,
+and the two chain-size freshness integers captured. On stream completion,
 `answer`, `completed_at`, and `status = 'completed'` are populated
 via UPDATE. On stream error, `status = 'failed'` is set. The user's
 question text is preserved across failure modes rather than lost.
@@ -288,26 +337,28 @@ UI states for rows that are dead.
 | Status | UI rendering |
 |---|---|
 | `in_flight` | Streaming render (live) for the originating subscriber; "still working…" placeholder for other subscribers tailing the same chain |
-| `completed` | Full answer, with snapshot tag if state has advanced since `created_at` |
+| `completed` | Full answer, with the freshness tag if the chain has advanced since the answer was produced |
 | `failed` | Question + failure indicator + "Re-ask?" affordance; partial answer rendered if `answer` is non-NULL |
 | `abandoned` | Question + "Did not complete — re-ask?" affordance |
 
-**Snapshot computation.** Per-conversation message count in Phoenix is
+**Freshness computation.** Per-conversation message count in Phoenix is
 **not a stored column** — `Conversation::message_count` is computed at
 load time via a correlated subquery (`(SELECT COUNT(*) FROM messages m
 WHERE m.conversation_id = c.id)`, see `src/db.rs`). When a question is
-submitted, the backend (a) walks the chain's members forward via the
+answered, the backend (a) walks the chain's members forward via the
 recursive CTE on `continued_in_conv_id`, (b) loads each member as a
 `Conversation` (which carries its query-time `message_count`), and
-(c) sums the counts in application code: `member_count =
-chain_members.len()`, `total_messages = chain_members.iter().map(|c|
-c.message_count).sum()`. Both integers are written into the row
-before invoking the model. On chain page load, the UI compares each
-Q&A row's snapshot integers against the current chain state (computed
-the same way) and surfaces the difference as the inline staleness tag
-(REQ-CHN-005). Two integers replace what would otherwise be a JSON
-snapshot — same user-visible signal, no parallel representation of
-conversation graph state.
+(c) records `chain_members_at_answer = chain_members.len()` and
+`chain_messages_at_answer = chain_members.iter().map(|c|
+c.message_count).sum()` on the row. On chain page load, the UI compares
+each Q&A row's two integers against the current chain state (computed the
+same way) and, when the chain has grown, surfaces the difference as the
+inline freshness tag (REQ-CHN-005). This is an *age-of-answer* signal:
+the answer was generated against live content at the time, and these
+integers tell the user only whether the chain has moved on since — not
+that the answer was computed against a stale snapshot. Two integers
+replace what would otherwise be a JSON snapshot — same user-visible
+signal, no parallel representation of conversation graph state.
 
 **Lifecycle and cascade behavior.**
 
@@ -338,24 +389,30 @@ addition to the user-visible non-requirements listed in
 - **No `chains` table.** Membership is derived from the conversation
   graph. Adding one would only be necessary if post-hoc manual
   membership editing entered scope.
-- **No persisted leaf-summary cache.** Replaced with in-process
-  summarization per Q&A request (see Q&A Backend section above for
-  the rationale).
+- **No bundled-context or summary cache for Q&A.** The agent reads chain
+  content live through the retrieval primitive per question; nothing
+  about the chain's content is pre-bundled or cached for Q&A, so there is
+  no cache that could go silently stale against in-place message edits.
 - **No tree-shaped chain membership.** Chains are linear; kickstart
   and offshoots are deferred (named in `requirements.md` Future
   Direction).
 - **No follow-up Q&A context layering.** REQ-CHN-006 prohibits prior
   Q&A in the model's context.
-- **No retrieval-backed Q&A.** Tracked as a future-direction note in
-  `requirements.md`.
+- **No new work-scope persistence (REQ-CHN-008).** The work-scope panel
+  reads existing `ConvMode` git metadata and `work_scope_pr_associations`;
+  it adds no table or column.
 
 ## Cross-Spec References
 
+- `specs/conversation-retrieval/` — owns the scope-filtered message
+  retrieval primitive and the scope-bound search/read tools that the
+  chain Q&A agent drives (REQ-CHN-009)
 - `specs/bedrock/` — owns `MessageType::Continuation` and the
   conversation state machine; chains consume continuation summary
-  messages as inputs to the Q&A bundle
-- `specs/projects/` — owns `project_id` scoping; chain membership
-  extends projects' conversation grouping with continuation-aware
-  collapsibility
+  messages for the orientation skeleton and as continuation edges
+- `specs/projects/` — owns `project_id` scoping and the per-work-scope
+  PR association (`work_scope_pr_associations`) the work-scope panel
+  reads (REQ-CHN-008); chain membership extends projects' conversation
+  grouping with continuation-aware collapsibility
 - `specs/sse_wire/` — owns the SSE streaming infrastructure used for
   Q&A token streaming
