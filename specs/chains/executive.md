@@ -53,12 +53,13 @@ mid-tier model balanced for cost and accuracy.
 | **REQ-CHN-005:** Q&A History Persists Per Chain | ✅ Complete | `chain_qa` table CRUD at `db.rs:2909-3008`; status enum + snapshot counters at `chain_qa.rs:145,323,520`; startup sweep `db.rs:1014` |
 | **REQ-CHN-006:** Consistent Quality As Q&A Accumulates | ✅ Complete | Stateless per-question invocation `chain_qa.rs:29,38,384`; `chain_qa_id` demux `chain_runtime.rs:8`, `api/chains.rs:119`, `api/wire.rs:463` |
 | **REQ-CHN-007:** Chain Has a User-Editable Name | ✅ Complete | Nullable `chain_name` column (`db.rs:2737`, `db.rs:3041`); whitespace clears the name (`api/chains.rs:182`) |
-| **REQ-CHN-008:** Chain Page Surfaces the Work Scope | Planned | Surface worktree/branch/task/PR (`work_scope_pr_associations`, `ConvMode` git metadata) above the member list |
+| **REQ-CHN-008:** Chain Page Surfaces Work Identity Alongside Runtime Resources | Planned | Adds worktree/branch/task + PR-health facet to the existing work-scope dock (`specs/work-scope-ui/` REQ-WSUI-009); identity from `ConvMode`, PR health from the PR-status pipeline; not in `WorkScopeInventory` |
 | **REQ-CHN-009:** Chain Q&A Is a Read-Only Agentic Loop | Planned | Scope-bound search + read tools over `specs/conversation-retrieval/`; replaces summaries bundling; reframes REQ-CHN-005 staleness as an age-of-answer freshness tag |
 
-**Progress:** v1 (REQ-CHN-001…007) shipped. REQ-CHN-008 (work-scope
-panel) and REQ-CHN-009 (read-only agentic Q&A) are the redesign,
-planned. REQ-CHN-009 depends on the new
+**Progress:** v1 (REQ-CHN-001…007) shipped. REQ-CHN-008 (work-identity
+facet on the work-scope dock) and REQ-CHN-009 (read-only agentic Q&A)
+are the redesign, planned. REQ-CHN-008 builds on `specs/work-scope-ui/`
+(the chain dock + `work_scope_key`); REQ-CHN-009 depends on the new
 `specs/conversation-retrieval/` primitive, exposed to the Q&A agent as
 scope-bound tools.
 
