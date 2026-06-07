@@ -5,7 +5,7 @@ import { SubAgentStatus, AgentMessage } from './MessageComponents';
 import { FilePathContextMenu } from './FilePathContextMenu';
 import { MessageContextMenu } from './MessageContextMenu';
 import { StreamingMessageView } from './StreamingMessage';
-import { api, type ConversationState, type Message, type ForkProposalSummary } from '../api';
+import { api, ConflictError, type ConversationState, type Message, type ForkProposalSummary } from '../api';
 import { copyToClipboard } from '../utils/clipboard';
 import { ForkProposalsProvider, useForkProposals } from '../contexts/ForkProposalsContext';
 import { ForkProposalReview } from './ForkProposalReview';
@@ -863,5 +863,144 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     expect(onOutcome).not.toHaveBeenCalledWith({ kind: 'dismissed' });
     // ...and it refetches to reconcile the true status.
     await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
+  });
+
+  // Bug N4: when the origin conversation reaches a terminal state the backend
+  // retires its pending proposals to `dismissed`. The provider must refetch once
+  // on that transition so the Review affordance withdraws without a reload.
+  it('refetches and withdraws the Review affordance when the origin goes terminal', async () => {
+    const listMock = api.listForkProposals as ReturnType<typeof vi.fn>;
+    // Initial list: pending (Review visible). Post-terminal refetch: retired.
+    listMock.mockResolvedValueOnce([proposal({ status: 'pending' })]);
+    listMock.mockResolvedValueOnce([proposal({ status: 'dismissed' })]);
+
+    const message = agentMessage('agent-msg-fork', [
+      { type: 'tool_use', id: 'tool-fork', name: 'propose_task', input: { task_file: 'tasks/00042-p2-ready--fix-parser.md' } },
+    ]);
+
+    function Harness({ terminal }: { terminal: boolean }) {
+      return (
+        <MemoryRouter>
+          <ForkProposalsProvider conversationId="agent-1" originTerminal={terminal}>
+            <AgentMessage
+              message={message}
+              toolResults={new Map([['tool-fork', forkToolResult('prop-1')]])}
+              onOpenFile={undefined}
+            />
+          </ForkProposalsProvider>
+        </MemoryRouter>
+      );
+    }
+
+    const { rerender } = render(<Harness terminal={false} />);
+
+    // Pending: Review button shows.
+    expect(await screen.findByRole('button', { name: 'Review' })).toBeInTheDocument();
+    expect(listMock).toHaveBeenCalledTimes(1);
+
+    // Origin transitions to terminal → the false→true edge triggers a refetch.
+    await act(async () => {
+      rerender(<Harness terminal={true} />);
+    });
+
+    await waitFor(() => expect(listMock).toHaveBeenCalledTimes(2));
+    // The affordance withdraws: terminal status, no Review action.
+    await waitFor(() => {
+      expect(screen.queryByRole('button', { name: 'Review' })).not.toBeInTheDocument();
+    });
+    expect(screen.getByText('Dismissed')).toBeInTheDocument();
+  });
+
+  // Bug N5: a 409 from approve is ambiguous. If the post-conflict refetch shows
+  // the proposal STILL pending, the conflict was an actionable precondition
+  // failure (e.g. a branch collision) — surface its message, do NOT claim the
+  // proposal was already resolved.
+  it('surfaces the conflict message when an approve 409 leaves the proposal pending', async () => {
+    const onOutcome = vi.fn();
+    const onError = vi.fn();
+    (api.approveForkProposal as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new ConflictError({
+        error: 'Branch tasks/00042 already exists outside this fork',
+        error_type: 'branch_collision',
+      }),
+    );
+    const listMock = api.listForkProposals as ReturnType<typeof vi.fn>;
+    // Initial + post-conflict refetch both show the proposal still pending.
+    listMock.mockResolvedValue([proposal({ status: 'pending' })]);
+
+    function ApproveHarness() {
+      const fork = useForkProposals();
+      if (!fork) return null;
+      return (
+        <button type="button" onClick={() => void fork.approve('prop-1')}>
+          trigger-approve
+        </button>
+      );
+    }
+
+    render(
+      <MemoryRouter>
+        <ForkProposalsProvider conversationId="agent-1" onOutcome={onOutcome} onError={onError}>
+          <ApproveHarness />
+        </ForkProposalsProvider>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(listMock).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      fireEvent.click(screen.getByText('trigger-approve'));
+    });
+
+    // The actionable conflict surfaces its message...
+    await waitFor(() => {
+      expect(onError).toHaveBeenCalledWith('Branch tasks/00042 already exists outside this fork');
+    });
+    // ...and the proposal is NOT falsely reported as already resolved.
+    expect(onOutcome).not.toHaveBeenCalledWith({ kind: 'already_resolved' });
+  });
+
+  // Bug N5 (other branch): a 409 whose refetch shows a TERMINAL status is a
+  // genuine resolution in another tab — keep the "already resolved" behavior.
+  it('reports already_resolved when an approve 409 refetch shows a terminal status', async () => {
+    const onOutcome = vi.fn();
+    const onError = vi.fn();
+    (api.approveForkProposal as ReturnType<typeof vi.fn>).mockRejectedValue(
+      new ConflictError({ error: 'already resolved', error_type: 'proposal_resolved' }),
+    );
+    const listMock = api.listForkProposals as ReturnType<typeof vi.fn>;
+    // Initial: pending. Post-conflict refetch: resolved elsewhere (spawned).
+    listMock.mockResolvedValueOnce([proposal({ status: 'pending' })]);
+    listMock.mockResolvedValueOnce([
+      proposal({ status: 'spawned', fork_conversation_id: 'fork-conv-9' }),
+    ]);
+
+    function ApproveHarness() {
+      const fork = useForkProposals();
+      if (!fork) return null;
+      return (
+        <button type="button" onClick={() => void fork.approve('prop-1')}>
+          trigger-approve
+        </button>
+      );
+    }
+
+    render(
+      <MemoryRouter>
+        <ForkProposalsProvider conversationId="agent-1" onOutcome={onOutcome} onError={onError}>
+          <ApproveHarness />
+        </ForkProposalsProvider>
+      </MemoryRouter>,
+    );
+
+    await waitFor(() => expect(listMock).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      fireEvent.click(screen.getByText('trigger-approve'));
+    });
+
+    await waitFor(() => {
+      expect(onOutcome).toHaveBeenCalledWith({ kind: 'already_resolved' });
+    });
+    // A genuine resolution never surfaces a conflict error.
+    expect(onError).not.toHaveBeenCalled();
   });
 });

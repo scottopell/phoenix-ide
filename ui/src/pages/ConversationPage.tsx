@@ -1,6 +1,6 @@
 import { lazy, Suspense, useState, useEffect, useRef, useCallback, useMemo, type MouseEvent as ReactMouseEvent } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { api, canChangeModelInState, ExpansionError, type Conversation, type FileAttachment, type ImageData } from '../api';
+import { api, canChangeModelInState, isTerminalConversationState, ExpansionError, type Conversation, type FileAttachment, type ImageData } from '../api';
 import { refreshModels } from '../modelsPoller';
 import { canCancelConversationState, isCancellingState, parseConversationState } from '../utils';
 import { copyToClipboard } from '../utils/clipboard';
@@ -1061,6 +1061,7 @@ function ConversationPageContent() {
   return (
     <ForkProposalsProvider
       conversationId={conversationId}
+      originTerminal={isTerminalConversationState(convStateForChildren)}
       onOutcome={handleForkOutcome}
       onError={showError}
     >

@@ -138,6 +138,13 @@ pub struct RuntimeManager {
     cancel_rx: RwLock<Option<mpsc::Receiver<SubAgentCancelRequest>>>,
     handoff_tx: mpsc::Sender<TaskApprovalHandoffRequest>,
     handoff_rx: RwLock<Option<mpsc::Receiver<TaskApprovalHandoffRequest>>>,
+    /// Channel to the single serialized fork-resolution consumer. Every fork
+    /// proposal resolution (approve / request-changes) and cleanup (dismiss /
+    /// retire-on-terminal / hard-delete) is a [`fork_resolve::ForkCommand`]
+    /// processed one at a time by that consumer, so mutual exclusion between a
+    /// resolve and a cleanup is structural rather than lock-based.
+    fork_cmd_tx: mpsc::Sender<fork_resolve::ForkCommand>,
+    fork_cmd_rx: RwLock<Option<mpsc::Receiver<fork_resolve::ForkCommand>>>,
     /// Credential helper for recovery settlement (REQ-BED-030).
     credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
     /// Receiver for browser session lifecycle edges. Taken once by
@@ -951,6 +958,7 @@ impl RuntimeManager {
         let (spawn_tx, spawn_rx) = mpsc::channel(32);
         let (cancel_tx, cancel_rx) = mpsc::channel(32);
         let (handoff_tx, handoff_rx) = mpsc::channel(32);
+        let (fork_cmd_tx, fork_cmd_rx) = mpsc::channel(32);
         // Browser session lifecycle channel. Unbounded because the volume is
         // O(user-clicks-on-browser-tools) — a tightly bounded channel could
         // drop edges and desync the UI's "session live" indicator. The
@@ -992,6 +1000,8 @@ impl RuntimeManager {
             cancel_rx: RwLock::new(Some(cancel_rx)),
             handoff_tx,
             handoff_rx: RwLock::new(Some(handoff_rx)),
+            fork_cmd_tx,
+            fork_cmd_rx: RwLock::new(Some(fork_cmd_rx)),
             credential_helper,
             browser_lifecycle_rx: RwLock::new(Some(browser_lifecycle_rx)),
             bash_lifecycle_rx: RwLock::new(Some(bash_lifecycle_rx)),
@@ -1367,9 +1377,14 @@ impl RuntimeManager {
         let spawn_rx = self.spawn_rx.write().await.take();
         let cancel_rx = self.cancel_rx.write().await.take();
         let handoff_rx = self.handoff_rx.write().await.take();
+        let fork_cmd_rx = self.fork_cmd_rx.write().await.take();
 
-        if let (Some(mut spawn_rx), Some(mut cancel_rx), Some(mut handoff_rx)) =
-            (spawn_rx, cancel_rx, handoff_rx)
+        if let (
+            Some(mut spawn_rx),
+            Some(mut cancel_rx),
+            Some(mut handoff_rx),
+            Some(mut fork_cmd_rx),
+        ) = (spawn_rx, cancel_rx, handoff_rx, fork_cmd_rx)
         {
             tokio::spawn(async move {
                 loop {
@@ -1383,10 +1398,16 @@ impl RuntimeManager {
                         Some(req) = handoff_rx.recv() => {
                             manager.handle_task_handoff_request(req).await;
                         }
+                        // Single serialized fork-resolution consumer: each command
+                        // is handled to completion before the next is taken, so two
+                        // fork critical sections cannot interleave (REQ-PROJ-034/035).
+                        Some(cmd) = fork_cmd_rx.recv() => {
+                            manager.handle_fork_command(cmd).await;
+                        }
                         else => break,
                     }
                 }
-                tracing::info!("Sub-agent/task-handoff handler stopped");
+                tracing::info!("Sub-agent/task-handoff/fork-resolution handler stopped");
             });
         }
     }
@@ -1932,12 +1953,13 @@ impl RuntimeManager {
         .with_agent_catalog(agent_catalog);
 
         // Fork proposals are bound to top-level (parent) origins; sub-agents
-        // never hold any. Give parent runtimes the DB handle so a terminal
-        // transition retires their still-pending proposals (REQ-PROJ-035).
+        // never hold any. Give parent runtimes the fork-resolution consumer
+        // sender so a terminal transition retires their still-pending proposals
+        // through the serialized consumer (REQ-PROJ-035).
         let runtime = if is_sub_agent {
             runtime
         } else {
-            runtime.with_fork_proposal_db(self.db.clone())
+            runtime.with_fork_command_sender(self.fork_cmd_tx.clone())
         };
 
         // If auto-continuing, inject a system message so the LLM knows a restart

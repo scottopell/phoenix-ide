@@ -489,33 +489,48 @@ pub fn detect_git_repo_root(path: &Path) -> Option<String> {
 /// fallback.
 #[must_use]
 pub fn resolve_default_branch(path: &Path) -> Option<String> {
-    let git = |args: &[&str]| -> Option<String> {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(path)
-            .output()
-            .ok()?;
-        if output.status.success() {
-            Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-        } else {
-            None
-        }
-    };
-
-    // Remote default branch via the cached symbolic ref (no network).
-    if let Some(remote) = git(&["symbolic-ref", "refs/remotes/origin/HEAD"]) {
-        if let Some(branch) = remote.strip_prefix("refs/remotes/origin/") {
-            if !branch.is_empty() {
-                return Some(branch.to_string());
-            }
-        }
+    if let Some(remote) = resolve_remote_default_branch(path) {
+        return Some(remote);
     }
 
     // Else the checked-out branch. A detached HEAD reports the literal "HEAD",
     // which is not a real branch name.
-    match git(&["rev-parse", "--abbrev-ref", "HEAD"]) {
+    match git_capture(path, &["rev-parse", "--abbrev-ref", "HEAD"]) {
         Some(current) if current != "HEAD" && !current.is_empty() => Some(current),
         _ => None,
+    }
+}
+
+/// Resolve a repository's *remote* default branch — the authoritative fork base
+/// signal for `main_ref` reconciliation (REQ-PROJ-034a).
+///
+/// Reads the cached `refs/remotes/origin/HEAD` symbolic ref (no network) and
+/// strips the `refs/remotes/origin/` prefix. Returns `None` when there is no
+/// remote HEAD (e.g. a local/no-origin repository). Unlike
+/// `resolve_default_branch`, there is deliberately no current-branch fallback:
+/// the current checkout is not an authoritative default and must never be used
+/// to overwrite an immutable stored `main_ref`.
+#[must_use]
+pub fn resolve_remote_default_branch(path: &Path) -> Option<String> {
+    let remote = git_capture(path, &["symbolic-ref", "refs/remotes/origin/HEAD"])?;
+    let branch = remote.strip_prefix("refs/remotes/origin/")?;
+    if branch.is_empty() {
+        return None;
+    }
+    Some(branch.to_string())
+}
+
+/// Run `git <args>` in `path`, returning trimmed stdout on success.
+fn git_capture(path: &Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(path)
+        .output()
+        .ok()?;
+    if output.status.success() {
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    } else {
+        None
     }
 }
 

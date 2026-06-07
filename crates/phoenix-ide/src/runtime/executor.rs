@@ -241,14 +241,15 @@ where
     /// runtime resolution never diverge mid-conversation (REQ-AG-004/008).
     /// Empty for sub-agents (which cannot spawn).
     agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
-    /// Database handle used solely to retire this conversation's still-pending
-    /// fork proposals when it reaches a terminal state
-    /// (`ForkProposalsRetiredOnOriginTerminal`, REQ-PROJ-035). Set by the
-    /// runtime manager for parent conversations that can propose forks; `None`
-    /// for sub-agents and in tests that don't exercise the terminal-retirement
-    /// path. The `Storage` trait is intentionally not widened for this — the
-    /// retirement is a control-plane concern on a different table.
-    fork_proposal_db: Option<crate::db::Database>,
+    /// Sender to the single serialized fork-resolution consumer, used solely to
+    /// retire this conversation's still-pending fork proposals when it reaches a
+    /// terminal state (`ForkProposalsRetiredOnOriginTerminal`, REQ-PROJ-035). Set
+    /// by the runtime manager for parent conversations that can propose forks;
+    /// `None` for sub-agents and in tests that don't exercise the
+    /// terminal-retirement path. Routing through the consumer (rather than a raw
+    /// DB handle) keeps retirement serialized with approve/request-changes so a
+    /// terminal transition can't tear down an in-flight resolve's worktree.
+    fork_cmd_tx: Option<mpsc::Sender<super::fork_resolve::ForkCommand>>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -312,15 +313,19 @@ where
             outcome_rx,
             credential_helper: None,
             agent_catalog: Arc::from(Vec::new()),
-            fork_proposal_db: None,
+            fork_cmd_tx: None,
         }
     }
 
-    /// Provide the database handle used to retire still-pending fork proposals
-    /// when this conversation reaches a terminal state (REQ-PROJ-035). Set by
-    /// the runtime manager for fork-proposing parent conversations.
-    pub fn with_fork_proposal_db(mut self, db: crate::db::Database) -> Self {
-        self.fork_proposal_db = Some(db);
+    /// Provide the fork-resolution consumer sender used to retire still-pending
+    /// fork proposals when this conversation reaches a terminal state
+    /// (REQ-PROJ-035). Set by the runtime manager for fork-proposing parent
+    /// conversations.
+    pub fn with_fork_command_sender(
+        mut self,
+        tx: mpsc::Sender<super::fork_resolve::ForkCommand>,
+    ) -> Self {
+        self.fork_cmd_tx = Some(tx);
         self
     }
 
@@ -578,19 +583,29 @@ where
     /// `ForkProposalsRetiredOnOriginTerminal` (REQ-PROJ-035): when this origin
     /// conversation becomes terminal, dismiss its still-pending fork proposals
     /// and clean any deterministic spawn/promote orphan a crashed approve/promote
-    /// left behind. Delegates to
-    /// [`crate::runtime::fork_resolve::retire_fork_proposals_for_terminal_origin`],
-    /// which serialises with approve/promote on `TASK_APPROVAL_MUTEX`. No-op
-    /// when this runtime has no fork-proposal DB handle (sub-agents).
+    /// left behind. Enqueues a `RetireForOrigin` command on the single serialized
+    /// fork-resolution consumer and awaits its best-effort completion. No-op when
+    /// this runtime has no fork-resolution sender (sub-agents).
     async fn retire_fork_proposals_on_terminal(&self) {
-        let Some(db) = self.fork_proposal_db.as_ref() else {
+        let Some(tx) = self.fork_cmd_tx.as_ref() else {
             return;
         };
-        crate::runtime::fork_resolve::retire_fork_proposals_for_terminal_origin(
-            db,
-            &self.context.conversation_id,
-        )
-        .await;
+        let (reply, reply_rx) = oneshot::channel();
+        if tx
+            .send(super::fork_resolve::ForkCommand::RetireForOrigin {
+                origin_id: self.context.conversation_id.clone(),
+                reply,
+            })
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                conv_id = %self.context.conversation_id,
+                "fork retirement on terminal: consumer gone; skipped"
+            );
+            return;
+        }
+        let _ = reply_rx.await;
     }
 
     /// Remove the conversation's worktree if it still exists on disk.

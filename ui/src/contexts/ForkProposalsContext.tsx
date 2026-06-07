@@ -41,10 +41,10 @@ interface ForkProposalsValue {
   /** True until the first list fetch settles. */
   loaded: boolean;
   /** Re-fetch the proposal list (after an action, or when a new proposal id
-   *  appears in the transcript). Resolves once the fetch settles (success or
-   *  failure), so a caller awaiting a newly-streamed id can tell when the
-   *  store has had its chance to learn about it. */
-  refetch: () => Promise<void>;
+   *  appears in the transcript). Resolves with the freshly-fetched list (or
+   *  the prior list if the fetch failed), so a caller can inspect a proposal's
+   *  reconciled status without racing React state. */
+  refetch: () => Promise<ForkProposalSummary[]>;
   /** The proposal whose review modal is open, if any. */
   openProposalId: string | null;
   openReview: (proposalId: string) => void;
@@ -62,6 +62,11 @@ export interface ForkProposalsProviderProps {
    *  conversation yet) the provider is inert: it fetches nothing and every
    *  lookup misses. */
   conversationId?: string | undefined;
+  /** True once the origin conversation has reached a terminal state (merged /
+   *  abandoned / context-exhausted / handed off). The backend retires pending
+   *  proposals to `dismissed` on that transition; the provider refetches once
+   *  when this flips true so the affordances withdraw without a reload. */
+  originTerminal?: boolean | undefined;
   /** Called after an action resolves so the page can navigate / toast. */
   onOutcome?: ((outcome: ForkActionOutcome) => void) | undefined;
   /** Called when an action fails for a non-conflict reason (network, 4xx),
@@ -72,6 +77,7 @@ export interface ForkProposalsProviderProps {
 export function ForkProposalsProvider({
   children,
   conversationId,
+  originTerminal,
   onOutcome,
   onError,
 }: ForkProposalsProviderProps) {
@@ -83,19 +89,29 @@ export function ForkProposalsProvider({
   const convIdRef = useRef<string | undefined>(conversationId);
   convIdRef.current = conversationId;
 
-  const refetch = useCallback(async () => {
+  // Latest fetched list, so a failed refetch can return prior state and a 409
+  // handler can inspect a proposal's reconciled status without racing React's
+  // async `setProposals`.
+  const proposalsRef = useRef<ForkProposalSummary[]>(proposals);
+  proposalsRef.current = proposals;
+
+  const refetch = useCallback(async (): Promise<ForkProposalSummary[]> => {
     const id = convIdRef.current;
     if (!id) {
       setProposals([]);
+      proposalsRef.current = [];
       setLoaded(true);
-      return;
+      return [];
     }
     try {
       const list = await api.listForkProposals(id);
       setProposals(list);
+      proposalsRef.current = list;
+      return list;
     } catch {
       // A failed list fetch leaves the prior state in place; the affordance
       // degrades to its last-known status rather than vanishing.
+      return proposalsRef.current;
     } finally {
       setLoaded(true);
     }
@@ -126,6 +142,19 @@ export function ForkProposalsProvider({
     };
   }, [conversationId]);
 
+  // N4: when the origin conversation goes terminal the backend retires its
+  // pending proposals to `dismissed`. Refetch once on the false→true edge so
+  // the affordances reflect that and the Review buttons withdraw. Tracking the
+  // prior value (rather than refetching on every render while terminal) keeps
+  // this to a single fetch per transition.
+  const prevTerminalRef = useRef<boolean>(originTerminal ?? false);
+  useEffect(() => {
+    const now = originTerminal ?? false;
+    const was = prevTerminalRef.current;
+    prevTerminalRef.current = now;
+    if (now && !was) refetch();
+  }, [originTerminal, refetch]);
+
   const byId = useMemo(() => {
     const m = new Map<string, ForkProposalSummary>();
     for (const p of proposals) m.set(p.id, p);
@@ -139,6 +168,27 @@ export function ForkProposalsProvider({
 
   const openReview = useCallback((proposalId: string) => setOpenProposalId(proposalId), []);
   const closeReview = useCallback(() => setOpenProposalId(null), []);
+
+  // N5: a 409 from approve / request-changes is ambiguous. It means either the
+  // proposal was already resolved in another tab, OR an actionable precondition
+  // failed (e.g. the fork's task branch already exists outside this proposal's
+  // deterministic worktree). Refetch and read the reconciled status to tell them
+  // apart: a now-terminal status is a genuine resolution (close + announce
+  // resolved); a still-`pending` status means the conflict was a precondition
+  // failure, so surface its message and leave the modal open for a retry.
+  const handleActionConflict = useCallback(
+    async (proposalId: string, err: ConflictError, fallbackMessage: string) => {
+      const list = await refetch();
+      const reconciled = list.find((p) => p.id === proposalId);
+      if (!reconciled || reconciled.status !== 'pending') {
+        setOpenProposalId(null);
+        onOutcome?.({ kind: 'already_resolved' });
+        return;
+      }
+      onError?.(err.message || fallbackMessage);
+    },
+    [refetch, onOutcome, onError],
+  );
 
   /** Optimistically mark a proposal resolved so the affordance withdraws
    *  immediately; the subsequent refetch reconciles with the server. */
@@ -163,18 +213,17 @@ export function ForkProposalsProvider({
         });
         setOpenProposalId(null);
         onOutcome?.({ kind: 'spawned', conversationId: fork_conversation_id });
+        refetch();
       } catch (e) {
         if (e instanceof ConflictError) {
-          setOpenProposalId(null);
-          onOutcome?.({ kind: 'already_resolved' });
+          await handleActionConflict(proposalId, e, 'Failed to approve proposal');
         } else {
           onError?.(e instanceof Error ? e.message : 'Failed to approve proposal');
+          refetch();
         }
-      } finally {
-        refetch();
       }
     },
-    [markResolved, onOutcome, onError, refetch],
+    [markResolved, onOutcome, onError, refetch, handleActionConflict],
   );
 
   const dismiss = useCallback(
@@ -223,18 +272,17 @@ export function ForkProposalsProvider({
         });
         setOpenProposalId(null);
         onOutcome?.({ kind: 'promoted', conversationId: refinement_conversation_id });
+        refetch();
       } catch (e) {
         if (e instanceof ConflictError) {
-          setOpenProposalId(null);
-          onOutcome?.({ kind: 'already_resolved' });
+          await handleActionConflict(proposalId, e, 'Failed to request changes');
         } else {
           onError?.(e instanceof Error ? e.message : 'Failed to request changes');
+          refetch();
         }
-      } finally {
-        refetch();
       }
     },
-    [markResolved, onOutcome, onError, refetch],
+    [markResolved, onOutcome, onError, refetch, handleActionConflict],
   );
 
   const value = useMemo<ForkProposalsValue>(

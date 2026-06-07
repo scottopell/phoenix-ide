@@ -304,6 +304,38 @@ export function canChangeModelInState(state: ConversationState): boolean {
   return state.type === 'idle' || state.type === 'error';
 }
 
+/** A conversation in a terminal state can no longer act on its pending fork
+ *  proposals — the backend retires them to `dismissed` (merged / abandoned →
+ *  `terminal`, context-exhausted → `context_exhausted`, handed off →
+ *  `handed_off`). The exhaustive switch makes a new backend state a compile
+ *  error here rather than a silently-missed retirement signal. */
+export function isTerminalConversationState(state: ConversationState): boolean {
+  switch (state.type) {
+    case 'terminal':
+    case 'context_exhausted':
+    case 'handed_off':
+      return true;
+    case 'idle':
+    case 'awaiting_llm':
+    case 'llm_requesting':
+    case 'seeded_llm_requesting':
+    case 'tool_executing':
+    case 'awaiting_sub_agents':
+    case 'awaiting_continuation':
+    case 'cancelling':
+    case 'cancelling_tool':
+    case 'cancelling_sub_agents':
+    case 'awaiting_task_approval':
+    case 'awaiting_user_response':
+    case 'error':
+    case 'awaiting_recovery':
+      return false;
+    default:
+      state satisfies never;
+      return false;
+  }
+}
+
 /** Derive the coarse display category from a conversation's raw state type string.
  *  Internal fallback — prefer `getConvDisplayState` which reads `presentation_mode`. */
 function getDisplayState(stateType: string | undefined): 'idle' | 'working' | 'error' | 'terminal' | 'awaiting-approval' {
