@@ -36,14 +36,26 @@ type OutputEntry =
   | { kind: 'line'; offset: number; text: string }
   | { kind: 'gap'; id: number };
 
-function bashGlyph(state: BashHandleState): { glyph: string; cls: string; title: string } {
-  switch (state) {
+// Liveness vs outcome, matching the Work scope panel: a running handle is a
+// green live dot (alive, not a success check); a terminal handle shows its
+// exit outcome — ✓ on a clean exit, ✗ on non-zero/kill.
+function bashGlyph(insp: BashHandleInspection): { glyph: string; cls: string; title: string } {
+  switch (insp.state) {
     case 'running':
-      return { glyph: '✓', cls: 'pinsp-glyph--ok', title: 'running' };
+      return { glyph: '●', cls: 'pinsp-glyph--live', title: 'running' };
     case 'kill_pending_kernel':
       return { glyph: '⏱', cls: 'pinsp-glyph--warn', title: 'kill pending (kernel)' };
-    case 'tombstoned':
-      return { glyph: '○', cls: 'pinsp-glyph--muted', title: 'tombstoned' };
+    case 'tombstoned': {
+      const success = insp.exit_code === 0 && insp.signal_number == null;
+      if (success) return { glyph: '✓', cls: 'pinsp-glyph--ok', title: 'exited 0' };
+      const title =
+        insp.signal_number != null
+          ? `killed (signal ${insp.signal_number})`
+          : insp.exit_code != null
+            ? `exited ${insp.exit_code}`
+            : 'exited (unknown status)';
+      return { glyph: '✗', cls: 'pinsp-glyph--err', title };
+    }
   }
 }
 
@@ -216,7 +228,7 @@ export function ProcessInspectorPanel({
     if (el) el.scrollTop = el.scrollHeight;
   }, [entries, following]);
 
-  const glyph = snapshot ? bashGlyph(snapshot.state) : null;
+  const glyph = snapshot ? bashGlyph(snapshot) : null;
   const label = snapshot?.label ?? null;
   const cmd = snapshot?.cmd ?? '';
   const terminal = snapshot != null && isTerminal(snapshot.state);

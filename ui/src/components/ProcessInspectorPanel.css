@@ -66,6 +66,15 @@
   color: var(--accent-green);
 }
 
+/* Liveness: a static green dot (alive), distinct from the ✓ success check. */
+.pinsp-glyph--live {
+  color: var(--accent-green);
+}
+
+.pinsp-glyph--err {
+  color: var(--accent-red);
+}
+
 .pinsp-glyph--warn {
   color: var(--accent-yellow);
 }
