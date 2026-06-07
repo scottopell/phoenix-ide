@@ -17,6 +17,17 @@ all members of the chain (root → leaf). Bundling architecture: each
 member contributes one context block (continuation summary for
 non-leaf members; transcript or in-process summary for the leaf).
 
+> **Redesign in progress (REQ-CHN-008, REQ-CHN-009).** The
+> summaries-bundling Q&A described in this section is the shipped v1.
+> The redesign replaces it with a read-only **agentic** Q&A that drives
+> the product-wide retrieval primitive (`specs/conversation-retrieval/`)
+> as a scope-bound tool and reads full member content on demand, and
+> adds a work-scope panel (worktree/branch/task/PR) above the member
+> list. Where this design document still describes the bundling path,
+> the snapshot-staleness counters, and the in-process leaf summary,
+> those are the superseded v1 design; REQ-CHN-009 and the
+> conversation-retrieval design are authoritative for the redesign.
+
 ## Chain Identity and Membership (REQ-CHN-002)
 
 A chain is identified by its **root conversation ID**: the oldest

@@ -36,10 +36,10 @@ happened across its members.
 The user must be able to confidently answer:
 
 1. Which conversations are in this chain, and in what order?
-2. What questions have I already asked this chain, and what answers
+2. What work does this chain represent — which worktree, branch, task,
+   and pull request is it driving, and what is that PR's state?
+3. What questions have I already asked this chain, and what answers
    did I get?
-3. Was this answer generated against the current state of the chain,
-   or has the chain advanced since then?
 
 ## Requirements
 
@@ -141,6 +141,14 @@ streaming pairs SHALL render below the active card in reverse
 chronological order, with the most recent pair immediately below the
 active card.
 
+> **Superseded by REQ-CHN-009.** Snapshot staleness was a property of
+> the summaries-bundling Q&A: an answer was computed against a fixed
+> snapshot, so a later-advanced chain could make it stale. Under
+> retrieval-backed Q&A every question runs against the live index, so an
+> answer is never "stale relative to a snapshot" — there is no snapshot.
+> The staleness indicator and the per-answer snapshot counters it relied
+> on are removed. The clause below is retained for traceability only.
+
 WHEN a stored Q&A answer was generated against an earlier snapshot of
 the chain (members or per-member message counts have changed since the
 answer was produced)
@@ -214,6 +222,106 @@ configurable object.
 
 ---
 
+### REQ-CHN-008: Chain Page Surfaces the Work Scope
+
+A chain's members are linked by continuation, but the thing they are
+all *working on* — the worktree, the branch, the task, the pull request
+— is shared across the chain and is the chain's real subject. Managed
+and Branch work preserve their worktree across context-exhaustion
+continuations and across the Explore→Work handoff, so a chain's members
+overwhelmingly share one work scope (`crate::work_scope::WorkScope`),
+even though chain membership (continuation lineage) and work scope
+(resource ownership) are distinct concepts that can in principle
+diverge.
+
+WHEN the chain page is displayed
+THE SYSTEM SHALL surface the chain's work scope above the member list:
+the worktree path, the branch and base branch, the task (id and title)
+when the chain is doing Managed work, and the associated pull request
+when one exists — its `display_state` (open / draft / merged / closed),
+checks, and feedback-freshness signal as already tracked per work scope
+
+WHEN the chain spans more than one work scope (a member diverged onto a
+different worktree, or a member is Direct/conversation-scoped)
+THE SYSTEM SHALL represent that honestly rather than collapsing the
+chain to a single arbitrary scope — the panel reflects the actual set
+of scopes the chain touches
+
+WHEN the chain has no work scope beyond conversation identity (e.g. a
+chain of Direct conversations with no worktree)
+THE SYSTEM SHALL indicate the absence of a managed work scope rather
+than showing empty worktree/branch/PR fields
+
+**Rationale:** The member list answers "what conversations happened";
+it does not answer "what is this chain *for*." The worktree / branch /
+task / PR is the through-line that makes the chain a unit of work rather
+than a list of transcripts, and it is information Phoenix already tracks
+per work scope (`work_scope_pr_associations`, the `ConvMode` git
+metadata) but the chain page omits. Surfacing it satisfies the
+Transparency Contract's "what work does this chain represent" question.
+Keeping the chain concept while adding this panel — rather than
+renaming the chain to a "work scope" — is deliberate: continuation
+lineage and resource ownership are not the same thing, and the
+near-1:1 correspondence is a strong default, not an invariant to
+hard-code.
+
+---
+
+### REQ-CHN-009: Chain Q&A Is a Read-Only Agentic Loop
+
+WHEN the user asks a chain a question
+THE SYSTEM SHALL answer it by running a read-only agent that is given
+tools to (a) search the chain's conversation content by relevance and
+(b) read the full content of any chain member, and that iterates —
+searching, reading, and reasoning — until it can answer, then streams
+the answer
+
+THE agent's tools SHALL be **scope-bound to the chain's members**: the
+search tool retrieves only across the chain's member conversations
+(`specs/conversation-retrieval/` REQ-RET-001 with
+`Conversations(member_ids)`), and the read tool can fetch only the
+content of conversations in that member set. The model SHALL NOT be able
+to widen its own scope to conversations outside the chain.
+
+THE agent SHALL be **read-only**: it is given no tool that mutates
+state (no bash, no patch, no worktree access). Its only side effect is
+producing the streamed answer.
+
+THE SYSTEM SHALL NOT restrict non-leaf members to their trailing
+continuation summary; the agent can read any member's actual message
+content on demand.
+
+THE agent SHALL run against the live index and live message content at
+query time, so an answer reflects the chain's current state by
+construction (this is what supersedes REQ-CHN-005's snapshot-staleness
+machinery).
+
+THE agent SHALL NOT see prior Q&A questions or answers from the same
+chain (REQ-CHN-006 holds): each question is a fresh agent run that may
+iterate internally but carries no cross-question memory.
+
+**Rationale:** A one-shot bundle — whether of summaries or of a single
+retrieval pass — caps the answer at whatever context was guessed up
+front. The capability the user actually wants is "go dig through the
+whole conversation": let the model search, decide what looks relevant,
+read it in full, and search again if the first pass missed. That is an
+agent loop, and it is the version that genuinely has access to the
+entire conversation rather than a pre-flattened slice of it. Binding
+the tools to the chain's member set by construction (the host fixes the
+scope; the model only supplies the query) keeps the agent from
+wandering outside the chain while still giving it full depth within it.
+Read-only because Q&A is recall, not work. Reusing the product-wide
+retrieval primitive as the search tool means the same agent, pointed at
+the `Global` scope, becomes the future application-wide Q&A — chain Q&A
+and global Q&A differ only in the scope the host binds into the tools.
+Keeping each question a fresh run preserves REQ-CHN-006's
+no-cross-question-drift guarantee; the cost/latency now varies with
+question difficulty rather than chain size, which is the intended
+trade — a pointed question stays cheap, a deep one is allowed to work
+for it.
+
+---
+
 ## Non-Requirements (explicit out-of-scope for v1)
 
 - **Kickstart action / offshoots / tree-shaped chains.** Deferred
@@ -243,18 +351,13 @@ configurable object.
 
 ## Future Direction (named, not v1)
 
-- **Retrieval-backed Q&A architecture.** v1 bundles every chain
-  member's continuation summary plus the leaf transcript (or an
-  in-process leaf summary) into the model invocation. This scales
-  linearly with chain size, regardless of how specific the question
-  is. A retrieval architecture (per-message embeddings + similarity
-  retrieval at query time) would scale with question specificity
-  rather than chain size, structurally eliminate snapshot staleness
-  (every query retrieves at current state), and pay off across
-  Phoenix's whole product (any conversation could pull related
-  context). **Trigger to pivot:** bundling cost becomes painful at
-  observed chain sizes, or a product-level decision to introduce
-  ambient memory across non-chain conversations as well.
+- **Retrieval-backed Q&A architecture (now specified).** Chain Q&A
+  assembling context by similarity retrieval rather than by bundling
+  per-member summaries is specified by REQ-CHN-009 and the product-wide
+  primitive in `specs/conversation-retrieval/`. The MVP backend is
+  lexical (FTS5/BM25); a vector/hybrid backend behind the same seam
+  remains future work, as does the application-wide Q&A surface that the
+  primitive's `Global` scope is built to serve.
 - **Kickstart (deferred from this spec).** "Spawn a related
   conversation in a different direction" has real user value but
   requires resolving the worktree-ownership invariant for peer
