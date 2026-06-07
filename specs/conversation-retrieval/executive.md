@@ -74,11 +74,13 @@ yet; this table is the implementation tracker.
 
 ## Scope
 
-The MVP ships REQ-RET-001 through REQ-RET-007 with the FTS5/BM25
-backend and one consumer (chain Q&A, `specs/chains/` REQ-CHN-009). The
-application-wide Q&A surface that motivates the `Global` scope is a
-separate spec; this primitive is built to serve it but does not depend
-on it.
+The MVP ships REQ-RET-001 through REQ-RET-008 with the FTS5/BM25
+backend and one consumer (chain Q&A, `specs/chains/` REQ-CHN-009).
+REQ-RET-008 (host-bound tool scope) is in MVP scope precisely because
+chain Q&A is: it is the requirement that makes REQ-CHN-009's
+"agent cannot widen past its chain" structural. The application-wide
+Q&A surface that motivates the `Global` scope is a separate spec; this
+primitive is built to serve it but does not depend on it.
 
 ## Out of Scope (Tracked for Future)
 

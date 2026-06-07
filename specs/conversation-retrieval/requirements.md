@@ -51,16 +51,25 @@ THE scope SHALL be one of:
 - `Global` — retrieval spans every conversation in the database (the
   application-wide case)
 
-THE retrieval primitive SHALL be the single entry point for all
-conversation-content recall surfaces; a surface SHALL NOT assemble
-recall context by re-querying the `messages` table directly.
+THE retrieval primitive SHALL be the single entry point for **ranked
+relevance recall** of conversation content; a surface SHALL NOT roll its
+own relevance/ranking strategy by re-querying the `messages` table
+directly.
+
+THIS prohibition governs ranked recall only. Reading the **full content
+of an already-identified conversation** (the scope-bound read capability
+of REQ-RET-008, used by an agent after retrieval has pointed it at a
+conversation) is a distinct, non-ranked operation and is permitted —
+it, too, is scope-bound, but it is not a parallel retrieval strategy.
 
 **Rationale:** The scope parameter is the *only* axis that separates
 chain recall from application-wide recall. Making it a parameter of one
 primitive — rather than two parallel code paths — is what guarantees
-both surfaces answer with the same quality. Routing all recall through
-this entry point keeps context-assembly strategy in one place that can
-be improved (e.g. swapping the backend) once for everyone.
+both surfaces answer with the same quality. Routing all *ranking*
+through this entry point keeps relevance strategy in one place that can
+be improved (e.g. swapping the backend) once for everyone. Fetching a
+known conversation's content is not ranking and does not compete with
+that strategy, so it is not what this prohibition forbids.
 
 ---
 
@@ -94,24 +103,51 @@ WHEN a message is persisted
 THE SYSTEM SHALL index it so that it becomes retrievable without
 requiring a restart
 
+WHEN an existing message's stored content is mutated (message content is
+not strictly append-only — e.g. a tool message's content is updated in
+place after the tool completes)
+THE SYSTEM SHALL re-index that message so its indexed text reflects the
+new content, rather than leaving the prior extraction in place
+
 WHEN the server starts
-THE SYSTEM SHALL reconcile the index against `messages` and index any
-message that is present in `messages` but absent from the index, idempotently
+THE SYSTEM SHALL reconcile the index against `messages`: index any
+message present in `messages` but absent from the index, AND re-index
+any message whose stored content has changed since it was last indexed
+(detected by a content fingerprint or version, not by id-presence
+alone), idempotently
 
 THE SYSTEM SHALL be able to rebuild the entire index from `messages`
 with no loss of source data
 
-THE index structure and its backfill SHALL be introduced through a
-database migration, not through serde defaults or ad-hoc runtime table
-creation
+THE SYSTEM SHALL be able to report the index's **freshness** — at
+minimum, whether startup reconciliation has completed and whether any
+message in `messages` is newer than the index has caught up to — so that
+a consuming surface (Transparency Contract item 3) can distinguish "no
+in-scope content matched" from "the index has not caught up yet." Until
+reconciliation completes, a surface MAY indicate that recall is still
+warming rather than presenting empty results as authoritative.
+
+THE index table SHALL be created by a database migration (not by serde
+defaults or ad-hoc runtime table creation). The migration creates the
+empty index structure; the **typed text backfill** that populates it
+from existing `messages` is performed by the Rust startup reconciliation
+above, because the indexed text is a Rust-side extraction of typed
+`MessageContent` (REQ-RET-004) that static SQL cannot reproduce from the
+stored JSON.
 
 **Rationale:** Treating the index as a cache over `messages` means a
 corrupt, stale, or schema-changed index is never a data-loss event — it
 is rebuilt. Insert-time indexing keeps live conversations searchable;
-the startup reconciliation closes the gap for messages written while a
-prior index shape was in effect or before the index existed. The
-migration requirement follows the repo-wide rule that persisted
-structure changes are owned by migrations.
+re-indexing on content mutation keeps the cache honest when a row
+changes after first index (indexing only newly-absent ids would let an
+updated tool result keep its stale extraction, and the index would no
+longer be a current view of `messages`); the startup reconciliation
+closes both gaps — absent ids and changed rows — for messages written
+or mutated while a prior index shape was in effect or before the index
+existed. Splitting table-creation (migration) from text-backfill (Rust)
+respects both the repo-wide "persisted structure changes are owned by
+migrations" rule and the reality that the static-SQL migration framework
+cannot run typed extraction.
 
 ---
 
@@ -127,16 +163,29 @@ reduced to a compact, low-noise representation rather than indexed
 verbatim or silently dropped
 
 THE text extraction used for indexing SHALL be the same logic used to
-render conversation transcripts for model context, so the indexed text
-and the text a model would read cannot diverge
+render the compact conversation transcript for model orientation, so the
+indexed text and that transcript cannot diverge
+
+THE folding of tool results to a compact marker is a property of the
+**index/orientation** text only. The scope-bound **read capability**
+(REQ-RET-008) that an agent uses to inspect an identified conversation
+SHALL be able to return the **full** content of a message, including the
+body of a tool result — folding is a ranking-signal optimization for the
+index, not a ceiling on what can be read. (The read capability bounds
+size by paging, REQ-RET-008, not by folding.)
 
 **Rationale:** Indexing raw JSON pollutes the index with structural
 tokens (`"role"`, `"type"`, braces) that match queries spuriously and
 crowd out content. Tool results are mostly machine output; indexing
-them verbatim drowns the signal, but dropping them silently is data
-loss indistinguishable from a bug — a compact marker is the correct
-middle. Sharing one extraction routine with transcript rendering means
-the index and the model see the same words.
+them verbatim drowns the *ranking* signal, but dropping them silently is
+data loss indistinguishable from a bug — a compact marker is the correct
+middle for the index. Reading is different from ranking: once an agent
+has decided a conversation is relevant, it must be able to read the
+actual tool output, build log, or sub-agent result that holds the
+answer, so the read path returns full content (paged) rather than the
+folded marker. Sharing one extraction routine between the index and the
+orientation transcript keeps those two in lockstep; the read path is the
+deliberate, separately-typed full-content path.
 
 ---
 
@@ -169,14 +218,30 @@ in the MVP.
 
 WHEN the retrieval primitive returns a chunk
 THE SYSTEM SHALL include the chunk's source `conversation_id`,
-`message_id`, `message_type`, `created_at`, a relevance score, and a
-text snippet suitable for display or for assembly into model context
+`message_id`, a **chunk identity** that locates the chunk **within** its
+message, `message_type`, `created_at`, a relevance score, and a text
+snippet suitable for display or for assembly into model context
+
+THE chunk identity SHALL distinguish two chunks that originate from the
+same `message_id` (a backend that splits a long message into multiple
+chunks SHALL assign each a stable ordinal and/or character range), so a
+caller can cite, de-duplicate, and re-read a specific chunk. For the MVP
+backend, which indexes one chunk per message, the identity is the whole
+message (ordinal 0 / full range); the field exists from the start so the
+result shape does not change when a chunking backend is substituted.
 
 **Rationale:** A retrieved chunk with no provenance cannot be cited,
 attributed, or ordered chronologically when assembled into a prompt,
 and a consuming UI cannot link the answer back to its source
-conversation. Provenance is what makes a retrieved answer auditable
-rather than an oracle.
+conversation. `message_id` alone is insufficient the moment a backend
+splits a message: two chunks from one message become indistinguishable,
+so a caller cannot cite *which part*, cannot de-duplicate, and cannot
+re-read the exact span. Because REQ-RET-005 promises a chunking
+vector/hybrid backend can be substituted **without changing callers**,
+the chunk identity must be in the result shape from the MVP — adding it
+later would be the caller-visible change the seam is supposed to
+prevent. Provenance is what makes a retrieved answer auditable rather
+than an oracle.
 
 ---
 
@@ -203,15 +268,32 @@ query guarantees the chain gets its own top_k.
 WHEN the retrieval primitive (or a companion read-content capability) is
 exposed to an LLM as a callable tool — for example to a read-only Q&A
 agent
-THE SYSTEM SHALL bind the scope at the host when the tool is
+THE SYSTEM SHALL fix the scope at the host when the tool is
 constructed, so the model supplies only the query (and, for read, a
 target conversation/message within scope)
 THE model SHALL NOT be able to specify, widen, or override the scope
 through tool arguments
 
+THE host-fixed scope MAY be a **rule resolved live** rather than a
+frozen list — e.g. "the members of chain root X," re-resolved at each
+tool call — so that membership changes during a run are reflected. What
+is fixed at construction is the *boundary the model cannot cross*, not
+necessarily a static set; liveness within that boundary is permitted and,
+for chain Q&A, required (see chains REQ-CHN-009).
+
 WHEN a tool call names a conversation outside the bound scope (e.g. a
 read for a conversation not in the bound set)
 THE SYSTEM SHALL refuse it rather than serving out-of-scope content
+
+WHEN the read-content tool is asked for a conversation whose full
+content would not safely fit a single tool result (chain members can be
+large enough to have triggered context-exhaustion continuation in the
+first place)
+THE read tool SHALL expose a **bounded/paged** contract — a message
+range or page plus a size limit, with an indication that more remains —
+rather than returning an unbounded full transcript in one call
+THE SYSTEM SHALL NOT return a single read result large enough to push
+the next bounded-loop model call past its context window
 
 **Rationale:** An agentic consumer (chains' read-only Q&A, the future
 application-wide Q&A) drives retrieval as a tool and iterates. If the
