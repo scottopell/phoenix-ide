@@ -228,24 +228,51 @@ transcript or in-process leaf summary). Consequences:
   earlier snapshot" state. REQ-CHN-009 supersedes the snapshot-staleness
   machinery of REQ-CHN-005.
 
-### Reusing the existing agent runtime vs. a bespoke loop
+### Design decision: a bespoke bounded loop, not the conversation runtime
 
-Phoenix already has an agentic runtime (state machine + tool executor +
-SSE streaming + sub-agent plumbing). Two implementation options:
+The agentic Q&A is a **small bounded search/read/answer loop in the Q&A
+module**, not a reuse of Phoenix's main conversation runtime.
 
-- **Reuse the runtime** as a constrained, ephemeral, read-only
-  conversation whose toolset is just the two scope-bound tools. Gets
-  streaming, persistence, and tool execution for free; pays the cost of
-  bending the conversation lifecycle to an ephemeral Q&A that persists
-  to `chain_qa`, not to `conversations`.
-- **Bespoke bounded loop** in the Q&A module: a small search/read/answer
-  loop calling `LlmService::complete` with the two tools and a turn cap.
-  Simpler lifecycle, no worktree/state-machine baggage; reimplements a
-  thin slice of the tool-execution loop.
+The loop: call `LlmService::complete_streaming` with the two scope-bound
+tools offered; if the model returns tool-use blocks, execute them (pure
+read-only DB lookups), append the results, and call again; when the
+model returns a final text answer — or a fixed turn cap is reached —
+stream it and finalize. The final answer streams over the existing
+chain-scoped broadcaster exactly as the one-shot answer does today.
 
-This is the load-bearing implementation decision for REQ-CHN-009 and is
-called out for resolution before build. The retrieval primitive and the
-two tools are identical either way.
+Why bespoke rather than the conversation runtime:
+
+- **Q&A already is its own mini-runtime.** `chain_qa` already owns a
+  detached spawned task, an `in_flight → completed | failed` lifecycle,
+  a chain-scoped SSE broadcaster with a `chain_qa_id` demux key, and a
+  DB finalize step. Adding a tool-call loop around its existing
+  streaming call is an incremental extension of code that already runs,
+  not new infrastructure.
+- **The tools are pure reads.** `search_conversations` and
+  `read_conversation` are read-only DB queries with no side effects, so
+  none of the conversation runtime's machinery — sandbox, worktree,
+  permission gating, the 18-state lifecycle, sub-agent
+  `AwaitingSubAgentResult` plumbing, message persistence to
+  `conversations`/`messages` — is needed. Reusing the runtime would mean
+  standing up all of it only to disable most of it.
+- **Q&A is not a conversation.** It has no single parent conversation
+  (it spans a chain), no worktree, and persists to `chain_qa`, not to
+  `conversations`. Forcing it into the `Conversation` + worktree +
+  state-machine shape is an impedance mismatch with nothing gained.
+- **Read-only by construction.** A loop whose only tools are two DB
+  reads structurally cannot mutate state — the read-only guarantee of
+  REQ-CHN-009 is a property of the toolset, not a runtime configuration
+  that could be misconfigured.
+
+The cost — reimplementing a thin slice of the tool-execution loop
+(parse tool-use, dispatch, append tool-result, re-call) — is small and
+contained because the tool set is two trivial reads and the turn cap
+bounds it. The retrieval primitive and the two tools are identical to
+what a runtime-reuse approach would need; only the host loop differs.
+
+A fixed **turn cap** bounds cost and latency (supporting REQ-CHN-006's
+stability-as-history-grows property): the loop runs at most N
+search/read iterations before it must answer with what it has.
 
 ## Crate placement
 
