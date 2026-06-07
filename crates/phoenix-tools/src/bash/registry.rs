@@ -427,29 +427,40 @@ pub async fn cascade_bash_on_delete(
         return report;
     };
 
-    let scope_handles = entry.read().await;
-    for h in scope_handles.all() {
-        let Some(group_id) = h.live_pgid().await else {
-            continue;
-        };
-        let process_id = h.live_pid().await;
-        let kill_pending = h.is_kill_pending_kernel().await;
-        record_handle_in_report(&mut report, group_id, process_id, kill_pending);
+    {
+        let scope_handles = entry.read().await;
+        for h in scope_handles.all() {
+            let Some(group_id) = h.live_pgid().await else {
+                continue;
+            };
+            let process_id = h.live_pid().await;
+            let kill_pending = h.is_kill_pending_kernel().await;
+            record_handle_in_report(&mut report, group_id, process_id, kill_pending);
 
-        #[cfg(unix)]
-        {
-            // SAFETY: kill(2) with negative pid signals the process group;
-            // no memory implications. ESRCH (group already gone) is
-            // expected and is not surfaced as an error.
-            let rc = unsafe { libc::kill(-group_id, libc::SIGKILL) };
-            if rc != 0 {
-                let err = std::io::Error::last_os_error();
-                if err.raw_os_error() != Some(libc::ESRCH) {
-                    report.kill_failures.push((group_id, err.to_string()));
+            #[cfg(unix)]
+            {
+                // SAFETY: kill(2) with negative pid signals the process group;
+                // no memory implications. ESRCH (group already gone) is
+                // expected and is not surfaced as an error.
+                let rc = unsafe { libc::kill(-group_id, libc::SIGKILL) };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    if err.raw_os_error() != Some(libc::ESRCH) {
+                        report.kill_failures.push((group_id, err.to_string()));
+                    }
                 }
             }
         }
     }
+
+    // The handle table was actually removed (and any live process groups
+    // SIGKILL'd), so the scope's inventory is now empty. Publish a lifecycle
+    // edge so the work-scope bridge re-broadcasts the refreshed (empty)
+    // inventory — without it, a scope with no tmux/browser change to drive
+    // the bridge would leave the collapsed work-scope badge showing the
+    // killed handles (REQ-WSUI-007). NOT emitted on the preserved early
+    // return above, where nothing changed.
+    registry.emit_lifecycle(work_scope);
 
     report
 }
@@ -769,6 +780,62 @@ mod tests {
         let report = cascade_bash_on_delete(&registry, &wt, Some(&other)).await;
         assert!(report.kill_failures.is_empty());
         assert_eq!(registry.scope_count().await, 0);
+    }
+
+    /// REQ-WSUI-007: the cascade teardown path (handle table actually
+    /// removed) must publish a `BashLifecycleEvent` for the scope so the
+    /// work-scope bridge re-broadcasts the now-empty inventory. Without
+    /// this, a scope with no concurrent tmux/browser change leaves the
+    /// collapsed work-scope badge showing the killed handles.
+    #[tokio::test]
+    async fn cascade_bash_on_delete_emits_lifecycle_on_teardown() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(tx)));
+        let s = scope("conv-teardown");
+        let handles_arc = registry.get_or_create(&s).await;
+        {
+            let mut g = handles_arc.write().await;
+            g.insert(make_handle("conv-teardown", "b-1", RING_BUFFER_BYTES));
+        }
+
+        let _ = cascade_bash_on_delete(&registry, &s, None).await;
+
+        let evt = rx.try_recv().expect("teardown must emit a lifecycle edge");
+        assert_eq!(evt.work_scope, s);
+        assert!(rx.try_recv().is_err(), "exactly one edge per teardown");
+    }
+
+    /// The preserved early-return path (inheritor shares the scope) must
+    /// NOT emit — nothing changed, so a refreshed broadcast would be a
+    /// phantom edge.
+    #[tokio::test]
+    async fn cascade_bash_on_delete_no_lifecycle_on_preserved_path() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(tx)));
+        let wt = WorkScope::Worktree("/tmp/wt-preserve-no-emit".to_string());
+        let _ = registry.get_or_create(&wt).await;
+
+        let _ = cascade_bash_on_delete(&registry, &wt, Some(&wt)).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "preserved path must not emit a lifecycle edge"
+        );
+    }
+
+    /// A cascade against a scope with no handle table (nothing removed)
+    /// must not emit — there is no stale inventory to refresh.
+    #[tokio::test]
+    async fn cascade_bash_on_delete_no_lifecycle_when_no_entry() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let registry = Arc::new(BashHandleRegistry::with_lifecycle_sink(Some(tx)));
+
+        let _ = cascade_bash_on_delete(&registry, &scope("never-existed"), None).await;
+
+        assert!(
+            rx.try_recv().is_err(),
+            "no-entry cascade must not emit a lifecycle edge"
+        );
     }
 
     #[tokio::test]

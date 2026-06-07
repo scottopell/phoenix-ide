@@ -2972,8 +2972,11 @@ pub(super) async fn run_resource_cleanup_cascade(
     crate::terminal::cascade_terminal_on_delete(&state.terminals, &work_scope, inheritor_scope)
         .await;
 
-    // Step 5: project worktree.
-    let project_report = cascade_projects_on_delete(state, conv).await;
+    // Step 5: project worktree. Preserve iff the scope is still owned by a
+    // live conversation other than this one — a Work sub-agent inherits the
+    // parent's `worktree_path`, so removing the worktree / deleting the
+    // branch here would destroy the live parent's checkout (REQ-PROJ-029).
+    let project_report = cascade_projects_on_delete(state, conv, inheritor_scope).await;
     if let Some(err) = &project_report.error {
         tracing::warn!(
             conv_id = %id,
@@ -3151,10 +3154,59 @@ struct CascadeProjectsReport {
 /// `create_managed_explore_worktree_blocking` created (REQ-PROJ-028). The
 /// branch was never promoted to a real task branch; it would otherwise
 /// linger as a dangling ref.
+///
+/// `inheritor_scope = Some(_)` means a live conversation OTHER THAN `conv`
+/// still owns the same `WorkScope` (e.g. a Work-mode sub-agent inherits the
+/// parent's `worktree_path`, so the parent shares the scope). In that case
+/// the worktree is still in use — removing it or deleting the branch would
+/// destroy the live owner's checkout — so this cascade is a no-op and
+/// reports no worktree work (REQ-PROJ-029). When `None`, the conversation
+/// being deleted is the last owner and the worktree/branch are reaped as
+/// usual.
+/// The `(branch_name, worktree_path, is_work_mode)` cleanup target for a
+/// conversation, or `None` when there is no worktree/branch to reap (Direct,
+/// or Explore with no worktree). `is_work_mode` gates the `branch -D`.
+fn cascade_project_target(conv: &crate::db::Conversation) -> Option<(String, String, bool)> {
+    match &conv.conv_mode {
+        ConvMode::Work {
+            branch_name,
+            worktree_path,
+            ..
+        } => Some((branch_name.to_string(), worktree_path.to_string(), true)),
+        ConvMode::Branch {
+            branch_name,
+            worktree_path,
+            ..
+        } => Some((branch_name.to_string(), worktree_path.to_string(), false)),
+        ConvMode::Explore {
+            worktree_path: Some(wt),
+        } => {
+            // Top-level managed Explore: temp branch follows the REQ-PROJ-028
+            // naming scheme. `is_work_mode = true` so the blocking closure
+            // also runs `branch -D` on it.
+            let id_prefix: String = conv.id.chars().take(8).collect();
+            Some((format!("task-pending-{id_prefix}"), wt.to_string(), true))
+        }
+        ConvMode::Direct
+        | ConvMode::Explore {
+            worktree_path: None,
+        } => None,
+    }
+}
+
 async fn cascade_projects_on_delete(
     state: &AppState,
     conv: &crate::db::Conversation,
+    inheritor_scope: Option<&crate::work_scope::WorkScope>,
 ) -> CascadeProjectsReport {
+    if inheritor_scope.is_some() {
+        tracing::debug!(
+            conv_id = %conv.id,
+            "skipping worktree/branch cleanup -- scope still owned by a live conversation"
+        );
+        return CascadeProjectsReport::default();
+    }
+
     // Chain-member preservation: if this conversation has a successor in
     // a continuation chain, the worktree + branch are shared with that
     // successor -- only the leaf (continued_in_conv_id = None) actually
@@ -3177,33 +3229,8 @@ async fn cascade_projects_on_delete(
         return CascadeProjectsReport::default();
     }
 
-    let (branch_name, worktree_path, is_work_mode) = match &conv.conv_mode {
-        ConvMode::Work {
-            branch_name,
-            worktree_path,
-            ..
-        } => (branch_name.to_string(), worktree_path.to_string(), true),
-        ConvMode::Branch {
-            branch_name,
-            worktree_path,
-            ..
-        } => (branch_name.to_string(), worktree_path.to_string(), false),
-        ConvMode::Explore {
-            worktree_path: Some(wt),
-        } => {
-            // Top-level managed Explore: temp branch follows the
-            // REQ-PROJ-028 naming scheme. `is_work_mode = true` so the
-            // blocking closure also runs `branch -D` on it.
-            let id_prefix: String = conv.id.chars().take(8).collect();
-            let temp_branch = format!("task-pending-{id_prefix}");
-            (temp_branch, wt.to_string(), true)
-        }
-        ConvMode::Direct
-        | ConvMode::Explore {
-            worktree_path: None,
-        } => {
-            return CascadeProjectsReport::default();
-        }
+    let Some((branch_name, worktree_path, is_work_mode)) = cascade_project_target(conv) else {
+        return CascadeProjectsReport::default();
     };
 
     let mut report = CascadeProjectsReport {
@@ -6002,7 +6029,7 @@ mod hard_delete_cascade_tests {
             build_workmode_chain_with_shared_worktree(&state, &[ids[0], ids[1], "pc-a3"]).await;
 
         let root_conv = state.db.get_conversation("pc-a").await.expect("root");
-        let report = cascade_projects_on_delete(&state, &root_conv).await;
+        let report = cascade_projects_on_delete(&state, &root_conv, None).await;
         assert!(
             report.worktree_path.is_none(),
             "cascade on chain root must report no worktree work (continuation owns it), got {report:?}"
@@ -6192,6 +6219,169 @@ mod hard_delete_cascade_tests {
         assert!(
             state.runtime.bash_handles().remove(&scope).await.is_none(),
             "scope must be torn down when its last live conversation is deleted"
+        );
+    }
+
+    /// Build a real git repo + shared worktree with a parent + sub-agent
+    /// pair of Work-mode conversations bound to it. Both resolve to
+    /// `WorkScope::Worktree(worktree)`; the sub-agent points at the parent
+    /// via `parent_conversation_id` and inherits the same `worktree_path`.
+    /// Returns the temp dir (kept alive by the caller), repo root, worktree
+    /// path, and branch name.
+    async fn build_parent_subagent_on_shared_worktree(
+        state: &AppState,
+        parent_id: &str,
+        child_id: &str,
+    ) -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        String,
+    ) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+
+        crate::git_ops::run_git(&repo, &["init", "--initial-branch=main"]).expect("git init");
+        crate::git_ops::run_git(&repo, &["config", "user.email", "test@phoenix"])
+            .expect("git config email");
+        crate::git_ops::run_git(&repo, &["config", "user.name", "phoenix-test"])
+            .expect("git config name");
+        crate::git_ops::run_git(&repo, &["commit", "--allow-empty", "-m", "init"])
+            .expect("initial commit");
+
+        let branch = format!("task-{parent_id}");
+        let worktree = tmp.path().join("worktree");
+        crate::git_ops::run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                &branch,
+                worktree.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .expect("worktree add");
+
+        let project = state
+            .db
+            .find_or_create_project(repo.to_str().unwrap())
+            .await
+            .expect("project");
+
+        create_workmode_conv_on_worktree(state, parent_id, &worktree, &branch, &project.id, None)
+            .await;
+        create_workmode_conv_on_worktree(
+            state,
+            child_id,
+            &worktree,
+            &branch,
+            &project.id,
+            Some(parent_id),
+        )
+        .await;
+
+        (tmp, repo, worktree, branch)
+    }
+
+    /// REQ-PROJ-029: deleting a Work-mode sub-agent that shares its live
+    /// parent's worktree must PRESERVE the worktree on disk and the task
+    /// branch. The sub-agent inherits the parent's `worktree_path`, so the
+    /// project cascade would `git worktree remove --force` + `branch -D`
+    /// the parent's still-in-use checkout — destructive data loss against a
+    /// live conversation. The any-live-owner signal must suppress it.
+    #[tokio::test]
+    async fn delete_subagent_sharing_parent_scope_preserves_worktree_and_branch() {
+        let state = make_test_state().await;
+        let (_tmp, repo, worktree, branch) =
+            build_parent_subagent_on_shared_worktree(&state, "wp-parent", "wp-child").await;
+
+        assert!(worktree.exists(), "precondition: worktree must exist");
+        assert!(
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
+            "precondition: branch must exist"
+        );
+
+        // Register a live runtime handle for the parent so it counts as a
+        // live owner of the scope during the sub-agent's cascade.
+        let _parent_rx = state
+            .runtime
+            .subscribe("wp-parent")
+            .await
+            .expect("subscribe");
+
+        run_hard_delete_cascade(&state, "wp-child")
+            .await
+            .expect("delete sub-agent");
+
+        assert!(
+            worktree.exists(),
+            "REQ-PROJ-029: parent's worktree must survive the sub-agent's deletion \
+             (scope still owned by the live parent)"
+        );
+        assert!(
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_ok(),
+            "parent's task branch must survive the sub-agent's deletion"
+        );
+        assert!(
+            state.db.get_conversation("wp-child").await.is_err(),
+            "sub-agent row must be gone"
+        );
+        assert!(
+            state.db.get_conversation("wp-parent").await.is_ok(),
+            "parent row must remain"
+        );
+    }
+
+    /// Counterpart: deleting the LAST live owner of the worktree scope (the
+    /// parent here, with no live sibling) must still reap the worktree and
+    /// the task branch as a normal solo Work conversation would.
+    #[tokio::test]
+    async fn delete_last_owner_still_removes_worktree_and_branch() {
+        let state = make_test_state().await;
+        let (_tmp, repo, worktree, branch) =
+            build_parent_subagent_on_shared_worktree(&state, "wl-parent", "wl-child").await;
+
+        // Keep the parent live (registered runtime handle) while the
+        // sub-agent is deleted, so the sub-agent's cascade preserves the
+        // shared worktree.
+        let parent_rx = state
+            .runtime
+            .subscribe("wl-parent")
+            .await
+            .expect("subscribe");
+        run_hard_delete_cascade(&state, "wl-child")
+            .await
+            .expect("delete sub-agent");
+
+        assert!(
+            worktree.exists(),
+            "worktree must still exist after sub-agent delete (parent owns it)"
+        );
+
+        // Drop the parent's runtime handle so it is no longer a live owner:
+        // evicting removes it from the `runtimes` map that
+        // `scope_has_live_conversation_excluding` enumerates. The parent is
+        // now the sole, last owner and its cascade tears down.
+        drop(parent_rx);
+        state
+            .runtime
+            .evict_runtime("wl-parent", crate::runtime::EvictionReason::ModelUpgrade)
+            .await;
+
+        run_hard_delete_cascade(&state, "wl-parent")
+            .await
+            .expect("delete parent");
+
+        assert!(
+            !worktree.exists(),
+            "worktree must be removed when its last owner is deleted"
+        );
+        assert!(
+            crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
+            "task branch must be deleted when the last owner is deleted (Work mode)"
         );
     }
 }

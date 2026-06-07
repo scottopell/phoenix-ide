@@ -713,8 +713,15 @@ following sequence of direct calls in order:
    `tmux kill-server` against the scope's socket, unlinks the socket
    file, removes the registry entry, unless the continuation inherits
    the same `WorkScope` (REQ-TMUX-007, REQ-TMUX-WS-002)
-4. `cascade_projects_on_delete(conversation)` — worktree/branch
-   cleanup, leaf-only (chain non-leaf members skip)
+4. `cascade_projects_on_delete(conversation, inheritor_scope)` —
+   worktree/branch cleanup, unless a live conversation other than the one
+   being deleted still owns the same `WorkScope` (a continuation that
+   inherits it, or a Work-mode sub-agent that shares its parent's
+   worktree). A Work sub-agent inherits the parent's `worktree_path`, so
+   removing the worktree or deleting the branch while the parent is live
+   would destroy the parent's still-in-use checkout — the same
+   any-live-owner preservation signal that gates steps 3 and 5 gates this
+   step (REQ-BASH-WS-002, REQ-PROJ-015)
 5. `cascade_browser_on_delete(work_scope, inheritor_scope)` — drops the
    Chrome session for the scope unless the continuation inherits the
    same `WorkScope` (REQ-BROWSER-WS-003)

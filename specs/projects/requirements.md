@@ -494,11 +494,30 @@ THE SYSTEM SHALL NOT treat its worktree as orphaned during reconciliation
 AND SHALL NOT demote the conversation's mode
   (the worktree is preserved pending explicit user action per REQ-BED-031)
 
+WHEN a conversation undergoes a terminal-transition cascade (hard-delete,
+archive, abandon, mark-merged — REQ-BED-032 step 4)
+AND a live conversation OTHER THAN the one being deleted resolves to the same
+`WorkScope` — a continuation that inherits it, or a Work-mode sub-agent that
+shares its parent's `worktree_path` (REQ-PROJ-008)
+THE SYSTEM SHALL NOT remove the worktree from disk
+AND SHALL NOT delete the task branch
+  (the surviving live owner keeps its still-in-use checkout)
+
+WHEN a conversation undergoes a terminal-transition cascade
+AND no live conversation other than the one being deleted resolves to its
+`WorkScope`
+THE SYSTEM SHALL remove the worktree and delete the task branch (Work mode) as
+the sole owner's normal cleanup
+
 **Rationale:** The registry enables the UI to show all active worktrees and detect
 orphans. Reconciliation on startup handles worktrees deleted externally or
 conversations that ended without cleanup. Context-exhausted conversations and
 their continuations are an explicit exception: their worktrees are held
-intentionally and must survive restart unchanged.
+intentionally and must survive restart unchanged. The cascade's any-live-owner
+guard is the same signal that gates the bash/tmux/browser cascades
+(REQ-BASH-WS-002): a Work-mode sub-agent inherits the parent's `worktree_path`,
+so removing the worktree or deleting the branch while the parent is live would
+destroy the parent's checkout out from under a running conversation.
 
 ---
 

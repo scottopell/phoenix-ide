@@ -164,7 +164,14 @@ Three registries publish scope-change signals into one work-scope bridge, each
 through its own lifecycle sink (`Option<UnboundedSender<…Event>>`, `None` for
 tool-level tests so existing constructors are unaffected):
 
-- The bash registry emits on spawn / transition-to-terminal / kill.
+- The bash registry emits on spawn / transition-to-terminal / kill, and on
+  cascade removal — when the terminal-transition cascade actually removes the
+  scope's handle table and SIGKILLs its live process groups. The cascade emit
+  fires only on the teardown path (a handle table was removed), never on the
+  preserved early return (a live owner still holds the scope) or a no-entry
+  cascade (nothing to remove). Without it, a scope whose only change is the
+  bash teardown — no concurrent tmux/browser edge — would leave the collapsed
+  work-scope badge showing the killed handles.
 - The tmux registry emits on first materialization (the first `ensure_live`
   for a scope), on a later `ServerStatus` transition, and on cascade
   removal — only on an actual state change, never on a probe-noop against an
@@ -352,7 +359,8 @@ eliminates.
   source variant and the scope→conversation routing for emission.
 - `crates/phoenix-ide/src/api/handlers.rs` — add the
   `GET /api/work-scope/:scope_key/inventory` route and handler.
-- The bash handle registry — emit on spawn / terminal / kill.
+- The bash handle registry — emit on spawn / terminal / kill / cascade
+  removal (teardown path only), via the same lifecycle-sink shape.
 - The tmux registry — emit on entry creation / `ServerStatus` transition /
   cascade removal, via the same lifecycle-sink shape.
 - `ui/src/sseSchemas.ts` — add `SseWorkScopeUpdateDataSchema`.
