@@ -141,21 +141,6 @@ streaming pairs SHALL render below the active card in reverse
 chronological order, with the most recent pair immediately below the
 active card.
 
-> **Superseded by REQ-CHN-009.** Snapshot staleness was a property of
-> the summaries-bundling Q&A: an answer was computed against a fixed
-> snapshot, so a later-advanced chain could make it stale. Under
-> retrieval-backed Q&A every question runs against the live index, so an
-> answer is never "stale relative to a snapshot" — there is no snapshot.
-> The staleness indicator and the per-answer snapshot counters it relied
-> on are removed. The clause below is retained for traceability only.
-
-WHEN a stored Q&A answer was generated against an earlier snapshot of
-the chain (members or per-member message counts have changed since the
-answer was produced)
-THE SYSTEM SHALL visually indicate the answer's snapshot staleness so
-the user can tell at a glance whether re-asking would likely yield a
-materially different answer
-
 WHEN a stored Q&A is in an incomplete or failed state (the stream
 ended without producing a complete answer)
 THE SYSTEM SHALL render the question and a clear failure indicator so
@@ -169,10 +154,14 @@ active card is visibly the same shape as past pairs (just unfilled), so
 the user understands their next question creates a new pair rather than
 continuing a thread. Reverse-chronological ordering keeps the freshest
 context next to the active card without requiring the user to scroll.
-Snapshot staleness prevents acting on stale recall — "where did we
-leave off?" captured before the latest conversation was added would
-mislead without this signal. Surfacing failed/incomplete Q&A preserves
-the user's question text rather than losing it on stream failure.
+Surfacing failed/incomplete Q&A preserves the user's question text
+rather than losing it on stream failure.
+
+This requirement does not track per-answer snapshot staleness: under
+REQ-CHN-009 each question is answered by an agent reading the chain's
+live content, so an answer is never stale relative to a fixed snapshot —
+there is no snapshot to compare against, and no staleness indicator or
+snapshot counters.
 
 ---
 
@@ -276,12 +265,15 @@ tools to (a) search the chain's conversation content by relevance and
 searching, reading, and reasoning — until it can answer, then streams
 the answer
 
-THE agent's tools SHALL be **scope-bound to the chain's members**: the
-search tool retrieves only across the chain's member conversations
-(`specs/conversation-retrieval/` REQ-RET-001 with
-`Conversations(member_ids)`), and the read tool can fetch only the
-content of conversations in that member set. The model SHALL NOT be able
-to widen its own scope to conversations outside the chain.
+THE agent's tools SHALL be **scope-bound to the chain** by the host
+(`specs/conversation-retrieval/` REQ-RET-008): the search tool retrieves
+only across the chain's member conversations, and the read tool can
+fetch only the content of conversations in that member set. The model
+SHALL NOT be able to widen its own scope to conversations outside the
+chain. The host SHALL bind the chain **root** and resolve the member set
+live per tool call (not freeze it at run start), so a member added by a
+continuation during the run is in scope — consistent with answering
+against the chain's current state.
 
 THE agent SHALL be **read-only**: it is given no tool that mutates
 state (no bash, no patch, no worktree access). Its only side effect is
@@ -290,6 +282,15 @@ producing the streamed answer.
 THE SYSTEM SHALL NOT restrict non-leaf members to their trailing
 continuation summary; the agent can read any member's actual message
 content on demand.
+
+THE read tool SHALL return the **full** content of the messages it
+returns — including tool-result bodies, build logs, and sub-agent output,
+not the folded compact marker the search index uses for ranking
+(`specs/conversation-retrieval/` REQ-RET-004) — because the answer to a
+question is often in a tool result. Because a chain member can be large,
+the read tool returns content in **bounded pages** (REQ-RET-008) and the
+agent pages forward as needed, so "full content" means "the actual
+content is reachable," not "the entire member in one unbounded result."
 
 THE agent SHALL run against the live index and live message content at
 query time, so an answer reflects the chain's current state by

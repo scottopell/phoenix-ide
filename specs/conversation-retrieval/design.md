@@ -35,10 +35,21 @@ pub enum RetrievalScope {
 pub struct RetrievedChunk {
     pub conversation_id: String,
     pub message_id: String,
+    pub chunk: ChunkRef,        // identity *within* the message (REQ-RET-006)
     pub message_type: MessageType,
     pub created_at: DateTime<Utc>,
     pub snippet: String,
     pub score: f64,
+}
+
+/// Locates a chunk within its message. The MVP indexes one chunk per
+/// message, so it is always `ordinal 0` over the whole message; a
+/// chunking vector/hybrid backend assigns a distinct ordinal (and
+/// optional char range) per chunk. The field is present from the MVP so
+/// substituting a chunking backend does not change `RetrievedChunk`.
+pub struct ChunkRef {
+    pub ordinal: u32,                 // 0 for whole-message (MVP)
+    pub char_range: Option<(usize, usize)>, // Some(..) once messages are split
 }
 
 #[async_trait]
@@ -65,43 +76,66 @@ A standalone FTS5 virtual table — *not* an external-content table over
 
 ```sql
 CREATE VIRTUAL TABLE message_fts USING fts5(
-    text,                       -- extracted, searchable
-    message_id     UNINDEXED,
+    text,                        -- extracted, searchable
+    message_id      UNINDEXED,
+    chunk_ordinal   UNINDEXED,   -- 0 for whole-message (MVP); per-chunk later
     conversation_id UNINDEXED,
-    message_type   UNINDEXED,
-    created_at     UNINDEXED
+    message_type    UNINDEXED,
+    created_at      UNINDEXED,
+    content_hash    UNINDEXED     -- fingerprint of source content, for change detection
 );
 ```
 
 `UNINDEXED` columns are stored but not tokenized: they are available to
 the `WHERE`/projection without participating in the match, which is
-exactly what scope filtering (REQ-RET-007) and provenance
-(REQ-RET-006) need. Carrying them on the FTS row removes any join back
-to `messages` at query time.
+exactly what scope filtering (REQ-RET-007), provenance/chunk identity
+(REQ-RET-006), and changed-row detection (below) need. Carrying them on
+the FTS row removes any join back to `messages` at query time.
+`content_hash` is a fingerprint of the message's stored content captured
+at index time; comparing it to the current message's fingerprint is how
+reconciliation detects a row whose content changed in place.
 
-The table and the backfill that populates it from existing `messages`
-ship in one migration (REQ-RET-003), alongside the other migrations in
-`crates/phoenix-db`. The table is keyed for rebuild: a full rebuild is
-`DELETE FROM message_fts` followed by re-extraction from `messages`.
+**Migration creates the table; Rust performs the backfill (REQ-RET-003).**
+The static-SQL migration framework (`Migration { sql: &'static str }`)
+creates the empty `message_fts` structure only. It cannot populate the
+extracted text, because that text is a Rust-side extraction of typed
+`MessageContent` (REQ-RET-004) and the migration would otherwise have to
+re-implement that extraction in SQL over the raw JSON `content` column.
+The **typed backfill** of existing rows is therefore done by the Rust
+startup reconciliation (below), not by the migration. A full rebuild is
+`DELETE FROM message_fts` followed by the same Rust re-extraction from
+`messages`.
 
 ### Keeping the index current
 
 - **On persist.** The message write path extracts text and inserts the
-  FTS row in the same logical operation that writes the message, so a
+  FTS row(s) in the same logical operation that writes the message, so a
   freshly persisted message is immediately retrievable
-  (REQ-RET-003). Insertion is `INSERT` guarded so a re-run for the same
-  `message_id` does not duplicate a row (delete-then-insert on
-  `message_id`, or an existence check).
-- **On startup.** A reconciliation sweep indexes any `message_id`
-  present in `messages` but absent from `message_fts`. This is the
-  backfill for pre-existing messages and the repair path for any window
-  where indexing lagged. It is idempotent and safe to run every boot.
+  (REQ-RET-003). Insertion is guarded so a re-run for the same
+  `(message_id, chunk_ordinal)` does not duplicate a row
+  (delete-then-insert on `message_id`, or an existence check).
+- **On content mutation.** Message content is not strictly append-only —
+  e.g. `Database::update_tool_message_content` rewrites a tool message's
+  content after the tool completes. The same write path re-extracts and
+  re-indexes (delete-then-insert on `message_id`) whenever stored
+  content is updated, so the index never keeps the stale extraction of a
+  mutated row.
+- **On startup.** A reconciliation sweep (a) indexes any `message_id`
+  present in `messages` but absent from `message_fts`, and (b)
+  re-indexes any message whose current content fingerprint differs from
+  the `content_hash` stored on its FTS row — catching rows that were
+  mutated while a prior index shape was in effect, or before the
+  on-mutation hook existed. It records a freshness watermark (e.g. the
+  max `messages.rowid`/sequence reconciled) so the system can report
+  whether the index has caught up (REQ-RET-003, Transparency Contract
+  item 3). It is idempotent and safe to run every boot.
 
 Triggers on `messages` are deliberately *not* used to maintain the FTS
 table, because the indexed text is a Rust-side extraction of typed
 `MessageContent` (REQ-RET-004) that SQL triggers cannot reproduce from
-the JSON column. The Rust write path owns extraction; the startup sweep
-owns reconciliation.
+the JSON column. The Rust write path owns extraction (on insert and on
+mutation); the startup sweep owns reconciliation (absent ids and changed
+fingerprints).
 
 ## Text extraction (REQ-RET-004)
 
@@ -126,6 +160,13 @@ Folding tool results keeps machine output from drowning the index while
 leaving a visible, countable trace (REQ-RET-004 rationale). If lexical
 recall over tool output proves valuable later, the marker can be
 widened to a truncated head without changing the index shape.
+
+This table is the **index/orientation** extraction. The
+`read_conversation` tool does *not* fold tool results — it returns their
+full bodies (paged), because reading ground truth is a different job
+from producing a clean ranking signal (REQ-RET-004; see Tool exposure).
+The shared-extraction "cannot diverge" guarantee is between the index
+and the orientation skeleton, not between the index and the read path.
 
 ## The MVP backend: `Fts5Retriever` (REQ-RET-005)
 
@@ -184,36 +225,57 @@ Q&A loop (`specs/chains/` REQ-CHN-009). It drives two scope-bound tools:
 // The model supplies only the highlighted argument(s).
 
 search_conversations { query }
-  -> retriever.retrieve(query, BOUND_SCOPE, top_k)   // ranked chunks
+  -> retriever.retrieve(query, bound_scope(), top_k)   // ranked chunks
 
-read_conversation { conversation_id }                // must be in BOUND_SCOPE
-  -> full extracted transcript of that member
+read_conversation { conversation_id, after_seq?, limit? } // must be in bound scope
+  -> { messages: [...full content...], next_seq: Option }  // one bounded page
 ```
 
-`BOUND_SCOPE` is fixed when the tools are constructed (REQ-RET-008): for
-chain Q&A it is `Conversations(chain_members_forward(root))`; for a
-future application-wide Q&A it is `Global`. The model never sees a scope
-argument, so it cannot widen its reach. `read_conversation` validates
-its `conversation_id` against the bound scope and refuses anything
-outside it (for `Global`, any conversation is in scope).
+**Scope is bound by the host, resolved live (REQ-RET-008 + liveness).**
+The host fixes *what* the agent may reach, not a frozen list. For chain
+Q&A it binds the **chain root**; `bound_scope()` resolves
+`Conversations(chain_members_forward(root))` at each tool call, so a
+member added mid-run (a rare continuation while the agent is searching)
+becomes visible rather than being excluded by a start-of-run snapshot —
+consistent with REQ-CHN-009's "reads current state, no snapshot" claim.
+The model still never sees a scope argument and cannot widen beyond the
+root's chain. For a future application-wide Q&A the bound scope is
+`Global`. `read_conversation` validates its `conversation_id` against the
+live bound scope and refuses anything outside it (for `Global`, any
+conversation is in scope).
 
-`read_conversation` returns extracted transcript text via the same
-extraction as indexing (REQ-RET-004), so what the agent reads matches
-what was indexed and what a transcript renderer would show — no parallel
-representation.
+**`read_conversation` returns full content, paged (REQ-RET-004,
+REQ-RET-008).** Unlike the index/orientation text — which folds tool
+results to a compact marker to keep the *ranking* signal clean —
+`read_conversation` returns the **full** content of each message it
+returns, including tool-result bodies, build logs, and sub-agent output,
+because that is often exactly where the answer lives. Since a chain
+member can be large enough to have triggered context-exhaustion
+continuation, the read is **bounded/paged**: it returns one page
+(`after_seq` + `limit`, ordered by `sequence_id`) with a `next_seq`
+cursor when more remains, so a single read can never push the next
+bounded-loop model call past its context window. The agent pages forward
+if it needs more. This is the deliberate full-content read path that
+REQ-RET-004 distinguishes from the folded index text — different
+purposes (read ground truth vs. rank), so different (separately-typed)
+renderings, not a parallel representation of the same thing.
 
 ## Consumer: chain Q&A loop
 
 `specs/chains/` REQ-CHN-009 specifies the chain side. The Q&A run:
 
-1. Resolve members with `Database::chain_members_forward(root_id)`.
-2. Construct `search_conversations` + `read_conversation` bound to
-   `Conversations(member_ids)`.
-3. Run a read-only agent (no bash, no patch, no worktree) seeded with
+1. Construct `search_conversations` + `read_conversation` bound to the
+   **chain root**; the bound scope resolves
+   `Conversations(chain_members_forward(root))` live at each tool call
+   (so a mid-run continuation is visible, not snapshotted).
+2. Run a read-only agent (no bash, no patch, no worktree) seeded with
    the question and a cheap **chain skeleton** (member titles + trailing
    continuation summaries) for orientation. The agent iterates:
-   search → read promising members in full → search again → answer.
-4. Stream the answer over the existing chain-scoped SSE broadcaster.
+   search → page through promising members' full content → search
+   again → answer.
+3. Stream **only the final answer turn** over the existing chain-scoped
+   SSE broadcaster; intermediate tool-use turns are not streamed to the
+   user (see streaming discipline below).
 
 This replaces `bundle_chain_context`'s summaries-only, single-shot
 assembly (trailing continuation summary per non-leaf member; leaf
@@ -274,6 +336,27 @@ A fixed **turn cap** bounds cost and latency (supporting REQ-CHN-006's
 stability-as-history-grows property): the loop runs at most N
 search/read iterations before it must answer with what it has.
 
+### Streaming discipline: only the final turn reaches the user
+
+`complete_streaming` emits text deltas for *every* turn, including the
+intermediate tool-use turns where the model may narrate its plan
+("I'll search for the migration discussion…") alongside its tool calls.
+Forwarding those deltas onto the chain Q&A broadcaster would interleave
+planning chatter with the answer. The loop therefore distinguishes
+**intermediate turns** from the **final answer turn**:
+
+- A turn that ends in tool-use is intermediate. Its text deltas are
+  consumed by the loop (and may be logged) but are **not** published to
+  the chain-scoped broadcaster — the user sees an in-flight indicator,
+  not the model's scratch narration.
+- The first turn that returns a final text answer with no tool-use is
+  the answer turn. *Its* deltas stream to the broadcaster, exactly as
+  the one-shot answer streams today, and are what `finalize` persists.
+
+So mid-loop the user sees "working…", then the answer streams once the
+agent commits to it. This keeps the visible behavior identical to the
+current one-shot Q&A from the user's side, despite the loop underneath.
+
 ## Crate placement
 
 The primitive is product-wide, not chain-specific. The index
@@ -288,9 +371,12 @@ holds a `&dyn LlmService`.
 
 - **Empty query / no matches:** return an empty result; the consumer
   decides how to degrade (chain Q&A can fall back to the skeleton).
-- **Index lag:** a message written but not yet indexed is missed by a
-  concurrent query; the startup sweep and same-operation insert keep
-  this window minimal. Correctness is eventual against the `messages`
-  truth, never lossy (REQ-RET-003).
+- **Index lag:** a message written (or mutated) but not yet indexed is
+  missed by a concurrent query; the same-operation insert/re-index hooks
+  and the startup sweep (absent ids + changed fingerprints) keep this
+  window minimal, and the freshness watermark lets a surface say "still
+  warming" rather than present empty results as authoritative.
+  Correctness is eventual against the `messages` truth, never lossy
+  (REQ-RET-003).
 - **Backend error:** surfaced as `RetrievalError`; the consumer chooses
   whether to fail the Q&A or degrade to skeleton-only context.
