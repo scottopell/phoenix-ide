@@ -154,25 +154,33 @@ representation. Per `MessageContent` variant:
 | `Error` | error message |
 | `Continuation` | continuation summary |
 | `Skill` | `/{name} {trigger}` |
-| `Tool` | compact marker (`(tool result: N chars)`) — folded, not verbatim, not dropped |
+| `Tool` | a **bounded searchable excerpt** of the result body (head-truncated to a fixed cap, e.g. the first ~2 KB), prefixed with a compact size marker (`(tool result: N chars)`) |
 
-Folding tool results keeps machine output from drowning the index while
-leaving a visible, countable trace (REQ-RET-004 rationale). If lexical
-recall over tool output proves valuable later, the marker can be
-widened to a truncated head without changing the index shape.
+Tool results are **content-bearing and must be searchable**: the user
+story explicitly asks to find actual conversation content, and the
+answer to a query is frequently a term that appears only in a build log,
+grep output, sub-agent output, or a file path — all of which live in
+tool results. Indexing only a `(tool result: N chars)` marker would make
+those terms unretrievable, so the index stores a bounded excerpt (a
+head-truncated slice capped at a fixed size) rather than a bare marker.
+The cap keeps a single huge result from dominating the FTS table while
+still exposing its leading domain terms to BM25. (A future chunking
+backend can index the whole result as multiple chunks; the MVP caps to
+one bounded excerpt per tool message.)
 
-This table is the **index/orientation** extraction. The
-`read_conversation` tool does *not* fold tool results — it returns their
-full bodies (paged), because reading ground truth is a different job
-from producing a clean ranking signal (REQ-RET-004; see Tool exposure).
-The shared-extraction "cannot diverge" guarantee is between the index
-and the orientation skeleton, not between the index and the read path.
+This table is the **index/orientation** extraction — optimized to make
+content *findable* within a size budget. The `read_conversation` tool
+returns the **full** result body (paged), because once the agent has
+found a promising conversation it must be able to read the part beyond
+the indexed excerpt (REQ-RET-004; see Tool exposure). The
+shared-extraction "cannot diverge" guarantee is between the index and the
+orientation skeleton, not between the index and the read path.
 
 ## The MVP backend: `Fts5Retriever` (REQ-RET-005)
 
 ```sql
 -- scope = Conversations([a, b, c])
-SELECT text, message_id, conversation_id, message_type, created_at,
+SELECT text, message_id, chunk_ordinal, conversation_id, message_type, created_at,
        bm25(message_fts) AS score
 FROM message_fts
 WHERE message_fts MATCH :query
@@ -185,8 +193,13 @@ LIMIT :top_k;
 
 The scope predicate is part of the ranked query (REQ-RET-007), so
 `LIMIT :top_k` yields the top *in-scope* results, never a global top_k
-thinned by a post-filter. `snippet(message_fts, …)` provides the
-display snippet; `bm25()` provides the score (REQ-RET-006).
+thinned by a post-filter. The projection includes `chunk_ordinal` so
+every row carries its full provenance and chunk identity (REQ-RET-006):
+the backend maps it into `RetrievedChunk.chunk` (`ChunkRef { ordinal,
+char_range }` — ordinal 0 / `None` range for the one-chunk-per-message
+MVP), so callers can cite and de-duplicate without the result shape
+changing when a chunking backend lands. `snippet(message_fts, …)`
+provides the display snippet; `bm25()` provides the score.
 
 FTS5 is available because `crates/phoenix-db` builds SQLite via
 `libsqlite3-sys` with the `bundled` feature, which compiles in FTS5. No
@@ -227,8 +240,8 @@ Q&A loop (`specs/chains/` REQ-CHN-009). It drives two scope-bound tools:
 search_conversations { query }
   -> retriever.retrieve(query, bound_scope(), top_k)   // ranked chunks
 
-read_conversation { conversation_id, after_seq?, limit? } // must be in bound scope
-  -> { messages: [...full content...], next_seq: Option }  // one bounded page
+read_conversation { conversation_id, cursor?, max_bytes? } // must be in bound scope
+  -> { content, next_cursor: Option }                      // one size-bounded page
 ```
 
 **Scope is bound by the host, resolved live (REQ-RET-008 + liveness).**
@@ -244,21 +257,28 @@ root's chain. For a future application-wide Q&A the bound scope is
 live bound scope and refuses anything outside it (for `Global`, any
 conversation is in scope).
 
-**`read_conversation` returns full content, paged (REQ-RET-004,
-REQ-RET-008).** Unlike the index/orientation text — which folds tool
-results to a compact marker to keep the *ranking* signal clean —
-`read_conversation` returns the **full** content of each message it
-returns, including tool-result bodies, build logs, and sub-agent output,
-because that is often exactly where the answer lives. Since a chain
-member can be large enough to have triggered context-exhaustion
-continuation, the read is **bounded/paged**: it returns one page
-(`after_seq` + `limit`, ordered by `sequence_id`) with a `next_seq`
-cursor when more remains, so a single read can never push the next
-bounded-loop model call past its context window. The agent pages forward
-if it needs more. This is the deliberate full-content read path that
-REQ-RET-004 distinguishes from the folded index text — different
-purposes (read ground truth vs. rank), so different (separately-typed)
-renderings, not a parallel representation of the same thing.
+**`read_conversation` returns full content, bounded by a byte budget
+(REQ-RET-004, REQ-RET-008).** Unlike the index/orientation text — which
+keeps only a capped excerpt of tool results for clean ranking —
+`read_conversation` returns the **full** content, including complete
+tool-result bodies, build logs, and sub-agent output, because that is
+often exactly where the answer lives.
+
+The page is bounded by **total size, not message count.** Each call
+returns at most `max_bytes` of content (a host default if the model
+omits it) and a `next_cursor` when more remains; the agent pages forward
+until `next_cursor` is `None`. The cursor is `(sequence_id,
+char_offset)`, so the bound holds **even within a single oversized
+message**: a 5 MB build-log tool result is returned as successive
+`max_bytes`-sized slices across calls (cursor advances the char offset
+within that `sequence_id`), then moves to the next message. A
+message-count-only cursor would not satisfy REQ-RET-008 — one giant
+message could still blow the next model call's context — so the budget
+is in bytes and continuation is intra-message. This is the deliberate
+full-content read path that REQ-RET-004 distinguishes from the capped
+index excerpt: different purposes (read ground truth vs. rank), so
+different (separately-typed) renderings, not a parallel representation of
+the same thing.
 
 ## Consumer: chain Q&A loop
 
