@@ -240,7 +240,13 @@ THE SYSTEM SHALL surface the chain's work scope above the member list:
 the worktree path, the branch and base branch, the task (id and title)
 when the chain is doing Managed work, and the associated pull request
 when one exists — its `display_state` (open / draft / merged / closed),
-checks, and feedback-freshness signal as already tracked per work scope
+its checks, and its feedback-freshness signal
+
+THE PR checks and feedback-freshness signal SHALL be obtained through the
+existing PR-status / feedback pipeline (the same one that drives the
+StateBar, `specs/projects/` REQ-PROJ-011/030/031), not from the PR
+association record alone — that record carries PR identity and state, but
+checks and feedback freshness are derived live by that pipeline
 
 WHEN the chain spans more than one work scope (a member diverged onto a
 different worktree, or a member is Direct/conversation-scoped)
@@ -297,18 +303,29 @@ content on demand.
 
 THE read tool SHALL return the **full** content of the messages it
 returns — including tool-result bodies, build logs, and sub-agent output,
-not the folded compact marker the search index uses for ranking
+not the size-capped excerpt the search index uses for ranking
 (`specs/conversation-retrieval/` REQ-RET-004) — because the answer to a
 question is often in a tool result. Because a chain member can be large,
 the read tool returns content in **bounded pages** (REQ-RET-008) and the
 agent pages forward as needed, so "full content" means "the actual
 content is reachable," not "the entire member in one unbounded result."
 
-THE agent SHALL run against the live index and live message content at
-query time, so each answer reflects the chain's current state by
-construction; REQ-CHN-005's freshness indicator is therefore an
+THE agent SHALL run against live message content (the read tool reads
+`messages` directly) and the current retrieval index at query time, so
+an answer reflects the chain's present state rather than a stored
+snapshot. REQ-CHN-005's freshness indicator is therefore an
 age-of-answer signal (did the chain grow *after* this answer), not a
 during-answer snapshot the answer was computed against.
+
+WHEN the retrieval index has not caught up to the chain's messages (the
+retrieval freshness of `specs/conversation-retrieval/` REQ-RET-003
+reports the index still warming or behind)
+THE SYSTEM SHALL NOT present a Q&A answer as authoritative-complete as if
+the full chain had been searched; it SHALL either wait for the index to
+catch up for the chain's members before answering, or surface that
+search coverage was partial. (Reads remain exact regardless — they hit
+`messages` directly; only the *search* step depends on index freshness,
+so the gap is incomplete recall, never wrong content.)
 
 THE agent SHALL NOT see prior Q&A questions or answers from the same
 chain (REQ-CHN-006 holds): each question is a fresh agent run that may
@@ -326,7 +343,7 @@ scope; the model only supplies the query) keeps the agent from
 wandering outside the chain while still giving it full depth within it.
 Read-only because Q&A is recall, not work. Reusing the product-wide
 retrieval primitive as the search tool means the same agent, pointed at
-the `Global` scope, becomes the future application-wide Q&A — chain Q&A
+the `Global` scope, becomes an application-wide Q&A surface — chain Q&A
 and global Q&A differ only in the scope the host binds into the tools.
 Keeping each question a fresh run preserves REQ-CHN-006's
 no-cross-question-drift guarantee; the cost/latency now varies with
@@ -365,13 +382,6 @@ for it.
 
 ## Future Direction (named, not v1)
 
-- **Retrieval-backed Q&A architecture (now specified).** Chain Q&A
-  assembling context by similarity retrieval rather than by bundling
-  per-member summaries is specified by REQ-CHN-009 and the product-wide
-  primitive in `specs/conversation-retrieval/`. The MVP backend is
-  lexical (FTS5/BM25); a vector/hybrid backend behind the same seam
-  remains future work, as does the application-wide Q&A surface that the
-  primitive's `Global` scope is built to serve.
 - **Kickstart (deferred from this spec).** "Spawn a related
   conversation in a different direction" has real user value but
   requires resolving the worktree-ownership invariant for peer

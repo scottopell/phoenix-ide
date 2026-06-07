@@ -51,6 +51,16 @@ THE scope SHALL be one of:
 - `Global` — retrieval spans every conversation in the database (the
   application-wide case)
 
+THE query SHALL be accepted as **natural language** (a user's question),
+and the primitive SHALL build whatever backend query that requires so
+that relevant messages are returned without demanding that every word of
+the question appear. A naive pass of the whole question to the backend —
+which for a lexical backend means an implicit AND across every filler
+word, or an exact-phrase match if the whole string is quoted — would make
+ordinary recall questions return nothing; the primitive owns the
+query-construction that prevents this (see design), so callers pass plain
+questions.
+
 THE retrieval primitive SHALL be the single entry point for **ranked
 relevance recall** of conversation content; a surface SHALL NOT roll its
 own relevance/ranking strategy by re-querying the `messages` table
@@ -109,12 +119,23 @@ place after the tool completes)
 THE SYSTEM SHALL re-index that message so its indexed text reflects the
 new content, rather than leaving the prior extraction in place
 
+WHEN a message is deleted from `messages` (including the cascade when a
+conversation is hard-deleted)
+THE SYSTEM SHALL remove that message's index rows, so deleted content is
+never returned by retrieval. The index SHALL NOT outlive its source: a
+row whose source `message_id` no longer exists in `messages` is a defect
+(deleted content resurfacing in recall), not a stale-but-harmless cache
+entry.
+
 WHEN the server starts
-THE SYSTEM SHALL reconcile the index against `messages`: index any
-message present in `messages` but absent from the index, AND re-index
-any message whose stored content has changed since it was last indexed
-(detected by a content fingerprint or version, not by id-presence
-alone), idempotently
+THE SYSTEM SHALL reconcile the index against `messages` in both
+directions: index any message present in `messages` but absent from the
+index; re-index any message whose stored content has changed since it was
+last indexed (detected by a content fingerprint or version, not by
+id-presence alone); AND prune any index row whose source `message_id` is
+no longer present in `messages` (repairing deletions that occurred while
+a delete hook was absent or a prior index shape was in effect),
+idempotently
 
 THE SYSTEM SHALL be able to rebuild the entire index from `messages`
 with no loss of source data
@@ -141,9 +162,13 @@ is rebuilt. Insert-time indexing keeps live conversations searchable;
 re-indexing on content mutation keeps the cache honest when a row
 changes after first index (indexing only newly-absent ids would let an
 updated tool result keep its stale extraction, and the index would no
-longer be a current view of `messages`); the startup reconciliation
-closes both gaps — absent ids and changed rows — for messages written
-or mutated while a prior index shape was in effect or before the index
+longer be a current view of `messages`); deleting index
+rows when their source disappears is a correctness requirement, not
+optional cleanup: a standalone FTS table has no foreign key to cascade
+the delete, so an orphaned row would resurface hard-deleted content in
+recall. The startup reconciliation closes all three gaps — absent ids,
+changed rows, and orphaned rows — for messages written, mutated, or
+deleted while a prior index shape was in effect or before the index
 existed. Splitting table-creation (migration) from text-backfill (Rust)
 respects both the repo-wide "persisted structure changes are owned by
 migrations" rule and the reality that the static-SQL migration framework
@@ -159,24 +184,28 @@ THE SYSTEM SHALL extract human-readable text from the message's typed
 
 THE extraction SHALL cover every `MessageContent` variant. A variant
 whose body is machine output (e.g. a tool result) SHALL be reduced to a
-**bounded searchable excerpt** — a size-capped slice of its actual
-content (not merely a `(tool result: N chars)` marker) — so that terms
-appearing only in build logs, command output, sub-agent output, or file
-paths remain retrievable, while a single huge result cannot dominate the
-index. It SHALL NOT be indexed verbatim-unbounded, and SHALL NOT be
-silently dropped to a content-free marker.
+**bounded searchable excerpt** — size-capped, but capturing the parts of
+the output most likely to carry the searchable signal, which for command
+output and build logs is **both the head and the tail** (an error,
+failing test name, or file path is commonly on the last lines, not the
+first). A head-only truncation is insufficient. The excerpt SHALL NOT be
+indexed verbatim-unbounded, and SHALL NOT be silently dropped to a
+content-free marker. Where even head+tail would miss mid-body terms, the
+content-bearing read path (REQ-RET-008) recovers them once search has
+located the conversation — but the index SHALL carry enough that a
+tail-only error term still surfaces the conversation in the first place.
 
 THE text extraction used for indexing SHALL be the same logic used to
 render the compact conversation transcript for model orientation, so the
 indexed text and that transcript cannot diverge
 
-THE folding of tool results to a compact marker is a property of the
+THE size-capping of tool results is a property of the
 **index/orientation** text only. The scope-bound **read capability**
 (REQ-RET-008) that an agent uses to inspect an identified conversation
 SHALL be able to return the **full** content of a message, including the
-body of a tool result — folding is a ranking-signal optimization for the
-index, not a ceiling on what can be read. (The read capability bounds
-size by paging, REQ-RET-008, not by folding.)
+complete body of a tool result — capping is a ranking-signal optimization
+for the index, not a ceiling on what can be read. (The read capability
+bounds size by paging, REQ-RET-008, not by truncation.)
 
 **Rationale:** Indexing raw JSON pollutes the index with structural
 tokens (`"role"`, `"type"`, braces) that match queries spuriously and
@@ -203,23 +232,23 @@ deliberate, separately-typed full-content path.
 THE retrieval primitive SHALL expose its query operation behind an
 interface that hides the ranking backend from callers
 
-THE first backend SHALL be lexical (FTS5/BM25), requiring no embedding
+THE ranking backend SHALL be lexical (FTS5/BM25), requiring no embedding
 provider and no network call on the query path
 
-WHEN a different ranking backend is introduced (vector similarity, or a
+WHEN a different ranking backend is substituted (vector similarity, or a
 rank-fused hybrid)
 THE SYSTEM SHALL be able to substitute it behind the same interface
 without changing any caller
 
-**Rationale:** Lexical retrieval is the honest MVP: the bundled SQLite
+**Rationale:** Lexical ranking is the honest default: the bundled SQLite
 ships FTS5, so it adds no dependency, runs offline, and answers the
 lexical recall questions that dominate ("which file", "the auth bug",
 "what optimizations"). The interface seam is what lets a semantic
-backend land later as a pure substitution — callers, having only ever
-seen `retrieve(query, scope, top_k)`, are unaffected. A vector backend
-is deferred because it requires an embedding provider (the Anthropic
-provider offers none) and a chunk-splitting strategy; neither belongs
-in the MVP.
+backend be substituted as a pure swap — callers, having only ever seen
+`retrieve(query, scope, top_k)`, are unaffected. A vector backend sits
+outside this contract because it requires an embedding provider (the
+Anthropic provider offers none) and a chunk-splitting strategy, neither
+of which this spec defines.
 
 ---
 
@@ -234,10 +263,11 @@ snippet suitable for display or for assembly into model context
 THE chunk identity SHALL distinguish two chunks that originate from the
 same `message_id` (a backend that splits a long message into multiple
 chunks SHALL assign each a stable ordinal and/or character range), so a
-caller can cite, de-duplicate, and re-read a specific chunk. For the MVP
-backend, which indexes one chunk per message, the identity is the whole
-message (ordinal 0 / full range); the field exists from the start so the
-result shape does not change when a chunking backend is substituted.
+caller can cite, de-duplicate, and re-read a specific chunk. For a
+backend that indexes one chunk per message, the identity is the whole
+message (ordinal 0 / full range); the field is part of the result shape
+unconditionally so that shape does not change when a chunking backend is
+substituted.
 
 **Rationale:** A retrieved chunk with no provenance cannot be cited,
 attributed, or ordered chronologically when assembled into a prompt,
@@ -247,10 +277,10 @@ splits a message: two chunks from one message become indistinguishable,
 so a caller cannot cite *which part*, cannot de-duplicate, and cannot
 re-read the exact span. Because REQ-RET-005 promises a chunking
 vector/hybrid backend can be substituted **without changing callers**,
-the chunk identity must be in the result shape from the MVP — adding it
-later would be the caller-visible change the seam is supposed to
-prevent. Provenance is what makes a retrieved answer auditable rather
-than an oracle.
+the chunk identity must be in the result shape unconditionally — were it
+added only alongside a chunking backend, that would be the
+caller-visible change the seam is supposed to prevent. Provenance is what
+makes a retrieved answer auditable rather than an oracle.
 
 ---
 
@@ -298,14 +328,21 @@ WHEN the read-content tool is asked for a conversation whose full
 content would not safely fit a single tool result (chain members can be
 large enough to have triggered context-exhaustion continuation in the
 first place)
-THE read tool SHALL expose a **bounded/paged** contract — a message
-range or page plus a size limit, with an indication that more remains —
-rather than returning an unbounded full transcript in one call
+THE read tool SHALL expose a **bounded/paged** contract — a cursor plus
+a size limit, with an indication that more remains — rather than
+returning an unbounded full transcript in one call
+THE size limit SHALL be **enforced by the host**, not merely defaulted: a
+model-supplied size argument is clamped to a fixed host ceiling
+(`min(requested, cap)`), so the model cannot request a page larger than
+the next call can safely hold
+THE bound SHALL be by size (bytes/tokens), not message count, and SHALL
+hold within a single oversized message (continuation by intra-message
+offset), so one huge message cannot exceed the bound
 THE SYSTEM SHALL NOT return a single read result large enough to push
 the next bounded-loop model call past its context window
 
-**Rationale:** An agentic consumer (chains' read-only Q&A, the future
-application-wide Q&A) drives retrieval as a tool and iterates. If the
+**Rationale:** An agentic consumer (chains' read-only Q&A, or an
+application-wide Q&A surface) drives retrieval as a tool and iterates. If the
 model could choose its own scope, a chain Q&A agent could read
 conversations outside the chain — the scope would be a suggestion, not a
 boundary. Making the host fix the scope at tool-construction time makes
@@ -316,33 +353,35 @@ as deep as it wants, but only within the conversations it was given."
 
 ---
 
-## Non-Requirements (explicit out-of-scope for the MVP)
+## Non-Requirements (out of scope)
 
-- **Vector or hybrid ranking.** The seam (REQ-RET-005) is required; the
-  semantic backend behind it is not part of the MVP.
-- **Chunk splitting of long messages.** The MVP indexes one chunk per
-  message. Sub-message chunking matters for an embedding backend and is
-  deferred with it.
-- **Re-ranking, query rewriting, or multi-hop logic inside the
-  primitive.** A single `retrieve` call does one ranked lookup. Iteration
-  (search again, read more, refine) is the consuming agent's job
-  (REQ-RET-008 / chains REQ-CHN-009), achieved by calling the primitive
-  repeatedly — not built into the primitive.
+These are capabilities this spec deliberately does not define. The
+`MessageRetriever` seam (REQ-RET-005) and the scope enum are shaped so
+each could be added behind them without changing callers; what is *not*
+defined here is the capability itself. (Sequencing — what is built
+first — lives in `executive.md`, not in these standing requirements.)
+
+- **A semantic (vector) or hybrid ranking backend.** This spec defines
+  the lexical ranking contract and the seam that admits another backend;
+  it does not define embedding generation, vector storage, or rank
+  fusion. A semantic backend additionally depends on an embedding
+  provider (the Anthropic provider offers none) and a sub-message
+  chunk-splitting strategy, neither of which this spec specifies.
+- **Sub-message chunk splitting.** The index carries one chunk per
+  message; splitting a long message into multiple chunks is a property of
+  a chunking backend, not of this contract (the chunk-identity result
+  shape, REQ-RET-006, already admits it).
+- **Re-ranking, query rewriting beyond the natural-language handling of
+  REQ-RET-001, or multi-hop logic inside the primitive.** A single
+  `retrieve` call does one ranked lookup. Iteration (search again, read
+  more, refine) is the consuming agent's job (REQ-RET-008 / chains
+  REQ-CHN-009), achieved by calling the primitive repeatedly.
 - **Indexing artifacts other than conversation messages** (task files,
-  diffs, PR feedback). Out of scope for this index.
+  diffs, PR feedback). This index covers conversation messages only.
 - **Relevance feedback / learning from which answers the user kept.**
-  No requirement defines it.
-
-## Future Direction (named, not MVP)
-
-- **Vector / hybrid backend behind the existing seam.** Per-message (or
-  per-chunk) embeddings plus similarity search, optionally rank-fused
-  with BM25 (reciprocal-rank fusion). Substituted behind REQ-RET-005's
-  interface. Requires an embedding provider and a chunk-splitting
-  strategy. **Trigger to pivot:** paraphrase-heavy questions recall
-  poorly under pure lexical ranking, or a product decision to add
-  semantic ambient memory across conversations.
-- **Additional scopes.** `Project(id)` and `Since(timestamp)` extend
-  the scope enum for surfaces that want "recall within this project" or
-  "recall recent activity"; they apply as additional in-query
-  predicates (REQ-RET-007) with no change to the primitive's shape.
+  Not defined.
+- **Scopes beyond `Conversations` and `Global`.** `Project(id)` and
+  `Since(timestamp)` are natural extensions of the scope enum — they
+  would apply as additional in-query predicates (REQ-RET-007) with no
+  change to the primitive's shape — but this spec defines only the two
+  scopes its consumers require.

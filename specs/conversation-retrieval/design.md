@@ -3,9 +3,9 @@
 ## Overview
 
 One index over all conversation messages, queried through one
-scope-filtered primitive. Chain Q&A and a future application-wide Q&A
+scope-filtered primitive. Chain Q&A and an application-wide Q&A surface
 are the same call with a different scope. The ranking backend sits
-behind a trait so a semantic backend can replace the lexical MVP
+behind a trait so a semantic backend can replace the lexical one
 without touching callers.
 
 ```
@@ -13,7 +13,7 @@ without touching callers.
  chain Q&A ──────────┐   │  MessageRetriever (trait)  │
  (scope = chain ids) │   │  retrieve(query, scope, k) │
                      ├──▶│                            │──▶ Vec<RetrievedChunk>
- app-wide Q&A ───────┘   │  impl: Fts5Retriever (MVP) │
+ app-wide Q&A ───────┘   │  impl: Fts5Retriever (lex.) │
  (scope = Global)        │  impl: VectorRetriever …   │
                          └─────────────┬──────────────┘
                                        │ reads
@@ -29,7 +29,7 @@ without touching callers.
 pub enum RetrievalScope {
     Conversations(Vec<String>), // chain members
     Global,                     // every conversation
-    // future: Project(String), Since(DateTime<Utc>)
+    // extension points: Project(String), Since(DateTime<Utc>)
 }
 
 pub struct RetrievedChunk {
@@ -42,13 +42,13 @@ pub struct RetrievedChunk {
     pub score: f64,
 }
 
-/// Locates a chunk within its message. The MVP indexes one chunk per
-/// message, so it is always `ordinal 0` over the whole message; a
-/// chunking vector/hybrid backend assigns a distinct ordinal (and
-/// optional char range) per chunk. The field is present from the MVP so
-/// substituting a chunking backend does not change `RetrievedChunk`.
+/// Locates a chunk within its message. The lexical backend indexes one
+/// chunk per message, so it is always `ordinal 0` over the whole message;
+/// a chunking vector/hybrid backend assigns a distinct ordinal (and
+/// optional char range) per chunk. The field is present unconditionally
+/// so substituting a chunking backend does not change `RetrievedChunk`.
 pub struct ChunkRef {
-    pub ordinal: u32,                 // 0 for whole-message (MVP)
+    pub ordinal: u32,                 // 0 for whole-message (one chunk per message)
     pub char_range: Option<(usize, usize)>, // Some(..) once messages are split
 }
 
@@ -78,7 +78,7 @@ A standalone FTS5 virtual table — *not* an external-content table over
 CREATE VIRTUAL TABLE message_fts USING fts5(
     text,                        -- extracted, searchable
     message_id      UNINDEXED,
-    chunk_ordinal   UNINDEXED,   -- 0 for whole-message (MVP); per-chunk later
+    chunk_ordinal   UNINDEXED,   -- 0 for whole-message; per-chunk under a chunking backend
     conversation_id UNINDEXED,
     message_type    UNINDEXED,
     created_at      UNINDEXED,
@@ -120,12 +120,21 @@ startup reconciliation (below), not by the migration. A full rebuild is
   re-indexes (delete-then-insert on `message_id`) whenever stored
   content is updated, so the index never keeps the stale extraction of a
   mutated row.
+- **On deletion.** Messages disappear when a conversation is hard-deleted
+  (`Database::delete_conversation` removes the conversation and its
+  messages). Because `message_fts` is a *standalone* table (not an
+  FK-backed / external-content table over `messages`), no cascade deletes
+  its rows automatically — the delete path must explicitly remove the
+  index rows for the deleted `message_id`s. Skipping this would leave
+  hard-deleted content searchable, which is a correctness defect, not a
+  harmless stale cache entry.
 - **On startup.** A reconciliation sweep (a) indexes any `message_id`
-  present in `messages` but absent from `message_fts`, and (b)
-  re-indexes any message whose current content fingerprint differs from
-  the `content_hash` stored on its FTS row — catching rows that were
-  mutated while a prior index shape was in effect, or before the
-  on-mutation hook existed. It records a freshness watermark (e.g. the
+  present in `messages` but absent from `message_fts`; (b) re-indexes any
+  message whose current content fingerprint differs from the
+  `content_hash` stored on its FTS row; and (c) **prunes** any
+  `message_fts` row whose `message_id` is no longer present in `messages`
+  — repairing deletions that slipped past the delete hook (e.g. a delete
+  while the process was down). It records a freshness watermark (e.g. the
   max `messages.rowid`/sequence reconciled) so the system can report
   whether the index has caught up (REQ-RET-003, Transparency Contract
   item 3). It is idempotent and safe to run every boot.
@@ -133,9 +142,9 @@ startup reconciliation (below), not by the migration. A full rebuild is
 Triggers on `messages` are deliberately *not* used to maintain the FTS
 table, because the indexed text is a Rust-side extraction of typed
 `MessageContent` (REQ-RET-004) that SQL triggers cannot reproduce from
-the JSON column. The Rust write path owns extraction (on insert and on
-mutation); the startup sweep owns reconciliation (absent ids and changed
-fingerprints).
+the JSON column. The Rust write path owns extraction and deletion (on
+insert, mutation, and message/conversation delete); the startup sweep
+owns reconciliation (absent ids, changed fingerprints, orphaned rows).
 
 ## Text extraction (REQ-RET-004)
 
@@ -154,19 +163,26 @@ representation. Per `MessageContent` variant:
 | `Error` | error message |
 | `Continuation` | continuation summary |
 | `Skill` | `/{name} {trigger}` |
-| `Tool` | a **bounded searchable excerpt** of the result body (head-truncated to a fixed cap, e.g. the first ~2 KB), prefixed with a compact size marker (`(tool result: N chars)`) |
+| `Tool` | a **bounded searchable excerpt** of the result body — a **head + tail** window (first ~1 KB and last ~1 KB, with the middle elided), prefixed with a size marker (`(tool result: N chars)`) |
 
 Tool results are **content-bearing and must be searchable**: the user
 story explicitly asks to find actual conversation content, and the
 answer to a query is frequently a term that appears only in a build log,
 grep output, sub-agent output, or a file path — all of which live in
 tool results. Indexing only a `(tool result: N chars)` marker would make
-those terms unretrievable, so the index stores a bounded excerpt (a
-head-truncated slice capped at a fixed size) rather than a bare marker.
-The cap keeps a single huge result from dominating the FTS table while
-still exposing its leading domain terms to BM25. (A future chunking
-backend can index the whole result as multiple chunks; the MVP caps to
-one bounded excerpt per tool message.)
+those terms unretrievable.
+
+A **head-only** truncation is not enough: the decisive term in a long
+command output — the failing test name, the error line, the offending
+file path — is usually near the **end** of the log, not the start. So the
+excerpt is a **head + tail** window (leading and trailing slices, middle
+elided) under a fixed total cap. The cap keeps one huge result from
+dominating the FTS table while still exposing both the command/context
+(head) and the outcome/error (tail) to BM25. A term buried in the elided
+middle is recovered by the full-content read path once search — on the
+strength of the head/tail terms — has located the conversation. (A
+chunking backend can instead index the whole result as multiple chunks;
+the lexical index caps to one head+tail excerpt per tool message.)
 
 This table is the **index/orientation** extraction — optimized to make
 content *findable* within a size budget. The `read_conversation` tool
@@ -176,14 +192,14 @@ the indexed excerpt (REQ-RET-004; see Tool exposure). The
 shared-extraction "cannot diverge" guarantee is between the index and the
 orientation skeleton, not between the index and the read path.
 
-## The MVP backend: `Fts5Retriever` (REQ-RET-005)
+## The lexical backend: `Fts5Retriever` (REQ-RET-005)
 
 ```sql
 -- scope = Conversations([a, b, c])
 SELECT text, message_id, chunk_ordinal, conversation_id, message_type, created_at,
        bm25(message_fts) AS score
 FROM message_fts
-WHERE message_fts MATCH :query
+WHERE message_fts MATCH :query   -- :query is the built OR-expression, not the raw question (see below)
   AND conversation_id IN (:a, :b, :c)
 ORDER BY score          -- bm25() is ascending = most relevant first
 LIMIT :top_k;
@@ -196,9 +212,9 @@ The scope predicate is part of the ranked query (REQ-RET-007), so
 thinned by a post-filter. The projection includes `chunk_ordinal` so
 every row carries its full provenance and chunk identity (REQ-RET-006):
 the backend maps it into `RetrievedChunk.chunk` (`ChunkRef { ordinal,
-char_range }` — ordinal 0 / `None` range for the one-chunk-per-message
-MVP), so callers can cite and de-duplicate without the result shape
-changing when a chunking backend lands. `snippet(message_fts, …)`
+char_range }` — ordinal 0 / `None` range when one chunk is indexed per
+message), so callers can cite and de-duplicate without the result shape
+changing when a chunking backend is substituted. `snippet(message_fts, …)`
 provides the display snippet; `bm25()` provides the score.
 
 FTS5 is available because `crates/phoenix-db` builds SQLite via
@@ -206,17 +222,37 @@ FTS5 is available because `crates/phoenix-db` builds SQLite via
 new dependency, no embedding provider, no network on the query path
 (REQ-RET-005 rationale).
 
-Query strings are passed through FTS5's query syntax defensively: user
-text is quoted/escaped so punctuation in a question is treated as terms,
-not as FTS5 operators.
+**`:query` is a built FTS5 expression, not the raw question
+(REQ-RET-001).** A natural-language question must not be passed to
+`MATCH` verbatim: FTS5 joins bare whitespace-separated terms with
+implicit **AND**, so `what did we decide about the auth schema` would
+require *every* filler word ("what", "did", "we"…) to appear in a
+message — and quoting the whole string instead demands one exact phrase.
+Either way ordinary recall questions return nothing. The `Fts5Retriever`
+therefore builds the expression:
 
-## The future backend: vector / hybrid
+1. tokenize the question; strip characters that are FTS5 operators
+   (`"`, `*`, `:`, `(`, `)`, `-`, `^`, `NEAR`, `AND`/`OR`/`NOT` as bare
+   words) so user punctuation can't become syntax or inject operators;
+2. drop a small stop-word list (`what`, `did`, `the`, `about`, …) so
+   filler words don't constrain the match;
+3. combine the remaining content terms with **`OR`** (each becomes
+   optional; `bm25()` then ranks by how many — and how rare — the terms a
+   message contains), rather than the implicit AND;
+4. preserve any user-quoted substring as a phrase term.
+
+The result is that a plain question retrieves messages sharing its
+salient terms, ranked by relevance, instead of requiring a total match.
+Callers still pass plain questions; this construction lives entirely in
+the backend.
+
+## Substituting a vector / hybrid backend
 
 A `VectorRetriever` (or `HybridRetriever`) implements the same trait.
 It would:
 
-- split long messages into chunks (the MVP's one-chunk-per-message is a
-  special case),
+- split long messages into chunks (one chunk per message is the lexical
+  backend's degenerate case),
 - embed chunks via an embedding provider (a capability the Anthropic
   provider lacks, so this forces a provider decision — deferred with
   the backend),
@@ -252,7 +288,7 @@ member added mid-run (a rare continuation while the agent is searching)
 becomes visible rather than being excluded by a start-of-run snapshot —
 consistent with REQ-CHN-009's "reads current state, no snapshot" claim.
 The model still never sees a scope argument and cannot widen beyond the
-root's chain. For a future application-wide Q&A the bound scope is
+root's chain. For an application-wide Q&A surface the bound scope is
 `Global`. `read_conversation` validates its `conversation_id` against the
 live bound scope and refuses anything outside it (for `Global`, any
 conversation is in scope).
@@ -264,18 +300,24 @@ keeps only a capped excerpt of tool results for clean ranking —
 tool-result bodies, build logs, and sub-agent output, because that is
 often exactly where the answer lives.
 
-The page is bounded by **total size, not message count.** Each call
-returns at most `max_bytes` of content (a host default if the model
-omits it) and a `next_cursor` when more remains; the agent pages forward
-until `next_cursor` is `None`. The cursor is `(sequence_id,
-char_offset)`, so the bound holds **even within a single oversized
-message**: a 5 MB build-log tool result is returned as successive
-`max_bytes`-sized slices across calls (cursor advances the char offset
-within that `sequence_id`), then moves to the next message. A
-message-count-only cursor would not satisfy REQ-RET-008 — one giant
-message could still blow the next model call's context — so the budget
-is in bytes and continuation is intra-message. This is the deliberate
-full-content read path that REQ-RET-004 distinguishes from the capped
+The page is bounded by **total size, not message count, and the bound is
+enforced by the host.** The model's `max_bytes` argument is only a
+*request*; the host returns `min(requested, HOST_CAP)` bytes (and the
+host default when the model omits it), where `HOST_CAP` is a fixed
+ceiling sized so a page always fits the next bounded-loop model call. The
+model cannot enlarge a page past `HOST_CAP` by asking for more — were
+`max_bytes` honored unclamped, the agent could request a page bigger than
+the next call can hold, defeating REQ-RET-008. Each call returns a
+`next_cursor` when more remains; the agent pages forward until it is
+`None`. The cursor is `(sequence_id, char_offset)`, so the bound holds
+**even within a single oversized message**: a 5 MB build-log tool result
+is returned as successive ≤`HOST_CAP` slices across calls (cursor
+advances the char offset within that `sequence_id`), then moves to the
+next message. A message-count-only cursor would not satisfy REQ-RET-008 —
+one giant message could still blow the next model call's context — so the
+budget is in bytes, host-clamped, and continuation is intra-message. This
+is the deliberate full-content read path that REQ-RET-004 distinguishes
+from the capped
 index excerpt: different purposes (read ground truth vs. rank), so
 different (separately-typed) renderings, not a parallel representation of
 the same thing.

@@ -8,9 +8,10 @@ continued into #42 continued into #44 — can give the chain a
 recognizable name ("auth refactor"), find it nested under a
 collapsible header in the sidebar, navigate to a dedicated chain page,
 and ask it recall questions ("what optimizations did we apply?")
-whose answers see every member of the chain. Q&A history persists per
-chain with snapshot-staleness indicators on answers generated against
-earlier chain states. Chains emerge automatically from the existing
+answered by a read-only agent that searches and reads across every
+member of the chain. Q&A history persists per chain, each stored answer
+carrying an age-of-answer freshness tag when the chain has grown since
+it was produced. Chains emerge automatically from the existing
 continuation graph (no manual grouping); standalone conversations
 remain ungrouped. Chains are linear in v1 — kickstart and offshoots
 are deferred pending resolution of the worktree-ownership invariant
@@ -27,16 +28,19 @@ Chains are a derived primitive over Phoenix's existing
 root conversations. One new table: `chain_qa` (one row per
 question/answer pair, indexed by `root_conv_id`, with explicit
 `status` enum tracking `in_flight` / `completed` / `failed` /
-`abandoned` and two integer snapshot counters for staleness
-comparison). Each Q&A invocation receives bundled context covering
-all chain members — for non-leaf members the trailing
-`MessageType::Continuation` summary on each member's tail; for the
-leaf the transcript or an in-process summary. Prior Q&A history is
-never fed back to the model, bounding cost and preventing drift. Token
-streaming reuses Phoenix's existing SSE infrastructure on a
-chain-scoped channel with per-question discriminator. A startup sweep
-transitions stale `in_flight` rows to `abandoned`. Q&A invocations
-use a mid-tier model balanced for cost and accuracy.
+`abandoned` and two integer chain-size markers recorded at answer time
+for the age-of-answer freshness tag). Each question runs a **read-only
+agentic loop**: a fresh agent drives the product-wide
+conversation-retrieval primitive (`specs/conversation-retrieval/`) as a
+chain-scoped search tool plus a chain-scoped paged read tool, iterating
+until it can answer. Its scope is bound to the chain (it cannot read
+outside it) and it has no state-mutating tools. Prior Q&A history is
+never fed back to the model, bounding drift; cost scales with question
+difficulty, bounded by a turn cap. Token streaming reuses Phoenix's
+existing SSE infrastructure on a chain-scoped channel with a per-question
+discriminator, publishing only the final answer turn. A startup sweep
+transitions stale `in_flight` rows to `abandoned`. The agent uses a
+mid-tier model balanced for cost and accuracy.
 
 ## Status Summary
 
