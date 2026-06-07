@@ -602,9 +602,14 @@ rule TerminalAbandonedWithConversation {
 -- continuation that inherits it, or a live sibling such as a Work-mode
 -- sub-agent sharing its parent's scope), the terminal is preserved; teardown
 -- fires only when the last live owner is gone. A live conversation here is one
--- that is BOTH non-terminal in state AND not archived: an archived
--- conversation does not count as a live owner even while non-terminal, since
--- its runtime handle can linger after a chain archive.
+-- that is BOTH non-terminal in state AND not archived, determined from the
+-- persisted conversation rows in the DATABASE — NOT from the set of live
+-- runtime handles. A non-terminal conversation with no runtime handle (after a
+-- server restart or runtime eviction) is still a live owner; enumerating
+-- handles would tear down a scope whose surviving owner is handle-less. An
+-- archived conversation does not count as a live owner even while non-terminal,
+-- because archiving a chain archives earlier members before the leaf's cascade
+-- runs.
 --
 -- Trigger params: `terminal` is the affected entity; `scope` is the
 -- WorkScope whose lifecycle hook fired. Mirrors

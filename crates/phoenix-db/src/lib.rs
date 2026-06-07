@@ -1325,6 +1325,45 @@ impl Database {
         Ok(count > 0)
     }
 
+    /// List non-archived conversations whose `conv_mode.worktree_path` equals
+    /// `worktree_path`, regardless of `user_initiated`.
+    ///
+    /// Used by the resource-cleanup cascade to decide whether a `WorkScope`
+    /// is still owned after a conversation is deleted: a worktree-scoped
+    /// resource (bash/tmux/browser/terminal handles, the shared git worktree
+    /// and task branch) may only be torn down once *no* non-terminal,
+    /// non-archived conversation still resolves to that scope. The query
+    /// deliberately omits the `user_initiated = 1` filter that
+    /// [`Self::list_conversations`] applies, because the surviving sibling
+    /// owner is frequently a non-user-initiated Work sub-agent (or its
+    /// parent). Terminality is a `ConvState`-domain concept, so it is filtered
+    /// by the caller after parsing rather than in SQL.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn list_conversations_for_worktree(
+        &self,
+        worktree_path: &str,
+    ) -> DbResult<Vec<Conversation>> {
+        let rows = sqlx::query(
+            "SELECT c.id, c.slug, c.title, c.cwd, c.parent_conversation_id, c.user_initiated, c.state,
+                    c.state_updated_at, c.created_at, c.updated_at, c.archived, c.model,
+                    c.project_id, c.conv_mode, c.desired_base_branch,
+                    c.seed_parent_id, c.seed_label, c.continued_in_conv_id, c.chain_name, c.steering_queue, c.llm_language,
+                    (SELECT COUNT(*) FROM messages m WHERE m.conversation_id = c.id) as message_count
+             FROM conversations c
+             WHERE c.archived = 0
+               AND json_extract(c.conv_mode, '$.worktree_path') = ?1",
+        )
+        .bind(worktree_path)
+        .try_map(parse_conversation_row)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
     /// Update a conversation's working directory.
     ///
     /// Conversation `cwd` is immutable post-creation. The only legitimate

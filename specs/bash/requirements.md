@@ -770,12 +770,18 @@ enumerating live owners. The cascade runs before the deleted conversation's
 terminal-state write, so it still reads non-terminal; excluding it is what lets
 the scope tear down when it is the last live owner.
 
-A live owner is a conversation that is BOTH non-terminal in state AND not
-`archived`. An archived conversation SHALL NOT count as a live owner even
-while its state row still reads non-terminal: archiving a chain archives its
-earlier members before the leaf's cleanup cascade runs, and an archived
-member's runtime handle can linger, so counting it as live would preserve the
-shared `WorkScope` and leak its processes and tombstones.
+A live owner is a conversation, RECORDED IN THE DATABASE, that is BOTH
+non-terminal in state AND not `archived`. Liveness SHALL be determined from
+the persisted conversation rows, NOT from the set of live runtime handles: a
+conversation can be non-terminal in the DB yet hold no runtime handle (after a
+server restart or runtime eviction), and such a conversation is still a live
+owner. Enumerating only handles would let the cascade tear down a scope whose
+surviving owner is a handle-less, non-terminal conversation — destroying its
+shared worktree, branch, and processes. An archived conversation SHALL NOT
+count as a live owner even while its state row still reads non-terminal:
+archiving a chain archives its earlier members before the leaf's cleanup
+cascade runs, so counting one as live would preserve the shared `WorkScope`
+and leak its processes and tombstones.
 
 **Rationale:** A continuation is not the only way a scope outlives one
 conversation. A Work-mode sub-agent inherits its parent's `conv_mode` and so

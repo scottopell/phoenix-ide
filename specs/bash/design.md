@@ -707,10 +707,14 @@ handler computes `inheritor_scope = Some(work_scope)` iff the scope is still
 owned by a live conversation OTHER THAN the one being deleted — either a
 continuation that inherits it, or a live sibling such as a Work-mode sub-agent
 that shares its parent's scope. A live conversation is one that is BOTH
-non-terminal in state AND not `archived`; an archived conversation does not
+non-terminal in state AND not `archived`, determined by querying the
+conversation rows in the DATABASE — not by enumerating live runtime handles.
+A non-terminal conversation that has no runtime handle (after a server restart
+or runtime eviction) is still a live owner; enumerating handles would tear down
+a scope whose surviving owner is handle-less. An archived conversation does not
 count as a live owner even while its state row still reads non-terminal,
 because archiving a chain archives earlier members before the leaf's cascade
-runs and their runtime handles can linger. The deleted conversation is excluded
+runs. The deleted conversation is excluded
 from that live-owner enumeration: the cascade runs before its terminal-state
 write, so it still reads non-terminal, and excluding it is what lets the scope
 tear down when it is the last live owner. There is no SQLite shadow store to

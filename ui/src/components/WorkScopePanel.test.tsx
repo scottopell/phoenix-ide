@@ -305,6 +305,89 @@ describe('WorkScopeSection stale-scope guard', () => {
   });
 });
 
+describe('WorkScopeSection SSE-generation guard (same-scope time ordering)', () => {
+  it('a pull that resolves AFTER an SSE update with a live handle does NOT overwrite the pushed inventory', async () => {
+    // Repro: the section opens just before a bash handle spawns. The initial
+    // GET sees an empty scope and is deferred; the spawn `work_scope_update`
+    // SSE lands first with a live handle. The older-but-later-resolving empty
+    // pull must NOT wipe the SSE row, and (because that would also stop the
+    // poll) must not strand the inventory stale.
+    let resolveInitial!: (v: WorkScopeInventory) => void;
+    const initialPending = new Promise<WorkScopeInventory>((r) => {
+      resolveInitial = r;
+    });
+    getInv.mockReturnValue(initialPending);
+
+    // Render with no SSE yet; the initial fetch is in flight (unresolved).
+    let utils!: ReturnType<typeof render>;
+    await act(async () => {
+      utils = render(
+        <WorkScopeSection
+          scopeKey="ws-1"
+          liveInventory={null}
+          expanded={true}
+          onToggleExpanded={() => {}}
+        />,
+      );
+    });
+
+    // SSE push lands first: a live handle. Bumps the generation.
+    const pushed = inv([bash({ cmd: 'SSE-LIVE-CMD', state: 'running' })]);
+    await act(async () => {
+      utils.rerender(
+        <WorkScopeSection
+          scopeKey="ws-1"
+          liveInventory={pushed}
+          expanded={true}
+          onToggleExpanded={() => {}}
+        />,
+      );
+      await Promise.resolve();
+    });
+    expect(screen.getByText('SSE-LIVE-CMD')).toBeTruthy();
+
+    // Now the stale empty initial pull resolves LAST. The generation advanced
+    // since it started → its result is dropped, the SSE row survives.
+    await act(async () => {
+      resolveInitial(inv([]));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByText('SSE-LIVE-CMD')).toBeTruthy();
+    // The badge still reflects the live handle (not wiped to 0).
+    expect(screen.getByText('1')).toBeTruthy();
+
+    // And because the live handle survived, the poll keeps running — a stale
+    // empty pull did not strand the inventory by stopping the poll.
+    getInv.mockResolvedValue(inv([bash({ cmd: 'SSE-LIVE-CMD', state: 'running' })]));
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+      await Promise.resolve();
+    });
+    expect(getInv.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('normal case: a pull with no intervening SSE still advances the byte count', async () => {
+    // No SSE update lands between the pull starting and resolving → the
+    // generation is unchanged, so the pull result applies as before.
+    getInv
+      .mockResolvedValueOnce(inv([bash({ output_bytes: 0 })]))
+      .mockResolvedValueOnce(inv([bash({ output_bytes: 4096 })]));
+
+    await renderExpanded();
+    openBashDetail();
+    expect(screen.getByText('0 B')).toBeTruthy();
+
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+      await Promise.resolve();
+    });
+
+    expect(getInv).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('4.0 KB')).toBeTruthy();
+  });
+});
+
 describe('useSeededLiveCount (collapsed-badge seed)', () => {
   // A tiny harness that renders the hook's result as text.
   function Harness({

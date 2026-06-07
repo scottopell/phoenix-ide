@@ -122,7 +122,12 @@ entity Conversation {
     -- non-terminal. Resource-liveness predicates (work-scope cascades, idle
     -- reaping) treat an archived conversation as NOT a live owner even while
     -- non-terminal, so archiving a chain does not leak the shared scope's
-    -- resources.
+    -- resources. Those predicates derive liveness from the persisted
+    -- conversation rows (this entity), NOT from the set of live runtime
+    -- handles: a conversation that is non-terminal and not archived is a live
+    -- owner even when it holds no runtime handle (after a server restart or
+    -- runtime eviction). Counting only handles would tear down a scope whose
+    -- surviving owner is handle-less.
     archived: Boolean = false
 
     -- Core status transitions (shared)

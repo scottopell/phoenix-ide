@@ -1239,23 +1239,26 @@ impl RuntimeManager {
     /// Whether `work_scope` still owns a non-terminal conversation — the
     /// "is this scope live?" question the browser idle-cleanup hook asks.
     ///
-    /// Uses the identical scope resolution as the lifecycle / work-scope
-    /// bridges: enumerate live runtime handles, resolve each conversation's
-    /// scope via `WorkScope::resolve`, match against `work_scope`. A match
-    /// counts as live only when its conversation is neither in a terminal
-    /// state (`ConvState::is_terminal`) nor archived — a runtime handle can
-    /// linger for a conversation that has gone terminal or been archived,
-    /// and such a scope is genuinely abandoned and must reap. REQ-PROJ-025
-    /// guarantees at most one non-terminal conversation per scope, so the
-    /// first match is decisive.
+    /// Authority is the DATABASE, not the live-runtime-handle set: a
+    /// conversation can be non-terminal in the DB yet carry no runtime handle
+    /// (after a server restart, or runtime eviction). For a
+    /// `WorkScope::Worktree(path)` we query the conversations whose
+    /// `conv_mode.worktree_path` is that path; for a `WorkScope::Conversation`
+    /// only that conversation resolves to the scope. Each candidate's scope is
+    /// resolved via `WorkScope::resolve` and matched against `work_scope`. A
+    /// match counts as live only when its conversation is neither terminal
+    /// (`ConvState::is_terminal`) nor archived. REQ-PROJ-025 guarantees at
+    /// most one non-terminal conversation per scope, so the first match is
+    /// decisive.
     pub(crate) async fn scope_has_live_conversation(&self, work_scope: &WorkScope) -> bool {
         self.scope_has_live_conversation_inner(work_scope, None)
             .await
     }
 
     /// Like [`scope_has_live_conversation`] but skips `excluded_conv_id` when
-    /// enumerating. Used by the resource-cleanup cascade to ask "does a live
-    /// conversation OTHER THAN the one being deleted still own this scope?"
+    /// enumerating. Used by the resource-cleanup cascade to ask "does a
+    /// non-terminal, non-archived conversation OTHER THAN the one being
+    /// deleted still resolve to this scope?"
     ///
     /// Exclusion is load-bearing: the cascade runs BEFORE the terminal-state
     /// write, so the conversation being deleted/archived still reads
@@ -1275,27 +1278,54 @@ impl RuntimeManager {
         work_scope: &WorkScope,
         excluded_conv_id: Option<&str>,
     ) -> bool {
-        let conv_ids: Vec<String> = {
-            let runtimes = self.runtimes.read().await;
-            runtimes.keys().cloned().collect()
+        // Candidate conversations come from the DB so a non-terminal owner
+        // without a runtime handle (post-restart / post-eviction) still
+        // counts. A `WorkScope::Conversation(id)` is single-owner: only `id`
+        // resolves to it, so we look up just that conversation. A
+        // `WorkScope::Worktree(path)` can be shared (a Work sub-agent and its
+        // parent), so we query every conversation on that worktree path.
+        let candidates: Vec<crate::db::Conversation> = match work_scope {
+            WorkScope::Conversation(id) => {
+                if excluded_conv_id == Some(id.as_str()) {
+                    return false;
+                }
+                match self.db().get_conversation(id).await {
+                    Ok(conv) => vec![conv],
+                    Err(_) => return false,
+                }
+            }
+            WorkScope::Worktree(path) => {
+                match self.db().list_conversations_for_worktree(path).await {
+                    Ok(convs) => convs,
+                    Err(e) => {
+                        tracing::warn!(
+                            work_scope = %work_scope,
+                            error = %e,
+                            "scope liveness query failed; treating scope as live to avoid premature teardown"
+                        );
+                        return true;
+                    }
+                }
+            }
+            // The `Global` singleton scope (the `/new` page global terminal)
+            // is not owned by any conversation — `WorkScope::resolve` only ever
+            // yields `Worktree` or `Conversation` — so no conversation can
+            // preserve it.
+            WorkScope::Global => return false,
         };
 
-        for conv_id in conv_ids {
-            if excluded_conv_id == Some(conv_id.as_str()) {
+        for conv in candidates {
+            if excluded_conv_id == Some(conv.id.as_str()) {
                 continue;
             }
-            let Ok(conv) = self.db().get_conversation(&conv_id).await else {
-                continue;
-            };
             if conv.state.is_terminal() {
                 continue;
             }
             // An archived conversation is not a live owner even when its
             // row still reads non-terminal: archiving a Work/Branch chain
-            // archives earlier members before the leaf's cleanup runs, and
-            // an archived member's runtime handle can linger. Counting it
-            // as live would preserve the shared scope and leak its
-            // bash/tmux/browser/terminal resources.
+            // archives earlier members before the leaf's cleanup runs.
+            // Counting it as live would preserve the shared scope and leak
+            // its bash/tmux/browser/terminal resources.
             if conv.archived {
                 continue;
             }
@@ -2832,16 +2862,58 @@ mod broadcaster_tests {
 
 #[cfg(test)]
 mod scope_liveness_tests {
-    //! `scope_has_live_conversation[_excluding]` must not count an archived
-    //! conversation as a live owner, even when its DB row still reads
-    //! non-terminal and its runtime handle lingers. Archiving a
-    //! Work/Branch chain archives earlier members before the leaf's cleanup
-    //! cascade runs; counting an archived member as live would preserve the
-    //! shared `WorkScope` and leak its bash/tmux/browser/terminal resources.
+    //! `scope_has_live_conversation[_excluding]` derives liveness from the
+    //! DATABASE, not the live-runtime-handle set. Two properties matter:
+    //!
+    //! - A non-terminal, non-archived sibling that resolves to the scope
+    //!   preserves it even when it has NO runtime handle (post-restart /
+    //!   post-eviction). Counting only handles would let the cascade tear
+    //!   down a worktree/branch and bash/tmux/browser still owned by a live
+    //!   conversation — data loss.
+    //! - An archived conversation is not a live owner even when its DB row
+    //!   still reads non-terminal: archiving a Work/Branch chain archives
+    //!   earlier members before the leaf's cleanup cascade runs; counting an
+    //!   archived member as live would preserve the shared `WorkScope` and
+    //!   leak its bash/tmux/browser/terminal resources.
     use super::*;
     use crate::llm::ModelRegistry;
     use crate::platform::PlatformCapability;
     use crate::tools::mcp::McpClientManager;
+    use phoenix_core::domain::db_schema::{ConvMode, NonEmptyString};
+    use phoenix_core::domain::sm_state::ConvState;
+
+    fn work_mode(worktree_path: &str) -> ConvMode {
+        ConvMode::Work {
+            branch_name: NonEmptyString::new("task-branch").unwrap(),
+            worktree_path: NonEmptyString::new(worktree_path).unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("T1").unwrap(),
+            task_title: NonEmptyString::new("title").unwrap(),
+        }
+    }
+
+    /// Create a non-user-initiated conversation in Work mode on `worktree_path`
+    /// and give it NO runtime handle — exactly the post-restart / post-eviction
+    /// shape the regression guards against.
+    async fn create_handleless_work_conv(mgr: &RuntimeManager, id: &str, worktree_path: &str) {
+        mgr.db()
+            .create_conversation_with_project(
+                id,
+                id,
+                worktree_path,
+                false,
+                None,
+                None,
+                None,
+                &work_mode(worktree_path),
+                None,
+                None,
+                None,
+                phoenix_core::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create work conv");
+    }
 
     async fn test_manager() -> RuntimeManager {
         let db = crate::db::Database::open_in_memory().await.expect("db");
@@ -2913,6 +2985,81 @@ mod scope_liveness_tests {
         assert!(
             !mgr.scope_has_live_conversation(&scope).await,
             "an archived conversation must not preserve its scope"
+        );
+    }
+
+    /// Regression: a non-terminal, non-archived sibling with NO runtime handle
+    /// still preserves its shared worktree scope. Deleting the leaf
+    /// (`excluded_conv_id`) must NOT let the cascade tear down the worktree /
+    /// branch / bash because the parent — handle-less after a restart — still
+    /// resolves to the same `WorkScope`.
+    #[tokio::test]
+    async fn handleless_non_terminal_sibling_preserves_worktree_scope() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+
+        // Parent (surviving owner) — non-terminal, non-archived, NO handle.
+        create_handleless_work_conv(&mgr, "parent", worktree).await;
+        // Leaf sub-agent being deleted — also on the shared worktree.
+        create_handleless_work_conv(&mgr, "leaf", worktree).await;
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+
+        assert!(
+            mgr.scope_has_live_conversation_excluding(&scope, "leaf")
+                .await,
+            "handle-less non-terminal parent still owns the shared worktree scope"
+        );
+    }
+
+    /// Counterpart: when the deleted leaf is genuinely the last live owner
+    /// (the sibling has gone terminal), the scope is NOT preserved and the
+    /// cascade tears down.
+    #[tokio::test]
+    async fn truly_last_owner_does_not_preserve_worktree_scope() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+
+        create_handleless_work_conv(&mgr, "parent", worktree).await;
+        create_handleless_work_conv(&mgr, "leaf", worktree).await;
+
+        // Parent reaches a terminal state — only the leaf remains live.
+        mgr.db()
+            .update_conversation_state(
+                "parent",
+                &ConvState::Completed {
+                    result: "done".to_string(),
+                },
+            )
+            .await
+            .expect("terminate parent");
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+
+        assert!(
+            !mgr.scope_has_live_conversation_excluding(&scope, "leaf")
+                .await,
+            "with the only other owner terminal, deleting the leaf leaves no live owner"
+        );
+    }
+
+    /// A non-terminal sibling on a DIFFERENT worktree must not preserve this
+    /// scope — the DB query is keyed on `worktree_path`, so unrelated live
+    /// conversations are not false positives.
+    #[tokio::test]
+    async fn sibling_on_other_worktree_does_not_preserve_scope() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+
+        create_handleless_work_conv(&mgr, "leaf", worktree).await;
+        create_handleless_work_conv(&mgr, "unrelated", "/repo/.phoenix/worktrees/other").await;
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+
+        assert!(
+            !mgr.scope_has_live_conversation_excluding(&scope, "leaf")
+                .await,
+            "a live conversation on a different worktree does not own this scope"
         );
     }
 }

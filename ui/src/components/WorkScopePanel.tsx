@@ -207,9 +207,9 @@ function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: nu
 }
 
 /**
- * Resolves the inventory to render via last-arrival-wins over a single local
- * snapshot fed by three sources, all of which are FULL inventory snapshots of
- * the same scope key (REQ-WSUI-006):
+ * Resolves the inventory to render over a single local snapshot fed by three
+ * sources, all of which are FULL inventory snapshots of the same scope key
+ * (REQ-WSUI-006):
  *
  *   1. the initial fetch keyed by `scopeKey`,
  *   2. the SSE-fed `liveInventory` prop (the conversation atom's `workScope`,
@@ -224,9 +224,13 @@ function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: nu
  * {@link RUNNING_POLL_INTERVAL_MS} so those fields advance. It stops once
  * nothing is live or the surface unmounts — self-limiting, no unbounded timers.
  *
- * Each source writes the same local `displayed` state; the most recent write
- * wins. This keeps the single-writer atom contract — none of these paths touch
- * the atom's `workScope`, which stays written only by the SSE reducer.
+ * All three sources write the same local `displayed` state. An SSE push always
+ * wins over a concurrently in-flight pull (initial or poll): each pull captures
+ * an SSE-generation counter at request time and drops its result on resolve if
+ * a push bumped that counter meanwhile. Between pushes — the common case where
+ * no SSE arrived during the pull — pulls advance the drifting fields. This
+ * keeps the single-writer atom contract: none of these paths touch the atom's
+ * `workScope`, which stays written only by the SSE reducer.
  *
  * `active` gates both the per-second elapsed-time tick and the running poll:
  * callers pass `false` while the surface is collapsed so an off-screen panel
@@ -246,20 +250,31 @@ function useWorkScopeInventory(
   const scopeKeyRef = useRef(scopeKey);
   scopeKeyRef.current = scopeKey;
 
-  // Stale-scope guard: a fetch (initial pull or poll) for the previous scope
-  // can resolve after `scopeKey` changes. Capturing the key at request time and
-  // re-checking it against the live ref at resolve time rejects that stale
-  // result so it never overwrites the new scope's snapshot — while leaving the
-  // last-arrival-wins merge among fetch / SSE / poll for the SAME scope intact.
+  // SSE-generation counter, bumped every time an SSE `liveInventory` update
+  // writes `displayed`. A pull captures this at request time; if it advanced
+  // before the pull resolved, a fresher SSE push landed mid-flight and the
+  // pull's (older) result is dropped — SSE always beats an older-but-later-
+  // resolving pull. This is the TIME-ordering counterpart to the scope-key
+  // guard below (which handles scope CHANGES): both reject a stale pull whose
+  // result would clobber a fresher snapshot for the same scope.
+  const sseGenRef = useRef(0);
+
+  // Stale-pull guard: a fetch (initial pull or poll) can resolve after the
+  // scope key changes OR after a newer SSE push lands. Capturing the scope key
+  // and SSE generation at request time and re-checking both at resolve time
+  // rejects a stale result so it never overwrites a fresher snapshot — while
+  // leaving the byte-advancing pull merge for the SAME scope with no
+  // intervening SSE intact.
   const fetchSnapshot = useCallback(async () => {
     const requestedKey = scopeKeyRef.current;
+    const requestedGen = sseGenRef.current;
     setError(false);
     try {
       const inv = await api.getWorkScopeInventory(requestedKey);
-      if (scopeKeyRef.current !== requestedKey) return;
+      if (scopeKeyRef.current !== requestedKey || sseGenRef.current !== requestedGen) return;
       setDisplayed(inv);
     } catch {
-      if (scopeKeyRef.current !== requestedKey) return;
+      if (scopeKeyRef.current !== requestedKey || sseGenRef.current !== requestedGen) return;
       setError(true);
     }
   }, []);
@@ -271,9 +286,14 @@ function useWorkScopeInventory(
     void fetchSnapshot();
   }, [scopeKey, fetchSnapshot]);
 
-  // SSE push: a fresh full snapshot for this scope. Last-arrival-wins.
+  // SSE push: a fresh full snapshot for this scope. It is "newer truth" — bump
+  // the generation so any pull in flight (captured an older gen) drops its
+  // result on resolve rather than clobbering this push.
   useEffect(() => {
-    if (liveInventory != null) setDisplayed(liveInventory);
+    if (liveInventory != null) {
+      sseGenRef.current += 1;
+      setDisplayed(liveInventory);
+    }
   }, [liveInventory]);
 
   useEffect(() => {

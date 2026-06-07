@@ -391,9 +391,9 @@ THE SYSTEM SHALL derive `browser_session_active` from `is_active(&WorkScope)` of
 
 WHEN the resource-cleanup cascade runs (archive / abandon / mark-merged / hard-delete)
 THE SYSTEM SHALL invoke `cascade_browser_on_delete(manager, &WorkScope, inheritor_scope)`
-AND `inheritor_scope` SHALL be `Some(work_scope)` iff a live conversation other than the one being deleted resolves to that scope — a continuation that inherits it, or a live sibling such as a Work-mode sub-agent that shares its parent's scope — and `None` otherwise, where a live conversation is one that is BOTH non-terminal in state AND not `archived`
+AND `inheritor_scope` SHALL be `Some(work_scope)` iff a live conversation other than the one being deleted resolves to that scope — a continuation that inherits it, or a live sibling such as a Work-mode sub-agent that shares its parent's scope — and `None` otherwise, where a live conversation is one that is BOTH non-terminal in state AND not `archived` according to the persisted conversation rows in the DATABASE, NOT merely one that holds a live runtime handle (a non-terminal conversation with no runtime handle, after a server restart or runtime eviction, is still a live owner)
 AND the deleted conversation SHALL be excluded from that live-owner enumeration, because the cascade runs before its terminal-state write so it still reads non-terminal
-AND an `archived` conversation SHALL NOT count as a live owner even while its state row still reads non-terminal, because archiving a chain archives earlier members before the leaf's cascade runs and their runtime handles can linger
+AND an `archived` conversation SHALL NOT count as a live owner even while its state row still reads non-terminal, because archiving a chain archives earlier members before the leaf's cascade runs
 AND failures SHALL log WARN and continue
     (consistent with the bash / tmux / projects cascade error policy)
 

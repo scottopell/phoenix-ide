@@ -517,7 +517,14 @@ intentionally and must survive restart unchanged. The cascade's any-live-owner
 guard is the same signal that gates the bash/tmux/browser cascades
 (REQ-BASH-WS-002): a Work-mode sub-agent inherits the parent's `worktree_path`,
 so removing the worktree or deleting the branch while the parent is live would
-destroy the parent's checkout out from under a running conversation.
+destroy the parent's checkout out from under a running conversation. A "live
+conversation" here is one that is non-terminal AND not `archived` according to
+the persisted conversation rows in the DATABASE — not merely one that holds a
+live runtime handle. A non-terminal parent that lost its runtime handle (after
+a server restart or runtime eviction) still owns the shared worktree; deciding
+preservation from runtime handles alone would `git worktree remove --force` the
+shared worktree and `branch -D` the task branch even though the surviving
+parent row still resolves to the same `WorkScope` — data loss.
 
 ---
 
