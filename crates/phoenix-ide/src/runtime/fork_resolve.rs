@@ -345,12 +345,33 @@ impl RuntimeManager {
         reply_rx.await.map_err(|_| fork_consumer_gone())?
     }
 
+    /// Fast-path read: does `origin_id` have any `pending` fork proposal worth
+    /// engaging the resolution consumer for? A terminal / being-deleted origin
+    /// creates no new proposals, so a no-`pending` read is authoritative and the
+    /// common case (no proposals at all) skips the consumer round-trip entirely.
+    /// On a read error, return `true` so the consumer still re-reads
+    /// authoritatively rather than silently skipping cleanup.
+    async fn origin_has_pending_fork_proposal(&self, origin_id: &str) -> bool {
+        match self.db.list_fork_proposals_for_origin(origin_id).await {
+            Ok(proposals) => proposals
+                .iter()
+                .any(|p| p.status == ForkProposalStatus::Pending),
+            Err(e) => {
+                tracing::warn!(conv_id = %origin_id, error = %e, "fork cleanup fast-path read failed; engaging consumer");
+                true
+            }
+        }
+    }
+
     /// Thin sender for retire-on-terminal; awaits the best-effort cleanup so the
     /// terminal hook observes completion. See [`handle_retire_for_origin`].
     pub(crate) async fn retire_fork_proposals_for_terminal_origin(
         self: &std::sync::Arc<Self>,
         origin_id: &str,
     ) {
+        if !self.origin_has_pending_fork_proposal(origin_id).await {
+            return;
+        }
         let (reply, reply_rx) = oneshot::channel();
         if self
             .fork_cmd_tx
@@ -374,6 +395,9 @@ impl RuntimeManager {
         self: &std::sync::Arc<Self>,
         origin_id: &str,
     ) {
+        if !self.origin_has_pending_fork_proposal(origin_id).await {
+            return;
+        }
         let (reply, reply_rx) = oneshot::channel();
         if self
             .fork_cmd_tx
