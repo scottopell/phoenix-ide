@@ -1444,6 +1444,66 @@ mod conv_mode_tests {
         .is_none());
         assert!(ConvMode::Direct.worktree_config().is_none());
     }
+
+    /// Pin the concrete `conv_mode` JSON shape that phoenix-db migrations query
+    /// via raw SQL `json_extract`. Those SQL string literals (`$.mode`='Work',
+    /// `$.worktree_path`, `$.base_branch`, `$.branch_name`, …) are untyped and
+    /// hand-authored in `crates/phoenix-db/src/migrations.rs`; the serde
+    /// roundtrip tests above are symmetric and would still pass if the `mode`
+    /// tag or a field key were renamed — silently breaking every migration's
+    /// `json_extract` path and any runtime SQL that reads this column. This
+    /// test fails loudly on such a rename. If you change a key here, update the
+    /// SQL literals in migrations.rs in the same change.
+    #[test]
+    fn test_sql_json_extract_contract() {
+        // Tag values the SQL matches on `$.mode`.
+        let direct: Value = serde_json::to_value(ConvMode::Direct).unwrap();
+        assert_eq!(direct["mode"], "Direct");
+
+        let explore_none: Value = serde_json::to_value(ConvMode::Explore {
+            worktree_path: None,
+        })
+        .unwrap();
+        assert_eq!(explore_none["mode"], "Explore");
+        // skip_serializing_if = Option::is_none: the key must be ABSENT, which
+        // the migration-007 Explore backfill relies on to detect un-backfilled
+        // rows (`$.worktree_path` IS NULL).
+        assert!(explore_none.get("worktree_path").is_none());
+
+        let explore_some: Value = serde_json::to_value(ConvMode::Explore {
+            worktree_path: Some(NonEmptyString::new("/wt/explore").unwrap()),
+        })
+        .unwrap();
+        assert_eq!(explore_some["mode"], "Explore");
+        assert_eq!(explore_some["worktree_path"], "/wt/explore");
+
+        // Work: SQL reads $.mode, $.worktree_path, $.base_branch, $.branch_name.
+        let work: Value = serde_json::to_value(ConvMode::Work {
+            branch_name: NonEmptyString::new("task-0042-fix-bug").unwrap(),
+            worktree_path: NonEmptyString::new("/wt/abc").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+            task_id: NonEmptyString::new("YF042").unwrap(),
+            task_title: NonEmptyString::new("Fix the bug").unwrap(),
+        })
+        .unwrap();
+        assert_eq!(work["mode"], "Work");
+        assert_eq!(work["worktree_path"], "/wt/abc");
+        assert_eq!(work["base_branch"], "main");
+        assert_eq!(work["branch_name"], "task-0042-fix-bug");
+
+        // Branch: SQL reads the same path fields, and Branch must carry no task_id.
+        let branch: Value = serde_json::to_value(ConvMode::Branch {
+            branch_name: NonEmptyString::new("fix-login").unwrap(),
+            worktree_path: NonEmptyString::new("/wt/login").unwrap(),
+            base_branch: NonEmptyString::new("main").unwrap(),
+        })
+        .unwrap();
+        assert_eq!(branch["mode"], "Branch");
+        assert_eq!(branch["worktree_path"], "/wt/login");
+        assert_eq!(branch["base_branch"], "main");
+        assert_eq!(branch["branch_name"], "fix-login");
+        assert!(branch.get("task_id").is_none());
+    }
 }
 
 #[cfg(test)]
