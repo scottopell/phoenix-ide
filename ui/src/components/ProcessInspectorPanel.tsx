@@ -21,7 +21,7 @@
  */
 
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { api } from '../api';
+import { api, NotFoundError } from '../api';
 import type { BashHandleInspection, BashHandleState } from '../api';
 import './ProcessInspectorPanel.css';
 
@@ -88,27 +88,51 @@ function metric(value: number | null | undefined, render: (v: number) => string)
 /**
  * Polls one handle's inspection snapshot while open and not terminal.
  *
- * Returns the latest full snapshot (identity/state/resources) plus the
- * accumulated output entries. Output is append-only across polls: the seed
- * fetch (no `since`) establishes the tail, then each poll passes
- * `since = end_offset` and appends only the new lines, inserting a gap marker
- * when a poll reports `truncated_before`.
+ * Returns the latest full snapshot (identity/state/resources), the accumulated
+ * output entries, and a `status` describing the health of the poll. Output is
+ * append-only across polls: the seed fetch (no `since`) establishes the tail,
+ * then each poll passes `since = end_offset` and appends only the new lines,
+ * inserting a gap marker when a poll reports `truncated_before`.
+ *
+ * The inspect endpoint samples resources (a CPU sleep + /proc reads), so a
+ * request can outlast the poll interval. An in-flight gate keeps at most one
+ * poll outstanding: the interval skips issuing a new fetch while one is
+ * pending. With no overlap the append + `sinceRef` advance are strictly
+ * ordered — an out-of-order resolution can never duplicate lines or move the
+ * cursor backwards.
+ *
+ * Poll health is surfaced even once a snapshot exists (REQ-PINSP-006): a
+ * failure after the seed leaves the last-known snapshot in place but marks the
+ * status `stale` so the operator knows the data may be out of date. A definitive
+ * 404 (the handle is gone) is terminal: polling stops and the status becomes
+ * `gone`.
  */
+type InspectStatus = 'ok' | 'loading-failed' | 'stale' | 'gone';
+
 function useHandleInspection(scopeKey: string, handleId: string) {
   const [snapshot, setSnapshot] = useState<BashHandleInspection | null>(null);
   const [entries, setEntries] = useState<OutputEntry[]>([]);
-  const [error, setError] = useState(false);
+  const [status, setStatus] = useState<InspectStatus>('ok');
 
   // Next `since` to request. `undefined` until the seed fetch lands, after
   // which it tracks the last `end_offset`. Held in a ref so the poll callback
   // reads the freshest cursor without being re-created each render.
   const sinceRef = useRef<number | undefined>(undefined);
   const gapIdRef = useRef(0);
-  // Once the snapshot reports terminal we never poll again (REQ-PINSP-006).
+  // Once the snapshot reports terminal — or the handle 404s — we never poll
+  // again (REQ-PINSP-006).
   const terminalRef = useRef(false);
+  // In-flight gate: true while an inspect fetch is outstanding. The recurring
+  // poll skips issuing a new fetch while this is set, so at most one poll is
+  // ever in flight. The inspect endpoint can be slower than the poll interval
+  // (it sleeps to sample CPU); without the gate, interval N+1 could start with
+  // the same `sinceRef` as N still in flight, and an out-of-order resolution
+  // would append duplicate lines and move `sinceRef` backwards. Cleared in a
+  // `.finally`, and reset on unmount / handle change by the seed effect.
+  const inFlightRef = useRef(false);
 
   const applyResponse = useCallback((insp: BashHandleInspection) => {
-    setError(false);
+    setStatus('ok');
     setSnapshot(insp);
     if (isTerminal(insp.state)) terminalRef.current = true;
 
@@ -129,29 +153,43 @@ function useHandleInspection(scopeKey: string, handleId: string) {
     }
   }, []);
 
+  // Translate a rejected fetch into a status. A 404 is definitive: the handle
+  // is gone, so stop polling. Any other failure is treated as transient — the
+  // last-known snapshot (if any) is retained and marked stale; with no snapshot
+  // yet the seed itself failed.
+  const applyError = useCallback((err: unknown, hadSnapshot: boolean) => {
+    if (err instanceof NotFoundError) {
+      terminalRef.current = true;
+      setStatus('gone');
+    } else {
+      setStatus(hadSnapshot ? 'stale' : 'loading-failed');
+    }
+  }, []);
+
   // Seed + reset when the target handle changes.
   useEffect(() => {
     let cancelled = false;
     sinceRef.current = undefined;
     terminalRef.current = false;
     gapIdRef.current = 0;
+    inFlightRef.current = false;
     setSnapshot(null);
     setEntries([]);
-    setError(false);
+    setStatus('ok');
 
     api
       .getBashHandleInspection(scopeKey, handleId)
       .then((insp) => {
         if (!cancelled) applyResponse(insp);
       })
-      .catch(() => {
-        if (!cancelled) setError(true);
+      .catch((err: unknown) => {
+        if (!cancelled) applyError(err, false);
       });
 
     return () => {
       cancelled = true;
     };
-  }, [scopeKey, handleId, applyResponse]);
+  }, [scopeKey, handleId, applyResponse, applyError]);
 
   // Poll loop: ~1s while open and not terminal. Self-limiting — the interval is
   // cleared on unmount, on handle change, and once the handle goes terminal.
@@ -162,23 +200,27 @@ function useHandleInspection(scopeKey: string, handleId: string) {
     if (!polling) return;
     let cancelled = false;
     const id = window.setInterval(() => {
-      if (terminalRef.current) return;
+      if (terminalRef.current || inFlightRef.current) return;
+      inFlightRef.current = true;
       api
         .getBashHandleInspection(scopeKey, handleId, sinceRef.current)
         .then((insp) => {
           if (!cancelled) applyResponse(insp);
         })
-        .catch(() => {
-          if (!cancelled) setError(true);
+        .catch((err: unknown) => {
+          if (!cancelled) applyError(err, true);
+        })
+        .finally(() => {
+          inFlightRef.current = false;
         });
     }, POLL_INTERVAL_MS);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [polling, scopeKey, handleId, applyResponse]);
+  }, [polling, scopeKey, handleId, applyResponse, applyError]);
 
-  return { snapshot, entries, error };
+  return { snapshot, entries, status };
 }
 
 interface ProcessInspectorPanelProps {
@@ -196,11 +238,12 @@ export function ProcessInspectorPanel({
   onClose,
   inline,
 }: ProcessInspectorPanelProps) {
-  const { snapshot, entries, error } = useHandleInspection(scopeKey, handleId);
+  const { snapshot, entries, status } = useHandleInspection(scopeKey, handleId);
 
   // Tick once a second so a live handle's elapsed time advances between polls.
+  // A `gone` handle no longer has a live process, so freeze the elapsed clock.
   const [now, setNow] = useState(() => Date.now());
-  const live = snapshot != null && !isTerminal(snapshot.state);
+  const live = snapshot != null && !isTerminal(snapshot.state) && status !== 'gone';
   useEffect(() => {
     if (!live) return;
     const id = window.setInterval(() => setNow(Date.now()), 1000);
@@ -274,10 +317,26 @@ export function ProcessInspectorPanel({
         )}
       </div>
 
-      {error && !snapshot && (
+      {status === 'loading-failed' && !snapshot && (
         <div className="pinsp-empty pinsp-empty--error">inspection failed to load</div>
       )}
-      {!error && !snapshot && <div className="pinsp-empty">loading&hellip;</div>}
+      {status === 'ok' && !snapshot && <div className="pinsp-empty">loading&hellip;</div>}
+
+      {snapshot && (status === 'stale' || status === 'gone') && (
+        <div
+          className={`pinsp-stale${status === 'gone' ? ' pinsp-stale--gone' : ''}`}
+          role="status"
+        >
+          <span className="pinsp-stale-glyph" aria-hidden="true">
+            {status === 'gone' ? '✗' : '⚠'}
+          </span>
+          <span className="pinsp-stale-text">
+            {status === 'gone'
+              ? 'handle no longer exists — updates stopped, last-known output below'
+              : 'updates stalled — data below may be stale'}
+          </span>
+        </div>
+      )}
 
       {snapshot && (
         <>

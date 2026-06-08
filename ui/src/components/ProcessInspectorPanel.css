@@ -95,6 +95,36 @@
   font-style: normal;
 }
 
+/* Non-destructive banner shown OVER the last-known snapshot when polling
+   stalls (transient failure) or the handle is gone (definitive 404). It marks
+   the data below as stale without blowing it away — operators still want the
+   last output. */
+.pinsp-stale {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 10px;
+  font-size: 11px;
+  color: var(--accent-yellow);
+  background: color-mix(in srgb, var(--accent-yellow) 12%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--accent-yellow) 30%, transparent);
+}
+
+.pinsp-stale--gone {
+  color: var(--accent-red);
+  background: color-mix(in srgb, var(--accent-red) 12%, transparent);
+  border-bottom-color: color-mix(in srgb, var(--accent-red) 30%, transparent);
+}
+
+.pinsp-stale-glyph {
+  flex: none;
+}
+
+.pinsp-stale-text {
+  flex: 1;
+  min-width: 0;
+}
+
 .pinsp-identity {
   display: flex;
   flex-direction: column;

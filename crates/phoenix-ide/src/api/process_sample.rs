@@ -183,9 +183,10 @@ fn proc_pss_bytes(pid: u32) -> Option<u64> {
 
 #[cfg(target_os = "macos")]
 fn group_member_pids(pgid: i32) -> Option<Vec<u32>> {
-    // Size the all-pids buffer. A null buffer returns the byte count the
-    // kernel would write; we over-allocate to that.
-    // SAFETY: proc_listallpids with a null buffer only queries the size.
+    // Size the all-pids buffer. A null buffer returns the *count* of pids the
+    // kernel would write — not a byte size — so we allocate that many `c_int`
+    // slots (plus headroom to absorb pids that appear between the two calls).
+    // SAFETY: proc_listallpids with a null buffer only queries the count.
     let needed = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
     if needed <= 0 {
         tracing::debug!(
@@ -193,13 +194,13 @@ fn group_member_pids(pgid: i32) -> Option<Vec<u32>> {
         );
         return None;
     }
-    let needed_usize = usize::try_from(needed).unwrap_or(0);
-    let count = needed_usize / std::mem::size_of::<libc::c_int>();
-    let mut buf = vec![0_i32; count];
+    let slots = usize::try_from(needed).unwrap_or(0).saturating_add(32);
+    let mut buf = vec![0_i32; slots];
     let buf_bytes = (buf.len() * std::mem::size_of::<libc::c_int>())
         .try_into()
         .unwrap_or(libc::c_int::MAX);
-    // SAFETY: buf is sized to hold `needed` bytes of pids.
+    // SAFETY: buf holds `slots` c_int entries; buf_bytes is its size in bytes,
+    // matching proc_listallpids' byte-sized buffersize parameter.
     let written =
         unsafe { libc::proc_listallpids(buf.as_mut_ptr().cast::<libc::c_void>(), buf_bytes) };
     if written <= 0 {

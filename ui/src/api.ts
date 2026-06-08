@@ -514,6 +514,16 @@ export class ConflictError extends Error {
   }
 }
 
+/** Thrown by API methods when the addressed resource is gone (404). A typed
+ *  error so callers can distinguish a definitive "no longer exists" outcome
+ *  from a transient/ambiguous failure rather than string-matching a message. */
+export class NotFoundError extends Error {
+  constructor(message = 'Not found') {
+    super(message);
+    this.name = 'NotFoundError';
+  }
+}
+
 export interface McpServerStatus {
   name: string;
   tool_count: number;
@@ -913,6 +923,10 @@ export const api = {
     const resp = await fetch(
       `/api/work-scope/${encodeURIComponent(scopeKey)}/bash/${encodeURIComponent(handleId)}/inspect${query}`,
     );
+    // 404 = the handle table no longer knows this id (e.g. lost after a
+    // restart). A typed error lets the inspector stop polling and show a
+    // definitive "handle no longer exists" state instead of a transient stall.
+    if (resp.status === 404) throw new NotFoundError('Bash handle no longer exists');
     if (!resp.ok) throw new Error('Failed to get bash handle inspection');
     return resp.json();
   },
