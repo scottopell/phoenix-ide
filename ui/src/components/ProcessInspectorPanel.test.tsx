@@ -108,6 +108,29 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     expect(screen.getByText('done')).toBeTruthy();
   });
 
+  it('surfaces truncated_before on the SEED response (earlier output already evicted), but not on a fresh non-truncated seed', async () => {
+    // A seed whose no-`since` window already reports earlier output gone (the
+    // ring evicted it, or a tombstone retains only a final tail). The marker is
+    // a real signal here and must be shown.
+    getInsp.mockResolvedValueOnce(
+      snap({ output: { start_offset: 10, end_offset: 11, truncated_before: true, lines: lines([10, 'tail']) } }),
+    );
+
+    const { unmount } = await renderPanel();
+    expect(screen.getByText(/output truncated/)).toBeTruthy();
+    expect(screen.getByText('tail')).toBeTruthy();
+    unmount();
+
+    // A fresh handle with no eviction reports truncated_before=false → no marker.
+    getInsp.mockReset();
+    getInsp.mockResolvedValueOnce(
+      snap({ output: { start_offset: 0, end_offset: 1, truncated_before: false, lines: lines([0, 'fresh']) } }),
+    );
+    await renderPanel();
+    expect(screen.getByText('fresh')).toBeTruthy();
+    expect(screen.queryByText(/output truncated/)).toBeNull();
+  });
+
   it('renders a truncation marker when a poll reports truncated_before', async () => {
     getInsp
       .mockResolvedValueOnce(
@@ -239,6 +262,88 @@ describe('ProcessInspectorPanel — poll serialization', () => {
     expect(screen.getAllByText('b').length).toBe(1);
     expect(screen.getByText('c')).toBeTruthy();
   });
+
+  it('a late poll from a PRIOR target cannot clear the new target\'s in-flight gate (no overlapping fetch on the new target)', async () => {
+    // Target A: seed resolves, then a slow poll goes in flight.
+    getInsp.mockResolvedValueOnce(
+      snap({ handle_id: 'a-1', output: { start_offset: 0, end_offset: 1, truncated_before: false, lines: lines([0, 'A-seed']) } }),
+    );
+    const slowPollA = deferred<BashHandleInspection>();
+    getInsp.mockReturnValueOnce(slowPollA.promise);
+
+    let utils!: ReturnType<typeof render>;
+    await act(async () => {
+      utils = render(<ProcessInspectorPanel scopeKey="ws-1" handleId="a-1" />);
+      await Promise.resolve();
+    });
+    expect(screen.getByText('A-seed')).toBeTruthy();
+
+    // A's poll fires and is left outstanding.
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+    expect(getInsp).toHaveBeenCalledTimes(2); // A seed + A slow poll
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'a-1', 1);
+
+    // Switch to target B while A's poll is still pending.
+    getInsp.mockResolvedValueOnce(
+      snap({ handle_id: 'b-2', output: { start_offset: 0, end_offset: 1, truncated_before: false, lines: lines([0, 'B-seed']) } }),
+    );
+    const slowPollB = deferred<BashHandleInspection>();
+    getInsp.mockReturnValueOnce(slowPollB.promise);
+    await act(async () => {
+      utils.rerender(<ProcessInspectorPanel scopeKey="ws-1" handleId="b-2" />);
+      await Promise.resolve();
+    });
+    expect(screen.getByText('B-seed')).toBeTruthy();
+    expect(getInsp).toHaveBeenCalledTimes(3); // + B seed
+
+    // B's poll fires and is left outstanding.
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+    expect(getInsp).toHaveBeenCalledTimes(4); // + B slow poll
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-2', 1);
+
+    // Now A's stale poll resolves LATE. Its `.finally` must NOT clear the shared
+    // in-flight gate — B still owns it.
+    await act(async () => {
+      slowPollA.resolve(
+        snap({ handle_id: 'a-1', output: { start_offset: 1, end_offset: 2, truncated_before: false, lines: lines([1, 'A-late']) } }),
+      );
+      await Promise.resolve();
+    });
+
+    // The next interval must NOT issue a second B fetch: B's gate is still held.
+    await act(async () => {
+      vi.advanceTimersByTime(3000);
+      await Promise.resolve();
+    });
+    expect(getInsp).toHaveBeenCalledTimes(4);
+
+    // A's late output is for the abandoned target and must not leak into B's view.
+    expect(screen.queryByText('A-late')).toBeNull();
+    expect(screen.getByText('B-seed')).toBeTruthy();
+
+    // When B's own poll resolves, the gate clears and a fresh B poll can run.
+    getInsp.mockResolvedValueOnce(
+      snap({ handle_id: 'b-2', output: { start_offset: 1, end_offset: 2, truncated_before: false, lines: lines([1, 'B-next']) } }),
+    );
+    await act(async () => {
+      slowPollB.resolve(
+        snap({ handle_id: 'b-2', output: { start_offset: 1, end_offset: 1, truncated_before: false, lines: [] } }),
+      );
+      await Promise.resolve();
+    });
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+    expect(getInsp).toHaveBeenCalledTimes(5);
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-2', 1);
+  });
 });
 
 describe('ProcessInspectorPanel — poll failure surfacing', () => {
@@ -317,6 +422,26 @@ describe('ProcessInspectorPanel — poll failure surfacing', () => {
       await Promise.resolve();
     });
     expect(getInsp).toHaveBeenCalledTimes(2);
+  });
+
+  it('renders a terminal "handle gone" state when the FIRST fetch 404s (no prior snapshot) and stops polling', async () => {
+    // A persisted inspector URL opened after Phoenix lost its handle table: the
+    // very first inspect request 404s, so there is no snapshot to fall back on.
+    getInsp.mockRejectedValueOnce(new NotFoundError('Bash handle no longer exists'));
+
+    await renderPanel();
+    // The panel still renders, and tells the user the handle is gone.
+    expect(screen.queryByTestId('process-inspector-panel')).toBeTruthy();
+    expect(screen.getByText(/handle no longer exists/)).toBeTruthy();
+    expect(getInsp).toHaveBeenCalledTimes(1);
+
+    // A 404 is terminal: no polling ever starts (no snapshot gate to satisfy,
+    // and the handle is marked gone regardless).
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+    expect(getInsp).toHaveBeenCalledTimes(1);
   });
 
   it('surfaces a seed failure as the load-failed empty state (no snapshot)', async () => {

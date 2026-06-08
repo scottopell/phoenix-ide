@@ -130,6 +130,14 @@ function useHandleInspection(scopeKey: string, handleId: string) {
   // would append duplicate lines and move `sinceRef` backwards. Cleared in a
   // `.finally`, and reset on unmount / handle change by the seed effect.
   const inFlightRef = useRef(false);
+  // Gate ownership token. The gate is shared, but a poll's `.finally` must only
+  // clear it if the poll still owns the current generation. When the target
+  // switches, the seed effect bumps `generationRef`; a still-pending poll for
+  // the OLD target then resolves with a stale token and must NOT clear the gate
+  // — otherwise it could unlock the NEW target's in-flight poll and let the next
+  // interval issue a second overlapping fetch (reintroducing the duplicate /
+  // cursor-regression race the gate prevents).
+  const generationRef = useRef(0);
 
   const applyResponse = useCallback((insp: BashHandleInspection) => {
     setStatus('ok');
@@ -138,10 +146,12 @@ function useHandleInspection(scopeKey: string, handleId: string) {
 
     const window = insp.output;
     const newEntries: OutputEntry[] = [];
-    // A gap means lines were evicted between polls; surface it once, before the
-    // lines from this poll. Only meaningful after the seed (a seed tail
-    // naturally starts mid-stream and is not a gap in the user's view).
-    if (window.truncated_before && sinceRef.current !== undefined) {
+    // A gap means earlier output is unavailable; surface it once, before the
+    // lines from this poll. `truncated_before` is authoritative on the seed too:
+    // a fresh handle with no eviction reports `false`, while a handle that has
+    // already evicted older output (or a tombstone retaining only a final tail)
+    // reports `true` — a real signal that earlier output is gone.
+    if (window.truncated_before) {
       newEntries.push({ kind: 'gap', id: gapIdRef.current++ });
     }
     for (const line of window.lines) {
@@ -173,6 +183,9 @@ function useHandleInspection(scopeKey: string, handleId: string) {
     terminalRef.current = false;
     gapIdRef.current = 0;
     inFlightRef.current = false;
+    // New target → new generation. Any poll still pending for the prior target
+    // now owns a stale token and will skip clearing the gate when it resolves.
+    generationRef.current += 1;
     setSnapshot(null);
     setEntries([]);
     setStatus('ok');
@@ -202,6 +215,10 @@ function useHandleInspection(scopeKey: string, handleId: string) {
     const id = window.setInterval(() => {
       if (terminalRef.current || inFlightRef.current) return;
       inFlightRef.current = true;
+      // Capture the generation this poll owns. Only clear the gate in `.finally`
+      // if it still matches — a target switch bumps `generationRef`, so a poll
+      // for a now-replaced target cannot unlock the new target's gate.
+      const generation = generationRef.current;
       api
         .getBashHandleInspection(scopeKey, handleId, sinceRef.current)
         .then((insp) => {
@@ -211,7 +228,7 @@ function useHandleInspection(scopeKey: string, handleId: string) {
           if (!cancelled) applyError(err, true);
         })
         .finally(() => {
-          inFlightRef.current = false;
+          if (generation === generationRef.current) inFlightRef.current = false;
         });
     }, POLL_INTERVAL_MS);
     return () => {
@@ -319,6 +336,15 @@ export function ProcessInspectorPanel({
 
       {status === 'loading-failed' && !snapshot && (
         <div className="pinsp-empty pinsp-empty--error">inspection failed to load</div>
+      )}
+      {/* The first inspect request 404'd (e.g. a persisted inspector URL opened
+          after a Phoenix restart dropped the handle table). There is no
+          last-known output to show, but the user must still be told the handle
+          is gone and that polling has stopped. */}
+      {status === 'gone' && !snapshot && (
+        <div className="pinsp-empty pinsp-empty--error" role="status">
+          handle no longer exists
+        </div>
       )}
       {status === 'ok' && !snapshot && <div className="pinsp-empty">loading&hellip;</div>}
 
