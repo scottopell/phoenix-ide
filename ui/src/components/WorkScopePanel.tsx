@@ -115,6 +115,26 @@ function formatBytes(n: number): string {
   return `${(n / (1024 * 1024)).toFixed(1)} MB`;
 }
 
+/** The "inspect →" affordance. Isolated into its own component so the
+ *  `useViewerSlot()` hook (which throws outside a `ViewerSlotProvider`) is only
+ *  invoked when a row is actually inspectable. A non-inspectable row never
+ *  renders this, so it never calls the hook — the standalone work-scope dock and
+ *  plain tests can render bash rows without a provider. An inspectable row does
+ *  need the provider; it is rendered inside one by construction. */
+function BashInspectButton({ scopeKey, handleId }: { scopeKey: string; handleId: string }) {
+  const { openInspect } = useViewerSlot();
+  return (
+    <button
+      type="button"
+      className="ws-row-inspect"
+      onClick={() => openInspect(scopeKey, handleId)}
+      title="Open the process inspector for this handle"
+    >
+      inspect →
+    </button>
+  );
+}
+
 function BashRow({
   handle,
   now,
@@ -127,7 +147,6 @@ function BashRow({
   inspectable: boolean;
 }) {
   const [open, setOpen] = useState(false);
-  const { openInspect } = useViewerSlot();
   const { glyph, cls, title } = bashGlyph(handle);
   const live = isLive(handle.state);
   const label = handle.label || handle.cmd;
@@ -169,16 +188,7 @@ function BashRow({
             <span className="ws-detail-key">output</span>
             <span className="ws-detail-val">{formatBytes(handle.output_bytes)}</span>
           </div>
-          {inspectable && (
-            <button
-              type="button"
-              className="ws-row-inspect"
-              onClick={() => openInspect(scopeKey, handle.handle_id)}
-              title="Open the process inspector for this handle"
-            >
-              inspect →
-            </button>
-          )}
+          {inspectable && <BashInspectButton scopeKey={scopeKey} handleId={handle.handle_id} />}
         </div>
       )}
     </div>

@@ -324,11 +324,17 @@ export function ProcessInspectorPanel({
     if (atBottom !== followingRef.current) setFollowing(atBottom);
   }, []);
 
+  // Re-pin on both completed-line growth (`entries`) and partial-only growth
+  // (`snapshot.output.partial`): a command emitting a growing un-newlined PARTIAL
+  // line leaves `entries` unchanged, but the rendered partial grows/wraps, so a
+  // following viewer would otherwise drift off the bottom. The `following` guard
+  // still keeps a user who scrolled up pinned where they are.
+  const partial = snapshot?.output.partial;
   useLayoutEffect(() => {
     if (!following) return;
     const el = outputRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [entries, following]);
+  }, [entries, partial, following]);
 
   const glyph = snapshot ? bashGlyph(snapshot) : null;
   const label = snapshot?.label ?? null;

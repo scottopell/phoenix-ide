@@ -37,7 +37,8 @@ read (`RingBuffer::since` / `tail`, the tombstone final-tail read). The resource
 trio is sampled over the handle's process *group*: `sysinfo` (already a
 dependency) covers CPU% and process enumeration, while proportional memory and
 group membership are platform-specific custom reads — Linux `/proc`
-(`smaps_rollup` `Pss`, scan-by-pgrp for membership), macOS `proc_listpgrppids` +
+(`smaps_rollup` `Pss`, scan-by-pgrp for membership), macOS `proc_listallpids`
+filtered by each PID's `pbi_pgid` (`proc_pidinfo` `PROC_PIDTBSDINFO`) +
 `proc_pid_rusage` `ri_phys_footprint`. Memory is proportional (PSS /
 `phys_footprint`), not RSS, which double-counts shared pages. Sampling happens
 only at request time while an inspector polls; an unavailable metric is null
@@ -67,13 +68,13 @@ weight (see `design.md`, "Why No Allium Spec"), mirroring `specs/work-scope-ui/`
 
 | Requirement | Status | Notes |
 |-------------|--------|-------|
-| **REQ-PINSP-001:** Combined Inspection Snapshot | Proposed | One `BashHandleInspection` from the registry + a request-time sample; not-found when the handle is absent |
-| **REQ-PINSP-002:** Handle Identity and State | Proposed | Reuses the inventory's `BashHandleState`; adds tombstone `exit_code` / `signal_number` (`specs/bash/` REQ-BASH-006) |
-| **REQ-PINSP-003:** Output Delta | Proposed | Thin wrapper over the ring read (`specs/bash/` REQ-BASH-004); reuses `tool_wire::BashRingWindow` |
-| **REQ-PINSP-004:** Resource Sample — The Core Trio | Proposed | `cpu_pct` / `memory_bytes` (PSS/phys_footprint, not RSS) / `process_count` over the `pgid`; null-on-gap, logged at debug; sampled only while open |
-| **REQ-PINSP-005:** Inspection Endpoint | Proposed | `GET /api/work-scope/:scope_key/bash/:handle_id/inspect?since=K`; mirrors the inventory handler shape |
-| **REQ-PINSP-006:** Polling Cadence and Termination | Proposed | ~1s poll with `since = end_offset`; stops on close or terminal handle |
-| **REQ-PINSP-007:** Inspector Viewer Kind | Proposed | New `inspect` `ViewerKind` keyed by `(scope_key, handle_id)`; inherits the slot's mutex / close / reset / URL restore (`specs/viewer_slot/`) |
-| **REQ-PINSP-008:** Inspector Layout and Live Behaviour | Proposed | Header + autoscroll-with-pause output pane + resource readout; null metric renders unavailable, `truncated_before` shown inline |
+| **REQ-PINSP-001:** Combined Inspection Snapshot | Implemented | One `BashHandleInspection` from the registry + a request-time sample; not-found when the handle is absent |
+| **REQ-PINSP-002:** Handle Identity and State | Implemented | Reuses the inventory's `BashHandleState`; adds tombstone `exit_code` / `signal_number` (`specs/bash/` REQ-BASH-006) |
+| **REQ-PINSP-003:** Output Delta | Implemented | Thin wrapper over the ring read (`specs/bash/` REQ-BASH-004); reuses `tool_wire::BashRingWindow` |
+| **REQ-PINSP-004:** Resource Sample — The Core Trio | Implemented | `cpu_pct` / `memory_bytes` (PSS/phys_footprint, not RSS) / `process_count` over the `pgid`; null-on-gap, logged at debug; sampled only while open |
+| **REQ-PINSP-005:** Inspection Endpoint | Implemented | `GET /api/work-scope/:scope_key/bash/:handle_id/inspect?since=K`; mirrors the inventory handler shape |
+| **REQ-PINSP-006:** Polling Cadence and Termination | Implemented | ~1s poll with `since = end_offset`; stops on close or terminal handle |
+| **REQ-PINSP-007:** Inspector Viewer Kind | Implemented | New `inspect` `ViewerKind` keyed by `(scope_key, handle_id)`; inherits the slot's mutex / close / reset / URL restore (`specs/viewer_slot/`) |
+| **REQ-PINSP-008:** Inspector Layout and Live Behaviour | Implemented | Header + autoscroll-with-pause output pane + resource readout; null metric renders unavailable, `truncated_before` shown inline |
 
-**Progress:** 0 of 8 implemented.
+**Progress:** 8 of 8 implemented.

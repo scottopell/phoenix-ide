@@ -220,6 +220,45 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     expect(rendered.length).toBe(CAP);
   });
 
+  it('stays pinned to the bottom on a partial-only update while following (no new full lines)', async () => {
+    // A command emitting a growing un-newlined PARTIAL line: `entries` does not
+    // change across the poll, only `snapshot.output.partial` grows. A following
+    // viewer must stay pinned to the bottom — the autoscroll effect has to re-run
+    // on partial growth, not only on completed-line growth.
+    getInsp
+      .mockResolvedValueOnce(
+        snap({ output: { start_offset: 0, end_offset: 1, truncated_before: false, lines: lines([0, 'header']), partial: 'progress 10%' } }),
+      )
+      .mockResolvedValueOnce(
+        // Same end_offset / no new full lines → `entries` is unchanged. Only the
+        // partial grows.
+        snap({ output: { start_offset: 1, end_offset: 1, truncated_before: false, lines: [], partial: 'progress 10% .......... 80%' } }),
+      );
+
+    await renderPanel();
+
+    // jsdom does not lay out, so drive scrollHeight/clientHeight by hand. A
+    // following viewer (scrollTop tracks scrollHeight) pins to the bottom.
+    const output = screen.getByText('header').closest('.pinsp-output') as HTMLDivElement;
+    Object.defineProperty(output, 'clientHeight', { configurable: true, value: 100 });
+    let height = 200;
+    Object.defineProperty(output, 'scrollHeight', { configurable: true, get: () => height });
+
+    // Seed established the partial; grow it on the next poll without new lines.
+    expect(screen.getByText('progress 10%')).toBeTruthy();
+    height = 600; // the wrapped partial grew the scroll height
+
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+
+    // No new full lines — only the partial changed.
+    expect(screen.getByText('progress 10% .......... 80%')).toBeTruthy();
+    // The follow effect re-ran on the partial change and re-pinned to the bottom.
+    expect(output.scrollTop).toBe(600);
+  });
+
   it('renders null resource metrics as unavailable, not zero', async () => {
     getInsp.mockResolvedValueOnce(
       // memory/process are null on the wire (capability gap); cpu is present.

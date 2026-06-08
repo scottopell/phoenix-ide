@@ -21,7 +21,7 @@ vi.mock('../api', async (importOriginal) => {
   };
 });
 
-import { WorkScopeSection } from './WorkScopePanel';
+import { WorkScopeSection, WorkScopePanel } from './WorkScopePanel';
 import { useSeededLiveCount } from './useWorkScopeSeed';
 
 const getInv = vi.mocked(api.getWorkScopeInventory);
@@ -440,6 +440,38 @@ describe('WorkScopeSection in-flight gate (slow poll, no overlap or starvation)'
     });
     expect(getInv).toHaveBeenCalledTimes(callsAfterSeed + 2);
     expect(screen.getByText('16.0 KB')).toBeTruthy();
+  });
+});
+
+describe('inspect affordance + provider dependency', () => {
+  it('a non-inspectable BashRow renders WITHOUT a ViewerSlotProvider (no hook, no throw)', async () => {
+    // The standalone chain-page dock renders with inspectable={false} and is NOT
+    // wrapped in a ViewerSlotProvider. A non-inspectable row must not call
+    // useViewerSlot() (which throws outside a provider), so this renders cleanly.
+    getInv.mockResolvedValue(inv([bash({ state: 'running' })]));
+
+    await act(async () => {
+      render(
+        <WorkScopePanel scopeKey="ws-1" liveInventory={null} collapsed={false} onToggle={() => {}} />,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    // The row rendered; opening its detail must not surface an inspect affordance.
+    openBashDetail();
+    expect(document.querySelector('.ws-row--bash')).toBeTruthy();
+    expect(screen.queryByTitle('Open the process inspector for this handle')).toBeNull();
+  });
+
+  it('an inspectable BashRow inside a ViewerSlotProvider renders the inspect affordance', async () => {
+    getInv.mockResolvedValue(inv([bash({ state: 'running' })]));
+
+    await renderExpanded(); // sectionTree → WorkScopeSection (inspectable) inside the provider
+    openBashDetail();
+    expect(screen.getByTitle('Open the process inspector for this handle')).toBeTruthy();
+    expect(screen.getByText('inspect →')).toBeTruthy();
   });
 });
 
