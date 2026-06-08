@@ -154,7 +154,11 @@ mod tests {
         assert!(out.contains("HEAD_START"), "head signal must survive");
         assert!(out.contains("TAIL_END"), "tail signal must survive");
         assert!(out.contains("chars elided"), "elision must be marked");
-        assert!(out.len() < 5000, "excerpt must be bounded, got {}", out.len());
+        assert!(
+            out.len() < 5000,
+            "excerpt must be bounded, got {}",
+            out.len()
+        );
     }
 
     #[test]
