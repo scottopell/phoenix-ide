@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from 'react';
+import { memo, useCallback, useRef, useState } from 'react';
 import type { ListRange } from 'react-virtuoso';
 import { MessageList, type MessageListHandle } from './MessageList';
 import { ConversationNav } from './ConversationNav';
@@ -19,7 +19,7 @@ type StackProps = Omit<
  * inside MessageList from the canonical `historicalUnits`), and the scroll-spy
  * active index. Renders the nav as a fixed-height strip above the list.
  */
-export function ConversationNavStack(props: StackProps) {
+export const ConversationNavStack = memo(function ConversationNavStack(props: StackProps) {
   const listRef = useRef<MessageListHandle>(null);
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [activeUnitIndex, setActiveUnitIndex] = useState<number | null>(null);
@@ -56,4 +56,4 @@ export function ConversationNavStack(props: StackProps) {
       />
     </>
   );
-}
+});

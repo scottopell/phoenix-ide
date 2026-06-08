@@ -69,6 +69,7 @@ import { ReviewNotesProvider } from '../contexts/ReviewNotesContext';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
 
 const TERMINAL_COLLAPSED_PX = 32;
+const terminalPaneMax = () => Math.min(800, Math.floor(window.innerHeight * 0.75));
 
 const AlertTriangle = () => (
   <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -255,7 +256,7 @@ function ConversationPageContent() {
   const terminalPane = useResizablePane({
     key: 'terminal-height',
     min: TERMINAL_COLLAPSED_PX,
-    max: () => Math.min(800, Math.floor(window.innerHeight * 0.75)),
+    max: terminalPaneMax,
     defaultSize: 300,
     collapseThreshold: 60,
     defaultCollapsed: true,
@@ -563,7 +564,7 @@ function ConversationPageContent() {
     }
   }, [isConnected, conversationId, pendingMessages]);
 
-  const handleSend = async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
+  const handleSend = useCallback(async (text: string, attachedImages: ImageData[], attachedFiles: FileAttachment[] = []) => {
     if (!conversationId) return;
 
     const msg = enqueue(text, attachedImages, attachedFiles);
@@ -572,7 +573,7 @@ function ConversationPageContent() {
       // Await so expansion errors propagate back to InputArea (REQ-IR-007)
       await sendMessage(msg.localId, text, attachedImages, attachedFiles);
     }
-  };
+  }, [conversationId, enqueue, isConnected, sendMessage]);
 
   const handleRetry = useCallback((localId: string) => {
     const msg = queuedMessages.find((m) => m.localId === localId);
@@ -587,7 +588,7 @@ function ConversationPageContent() {
     requestComposerFocus();
   }, [queuedMessages, dismiss, appendDraftCb, setFiles, requestComposerFocus]);
 
-  const handleCancel = async () => {
+  const handleCancel = useCallback(async () => {
     if (!conversationId || !canCancelConversationState(atom.phase)) return;
     if (isCancellingState(atom.phase)) return;
 
@@ -596,7 +597,7 @@ function ConversationPageContent() {
     } catch (err) {
       console.error('Failed to cancel:', err);
     }
-  };
+  }, [conversationId, atom.phase]);
 
   const handleCancelSteering = useCallback(async (localId: string) => {
     if (!conversationId) return;
@@ -608,7 +609,7 @@ function ConversationPageContent() {
     }
   }, [conversationId, dismiss]);
 
-  const handleTriggerContinuation = async () => {
+  const handleTriggerContinuation = useCallback(async () => {
     if (!conversationId) return;
 
     try {
@@ -616,9 +617,9 @@ function ConversationPageContent() {
     } catch (err) {
       console.error('Failed to trigger continuation:', err);
     }
-  };
+  }, [conversationId]);
 
-  const handleUpgradeModel = async (newModelId: string) => {
+  const handleUpgradeModel = useCallback(async (newModelId: string) => {
     if (!conversationId || !canChangeModelInState(atom.phase)) return;
 
     try {
@@ -628,7 +629,7 @@ function ConversationPageContent() {
     } catch (err) {
       console.error('Failed to upgrade model:', err);
     }
-  };
+  }, [conversationId, atom.phase, showInfo, dispatch]);
 
   // REQ-TERM-020 / REQ-SEED-001: "Let Phoenix set this up for me" handler.
   // TerminalPanel builds the prompt text and hands it off; this owns the API
@@ -823,6 +824,16 @@ function ConversationPageContent() {
     navigate(`/c/${parentConvSlugForCallback}`);
   }, [parentConvSlugForCallback, navigate]);
 
+  const convStateForChildren = atom.phase;
+  const handleSendTextOnly = useCallback((text: string) => handleSend(text, []), [handleSend]);
+  const handleOpenFiles = useCallback(() => setShowFileBrowser(true), []);
+  const stateBarContinuation = useMemo(
+    () => convStateForChildren.type === 'idle'
+      ? { phase: 'idle' as const, onTrigger: handleTriggerContinuation }
+      : { phase: 'unavailable' as const },
+    [convStateForChildren.type, handleTriggerContinuation],
+  );
+
   if (error) {
     return (
       <div id="app">
@@ -909,7 +920,6 @@ function ConversationPageContent() {
     }
   }
 
-  const convStateForChildren = atom.phase;
   // Terminal cleanup (Clean up merged PR / Abandon) for a Work/Branch
   // conversation stuck in a disposable phase (error or context-exhausted): the
   // backend and specs permit TaskResolved from those states. PR-aware; renders
@@ -1237,7 +1247,7 @@ function ConversationPageContent() {
             convModeLabel={conversation.conv_mode_label}
             phaseType={convStateForChildren.type}
             continuedInConvId={conversation.continued_in_conv_id}
-            onSendMessage={(text) => handleSend(text, [])}
+            onSendMessage={handleSendTextOnly}
             showError={showError}
             prStatusHandle={prStatusHandle}
           />
@@ -1292,17 +1302,13 @@ function ConversationPageContent() {
         modelContextWindow={modelContextWindow}
         availableModels={availableModels}
         onRetryNow={connectionInfo.retryNow}
-        continuation={
-          convStateForChildren.type === 'idle'
-            ? { phase: 'idle', onTrigger: handleTriggerContinuation }
-            : { phase: 'unavailable' }
-        }
+        continuation={stateBarContinuation}
         onUpgradeModel={handleUpgradeModel}
         toolExecutingStartedAt={atom.toolExecutingStartedAt}
         phaseStateUpdatedAt={atom.phaseStateUpdatedAt}
         firstByteRequestId={atom.firstByteRequestId}
         turnRetryContext={atom.turnRetryContext}
-        onOpenFiles={isDesktop ? undefined : () => setShowFileBrowser(true)}
+        onOpenFiles={isDesktop ? undefined : handleOpenFiles}
         prStatusState={prStatusHandle.state}
       />
       </RenderProfiler>

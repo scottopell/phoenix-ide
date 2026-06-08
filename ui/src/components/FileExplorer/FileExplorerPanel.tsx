@@ -70,9 +70,9 @@ export function FileExplorerPanel({ collapsed, onToggle, rootPath, conversationI
   // One fetch per scope (no poll); SSE stays authoritative once it arrives.
   const workScopeCount = useSeededLiveCount(workScopeKey, liveWorkScope);
 
-  const handleFileSelect = (filePath: string, rootDir: string) => {
+  const handleFileSelect = useCallback((filePath: string, rootDir: string) => {
     openFile(filePath, rootDir);
-  };
+  }, [openFile]);
 
   if (collapsed) {
     return (

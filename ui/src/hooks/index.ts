@@ -7,7 +7,7 @@ export {
   DraftLifecycle,
 } from './useDraft';
 export type { DraftActions } from './useDraft';
-export { FocusScopeProvider, useFocusScope, useRegisterFocusScope } from './useFocusScope';
+export { FocusScopeProvider, useFocusScope, useFocusScopeCommands, useRegisterFocusScope } from './useFocusScope';
 export {
   useMessageQueue,
   derivePendingMessages,

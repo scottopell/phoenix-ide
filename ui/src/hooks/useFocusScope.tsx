@@ -1,21 +1,32 @@
 /* eslint-disable react-refresh/only-export-components -- context provider + hooks in one file is idiomatic React */
-import { createContext, useContext, useCallback, useState, useEffect, type ReactNode } from 'react';
+import { createContext, useContext, useCallback, useMemo, useState, useEffect, type ReactNode } from 'react';
 
-interface FocusScopeContextValue {
+interface FocusScopeCommands {
   pushScope(id: string): void;
   popScope(id: string): void;
+}
+
+interface FocusScopeState {
   isActiveScope(id: string): boolean;
   activeScope: string | null;
   hasActiveScope: boolean;
 }
 
-const FocusScopeContext = createContext<FocusScopeContextValue>({
+type FocusScopeContextValue = FocusScopeCommands & FocusScopeState;
+
+const noopCommands: FocusScopeCommands = {
   pushScope: () => {},
   popScope: () => {},
+};
+
+const defaultState: FocusScopeState = {
   isActiveScope: () => false,
   activeScope: null,
   hasActiveScope: false,
-});
+};
+
+const FocusScopeCommandsContext = createContext<FocusScopeCommands>(noopCommands);
+const FocusScopeStateContext = createContext<FocusScopeState>(defaultState);
 
 export function FocusScopeProvider({ children }: { children: ReactNode }) {
   const [scopes, setScopes] = useState<string[]>([]);
@@ -34,24 +45,37 @@ export function FocusScopeProvider({ children }: { children: ReactNode }) {
 
   const activeScope: string | null = scopes.length > 0 ? scopes[scopes.length - 1]! : null;
 
+  const state = useMemo<FocusScopeState>(() => ({
+    isActiveScope,
+    activeScope,
+    hasActiveScope: scopes.length > 0,
+  }), [isActiveScope, activeScope, scopes.length]);
+
+  const commands = useMemo<FocusScopeCommands>(() => ({ pushScope, popScope }), [pushScope, popScope]);
+
   return (
-    <FocusScopeContext.Provider value={{
-      pushScope, popScope, isActiveScope,
-      activeScope,
-      hasActiveScope: scopes.length > 0,
-    }}>
-      {children}
-    </FocusScopeContext.Provider>
+    <FocusScopeCommandsContext.Provider value={commands}>
+      <FocusScopeStateContext.Provider value={state}>
+        {children}
+      </FocusScopeStateContext.Provider>
+    </FocusScopeCommandsContext.Provider>
   );
 }
 
-export function useFocusScope() {
-  return useContext(FocusScopeContext);
+export function useFocusScope(): FocusScopeContextValue {
+  return {
+    ...useContext(FocusScopeCommandsContext),
+    ...useContext(FocusScopeStateContext),
+  };
+}
+
+export function useFocusScopeCommands(): FocusScopeCommands {
+  return useContext(FocusScopeCommandsContext);
 }
 
 /** Hook that registers a focus scope on mount and unregisters on unmount */
 export function useRegisterFocusScope(id: string) {
-  const { pushScope, popScope } = useFocusScope();
+  const { pushScope, popScope } = useFocusScopeCommands();
   useEffect(() => {
     pushScope(id);
     return () => popScope(id);

@@ -29,6 +29,8 @@ import {
   useNotificationClickNavigationBridge,
 } from '../notifications';
 
+const subAgentViewerPaneMax = () => Math.max(360, Math.round(window.innerWidth * 0.6));
+
 interface DesktopLayoutProps {
   children: React.ReactNode;
 }
@@ -43,7 +45,7 @@ function SubAgentViewerDock() {
   const pane = useResizablePane({
     key: 'subagent-viewer-width',
     min: 320,
-    max: () => Math.max(360, Math.round(window.innerWidth * 0.6)),
+    max: subAgentViewerPaneMax,
     defaultSize: 460,
   });
   if (!viewer?.opened) return null;
