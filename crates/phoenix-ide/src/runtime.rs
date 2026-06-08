@@ -1048,7 +1048,21 @@ impl RuntimeManager {
                 let weak = weak.clone();
                 Box::pin(async move {
                     match weak.upgrade() {
-                        Some(manager) => manager.scope_has_live_conversation(&scope).await,
+                        Some(manager) => match manager.scope_has_live_conversation(&scope).await {
+                            Ok(live) => live,
+                            // The idle reaper fails closed: an unreadable DB
+                            // (transient lock contention during cleanup) must
+                            // not reap a still-live session, so treat the scope
+                            // as live and try again on the next idle sweep.
+                            Err(e) => {
+                                tracing::warn!(
+                                    work_scope = %scope,
+                                    error = %e,
+                                    "scope liveness query failed; preserving scope to avoid reaping a live browser session"
+                                );
+                                true
+                            }
+                        },
                         None => false,
                     }
                 }) as futures::future::BoxFuture<'static, bool>
@@ -1250,7 +1264,17 @@ impl RuntimeManager {
     /// (`ConvState::is_terminal`) nor archived. REQ-PROJ-025 guarantees at
     /// most one non-terminal conversation per scope, so the first match is
     /// decisive.
-    pub(crate) async fn scope_has_live_conversation(&self, work_scope: &WorkScope) -> bool {
+    ///
+    /// A genuinely absent conversation row (`DbError::ConversationNotFound`)
+    /// is `Ok(false)` — that is a definitive "not live", not a failure. Any
+    /// other DB error propagates as `Err`: liveness is unknowable, and each
+    /// caller picks its own policy (the idle reaper maps `Err` to "live" to
+    /// avoid premature teardown; the cleanup cascade fails the operation
+    /// rather than archive while skipping resource teardown).
+    pub(crate) async fn scope_has_live_conversation(
+        &self,
+        work_scope: &WorkScope,
+    ) -> Result<bool, crate::db::DbError> {
         self.scope_has_live_conversation_inner(work_scope, None)
             .await
     }
@@ -1268,7 +1292,7 @@ impl RuntimeManager {
         &self,
         work_scope: &WorkScope,
         excluded_conv_id: &str,
-    ) -> bool {
+    ) -> Result<bool, crate::db::DbError> {
         self.scope_has_live_conversation_inner(work_scope, Some(excluded_conv_id))
             .await
     }
@@ -1277,7 +1301,7 @@ impl RuntimeManager {
         &self,
         work_scope: &WorkScope,
         excluded_conv_id: Option<&str>,
-    ) -> bool {
+    ) -> Result<bool, crate::db::DbError> {
         // Candidate conversations come from the DB so a non-terminal owner
         // without a runtime handle (post-restart / post-eviction) still
         // counts. A `WorkScope::Conversation(id)` is single-owner: only `id`
@@ -1287,43 +1311,23 @@ impl RuntimeManager {
         let candidates: Vec<crate::db::Conversation> = match work_scope {
             WorkScope::Conversation(id) => {
                 if excluded_conv_id == Some(id.as_str()) {
-                    return false;
+                    return Ok(false);
                 }
                 match self.db().get_conversation(id).await {
                     Ok(conv) => vec![conv],
-                    // Fail closed, mirroring the worktree branch: only a
-                    // genuinely absent row means "not live". A transient DB
-                    // error (lock contention during browser idle cleanup) must
-                    // preserve the scope, not reap a still-live session.
-                    Err(crate::db::DbError::ConversationNotFound(_)) => return false,
-                    Err(e) => {
-                        tracing::warn!(
-                            work_scope = %work_scope,
-                            error = %e,
-                            "scope liveness query failed; treating scope as live to avoid premature teardown"
-                        );
-                        return true;
-                    }
+                    // A genuinely absent row is a definitive "not live", not a
+                    // failure. Any other DB error is unknowable liveness and
+                    // propagates so each caller picks its own policy.
+                    Err(crate::db::DbError::ConversationNotFound(_)) => return Ok(false),
+                    Err(e) => return Err(e),
                 }
             }
-            WorkScope::Worktree(path) => {
-                match self.db().list_conversations_for_worktree(path).await {
-                    Ok(convs) => convs,
-                    Err(e) => {
-                        tracing::warn!(
-                            work_scope = %work_scope,
-                            error = %e,
-                            "scope liveness query failed; treating scope as live to avoid premature teardown"
-                        );
-                        return true;
-                    }
-                }
-            }
+            WorkScope::Worktree(path) => self.db().list_conversations_for_worktree(path).await?,
             // The `Global` singleton scope (the `/new` page global terminal)
             // is not owned by any conversation — `WorkScope::resolve` only ever
             // yields `Worktree` or `Conversation` — so no conversation can
             // preserve it.
-            WorkScope::Global => return false,
+            WorkScope::Global => return Ok(false),
         };
 
         for conv in candidates {
@@ -1346,10 +1350,10 @@ impl RuntimeManager {
                 conv.conv_mode.worktree_path().map(std::path::Path::new),
             );
             if &conv_scope == work_scope {
-                return true;
+                return Ok(true);
             }
         }
-        false
+        Ok(false)
     }
 
     /// Start the background task that handles sub-agent spawn/cancel requests
@@ -2963,7 +2967,7 @@ mod scope_liveness_tests {
 
         let scope = crate::work_scope::WorkScope::Conversation("conv-live".to_string());
         assert!(
-            mgr.scope_has_live_conversation(&scope).await,
+            mgr.scope_has_live_conversation(&scope).await.unwrap(),
             "a non-terminal, unarchived owner with a live handle is live"
         );
     }
@@ -2979,7 +2983,7 @@ mod scope_liveness_tests {
 
         // Sanity: live before archiving.
         let scope = crate::work_scope::WorkScope::Conversation("conv-arch".to_string());
-        assert!(mgr.scope_has_live_conversation(&scope).await);
+        assert!(mgr.scope_has_live_conversation(&scope).await.unwrap());
 
         // Archive the (still non-terminal) conversation; the lingering
         // runtime handle stays registered, as it does in the real cascade.
@@ -2995,7 +2999,7 @@ mod scope_liveness_tests {
         );
 
         assert!(
-            !mgr.scope_has_live_conversation(&scope).await,
+            !mgr.scope_has_live_conversation(&scope).await.unwrap(),
             "an archived conversation must not preserve its scope"
         );
     }
@@ -3019,7 +3023,8 @@ mod scope_liveness_tests {
 
         assert!(
             mgr.scope_has_live_conversation_excluding(&scope, "leaf")
-                .await,
+                .await
+                .unwrap(),
             "handle-less non-terminal parent still owns the shared worktree scope"
         );
     }
@@ -3050,7 +3055,8 @@ mod scope_liveness_tests {
 
         assert!(
             !mgr.scope_has_live_conversation_excluding(&scope, "leaf")
-                .await,
+                .await
+                .unwrap(),
             "with the only other owner terminal, deleting the leaf leaves no live owner"
         );
     }
@@ -3070,24 +3076,49 @@ mod scope_liveness_tests {
 
         assert!(
             !mgr.scope_has_live_conversation_excluding(&scope, "leaf")
-                .await,
+                .await
+                .unwrap(),
             "a live conversation on a different worktree does not own this scope"
         );
     }
 
     /// A `WorkScope::Conversation(id)` whose row is genuinely absent
-    /// (`DbError::ConversationNotFound`) is not live — the only DB outcome
-    /// that returns false in the Conversation branch. A non-NotFound error
-    /// fails closed instead (returns true), but that path needs DB fault
-    /// injection the in-memory test DB does not expose, so it is exercised
-    /// by inspection of the match arm rather than a unit test.
+    /// (`DbError::ConversationNotFound`) is `Ok(false)` — a definitive
+    /// "not live", not an error. A non-NotFound DB error propagates as
+    /// `Err` instead, leaving each caller to pick its policy (idle reaper
+    /// preserves, cleanup cascade fails the operation). That error path
+    /// needs DB fault injection the in-memory test DB does not expose, so it
+    /// is exercised at the caller layer (`handlers.rs` cascade tests) and by
+    /// inspection of the match arm rather than a unit test here.
     #[tokio::test]
     async fn missing_conversation_scope_is_not_live() {
         let mgr = test_manager().await;
         let scope = crate::work_scope::WorkScope::Conversation("does-not-exist".to_string());
         assert!(
-            !mgr.scope_has_live_conversation(&scope).await,
+            !mgr.scope_has_live_conversation(&scope).await.unwrap(),
             "an absent conversation row resolves to not-live"
+        );
+    }
+
+    /// An unreadable DB makes liveness unknowable: a non-NotFound error
+    /// propagates as `Err` rather than being swallowed to a bool. This is the
+    /// input the idle-reaper hook maps to "preserve" (its `Err => true` arm)
+    /// and the cleanup cascade maps to "fail the operation". Fault injection:
+    /// closing the pool makes the worktree query fail with a non-NotFound
+    /// `DbError`.
+    #[tokio::test]
+    async fn unreadable_db_propagates_error_for_caller_policy() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+        create_handleless_work_conv(&mgr, "owner", worktree).await;
+
+        mgr.db().pool().close().await;
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+        assert!(
+            mgr.scope_has_live_conversation(&scope).await.is_err(),
+            "an unreadable DB must surface as Err, not a swallowed bool — the \
+             idle reaper preserves on Err, the cascade fails on Err"
         );
     }
 }

@@ -232,6 +232,10 @@ function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: nu
  * keeps the single-writer atom contract: none of these paths touch the atom's
  * `workScope`, which stays written only by the SSE reducer.
  *
+ * The poll holds an in-flight gate so at most one poll is outstanding: a fetch
+ * slower than the poll interval still completes and applies rather than being
+ * perpetually superseded (and discarded) by the next interval's fetch.
+ *
  * `active` gates both the per-second elapsed-time tick and the running poll:
  * callers pass `false` while the surface is collapsed so an off-screen panel
  * does no background work.
@@ -259,45 +263,33 @@ function useWorkScopeInventory(
   // result would clobber a fresher snapshot for the same scope.
   const sseGenRef = useRef(0);
 
-  // Monotonic pull-sequence counter, bumped at the START of every
-  // `fetchSnapshot`. Each invocation captures its own sequence; on resolve it
-  // writes `displayed` only if no later pull has been issued since. The 2s
-  // running poll can have two pulls in flight at once, and if a slower EARLIER
-  // pull resolves AFTER a faster later pull, the earlier result is stale even
-  // though the scope key and SSE generation are unchanged. This guard is the
-  // PULL-vs-PULL ordering counterpart to the scope-key (scope CHANGE) and
-  // SSE-generation (intervening push) guards: only the most-recently-issued
-  // pull may write `displayed`.
-  const pullSeqRef = useRef(0);
+  // In-flight gate: true while a poll fetch is outstanding. The recurring poll
+  // skips issuing a new fetch while this is set, so at most one poll is ever
+  // outstanding. Without it, when the inventory endpoint is slower than the
+  // poll interval, each interval issues a new pull that supersedes the prior
+  // in-flight one — so the slow pull never gets to apply, perpetually
+  // starving `output_bytes`/`idle_ms` advancement and suppressing errors. The
+  // gate replaces the prior pull-vs-pull sequence guard: polls no longer
+  // overlap, so there is no later pull to make an earlier one stale.
+  const inFlightRef = useRef(false);
 
   // Stale-pull guard: a fetch (initial pull or poll) can resolve after the
-  // scope key changes, after a newer SSE push lands, OR after a later pull for
-  // the same scope was issued. Capturing the scope key, SSE generation, and
-  // pull sequence at request time and re-checking all three at resolve time
+  // scope key changes or after a newer SSE push lands. Capturing the scope key
+  // and SSE generation at request time and re-checking both at resolve time
   // rejects a stale result so it never overwrites a fresher snapshot — while
   // leaving the byte-advancing pull merge for the SAME scope with no
-  // intervening SSE intact.
+  // intervening SSE intact. The in-flight gate prevents poll-vs-poll overlap,
+  // so no pull-sequence guard is needed.
   const fetchSnapshot = useCallback(async () => {
     const requestedKey = scopeKeyRef.current;
     const requestedGen = sseGenRef.current;
-    const requestedSeq = (pullSeqRef.current += 1);
     setError(false);
     try {
       const inv = await api.getWorkScopeInventory(requestedKey);
-      if (
-        scopeKeyRef.current !== requestedKey ||
-        sseGenRef.current !== requestedGen ||
-        pullSeqRef.current !== requestedSeq
-      )
-        return;
+      if (scopeKeyRef.current !== requestedKey || sseGenRef.current !== requestedGen) return;
       setDisplayed(inv);
     } catch {
-      if (
-        scopeKeyRef.current !== requestedKey ||
-        sseGenRef.current !== requestedGen ||
-        pullSeqRef.current !== requestedSeq
-      )
-        return;
+      if (scopeKeyRef.current !== requestedKey || sseGenRef.current !== requestedGen) return;
       setError(true);
     }
   }, []);
@@ -334,7 +326,17 @@ function useWorkScopeInventory(
   const pollRunning = active && hasLiveResource(displayed);
   useEffect(() => {
     if (!pollRunning) return;
-    const id = setInterval(() => void fetchSnapshot(), RUNNING_POLL_INTERVAL_MS);
+    const id = setInterval(() => {
+      // In-flight gate: never stack a second poll on top of an outstanding
+      // one. If the endpoint is slower than the interval this means a slow
+      // poll still completes and applies instead of being perpetually
+      // superseded by the next interval's fetch.
+      if (inFlightRef.current) return;
+      inFlightRef.current = true;
+      void fetchSnapshot().finally(() => {
+        inFlightRef.current = false;
+      });
+    }, RUNNING_POLL_INTERVAL_MS);
     return () => clearInterval(id);
   }, [pollRunning, fetchSnapshot]);
 

@@ -2865,11 +2865,27 @@ async fn scope_still_owned_after_delete(
         false
     };
 
-    Ok(continuation_inherits_scope
-        || state
-            .runtime
-            .scope_has_live_conversation_excluding(work_scope, id)
-            .await)
+    if continuation_inherits_scope {
+        return Ok(true);
+    }
+
+    // The cleanup cascade fails loud: an unreadable DB makes the liveness of a
+    // sibling owner unknowable. Proceeding on a fail-closed "assume live" would
+    // skip every resource + worktree teardown while the row is still
+    // archived/deleted, orphaning those resources with no retry. Failing the
+    // request instead lets the caller retry once the DB is healthy.
+    state
+        .runtime
+        .scope_has_live_conversation_excluding(work_scope, id)
+        .await
+        .map_err(|e| {
+            AppError::Internal(format!(
+                "cleanup cascade refused: sibling liveness lookup failed for \
+                 conv={id} scope={work_scope}: {e} \
+                 (proceeding would skip resource + worktree teardown while \
+                 archiving the row; retry once the DB is healthy)"
+            ))
+        })
 }
 
 /// REQ-BED-032 steps 2-5 (bash + tmux + projects + browser cleanup),
@@ -6382,6 +6398,62 @@ mod hard_delete_cascade_tests {
         assert!(
             crate::git_ops::run_git(&repo, &["rev-parse", "--verify", &branch]).is_err(),
             "task branch must be deleted when the last owner is deleted (Work mode)"
+        );
+    }
+
+    /// The cleanup cascade fails loud when the sibling-liveness lookup cannot
+    /// reach the DB. Proceeding on a fail-closed "assume live" would skip every
+    /// resource + worktree teardown while the row is still archived/deleted,
+    /// orphaning those resources with no retry — so the cascade refuses and
+    /// surfaces the error to the caller, who can retry once the DB is healthy.
+    /// The early return precedes all side effects, so refusal leaves no partial
+    /// state.
+    #[tokio::test]
+    async fn cleanup_cascade_fails_loud_when_sibling_liveness_lookup_errors() {
+        let state = make_test_state().await;
+        let worktree = "/repo/.phoenix/worktrees/cascade-err";
+        let mode = crate::db::ConvMode::Work {
+            branch_name: crate::db::NonEmptyString::new("task-branch").unwrap(),
+            worktree_path: crate::db::NonEmptyString::new(worktree.to_string()).unwrap(),
+            base_branch: crate::db::NonEmptyString::new("main").unwrap(),
+            task_id: crate::db::NonEmptyString::new("T1").unwrap(),
+            task_title: crate::db::NonEmptyString::new("title").unwrap(),
+        };
+        state
+            .db
+            .create_conversation_with_project(
+                "leaf",
+                "leaf",
+                worktree,
+                false,
+                None,
+                None,
+                None,
+                &mode,
+                None,
+                None,
+                None,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create");
+
+        // Capture the conversation before disabling the DB; the cascade takes
+        // the row by value and never re-reads it.
+        let conv = state.db.get_conversation("leaf").await.expect("get conv");
+
+        // Fault injection: closing the pool makes the WorkScope::Worktree
+        // sibling-liveness query (`list_conversations_for_worktree`) return a
+        // non-NotFound DbError — the exact transient-failure shape the fix
+        // must propagate rather than swallow to "assume live".
+        state.db.pool().close().await;
+
+        let result = run_resource_cleanup_cascade(&state, &conv).await;
+
+        assert!(
+            matches!(result, Err(AppError::Internal(_))),
+            "an unreadable DB during the sibling-liveness lookup must fail the \
+             cascade, not silently preserve-and-archive; got {result:?}"
         );
     }
 }

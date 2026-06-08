@@ -2791,8 +2791,45 @@ where
                 // The post-approval `conv_mode` is Work, whose
                 // `worktree_path()` is the path just created, mirroring how
                 // construction seeds this from `conv_mode.worktree_path()`.
+                //
+                // The scope flips here from `old_scope` (pre-approval) to
+                // `new_scope` (post-approval). Resources opened pre-approval
+                // (bash/browser/tmux) are keyed under `old_scope`; migrate them
+                // to `new_scope` below so the inventory and idle/cleanup paths
+                // resolve them under the same scope the cache now uses.
+                let old_scope = phoenix_core::work_scope::WorkScope::resolve(
+                    self.context.conversation_id.clone(),
+                    self.context.work_scope_worktree.as_deref(),
+                );
                 self.context.work_scope_worktree =
                     Some(std::path::PathBuf::from(&approval_result.worktree_path));
+                let new_scope = phoenix_core::work_scope::WorkScope::resolve(
+                    self.context.conversation_id.clone(),
+                    self.context.work_scope_worktree.as_deref(),
+                );
+
+                // Migrate WorkScope-keyed resources opened before approval from
+                // the conversation scope to the worktree scope. Each rekey moves
+                // the in-memory lookup key only — the underlying process /
+                // session / server is untouched. A no-op when nothing was opened
+                // pre-approval (the common case) or when the scope did not flip
+                // (a top-level Explore that already owned a worktree).
+                let bash_moved = self.bash_handles.rekey_scope(&old_scope, &new_scope).await;
+                let browser_moved = self
+                    .browser_sessions
+                    .rekey_scope(&old_scope, &new_scope)
+                    .await;
+                let tmux_moved = self.tmux_registry.rekey_scope(&old_scope, &new_scope).await;
+
+                // If anything migrated, nudge the work-scope bridge to
+                // re-broadcast `new_scope`'s inventory so the panel reflects the
+                // moved resources without waiting for its next poll. The bridge
+                // assembles the full (bash + tmux + browser) inventory from the
+                // affected scope, so a single emit on any registry sink covers
+                // all three kinds; bash is used as the carrier.
+                if bash_moved || browser_moved || tmux_moved {
+                    self.bash_handles.emit_lifecycle(&new_scope);
+                }
 
                 // Upgrade tool registry from Explore to Work mode so the agent
                 // gets bash, patch, etc. for the rest of this conversation.
@@ -4613,6 +4650,27 @@ mod approve_task_refreshes_mode_context_tests {
         let event_tx_dup = mpsc::channel::<Event>(1).0;
         let broadcaster = SseBroadcaster::new(128, 0);
 
+        // Seed a bash handle under the pre-approval conversation scope —
+        // the sub-agent-Explore shape keys resources under
+        // `WorkScope::Conversation(conv_id)`. After approval it must be
+        // reachable under the worktree scope (and gone from the old scope).
+        let bash_handles = Arc::new(crate::tools::BashHandleRegistry::new());
+        let old_scope = crate::work_scope::WorkScope::Conversation(conv_id.to_string());
+        {
+            use phoenix_tools::bash::handle::{Handle, HandleId};
+            use phoenix_tools::bash::ring::RING_BUFFER_BYTES;
+            let table = bash_handles.get_or_create(&old_scope).await;
+            table.write().await.insert(Handle::new_live(
+                old_scope.clone(),
+                HandleId::new("b-1"),
+                "echo pre-approval".to_string(),
+                None,
+                12345,
+                12345,
+                RING_BUFFER_BYTES,
+            ));
+        }
+
         let mut rt = ConversationRuntime::new(
             context,
             ConvState::AwaitingTaskApproval {
@@ -4625,7 +4683,7 @@ mod approve_task_refreshes_mode_context_tests {
             Arc::new(MockLlmClient::new("test-model")),
             Arc::new(MockToolExecutor::new()),
             Arc::new(BrowserSessionManager::default()),
-            Arc::new(crate::tools::BashHandleRegistry::new()),
+            bash_handles.clone(),
             Arc::new(crate::tools::TmuxRegistry::new()),
             Arc::new(ModelRegistry::new_empty()),
             crate::terminal::ActiveTerminals::new(),
@@ -4675,6 +4733,30 @@ mod approve_task_refreshes_mode_context_tests {
             rt.context.work_scope_worktree.as_deref(),
             Some(explore_wt.as_path()),
             "work_scope_worktree must be refreshed to the post-approval Work worktree"
+        );
+
+        // The pre-approval bash handle, opened under the conversation scope,
+        // must follow the scope flip: reachable under the new worktree scope
+        // and gone from the old conversation scope. Without the rekey it would
+        // be orphaned — invisible to the inventory and reapable by the idle
+        // reaper as an abandoned conversation scope.
+        let new_scope =
+            crate::work_scope::WorkScope::Worktree(explore_wt.to_string_lossy().into_owned());
+        assert!(
+            bash_handles.get_existing(&old_scope).await.is_none(),
+            "old conversation scope must be empty after approval rekey"
+        );
+        let migrated = bash_handles
+            .get_existing(&new_scope)
+            .await
+            .expect("bash handle table must be reachable under the new worktree scope");
+        assert!(
+            migrated
+                .read()
+                .await
+                .get(&phoenix_tools::bash::handle::HandleId::new("b-1"))
+                .is_some(),
+            "the pre-approval handle must be present under the worktree scope"
         );
     }
 }

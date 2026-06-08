@@ -190,6 +190,16 @@ rule ContinuationReusesSession {
 -- reads non-terminal, and excluding it is what makes this rule reachable when
 -- it is the last live owner. Preservation is the complementary case — see
 -- CascadePreservesOnScopeMatch below.
+--
+-- The inheritor-scope derivation reads the persisted conversation rows. When
+-- the DB is unreadable the live-owner question is unanswerable, so the
+-- orchestrator refuses the whole cascade and surfaces the error rather than
+-- proceeding from an assumed-live answer (which would skip every teardown
+-- while the row is archived/deleted, orphaning resources with no retry). The
+-- refusal precedes every side effect, so CleanupCascadeRunFor never fires in
+-- that case and both cascade rules below remain exact. This is the opposite
+-- of the idle reaper, which fails closed and preserves on an unreadable DB —
+-- there preserving is the safe error response, here it is the unsafe one.
 rule CascadeTearsDownWhenNoInheritor {
     when: CleanupCascadeRunFor(conversation, inheritor_scope)
 

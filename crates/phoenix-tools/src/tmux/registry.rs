@@ -543,6 +543,52 @@ impl TmuxRegistry {
         (entry, true)
     }
 
+    /// Move a `WorkScope`'s tmux server entry from `old` to `new`.
+    ///
+    /// Used at an Explore→Work approval, where the conversation's scope flips
+    /// from `WorkScope::Conversation(id)` to `WorkScope::Worktree(path)`: a tmux
+    /// server spawned pre-approval is stored under `old` and must follow the
+    /// scope so the inventory and cleanup cascade resolve it under `new`.
+    ///
+    /// Only the registry key and the entry's `work_scope` diagnostic field
+    /// move. The `socket_path` is left untouched — the running tmux server
+    /// lives on the socket derived from `old`, and the OS process is not
+    /// re-socketed. The cascade reads the stored `socket_path` (it does not
+    /// re-derive from the scope when an entry is present), so subsequent
+    /// kill/unlink still targets the correct socket.
+    ///
+    /// Returns `true` if an entry was moved. No-ops (returns `false`) when:
+    /// - `old == new` (nothing to do), or
+    /// - there is no entry under `old`, or
+    /// - `new` is already occupied — the pre-existing `new` entry is preserved
+    ///   and `old` is left in place (NOT clobbered), with a WARN. At approval
+    ///   `new` is a freshly created worktree scope, so occupancy is not
+    ///   expected.
+    pub async fn rekey_scope(&self, old: &WorkScope, new: &WorkScope) -> bool {
+        if old == new {
+            return false;
+        }
+        let old_key = old.stable_key();
+        let new_key = new.stable_key();
+        let mut map = self.inner.write().await;
+        if map.contains_key(&new_key) {
+            if map.contains_key(&old_key) {
+                tracing::warn!(
+                    old = %old,
+                    new = %new,
+                    "tmux: refusing to rekey server entry — destination scope already occupied; leaving both entries in place"
+                );
+            }
+            return false;
+        }
+        let Some(entry) = map.remove(&old_key) else {
+            return false;
+        };
+        entry.write().await.work_scope = new.clone();
+        map.insert(new_key, entry);
+        true
+    }
+
     /// Look up a `WorkScope`'s tmux server entry **without creating one or
     /// probing the socket**.
     ///
@@ -1179,6 +1225,84 @@ mod tests {
             reg.config_path(),
             std::path::PathBuf::from("/tmp/x/_phoenix.tmux.conf")
         );
+    }
+
+    /// Approval scope-flip: a server entry created under the conversation
+    /// scope is reachable under the worktree scope after a rekey, the old key
+    /// is gone, and the stored `socket_path` is PRESERVED (the running tmux
+    /// server lives on the old socket — re-deriving from the new scope would
+    /// orphan it). The `work_scope` diagnostic field follows the new scope.
+    #[tokio::test]
+    async fn rekey_scope_moves_entry_and_preserves_socket_path() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let old = WorkScope::Conversation("conv-explore".to_string());
+        let new = WorkScope::Worktree("/tmp/wt-approved".to_string());
+        let conv_sock = socket_path_for(tmp.path(), "conv-explore");
+        let (before, _) = reg.get_or_insert(&old, conv_sock.clone()).await;
+
+        assert!(
+            reg.rekey_scope(&old, &new).await,
+            "rekey must report a move"
+        );
+
+        assert!(
+            reg.get_existing(&old).await.is_none(),
+            "old key must be gone"
+        );
+        let after = reg
+            .get_existing(&new)
+            .await
+            .expect("entry must be reachable under the new scope");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "rekey must move the Arc, not clone"
+        );
+        let server = after.read().await;
+        assert_eq!(
+            server.socket_path, conv_sock,
+            "socket_path must be preserved — the running server is on the old socket"
+        );
+        assert_eq!(
+            server.work_scope, new,
+            "work_scope diagnostic must follow the new scope"
+        );
+    }
+
+    #[tokio::test]
+    async fn rekey_scope_no_entry_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let old = WorkScope::Conversation("never".to_string());
+        let new = WorkScope::Worktree("/tmp/wt".to_string());
+        assert!(!reg.rekey_scope(&old, &new).await);
+        assert!(reg.get_existing(&new).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn rekey_scope_occupied_destination_does_not_clobber() {
+        let tmp = TempDir::new().unwrap();
+        let reg = TmuxRegistry::with_socket_dir_and_binary(tmp.path().to_path_buf(), false);
+        let old = WorkScope::Conversation("conv".to_string());
+        let new = WorkScope::Worktree("/tmp/wt".to_string());
+        let (old_arc, _) = reg
+            .get_or_insert(&old, socket_path_for(tmp.path(), "conv"))
+            .await;
+        let (new_arc, _) = reg
+            .get_or_insert(
+                &new,
+                socket_path_for_worktree(tmp.path(), Path::new("/tmp/wt")),
+            )
+            .await;
+
+        assert!(
+            !reg.rekey_scope(&old, &new).await,
+            "occupied dest must not move"
+        );
+        let old_after = reg.get_existing(&old).await.expect("old entry preserved");
+        let new_after = reg.get_existing(&new).await.expect("new entry preserved");
+        assert!(Arc::ptr_eq(&old_arc, &old_after));
+        assert!(Arc::ptr_eq(&new_arc, &new_after));
     }
 
     #[tokio::test]

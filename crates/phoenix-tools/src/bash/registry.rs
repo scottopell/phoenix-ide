@@ -307,6 +307,43 @@ impl BashHandleRegistry {
         entry
     }
 
+    /// Move a `WorkScope`'s handle table from `old` to `new`.
+    ///
+    /// Used at an Explore→Work approval, where the conversation's scope flips
+    /// from `WorkScope::Conversation(id)` to `WorkScope::Worktree(path)`: bash
+    /// handles opened pre-approval are stored under `old` and must follow the
+    /// scope so the inventory and idle/cleanup paths resolve them under `new`.
+    /// The underlying processes are untouched — only the lookup key moves.
+    ///
+    /// Returns `true` if an entry was moved. No-ops (returns `false`) when:
+    /// - `old == new` (nothing to do), or
+    /// - there is no entry under `old`, or
+    /// - `new` is already occupied — in that case the pre-existing `new` entry
+    ///   is preserved and the `old` entry is left in place (NOT clobbered), and
+    ///   the collision is logged at WARN. At approval `new` is a freshly created
+    ///   worktree scope, so occupancy is not expected.
+    pub async fn rekey_scope(&self, old: &WorkScope, new: &WorkScope) -> bool {
+        if old == new {
+            return false;
+        }
+        let mut map = self.inner.write().await;
+        if map.contains_key(new) {
+            if map.contains_key(old) {
+                tracing::warn!(
+                    old = %old,
+                    new = %new,
+                    "bash: refusing to rekey handle table — destination scope already occupied; leaving both entries in place"
+                );
+            }
+            return false;
+        }
+        let Some(entry) = map.remove(old) else {
+            return false;
+        };
+        map.insert(new.clone(), entry);
+        true
+    }
+
     /// Look up a `WorkScope`'s handle table **without creating one**.
     ///
     /// Read-only counterpart to [`Self::get_or_create`], for observability
@@ -648,6 +685,85 @@ mod tests {
         let conv = WorkScope::Conversation("/tmp/wt-shared".to_string());
         let c = registry.get_or_create(&conv).await;
         assert!(!Arc::ptr_eq(&a, &c));
+    }
+
+    /// Approval scope-flip: a handle table opened under the conversation
+    /// scope is reachable under the worktree scope after a rekey, and the old
+    /// scope is empty. The moved table is the SAME `Arc` (the live process is
+    /// untouched — only the lookup key changed).
+    #[tokio::test]
+    async fn rekey_scope_moves_table_from_conversation_to_worktree() {
+        let registry = BashHandleRegistry::new();
+        let old = WorkScope::Conversation("conv-explore".to_string());
+        let new = WorkScope::Worktree("/tmp/wt-approved".to_string());
+
+        let before = registry.get_or_create(&old).await;
+        {
+            let mut g = before.write().await;
+            g.insert(make_handle("conv-explore", "b-1", RING_BUFFER_BYTES));
+        }
+
+        assert!(
+            registry.rekey_scope(&old, &new).await,
+            "rekey must report a move"
+        );
+
+        // Old scope is now empty; new scope holds the same Arc and the handle.
+        assert!(registry.get_existing(&old).await.is_none());
+        let after = registry
+            .get_existing(&new)
+            .await
+            .expect("handle table must be reachable under the new scope");
+        assert!(
+            Arc::ptr_eq(&before, &after),
+            "rekey must move the Arc, not clone"
+        );
+        assert!(after.read().await.get(&HandleId::new("b-1")).is_some());
+    }
+
+    #[tokio::test]
+    async fn rekey_scope_no_entry_is_noop() {
+        let registry = BashHandleRegistry::new();
+        let old = WorkScope::Conversation("never".to_string());
+        let new = WorkScope::Worktree("/tmp/wt".to_string());
+        assert!(!registry.rekey_scope(&old, &new).await);
+        assert!(registry.get_existing(&new).await.is_none());
+    }
+
+    /// Occupied destination: the pre-existing `new` entry is preserved and the
+    /// `old` entry is left in place — neither is clobbered.
+    #[tokio::test]
+    async fn rekey_scope_occupied_destination_does_not_clobber() {
+        let registry = BashHandleRegistry::new();
+        let old = WorkScope::Conversation("conv".to_string());
+        let new = WorkScope::Worktree("/tmp/wt".to_string());
+        let old_table = registry.get_or_create(&old).await;
+        let new_table = registry.get_or_create(&new).await;
+
+        assert!(
+            !registry.rekey_scope(&old, &new).await,
+            "occupied dest must not move"
+        );
+
+        let old_after = registry
+            .get_existing(&old)
+            .await
+            .expect("old entry preserved");
+        let new_after = registry
+            .get_existing(&new)
+            .await
+            .expect("new entry preserved");
+        assert!(Arc::ptr_eq(&old_table, &old_after));
+        assert!(Arc::ptr_eq(&new_table, &new_after));
+    }
+
+    #[tokio::test]
+    async fn rekey_scope_same_scope_is_noop() {
+        let registry = BashHandleRegistry::new();
+        let s = WorkScope::Worktree("/tmp/wt".to_string());
+        let _ = registry.get_or_create(&s).await;
+        assert!(!registry.rekey_scope(&s, &s).await);
+        assert!(registry.get_existing(&s).await.is_some());
     }
 
     #[tokio::test]

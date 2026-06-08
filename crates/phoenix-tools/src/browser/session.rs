@@ -1032,6 +1032,48 @@ impl BrowserSessionManager {
         Ok(session_arc)
     }
 
+    /// Move a `work_scope`'s session from `old` to `new`.
+    ///
+    /// Used at an Explore→Work approval, where the conversation's scope flips
+    /// from `WorkScope::Conversation(id)` to `WorkScope::Worktree(path)`: a
+    /// Chrome session opened pre-approval is stored under `old` and must follow
+    /// the scope so the inventory and idle reaper resolve it under `new`. The
+    /// underlying Chrome process (and its on-disk profile dir, which is keyed by
+    /// the old `stable_key`) are untouched — only the in-memory lookup key and
+    /// the `ScopedSession::scope` tag move.
+    ///
+    /// Returns `true` if a session was moved. No-ops (returns `false`) when:
+    /// - `old == new` (nothing to do), or
+    /// - there is no session under `old`, or
+    /// - `new` is already occupied — the pre-existing `new` session is
+    ///   preserved and `old` is left in place (NOT clobbered), with a WARN.
+    ///   At approval `new` is a freshly created worktree scope, so occupancy is
+    ///   not expected.
+    pub async fn rekey_scope(&self, old: &WorkScope, new: &WorkScope) -> bool {
+        if old == new {
+            return false;
+        }
+        let old_key = old.stable_key();
+        let new_key = new.stable_key();
+        let mut sessions = self.sessions.write().await;
+        if sessions.contains_key(&new_key) {
+            if sessions.contains_key(&old_key) {
+                tracing::warn!(
+                    old = %old,
+                    new = %new,
+                    "browser: refusing to rekey session — destination scope already occupied; leaving both sessions in place"
+                );
+            }
+            return false;
+        }
+        let Some(mut entry) = sessions.remove(&old_key) else {
+            return false;
+        };
+        entry.scope = new.clone();
+        sessions.insert(new_key, entry);
+        true
+    }
+
     /// Get the session for a `work_scope` **without creating one**.
     ///
     /// Used by the live-view WS endpoint, which deliberately must not spawn
@@ -1279,6 +1321,28 @@ mod lifecycle_hook_tests {
             "kill_session on absent scope must not emit a lifecycle event"
         );
         assert!(!manager.is_active(&scope).await);
+    }
+
+    /// `rekey_scope` on a manager with no session for `old` is a no-op:
+    /// returns `false` and creates nothing under `new`. (The move and
+    /// occupied-destination branches share the same map-level logic as the
+    /// bash/tmux registries, which test those branches with constructible
+    /// entries; a real `BrowserSession` needs a live chromium, so it cannot be
+    /// staged here.)
+    #[tokio::test]
+    async fn rekey_scope_no_session_is_noop() {
+        let (manager, _rx) = install_sink();
+        let old = scope_conv("conv-explore");
+        let new = scope_wt("/tmp/wt-approved");
+        assert!(!manager.rekey_scope(&old, &new).await);
+        assert!(!manager.is_active(&new).await);
+    }
+
+    #[tokio::test]
+    async fn rekey_scope_same_scope_is_noop() {
+        let (manager, _rx) = install_sink();
+        let s = scope_wt("/tmp/wt");
+        assert!(!manager.rekey_scope(&s, &s).await);
     }
 
     /// `is_active` must reflect the underlying `HashMap`. We can't create a
