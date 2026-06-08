@@ -4,23 +4,25 @@
  * The core resource trio over a bash handle's process group, sampled at
  * request time.
  *
- * Each field is independently `Option`: a `null` is a real capability gap
- * (the metric could not be read on this platform/kernel, logged at `debug`),
- * distinct from a `0` sample. This is distinct from the parent
- * [`BashHandleInspection::resources`] being `None`, which means "no process
- * group to sample" (terminal handle).
+ * Each field is independently `Option` and serializes as an explicit `null`
+ * when unavailable: a `null` is a real capability gap (the metric could not be
+ * read on this platform/kernel, logged at `debug`), distinct from a `0`
+ * sample. Reporting an explicit `null` rather than omitting the field lets a
+ * client distinguish "measured a gap" from "field absent" (REQ-PINSP-004).
+ * This is distinct from the parent [`BashHandleInspection::resources`] being
+ * `None`, which means "no process group to sample" (terminal handle).
  */
 export type ResourceSample = { 
 /**
  * Summed CPU percentage over the process group; null if unavailable.
  */
-cpu_pct?: number, 
+cpu_pct: number | null, 
 /**
  * Proportional, shared-aware memory of the group in bytes — PSS on
  * Linux, `phys_footprint` on macOS, NOT RSS. Null if unavailable.
  */
-memory_bytes?: number, 
+memory_bytes: number | null, 
 /**
  * Count of live processes in the group; null if unavailable.
  */
-process_count?: number, };
+process_count: number | null, };

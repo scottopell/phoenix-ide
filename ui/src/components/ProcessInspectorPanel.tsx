@@ -28,6 +28,19 @@ import './ProcessInspectorPanel.css';
 /** Polling cadence while open on a live handle (REQ-PINSP-006). */
 const POLL_INTERVAL_MS = 1000;
 
+/** UI scrollback bound on accumulated output entries (REQ-PINSP-003): the
+ *  inspector appends every observed line, so a long-lived chatty handle would
+ *  otherwise grow this array without limit. We keep at most this many entries,
+ *  dropping the OLDEST as new snapshots arrive (a sliding window) so the
+ *  browser retains roughly what the backend ring does rather than unbounded
+ *  scrollback. This is a *client-side* retention cap, distinct from the ring's
+ *  `truncated_before` flag — that signals backend eviction; this caps what the
+ *  UI holds regardless. Gap markers count as entries too, so a flood of
+ *  truncation events can't accumulate unbounded either. The backend live ring
+ *  is 4 MB and its tombstone tail is ~2000 lines; a few thousand lines here is
+ *  a comparable order of magnitude. */
+const MAX_OUTPUT_ENTRIES = 5000;
+
 /** A rendered output entry: either a real ring line or a synthetic gap marker
  *  inserted when a poll reports `truncated_before` (output evicted between
  *  polls, REQ-PINSP-008). The marker is structurally distinct from a line so it
@@ -138,9 +151,17 @@ function useHandleInspection(scopeKey: string, handleId: string) {
   // interval issue a second overlapping fetch (reintroducing the duplicate /
   // cursor-regression race the gate prevents).
   const generationRef = useRef(0);
+  // Whether a snapshot has ever landed for the current target. Read by
+  // `applyError` to distinguish a failed seed (no snapshot yet → recoverable
+  // `loading-failed`, retried on the interval) from a failed poll after a good
+  // seed (→ `stale`). Held in a ref so the error path sees the freshest value
+  // without depending on the `snapshot` state in a stale closure. Reset by the
+  // seed effect on target change.
+  const hasSnapshotRef = useRef(false);
 
   const applyResponse = useCallback((insp: BashHandleInspection) => {
     setStatus('ok');
+    hasSnapshotRef.current = true;
     setSnapshot(insp);
     if (isTerminal(insp.state)) terminalRef.current = true;
 
@@ -159,20 +180,29 @@ function useHandleInspection(scopeKey: string, handleId: string) {
     }
     sinceRef.current = window.end_offset;
     if (newEntries.length > 0) {
-      setEntries((prev) => (prev.length === 0 ? newEntries : [...prev, ...newEntries]));
+      setEntries((prev) => {
+        const merged = prev.length === 0 ? newEntries : [...prev, ...newEntries];
+        // Sliding-window scrollback cap: keep only the newest MAX_OUTPUT_ENTRIES,
+        // dropping from the front. Autoscroll follows the tail, so trimming the
+        // head is invisible to a following viewer.
+        return merged.length > MAX_OUTPUT_ENTRIES
+          ? merged.slice(merged.length - MAX_OUTPUT_ENTRIES)
+          : merged;
+      });
     }
   }, []);
 
   // Translate a rejected fetch into a status. A 404 is definitive: the handle
   // is gone, so stop polling. Any other failure is treated as transient — the
   // last-known snapshot (if any) is retained and marked stale; with no snapshot
-  // yet the seed itself failed.
-  const applyError = useCallback((err: unknown, hadSnapshot: boolean) => {
+  // yet the seed itself failed (`loading-failed`), which the recurring effect
+  // keeps retrying until it succeeds or hits a 404.
+  const applyError = useCallback((err: unknown) => {
     if (err instanceof NotFoundError) {
       terminalRef.current = true;
       setStatus('gone');
     } else {
-      setStatus(hadSnapshot ? 'stale' : 'loading-failed');
+      setStatus(hasSnapshotRef.current ? 'stale' : 'loading-failed');
     }
   }, []);
 
@@ -183,6 +213,7 @@ function useHandleInspection(scopeKey: string, handleId: string) {
     terminalRef.current = false;
     gapIdRef.current = 0;
     inFlightRef.current = false;
+    hasSnapshotRef.current = false;
     // New target → new generation. Any poll still pending for the prior target
     // now owns a stale token and will skip clearing the gate when it resolves.
     generationRef.current += 1;
@@ -196,7 +227,7 @@ function useHandleInspection(scopeKey: string, handleId: string) {
         if (!cancelled) applyResponse(insp);
       })
       .catch((err: unknown) => {
-        if (!cancelled) applyError(err, false);
+        if (!cancelled) applyError(err);
       });
 
     return () => {
@@ -204,11 +235,22 @@ function useHandleInspection(scopeKey: string, handleId: string) {
     };
   }, [scopeKey, handleId, applyResponse, applyError]);
 
-  // Poll loop: ~1s while open and not terminal. Self-limiting — the interval is
-  // cleared on unmount, on handle change, and once the handle goes terminal.
-  // Gating on `snapshot` (re)starts it after the seed lands and lets the
-  // terminal check below short-circuit it.
-  const polling = snapshot != null && !isTerminal(snapshot.state);
+  // Recurring fetch loop: ~1s while open and not terminal. Self-limiting — the
+  // interval is cleared on unmount, on handle change, and once the handle goes
+  // terminal (`terminalRef`). It runs in two modes off the same interval:
+  //   - a successful seed has landed → poll with `since = sinceRef.current`
+  //     (the advancing cursor), appending new lines;
+  //   - the seed FAILED transiently (`loading-failed`, no snapshot, so
+  //     `sinceRef.current` is still `undefined`) → retry the seed with no
+  //     `since` until it succeeds or hits a definitive 404 (`gone` → terminal,
+  //     loop stops). Without this a one-off seed blip would wedge the panel on
+  //     "inspection failed to load" until remount.
+  // The in-flight gate + generation token are shared across both modes, so a
+  // seed retry can't overlap an outstanding fetch or leak across a target
+  // switch.
+  const polling =
+    (snapshot != null && !isTerminal(snapshot.state)) ||
+    (snapshot == null && status === 'loading-failed');
   useEffect(() => {
     if (!polling) return;
     let cancelled = false;
@@ -225,7 +267,7 @@ function useHandleInspection(scopeKey: string, handleId: string) {
           if (!cancelled) applyResponse(insp);
         })
         .catch((err: unknown) => {
-          if (!cancelled) applyError(err, true);
+          if (!cancelled) applyError(err);
         })
         .finally(() => {
           if (generation === generationRef.current) inFlightRef.current = false;

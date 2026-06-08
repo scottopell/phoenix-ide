@@ -77,26 +77,22 @@ pub struct BashHandleInspection {
 /// The core resource trio over a bash handle's process group, sampled at
 /// request time.
 ///
-/// Each field is independently `Option`: a `null` is a real capability gap
-/// (the metric could not be read on this platform/kernel, logged at `debug`),
-/// distinct from a `0` sample. This is distinct from the parent
-/// [`BashHandleInspection::resources`] being `None`, which means "no process
-/// group to sample" (terminal handle).
+/// Each field is independently `Option` and serializes as an explicit `null`
+/// when unavailable: a `null` is a real capability gap (the metric could not be
+/// read on this platform/kernel, logged at `debug`), distinct from a `0`
+/// sample. Reporting an explicit `null` rather than omitting the field lets a
+/// client distinguish "measured a gap" from "field absent" (REQ-PINSP-004).
+/// This is distinct from the parent [`BashHandleInspection::resources`] being
+/// `None`, which means "no process group to sample" (terminal handle).
 #[derive(Debug, Clone, Serialize, TS)]
 #[ts(export, export_to = "../../../ui/src/generated/")]
 pub struct ResourceSample {
     /// Summed CPU percentage over the process group; null if unavailable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub cpu_pct: Option<f32>,
     /// Proportional, shared-aware memory of the group in bytes — PSS on
     /// Linux, `phys_footprint` on macOS, NOT RSS. Null if unavailable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub memory_bytes: Option<u64>,
     /// Count of live processes in the group; null if unavailable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    #[ts(optional)]
     pub process_count: Option<u32>,
 }
 
@@ -172,7 +168,7 @@ mod tests {
     }
 
     #[test]
-    fn resource_sample_nulls_skip_on_the_wire() {
+    fn resource_sample_unavailable_metrics_serialize_as_explicit_null() {
         let sample = ResourceSample {
             cpu_pct: None,
             memory_bytes: Some(2048),
@@ -180,7 +176,7 @@ mod tests {
         };
         let v = serde_json::to_value(&sample).unwrap();
         assert_eq!(v["memory_bytes"], 2048);
-        assert!(v.get("cpu_pct").is_none());
-        assert!(v.get("process_count").is_none());
+        assert_eq!(v["cpu_pct"], serde_json::Value::Null);
+        assert_eq!(v["process_count"], serde_json::Value::Null);
     }
 }

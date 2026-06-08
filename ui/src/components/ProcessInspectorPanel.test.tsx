@@ -175,11 +175,56 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     expect(getInsp).toHaveBeenCalledTimes(1);
   });
 
+  it('caps accumulated entries at the scrollback bound, dropping the oldest while keeping the newest', async () => {
+    const CAP = 5000;
+    // Seed with one line, then drive enough polls that the running total of
+    // appended lines exceeds the UI cap.
+    getInsp.mockResolvedValueOnce(
+      snap({ output: { start_offset: 0, end_offset: 1, truncated_before: false, lines: lines([0, 'line-0']) } }),
+    );
+
+    await renderPanel();
+    expect(screen.getByText('line-0')).toBeTruthy();
+
+    // Each poll appends a batch of lines. Total appended (seed + polls) climbs
+    // well past CAP so the front must be trimmed.
+    const BATCH = 1000;
+    const POLLS = 7; // 1 (seed) + 7*1000 = 7001 lines total observed
+    let offset = 1;
+    for (let p = 0; p < POLLS; p++) {
+      const batch: [number, string][] = [];
+      for (let i = 0; i < BATCH; i++) {
+        batch.push([offset, `line-${offset}`]);
+        offset++;
+      }
+      getInsp.mockResolvedValueOnce(
+        snap({ output: { start_offset: offset - BATCH, end_offset: offset, truncated_before: false, lines: lines(...batch) } }),
+      );
+      await act(async () => {
+        vi.advanceTimersByTime(1000);
+        await Promise.resolve();
+      });
+    }
+
+    const total = 1 + POLLS * BATCH; // 7001
+    const newest = total - 1; // last offset observed
+    // The newest line is retained…
+    expect(screen.getByText(`line-${newest}`)).toBeTruthy();
+    // …the line exactly at the cap boundary (the oldest survivor) is retained…
+    expect(screen.getByText(`line-${total - CAP}`)).toBeTruthy();
+    // …and lines older than the cap window are dropped.
+    expect(screen.queryByText('line-0')).toBeNull();
+    expect(screen.queryByText(`line-${total - CAP - 1}`)).toBeNull();
+    // Exactly CAP line rows remain.
+    const rendered = document.querySelectorAll('.pinsp-output-line:not(.pinsp-output-line--partial)');
+    expect(rendered.length).toBe(CAP);
+  });
+
   it('renders null resource metrics as unavailable, not zero', async () => {
     getInsp.mockResolvedValueOnce(
-      // memory/process are absent (the wire null/skip → capability gap); cpu is
-      // present. The readout must show `—` for the gaps, not `0`.
-      snap({ resources: { cpu_pct: 12.5 } }),
+      // memory/process are null on the wire (capability gap); cpu is present.
+      // The readout must show `—` for the gaps, not `0`.
+      snap({ resources: { cpu_pct: 12.5, memory_bytes: null, process_count: null } }),
     );
 
     await renderPanel();
@@ -450,5 +495,49 @@ describe('ProcessInspectorPanel — poll failure surfacing', () => {
     await renderPanel();
     expect(screen.getByText('inspection failed to load')).toBeTruthy();
     expect(screen.queryByTestId('process-inspector-panel')).toBeTruthy();
+  });
+
+  it('retries a transient seed failure on the next interval and recovers to a normal snapshot', async () => {
+    // First seed fails transiently (non-404), so no snapshot lands.
+    getInsp
+      .mockRejectedValueOnce(new Error('seed blip'))
+      // The retry on the next interval succeeds.
+      .mockResolvedValueOnce(
+        snap({ output: { start_offset: 0, end_offset: 1, truncated_before: false, lines: lines([0, 'seeded after retry']) } }),
+      );
+
+    await renderPanel();
+    // The seed-failed empty state is shown, and only the seed fetch has run.
+    expect(screen.getByText('inspection failed to load')).toBeTruthy();
+    expect(getInsp).toHaveBeenCalledTimes(1);
+
+    // The recurring effect retries the seed on the interval — with no `since`,
+    // since the cursor never advanced past the failed seed.
+    await act(async () => {
+      vi.advanceTimersByTime(1000);
+      await Promise.resolve();
+    });
+    expect(getInsp).toHaveBeenCalledTimes(2);
+    // The retry carries no advanced cursor (the failed seed never set one).
+    expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', undefined);
+
+    // Recovered: the empty error state is gone and the snapshot's output renders.
+    expect(screen.queryByText('inspection failed to load')).toBeNull();
+    expect(screen.getByText('seeded after retry')).toBeTruthy();
+  });
+
+  it('does NOT retry when the first seed 404s — it stops on the definitive gone state', async () => {
+    getInsp.mockRejectedValueOnce(new NotFoundError('Bash handle no longer exists'));
+
+    await renderPanel();
+    expect(screen.getByText(/handle no longer exists/)).toBeTruthy();
+    expect(getInsp).toHaveBeenCalledTimes(1);
+
+    // A 404 seed is terminal: no retry fires on subsequent intervals.
+    await act(async () => {
+      vi.advanceTimersByTime(5000);
+      await Promise.resolve();
+    });
+    expect(getInsp).toHaveBeenCalledTimes(1);
   });
 });
