@@ -4953,6 +4953,8 @@ mod hard_delete_cascade_tests {
         ));
         let terminals = runtime.terminals.clone();
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
+        let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
         AppState {
             runtime,
             llm_registry,
@@ -4963,6 +4965,7 @@ mod hard_delete_cascade_tests {
             password: None,
             terminals,
             chain_qa,
+            message_retriever,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
         }
@@ -6726,6 +6729,8 @@ mod upgrade_model_state_guard_tests {
         ));
         let terminals = runtime.terminals.clone();
         let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
+        let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
         AppState {
             runtime,
             llm_registry,
@@ -6736,6 +6741,7 @@ mod upgrade_model_state_guard_tests {
             password: None,
             terminals,
             chain_qa,
+            message_retriever,
             codex_login: super::super::codex_login::CodexLoginManager::new(),
             deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
         }

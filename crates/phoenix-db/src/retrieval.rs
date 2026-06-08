@@ -133,19 +133,18 @@ impl Fts5Retriever {
     /// # Errors
     /// Returns [`RetrievalError`] if any underlying query fails.
     pub async fn reconcile(&self) -> Result<ReconcileStats, RetrievalError> {
-        let mut existing: HashMap<String, String> = sqlx::query(
-            "SELECT message_id, content_hash FROM message_fts",
-        )
-        .try_map(|row: sqlx::sqlite::SqliteRow| {
-            Ok((
-                row.try_get::<String, _>("message_id")?,
-                row.try_get::<String, _>("content_hash")?,
-            ))
-        })
-        .fetch_all(&self.pool)
-        .await?
-        .into_iter()
-        .collect();
+        let mut existing: HashMap<String, String> =
+            sqlx::query("SELECT message_id, content_hash FROM message_fts")
+                .try_map(|row: sqlx::sqlite::SqliteRow| {
+                    Ok((
+                        row.try_get::<String, _>("message_id")?,
+                        row.try_get::<String, _>("content_hash")?,
+                    ))
+                })
+                .fetch_all(&self.pool)
+                .await?
+                .into_iter()
+                .collect();
 
         let messages = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at FROM messages",
@@ -488,9 +487,15 @@ mod tests {
     #[tokio::test]
     async fn prunes_index_on_conversation_delete() {
         let db = seed().await;
-        db.add_message("m1", "c-a", &MessageContent::user("zebra crossing"), None, None)
-            .await
-            .unwrap();
+        db.add_message(
+            "m1",
+            "c-a",
+            &MessageContent::user("zebra crossing"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let r = Fts5Retriever::new(db.pool().clone());
         assert_eq!(
             r.retrieve("zebra", RetrievalScope::Global, 10)
@@ -511,9 +516,15 @@ mod tests {
     #[tokio::test]
     async fn reconcile_backfills_and_prunes() {
         let db = seed().await;
-        db.add_message("m1", "c-a", &MessageContent::user("orange marmalade"), None, None)
-            .await
-            .unwrap();
+        db.add_message(
+            "m1",
+            "c-a",
+            &MessageContent::user("orange marmalade"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let r = Fts5Retriever::new(db.pool().clone());
 
         // Simulate a stale index: wipe it, plus inject an orphan row.

@@ -12,8 +12,7 @@ use phoenix_core::domain::db_schema as schema;
 
 pub use migrations::run_pending_migrations;
 pub use retrieval::{
-    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalScope,
-    RetrievedChunk,
+    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalScope, RetrievedChunk,
 };
 pub use schema::*;
 
