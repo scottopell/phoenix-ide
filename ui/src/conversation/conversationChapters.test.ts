@@ -90,6 +90,7 @@ function systemUnit(id: string): HistoricalUnit {
 function pendingUserUnit(localId: string, text: string): HistoricalUnit {
   const q: QueuedMessage = {
     localId,
+    conversationId: 'conv-1',
     text,
     images: [],
     timestamp: 0,
