@@ -21,8 +21,8 @@ use crate::db::{
     MessageContent, MessageType, NonEmptyString, UserContent,
 };
 use crate::git_ops::{
-    create_worktree, ensure_gitignore_has_phoenix, ensure_local_exclude_has_phoenix,
-    find_branch_in_worktree_list, materialize_branch, run_git, GitOpError, PhoenixIgnoreStrategy,
+    create_worktree, ensure_local_exclude_has_phoenix, find_branch_in_worktree_list,
+    materialize_branch, run_git, GitOpError, PhoenixIgnoreStrategy,
 };
 use crate::runtime::executor::{promote_task_status_to_in_progress, TASK_APPROVAL_MUTEX};
 use crate::runtime::RuntimeManager;
@@ -290,6 +290,100 @@ async fn handle_cleanup_on_hard_delete(db: &crate::db::Database, origin_id: &str
             conv_id = %origin_id,
             error = %e,
             "fork orphan cleanup on delete: failed to dismiss pending proposals"
+        );
+    }
+}
+
+/// Startup reconciliation (REQ-PROJ-035): retire every still-`pending` fork
+/// proposal whose origin conversation is already terminal. A crash AFTER the
+/// origin was marked terminal but BEFORE `retire_fork_proposals_for_terminal_origin`
+/// ran leaves the proposal `pending` across restart — so approve/request-changes
+/// return 409 (origin terminal) forever while `GET /proposals` still reports it
+/// `pending`, stranding a Review action that can never spawn/promote. This sweep
+/// converges each such row to `dismissed` and cleans its deterministic orphans.
+///
+/// Runs at startup, before the fork-resolution consumer exists, so there is no
+/// concurrent approve to serialise against — a direct DB dismiss + orphan clean
+/// is sufficient. Best-effort: a failure to list / clean / dismiss is logged at
+/// WARN and never blocks startup. Proposals whose origin is still live are left
+/// pending (the live Review path). Resolved (`spawned`/`promoted`/`dismissed`)
+/// proposals are excluded by the `pending`-only query, so a live decoupled
+/// child's deterministic path is never touched.
+pub(crate) async fn reconcile_terminal_origin_fork_proposals(db: &crate::db::Database) {
+    let pending = match db.list_pending_fork_proposals().await {
+        Ok(proposals) => proposals,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "fork startup reconciliation: failed to list pending proposals; stale rows may linger"
+            );
+            return;
+        }
+    };
+    if pending.is_empty() {
+        return;
+    }
+
+    // Group by origin so each terminal origin is retired once (clean its
+    // deterministic orphans, then dismiss all its pending rows in one update).
+    let mut by_origin: std::collections::HashMap<String, Vec<ForkProposal>> =
+        std::collections::HashMap::new();
+    for proposal in pending {
+        by_origin
+            .entry(proposal.origin_conversation_id.clone())
+            .or_default()
+            .push(proposal);
+    }
+
+    let mut retired_origins = 0usize;
+    for (origin_id, proposals) in by_origin {
+        // Re-read the origin's authoritative state. A missing origin row (a
+        // racing/partial delete) is treated as terminal: its proposals can
+        // never resolve, so retiring them is correct and matches the cascade.
+        let is_terminal = match db.get_conversation(&origin_id).await {
+            Ok(conv) => conv.state.is_terminal(),
+            Err(e) => {
+                tracing::warn!(
+                    conv_id = %origin_id,
+                    error = %e,
+                    "fork startup reconciliation: origin conversation unreadable; treating as terminal and retiring its pending proposals"
+                );
+                true
+            }
+        };
+        if !is_terminal {
+            continue;
+        }
+
+        let repo_root = fork_origin_repo_root(db, &origin_id).await;
+        let _ = tokio::task::spawn_blocking(move || {
+            let _guard = TASK_APPROVAL_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for proposal in &proposals {
+                clean_deterministic_fork_orphans(repo_root.as_deref(), proposal);
+            }
+        })
+        .await;
+
+        if let Err(e) = db
+            .retire_pending_fork_proposals_for_origin(&origin_id)
+            .await
+        {
+            tracing::warn!(
+                conv_id = %origin_id,
+                error = %e,
+                "fork startup reconciliation: failed to dismiss pending proposals"
+            );
+        } else {
+            retired_origins += 1;
+        }
+    }
+
+    if retired_origins > 0 {
+        tracing::info!(
+            origins = retired_origins,
+            "Retired stale pending fork proposals whose origin is terminal"
         );
     }
 }
@@ -870,6 +964,37 @@ impl RuntimeManager {
             .map_err(|e| ForkResolveError::Internal(e.to_string()))
     }
 
+    /// Retire a still-`pending` proposal whose origin has gone terminal: clean
+    /// its deterministic spawn/promote orphans, then dismiss it. Called from the
+    /// approve/request-changes path (already inside the single fork-resolution
+    /// consumer, so this is serialized), so a user's retry converges a row left
+    /// `pending` by a crash between the origin going terminal and
+    /// `retire_fork_proposals_for_terminal_origin` running. Best-effort: a clean
+    /// or dismiss failure is logged at WARN and never masks the returned conflict.
+    /// A guard skips already-resolved proposals so a live decoupled child's
+    /// deterministic path is never touched.
+    async fn retire_terminal_origin_proposal(&self, proposal: &ForkProposal) {
+        if proposal.status != ForkProposalStatus::Pending {
+            return;
+        }
+        let repo_root = fork_origin_repo_root(&self.db, &proposal.origin_conversation_id).await;
+        let proposal_for_git = proposal.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _guard = TASK_APPROVAL_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            clean_deterministic_fork_orphans(repo_root.as_deref(), &proposal_for_git);
+        })
+        .await;
+        if let Err(e) = self.db.dismiss_fork_proposal(&proposal.id).await {
+            tracing::warn!(
+                proposal_id = %proposal.id,
+                error = %e,
+                "terminal-origin retire: failed to dismiss stale pending proposal"
+            );
+        }
+    }
+
     /// Load a proposal and validate the shared resolve preconditions: it exists,
     /// is `pending`, its origin is not terminal and is in a writing mode, and its
     /// project has a repo root + `main_ref`. Returns `(proposal, repo_root, base)`.
@@ -900,6 +1025,14 @@ impl RuntimeManager {
         // Origin must be live (is_terminal covers terminal, context-exhausted,
         // handed-off) — a stale proposal can't spawn after the origin ended.
         if origin.state.is_terminal() {
+            // Converge the stale row instead of only 409-ing forever: retire the
+            // proposal (dismiss + clean its deterministic orphans) under the fork
+            // actor's serialization, so a user's retry self-heals a pending row
+            // left behind by a crash between the origin going terminal and
+            // `retire_fork_proposals_for_terminal_origin` running. We still return
+            // the conflict — this resolve cannot spawn/promote — but the proposal
+            // is now `dismissed`, so `GET /proposals` stops offering a dead Review.
+            self.retire_terminal_origin_proposal(&proposal).await;
             return Err(ForkResolveError::Conflict(
                 "the originating conversation has reached a terminal state — \
                  its fork proposals can no longer be resolved"
@@ -1194,7 +1327,12 @@ fn prepare_promote_blocking(
     let draft_rel = format!("{tasks_dir_rel}/{id_prefix}-{stem}.md");
     write_body_to_worktree(&worktree_path, &draft_rel, &proposal.body)?;
 
-    ensure_gitignore_has_phoenix(&worktree_path).map_err(ForkResolveError::Internal)?;
+    // Do NOT stage/append `.gitignore` here. The worktree was created with
+    // LocalExclude, and a linked worktree shares the main repo's
+    // `.git/info/exclude` (common dir), so `.phoenix/` is already ignored without
+    // staging anything. The refinement must start with ONLY the drafted brief as
+    // uncommitted work — a staged `.gitignore` edit would be swept into the task
+    // branch by a later Explore approval (which commits everything staged).
     // Nothing is committed — the draft sits uncommitted on the temp branch for
     // the Explore agent to revise (REQ-PROJ-037).
 
@@ -2106,6 +2244,68 @@ mod tests {
         assert_eq!(db.get_messages(&origin).await.unwrap().len(), 0);
     }
 
+    /// F3: the Request-Changes refinement worktree must start with ONLY the
+    /// drafted brief as uncommitted work. In a repo whose tracked `.gitignore`
+    /// lacks `.phoenix/`, the promote must NOT append/stage `.gitignore` inside
+    /// the refinement worktree (the worktree shares the main repo's local exclude,
+    /// so `.phoenix/` is already ignored). Otherwise a later Explore approval would
+    /// sweep an unrelated `.gitignore` edit onto the task branch.
+    #[tokio::test]
+    async fn request_changes_draft_is_only_change_gitignore_untouched() {
+        let (_tmp, repo) = init_repo();
+        // The origin checkout's tracked `.gitignore` exists but lacks `.phoenix/`.
+        std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
+        git(&repo, &["add", ".gitignore"]);
+        git(
+            &repo,
+            &["commit", "-q", "-m", "add gitignore without .phoenix"],
+        );
+
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(&db, &origin, "docs/plan.md", "# Plan\n\nbody\n").await;
+        let rt = make_runtime(db.clone()).await;
+
+        let refinement_id = rt
+            .request_changes_on_fork_proposal(&pid, "shorten".to_string())
+            .await
+            .unwrap();
+
+        let wt = repo.join(".phoenix/worktrees").join(&refinement_id);
+        let prefix: String = refinement_id.chars().take(8).collect();
+        let draft_rel = format!("tasks/{prefix}-plan.md");
+
+        // The brief draft is the ONLY working-tree change.
+        let status = git(&wt, &["status", "--porcelain"]);
+        let changed: Vec<&str> = status.lines().collect();
+        assert_eq!(
+            changed.len(),
+            1,
+            "exactly one working-tree change (the draft) expected: {status:?}"
+        );
+        assert!(
+            changed[0].contains(&draft_rel),
+            "the single change must be the brief draft: {status:?}"
+        );
+
+        // `.gitignore` is neither modified nor staged in the refinement worktree.
+        assert!(
+            !status.contains(".gitignore"),
+            "the refinement must not modify/stage .gitignore: {status:?}"
+        );
+        assert_eq!(
+            git(&wt, &["diff", "--cached", "--name-only"]),
+            "",
+            "nothing may be staged in the refinement worktree"
+        );
+        // `.phoenix/` is still ignored (via the shared local exclude), so the
+        // worktree's own `.phoenix` admin/dir never surfaces as untracked.
+        assert!(
+            !status.contains(".phoenix"),
+            ".phoenix/ must remain ignored in the refinement worktree: {status:?}"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_and_promote_namespaces_are_disjoint() {
         let pid = "deadbeef-0000-0000-0000-000000000000";
@@ -2384,6 +2584,87 @@ mod tests {
         assert!(
             !repo.join(".phoenix/worktrees").join(&fork_id).exists(),
             "no fork may be spawned from a proposal whose origin is being deleted"
+        );
+    }
+
+    /// F1 (retry-converges): approving a pending proposal whose origin has gone
+    /// terminal returns a 409 BUT also retires the proposal — dismiss + clean its
+    /// deterministic orphan — so a user's retry self-heals the stale `pending` row
+    /// instead of 409-ing forever while `GET /proposals` still shows a Review.
+    #[tokio::test]
+    async fn approve_on_terminal_origin_retires_proposal_and_conflicts() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
+        // A crashed approve left a deterministic spawn orphan for this proposal.
+        let orphan_id =
+            make_deterministic_orphan(&repo, &pid, ResolutionKind::Spawn, "task-12345-x");
+        let orphan_wt = repo.join(".phoenix/worktrees").join(&orphan_id);
+        assert!(orphan_wt.is_dir());
+        // Origin reached terminal, but its proposals were never retired (crash).
+        db.update_conversation_state(&origin, &ConvState::Terminal)
+            .await
+            .unwrap();
+        let rt = make_runtime(db.clone()).await;
+
+        let err = rt.approve_fork_proposal(&pid).await.unwrap_err();
+        assert!(matches!(err, ForkResolveError::Conflict(_)), "got {err:?}");
+
+        // The stale row converged to dismissed and its orphan was cleaned.
+        let after = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            ForkProposalStatus::Dismissed,
+            "retry against a terminal origin must converge the pending row to dismissed"
+        );
+        assert!(
+            !orphan_wt.exists(),
+            "terminal-origin retire must clean the crashed-approve orphan"
+        );
+    }
+
+    /// F1 (startup self-heal): a pure crash — origin went terminal, proposals
+    /// never retired, user never retries — is reconciled on restart. The startup
+    /// pass dismisses each pending proposal bound to a terminal origin and cleans
+    /// its deterministic orphan; a still-live origin's proposal is left pending.
+    #[tokio::test]
+    async fn startup_reconcile_retires_pending_against_terminal_origin_only() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+
+        // Origin A is terminal with a stranded pending proposal + crashed orphan.
+        let (_pa, origin_a) = seed_project_and_origin(&db, &repo).await;
+        let pid_a = insert_pending(&db, &origin_a, "tasks/12345-p1-ready--a.md", "# a\n").await;
+        let orphan_a =
+            make_deterministic_orphan(&repo, &pid_a, ResolutionKind::Spawn, "task-12345-a");
+        let orphan_a_wt = repo.join(".phoenix/worktrees").join(&orphan_a);
+        assert!(orphan_a_wt.is_dir());
+        db.update_conversation_state(&origin_a, &ConvState::Terminal)
+            .await
+            .unwrap();
+
+        // Origin B is still live with a pending proposal — must be left pending.
+        let (_pb, origin_b) = seed_project_and_origin(&db, &repo).await;
+        let pid_b = insert_pending(&db, &origin_b, "tasks/22222-p1-ready--b.md", "# b\n").await;
+
+        reconcile_terminal_origin_fork_proposals(&db).await;
+
+        let a = db.get_fork_proposal(&pid_a).await.unwrap().unwrap();
+        assert_eq!(
+            a.status,
+            ForkProposalStatus::Dismissed,
+            "a pending proposal whose origin is terminal must be retired on startup"
+        );
+        assert!(
+            !orphan_a_wt.exists(),
+            "startup reconcile must clean the terminal origin's crashed-approve orphan"
+        );
+        let b = db.get_fork_proposal(&pid_b).await.unwrap().unwrap();
+        assert_eq!(
+            b.status,
+            ForkProposalStatus::Pending,
+            "a live origin's pending proposal must NOT be retired"
         );
     }
 }

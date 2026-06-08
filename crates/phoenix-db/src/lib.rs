@@ -2193,6 +2193,30 @@ impl Database {
         Ok(rows)
     }
 
+    /// List every still-`pending` fork proposal across all origins, oldest
+    /// first. Used by the startup reconciliation pass that retires proposals
+    /// whose origin conversation has reached a terminal state (REQ-PROJ-035):
+    /// a crash after the origin went terminal but before its proposals were
+    /// retired leaves them `pending`, so they must be swept on restart.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn list_pending_fork_proposals(&self) -> DbResult<Vec<ForkProposal>> {
+        let rows = sqlx::query(
+            "SELECT id, origin_conv_id, task_file, title, priority, body, status,
+                    fork_conv_id, refinement_conv_id, created_at, resolved_at
+             FROM fork_proposals
+             WHERE status = ?1
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(ForkProposalStatus::Pending.as_str())
+        .try_map(parse_fork_proposal_row)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Dismiss a pending fork proposal (REQ-PROJ-034). Idempotent: returns
     /// `true` iff a pending row was transitioned to `dismissed`; a second
     /// call (or dismissing an already-resolved proposal) updates nothing and

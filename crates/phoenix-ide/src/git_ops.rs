@@ -545,6 +545,20 @@ pub(crate) fn create_worktree(
     create_branch: Option<&str>, // start_point for -b mode
     ignore_strategy: PhoenixIgnoreStrategy,
 ) -> Result<String, GitOpError> {
+    // For LocalExclude (fork resolution), make `.phoenix/` ignored via the repo's
+    // `.git/info/exclude` BEFORE creating the `.phoenix/worktrees` dir or running
+    // `git worktree add`. If the add later fails (occupied deterministic path, FS
+    // error), the exclude is already in place, so the partial `.phoenix/` dir never
+    // surfaces as `?? .phoenix/` in the originating checkout — the decoupling this
+    // strategy preserves (REQ-PROJ-035). StageGitignore keeps its post-add ordering
+    // below (staging a tracked file before the worktree exists has no benefit and
+    // would dirty the index on a failed add).
+    if ignore_strategy == PhoenixIgnoreStrategy::LocalExclude {
+        if let Err(e) = ensure_local_exclude_has_phoenix(cwd) {
+            tracing::warn!(error = %e, "Failed to ignore .phoenix/ via local exclude before worktree add (non-fatal)");
+        }
+    }
+
     // 1. Create .phoenix/worktrees/ directory
     let phoenix_dir = cwd.join(".phoenix").join("worktrees");
     std::fs::create_dir_all(&phoenix_dir)
@@ -586,13 +600,13 @@ pub(crate) fn create_worktree(
         })?;
     }
 
-    // 3. Ensure .phoenix/ is ignored in `cwd`'s repo per the caller's strategy.
-    let ignore_result = match ignore_strategy {
-        PhoenixIgnoreStrategy::StageGitignore => ensure_gitignore_has_phoenix(cwd),
-        PhoenixIgnoreStrategy::LocalExclude => ensure_local_exclude_has_phoenix(cwd),
-    };
-    if let Err(e) = ignore_result {
-        tracing::warn!(error = %e, "Failed to ignore .phoenix/ (non-fatal)");
+    // 3. Stage `.phoenix/` into the tracked `.gitignore` for StageGitignore.
+    //    LocalExclude already wrote its exclude entry BEFORE the add (above), so
+    //    `.phoenix/` is ignored even if the add failed; nothing to do here.
+    if ignore_strategy == PhoenixIgnoreStrategy::StageGitignore {
+        if let Err(e) = ensure_gitignore_has_phoenix(cwd) {
+            tracing::warn!(error = %e, "Failed to ignore .phoenix/ (non-fatal)");
+        }
     }
 
     Ok(worktree_path_str)
@@ -1155,6 +1169,47 @@ mod tests {
             branches.trim(),
             "",
             "no task-pending branch may leak: {branches:?}"
+        );
+    }
+
+    #[test]
+    fn local_exclude_fork_failure_leaves_no_untracked_phoenix_in_origin() {
+        // F2: for the LocalExclude (fork) strategy, the `.git/info/exclude` entry
+        // is written BEFORE `git worktree add`. So even when the add FAILS (here,
+        // the deterministic target path is pre-occupied by a non-empty dir), the
+        // partial `.phoenix/` dir is already ignored and never surfaces as
+        // `?? .phoenix/` in the origin checkout — the decoupling forks must keep.
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        commit_file(tmp.path(), "tracked.txt", "content\n", "add tracked file");
+
+        let conv_id = "feedface-1111-1111-1111-111111111111";
+        let target = tmp.path().join(".phoenix/worktrees").join(conv_id);
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("squatter"), "blocks the add\n").unwrap();
+
+        let res = create_worktree(
+            tmp.path(),
+            conv_id,
+            "task-pending-feedface",
+            Some("main"),
+            PhoenixIgnoreStrategy::LocalExclude,
+        );
+        assert!(res.is_err(), "add into a non-empty dir should fail");
+
+        // The exclude entry was written first, so `.phoenix/` is ignored.
+        let exclude =
+            std::fs::read_to_string(tmp.path().join(".git/info/exclude")).unwrap_or_default();
+        assert!(
+            exclude.lines().any(|l| l.trim() == ".phoenix/"),
+            "`.phoenix/` must be in .git/info/exclude even on a failed add: {exclude:?}"
+        );
+
+        // The origin status shows NO untracked `.phoenix/` (and nothing staged).
+        let status = run_git(tmp.path(), &["status", "--porcelain"]).unwrap();
+        assert!(
+            !status.contains(".phoenix"),
+            "a failed fork worktree add must not leave `?? .phoenix/` in the origin: {status:?}"
         );
     }
 

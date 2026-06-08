@@ -330,6 +330,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // forks (cut from main_ref) rely on them.
     reconcile_project_main_refs(&db).await;
 
+    // Retire fork proposals stranded `pending` against a terminal origin
+    // (REQ-PROJ-035): a crash after the origin went terminal but before its
+    // proposals were retired leaves a Review action that can never spawn/promote.
+    // This self-heals such rows to `dismissed` on restart.
+    crate::runtime::fork_resolve::reconcile_terminal_origin_fork_proposals(&db).await;
+
     // REQ-CHN-005 startup sweep: any chain_qa row left in_flight from a
     // previous process has no live stream behind it; flip it to abandoned
     // so the UI shows a re-ask affordance instead of an indefinite spinner.
@@ -692,19 +698,40 @@ async fn reconcile_worktrees(db: &Database) {
 /// that does not exist in repos whose default is `master`/`develop`/etc. Forks
 /// are cut from `main_ref`, so it must be corrected before forks rely on it.
 ///
-/// Reconciles only from an *authoritative* remote-default signal
-/// (`schema::resolve_remote_default_branch`: the cached
-/// `refs/remotes/origin/HEAD`). Updates the row only when that returns
-/// `Some(remote_default)` differing from the stored value. A local/no-origin
-/// repo (no remote HEAD) yields `None` and leaves the stored `main_ref`
-/// untouched — the current checkout is not an authoritative default, and
-/// `main_ref` is immutable after creation, so it must never be overwritten from
-/// the current branch.
+/// Prefers the *authoritative* remote-default signal
+/// (`schema::resolve_remote_default_branch`: the cached `refs/remotes/origin/HEAD`):
+/// when present, the row is updated to it. A valid stored `main_ref` is never
+/// overwritten from the current checkout.
 ///
-/// Best-effort and idempotent: a project whose repo is missing or has no remote
-/// default on disk is skipped — never fatal to startup — and a re-run over
-/// already-correct rows writes nothing. This only updates a DB string; it never
-/// moves a git ref, so the "owned environments" rule is not engaged.
+/// On a local/no-origin repo (no remote HEAD), the stored `main_ref` is trusted
+/// only if its branch EXISTS locally — then it is left untouched (it is the
+/// immutable fork base, not in-progress work). If the stored branch does NOT
+/// exist (a legacy literal `main` on a repo whose real branch is
+/// `master`/`develop`), it is a broken value that would later fail fork approval,
+/// so it is repaired to the current checked-out branch
+/// (`schema::resolve_default_branch`).
+///
+/// Best-effort and idempotent: a project whose repo is missing or has a detached
+/// HEAD with no resolvable branch is skipped — never fatal to startup — and a
+/// re-run over already-correct rows writes nothing. This only updates a DB
+/// string; it never moves a git ref, so the "owned environments" rule is not
+/// engaged.
+/// Whether `refs/heads/{branch}` exists in the repo at `repo_path`. Used by
+/// `reconcile_project_main_refs` to decide whether a stored `main_ref` on a
+/// no-remote repo is a valid (keep) or broken (repair) value.
+fn local_branch_exists(repo_path: &std::path::Path, branch: &str) -> bool {
+    std::process::Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(repo_path)
+        .output()
+        .is_ok_and(|out| out.status.success())
+}
+
 async fn reconcile_project_main_refs(db: &Database) {
     let projects = match db.list_projects().await {
         Ok(projects) => projects,
@@ -717,30 +744,50 @@ async fn reconcile_project_main_refs(db: &Database) {
     let mut updated = 0usize;
     for project in &projects {
         let repo_path = std::path::Path::new(&project.canonical_path);
-        let Some(remote_default) = db::resolve_remote_default_branch(repo_path) else {
-            tracing::warn!(
-                project_id = %project.id,
-                canonical_path = %project.canonical_path,
-                stored_main_ref = %project.main_ref,
-                "skipping main_ref reconciliation: no remote default branch (repo missing or no origin HEAD)"
-            );
-            continue;
+        // Authoritative remote-default signal wins when present (round-2 fix: a
+        // valid stored `main_ref` is never overwritten from the current checkout).
+        // When there is no remote default, a local/no-origin repo's stored
+        // `main_ref` is only trustworthy if its branch actually EXISTS locally —
+        // a legacy literal `main` on a repo whose real branch is `master`/`develop`
+        // is broken and would later fail fork approval ("base branch 'main' not
+        // found"). So: if the stored ref exists locally, leave it; if it does not,
+        // repair it to the current checked-out branch (the same fallback creation
+        // uses). This never clobbers a valid value, only repairs a broken one.
+        let new_main_ref = if let Some(remote_default) =
+            db::resolve_remote_default_branch(repo_path)
+        {
+            remote_default
+        } else {
+            // No remote default. A stored ref that still exists locally is the
+            // immutable fork base — leave it. A non-existent one is broken; repair
+            // it to the current branch.
+            if local_branch_exists(repo_path, &project.main_ref) {
+                continue;
+            }
+            let Some(current) = phoenix_core::domain::db_schema::resolve_default_branch(repo_path)
+            else {
+                tracing::warn!(
+                    project_id = %project.id,
+                    canonical_path = %project.canonical_path,
+                    stored_main_ref = %project.main_ref,
+                    "skipping main_ref reconciliation: stored main_ref branch missing and no resolvable current branch (repo missing or detached HEAD)"
+                );
+                continue;
+            };
+            current
         };
 
-        if remote_default == project.main_ref {
+        if new_main_ref == project.main_ref {
             continue;
         }
 
-        match db
-            .update_project_main_ref(&project.id, &remote_default)
-            .await
-        {
+        match db.update_project_main_ref(&project.id, &new_main_ref).await {
             Ok(()) => {
                 tracing::info!(
                     project_id = %project.id,
                     old_main_ref = %project.main_ref,
-                    new_main_ref = %remote_default,
-                    "Reconciled project main_ref to remote default branch"
+                    new_main_ref = %new_main_ref,
+                    "Reconciled project main_ref to resolved default branch"
                 );
                 updated += 1;
             }
@@ -1123,13 +1170,25 @@ mod reconcile_main_ref_tests {
         );
     }
 
-    /// Regression: a no-origin repo checked out on a feature branch must NOT
-    /// have its stored `main_ref` rewritten to the feature branch. With no
-    /// remote HEAD there is no authoritative default, so the immutable fork base
-    /// is preserved — forks keep cutting from `main`, not in-progress work.
+    /// Create a real local branch (off HEAD) without checking it out.
+    fn create_branch(repo: &std::path::Path, branch: &str) {
+        let status = std::process::Command::new("git")
+            .args(["branch", branch])
+            .current_dir(repo)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git branch {branch} failed");
+    }
+
+    /// Regression (round-2): a no-origin repo whose stored `main_ref` is a VALID
+    /// local branch must NOT be rewritten to the current checkout, even when the
+    /// repo is on a different (feature) branch. The immutable fork base is
+    /// preserved — forks keep cutting from `main`, not in-progress work.
     #[tokio::test]
-    async fn no_origin_feature_branch_does_not_rewrite_main_ref() {
-        let (_tmp, repo) = init_repo_on("feature-xyz");
+    async fn no_origin_feature_branch_does_not_rewrite_valid_main_ref() {
+        // Repo on `feature`, but a real `main` branch ALSO exists locally.
+        let (_tmp, repo) = init_repo_on("feature");
+        create_branch(&repo, "main");
         let db = Database::open_in_memory().await.unwrap();
         let project = db
             .find_or_create_project(repo.to_str().unwrap())
@@ -1142,7 +1201,32 @@ mod reconcile_main_ref_tests {
         let after = db.get_project(&project.id).await.unwrap();
         assert_eq!(
             after.main_ref, "main",
-            "a no-origin repo must not overwrite main_ref from the current branch"
+            "a valid stored main_ref must not be clobbered by the current branch"
+        );
+    }
+
+    /// F4 repair: a no-origin repo with a legacy literal `main_ref = "main"` whose
+    /// `main` branch does NOT exist (real branch is `master`) gets `main_ref`
+    /// repaired to the current checked-out branch — otherwise fork approval later
+    /// fails "base branch 'main' not found".
+    #[tokio::test]
+    async fn no_origin_broken_main_ref_is_repaired_to_current_branch() {
+        // Repo's only branch is `master`; there is no `main`.
+        let (_tmp, repo) = init_repo_on("master");
+        let db = Database::open_in_memory().await.unwrap();
+        let project = db
+            .find_or_create_project(repo.to_str().unwrap())
+            .await
+            .unwrap();
+        force_main_ref(&db, &project.id, "main").await;
+
+        reconcile_project_main_refs(&db).await;
+
+        let after = db.get_project(&project.id).await.unwrap();
+        assert_eq!(
+            after.main_ref, "master",
+            "a broken (non-existent) main_ref on a no-origin repo must be repaired \
+             to the current branch"
         );
     }
 

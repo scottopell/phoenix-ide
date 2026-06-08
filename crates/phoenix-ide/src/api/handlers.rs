@@ -3237,6 +3237,22 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
         ))));
     }
 
+    // ForkProposalsRemovedOnOriginDelete (REQ-PROJ-035): dismiss every
+    // still-`pending` proposal bound to this origin and clean its deterministic
+    // spawn/promote git orphan — BEFORE the long resource-cleanup teardown opens
+    // its window. Dismissing under the fork actor first is what makes a
+    // fork-from-a-being-deleted-origin structurally impossible: an approve /
+    // request-changes that races the cascade enters the actor, finds the proposal
+    // non-`pending`, and aborts before creating a worktree. Ordering this AFTER
+    // the long teardown would leave a window where a concurrent approve sees the
+    // origin still live + proposal pending and spawns a child the later cleanup
+    // then skips as resolved. A pending proposal's deterministic path can only be
+    // a crashed-approve orphan; a spawned/promoted proposal's same path is the
+    // LIVE decoupled fork/refinement, which survives origin deletion and is NOT
+    // touched. The proposal ROWS are removed by the fork_proposals.origin_conv_id
+    // ON DELETE CASCADE on the row deletion below — not duplicated here.
+    cleanup_pending_fork_orphans_on_delete(state, &conv).await;
+
     // Steps 2-5: bash handles, tmux server, project worktree, browser
     // session. Cleanup-step failures log WARN and continue; the only
     // fatal error from this call is a continuation-row DB lookup failure
@@ -3244,15 +3260,6 @@ pub(super) async fn run_hard_delete_cascade(state: &AppState, id: &str) -> Resul
     // abandon / mark-merged so the resource teardown is byte-for-byte
     // identical.
     run_resource_cleanup_cascade(state, &conv).await?;
-
-    // ForkProposalsRemovedOnOriginDelete (REQ-PROJ-035): clean deterministic
-    // spawn/promote git orphans for STILL-PENDING proposals only — a pending
-    // proposal's deterministic path can only be a crashed-approve orphan; for a
-    // spawned/promoted proposal that same path is the LIVE decoupled
-    // fork/refinement, which survives origin deletion and must NOT be touched.
-    // The proposal ROWS are removed by the fork_proposals.origin_conv_id
-    // ON DELETE CASCADE on the row deletion below — not duplicated here.
-    cleanup_pending_fork_orphans_on_delete(state, &conv).await;
 
     // Step 5: row deletion. SQLite ON DELETE CASCADE removes dependent
     // rows. This is the only step whose failure is fatal to the request
@@ -6973,6 +6980,114 @@ mod hard_delete_cascade_tests {
             matches!(result, Err(AppError::Internal(_))),
             "an unreadable DB during the sibling-liveness lookup must fail the \
              cascade, not silently preserve-and-archive; got {result:?}"
+        );
+    }
+
+    /// F5: `run_hard_delete_cascade` must dismiss + clean pending fork proposals
+    /// BEFORE the long resource-cleanup teardown opens its window, so a concurrent
+    /// approve racing the cascade finds the proposal non-pending and aborts.
+    ///
+    /// The origin is a Direct-mode conversation (no worktree of its own), so the
+    /// ONLY thing that removes the proposal's deterministic orphan worktree is the
+    /// fork-cleanup step. Asserting that orphan is gone after the cascade proves
+    /// the fork cleanup ran as part of the delete — and because resource cleanup
+    /// never touches a fork orphan path, its removal is attributable solely to the
+    /// fork-cleanup step the cascade now runs first.
+    #[tokio::test]
+    async fn hard_delete_dismisses_pending_fork_proposal_and_cleans_orphan() {
+        use crate::db::{ForkProposal, ForkProposalStatus};
+        use crate::runtime::fork_resolve::{derive_conv_id, ResolutionKind};
+
+        let state = make_test_state().await;
+        // Start the single fork-resolution consumer so the cascade's
+        // `cleanup_pending_fork_orphans_on_delete` routes through it.
+        state.runtime.start_sub_agent_handler().await;
+
+        // Real repo so the deterministic orphan worktree can be created + cleaned.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).expect("repo dir");
+        crate::git_ops::run_git(&repo, &["init", "--initial-branch=main"]).expect("git init");
+        crate::git_ops::run_git(&repo, &["config", "user.email", "t@phoenix"]).expect("email");
+        crate::git_ops::run_git(&repo, &["config", "user.name", "t"]).expect("name");
+        crate::git_ops::run_git(&repo, &["commit", "--allow-empty", "-m", "init"]).expect("commit");
+
+        let project = state
+            .db
+            .find_or_create_project(repo.to_str().unwrap())
+            .await
+            .expect("project");
+        let origin = "fd-origin";
+        state
+            .db
+            .create_conversation_with_project(
+                origin,
+                "fd-origin",
+                repo.to_str().unwrap(),
+                true,
+                None,
+                None,
+                Some(&project.id),
+                &crate::db::ConvMode::Direct,
+                None,
+                None,
+                None,
+                crate::llm_language::LlmLanguage::default(),
+            )
+            .await
+            .expect("create origin");
+
+        // Pending proposal with a crashed-approve deterministic orphan worktree.
+        let pid = uuid::Uuid::new_v4().to_string();
+        state
+            .db
+            .insert_fork_proposal(&ForkProposal {
+                id: pid.clone(),
+                origin_conversation_id: origin.to_string(),
+                task_file: "tasks/12345-p1-ready--x.md".to_string(),
+                title: "x".to_string(),
+                priority: "p1".to_string(),
+                body: "# x\n".to_string(),
+                status: ForkProposalStatus::Pending,
+                fork_conversation_id: None,
+                refinement_conversation_id: None,
+                created_at: chrono::Utc::now(),
+                resolved_at: None,
+            })
+            .await
+            .expect("insert proposal");
+
+        let orphan_id = derive_conv_id(&pid, ResolutionKind::Spawn);
+        let orphan_wt = repo.join(".phoenix/worktrees").join(&orphan_id);
+        std::fs::create_dir_all(orphan_wt.parent().unwrap()).unwrap();
+        crate::git_ops::run_git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "task-12345-x",
+                orphan_wt.to_str().unwrap(),
+                "main",
+            ],
+        )
+        .expect("orphan worktree");
+        assert!(orphan_wt.is_dir(), "precondition: orphan worktree exists");
+
+        run_hard_delete_cascade(&state, origin)
+            .await
+            .expect("hard delete");
+
+        // The origin row is gone (ON DELETE CASCADE removed the proposal row too)
+        // and the deterministic orphan worktree was cleaned by the fork step that
+        // the cascade ran BEFORE resource cleanup.
+        assert!(
+            state.db.get_conversation(origin).await.is_err(),
+            "origin row must be deleted"
+        );
+        assert!(
+            !orphan_wt.exists(),
+            "pending proposal's deterministic orphan must be cleaned by the fork step"
         );
     }
 }
