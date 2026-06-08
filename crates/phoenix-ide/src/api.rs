@@ -86,13 +86,6 @@ impl AppState {
         runtime.start_work_scope_bridge().await;
         handlers::start_attachment_cleanup_task(db.clone());
         let terminals = runtime.terminals.clone();
-        // Chain Q&A is constructed last so it can share the same `Database`
-        // and `ModelRegistry` handles. Its internal `ChainRuntimeRegistry`
-        // is owned by this `ChainQa` value — chain SSE handlers reach into
-        // it via `state.chain_qa.runtime_registry()` so subscribers and
-        // publishers go through one registry.
-        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
-        let codex_login = codex_login::CodexLoginManager::new();
         // Conversation-retrieval index: bring it in line with `messages` once
         // at startup (REQ-RET-003) off the request path — retrieval works on
         // whatever is already indexed while the sweep runs, and reports
@@ -116,6 +109,13 @@ impl AppState {
             });
         }
         let message_retriever: Arc<dyn MessageRetriever> = retriever;
+        // Chain Q&A shares the same `Database`, `ModelRegistry`, and retrieval
+        // seam. Its internal `ChainRuntimeRegistry` is owned by this `ChainQa`
+        // value — chain SSE handlers reach into it via
+        // `state.chain_qa.runtime_registry()` so subscribers and publishers go
+        // through one registry.
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
+        let codex_login = codex_login::CodexLoginManager::new();
         Self {
             runtime,
             llm_registry,

@@ -5070,9 +5070,9 @@ mod hard_delete_cascade_tests {
             None,
         ));
         let terminals = runtime.terminals.clone();
-        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
             std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         AppState {
             runtime,
             llm_registry,
@@ -7151,9 +7151,9 @@ mod upgrade_model_state_guard_tests {
             None,
         ));
         let terminals = runtime.terminals.clone();
-        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone());
         let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
             std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
         AppState {
             runtime,
             llm_registry,

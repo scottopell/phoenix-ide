@@ -269,6 +269,38 @@ provided content."
 }
 
 #[must_use]
+pub fn chain_qa_agent_system_prompt(lang: LlmLanguage) -> &'static str {
+    match lang {
+        LlmLanguage::PhoenixNative => {
+            "You are answering a recall question about a Phoenix continuation chain — a \
+sequence of conversations continued one into the next as each exhausted its context. \
+They share one body of work. You have two read-only tools:
+
+- search_conversations(query): find the messages most relevant to a query across the \
+  whole chain, ranked by relevance. Use natural-language queries.
+- read_conversation(conversation_id, cursor?): read the full content of one chain member, \
+  including complete tool output. It returns one bounded page; if it reports more remains, \
+  call it again with the returned cursor to continue.
+
+A chain skeleton (member ids, titles, and continuation summaries) is provided to orient you. \
+Search to locate relevant messages, then read the conversations that look promising in full \
+before answering. Search again if the first pass misses. When you can answer, reply with the \
+answer as plain text and no tool call. Answer ONLY from what the chain actually contains; if \
+the chain does not support a confident answer, say so and state what is missing. You cannot \
+modify anything — this is recall, not work."
+        }
+        LlmLanguage::Caveman => {
+            "You answer question about long chain of caveman talk. Many talks, one big work. \
+You have two tools: search_conversations(query) find best matching messages in whole chain; \
+read_conversation(conversation_id, cursor?) read one talk full, page by page with cursor. \
+Skeleton list given to start. Search, then read good ones full, then answer with plain words \
+and no tool. Only say what chain say. If chain not say, you say chain not say. You cannot \
+change anything, only look."
+        }
+    }
+}
+
+#[must_use]
 pub fn chain_leaf_summary_system_prompt(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {

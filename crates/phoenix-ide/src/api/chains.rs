@@ -660,7 +660,11 @@ mod tests {
         add_continuation_summary(&db, "v-b", "summary B").await;
         add_user_message(&db, "v-c", 0, "leaf-only").await;
 
-        let chain_qa = crate::chain_qa::ChainQa::new(db.clone(), registry_with_test_llm());
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+        );
         let view = build_view_for_test(&db, &chain_qa, "v-a").await.unwrap();
 
         assert_eq!(view.root_conv_id, "v-a");
@@ -689,7 +693,11 @@ mod tests {
             .await
             .unwrap();
 
-        let chain_qa = crate::chain_qa::ChainQa::new(db.clone(), registry_with_test_llm());
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+        );
         let view = build_view_for_test(&db, &chain_qa, "dn-a").await.unwrap();
 
         assert_eq!(view.chain_name.as_deref(), Some("auth refactor"));
@@ -704,7 +712,11 @@ mod tests {
         // No explicit chain_name set => display_name uses title.
         add_user_message(&db, "fb-b", 0, "leaf").await;
 
-        let chain_qa = crate::chain_qa::ChainQa::new(db.clone(), registry_with_test_llm());
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+        );
         let view = build_view_for_test(&db, &chain_qa, "fb-a").await.unwrap();
 
         assert_eq!(view.chain_name, None);
@@ -721,7 +733,11 @@ mod tests {
             .await
             .unwrap();
 
-        let chain_qa = crate::chain_qa::ChainQa::new(db.clone(), registry_with_test_llm());
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+        );
         let err = build_view_for_test(&db, &chain_qa, "solo")
             .await
             .unwrap_err();
@@ -738,7 +754,11 @@ mod tests {
         add_continuation_summary(&db, "nr-a", "summary").await;
         add_continuation_summary(&db, "nr-b", "summary").await;
 
-        let chain_qa = crate::chain_qa::ChainQa::new(db.clone(), registry_with_test_llm());
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+        );
         let err = build_view_for_test(&db, &chain_qa, "nr-b")
             .await
             .unwrap_err();
@@ -751,7 +771,11 @@ mod tests {
     #[tokio::test]
     async fn build_view_rejects_unknown_root() {
         let db = Database::open_in_memory().await.unwrap();
-        let chain_qa = crate::chain_qa::ChainQa::new(db.clone(), registry_with_test_llm());
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+        );
         let err = build_view_for_test(&db, &chain_qa, "ghost")
             .await
             .unwrap_err();
@@ -768,7 +792,11 @@ mod tests {
         add_continuation_summary(&db, "q-a", "first").await;
         add_user_message(&db, "q-b", 0, "leaf").await;
 
-        let chain_qa = crate::chain_qa::ChainQa::new(db.clone(), registry_with_test_llm());
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+        );
         let _ = chain_qa
             .submit_question_blocking("q-a", "what happened?")
             .await
@@ -819,7 +847,11 @@ mod tests {
         .await
         .unwrap();
 
-        let chain_qa = crate::chain_qa::ChainQa::new(db.clone(), registry_with_test_llm());
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+        );
         let view = build_view_for_test(&db, &chain_qa, "hw-a").await.unwrap();
 
         let by_id: std::collections::HashMap<&str, &ChainMemberSummary> = view
