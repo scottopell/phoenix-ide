@@ -53,25 +53,7 @@ function inv(
 async function renderExpanded(liveInventory?: WorkScopeInventory | null) {
   let utils!: ReturnType<typeof render>;
   await act(async () => {
-    utils = render(
-      <MemoryRouter initialEntries={['/c/conv-A']}>
-        <Routes>
-          <Route
-            path="/c/:slug"
-            element={
-              <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
-                <WorkScopeSection
-                  scopeKey="ws-1"
-                  liveInventory={liveInventory}
-                  expanded={true}
-                  onToggleExpanded={() => {}}
-                />
-              </ViewerSlotProvider>
-            }
-          />
-        </Routes>
-      </MemoryRouter>,
-    );
+    utils = render(sectionTree({ scopeKey: 'ws-1', liveInventory: liveInventory ?? null }));
   });
   return utils;
 }
@@ -79,6 +61,32 @@ async function renderExpanded(liveInventory?: WorkScopeInventory | null) {
 /** Open the bash row's detail disclosure so `output` becomes visible. */
 function openBashDetail() {
   fireEvent.click(screen.getByTitle('Toggle details'));
+}
+
+/** The provider tree the section needs at runtime: a Router (ViewerSlot uses
+ *  useLocation) wrapping the viewer-slot context (BashRow's inspect affordance
+ *  calls useViewerSlot). Tests render/rerender through this so the section
+ *  mounts in the same context the app gives it. */
+function sectionTree(props: { scopeKey: string; liveInventory?: WorkScopeInventory | null }) {
+  return (
+    <MemoryRouter initialEntries={['/c/conv-A']}>
+      <Routes>
+        <Route
+          path="/c/:slug"
+          element={
+            <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
+              <WorkScopeSection
+                scopeKey={props.scopeKey}
+                liveInventory={props.liveInventory ?? null}
+                expanded={true}
+                onToggleExpanded={() => {}}
+              />
+            </ViewerSlotProvider>
+          }
+        />
+      </Routes>
+    </MemoryRouter>
+  );
 }
 
 beforeEach(() => {
@@ -283,26 +291,12 @@ describe('WorkScopeSection stale-scope guard', () => {
 
     let utils!: ReturnType<typeof render>;
     await act(async () => {
-      utils = render(
-        <WorkScopeSection
-          scopeKey="ws-old"
-          liveInventory={null}
-          expanded={true}
-          onToggleExpanded={() => {}}
-        />,
-      );
+      utils = render(sectionTree({ scopeKey: 'ws-old', liveInventory: null }));
     });
 
     // Switch to the new scope; its fetch resolves immediately.
     await act(async () => {
-      utils.rerender(
-        <WorkScopeSection
-          scopeKey="ws-new"
-          liveInventory={null}
-          expanded={true}
-          onToggleExpanded={() => {}}
-        />,
-      );
+      utils.rerender(sectionTree({ scopeKey: 'ws-new', liveInventory: null }));
       await Promise.resolve();
     });
     expect(screen.getByText('NEW-SCOPE-CMD')).toBeTruthy();
@@ -334,27 +328,13 @@ describe('WorkScopeSection SSE-generation guard (same-scope time ordering)', () 
     // Render with no SSE yet; the initial fetch is in flight (unresolved).
     let utils!: ReturnType<typeof render>;
     await act(async () => {
-      utils = render(
-        <WorkScopeSection
-          scopeKey="ws-1"
-          liveInventory={null}
-          expanded={true}
-          onToggleExpanded={() => {}}
-        />,
-      );
+      utils = render(sectionTree({ scopeKey: 'ws-1', liveInventory: null }));
     });
 
     // SSE push lands first: a live handle. Bumps the generation.
     const pushed = inv([bash({ cmd: 'SSE-LIVE-CMD', state: 'running' })]);
     await act(async () => {
-      utils.rerender(
-        <WorkScopeSection
-          scopeKey="ws-1"
-          liveInventory={pushed}
-          expanded={true}
-          onToggleExpanded={() => {}}
-        />,
-      );
+      utils.rerender(sectionTree({ scopeKey: 'ws-1', liveInventory: pushed }));
       await Promise.resolve();
     });
     expect(screen.getByText('SSE-LIVE-CMD')).toBeTruthy();
