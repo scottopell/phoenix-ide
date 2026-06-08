@@ -3378,7 +3378,6 @@ fn normalize_task_file_repo_relative(
     task_file: &str,
     proposal_id: &str,
 ) -> String {
-    let absolute = working_dir.join(task_file);
     let Some(repo_root) = crate::db::detect_git_repo_root(working_dir) else {
         tracing::warn!(
             proposal_id = %proposal_id,
@@ -3389,21 +3388,27 @@ fn normalize_task_file_repo_relative(
     };
     let repo_root = std::path::Path::new(&repo_root);
 
-    // Canonicalize both sides so symlinked tmp roots (e.g. /var -> /private/var)
-    // and `.`/`..` components don't defeat the prefix strip.
-    let canon_abs = absolute.canonicalize().unwrap_or(absolute);
+    // Compute the subdir offset from `working_dir`, not from
+    // `working_dir.join(task_file)`: the task file may not exist on disk yet, and
+    // `Path::canonicalize` fails on a non-existent path — falling back to the raw
+    // (still-symlinked) path and defeating the strip on platforms where tmp roots
+    // are symlinks (macOS /var -> /private/var). `working_dir` always exists, so
+    // canonicalizing it and the repo root resolves symlinks on both sides.
+    let canon_wd = working_dir
+        .canonicalize()
+        .unwrap_or_else(|_| working_dir.to_path_buf());
     let canon_root = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
 
-    if let Ok(rel) = canon_abs.strip_prefix(&canon_root) {
-        rel.to_string_lossy().into_owned()
+    if let Ok(offset) = canon_wd.strip_prefix(&canon_root) {
+        offset.join(task_file).to_string_lossy().into_owned()
     } else {
         tracing::warn!(
             proposal_id = %proposal_id,
             task_file = %task_file,
             repo_root = %canon_root.display(),
-            "fork proposal: task_file not under repo root; storing raw task_file"
+            "fork proposal: working_dir not under repo root; storing raw task_file"
         );
         task_file.to_string()
     }
