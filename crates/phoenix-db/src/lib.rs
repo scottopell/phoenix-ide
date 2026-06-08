@@ -1612,11 +1612,12 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
 
+        let handoff_summary_msg_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
         )
-        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&handoff_summary_msg_id)
         .bind(parent_id)
         .bind(parent_next_sequence_id)
         .bind(handoff_summary.message_type().to_string())
@@ -1644,6 +1645,35 @@ impl Database {
             }
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
+
+        // Index the two messages this handoff inserts (the seed message and the
+        // parent's continuation summary) in the same transaction — they go in
+        // via raw INSERTs that bypass the `add_message` index hook, so without
+        // this they'd be missing from retrieval until the next startup
+        // reconcile (specs/conversation-retrieval/ REQ-RET-003).
+        let seed_msg = Message {
+            message_id: seed_message_id.clone(),
+            conversation_id: new_id.clone(),
+            sequence_id: 1,
+            message_type: seed_content.message_type(),
+            content: seed_content.clone(),
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+        let handoff_msg = Message {
+            message_id: handoff_summary_msg_id,
+            conversation_id: parent_id.to_string(),
+            sequence_id: parent_next_sequence_id,
+            message_type: handoff_summary.message_type(),
+            content: handoff_summary.clone(),
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+        retrieval::fts_upsert_conn(&mut tx, &seed_msg).await?;
+        retrieval::fts_upsert_conn(&mut tx, &handoff_msg).await?;
+
         tx.commit().await?;
 
         Ok(Conversation {
@@ -2481,19 +2511,22 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
-        // Messages are deleted by CASCADE
+        // Conversation + messages (FK CASCADE) and the standalone FTS prune
+        // run in one transaction. The FTS table has no FK cascade, so without
+        // the shared transaction a crash between the source delete and the
+        // prune would leave orphaned index rows and hard-deleted content could
+        // resurface in recall until the next reconcile (REQ-RET-003).
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-
         if result.rows_affected() == 0 {
+            // tx dropped without commit → rollback.
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
-        // The standalone FTS index has no FK cascade — prune its rows
-        // explicitly so deleted content never resurfaces in recall
-        // (specs/conversation-retrieval/ REQ-RET-003).
-        retrieval::fts_delete_conversation(&self.pool, id).await?;
+        retrieval::fts_delete_conversation_conn(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2785,7 +2818,12 @@ impl Database {
         // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
         // The startup reconcile is the backstop if this ever fails after the
         // message row commits.
-        retrieval::fts_upsert(&self.pool, &message).await?;
+        if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+            tracing::warn!(
+                message_id = %message.message_id, error = %e,
+                "failed to index message for retrieval; startup reconcile will repair",
+            );
+        }
         Ok(message)
     }
 
@@ -2855,7 +2893,12 @@ impl Database {
             created_at,
         };
         // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
-        retrieval::fts_upsert(&self.pool, &message).await?;
+        if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+            tracing::warn!(
+                message_id = %message.message_id, error = %e,
+                "failed to index message for retrieval; startup reconcile will repair",
+            );
+        }
         Ok(message)
     }
 
@@ -3010,7 +3053,12 @@ impl Database {
         .fetch_optional(&self.pool)
         .await?;
         if let Some(message) = updated {
-            retrieval::fts_upsert(&self.pool, &message).await?;
+            if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+                tracing::warn!(
+                    message_id = %message.message_id, error = %e,
+                    "failed to index message for retrieval; startup reconcile will repair",
+                );
+            }
         }
         Ok(())
     }

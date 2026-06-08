@@ -241,18 +241,30 @@ impl MessageRetriever for Fts5Retriever {
 /// # Errors
 /// Returns the underlying [`sqlx::Error`] if the delete or insert fails.
 pub async fn fts_upsert(pool: &SqlitePool, message: &Message) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    fts_upsert_conn(&mut tx, message).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Replace a message's index row(s) using a caller-provided connection or
+/// transaction, so the index write commits **atomically with the source
+/// write** (REQ-RET-003). The delete+insert pair is two statements; running
+/// them on one connection keeps them in the caller's transaction, so a
+/// concurrent upsert of the same `message_id` cannot interleave into duplicate
+/// rows (`SQLite` serializes write transactions).
+///
+/// # Errors
+/// Returns the underlying [`sqlx::Error`] if the delete or insert fails.
+pub async fn fts_upsert_conn(
+    conn: &mut sqlx::SqliteConnection,
+    message: &Message,
+) -> Result<(), sqlx::Error> {
     let text = index_text(message);
     let fingerprint = content_fingerprint(&text);
-    // Delete + insert in one transaction so the replace is atomic. The live
-    // write path and the startup reconcile sweep can both upsert the same
-    // `message_id` concurrently; SQLite serializes write transactions, so
-    // wrapping the pair prevents an interleaving (delete, delete, insert,
-    // insert) that would leave two index rows for one message — duplicates
-    // that the reconcile sweep's `message_id`-keyed map would not later prune.
-    let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM message_fts WHERE message_id = ?1")
         .bind(&message.message_id)
-        .execute(&mut *tx)
+        .execute(&mut *conn)
         .await?;
     sqlx::query(
         "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
@@ -264,9 +276,8 @@ pub async fn fts_upsert(pool: &SqlitePool, message: &Message) -> Result<(), sqlx
     .bind(message.message_type.to_string())
     .bind(message.created_at.to_rfc3339())
     .bind(fingerprint)
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -294,6 +305,25 @@ pub async fn fts_delete_conversation(
     sqlx::query("DELETE FROM message_fts WHERE conversation_id = ?1")
         .bind(conversation_id)
         .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Remove all index rows for a conversation using a caller-provided
+/// connection/transaction, so the index prune commits atomically with the
+/// conversation/message delete — deleted content cannot resurface in recall
+/// even if the process crashes between the source delete and the prune
+/// (REQ-RET-003).
+///
+/// # Errors
+/// Returns the underlying [`sqlx::Error`] if the delete fails.
+pub async fn fts_delete_conversation_conn(
+    conn: &mut sqlx::SqliteConnection,
+    conversation_id: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM message_fts WHERE conversation_id = ?1")
+        .bind(conversation_id)
+        .execute(&mut *conn)
         .await?;
     Ok(())
 }
