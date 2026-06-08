@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { render, screen, waitFor, cleanup } from '@testing-library/react';
+import { render, screen, waitFor, cleanup, fireEvent } from '@testing-library/react';
 import { FileTree } from './FileTree';
 import { computeAncestors, isUnderRoot } from './computeAncestors';
 
@@ -183,6 +183,30 @@ describe('FileTree — reveal active file', () => {
     // invoked on.
     const calledOn = scrollSpy.mock.contexts[0] as HTMLElement;
     expect(calledOn).toBe(rowEl);
+  });
+
+  it('propagates manual expansion state through already-rendered ancestors', async () => {
+    const onFileSelect = vi.fn();
+    render(
+      <FileTree
+        rootPath="/proj"
+        onFileSelect={onFileSelect}
+        activeFile={null}
+        conversationId="conv-test-nested-manual"
+      />,
+    );
+
+    const uiRow = await screen.findByText('ui');
+    fireEvent.click(uiRow.closest('.ft-item')!);
+
+    const srcRow = await screen.findByText('src');
+    fireEvent.click(srcRow.closest('.ft-item')!);
+
+    const componentsRow = await screen.findByText('components');
+    fireEvent.click(componentsRow.closest('.ft-item')!);
+
+    expect(await screen.findByText('FileTree.tsx')).toBeInTheDocument();
+    expect(screen.getByText('Other.tsx')).toBeInTheDocument();
   });
 
   it('does NOT scroll or expand when activeFile is outside rootPath', async () => {

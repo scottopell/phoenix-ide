@@ -244,14 +244,31 @@ function areFileTreeItemPropsEqual(prev: FileTreeItemProps, next: FileTreeItemPr
 
   if (!next.item.is_directory || !next.isExpanded) return true;
 
-  for (const child of next.visibleChildren) {
-    if (prev.expandedPaths.has(child.path) !== next.expandedPaths.has(child.path)) return false;
-    if (prev.loadingPaths.has(child.path) !== next.loadingPaths.has(child.path)) return false;
-    if ((prev.activeFile === child.path) !== (next.activeFile === child.path)) return false;
-    if (prev.childrenByPath.get(child.path) !== next.childrenByPath.get(child.path)) return false;
+  return !hasVisibleSubtreeStateChange(prev, next, next.visibleChildren);
+}
+
+function hasVisibleSubtreeStateChange(
+  prev: FileTreeItemProps,
+  next: FileTreeItemProps,
+  visibleChildren: FileItem[],
+): boolean {
+  for (const child of visibleChildren) {
+    const wasExpanded = prev.expandedPaths.has(child.path);
+    const isExpanded = next.expandedPaths.has(child.path);
+    if (wasExpanded !== isExpanded) return true;
+    if (prev.loadingPaths.has(child.path) !== next.loadingPaths.has(child.path)) return true;
+    if ((prev.activeFile === child.path) !== (next.activeFile === child.path)) return true;
+
+    const prevChildren = prev.childrenByPath.get(child.path) ?? EMPTY_FILE_ITEMS;
+    const nextChildren = next.childrenByPath.get(child.path) ?? EMPTY_FILE_ITEMS;
+    if (prevChildren !== nextChildren) return true;
+
+    if ((wasExpanded || isExpanded) && hasVisibleSubtreeStateChange(prev, next, nextChildren)) {
+      return true;
+    }
   }
 
-  return true;
+  return false;
 }
 
 export function FileTree({ rootPath, onFileSelect, activeFile, conversationId, refreshKey }: FileTreeProps) {
