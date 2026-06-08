@@ -118,122 +118,6 @@ async fn compute_chain_snapshot_sums_message_counts_across_three_members() {
     assert_eq!(snap.total_messages, 3 + 2 + 3);
 }
 
-// --- bundle_chain_context --------------------------------------------------
-
-#[tokio::test]
-async fn bundle_chain_context_three_member_with_short_leaf() {
-    let db = Database::open_in_memory().await.unwrap();
-    build_linear_chain(&db, &["m1", "m2", "m3"]).await;
-    add_continuation_summary(&db, "m1", "summary M1: built skeleton").await;
-    add_continuation_summary(&db, "m2", "summary M2: hooked up auth").await;
-    add_user_message(&db, "m3", 0, "leaf hello").await;
-    add_user_message(&db, "m3", 1, "leaf world").await;
-
-    let llm = CountingLlm::new("unused");
-    let mut members = Vec::new();
-    for id in ["m1", "m2", "m3"] {
-        members.push(db.get_conversation(id).await.unwrap());
-    }
-    let bundled = bundle_chain_context(
-        &db,
-        &members,
-        llm.as_ref(),
-        crate::llm_language::LlmLanguage::default(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(bundled.blocks.len(), 3);
-    assert_eq!(bundled.blocks[0].kind, MemberBlockKind::ContinuationSummary);
-    assert_eq!(bundled.blocks[0].conv_id, "m1");
-    assert!(bundled.blocks[0].body.contains("built skeleton"));
-    assert_eq!(bundled.blocks[1].kind, MemberBlockKind::ContinuationSummary);
-    assert_eq!(bundled.blocks[1].conv_id, "m2");
-    assert!(bundled.blocks[1].body.contains("hooked up auth"));
-    assert_eq!(bundled.blocks[2].kind, MemberBlockKind::LeafTranscript);
-    assert_eq!(bundled.blocks[2].conv_id, "m3");
-    assert!(bundled.blocks[2].body.contains("leaf hello"));
-    assert_eq!(
-        llm.call_count(),
-        0,
-        "short leaf should not invoke the LLM for summarization",
-    );
-
-    let rendered = bundled.render_for_prompt();
-    assert!(rendered.contains("[summary:#m1]"));
-    assert!(rendered.contains("[summary:#m2]"));
-    assert!(rendered.contains("[leaf:#m3]"));
-}
-
-#[tokio::test]
-async fn bundle_chain_context_long_leaf_summarizes_via_llm() {
-    let db = Database::open_in_memory().await.unwrap();
-    build_linear_chain(&db, &["L1", "L2"]).await;
-    add_continuation_summary(&db, "L1", "first member summary").await;
-    // Push the leaf over LEAF_DIRECT_MESSAGE_LIMIT.
-    let n = LEAF_DIRECT_MESSAGE_LIMIT + 5;
-    for i in 0..n {
-        add_user_message(
-            &db,
-            "L2",
-            i,
-            "this is a normal user message that takes some bytes",
-        )
-        .await;
-    }
-
-    let llm = CountingLlm::new("(IN-PROCESS LEAF SUMMARY)");
-    let mut members = Vec::new();
-    for id in ["L1", "L2"] {
-        members.push(db.get_conversation(id).await.unwrap());
-    }
-    let bundled = bundle_chain_context(
-        &db,
-        &members,
-        llm.as_ref(),
-        crate::llm_language::LlmLanguage::default(),
-    )
-    .await
-    .unwrap();
-
-    assert_eq!(bundled.blocks.len(), 2);
-    assert_eq!(bundled.blocks[1].kind, MemberBlockKind::LeafSummary);
-    assert_eq!(bundled.blocks[1].body, "(IN-PROCESS LEAF SUMMARY)");
-    assert_eq!(
-        llm.call_count(),
-        1,
-        "long leaf should fire one summarization call",
-    );
-    assert_eq!(bundled.leaf_summary_model.as_deref(), Some("test-model"));
-}
-
-#[tokio::test]
-async fn bundle_chain_context_marks_missing_continuation_summary() {
-    let db = Database::open_in_memory().await.unwrap();
-    build_linear_chain(&db, &["mc-a", "mc-b"]).await;
-    // mc-a deliberately has NO continuation message — degenerate non-leaf.
-    add_user_message(&db, "mc-b", 0, "leaf").await;
-
-    let llm = CountingLlm::new("unused");
-    let mut members = Vec::new();
-    for id in ["mc-a", "mc-b"] {
-        members.push(db.get_conversation(id).await.unwrap());
-    }
-    let bundled = bundle_chain_context(
-        &db,
-        &members,
-        llm.as_ref(),
-        crate::llm_language::LlmLanguage::default(),
-    )
-    .await
-    .unwrap();
-    assert_eq!(
-        bundled.blocks[0].kind,
-        MemberBlockKind::ContinuationSummaryMissing,
-        "missing summary should surface as a structural tag, not silent drop",
-    );
-}
-
 // --- ChainQa::submit_question end-to-end (synchronous in Phase 2) ---------
 
 /// Wrap a test `LlmService` in a `ModelRegistry` so `get_mid_tier_model`
@@ -241,6 +125,12 @@ async fn bundle_chain_context_marks_missing_continuation_summary() {
 /// test-only constructor on the registry that bypasses gateway plumbing.
 fn registry_with_service(service: Arc<dyn LlmService>) -> Arc<ModelRegistry> {
     Arc::new(ModelRegistry::for_test_with_sonnet(service))
+}
+
+/// An FTS5 retriever over the test db's pool, for the Q&A agent's
+/// `search_conversations` tool.
+fn test_retriever(db: &Database) -> Arc<dyn crate::db::MessageRetriever> {
+    Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()))
 }
 
 #[tokio::test]
@@ -253,7 +143,7 @@ async fn submit_question_persists_and_completes() {
 
     let llm = CountingLlm::new("THE ANSWER");
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
-    let qa = ChainQa::new(db.clone(), registry);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     let qa_id = qa
         .submit_question_blocking("chq-a", "what happened in this chain?")
@@ -286,7 +176,7 @@ async fn submit_question_rejects_single_member_root() {
 
     let llm = CountingLlm::new("unused");
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
-    let qa = ChainQa::new(db.clone(), registry);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     let err = qa
         .submit_question("solo-root", "anything")
@@ -304,7 +194,7 @@ async fn submit_question_rejects_non_root_member() {
 
     let llm = CountingLlm::new("unused");
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
-    let qa = ChainQa::new(db.clone(), registry);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     let err = qa.submit_question("nrr-mid", "anything").await.unwrap_err();
     matches!(err, ChainQaError::NotAChainRoot(_));
@@ -422,7 +312,7 @@ async fn submit_question_streams_tokens_and_persists_completed_row() {
 
     let llm = StreamingLlm::new(&["Hel", "lo, ", "world!"]);
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
-    let qa = ChainQa::new(db.clone(), registry);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     let runtime = qa.runtime_registry().get_or_create("st-a").await;
     let (mut rx, _guard) = runtime.subscribe();
@@ -474,7 +364,7 @@ async fn submit_question_streams_failure_event_and_persists_partial() {
 
     let llm: Arc<FailingStreamingLlm> = Arc::new(FailingStreamingLlm);
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
-    let qa = ChainQa::new(db.clone(), registry);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     let runtime = qa.runtime_registry().get_or_create("sf-a").await;
     let (mut rx, _guard) = runtime.subscribe();
@@ -520,7 +410,7 @@ async fn submit_question_returns_qa_id_before_stream_completes() {
 
     let llm = StreamingLlm::new(&["x"]);
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
-    let qa = ChainQa::new(db.clone(), registry);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     let qa_id = qa.submit_question("sy-a", "?").await.unwrap();
 
@@ -545,7 +435,7 @@ async fn tab_close_mid_stream_does_not_orphan_invocation() {
 
     let llm = StreamingLlm::new(&["one ", "two ", "three"]);
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
-    let qa = ChainQa::new(db.clone(), registry);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     // Subscriber connects, then drops before the stream starts.
     let runtime = qa.runtime_registry().get_or_create("tc-a").await;
@@ -575,7 +465,7 @@ async fn chain_runtime_dropped_from_registry_after_qa_completes_with_no_subscrib
 
     let llm = StreamingLlm::new(&["x"]);
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
-    let qa = ChainQa::new(db.clone(), registry);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
 
     qa.submit_question_blocking("dr-a", "?").await.unwrap();
 
@@ -585,5 +475,92 @@ async fn chain_runtime_dropped_from_registry_after_qa_completes_with_no_subscrib
     assert!(
         !qa.runtime_registry().contains("dr-a").await,
         "registry should drop idle runtimes after Q&A finalize",
+    );
+}
+
+/// Scripted agentic LLM: turn 1 issues a `search_conversations` tool call;
+/// turn 2 (after the tool result is fed back) returns the final answer.
+/// Proves the loop executes a tool then answers (REQ-CHN-009).
+#[derive(Debug)]
+struct ScriptedToolLlm {
+    calls: AtomicUsize,
+}
+
+#[async_trait]
+impl LlmService for ScriptedToolLlm {
+    async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
+        // The loop drives `complete_streaming`; this satisfies the trait.
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text("unused")],
+            end_turn: true,
+            usage: Usage::default(),
+        })
+    }
+
+    async fn complete_streaming(
+        &self,
+        _request: &LlmRequest,
+        _chunk_tx: &broadcast::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            // Intermediate turn: ask to search (no answer text published).
+            Ok(LlmResponse {
+                content: vec![ContentBlock::ToolUse {
+                    id: "t1".to_string(),
+                    name: "search_conversations".to_string(),
+                    input: serde_json::json!({ "query": "rate limiter" }),
+                }],
+                end_turn: false,
+                usage: Usage::default(),
+            })
+        } else {
+            // Final turn: answer with no tool call.
+            Ok(LlmResponse {
+                content: vec![ContentBlock::text("final answer after search")],
+                end_turn: true,
+                usage: Usage::default(),
+            })
+        }
+    }
+
+    #[allow(clippy::unnecessary_literal_bound)]
+    fn model_id(&self) -> &str {
+        "test-model"
+    }
+}
+
+#[tokio::test]
+async fn agent_loop_executes_tool_then_answers() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["ag-a", "ag-b"]).await;
+    add_continuation_summary(&db, "ag-a", "set up the limiter").await;
+    add_user_message(&db, "ag-b", 0, "the rate limiter uses a token bucket").await;
+
+    let llm: Arc<ScriptedToolLlm> = Arc::new(ScriptedToolLlm {
+        calls: AtomicUsize::new(0),
+    });
+    let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+
+    // Index must be populated for the search tool to find the leaf message;
+    // add_message indexes on insert, so it already is.
+    let qa_id = qa
+        .submit_question_blocking("ag-a", "how does rate limiting work here?")
+        .await
+        .unwrap();
+
+    let history = qa.list_history("ag-a").await.unwrap();
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, qa_id);
+    assert_eq!(history[0].status, ChainQaStatus::Completed);
+    assert_eq!(
+        history[0].answer.as_deref(),
+        Some("final answer after search"),
+    );
+    assert_eq!(
+        llm.calls.load(Ordering::SeqCst),
+        2,
+        "loop should take one tool turn then one answer turn",
     );
 }
