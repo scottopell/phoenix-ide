@@ -3757,6 +3757,7 @@ mod tests {
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
             persona: None,
+            work_scope_worktree: None,
         };
 
         let propose_tool = ToolCall::new(
