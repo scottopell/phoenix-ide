@@ -107,6 +107,7 @@ describe('MessageList', () => {
     // on a single DOM node — no cross-region promotion.
     const pending = {
       localId: 'msg-21',
+      conversationId: 'conv-1',
       text: 'pending acknowledgement',
       images: [],
       timestamp: 1,

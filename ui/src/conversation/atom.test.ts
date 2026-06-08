@@ -272,6 +272,7 @@ describe('conversationReducer', () => {
   describe('pending user-message reconciliation', () => {
     const queued: QueuedMessage = {
       localId: 'local-user-1',
+      conversationId: 'conv-1',
       text: 'hello',
       images: [],
       timestamp: 1,

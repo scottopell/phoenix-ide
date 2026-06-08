@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef, useEffect } from 'react';
 import { generateUUID } from '../utils/uuid';
 import type { FileAttachment, ImageData } from '../api';
 
@@ -19,6 +19,8 @@ export type MessageStatus = 'pending' | 'failed' | 'steering_queued';
 
 export interface QueuedMessage {
   localId: string;
+  /** Owning conversation (`LocalQueueEntry.scope.conversation_id` in the spec). */
+  conversationId: string;
   text: string;
   images: ImageData[];
   files?: FileAttachment[];
@@ -67,22 +69,17 @@ interface UseMessageQueueReturn {
   dismiss: (localId: string) => void;
 }
 
-function loadQueueFromStorage(storageKey: string | null): QueuedMessage[] {
-  if (!storageKey) return [];
+const STORAGE_PREFIX = 'phoenix:queue:';
+
+function loadQueueFromStorage(conversationId: string | undefined): QueuedMessage[] {
+  if (!conversationId) return [];
   try {
-    const stored = localStorage.getItem(storageKey);
+    const stored = localStorage.getItem(STORAGE_PREFIX + conversationId);
     if (!stored) return [];
     const parsed = JSON.parse(stored) as QueuedMessage[];
-    // Coerce the legacy `'sending'` status to `'pending'` (renamed in task
-    // 02676) so rehydrated entries survive the schema change without an
-    // explicit migration path.
-    return parsed.map((m) => {
-      const rawStatus = (m as unknown as { status?: string }).status;
-      if (rawStatus === 'sending') {
-          return { ...m, files: (m as Partial<QueuedMessage>).files ?? [], status: 'pending' as const };
-        }
-        return { ...m, files: (m as Partial<QueuedMessage>).files ?? [] };
-    });
+    // Keep only entries tagged for this conversation; drop foreign-tagged and
+    // untagged rows (spec rule RehydrateQueueForConversationOnly).
+    return parsed.filter((m) => m.conversationId === conversationId);
   } catch (error) {
     console.warn('Error reading message queue from localStorage:', error);
     return [];
@@ -102,7 +99,7 @@ function loadQueueFromStorage(storageKey: string | null): QueuedMessage[] {
  * a reconciliation effect (task 02673 → 02676).
  */
 export function useMessageQueue(conversationId: string | undefined): UseMessageQueueReturn {
-  const storageKey = conversationId ? `phoenix:queue:${conversationId}` : null;
+  const storageKey = conversationId ? STORAGE_PREFIX + conversationId : null;
 
   // In-render reset on conversationId change. The previous `useEffect`-based
   // reload committed the prior conversation's queue for one frame on
@@ -111,13 +108,22 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
   // from A briefly appeared in B's view. Reading storage during render — and
   // bumping a tracked-scope sentinel before returning — keeps state and props
   // in lockstep without a commit gap.
-  const [messages, setMessages] = useState<QueuedMessage[]>(() => loadQueueFromStorage(storageKey));
+  const [messages, setMessages] = useState<QueuedMessage[]>(() =>
+    loadQueueFromStorage(conversationId),
+  );
   const [trackedConversationId, setTrackedConversationId] = useState<string | undefined>(conversationId);
+
+  // Latest active conversation, read by mutations to tell whether they still
+  // own the rendered view (see `updateMessages`).
+  const activeConversationIdRef = useRef(conversationId);
+  useEffect(() => {
+    activeConversationIdRef.current = conversationId;
+  }, [conversationId]);
 
   let currentMessages = messages;
   if (trackedConversationId !== conversationId) {
     setTrackedConversationId(conversationId);
-    currentMessages = loadQueueFromStorage(storageKey);
+    currentMessages = loadQueueFromStorage(conversationId);
     setMessages(currentMessages);
   }
 
@@ -135,19 +141,31 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
     }
   }, [storageKey]);
 
-  // Update state and storage together
+  // Read the "previous" queue from this conversation's own key rather than
+  // shared React state, so a mutation can only ever touch its own
+  // conversation's queue (spec rule RehydrateQueueForConversationOnly).
+  //
+  // Persist always, but reflect into the shared rendered state only while this
+  // conversation is still the active one. A stale async callback bound to a
+  // prior conversation (e.g. a POST that resolves after navigation) must update
+  // its own stored queue without pushing it into the current conversation's view.
   const updateMessages = useCallback((updater: (prev: QueuedMessage[]) => QueuedMessage[]) => {
-    setMessages(prev => {
-      const next = updater(prev);
-      saveToStorage(next);
-      return next;
-    });
-  }, [saveToStorage]);
+    if (!conversationId) return;
+    const next = updater(loadQueueFromStorage(conversationId));
+    saveToStorage(next);
+    if (activeConversationIdRef.current === conversationId) {
+      setMessages(next);
+    }
+  }, [conversationId, saveToStorage]);
 
-  // Add a new message to the queue
+  // Add a new message to the queue. Callers gate sending on an active
+  // conversation; the guard keeps the spec invariant (conversation_id != "")
+  // true by construction rather than stamping an empty sentinel.
   const enqueue = useCallback((text: string, images: ImageData[] = [], files: FileAttachment[] = []): QueuedMessage => {
+    if (!conversationId) throw new Error('enqueue requires an active conversation');
     const msg: QueuedMessage = {
       localId: generateUUID(),
+      conversationId,
       text,
       images,
       files,
@@ -156,7 +174,7 @@ export function useMessageQueue(conversationId: string | undefined): UseMessageQ
     };
     updateMessages(prev => [...prev, msg]);
     return msg;
-  }, [updateMessages]);
+  }, [updateMessages, conversationId]);
 
   // Mark a message as failed
   const markFailed = useCallback((localId: string) => {

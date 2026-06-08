@@ -11,12 +11,26 @@ import {
 function queued(localId: string, overrides: Partial<QueuedMessage> = {}): QueuedMessage {
   return {
     localId,
+    conversationId: 'conv-1',
     text: `text-${localId}`,
     images: [],
     timestamp: 0,
     status: 'pending',
     ...overrides,
   };
+}
+
+// Write entries into a conversation's storage key. Each entry is tagged with
+// that conversation by default; pass an explicit `conversationId` to write a
+// foreign-tagged row (the contamination cases).
+function seed(
+  conversationId: string,
+  ...entries: Array<{ localId: string } & Partial<QueuedMessage>>
+): void {
+  localStorage.setItem(
+    `phoenix:queue:${conversationId}`,
+    JSON.stringify(entries.map((e) => queued(e.localId, { conversationId, ...e }))),
+  );
 }
 
 describe('derivePendingMessages', () => {
@@ -178,14 +192,8 @@ describe('useMessageQueue', () => {
   // queued items rendered as pending in conv B's view.
   it('reloads the queue when conversationId changes between two truthy values', () => {
     // Seed conv-a and conv-b storage with disjoint queues.
-    localStorage.setItem(
-      'phoenix:queue:conv-a',
-      JSON.stringify([queued('a-1', { text: 'from A' })]),
-    );
-    localStorage.setItem(
-      'phoenix:queue:conv-b',
-      JSON.stringify([queued('b-1', { text: 'from B' })]),
-    );
+    seed('conv-a', { localId: 'a-1', text: 'from A' });
+    seed('conv-b', { localId: 'b-1', text: 'from B' });
 
     const { result, rerender } = renderHook(
       ({ id }: { id: string }) => useMessageQueue(id),
@@ -198,10 +206,7 @@ describe('useMessageQueue', () => {
   });
 
   it('clears the queue when conversationId becomes undefined', () => {
-    localStorage.setItem(
-      'phoenix:queue:conv-a',
-      JSON.stringify([queued('a-1')]),
-    );
+    seed('conv-a', { localId: 'a-1' });
     const { result, rerender } = renderHook(
       ({ id }: { id: string | undefined }) => useMessageQueue(id),
       { initialProps: { id: 'conv-a' as string | undefined } },
@@ -212,15 +217,116 @@ describe('useMessageQueue', () => {
     expect(result.current.queuedMessages).toEqual([]);
   });
 
-  it("migrates legacy 'sending' status to 'pending' on rehydration", () => {
-    // Seed storage with the pre-02676 shape where pending was stored as
-    // 'sending'. The hook must coerce it so derivation works.
+  // Regression (cross-conversation queue bleed): a write that raced an
+  // A↔B switch persisted conversation B's pending entries under
+  // conversation A's storage key. Tagged with B's id, they could never
+  // reconcile against A's `atom.messages` (their localIds match B's server
+  // rows, not A's) and rendered as phantom `pending` bubbles that survived
+  // reload and restart. The load-path contamination guard drops them.
+  it('drops foreign-conversation entries stamped under the wrong key (self-heal)', () => {
+    // conv-a's storage was contaminated with a conv-b-tagged entry plus a
+    // legitimate conv-a entry.
+    seed(
+      'conv-a',
+      { localId: 'foreign', text: 'belongs to B', conversationId: 'conv-b' },
+      { localId: 'native', text: 'belongs to A' },
+    );
+
+    const { result } = renderHook(() => useMessageQueue('conv-a'));
+
+    expect(result.current.queuedMessages.map((q) => q.text)).toEqual(['belongs to A']);
+  });
+
+  it('rewrites storage without the foreign entry on the next mutation', () => {
+    seed(
+      'conv-a',
+      { localId: 'foreign', text: 'belongs to B', conversationId: 'conv-b' },
+      { localId: 'native', text: 'belongs to A' },
+    );
+
+    const { result } = renderHook(() => useMessageQueue('conv-a'));
+    act(() => {
+      result.current.enqueue('fresh A message', []);
+    });
+
+    const persisted = JSON.parse(
+      localStorage.getItem('phoenix:queue:conv-a')!,
+    ) as QueuedMessage[];
+    expect(persisted.map((q) => q.localId)).toEqual(['native', expect.any(String)]);
+    expect(persisted.every((q) => q.conversationId === 'conv-a')).toBe(true);
+  });
+
+  // Regression: a mutation bound to conversation A must never fold a stale
+  // localId from conversation B into A's storage. The write path reads the
+  // current key from localStorage rather than a shared React `prev`, so a
+  // foreign localId is simply absent and the mutation no-ops out.
+  it('marking a foreign localId failed does not resurrect it into the current queue', () => {
+    seed('conv-a', { localId: 'native', text: 'belongs to A' });
+
+    const { result } = renderHook(() => useMessageQueue('conv-a'));
+    act(() => {
+      // 'b-orphan' belongs to conversation B and was never enqueued under A.
+      result.current.markFailed('b-orphan');
+    });
+
+    expect(result.current.queuedMessages.map((q) => q.localId)).toEqual(['native']);
+    const persisted = JSON.parse(
+      localStorage.getItem('phoenix:queue:conv-a')!,
+    ) as QueuedMessage[];
+    expect(persisted.map((q) => q.localId)).toEqual(['native']);
+  });
+
+  // Regression: a callback captured under conversation A and fired after
+  // navigating to B (e.g. a POST that resolves post-navigation) must persist
+  // to A's own key without pushing A's queue into B's rendered view.
+  it('a stale mutation from a prior conversation does not pollute the current view', () => {
+    const { result, rerender } = renderHook(
+      ({ id }: { id: string }) => useMessageQueue(id),
+      { initialProps: { id: 'conv-a' } },
+    );
+
+    // Capture A's enqueue, then navigate to B (empty queue).
+    const enqueueA = result.current.enqueue;
+    rerender({ id: 'conv-b' });
+    expect(result.current.queuedMessages).toEqual([]);
+
+    // The stale A-bound callback resolves now.
+    act(() => {
+      enqueueA('late A message', []);
+    });
+
+    // B's view is untouched...
+    expect(result.current.queuedMessages).toEqual([]);
+    // ...but A's stored queue did receive the message.
+    const aStored = JSON.parse(
+      localStorage.getItem('phoenix:queue:conv-a')!,
+    ) as QueuedMessage[];
+    expect(aStored.map((q) => q.text)).toEqual(['late A message']);
+  });
+
+  it('stamps newly enqueued messages with the active conversationId', () => {
+    const { result } = renderHook(() => useMessageQueue('conv-active'));
+    let msg: QueuedMessage | undefined;
+    act(() => {
+      msg = result.current.enqueue('tagged', []);
+    });
+    expect(msg!.conversationId).toBe('conv-active');
+    expect(result.current.queuedMessages[0]!.conversationId).toBe('conv-active');
+  });
+
+  // Self-heal of pre-existing contamination: entries written before the
+  // conversation tag existed carry no `conversationId`, so their ownership
+  // cannot be confirmed. They are exactly the rows a pre-tag write race could
+  // have stranded under another conversation's key, so rehydration drops them
+  // rather than blessing them as belonging here (which would keep the phantom
+  // pending bubble alive across reload).
+  it('drops untagged legacy entries whose ownership cannot be confirmed', () => {
     const legacyEntry = {
       localId: 'legacy-1',
       text: 'old format',
       images: [],
       timestamp: 0,
-      status: 'sending',
+      status: 'pending',
     };
     localStorage.setItem(
       'phoenix:queue:conv-legacy',
@@ -228,8 +334,7 @@ describe('useMessageQueue', () => {
     );
 
     const { result } = renderHook(() => useMessageQueue('conv-legacy'));
-    expect(result.current.queuedMessages).toHaveLength(1);
-    expect(result.current.queuedMessages[0]!.status).toBe('pending');
+    expect(result.current.queuedMessages).toEqual([]);
   });
 });
 
@@ -267,14 +372,8 @@ describe('useMessageQueue — returning navigation does not flash stale queue', 
   }
 
   it('renders B-only items immediately after A→B switch (no A flash)', () => {
-    localStorage.setItem(
-      'phoenix:queue:conv-a',
-      JSON.stringify([queued('a-1', { text: 'from A' })]),
-    );
-    localStorage.setItem(
-      'phoenix:queue:conv-b',
-      JSON.stringify([queued('b-1', { text: 'from B' })]),
-    );
+    seed('conv-a', { localId: 'a-1', text: 'from A' });
+    seed('conv-b', { localId: 'b-1', text: 'from B' });
 
     const { getByTestId, queryByText } = render(<Harness initial="conv-a" />);
     expect(queryByText('from A')).not.toBeNull();
@@ -290,14 +389,8 @@ describe('useMessageQueue — returning navigation does not flash stale queue', 
   });
 
   it('renders A-only items immediately on returning A→B→A (no B flash)', () => {
-    localStorage.setItem(
-      'phoenix:queue:conv-a',
-      JSON.stringify([queued('a-1', { text: 'from A' })]),
-    );
-    localStorage.setItem(
-      'phoenix:queue:conv-b',
-      JSON.stringify([queued('b-1', { text: 'from B' })]),
-    );
+    seed('conv-a', { localId: 'a-1', text: 'from A' });
+    seed('conv-b', { localId: 'b-1', text: 'from B' });
 
     const { getByTestId, queryByText } = render(<Harness initial="conv-a" />);
     act(() => {
@@ -314,10 +407,7 @@ describe('useMessageQueue — returning navigation does not flash stale queue', 
   });
 
   it('renders empty list immediately when conversationId becomes undefined', () => {
-    localStorage.setItem(
-      'phoenix:queue:conv-a',
-      JSON.stringify([queued('a-1', { text: 'from A' })]),
-    );
+    seed('conv-a', { localId: 'a-1', text: 'from A' });
 
     function ClearHarness() {
       const [id, setId] = useState<string | undefined>('conv-a');

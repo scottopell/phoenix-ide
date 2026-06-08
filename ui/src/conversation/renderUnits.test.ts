@@ -93,6 +93,7 @@ function skillMsg(id: string): Message {
 function queued(localId: string): QueuedMessage {
   return {
     localId,
+    conversationId: 'conv-1',
     text: 'queued',
     images: [],
     timestamp: 0,

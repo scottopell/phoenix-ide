@@ -263,6 +263,26 @@ rule RehydrateQueueForConversationOnly {
         -- Queue storage is scoped by conversation id. Navigating between
         -- conversations must not render another conversation's local entries,
         -- even for a single frame.
+        --
+        -- Each persisted entry carries its owning conversation_id. Rehydration
+        -- trusts only entries whose tag matches the active conversation; a
+        -- foreign tag, or an untagged entry whose ownership cannot be
+        -- confirmed, is dropped. This makes a cross-conversation entry — which
+        -- can never reconcile against this conversation's authoritative
+        -- history (its local_id matches the other conversation's rows) —
+        -- unrenderable rather than a phantom pending bubble that survives
+        -- reload.
+        --
+        -- The render layer holds the queue in storage keyed by conversation;
+        -- when one hosting component is reused across a conversation switch,
+        -- mutations must read-modify-write the active conversation's key
+        -- rather than fold shared in-memory state. Otherwise a write that
+        -- races the switch persists one conversation's entries under another's
+        -- key. A mutation always persists to its own conversation's key, but
+        -- reflects into the rendered view only while that conversation is the
+        -- active one — so a callback that resolves after navigation (an
+        -- in-flight POST, say) updates its own stored queue without pushing it
+        -- into the now-displayed conversation.
 }
 
 ------------------------------------------------------------
