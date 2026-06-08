@@ -114,11 +114,11 @@ fn group_member_pids(pgid: i32) -> Option<Vec<u32>> {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        let Ok(pid) = name.parse::<u32>() else {
+        let Ok(member_pid) = name.parse::<u32>() else {
             continue;
         };
-        if proc_pgrp(pid) == Some(pgid) {
-            out.push(pid);
+        if proc_pgrp(member_pid) == Some(pgid) {
+            out.push(member_pid);
         }
     }
     Some(out)
