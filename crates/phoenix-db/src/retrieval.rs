@@ -169,14 +169,41 @@ impl Fts5Retriever {
             }
         }
 
-        // Whatever remains in `existing` has no live source message — prune.
-        for orphan_id in existing.keys() {
-            fts_delete_message(&self.pool, orphan_id).await?;
-        }
-        stats.pruned = existing.len();
+        // Prune index rows with no live source message, evaluated against the
+        // CURRENT `messages` table — not the (now possibly stale) snapshot
+        // loaded above. This closes a startup race: a hard delete can remove a
+        // conversation (and atomically prune its FTS rows) *after* this sweep
+        // snapshotted `messages`, and the upsert loop above would then
+        // re-insert the deleted message from its stale snapshot. Re-deriving
+        // orphans from the live table removes any such re-inserted row.
+        let pruned = sqlx::query(
+            "DELETE FROM message_fts WHERE message_id NOT IN (SELECT message_id FROM messages)",
+        )
+        .execute(&self.pool)
+        .await?;
+        stats.pruned = usize::try_from(pruned.rows_affected()).unwrap_or(usize::MAX);
 
         self.reconciled.store(true, Ordering::Release);
         Ok(stats)
+    }
+
+    /// Whether the index covers every row in `messages` — the freshness
+    /// watermark of REQ-RET-003. Unlike [`Self::index_reconciled`] (which only
+    /// records that the startup sweep ran), this re-checks live state, so it
+    /// also catches a best-effort live-write hook that logged-and-swallowed an
+    /// index failure. A consuming surface uses it to distinguish "no in-scope
+    /// match" from "the index is behind."
+    ///
+    /// # Errors
+    /// Returns [`RetrievalError`] if the query fails.
+    pub async fn index_is_current(&self) -> Result<bool, RetrievalError> {
+        let lagging: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM messages m \
+             WHERE NOT EXISTS(SELECT 1 FROM message_fts f WHERE f.message_id = m.message_id))",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(lagging == 0)
     }
 }
 
@@ -628,5 +655,25 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(hits.len(), 1, "repeated upsert must not duplicate the row");
+    }
+
+    #[tokio::test]
+    async fn index_is_current_reflects_coverage() {
+        let db = seed().await;
+        db.add_message("m1", "c-a", &MessageContent::user("indexed"), None, None)
+            .await
+            .unwrap();
+        let r = Fts5Retriever::new(db.pool().clone());
+        assert!(r.index_is_current().await.unwrap(), "all messages indexed");
+
+        // Simulate a best-effort index miss: a message exists with no FTS row.
+        sqlx::query("DELETE FROM message_fts WHERE message_id = 'm1'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            !r.index_is_current().await.unwrap(),
+            "a message missing from the index must report as behind",
+        );
     }
 }

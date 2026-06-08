@@ -33,8 +33,15 @@ pub const TOOL_EXCERPT_TAIL_CHARS: usize = 1024;
 /// role is carried in the index's `message_type` column, not the indexed
 /// text. Tool-use blocks within an agent message are omitted (they are
 /// structured calls, not prose); tool *results* are excerpted (head + tail).
+///
+/// Messages the UI deliberately hides (`display_data.hidden == true`, e.g.
+/// dismissed-error / dismissed-question recovery markers persisted as
+/// `System`) yield empty text, so internal artifacts never surface in recall.
 #[must_use]
 pub fn index_text(message: &Message) -> String {
+    if is_hidden(message) {
+        return String::new();
+    }
     match &message.content {
         MessageContent::User(c) => c.text.clone(),
         MessageContent::Agent(blocks) => blocks
@@ -53,6 +60,19 @@ pub fn index_text(message: &Message) -> String {
         MessageContent::Continuation(c) => c.summary.clone(),
         MessageContent::Skill(c) => format!("/{} {}", c.name, c.trigger),
     }
+}
+
+/// Whether the UI deliberately hides this message (`display_data.hidden ==
+/// true`), e.g. dismissed-error / dismissed-question recovery markers. Hidden
+/// messages are kept out of the retrieval index so internal artifacts don't
+/// pollute recall.
+fn is_hidden(message: &Message) -> bool {
+    message
+        .display_data
+        .as_ref()
+        .and_then(|d| d.get("hidden"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Size-capped head + tail excerpt of a tool-result body. Short results pass
@@ -201,5 +221,25 @@ mod tests {
             }))),
             "/review /review"
         );
+    }
+
+    #[test]
+    fn hidden_messages_are_not_indexed() {
+        let mut m = msg(MessageContent::System(SystemContent {
+            text: "user dismissed the error".into(),
+        }));
+        m.display_data = Some(serde_json::json!({ "hidden": true }));
+        assert_eq!(
+            index_text(&m),
+            "",
+            "hidden recovery markers must not enter the index",
+        );
+
+        // A non-hidden system message still indexes normally.
+        let mut visible = msg(MessageContent::System(SystemContent {
+            text: "context restored".into(),
+        }));
+        visible.display_data = Some(serde_json::json!({ "hidden": false }));
+        assert_eq!(index_text(&visible), "context restored");
     }
 }
