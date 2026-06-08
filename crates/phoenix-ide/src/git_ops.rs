@@ -759,10 +759,44 @@ pub(crate) fn repo_root_from_phoenix_worktree(path: &Path) -> Option<std::path::
         .map(std::path::Path::to_path_buf)
 }
 
-/// Ensure .gitignore in the given directory contains `.phoenix/`.
-/// Creates .gitignore if it doesn't exist. Stages the change if modified.
+/// True when `git check-ignore` reports `.phoenix/` already ignored in `dir` —
+/// by `.git/info/exclude`, a parent `.gitignore`, or any other mechanism. The
+/// `-q` form exits 0 when ignored, 1 when not, and >1 on error; we treat only a
+/// clean exit-0 as "already ignored" (an error/missing-git resolves to false so
+/// the caller falls back to its append+stage path).
+///
+/// The query path carries a trailing slash (`.phoenix/`): the canonical exclude
+/// pattern `.phoenix/` is directory-only, and git matches a directory-only
+/// pattern against a pathname only when the path is known to be a directory —
+/// either it exists on disk OR the queried path itself ends in `/`. Querying the
+/// bare `.phoenix` would spuriously report "not ignored" whenever the `.phoenix`
+/// directory does not yet exist.
+fn phoenix_is_already_ignored(dir: &Path) -> bool {
+    std::process::Command::new("git")
+        .args(["check-ignore", "-q", ".phoenix/"])
+        .current_dir(dir)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Ensure `.phoenix/` is ignored in the given directory, appending + staging the
+/// tracked `.gitignore` only when it is NOT already ignored by some other
+/// mechanism. Creates `.gitignore` if it doesn't exist.
+///
+/// No-op when `git check-ignore` already reports `.phoenix/` ignored — e.g. a
+/// fork/refinement worktree created with `PhoenixIgnoreStrategy::LocalExclude`
+/// shares the main repo's `.git/info/exclude`, so `.phoenix/` is already covered.
+/// Re-staging the tracked `.gitignore` there would sweep an unrelated `.gitignore`
+/// edit onto the task branch when the refinement is later approved (Explore→Work).
 pub(crate) fn ensure_gitignore_has_phoenix(dir: &Path) -> Result<(), String> {
     use std::io::Write as _;
+
+    // Already covered by `.git/info/exclude` (the fork strategy's shared
+    // exclude), a parent `.gitignore`, or anything else → touch nothing: no
+    // append, no staging.
+    if phoenix_is_already_ignored(dir) {
+        return Ok(());
+    }
 
     let gitignore_path = dir.join(".gitignore");
     let needs_update = if gitignore_path.exists() {
@@ -1387,5 +1421,71 @@ mod tests {
         // branch with no upstream should fall back to bare.
         run_git(clone.path(), &["branch", "feature"]).unwrap();
         assert_eq!(effective_base_ref(clone.path(), "feature"), "feature");
+    }
+
+    /// Bug 2: when `.phoenix/` is ALREADY ignored (here via `.git/info/exclude`,
+    /// the shared exclude a fork/refinement worktree inherits), a later
+    /// Explore→Work approval that calls `ensure_gitignore_has_phoenix` must NOT
+    /// touch the tracked `.gitignore` — no append, no `git add`. Otherwise an
+    /// unrelated `.gitignore` edit is swept onto the task branch.
+    #[test]
+    fn ensure_gitignore_is_noop_when_phoenix_already_ignored_via_exclude() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+        // Ignore `.phoenix/` via the local exclude (the fork strategy's path),
+        // not via the tracked `.gitignore`.
+        let info_dir = tmp.path().join(".git/info");
+        std::fs::create_dir_all(&info_dir).unwrap();
+        std::fs::write(info_dir.join("exclude"), ".phoenix/\n").unwrap();
+
+        // Stage an UNRELATED edit to a tracked `.gitignore` (not yet committed),
+        // to detect any accidental re-staging by the call below.
+        std::fs::write(tmp.path().join(".gitignore"), "*.log\n").unwrap();
+        run_git(tmp.path(), &["add", ".gitignore"]).unwrap();
+        run_git(tmp.path(), &["commit", "-q", "-m", "add gitignore"]).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "*.log\nbuild/\n").unwrap();
+        let before = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+
+        ensure_gitignore_has_phoenix(tmp.path()).unwrap();
+
+        // Content unchanged: no `.phoenix/` appended.
+        let after = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(
+            before, after,
+            "`.gitignore` must not be modified when `.phoenix/` is already ignored"
+        );
+        assert!(
+            !after.contains(".phoenix"),
+            "no `.phoenix/` line should be appended: {after:?}"
+        );
+        // The unrelated working-tree edit must NOT have been staged.
+        let staged = run_git(tmp.path(), &["diff", "--cached", "--name-only"]).unwrap();
+        assert!(
+            staged.trim().is_empty(),
+            "nothing should be staged (the unrelated .gitignore edit must not be swept): {staged:?}"
+        );
+    }
+
+    /// Bug 2 complement: when `.phoenix/` is NOT yet ignored (a plain
+    /// Explore/Branch worktree), `ensure_gitignore_has_phoenix` keeps its
+    /// append + stage behaviour.
+    #[test]
+    fn ensure_gitignore_appends_and_stages_when_not_yet_ignored() {
+        let tmp = TempDir::new().unwrap();
+        init_repo(tmp.path());
+
+        ensure_gitignore_has_phoenix(tmp.path()).unwrap();
+
+        let content = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(
+            content.lines().any(|l| l.trim() == ".phoenix/"),
+            "`.phoenix/` must be appended: {content:?}"
+        );
+        let staged = run_git(tmp.path(), &["diff", "--cached", "--name-only"]).unwrap();
+        assert_eq!(
+            staged.trim(),
+            ".gitignore",
+            "the new `.gitignore` must be staged: {staged:?}"
+        );
     }
 }

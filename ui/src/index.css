@@ -12476,6 +12476,14 @@ button.keyword-search-filepath:hover {
   color: var(--text-muted);
 }
 
+.fork-proposal-affordance--withdrawn {
+  color: var(--text-muted);
+}
+
+.fork-proposal-affordance__icon--muted {
+  color: var(--text-muted);
+}
+
 .fork-proposal-affordance__label {
   color: var(--text-secondary);
 }

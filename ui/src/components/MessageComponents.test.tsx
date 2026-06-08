@@ -911,6 +911,67 @@ describe('fork proposal Review affordance (REQ-PROJ-034 / 037)', () => {
     expect(screen.getByText('Dismissed')).toBeInTheDocument();
   });
 
+  // Bug P2 (race-proof withdrawal): the terminal `state_change` can arrive before
+  // the backend retires the pending proposals, so the immediate refetch may still
+  // read a `pending` row. The affordance must NOT offer Review when the origin is
+  // terminal — it withdraws to a "No longer available" state regardless of the
+  // stored status, because approve/request-changes would 409.
+  it('withdraws Review for a pending proposal whose origin is terminal (store still reports pending)', async () => {
+    const listMock = api.listForkProposals as ReturnType<typeof vi.fn>;
+    // The backend hasn't retired yet: every fetch (initial + terminal refetch +
+    // retry) reads the still-pending row. The UI must withdraw regardless.
+    listMock.mockResolvedValue([proposal({ status: 'pending' })]);
+
+    const message = agentMessage('agent-msg-fork', [
+      { type: 'tool_use', id: 'tool-fork', name: 'propose_task', input: { task_file: 'tasks/00042-p2-ready--fix-parser.md' } },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <ForkProposalsProvider conversationId="agent-1" originTerminal={true}>
+          <AgentMessage
+            message={message}
+            toolResults={new Map([['tool-fork', forkToolResult('prop-1')]])}
+            onOpenFile={undefined}
+          />
+        </ForkProposalsProvider>
+      </MemoryRouter>,
+    );
+
+    // Withdrawn state shows; no Review action despite the store reporting pending.
+    expect(await screen.findByText('No longer available')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review' })).not.toBeInTheDocument();
+  });
+
+  // Bug P2 (resolved proposals survive): a proposal already resolved
+  // (spawned/promoted) before the origin went terminal keeps its real terminal
+  // status + link — withdrawal applies only to still-`pending` proposals.
+  it('keeps a spawned terminal status (and link) when the origin is terminal', async () => {
+    (api.listForkProposals as ReturnType<typeof vi.fn>).mockResolvedValue([
+      proposal({ status: 'spawned', fork_conversation_id: 'fork-conv-9' }),
+    ]);
+
+    const message = agentMessage('agent-msg-fork', [
+      { type: 'tool_use', id: 'tool-fork', name: 'propose_task', input: { task_file: 'tasks/00042-p2-ready--fix-parser.md' } },
+    ]);
+
+    render(
+      <MemoryRouter>
+        <ForkProposalsProvider conversationId="agent-1" originTerminal={true}>
+          <AgentMessage
+            message={message}
+            toolResults={new Map([['tool-fork', forkToolResult('prop-1')]])}
+            onOpenFile={undefined}
+          />
+        </ForkProposalsProvider>
+      </MemoryRouter>,
+    );
+
+    // The Forked link survives a terminal origin; it is not withdrawn.
+    expect(await screen.findByRole('button', { name: 'Forked' })).toBeInTheDocument();
+    expect(screen.queryByText('No longer available')).not.toBeInTheDocument();
+  });
+
   // Bug N5: a 409 from approve is ambiguous. If the post-conflict refetch shows
   // the proposal STILL pending, the conflict was an actionable precondition
   // failure (e.g. a branch collision) — surface its message, do NOT claim the

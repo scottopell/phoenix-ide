@@ -11,6 +11,12 @@
  *  - `dismissed` → terminal "✗ Dismissed" status.
  *  - `promoted`  → terminal "→ Promoted to refinement" status, linking it.
  *
+ * Review is offered only while `pending` AND the origin conversation is not
+ * terminal: a terminal origin can never spawn/promote (the backend will 409 and
+ * retire the proposal), so a still-`pending` proposal whose origin is terminal
+ * is withdrawn to a "No longer available" status rather than offering an action
+ * that would fail. An already-resolved proposal keeps its real terminal status.
+ *
  * Inline symbols + color follow the AGENTS.md feedback patterns (green ✓ /
  * yellow + / red ✗); no heavy panel.
  */
@@ -82,6 +88,18 @@ export function ForkProposalAffordance({ proposalId }: ForkProposalAffordancePro
   }
 
   if (proposal.status === 'pending') {
+    // A terminal origin can never spawn/promote — the backend retires this
+    // proposal to `dismissed`, and approve/request-changes would 409. Withdraw
+    // the Review action regardless of the (possibly stale) `pending` status and
+    // show a muted withdrawn state, consistent with the terminal-status styling.
+    if (fork.originTerminal) {
+      return (
+        <div className="fork-proposal-affordance fork-proposal-affordance--withdrawn">
+          <X size={13} className="fork-proposal-affordance__icon--muted" />
+          <span>No longer available</span>
+        </div>
+      );
+    }
     return (
       <div className="fork-proposal-affordance fork-proposal-affordance--pending">
         <ClipboardCheck size={13} />

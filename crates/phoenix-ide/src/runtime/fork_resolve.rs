@@ -777,17 +777,53 @@ fn resolve_fork_start_point(repo_root: &Path, base: &str) -> Result<String, Fork
 
 /// Adopt-on-retry guard for a deterministically-named branch + worktree.
 ///
-/// Returns `Ok(true)` when the branch must be ADOPTED (already checked out in
-/// *this* proposal's deterministic worktree from a crashed prior attempt), so
-/// the caller skips `create_worktree`. `Ok(false)` when the branch does not
-/// exist and a fresh worktree must be created. `Err(Conflict)` when the branch
-/// exists but is checked out elsewhere (or not at all) — a real collision with
-/// a distinct unit of work.
+/// What `prepare_*_blocking` must do with the deterministic branch + worktree on
+/// (re)try, given the current git state. Distinguishing `Adopt` from `Recreate`
+/// is what makes a crashed-then-pruned attempt recover instead of looping: a
+/// porcelain entry whose checkout directory was deleted ("prunable") still
+/// reports the branch at the deterministic path, but adopting it writes files at
+/// a path that is not a real worktree and `git add` fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BranchDisposition {
+    /// Branch does not exist (or its only worktree was a pruned-away orphan whose
+    /// branch was cleaned): create a fresh worktree with `-b` off the base.
+    Create,
+    /// Branch is checked out in this proposal's OWN, REAL (present, non-prunable)
+    /// deterministic worktree from a crashed prior attempt: skip `create_worktree`
+    /// and converge the existing checkout in place.
+    Adopt,
+}
+
+/// True when `worktree_path` is an ACTUAL, present worktree — the directory
+/// exists on disk AND git recognises it as a work tree (`rev-parse
+/// --is-inside-work-tree` succeeds). A prunable porcelain entry (admin record
+/// present, checkout dir deleted) fails this, so it is never adopted into.
+fn is_real_present_worktree(worktree_path: &Path) -> bool {
+    worktree_path.is_dir()
+        && run_git(worktree_path, &["rev-parse", "--is-inside-work-tree"])
+            .map(|out| out.trim() == "true")
+            .unwrap_or(false)
+}
+
+/// Decide what to do with the deterministic branch/worktree for this proposal.
+///
+/// - branch absent → [`BranchDisposition::Create`].
+/// - branch checked out in this proposal's own, REAL deterministic worktree →
+///   [`BranchDisposition::Adopt`] (crash-recovery re-use, no duplicate id).
+/// - branch reported at the deterministic path but that worktree is PRUNABLE
+///   (checkout dir gone): not adoptable. Prune the stale admin entry and delete
+///   the now-unreferenced deterministic branch, then [`BranchDisposition::Create`]
+///   so the caller recreates a clean worktree off the base. Deleting the branch
+///   is safe — it is this proposal's own deterministic branch from a crashed
+///   attempt and (post-prune) is checked out nowhere.
+/// - branch checked out in some OTHER worktree → `Err(Conflict)`: a real
+///   collision with a distinct unit of work.
+/// - branch exists but is checked out nowhere → `Err(Conflict)`: same.
 fn classify_branch_collision(
     repo_root: &Path,
     worktree_path: &Path,
     branch_name: &str,
-) -> Result<bool, ForkResolveError> {
+) -> Result<BranchDisposition, ForkResolveError> {
     let branch_ref = format!("refs/heads/{branch_name}");
     let exists = run_git(
         repo_root,
@@ -795,19 +831,43 @@ fn classify_branch_collision(
     )
     .is_ok();
     if !exists {
-        return Ok(false);
+        return Ok(BranchDisposition::Create);
     }
-    // Branch exists: adopt iff it is checked out in this proposal's own worktree.
+    // Branch exists. It is adoptable only when it is checked out in THIS
+    // proposal's own deterministic worktree.
     let checked_out_here = find_branch_in_worktree_list(repo_root, branch_name)
         .is_some_and(|p| Path::new(&p) == worktree_path);
-    if checked_out_here {
-        Ok(true)
-    } else {
-        Err(ForkResolveError::Conflict(format!(
+    if !checked_out_here {
+        return Err(ForkResolveError::Conflict(format!(
             "branch '{branch_name}' already exists and is not this fork's own worktree — \
              a fork must name a distinct unit of work"
-        )))
+        )));
     }
+    // The porcelain entry ties the branch to the deterministic path, but that is
+    // only adoptable if the checkout directory is actually a present worktree. A
+    // prunable entry (dir deleted) must be pruned + recreated, not adopted.
+    if is_real_present_worktree(worktree_path) {
+        return Ok(BranchDisposition::Adopt);
+    }
+    tracing::info!(
+        branch = branch_name,
+        worktree = %worktree_path.display(),
+        "deterministic worktree is prunable (checkout dir gone); pruning + recreating instead of adopting"
+    );
+    // Drop the stale admin entry, then delete the orphaned deterministic branch
+    // so `create_worktree`'s `-b` can recreate it cleanly off the base. Both are
+    // best-effort: a failure surfaces as the original create error downstream.
+    if let Err(e) = run_git(repo_root, &["worktree", "prune"]) {
+        tracing::warn!(error = %e, "git worktree prune of stale deterministic entry failed (non-fatal)");
+    }
+    if let Err(e) = run_git(repo_root, &["branch", "-D", branch_name]) {
+        tracing::warn!(
+            error = %e,
+            branch = branch_name,
+            "deleting orphaned deterministic branch after prune failed (non-fatal)"
+        );
+    }
+    Ok(BranchDisposition::Create)
 }
 
 /// Write the snapshot body into the worktree, creating missing parent dirs.
@@ -856,6 +916,7 @@ impl RuntimeManager {
         // already runs to completion before any cleanup command is taken.
         let ctx = self.load_resolvable_proposal(proposal_id).await?;
         let fork_conv_id = derive_conv_id(proposal_id, ResolutionKind::Spawn);
+        let proposal = ctx.proposal.clone();
 
         let prepared = {
             let fork_conv_id = fork_conv_id.clone();
@@ -863,6 +924,14 @@ impl RuntimeManager {
                 .await
                 .map_err(|e| ForkResolveError::Internal(format!("spawn task panicked: {e}")))??
         };
+
+        // Close the during-git terminal race: the pre-git `load_resolvable_proposal`
+        // check can be made stale by the origin reaching a terminal state WHILE the
+        // blocking git phase ran (the RetireForOrigin command is serialized BEHIND
+        // this in-flight resolve, so it cannot moot the proposal in time). Re-read
+        // the origin now; if it went terminal, abort before recording `spawned` —
+        // retire the proposal + clean the orphan we just created — and 409.
+        self.abort_if_origin_now_terminal(&proposal).await?;
 
         self.db
             .resolve_fork_proposal_spawned(proposal_id, &prepared.conv, &[prepared.seed])
@@ -896,6 +965,7 @@ impl RuntimeManager {
         // No lock: serialized by the single fork-resolution consumer.
         let ctx = self.load_resolvable_proposal(proposal_id).await?;
         let refinement_conv_id = derive_conv_id(proposal_id, ResolutionKind::Promote);
+        let proposal = ctx.proposal.clone();
 
         let prepared = {
             let refinement_conv_id = refinement_conv_id.clone();
@@ -905,6 +975,10 @@ impl RuntimeManager {
             .await
             .map_err(|e| ForkResolveError::Internal(format!("spawn task panicked: {e}")))??
         };
+
+        // See `handle_approve`: re-check origin liveness after the git phase to
+        // close the during-git terminal race before recording `promoted`.
+        self.abort_if_origin_now_terminal(&proposal).await?;
 
         self.db
             .resolve_fork_proposal_promoted(proposal_id, &prepared.conv, &[prepared.seed])
@@ -993,6 +1067,52 @@ impl RuntimeManager {
                 "terminal-origin retire: failed to dismiss stale pending proposal"
             );
         }
+    }
+
+    /// Re-read the origin AFTER the blocking git phase and, if it has reached a
+    /// terminal state since `load_resolvable_proposal` checked, ABORT the
+    /// spawn/promote: retire the proposal (dismiss + clean the deterministic
+    /// orphan the git phase just created) and return the terminal-origin
+    /// `Conflict` WITHOUT recording `spawned`/`promoted`. This closes the
+    /// during-git race where the origin goes terminal while the worktree is being
+    /// built and the serialized `RetireForOrigin` command cannot moot the proposal
+    /// in time. `Ok(())` means the origin is still live — proceed to resolve.
+    ///
+    /// A DB read failure here is non-fatal to liveness: we cannot prove the origin
+    /// terminal, so we proceed (the pre-git check already passed) rather than
+    /// abort a valid resolve on a transient error.
+    async fn abort_if_origin_now_terminal(
+        &self,
+        proposal: &ForkProposal,
+    ) -> Result<(), ForkResolveError> {
+        let still_terminal = match self
+            .db
+            .get_conversation(&proposal.origin_conversation_id)
+            .await
+        {
+            Ok(origin) => origin.state.is_terminal(),
+            Err(e) => {
+                tracing::warn!(
+                    proposal_id = %proposal.id,
+                    error = %e,
+                    "post-git origin re-read failed; proceeding with resolve (cannot prove terminal)"
+                );
+                false
+            }
+        };
+        if !still_terminal {
+            return Ok(());
+        }
+        // Origin went terminal during the git phase. Undo the in-flight resolve:
+        // retire the proposal (dismiss + clean its deterministic orphan) under the
+        // fork actor's serialization, then surface the conflict so nothing is
+        // recorded as spawned/promoted and no child is started.
+        self.retire_terminal_origin_proposal(proposal).await;
+        Err(ForkResolveError::Conflict(
+            "the originating conversation reached a terminal state during fork \
+             resolution — the fork was not created"
+                .to_string(),
+        ))
     }
 
     /// Load a proposal and validate the shared resolve preconditions: it exists,
@@ -1236,7 +1356,8 @@ fn prepare_spawn_blocking(
     let start_point = resolve_fork_start_point(repo_root, base)?;
 
     let worktree_path = worktree_path(repo_root, fork_conv_id);
-    let adopt = classify_branch_collision(repo_root, &worktree_path, &branch_name)?;
+    let disposition = classify_branch_collision(repo_root, &worktree_path, &branch_name)?;
+    let adopt = disposition == BranchDisposition::Adopt;
     if !adopt {
         create_worktree(
             repo_root,
@@ -1303,7 +1424,8 @@ fn prepare_promote_blocking(
     let start_point = resolve_fork_start_point(repo_root, base)?;
 
     let worktree_path = worktree_path(repo_root, refinement_conv_id);
-    let adopt = classify_branch_collision(repo_root, &worktree_path, &temp_branch)?;
+    let adopt = classify_branch_collision(repo_root, &worktree_path, &temp_branch)?
+        == BranchDisposition::Adopt;
     if !adopt {
         create_worktree(
             repo_root,
@@ -2665,6 +2787,172 @@ mod tests {
             b.status,
             ForkProposalStatus::Pending,
             "a live origin's pending proposal must NOT be retired"
+        );
+    }
+
+    /// Bug 3 (during-git terminal race): the origin passes the PRE-git liveness
+    /// check, then goes terminal WHILE the blocking git phase builds the worktree.
+    /// The post-git re-check (`abort_if_origin_now_terminal`) must abort the
+    /// resolve: NO fork conversation recorded/started, the proposal converged to
+    /// `dismissed`, and the deterministic worktree the git phase created cleaned.
+    ///
+    /// Interpose: the deterministic spawn worktree is created up-front (standing in
+    /// for "the git phase already ran and produced this worktree"), the origin is
+    /// driven terminal AFTER that point, and the re-check guard is invoked directly
+    /// — exactly the state the real handler reaches between `prepare_spawn_blocking`
+    /// and `resolve_fork_proposal_spawned`.
+    #[tokio::test]
+    async fn during_git_terminal_aborts_resolve_and_cleans_orphan() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(
+            &db,
+            &origin,
+            "tasks/12345-p1-ready--fix-thing.md",
+            "# Fix the thing\n",
+        )
+        .await;
+        // The blocking git phase has run: the deterministic spawn worktree exists.
+        let fork_id =
+            make_deterministic_orphan(&repo, &pid, ResolutionKind::Spawn, "task-12345-fix-thing");
+        let fork_wt = repo.join(".phoenix/worktrees").join(&fork_id);
+        assert!(fork_wt.is_dir(), "git phase produced the worktree");
+
+        // The origin goes terminal DURING the git phase — after the pre-git check
+        // passed, before the DB resolve.
+        db.update_conversation_state(&origin, &ConvState::Terminal)
+            .await
+            .unwrap();
+
+        let rt = make_runtime(db.clone()).await;
+        let proposal = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+
+        // The post-git re-check guard aborts: returns a conflict, records nothing.
+        let err = rt
+            .abort_if_origin_now_terminal(&proposal)
+            .await
+            .expect_err("a now-terminal origin must abort the resolve");
+        assert!(matches!(err, ForkResolveError::Conflict(_)), "got {err:?}");
+
+        // No fork conversation was created.
+        assert!(
+            db.get_conversation(&fork_id).await.is_err(),
+            "no fork conversation may be created when the origin went terminal mid-resolve"
+        );
+        // The proposal converged to dismissed (not spawned).
+        let after = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            ForkProposalStatus::Dismissed,
+            "the proposal must be dismissed, never spawned"
+        );
+        assert!(
+            after.fork_conversation_id.is_none(),
+            "no fork conversation id may be recorded"
+        );
+        // The worktree the git phase created was cleaned.
+        assert!(
+            !fork_wt.exists(),
+            "the mid-resolve worktree orphan must be cleaned"
+        );
+        assert!(
+            git(&repo, &["branch", "--list", "task-12345-fix-thing"]).is_empty(),
+            "the orphan branch must be deleted"
+        );
+    }
+
+    /// Bug 3 fast-path preserved: a still-LIVE origin passes the post-git re-check,
+    /// so the resolve proceeds (the guard returns `Ok` and leaves the proposal
+    /// pending for the caller to resolve).
+    #[tokio::test]
+    async fn during_git_recheck_is_noop_when_origin_still_live() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(&db, &origin, "tasks/12345-p1-ready--x.md", "# x\n").await;
+        let rt = make_runtime(db.clone()).await;
+        let proposal = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+
+        // Origin is live: the guard must NOT abort and must NOT touch the proposal.
+        rt.abort_if_origin_now_terminal(&proposal)
+            .await
+            .expect("a live origin must let the resolve proceed");
+        let after = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(
+            after.status,
+            ForkProposalStatus::Pending,
+            "a live-origin re-check must leave the proposal pending"
+        );
+        let _ = origin;
+    }
+
+    /// Bug 4 (prunable deterministic worktree): a retry against a deterministic
+    /// worktree whose checkout DIRECTORY was deleted (admin entry still present,
+    /// `git worktree list --porcelain` reports it `prunable`) must NOT adopt it.
+    /// Adopting skips `create_worktree` and then `git add` fails at a path that is
+    /// not a real worktree, so retries loop forever. The resolve must instead prune
+    /// the stale entry and recreate the worktree, then succeed.
+    #[tokio::test]
+    async fn approve_prunes_and_recreates_prunable_deterministic_worktree() {
+        let (_tmp, repo) = init_repo();
+        let db = Database::open_in_memory().await.unwrap();
+        let (_pid, origin) = seed_project_and_origin(&db, &repo).await;
+        let pid = insert_pending(
+            &db,
+            &origin,
+            "tasks/12345-p1-ready--fix-thing.md",
+            "# Fix the thing\n",
+        )
+        .await;
+
+        // Crashed prior approve: deterministic worktree + branch created, then the
+        // checkout DIR deleted — git's porcelain still reports the branch at the
+        // deterministic path, flagged `prunable`.
+        let fork_id = make_dirless_deterministic_orphan(
+            &repo,
+            &pid,
+            ResolutionKind::Spawn,
+            "task-12345-fix-thing",
+        );
+        let fork_wt = repo.join(".phoenix/worktrees").join(&fork_id);
+        assert!(!fork_wt.exists(), "checkout dir is gone (prunable)");
+        // Sanity: the porcelain entry is prunable, the precondition for the bug.
+        let porcelain = git(&repo, &["worktree", "list", "--porcelain"]);
+        assert!(
+            porcelain.contains("prunable"),
+            "the deterministic entry must be prunable: {porcelain}"
+        );
+
+        // Approve must prune + recreate (not adopt-into-failure) and succeed.
+        let rt = make_runtime(db.clone()).await;
+        let got = rt
+            .approve_fork_proposal(&pid)
+            .await
+            .expect("approve must recover from a prunable deterministic worktree");
+        assert_eq!(got, fork_id, "recreated at the same deterministic id");
+
+        // The worktree is now a REAL, present worktree with the committed task.
+        assert!(fork_wt.is_dir(), "the worktree was recreated on disk");
+        let committed = git(
+            &fork_wt,
+            &[
+                "log",
+                "-1",
+                "--name-only",
+                "--pretty=format:",
+                "task-12345-fix-thing",
+            ],
+        );
+        assert!(
+            committed.contains("12345-p1-in-progress--fix-thing.md"),
+            "the recreated worktree carries the committed in-progress task: {committed}"
+        );
+        let resolved = db.get_fork_proposal(&pid).await.unwrap().unwrap();
+        assert_eq!(resolved.status, ForkProposalStatus::Spawned);
+        assert_eq!(
+            resolved.fork_conversation_id.as_deref(),
+            Some(fork_id.as_str())
         );
     }
 }

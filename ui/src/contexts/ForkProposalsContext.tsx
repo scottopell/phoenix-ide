@@ -38,6 +38,10 @@ interface ForkProposalsValue {
   /** Proposal keyed by id, or `undefined` while the list hasn't loaded yet
    *  (the affordance shows a muted loading state until then). */
   getProposal: (proposalId: string) => ForkProposalSummary | undefined;
+  /** True once the origin conversation has reached a terminal state. A terminal
+   *  origin can never spawn/promote, so a still-`pending` proposal is withdrawn
+   *  in the UI regardless of its (possibly stale) stored status. */
+  originTerminal: boolean;
   /** True until the first list fetch settles. */
   loaded: boolean;
   /** Re-fetch the proposal list (after an action, or when a new proposal id
@@ -147,12 +151,30 @@ export function ForkProposalsProvider({
   // the affordances reflect that and the Review buttons withdraw. Tracking the
   // prior value (rather than refetching on every render while terminal) keeps
   // this to a single fetch per transition.
+  //
+  // The terminal `state_change` can arrive before the backend finishes retiring
+  // the proposals, so the immediate refetch may still read `pending` rows. The
+  // affordance is already correct (it withdraws on `originTerminal` directly),
+  // but reconcile the stored status with a single delayed retry if any proposal
+  // is still `pending` after the immediate refetch. One retry, not polling.
   const prevTerminalRef = useRef<boolean>(originTerminal ?? false);
   useEffect(() => {
     const now = originTerminal ?? false;
     const was = prevTerminalRef.current;
     prevTerminalRef.current = now;
-    if (now && !was) refetch();
+    if (!now || was) return;
+    let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | undefined;
+    refetch().then((list) => {
+      if (cancelled) return;
+      if (list.some((p) => p.status === 'pending')) {
+        retry = setTimeout(() => refetch(), 1500);
+      }
+    });
+    return () => {
+      cancelled = true;
+      if (retry) clearTimeout(retry);
+    };
   }, [originTerminal, refetch]);
 
   const byId = useMemo(() => {
@@ -288,6 +310,7 @@ export function ForkProposalsProvider({
   const value = useMemo<ForkProposalsValue>(
     () => ({
       getProposal,
+      originTerminal: originTerminal ?? false,
       loaded,
       refetch,
       openProposalId,
@@ -299,6 +322,7 @@ export function ForkProposalsProvider({
     }),
     [
       getProposal,
+      originTerminal,
       loaded,
       refetch,
       openProposalId,
