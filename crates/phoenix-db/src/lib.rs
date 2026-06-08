@@ -3,6 +3,7 @@
 //! Provides persistence for conversations and messages.
 
 mod migrations;
+pub mod retrieval;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
@@ -10,6 +11,10 @@ mod migrations;
 use phoenix_core::domain::db_schema as schema;
 
 pub use migrations::run_pending_migrations;
+pub use retrieval::{
+    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalScope,
+    RetrievedChunk,
+};
 pub use schema::*;
 
 use chrono::{DateTime, Utc};
@@ -2140,6 +2145,10 @@ impl Database {
         if result.rows_affected() == 0 {
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        // The standalone FTS index has no FK cascade — prune its rows
+        // explicitly so deleted content never resurfaces in recall
+        // (specs/conversation-retrieval/ REQ-RET-003).
+        retrieval::fts_delete_conversation(&self.pool, id).await?;
         Ok(())
     }
 
@@ -2418,7 +2427,7 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
-        Ok(Message {
+        let message = Message {
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -2427,7 +2436,12 @@ impl Database {
             display_data: display_data.cloned(),
             usage_data: usage_data.cloned(),
             created_at: now,
-        })
+        };
+        // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
+        // The startup reconcile is the backstop if this ever fails after the
+        // message row commits.
+        retrieval::fts_upsert(&self.pool, &message).await?;
+        Ok(message)
     }
 
     /// Like `add_message_with_seq`, but persists a caller-supplied
@@ -2485,7 +2499,7 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
-        Ok(Message {
+        let message = Message {
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -2494,7 +2508,10 @@ impl Database {
             display_data: display_data.cloned(),
             usage_data: usage_data.cloned(),
             created_at,
-        })
+        };
+        // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
+        retrieval::fts_upsert(&self.pool, &message).await?;
+        Ok(message)
     }
 
     /// Get messages for a conversation
@@ -2636,6 +2653,19 @@ impl Database {
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::MessageNotFound(message_id.to_string()));
+        }
+        // Re-index the mutated message so the retrieval index reflects the new
+        // content (specs/conversation-retrieval/ REQ-RET-003).
+        let updated: Option<Message> = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages WHERE message_id = ?1",
+        )
+        .bind(message_id)
+        .try_map(parse_message_row)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(message) = updated {
+            retrieval::fts_upsert(&self.pool, &message).await?;
         }
         Ok(())
     }

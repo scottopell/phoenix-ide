@@ -11,6 +11,12 @@
 //! it). The full body is always reachable through the read path; this is the
 //! ranking-signal projection.
 
+// Extraction keys off the prose-bearing variants; non-prose ContentBlock
+// kinds (images, tool-use/result blocks, …) are uniformly skipped, so a
+// blanket arm is the intent here rather than per-variant enumeration of the
+// dozen-plus block kinds (mirrors `chain_qa`'s transcript renderer).
+#![allow(clippy::wildcard_enum_match_arm)]
+
 use super::db_schema::{Message, MessageContent};
 use super::llm_types::ContentBlock;
 
