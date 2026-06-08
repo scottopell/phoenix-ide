@@ -243,7 +243,17 @@ impl MessageRetriever for Fts5Retriever {
 pub async fn fts_upsert(pool: &SqlitePool, message: &Message) -> Result<(), sqlx::Error> {
     let text = index_text(message);
     let fingerprint = content_fingerprint(&text);
-    fts_delete_message(pool, &message.message_id).await?;
+    // Delete + insert in one transaction so the replace is atomic. The live
+    // write path and the startup reconcile sweep can both upsert the same
+    // `message_id` concurrently; SQLite serializes write transactions, so
+    // wrapping the pair prevents an interleaving (delete, delete, insert,
+    // insert) that would leave two index rows for one message — duplicates
+    // that the reconcile sweep's `message_id`-keyed map would not later prune.
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM message_fts WHERE message_id = ?1")
+        .bind(&message.message_id)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query(
         "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
          VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
@@ -254,8 +264,9 @@ pub async fn fts_upsert(pool: &SqlitePool, message: &Message) -> Result<(), sqlx
     .bind(message.message_type.to_string())
     .bind(message.created_at.to_rfc3339())
     .bind(fingerprint)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -558,5 +569,34 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn repeated_upsert_keeps_a_single_index_row() {
+        // The atomic delete+insert upsert must be idempotent: re-indexing the
+        // same message (as the live path and reconcile can both do during
+        // warmup) leaves exactly one row, not duplicate retrieval hits.
+        let db = seed().await;
+        let msg = db
+            .add_message(
+                "dup-1",
+                "c-a",
+                &MessageContent::user("kangaroo jurisprudence"),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        // add_message already indexed once; upsert the same message twice more.
+        fts_upsert(db.pool(), &msg).await.unwrap();
+        fts_upsert(db.pool(), &msg).await.unwrap();
+
+        let r = Fts5Retriever::new(db.pool().clone());
+        let hits = r
+            .retrieve("kangaroo", RetrievalScope::Global, 10)
+            .await
+            .unwrap();
+        assert_eq!(hits.len(), 1, "repeated upsert must not duplicate the row");
     }
 }
