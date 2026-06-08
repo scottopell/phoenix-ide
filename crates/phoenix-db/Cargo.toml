@@ -43,6 +43,9 @@ thiserror = "2"
 
 tracing = "0.1"
 
+# Async trait objects for the MessageRetriever seam (Arc<dyn MessageRetriever>).
+async-trait = "0.1"
+
 [dev-dependencies]
 # Re-declared with test-support so phoenix-core's #[cfg(test)] domain
 # constructors (ContentBlock::tool_use, …) are visible when this crate's own

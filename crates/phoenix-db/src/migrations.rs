@@ -99,6 +99,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "add_spawned_from_conversation_id",
         sql: MIGRATION_017,
     },
+    Migration {
+        version: 18,
+        name: "create_message_fts",
+        sql: MIGRATION_018,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -433,6 +438,28 @@ const MIGRATION_017: &str = r"
 ALTER TABLE conversations ADD COLUMN spawned_from_conversation_id TEXT;
 ";
 
+/// Conversation-retrieval index (`specs/conversation-retrieval/`).
+///
+/// A standalone FTS5 table over extracted message prose — *not* an
+/// external-content table over `messages`, because the indexed text is a
+/// Rust-side extraction of typed `MessageContent`, not the raw JSON column.
+/// `text` is the only tokenized column; the rest are `UNINDEXED` provenance /
+/// change-detection columns available to filtering and projection without
+/// participating in the match. The migration creates the empty structure; the
+/// typed backfill from existing `messages` is performed by the Rust startup
+/// reconciliation (`Fts5Retriever::reconcile`), which static SQL cannot do.
+const MIGRATION_018: &str = r"
+CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
+    text,
+    message_id      UNINDEXED,
+    chunk_ordinal   UNINDEXED,
+    conversation_id UNINDEXED,
+    message_type    UNINDEXED,
+    created_at      UNINDEXED,
+    content_hash    UNINDEXED
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -552,7 +579,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 17);
+        assert_eq!(first, 18);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
