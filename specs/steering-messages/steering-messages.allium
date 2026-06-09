@@ -161,6 +161,12 @@ rule EnqueueSteeringMessage {
 -- in FIFO order. The conversation re-enters llm_requesting to respond.
 rule DrainOnIdleEntry {
     when: conversation: bedrock.Conversation.core_status transitions_to idle
+    -- Turn-end only: error dismissal (error -> idle) is the user clearing a
+    -- banner, not a turn completing, so it must not drain the queue. The
+    -- dismissal edge emits bedrock.ErrorDismissed; this guard excludes it so
+    -- queued steers wait for an explicit retry/send. See bedrock's
+    -- UserDismissesError.
+    requires: not bedrock.ErrorDismissed(conversation)
     for q in SteeringQueue where q.conversation = conversation and q.depth > 0:
         -- The entire queue is taken; nothing remains.
         ensures: q.depth = 0
@@ -175,8 +181,13 @@ rule DrainOnIdleEntry {
         ensures: bedrock.RequestLlmIssued(conversation)
 
     @guidance
-        -- Triggers on any transition whose destination state is idle, regardless
-        -- of the source state (e.g., cancelling_tool -> idle, executing_tools -> idle).
+        -- Triggers on transitions whose destination state is idle and that
+        -- represent turn completion (e.g., cancelling_tool -> idle,
+        -- cancelling_sub_agents -> idle, llm_requesting -> idle). The one
+        -- excluded source is error dismissal (error -> idle, bedrock's
+        -- UserDismissesError): the requires guard above drops it because the
+        -- user is clearing a banner, not completing a turn, so queued steers
+        -- must wait for an explicit retry/send.
         --
         -- Drain-all (not one-at-a-time): the executor uses std::mem::take to swap
         -- the entire Vec<SteerEntry> out atomically. The bedrock arm for

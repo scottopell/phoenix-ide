@@ -287,7 +287,11 @@ pub(crate) fn extract_console_arg_text(arg: &RemoteObject) -> String {
     if let Some(value) = &arg.value {
         let raw = match value {
             serde_json::Value::String(s) => s.clone(),
-            other => other.to_string(),
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => value.to_string(),
         };
         return cap_for_memory(raw);
     }

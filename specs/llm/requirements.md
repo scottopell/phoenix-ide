@@ -113,13 +113,13 @@ AND SHALL NOT use a catch-all or unknown classification
 WHEN error is retryable for automatic runtime retry (network timeout, transient rate-limit throttle, server error)
 THE SYSTEM SHALL include retry-after hint when available
 
-WHEN error is not retryable for automatic runtime retry but may be recovered by user action (authentication failure, selected model overload)
+WHEN error is not retryable for automatic runtime retry but may be recovered by user action (authentication failure, selected model overload, usage-limit window reset)
 THE SYSTEM SHALL classify automatic retry policy separately from user-resume policy
 AND SHALL NOT use automatic retry classification to hide a persisted conversation resume affordance
 
 WHEN error is a quota/usage-limit exhaustion (distinct from a transient throttle)
-THE SYSTEM SHALL classify it as a terminal, non-retryable error category
-AND SHALL NOT collapse it into the transient rate-limit category
+THE SYSTEM SHALL classify it as a non-auto-retryable error category distinct from the transient rate-limit category
+AND SHALL classify it as user-resumable, because the quota window resets on a clock boundary and the user can resume the conversation once it clears
 
 WHEN error indicates the selected model is at capacity (e.g. provider returns `server_is_overloaded` or `slow_down`)
 THE SYSTEM SHALL classify it as a terminal, non-retryable error category distinct from generic server errors

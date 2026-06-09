@@ -408,7 +408,7 @@ mod tests {
         let cases = [
             (Network, AutoRetryable, Resumable),
             (RateLimit, AutoRetryable, Resumable),
-            (UsageLimitReached, NoAutoRetry, NotResumable),
+            (UsageLimitReached, NoAutoRetry, Resumable),
             (ServerError, AutoRetryable, Resumable),
             (ServerOverloaded, NoAutoRetry, Resumable),
             (Auth, NoAutoRetry, Resumable),

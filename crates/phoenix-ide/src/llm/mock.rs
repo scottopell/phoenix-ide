@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Mock LLM provider for frontend development without real API keys.
 //!
 //! Streams lorem-ipsum-style responses with realistic delays and cycles

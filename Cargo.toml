@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/phoenix-bash-display", "crates/phoenix-core", "crates/phoenix-db", "crates/phoenix-ide", "crates/phoenix-monitor", "crates/phoenix-skills", "crates/phoenix-state-machine", "crates/phoenix-terminal", "crates/phoenix-tls", "crates/phoenix-tools"]
+members = ["crates/phoenix-bash-display", "crates/phoenix-core", "crates/phoenix-db", "crates/phoenix-ide", "crates/phoenix-agents", "crates/phoenix-skills", "crates/phoenix-state-machine", "crates/phoenix-terminal", "crates/phoenix-tls", "crates/phoenix-tools"]
 
 [workspace.lints.clippy]
 pedantic = { level = "deny", priority = -1 }
@@ -12,6 +12,8 @@ unnecessary_to_owned = "deny"
 dbg_macro = "deny"
 mod_module_files = "deny"
 string_slice = "deny"
+wildcard_enum_match_arm = "deny"
+match_wildcard_for_single_variants = "deny"
 
 [workspace.lints.rust]
 unused_extern_crates = "deny"

@@ -8,9 +8,10 @@ continued into #42 continued into #44 — can give the chain a
 recognizable name ("auth refactor"), find it nested under a
 collapsible header in the sidebar, navigate to a dedicated chain page,
 and ask it recall questions ("what optimizations did we apply?")
-whose answers see every member of the chain. Q&A history persists per
-chain with snapshot-staleness indicators on answers generated against
-earlier chain states. Chains emerge automatically from the existing
+answered by a read-only agent that searches and reads across every
+member of the chain. Q&A history persists per chain, each stored answer
+carrying an age-of-answer freshness tag when the chain has grown since
+it was produced. Chains emerge automatically from the existing
 continuation graph (no manual grouping); standalone conversations
 remain ungrouped. Chains are linear in v1 — kickstart and offshoots
 are deferred pending resolution of the worktree-ownership invariant
@@ -27,16 +28,19 @@ Chains are a derived primitive over Phoenix's existing
 root conversations. One new table: `chain_qa` (one row per
 question/answer pair, indexed by `root_conv_id`, with explicit
 `status` enum tracking `in_flight` / `completed` / `failed` /
-`abandoned` and two integer snapshot counters for staleness
-comparison). Each Q&A invocation receives bundled context covering
-all chain members — for non-leaf members the trailing
-`MessageType::Continuation` summary on each member's tail; for the
-leaf the transcript or an in-process summary. Prior Q&A history is
-never fed back to the model, bounding cost and preventing drift. Token
-streaming reuses Phoenix's existing SSE infrastructure on a
-chain-scoped channel with per-question discriminator. A startup sweep
-transitions stale `in_flight` rows to `abandoned`. Q&A invocations
-use a mid-tier model balanced for cost and accuracy.
+`abandoned` and two integer chain-size markers recorded at answer time
+for the age-of-answer freshness tag). Each question runs a **read-only
+agentic loop**: a fresh agent drives the product-wide
+conversation-retrieval primitive (`specs/conversation-retrieval/`) as a
+chain-scoped search tool plus a chain-scoped paged read tool, iterating
+until it can answer. Its scope is bound to the chain (it cannot read
+outside it) and it has no state-mutating tools. Prior Q&A history is
+never fed back to the model, bounding drift; cost scales with question
+difficulty, bounded by a turn cap. Token streaming reuses Phoenix's
+existing SSE infrastructure on a chain-scoped channel with a per-question
+discriminator, publishing only the final answer turn. A startup sweep
+transitions stale `in_flight` rows to `abandoned`. The agent uses a
+mid-tier model balanced for cost and accuracy.
 
 ## Status Summary
 
@@ -49,8 +53,15 @@ use a mid-tier model balanced for cost and accuracy.
 | **REQ-CHN-005:** Q&A History Persists Per Chain | ✅ Complete | `chain_qa` table CRUD at `db.rs:2909-3008`; status enum + snapshot counters at `chain_qa.rs:145,323,520`; startup sweep `db.rs:1014` |
 | **REQ-CHN-006:** Consistent Quality As Q&A Accumulates | ✅ Complete | Stateless per-question invocation `chain_qa.rs:29,38,384`; `chain_qa_id` demux `chain_runtime.rs:8`, `api/chains.rs:119`, `api/wire.rs:463` |
 | **REQ-CHN-007:** Chain Has a User-Editable Name | ✅ Complete | Nullable `chain_name` column (`db.rs:2737`, `db.rs:3041`); whitespace clears the name (`api/chains.rs:182`) |
+| **REQ-CHN-008:** Chain Page Surfaces Work Identity Alongside Runtime Resources | Planned | Adds worktree/branch/task + PR-health facet to the existing work-scope dock (`specs/work-scope-ui/` REQ-WSUI-009); identity from `ConvMode`, PR health from the PR-status pipeline; not in `WorkScopeInventory` |
+| **REQ-CHN-009:** Chain Q&A Is a Read-Only Agentic Loop | Planned | Scope-bound search + read tools over `specs/conversation-retrieval/`; replaces summaries bundling; reframes REQ-CHN-005 staleness as an age-of-answer freshness tag |
 
-**Progress:** 7 of 7 complete. v1 shipped.
+**Progress:** v1 (REQ-CHN-001…007) shipped. REQ-CHN-008 (work-identity
+facet on the work-scope dock) and REQ-CHN-009 (read-only agentic Q&A)
+are the redesign, planned. REQ-CHN-008 builds on `specs/work-scope-ui/`
+(the chain dock + `work_scope_key`); REQ-CHN-009 depends on the new
+`specs/conversation-retrieval/` primitive, exposed to the Q&A agent as
+scope-bound tools.
 
 The "out of scope" list below remains accurate — the deferred Allium spec for the Q&A lifecycle is recommended now that the actual transitions are observable in production.
 
@@ -78,10 +89,10 @@ under `tasks/`.
   preserving REQ-CHN-006's stateless contract.
 - Cross-chain linking.
 - Project-level summary or steering doc.
-- Retrieval-backed Q&A architecture. Named future direction; trigger
-  to pivot is bundling cost becoming painful at observed chain sizes
-  or a product-level decision to introduce ambient memory across
-  non-chain conversations.
+- Retrieval-backed Q&A architecture. Now specified (REQ-CHN-009 +
+  `specs/conversation-retrieval/`) with a lexical FTS5/BM25 MVP backend.
+  Still out of scope: the vector/hybrid backend behind the retriever
+  seam, and the application-wide Q&A surface the `Global` scope serves.
 - Allium behavioral spec for chain Q&A lifecycle (`in_flight` /
   streaming / `completed` / `failed` / `abandoned`, snapshot
   computation, concurrent Q&A across tabs). The lifecycle has enough

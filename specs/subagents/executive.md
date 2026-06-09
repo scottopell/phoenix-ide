@@ -47,6 +47,13 @@ only the architectural seams.
 - **Timeout** is a 20-minute wall-clock safety-net set when the parent
   enters `awaiting_sub_agents`; `max_turns` (per-mode default 20/50) is
   the primary budget.
+- **Named agents** (see [`../agents/`](../agents/executive.md)) thread
+  through this layer: `SubAgentTask` gains an optional `agent_type`;
+  `SubAgentSpec` gains `agent_name` and `persona`;
+  `SpawnRejectedUnknownAgentType` rejects an unmatched `agent_type`; and
+  `SubAgentSpecsResolved` resolves mode/model with the agent definition as
+  the middle precedence layer. Persona discovery and composition are owned
+  by `agents.allium`.
 
 ## Status Summary
 

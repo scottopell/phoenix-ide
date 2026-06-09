@@ -26,6 +26,8 @@ export { useTheme } from './useTheme';
 export { useDensity, isSignificantText, SIGNIFICANCE_THRESHOLD } from './useDensity';
 export type { Density } from './useDensity';
 export { useScopedState } from './useScopedState';
+export { useInlineReferences } from './useInlineReferences';
+export type { UseInlineReferencesParams, InlineReferences } from './useInlineReferences';
 export { useMediaQuery, useIsDesktop, useIsWideDesktop, useIsMobile } from './useMediaQuery';
 
 // Export state machine for testing

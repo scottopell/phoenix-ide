@@ -626,6 +626,26 @@ export type CodexLoginStatus =
   | { kind: 'success'; account_id: string | null; auth_path: string }
   | { kind: 'error'; message: string };
 
+/**
+ * Selects the root that directory-scoped discovery (`@file` / `/skill`)
+ * resolves against, for the new-conversation composer. `mode`/`baseBranch`
+ * mirror the create-time submission: a branch/managed workflow discovers
+ * against the chosen branch's committed tree (what its worktree will hold),
+ * so suggestions match what create-time expansion can resolve. Omitted ⇒
+ * Direct (the working directory).
+ */
+export interface ProjectResolutionOpts {
+  // Explicit `| undefined` so a caller can pass `{ mode: undefined }` under
+  // exactOptionalPropertyTypes (the in-conversation composer leaves these unset).
+  mode?: 'direct' | 'managed' | 'branch' | undefined;
+  baseBranch?: string | null | undefined;
+}
+
+function applyResolutionOpts(params: URLSearchParams, opts?: ProjectResolutionOpts): void {
+  if (opts?.mode) params.set('mode', opts.mode);
+  if (opts?.baseBranch) params.set('base_branch', opts.baseBranch);
+}
+
 export const api = {
   async authStatus(): Promise<AuthStatus> {
     const resp = await fetch('/api/auth/status');
@@ -802,6 +822,12 @@ export const api = {
         if (resp.status === 409) {
           throw new ConflictError(err as ConflictErrorDetail);
         }
+        // The first message is expanded at create time even on the attachment
+        // path, so an unresolvable `@file`/`/skill` reference comes back as 422
+        // (REQ-IR-007) — surface it as ExpansionError like the JSON path does.
+        if (resp.status === 422) {
+          throw new ExpansionError(err as ExpansionErrorDetail);
+        }
         throw new Error(err.error || 'Failed to create conversation');
       }
       return (await resp.json()).conversation;
@@ -815,6 +841,11 @@ export const api = {
       const err = await resp.json();
       if (resp.status === 409) {
         throw new ConflictError(err as ConflictErrorDetail);
+      }
+      // The first message is expanded at create time, same as a chat send, so
+      // an unresolvable `@file` reference comes back as 422 (REQ-IR-007).
+      if (resp.status === 422) {
+        throw new ExpansionError(err as ExpansionErrorDetail);
       }
       throw new Error(err.error || 'Failed to create conversation');
     }
@@ -1042,6 +1073,26 @@ export const api = {
     return resp.json();
   },
 
+  /**
+   * List skills available for a working directory before a conversation exists
+   * (the new-conversation composer). Directory-scoped sibling of
+   * {@link listConversationSkills} (REQ-IR-005).
+   */
+  async listProjectSkills(
+    cwd: string,
+    opts?: ProjectResolutionOpts,
+    signal?: AbortSignal,
+  ): Promise<{ skills: SkillEntry[] }> {
+    const params = new URLSearchParams({ cwd });
+    applyResolutionOpts(params, opts);
+    const resp = await fetch(
+      `/api/skills?${params}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to list skills');
+    return resp.json();
+  },
+
   /** List tasks from a project tasks/ directory before a conversation exists */
   async listProjectTasks(cwd: string, signal?: AbortSignal): Promise<{ tasks: TaskEntry[] }> {
     const resp = await fetch(
@@ -1074,6 +1125,28 @@ export const api = {
     const params = new URLSearchParams({ q: query, limit: String(limit) });
     const resp = await fetch(
       `/api/conversations/${convId}/files/search?${params}`,
+      signal ? { signal } : {},
+    );
+    if (!resp.ok) throw new Error('Failed to search files');
+    return resp.json();
+  },
+
+  /**
+   * Search files in a working directory before a conversation exists (the
+   * new-conversation composer). Directory-scoped sibling of
+   * {@link searchConversationFiles} (REQ-IR-004).
+   */
+  async searchProjectFiles(
+    cwd: string,
+    query: string,
+    limit = 50,
+    opts?: ProjectResolutionOpts,
+    signal?: AbortSignal,
+  ): Promise<{ items: FileSearchEntry[] }> {
+    const params = new URLSearchParams({ cwd, q: query, limit: String(limit) });
+    applyResolutionOpts(params, opts);
+    const resp = await fetch(
+      `/api/files/search?${params}`,
       signal ? { signal } : {},
     );
     if (!resp.ok) throw new Error('Failed to search files');
@@ -1222,6 +1295,14 @@ export const api = {
       method: 'POST',
     });
     if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to dismiss question'); }
+    return resp.json();
+  },
+
+  async dismissError(convId: string): Promise<{ success: boolean }> {
+    const resp = await fetch(`/api/conversations/${convId}/dismiss-error`, {
+      method: 'POST',
+    });
+    if (!resp.ok) { const err = await resp.json(); throw new Error(err.error || 'Failed to dismiss error'); }
     return resp.json();
   },
 

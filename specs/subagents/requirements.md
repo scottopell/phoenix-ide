@@ -12,6 +12,13 @@ context window.
 > [`subagents.allium`](./subagents.allium) and
 > [`bedrock.allium`](../bedrock/bedrock.allium). This file records user
 > need, rationale, and per-requirement status only.
+>
+> Named agents ([`../agents/`](../agents/requirements.md)) extend the spawn
+> path: a task may carry an `agent_type` that supplies the spawned sub-agent's
+> persona and its default model and mode. The unknown-`agent_type` rejection
+> and the resolution precedence (task field → agent definition → mode default)
+> are normative in [`subagents.allium`](./subagents.allium); persona discovery
+> and composition are normative in [`agents.allium`](../agents/agents.allium).
 
 ## Requirements
 

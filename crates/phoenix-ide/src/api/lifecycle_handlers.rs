@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Conversation lifecycle HTTP handlers: task approval, abandon, mark-merged.
 
 use super::handlers::{run_resource_cleanup_cascade, AppError};
@@ -191,17 +192,18 @@ pub(crate) async fn abandon_task(
     // The live conversation is the continuation; terminal actions belong there.
     reject_if_continued(&conv, "abandon")?;
 
-    // REQ-BED-031: abandon is permitted from Idle *and* ContextExhausted.
-    // A context-exhausted parent with no continuation is the canonical
-    // "user is done; tear it down" path — the gate above already ensured
-    // no continuation exists, so the worktree/branch are still ours to
-    // destroy.
+    // REQ-BED-031: abandon is permitted from Idle, ContextExhausted, *and*
+    // Error. A parent with no continuation that is stuck (context-exhausted
+    // or errored, e.g. a usage-limit window) is the canonical "user is done;
+    // tear it down" path — the gate above already ensured no continuation
+    // exists, so the worktree/branch are still ours to destroy.
     if !matches!(
         conv.state,
-        ConvState::Idle | ConvState::ContextExhausted { .. },
+        ConvState::Idle | ConvState::ContextExhausted { .. } | ConvState::Error { .. },
     ) {
         return Err(AppError::BadRequest(
-            "Conversation must be idle or context-exhausted to abandon a task".to_string(),
+            "Conversation must be idle, context-exhausted, or in an error state to abandon a task"
+                .to_string(),
         ));
     }
 
@@ -475,16 +477,18 @@ pub(crate) async fn mark_merged(
     // The live conversation is the continuation; terminal actions belong there.
     reject_if_continued(&conv, "mark as merged")?;
 
-    // REQ-BED-031: mark-as-merged is permitted from Idle *and*
-    // ContextExhausted. A context-exhausted parent whose work has already
-    // been merged (e.g. user committed and merged externally) needs a way
-    // to dispose of the worktree without forcing a continuation first.
+    // REQ-BED-031: mark-as-merged is permitted from Idle, ContextExhausted,
+    // *and* Error. A parent whose work has already been merged externally
+    // needs a way to dispose of the worktree without forcing a continuation
+    // or a successful LLM turn first — and a conversation stuck in Error
+    // (e.g. a usage-limit window) is exactly such a case.
     if !matches!(
         conv.state,
-        ConvState::Idle | ConvState::ContextExhausted { .. },
+        ConvState::Idle | ConvState::ContextExhausted { .. } | ConvState::Error { .. },
     ) {
         return Err(AppError::BadRequest(
-            "Conversation must be idle or context-exhausted to mark as merged".to_string(),
+            "Conversation must be idle, context-exhausted, or in an error state to mark as merged"
+                .to_string(),
         ));
     }
 

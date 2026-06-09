@@ -207,7 +207,6 @@ function ConversationPageContent() {
   // Context-full banner: summary expanded by default; user can collapse to
   // read the conversation above.
   const [contextExhaustedExpanded, setContextExhaustedExpanded] = useState(true);
-  const [abandoningContextExhausted, setAbandoningContextExhausted] = useState(false);
 
   // ---------------------------------------------------------------------------
   // Per-slug state reset (task 02703).
@@ -244,7 +243,6 @@ function ConversationPageContent() {
     setShowTaskApproval(false);
     setShowFirstTaskWelcome(false);
     setContextExhaustedExpanded(true);
-    setAbandoningContextExhausted(false);
     setFocusToken(0);
     // Ref resets — immediate, no re-render.
     sendingMessagesRef.current = new Set();
@@ -912,6 +910,23 @@ function ConversationPageContent() {
   }
 
   const convStateForChildren = atom.phase;
+  // Terminal cleanup (Clean up merged PR / Abandon) for a Work/Branch
+  // conversation stuck in a disposable phase (error or context-exhausted): the
+  // backend and specs permit TaskResolved from those states. PR-aware; renders
+  // nothing for non-Work/Branch conversations; once continued the actions
+  // disable with a tooltip. Deliberately no onSendMessage — a stuck
+  // conversation exposes only terminal cleanup, never a message-posting action
+  // that would reopen the error. One definition, shared by both stuck branches.
+  const stuckCleanupBar = conversationId && (
+    <WorkControlBar
+      conversationId={conversationId}
+      convModeLabel={conversation.conv_mode_label}
+      phaseType={convStateForChildren.type}
+      continuedInConvId={conversation.continued_in_conv_id}
+      showError={showError}
+      prStatusHandle={prStatusHandle}
+    />
+  );
   const showTerminal =
     !!conversationId &&
     convStateForChildren.type !== 'terminal' &&
@@ -1112,43 +1127,8 @@ function ConversationPageContent() {
               >
                 Copy Summary
               </button>
-              {!conversation.continued_in_conv_id &&
-                (conversation.conv_mode_label === 'Work' ||
-                  conversation.conv_mode_label === 'Branch') && (
-                  // REQ-BED-031: abandon remains available on a context-exhausted
-                  // parent as long as no continuation exists. Once continued, the
-                  // abandon action belongs on the continuation. Only Work/Branch
-                  // mode have a worktree to tear down — `abandon-task` rejects
-                  // Explore/Direct with a 400, so the button only renders for
-                  // modes that the API accepts.
-                  <button
-                    type="button"
-                    className="context-exhausted-abandon"
-                    data-testid="context-exhausted-abandon"
-                    disabled={abandoningContextExhausted}
-                    onClick={async () => {
-                      if (!conversation?.id) return;
-                      const isBranch = conversation.conv_mode_label === 'Branch';
-                      const confirmed = window.confirm(
-                        isBranch
-                          ? 'Abandon this conversation? The worktree will be deleted but your branch will be kept.'
-                          : 'Abandon this task? The worktree and task branch will be deleted.',
-                      );
-                      if (!confirmed) return;
-                      setAbandoningContextExhausted(true);
-                      try {
-                        await api.abandonTask(conversation.id);
-                      } catch (err) {
-                        showInfo(err instanceof Error ? err.message : 'Failed to abandon task');
-                      } finally {
-                        setAbandoningContextExhausted(false);
-                      }
-                    }}
-                  >
-                    {abandoningContextExhausted ? 'Abandoning...' : 'Abandon'}
-                  </button>
-                )}
             </div>
+            {stuckCleanupBar}
             {contextExhaustedExpanded && (
               <pre className="context-exhausted-content">
                 {convStateForChildren.summary}
@@ -1206,7 +1186,8 @@ function ConversationPageContent() {
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
-          conversationId={conversationId}
+          cwd={conversation.cwd}
+          scopeKey={conversationId}
           convState={convStateForChildren}
           images={images}
           setImages={setImages}
@@ -1224,12 +1205,22 @@ function ConversationPageContent() {
         </RenderProfiler>
         </>
       ) : convStateForChildren.type === 'error' ? (
+        <>
+        {stuckCleanupBar}
         <ErrorBanner
           message={convStateForChildren.message}
           error={convStateForChildren.error}
           onRetry={() => handleSend('continue', [])}
-          onDismiss={() => dispatch({ type: 'local_phase_change', phase: { type: 'idle' }, expectedConversationId: conversation.id })}
+          onDismiss={() => {
+            // No optimistic idle: `dismissError` resolves on enqueue, not on
+            // persist, so faking idle could diverge if the executor races/
+            // rejects. The server-broadcast state_change SSE drives idle.
+            void api.dismissError(conversation.id).catch((e) => {
+              showError(e instanceof Error ? e.message : 'Failed to dismiss error');
+            });
+          }}
         />
+        </>
       ) : convStateForChildren.type === 'awaiting_user_response' ? (
         <QuestionPanel
           questions={convStateForChildren.questions}
@@ -1270,7 +1261,8 @@ function ConversationPageContent() {
         <ConnectedInputArea
           ref={inputRef}
           slug={slug!}
-          conversationId={conversationId}
+          cwd={conversation.cwd}
+          scopeKey={conversationId}
           convState={convStateForChildren}
           images={images}
           setImages={setImages}

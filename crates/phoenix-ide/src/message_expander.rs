@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Message expansion layer for inline references (REQ-IR-001 through REQ-IR-007)
 //!
 //! Resolves `@path/to/file` and `/skill-name` tokens in user messages before they
@@ -6,8 +7,7 @@
 //!
 //! Path (`./`) references are not expanded here — they are autocomplete-only (Task 572).
 
-use std::path::{Path, PathBuf};
-
+use crate::resolution_root::{FileResolution, ResolutionRoot};
 use crate::system_prompt::discover_skills;
 
 /// The result of expanding a user message.
@@ -239,12 +239,7 @@ fn looks_like_file_path(token: &str) -> bool {
     false
 }
 
-/// Determine whether `content` is valid UTF-8 text (no null bytes).
-fn is_text_content(content: &[u8]) -> bool {
-    !content.contains(&0) && std::str::from_utf8(content).is_ok()
-}
-
-/// Expand all inline references in `text` relative to `working_dir`.
+/// Expand all inline references in `text` against `root`.
 ///
 /// Tokenizes the ORIGINAL text once for both `@` and `/` sigils, then:
 /// 1. Checks for skill invocations (`/` sigil, validated against discovered skills).
@@ -255,16 +250,24 @@ fn is_text_content(content: &[u8]) -> bool {
 /// Tokenizing the original text (not skill-expanded text) prevents skill output
 /// from accidentally introducing `@` tokens that trigger file expansion.
 ///
+/// `root` is the conversation's [`ResolutionRoot`] — the same value the
+/// composer's autocomplete discovered candidates against, so a reference that
+/// autocompleted will resolve here.
+///
 /// Returns `Ok(ExpandedMessage)` when all references resolve successfully.
 /// Returns the first `Err(ExpansionError)` encountered when any reference fails.
-pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, ExpansionError> {
+pub fn expand(text: &str, root: &ResolutionRoot) -> Result<ExpandedMessage, ExpansionError> {
     let refs = tokenize_references(text, &['/', '@']);
 
     // --- Skill expansion (REQ-IR-002, REQ-IR-003) ----------------------------
     // Check for skill invocation first. Skill expansion replaces the entire
     // message, so it takes priority over file references.
     if let Some(skill_ref) = refs.iter().find(|r| r.sigil == '/') {
-        let skills = discover_skills(working_dir);
+        // `skills_view` materializes a branch's committed `SKILL.md` files for a
+        // GitTree root; keep it alive through `invoke_skill`, which reads them
+        // back from the same paths.
+        let skills_view = root.skills_view();
+        let skills = discover_skills(&skills_view.dir);
         if skills.iter().any(|s| s.name == skill_ref.token) {
             // Safety: `skill_ref.span.end` is produced by the tokenizer from
             // `char_indices()` on `text`, so it is always a valid UTF-8
@@ -290,45 +293,42 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
     }
 
     // --- File reference expansion (REQ-IR-001, REQ-IR-007) ---------------------
-    let mut llm_text = text.to_string();
-    let file_refs: Vec<_> = refs.iter().filter(|r| r.sigil == '@').collect();
-
-    for file_ref in file_refs {
+    // Collect (span, replacement) for each resolvable `@reference`, then splice
+    // them into the original text by span in reverse order. Splicing by the
+    // tokenizer's recorded spans — rather than a global string replace — means
+    // only the occurrences the tokenizer accepted are expanded: an identical
+    // literal sitting inside a masked code region (which the tokenizer skipped)
+    // is left untouched (`NoExpansionInsideCode`).
+    let mut replacements: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    for file_ref in refs.iter().filter(|r| r.sigil == '@') {
         // ClassifyAtReference: only treat path-like tokens as file references.
         // Bare words (@username, @param) pass through as literal text.
         if !looks_like_file_path(&file_ref.token) {
             continue;
         }
 
-        let full_path = resolve_path(&file_ref.token, working_dir);
+        let file_text = match root.read_file(&file_ref.token) {
+            FileResolution::Text(text) => text,
+            FileResolution::Binary => {
+                return Err(ExpansionError::FileNotText {
+                    path: file_ref.token.clone(),
+                });
+            }
+            FileResolution::NotFound => {
+                return Err(ExpansionError::FileNotFound {
+                    path: file_ref.token.clone(),
+                });
+            }
+        };
 
-        // Validate existence
-        if !full_path.exists() {
-            return Err(ExpansionError::FileNotFound {
-                path: file_ref.token.clone(),
-            });
-        }
-
-        // Read contents
-        let content = std::fs::read(&full_path).map_err(|_| ExpansionError::FileNotFound {
-            path: file_ref.token.clone(),
-        })?;
-
-        // Reject binary files
-        if !is_text_content(&content) {
-            return Err(ExpansionError::FileNotText {
-                path: file_ref.token.clone(),
-            });
-        }
-
-        let file_text = String::from_utf8(content).map_err(|_| ExpansionError::FileNotText {
-            path: file_ref.token.clone(),
-        })?;
-
-        // Replace `@ref_path` token with structured block
-        let token = format!("@{}", file_ref.token);
         let block = format!("<file path=\"{}\">\n{file_text}\n</file>", file_ref.token);
-        llm_text = llm_text.replace(&token, &block);
+        replacements.push((file_ref.span.clone(), block));
+    }
+
+    let mut llm_text = text.to_string();
+    // Reverse so each splice leaves earlier spans' byte offsets valid.
+    for (span, block) in replacements.into_iter().rev() {
+        llm_text.replace_range(span, &block);
     }
 
     Ok(ExpandedMessage {
@@ -338,23 +338,17 @@ pub fn expand(text: &str, working_dir: &Path) -> Result<ExpandedMessage, Expansi
     })
 }
 
-/// Resolve a reference path to an absolute filesystem path.
-///
-/// Absolute paths are used as-is; relative paths are joined to `working_dir`.
-fn resolve_path(ref_path: &str, working_dir: &Path) -> PathBuf {
-    let p = Path::new(ref_path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        working_dir.join(p)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::Path;
     use tempfile::TempDir;
+
+    /// Wrap a temp dir as a working-directory resolution root for tests.
+    fn root(dir: &Path) -> ResolutionRoot {
+        ResolutionRoot::working_dir(dir)
+    }
 
     fn make_tmp() -> TempDir {
         TempDir::new().unwrap()
@@ -560,7 +554,7 @@ mod tests {
     #[test]
     fn test_expand_no_refs_passthrough() {
         let tmp = make_tmp();
-        let result = expand("hello world", tmp.path()).unwrap();
+        let result = expand("hello world", &root(tmp.path())).unwrap();
         assert_eq!(result.display_text, "hello world");
         assert_eq!(result.llm_text, "hello world");
         assert!(result.skill_invocation.is_none());
@@ -571,7 +565,7 @@ mod tests {
         let tmp = make_tmp();
         fs::write(tmp.path().join("hello.txt"), "contents here").unwrap();
 
-        let result = expand("check @hello.txt please", tmp.path()).unwrap();
+        let result = expand("check @hello.txt please", &root(tmp.path())).unwrap();
         assert_eq!(result.display_text, "check @hello.txt please");
         assert!(result.llm_text.contains("<file path=\"hello.txt\">"));
         assert!(result.llm_text.contains("contents here"));
@@ -585,7 +579,7 @@ mod tests {
         fs::write(tmp.path().join("a.txt"), "aaa").unwrap();
         fs::write(tmp.path().join("b.txt"), "bbb").unwrap();
 
-        let result = expand("@a.txt and @b.txt", tmp.path()).unwrap();
+        let result = expand("@a.txt and @b.txt", &root(tmp.path())).unwrap();
         assert!(result.llm_text.contains("<file path=\"a.txt\">"));
         assert!(result.llm_text.contains("<file path=\"b.txt\">"));
         assert!(result.llm_text.contains("aaa"));
@@ -597,9 +591,36 @@ mod tests {
         let tmp = make_tmp();
         fs::write(tmp.path().join("f.txt"), "x").unwrap();
 
-        let result = expand("see @f.txt", tmp.path()).unwrap();
+        let result = expand("see @f.txt", &root(tmp.path())).unwrap();
         // display_text is exactly what the user typed
         assert_eq!(result.display_text, "see @f.txt");
+    }
+
+    #[test]
+    fn test_expand_leaves_same_ref_inside_code_fence_untouched() {
+        // A real `@hello.txt` reference plus the identical literal inside a
+        // fenced code block: only the real (tokenized) one expands; the masked
+        // copy must survive verbatim (NoExpansionInsideCode).
+        let tmp = make_tmp();
+        fs::write(tmp.path().join("hello.txt"), "REALCONTENT").unwrap();
+
+        let input = "see @hello.txt\n```\ntrace @hello.txt here\n```";
+        let result = expand(input, &root(tmp.path())).unwrap();
+
+        // Exactly one expansion (the reference outside the fence).
+        assert_eq!(
+            result.llm_text.matches("<file path=\"hello.txt\">").count(),
+            1,
+            "only the out-of-code reference should expand: {}",
+            result.llm_text
+        );
+        assert!(result.llm_text.contains("REALCONTENT"));
+        // The in-fence occurrence is preserved verbatim, not turned into a block.
+        assert!(
+            result.llm_text.contains("trace @hello.txt here"),
+            "fenced occurrence must survive: {}",
+            result.llm_text
+        );
     }
 
     // -------------------------------------------------------------------------
@@ -609,7 +630,7 @@ mod tests {
     #[test]
     fn test_expand_missing_file_error() {
         let tmp = make_tmp();
-        let err = expand("check @missing.rs", tmp.path()).unwrap_err();
+        let err = expand("check @missing.rs", &root(tmp.path())).unwrap_err();
         assert_eq!(
             err,
             ExpansionError::FileNotFound {
@@ -625,7 +646,7 @@ mod tests {
         // Uses .txt extension so ClassifyAtReference treats it as a file reference.
         fs::write(tmp.path().join("bin.txt"), b"hello\x00world").unwrap();
 
-        let err = expand("check @bin.txt", tmp.path()).unwrap_err();
+        let err = expand("check @bin.txt", &root(tmp.path())).unwrap_err();
         assert_eq!(
             err,
             ExpansionError::FileNotText {
@@ -768,7 +789,7 @@ mod tests {
             "Write in a formal tone.",
         );
 
-        let result = expand("/writing-style", tmp.path()).unwrap();
+        let result = expand("/writing-style", &root(tmp.path())).unwrap();
         assert_eq!(result.display_text, "/writing-style");
         assert!(result.llm_text.contains("Write in a formal tone."));
         // No text after the token — arguments is empty, so append fallback does not fire
@@ -790,7 +811,7 @@ mod tests {
             "Please review $ARGUMENTS carefully.",
         );
 
-        let result = expand("/review src/main.rs", tmp.path()).unwrap();
+        let result = expand("/review src/main.rs", &root(tmp.path())).unwrap();
         assert_eq!(result.display_text, "/review src/main.rs");
         // $ARGUMENTS is replaced with only the text after the skill token
         assert!(result
@@ -811,7 +832,7 @@ mod tests {
             "Run the deployment steps.",
         );
 
-        let result = expand("/deploy staging", tmp.path()).unwrap();
+        let result = expand("/deploy staging", &root(tmp.path())).unwrap();
         assert_eq!(result.display_text, "/deploy staging");
         assert!(result.llm_text.contains("Run the deployment steps."));
         // Only the text after the skill token is appended as ARGUMENTS
@@ -829,7 +850,7 @@ mod tests {
             "Run the build steps.",
         );
 
-        let result = expand("use /build to compile", tmp.path()).unwrap();
+        let result = expand("use /build to compile", &root(tmp.path())).unwrap();
         assert_eq!(result.display_text, "use /build to compile");
         assert!(result.llm_text.contains("Run the build steps."));
         assert!(result.llm_text.contains("ARGUMENTS: to compile"));
@@ -846,7 +867,7 @@ mod tests {
             "Please review $ARGUMENTS carefully.",
         );
 
-        let result = expand("use /review to check this PR", tmp.path()).unwrap();
+        let result = expand("use /review to check this PR", &root(tmp.path())).unwrap();
         assert_eq!(result.display_text, "use /review to check this PR");
         assert!(result
             .llm_text
@@ -857,7 +878,7 @@ mod tests {
     fn test_expand_file_path_not_skill() {
         // /usr/bin/ls should not trigger skill expansion
         let tmp = make_tmp();
-        let result = expand("run /usr/bin/ls please", tmp.path()).unwrap();
+        let result = expand("run /usr/bin/ls please", &root(tmp.path())).unwrap();
         assert_eq!(result.display_text, "run /usr/bin/ls please");
         assert_eq!(result.llm_text, "run /usr/bin/ls please");
     }
@@ -867,7 +888,7 @@ mod tests {
         let tmp = make_tmp();
         // With no skills defined, /nonexistent should pass through as plain text
         // (tokenizer finds it but expand validates against known skills)
-        let result = expand("/nonexistent", tmp.path()).unwrap();
+        let result = expand("/nonexistent", &root(tmp.path())).unwrap();
         assert_eq!(result.llm_text, "/nonexistent");
     }
 
@@ -877,7 +898,7 @@ mod tests {
         write_skill(tmp.path(), "foo-skill", "foo", "Foo skill", "Foo body.");
 
         // /missing is not a known skill, so it passes through as plain text
-        let result = expand("/missing", tmp.path()).unwrap();
+        let result = expand("/missing", &root(tmp.path())).unwrap();
         assert_eq!(result.llm_text, "/missing");
     }
 
@@ -886,14 +907,14 @@ mod tests {
         let tmp = make_tmp();
         write_skill(tmp.path(), "ws", "ws", "Writing style", "Be concise.");
 
-        let result = expand("/ws help with email", tmp.path()).unwrap();
+        let result = expand("/ws help with email", &root(tmp.path())).unwrap();
         assert_eq!(result.display_text, "/ws help with email");
     }
 
     #[test]
     fn test_non_slash_message_unchanged() {
         let tmp = make_tmp();
-        let result = expand("hello world", tmp.path()).unwrap();
+        let result = expand("hello world", &root(tmp.path())).unwrap();
         assert_eq!(result.display_text, "hello world");
         assert_eq!(result.llm_text, "hello world");
         assert!(result.skill_invocation.is_none());
@@ -904,14 +925,14 @@ mod tests {
     #[test]
     fn test_bare_at_word_passes_through() {
         let tmp = make_tmp();
-        let result = expand("hello @username how are you", tmp.path()).unwrap();
+        let result = expand("hello @username how are you", &root(tmp.path())).unwrap();
         assert_eq!(result.llm_text, "hello @username how are you");
     }
 
     #[test]
     fn test_at_param_passes_through() {
         let tmp = make_tmp();
-        let result = expand("use @param annotation", tmp.path()).unwrap();
+        let result = expand("use @param annotation", &root(tmp.path())).unwrap();
         assert_eq!(result.llm_text, "use @param annotation");
     }
 
@@ -919,7 +940,7 @@ mod tests {
     fn test_at_with_extension_treated_as_file_ref() {
         let tmp = make_tmp();
         // This has .md extension -- looks like a file, should try to resolve
-        let result = expand("check @MISSING.md please", tmp.path());
+        let result = expand("check @MISSING.md please", &root(tmp.path()));
         assert!(result.is_err()); // FileNotFound because the file doesn't exist
     }
 
@@ -927,7 +948,7 @@ mod tests {
     fn test_at_with_slash_treated_as_file_ref() {
         let tmp = make_tmp();
         // Contains / -- looks like a path, should try to resolve
-        let result = expand("check @src/main.rs please", tmp.path());
+        let result = expand("check @src/main.rs please", &root(tmp.path()));
         assert!(result.is_err()); // FileNotFound
     }
 
@@ -935,7 +956,7 @@ mod tests {
     fn test_at_existing_file_with_extension_expands() {
         let tmp = make_tmp();
         fs::write(tmp.path().join("test.txt"), "file content").unwrap();
-        let result = expand("see @test.txt here", tmp.path()).unwrap();
+        let result = expand("see @test.txt here", &root(tmp.path())).unwrap();
         assert!(result.llm_text.contains("file content"));
         assert!(result.llm_text.contains("<file"));
     }
@@ -955,7 +976,11 @@ mod tests {
     #[test]
     fn test_bazel_label_passes_through() {
         let tmp = make_tmp();
-        let result = expand("build @+go_fast+go_fast//:go_fast.exe target", tmp.path()).unwrap();
+        let result = expand(
+            "build @+go_fast+go_fast//:go_fast.exe target",
+            &root(tmp.path()),
+        )
+        .unwrap();
         assert_eq!(
             result.llm_text,
             "build @+go_fast+go_fast//:go_fast.exe target"
@@ -965,14 +990,14 @@ mod tests {
     #[test]
     fn test_bare_bazel_label_passes_through() {
         let tmp = make_tmp();
-        let result = expand("run @//pkg:target please", tmp.path()).unwrap();
+        let result = expand("run @//pkg:target please", &root(tmp.path())).unwrap();
         assert_eq!(result.llm_text, "run @//pkg:target please");
     }
 
     #[test]
     fn test_url_after_at_passes_through() {
         let tmp = make_tmp();
-        let result = expand("see @https://example.com/docs", tmp.path()).unwrap();
+        let result = expand("see @https://example.com/docs", &root(tmp.path())).unwrap();
         assert_eq!(result.llm_text, "see @https://example.com/docs");
     }
 

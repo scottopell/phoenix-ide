@@ -692,15 +692,25 @@ pub struct ToolRegistryExecutor {
     /// into the registry. This means enable/disable and reload take effect
     /// immediately across all conversations.
     mcp_manager: Option<Arc<crate::tools::mcp::McpClientManager>>,
+    /// The named-agent catalog frozen at conversation start. Reused when
+    /// upgrading Explore → Work so the rebuilt Work registry's `spawn_agents`
+    /// tool advertises the *same* `agent_type` enum the executor resolves
+    /// against, instead of re-discovering the filesystem (REQ-AG-004/008).
+    /// Empty for sub-agents.
+    agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
 }
 
 impl ToolRegistryExecutor {
     /// Create an executor with built-in tools only (no MCP).
     /// Used for sub-agents which have a restricted tool set.
-    pub fn builtin_only(registry: ToolRegistry) -> Self {
+    pub fn builtin_only(
+        registry: ToolRegistry,
+        agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
+    ) -> Self {
         Self {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: None,
+            agent_catalog,
         }
     }
 
@@ -710,10 +720,12 @@ impl ToolRegistryExecutor {
     pub fn with_mcp(
         registry: ToolRegistry,
         manager: Arc<crate::tools::mcp::McpClientManager>,
+        agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
     ) -> Self {
         Self {
             registry: std::sync::RwLock::new(registry),
             mcp_manager: Some(manager),
+            agent_catalog,
         }
     }
 
@@ -812,7 +824,9 @@ impl ToolExecutor for ToolRegistryExecutor {
     }
 
     fn upgrade_to_work_mode(&self) {
-        self.swap_registry(ToolRegistry::direct());
+        // Reuse the frozen catalog so the upgraded registry advertises the same
+        // agent_type enum the executor resolves against (REQ-AG-008).
+        self.swap_registry(ToolRegistry::direct(self.agent_catalog.to_vec()));
         tracing::info!("Tool registry upgraded to Work mode (full tool suite)");
     }
 }

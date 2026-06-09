@@ -434,12 +434,17 @@ requiring every state variant to carry mode.
 
 **Tool registry configuration by mode:**
 
-| Tool | Explore | Work |
-|------|---------|------|
-| `patch` | Disabled | Enabled (worktree only) |
-| `bash` | Allowed (read-only enforced) | Allowed (write in worktree) |
-| `propose_task` | Allowed (intercepted, not executed) | Disabled |
-| `think`, `keyword_search`, `read_image`, `browser_*` | Allowed | Allowed |
+| Tool | Explore | Work | Branch | Direct |
+|------|---------|------|--------|--------|
+| `patch` | Allowed, scoped to the `tasks/` dir (REQ-PROJ-003) — draft/revise task files only | Enabled (worktree only) | Enabled (worktree only) | Enabled (cwd) |
+| `bash` | Allowed (read-only enforced) | Allowed (write in worktree) | Allowed (write in worktree) | Allowed (write in cwd) |
+| `propose_task` | Allowed — Explore→Work gateway, parks (intercepted, not executed) | Allowed — fork proposal, non-blocking (REQ-PROJ-033) | Allowed — fork proposal, non-blocking (REQ-PROJ-033) | Allowed **only when cwd is in a git repo** — fork proposal (REQ-PROJ-033/036); otherwise not provided |
+| `think`, `keyword_search`, `read_image`, `browser_*` | Allowed | Allowed | Allowed | Allowed |
+
+Branch and git-backed Direct configure `propose_task` exactly as Work does — a non-blocking
+fork proposal (REQ-PROJ-036) — so an implementer must enable the intercepted path for all
+three writing modes, not Work alone. Direct gates the tool on a git repository (no default
+branch to fork from otherwise).
 
 ## Task Approval State (REQ-BED-028, REQ-PROJ-003, REQ-PROJ-004)
 
@@ -483,6 +488,45 @@ AwaitingTaskApproval + Rejected → Idle (mode stays Explore)
 On server restart with a conversation in `AwaitingTaskApproval`: restore state from the
 serialized `ConvState` column; the UI re-opens the task-approval reader on reconnect
 from the conversation state payload (there is no dedicated SSE event).
+
+### Fork Proposal Interception — Non-Parking (REQ-PROJ-033)
+
+In a writing mode (Work, Branch, or Direct-in-a-git-repo) `propose_task` is intercepted
+as a **fork proposal** rather than the Explore parking gateway. The two interception arms
+are mutually exclusive on `mode`:
+
+```
+LlmRequesting + LlmResponse(propose_task), mode = explore
+    → AwaitingTaskApproval                (parks; see above)
+
+LlmRequesting + LlmResponse(propose_task),
+    mode = work | branch | (direct AND working_dir is inside a git repo)
+    → LlmRequesting                       (does NOT park)
+    Effects: PersistForkProposal { ToolRound with a synthetic success ack
+                                   AND the ForkProposal control-plane row, in ONE
+                                   transaction }, then LlmRequestDispatched
+    Note: must be the only tool call; the conversation continues its own work.
+          The ack and the proposal row commit ATOMICALLY (single transaction): the ack
+          says "recorded — pending review", so it must never be durable without the row
+          the Review/approve endpoints read. A crash between the two would otherwise
+          leave the origin transcript promising a proposal that does not exist; the
+          combined effect makes that state unreachable (cf. REQ-PROJ-003's atomic
+          message+tool-result persist).
+          Direct is admitted ONLY when git-backed (REQ-PROJ-036): a fork cuts from the
+          repository default branch, so propose_task is absent from a Direct-not-in-a-repo
+          tool registry and never reaches this arm (mirrors the Allium git guard).
+```
+
+The fork proposal is a content snapshot (the drafted file's bytes plus display fields and
+a stable `proposal_id`), recorded for asynchronous review. It does **not** snapshot the
+fork base: the base is always the project's `main_ref` (the repository default branch),
+resolved at approval time by the projects layer — so a proposal recorded earlier can never
+spawn from stale base data. Its lifecycle — review, spawn,
+dismiss — is owned by the projects layer (`specs/projects/` REQ-PROJ-034/035) and runs off
+the originating conversation's state machine entirely: there is no resolution transition
+here, and the resolution is never fed back into this conversation's LLM context. That
+absence is the decoupling — contrast the Explore fresh-handoff approval, which moves the
+predecessor to `HandedOff`. A fork's origin is untouched and uninformed by construction.
 
 ## Task Resolution: Mark as Merged and Abandon (REQ-BED-029, REQ-PROJ-010/026/027)
 

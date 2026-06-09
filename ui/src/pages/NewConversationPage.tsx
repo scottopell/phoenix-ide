@@ -5,9 +5,11 @@ import { ConversationSettings } from '../components/ConversationSettings';
 import { VoiceRecorder } from '../components/VoiceInput/VoiceRecorder';
 import { PaneDivider } from '../components/PaneDivider';
 import { SUPPORTED_IMAGE_TYPES } from '../utils/images';
+import { ExpansionError } from '../api';
 import { useCreateConversation } from '../hooks/useCreateConversation';
 import { useResizablePane } from '../hooks/useResizablePane';
 import { useIsDesktop } from '../hooks/useMediaQuery';
+import { useInlineReferences } from '../hooks';
 
 // Lazy: xterm + addon are a non-trivial bundle slice. Deferred behind the
 // `everExpanded` gate below — the dynamic import only fires once the user
@@ -58,6 +60,50 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   const conv = useCreateConversation(navigate);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  // Inline reference autocomplete (@file, ./path, /skill). Discovery resolves
+  // against the same root the first message will expand against: for a
+  // branch/managed workflow that is the chosen branch's committed tree (what
+  // the conversation's fresh worktree will hold), not the current checkout —
+  // so suggestions never point at uncommitted/untracked files that would 422 on
+  // send. `mode`/`baseBranch` come from the same `submission` mapping the create
+  // call uses, so the two cannot drift. The composer renders both a desktop and
+  // a mobile textarea (one hidden by CSS); `inlineRefTextarea` tracks whichever
+  // is focused so trigger detection reads the right caret.
+  const inlineRefTextarea = useRef<HTMLTextAreaElement | null>(null);
+  const ir = useInlineReferences({
+    cwd: conv.cwd,
+    mode: conv.submission.mode,
+    baseBranch: conv.submission.baseBranch,
+    // The new-conversation composer's identity is its directory: switching the
+    // chosen directory resets the dropdown / inline error.
+    scopeKey: conv.cwd,
+    textareaRef: inlineRefTextarea,
+    value: conv.draft,
+    setValue: conv.updateDraft,
+  });
+  const handleDraftChange = (next: string) => {
+    conv.updateDraft(next);
+    ir.onValueChange(next);
+  };
+  const handleSend = async () => {
+    // The Send buttons are disabled while an expansion error is shown; gate the
+    // keyboard (Enter) path too so a stale broken @reference can't be resubmitted
+    // before it's corrected.
+    if (ir.expansionError) return;
+    ir.reset();
+    try {
+      await conv.handleSend();
+    } catch (err) {
+      // The create endpoint expands the first message and rejects unresolvable
+      // `@file` references with the same 422 as a chat send. Surface it inline
+      // next to the composer (REQ-IR-007) instead of the page-level error,
+      // which on mobile renders up in the settings area away from the input.
+      if (err instanceof ExpansionError) {
+        ir.setExpansionError(err.detail.error);
+      }
+    }
+  };
 
   // Real-breakpoint gate for the global terminal. CSS `display:none` would
   // hide it on mobile but React effects (lazy import, WebSocket open,
@@ -147,9 +193,10 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
   };
 
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    if (ir.onKeyDown(e)) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
-      conv.handleSend();
+      handleSend();
     }
   };
 
@@ -219,6 +266,19 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
             <>
               {conv.isDragOver && <div className="input-drop-affordance">Drop files to attach</div>}
               <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
+              <div className="iac-container">{ir.dropdown}</div>
+              {ir.skillArgumentHint && !ir.expansionError && (
+                <div className="input-skill-hint" aria-live="polite">
+                  <span className="input-skill-hint-text">{ir.skillArgumentHint}</span>
+                </div>
+              )}
+              {ir.expansionError && (
+                <div className="input-expansion-error" role="alert">
+                  <span className="input-expansion-error-icon">x</span>
+                  <span className="input-expansion-error-text">{ir.expansionError}</span>
+                  <button className="input-expansion-error-dismiss" onClick={() => ir.setExpansionError(null)} title="Dismiss">x</button>
+                </div>
+              )}
               <NewConversationFileChips files={conv.files} onRemove={conv.removeFile} />
               <textarea
                 ref={textareaRef}
@@ -226,9 +286,11 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
                 placeholder={inputPlaceholder}
                 rows={3}
                 value={conv.textareaValue}
-                onChange={(e) => conv.updateDraft(e.target.value)}
+                onChange={(e) => handleDraftChange(e.target.value)}
                 onKeyDown={handleKeyDown}
                 onPaste={handlePaste}
+                onSelect={ir.onSelectionChange}
+                onFocus={(e) => { inlineRefTextarea.current = e.currentTarget; }}
                 disabled={conv.creating}
               />
 
@@ -237,7 +299,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
                 <div className="new-conv-send-group">
                   <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
                   {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
-                  <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
+                  <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend || !!ir.expansionError}>{buttonText}</button>
                 </div>
               </div>
             </>
@@ -317,15 +379,30 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
       {llmReady && (
         <div className="new-conv-bottom-input mobile-only">
           <ImageAttachments images={conv.images} onRemove={conv.removeImage} />
+          <div className="iac-container">{ir.dropdown}</div>
+          {ir.skillArgumentHint && !ir.expansionError && (
+            <div className="input-skill-hint" aria-live="polite">
+              <span className="input-skill-hint-text">{ir.skillArgumentHint}</span>
+            </div>
+          )}
+          {ir.expansionError && (
+            <div className="input-expansion-error" role="alert">
+              <span className="input-expansion-error-icon">x</span>
+              <span className="input-expansion-error-text">{ir.expansionError}</span>
+              <button className="input-expansion-error-dismiss" onClick={() => ir.setExpansionError(null)} title="Dismiss">x</button>
+            </div>
+          )}
           <NewConversationFileChips files={conv.files} onRemove={conv.removeFile} />
           <textarea
             className="new-conv-textarea-mobile"
             placeholder={inputPlaceholder}
             rows={2}
             value={conv.textareaValue}
-            onChange={(e) => conv.updateDraft(e.target.value)}
+            onChange={(e) => handleDraftChange(e.target.value)}
             onKeyDown={handleKeyDown}
             onPaste={handlePaste}
+            onSelect={ir.onSelectionChange}
+            onFocus={(e) => { inlineRefTextarea.current = e.currentTarget; }}
             disabled={conv.creating}
           />
           <div className="new-conv-input-row">
@@ -333,7 +410,7 @@ export function NewConversationPage({ desktopMode }: NewConversationPageProps = 
               <button className="icon-btn" onClick={() => fileInputRef.current?.click()} title="Attach image" disabled={conv.creating}>+</button>
               {conv.voiceSupported && <VoiceRecorder onSpeech={conv.handleVoiceFinal} onInterim={conv.handleVoiceInterim} disabled={conv.creating} />}
             </div>
-            <button className="new-conv-send" onClick={() => conv.handleSend()} disabled={!conv.canSend}>{buttonText}</button>
+            <button className="new-conv-send" onClick={handleSend} disabled={!conv.canSend || !!ir.expansionError}>{buttonText}</button>
           </div>
         </div>
       )}

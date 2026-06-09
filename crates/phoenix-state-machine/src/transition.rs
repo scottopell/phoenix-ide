@@ -30,6 +30,14 @@ use thiserror::Error;
 /// distinguish deliberate dismissal from an interrupted tool turn.
 pub const USER_QUESTION_DISMISSED_MARKER: &str = "[ask-user-question-dismissed]";
 
+/// Stable marker persisted as a hidden system message when the user dismisses
+/// a persisted error (`DismissError`). Without it, a usage-limit error that
+/// occurred after a tool result would persist as `Idle` with a trailing tool
+/// result, and the restart recovery heuristic (`should_auto_continue`) would
+/// auto-continue the exact turn the user dismissed. The marker becomes the
+/// last message, so recovery sees a deliberate dismissal and stays `Idle`.
+pub const ERROR_DISMISSED_MARKER: &str = "[error-dismissed]";
+
 /// Statuses a task file may be in for `propose_task` to accept it.
 const ACCEPTABLE_PROPOSE_STATUSES: &[taskmd_core::constants::Status] = &[
     taskmd_core::constants::Status::Ready,
@@ -990,7 +998,19 @@ fn handle_core_tool_complete(
         }
 
         // tool_use_id mismatch or unexpected event variant
-        _ => Err(TransitionError::InvalidTransition {
+        CoreEvent::ToolComplete { .. }
+        | CoreEvent::SpawnAgentsComplete { .. }
+        | CoreEvent::UserMessage { .. }
+        | CoreEvent::UserCancel { .. }
+        | CoreEvent::LlmResponse { .. }
+        | CoreEvent::LlmError { .. }
+        | CoreEvent::RetryTimeout { .. }
+        | CoreEvent::ToolAborted { .. }
+        | CoreEvent::SubAgentResult { .. }
+        | CoreEvent::ContinuationResponse { .. }
+        | CoreEvent::ContinuationFailed { .. }
+        | CoreEvent::UserTriggerContinuation
+        | CoreEvent::SteerDrainedUserMessages { .. } => Err(TransitionError::InvalidTransition {
             state: state.variant_name(),
             event: event.variant_name(),
         }),
@@ -1729,6 +1749,52 @@ pub fn transition_parent(
             )
         }
 
+        // Error dismissal: Error -> Idle, guarded to user-resumable errors.
+        // The resumable-only policy and its rationale live in the bedrock spec
+        // (core_status dismissal). Non-resumable errors fall through to
+        // InvalidTransition.
+        (
+            ParentState::Core(CoreState::Error { error_kind, .. }),
+            ParentEvent::Parent(ParentOnlyEvent::DismissError),
+        ) if error_kind.is_user_resumable() => Ok(ParentTransitionResult::new(ParentState::Core(
+            CoreState::Idle,
+        ))
+        // Persist a hidden dismissal marker as the last message so a restart's
+        // recovery heuristic does not auto-continue a turn the user dismissed
+        // (see ERROR_DISMISSED_MARKER).
+        .with_effect(Effect::PersistHiddenSystemMarker {
+            marker: ERROR_DISMISSED_MARKER,
+            message_id: uuid::Uuid::new_v4().to_string(),
+        })
+        .with_effect(Effect::PersistState)
+        .with_effect(Effect::notify_state_change())),
+
+        // ============================================================
+        // Task resolution: terminal cleanup (mark-merged / abandon) ->
+        // Terminal (REQ-BED-029).
+        //
+        // Reachable from a *stuck* conversation, not just Idle: an Error
+        // (e.g. a usage-limit window the user merged around externally) or a
+        // ContextExhausted parent whose work was merged externally must still
+        // be disposable without first forcing a successful LLM turn. All three
+        // converge to Terminal via the same ResolveTask effect. This arm
+        // precedes the ContextExhausted catch-all below so TaskResolved is not
+        // swallowed as a no-op for that state.
+        // ============================================================
+        (
+            ParentState::Core(CoreState::Idle | CoreState::Error { .. })
+            | ParentState::ContextExhausted { .. },
+            ParentEvent::Parent(ParentOnlyEvent::TaskResolved {
+                system_message,
+                repo_root,
+            }),
+        ) => Ok(
+            ParentTransitionResult::new(ParentState::Terminal).with_effect(Effect::ResolveTask {
+                system_message,
+                repo_root,
+            }),
+        ),
+
         // ============================================================
         // Parent-only state: ContextExhausted
         // ============================================================
@@ -1754,22 +1820,6 @@ pub fn transition_parent(
         }
 
         (ParentState::Terminal, _event) => Ok(ParentTransitionResult::new(ParentState::Terminal)),
-
-        // ============================================================
-        // Task resolution: Idle + TaskResolved -> Terminal (REQ-BED-029)
-        // ============================================================
-        (
-            ParentState::Core(CoreState::Idle),
-            ParentEvent::Parent(ParentOnlyEvent::TaskResolved {
-                system_message,
-                repo_root,
-            }),
-        ) => Ok(
-            ParentTransitionResult::new(ParentState::Terminal).with_effect(Effect::ResolveTask {
-                system_message,
-                repo_root,
-            }),
-        ),
 
         // ============================================================
         // Parent-specific LLM response interceptions (before core)
@@ -1813,7 +1863,17 @@ pub fn transition_parent(
                 ToolInput::Malformed { name, error, .. } if name == "propose_task" => {
                     Some((t, ProposeTaskCall::Malformed(error.as_str())))
                 }
-                _ => None,
+                ToolInput::Bash(_)
+                | ToolInput::Think(_)
+                | ToolInput::Patch(_)
+                | ToolInput::KeywordSearch(_)
+                | ToolInput::ReadImage(_)
+                | ToolInput::SpawnAgents(_)
+                | ToolInput::SubmitResult(_)
+                | ToolInput::SubmitError(_)
+                | ToolInput::AskUserQuestion(_)
+                | ToolInput::Unknown { .. }
+                | ToolInput::Malformed { .. } => None,
             }) {
                 // propose_task is only valid in Managed mode (Explore/Work lifecycle).
                 // Direct and Branch mode should never produce this tool call.
@@ -1957,7 +2017,17 @@ pub fn transition_parent(
                 ToolInput::Malformed { name, error, .. } if name == "ask_user_question" => {
                     Some((t, AskUserQuestionCall::Malformed(error.as_str())))
                 }
-                _ => None,
+                ToolInput::Bash(_)
+                | ToolInput::Think(_)
+                | ToolInput::Patch(_)
+                | ToolInput::KeywordSearch(_)
+                | ToolInput::ReadImage(_)
+                | ToolInput::SpawnAgents(_)
+                | ToolInput::SubmitResult(_)
+                | ToolInput::SubmitError(_)
+                | ToolInput::ProposeTask(_)
+                | ToolInput::Unknown { .. }
+                | ToolInput::Malformed { .. } => None,
             }) {
                 if tool_calls.len() > 1 {
                     let msg = "ask_user_question must be the only tool in response".to_string();
@@ -2162,7 +2232,13 @@ pub fn transition_parent(
                 ParentState::Core(CoreState::AwaitingContinuation { attempt, .. }) => {
                     *attempt >= MAX_RETRY_ATTEMPTS
                 }
-                _ => false,
+                ParentState::Core(_)
+                | ParentState::AwaitingRecovery { .. }
+                | ParentState::AwaitingTaskApproval { .. }
+                | ParentState::AwaitingUserResponse { .. }
+                | ParentState::ContextExhausted { .. }
+                | ParentState::HandedOff { .. }
+                | ParentState::Terminal => false,
             }
         } =>
         {
@@ -2438,7 +2514,18 @@ pub fn transition_sub_agent(
                             },
                         }))
                     }
-                    _ => unreachable!("is_terminal_tool returned true for non-terminal tool"),
+                    ToolInput::Bash(_)
+                    | ToolInput::Think(_)
+                    | ToolInput::Patch(_)
+                    | ToolInput::KeywordSearch(_)
+                    | ToolInput::ReadImage(_)
+                    | ToolInput::SpawnAgents(_)
+                    | ToolInput::ProposeTask(_)
+                    | ToolInput::AskUserQuestion(_)
+                    | ToolInput::Unknown { .. }
+                    | ToolInput::Malformed { .. } => {
+                        unreachable!("is_terminal_tool returned true for non-terminal tool")
+                    }
                 };
             }
 
@@ -2663,7 +2750,20 @@ fn current_attempt(state: &ConvState) -> u32 {
         ConvState::LlmRequesting { attempt }
         | ConvState::SeededLlmRequesting { attempt, .. }
         | ConvState::AwaitingContinuation { attempt, .. } => *attempt,
-        _ => 1,
+        ConvState::Idle
+        | ConvState::ToolExecuting { .. }
+        | ConvState::CancellingTool { .. }
+        | ConvState::AwaitingSubAgents { .. }
+        | ConvState::CancellingSubAgents { .. }
+        | ConvState::Completed { .. }
+        | ConvState::Failed { .. }
+        | ConvState::Error { .. }
+        | ConvState::AwaitingRecovery { .. }
+        | ConvState::AwaitingTaskApproval { .. }
+        | ConvState::AwaitingUserResponse { .. }
+        | ConvState::ContextExhausted { .. }
+        | ConvState::HandedOff { .. }
+        | ConvState::Terminal => 1,
     }
 }
 
@@ -2745,7 +2845,22 @@ fn extract_text_from_content(blocks: &[phoenix_core::domain::llm_types::ContentB
         .iter()
         .filter_map(|b| match b {
             phoenix_core::domain::llm_types::ContentBlock::Text { text } => Some(text.as_str()),
-            _ => None,
+            phoenix_core::domain::llm_types::ContentBlock::Image { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::ToolUse { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::ToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::ServerToolUse { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::ToolSearchToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::WebSearchToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::WebFetchToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::CodeExecutionToolResult { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::BashCodeExecutionToolResult {
+                ..
+            }
+            | phoenix_core::domain::llm_types::ContentBlock::TextEditorCodeExecutionToolResult {
+                ..
+            }
+            | phoenix_core::domain::llm_types::ContentBlock::McpToolUse { .. }
+            | phoenix_core::domain::llm_types::ContentBlock::McpToolResult { .. } => None,
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -3152,6 +3267,7 @@ mod tests {
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
         };
 
         let result = handle_context_exhaustion(
@@ -3274,6 +3390,7 @@ mod tests {
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
         };
 
         let result = transition(
@@ -3380,6 +3497,7 @@ mod tests {
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
         };
 
         // attempt == MAX_RETRY_ATTEMPTS (3), retryable error → retries exhausted
@@ -3432,6 +3550,7 @@ mod tests {
             work_scope_worktree: None,
             tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
             llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
         };
 
         // Non-retryable error at attempt 1 → immediate failure
@@ -3710,12 +3829,12 @@ mod tests {
         );
     }
 
-    /// Task 13018 follow-up: a propose_task whose payload failed to
+    /// Task 13018 follow-up: a `propose_task` whose payload failed to
     /// deserialise (`ToolInput::Malformed{name: "propose_task", ...}`) must
     /// be intercepted in the typed approval flow — the serde error is
-    /// surfaced as a tool_result and the LLM is re-requested. Without this
+    /// surfaced as a `tool_result` and the LLM is re-requested. Without this
     /// interception the malformed call would fall through to the executor
-    /// where propose_task's fallback `run()` returns a generic error, hiding
+    /// where `propose_task`'s fallback `run()` returns a generic error, hiding
     /// the precise serde diagnostic and skipping the typed approval path.
     #[test]
     fn test_malformed_propose_task_surfaces_serde_error_to_llm() {
@@ -3783,7 +3902,7 @@ mod tests {
         assert!(has_request_llm, "must re-request the LLM");
     }
 
-    /// Task 13018 follow-up: same structural backstop for ask_user_question.
+    /// Task 13018 follow-up: same structural backstop for `ask_user_question`.
     #[test]
     fn test_malformed_ask_user_question_surfaces_serde_error_to_llm() {
         use crate::state::ToolInput;
@@ -4423,6 +4542,115 @@ mod tests {
             "empty drain must produce no effects, got {} effects",
             result.effects.len()
         );
+    }
+
+    #[test]
+    fn task_resolved_from_error_reaches_terminal_with_resolve_effect() {
+        // Terminal cleanup (mark-merged / abandon) must be reachable from a
+        // conversation stuck in Error (e.g. a usage-limit window the user
+        // merged around externally) — not just from Idle.
+        let state = ConvState::Error {
+            message: "You've hit your usage limit.".to_string(),
+            error_kind: ErrorKind::UsageLimitReached,
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::TaskResolved {
+                system_message: "Marked as merged.".to_string(),
+                repo_root: "/tmp".to_string(),
+            },
+        )
+        .expect("TaskResolved must be accepted from Error");
+
+        assert!(matches!(result.new_state, ConvState::Terminal));
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::ResolveTask { .. })),
+            "must emit ResolveTask, got {:?}",
+            result.effects
+        );
+    }
+
+    #[test]
+    fn task_resolved_from_context_exhausted_reaches_terminal_with_resolve_effect() {
+        let state = ConvState::ContextExhausted {
+            summary: "ran out of context".to_string(),
+        };
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::TaskResolved {
+                system_message: "Task abandoned.".to_string(),
+                repo_root: "/tmp".to_string(),
+            },
+        )
+        .expect("TaskResolved must be accepted from ContextExhausted");
+
+        assert!(matches!(result.new_state, ConvState::Terminal));
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::ResolveTask { .. })),
+            "must emit ResolveTask, got {:?}",
+            result.effects
+        );
+    }
+
+    #[test]
+    fn dismiss_error_from_resumable_error_returns_to_idle() {
+        // UsageLimitReached is user-resumable — dismissable.
+        let state = ConvState::Error {
+            message: "boom".to_string(),
+            error_kind: ErrorKind::UsageLimitReached,
+        };
+        let result = transition(&state, &test_context(), Event::DismissError)
+            .expect("DismissError must be accepted from a resumable Error");
+
+        assert!(matches!(result.new_state, ConvState::Idle));
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::PersistState)),
+            "must persist the idle transition, got {:?}",
+            result.effects
+        );
+    }
+
+    #[test]
+    fn dismiss_error_from_non_resumable_error_is_invalid() {
+        // A non-resumable error (InvalidRequest) must NOT be dismissable to
+        // Idle — that would reopen the resume path the policy denies.
+        let state = ConvState::Error {
+            message: "bad request".to_string(),
+            error_kind: ErrorKind::InvalidRequest,
+        };
+        let err = transition(&state, &test_context(), Event::DismissError)
+            .expect_err("DismissError must be rejected for a non-resumable Error");
+        assert!(matches!(
+            err,
+            TransitionError::InvalidTransition {
+                event: "DismissError",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn dismiss_error_from_idle_is_invalid() {
+        let err = transition(&ConvState::Idle, &test_context(), Event::DismissError)
+            .expect_err("DismissError is only valid from Error");
+        assert!(matches!(
+            err,
+            TransitionError::InvalidTransition {
+                event: "DismissError",
+                ..
+            }
+        ));
     }
 }
 

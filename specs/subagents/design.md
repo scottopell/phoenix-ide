@@ -59,6 +59,16 @@ Two layers cooperate:
    cwd-scoping invariant in `subagents.allium` keeps Work sub-agent
    writes inside that boundary.
 
+4. **Named-agent seam** — [`agents.allium`](../agents/agents.allium) owns
+   agent discovery, the `agent_type` schema enum, and persona composition.
+   This spec owns the spawn-side threading: `SubAgentTask` carries an
+   optional `agent_type`; `SubAgentSpec` carries the resolved `agent_name`
+   and `persona`; `SpawnRejectedUnknownAgentType` rejects an unmatched
+   `agent_type`; and `SubAgentSpecsResolved` resolves mode/model with the
+   agent definition as the middle precedence layer (task field → agent
+   definition → mode default). A named agent never changes the tool
+   registry — capability stays a pure function of mode.
+
 ## Mode rules (summary)
 
 - **Explore parent** → can spawn Explore sub-agents only. A Work spawn

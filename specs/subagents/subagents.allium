@@ -42,9 +42,11 @@ use "./projects.allium" as projects
 value SubAgentTask {
     task: String                  -- task description, required, non-empty
     cwd: String?                  -- working-directory override
-    mode: SubAgentMode?           -- absent => explore (default)
+    mode: SubAgentMode?           -- absent => agent default, else explore
     model: String?                -- explicit model id (must exist in registry)
     max_turns: Integer?           -- override per-mode default
+    agent_type: String?           -- named agent persona (see specs/agents/);
+                                  -- must match a discovered agent name
 }
 
 -- The resolved spec the runtime spawns the sub-agent from.
@@ -58,6 +60,8 @@ value SubAgentSpec {
     mode: SubAgentMode
     model_id: String              -- exists in LLM registry
     max_turns: Integer            -- > 0
+    agent_name: String?           -- named agent that produced this spec (see specs/agents/)
+    persona: String?              -- resolved agent body; replaces the base preamble
 }
 
 ------------------------------------------------------------
@@ -195,6 +199,27 @@ rule SpawnRejectedUnknownModel {
         --   t.model present  => t.model (after this check)
 }
 
+-- An `agent_type` on a task must match a discovered agent name (see
+-- specs/agents/). Defaulting never invents an agent_type, so this only
+-- checks the LLM-supplied value. Mirrors SpawnRejectedUnknownModel.
+-- (REQ-AG-007)
+rule SpawnRejectedUnknownAgentType {
+    when: SpawnAgentsToolInvoked(parent, tasks)
+    requires: any_task_has_unknown_agent_type(tasks, parent.working_dir)
+    ensures: SpawnAgentsRejected(parent,
+        reason: "Unknown agent_type in task spec")
+
+    @guidance
+        -- any_task_has_unknown_agent_type(tasks, parent): black box — true iff
+        -- some task sets agent_type to a value absent from the parent
+        -- conversation's frozen agent catalog (the one that rendered the
+        -- spawn_agents schema; see agents.allium DiscoverAgentCatalog /
+        -- InjectAgentTypeEnum). Resolution reads the frozen catalog, not a fresh
+        -- filesystem scan, so an advertised agent_type cannot be rejected here
+        -- due to a mid-conversation file change (REQ-AG-008). The error message
+        -- names the offending agent_type and lists available agent names.
+}
+
 -- ===========================================================
 -- 4. CWD SCOPING (REQ-PROJ-008)
 -- ===========================================================
@@ -265,6 +290,7 @@ rule SubAgentSpecsResolved {
     requires: work_task_count(tasks) = 0
         or active_work_subagents(parent) = 0
     requires: not any_task_has_unknown_model(tasks)
+    requires: not any_task_has_unknown_agent_type(tasks, parent.working_dir)
     requires: parent.mode not in { work, branch }
         or not any_work_task_has_cwd_outside_worktree(
             tasks, parent.worktree_path)
@@ -275,17 +301,32 @@ rule SubAgentSpecsResolved {
         = previous(active_work_subagents(parent)) + work_task_count(tasks)
 
     @guidance
-        -- Per-task resolution (referenced as `resolve_*` helpers):
+        -- Per-task resolution (referenced as `resolve_*` helpers). When a task
+        -- sets agent_type, the matching agent definition (see specs/agents/) is
+        -- the middle precedence layer between the task's explicit fields and the
+        -- mode-based defaults. resolve_agent(t) = find_agent(frozen_catalog,
+        --   t.agent_type), or none when agent_type is absent. frozen_catalog is
+        -- the parent conversation's once-discovered catalog (the same one that
+        -- rendered the schema; agents.allium), not a fresh scan (REQ-AG-008).
         --
         --   resolve_mode(t):
-        --     t.mode.present => t.mode
-        --     else            => explore   (REQ-PROJ-008 default)
+        --     t.mode.present        => t.mode
+        --     resolve_agent(t).mode => agent.mode
+        --     else                  => explore   (REQ-PROJ-008 default)
         --
         --   resolve_model_id(t, parent):
-        --     t.model.present  => t.model
+        --     t.model.present        => t.model
+        --     resolve_agent(t).model => agent.model
         --     resolve_mode(t)=explore =>
         --         LlmRegistry.cheap_model_for_provider(parent.model_id)
         --     resolve_mode(t)=work    => parent.model_id
+        --
+        --   resolve_persona(t)    => resolve_agent(t).body   (none when no agent)
+        --   resolve_agent_name(t) => resolve_agent(t).name   (none when no agent)
+        --   persona/agent_name populate SubAgentSpec; persona feeds
+        --   agents.allium ComposeSubAgentPersona. Mode validation
+        --   (WorkSubAgentRequiresWriteableParent) runs on the *resolved* mode,
+        --   so an agent defaulting to work from an Explore parent is rejected.
         --
         --   resolve_max_turns(t):
         --     t.max_turns.present => t.max_turns
@@ -351,6 +392,12 @@ rule SubAgentRegistryOnResume {
         else:
             sub_agent.tool_registry = subagent_work
     ensures: sub_agent.mcp_enabled = true
+    -- A named agent's persona is likewise restored on this path: it is
+    -- persisted with the sub-agent conversation at spawn and re-read into the
+    -- rebuilt ConvContext here, so a runtime recreated mid-run keeps it (see
+    -- specs/agents/ ComposeSubAgentPersona, REQ-AG-006). Registry and persona
+    -- are the two pieces of sub-agent identity that a from-DB context rebuild
+    -- must recover.
 
     @guidance
         -- The persisted `conv_mode` encodes the explore/work distinction:

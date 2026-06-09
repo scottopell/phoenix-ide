@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! HTTP API for the native `ChatGPT`/Codex login flows.
 //!
 //! Two flows are exposed (matching `crate::llm::codex_login`):

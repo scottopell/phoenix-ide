@@ -182,10 +182,16 @@ export function AboutDeploymentPage() {
 
               <section className="settings-section">
                 <h3 className="settings-section__title">Logs</h3>
-                {info.log.sink === 'file' ? (
-                  <Row label="Log file"><code className="deploy-path">{info.log.path}</code></Row>
+                <Row label="stdout">
+                  {info.log.stdout ? 'on (captured by the supervising process)' : 'off'}
+                </Row>
+                {info.log.file ? (
+                  <Row label="Log file"><code className="deploy-path">{info.log.file}</code></Row>
                 ) : (
-                  <Row label="Logs">stdout (captured by the supervising process)</Row>
+                  <Row label="Log file">none</Row>
+                )}
+                {!info.log.stdout && !info.log.file && (
+                  <div className="settings-section__hint">No log output configured.</div>
                 )}
               </section>
 

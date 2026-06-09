@@ -996,7 +996,7 @@ async fn shape_handle_response(
             signal_sent: Some(sig),
             ..
         } => Some(sig.as_str().into()),
-        _ => None,
+        ResponseKind::Peek | ResponseKind::Wait | ResponseKind::Kill { .. } => None,
     };
 
     let typed: BashResponse = match state.as_ref() {

@@ -24,6 +24,7 @@ import {
   buildConversationChapters,
   type Chapter,
 } from '../conversation/conversationChapters';
+import { ensureTargetTopVisible } from './jumpScroll';
 
 const ChevronRight = () => (
   <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -493,22 +494,40 @@ function MessageListImpl({
   // row exists, after the scroll settles. `data-render-unit-key` is stamped on
   // every virtuoso row wrapper (see `itemContent`).
   const pendingPulseKeyRef = useRef<string | null>(null);
+  const activeJumpKeyRef = useRef<string | null>(null);
+  const jumpRetryTimersRef = useRef<number[]>([]);
   const pulseTimersRef = useRef<number[]>([]);
+
+  const clearJumpRetryTimers = useCallback(() => {
+    jumpRetryTimersRef.current.forEach((t) => clearTimeout(t));
+    jumpRetryTimersRef.current.length = 0;
+  }, []);
+
+  const findRowByKey = useCallback((key: string): Element | null => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return null;
+    // CSS.escape may be absent (or throw on a pathological key) in some
+    // environments; guard it so a missing escape degrades to "no pulse"
+    // rather than throwing out of the timer callback (matches FileTree).
+    try {
+      return scroller.querySelector(`[data-render-unit-key="${CSS.escape(key)}"]`);
+    } catch {
+      return null;
+    }
+  }, []);
+
+  const correctPendingJumpOffset = useCallback((key: string) => {
+    const scroller = scrollerRef.current;
+    if (!scroller) return;
+    const row = findRowByKey(key);
+    const target = row?.querySelector('.message') ?? row;
+    if (target) ensureTargetTopVisible(target, scroller);
+  }, [findRowByKey]);
 
   const applyPendingPulse = useCallback(() => {
     const key = pendingPulseKeyRef.current;
     if (key === null) return;
-    const scroller = scrollerRef.current;
-    if (!scroller) return;
-    // CSS.escape may be absent (or throw on a pathological key) in some
-    // environments; guard it so a missing escape degrades to "no pulse"
-    // rather than throwing out of the timer callback (matches FileTree).
-    let row: Element | null = null;
-    try {
-      row = scroller.querySelector(`[data-render-unit-key="${CSS.escape(key)}"]`);
-    } catch {
-      return;
-    }
+    const row = findRowByKey(key);
     // The pulse styling lives on `.message`; fall back to the row wrapper if a
     // unit kind renders without a `.message` element (skill/system don't, but
     // chapters only target user/agent units which do).
@@ -520,18 +539,22 @@ function MessageListImpl({
       target.classList.remove('breadcrumb-highlight');
     }, 1500);
     pulseTimersRef.current.push(t);
-  }, []);
+  }, [findRowByKey]);
 
   useEffect(() => {
-    const timers = pulseTimersRef.current;
+    const pulseTimers = pulseTimersRef.current;
+    const jumpRetryTimers = jumpRetryTimersRef.current;
     return () => {
-      timers.forEach((t) => clearTimeout(t));
+      pulseTimers.forEach((t) => clearTimeout(t));
+      jumpRetryTimers.forEach((t) => clearTimeout(t));
     };
   }, []);
 
   const scrollToUnitIndex = useCallback((unitIndex: number) => {
     const unit = historicalUnits[unitIndex];
     if (!unit) return;
+    clearJumpRetryTimers();
+    activeJumpKeyRef.current = unit.key;
     pendingPulseKeyRef.current = unit.key;
     virtuosoRef.current?.scrollToIndex({
       index: unitIndex,
@@ -539,14 +562,17 @@ function MessageListImpl({
       behavior: 'smooth',
     });
     // The row mounts during the smooth scroll; querying immediately would miss
-    // it. Retry a few times so the pulse lands even on a long jump that takes
-    // a moment to settle. applyPendingPulse is a no-op once the pulse fires
-    // (it clears pendingPulseKeyRef), so the extra ticks are harmless.
+    // it. Retry as the scroll progresses so the pulse lands even on a long jump
+    // and the final mounted position is nudged below the nav strip if needed.
     [120, 320, 600].forEach((delay) => {
-      const t = window.setTimeout(applyPendingPulse, delay);
-      pulseTimersRef.current.push(t);
+      const t = window.setTimeout(() => {
+        if (activeJumpKeyRef.current !== unit.key) return;
+        correctPendingJumpOffset(unit.key);
+        applyPendingPulse();
+      }, delay);
+      jumpRetryTimersRef.current.push(t);
     });
-  }, [historicalUnits, applyPendingPulse]);
+  }, [historicalUnits, clearJumpRetryTimers, correctPendingJumpOffset, applyPendingPulse]);
 
   useImperativeHandle(ref, () => ({ scrollToUnitIndex }), [scrollToUnitIndex]);
 

@@ -84,6 +84,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "backfill_user_content_files",
         sql: MIGRATION_014,
     },
+    Migration {
+        version: 15,
+        name: "create_sub_agent_personas",
+        sql: MIGRATION_015,
+    },
+    Migration {
+        version: 16,
+        name: "create_message_fts",
+        sql: MIGRATION_016,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -367,6 +377,42 @@ WHERE message_type IN ('user', 'skill')
   AND json_type(content, '$.files') IS NULL;
 ";
 
+/// Persist named-agent personas for sub-agent conversations so a sub-agent
+/// runtime recreated mid-run (e.g. model-upgrade eviction) keeps its persona
+/// instead of falling back to the generic sub-agent prompt (REQ-AG-006).
+/// Sub-agent-only metadata, kept in its own cascade-deleted table rather than
+/// widening the `conversations` row that the vast majority of conversations
+/// would leave NULL.
+const MIGRATION_015: &str = r"
+CREATE TABLE IF NOT EXISTS sub_agent_personas (
+    conversation_id TEXT PRIMARY KEY
+        REFERENCES conversations(id) ON DELETE CASCADE,
+    persona TEXT NOT NULL
+);
+";
+
+/// Conversation-retrieval index (`specs/conversation-retrieval/`).
+///
+/// A standalone FTS5 table over extracted message prose — *not* an
+/// external-content table over `messages`, because the indexed text is a
+/// Rust-side extraction of typed `MessageContent`, not the raw JSON column.
+/// `text` is the only tokenized column; the rest are `UNINDEXED` provenance /
+/// change-detection columns available to filtering and projection without
+/// participating in the match. The migration creates the empty structure; the
+/// typed backfill from existing `messages` is performed by the Rust startup
+/// reconciliation (`Fts5Retriever::reconcile`), which static SQL cannot do.
+const MIGRATION_016: &str = r"
+CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
+    text,
+    message_id      UNINDEXED,
+    chunk_ordinal   UNINDEXED,
+    conversation_id UNINDEXED,
+    message_type    UNINDEXED,
+    created_at      UNINDEXED,
+    content_hash    UNINDEXED
+);
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -486,7 +532,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 14);
+        assert_eq!(first, 16);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

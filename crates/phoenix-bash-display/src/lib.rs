@@ -186,7 +186,7 @@ fn is_cd_to_cwd_pipeline(pipeline: &Pipeline, cwd: &str) -> bool {
 
     match &pipeline.seq[0] {
         Command::Simple(simple) => is_cd_to_cwd_simple_command(simple, cwd),
-        _ => false,
+        Command::Compound(..) | Command::Function(_) | Command::ExtendedTest(..) => false,
     }
 }
 
@@ -263,6 +263,9 @@ fn paths_match(target: &str, cwd: &str) -> bool {
 
     target_canonical == cwd_canonical
 }
+
+#[cfg(test)]
+mod proptests;
 
 #[cfg(test)]
 mod tests {

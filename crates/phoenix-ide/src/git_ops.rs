@@ -83,6 +83,28 @@ pub(crate) fn run_git(cwd: &Path, args: &[&str]) -> Result<String, String> {
     run_git_with_env(cwd, args, &[])
 }
 
+/// Like [`run_git`], but returns raw stdout bytes — no trimming, no UTF-8
+/// lossy conversion. Required when the output is file content (e.g.
+/// `git cat-file -p <ref>:<path>`) where trailing whitespace is significant
+/// and binary detection needs the exact bytes.
+pub(crate) fn run_git_bytes(cwd: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let mut cmd = std::process::Command::new("git");
+    cmd.args(args)
+        .current_dir(cwd)
+        .env("GIT_CONFIG_COUNT", "1")
+        .env("GIT_CONFIG_KEY_0", "commit.gpgsign")
+        .env("GIT_CONFIG_VALUE_0", "false");
+    let output = cmd
+        .output()
+        .map_err(|e| format!("Failed to run git {}: {e}", args.join(" ")))?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!("git {} failed: {stderr}", args.join(" ")))
+    }
+}
+
 /// Like [`run_git`], but layers `extra_env` on top of the signing-disabled
 /// defaults. Used by [`capture_branch_diff`] to redirect index writes via
 /// `GIT_INDEX_FILE` so a read-only diff capture doesn't mutate the worktree's

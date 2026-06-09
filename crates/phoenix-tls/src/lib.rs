@@ -181,3 +181,170 @@ fn write_pem(path: &Path, contents: &str, kind: PemKind) -> Result<(), Box<dyn E
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn ca_paths_uses_canonical_filenames_under_dir() {
+        let dir = Path::new("/some/base/dir");
+        let paths = ca_paths(dir);
+
+        assert_eq!(paths.cert_path, dir.join("phoenix-local-ca.pem"));
+        assert_eq!(paths.key_path, dir.join("phoenix-local-ca-key.pem"));
+        assert!(paths
+            .cert_path
+            .to_string_lossy()
+            .ends_with("phoenix-local-ca.pem"));
+        assert!(paths
+            .key_path
+            .to_string_lossy()
+            .ends_with("phoenix-local-ca-key.pem"));
+    }
+
+    #[test]
+    fn ensure_ca_creates_both_files_on_empty_dir() {
+        let tmp = TempDir::new().unwrap();
+        let paths = ensure_ca(tmp.path()).unwrap();
+
+        assert!(paths.cert_path.exists(), "CA cert should exist");
+        assert!(paths.key_path.exists(), "CA key should exist");
+    }
+
+    #[test]
+    fn ensure_ca_is_idempotent_and_does_not_regenerate() {
+        let tmp = TempDir::new().unwrap();
+        let first = ensure_ca(tmp.path()).unwrap();
+        let cert_bytes = fs::read(&first.cert_path).unwrap();
+        let key_bytes = fs::read(&first.key_path).unwrap();
+
+        let second = ensure_ca(tmp.path()).unwrap();
+
+        assert_eq!(first.cert_path, second.cert_path);
+        assert_eq!(first.key_path, second.key_path);
+        assert_eq!(
+            cert_bytes,
+            fs::read(&second.cert_path).unwrap(),
+            "CA cert must not be regenerated"
+        );
+        assert_eq!(
+            key_bytes,
+            fs::read(&second.key_path).unwrap(),
+            "CA key must not be regenerated"
+        );
+    }
+
+    #[test]
+    fn ensure_ca_errors_when_only_cert_exists() {
+        let tmp = TempDir::new().unwrap();
+        let paths = ca_paths(tmp.path());
+        fs::write(&paths.cert_path, "not a real cert").unwrap();
+
+        assert!(ensure_ca(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn ensure_ca_errors_when_only_key_exists() {
+        let tmp = TempDir::new().unwrap();
+        let paths = ca_paths(tmp.path());
+        fs::write(&paths.key_path, "not a real key").unwrap();
+
+        assert!(ensure_ca(tmp.path()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_ca_sets_unix_permissions() {
+        let tmp = TempDir::new().unwrap();
+        let paths = ensure_ca(tmp.path()).unwrap();
+
+        assert_eq!(mode_of(&paths.key_path), 0o600, "CA key should be 0o600");
+        assert_eq!(mode_of(&paths.cert_path), 0o644, "CA cert should be 0o644");
+    }
+
+    #[test]
+    fn issue_leaf_errors_on_empty_hosts() {
+        let tmp = TempDir::new().unwrap();
+        let cert_path = tmp.path().join("leaf.pem");
+        let key_path = tmp.path().join("leaf-key.pem");
+
+        let result = issue_leaf(tmp.path(), &cert_path, &key_path, &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn issue_leaf_creates_ca_and_leaf_files() {
+        let tmp = TempDir::new().unwrap();
+        let ca_dir = tmp.path().join("ca");
+        let cert_path = tmp.path().join("leaf/leaf.pem");
+        let key_path = tmp.path().join("leaf/leaf-key.pem");
+        let hosts = vec!["localhost".to_string(), "127.0.0.1".to_string()];
+
+        let issued = issue_leaf(&ca_dir, &cert_path, &key_path, &hosts).unwrap();
+
+        let ca = ca_paths(&ca_dir);
+        assert!(ca.cert_path.exists(), "CA cert should exist");
+        assert!(ca.key_path.exists(), "CA key should exist");
+        assert!(issued.cert_path.exists(), "leaf cert should exist");
+        assert!(issued.key_path.exists(), "leaf key should exist");
+    }
+
+    #[test]
+    fn issue_leaf_writes_parseable_pem() {
+        let tmp = TempDir::new().unwrap();
+        let ca_dir = tmp.path().join("ca");
+        let cert_path = tmp.path().join("leaf.pem");
+        let key_path = tmp.path().join("leaf-key.pem");
+        let hosts = vec!["localhost".to_string()];
+
+        let issued = issue_leaf(&ca_dir, &cert_path, &key_path, &hosts).unwrap();
+
+        let cert_pem = fs::read_to_string(&issued.cert_path).unwrap();
+        assert!(
+            cert_pem.contains("BEGIN CERTIFICATE"),
+            "leaf cert PEM should contain a certificate header"
+        );
+
+        let key_pem = fs::read_to_string(&issued.key_path).unwrap();
+        rcgen::KeyPair::from_pem(&key_pem).expect("leaf key PEM should round-trip");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn issue_leaf_sets_unix_key_permissions() {
+        let tmp = TempDir::new().unwrap();
+        let ca_dir = tmp.path().join("ca");
+        let cert_path = tmp.path().join("leaf.pem");
+        let key_path = tmp.path().join("leaf-key.pem");
+        let hosts = vec!["localhost".to_string()];
+
+        let issued = issue_leaf(&ca_dir, &cert_path, &key_path, &hosts).unwrap();
+
+        assert_eq!(mode_of(&issued.key_path), 0o600, "leaf key should be 0o600");
+    }
+
+    #[test]
+    fn validity_window_brackets_now_and_spans_expected_seconds() {
+        let valid_days = 397;
+        let (not_before, not_after) = validity_window(valid_days).unwrap();
+        let now = OffsetDateTime::now_utc();
+
+        assert!(not_before < now, "not_before should precede now");
+        assert!(now < not_after, "not_after should follow now");
+
+        let span = (not_after - not_before).whole_seconds();
+        let expected = DAY_SECONDS * (valid_days + 1);
+        assert_eq!(
+            span, expected,
+            "validity window should span (valid_days + 1) days of seconds"
+        );
+    }
+}

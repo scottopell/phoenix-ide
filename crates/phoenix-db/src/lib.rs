@@ -3,6 +3,7 @@
 //! Provides persistence for conversations and messages.
 
 mod migrations;
+pub mod retrieval;
 // The schema *types* (MessageContent, ToolResult, ConvState's persisted shape,
 // …) moved to the phoenix-core domain crate to break the db↔state_machine
 // cycle. Alias the module back as `schema` so the persistence logic in this
@@ -10,6 +11,9 @@ mod migrations;
 use phoenix_core::domain::db_schema as schema;
 
 pub use migrations::run_pending_migrations;
+pub use retrieval::{
+    Fts5Retriever, MessageRetriever, ReconcileStats, RetrievalError, RetrievalScope, RetrievedChunk,
+};
 pub use schema::*;
 
 use chrono::{DateTime, Utc};
@@ -714,6 +718,44 @@ impl Database {
             .await
     }
 
+    // ==================== Sub-Agent Personas ====================
+
+    /// Persist a named-agent persona for a sub-agent conversation so it
+    /// survives runtime recreation (REQ-AG-006). Upserts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn set_sub_agent_persona(
+        &self,
+        conversation_id: &str,
+        persona: &str,
+    ) -> DbResult<()> {
+        sqlx::query(
+            "INSERT INTO sub_agent_personas (conversation_id, persona) VALUES (?1, ?2) \
+             ON CONFLICT(conversation_id) DO UPDATE SET persona = excluded.persona",
+        )
+        .bind(conversation_id)
+        .bind(persona)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Read a sub-agent conversation's persisted persona, if any.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn get_sub_agent_persona(&self, conversation_id: &str) -> DbResult<Option<String>> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT persona FROM sub_agent_personas WHERE conversation_id = ?1")
+                .bind(conversation_id)
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(p,)| p))
+    }
+
     // ==================== MCP Disabled Servers ====================
 
     /// Return the set of MCP server names that have been disabled.
@@ -1082,9 +1124,12 @@ impl Database {
         .try_map(parse_conversation_row)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => DbError::ConversationNotFound(id.to_string()),
-            other => DbError::Sqlx(other),
+        .map_err(|e| {
+            if matches!(e, sqlx::Error::RowNotFound) {
+                DbError::ConversationNotFound(id.to_string())
+            } else {
+                DbError::Sqlx(e)
+            }
         })
     }
 
@@ -1106,9 +1151,12 @@ impl Database {
         .try_map(parse_conversation_row)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => DbError::ConversationNotFound(slug.to_string()),
-            other => DbError::Sqlx(other),
+        .map_err(|e| {
+            if matches!(e, sqlx::Error::RowNotFound) {
+                DbError::ConversationNotFound(slug.to_string())
+            } else {
+                DbError::Sqlx(e)
+            }
         })
     }
 
@@ -1528,11 +1576,12 @@ impl Database {
         .fetch_one(&mut *tx)
         .await?;
 
+        let handoff_summary_msg_id = uuid::Uuid::new_v4().to_string();
         sqlx::query(
             "INSERT INTO messages (message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, NULL, NULL, ?6)",
         )
-        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&handoff_summary_msg_id)
         .bind(parent_id)
         .bind(parent_next_sequence_id)
         .bind(handoff_summary.message_type().to_string())
@@ -1560,6 +1609,35 @@ impl Database {
             }
             return Err(DbError::ConversationNotFound(parent_id.to_string()));
         }
+
+        // Index the two messages this handoff inserts (the seed message and the
+        // parent's continuation summary) in the same transaction — they go in
+        // via raw INSERTs that bypass the `add_message` index hook, so without
+        // this they'd be missing from retrieval until the next startup
+        // reconcile (specs/conversation-retrieval/ REQ-RET-003).
+        let seed_msg = Message {
+            message_id: seed_message_id.clone(),
+            conversation_id: new_id.clone(),
+            sequence_id: 1,
+            message_type: seed_content.message_type(),
+            content: seed_content.clone(),
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+        let handoff_msg = Message {
+            message_id: handoff_summary_msg_id,
+            conversation_id: parent_id.to_string(),
+            sequence_id: parent_next_sequence_id,
+            message_type: handoff_summary.message_type(),
+            content: handoff_summary.clone(),
+            display_data: None,
+            usage_data: None,
+            created_at: now,
+        };
+        retrieval::fts_upsert_conn(&mut tx, &seed_msg).await?;
+        retrieval::fts_upsert_conn(&mut tx, &handoff_msg).await?;
+
         tx.commit().await?;
 
         Ok(Conversation {
@@ -2087,15 +2165,22 @@ impl Database {
     ///
     /// Returns a [`DbError`] if the underlying database operation fails.
     pub async fn delete_conversation(&self, id: &str) -> DbResult<()> {
-        // Messages are deleted by CASCADE
+        // Conversation + messages (FK CASCADE) and the standalone FTS prune
+        // run in one transaction. The FTS table has no FK cascade, so without
+        // the shared transaction a crash between the source delete and the
+        // prune would leave orphaned index rows and hard-deleted content could
+        // resurface in recall until the next reconcile (REQ-RET-003).
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM conversations WHERE id = ?1")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
-
         if result.rows_affected() == 0 {
+            // tx dropped without commit → rollback.
             return Err(DbError::ConversationNotFound(id.to_string()));
         }
+        retrieval::fts_delete_conversation_conn(&mut tx, id).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -2374,7 +2459,7 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
-        Ok(Message {
+        let message = Message {
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -2383,7 +2468,17 @@ impl Database {
             display_data: display_data.cloned(),
             usage_data: usage_data.cloned(),
             created_at: now,
-        })
+        };
+        // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
+        // The startup reconcile is the backstop if this ever fails after the
+        // message row commits.
+        if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+            tracing::warn!(
+                message_id = %message.message_id, error = %e,
+                "failed to index message for retrieval; startup reconcile will repair",
+            );
+        }
+        Ok(message)
     }
 
     /// Like `add_message_with_seq`, but persists a caller-supplied
@@ -2441,7 +2536,7 @@ impl Database {
             .execute(&self.pool)
             .await?;
 
-        Ok(Message {
+        let message = Message {
             message_id: message_id.to_string(),
             conversation_id: conversation_id.to_string(),
             sequence_id,
@@ -2450,7 +2545,15 @@ impl Database {
             display_data: display_data.cloned(),
             usage_data: usage_data.cloned(),
             created_at,
-        })
+        };
+        // Index for retrieval (specs/conversation-retrieval/ REQ-RET-003).
+        if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+            tracing::warn!(
+                message_id = %message.message_id, error = %e,
+                "failed to index message for retrieval; startup reconcile will repair",
+            );
+        }
+        Ok(message)
     }
 
     /// Get messages for a conversation
@@ -2508,9 +2611,12 @@ impl Database {
         .try_map(parse_message_row)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| match e {
-            sqlx::Error::RowNotFound => DbError::MessageNotFound(message_id.to_string()),
-            other => DbError::Sqlx(other),
+        .map_err(|e| {
+            if matches!(e, sqlx::Error::RowNotFound) {
+                DbError::MessageNotFound(message_id.to_string())
+            } else {
+                DbError::Sqlx(e)
+            }
         })
     }
 
@@ -2589,6 +2695,24 @@ impl Database {
         .await?;
         if result.rows_affected() == 0 {
             return Err(DbError::MessageNotFound(message_id.to_string()));
+        }
+        // Re-index the mutated message so the retrieval index reflects the new
+        // content (specs/conversation-retrieval/ REQ-RET-003).
+        let updated: Option<Message> = sqlx::query(
+            "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at
+             FROM messages WHERE message_id = ?1",
+        )
+        .bind(message_id)
+        .try_map(parse_message_row)
+        .fetch_optional(&self.pool)
+        .await?;
+        if let Some(message) = updated {
+            if let Err(e) = retrieval::fts_upsert(&self.pool, &message).await {
+                tracing::warn!(
+                    message_id = %message.message_id, error = %e,
+                    "failed to index message for retrieval; startup reconcile will repair",
+                );
+            }
         }
         Ok(())
     }
@@ -3056,6 +3180,46 @@ mod tests {
 
         let fetched = db.get_conversation("test-id").await.unwrap();
         assert_eq!(fetched.id, conv.id);
+    }
+
+    #[tokio::test]
+    async fn sub_agent_persona_roundtrips_and_upserts() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("sub-1", "sub-slug", "/tmp", false, None, None)
+            .await
+            .unwrap();
+
+        // Absent until written.
+        assert_eq!(db.get_sub_agent_persona("sub-1").await.unwrap(), None);
+
+        db.set_sub_agent_persona("sub-1", "You are a reviewer.")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_sub_agent_persona("sub-1").await.unwrap(),
+            Some("You are a reviewer.".to_string())
+        );
+
+        // Upsert replaces.
+        db.set_sub_agent_persona("sub-1", "You are a docs writer.")
+            .await
+            .unwrap();
+        assert_eq!(
+            db.get_sub_agent_persona("sub-1").await.unwrap(),
+            Some("You are a docs writer.".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_agent_persona_cascade_deletes_with_conversation() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("sub-2", "sub-slug-2", "/tmp", false, None, None)
+            .await
+            .unwrap();
+        db.set_sub_agent_persona("sub-2", "persona").await.unwrap();
+
+        db.delete_conversation("sub-2").await.unwrap();
+        assert_eq!(db.get_sub_agent_persona("sub-2").await.unwrap(), None);
     }
 
     #[tokio::test]

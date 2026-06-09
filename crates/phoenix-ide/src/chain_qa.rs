@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Chain Q&A backend (REQ-CHN-001, REQ-CHN-004, REQ-CHN-005, REQ-CHN-006).
 //!
 //! Phase 2 of Phoenix Chains v1: bundles per-member context, invokes a
@@ -660,9 +661,10 @@ fn approx_token_count(text: &str) -> usize {
 
 /// Render a leaf transcript as a human-readable plain-text block.
 ///
-/// Tool calls and tool results are folded into compact one-line markers so
-/// the leaf budget heuristic isn't dominated by JSON. Continuation messages
-/// inside a leaf transcript would be unusual but are passed through verbatim.
+/// The per-message body comes from the shared retrieval extractor
+/// (`phoenix_core::domain::message_text::index_text`) so the bundled
+/// transcript and the search index cannot diverge (REQ-RET-004): both fold
+/// tool results to the same head+tail excerpt and skip hidden messages.
 fn render_leaf_transcript(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
@@ -675,22 +677,7 @@ fn render_leaf_transcript(messages: &[Message]) -> String {
             MessageType::Continuation => "Continuation",
             MessageType::Skill => "Skill",
         };
-        let body = match &m.content {
-            MessageContent::User(c) => c.text.clone(),
-            MessageContent::Agent(blocks) => blocks
-                .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-            MessageContent::Tool(c) => format!("(tool result: {} chars)", c.content.len()),
-            MessageContent::System(c) => c.text.clone(),
-            MessageContent::Error(c) => c.message.clone(),
-            MessageContent::Continuation(c) => c.summary.clone(),
-            MessageContent::Skill(c) => format!("/{} {}", c.name, c.trigger),
-        };
+        let body = phoenix_core::domain::message_text::index_text(m);
         out.push_str(label);
         out.push_str(": ");
         out.push_str(&body);

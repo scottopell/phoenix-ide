@@ -16,5 +16,8 @@ path = "src/main.rs"
 rcgen = { version = "0.14", features = ["x509-parser"] }
 time = "0.3"
 
+[dev-dependencies]
+tempfile = "3"
+
 [lints]
 workspace = true

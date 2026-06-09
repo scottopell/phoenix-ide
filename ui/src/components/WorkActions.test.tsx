@@ -120,6 +120,70 @@ describe('WorkControlBar — continuation gate (REQ-BED-031)', () => {
     fireEvent.click(mark);
     expect(api.markMerged).toHaveBeenCalledWith('conv-1');
   });
+  it('exposes cleanup actions while the conversation is errored', async () => {
+    // A Work conversation stuck in error (e.g. a usage-limit window the user
+    // merged around) must still reach Mark-as-Merged / Abandon — the backend
+    // permits terminal cleanup from Error.
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="error"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle()}
+      />
+    );
+
+    const abandon = screen.getByTestId('abandon-button') as HTMLButtonElement;
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    await waitFor(() => {
+      expect(abandon.disabled).toBe(false);
+      expect(mark.disabled).toBe(false);
+    });
+    fireEvent.click(mark);
+    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
+  });
+
+  it('exposes cleanup actions while context-exhausted', async () => {
+    // TaskResolved is permitted from ContextExhausted, so a Work conversation
+    // that filled context after its PR merged externally must reach cleanup.
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="context_exhausted"
+        continuedInConvId={null}
+        prStatusHandle={prStatusHandle({ found: true, number: 12, display_state: 'merged' })}
+      />
+    );
+
+    const mark = screen.getByTestId('mark-merged-button') as HTMLButtonElement;
+    await waitFor(() => expect(mark.disabled).toBe(false));
+    expect(mark.textContent).toMatch(/clean up merged pr/i);
+    fireEvent.click(mark);
+    expect(api.markMerged).toHaveBeenCalledWith('conv-1');
+  });
+
+  it('suppresses PR remediation while errored, even with an open PR', async () => {
+    // "Address CI & comments" posts a normal UserMessage, which Error accepts;
+    // surfacing it on an errored bar would reopen the error through a side
+    // action. While errored the bar exposes only terminal cleanup.
+    renderWithProviders(
+      <WorkControlBar
+        conversationId="conv-1"
+        convModeLabel="Work"
+        phaseType="error"
+        continuedInConvId={null}
+        onSendMessage={vi.fn()}
+        prStatusHandle={prStatusHandle({ found: true, number: 12, display_state: 'open' })}
+      />
+    );
+
+    expect(screen.queryByRole('button', { name: /Address CI & comments/i })).not.toBeInTheDocument();
+    // Terminal cleanup is still reachable.
+    expect(screen.getByTestId('mark-merged-button')).toBeInTheDocument();
+  });
+
   it('requires an explicit manual fallback click when gh is unavailable', async () => {
     renderWithProviders(
       <WorkControlBar

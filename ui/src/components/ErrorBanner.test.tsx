@@ -25,18 +25,38 @@ describe('ErrorBanner', () => {
     expect(screen.queryByText(/start a new conversation/i)).not.toBeInTheDocument();
   });
 
-  it('does not show retry/continue affordance for non-resumable usage limits', () => {
+  it('shows retry/continue affordance for usage limits (window resets on a clock boundary)', () => {
+    const onRetry = vi.fn();
     render(
       <ErrorBanner
         message="You've hit your usage limit. Try again later."
         error={getErrorPresentation('usage_limit_reached')}
+        onRetry={onRetry}
+        onDismiss={vi.fn()}
+      />,
+    );
+
+    const retry = screen.getByRole('button', { name: /retry.*continue/i });
+    fireEvent.click(retry);
+    expect(onRetry).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/start a new conversation/i)).not.toBeInTheDocument();
+  });
+
+  it('offers neither Retry nor Dismiss for a non-resumable error', () => {
+    render(
+      <ErrorBanner
+        message="Bad request"
+        error={getErrorPresentation('invalid_request')}
         onRetry={vi.fn()}
         onDismiss={vi.fn()}
       />,
     );
 
     expect(screen.queryByRole('button', { name: /retry.*continue/i })).not.toBeInTheDocument();
-    expect(screen.getByText(/switch to a different model/i)).toBeInTheDocument();
+    // Dismiss -> Idle would reopen the resume path the policy denies, so it is
+    // not offered for non-resumable errors.
+    expect(screen.queryByRole('button', { name: /dismiss/i })).not.toBeInTheDocument();
+    expect(screen.getByText(/start a new conversation/i)).toBeInTheDocument();
   });
 
   it('still shows retry/continue affordance for transient errors', () => {

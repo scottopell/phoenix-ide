@@ -34,9 +34,14 @@ branch is renamed to `task-{NNNN}-{slug}`, the task file's status is promoted to
 Work.
 Branch mode creates a worktree on the user's chosen branch immediately, with no Explore
 phase and no task file. Worktree paths are derived from conversation IDs -- collision is
-structurally impossible. One tool: `propose_task` (Explore mode only, pure data carrier
-intercepted like submit_result). Tool registry is configured by mode: write tools
-disabled in Explore, enabled in Work and Branch. Push is a regular bash command with no
+structurally impossible. `propose_task` is intercepted like submit_result and serves two
+shapes by mode: in Explore it is the blocking Explore→Work gateway; in the writing modes
+(Work, Branch, Direct-in-a-git-repo) it is a non-blocking **fork proposal** that spawns a
+fully decoupled top-level Work conversation off the repository default branch (REQ-PROJ-033
+through 036). It is withheld only from Direct-not-in-a-repo and from sub-agents. Tool
+registry is configured by mode: unscoped writes disabled in Explore, except `patch` scoped
+to the `tasks/` dir (so the agent can draft/revise a task file — REQ-PROJ-003, and the
+Request Changes refinement of REQ-PROJ-037); write tools enabled in Work and Branch. Push is a regular bash command with no
 lifecycle side effects. Phoenix can observe PR state through `gh` to guide the
 user-visible cleanup affordance, but does not push, merge, or run unattended
 cleanup. Terminal actions remain user-initiated: verified merged PR cleanup / manual
@@ -59,7 +64,7 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-009:** ~~Complete a Task (Squash Merge)~~ | Removed | Code deleted. Superseded by REQ-PROJ-027 (push branch, user merges via PR) |
 | **REQ-PROJ-010:** Abandon a Conversation | ✅ Complete | Worktree removed; Managed deletes the task branch, Branch keeps it; diff snapshot captured as a system message first; no task-file edit |
 | **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | ✅ Complete | PR badge replaces ahead/behind StateBar noise |
-| **REQ-PROJ-012:** Provide propose_task Tool to Agents | ✅ Complete | Same as REQ-PROJ-003 |
+| **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Explore gateway shipped; the writing-mode fork registry/interception path (REQ-PROJ-033/036) is spec-only |
 | **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 08601 (M1) |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
 | **REQ-PROJ-015:** Project Worktree Registry | Descoped | ConvMode::Work serves as de facto registry |
@@ -80,9 +85,16 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-030:** PR Feedback Freshness Indicator | ✅ Complete | Work Actions shows advisory `new`/`updated` marker beside `Address CI & comments`; StateBar remains branch health only |
 | **REQ-PROJ-031:** Agent-Facing PR Context Baseline | ✅ Complete | Successful PR auto-fix context capture records work-scope/PR baseline with timestamp, PR updated_at, and feedback identities |
 | **REQ-PROJ-032:** Bounded PR Feedback Refresh | ✅ Complete | Routine PR status uses PR updated_at as the gate before fetching feedback surfaces; failures degrade to coarse advisory |
+| **REQ-PROJ-033:** Propose a Decoupled Task Fork from a Writing Mode | 📐 Spec only | Non-blocking `propose_task` in Work/Branch/Direct-in-git; snapshots the task and continues |
+| **REQ-PROJ-034:** Approve a Fork Proposal — Spawn an Independent Conversation | 📐 Spec only | Async approval spawns a fresh top-level Work conversation cut from the repository default branch (`main_ref`), never the origin's `base_branch`/HEAD |
+| **REQ-PROJ-035:** Fork Provenance and Decoupling Guarantees | 📐 Spec only | `spawned_from_conversation_id` breadcrumb; no lifecycle notifications; proposal bound to origin |
+| **REQ-PROJ-036:** Fork-Eligible Mode Availability | 📐 Spec only | Writing-mode matrix; Direct gated on git repo; Explore keeps its parking gateway |
+| **REQ-PROJ-037:** Request Changes — Promote a Fork Proposal to an Explore Refinement | 📐 Spec only (not implemented yet) | Third review action promotes a pending proposal into a fresh Explore conversation seeded with the brief + change note; refinement runs via the Explore propose/feedback loop, decoupled from the origin |
 
-**Progress:** of the 28 active requirements, all 28 complete. REQ-PROJ-009
-and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by
+**Progress:** of 33 active requirements, 27 complete, 1 partial (REQ-PROJ-012 — its
+Explore gateway ships but the writing-mode fork path is spec-only), and 5 (REQ-PROJ-033..037,
+task forks + fork-proposal Request Changes) specified but not yet implemented.
+REQ-PROJ-009 and -023 removed; REQ-PROJ-015 descoped; REQ-PROJ-016 superseded by
 REQ-PROJ-018.
 
 ## Dependencies

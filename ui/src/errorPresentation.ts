@@ -12,9 +12,11 @@ export function getErrorPresentation(errorKind?: ErrorKind): ErrorPresentation |
     case 'server_error':
     case 'timed_out':
       return { kind: errorKind, can_auto_retry: true, can_user_resume: true };
+    // usage_limit_reached: a quota window resets on a clock boundary, so the
+    // user can resume once it clears — user-resumable, never auto-retried.
     case 'server_overloaded':
-      return { kind: errorKind, can_auto_retry: false, can_user_resume: true };
     case 'usage_limit_reached':
+      return { kind: errorKind, can_auto_retry: false, can_user_resume: true };
     case 'invalid_request':
     case 'cancelled':
     case 'sub_agent_error':

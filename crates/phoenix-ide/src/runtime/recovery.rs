@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Conversation recovery logic
 //!
 //! Handles detection of interrupted conversations that need auto-continuation.
@@ -30,6 +31,8 @@ pub enum RecoveryReason {
     AgentHasTextResponse,
     /// Last message marks a deliberate `ask_user_question` dismissal
     UserQuestionDismissed,
+    /// Last message marks a deliberate error-banner dismissal
+    ErrorDismissed,
     /// Last agent message is `tool_use` only, needs continuation
     InterruptedMidTurn,
     /// Too many consecutive auto-continue restarts (liveness bound)
@@ -79,8 +82,11 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
 
     // Last message must be a tool result
     let last_msg = messages.last().unwrap();
-    if is_user_question_dismissed_marker(last_msg) {
-        return RecoveryDecision::idle(RecoveryReason::UserQuestionDismissed);
+    if let Some(reason) = dismissal_marker_reason(last_msg) {
+        // A deliberate dismissal (a question panel dismissed, or an error
+        // banner dismissed) persists a hidden marker as the last message.
+        // Treat it as a settled Idle, never an interrupted tool turn.
+        return RecoveryDecision::idle(reason);
     }
 
     if !matches!(last_msg.message_type, MessageType::Tool) {
@@ -123,12 +129,27 @@ pub fn should_auto_continue(messages: &[Message]) -> RecoveryDecision {
     }
 }
 
-fn is_user_question_dismissed_marker(message: &Message) -> bool {
-    matches!(
-        &message.content,
-        MessageContent::System(sys)
-            if sys.text.contains(crate::state_machine::transition::USER_QUESTION_DISMISSED_MARKER)
-    )
+/// If `message` is a hidden dismissal marker, return the matching recovery
+/// reason. Both dismissal kinds (question panel, error banner) persist a hidden
+/// system marker as the last message to signal a settled Idle that recovery
+/// must not auto-continue.
+fn dismissal_marker_reason(message: &Message) -> Option<RecoveryReason> {
+    let MessageContent::System(sys) = &message.content else {
+        return None;
+    };
+    if sys
+        .text
+        .contains(crate::state_machine::transition::USER_QUESTION_DISMISSED_MARKER)
+    {
+        return Some(RecoveryReason::UserQuestionDismissed);
+    }
+    if sys
+        .text
+        .contains(crate::state_machine::transition::ERROR_DISMISSED_MARKER)
+    {
+        return Some(RecoveryReason::ErrorDismissed);
+    }
+    None
 }
 
 /// Count restart system messages since the last user message.
@@ -521,6 +542,39 @@ mod tests {
         assert!(matches!(decision.state, ConvState::Idle));
     }
 
+    fn system_error_dismissed_msg(seq: i64) -> Message {
+        Message {
+            message_id: format!("sys-err-dismissed-{seq}"),
+            conversation_id: "test-conv".to_string(),
+            sequence_id: seq,
+            message_type: MessageType::System,
+            content: MessageContent::System(SystemContent {
+                text: crate::state_machine::transition::ERROR_DISMISSED_MARKER.to_string(),
+            }),
+            display_data: Some(json!({ "hidden": true })),
+            usage_data: None,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_error_dismissal_marker_prevents_auto_continue_after_tool_result() {
+        // A usage-limit error after a tool result, then dismissed: the marker
+        // is the last message, so a restart must NOT auto-continue the turn the
+        // user dismissed — even though a bare trailing tool result would.
+        let messages = vec![
+            user_msg(1, "list the files"),
+            agent_tool_use_only(2, &["bash"]),
+            tool_result(3, "tool-2-0", "file1.txt\nfile2.txt"),
+            system_error_dismissed_msg(4),
+        ];
+
+        let decision = should_auto_continue(&messages);
+        assert!(!decision.needs_auto_continue);
+        assert_eq!(decision.reason, RecoveryReason::ErrorDismissed);
+        assert!(matches!(decision.state, ConvState::Idle));
+    }
+
     // =========================================================================
     // Restart loop detection
     // =========================================================================
@@ -882,7 +936,7 @@ mod proptests {
                         }
                     }
                 }
-                RecoveryReason::UserQuestionDismissed => {
+                RecoveryReason::UserQuestionDismissed | RecoveryReason::ErrorDismissed => {
                     prop_assert!(!decision.needs_auto_continue);
                 }
                 RecoveryReason::InterruptedMidTurn => {

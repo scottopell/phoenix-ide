@@ -35,6 +35,10 @@ phoenix-tls = { path = "../phoenix-tls" }
 # `phoenix-tools` crate can call it without depending on phoenix-ide.
 phoenix-skills = { path = "../phoenix-skills" }
 
+# Named-agent discovery (.claude/agents, .agents/agents) for the spawn-time
+# agent_type resolution and persona composition.
+phoenix-agents = { path = "../phoenix-agents" }
+
 # Tool implementations (bash, patch, browser, tmux, search, …). The Tool
 # trait, ToolContext, and ToolRegistry live here. The axum/HTTP glue that
 # drives tools (api::handlers, api::browser_view) stays in phoenix-ide.
@@ -82,6 +86,9 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+# Non-blocking file writer for the optional PHOENIX_LOG_FILE sink. The worker
+# thread + WorkerGuard keep log I/O off the async runtime (specs/deployment-info/).
+tracing-appender = "0.2"
 base64 = "0.22"
 sha2 = "0.11"
 rand = "0.10"
@@ -97,6 +104,10 @@ vte = "0.15"
 
 # Gitignore-aware directory walking (for file search)
 ignore = "0.4"
+
+# Temp dirs for materializing a branch ref's SKILL.md files during GitTree
+# skill discovery (resolution_root); also used across tests.
+tempfile = "3"
 
 # Glob matching for search tool's include/exclude params
 globset = "0.4"
@@ -141,7 +152,6 @@ phoenix-terminal = { path = "../phoenix-terminal", features = ["test-support"] }
 # Re-declared with test-support so phoenix-db's #[cfg(test)] `create_conversation`
 # explore-mode test wrapper is visible to this crate's tests. Dev-only.
 phoenix-db = { path = "../phoenix-db", features = ["test-support"] }
-tempfile = "3"
 proptest = "1"
 # `test-util` enables `tokio::time::pause`/`advance`, used by the
 # bounded-shutdown drain tests to exercise the SHUTDOWN_GRACE timeout

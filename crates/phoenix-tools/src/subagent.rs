@@ -6,6 +6,7 @@
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
+use phoenix_agents::AgentDefinition;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -96,8 +97,34 @@ impl Tool for SubmitErrorTool {
     }
 }
 
-/// Tool for parent conversations to spawn sub-agents
-pub struct SpawnAgentsTool;
+/// Tool for parent conversations to spawn sub-agents.
+///
+/// Holds the working-directory's discovered named agents (sorted by name) so
+/// `input_schema` can render them as an `agent_type` enum (REQ-AG-004). The
+/// catalog is captured per-conversation at registry-construction time; the
+/// `Tool` trait's `input_schema(&self)` has no working-directory parameter, so
+/// capturing here is what lets a static schema method emit a dynamic enum.
+#[derive(Default)]
+pub struct SpawnAgentsTool {
+    agents: Vec<AgentDefinition>,
+}
+
+impl SpawnAgentsTool {
+    /// A spawn tool with no named agents — `agent_type` is omitted from the
+    /// schema. Used by tests and any caller without a discovered catalog.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { agents: Vec::new() }
+    }
+
+    /// A spawn tool whose schema exposes the given named agents as the
+    /// `agent_type` enum. `agents` must be sorted by name (the discovery
+    /// contract) for the rendered schema to be cache-stable (REQ-AG-008).
+    #[must_use]
+    pub fn with_agents(agents: Vec<AgentDefinition>) -> Self {
+        Self { agents }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 struct SpawnAgentsInput {
@@ -105,7 +132,7 @@ struct SpawnAgentsInput {
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Fields consumed in Phase 2 when mode resolution is wired up
+#[allow(dead_code)] // Authoritative parsing/resolution happens in the executor.
 struct TaskSpec {
     task: String,
     #[serde(default)]
@@ -116,6 +143,8 @@ struct TaskSpec {
     model: Option<String>,
     #[serde(default)]
     max_turns: Option<u32>,
+    #[serde(default)]
+    agent_type: Option<String>,
 }
 
 #[async_trait]
@@ -129,6 +158,52 @@ impl Tool for SpawnAgentsTool {
     }
 
     fn input_schema(&self) -> Value {
+        let mut task_props = json!({
+            "task": {
+                "type": "string",
+                "description": "Task description for the sub-agent"
+            },
+            "cwd": {
+                "type": "string",
+                "description": "Working directory (defaults to parent's cwd)"
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["explore", "work"],
+                "description": "Sub-agent mode. Explore (default): read-only tools, haiku model. Work: full tool suite, inherits parent model. Work mode requires the parent to be in Work mode."
+            },
+            "model": {
+                "type": "string",
+                "description": "LLM model override (e.g., 'claude-haiku-4-5', 'claude-sonnet-4-6'). Defaults based on mode."
+            },
+            "max_turns": {
+                "type": "integer",
+                "minimum": 1,
+                "description": "Maximum LLM turns before forced completion. Defaults to 20 (explore) or 50 (work)."
+            }
+        });
+
+        // REQ-AG-004: surface discovered named agents as a typed agent_type
+        // enum. Omitted entirely when none are discovered, so the schema is a
+        // strict subset of the agent-free shape. The catalog is pre-sorted by
+        // name, so the rendered enum is byte-stable turn-to-turn (REQ-AG-008).
+        if !self.agents.is_empty() {
+            use std::fmt::Write as _;
+            let names: Vec<&str> = self.agents.iter().map(|a| a.name.as_str()).collect();
+            let mut description = String::from(
+                "Named agent persona to spawn. Supplies the sub-agent's persona \
+                              and its default model/mode. One of:",
+            );
+            for agent in &self.agents {
+                let _ = write!(description, "\n- {}: {}", agent.name, agent.description);
+            }
+            task_props["agent_type"] = json!({
+                "type": "string",
+                "enum": names,
+                "description": description
+            });
+        }
+
         json!({
             "type": "object",
             "required": ["tasks"],
@@ -138,30 +213,7 @@ impl Tool for SpawnAgentsTool {
                     "items": {
                         "type": "object",
                         "required": ["task"],
-                        "properties": {
-                            "task": {
-                                "type": "string",
-                                "description": "Task description for the sub-agent"
-                            },
-                            "cwd": {
-                                "type": "string",
-                                "description": "Working directory (defaults to parent's cwd)"
-                            },
-                            "mode": {
-                                "type": "string",
-                                "enum": ["explore", "work"],
-                                "description": "Sub-agent mode. Explore (default): read-only tools, haiku model. Work: full tool suite, inherits parent model. Work mode requires the parent to be in Work mode."
-                            },
-                            "model": {
-                                "type": "string",
-                                "description": "LLM model override (e.g., 'claude-haiku-4-5', 'claude-sonnet-4-6'). Defaults based on mode."
-                            },
-                            "max_turns": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "description": "Maximum LLM turns before forced completion. Defaults to 20 (explore) or 50 (work)."
-                            }
-                        }
+                        "properties": task_props
                     },
                     "minItems": 1,
                     "maxItems": 10,
@@ -265,9 +317,57 @@ mod tests {
         assert!(result.output().contains("Error submitted"));
     }
 
+    fn agent(name: &str, description: &str) -> AgentDefinition {
+        AgentDefinition {
+            name: name.to_string(),
+            description: description.to_string(),
+            body: format!("You are {name}."),
+            path: std::path::PathBuf::from(format!("/agents/{name}.md")),
+            source_dir: ".claude/agents".to_string(),
+            model: None,
+            mode: None,
+            tools: None,
+        }
+    }
+
+    #[test]
+    fn schema_omits_agent_type_when_no_agents() {
+        // REQ-AG-004: agent-free schema is a strict subset of today's shape.
+        let schema = SpawnAgentsTool::new().input_schema();
+        let props = &schema["properties"]["tasks"]["items"]["properties"];
+        assert!(props.get("agent_type").is_none());
+    }
+
+    #[test]
+    fn schema_renders_agent_type_enum_sorted() {
+        // REQ-AG-004 / REQ-AG-008: enum present, in the given (sorted) order,
+        // with per-agent description lines.
+        let tool = SpawnAgentsTool::with_agents(vec![
+            agent("docs-writer", "Writes docs"),
+            agent("security-reviewer", "Finds vulns"),
+        ]);
+        let schema = tool.input_schema();
+        let agent_type = &schema["properties"]["tasks"]["items"]["properties"]["agent_type"];
+        assert_eq!(
+            agent_type["enum"],
+            json!(["docs-writer", "security-reviewer"])
+        );
+        let desc = agent_type["description"].as_str().unwrap();
+        assert!(desc.contains("docs-writer: Writes docs"));
+        assert!(desc.contains("security-reviewer: Finds vulns"));
+    }
+
+    #[test]
+    fn schema_is_byte_stable_across_calls() {
+        // REQ-AG-008: repeated input_schema() over the same catalog is identical.
+        let tool =
+            SpawnAgentsTool::with_agents(vec![agent("a", "A"), agent("b", "B"), agent("c", "C")]);
+        assert_eq!(tool.input_schema(), tool.input_schema());
+    }
+
     #[tokio::test]
     async fn test_spawn_agents_valid() {
-        let tool = SpawnAgentsTool;
+        let tool = SpawnAgentsTool::new();
         let result = tool
             .run(
                 json!({
@@ -285,14 +385,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_spawn_agents_empty_tasks() {
-        let tool = SpawnAgentsTool;
+        let tool = SpawnAgentsTool::new();
         let result = tool.run(json!({"tasks": []}), test_context()).await;
         assert!(!result.is_success());
     }
 
     #[tokio::test]
     async fn test_spawn_agents_missing_tasks() {
-        let tool = SpawnAgentsTool;
+        let tool = SpawnAgentsTool::new();
         let result = tool.run(json!({}), test_context()).await;
         assert!(!result.is_success());
     }

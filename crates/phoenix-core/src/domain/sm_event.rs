@@ -232,6 +232,13 @@ pub enum Event {
     /// User dismissed the structured question UI without answering it.
     UserQuestionDismissed,
 
+    /// User dismissed a persisted `Error` state, returning the conversation to
+    /// `Idle`. Server-authoritative: the UI does not fake the idle phase
+    /// locally — it sends this event so the displayed state and the server
+    /// state cannot diverge (a divergence makes server-gated actions like
+    /// mark-merged reject while the UI claims the conversation is idle).
+    DismissError,
+
     /// Grace turn exhausted -- sub-agent used its extra turn without calling `submit_result`.
     /// The executor extracted the last assistant text (if any) before sending this event.
     GraceTurnExhausted {
@@ -324,6 +331,7 @@ impl Event {
             Event::TaskHandoffComplete { .. } => "TaskHandoffComplete",
             Event::UserQuestionResponse { .. } => "UserQuestionResponse",
             Event::UserQuestionDismissed => "UserQuestionDismissed",
+            Event::DismissError => "DismissError",
             Event::GraceTurnExhausted { .. } => "GraceTurnExhausted",
             Event::CredentialBecameAvailable => "CredentialBecameAvailable",
             Event::CredentialHelperFailed { .. } => "CredentialHelperFailed",
@@ -422,6 +430,7 @@ pub enum ParentOnlyEvent {
         annotations: Option<HashMap<String, QuestionAnnotation>>,
     },
     UserQuestionDismissed,
+    DismissError,
     CredentialBecameAvailable,
     CredentialHelperFailed {
         message: String,
@@ -595,6 +604,7 @@ impl TryFrom<Event> for ParentEvent {
             Event::UserQuestionDismissed => {
                 Ok(ParentEvent::Parent(ParentOnlyEvent::UserQuestionDismissed))
             }
+            Event::DismissError => Ok(ParentEvent::Parent(ParentOnlyEvent::DismissError)),
             Event::CredentialBecameAvailable => Ok(ParentEvent::Parent(
                 ParentOnlyEvent::CredentialBecameAvailable,
             )),
@@ -728,6 +738,7 @@ impl TryFrom<Event> for SubAgentEvent {
             | Event::TaskHandoffComplete { .. }
             | Event::UserQuestionResponse { .. }
             | Event::UserQuestionDismissed
+            | Event::DismissError
             | Event::CredentialBecameAvailable
             | Event::CredentialHelperFailed { .. }
             | Event::TaskResolved { .. }
@@ -775,6 +786,7 @@ impl ParentEvent {
                 ParentOnlyEvent::TaskHandoffComplete { .. } => "TaskHandoffComplete",
                 ParentOnlyEvent::UserQuestionResponse { .. } => "UserQuestionResponse",
                 ParentOnlyEvent::UserQuestionDismissed => "UserQuestionDismissed",
+                ParentOnlyEvent::DismissError => "DismissError",
                 ParentOnlyEvent::CredentialBecameAvailable => "CredentialBecameAvailable",
                 ParentOnlyEvent::CredentialHelperFailed { .. } => "CredentialHelperFailed",
                 ParentOnlyEvent::TaskResolved { .. } => "TaskResolved",

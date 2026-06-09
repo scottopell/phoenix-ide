@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Runtime for executing conversations
 //!
 //! REQ-BED-007: State Persistence
@@ -1492,6 +1493,21 @@ impl RuntimeManager {
             }
         };
 
+        // Persist the named-agent persona (REQ-AG-006) so a sub-agent runtime
+        // recreated mid-run (e.g. model-upgrade eviction) keeps it instead of
+        // falling back to the generic prompt. Best-effort: the live
+        // conv_context built below carries the persona regardless, so a write
+        // failure only degrades a subsequent resume — logged, not fatal.
+        if let Some(persona) = spec.persona.as_deref() {
+            if let Err(e) = self.db.set_sub_agent_persona(&conv.id, persona).await {
+                tracing::warn!(
+                    error = %e,
+                    conv_id = %conv.id,
+                    "Failed to persist sub-agent persona; a resumed runtime would fall back to the generic prompt"
+                );
+            }
+        }
+
         // 2. Insert initial task as synthetic user message
         let message_id = uuid::Uuid::new_v4().to_string();
         let content = crate::db::MessageContent::user(&spec.task);
@@ -1545,6 +1561,9 @@ impl RuntimeManager {
                 .into_owned();
         // Sub-agents inherit their parent's LLM language.
         conv_context.llm_language = conv.llm_language;
+        // Named-agent persona (REQ-AG-006): replaces the base preamble in the
+        // sub-agent's system prompt. `None` for anonymous spawns.
+        conv_context.persona = spec.persona.clone();
 
         // 4. Create channels for the sub-agent runtime. The broadcaster
         // seeds its counter from the message we just inserted (sequence_id=1)
@@ -1561,7 +1580,12 @@ impl RuntimeManager {
             SubAgentMode::Explore => ToolRegistry::for_subagent_explore(),
             SubAgentMode::Work => ToolRegistry::for_subagent_work(),
         };
-        let tool_executor = ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone());
+        // Sub-agents cannot spawn, so they carry an empty agent catalog.
+        let tool_executor = ToolRegistryExecutor::with_mcp(
+            registry,
+            self.mcp_manager.clone(),
+            Arc::from(Vec::new()),
+        );
 
         // 6. Create runtime with parent notification
         let runtime: ProductionRuntime = ConversationRuntime::new(
@@ -1763,6 +1787,20 @@ impl RuntimeManager {
         // the system prompt and tool descriptions stay consistent across all
         // turns even if the global default changes mid-conversation.
         context.llm_language = conv.llm_language;
+        // Restore a named-agent persona (REQ-AG-006) on the resume path: it is
+        // set at spawn on the fresh ConvContext, but a runtime recreated mid-run
+        // (e.g. model-upgrade eviction) rebuilds the context from the DB, so the
+        // persona must be re-read here or remaining turns lose it.
+        if is_sub_agent {
+            match self.db.get_sub_agent_persona(conversation_id).await {
+                Ok(persona) => context.persona = persona,
+                Err(e) => tracing::warn!(
+                    error = %e,
+                    conv_id = %conversation_id,
+                    "Failed to read sub-agent persona on resume; falling back to the generic prompt"
+                ),
+            }
+        }
 
         let (event_tx, event_rx) = mpsc::channel(32);
         // Inherit the broadcaster from an eviction if available (e.g. model
@@ -1807,29 +1845,52 @@ impl RuntimeManager {
         // conversations get the mode-appropriate registry. Both layers wrap
         // their registry with `with_mcp` so MCP tool defs resolve live from
         // the manager on every `definitions()` call.
+        // Freeze the named-agent catalog once per conversation so the
+        // spawn_agents schema and the executor's agent_type resolution share a
+        // single catalog instead of independently re-discovering the filesystem
+        // (REQ-AG-008). Sub-agents cannot spawn, so theirs is empty.
+        let agent_catalog: Arc<[phoenix_agents::AgentDefinition]> = if is_sub_agent {
+            Arc::from(Vec::new())
+        } else {
+            Arc::from(phoenix_agents::discover_agents(&context.working_dir))
+        };
         let tool_executor = if is_sub_agent {
             let registry = sub_agent_registry_for_conv_mode(&conv.conv_mode);
-            ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone())
+            ToolRegistryExecutor::with_mcp(
+                registry,
+                self.mcp_manager.clone(),
+                agent_catalog.clone(),
+            )
         } else {
             use crate::db::ConvMode;
             let registry = match conv.conv_mode {
                 ConvMode::Explore { .. } => {
                     if self.platform.has_sandbox() {
-                        ToolRegistry::explore_with_sandbox(&context.tasks_dir_name)
+                        ToolRegistry::explore_with_sandbox(
+                            &context.tasks_dir_name,
+                            agent_catalog.to_vec(),
+                        )
                     } else {
-                        ToolRegistry::explore_no_sandbox(&context.tasks_dir_name)
+                        ToolRegistry::explore_no_sandbox(
+                            &context.tasks_dir_name,
+                            agent_catalog.to_vec(),
+                        )
                     }
                 }
                 ConvMode::Direct => {
                     // Full tool suite for Direct mode
-                    ToolRegistry::direct()
+                    ToolRegistry::direct(agent_catalog.to_vec())
                 }
                 ConvMode::Work { .. } | ConvMode::Branch { .. } => {
                     // Full tool suite for Work/Branch mode (same as Direct)
-                    ToolRegistry::direct()
+                    ToolRegistry::direct(agent_catalog.to_vec())
                 }
             };
-            ToolRegistryExecutor::with_mcp(registry, self.mcp_manager.clone())
+            ToolRegistryExecutor::with_mcp(
+                registry,
+                self.mcp_manager.clone(),
+                agent_catalog.clone(),
+            )
         };
 
         // Determine initial state: check if conversation needs auto-continuation
@@ -1856,7 +1917,8 @@ impl RuntimeManager {
         .with_steering_queue(conv.steering_queue)
         .with_spawn_channels(self.spawn_tx.clone(), self.cancel_tx.clone())
         .with_task_handoff_channel(self.handoff_tx.clone())
-        .with_credential_helper(self.credential_helper.clone());
+        .with_credential_helper(self.credential_helper.clone())
+        .with_agent_catalog(agent_catalog);
 
         // If auto-continuing, inject a system message so the LLM knows a restart
         // happened. This also serves as the restart loop counter — recovery.rs
@@ -2234,7 +2296,7 @@ async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> Stri
 }
 
 /// Convert a database `ConvMode` into a `ModeContext` for the system prompt.
-fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
+pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
     match mode {
         ConvMode::Explore { .. } => ModeContext::Explore,
         ConvMode::Work {

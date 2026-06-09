@@ -1,5 +1,6 @@
+import { createRef, forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react';
 import { describe, expect, it, vi } from 'vitest';
-import { render, waitFor } from '@testing-library/react';
+import { render, waitFor, act } from '@testing-library/react';
 import type { ConversationState, Message } from '../api';
 import { MessageList } from './MessageList';
 import { ConversationContext } from '../conversation/ConversationContext';
@@ -47,20 +48,28 @@ vi.mock('./MessageContextMenu', () => ({
 //   - per-unit component dispatch
 //   - keyed in-place reconciliation across the pending → sent transition
 vi.mock('react-virtuoso', () => ({
-  Virtuoso: <T,>({
+  Virtuoso: forwardRef(<T,>({
     data,
     itemContent,
     components,
     computeItemKey,
+    scrollerRef,
   }: {
     data: T[];
     itemContent: (index: number, data: T) => React.ReactNode;
     components?: { Header?: React.ComponentType };
     computeItemKey?: (index: number, data: T) => React.Key;
-  }) => {
+    scrollerRef?: (ref: HTMLElement | Window | null) => void;
+  }, ref: React.Ref<{ scrollToIndex: (options: unknown) => void }>) => {
     const Header = components?.Header;
+    const containerRef = useRef<HTMLDivElement>(null);
+    useImperativeHandle(ref, () => ({ scrollToIndex: vi.fn() }), []);
+    useLayoutEffect(() => {
+      scrollerRef?.(containerRef.current);
+      return () => scrollerRef?.(null);
+    }, [scrollerRef]);
     return (
-      <div data-testid="mock-virtuoso">
+      <div data-testid="mock-virtuoso" ref={containerRef}>
         {Header && <Header />}
         {data.map((item, i) => {
           const key = computeItemKey ? computeItemKey(i, item) : i;
@@ -68,7 +77,7 @@ vi.mock('react-virtuoso', () => ({
         })}
       </div>
     );
-  },
+  }),
 }));
 
 function makeMessage(sequence_id: number, message_type: Message['message_type'] = 'user'): Message {
@@ -208,5 +217,85 @@ describe('MessageList', () => {
     );
 
     expect(container.querySelectorAll('[data-render-unit-key]').length).toBe(100);
+  });
+
+  it('ignores stale chapter jump offset retries after a newer jump', () => {
+    vi.useFakeTimers();
+    try {
+      const historical = Array.from({ length: 2 }, (_, i) => makeMessage(i + 1, 'user'));
+      const listRef = createRef<React.ElementRef<typeof MessageList>>();
+      const { container } = render(
+        withConvContext(
+          <MessageList
+            ref={listRef}
+            messages={historical}
+            pendingMessages={[]}
+            convState={idleState}
+            onRetry={vi.fn()}
+            onOpenFile={undefined}
+            conversationId="conv-jumps"
+          />,
+        ),
+      );
+
+      const scroller = container.querySelector<HTMLElement>('#messages')!;
+      scroller.scrollTop = 100;
+      scroller.getBoundingClientRect = () => ({
+        left: 0,
+        right: 800,
+        top: 36,
+        bottom: 600,
+        width: 800,
+        height: 564,
+        x: 0,
+        y: 36,
+        toJSON: () => ({}),
+      } as DOMRect);
+      const firstRow = container.querySelector<HTMLElement>('[data-render-unit-key="msg-1"]')!;
+      firstRow.getBoundingClientRect = () => ({
+        left: 0,
+        right: 800,
+        top: 20 + (100 - scroller.scrollTop),
+        bottom: 80 + (100 - scroller.scrollTop),
+        width: 800,
+        height: 60,
+        x: 0,
+        y: 20 + (100 - scroller.scrollTop),
+        toJSON: () => ({}),
+      } as DOMRect);
+      firstRow.querySelector<HTMLElement>('.message')!.getBoundingClientRect = firstRow.getBoundingClientRect;
+      const secondRow = container.querySelector<HTMLElement>('[data-render-unit-key="msg-2"]')!;
+      secondRow.getBoundingClientRect = () => ({
+        left: 0,
+        right: 800,
+        top: 25 + (100 - scroller.scrollTop),
+        bottom: 85 + (100 - scroller.scrollTop),
+        width: 800,
+        height: 60,
+        x: 0,
+        y: 25 + (100 - scroller.scrollTop),
+        toJSON: () => ({}),
+      } as DOMRect);
+      secondRow.querySelector<HTMLElement>('.message')!.getBoundingClientRect = secondRow.getBoundingClientRect;
+
+      act(() => {
+        listRef.current?.scrollToUnitIndex(0);
+      });
+      act(() => {
+        vi.advanceTimersByTime(60);
+      });
+      act(() => {
+        listRef.current?.scrollToUnitIndex(1);
+      });
+      act(() => {
+        vi.advanceTimersByTime(601);
+      });
+
+      expect(scroller.scrollTop).toBe(81);
+      expect(firstRow.querySelector('.message')).not.toHaveClass('breadcrumb-highlight');
+      expect(secondRow.querySelector('.message')).toHaveClass('breadcrumb-highlight');
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

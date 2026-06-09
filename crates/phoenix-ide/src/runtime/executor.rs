@@ -1,3 +1,4 @@
+#![allow(clippy::wildcard_enum_match_arm)]
 //! Conversation runtime executor
 //!
 //! The executor loop receives inputs from two sources:
@@ -234,6 +235,12 @@ where
     /// Credential helper for recovery settlement (REQ-BED-030).
     /// When the state is `AwaitingRecovery`, the select loop awaits `settled.notified()`.
     credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
+    /// Named-agent catalog frozen at conversation start (parent conversations
+    /// only). The same catalog renders the `spawn_agents` `agent_type` enum and
+    /// resolves `agent_type` at spawn time, so the advertised choice and the
+    /// runtime resolution never diverge mid-conversation (REQ-AG-004/008).
+    /// Empty for sub-agents (which cannot spawn).
+    agent_catalog: Arc<[phoenix_agents::AgentDefinition]>,
 }
 
 impl<S, L, T> ConversationRuntime<S, L, T>
@@ -296,6 +303,7 @@ where
             outcome_tx,
             outcome_rx,
             credential_helper: None,
+            agent_catalog: Arc::from(Vec::new()),
         }
     }
 
@@ -329,6 +337,14 @@ where
     /// Set the parent event channel (for sub-agents)
     pub fn with_parent(mut self, parent_tx: mpsc::Sender<Event>) -> Self {
         self.parent_event_tx = Some(parent_tx);
+        self
+    }
+
+    /// Freeze the named-agent catalog used to render the `spawn_agents` schema
+    /// and resolve `agent_type` at spawn time. Set by the runtime manager for
+    /// parent conversations so both surfaces share one catalog (REQ-AG-008).
+    pub fn with_agent_catalog(mut self, catalog: Arc<[phoenix_agents::AgentDefinition]>) -> Self {
+        self.agent_catalog = catalog;
         self
     }
 
@@ -850,7 +866,20 @@ where
         // (or after) the LLM task reading the DB; if the in-flight LLM then
         // returned a no-tool response, the conversation would settle to Idle
         // with the steers persisted but unanswered.
-        if let Some(drain_event) = self.maybe_drain_steering_queue(&old_state) {
+        // An error dismissal (DismissError) enters Idle but is the user
+        // clearing a banner, not a turn completing, so it must not drain the
+        // steering queue. It is identified by the hidden marker it persists —
+        // keyed on that effect, not on the source state, so the exclusion stays
+        // correct if another `Error -> Idle` edge (that *should* drain) is ever
+        // added. Mirrors specs/steering-messages DrainOnIdleEntry's guard.
+        let is_error_dismissal = result.effects.iter().any(|e| {
+            matches!(
+                e,
+                Effect::PersistHiddenSystemMarker { marker, .. }
+                    if *marker == crate::state_machine::transition::ERROR_DISMISSED_MARKER
+            )
+        });
+        if let Some(drain_event) = self.maybe_drain_steering_queue(&old_state, is_error_dismissal) {
             self.run_effects_with_inline_drain(result.effects, drain_event, &mut generated_events)
                 .await?;
         } else {
@@ -977,8 +1006,19 @@ where
     /// - Entering `LlmRequesting` from `ToolExecuting`/`AwaitingSubAgents` (mid-
     ///   turn; the prior transition already dispatched `RequestLlm`, so steers
     ///   land in the NEXT LLM call, not the in-flight one).
-    fn maybe_drain_steering_queue(&mut self, old_state: &ConvState) -> Option<Event> {
+    fn maybe_drain_steering_queue(
+        &mut self,
+        old_state: &ConvState,
+        is_error_dismissal: bool,
+    ) -> Option<Event> {
         if self.context.is_sub_agent {
+            return None;
+        }
+
+        // An error dismissal enters Idle but is not a turn-end, so it must not
+        // drain (see the call site). Draining is reserved for turn-completion
+        // idle entries.
+        if is_error_dismissal {
             return None;
         }
 
@@ -1209,6 +1249,49 @@ where
         // Bounded buffer: pre-allocate with capacity = sub-agent count (FM-6 prevention)
         self.sub_agent_result_buffer = Vec::with_capacity(input.tasks.len());
 
+        // --- Named-agent resolution (REQ-AG-005, REQ-AG-007) ---
+        // Resolve against the catalog frozen at conversation start — the same
+        // one that rendered the spawn_agents schema — so the advertised
+        // agent_type enum and this validation never diverge if agent files
+        // change mid-conversation (REQ-AG-008). Reject an unknown agent_type and
+        // resolve each task's effective mode (task field > agent default >
+        // Explore) up front, so the write-capability checks below run on the
+        // *resolved* mode.
+        let agents: &[phoenix_agents::AgentDefinition] = &self.agent_catalog;
+        let mut resolved_tasks: Vec<(Option<&phoenix_agents::AgentDefinition>, SubAgentMode)> =
+            Vec::with_capacity(input.tasks.len());
+        for task in &input.tasks {
+            let agent = if let Some(ref agent_type) = task.agent_type {
+                let Some(found) = phoenix_agents::find_agent(agents, agent_type) else {
+                    let available: Vec<&str> = agents.iter().map(|a| a.name.as_str()).collect();
+                    let result = ToolResult::error(
+                        tool_use_id.clone(),
+                        format!(
+                            "Unknown agent_type '{}'. Available: {}",
+                            agent_type,
+                            if available.is_empty() {
+                                "none".to_string()
+                            } else {
+                                available.join(", ")
+                            }
+                        ),
+                    );
+                    return Ok(Some(Event::ToolComplete {
+                        tool_use_id,
+                        result,
+                    }));
+                };
+                Some(found)
+            } else {
+                None
+            };
+            let mode = task
+                .mode
+                .or_else(|| agent.and_then(|a| a.mode))
+                .unwrap_or_default();
+            resolved_tasks.push((agent, mode));
+        }
+
         // --- Mode validation and one-writer constraint (REQ-PROJ-008) ---
         let parent_allows_work = match self.context.mode_context.as_ref() {
             Some(ModeContext::Work { .. } | ModeContext::Direct | ModeContext::Branch { .. }) => {
@@ -1218,8 +1301,7 @@ where
         };
 
         let mut work_count_in_batch = 0u32;
-        for task in &input.tasks {
-            let mode = task.mode.unwrap_or_default();
+        for &(_, mode) in &resolved_tasks {
             if mode == SubAgentMode::Work {
                 if !parent_allows_work {
                     let result = ToolResult::error(
@@ -1279,8 +1361,7 @@ where
             _ => None,
         };
         if let Some(worktree_root) = parent_worktree_path {
-            for task in &input.tasks {
-                let mode = task.mode.unwrap_or_default();
+            for (task, &(_, mode)) in input.tasks.iter().zip(&resolved_tasks) {
                 if mode != SubAgentMode::Work {
                     continue;
                 }
@@ -1304,18 +1385,27 @@ where
             }
         }
 
-        // Generate agent IDs and prepare spawn specs
-        let mut spawned = Vec::new();
+        // Resolve and validate every spec BEFORE sending any spawn request.
+        // Model validation can fail per-task; doing it inside the send loop
+        // would leave earlier tasks already spawned (and untracked, since the
+        // tool call then reports failure instead of SpawnAgentsComplete) when a
+        // later task's effective model is unknown. Build-and-validate first,
+        // then send the whole batch.
         let parent_cwd = self.context.working_dir.to_string_lossy().to_string();
+        let mut specs: Vec<SubAgentSpec> = Vec::with_capacity(input.tasks.len());
 
-        for task in &input.tasks {
-            let agent_id = uuid::Uuid::new_v4().to_string();
+        for (task, &(agent, mode)) in input.tasks.iter().zip(&resolved_tasks) {
             let cwd = task.cwd.clone().unwrap_or_else(|| parent_cwd.clone());
-            let mode = task.mode.unwrap_or_default();
 
-            // Resolve model (REQ-PROJ-008)
-            let resolved_model = if let Some(ref model) = task.model {
-                if self.llm_registry.get(model).is_none() {
+            // Resolve model: task field > agent default > mode default
+            // (REQ-AG-005, REQ-PROJ-008). An explicit model from either the
+            // task or the agent definition must exist in the registry.
+            let explicit_model = task
+                .model
+                .clone()
+                .or_else(|| agent.and_then(|a| a.model.clone()));
+            let resolved_model = if let Some(model) = explicit_model {
+                if self.llm_registry.get(&model).is_none() {
                     let result = ToolResult::error(
                         tool_use_id.clone(),
                         format!(
@@ -1329,7 +1419,7 @@ where
                         result,
                     }));
                 }
-                model.clone()
+                model
             } else {
                 match mode {
                     SubAgentMode::Explore => self
@@ -1345,44 +1435,49 @@ where
                 SubAgentMode::Work => 50,
             });
 
-            spawned.push(PendingSubAgent {
-                agent_id: agent_id.clone(),
+            specs.push(SubAgentSpec {
+                agent_id: uuid::Uuid::new_v4().to_string(),
                 task: task.task.clone(),
+                cwd,
+                timeout: DEFAULT_SUBAGENT_TIMEOUT,
                 mode,
+                model_id: resolved_model,
+                max_turns,
+                agent_name: agent.map(|a| a.name.clone()),
+                persona: agent.map(|a| a.body.clone()),
             });
+        }
 
-            // Send spawn request to RuntimeManager
-            if let Some(spawn_tx) = &self.spawn_tx {
-                let spec = SubAgentSpec {
-                    agent_id,
-                    task: task.task.clone(),
-                    cwd,
-                    timeout: DEFAULT_SUBAGENT_TIMEOUT,
-                    mode,
-                    model_id: resolved_model,
-                    max_turns,
-                };
-                let request = SubAgentSpawnRequest {
-                    spec,
-                    parent_conversation_id: self.context.conversation_id.clone(),
-                    parent_event_tx: self.event_tx.clone(),
-                };
-                if let Err(e) = spawn_tx.send(request).await {
-                    tracing::error!(error = %e, "Failed to send spawn request");
-                    let result = ToolResult::error(
-                        tool_use_id.clone(),
-                        format!("Failed to spawn sub-agents: {e}"),
-                    );
-                    return Ok(Some(Event::ToolComplete {
-                        tool_use_id,
-                        result,
-                    }));
-                }
-            } else {
-                tracing::warn!("No spawn channel configured, cannot spawn sub-agents");
+        // All specs validated; require a spawn channel before sending any.
+        let Some(spawn_tx) = &self.spawn_tx else {
+            tracing::warn!("No spawn channel configured, cannot spawn sub-agents");
+            let result = ToolResult::error(
+                tool_use_id.clone(),
+                "Sub-agent spawning not configured".to_string(),
+            );
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id,
+                result,
+            }));
+        };
+
+        let mut spawned = Vec::with_capacity(specs.len());
+        for spec in specs {
+            spawned.push(PendingSubAgent {
+                agent_id: spec.agent_id.clone(),
+                task: spec.task.clone(),
+                mode: spec.mode,
+            });
+            let request = SubAgentSpawnRequest {
+                spec,
+                parent_conversation_id: self.context.conversation_id.clone(),
+                parent_event_tx: self.event_tx.clone(),
+            };
+            if let Err(e) = spawn_tx.send(request).await {
+                tracing::error!(error = %e, "Failed to send spawn request");
                 let result = ToolResult::error(
                     tool_use_id.clone(),
-                    "Sub-agent spawning not configured".to_string(),
+                    format!("Failed to spawn sub-agents: {e}"),
                 );
                 return Ok(Some(Event::ToolComplete {
                     tool_use_id,
@@ -1814,6 +1909,7 @@ where
         let is_sub_agent = self.context.is_sub_agent;
         let mode_context = self.context.mode_context.clone();
         let llm_language = self.context.llm_language;
+        let persona = self.context.persona.clone();
 
         // Token streaming channel (REQ-BED-025).
         //
@@ -1913,6 +2009,7 @@ where
                 is_sub_agent,
                 mode_context.as_ref(),
                 llm_language,
+                persona.as_deref(),
             );
 
             // Build request — normalize messages against current tool set
@@ -5428,6 +5525,7 @@ mod work_subagent_cwd_guard_tests {
                     mode: Some(SubAgentMode::Work),
                     model: None,
                     max_turns: None,
+                    agent_type: None,
                 }],
             }))
             .await
@@ -5450,6 +5548,145 @@ mod work_subagent_cwd_guard_tests {
         );
     }
 
+    /// An `agent_type` that matches no discovered agent is rejected before any
+    /// sub-agent is spawned (REQ-AG-007). The empty worktree has no
+    /// `.claude/agents/`, so discovery returns nothing and the lookup fails.
+    #[tokio::test]
+    async fn rejects_unknown_agent_type() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let mut rt = runtime_in_work_mode(worktree.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "review".to_string(),
+                    cwd: None,
+                    mode: None,
+                    model: None,
+                    max_turns: None,
+                    agent_type: Some("ghost".to_string()),
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                assert!(
+                    result.is_error(),
+                    "unknown agent_type must surface as error"
+                );
+                let msg = tool_result_text(&result);
+                assert!(
+                    msg.contains("Unknown agent_type 'ghost'"),
+                    "error should name the unknown agent_type, got: {msg}"
+                );
+            }
+            other => panic!("expected ToolComplete with error, got {other:?}"),
+        }
+        assert_eq!(
+            rt.active_work_subagents, 0,
+            "rejected spawn must not increment active_work_subagents"
+        );
+    }
+
+    /// A later task with an unknown explicit model is rejected during the
+    /// build/validate pass, before any spawn request is sent — so a partial
+    /// validation failure cannot orphan earlier sub-agents. With no spawn
+    /// channel wired, surfacing the *model* error (not the "not configured"
+    /// error that pass B would emit) proves validation runs before sending.
+    #[tokio::test]
+    async fn unknown_model_on_later_task_rejected_before_any_spawn() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let mut rt = runtime_in_work_mode(worktree.path());
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![
+                    SubAgentTask {
+                        task: "first".to_string(),
+                        cwd: None,
+                        mode: Some(SubAgentMode::Explore),
+                        model: None,
+                        max_turns: None,
+                        agent_type: None,
+                    },
+                    SubAgentTask {
+                        task: "second".to_string(),
+                        cwd: None,
+                        mode: Some(SubAgentMode::Explore),
+                        model: Some("ghost-model".to_string()),
+                        max_turns: None,
+                        agent_type: None,
+                    },
+                ],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                assert!(result.is_error());
+                let msg = tool_result_text(&result);
+                assert!(
+                    msg.contains("ghost-model"),
+                    "should fail on the unknown model before reaching the spawn channel, got: {msg}"
+                );
+            }
+            other => panic!("expected ToolComplete with model error, got {other:?}"),
+        }
+        assert_eq!(rt.active_work_subagents, 0);
+    }
+
+    /// `agent_type` resolves against the catalog frozen on the runtime, not a
+    /// fresh filesystem scan (REQ-AG-008): the worktree has no `.claude/agents`,
+    /// yet a frozen-catalog agent resolves, so we reach the missing-spawn-channel
+    /// path rather than an "Unknown agent_type" rejection.
+    #[tokio::test]
+    async fn agent_type_resolves_from_frozen_catalog_not_filesystem() {
+        let worktree = TempDir::new().expect("worktree tempdir");
+        let catalog = std::sync::Arc::from(vec![phoenix_agents::AgentDefinition {
+            name: "reviewer".to_string(),
+            description: "Reviews".to_string(),
+            body: "You are a reviewer.".to_string(),
+            path: std::path::PathBuf::from("/virtual/reviewer.md"),
+            source_dir: ".claude/agents".to_string(),
+            model: None,
+            mode: None,
+            tools: None,
+        }]);
+        let mut rt = runtime_in_work_mode(worktree.path()).with_agent_catalog(catalog);
+
+        let result = rt
+            .handle_spawn_agents_tool(spawn_tool(SpawnAgentsInput {
+                tasks: vec![SubAgentTask {
+                    task: "review".to_string(),
+                    cwd: None,
+                    mode: Some(SubAgentMode::Explore),
+                    model: None,
+                    max_turns: None,
+                    agent_type: Some("reviewer".to_string()),
+                }],
+            }))
+            .await
+            .expect("handle_spawn_agents_tool returned error");
+
+        match result {
+            Some(Event::ToolComplete { result, .. }) => {
+                let msg = tool_result_text(&result);
+                assert!(
+                    !msg.contains("Unknown agent_type"),
+                    "frozen-catalog agent should resolve despite empty filesystem, got: {msg}"
+                );
+                assert!(
+                    msg.contains("not configured"),
+                    "resolution should succeed and reach the missing-channel path, got: {msg}"
+                );
+            }
+            other => panic!("expected ToolComplete, got {other:?}"),
+        }
+    }
+
     /// A Work sub-agent whose `cwd` is inside the worktree is NOT rejected
     /// by the scoping guard. (It will still fail downstream because no
     /// `spawn_tx` is wired in this test runtime, but that failure is
@@ -5470,6 +5707,7 @@ mod work_subagent_cwd_guard_tests {
                     mode: Some(SubAgentMode::Work),
                     model: None,
                     max_turns: None,
+                    agent_type: None,
                 }],
             }))
             .await
@@ -5512,6 +5750,7 @@ mod work_subagent_cwd_guard_tests {
                     mode: Some(SubAgentMode::Work),
                     model: None,
                     max_turns: None,
+                    agent_type: None,
                 }],
             }))
             .await
@@ -5627,6 +5866,7 @@ mod work_subagent_cwd_guard_tests {
                     mode: Some(SubAgentMode::Work),
                     model: None,
                     max_turns: None,
+                    agent_type: None,
                 }],
             }))
             .await

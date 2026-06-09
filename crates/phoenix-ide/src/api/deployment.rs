@@ -156,24 +156,16 @@ pub enum DiskSize {
     InlineDb,
 }
 
-/// Where the deployment's logs go. Derived from the sink the logger actually
-/// writes to: a process-owned file path only when the logger writes to one,
-/// otherwise the real sink (stdout).
+/// The deployment's active log sinks. Both are independent — logs fan out to
+/// every enabled sink — so this mirrors the actual subscriber configuration
+/// rather than picking one. Derived from [`crate::logging::LogConfig`].
 #[derive(Serialize, TS, Clone, Debug)]
-#[serde(tag = "sink", rename_all = "snake_case")]
 #[ts(export, export_to = "../../../ui/src/generated/")]
-pub enum LogInfo {
-    /// Logs are written to a deployment-owned file at this path. Part of the
-    /// wire contract (the page renders it); constructed once the tracing layer
-    /// is wired to honor a process-owned log file — see tasks/58013. The
-    /// `expect` fires when that lands, flagging this attribute for removal.
-    #[expect(
-        dead_code,
-        reason = "wire-contract variant; constructed by tasks/58013"
-    )]
-    File { path: String },
-    /// Logs are written to standard output, captured by the supervising process.
-    Stdout,
+pub struct LogInfo {
+    /// Logs are written to stdout (captured by the supervising process).
+    pub stdout: bool,
+    /// Absolute path of the process-owned log file, when file logging is active.
+    pub file: Option<String>,
 }
 
 // ============================================================
@@ -345,7 +337,10 @@ impl DeploymentConfig {
         Self {
             bind_address: SocketAddr::from(([127, 0, 0, 1], 0)),
             tls: TlsInfo::disabled(),
-            log: LogInfo::Stdout,
+            log: LogInfo {
+                stdout: true,
+                file: None,
+            },
             locations: Vec::new(),
         }
     }

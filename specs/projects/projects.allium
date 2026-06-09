@@ -8,6 +8,7 @@
 --           branch discovery, task approval, worktree lifecycle,
 --           task file lifecycle, mark-as-merged flow, abandon flow,
 --           write scoping, sub-agent worktree inheritance,
+--           task forks (decoupled spawn from a writing mode),
 --           server restart worktree reconciliation
 -- Excludes:
 --   - Conversation state machine (see bedrock.allium)
@@ -24,7 +25,8 @@
 --   (see bedrock.allium task 02668 for spec alignment).
 --
 -- Requirement traceability: REQ-PROJ-001 through REQ-PROJ-029
--- (2 descoped: REQ-PROJ-009, REQ-PROJ-015)
+-- (2 descoped: REQ-PROJ-009, REQ-PROJ-015) plus REQ-PROJ-033..037 (task forks +
+-- Request Changes promotion)
 
 use "./bedrock.allium" as bedrock
 
@@ -96,6 +98,13 @@ enum RefKind { branch | tag }
 -- Non-git directories do not have a Project entity.
 entity Project {
     repo: GitRepository
+
+    -- The repository default branch (e.g. "main"). Mandatory and immutable,
+    -- resolved once at project creation: repo.remote_default_branch when
+    -- detectable, else repo.current_branch at creation time. This is the
+    -- canonical, single source of truth for the fork base (ForkProposalApproved);
+    -- forks never use an origin conversation's base_branch.
+    main_ref: String
 
     -- ls-remote output cached for branch-picker typeahead.
     -- Refreshed on miss/expiry by SearchRemoteBranches.
@@ -170,9 +179,72 @@ entity Worktree {
     branch_name: String            -- task-{NNNN}-{slug} (managed) or existing branch (branch mode)
     base_branch: String            -- recorded at creation time
     task_file: TaskFile?           -- present only for managed (work mode) worktrees
+    plain_brief_path: String?      -- repo-relative path of the committed *plain* (non-taskmd)
+                                   -- brief on ANY plain-brief Work worktree — a plain-brief fork
+                                   -- (REQ-PROJ-034) OR an ordinary Explore→Work approval of a
+                                   -- plain markdown brief (REQ-PROJ-006, set by
+                                   -- TaskApprovalExecuted / TaskApprovalFreshHandoffExecuted).
+                                   -- Absent for taskmd worktrees. It is the durable marker that
+                                   -- a Work worktree legitimately has no task_file (and, on a
+                                   -- fork, outlives the origin so the exemption survives origin
+                                   -- hard-delete). Exactly one of task_file / plain_brief_path is
+                                   -- set on a Work worktree.
 
     -- Derived
     is_clean: git_status_clean(path)
+}
+
+-- A fork proposal: a writing-mode agent's hand-off of a self-contained unit of
+-- work to a new, independent conversation (REQ-PROJ-033). Created when bedrock
+-- intercepts propose_task in a writing mode (bedrock/ForkProposalIntercepted)
+-- emits ForkProposalPersisted — the agent keeps running; the proposal is recorded
+-- here, bound to the originating conversation, and reviewed asynchronously.
+--
+-- Bound to origin: a ForkProposal exists only as an artifact of its origin
+-- conversation and is removed with it on hard delete (ForkProposalsRemovedOnOriginDelete).
+-- The origin reaching a terminal state retires only the *unreviewed* case: a `pending`
+-- proposal is dismissed (ForkProposalsRetiredOnOriginTerminal), while a resolved
+-- `spawned`/`dismissed` resolution persists through ordinary terminal cleanup
+-- (mark-merged / abandon) as control-plane audit, removed only on hard delete. That
+-- resolution is never part of the origin's LLM transcript (REQ-PROJ-035) — a resolution
+-- the origin's agent could read would itself be a forbidden lifecycle notification.
+entity ForkProposal {
+    id: String                          -- stable proposal id; the approve/dismiss surface
+                                        -- and HTTP endpoints address a proposal by it, and
+                                        -- it is the idempotency key (a pending proposal
+                                        -- spawns exactly one fork)
+    origin: bedrock/Conversation        -- the conversation whose agent proposed it
+    task_file: String                   -- the drafted file's path, normalized at capture
+                                        -- to **repository-relative** (the agent's path is
+                                        -- relative to origin.working_dir, which for a
+                                        -- Direct-in-subdir origin is a repo subdirectory).
+                                        -- The fork writes the body at this repo-relative
+                                        -- path so it lands in the same location regardless
+                                        -- of which subdir the origin ran in.
+    title: String
+    priority: String
+    body: String                        -- snapshotted file bytes — authoritative at spawn
+    status: pending | spawned | dismissed | promoted
+    fork: String?                       -- id of the spawned conversation, present iff status =
+                                        -- spawned. A RAW conversation id, NOT a Conversation FK:
+                                        -- the fork is independent (REQ-PROJ-035) and may be
+                                        -- hard-deleted while this (origin-bound) proposal lives,
+                                        -- so the audit link is a plain id that may dangle — no
+                                        -- cascade, no null-on-delete, no blocking its delete.
+    refinement: String?                 -- REQ-PROJ-037: id of the Explore conversation a
+                                        -- `Request Changes` promotion created, present iff
+                                        -- status = promoted. Same raw-id, non-live audit
+                                        -- semantics as `fork` — independent lifecycle.
+
+    -- The fork base is NOT stored: it is always origin.project.main_ref (the
+    -- repository default branch), resolved at approval time (ForkProposalApproved).
+
+    transitions status {
+        pending -> spawned
+        pending -> dismissed
+        pending -> promoted
+        terminal: spawned, dismissed, promoted
+    }
 }
 
 ------------------------------------------------------------
@@ -197,13 +269,19 @@ rule GitDirectoryDetected {
 
     requires: is_git_repository(directory)
 
+    let repo = git_repo_at(directory)
+
     ensures: Project.created(
-        repo: git_repo_at(directory)
+        repo: repo,
+        main_ref: repo.remote_default_branch or repo.current_branch
     )
 
     @guidance
         -- The project is associated with the git repository root,
         -- not the provided directory (which may be a subdirectory).
+        -- main_ref (the repository default branch and canonical fork base —
+        -- REQ-PROJ-034a) is bound once here: the remote default when detectable,
+        -- else the checked-out branch. It is mandatory and never rewritten.
 }
 
 -- REQ-PROJ-002/018: Default mode is Direct
@@ -332,9 +410,12 @@ rule ManagedWorktreeOnFirstMessage {
         -- The agent has read-only tools in this worktree.
 }
 
--- REQ-PROJ-016/018: Non-git or Direct mode has no project features
--- (No propose_task tool, no worktrees, no task files)
--- Enforced by tool registry configuration, not by rules.
+-- REQ-PROJ-016/018: Non-git or Direct mode has no Managed project ceremony of its
+-- own (no Explore/Work worktree, no task file). Direct-in-a-git-repo is the one
+-- exception that still gets `propose_task` — as the non-blocking *fork proposal*
+-- of REQ-PROJ-033/036 (it spawns a managed fork; the Direct origin itself stays
+-- ceremony-free). Direct-not-in-a-repo gets no `propose_task` at all. Enforced by
+-- tool registry configuration, not by rules.
 
 -- ===========================================================
 -- 2. BRANCH DISCOVERY (REQ-PROJ-020, 021, 022)
@@ -488,22 +569,30 @@ rule TaskApprovalExecuted {
     -- holds `task_file` plus display copies of title/priority/body).
     -- For a taskmd filename, Phoenix allocates no ID — the metadata lives in
     -- the filename and the executor parses id/priority/status/slug back out.
-    let task_id = parse_task_id(conversation.proposal.task_file)
-    let slug = parse_slug(conversation.proposal.task_file)
-    let branch_name = "task-" + task_id + "-" + slug
+    -- Input-agnostic derivation (taskmd vs plain brief — REQ-PROJ-006), mirroring
+    -- ForkProposalApproved: taskmd parses id/slug and branches task-{id}-{slug}; a plain
+    -- brief uses the sanitized stem and branches task-{stem}-{conv-id-prefix}.
+    let task_id = approval_task_id(conversation.proposal.task_file)
+    let branch_name = approval_branch_name(conversation.proposal.task_file, conversation)
 
     -- Rename the temporary branch to the final task branch name (in place).
     ensures: worktree.branch_name = branch_name
 
-    -- The worktree now has a task file; its status is in-progress and it is
-    -- committed on the task branch (never on main / base_branch).
-    ensures: worktree.task_file = TaskFile{task_id: task_id}
-    ensures: worktree.task_file.status = in_progress
-    ensures: TaskFileCommittedOnBranch(worktree, task_id)
+    -- The committed brief splits by shape — TaskFile is the taskmd-only entity, never
+    -- synthesized for a plain brief, which records plain_brief_path instead (exactly as a
+    -- plain-brief fork does). Both land committed on the task branch (never on base).
+    ensures:
+        if is_taskmd_file(conversation.proposal.task_file):
+            worktree.task_file = TaskFile{task_id: task_id, status: in_progress}
+            and TaskFileCommittedOnBranch(worktree, task_id)
+        else:
+            worktree.plain_brief_path = conversation.proposal.task_file
+            and BriefCommittedOnBranch(worktree, conversation.proposal.task_file, conversation.proposal.body)
 
     -- Mode transition to Work
     ensures: conversation.branch_name = branch_name
     ensures: conversation.task_id = task_id
+    ensures: conversation.task_title = conversation.proposal.title
 
     @guidance
         -- All operations run under a process-global approval mutex so two
@@ -550,17 +639,25 @@ rule TaskApprovalFreshHandoffExecuted {
     requires: decision = approved_start_fresh
 
     let worktree = Worktree{conversation: conversation}
-    let task_id = parse_task_id(conversation.proposal.task_file)
-    let slug = parse_slug(conversation.proposal.task_file)
-    let branch_name = "task-" + task_id + "-" + slug
+    let task_id = approval_task_id(conversation.proposal.task_file)
+    let branch_name = approval_branch_name(conversation.proposal.task_file, conversation)
     let successor = conversation.continued_in_conv_id
 
     ensures: worktree.branch_name = branch_name
-    ensures: TaskFileCommittedOnBranch(worktree, task_id)
+    -- Same taskmd-vs-plain split as TaskApprovalExecuted — TaskFile is never synthesized for
+    -- a plain brief; the successor's worktree records plain_brief_path instead.
+    ensures:
+        if is_taskmd_file(conversation.proposal.task_file):
+            worktree.task_file = TaskFile{task_id: task_id, status: in_progress}
+            and TaskFileCommittedOnBranch(worktree, task_id)
+        else:
+            worktree.plain_brief_path = conversation.proposal.task_file
+            and BriefCommittedOnBranch(worktree, conversation.proposal.task_file, conversation.proposal.body)
     ensures: FreshWorkConversationCreated(conversation, successor)
     ensures: successor.mode = work
     ensures: successor.worktree_path = conversation.worktree_path
     ensures: successor.task_id = task_id
+    ensures: successor.task_title = conversation.proposal.title
     ensures: conversation.continued_in_conv_id = successor
     ensures: worktree.conversation = successor
     ensures: conversation.parent_status = handed_off
@@ -571,6 +668,418 @@ rule TaskApprovalFreshHandoffExecuted {
 -- branch and the agent can revise it (UserProvidesFeedback) or the user
 -- can reject. This spec emits no rule for those events — bedrock handles
 -- the state transitions and there are no git side-effects.
+
+-- ===========================================================
+-- 3b. TASK FORKS (REQ-PROJ-033, 034, 035, 036)
+-- ===========================================================
+
+-- REQ-PROJ-033: bedrock intercepts propose_task in a writing mode (non-parking) and emits
+-- ForkProposalPersisted — the atomic commit of the origin's success ack and this control-plane
+-- row (bedrock/ForkProposalIntercepted). This rule materialises the bound proposal in
+-- `pending`. No git operations yet — the spawn happens only on approval.
+rule ForkProposalCreated {
+    when: ForkProposalPersisted(origin, proposal)
+
+    ensures: ForkProposal.created(
+        id: proposal.id,
+        origin: origin,
+        task_file: proposal.task_file,
+        title: proposal.title,
+        priority: proposal.priority,
+        body: proposal.body,
+        status: pending,
+        fork: absent
+    )
+
+    @guidance
+        -- The originating conversation is unaffected: bedrock returned it to its
+        -- running flow. The proposal surfaces in that conversation's tool output
+        -- with a Review affordance while status = pending and the origin is live.
+}
+
+-- REQ-PROJ-034/035: user approves a pending fork proposal whose origin is still
+-- live. `fork` is a fresh top-level conversation allocated by the approval action
+-- (the same shape as WorktreeTransferredOnContinuation receiving `new_conv`), so
+-- the rule never reads an id out of the still-pending proposal. The fork's worktree
+-- is cut from the repository default branch (origin.project.main_ref) — NEVER the
+-- origin's `base_branch` or HEAD, uniformly for every origin mode — and the only
+-- link back to the origin is the provenance breadcrumb.
+--
+-- Covers both accepted snapshot shapes. The input-agnostic `fork_task_id` /
+-- `fork_branch_name` helpers derive the id and branch (taskmd id+slug, or sanitized
+-- stem + fork-id-prefix) without forward-referencing a missing taskmd id. The
+-- worktree's committed brief, however, is NOT uniform: a taskmd snapshot carries a
+-- typed `TaskFile` (promoted to in-progress before commit, REQ-PROJ-006) and lands
+-- under the tasks directory; a plain brief carries NO typed task_file (it has no
+-- taskmd metadata or status segment) and is committed verbatim at its own
+-- repo-relative path (REQ-PROJ-034). The postconditions split on `is_taskmd_file`
+-- accordingly — TaskFile is the taskmd-only entity, never synthesized for a plain brief.
+rule ForkProposalApproved {
+    when: UserApprovesForkProposal(proposal)
+
+    requires: proposal.status = pending
+    -- Bound to origin: the proposal is moot once the origin's lifecycle has ended.
+    -- Key off bedrock's own predicate (Parent.is_terminal covers terminal,
+    -- context_exhausted, AND handed_off) so a stale proposal can't be spawned after
+    -- the origin terminated or was continued away (REQ-PROJ-034/035).
+    requires: proposal.origin.is_terminal = false
+    requires: proposal.origin.mode in { work, branch, direct }
+
+    -- `fork` is the freshly-allocated successor conversation, identified by its DETERMINISTIC
+    -- id (from proposal.id, `spawn`) — the same id that anchors crash recovery below. Binding
+    -- the conversation by that id (rather than a Conversation field) lets `proposal.fork` stay
+    -- a raw id rather than an FK reference. proposal.fork is absent while pending and is set to
+    -- fork.id == spawned here.
+    let fork = Conversation{id: fork_conv_id(proposal)}
+    let base = proposal.origin.project.main_ref
+    -- Input-agnostic derivation covering both accepted shapes (REQ-PROJ-006/034):
+    --   taskmd brief: task_id/slug parsed from the filename; branch task-{id}-{slug}.
+    --   plain brief:  task_id = sanitized file stem; branch
+    --                 task-{stem}-{fork-id-prefix} (the *fork's* id uniquifies, so a
+    --                 plain-brief fork branch can never collide).
+    -- The helpers pick the shape; there is no parse_task_id on a plain brief.
+    let task_id = fork_task_id(proposal.task_file)
+    let branch_name = fork_branch_name(proposal.task_file, fork)
+
+    -- Reject a fork whose derived task branch already exists locally — whether it is
+    -- checked out (e.g. a Work origin proposing its OWN in-progress task, recreating
+    -- task-{id}-{slug}) or a dormant/completed branch left in the repo. `git worktree
+    -- add -b <branch>` creates a NEW branch and fails on an existing ref, and an
+    -- active one also violates OneBranchOneActiveWorktree. The fork must name a
+    -- distinct unit of work (REQ-PROJ-025). (Plain briefs can't collide — their
+    -- branch carries the fork's unique id prefix.)
+    --
+    -- Idempotent across interruption: the durable retry identity is the fork conversation
+    -- id, DERIVED DETERMINISTICALLY from proposal.id (see the @guidance recovery note), so its
+    -- worktree path .phoenix/worktrees/{fork-id} is recomputable on retry WITHOUT writing the
+    -- spawned-only `fork` field early (which would violate its present-iff-spawned contract).
+    -- A colliding branch is ADOPTED on retry iff it is checked out in *that* worktree —
+    -- knowable even for a taskmd fork whose branch name (task-{id}-{slug}) is otherwise
+    -- indistinguishable from an unrelated branch. Any other existing branch — a different
+    -- unit of work, or the origin's own in-progress task branch — is rejected.
+    requires: not exists git_ref(proposal.origin.project.repo, "refs/heads/" + branch_name)
+           or branch_checked_out_in_fork_worktree(proposal, branch_name)
+
+    -- Materialize the fork base before the worktree add — single-branch fetch plus
+    -- local-ref resolution (cf. MaterializeBranch, REQ-PROJ-022), since main_ref may
+    -- be remote-only (`origin/<name>`) with no local ref yet. Owned-environments
+    -- rule ("Git worktrees are owned environments"): a refs/heads/* ref checked out
+    -- in any worktree is NOT moved — and main_ref is typically checked out in the
+    -- user's main worktree.
+    ensures: BestEffortFetch(proposal.origin.project.repo, base)
+    ensures:
+        if exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and not branch_checked_out_in_any_worktree(proposal.origin.project.repo, base):
+            -- Local ref present and not checked out anywhere: safe to fast-forward.
+            FastForwardIfPossible(proposal.origin.project.repo, base)
+        else if not exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
+            -- Remote-only: create the local tracking ref (a new ref — never checked out).
+            CreateTrackingBranch(proposal.origin.project.repo, base, "origin/" + base)
+        else if not exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and not exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
+            error("Fork base branch '" + base + "' not found locally or at origin")
+        -- else: local ref exists but is checked out in a worktree — leave it
+        -- untouched. The fork's task branch is cut from the fetched origin/<base>
+        -- tip (below) and `git worktree add -b` creates a NEW branch, so
+        -- refs/heads/<base> is never moved.
+
+    -- A fresh, independent conversation — created through the top-level
+    -- conversation path, never the sub-agent path (no parent event channel).
+    -- The Work-mode conversation fields are set on the fork row itself (not only
+    -- on the Worktree entity), so callers reading conv mode/cwd directly get the
+    -- branch/path needed for navigation, tool cwd, and cleanup.
+    ensures: ForkConversationCreated(proposal, fork)
+    ensures: fork.kind = Parent
+    ensures: fork.mode = work
+    ensures: fork.task_id = task_id
+    ensures: fork.task_title = proposal.title
+    ensures: fork.branch_name = branch_name
+    ensures: fork.base_branch = base
+    ensures: fork.worktree_path = worktree_path(fork)
+    ensures: fork.working_dir = worktree_path(fork)
+    ensures: fork.spawned_from_conversation_id = proposal.origin.id
+
+    -- Its own worktree, cut from the repository default branch. Created with no
+    -- task_file (as Explore/Branch worktrees are); the taskmd branch below sets the
+    -- typed file, the plain branch leaves it absent.
+    ensures: Worktree.created(
+        conversation: fork,
+        project: proposal.origin.project,
+        path: WorktreePath { absolute_path: worktree_path(fork) },
+        branch_name: branch_name,
+        base_branch: base,
+        task_file: absent
+    )
+    -- The committed brief splits by shape (REQ-PROJ-006/034) — TaskFile is never
+    -- synthesized for a plain brief:
+    ensures:
+        if is_taskmd_file(proposal.task_file):
+            -- taskmd: typed task file, status promoted to in-progress before commit
+            -- (REQ-PROJ-006) so a ready/brainstorming snapshot never lands on a Work
+            -- branch advertising a non-work status; committed under the tasks directory.
+            Worktree{conversation: fork}.task_file = TaskFile{task_id: task_id, status: in_progress}
+            and TaskFileCommittedOnBranch(Worktree{conversation: fork}, task_id)
+        else:
+            -- plain brief: no taskmd metadata and no status segment to promote; the
+            -- snapshot body is committed verbatim at its own repo-relative path and the
+            -- worktree carries no typed task_file. The path is recorded durably on the
+            -- worktree (plain_brief_path) so the no-task_file exemption survives the
+            -- origin's deletion without depending on the (origin-bound) proposal row.
+            Worktree{conversation: fork}.plain_brief_path = proposal.task_file
+            and BriefCommittedOnBranch(Worktree{conversation: fork}, proposal.task_file, proposal.body)
+
+    -- Resolve the proposal. fork (the raw id) present iff spawned — so a pending proposal
+    -- spawns exactly one fork (idempotency keyed on proposal.id).
+    ensures: proposal.fork = fork.id
+    ensures: proposal.status = spawned
+
+    -- Start the fork working immediately, like the fresh-handoff successor — a spawned fork
+    -- must begin the approved task on its own, not sit idle until the user intervenes.
+    ensures: LlmRequestDispatched(fork)
+
+    @guidance
+        -- Sequence (under the same process-global approval mutex as
+        -- TaskApprovalExecuted, so concurrent spawns don't race on names):
+        --   0. Derive the fork conversation id DETERMINISTICALLY from (proposal.id, `spawn`)
+        --      — namespaced by RESOLUTION KIND so the approval and Request-Changes promotion
+        --      recovery paths are disjoint: an interrupted promotion's orphan lives at the
+        --      `promote` namespace, so a later Approve on the still-`pending` proposal never
+        --      adopts an Explore refinement as a Work fork. Its worktree path
+        --      .phoenix/worktrees/{fork-id} is recomputable, so after an interruption a retry
+        --      recognises an orphaned branch as this proposal's own — even for a taskmd fork
+        --      whose branch name is otherwise generic — WITHOUT writing the spawned-only
+        --      `fork` field early (the field stays present-iff-spawned; the in-flight identity
+        --      is the deterministic id, not an overloaded resolution field).
+        --   1. base = origin.project.main_ref (repository default branch, the same
+        --      for every origin mode). Materialize it (cf. MaterializeBranch,
+        --      REQ-PROJ-022): single-branch fetch, then fast-forward the local ref
+        --      ONLY if it is not checked out in any worktree (owned-environments
+        --      rule), or create a local tracking branch from origin/<base> when the
+        --      default branch is remote-only.
+        --   2. `git worktree add -b <task-branch> <fork-worktree> <commit-ish>` — a
+        --      NEW worktree at .phoenix/worktrees/{fork-id}. The commit-ish is the
+        --      freshest non-mutating base: origin/<base> when it was fetched, else
+        --      the local refs/heads/<base>. `add -b` creates a NEW task branch and
+        --      never moves refs/heads/<base>, so a checked-out default branch is safe.
+        --   3. Write proposal.body into the worktree at proposal.task_file (its
+        --      repo-relative path; taskmd file under the tasks dir, promoted to
+        --      ...-in-progress--<slug>.md; plain brief at its own path with no status
+        --      rename), `git add` + `git commit` (never on base).
+        --   4. & 5. In ONE DB transaction: persist the fork as a top-level Work conversation
+        --      (conv_mode Work, spawned_from_conversation_id = origin.id, seed its LLM context
+        --      with the brief proposal.body plus a line naming the resolved branch_name — the
+        --      brief is in context, not merely a committed file to discover; it inherits none
+        --      of the origin transcript) AND mark the proposal spawned { fork }. These commit
+        --      atomically so there is never a window where a live child conversation row exists
+        --      under a still-`pending` proposal — which the pending-only orphan cleanup would
+        --      otherwise tear down. Before this commit only GIT orphans exist (worktree/branch
+        --      with no conversation row), which cleanup removes safely.
+        --
+        -- Crash recovery / idempotency: because the fork id is deterministic (step 0), the
+        -- irreversible git effects (2-3) can never strand the proposal as `pending` with an
+        -- UNidentifiable orphaned worktree/branch. The whole sequence runs under the approval
+        -- mutex and is safe to RE-DRIVE: on retry the orphaned worktree/branch at
+        -- .phoenix/worktrees/{fork-id} is recomputed and recognised as this proposal's own
+        -- (the collision check above admits exactly that branch) and adopted rather than
+        -- recreated, and the resolution completed — converging on a single `spawned { fork }`
+        -- outcome (idempotency keyed on proposal.id). A crash before the step-4/5 commit leaves
+        -- only a git orphan (no child row); a crash after leaves a consistent live+spawned
+        -- state. The boundary is always recoverable, never terminal.
+        --
+        -- The origin is read for immutable metadata only (project -> main_ref, id ->
+        -- breadcrumb); it is never mutated or notified: no continued_in_conv_id, no
+        -- parent_status change, no sub-agent linkage, no message into its context
+        -- (contrast TaskApprovalFreshHandoffExecuted, which sets handed_off and links
+        -- continued_in_conv_id). Branching off the default branch keeps the fork's
+        -- diff independent of the origin's in-progress work (REQ-PROJ-034).
+}
+
+-- REQ-PROJ-034: user dismisses a pending fork proposal. Nothing is spawned; the
+-- origin is unaffected.
+rule ForkProposalDismissed {
+    when: UserDismissesForkProposal(proposal)
+
+    requires: proposal.status = pending
+
+    -- Defensive cleanup before terminally resolving: an earlier approve or Request-Changes
+    -- attempt on this still-`pending` proposal may have crashed after creating its
+    -- deterministic worktree/branch (.phoenix/worktrees/{proposal.id, spawn|promote}) but
+    -- before recording `spawned`/`promoted`. Dismiss removes any such orphan under both
+    -- resolution namespaces first, so a terminal `dismissed` can't leak a worktree/branch or
+    -- leave a deterministic path that later collides.
+    ensures: DeterministicForkOrphansCleaned(proposal)
+    ensures: proposal.status = dismissed
+    ensures: proposal.fork = absent
+}
+
+-- REQ-PROJ-037: "Request Changes" promotes a pending proposal into a fresh Explore conversation seeded
+-- with the brief + the user's change note, where refinement proceeds via the ordinary
+-- Explore propose/feedback loop (REQ-PROJ-004). The proposer is decoupled and has no
+-- attached LLM (REQ-PROJ-035), so the iteration must land in a NEW conversation, not the
+-- origin. The Explore worktree is cut from the same independent base (main_ref) a direct
+-- approval uses; nothing is committed (the draft sits on the temp branch for the agent to
+-- revise). The `promoted` resolution is terminal for the proposal and carries no behaviour
+-- back to the origin; the refinement conversation has an independent lifecycle.
+rule ForkProposalPromotedToExplore {
+    when: UserRequestsForkProposalChanges(proposal, change_request)
+
+    requires: proposal.status = pending
+    -- Bound to origin: a promotion, like an approval, is moot once the origin's lifecycle
+    -- has ended (Parent.is_terminal covers terminal, context_exhausted, handed_off).
+    requires: proposal.origin.is_terminal = false
+
+    -- `refinement` is the freshly-allocated Explore successor, identified by its DETERMINISTIC
+    -- id (from proposal.id, `promote`) — same approach as ForkProposalApproved's `fork`, so
+    -- `proposal.refinement` stays a raw id rather than a Conversation FK.
+    let refinement = Conversation{id: refinement_conv_id(proposal)}
+    let base = proposal.origin.project.main_ref
+
+    -- Idempotent across interruption, exactly as ForkProposalApproved: the deterministic
+    -- Explore temp branch may already exist from an interrupted prior promotion of THIS
+    -- proposal. Admit it ONLY when it is checked out at this proposal's refinement worktree
+    -- (.phoenix/worktrees/{refinement-id}) — adopt-on-retry — and reject any other existing
+    -- ref with that name so a retry can't fail spuriously or adopt an unrelated branch.
+    requires: not exists git_ref(proposal.origin.project.repo, "refs/heads/" + explore_temp_branch(refinement))
+           or branch_checked_out_in_refinement_worktree(proposal, explore_temp_branch(refinement))
+
+    -- A fresh top-level Explore conversation, NOT a sub-agent — seeded with the brief and the
+    -- change request, its worktree cut from the repository default branch.
+    ensures: ExploreRefinementCreated(proposal, refinement, change_request)
+    ensures: refinement.kind = Parent
+    ensures: refinement.mode = explore
+    ensures: refinement.spawned_from_conversation_id = proposal.origin.id
+    -- The Explore-mode worktree fields are set on the conversation row itself (not only on
+    -- the Worktree entity), as ForkProposalApproved does for the fork, so callers reading
+    -- conv mode/cwd directly run tools and navigate in the refinement's own worktree.
+    ensures: refinement.worktree_path = worktree_path(refinement)
+    ensures: refinement.branch_name = explore_temp_branch(refinement)
+    ensures: refinement.base_branch = base
+    ensures: refinement.working_dir = worktree_path(refinement)
+    -- Materialize the default-branch base before the worktree add — mirrors
+    -- ForkProposalApproved exactly (main_ref may be remote-only or stale locally, and the
+    -- owned-environments rule forbids moving a refs/heads/* ref checked out in any worktree).
+    -- Without it the promotion could fail for a remote-only default or cut the refinement
+    -- from an older local ref, breaking REQ-PROJ-037's same-independent-base promise.
+    ensures: BestEffortFetch(proposal.origin.project.repo, base)
+    ensures:
+        if exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and not branch_checked_out_in_any_worktree(proposal.origin.project.repo, base):
+            FastForwardIfPossible(proposal.origin.project.repo, base)
+        else if not exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
+            CreateTrackingBranch(proposal.origin.project.repo, base, "origin/" + base)
+        else if not exists git_ref(proposal.origin.project.repo, "refs/heads/" + base)
+                and not exists git_ref(proposal.origin.project.repo, "refs/remotes/origin/" + base):
+            error("Fork base branch '" + base + "' not found locally or at origin")
+    -- Cut the temp branch from the freshest non-mutating base — origin/<base> when the fetch
+    -- succeeded, else the local refs/heads/<base> — exactly as ForkProposalApproved's
+    -- `git worktree add -b`, so a stale-but-checked-out local default never yields an older
+    -- refinement base. base_branch records the logical default-branch name.
+    ensures: Worktree.created(
+        conversation: refinement,
+        project: proposal.origin.project,
+        path: WorktreePath { absolute_path: worktree_path(refinement) },
+        branch_name: explore_temp_branch(refinement),
+        base_branch: base,
+        task_file: absent
+    )
+    -- The brief body seeds the agent's context AND is written as an uncommitted DRAFT under
+    -- the tasks directory (Explore's patch allowlist — REQ-PROJ-003), never at the brief's
+    -- original path: a plain brief that lived at e.g. docs/plan.md could not be revised in a
+    -- tasks-scoped Explore worktree. The tasks dir is created first if main_ref does not
+    -- already have one (a project that only ever used plain briefs may have none), so the
+    -- draft write can't fail on a missing parent.
+    ensures: TasksDirEnsured(Worktree{conversation: refinement})
+    ensures: BriefDraftedUnderTasksDir(Worktree{conversation: refinement}, proposal.body, change_request)
+
+    -- Resolve the proposal. refinement (the raw id) present iff promoted — one pending proposal
+    -- promotes exactly once (idempotency keyed on proposal.id).
+    ensures: proposal.refinement = refinement.id
+    ensures: proposal.status = promoted
+
+    -- Start the refinement agent immediately on the brief + change request, like a spawned
+    -- fork — it must begin iterating, not sit idle awaiting user input.
+    ensures: LlmRequestDispatched(refinement)
+
+    @guidance
+        -- Dispatched by /proposals/:id/request-changes under TASK_APPROVAL_MUTEX, off the
+        -- originating conversation's state machine entirely (the origin never transitions).
+        -- The proposal-resolution write and the synthetic surface update commit atomically,
+        -- like ForkProposalApproved. Refinement continues via the Explore gateway
+        -- (TaskApprovalExecuted / TaskApprovalFreshHandoffExecuted) — there is no second fork
+        -- proposal and no link back to the origin.
+        --
+        -- Crash recovery / "promotes exactly once": the refinement conversation id is
+        -- derived DETERMINISTICALLY from (proposal.id, `promote`) — namespaced by RESOLUTION
+        -- KIND, disjoint from ForkProposalApproved's (proposal.id, `spawn`) namespace, so an
+        -- interrupted promotion (worktree created, status still `pending`) and a later Approve
+        -- can never recompute the same path: Approve looks under `spawn`, this orphan lives
+        -- under `promote`. Its worktree path .phoenix/worktrees/{refinement-id} is recomputable
+        -- on retry without an early write to the promoted-only `refinement` field. If a crash
+        -- interrupts after the Explore worktree is created but before `status = promoted` is
+        -- persisted, re-driving under the mutex recognises and ADOPTS the orphaned worktree at
+        -- that deterministic path rather than allocating a second refinement — converging on a
+        -- single `promoted { refinement }` outcome. (Same durable-identity boundary as
+        -- ForkProposalApproved; neither overloads the resolution field for in-flight state.)
+        -- The refinement conversation row and the `promoted { refinement }` resolution commit
+        -- in ONE DB transaction, so there is never a live child row under a still-`pending`
+        -- proposal for the pending-only orphan cleanup to tear down; before that commit only a
+        -- git worktree/branch orphan exists.
+}
+
+-- REQ-PROJ-035: when the origin reaches a terminal state, its still-pending
+-- proposals are retired (bound to origin) — they can no longer be reviewed or
+-- approved, so they are dismissed rather than left as permanently-unreviewable
+-- pending records. Maintains PendingForkProposalRequiresLiveOrigin. Subscribes to
+-- bedrock's ConversationBecameTerminal (the same lifecycle event
+-- ExploreWorktreeCleanupOnTerminal uses). Like UserDismissesForkProposal, this also
+-- clears any deterministic spawn/promote orphan left by an approve/promote that crashed
+-- before recording its resolution — auto-retirement removes the user's chance to dismiss
+-- through the cleanup path, so it must do the cleanup itself.
+rule ForkProposalsRetiredOnOriginTerminal {
+    when: ConversationBecameTerminal(origin)
+
+    ensures:
+        for p in ForkProposal where p.origin = origin and p.status = pending:
+            p.status = dismissed
+            and DeterministicForkOrphansCleaned(p)
+
+    @guidance
+        -- Serialized with approvals: this retirement (and its DeterministicForkOrphansCleaned)
+        -- runs under the SAME process-global TASK_APPROVAL_MUTEX as ForkProposalApproved /
+        -- ForkProposalPromotedToExplore. Without that, a terminal transition arriving while an
+        -- approve/promote is mid-flight (deterministic worktree created, step-4/5 commit not yet
+        -- durable) would see the proposal still `pending` and could delete the worktree the
+        -- in-flight operation is about to adopt. Under the mutex the two are ordered: either the
+        -- approve/promote commits first (the proposal is no longer `pending`, so the pending
+        -- filter skips it and its now-live child is untouched), or retirement runs first
+        -- (dismisses + cleans the orphan, and the approve/promote then finds the proposal no
+        -- longer `pending` and aborts). The same mutex discipline applies to
+        -- UserDismissesForkProposal and ForkProposalsRemovedOnOriginDelete.
+}
+
+-- REQ-PROJ-035: a hard delete removes the origin row outright (bedrock's
+-- ConversationHardDeleted, not the terminal-transition event), so its proposals are
+-- removed *with the conversation* — not merely dismissed, since a dismissed proposal
+-- still references a now-nonexistent origin and would violate ForkProposalBoundToOrigin.
+-- This is the delete-side complement to ForkProposalsRetiredOnOriginTerminal and runs
+-- alongside WorktreeRemovedByConversationDelete on the same event.
+rule ForkProposalsRemovedOnOriginDelete {
+    when: ConversationHardDeleted(origin)
+
+    -- Clean deterministic orphans for STILL-PENDING proposals only: a pending proposal's
+    -- spawn/promote path can only be an orphan from a crashed approve/promote. For a
+    -- spawned/promoted proposal that same path is the LIVE, decoupled fork/refinement
+    -- conversation, which survives origin deletion (REQ-PROJ-035) and must NOT be touched —
+    -- so the cleanup is guarded to `pending` and never reaches a live child's worktree/branch.
+    ensures:
+        for p in ForkProposal where p.origin = origin and p.status = pending:
+            DeterministicForkOrphansCleaned(p)
+    ensures:
+        for p in ForkProposal where p.origin = origin:
+            not exists p
+}
 
 -- ===========================================================
 -- 4. TERMINAL ACTIONS (REQ-PROJ-026, REQ-PROJ-027)
@@ -592,7 +1101,14 @@ rule MarkAsMerged {
     let worktree = Worktree{conversation: conversation}
 
     -- Agent must not be running (no live tool execution, LLM call, etc.).
+    -- `idle` is the ordinary disposable state; `error` is a stuck,
+    -- non-running terminal-error state (e.g. a usage-limit window the
+    -- user merged around externally). An errored conversation is not
+    -- executing anything, so destructive cleanup is safe — the user must
+    -- not be forced to coax out a successful LLM turn just to dispose of
+    -- a conversation whose work is already merged.
     requires: conversation.core_status = idle
+           or conversation.core_status = error
     -- REQ-BED-031: permitted in normal idle (parent_status absent) and
     -- on a context-exhausted parent. Excludes awaiting_recovery /
     -- awaiting_task_approval / awaiting_user_response (those need
@@ -643,7 +1159,14 @@ rule ConfirmAbandon {
     let worktree = Worktree{conversation: conversation}
 
     -- Agent must not be running (no live tool execution, LLM call, etc.).
+    -- `idle` is the ordinary disposable state; `error` is a stuck,
+    -- non-running terminal-error state (e.g. a usage-limit window the
+    -- user merged around externally). An errored conversation is not
+    -- executing anything, so destructive cleanup is safe — the user must
+    -- not be forced to coax out a successful LLM turn just to abandon a
+    -- conversation that is already stuck.
     requires: conversation.core_status = idle
+           or conversation.core_status = error
     -- REQ-BED-031: permitted in normal idle (parent_status absent) and
     -- on a context-exhausted parent. Excludes awaiting_recovery /
     -- awaiting_task_approval / awaiting_user_response (those need
@@ -869,7 +1392,9 @@ rule WorktreeTransferredOnContinuation {
 -- REQ-BED-030: Work-mode continuation also inherits the parent's task_id
 -- (and therefore its task file, since the task file lives on the
 -- transferred branch inside the transferred worktree). Ensures a new
--- task ID isn't minted for the same underlying task.
+-- task ID isn't minted for the same underlying task. task_title is inherited
+-- too — it is a mandatory mode=work field, so the continuation must carry the
+-- title approval set rather than drop it or leave the required field unset.
 rule WorkContinuationInheritsTaskId {
     when: UserStartsContinuationConversation(parent, new_conv)
 
@@ -878,6 +1403,7 @@ rule WorkContinuationInheritsTaskId {
     requires: parent.continued_in_conv_id = absent
 
     ensures: new_conv.task_id = parent.task_id
+    ensures: new_conv.task_title = parent.task_title
 }
 
 -- REQ-BED-030: Direct parents have no worktree, so continuation
@@ -1157,10 +1683,37 @@ invariant OneWorktreePerConversation {
 -- from desired_base_branch or current HEAD, then stored in ConvMode::Work.
 -- No rule updates it after approval.)
 
--- Task file exists after approval (managed worktrees only)
+-- A managed Work worktree carries EITHER a typed taskmd `task_file` OR a `plain_brief_path`,
+-- never neither. A *taskmd* brief (Explore→Work approval or taskmd fork) sets task_file; a
+-- *plain* markdown brief sets plain_brief_path instead, with no taskmd metadata — for BOTH a
+-- plain-brief fork (REQ-PROJ-034) and an ordinary Explore→Work plain approval (REQ-PROJ-006,
+-- TaskApprovalExecuted / TaskApprovalFreshHandoffExecuted). Keying off the durable
+-- plain_brief_path marker (not the origin-bound proposal row, which a hard delete removes)
+-- means a surviving plain-brief fork stays exempt, while a taskmd worktree that lost its
+-- task_file still violates this.
 invariant TaskFileExistsForManagedWorktrees {
     for w in Worktrees where w.conversation.mode = work:
-        w.conversation.mode = work implies exists w.task_file
+        exists w.task_file or exists w.plain_brief_path
+}
+
+-- plain_brief_path is not a free-floating flag: it exists ONLY on a Work worktree whose
+-- brief is a plain (non-taskmd) markdown file — whether that worktree is a fork
+-- (ForkProposalApproved) or an ordinary Explore→Work plain-brief approval (REQ-PROJ-006),
+-- neither of which has a taskmd task_file. Combined with TaskFileExistsForManagedWorktrees
+-- (a Work worktree has task_file OR plain_brief_path), this forces **exactly one** of the
+-- two on a Work worktree and makes the field unrepresentable elsewhere — so it can't be
+-- sprinkled onto a taskmd worktree (which has a task_file) to suppress its status, nor onto
+-- a Branch/Explore-temp worktree. It deliberately does NOT require fork provenance, since a
+-- plain-brief Work conversation can arise without a fork.
+invariant PlainBriefPathIsExclusiveForkMarker {
+    for w in Worktrees:
+        exists w.plain_brief_path implies
+            w.conversation.mode = work
+            and not exists w.task_file
+            -- The marked path must itself be a *plain* (non-taskmd) brief, so a taskmd Work
+            -- worktree that lost its typed task_file cannot point plain_brief_path at a taskmd
+            -- path to forge the exemption — structurally limited to genuine plain briefs.
+            and not is_taskmd_file(w.plain_brief_path)
 }
 
 -- REQ-PROJ-024: Branch mode worktrees never have task files
@@ -1247,6 +1800,42 @@ invariant TerminalActionRequiresNoContinuation {
         UserMarksAsMerged(c) implies c.continued_in_conv_id = absent
 }
 
+-- REQ-PROJ-035: a spawned fork links to its origin only through the provenance
+-- breadcrumb — never as a sub-agent (it is a top-level Parent) and never as a
+-- chain continuation (the origin's continued_in_conv_id does not point at it).
+-- The breadcrumb carries no behaviour; this invariant pins the decoupling.
+--
+-- Guarded on both rows existing: fork and origin have fully independent lifecycles
+-- (the whole point of the decoupling), so either may be hard-deleted while the other
+-- lives. The breadcrumb is a non-live audit reference (see `fork` / Parent
+-- `spawned_from_conversation_id`), so once a target is deleted this link is vacuous
+-- rather than a dangling-deref violation.
+invariant ForkCarriesOnlyProvenanceLink {
+    for p in ForkProposals:
+        p.status = spawned and exists Conversation{id: p.fork} and exists p.origin implies
+            Conversation{id: p.fork}.spawned_from_conversation_id = p.origin.id
+            and Conversation{id: p.fork}.kind = Parent
+            and p.origin.continued_in_conv_id != Conversation{id: p.fork}
+}
+
+-- REQ-PROJ-035: a fork proposal is an artifact of its origin (bound to origin),
+-- referencing a live conversation — not a free-floating queue item that outlives it.
+invariant ForkProposalBoundToOrigin {
+    for p in ForkProposals:
+        exists Conversation{id: p.origin.id}
+}
+
+-- REQ-PROJ-035: a `pending` proposal does not survive its origin reaching any
+-- terminal state (Parent.is_terminal — terminal/abandoned/merged, context_exhausted,
+-- handed_off). It is retired (dismissed) on the terminal transition
+-- (ForkProposalsRetiredOnOriginTerminal), so no permanently-unreviewable pending
+-- record can linger. Together with the review-surface and approval is_terminal guards,
+-- this makes "moot once the origin ends" structural, not conventional.
+invariant PendingForkProposalRequiresLiveOrigin {
+    for p in ForkProposals:
+        p.status = pending implies p.origin.is_terminal = false
+}
+
 ------------------------------------------------------------
 -- Surfaces
 ------------------------------------------------------------
@@ -1255,7 +1844,7 @@ surface ProjectManagement {
     facing: bedrock/User
 
     context conversation: bedrock/Conversation
-        where mode in { work, branch } and core_status = idle
+        where mode in { work, branch } and core_status in { idle, error }
 
     let worktree = Worktree{conversation: conversation}
 
@@ -1264,7 +1853,9 @@ surface ProjectManagement {
         worktree.base_branch
         conversation.mode
         worktree.is_clean
-        worktree.task_file.status when conversation.mode = work
+        -- Plain-brief forks are Work-mode with no typed task_file (REQ-PROJ-034), so
+        -- gate the status read on its presence — never deref an absent task_file.
+        worktree.task_file.status when conversation.mode = work and exists worktree.task_file
 
     provides:
         UserMarksAsMerged(conversation)
@@ -1273,6 +1864,40 @@ surface ProjectManagement {
     @guarantee NonFatalBookkeeping
         -- Task file status updates are best-effort. If they fail,
         -- the completion/abandonment still proceeds. Failures are logged.
+}
+
+-- REQ-PROJ-034: the asynchronous review of a pending fork proposal. Surfaced in
+-- the originating conversation's tool output; the user opens the same full-screen
+-- task-review interface as Explore approvals to read the snapshot and decide.
+surface ForkProposalReview {
+    facing: bedrock/User
+
+    -- Only a pending proposal whose origin is still live is reviewable. Once the
+    -- origin is terminal (Parent.is_terminal — terminal/abandoned/merged,
+    -- context_exhausted, or handed_off) the proposal is moot and withdrawn
+    -- (REQ-PROJ-035, bound to origin) — neither action is offered.
+    context proposal: ForkProposal
+        where status = pending and origin.is_terminal = false
+
+    exposes:
+        proposal.id
+        proposal.title
+        proposal.priority
+        proposal.body
+        proposal.origin
+
+    provides:
+        UserApprovesForkProposal(proposal)
+        UserDismissesForkProposal(proposal)
+        -- Third review action (REQ-PROJ-037): promote the snapshot into a fresh Explore
+        -- conversation for agent-assisted iteration, carrying the user's change note.
+        UserRequestsForkProposalChanges(proposal, change_request)
+
+    @guarantee OriginUnaffectedByReview
+        -- Reviewing, approving, or dismissing a fork proposal never transitions
+        -- the originating conversation and is never delivered to its agent
+        -- (REQ-PROJ-035). Approval spawns an independent conversation; dismissal
+        -- spawns nothing. Either way the origin keeps running, uninformed.
 }
 
 surface BranchPicker {

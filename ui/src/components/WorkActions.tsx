@@ -28,7 +28,14 @@ function deriveWorkLifecycleControls({
   manualFallbackEnabled: boolean;
   isLoading?: boolean;
 }) {
-  const visible = (convModeLabel === 'Work' || convModeLabel === 'Branch') && phaseType === 'idle';
+  // Cleanup is offered from every disposable phase: idle, errored, and
+  // context-exhausted. A Work/Branch conversation stuck in error or out of
+  // context (e.g. a usage-limit window or a full context after the PR was
+  // merged externally) must be disposable without first recovering an LLM
+  // turn. Other phases (running, awaiting) are transient and hide the bar.
+  const visible =
+    (convModeLabel === 'Work' || convModeLabel === 'Branch') &&
+    (phaseType === 'idle' || phaseType === 'error' || phaseType === 'context_exhausted');
   const hasContinuation = !!continuedInConvId;
   const prChecking = prStatusState.status === 'loading';
   const prStatus = prStatusState.status === 'ready' ? prStatusState.prStatus : null;
@@ -178,13 +185,19 @@ export function WorkControlBar({ conversationId, convModeLabel, phaseType, conti
     <div className="work-actions-bar">
       <span className="work-actions-label">Done?</span>
       <WorkViewerActions />
-      <PrRemediationActions
-        conversationId={conversationId}
-        prStatus={lifecycle.prStatus}
-        onSendMessage={onSendMessage}
-        onRefreshPrStatus={prStatusHandle.refresh}
-        showError={showError}
-      />
+      {/* PR remediation ("Address CI & comments") posts a normal UserMessage,
+          which Error accepts — that would reopen even a non-resumable error
+          through a side action. While errored, expose only terminal cleanup
+          (Mark-as-Merged / Abandon below); remediation is idle-only. */}
+      {phaseType === 'idle' && (
+        <PrRemediationActions
+          conversationId={conversationId}
+          prStatus={lifecycle.prStatus}
+          onSendMessage={onSendMessage}
+          onRefreshPrStatus={prStatusHandle.refresh}
+          showError={showError}
+        />
+      )}
       <button
         className="work-actions-btn work-actions-complete"
         disabled={lifecycle.completeDisabled}
