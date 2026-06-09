@@ -62,7 +62,7 @@ correct weight (see `design.md`, "Why No Allium Spec").
 | **REQ-WSUI-006:** Inventory Pull Endpoint | Proposed | `GET /api/work-scope/:scope_key/inventory`; `get_conversation` shape |
 | **REQ-WSUI-007:** Inventory Push Event | Proposed | `WorkScopeUpdate` `SseWireEvent`; full snapshot, no deltas |
 | **REQ-WSUI-008:** Push Event Routing | Proposed | Single non-terminal conversation per scope (REQ-PROJ-025) |
-| **REQ-WSUI-009:** Chain Page Single-Scope Query | Proposed | One scope key; standalone dock sharing the section's rows; no per-member fan-out |
+| **REQ-WSUI-009:** Chain Page Active-Member Scope Query | Proposed | Active (latest) member's scope key, root fallback; standalone dock sharing the section's rows; no per-member fan-out; SSE-less dock polls while collapsed |
 | **REQ-WSUI-010:** Conversation Page Section | Proposed | `WorkScopeSection` in left `FileExplorerPanel`, stacked with Files/Skills/Tasks; collapsed-rail badge; atom `workScope` field |
 | **REQ-WSUI-011:** CLI Client Not a Visualization Surface | Proposed | `phoenix-client.py` text-only; CLI subcommand is future work |
 

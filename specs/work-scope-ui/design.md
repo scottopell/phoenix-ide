@@ -304,14 +304,32 @@ are no unbounded background timers.
 ### Chain page (REQ-WSUI-009)
 
 The chain page has no left `FileExplorerPanel` to host a section, so it queries
-the one `scope_key` for the chain root via the pull endpoint and renders the
-standalone right-adjacent `WorkScopePanel` dock (width via `useResizablePane`,
-collapsed by default). Both surfaces render the same per-resource rows from
-shared code in `WorkScopePanel.tsx`. No per-member aggregation: because
-resources are `WorkScope`-keyed and the chain's members share one scope, one
-query is complete. A conversation-keyed design would instead require one query
-per member and a client-side merge — the fan-out the `WorkScope` key
-eliminates.
+the `scope_key` of the chain's active (latest) member via the pull endpoint and
+renders the standalone right-adjacent `WorkScopePanel` dock (width via
+`useResizablePane`, collapsed by default). The active member is the one with
+`position === "latest"`; a single-member chain has no `latest`, so the dock
+falls back to the root. Both surfaces render the same per-resource rows from
+shared code in `WorkScopePanel.tsx`.
+
+The active member, not the root, is the right scope because the chain's members
+do not all share one scope. Shared-worktree chains (Worktree / Branch / Work)
+resolve every member to the same worktree scope, but Direct continuation chains
+resolve each member to a distinct `WorkScope::Conversation(<member id>)`, so the
+leaf's live resources are under its own scope, not the root's. The latest
+member's scope is correct for both: it is the shared worktree scope for the
+former and the leaf's own conversation scope for the latter. No per-member
+aggregation is needed — one query against the active member's `WorkScope` key is
+complete; a conversation-keyed fan-out across every member with a client-side
+merge would add divergence risk for no gain.
+
+Because the chain dock has no per-conversation SSE channel (it omits
+`liveInventory`), its live-resource poll must stay active even while the dock is
+collapsed: with no push to correct it, a resource that is live at collapse and
+then exits or is reaped would otherwise leave the collapsed count badge reading
+"running" indefinitely. An SSE-less surface therefore keeps polling while
+collapsed (the poll still self-limits once nothing is live), whereas an
+SSE-backed surface pauses its poll when collapsed and relies on the push to keep
+the badge fresh.
 
 ## Wire-Shape Notes
 

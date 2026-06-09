@@ -443,6 +443,99 @@ describe('WorkScopeSection in-flight gate (slow poll, no overlap or starvation)'
   });
 });
 
+describe('WorkScopePanel collapsed standalone dock keeps polling without SSE (REQ-WSUI-009)', () => {
+  // The chain dock omits `liveInventory` (no per-conversation SSE channel). If
+  // its poll paused while collapsed, a resource live at collapse and then
+  // reaped would leave the count badge reading "running" forever until expand.
+  // An SSE-less surface therefore keeps polling while collapsed so the badge
+  // settles to 0.
+  it('polls while collapsed and the badge settles to 0 once nothing is live', async () => {
+    getInv
+      // Initial fetch: one live handle → badge shows 1.
+      .mockResolvedValueOnce(inv([bash({ state: 'running' })]))
+      // First poll: the handle has exited → nothing live, badge settles to 0.
+      .mockResolvedValueOnce(inv([bash({ state: 'tombstoned' })]));
+
+    await act(async () => {
+      render(
+        <WorkScopePanel scopeKey="ws-1" liveInventory={null} collapsed={true} onToggle={() => {}} />,
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const badge = () => document.querySelector('.ws-count-badge');
+    // Initial fetch landed with a live handle.
+    expect(badge()?.textContent).toBe('1');
+    expect(getInv).toHaveBeenCalledTimes(1);
+
+    // Advance one poll interval: despite being collapsed, the SSE-less dock
+    // re-fetches and the badge settles to 0.
+    await act(async () => {
+      vi.advanceTimersByTime(2000);
+      await Promise.resolve();
+    });
+    expect(getInv.mock.calls.length).toBeGreaterThan(1);
+    expect(badge()?.textContent).toBe('0');
+
+    // The poll self-limits: nothing live → no further fetches.
+    const callsAfterSettle = getInv.mock.calls.length;
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+      await Promise.resolve();
+    });
+    expect(getInv.mock.calls.length).toBe(callsAfterSettle);
+  });
+
+  it('an SSE-backed collapsed surface does NOT poll (its push keeps the badge fresh)', async () => {
+    // WorkScopeSection is SSE-backed; collapsed (expanded=false) it must stay
+    // inert — no poll — relying on the push channel. Guards against the
+    // SSE-less fix leaking into the SSE-backed surface.
+    getInv.mockResolvedValue(inv([bash({ state: 'running' })]));
+
+    await act(async () => {
+      render(
+        sectionCollapsedTree({ scopeKey: 'ws-1', liveInventory: inv([bash({ state: 'running' })]) }),
+      );
+    });
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    const callsAfterMount = getInv.mock.calls.length;
+    await act(async () => {
+      vi.advanceTimersByTime(10_000);
+      await Promise.resolve();
+    });
+    // No additional polls while collapsed + SSE-backed.
+    expect(getInv.mock.calls.length).toBe(callsAfterMount);
+  });
+});
+
+/** WorkScopeSection rendered collapsed (expanded=false) in its provider tree. */
+function sectionCollapsedTree(props: { scopeKey: string; liveInventory?: WorkScopeInventory | null }) {
+  return (
+    <MemoryRouter initialEntries={['/c/conv-A']}>
+      <Routes>
+        <Route
+          path="/c/:slug"
+          element={
+            <ViewerSlotProvider scopeKey="conv-A" browserSessionActive={false}>
+              <WorkScopeSection
+                scopeKey={props.scopeKey}
+                liveInventory={props.liveInventory ?? null}
+                expanded={false}
+                onToggleExpanded={() => {}}
+              />
+            </ViewerSlotProvider>
+          }
+        />
+      </Routes>
+    </MemoryRouter>
+  );
+}
+
 describe('inspect affordance + provider dependency', () => {
   it('a non-inspectable BashRow renders WITHOUT a ViewerSlotProvider (no hook, no throw)', async () => {
     // The standalone chain-page dock renders with inspectable={false} and is NOT

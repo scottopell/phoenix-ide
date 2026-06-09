@@ -56,6 +56,17 @@ vi.mock('../api', async () => {
       getChain: vi.fn(),
       submitChainQuestion: vi.fn(),
       setChainName: vi.fn(),
+      // The work-scope dock resolves the active member's scope key via
+      // getConversation, then polls getWorkScopeInventory. Defaults below are
+      // overridden per-test where the dock behaviour is under test.
+      getConversation: vi.fn(async () => ({
+        conversation: { work_scope_key: 'scope-default' },
+      })),
+      getWorkScopeInventory: vi.fn(async () => ({
+        bash: [],
+        tmux: null,
+        browser: null,
+      })),
     },
     subscribeToChainStream: vi.fn(
       (_rootId: string, onEvent: ChainEventHandler, onErr?: ChainErrorHandler) => {
@@ -860,6 +871,54 @@ describe('ChainPage — per-rootConvId state isolation (task 08682)', () => {
     expect(screen.getByText('Title B1')).toBeInTheDocument();
     expect(screen.queryByText('Title A1')).not.toBeInTheDocument();
     expect(screen.queryByText('Title A2')).not.toBeInTheDocument();
+  });
+});
+
+describe('ChainPage — work-scope dock active-member scope (REQ-WSUI-009)', () => {
+  it('resolves the LATEST member’s conv id, not the root, when a latest member exists', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({
+        members: [
+          makeMember('m1', 'root'),
+          makeMember('m2', 'continuation'),
+          makeMember('m3', 'latest'),
+        ],
+      }),
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(screen.getByText('Title m1')).toBeInTheDocument();
+    });
+
+    // The dock queries the latest member's scope, not the root's.
+    await waitFor(() => {
+      expect(api.getConversation as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('m3');
+    });
+    expect(api.getConversation as ReturnType<typeof vi.fn>).not.toHaveBeenCalledWith(ROOT_ID);
+  });
+
+  it('falls back to the root conv id when the chain has no latest member', async () => {
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({
+        // Single-member chain: only a root, no latest.
+        members: [makeMember(ROOT_ID, 'root')],
+        current_member_count: 1,
+      }),
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(screen.getByText(`Title ${ROOT_ID}`)).toBeInTheDocument();
+    });
+
+    await waitFor(() => {
+      expect(api.getConversation as ReturnType<typeof vi.fn>).toHaveBeenCalledWith(ROOT_ID);
+    });
   });
 });
 

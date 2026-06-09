@@ -14,10 +14,13 @@
  *     atom's `workScope`, kept fresh by the `work_scope_update` SSE push) is
  *     authoritative when present. An initial fetch fills the gap before the
  *     first push lands.
- *   - Chain page: no per-conversation SSE channel, so the initial fetch is
- *     the only data source (REQ-WSUI-009 rationale). One query against the
- *     chain root's scope key is complete — resources are WorkScope-keyed, so
- *     there is no per-member aggregation.
+ *   - Chain page: no per-conversation SSE channel, so the poll-augmented
+ *     fetch is the only data source (REQ-WSUI-009 rationale). The dock queries
+ *     the ACTIVE (latest) member's scope key, not the root's: Direct-chain
+ *     members resolve to distinct per-conversation scopes, so the latest
+ *     leaf's resources do not share the root's scope. Lacking an SSE channel,
+ *     this dock keeps polling even while collapsed so the count badge can
+ *     settle when a live resource exits.
  *
  * Density (AGENTS.md UI Design Philosophy): collapsed, the rail is a single
  * live-count badge ("is anything running?"); expanded, each resource is one
@@ -49,7 +52,7 @@ const BROWSER_IDLE_THRESHOLD_MS = 60_000;
 
 interface Props {
   /** The scope key to query (`work_scope_key` on the conversation, or the
-   *  chain root's scope key). */
+   *  chain's active/latest member's scope key). */
   scopeKey: string;
   /** Live inventory from the conversation atom (SSE-fed). When provided it
    *  overrides the panel's initial fetch — it is at least as fresh. Omit on
@@ -483,7 +486,14 @@ export function WorkScopeSection({ scopeKey, liveInventory, expanded, onToggleEx
  * live-count badge rail; expanded it shows the shared resource body.
  */
 export function WorkScopePanel({ scopeKey, liveInventory, collapsed, onToggle, width }: Props) {
-  const { inventory, error, now, retry } = useWorkScopeInventory(scopeKey, liveInventory, !collapsed);
+  // An SSE-less surface (no `liveInventory`) must keep polling even while
+  // collapsed so the count badge can settle: with no push channel, a resource
+  // live at collapse and then exited/reaped would otherwise read as running
+  // forever until expand. The poll self-limits — `pollRunning = active &&
+  // hasLiveResource` — so it stops once nothing is live. An SSE-backed surface
+  // still pauses when collapsed (its push channel keeps the badge fresh).
+  const active = !collapsed || liveInventory == null;
+  const { inventory, error, now, retry } = useWorkScopeInventory(scopeKey, liveInventory, active);
   const count = workScopeLiveCount(inventory);
   const browserGlyph = inventory?.browser?.state === 'live' ? '◉' : null;
   const tmuxLive = inventory?.tmux?.status === 'live';

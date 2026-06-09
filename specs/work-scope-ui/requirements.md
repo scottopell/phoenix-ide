@@ -228,21 +228,29 @@ conversation→scope resolution the browser lifecycle bridge already performs
 
 ---
 
-### REQ-WSUI-009: Chain Page Single-Scope Query
+### REQ-WSUI-009: Chain Page Active-Member Scope Query
 
 WHEN the chain page renders the work-scope panel
-THE SYSTEM SHALL query the one `scope_key` for the chain root and render a
-standalone right-adjacent dock that shares the per-resource row vocabulary of
-the conversation page's section (REQ-WSUI-010)
+THE SYSTEM SHALL query the one `scope_key` of the chain's active (latest)
+member — falling back to the root when the chain has a single member — and
+render a standalone right-adjacent dock that shares the per-resource row
+vocabulary of the conversation page's section (REQ-WSUI-010)
 AND SHALL NOT aggregate per-member inventories.
 
-**Rationale:** Because resources are `WorkScope`-keyed and a chain's members
-share one scope, a single inventory query is complete. A hypothetical
-conversation-keyed design would force the chain page to fan out one query per
-member and merge the results, with all the divergence risk that implies; the
-`WorkScope` key collapses that to one read. The chain page has no left
-file-explorer panel to host a section, so it uses a standalone collapsible
-dock; both surfaces render the same resource rows from shared code.
+**Rationale:** A chain's members do not all share one scope. Worktree, Branch,
+and Work chains share a single worktree scope across every member, but Direct
+continuation chains resolve each member to a distinct
+`WorkScope::Conversation(<member id>)` — so the active leaf's live resources
+live under its own scope, not the root's. Querying the active (latest) member
+is correct for both kinds: for shared-worktree chains the latest member's scope
+*is* the shared worktree scope, and for Direct chains it is the leaf's own
+conversation scope where the running resources actually reside. Querying the
+root would show an empty inventory for a Direct chain whose work is on the leaf.
+A single query against the active member's `WorkScope` key is complete; a
+hypothetical fan-out across every member and merge would add divergence risk
+for no gain. The chain page has no left file-explorer panel to host a section,
+so it uses a standalone collapsible dock; both surfaces render the same
+resource rows from shared code.
 
 ---
 
