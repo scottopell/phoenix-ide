@@ -89,6 +89,18 @@ pub trait MessageRetriever: Send + Sync {
         scope: RetrievalScope,
         top_k: usize,
     ) -> Result<Vec<RetrievedChunk>, RetrievalError>;
+
+    /// Whether the index **fully and freshly** covers the given conversations:
+    /// every message present AND its indexed `content_hash` matching the
+    /// current extraction (so a swallowed best-effort reindex that left a
+    /// stale row reports as not-fresh, not just missing rows). Scoped — cheap
+    /// for a chain's handful of members — so a consumer that must not answer
+    /// from a partial index can block on it (chains REQ-CHN-009). Empty input
+    /// is trivially fresh.
+    ///
+    /// # Errors
+    /// Returns [`RetrievalError`] if a backing query fails.
+    async fn is_fresh_for(&self, conversation_ids: &[String]) -> Result<bool, RetrievalError>;
 }
 
 /// Counts from a reconciliation pass, for logging.
@@ -186,25 +198,6 @@ impl Fts5Retriever {
         self.reconciled.store(true, Ordering::Release);
         Ok(stats)
     }
-
-    /// Whether the index covers every row in `messages` — the freshness
-    /// watermark of REQ-RET-003. Unlike [`Self::index_reconciled`] (which only
-    /// records that the startup sweep ran), this re-checks live state, so it
-    /// also catches a best-effort live-write hook that logged-and-swallowed an
-    /// index failure. A consuming surface uses it to distinguish "no in-scope
-    /// match" from "the index is behind."
-    ///
-    /// # Errors
-    /// Returns [`RetrievalError`] if the query fails.
-    pub async fn index_is_current(&self) -> Result<bool, RetrievalError> {
-        let lagging: i64 = sqlx::query_scalar(
-            "SELECT EXISTS(SELECT 1 FROM messages m \
-             WHERE NOT EXISTS(SELECT 1 FROM message_fts f WHERE f.message_id = m.message_id))",
-        )
-        .fetch_one(&self.pool)
-        .await?;
-        Ok(lagging == 0)
-    }
 }
 
 #[async_trait]
@@ -257,6 +250,68 @@ impl MessageRetriever for Fts5Retriever {
 
         let rows = q.try_map(parse_chunk_row).fetch_all(&self.pool).await?;
         Ok(rows)
+    }
+
+    async fn is_fresh_for(&self, conversation_ids: &[String]) -> Result<bool, RetrievalError> {
+        if conversation_ids.is_empty() {
+            return Ok(true);
+        }
+        let placeholders = {
+            let mut s = String::new();
+            for i in 0..conversation_ids.len() {
+                if i > 0 {
+                    s.push(',');
+                }
+                s.push('?');
+            }
+            s
+        };
+
+        // Current source messages for these conversations.
+        let messages = {
+            let sql = format!(
+                "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at \
+                 FROM messages WHERE conversation_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for id in conversation_ids {
+                q = q.bind(id);
+            }
+            q.try_map(crate::parse_message_row)
+                .fetch_all(&self.pool)
+                .await?
+        };
+
+        // Indexed content fingerprints for these conversations.
+        let indexed: HashMap<String, String> = {
+            let sql = format!(
+                "SELECT message_id, content_hash FROM message_fts WHERE conversation_id IN ({placeholders})"
+            );
+            let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+            for id in conversation_ids {
+                q = q.bind(id);
+            }
+            q.try_map(|row: sqlx::sqlite::SqliteRow| {
+                Ok((
+                    row.try_get::<String, _>("message_id")?,
+                    row.try_get::<String, _>("content_hash")?,
+                ))
+            })
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .collect()
+        };
+
+        // Fresh iff every current message has an index row whose fingerprint
+        // matches the current extraction (missing OR stale → not fresh).
+        for m in &messages {
+            match indexed.get(&m.message_id) {
+                Some(stored) if *stored == content_fingerprint(&index_text(m)) => {}
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 }
 
@@ -658,22 +713,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn index_is_current_reflects_coverage() {
+    async fn is_fresh_for_detects_missing_and_stale_rows() {
         let db = seed().await;
         db.add_message("m1", "c-a", &MessageContent::user("indexed"), None, None)
             .await
             .unwrap();
         let r = Fts5Retriever::new(db.pool().clone());
-        assert!(r.index_is_current().await.unwrap(), "all messages indexed");
+        assert!(
+            r.is_fresh_for(&["c-a".into()]).await.unwrap(),
+            "all messages indexed and fresh",
+        );
 
-        // Simulate a best-effort index miss: a message exists with no FTS row.
+        // Stale row: index text no longer matches the source (simulate a
+        // swallowed best-effort reindex by corrupting the stored content_hash).
+        sqlx::query("UPDATE message_fts SET content_hash = 'stale' WHERE message_id = 'm1'")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        assert!(
+            !r.is_fresh_for(&["c-a".into()]).await.unwrap(),
+            "a stale-content index row must report as not fresh",
+        );
+
+        // Missing row: a message with no index row at all.
         sqlx::query("DELETE FROM message_fts WHERE message_id = 'm1'")
             .execute(db.pool())
             .await
             .unwrap();
         assert!(
-            !r.index_is_current().await.unwrap(),
-            "a message missing from the index must report as behind",
+            !r.is_fresh_for(&["c-a".into()]).await.unwrap(),
+            "a missing index row must report as not fresh",
         );
+
+        // A conversation set with no messages is trivially fresh.
+        assert!(r.is_fresh_for(&[]).await.unwrap());
     }
 }
