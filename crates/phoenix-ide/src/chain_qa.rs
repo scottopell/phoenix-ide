@@ -866,15 +866,22 @@ fn render_full_transcript(messages: &[Message]) -> String {
             // representable in the text read path — surface the gap rather than
             // presenting an apparently complete message.
             MessageContent::User(c) => {
-                let text = c.llm_text().to_string();
-                if c.images.is_empty() {
-                    text
-                } else {
-                    format!(
-                        "{text}\n[{} image(s) attached to this message are not shown — chain Q&A reads text only]",
-                        c.images.len()
-                    )
+                let mut text = c.llm_text().to_string();
+                // Non-image attachments contribute their context tag (name /
+                // path / metadata) to LLM history at runtime; include it so the
+                // agent can answer about attached files it reads.
+                for f in &c.files {
+                    text.push('\n');
+                    text.push_str(&f.llm_context_tag());
                 }
+                if !c.images.is_empty() {
+                    let _ = write!(
+                        text,
+                        "\n[{} image(s) attached to this message are not shown — chain Q&A reads text only]",
+                        c.images.len()
+                    );
+                }
+                text
             }
             // Keep text AND a readable rendering of every tool block (local,
             // server-side, and MCP tool calls/results) — recall questions about
@@ -907,10 +914,17 @@ fn render_full_transcript(messages: &[Message]) -> String {
             MessageContent::System(c) => c.text.clone(),
             MessageContent::Error(c) => c.message.clone(),
             MessageContent::Continuation(c) => c.summary.clone(),
-            // Include the expanded skill body, not just the trigger — when a
-            // question depends on instructions a skill injected, that text lives
-            // in `body`.
-            MessageContent::Skill(c) => format!("/{} {}\n{}", c.name, c.trigger, c.body),
+            // Include the expanded skill body (and any attached file tags), not
+            // just the trigger — when a question depends on instructions a skill
+            // injected, that text lives in `body`.
+            MessageContent::Skill(c) => {
+                let mut body = format!("/{} {}\n{}", c.name, c.trigger, c.body);
+                for f in &c.files {
+                    body.push('\n');
+                    body.push_str(&f.llm_context_tag());
+                }
+                body
+            }
         };
         out.push_str(label);
         out.push_str(": ");

@@ -313,6 +313,15 @@ impl MessageRetriever for Fts5Retriever {
                 _ => return Ok(false),
             }
         }
+        // Reject orphaned index rows: an FTS row in these conversations whose
+        // source message no longer exists (e.g. a failed delete hook, or before
+        // the startup reconcile prunes) would still surface deleted content in
+        // search. Every current message is present after the loop above, so an
+        // indexed-row count exceeding the live message count means at least one
+        // orphan — not fresh until it is pruned.
+        if indexed.len() != messages.len() {
+            return Ok(false);
+        }
         Ok(true)
     }
 }
@@ -813,5 +822,31 @@ mod tests {
 
         // A conversation set with no messages is trivially fresh.
         assert!(r.is_fresh_for(&[]).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn is_fresh_for_rejects_orphaned_index_rows() {
+        let db = seed().await;
+        db.add_message("m1", "c-a", &MessageContent::user("indexed"), None, None)
+            .await
+            .unwrap();
+        let r = Fts5Retriever::new(db.pool().clone());
+        assert!(r.is_fresh_for(&["c-a".into()]).await.unwrap());
+
+        // Orphan: an index row in this conversation with no live source message
+        // (e.g. a failed delete hook). Every current message is still present
+        // and fresh, but the orphan could surface deleted content in search, so
+        // freshness must report false until the row is pruned.
+        sqlx::query(
+            "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
+             VALUES ('ghost', 'orphan-1', 0, 'c-a', 'user', '2026-01-01T00:00:00Z', 'h')",
+        )
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            !r.is_fresh_for(&["c-a".into()]).await.unwrap(),
+            "an orphaned index row must report as not fresh",
+        );
     }
 }

@@ -44,9 +44,17 @@ pub fn index_text(message: &Message) -> String {
     }
     match &message.content {
         // `llm_text()` is the expanded form the model actually saw (e.g.
-        // `@file` content), not the display shorthand — index that so recall
-        // covers terms that exist only in the expansion.
-        MessageContent::User(c) => c.llm_text().to_string(),
+        // `@file` content), not the display shorthand. Attached non-image files
+        // contribute their context tag (name/path/metadata) just as the runtime
+        // appends to LLM history — index that so recall can find them too.
+        MessageContent::User(c) => {
+            let mut text = c.llm_text().to_string();
+            for f in &c.files {
+                text.push('\n');
+                text.push_str(&f.llm_context_tag());
+            }
+            text
+        }
         MessageContent::Agent(blocks) => blocks
             .iter()
             .filter_map(|b| match b {
@@ -61,7 +69,17 @@ pub fn index_text(message: &Message) -> String {
         MessageContent::System(c) => c.text.clone(),
         MessageContent::Error(c) => c.message.clone(),
         MessageContent::Continuation(c) => c.summary.clone(),
-        MessageContent::Skill(c) => format!("/{} {}", c.name, c.trigger),
+        // Index the expanded skill body (and any attached file tags), not just
+        // the name/trigger — recall must be able to locate a conversation by
+        // text that lives only in the injected skill instructions.
+        MessageContent::Skill(c) => {
+            let mut text = format!("/{} {}\n{}", c.name, c.trigger, c.body);
+            for f in &c.files {
+                text.push('\n');
+                text.push_str(&f.llm_context_tag());
+            }
+            text
+        }
     }
 }
 
@@ -231,14 +249,18 @@ mod tests {
             }))),
             "did things"
         );
-        assert_eq!(
-            index_text(&msg(MessageContent::Skill(SkillContent {
-                name: "review".into(),
-                body: "b".into(),
-                trigger: "/review".into(),
-                files: vec![],
-            }))),
-            "/review /review"
+        // The expanded body is indexed (not just name/trigger) so recall can
+        // locate a conversation by skill-injected instructions.
+        let skill = index_text(&msg(MessageContent::Skill(SkillContent {
+            name: "review".into(),
+            body: "inspect the auth middleware for token leaks".into(),
+            trigger: "/review".into(),
+            files: vec![],
+        })));
+        assert!(skill.contains("/review /review"), "got: {skill}");
+        assert!(
+            skill.contains("inspect the auth middleware for token leaks"),
+            "skill body must be indexed: {skill}",
         );
     }
 
