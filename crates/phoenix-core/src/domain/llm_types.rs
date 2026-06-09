@@ -189,6 +189,56 @@ pub enum ContentBlock {
     },
 }
 
+impl ContentBlock {
+    /// Render this block to plain searchable/readable text — the single source
+    /// of truth shared by the retrieval index extractor and the chain Q&A read
+    /// path, so the two never disagree on what a block's text is. Exhaustive on
+    /// purpose (no wildcard): a new variant must be given a rendering here
+    /// rather than silently vanishing from search and reads.
+    #[must_use]
+    pub fn render_text(&self) -> String {
+        match self {
+            Self::Text { text } => text.clone(),
+            Self::ToolUse { name, input, .. } => format!("[tool call: {name} {input}]"),
+            Self::ServerToolUse { name, input, .. } => {
+                format!("[server tool call: {name} {input}]")
+            }
+            Self::McpToolUse {
+                name,
+                server_name,
+                input,
+                ..
+            } => format!("[mcp tool call: {server_name}/{name} {input}]"),
+            Self::ToolSearchToolResult { content, .. } => format!(
+                "[tool search result: {}]",
+                serde_json::to_string(content).unwrap_or_default()
+            ),
+            Self::WebSearchToolResult { content, .. } => format!("[web search result: {content}]"),
+            Self::WebFetchToolResult { content, .. } => format!("[web fetch result: {content}]"),
+            Self::CodeExecutionToolResult { content, .. } => {
+                format!("[code execution result: {content}]")
+            }
+            Self::BashCodeExecutionToolResult { content, .. } => {
+                format!("[bash execution result: {content}]")
+            }
+            Self::TextEditorCodeExecutionToolResult { content, .. } => {
+                format!("[text editor execution result: {content}]")
+            }
+            Self::McpToolResult {
+                content, is_error, ..
+            } => format!(
+                "[mcp tool result{}: {content}]",
+                if *is_error { " (error)" } else { "" }
+            ),
+            // Images carry no text; a generic marker keeps the gap visible.
+            Self::Image { .. } => "[image]".to_string(),
+            // Results live in the following user message, not the assistant
+            // block — but if one ever appears here, render its text.
+            Self::ToolResult { content, .. } => content.clone(),
+        }
+    }
+}
+
 /// Content of a `tool_search_tool_result` block.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ToolSearchResultContent {

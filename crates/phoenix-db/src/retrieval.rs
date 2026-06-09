@@ -285,7 +285,10 @@ impl MessageRetriever for Fts5Retriever {
         };
 
         // Indexed content fingerprints for these conversations.
-        let indexed: HashMap<String, String> = {
+        // Physical index rows for these conversations (one row per chunk). We
+        // keep the raw Vec — not just a deduplicated map — so a duplicate
+        // physical row for the same message_id is counted, not collapsed.
+        let indexed_rows: Vec<(String, String)> = {
             let sql = format!(
                 "SELECT message_id, content_hash FROM message_fts WHERE conversation_id IN ({placeholders})"
             );
@@ -301,25 +304,30 @@ impl MessageRetriever for Fts5Retriever {
             })
             .fetch_all(&self.pool)
             .await?
-            .into_iter()
-            .collect()
         };
+        let indexed: HashMap<&str, &str> = indexed_rows
+            .iter()
+            .map(|(id, hash)| (id.as_str(), hash.as_str()))
+            .collect();
 
         // Fresh iff every current message has an index row whose fingerprint
         // matches the current extraction (missing OR stale → not fresh).
         for m in &messages {
-            match indexed.get(&m.message_id) {
+            match indexed.get(m.message_id.as_str()) {
                 Some(stored) if *stored == content_fingerprint(&index_text(m)) => {}
                 _ => return Ok(false),
             }
         }
-        // Reject orphaned index rows: an FTS row in these conversations whose
-        // source message no longer exists (e.g. a failed delete hook, or before
-        // the startup reconcile prunes) would still surface deleted content in
-        // search. Every current message is present after the loop above, so an
-        // indexed-row count exceeding the live message count means at least one
-        // orphan — not fresh until it is pruned.
-        if indexed.len() != messages.len() {
+        // Reject orphaned/duplicate index rows: a *physical* row in these
+        // conversations with no live source message (failed delete hook, or
+        // before the startup reconcile prunes) — or a stale duplicate row for a
+        // live message_id — would still surface deleted/edited-away content in
+        // search. Every current message is present after the loop above, so a
+        // physical-row count differing from the live message count means at
+        // least one orphan or duplicate — not fresh until it is pruned. Counting
+        // physical rows (not the deduplicated map) is deliberate: a `HashMap`
+        // would collapse a stale+fresh pair for one id and hide the duplicate.
+        if indexed_rows.len() != messages.len() {
             return Ok(false);
         }
         Ok(true)
@@ -847,6 +855,40 @@ mod tests {
         assert!(
             !r.is_fresh_for(&["c-a".into()]).await.unwrap(),
             "an orphaned index row must report as not fresh",
+        );
+    }
+
+    #[tokio::test]
+    async fn is_fresh_for_rejects_duplicate_rows_for_one_message() {
+        let db = seed().await;
+        db.add_message("m1", "c-a", &MessageContent::user("indexed"), None, None)
+            .await
+            .unwrap();
+        let r = Fts5Retriever::new(db.pool().clone());
+        assert!(r.is_fresh_for(&["c-a".into()]).await.unwrap());
+
+        // A second physical row for the same live message_id carrying the same
+        // (fresh) hash — e.g. a stale+fresh pair left by interleaved index
+        // maintenance. The per-id loop is satisfied, but the duplicate row's
+        // text is still searchable, so freshness must report false. A HashMap
+        // would collapse the two rows and miss this; the physical-row count
+        // catches it.
+        let fresh_hash: String =
+            sqlx::query_scalar("SELECT content_hash FROM message_fts WHERE message_id = 'm1'")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
+             VALUES ('dup', 'm1', 1, 'c-a', 'user', '2026-01-01T00:00:00Z', ?1)",
+        )
+        .bind(&fresh_hash)
+        .execute(db.pool())
+        .await
+        .unwrap();
+        assert!(
+            !r.is_fresh_for(&["c-a".into()]).await.unwrap(),
+            "a duplicate physical row must report as not fresh",
         );
     }
 }

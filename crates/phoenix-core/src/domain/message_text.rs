@@ -11,12 +11,6 @@
 //! it). The full body is always reachable through the read path; this is the
 //! ranking-signal projection.
 
-// Extraction keys off the prose-bearing variants; non-prose ContentBlock
-// kinds (images, tool-use/result blocks, …) are uniformly skipped, so a
-// blanket arm is the intent here rather than per-variant enumeration of the
-// dozen-plus block kinds (mirrors `chain_qa`'s transcript renderer).
-#![allow(clippy::wildcard_enum_match_arm)]
-
 use super::db_schema::{Message, MessageContent};
 use super::llm_types::ContentBlock;
 
@@ -31,8 +25,10 @@ pub const TOOL_EXCERPT_TAIL_CHARS: usize = 1024;
 ///
 /// Returns the message body only — no role label or framing — because the
 /// role is carried in the index's `message_type` column, not the indexed
-/// text. Tool-use blocks within an agent message are omitted (they are
-/// structured calls, not prose); tool *results* are excerpted (head + tail).
+/// text. Agent tool calls and server-side/MCP tool results are rendered via
+/// the shared [`ContentBlock::render_text`] so recall can find terms that live
+/// only in a tool block; the rendering is excerpted (head + tail) like other
+/// tool output.
 ///
 /// Messages the UI deliberately hides (`display_data.hidden == true`, e.g.
 /// dismissed-error / dismissed-question recovery markers persisted as
@@ -55,14 +51,19 @@ pub fn index_text(message: &Message) -> String {
             }
             text
         }
-        MessageContent::Agent(blocks) => blocks
-            .iter()
-            .filter_map(|b| match b {
-                ContentBlock::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        // Index every content-bearing block (text, tool calls, and server-side
+        // / MCP tool results) via the shared renderer, so recall can locate a
+        // member by terms that live only in a tool block — bounded head+tail
+        // like other tool output so a large result payload can't bloat the
+        // index.
+        MessageContent::Agent(blocks) => {
+            let rendered = blocks
+                .iter()
+                .map(ContentBlock::render_text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            tool_excerpt(&rendered, TOOL_EXCERPT_HEAD_CHARS, TOOL_EXCERPT_TAIL_CHARS)
+        }
         MessageContent::Tool(c) => {
             tool_excerpt(&c.content, TOOL_EXCERPT_HEAD_CHARS, TOOL_EXCERPT_TAIL_CHARS)
         }
@@ -168,7 +169,9 @@ mod tests {
     }
 
     #[test]
-    fn agent_concatenates_text_blocks_and_drops_tool_use() {
+    fn agent_indexes_text_and_tool_blocks() {
+        // Tool calls and server-side tool results are indexed (not dropped) so
+        // recall can locate a member by terms that live only in a tool block.
         let m = msg(MessageContent::Agent(vec![
             ContentBlock::Text {
                 text: "first".into(),
@@ -176,13 +179,26 @@ mod tests {
             ContentBlock::ToolUse {
                 id: "t".into(),
                 name: "bash".into(),
-                input: serde_json::json!({}),
+                input: serde_json::json!({ "command": "grep token_bucket" }),
+            },
+            ContentBlock::WebSearchToolResult {
+                tool_use_id: "w".into(),
+                content: serde_json::json!({ "found": "rate limiter design" }),
             },
             ContentBlock::Text {
                 text: "second".into(),
             },
         ]));
-        assert_eq!(index_text(&m), "first\nsecond");
+        let indexed = index_text(&m);
+        assert!(indexed.contains("first") && indexed.contains("second"));
+        assert!(
+            indexed.contains("grep token_bucket"),
+            "tool input: {indexed}"
+        );
+        assert!(
+            indexed.contains("rate limiter design"),
+            "tool result: {indexed}",
+        );
     }
 
     #[test]

@@ -331,17 +331,19 @@ impl ChainQa {
     ) -> Result<AnswerOutcome, RunInvocationError> {
         // Block-wait for the chain's index to catch up before answering, so the
         // agent doesn't search a partial index right after startup (REQ-CHN-009).
-        // If the wait budget elapses while still stale, search coverage may be
-        // partial; tell the agent so it doesn't read a no-hit search as proof
-        // the chain lacks the content (it can always read members directly).
+        // If the wait budget elapses while the index is still not fresh, we
+        // cannot rule out stale/orphaned rows that ranked search would surface
+        // as deleted/edited-away content — so `search_conversations` is withheld
+        // (only `read_conversation`, which reads live `messages`, is offered) and
+        // the agent is told to read members directly (REQ-RET: deleted content
+        // is never returned).
         let index_fresh = self.await_index_fresh(&prep.root_id).await;
         let coverage_note = if index_fresh {
             ""
         } else {
-            "\n\nNote: the search index may not yet cover the whole chain. If \
-             search_conversations returns nothing, do not conclude the chain \
-             lacks the information — read the relevant members directly with \
-             read_conversation before answering."
+            "\n\nNote: search is unavailable for this question because the index \
+             is not yet confirmed up to date. Read the relevant members directly \
+             with read_conversation to answer."
         };
 
         let mut messages = vec![LlmMessage {
@@ -360,7 +362,7 @@ impl ChainQa {
 
             // Planning turn: offer tools, non-streamed so its (possibly
             // narrated) text never reaches the user.
-            let request = build_agent_request(&messages, prep.language, false);
+            let request = build_agent_request(&messages, prep.language, false, index_fresh);
             let resp = prep
                 .service
                 .complete(&request)
@@ -466,7 +468,9 @@ impl ChainQa {
         prep: &PreparedInvocation,
         runtime: &Arc<ChainRuntime>,
     ) -> Result<String, RunInvocationError> {
-        let request = build_agent_request(messages, prep.language, true);
+        // Final turn forces an answer with an empty tool set; search gating is
+        // irrelevant here.
+        let request = build_agent_request(messages, prep.language, true, false);
         let (chunk_tx, mut chunk_rx) = broadcast::channel::<TokenChunk>(256);
         let qa_id = prep.row_id.clone();
         let runtime_handle = Arc::clone(runtime);
@@ -730,15 +734,21 @@ struct RunInvocationError {
     partial_answer: Option<String>,
 }
 
-/// Build one turn's `LlmRequest`. Offers the two Q&A tools unless
-/// `force_answer` (the final allowed turn), where an empty tool set forces the
-/// model to answer with what it has.
+/// Build one turn's `LlmRequest`. Offers the Q&A tools unless `force_answer`
+/// (the final allowed turn), where an empty tool set forces the model to answer
+/// with what it has. `search_enabled` gates the `search_conversations` tool on
+/// index freshness (see [`qa_tools`]).
 fn build_agent_request(
     messages: &[LlmMessage],
     language: crate::llm_language::LlmLanguage,
     force_answer: bool,
+    search_enabled: bool,
 ) -> LlmRequest {
-    let tools = if force_answer { vec![] } else { qa_tools() };
+    let tools = if force_answer {
+        vec![]
+    } else {
+        qa_tools(search_enabled)
+    };
     LlmRequest {
         system: vec![SystemContent::new(
             crate::llm_language::chain_qa_agent_system_prompt(language),
@@ -752,12 +762,19 @@ fn build_agent_request(
     }
 }
 
-/// The two read-only, scope-bound tools the Q&A agent drives (REQ-CHN-009).
-/// The scope is fixed by the host (the chain's members); the model supplies
-/// only the query / target — it cannot widen its reach (REQ-RET-008).
-fn qa_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
+/// The read-only, scope-bound tools the Q&A agent drives (REQ-CHN-009). The
+/// scope is fixed by the host (the chain's members); the model supplies only
+/// the query / target — it cannot widen its reach (REQ-RET-008).
+///
+/// `search_conversations` is offered only when the index is fresh: a stale or
+/// still-pruning index could otherwise surface deleted/edited-away content
+/// through ranked search, which `read_conversation` (live `messages`) never
+/// can — so when freshness can't be established the agent gets the read tool
+/// alone (REQ-RET: deleted content is never returned).
+fn qa_tools(search_enabled: bool) -> Vec<ToolDefinition> {
+    let mut tools = Vec::with_capacity(2);
+    if search_enabled {
+        tools.push(ToolDefinition {
             name: "search_conversations".to_string(),
             description: "Search this chain's messages by relevance to a natural-language query. \
                 Returns ranked snippets, each tagged with its source conversation id. Use this to \
@@ -774,31 +791,32 @@ fn qa_tools() -> Vec<ToolDefinition> {
                 "required": ["query"]
             }),
             defer_loading: false,
-        },
-        ToolDefinition {
-            name: "read_conversation".to_string(),
-            description: "Read the full content of one chain member — including complete tool \
-                output — one bounded page at a time. Pass a conversation_id from the skeleton or a \
-                search result. If the page ends with a 'more' marker, call again with the given \
-                cursor to continue."
-                .to_string(),
-            input_schema: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "conversation_id": {
-                        "type": "string",
-                        "description": "A conversation id from the chain skeleton or a search result."
-                    },
-                    "cursor": {
-                        "type": "integer",
-                        "description": "Resume offset returned by a previous read_conversation page; omit to start at the beginning."
-                    }
+        });
+    }
+    tools.push(ToolDefinition {
+        name: "read_conversation".to_string(),
+        description: "Read the full content of one chain member — including complete tool \
+            output — one bounded page at a time. Pass a conversation_id from the skeleton or a \
+            search result. If the page ends with a 'more' marker, call again with the given \
+            cursor to continue."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "conversation_id": {
+                    "type": "string",
+                    "description": "A conversation id from the chain skeleton or a search result."
                 },
-                "required": ["conversation_id"]
-            }),
-            defer_loading: false,
-        },
-    ]
+                "cursor": {
+                    "type": "integer",
+                    "description": "Resume offset returned by a previous read_conversation page; omit to start at the beginning."
+                }
+            },
+            "required": ["conversation_id"]
+        }),
+        defer_loading: false,
+    });
+    tools
 }
 
 /// Format ranked search hits into a compact, citable tool result.
@@ -875,6 +893,10 @@ fn render_full_transcript(messages: &[Message]) -> String {
                     text.push_str(&f.llm_context_tag());
                 }
                 if !c.images.is_empty() {
+                    tracing::debug!(
+                        n = c.images.len(),
+                        "chain Q&A read_conversation: dropping user-message images — image recall is unsupported",
+                    );
                     let _ = write!(
                         text,
                         "\n[{} image(s) attached to this message are not shown — chain Q&A reads text only]",
@@ -888,7 +910,7 @@ fn render_full_transcript(messages: &[Message]) -> String {
             // what was searched, fetched, run, or returned live in those blocks.
             MessageContent::Agent(blocks) => blocks
                 .iter()
-                .map(render_agent_block)
+                .map(ContentBlock::render_text)
                 .collect::<Vec<_>>()
                 .join("\n"),
             // Keep the full tool-result text. Tool results can also carry image
@@ -932,58 +954,6 @@ fn render_full_transcript(messages: &[Message]) -> String {
         out.push('\n');
     }
     out
-}
-
-/// Render one assistant content block to its text form for the read path.
-/// Exhaustive on purpose (no wildcard): a new [`ContentBlock`] variant must be
-/// given a textual rendering here rather than silently vanishing from reads.
-/// Opaque server-side result payloads are emitted as compact JSON; that's the
-/// best text form, and [`read_page`] paginates the transcript so a large
-/// payload can't overflow a single page.
-fn render_agent_block(b: &ContentBlock) -> String {
-    match b {
-        ContentBlock::Text { text } => text.clone(),
-        ContentBlock::ToolUse { name, input, .. } => format!("[tool call: {name} {input}]"),
-        ContentBlock::ServerToolUse { name, input, .. } => {
-            format!("[server tool call: {name} {input}]")
-        }
-        ContentBlock::McpToolUse {
-            name,
-            server_name,
-            input,
-            ..
-        } => format!("[mcp tool call: {server_name}/{name} {input}]"),
-        ContentBlock::ToolSearchToolResult { content, .. } => format!(
-            "[tool search result: {}]",
-            serde_json::to_string(content).unwrap_or_default()
-        ),
-        ContentBlock::WebSearchToolResult { content, .. } => {
-            format!("[web search result: {content}]")
-        }
-        ContentBlock::WebFetchToolResult { content, .. } => {
-            format!("[web fetch result: {content}]")
-        }
-        ContentBlock::CodeExecutionToolResult { content, .. } => {
-            format!("[code execution result: {content}]")
-        }
-        ContentBlock::BashCodeExecutionToolResult { content, .. } => {
-            format!("[bash execution result: {content}]")
-        }
-        ContentBlock::TextEditorCodeExecutionToolResult { content, .. } => {
-            format!("[text editor execution result: {content}]")
-        }
-        ContentBlock::McpToolResult {
-            content, is_error, ..
-        } => format!(
-            "[mcp tool result{}: {content}]",
-            if *is_error { " (error)" } else { "" }
-        ),
-        // Images can't be represented in the text read path.
-        ContentBlock::Image { .. } => "[image omitted — chain Q&A reads text only]".to_string(),
-        // Results live in the following user message, not the assistant block —
-        // but if one ever appears here, render its text rather than drop it.
-        ContentBlock::ToolResult { content, .. } => content.clone(),
-    }
 }
 
 /// Whether the UI hides this message (`display_data.hidden == true`) — e.g.
