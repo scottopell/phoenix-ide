@@ -162,8 +162,8 @@ async fn submit_question_persists_and_completes() {
     assert_eq!(row.model, "claude-sonnet-4-6");
     assert_eq!(
         llm.call_count(),
-        1,
-        "short leaf → no summary call → exactly one answer call",
+        2,
+        "one planning turn (no tool call → ready) + one streaming answer turn",
     );
 }
 
@@ -259,14 +259,21 @@ impl LlmService for StreamingLlm {
     }
 }
 
-/// Failing streaming LLM: emits one chunk before returning an error.
+/// Failing streaming LLM: the planning turn succeeds with no tool call (so the
+/// loop proceeds to the final streaming turn), then the streaming answer turn
+/// emits one chunk before erroring — exercising the partial-answer path.
 #[derive(Debug)]
 struct FailingStreamingLlm;
 
 #[async_trait]
 impl LlmService for FailingStreamingLlm {
     async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        Err(LlmError::auth("boom"))
+        // Planning turn: no tool call → the loop moves to the final answer.
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text("")],
+            end_turn: true,
+            usage: Usage::default(),
+        })
     }
 
     async fn complete_streaming(
@@ -478,33 +485,22 @@ async fn chain_runtime_dropped_from_registry_after_qa_completes_with_no_subscrib
     );
 }
 
-/// Scripted agentic LLM: turn 1 issues a `search_conversations` tool call;
-/// turn 2 (after the tool result is fed back) returns the final answer.
-/// Proves the loop executes a tool then answers (REQ-CHN-009).
+/// Scripted agentic LLM exercising the planning→answer split: the first
+/// planning `complete()` issues a `search_conversations` tool call; the next
+/// planning `complete()` returns no tool call (ready); the final streaming turn
+/// (`complete_streaming`) returns the answer. Proves the loop executes a tool,
+/// detects readiness, then streams the answer (REQ-CHN-009).
 #[derive(Debug)]
 struct ScriptedToolLlm {
-    calls: AtomicUsize,
+    complete_calls: AtomicUsize,
 }
 
 #[async_trait]
 impl LlmService for ScriptedToolLlm {
     async fn complete(&self, _request: &LlmRequest) -> Result<LlmResponse, LlmError> {
-        // The loop drives `complete_streaming`; this satisfies the trait.
-        Ok(LlmResponse {
-            content: vec![ContentBlock::text("unused")],
-            end_turn: true,
-            usage: Usage::default(),
-        })
-    }
-
-    async fn complete_streaming(
-        &self,
-        _request: &LlmRequest,
-        _chunk_tx: &broadcast::Sender<TokenChunk>,
-    ) -> Result<LlmResponse, LlmError> {
-        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        let n = self.complete_calls.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
-            // Intermediate turn: ask to search (no answer text published).
+            // Planning turn 1: ask to search.
             Ok(LlmResponse {
                 content: vec![ContentBlock::ToolUse {
                     id: "t1".to_string(),
@@ -515,13 +511,28 @@ impl LlmService for ScriptedToolLlm {
                 usage: Usage::default(),
             })
         } else {
-            // Final turn: answer with no tool call.
+            // Planning turn 2: no tool call → ready to answer.
             Ok(LlmResponse {
-                content: vec![ContentBlock::text("final answer after search")],
+                content: vec![ContentBlock::text("")],
                 end_turn: true,
                 usage: Usage::default(),
             })
         }
+    }
+
+    async fn complete_streaming(
+        &self,
+        _request: &LlmRequest,
+        chunk_tx: &broadcast::Sender<TokenChunk>,
+    ) -> Result<LlmResponse, LlmError> {
+        // Final answer turn: stream the answer.
+        let _ = chunk_tx.send(TokenChunk::Text("final answer after search".to_string()));
+        tokio::task::yield_now().await;
+        Ok(LlmResponse {
+            content: vec![ContentBlock::text("final answer after search")],
+            end_turn: true,
+            usage: Usage::default(),
+        })
     }
 
     #[allow(clippy::unnecessary_literal_bound)]
@@ -538,7 +549,7 @@ async fn agent_loop_executes_tool_then_answers() {
     add_user_message(&db, "ag-b", 0, "the rate limiter uses a token bucket").await;
 
     let llm: Arc<ScriptedToolLlm> = Arc::new(ScriptedToolLlm {
-        calls: AtomicUsize::new(0),
+        complete_calls: AtomicUsize::new(0),
     });
     let registry = registry_with_service(llm.clone() as Arc<dyn LlmService>);
     let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
@@ -559,8 +570,8 @@ async fn agent_loop_executes_tool_then_answers() {
         Some("final answer after search"),
     );
     assert_eq!(
-        llm.calls.load(Ordering::SeqCst),
+        llm.complete_calls.load(Ordering::SeqCst),
         2,
-        "loop should take one tool turn then one answer turn",
+        "one planning turn that searches + one planning turn that's ready (answer streams separately)",
     );
 }

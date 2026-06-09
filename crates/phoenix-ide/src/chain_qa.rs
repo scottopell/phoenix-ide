@@ -26,6 +26,7 @@ use crate::llm::{
 use chrono::Utc;
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::broadcast;
 
 /// Maximum number of tool-using turns the Q&A agent may take before it must
@@ -45,6 +46,14 @@ const READ_PAGE_CHARS: usize = 6000;
 /// Maximum tokens cap for an answer turn. Sized to a typical recall answer;
 /// the model can stop earlier via `end_turn`.
 const ANSWER_MAX_TOKENS: u32 = 2048;
+
+/// Block-wait budget for the chain's index to become fresh before answering
+/// (REQ-CHN-009): up to `INDEX_WAIT_ATTEMPTS * INDEX_POLL_MS` ms. After that we
+/// answer anyway (`read_conversation` reads live `messages`, so the agent can
+/// still answer — only search coverage may lag). The reconcile sweep is fast,
+/// so this only ever bites in the first moments after startup.
+const INDEX_WAIT_ATTEMPTS: usize = 100;
+const INDEX_POLL_MS: u64 = 100;
 
 /// Snapshot of chain shape captured at answer time (REQ-CHN-005). Two integers
 /// stand in for a full member-graph snapshot; the UI compares them against
@@ -266,7 +275,7 @@ impl ChainQa {
             row_id: qa_id,
             question: question.to_string(),
             skeleton,
-            member_ids,
+            root_id: root_id.to_string(),
             service,
             model_id,
             language,
@@ -300,18 +309,21 @@ impl ChainQa {
 
     /// Phase 2 — the read-only agent loop (REQ-CHN-009).
     ///
-    /// Seeds the model with the question + skeleton and the two scope-bound
-    /// tools, then loops: each turn streams into a per-turn buffer. A turn that
-    /// ends in tool calls is **intermediate** — its buffered text is discarded
-    /// (streaming discipline: only the final answer reaches the user), its
-    /// tool calls are executed, and their results are appended. A turn with no
-    /// tool call is the **answer**: its buffered tokens are published. The last
-    /// allowed turn offers no tools, forcing an answer (bounded cost).
+    /// First blocks until the chain's index is fresh (so search sees the whole
+    /// chain), then runs **planning turns** that may call the scope-bound
+    /// search/read tools. Planning turns run non-streamed, so intermediate
+    /// "I'll search…" narration never reaches the user. When the model stops
+    /// calling tools (or the turn cap is hit), a dedicated final turn with no
+    /// tools streams the answer token-by-token over the chain broadcaster.
     async fn run_answer_invocation(
         &self,
         prep: &PreparedInvocation,
         runtime: &Arc<ChainRuntime>,
     ) -> Result<String, RunInvocationError> {
+        // Block-wait for the chain's index to catch up before answering, so the
+        // agent doesn't search a partial index right after startup (REQ-CHN-009).
+        self.await_index_fresh(&prep.root_id).await;
+
         let mut messages = vec![LlmMessage {
             role: MessageRole::User,
             content: vec![ContentBlock::text(format!(
@@ -321,43 +333,22 @@ impl ChainQa {
         }];
 
         for turn in 0..MAX_QA_TURNS {
-            let force_answer = turn + 1 == MAX_QA_TURNS;
-            let request = build_agent_request(&messages, prep.language, force_answer);
+            // Final allowed turn: answer directly (streamed, no tools).
+            if turn + 1 == MAX_QA_TURNS {
+                break;
+            }
 
-            // Per-turn buffer: collect this turn's deltas without publishing.
-            // We only know whether the turn is intermediate (tool calls) or
-            // the final answer after it completes.
-            let (chunk_tx, mut chunk_rx) = broadcast::channel::<TokenChunk>(256);
-            let collector = tokio::spawn(async move {
-                let mut deltas: Vec<String> = Vec::new();
-                loop {
-                    match chunk_rx.recv().await {
-                        Ok(TokenChunk::Text(d)) => deltas.push(d),
-                        Err(broadcast::error::RecvError::Closed) => break,
-                        Ok(TokenChunk::RateLimitSnapshot(_))
-                        | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    }
-                }
-                deltas
-            });
-
-            let response = prep.service.complete_streaming(&request, &chunk_tx).await;
-            drop(chunk_tx);
-            let deltas = collector.await.unwrap_or_default();
-
-            let resp = match response {
-                Ok(r) => r,
-                Err(e) => {
-                    // Publish whatever streamed before the error so the user
-                    // sees the partial (REQ-CHN-005), then fail.
-                    Self::publish_deltas(runtime, &prep.row_id, &deltas);
-                    let partial = deltas.concat();
-                    return Err(RunInvocationError {
-                        error: ChainQaError::from(e),
-                        partial_answer: (!partial.is_empty()).then_some(partial),
-                    });
-                }
-            };
+            // Planning turn: offer tools, non-streamed so its (possibly
+            // narrated) text never reaches the user.
+            let request = build_agent_request(&messages, prep.language, false);
+            let resp = prep
+                .service
+                .complete(&request)
+                .await
+                .map_err(|e| RunInvocationError {
+                    error: ChainQaError::from(e),
+                    partial_answer: None,
+                })?;
 
             let tool_calls: Vec<(String, String, serde_json::Value)> = resp
                 .tool_uses()
@@ -365,26 +356,26 @@ impl ChainQa {
                 .map(|(id, name, input)| (id.to_string(), name.to_string(), input.clone()))
                 .collect();
 
+            // No tool call → the agent is ready; stream the final answer.
             if tool_calls.is_empty() {
-                // Final answer turn: publish its tokens.
-                let answer = resp.text();
-                if deltas.is_empty() && !answer.is_empty() {
-                    Self::publish_deltas(runtime, &prep.row_id, std::slice::from_ref(&answer));
-                } else {
-                    Self::publish_deltas(runtime, &prep.row_id, &deltas);
-                }
-                return Ok(answer);
+                break;
             }
 
-            // Intermediate turn: drop its buffered text, execute the tools,
-            // append the assistant turn and the tool results, and continue.
+            // Execute the tools and feed results back. Re-resolve the chain's
+            // members live so a continuation added mid-run is in scope
+            // (REQ-RET-008 host-bound-to-root, REQ-CHN-009).
+            let members = self
+                .db
+                .chain_members_forward(&prep.root_id)
+                .await
+                .unwrap_or_default();
             messages.push(LlmMessage {
                 role: MessageRole::Assistant,
                 content: resp.content.clone(),
             });
             let mut results = Vec::with_capacity(tool_calls.len());
             for (id, name, input) in &tool_calls {
-                let (content, is_error) = self.execute_tool(name, input, &prep.member_ids).await;
+                let (content, is_error) = self.execute_tool(name, input, &members).await;
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content,
@@ -398,19 +389,80 @@ impl ChainQa {
             });
         }
 
-        // The final turn sets `force_answer` (no tools), so the loop always
-        // returns from the `tool_calls.is_empty()` branch above.
-        unreachable!("agent loop must answer on its final, tool-free turn")
+        self.stream_final_answer(&messages, prep, runtime).await
     }
 
-    /// Publish a sequence of answer-token deltas onto the chain broadcaster.
-    fn publish_deltas(runtime: &Arc<ChainRuntime>, qa_id: &str, deltas: &[String]) {
-        for delta in deltas {
-            runtime.publish(ChainSseEvent::Token {
-                chain_qa_id: qa_id.to_string(),
-                delta: delta.clone(),
-            });
+    /// Final turn: a no-tools invocation whose tokens stream live onto the
+    /// chain broadcaster as they arrive (REQ-CHN-004). Only this turn is
+    /// published — planning turns ran non-streamed — so the user sees a working
+    /// indicator, then the answer streaming in.
+    async fn stream_final_answer(
+        &self,
+        messages: &[LlmMessage],
+        prep: &PreparedInvocation,
+        runtime: &Arc<ChainRuntime>,
+    ) -> Result<String, RunInvocationError> {
+        let request = build_agent_request(messages, prep.language, true);
+        let (chunk_tx, mut chunk_rx) = broadcast::channel::<TokenChunk>(256);
+        let qa_id = prep.row_id.clone();
+        let runtime_handle = Arc::clone(runtime);
+        let forwarder = tokio::spawn(async move {
+            let mut partial = String::new();
+            loop {
+                match chunk_rx.recv().await {
+                    Ok(TokenChunk::Text(delta)) => {
+                        partial.push_str(&delta);
+                        runtime_handle.publish(ChainSseEvent::Token {
+                            chain_qa_id: qa_id.clone(),
+                            delta,
+                        });
+                    }
+                    Ok(TokenChunk::RateLimitSnapshot(_))
+                    | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+            partial
+        });
+
+        let response = prep.service.complete_streaming(&request, &chunk_tx).await;
+        drop(chunk_tx);
+        let partial = forwarder.await.unwrap_or_default();
+
+        match response {
+            Ok(resp) => Ok(resp.text()),
+            Err(e) => Err(RunInvocationError {
+                error: ChainQaError::from(e),
+                partial_answer: (!partial.is_empty()).then_some(partial),
+            }),
         }
+    }
+
+    /// Block until the chain's index is fresh for its members, or the wait
+    /// budget elapses (REQ-CHN-009). Best-effort: on error or timeout it returns
+    /// and the caller answers anyway (`read_conversation` reads live `messages`,
+    /// so only search coverage — not answerability — is affected).
+    async fn await_index_fresh(&self, root_id: &str) {
+        let members = self
+            .db
+            .chain_members_forward(root_id)
+            .await
+            .unwrap_or_default();
+        if members.is_empty() {
+            return;
+        }
+        for _ in 0..INDEX_WAIT_ATTEMPTS {
+            match self.retriever.is_fresh_for(&members).await {
+                Ok(true) => return,
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(root = %root_id, error = %e, "chain index freshness check failed; answering anyway");
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(INDEX_POLL_MS)).await;
+        }
+        tracing::warn!(root = %root_id, "chain index not fresh after wait; answering on a partial index");
     }
 
     /// Execute one tool call. Read-only: `search_conversations` runs ranked
@@ -546,8 +598,10 @@ struct PreparedInvocation {
     question: String,
     /// Orientation skeleton (member ids + titles + continuation summaries).
     skeleton: String,
-    /// The chain's member conversation ids — the tool scope (REQ-RET-008).
-    member_ids: Vec<String>,
+    /// The chain root. The tool scope is re-resolved live from this per turn
+    /// (`chain_members_forward`), so a continuation added mid-run is in scope
+    /// (REQ-RET-008 host-bound-to-root, REQ-CHN-009).
+    root_id: String,
     service: Arc<dyn LlmService>,
     #[allow(dead_code)] // Persisted into chain_qa.model via insert_chain_qa.
     model_id: String,
@@ -669,12 +723,21 @@ fn read_page(messages: &[Message], cursor: usize) -> String {
     }
 }
 
-/// Render a conversation transcript with **full** content, including complete
-/// tool-result bodies (unlike the search index, which keeps a head+tail
-/// excerpt for ranking). This is the agent's ground-truth read path.
+/// Render a conversation transcript with **full** content for the agent's
+/// ground-truth read path. Unlike the search index it keeps complete
+/// tool-result bodies; like the index it skips UI-hidden messages, uses the
+/// model-visible (`llm_text`) form of user messages, and additionally
+/// surfaces agent tool calls (name + arguments) so recall questions about
+/// *what the agent did* are answerable.
 fn render_full_transcript(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
+        // Mirror the index extractor: never surface UI-hidden recovery/
+        // dismissal markers, so the agent can't answer from suppressed
+        // implementation artifacts.
+        if message_is_hidden(m) {
+            continue;
+        }
         let label = match m.message_type {
             MessageType::User => "User",
             MessageType::Agent => "Agent",
@@ -685,11 +748,18 @@ fn render_full_transcript(messages: &[Message]) -> String {
             MessageType::Skill => "Skill",
         };
         let body = match &m.content {
-            MessageContent::User(c) => c.text.clone(),
+            // `llm_text()` is the expanded form the model actually saw (e.g.
+            // @file content), not the display shorthand.
+            MessageContent::User(c) => c.llm_text().to_string(),
+            // Keep text blocks AND a readable rendering of tool calls — the
+            // command/patch target/URL lives in the tool-use arguments.
             MessageContent::Agent(blocks) => blocks
                 .iter()
                 .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.as_str()),
+                    ContentBlock::Text { text } => Some(text.clone()),
+                    ContentBlock::ToolUse { name, input, .. } => {
+                        Some(format!("[tool call: {name} {input}]"))
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -706,6 +776,18 @@ fn render_full_transcript(messages: &[Message]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Whether the UI hides this message (`display_data.hidden == true`) — e.g.
+/// dismissed-error/question recovery markers. Mirrors the index extractor's
+/// hidden guard so the read path and the search index agree on what content
+/// is user-visible.
+fn message_is_hidden(m: &Message) -> bool {
+    m.display_data
+        .as_ref()
+        .and_then(|d| d.get("hidden"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Find the **trailing** `MessageType::Continuation` message and extract its
