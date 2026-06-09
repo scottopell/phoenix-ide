@@ -575,3 +575,32 @@ async fn agent_loop_executes_tool_then_answers() {
         "one planning turn that searches + one planning turn that's ready (answer streams separately)",
     );
 }
+
+/// The skeleton and search hits render member ids as `#<id>`, and the tool
+/// tells the model to pass an id "from the skeleton or a search result" — so a
+/// `#`-prefixed id must be accepted, not rejected as out-of-chain.
+#[tokio::test]
+async fn read_conversation_accepts_hash_prefixed_id() {
+    let db = Database::open_in_memory().await.unwrap();
+    build_linear_chain(&db, &["rd-a", "rd-b"]).await;
+    add_user_message(&db, "rd-b", 0, "hello from b").await;
+
+    let llm = CountingLlm::new("unused");
+    let registry = registry_with_service(llm as Arc<dyn LlmService>);
+    let qa = ChainQa::new(db.clone(), registry, test_retriever(&db));
+    let members = vec!["rd-a".to_string(), "rd-b".to_string()];
+
+    let (out, is_error) = qa
+        .execute_tool(
+            "read_conversation",
+            &serde_json::json!({ "conversation_id": "#rd-b" }),
+            &members,
+        )
+        .await;
+
+    assert!(!is_error, "hash-prefixed id should be accepted, got: {out}");
+    assert!(
+        out.contains("hello from b"),
+        "read should return the member's content, got: {out}",
+    );
+}

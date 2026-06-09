@@ -456,8 +456,25 @@ impl ChainQa {
                             delta,
                         });
                     }
-                    Ok(TokenChunk::RateLimitSnapshot(_))
-                    | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Ok(TokenChunk::RateLimitSnapshot(_)) => {}
+                    // The forwarder fell behind the provider and the channel
+                    // dropped `skipped` token chunks. They're unrecoverable, but
+                    // the failed-row contract preserves *what streamed* — so
+                    // record the gap (in both the persisted partial and the live
+                    // view) instead of silently concatenating a misleading
+                    // suffix.
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        tracing::warn!(
+                            chain_qa_id = %qa_id, skipped,
+                            "chain Q&A answer stream lagged; dropped token chunks",
+                        );
+                        let marker = "\n[… some streamed tokens were dropped …]\n".to_string();
+                        partial.push_str(&marker);
+                        runtime_handle.publish(ChainSseEvent::Token {
+                            chain_qa_id: qa_id.clone(),
+                            delta: marker,
+                        });
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -547,10 +564,16 @@ impl ChainQa {
                 }
             }
             "read_conversation" => {
+                // The skeleton and search hits render ids with a leading `#`
+                // (`#<id>`), and the tool tells the model to pass an id "from
+                // the skeleton or a search result" — so accept that exact token
+                // by stripping a leading `#` before the membership check.
                 let conv_id = input
                     .get("conversation_id")
                     .and_then(serde_json::Value::as_str)
-                    .unwrap_or("");
+                    .unwrap_or("")
+                    .trim();
+                let conv_id = conv_id.strip_prefix('#').unwrap_or(conv_id);
                 if conv_id.is_empty() {
                     return (
                         "error: read_conversation requires 'conversation_id'".to_string(),
@@ -829,7 +852,26 @@ fn render_full_transcript(messages: &[Message]) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join("\n"),
-            MessageContent::Tool(c) => c.content.clone(),
+            // Keep the full tool-result text. Tool results can also carry image
+            // payloads bound for the LLM, but the chain Q&A read path is
+            // text-only — surface the gap to the agent (and the logs) rather
+            // than silently stranding the images.
+            MessageContent::Tool(c) => {
+                if c.images.is_empty() {
+                    c.content.clone()
+                } else {
+                    tracing::debug!(
+                        tool_use_id = %c.tool_use_id,
+                        n = c.images.len(),
+                        "chain Q&A read_conversation: dropping tool-result images — image recall is unsupported",
+                    );
+                    format!(
+                        "{}\n[{} image(s) in this tool result are not shown — chain Q&A reads text only]",
+                        c.content,
+                        c.images.len()
+                    )
+                }
+            }
             MessageContent::System(c) => c.text.clone(),
             MessageContent::Error(c) => c.message.clone(),
             MessageContent::Continuation(c) => c.summary.clone(),
