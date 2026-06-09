@@ -71,8 +71,7 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     expect(screen.getByText('second')).toBeTruthy();
 
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
 
     // Poll call advances `since` to the prior `end_offset` (2).
@@ -97,8 +96,7 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     expect(partialEl.className).toContain('pinsp-output-line--partial');
 
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
 
     // Partial is transient: the prior value is gone, replaced by the latest.
@@ -144,8 +142,7 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     expect(screen.queryByText(/output truncated/)).toBeNull();
 
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
 
     expect(screen.getByText(/output truncated/)).toBeTruthy();
@@ -167,8 +164,7 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     expect(screen.getByText('exit 0')).toBeTruthy();
 
     await act(async () => {
-      vi.advanceTimersByTime(5000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(5000);
     });
 
     // Only the seed fetch — no polling on a terminal handle.
@@ -201,8 +197,7 @@ describe('ProcessInspectorPanel — output accumulation', () => {
         snap({ output: { start_offset: offset - BATCH, end_offset: offset, truncated_before: false, lines: lines(...batch) } }),
       );
       await act(async () => {
-        vi.advanceTimersByTime(1000);
-        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(1000);
       });
     }
 
@@ -249,8 +244,7 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     height = 600; // the wrapped partial grew the scroll height
 
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
 
     // No new full lines — only the partial changed.
@@ -304,8 +298,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
 
     // First interval fires the (slow) poll with since = 1.
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(2);
     expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', 1);
@@ -313,8 +306,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
     // Several more intervals fire while the first poll is still outstanding.
     // The in-flight gate must suppress every one of them — no second fetch.
     await act(async () => {
-      vi.advanceTimersByTime(3000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(3000);
     });
     expect(getInsp).toHaveBeenCalledTimes(2);
 
@@ -335,8 +327,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
       snap({ output: { start_offset: 3, end_offset: 4, truncated_before: false, lines: lines([3, 'c']) } }),
     );
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(3);
     expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-1', 3);
@@ -364,8 +355,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
 
     // A's poll fires and is left outstanding.
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(2); // A seed + A slow poll
     expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'a-1', 1);
@@ -385,8 +375,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
 
     // B's poll fires and is left outstanding.
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(4); // + B slow poll
     expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-2', 1);
@@ -402,8 +391,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
 
     // The next interval must NOT issue a second B fetch: B's gate is still held.
     await act(async () => {
-      vi.advanceTimersByTime(3000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(3000);
     });
     expect(getInsp).toHaveBeenCalledTimes(4);
 
@@ -422,8 +410,7 @@ describe('ProcessInspectorPanel — poll serialization', () => {
       await Promise.resolve();
     });
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(5);
     expect(getInsp).toHaveBeenLastCalledWith('ws-1', 'b-2', 1);
@@ -444,8 +431,7 @@ describe('ProcessInspectorPanel — poll failure surfacing', () => {
     expect(screen.queryByText(/stale/)).toBeNull();
 
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
 
     // The failing poll surfaces a non-destructive stale indicator…
@@ -466,14 +452,12 @@ describe('ProcessInspectorPanel — poll failure surfacing', () => {
 
     await renderPanel();
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
     expect(screen.getByText(/data below may be stale/)).toBeTruthy();
 
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
     expect(screen.queryByText(/data below may be stale/)).toBeNull();
     expect(screen.getByText('recovered')).toBeTruthy();
@@ -490,8 +474,7 @@ describe('ProcessInspectorPanel — poll failure surfacing', () => {
     expect(getInsp).toHaveBeenCalledTimes(1);
 
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
 
     // The 404 surfaces a definitive "no longer exists" indicator, keeping the
@@ -502,8 +485,7 @@ describe('ProcessInspectorPanel — poll failure surfacing', () => {
 
     // Polling has stopped — further intervals issue no new fetches.
     await act(async () => {
-      vi.advanceTimersByTime(5000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(5000);
     });
     expect(getInsp).toHaveBeenCalledTimes(2);
   });
@@ -522,8 +504,7 @@ describe('ProcessInspectorPanel — poll failure surfacing', () => {
     // A 404 is terminal: no polling ever starts (no snapshot gate to satisfy,
     // and the handle is marked gone regardless).
     await act(async () => {
-      vi.advanceTimersByTime(5000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(5000);
     });
     expect(getInsp).toHaveBeenCalledTimes(1);
   });
@@ -553,8 +534,7 @@ describe('ProcessInspectorPanel — poll failure surfacing', () => {
     // The recurring effect retries the seed on the interval — with no `since`,
     // since the cursor never advanced past the failed seed.
     await act(async () => {
-      vi.advanceTimersByTime(1000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(1000);
     });
     expect(getInsp).toHaveBeenCalledTimes(2);
     // The retry carries no advanced cursor (the failed seed never set one).
@@ -574,8 +554,7 @@ describe('ProcessInspectorPanel — poll failure surfacing', () => {
 
     // A 404 seed is terminal: no retry fires on subsequent intervals.
     await act(async () => {
-      vi.advanceTimersByTime(5000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(5000);
     });
     expect(getInsp).toHaveBeenCalledTimes(1);
   });
