@@ -276,6 +276,7 @@ impl ChainQa {
             question: question.to_string(),
             skeleton,
             root_id: root_id.to_string(),
+            snapshot,
             service,
             model_id,
             language,
@@ -319,16 +320,27 @@ impl ChainQa {
         &self,
         prep: &PreparedInvocation,
         runtime: &Arc<ChainRuntime>,
-    ) -> Result<String, RunInvocationError> {
+    ) -> Result<AnswerOutcome, RunInvocationError> {
         // Block-wait for the chain's index to catch up before answering, so the
         // agent doesn't search a partial index right after startup (REQ-CHN-009).
-        self.await_index_fresh(&prep.root_id).await;
+        // If the wait budget elapses while still stale, search coverage may be
+        // partial; tell the agent so it doesn't read a no-hit search as proof
+        // the chain lacks the content (it can always read members directly).
+        let index_fresh = self.await_index_fresh(&prep.root_id).await;
+        let coverage_note = if index_fresh {
+            ""
+        } else {
+            "\n\nNote: the search index may not yet cover the whole chain. If \
+             search_conversations returns nothing, do not conclude the chain \
+             lacks the information — read the relevant members directly with \
+             read_conversation before answering."
+        };
 
         let mut messages = vec![LlmMessage {
             role: MessageRole::User,
             content: vec![ContentBlock::text(format!(
-                "Chain skeleton (members in order):\n{}\n---\nQuestion: {}",
-                prep.skeleton, prep.question
+                "Chain skeleton (members in order):\n{}\n---\nQuestion: {}{}",
+                prep.skeleton, prep.question, coverage_note
             ))],
         }];
 
@@ -363,12 +375,18 @@ impl ChainQa {
 
             // Execute the tools and feed results back. Re-resolve the chain's
             // members live so a continuation added mid-run is in scope
-            // (REQ-RET-008 host-bound-to-root, REQ-CHN-009).
+            // (REQ-RET-008 host-bound-to-root, REQ-CHN-009). A lookup failure
+            // here would silently empty the scope (every search a miss, every
+            // read "not part of this chain"), so fail the Q&A instead of
+            // answering against a fabricated empty chain.
             let members = self
                 .db
                 .chain_members_forward(&prep.root_id)
                 .await
-                .unwrap_or_default();
+                .map_err(|e| RunInvocationError {
+                    error: ChainQaError::from(e),
+                    partial_answer: None,
+                })?;
             messages.push(LlmMessage {
                 role: MessageRole::Assistant,
                 content: resp.content.clone(),
@@ -389,7 +407,28 @@ impl ChainQa {
             });
         }
 
-        self.stream_final_answer(&messages, prep, runtime).await
+        let answer = self.stream_final_answer(&messages, prep, runtime).await?;
+        // Recompute the freshness snapshot from the chain's live shape now that
+        // the answer is produced (the tool scope resolved members live, so the
+        // answer reflects any mid-run continuation). Falls back to the
+        // submission-time snapshot if the recompute hits a DB error.
+        let snapshot = self
+            .live_snapshot(&prep.root_id)
+            .await
+            .unwrap_or(prep.snapshot);
+        Ok(AnswerOutcome { answer, snapshot })
+    }
+
+    /// Recompute the chain snapshot from its current members. Returns `None` on
+    /// any DB error so the caller can fall back to the submission-time value
+    /// rather than fail an otherwise-successful answer.
+    async fn live_snapshot(&self, root_id: &str) -> Option<ChainSnapshot> {
+        let member_ids = self.db.chain_members_forward(root_id).await.ok()?;
+        let mut members = Vec::with_capacity(member_ids.len());
+        for id in &member_ids {
+            members.push(self.db.get_conversation(id).await.ok()?);
+        }
+        Some(compute_chain_snapshot(&members))
     }
 
     /// Final turn: a no-tools invocation whose tokens stream live onto the
@@ -439,30 +478,31 @@ impl ChainQa {
     }
 
     /// Block until the chain's index is fresh for its members, or the wait
-    /// budget elapses (REQ-CHN-009). Best-effort: on error or timeout it returns
-    /// and the caller answers anyway (`read_conversation` reads live `messages`,
-    /// so only search coverage — not answerability — is affected).
-    async fn await_index_fresh(&self, root_id: &str) {
-        let members = self
-            .db
-            .chain_members_forward(root_id)
-            .await
-            .unwrap_or_default();
+    /// budget elapses (REQ-CHN-009). Returns whether the index is fresh:
+    /// `false` means the caller should warn the agent that search coverage may
+    /// be partial. Best-effort — on a DB/retriever error it returns `false`
+    /// (treat as partial) and the caller answers anyway, since
+    /// `read_conversation` reads live `messages` regardless of the index.
+    async fn await_index_fresh(&self, root_id: &str) -> bool {
+        let Ok(members) = self.db.chain_members_forward(root_id).await else {
+            return false;
+        };
         if members.is_empty() {
-            return;
+            return true;
         }
         for _ in 0..INDEX_WAIT_ATTEMPTS {
             match self.retriever.is_fresh_for(&members).await {
-                Ok(true) => return,
+                Ok(true) => return true,
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(root = %root_id, error = %e, "chain index freshness check failed; answering anyway");
-                    return;
+                    tracing::warn!(root = %root_id, error = %e, "chain index freshness check failed; answering on a partial index");
+                    return false;
                 }
             }
             tokio::time::sleep(Duration::from_millis(INDEX_POLL_MS)).await;
         }
         tracing::warn!(root = %root_id, "chain index not fresh after wait; answering on a partial index");
+        false
     }
 
     /// Execute one tool call. Read-only: `search_conversations` runs ranked
@@ -545,12 +585,22 @@ impl ChainQa {
     async fn finalize(
         &self,
         qa_id: &str,
-        result: Result<String, RunInvocationError>,
+        result: Result<AnswerOutcome, RunInvocationError>,
         runtime: &Arc<ChainRuntime>,
     ) {
         match result {
-            Ok(answer) => {
-                if let Err(e) = self.db.complete_chain_qa(qa_id, &answer, Utc::now()).await {
+            Ok(AnswerOutcome { answer, snapshot }) => {
+                if let Err(e) = self
+                    .db
+                    .complete_chain_qa(
+                        qa_id,
+                        &answer,
+                        snapshot.member_count,
+                        snapshot.total_messages,
+                        Utc::now(),
+                    )
+                    .await
+                {
                     tracing::error!(
                         qa_id = %qa_id, error = %e,
                         "chain Q&A complete UPDATE failed; row will be swept on restart",
@@ -602,11 +652,26 @@ struct PreparedInvocation {
     /// (`chain_members_forward`), so a continuation added mid-run is in scope
     /// (REQ-RET-008 host-bound-to-root, REQ-CHN-009).
     root_id: String,
+    /// Chain shape at submission time. Used as the fallback freshness snapshot
+    /// if the completion-time recompute fails — never staler than the row's
+    /// inserted value.
+    snapshot: ChainSnapshot,
     service: Arc<dyn LlmService>,
     #[allow(dead_code)] // Persisted into chain_qa.model via insert_chain_qa.
     model_id: String,
     /// Language inherited from the chain's root conversation.
     language: crate::llm_language::LlmLanguage,
+}
+
+/// Successful outcome of an agent run: the answer plus the chain snapshot as
+/// of completion. The snapshot is recomputed at completion (not reused from
+/// submission) because the tool scope resolves chain members live, so a
+/// continuation added mid-run can legitimately inform the answer — the
+/// persisted freshness counters must reflect the shape the answer actually saw
+/// (REQ-CHN-005, REQ-CHN-009).
+struct AnswerOutcome {
+    answer: String,
+    snapshot: ChainSnapshot,
 }
 
 /// Internal error wrapper pairing a [`ChainQaError`] with whatever partial

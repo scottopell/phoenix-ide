@@ -2006,7 +2006,13 @@ impl Database {
         Ok(())
     }
 
-    /// Mark a Q&A row complete with the final answer (REQ-CHN-005).
+    /// Mark a Q&A row complete with the final answer and the chain snapshot as
+    /// of completion (REQ-CHN-005).
+    ///
+    /// The snapshot counters are rewritten (not just set once at insert)
+    /// because the Q&A agent resolves chain members live, so a continuation
+    /// added mid-run can inform the answer; the freshness comparison must be
+    /// against the shape the answer actually saw.
     ///
     /// # Errors
     ///
@@ -2016,16 +2022,21 @@ impl Database {
         &self,
         id: &str,
         answer: &str,
+        snapshot_member_count: i64,
+        snapshot_total_messages: i64,
         completed_at: DateTime<Utc>,
     ) -> DbResult<()> {
         let result = sqlx::query(
             "UPDATE chain_qa
-             SET answer = ?1, status = ?2, completed_at = ?3
-             WHERE id = ?4",
+             SET answer = ?1, status = ?2, completed_at = ?3,
+                 snapshot_member_count = ?4, snapshot_total_messages = ?5
+             WHERE id = ?6",
         )
         .bind(answer)
         .bind(ChainQaStatus::Completed.as_str())
         .bind(completed_at.to_rfc3339())
+        .bind(snapshot_member_count)
+        .bind(snapshot_total_messages)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -4423,7 +4434,8 @@ mod tests {
         assert!(row.completed_at.is_none());
     }
 
-    /// REQ-CHN-005: `complete_chain_qa` sets answer + `completed_at` + status.
+    /// REQ-CHN-005: `complete_chain_qa` sets answer + `completed_at` + status,
+    /// and rewrites the snapshot counters to the completion-time chain shape.
     #[tokio::test]
     async fn test_complete_chain_qa_transitions_row() {
         let db = Database::open_in_memory().await.unwrap();
@@ -4432,8 +4444,10 @@ mod tests {
             .await
             .unwrap();
 
+        // Complete with a snapshot larger than the inserted one (a continuation
+        // landed mid-run): the completion-time counters must overwrite.
         let now = Utc::now();
-        db.complete_chain_qa("qac-1", "the final answer", now)
+        db.complete_chain_qa("qac-1", "the final answer", 4, 21, now)
             .await
             .unwrap();
 
@@ -4441,6 +4455,8 @@ mod tests {
         assert_eq!(row.status, ChainQaStatus::Completed);
         assert_eq!(row.answer.as_deref(), Some("the final answer"));
         assert!(row.completed_at.is_some());
+        assert_eq!(row.snapshot_member_count, 4);
+        assert_eq!(row.snapshot_total_messages, 21);
     }
 
     /// REQ-CHN-005: `fail_chain_qa` preserves the question and an optional partial.
@@ -4509,7 +4525,7 @@ mod tests {
         db.insert_chain_qa(fresh_new_chain_qa("qas-c", "qas-a"))
             .await
             .unwrap();
-        db.complete_chain_qa("qas-c", "done", Utc::now())
+        db.complete_chain_qa("qas-c", "done", 2, 8, Utc::now())
             .await
             .unwrap();
 
