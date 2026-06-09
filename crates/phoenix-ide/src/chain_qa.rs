@@ -34,6 +34,14 @@ use tokio::sync::broadcast;
 /// agent typically searches once or twice and reads a member or two.
 const MAX_QA_TURNS: usize = 6;
 
+/// Maximum tool calls actually executed in one planning turn. Providers may
+/// batch parallel tool calls in a single assistant message; without a cap a
+/// batch of `read_conversation`s could inject (batch × [`READ_PAGE_CHARS`])
+/// into the next turn, defeating the per-page budget. Calls beyond the cap get
+/// a "skipped" tool result (every `tool_use` must still be answered to keep the
+/// request valid) so the model re-requests fewer.
+const MAX_TOOL_CALLS_PER_TURN: usize = 4;
+
 /// How many ranked chunks `search_conversations` returns per call.
 const SEARCH_TOP_K: usize = 8;
 
@@ -392,8 +400,21 @@ impl ChainQa {
                 content: resp.content.clone(),
             });
             let mut results = Vec::with_capacity(tool_calls.len());
-            for (id, name, input) in &tool_calls {
-                let (content, is_error) = self.execute_tool(name, input, &members).await;
+            for (idx, (id, name, input)) in tool_calls.iter().enumerate() {
+                // Cap the executed calls so a batched response can't blow past
+                // the per-page budget; still answer every tool_use so the next
+                // request stays valid.
+                let (content, is_error) = if idx < MAX_TOOL_CALLS_PER_TURN {
+                    self.execute_tool(name, input, &members).await
+                } else {
+                    (
+                        format!(
+                            "error: too many tool calls in one turn (limit {MAX_TOOL_CALLS_PER_TURN}); \
+                             this call was not run — issue fewer calls per turn"
+                        ),
+                        true,
+                    )
+                };
                 results.push(ContentBlock::ToolResult {
                     tool_use_id: id.clone(),
                     content,
@@ -407,15 +428,19 @@ impl ChainQa {
             });
         }
 
-        let answer = self.stream_final_answer(&messages, prep, runtime).await?;
-        // Recompute the freshness snapshot from the chain's live shape now that
-        // the answer is produced (the tool scope resolved members live, so the
-        // answer reflects any mid-run continuation). Falls back to the
-        // submission-time snapshot if the recompute hits a DB error.
+        // Recompute the freshness snapshot from the chain's live shape *before*
+        // the final request runs: this is the latest chain state the answer can
+        // reflect (planning resolved members live; the final turn sees only
+        // what's already in `messages`). Capturing it here — not after the
+        // stream returns — means a write that lands while the answer is
+        // generating is correctly counted as newer than the answer, so the UI
+        // shows the age-of-answer tag. Falls back to the submission-time
+        // snapshot on a DB error.
         let snapshot = self
             .live_snapshot(&prep.root_id)
             .await
             .unwrap_or(prep.snapshot);
+        let answer = self.stream_final_answer(&messages, prep, runtime).await?;
         Ok(AnswerOutcome { answer, snapshot })
     }
 
@@ -837,19 +862,26 @@ fn render_full_transcript(messages: &[Message]) -> String {
         };
         let body = match &m.content {
             // `llm_text()` is the expanded form the model actually saw (e.g.
-            // @file content), not the display shorthand.
-            MessageContent::User(c) => c.llm_text().to_string(),
-            // Keep text blocks AND a readable rendering of tool calls — the
-            // command/patch target/URL lives in the tool-use arguments.
+            // @file content), not the display shorthand. Attached images aren't
+            // representable in the text read path — surface the gap rather than
+            // presenting an apparently complete message.
+            MessageContent::User(c) => {
+                let text = c.llm_text().to_string();
+                if c.images.is_empty() {
+                    text
+                } else {
+                    format!(
+                        "{text}\n[{} image(s) attached to this message are not shown — chain Q&A reads text only]",
+                        c.images.len()
+                    )
+                }
+            }
+            // Keep text AND a readable rendering of every tool block (local,
+            // server-side, and MCP tool calls/results) — recall questions about
+            // what was searched, fetched, run, or returned live in those blocks.
             MessageContent::Agent(blocks) => blocks
                 .iter()
-                .filter_map(|b| match b {
-                    ContentBlock::Text { text } => Some(text.clone()),
-                    ContentBlock::ToolUse { name, input, .. } => {
-                        Some(format!("[tool call: {name} {input}]"))
-                    }
-                    _ => None,
-                })
+                .map(render_agent_block)
                 .collect::<Vec<_>>()
                 .join("\n"),
             // Keep the full tool-result text. Tool results can also carry image
@@ -875,7 +907,10 @@ fn render_full_transcript(messages: &[Message]) -> String {
             MessageContent::System(c) => c.text.clone(),
             MessageContent::Error(c) => c.message.clone(),
             MessageContent::Continuation(c) => c.summary.clone(),
-            MessageContent::Skill(c) => format!("/{} {}", c.name, c.trigger),
+            // Include the expanded skill body, not just the trigger — when a
+            // question depends on instructions a skill injected, that text lives
+            // in `body`.
+            MessageContent::Skill(c) => format!("/{} {}\n{}", c.name, c.trigger, c.body),
         };
         out.push_str(label);
         out.push_str(": ");
@@ -883,6 +918,58 @@ fn render_full_transcript(messages: &[Message]) -> String {
         out.push('\n');
     }
     out
+}
+
+/// Render one assistant content block to its text form for the read path.
+/// Exhaustive on purpose (no wildcard): a new [`ContentBlock`] variant must be
+/// given a textual rendering here rather than silently vanishing from reads.
+/// Opaque server-side result payloads are emitted as compact JSON; that's the
+/// best text form, and [`read_page`] paginates the transcript so a large
+/// payload can't overflow a single page.
+fn render_agent_block(b: &ContentBlock) -> String {
+    match b {
+        ContentBlock::Text { text } => text.clone(),
+        ContentBlock::ToolUse { name, input, .. } => format!("[tool call: {name} {input}]"),
+        ContentBlock::ServerToolUse { name, input, .. } => {
+            format!("[server tool call: {name} {input}]")
+        }
+        ContentBlock::McpToolUse {
+            name,
+            server_name,
+            input,
+            ..
+        } => format!("[mcp tool call: {server_name}/{name} {input}]"),
+        ContentBlock::ToolSearchToolResult { content, .. } => format!(
+            "[tool search result: {}]",
+            serde_json::to_string(content).unwrap_or_default()
+        ),
+        ContentBlock::WebSearchToolResult { content, .. } => {
+            format!("[web search result: {content}]")
+        }
+        ContentBlock::WebFetchToolResult { content, .. } => {
+            format!("[web fetch result: {content}]")
+        }
+        ContentBlock::CodeExecutionToolResult { content, .. } => {
+            format!("[code execution result: {content}]")
+        }
+        ContentBlock::BashCodeExecutionToolResult { content, .. } => {
+            format!("[bash execution result: {content}]")
+        }
+        ContentBlock::TextEditorCodeExecutionToolResult { content, .. } => {
+            format!("[text editor execution result: {content}]")
+        }
+        ContentBlock::McpToolResult {
+            content, is_error, ..
+        } => format!(
+            "[mcp tool result{}: {content}]",
+            if *is_error { " (error)" } else { "" }
+        ),
+        // Images can't be represented in the text read path.
+        ContentBlock::Image { .. } => "[image omitted — chain Q&A reads text only]".to_string(),
+        // Results live in the following user message, not the assistant block —
+        // but if one ever appears here, render its text rather than drop it.
+        ContentBlock::ToolResult { content, .. } => content.clone(),
+    }
 }
 
 /// Whether the UI hides this message (`display_data.hidden == true`) — e.g.

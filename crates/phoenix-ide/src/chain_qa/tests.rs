@@ -604,3 +604,66 @@ async fn read_conversation_accepts_hash_prefixed_id() {
         "read should return the member's content, got: {out}",
     );
 }
+
+/// read_conversation's transcript renderer surfaces content that lives outside
+/// plain text: expanded skill bodies, server-side tool blocks, and a visible
+/// marker for image payloads it can't render.
+#[test]
+fn render_full_transcript_surfaces_skill_body_images_and_server_tools() {
+    let mk = |seq: i64, mt: MessageType, content: MessageContent| crate::db::Message {
+        message_id: format!("m{seq}"),
+        conversation_id: "c".to_string(),
+        sequence_id: seq,
+        message_type: mt,
+        content,
+        display_data: None,
+        usage_data: None,
+        created_at: chrono::Utc::now(),
+    };
+
+    let messages = vec![
+        mk(
+            0,
+            MessageType::Skill,
+            MessageContent::Skill(crate::db::SkillContent {
+                name: "build".into(),
+                body: "EXPANDED SKILL BODY".into(),
+                trigger: "/build now".into(),
+                files: vec![],
+            }),
+        ),
+        mk(
+            1,
+            MessageType::User,
+            MessageContent::user_with_images(
+                "look at this",
+                vec![crate::db::ImageData {
+                    data: "AAA".into(),
+                    media_type: "image/png".into(),
+                }],
+            ),
+        ),
+        mk(
+            2,
+            MessageType::Agent,
+            MessageContent::agent(vec![ContentBlock::WebSearchToolResult {
+                tool_use_id: "w1".into(),
+                content: serde_json::json!({ "found": "the answer" }),
+            }]),
+        ),
+    ];
+
+    let rendered = render_full_transcript(&messages);
+    assert!(
+        rendered.contains("EXPANDED SKILL BODY"),
+        "skill body must be included: {rendered}",
+    );
+    assert!(
+        rendered.contains("image(s) attached"),
+        "user image gap must be marked: {rendered}",
+    );
+    assert!(
+        rendered.contains("web search result") && rendered.contains("the answer"),
+        "server-side tool block must be rendered: {rendered}",
+    );
+}
