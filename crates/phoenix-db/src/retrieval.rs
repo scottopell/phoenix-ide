@@ -145,7 +145,12 @@ impl Fts5Retriever {
     /// # Errors
     /// Returns [`RetrievalError`] if any underlying query fails.
     pub async fn reconcile(&self) -> Result<ReconcileStats, RetrievalError> {
-        let mut existing: HashMap<String, String> =
+        // Physical index rows. We track a per-id row count alongside a sample
+        // hash so a *duplicate* physical row for one message_id (which a plain
+        // map would collapse) is detected and repaired — otherwise
+        // `is_fresh_for` would reject the scope forever and chain Q&A would keep
+        // disabling search after every restart.
+        let existing_rows: Vec<(String, String)> =
             sqlx::query("SELECT message_id, content_hash FROM message_fts")
                 .try_map(|row: sqlx::sqlite::SqliteRow| {
                     Ok((
@@ -154,9 +159,13 @@ impl Fts5Retriever {
                     ))
                 })
                 .fetch_all(&self.pool)
-                .await?
-                .into_iter()
-                .collect();
+                .await?;
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        let mut existing: HashMap<String, String> = HashMap::new();
+        for (id, hash) in existing_rows {
+            *counts.entry(id.clone()).or_default() += 1;
+            existing.insert(id, hash);
+        }
 
         let messages = sqlx::query(
             "SELECT message_id, conversation_id, sequence_id, message_type, content, display_data, usage_data, created_at FROM messages",
@@ -168,18 +177,26 @@ impl Fts5Retriever {
         let mut stats = ReconcileStats::default();
         for m in &messages {
             let fingerprint = content_fingerprint(&index_text(m));
-            match existing.remove(&m.message_id) {
-                Some(prev) if prev == fingerprint => {}
-                Some(prev) => {
-                    if fts_reconcile_upsert(&self.pool, m, Some(&prev)).await? {
-                        stats.reindexed += 1;
-                    }
+            let count = counts.get(&m.message_id).copied().unwrap_or(0);
+            if count == 0 {
+                // Absent: insert (guarded so a concurrent add wins).
+                if fts_reconcile_upsert(&self.pool, m, None).await? {
+                    stats.indexed += 1;
                 }
-                None => {
-                    if fts_reconcile_upsert(&self.pool, m, None).await? {
-                        stats.indexed += 1;
-                    }
+            } else if count == 1 {
+                // Single row: re-index only if stale, compare-and-set so a
+                // concurrent edit's fresh content is never clobbered.
+                let prev = existing[&m.message_id].as_str();
+                if prev != fingerprint.as_str()
+                    && fts_reconcile_upsert(&self.pool, m, Some(prev)).await?
+                {
+                    stats.reindexed += 1;
                 }
+            } else {
+                // Duplicate physical rows for one live id: force-collapse to a
+                // single fresh row (unconditional delete-all + insert).
+                fts_upsert(&self.pool, m).await?;
+                stats.reindexed += 1;
             }
         }
 

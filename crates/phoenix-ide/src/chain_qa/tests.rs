@@ -605,6 +605,36 @@ async fn read_conversation_accepts_hash_prefixed_id() {
     );
 }
 
+/// read_page streams the requested window without materializing the whole
+/// transcript, and its slicing/“more” marker match a simple full-render slice.
+#[test]
+fn read_page_paginates_large_transcript() {
+    let big = "x".repeat(READ_PAGE_CHARS + 500);
+    let messages = vec![crate::db::Message {
+        message_id: "m0".into(),
+        conversation_id: "c".into(),
+        sequence_id: 0,
+        message_type: MessageType::User,
+        content: MessageContent::user(big),
+        display_data: None,
+        usage_data: None,
+        created_at: chrono::Utc::now(),
+    }];
+
+    // Page 1: full window + a "more" marker pointing at the next cursor.
+    let page1 = read_page(&messages, 0);
+    assert!(page1.starts_with("User: x"), "got: {}", &page1[..20]);
+    assert!(page1.contains("more content"), "page 1 should signal more");
+    assert!(page1.contains(&format!("cursor={READ_PAGE_CHARS}")));
+
+    // Page 2: the tail, no further marker.
+    let page2 = read_page(&messages, READ_PAGE_CHARS);
+    assert!(!page2.contains("more content"), "page 2 is the final page");
+
+    // A cursor at/after the end yields the terminal marker.
+    assert_eq!(read_page(&messages, 1_000_000), "(end of conversation)");
+}
+
 /// read_conversation's transcript renderer surfaces content that lives outside
 /// plain text: expanded skill bodies, server-side tool blocks, and a visible
 /// marker for image payloads it can't render.

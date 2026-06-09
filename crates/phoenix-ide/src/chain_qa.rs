@@ -575,6 +575,24 @@ impl ChainQa {
                         true,
                     );
                 }
+                // Re-validate freshness against the *live* member set at call
+                // time: the scope is re-resolved each turn, so a continuation
+                // added since the warmup wait could carry an unconfirmed/stale
+                // FTS row. Refuse the search rather than risk returning
+                // deleted/edited-away content (REQ-RET); the agent can still
+                // read members directly.
+                match self.retriever.is_fresh_for(member_ids).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return (
+                            "search unavailable: the index is not current for this chain \
+                             (it may have just grown); read members directly with read_conversation"
+                                .to_string(),
+                            true,
+                        );
+                    }
+                    Err(e) => return (format!("error: index freshness check failed: {e}"), true),
+                }
                 match self
                     .retriever
                     .retrieve(
@@ -840,26 +858,44 @@ fn format_search_hits(hits: &[RetrievedChunk]) -> String {
 /// REQ-RET-008); paging by character offset bounds the page even within one
 /// oversized message.
 fn read_page(messages: &[Message], cursor: usize) -> String {
-    let full: Vec<char> = render_full_transcript(messages).chars().collect();
-    let total = full.len();
-    if cursor >= total {
+    let end = cursor.saturating_add(READ_PAGE_CHARS);
+    let mut out = String::new();
+    let mut pos = 0usize; // char offset into the full (non-hidden) transcript
+    let mut has_more = false;
+    'outer: for m in messages {
+        if message_is_hidden(m) {
+            continue;
+        }
+        // Render one message at a time and copy only the window chars, so a
+        // multi-message transcript is never fully materialized; stop as soon as
+        // the page is filled (the next char proves there's more).
+        for ch in render_message_line(m).chars() {
+            if pos >= end {
+                has_more = true;
+                break 'outer;
+            }
+            if pos >= cursor {
+                out.push(ch);
+            }
+            pos += 1;
+        }
+    }
+    // `pos` is now the total transcript length (unless we stopped early).
+    if out.is_empty() && !has_more {
         return "(end of conversation)".to_string();
     }
-    let end = cursor.saturating_add(READ_PAGE_CHARS).min(total);
-    let page: String = full[cursor..end].iter().collect();
-    if end < total {
-        format!("{page}\n[… more content; call read_conversation again with cursor={end}]")
+    if has_more {
+        format!("{out}\n[… more content; call read_conversation again with cursor={end}]")
     } else {
-        page
+        out
     }
 }
 
-/// Render a conversation transcript with **full** content for the agent's
-/// ground-truth read path. Unlike the search index it keeps complete
-/// tool-result bodies; like the index it skips UI-hidden messages, uses the
-/// model-visible (`llm_text`) form of user messages, and additionally
-/// surfaces agent tool calls (name + arguments) so recall questions about
-/// *what the agent did* are answerable.
+/// Render a whole conversation transcript by concatenating
+/// [`render_message_line`] over non-hidden messages. The production read path
+/// ([`read_page`]) streams the window incrementally instead; this materializes
+/// the full transcript and is used only to assert rendering in tests.
+#[cfg(test)]
 fn render_full_transcript(messages: &[Message]) -> String {
     let mut out = String::new();
     for m in messages {
@@ -869,91 +905,95 @@ fn render_full_transcript(messages: &[Message]) -> String {
         if message_is_hidden(m) {
             continue;
         }
-        let label = match m.message_type {
-            MessageType::User => "User",
-            MessageType::Agent => "Agent",
-            MessageType::Tool => "Tool",
-            MessageType::System => "System",
-            MessageType::Error => "Error",
-            MessageType::Continuation => "Continuation",
-            MessageType::Skill => "Skill",
-        };
-        let body = match &m.content {
-            // `llm_text()` is the expanded form the model actually saw (e.g.
-            // @file content), not the display shorthand. Attached images aren't
-            // representable in the text read path — surface the gap rather than
-            // presenting an apparently complete message.
-            MessageContent::User(c) => {
-                let mut text = c.llm_text().to_string();
-                // Non-image attachments contribute their context tag (name /
-                // path / metadata) to LLM history at runtime; include it so the
-                // agent can answer about attached files it reads.
-                for f in &c.files {
-                    text.push('\n');
-                    text.push_str(&f.llm_context_tag());
-                }
-                if !c.images.is_empty() {
-                    tracing::debug!(
+        out.push_str(&render_message_line(m));
+    }
+    out
+}
+
+/// Render one (non-hidden) message as a `"Label: body\n"` line for the read
+/// path. Factored out so [`read_page`] can stream the transcript a message at a
+/// time without materializing the whole thing.
+fn render_message_line(m: &Message) -> String {
+    let label = match m.message_type {
+        MessageType::User => "User",
+        MessageType::Agent => "Agent",
+        MessageType::Tool => "Tool",
+        MessageType::System => "System",
+        MessageType::Error => "Error",
+        MessageType::Continuation => "Continuation",
+        MessageType::Skill => "Skill",
+    };
+    let body = match &m.content {
+        // `llm_text()` is the expanded form the model actually saw (e.g.
+        // @file content), not the display shorthand. Attached images aren't
+        // representable in the text read path — surface the gap rather than
+        // presenting an apparently complete message.
+        MessageContent::User(c) => {
+            let mut text = c.llm_text().to_string();
+            // Non-image attachments contribute their context tag (name /
+            // path / metadata) to LLM history at runtime; include it so the
+            // agent can answer about attached files it reads.
+            for f in &c.files {
+                text.push('\n');
+                text.push_str(&f.llm_context_tag());
+            }
+            if !c.images.is_empty() {
+                tracing::debug!(
                         n = c.images.len(),
                         "chain Q&A read_conversation: dropping user-message images — image recall is unsupported",
                     );
-                    let _ = write!(
+                let _ = write!(
                         text,
                         "\n[{} image(s) attached to this message are not shown — chain Q&A reads text only]",
                         c.images.len()
                     );
-                }
-                text
             }
-            // Keep text AND a readable rendering of every tool block (local,
-            // server-side, and MCP tool calls/results) — recall questions about
-            // what was searched, fetched, run, or returned live in those blocks.
-            MessageContent::Agent(blocks) => blocks
-                .iter()
-                .map(ContentBlock::render_text)
-                .collect::<Vec<_>>()
-                .join("\n"),
-            // Keep the full tool-result text. Tool results can also carry image
-            // payloads bound for the LLM, but the chain Q&A read path is
-            // text-only — surface the gap to the agent (and the logs) rather
-            // than silently stranding the images.
-            MessageContent::Tool(c) => {
-                if c.images.is_empty() {
-                    c.content.clone()
-                } else {
-                    tracing::debug!(
-                        tool_use_id = %c.tool_use_id,
-                        n = c.images.len(),
-                        "chain Q&A read_conversation: dropping tool-result images — image recall is unsupported",
-                    );
-                    format!(
+            text
+        }
+        // Keep text AND a readable rendering of every tool block (local,
+        // server-side, and MCP tool calls/results) — recall questions about
+        // what was searched, fetched, run, or returned live in those blocks.
+        MessageContent::Agent(blocks) => blocks
+            .iter()
+            .map(ContentBlock::render_text)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        // Keep the full tool-result text. Tool results can also carry image
+        // payloads bound for the LLM, but the chain Q&A read path is
+        // text-only — surface the gap to the agent (and the logs) rather
+        // than silently stranding the images.
+        MessageContent::Tool(c) => {
+            if c.images.is_empty() {
+                c.content.clone()
+            } else {
+                tracing::debug!(
+                    tool_use_id = %c.tool_use_id,
+                    n = c.images.len(),
+                    "chain Q&A read_conversation: dropping tool-result images — image recall is unsupported",
+                );
+                format!(
                         "{}\n[{} image(s) in this tool result are not shown — chain Q&A reads text only]",
                         c.content,
                         c.images.len()
                     )
-                }
             }
-            MessageContent::System(c) => c.text.clone(),
-            MessageContent::Error(c) => c.message.clone(),
-            MessageContent::Continuation(c) => c.summary.clone(),
-            // Include the expanded skill body (and any attached file tags), not
-            // just the trigger — when a question depends on instructions a skill
-            // injected, that text lives in `body`.
-            MessageContent::Skill(c) => {
-                let mut body = format!("/{} {}\n{}", c.name, c.trigger, c.body);
-                for f in &c.files {
-                    body.push('\n');
-                    body.push_str(&f.llm_context_tag());
-                }
-                body
+        }
+        MessageContent::System(c) => c.text.clone(),
+        MessageContent::Error(c) => c.message.clone(),
+        MessageContent::Continuation(c) => c.summary.clone(),
+        // Include the expanded skill body (and any attached file tags), not
+        // just the trigger — when a question depends on instructions a skill
+        // injected, that text lives in `body`.
+        MessageContent::Skill(c) => {
+            let mut body = format!("/{} {}\n{}", c.name, c.trigger, c.body);
+            for f in &c.files {
+                body.push('\n');
+                body.push_str(&f.llm_context_tag());
             }
-        };
-        out.push_str(label);
-        out.push_str(": ");
-        out.push_str(&body);
-        out.push('\n');
-    }
-    out
+            body
+        }
+    };
+    format!("{label}: {body}\n")
 }
 
 /// Whether the UI hides this message (`display_data.hidden == true`) — e.g.

@@ -53,17 +53,21 @@ pub fn index_text(message: &Message) -> String {
         }
         // Index every content-bearing block (text, tool calls, and server-side
         // / MCP tool results) via the shared renderer, so recall can locate a
-        // member by terms that live only in a tool block — bounded head+tail
-        // like other tool output so a large result payload can't bloat the
-        // index.
-        MessageContent::Agent(blocks) => {
-            let rendered = blocks
-                .iter()
-                .map(ContentBlock::render_text)
-                .collect::<Vec<_>>()
-                .join("\n");
-            tool_excerpt(&rendered, TOOL_EXCERPT_HEAD_CHARS, TOOL_EXCERPT_TAIL_CHARS)
-        }
+        // member by terms in a tool block. Prose `Text` stays fully searchable;
+        // only bulky tool-result payloads are excerpted head+tail, so a long
+        // plain answer isn't truncated to its first/last KB.
+        MessageContent::Agent(blocks) => blocks
+            .iter()
+            .map(|b| {
+                let rendered = b.render_text();
+                if matches!(b, ContentBlock::Text { .. }) {
+                    rendered
+                } else {
+                    tool_excerpt(&rendered, TOOL_EXCERPT_HEAD_CHARS, TOOL_EXCERPT_TAIL_CHARS)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         MessageContent::Tool(c) => {
             tool_excerpt(&c.content, TOOL_EXCERPT_HEAD_CHARS, TOOL_EXCERPT_TAIL_CHARS)
         }
@@ -166,6 +170,21 @@ mod tests {
         }));
         let indexed = index_text(&m);
         assert!(indexed.contains("timeout_seconds = 42"), "got: {indexed}");
+    }
+
+    #[test]
+    fn agent_long_text_is_not_truncated() {
+        // A long plain assistant reply (no tool output) must stay fully
+        // searchable — only bulky tool-result payloads are excerpted.
+        let long = format!("needle {} endneedle", "filler ".repeat(1000));
+        let m = msg(MessageContent::Agent(vec![ContentBlock::Text {
+            text: long.clone(),
+        }]));
+        assert_eq!(
+            index_text(&m),
+            long,
+            "prose must not be head/tail excerpted"
+        );
     }
 
     #[test]

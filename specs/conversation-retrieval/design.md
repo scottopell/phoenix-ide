@@ -148,21 +148,21 @@ owns reconciliation (absent ids, changed fingerprints, orphaned rows).
 
 ## Text extraction (REQ-RET-004)
 
-Indexing reuses the message-text extraction already used to render
-transcripts for model context (the logic behind
-`chain_qa::render_leaf_transcript`). Extracting it to a shared function
-that both the indexer and the transcript renderer call satisfies
-REQ-RET-004's "cannot diverge" clause and removes a parallel
-representation. Per `MessageContent` variant:
+Assistant content blocks are rendered to text by a single shared
+renderer (`ContentBlock::render_text`) that both the index extractor and
+the chain read path call, so the searchable projection and the
+transcript the agent reads cannot disagree on a block's text
+(REQ-RET-004's "cannot diverge" clause) — one representation, two
+consumers. Per `MessageContent` variant:
 
 | Variant | Indexed text |
 |---|---|
-| `User` | message text |
-| `Agent` | concatenated `Text` blocks (tool-use blocks omitted) |
+| `User` | the model-visible `llm_text()` (expanded `@file` / input content), plus each non-image attachment's context tag (name/path/metadata) |
+| `Agent` | every block via `ContentBlock::render_text` — `Text` prose kept in full; tool-use, server-side, and MCP tool calls/results rendered to text and excerpted head+tail like a `Tool` result |
 | `System` | message text |
 | `Error` | error message |
 | `Continuation` | continuation summary |
-| `Skill` | `/{name} {trigger}` |
+| `Skill` | `/{name} {trigger}`, the expanded skill `body`, and attached file tags |
 | `Tool` | a **bounded searchable excerpt** of the result body — a **head + tail** window (first ~1 KB and last ~1 KB, with the middle elided), prefixed with a size marker (`(tool result: N chars)`) |
 
 Tool results are **content-bearing and must be searchable**: the user
