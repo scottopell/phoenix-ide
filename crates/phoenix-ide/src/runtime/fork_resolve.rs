@@ -1606,7 +1606,14 @@ mod tests {
     /// and one commit.
     fn init_repo() -> (TempDir, PathBuf) {
         let tmp = TempDir::new().unwrap();
-        let root = tmp.path().to_path_buf();
+        // Canonicalize so the root matches what `git rev-parse --show-toplevel`
+        // (and `git worktree list --porcelain`) report. On macOS the tempdir lives
+        // under `/var/folders/...`, a symlink to `/private/var/...`; git always
+        // emits the resolved path. Production feeds orphan cleanup a git-toplevel
+        // root, so path-equality checks compare canonical-to-canonical — the test
+        // root must too, or `delete_branch_if_unused`'s deterministic-path match
+        // spuriously fails.
+        let root = tmp.path().canonicalize().unwrap();
         git(&root, &["init", "--quiet", "--initial-branch=main"]);
         git(&root, &["config", "user.email", "t@example.com"]);
         git(&root, &["config", "user.name", "t"]);
