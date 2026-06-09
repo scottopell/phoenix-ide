@@ -3437,6 +3437,12 @@ async fn insert_message_tx(
     .bind(msg.created_at.to_rfc3339())
     .execute(&mut **tx)
     .await?;
+    // Index for retrieval atomically with the message insert, so tx-based
+    // persists (fork-resolution seed messages, checkpoint replays) get the
+    // same FTS coverage as `add_message_with_seq` — no message reaches a chain
+    // unindexed before the startup reconcile (specs/conversation-retrieval/
+    // REQ-RET-003).
+    retrieval::fts_upsert_conn(tx, msg).await?;
     Ok(())
 }
 

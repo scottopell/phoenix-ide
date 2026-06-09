@@ -170,13 +170,15 @@ impl Fts5Retriever {
             let fingerprint = content_fingerprint(&index_text(m));
             match existing.remove(&m.message_id) {
                 Some(prev) if prev == fingerprint => {}
-                Some(_) => {
-                    fts_upsert(&self.pool, m).await?;
-                    stats.reindexed += 1;
+                Some(prev) => {
+                    if fts_reconcile_upsert(&self.pool, m, Some(&prev)).await? {
+                        stats.reindexed += 1;
+                    }
                 }
                 None => {
-                    fts_upsert(&self.pool, m).await?;
-                    stats.indexed += 1;
+                    if fts_reconcile_upsert(&self.pool, m, None).await? {
+                        stats.indexed += 1;
+                    }
                 }
             }
         }
@@ -361,6 +363,70 @@ pub async fn fts_upsert_conn(
     .execute(&mut *conn)
     .await?;
     Ok(())
+}
+
+/// Reconcile-path upsert that will not clobber a fresher concurrent write.
+///
+/// The startup reconcile snapshots `messages`, then upserts changed/absent
+/// rows one at a time. If a live edit re-indexes the same message between the
+/// snapshot and this write, writing the snapshot would overwrite the fresher
+/// content (and leave `is_fresh_for` false until the next update). Guard the
+/// write on the index state the reconcile observed: for a stale row, replace
+/// it only while it still carries the observed `content_hash` (compare-and-set
+/// — a concurrent writer that already changed it wins); for an absent row,
+/// insert only while it is still absent. `SQLite` serializes write
+/// transactions, so the guard check and the write commit atomically against
+/// the edit path. Returns whether a write was performed (for accurate stats).
+///
+/// # Errors
+/// Returns the underlying [`sqlx::Error`] if a query fails.
+pub async fn fts_reconcile_upsert(
+    pool: &SqlitePool,
+    message: &Message,
+    observed: Option<&str>,
+) -> Result<bool, sqlx::Error> {
+    let text = index_text(message);
+    let fingerprint = content_fingerprint(&text);
+    let mut tx = pool.begin().await?;
+    if let Some(prev) = observed {
+        // Replace a stale row only while it still carries the observed hash.
+        let deleted =
+            sqlx::query("DELETE FROM message_fts WHERE message_id = ?1 AND content_hash = ?2")
+                .bind(&message.message_id)
+                .bind(prev)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        if deleted == 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    } else {
+        // Insert an absent row only while it is still absent.
+        let existing: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM message_fts WHERE message_id = ?1")
+                .bind(&message.message_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        if existing > 0 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+    }
+    sqlx::query(
+        "INSERT INTO message_fts (text, message_id, chunk_ordinal, conversation_id, message_type, created_at, content_hash) \
+         VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6)",
+    )
+    .bind(text)
+    .bind(&message.message_id)
+    .bind(&message.conversation_id)
+    .bind(message.message_type.to_string())
+    .bind(message.created_at.to_rfc3339())
+    .bind(fingerprint)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(true)
 }
 
 /// Remove all index rows for one message id.

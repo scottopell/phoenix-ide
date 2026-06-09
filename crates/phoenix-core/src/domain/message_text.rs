@@ -43,7 +43,10 @@ pub fn index_text(message: &Message) -> String {
         return String::new();
     }
     match &message.content {
-        MessageContent::User(c) => c.text.clone(),
+        // `llm_text()` is the expanded form the model actually saw (e.g.
+        // `@file` content), not the display shorthand — index that so recall
+        // covers terms that exist only in the expansion.
+        MessageContent::User(c) => c.llm_text().to_string(),
         MessageContent::Agent(blocks) => blocks
             .iter()
             .filter_map(|b| match b {
@@ -128,6 +131,22 @@ mod tests {
             is_meta: false,
         }));
         assert_eq!(index_text(&m), "fix the auth schema");
+    }
+
+    #[test]
+    fn user_expanded_llm_text_is_indexed() {
+        // When input expansion occurred (e.g. `@file`), the searchable text is
+        // the expanded form the model saw, not the display shorthand — so
+        // recall covers terms that exist only in the expansion.
+        let m = msg(MessageContent::User(UserContent {
+            text: "review @config".into(),
+            images: vec![],
+            files: vec![],
+            llm_text: Some("review <file path=\"config\">timeout_seconds = 42</file>".into()),
+            is_meta: false,
+        }));
+        let indexed = index_text(&m);
+        assert!(indexed.contains("timeout_seconds = 42"), "got: {indexed}");
     }
 
     #[test]
