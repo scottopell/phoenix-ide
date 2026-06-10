@@ -567,7 +567,8 @@ fn translate_request(spec: &super::ModelSpec, request: &LlmRequest) -> Anthropic
     if let Some(last_user) = messages.iter_mut().rev().find(|m| m.role == "user") {
         if let Some(
             AnthropicContentBlock::Text { cache_control, .. }
-            | AnthropicContentBlock::Image { cache_control, .. },
+            | AnthropicContentBlock::Image { cache_control, .. }
+            | AnthropicContentBlock::ToolResult { cache_control, .. },
         ) = last_user.content.last_mut()
         {
             *cache_control = Some(CacheControl {
@@ -645,6 +646,7 @@ pub(crate) fn translate_message(msg: &LlmMessage) -> AnthropicMessage {
                     tool_use_id: tool_use_id.clone(),
                     content: wire_content,
                     is_error: *is_error,
+                    cache_control: None,
                 }
             }
             // Server-handled blocks: round-trip back to their Anthropic wire types.
@@ -987,6 +989,8 @@ pub(crate) enum AnthropicContentBlock {
         content: serde_json::Value,
         #[serde(default)]
         is_error: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
     /// Server-side tool invocation (tool search, web search, code execution).
     /// Handled by Anthropic -- Phoenix preserves these for multi-turn history.
@@ -1191,6 +1195,38 @@ mod tests {
                 .iter()
                 .any(|t| t.get("type").and_then(|v| v.as_str()) == Some(TOOL_SEARCH_VARIANT)),
             "tool_search entry should not be present when supports_tool_search is false"
+        );
+    }
+
+    #[test]
+    fn test_cache_breakpoint_lands_on_trailing_tool_result() {
+        // A tool-loop request whose last user message is a single ToolResult block
+        // must still receive the message-history cache breakpoint. Otherwise the
+        // accumulating tool-loop tail is re-sent and re-charged at full price every
+        // turn until the next user-text message resets a breakpoint.
+        let spec = test_spec(false);
+        let request = LlmRequest {
+            system: vec![],
+            messages: vec![LlmMessage {
+                role: MessageRole::User,
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "toolu_abc".into(),
+                    content: "command output".into(),
+                    images: vec![],
+                    is_error: false,
+                }],
+            }],
+            tools: vec![],
+            max_tokens: None,
+            cache_key: PromptCacheKey::ephemeral(),
+        };
+        let req = translate_request(&spec, &request);
+        let json = serde_json::to_value(&req).unwrap();
+        let block = &json["messages"][0]["content"][0];
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(
+            block["cache_control"]["type"], "ephemeral",
+            "trailing tool_result must carry the message-history cache breakpoint; got {block}"
         );
     }
 

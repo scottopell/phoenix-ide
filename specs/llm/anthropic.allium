@@ -234,10 +234,13 @@ rule AnthropicToolResultTranslated {
 
 -- The three deterministic cache breakpoints translate_request places so
 -- Anthropic has stable prefix-cache anchors: (1) the last system block,
--- (2) the last tool entry, (3) the last text/image block of the last
--- user message. Breakpoint (2) is skipped when tool search is active,
--- because the injected tool_search entry becomes the final tool entry
--- and cannot itself carry cache_control.
+-- (2) the last tool entry, (3) the last cache-bearing block of the last
+-- user message — a Text, Image, or ToolResult block. ToolResult is load-
+-- bearing here: during a tool loop the last user message holds a single
+-- ToolResult block, so without it the accumulating tool-loop tail would
+-- never be cache-written. Breakpoint (2) is skipped when tool search is
+-- active, because the injected tool_search entry becomes the final tool
+-- entry and cannot itself carry cache_control.
 rule AnthropicCacheBreakpointsPlaced {
     when: TranslateAnthropicRequest(request, has_deferred_tools)
 
