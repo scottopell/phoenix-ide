@@ -106,11 +106,19 @@ SSE events), parsing both into the same JSON-RPC result.
 THE SYSTEM SHALL send the negotiated `MCP-Protocol-Version` header on every
 request after the `initialize` response.
 
+WHEN the client POSTs a JSON-RPC **notification** (e.g.
+`notifications/initialized`)
+THE SYSTEM SHALL treat an HTTP `202 Accepted` with an empty body as success,
+not as a parse failure -- a conforming server acknowledges an accepted
+notification with `202` and no JSON-RPC body.
+
 **Rationale:** The Streamable HTTP transport lets a server answer a single POST
 with either a unary reply or a stream. The client advertises both shapes via
 `Accept` so a conformant server or gateway can choose framing rather than
 rejecting the request; a client that handles only one shape fails against
-servers that choose the other.
+servers that choose the other. Notifications carry no response payload, so a
+client that insists on a JSON/SSE body would treat the `202` ack as a failure
+and never finish initialization.
 
 ---
 
@@ -134,14 +142,17 @@ call instead of re-initializing would surface as a spurious tool error.
 ### REQ-MCP-006: Server-Initiated Stream and Resumability
 
 WHERE a server is HTTP and supports it
-THE SYSTEM SHALL open a server→client SSE stream via GET to receive
-server-initiated messages, notably `notifications/tools/list_changed`
+THE SYSTEM SHALL open a server→client SSE stream via GET, with an
+`Accept: text/event-stream` header, to receive server-initiated messages,
+notably `notifications/tools/list_changed`
 AND, on a dropped stream, reconnect supplying the last received event id via
 `Last-Event-ID` so the server can replay missed messages.
 
 **Rationale:** Without the GET stream, `tools/list_changed` from an HTTP server
-never arrives and the tool list goes stale. Resumability avoids losing
-notifications across a transient disconnect.
+never arrives and the tool list goes stale. The `Accept: text/event-stream`
+header is required for the GET; a conforming server or intermediary may reject a
+GET that omits it. Resumability avoids losing notifications across a transient
+disconnect.
 
 ---
 
@@ -219,9 +230,11 @@ resources behind one authorization server share a single client identity.
 THE SYSTEM SHALL complete the OAuth 2.1 authorization code flow with PKCE:
 verify the authorization server advertises `code_challenge_methods_supported`
 (and refuse to proceed if it does not), generate a code verifier/challenge,
-surface the authorization URL for the user to open in a browser, receive the
-redirect with the authorization code, and exchange the code (plus verifier) for
-an access token at the token endpoint.
+generate an unguessable `state` value bound to the pending server, surface the
+authorization URL for the user to open in a browser, receive the redirect on a
+local callback, reject the callback unless its `state` matches the pending
+flow, and only then exchange the code (plus verifier) for an access token at
+the token endpoint.
 
 THE SYSTEM SHALL include the MCP server's canonical URI as the `resource`
 parameter (RFC 8707 Resource Indicators) on both the authorization request and
@@ -232,20 +245,29 @@ process such as `mcp-remote`.
 
 **Rationale:** PKCE is mandatory under OAuth 2.1; a server that omits
 `code_challenge_methods_supported` cannot be used safely, so the client refuses
-before the browser round trip rather than failing after it. Resource Indicators
-bind the token's audience to the MCP server, which compliant authorization and
-resource servers require. Performing the flow natively removes the
-npm/subprocess dependency and the browser-popup-on-every-reload behavior of the
-external bridge.
+before the browser round trip rather than failing after it. The `state` nonce
+binds the redirect to the flow that started it: without it, a code injected by
+another tab, process, or pending server could be exchanged and its token
+persisted under the wrong MCP server. Resource Indicators bind the token's
+audience to the MCP server, which compliant authorization and resource servers
+require. Performing the flow natively removes the npm/subprocess dependency and
+the browser-popup-on-every-reload behavior of the external bridge.
 
 ---
 
 ### REQ-MCP-012: Token Storage, Refresh, Invalidation, and Step-Up
 
 THE SYSTEM SHALL persist OAuth access tokens, refresh tokens, and expiry to the
-database
-AND reuse a stored, unexpired token on reconnect without re-prompting the user
-AND, on expiry or a post-authorization 401, refresh using the refresh token
+database, bound to the MCP server's canonical resource URI
+AND attach the access token as an `Authorization: Bearer` header on **every**
+HTTP request to that server -- `initialize` and its retries, `tools/*`, the GET
+stream, and the session `DELETE`
+AND reuse a stored, unexpired token on reconnect without re-prompting the user,
+**only when** its bound resource URI still matches the server's configured URI;
+a changed URL (or authorization server) discards the stored token instead of
+sending it to the new endpoint
+AND, on expiry or a post-authorization 401, refresh using the refresh token,
+persisting any rotated refresh token the server returns
 AND, when refresh fails, discard the stored token and return the server to an
 unauthorized state requiring a new authorization
 AND, when a tool call returns HTTP 403 `insufficient_scope` with a
@@ -253,11 +275,17 @@ AND, when a tool call returns HTTP 403 `insufficient_scope` with a
 rather than surfacing a permanent tool failure.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
-survive restarts; refresh keeps a session alive. A failed refresh must discard
-the stale token so it cannot be reused or duplicated, and is the condition that
-re-prompts the user. A `403 insufficient_scope` is a step-up request, not a
-terminal error -- treating it as one would make scope-gated tools permanently
-unusable.
+survive restarts; refresh keeps a session alive. A token is audience-bound to
+one resource, so reusing it merely because the config kept the same display
+name -- after the URL changed -- would leak a credential to a different
+endpoint; the binding makes reuse conditional on the resource matching. A
+rotating server may issue a replacement refresh token on each refresh; dropping
+it forces a needless re-authorization. The access token must ride every request
+or protected servers reject calls despite a successful authorization. A failed
+refresh must discard the stale token so it cannot be reused or duplicated, and
+is the condition that re-prompts the user. A `403 insufficient_scope` is a
+step-up request, not a terminal error -- treating it as one would make
+scope-gated tools permanently unusable.
 
 ---
 

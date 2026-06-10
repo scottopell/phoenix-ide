@@ -84,10 +84,13 @@ entity OAuthRegistration {
 }
 
 -- Persisted OAuth tokens (plaintext in SQLite, consistent with existing
--- operator-state storage). A stored, unexpired token lets reconnect skip
--- the browser flow (REQ-MCP-012).
+-- operator-state storage). Looked up by server_name but audience-bound to
+-- `resource` (the canonical resource URI): a stored, unexpired token is reused
+-- on reconnect only while its resource still matches the server's configured
+-- URL (REQ-MCP-012).
 entity OAuthToken {
     server_name: String
+    resource: String
     access_token: String
     refresh_token: String?
     expires_at: Timestamp
@@ -149,9 +152,14 @@ rule ServerDiscovered {
 
     @guidance
         -- read_all_configs classifies each mcpServers entry into a transport
-        -- (command -> stdio, type:http + url -> http) and an auth_scheme
-        -- (token/headers -> static, else none). start_background_discovery /
-        -- connect_one then spawns or connects (REQ-MCP-001).
+        -- (command -> stdio, type:http + url -> http) and an auth_scheme.
+        -- auth_scheme = static ONLY when an explicit auth credential (bearer
+        -- token) is configured; generic per-request headers (org id, beta
+        -- flag) do NOT imply static and must not preempt OAuth -- they ride
+        -- every request under any scheme. Absent an explicit credential the
+        -- scheme is none, so a 401 can still drive the OAuth flow.
+        -- start_background_discovery / connect_one then spawns or connects
+        -- (REQ-MCP-001).
 }
 
 -- A stdio server completes initialize + first tools/list and is ready.
@@ -186,11 +194,14 @@ rule HttpConnected {
 
     @guidance
         -- POST initialize to the MCP endpoint; the response may be
-        -- application/json or text/event-stream (REQ-MCP-004). Capture
-        -- Mcp-Session-Id and send it (plus MCP-Protocol-Version) on every
-        -- subsequent request (REQ-MCP-005). A static-auth server attaches its
-        -- config bearer token / headers on every request and reaches ready
-        -- directly, never entering the OAuth sub-lifecycle (REQ-MCP-008).
+        -- application/json or text/event-stream (REQ-MCP-004). session_id_from_
+        -- init is null for a stateless server that returns no Mcp-Session-Id;
+        -- such a server still reaches ready. When present, send the session id
+        -- (plus MCP-Protocol-Version) on every subsequent request
+        -- (REQ-MCP-005). A static-auth server attaches its config bearer token
+        -- and reaches ready directly, never entering the OAuth sub-lifecycle
+        -- (REQ-MCP-008); an OAuth server attaches Authorization: Bearer on
+        -- every request including this handshake (REQ-MCP-012).
 }
 
 -- Connect or handshake failed (non-auth). Entry retained with the cause.
@@ -336,9 +347,11 @@ rule OAuthAuthorized {
     when: OperatorCompletedAuthorization(srv, code)
 
     requires: srv.oauth_phase = awaiting_user
+    requires: callback_state_matches(srv, code)
 
     ensures: OAuthToken.created(
         server_name: srv.name,
+        resource: server_resource(srv),
         access_token: exchanged_access_token(srv, code),
         refresh_token: exchanged_refresh_token(srv, code),
         expires_at: token_expiry(srv, code)
@@ -348,10 +361,15 @@ rule OAuthAuthorized {
     ensures: srv.state = connecting
 
     @guidance
-        -- Exchange code + PKCE verifier (plus the RFC 8707 resource indicator)
-        -- at the token endpoint. Persist tokens, clear the pending URL, and
-        -- re-enter connecting so HttpConnected drives the now-authorized
-        -- handshake to ready (REQ-MCP-011, REQ-MCP-012).
+        -- The local callback first checks the `state` nonce: a redirect whose
+        -- state does not match this pending flow is rejected before any
+        -- exchange (callback_state_matches), so a code from another tab or
+        -- pending server cannot be persisted under the wrong server
+        -- (REQ-MCP-011). Then exchange code + PKCE verifier (plus the RFC 8707
+        -- resource indicator) at the token endpoint, persist the token bound to
+        -- the resource URI, clear the pending URL, and re-enter connecting so
+        -- HttpConnected drives the now-authorized handshake to ready
+        -- (REQ-MCP-011, REQ-MCP-012).
 }
 
 -- A 401 on a previously authorized server: the access token expired or was
@@ -365,13 +383,15 @@ rule TokenRefreshNeeded {
     ensures: srv.oauth_phase = refreshing
 }
 
--- Refresh succeeded: update the stored token, return to authorized.
+-- Refresh succeeded: update the stored token (including a rotated refresh
+-- token, if the server issued one), return to authorized.
 rule TokenRefreshed {
     when: OAuthTokenRefreshed(srv)
 
     requires: srv.oauth_phase = refreshing
 
     ensures: OAuthToken{server_name: srv.name}.access_token = refreshed_access_token(srv)
+    ensures: OAuthToken{server_name: srv.name}.refresh_token = refreshed_refresh_token(srv)
     ensures: OAuthToken{server_name: srv.name}.expires_at = refreshed_expiry(srv)
     ensures: srv.oauth_phase = authorized
 }
@@ -463,6 +483,19 @@ rule ReloadRestartsServer {
         -- auth triggers terminate + reconnect.
 }
 
+-- Reload repointed an HTTP server (URL / authorization server changed): the
+-- stored token is bound to the old resource and must not be sent to the new
+-- endpoint. Discard it so reconnect re-authorizes (REQ-MCP-012). Fires
+-- alongside ReloadRestartsServer.
+rule ReloadDiscardsRepointedToken {
+    when: ReloadServerConfigChanged(srv)
+
+    requires: srv.transport = http
+    requires: resource_changed(srv)
+
+    ensures: not exists OAuthToken{server_name: srv.name}
+}
+
 -- Reload found a server gone from config: disconnect and forget it.
 rule ReloadRemovesServer {
     when: ReloadRemovedServer(srv)
@@ -551,8 +584,21 @@ invariant OneTokenPerServer {
 -- discovered_tools(srv): List<String>
 --   The tool names from the server's tools/list response (paginated).
 --
--- session_id_from_init(srv): String
---   The Mcp-Session-Id header value on the initialize response.
+-- session_id_from_init(srv): String?
+--   The Mcp-Session-Id header value on the initialize response, or null for a
+--   stateless server that returns no session header.
+--
+-- server_resource(srv): String
+--   The canonical resource URI of srv -- the audience an issued token is bound
+--   to, and the OAuthToken.resource value.
+--
+-- resource_changed(srv): Bool
+--   True iff srv's configured URL / authorization server (its canonical
+--   resource URI) differs from the one a persisted token is bound to.
+--
+-- callback_state_matches(srv, code): Bool
+--   True iff the OAuth redirect that carried `code` presented the `state`
+--   nonce issued for srv's pending flow.
 --
 -- auth_server_of(srv): String
 --   The identifier (issuer) of the authorization server protecting srv,
@@ -581,8 +627,10 @@ invariant OneTokenPerServer {
 --   the PKCE verifier.
 --
 -- refreshed_access_token(srv): String
+-- refreshed_refresh_token(srv): String?
 -- refreshed_expiry(srv): Timestamp
---   The token endpoint's response to a refresh-token grant.
+--   The token endpoint's response to a refresh-token grant. The refresh token
+--   is the server's replacement when it rotates, otherwise the existing one.
 --
 -- static_auth_error(srv): String
 --   The error recorded when a static-credential server is rejected with 401.

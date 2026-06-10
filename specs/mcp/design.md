@@ -70,11 +70,22 @@ enum McpServerConfig {
     Http  { url: String, headers: HashMap<String, String>, auth: HttpAuth },
 }
 
-enum HttpAuth { None, Static, OAuth }  // Static: token/headers already in `headers`
+// Auth credential, distinct from `headers`. `headers` are generic per-request
+// headers (org id, beta flag, …) attached under ANY scheme; they do not imply
+// auth and must not preempt OAuth.
+enum HttpAuth {
+    None,                       // no credential; a 401 starts OAuth discovery
+    Static { token: String },   // an explicit bearer token from config
+    OAuth,                      // discovered on 401 (or pre-selected in config)
+}
 ```
 
 `read_all_configs` classifies each `mcpServers` entry into a variant
-(REQ-MCP-001). The reload reconciler compares configs with `PartialEq` to
+(REQ-MCP-001). Crucially, presence of `headers` alone does **not** make a
+server `Static`: only an explicit auth credential does. A server carrying both a
+required non-auth header and OAuth is representable -- the header rides every
+request while the 401 still drives the OAuth flow, rather than tripping
+`StaticAuthRejected`. The reload reconciler compares configs with `PartialEq` to
 decide unchanged-vs-restart; the comparison extends to the HTTP variant so a
 changed URL, header set, or auth scheme triggers a restart
 (`reload_from_configs`, REQ-MCP-015).
@@ -150,15 +161,20 @@ table (`crates/phoenix-db/src/lib.rs`):
 - `mcp_oauth_registrations` -- `(auth_server, client_id, ...)`, keyed by the
   authorization server so resources sharing one authorization server share a
   client identity (REQ-MCP-010, `OAuthRegistration`).
-- `mcp_oauth_tokens` -- `(server_name, access_token, refresh_token,
-  expires_at)`, keyed by the MCP server because tokens are audience-bound to a
-  resource (`OAuthToken`). The client id is **not** duplicated here; it lives in
-  the registration table.
+- `mcp_oauth_tokens` -- `(server_name, resource_uri, access_token,
+  refresh_token, expires_at)`, looked up by MCP server name but carrying the
+  canonical `resource_uri` the token is audience-bound to (`OAuthToken`). The
+  client id is **not** duplicated here; it lives in the registration table.
 
 Tokens are stored in plaintext, consistent with how the database already holds
 operator state; the database file's on-disk protection is the trust boundary,
 not per-row encryption. A stored, unexpired token lets reconnect skip the
-browser flow entirely; a failed refresh discards the row (REQ-MCP-012).
+browser flow entirely -- but only when its `resource_uri` still matches the
+server's configured URL. Because the config key (server name) is mutable while
+the token's audience is not, the reload path discards the token when the URL or
+authorization server changes, so a renamed-or-repointed server never sends an
+old credential to a new endpoint. A successful refresh persists any rotated
+refresh token; a failed refresh discards the row (REQ-MCP-012).
 
 ---
 
