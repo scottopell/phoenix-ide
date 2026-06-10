@@ -102,6 +102,43 @@ fn test_context(conversation_id: &str) -> (ToolContext, Arc<BrowserSessionManage
     (ctx, manager)
 }
 
+// Vendored React UMD bundles + the shared test app, inlined into the
+// React-profiling test pages (see `fixtures/README.md`) so those tests have no
+// off-box network dependency — they previously fetched these from unpkg.com and
+// flaked on CDN latency. The production vs profiling react-dom build is the only
+// thing the two tests vary.
+const REACT_UMD: &str = include_str!("fixtures/react-18.3.1.production.min.js");
+const SCHEDULER_UMD: &str = include_str!("fixtures/scheduler-0.23.2.production.min.js");
+const REACT_DOM_PRODUCTION_UMD: &str = include_str!("fixtures/react-dom-18.3.1.production.min.js");
+const REACT_DOM_PROFILING_UMD: &str = include_str!("fixtures/react-dom-18.3.1.profiling.min.js");
+const REACT_TEST_APP_JS: &str = r#"
+window.__renders = 0;
+var e = React.createElement;
+function App() {
+  var st = React.useState(0); var n = st[0], set = st[1];
+  window.__renders++;
+  React.useEffect(function () { window.__ready = true; }, []);
+  return e('div', null,
+    e('div', { id: 'ready' }, 'ready'),
+    e('button', { id: 'inc', onClick: function () { set(function (x) { return x + 1; }); } }, 'n=' + n));
+}
+ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+"#;
+
+/// Build the React-profiling test page from the vendored UMD bundles, inlining
+/// the given react-dom build (production or profiling) in load order
+/// react → scheduler → react-dom → app.
+fn react_profiling_test_html(react_dom_umd: &str) -> String {
+    format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head>\n\
+<body><div id=\"root\"></div>\n\
+<script>{REACT_UMD}</script>\n\
+<script>{SCHEDULER_UMD}</script>\n\
+<script>{react_dom_umd}</script>\n\
+<script>{REACT_TEST_APP_JS}</script></body></html>"
+    )
+}
+
 /// Simple HTTP test server that serves static content
 struct TestServer {
     addr: std::net::SocketAddr,
@@ -2423,37 +2460,8 @@ async fn test_browser_profile_react_measured_path() {
     require_chrome!();
 
     // Profiling build => fibers carry numeric `actualDuration` without any
-    // DevTools backend toggle (our hook does not implement that). Script order
-    // matters: react -> scheduler -> react-dom.profiling.
-    //
-    // UMD bundles are vendored and inlined (see `fixtures/README.md`) rather
-    // than fetched from a CDN, so this test has no off-box network dependency.
-    const REACT_UMD: &str = include_str!("fixtures/react-18.3.1.production.min.js");
-    const SCHEDULER_UMD: &str = include_str!("fixtures/scheduler-0.23.2.production.min.js");
-    const REACT_DOM_PROFILING_UMD: &str =
-        include_str!("fixtures/react-dom-18.3.1.profiling.min.js");
-    // Separate arg so its `{ }` don't collide with `format!` placeholders.
-    const APP_JS: &str = r#"
-window.__renders = 0;
-var e = React.createElement;
-function App() {
-  var st = React.useState(0); var n = st[0], set = st[1];
-  window.__renders++;
-  React.useEffect(function () { window.__ready = true; }, []);
-  return e('div', null,
-    e('div', { id: 'ready' }, 'ready'),
-    e('button', { id: 'inc', onClick: function () { set(function (x) { return x + 1; }); } }, 'n=' + n));
-}
-ReactDOM.createRoot(document.getElementById('root')).render(e(App));
-"#;
-    let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"></head>\n\
-<body><div id=\"root\"></div>\n\
-<script>{REACT_UMD}</script>\n\
-<script>{SCHEDULER_UMD}</script>\n\
-<script>{REACT_DOM_PROFILING_UMD}</script>\n\
-<script>{APP_JS}</script></body></html>"
-    );
+    // DevTools backend toggle (our hook does not implement that).
+    let html = react_profiling_test_html(REACT_DOM_PROFILING_UMD);
 
     let server = TestServer::start(&html).await;
     let (ctx, manager) = test_context("test-profile-react-measured");
@@ -2846,37 +2854,8 @@ async fn test_browser_profile_react_no_profiling_build_path() {
     require_chrome!();
 
     // Production react-dom => fibers do NOT carry actualDuration even though the
-    // commit hook fires. Script order: react -> scheduler -> react-dom.production.
-    //
-    // The React/scheduler/react-dom UMD bundles are vendored and inlined (see
-    // `fixtures/README.md`) rather than fetched from a CDN, so this test has no
-    // off-box network dependency and can't flake on CDN latency.
-    const REACT_UMD: &str = include_str!("fixtures/react-18.3.1.production.min.js");
-    const SCHEDULER_UMD: &str = include_str!("fixtures/scheduler-0.23.2.production.min.js");
-    const REACT_DOM_UMD: &str = include_str!("fixtures/react-dom-18.3.1.production.min.js");
-    // Kept as a separate arg (not inlined in the template) so its `{ }` don't
-    // collide with `format!` placeholders.
-    const APP_JS: &str = r#"
-window.__renders = 0;
-var e = React.createElement;
-function App() {
-  var st = React.useState(0); var n = st[0], set = st[1];
-  window.__renders++;
-  React.useEffect(function () { window.__ready = true; }, []);
-  return e('div', null,
-    e('div', { id: 'ready' }, 'ready'),
-    e('button', { id: 'inc', onClick: function () { set(function (x) { return x + 1; }); } }, 'n=' + n));
-}
-ReactDOM.createRoot(document.getElementById('root')).render(e(App));
-"#;
-    let html = format!(
-        "<!doctype html><html><head><meta charset=\"utf-8\"></head>\n\
-<body><div id=\"root\"></div>\n\
-<script>{REACT_UMD}</script>\n\
-<script>{SCHEDULER_UMD}</script>\n\
-<script>{REACT_DOM_UMD}</script>\n\
-<script>{APP_JS}</script></body></html>"
-    );
+    // commit hook fires.
+    let html = react_profiling_test_html(REACT_DOM_PRODUCTION_UMD);
 
     let server = TestServer::start(&html).await;
     let (ctx, manager) = test_context("test-profile-react-noprof");
