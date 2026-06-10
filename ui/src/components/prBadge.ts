@@ -63,3 +63,19 @@ export function prFeedbackFreshnessLabel(pr: PrStatusResponse): string | null {
   }
   return 'updated';
 }
+
+/** Short hint for why PR status is unavailable (the pipeline couldn't check),
+ *  or null when the reason is absent — distinct from a genuine "no PR found"
+ *  so a surface can avoid telling the user there's no PR when it simply
+ *  couldn't look. */
+export function unavailablePrHint(
+  reason: PrStatusResponse['unavailable_reason'],
+): string | null {
+  switch (reason) {
+    case 'gh_missing': return 'gh missing';
+    case 'not_authenticated': return 'gh auth';
+    case 'not_git_repo': return 'no worktree';
+    case 'command_failed': return 'PR status unavailable';
+    default: return null;
+  }
+}

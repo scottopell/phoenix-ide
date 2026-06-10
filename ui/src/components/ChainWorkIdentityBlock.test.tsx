@@ -90,6 +90,25 @@ describe('ChainWorkIdentityBlock', () => {
     expect(screen.getByText('3 new')).toBeInTheDocument();
   });
 
+  it('surfaces an unavailable-PR hint rather than claiming "no PR"', () => {
+    const prStatus: PrStatusResponse = {
+      found: false,
+      unavailable_reason: 'gh_missing',
+      refresh: {
+        state: 'unavailable',
+        reason: 'gh_missing',
+        stale: false,
+        last_attempted_at: '2026-04-29T12:00:00Z',
+      },
+    };
+    setPrState({ status: 'ready', prStatus });
+
+    render(<ChainWorkIdentityBlock identity={WORK_IDENTITY} />);
+
+    expect(screen.getByText('gh missing')).toBeInTheDocument();
+    expect(screen.queryByText('no PR')).not.toBeInTheDocument();
+  });
+
   it('shows "No managed work scope" when the chain owns no worktree', () => {
     render(<ChainWorkIdentityBlock identity={null} />);
     expect(screen.getByText('No managed work scope')).toBeInTheDocument();

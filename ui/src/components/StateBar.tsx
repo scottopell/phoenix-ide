@@ -8,7 +8,7 @@ import type { ConnectionState } from '../hooks';
 import { useIsMobile } from '../hooks';
 import { getStateDescription, isAgentWorking } from '../utils';
 import { ContextIndicator } from './ContextIndicator';
-import { prBadgeClass, prBadgeLabel, prRefreshStaleText, prTooltip } from './prBadge';
+import { prBadgeClass, prBadgeLabel, prRefreshStaleText, prTooltip, unavailablePrHint } from './prBadge';
 
 const CheckIcon = () => (
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -188,15 +188,6 @@ function PrStatusPopover({ pr }: { pr: PrStatusResponse }) {
       {pr.url && <a href={pr.url} target="_blank" rel="noreferrer">Open PR/checks ↗</a>}
     </div>
   );
-}
-function unavailablePrHint(reason: PrStatusResponse['unavailable_reason']): string | null {
-  switch (reason) {
-    case 'gh_missing': return 'gh missing';
-    case 'not_authenticated': return 'gh auth';
-    case 'not_git_repo': return 'no worktree';
-    case 'command_failed': return 'PR status unavailable';
-    default: return null;
-  }
 }
 
 /** Format elapsed seconds as a compact duration string.

@@ -13,6 +13,7 @@ import {
   prBadgeLabel,
   prTooltip,
   prFeedbackFreshnessLabel,
+  unavailablePrHint,
 } from './prBadge';
 
 export function ChainWorkIdentityBlock({ identity }: { identity: ChainWorkIdentity | null }) {
@@ -36,6 +37,10 @@ export function ChainWorkIdentityBlock({ identity }: { identity: ChainWorkIdenti
 
   const pr = prHandle.state.status === 'ready' ? prHandle.state.prStatus : null;
   const freshness = pr?.found ? prFeedbackFreshnessLabel(pr) : null;
+  // Distinguish "the pipeline couldn't check" (gh missing / unauthenticated /
+  // not a repo / command failed) from a genuine "no PR for this branch", so the
+  // dock doesn't claim there's no PR when it simply couldn't look.
+  const unavailableHint = pr && !pr.found ? unavailablePrHint(pr.unavailable_reason) : null;
 
   return (
     <section className="chain-work-identity">
@@ -77,7 +82,9 @@ export function ChainWorkIdentityBlock({ identity }: { identity: ChainWorkIdenti
               </span>
             ) : (
               <span className="chain-work-identity-muted">
-                {prHandle.state.status === 'loading' ? '…' : 'no PR'}
+                {prHandle.state.status === 'loading'
+                  ? '…'
+                  : (unavailableHint ?? 'no PR')}
               </span>
             )}
           </dd>
