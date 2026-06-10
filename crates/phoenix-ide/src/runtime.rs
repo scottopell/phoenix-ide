@@ -1470,10 +1470,9 @@ impl RuntimeManager {
         // Explore sub-agents are always Explore. Work sub-agents inherit
         // the parent's Work mode (branch, base_branch, worktree_path).
         let sub_conv_mode = match spec.mode {
-            // Sub-agent Explore conversations have no worktree of their own;
-            // they share the parent's working directory and tmux server.
             SubAgentMode::Explore => ConvMode::Explore {
                 worktree_path: None,
+                next_taskmd_id_hint: None,
             },
             SubAgentMode::Work => parent_conv.conv_mode.clone(),
         };
@@ -2340,7 +2339,12 @@ async fn find_root_conversation_id(db: &Database, conversation_id: &str) -> Stri
 /// Convert a database `ConvMode` into a `ModeContext` for the system prompt.
 pub(crate) fn conv_mode_to_context(mode: &ConvMode) -> ModeContext {
     match mode {
-        ConvMode::Explore { .. } => ModeContext::Explore,
+        ConvMode::Explore {
+            next_taskmd_id_hint,
+            ..
+        } => ModeContext::Explore {
+            next_taskmd_id_hint: next_taskmd_id_hint.as_ref().map(ToString::to_string),
+        },
         ConvMode::Work {
             branch_name,
             base_branch,
@@ -2386,9 +2390,9 @@ mod sub_agent_registry_resume_tests {
 
     #[test]
     fn explore_subagent_resume_excludes_patch() {
-        // An Explore sub-agent is read-only -- no `patch`.
         let mode = ConvMode::Explore {
             worktree_path: None,
+            next_taskmd_id_hint: None,
         };
         assert!(!registry_has(&mode, "patch"));
         assert!(registry_has(&mode, "submit_result"));
@@ -2474,9 +2478,9 @@ mod work_scope_derivation_tests {
 
     #[test]
     fn explore_subagent_resolves_to_its_own_conversation_scope() {
-        // The bug's epicentre: no worktree of its own → isolated conv scope.
         let mode = ConvMode::Explore {
             worktree_path: None,
+            next_taskmd_id_hint: None,
         };
         assert_scopes_agree(
             "explore-subagent-1",
@@ -2487,9 +2491,9 @@ mod work_scope_derivation_tests {
 
     #[test]
     fn top_level_explore_resolves_to_its_worktree_scope() {
-        // A top-level Explore conversation owns a worktree pre-approval.
         let mode = ConvMode::Explore {
             worktree_path: Some(NonEmptyString::new("/tmp/wt-explore").unwrap()),
+            next_taskmd_id_hint: None,
         };
         assert_scopes_agree(
             "explore-toplevel-1",

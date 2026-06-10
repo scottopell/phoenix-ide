@@ -114,6 +114,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "backfill_awaiting_recovery_resume_target",
         sql: MIGRATION_020,
     },
+    Migration {
+        version: 21,
+        name: "normalize_explore_taskmd_id_hint",
+        sql: MIGRATION_021,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -493,6 +498,14 @@ WHERE json_extract(state, '$.type') = 'awaiting_recovery'
   AND json_extract(state, '$.resume') IS NULL;
 "#;
 
+/// Normalize persisted Explore `conv_mode` JSON for the taskmd ID hint field.
+const MIGRATION_021: &str = r"
+UPDATE conversations
+SET conv_mode = json_remove(conv_mode, '$.next_taskmd_id_hint')
+WHERE json_extract(conv_mode, '$.mode') = 'Explore'
+  AND json_extract(conv_mode, '$.next_taskmd_id_hint') IS NULL;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -612,10 +625,33 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 20);
+        assert_eq!(first, 21);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_021_removes_null_explore_taskmd_id_hint() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+        sqlx::query(
+            "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+             VALUES ('c-hint', '{\"mode\":\"Explore\",\"next_taskmd_id_hint\":null}', '{\"type\":\"idle\"}', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        let conv_mode: String =
+            sqlx::query_scalar("SELECT conv_mode FROM conversations WHERE id = 'c-hint'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&conv_mode).unwrap();
+        assert!(value.get("next_taskmd_id_hint").is_none());
     }
 
     #[tokio::test]

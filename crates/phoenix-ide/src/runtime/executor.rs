@@ -1349,7 +1349,7 @@ where
             Some(ModeContext::Work { .. } | ModeContext::Direct | ModeContext::Branch { .. }) => {
                 true
             }
-            Some(ModeContext::Explore) | None => false,
+            Some(ModeContext::Explore { .. }) | None => false,
         };
 
         let mut work_count_in_batch = 0u32;
@@ -4918,6 +4918,159 @@ mod plain_markdown_approval_tests {
 }
 
 // ============================================================
+// Explore prompt cache shape across tool loops
+// ============================================================
+
+#[cfg(test)]
+mod explore_prompt_cache_shape_tests {
+    use super::*;
+    use crate::llm::{ContentBlock, LlmResponse, ModelRegistry, ToolDefinition, Usage};
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient};
+    use crate::runtime::traits::ToolExecutor;
+    use crate::state_machine::{ConvContext, Event};
+    use crate::system_prompt::{snapshot_next_taskmd_id_hint, ModeContext};
+    use crate::tools::{BrowserSessionManager, ToolContext, ToolOutput};
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    struct TaskCreatingPatchExecutor {
+        task_path: PathBuf,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for TaskCreatingPatchExecutor {
+        async fn execute(
+            &self,
+            name: &str,
+            _input: Value,
+            _ctx: ToolContext,
+        ) -> Option<ToolOutput> {
+            if name != "patch" {
+                return None;
+            }
+            std::fs::write(&self.task_path, "# Draft\n").unwrap();
+            Some(ToolOutput::success("created task draft"))
+        }
+
+        async fn definitions(&self) -> Vec<ToolDefinition> {
+            vec![ToolDefinition {
+                name: "patch".to_string(),
+                description: "Mock patch".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                defer_loading: false,
+            }]
+        }
+    }
+
+    #[tokio::test]
+    async fn explore_tool_loop_keeps_system_prompt_and_cache_key_stable_after_task_file_write() {
+        let temp = TempDir::new().unwrap();
+        let tasks_dir = temp.path().join("tasks");
+        std::fs::create_dir(&tasks_dir).unwrap();
+        std::fs::write(
+            tasks_dir.join(taskmd_core::constants::TEMPLATE_FILENAME),
+            "# Task Title\n",
+        )
+        .unwrap();
+        let hinted_id = snapshot_next_taskmd_id_hint(temp.path(), "tasks")
+            .expect("taskmd marker should produce hint")
+            .to_string();
+
+        let conv_id = "explore-cache-shape";
+        let mut context =
+            ConvContext::new(conv_id, temp.path().to_path_buf(), "test-model", 200_000);
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: Some(hinted_id.clone()),
+        });
+        context.tasks_dir_name = "tasks".to_string();
+
+        let storage = Arc::new(InMemoryStorage::new());
+        let llm = Arc::new(MockLlmClient::new("test-model"));
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::ToolUse {
+                id: "tool-patch-1".to_string(),
+                name: "patch".to_string(),
+                input: serde_json::json!({
+                    "path": format!("tasks/{hinted_id}-p2-ready--draft.md"),
+                    "patches": [{"operation": "overwrite", "newText": "# Draft\\n"}]
+                }),
+            }],
+            end_turn: false,
+            usage: Usage::default(),
+        });
+        llm.queue_response(LlmResponse {
+            content: vec![ContentBlock::text("ready to propose")],
+            end_turn: true,
+            usage: Usage::default(),
+        });
+
+        let (event_tx, runtime_event_rx) = mpsc::channel(32);
+        let broadcaster = SseBroadcaster::new(128, 0);
+        let runtime = ConversationRuntime::new(
+            context,
+            ConvState::Idle,
+            storage,
+            llm.clone(),
+            Arc::new(TaskCreatingPatchExecutor {
+                task_path: tasks_dir.join(format!("{hinted_id}-p2-ready--draft.md")),
+            }),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            runtime_event_rx,
+            event_tx.clone(),
+            broadcaster,
+        );
+        let runtime_handle = tokio::spawn(async move { runtime.run().await });
+
+        event_tx
+            .send(Event::UserMessage {
+                text: "draft a task".to_string(),
+                llm_text: None,
+                images: vec![],
+                files: vec![],
+                message_id: "user-msg-1".to_string(),
+                user_agent: None,
+                skill_invocation: None,
+            })
+            .await
+            .unwrap();
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if llm.recorded_requests().len() >= 2 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for two LLM requests"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        let requests = llm.recorded_requests();
+        assert!(tasks_dir
+            .join(format!("{hinted_id}-p2-ready--draft.md"))
+            .is_file());
+        assert_eq!(requests[0].system.len(), requests[1].system.len());
+        assert_eq!(requests[0].system[0].text, requests[1].system[0].text);
+        assert_eq!(
+            requests[0].cache_key.as_str(),
+            requests[1].cache_key.as_str()
+        );
+        assert_eq!(requests[0].cache_key.as_str(), conv_id);
+
+        runtime_handle.abort();
+    }
+}
+
+// ============================================================
 // Mode-context refresh on Explore -> Work promotion
 // ============================================================
 //
@@ -4961,7 +5114,9 @@ mod approve_task_refreshes_mode_context_tests {
 
         let storage = Arc::new(InMemoryStorage::new());
         let mut context = ConvContext::new(conv_id, explore_wt.clone(), "test-model", 200_000);
-        context.mode_context = Some(ModeContext::Explore);
+        context.mode_context = Some(ModeContext::Explore {
+            next_taskmd_id_hint: None,
+        });
         context.desired_base_branch = Some(base_branch.to_string());
         // Pre-approval Explore owns no scope-defining worktree (the
         // sub-agent-Explore shape that keys tool resources under

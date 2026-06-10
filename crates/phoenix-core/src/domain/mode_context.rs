@@ -5,7 +5,10 @@
 #[derive(Debug, Clone)]
 pub enum ModeContext {
     /// Read-only git project. Agent can investigate and propose tasks.
-    Explore,
+    Explore {
+        /// Stable taskmd ID hint captured when the Explore workflow starts.
+        next_taskmd_id_hint: Option<String>,
+    },
     /// Isolated worktree with write access for an approved task.
     Work {
         branch_name: String,

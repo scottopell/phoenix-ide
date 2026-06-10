@@ -89,6 +89,19 @@ fn next_taskmd_id(working_dir: &Path, tasks_dir_name: &str) -> Option<String> {
     Some(taskmd_core::ids::next_id(&tasks_dir))
 }
 
+pub fn snapshot_next_taskmd_id_hint(
+    working_dir: &Path,
+    tasks_dir_name: &str,
+) -> Option<phoenix_core::domain::db_schema::NonEmptyString> {
+    next_taskmd_id(working_dir, tasks_dir_name).and_then(|id| {
+        phoenix_core::domain::db_schema::NonEmptyString::new(id)
+            .map_err(|e| {
+                tracing::warn!(error = %e, "computed empty taskmd ID hint; omitting Explore hint");
+            })
+            .ok()
+    })
+}
+
 /// Build the complete system prompt for a conversation.
 pub fn build_system_prompt(
     working_dir: &Path,
@@ -194,13 +207,15 @@ pub fn build_system_prompt_with_options(
     // Add mode context so the agent understands its capabilities
     if let Some(mode) = mode {
         match mode {
-            ModeContext::Explore => {
+            ModeContext::Explore {
+                next_taskmd_id_hint,
+            } => {
                 prompt.push_str(&llm_language::mode_explore(language, tasks_dir_name));
-                if let Some(next_id) = next_taskmd_id(working_dir, tasks_dir_name) {
+                if let Some(next_id) = next_taskmd_id_hint {
                     prompt.push_str(&llm_language::next_taskmd_id_hint(
                         language,
                         tasks_dir_name,
-                        &next_id,
+                        next_id,
                     ));
                 }
             }
@@ -518,11 +533,15 @@ mod tests {
         )
         .unwrap();
 
+        let mode = ModeContext::Explore {
+            next_taskmd_id_hint: snapshot_next_taskmd_id_hint(temp.path(), "tasks")
+                .map(|id| id.to_string()),
+        };
         let prompt = build_system_prompt_with_options(
             temp.path(),
             "tasks",
             false,
-            Some(&ModeContext::Explore),
+            Some(&mode),
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
@@ -553,7 +572,9 @@ mod tests {
             temp.path(),
             "tasks",
             false,
-            Some(&ModeContext::Explore),
+            Some(&ModeContext::Explore {
+                next_taskmd_id_hint: None,
+            }),
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
@@ -575,7 +596,9 @@ mod tests {
             temp.path(),
             "tasks",
             false,
-            Some(&ModeContext::Explore),
+            Some(&ModeContext::Explore {
+                next_taskmd_id_hint: None,
+            }),
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
@@ -595,11 +618,15 @@ mod tests {
         )
         .unwrap();
 
+        let mode = ModeContext::Explore {
+            next_taskmd_id_hint: snapshot_next_taskmd_id_hint(temp.path(), "task-archive")
+                .map(|id| id.to_string()),
+        };
         let prompt = build_system_prompt_with_options(
             temp.path(),
             "task-archive",
             false,
-            Some(&ModeContext::Explore),
+            Some(&mode),
             Some(temp.path()),
             None,
             crate::llm_language::LlmLanguage::default(),
@@ -609,6 +636,58 @@ mod tests {
         let expected_id = taskmd_core::ids::next_id(&tasks_dir);
         assert!(prompt.contains(&format!("`{expected_id}`")));
         assert!(prompt.contains(&format!("`task-archive/{expected_id}")));
+    }
+
+    #[test]
+    fn test_explore_mode_reuses_snapshotted_taskmd_id_after_file_creation() {
+        let temp = TempDir::new().unwrap();
+        let tasks_dir = temp.path().join("tasks");
+        fs::create_dir(&tasks_dir).unwrap();
+        fs::write(
+            tasks_dir.join(taskmd_core::constants::TEMPLATE_FILENAME),
+            "# Task Title\n",
+        )
+        .unwrap();
+
+        let hinted_id = snapshot_next_taskmd_id_hint(temp.path(), "tasks")
+            .expect("taskmd marker should produce a hint")
+            .to_string();
+        let mode = ModeContext::Explore {
+            next_taskmd_id_hint: Some(hinted_id.clone()),
+        };
+        let first_prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&mode),
+            Some(temp.path()),
+            None,
+            crate::llm_language::LlmLanguage::default(),
+            None,
+        );
+
+        fs::write(
+            tasks_dir.join(format!("{hinted_id}-p2-ready--draft.md")),
+            "# Draft\n",
+        )
+        .unwrap();
+        let recomputed_id = taskmd_core::ids::next_id(&tasks_dir);
+        assert_ne!(hinted_id, recomputed_id);
+
+        let second_prompt = build_system_prompt_with_options(
+            temp.path(),
+            "tasks",
+            false,
+            Some(&mode),
+            Some(temp.path()),
+            None,
+            crate::llm_language::LlmLanguage::default(),
+            None,
+        );
+
+        assert_eq!(first_prompt, second_prompt);
+        assert!(second_prompt.contains(&format!("`{hinted_id}`")));
+        assert!(!second_prompt.contains(&format!("`{recomputed_id}`")));
     }
 
     #[test]

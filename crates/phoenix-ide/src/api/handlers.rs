@@ -1466,11 +1466,20 @@ async fn create_conversation_with_id(
             Err(ManagedWorktreeError::Git(msg)) => return Err(AppError::Internal(msg)),
         };
 
+        let next_taskmd_id_hint = {
+            let tasks_dir_name =
+                taskmd_core::discover::discover_or_default(std::path::Path::new(&worktree_path));
+            crate::system_prompt::snapshot_next_taskmd_id_hint(
+                std::path::Path::new(&worktree_path),
+                &tasks_dir_name.to_string_lossy(),
+            )
+        };
         let worktree_nes = crate::db::NonEmptyString::new(&worktree_path)
             .map_err(|_| AppError::Internal("managed worktree path was empty".to_string()))?;
         (
             crate::db::ConvMode::Explore {
                 worktree_path: Some(worktree_nes),
+                next_taskmd_id_hint,
             },
             worktree_path,
         )
@@ -3372,6 +3381,7 @@ fn cascade_project_target(conv: &crate::db::Conversation) -> Option<(String, Str
         } => Some((branch_name.to_string(), worktree_path.to_string(), false)),
         ConvMode::Explore {
             worktree_path: Some(wt),
+            ..
         } => {
             // Top-level managed Explore: temp branch follows the REQ-PROJ-028
             // naming scheme. `is_work_mode = true` so the blocking closure
@@ -3382,6 +3392,7 @@ fn cascade_project_target(conv: &crate::db::Conversation) -> Option<(String, Str
         ConvMode::Direct
         | ConvMode::Explore {
             worktree_path: None,
+            ..
         } => None,
     }
 }

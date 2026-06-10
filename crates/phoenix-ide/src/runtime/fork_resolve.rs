@@ -1460,6 +1460,7 @@ fn prepare_promote_blocking(
 
     let conv_mode = ConvMode::Explore {
         worktree_path: Some(nes(&worktree_path_str, "worktree path")?),
+        next_taskmd_id_hint: None,
     };
 
     let seed_text = format!(
@@ -2342,7 +2343,7 @@ mod tests {
 
         let refinement = db.get_conversation(&refinement_id).await.unwrap();
         match &refinement.conv_mode {
-            ConvMode::Explore { worktree_path } => {
+            ConvMode::Explore { worktree_path, .. } => {
                 assert!(worktree_path.is_some());
             }
             other => panic!("expected Explore mode, got {other:?}"),

@@ -2010,7 +2010,7 @@ pub fn transition_parent(
                 // non-blocking fork and keep running. `ModeKind::Managed` covers
                 // both Explore and Work, so the precise mode comes from
                 // `mode_context`.
-                let is_explore = matches!(context.mode_context, Some(ModeContext::Explore));
+                let is_explore = matches!(context.mode_context, Some(ModeContext::Explore { .. }));
                 let fork_eligible = matches!(context.mode, ModeKind::Branch)
                     || matches!(
                         context.mode_context,
@@ -5273,7 +5273,13 @@ mod tests {
         #[test]
         fn explore_valid_file_parks_into_awaiting_task_approval() {
             let (tmp, rel) = worktree_with_task();
-            let ctx = ctx_for(&tmp, ModeKind::Managed, Some(ModeContext::Explore));
+            let ctx = ctx_for(
+                &tmp,
+                ModeKind::Managed,
+                Some(ModeContext::Explore {
+                    next_taskmd_id_hint: None,
+                }),
+            );
 
             let result = transition(
                 &ConvState::LlmRequesting { attempt: 1 },

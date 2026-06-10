@@ -359,6 +359,7 @@ mod tests {
             project_id: None,
             conv_mode: ConvMode::Explore {
                 worktree_path: None,
+                next_taskmd_id_hint: None,
             },
             desired_base_branch: None,
             message_count: 3,

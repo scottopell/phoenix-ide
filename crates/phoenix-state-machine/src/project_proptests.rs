@@ -215,6 +215,7 @@ mod tests {
             // Work is a terminal mode -- cannot transition to anything
             let explore = ConvMode::Explore {
                 worktree_path: None,
+                next_taskmd_id_hint: None,
             };
             prop_assert!(!is_valid_mode_transition(&mode, &explore));
             prop_assert!(!is_valid_mode_transition(&mode, &ConvMode::Direct));

@@ -312,6 +312,8 @@ pub enum ConvMode {
     Explore {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         worktree_path: Option<NonEmptyString>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        next_taskmd_id_hint: Option<NonEmptyString>,
     },
     /// Direct mode: full tool access, no lifecycle ceremony.
     /// Default for all new conversations (git and non-git).
@@ -349,6 +351,7 @@ impl Default for ConvMode {
     fn default() -> Self {
         Self::Explore {
             worktree_path: None,
+            next_taskmd_id_hint: None,
         }
     }
 }
@@ -387,7 +390,9 @@ impl ConvMode {
             Self::Work { worktree_path, .. } | Self::Branch { worktree_path, .. } => {
                 Some(worktree_path.as_str())
             }
-            Self::Explore { worktree_path } => worktree_path.as_ref().map(NonEmptyString::as_str),
+            Self::Explore { worktree_path, .. } => {
+                worktree_path.as_ref().map(NonEmptyString::as_str)
+            }
             Self::Direct => None,
         }
     }
@@ -1502,7 +1507,8 @@ mod conv_mode_tests {
         assert_eq!(
             parsed,
             ConvMode::Explore {
-                worktree_path: None
+                worktree_path: None,
+                next_taskmd_id_hint: None,
             }
         );
     }
@@ -1570,7 +1576,8 @@ mod conv_mode_tests {
         assert_eq!(config.base_branch.as_str(), "main");
 
         assert!(ConvMode::Explore {
-            worktree_path: None
+            worktree_path: None,
+            next_taskmd_id_hint: None,
         }
         .worktree_config()
         .is_none());
@@ -1594,6 +1601,7 @@ mod conv_mode_tests {
 
         let explore_none: Value = serde_json::to_value(ConvMode::Explore {
             worktree_path: None,
+            next_taskmd_id_hint: None,
         })
         .unwrap();
         assert_eq!(explore_none["mode"], "Explore");
@@ -1601,13 +1609,16 @@ mod conv_mode_tests {
         // the migration-007 Explore backfill relies on to detect un-backfilled
         // rows (`$.worktree_path` IS NULL).
         assert!(explore_none.get("worktree_path").is_none());
+        assert!(explore_none.get("next_taskmd_id_hint").is_none());
 
         let explore_some: Value = serde_json::to_value(ConvMode::Explore {
             worktree_path: Some(NonEmptyString::new("/wt/explore").unwrap()),
+            next_taskmd_id_hint: Some(NonEmptyString::new("43002").unwrap()),
         })
         .unwrap();
         assert_eq!(explore_some["mode"], "Explore");
         assert_eq!(explore_some["worktree_path"], "/wt/explore");
+        assert_eq!(explore_some["next_taskmd_id_hint"], "43002");
 
         // Work: SQL reads $.mode, $.worktree_path, $.base_branch, $.branch_name.
         let work: Value = serde_json::to_value(ConvMode::Work {
@@ -1764,6 +1775,7 @@ mod conversation_serde_tests {
             project_id: None,
             conv_mode: ConvMode::Explore {
                 worktree_path: None,
+                next_taskmd_id_hint: None,
             },
             desired_base_branch: None,
             message_count: 0,

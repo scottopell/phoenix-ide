@@ -1030,6 +1030,7 @@ impl Database {
             None,
             &ConvMode::Explore {
                 worktree_path: None,
+                next_taskmd_id_hint: None,
             },
             None,
             None,
@@ -4521,6 +4522,7 @@ mod tests {
             "/tmp/explore-cwd",
             &ConvMode::Explore {
                 worktree_path: None,
+                next_taskmd_id_hint: None,
             },
         )
         .await;
