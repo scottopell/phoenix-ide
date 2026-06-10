@@ -223,6 +223,27 @@ describe('notification policy reducer', () => {
   });
 
   describe('settings load transitions', () => {
+    it('records a load failure error and clears it on retry', () => {
+      let state = notificationPolicyReducer(initialPolicyState(), { type: 'settings_load_started' }, env()).state;
+      state = notificationPolicyReducer(state, { type: 'settings_load_failed', error: 'offline' }, env()).state;
+      expect(state.settingsStatus).toBe('failed');
+      expect(state.loadError).toBe('offline');
+
+      // A retry clears the surfaced error while the new fetch is in flight.
+      state = notificationPolicyReducer(state, { type: 'settings_load_started' }, env()).state;
+      expect(state.settingsStatus).toBe('loading');
+      expect(state.loadError).toBeNull();
+    });
+
+    it('clears a prior load error once a user edit takes authority', () => {
+      let state = notificationPolicyReducer(initialPolicyState(), { type: 'settings_load_started' }, env()).state;
+      state = notificationPolicyReducer(state, { type: 'settings_load_failed', error: 'offline' }, env()).state;
+      expect(state.loadError).toBe('offline');
+      state = notificationPolicyReducer(state, { type: 'settings_save_requested', settings: DEFAULT_NOTIFICATION_SETTINGS }, env()).state;
+      expect(state.loadError).toBeNull();
+      expect(state.settingsStatus).toBe('loaded');
+    });
+
     it('ignores a stale load result once a save has taken authority', () => {
       let state = notificationPolicyReducer(initialPolicyState(), { type: 'settings_load_started' }, env()).state;
       expect(state.settingsStatus).toBe('loading');

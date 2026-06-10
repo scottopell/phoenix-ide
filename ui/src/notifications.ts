@@ -106,7 +106,9 @@ export function useNotificationSettings(): {
     settings: state.settings,
     status: state.settingsStatus,
     saving: state.saving,
-    error: state.saveError,
+    // Surface a save error if one is pending, otherwise a load failure, so a
+    // failed initial fetch is visible rather than silently showing defaults.
+    error: state.saveError ?? state.loadError,
     save,
   };
 }

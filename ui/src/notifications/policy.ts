@@ -53,6 +53,10 @@ export type NotificationPolicyState = {
   latestSaveId: number;
   saving: boolean;
   saveError: string | null;
+  // Error from the most recent failed settings load, surfaced until a retry
+  // starts, a load succeeds, or a user edit takes authority. Kept separate
+  // from saveError so neither clobbers the other.
+  loadError: string | null;
   // True when delivery wanted to fire but browser permission was still
   // `default`. The adapter surfaces an in-app cue the next time the tab
   // gains focus, then dispatches `permission_cue_consumed`.
@@ -112,6 +116,7 @@ export function initialPolicyState(): NotificationPolicyState {
     latestSaveId: 0,
     saving: false,
     saveError: null,
+    loadError: null,
     permissionCuePending: false,
     busyStartedAtByConversationId: new Map(),
     attentionSeenByConversationId: new Map(),
@@ -291,17 +296,17 @@ export function notificationPolicyReducer(
 ): ReduceResult {
   switch (event.type) {
     case 'settings_load_started':
-      return { state: { ...state, settingsStatus: 'loading' }, effects: [{ type: 'load_settings' }] };
+      return { state: { ...state, settingsStatus: 'loading', loadError: null }, effects: [{ type: 'load_settings' }] };
 
     case 'settings_loaded':
       // A save that landed mid-load already moved us to `loaded` with
       // user-authoritative settings; the stale load result is ignored.
       if (state.settingsStatus !== 'loading') return { state, effects: [] };
-      return { state: { ...state, settingsStatus: 'loaded', settings: event.settings }, effects: [] };
+      return { state: { ...state, settingsStatus: 'loaded', settings: event.settings, loadError: null }, effects: [] };
 
     case 'settings_load_failed':
       if (state.settingsStatus !== 'loading') return { state, effects: [] };
-      return { state: { ...state, settingsStatus: 'failed' }, effects: [] };
+      return { state: { ...state, settingsStatus: 'failed', loadError: event.error }, effects: [] };
 
     case 'settings_save_requested': {
       const latestSaveId = state.latestSaveId + 1;
@@ -313,6 +318,9 @@ export function notificationPolicyReducer(
           settingsStatus: 'loaded',
           saving: true,
           saveError: null,
+          // The user's edit is now authoritative, so a prior load failure no
+          // longer applies.
+          loadError: null,
         },
         effects: [{ type: 'save_settings', requestId: latestSaveId, settings: event.settings }],
       };
