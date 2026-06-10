@@ -232,9 +232,12 @@ verify the authorization server advertises `code_challenge_methods_supported`
 (and refuse to proceed if it does not), generate a code verifier/challenge,
 generate an unguessable `state` value bound to the pending server, surface the
 authorization URL for the user to open in a browser, receive the redirect on a
-local callback, reject the callback unless its `state` matches the pending
-flow, and only then exchange the code (plus verifier) for an access token at
-the token endpoint.
+local callback, reject the callback unless its `state` matches the pending flow
+**and** -- when the authorization server returns an `iss` parameter or
+advertises `authorization_response_iss_parameter_supported` -- its `iss`
+matches the issuer of the validated authorization-server metadata, and only
+then exchange the code (plus verifier) for an access token at the token
+endpoint.
 
 THE SYSTEM SHALL include the MCP server's canonical URI as the `resource`
 parameter (RFC 8707 Resource Indicators) on both the authorization request and
@@ -248,7 +251,10 @@ process such as `mcp-remote`.
 before the browser round trip rather than failing after it. The `state` nonce
 binds the redirect to the flow that started it: without it, a code injected by
 another tab, process, or pending server could be exchanged and its token
-persisted under the wrong MCP server. Resource Indicators bind the token's
+persisted under the wrong MCP server. The `iss` check defends against
+authorization-server mix-up: a `state`-valid callback delivered from a
+different authorization server is rejected before the code reaches the token
+endpoint. Resource Indicators bind the token's
 audience to the MCP server, which compliant authorization and resource servers
 require. Performing the flow natively removes the npm/subprocess dependency and
 the browser-popup-on-every-reload behavior of the external bridge.
@@ -262,30 +268,36 @@ database, bound to the MCP server's canonical resource URI
 AND attach the access token as an `Authorization: Bearer` header on **every**
 HTTP request to that server -- `initialize` and its retries, `tools/*`, the GET
 stream, and the session `DELETE`
-AND reuse a stored, unexpired token on reconnect without re-prompting the user,
-**only when** its bound resource URI still matches the server's configured URI;
-a changed URL (or authorization server) discards the stored token instead of
-sending it to the new endpoint
+AND, on startup and on reload, load a stored, unexpired token for a server and
+attach it to the `initialize` handshake -- entering the connected state without
+an unauthenticated 401 round trip or a re-prompt -- **only when** its bound
+resource URI still matches the server's configured URI; a changed URL (or
+authorization server) discards the stored token instead of sending it to the
+new endpoint
 AND, on expiry or a post-authorization 401, refresh using the refresh token,
 persisting any rotated refresh token the server returns
 AND, when refresh fails, discard the stored token and return the server to an
 unauthorized state requiring a new authorization
 AND, when a tool call returns HTTP 403 `insufficient_scope` with a
-`WWW-Authenticate` challenge, re-authorize for the expanded scope and retry
-rather than surfacing a permanent tool failure.
+`WWW-Authenticate` challenge, re-authorize requesting the **union** of the
+previously granted scopes and the newly challenged scope, then retry, rather
+than surfacing a permanent tool failure.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
-survive restarts; refresh keeps a session alive. A token is audience-bound to
-one resource, so reusing it merely because the config kept the same display
-name -- after the URL changed -- would leak a credential to a different
-endpoint; the binding makes reuse conditional on the resource matching. A
-rotating server may issue a replacement refresh token on each refresh; dropping
-it forces a needless re-authorization. The access token must ride every request
-or protected servers reject calls despite a successful authorization. A failed
-refresh must discard the stale token so it cannot be reused or duplicated, and
-is the condition that re-prompts the user. A `403 insufficient_scope` is a
-step-up request, not a terminal error -- treating it as one would make
-scope-gated tools permanently unusable.
+survive restarts; the stored token must be loaded and attached to the very
+first handshake or every restart degrades into a fresh browser authorization,
+defeating authorize-once. A token is audience-bound to one resource, so reusing
+it merely because the config kept the same display name -- after the URL changed
+-- would leak a credential to a different endpoint; the binding makes reuse
+conditional on the resource matching. A rotating server may issue a replacement
+refresh token on each refresh; dropping it forces a needless re-authorization.
+The access token must ride every request or protected servers reject calls
+despite a successful authorization. A failed refresh must discard the stale
+token so it cannot be reused or duplicated, and is the condition that re-prompts
+the user. A `403 insufficient_scope` is a step-up request, not a terminal error;
+it must request the union of prior and challenged scopes, or fixing one
+scope-gated tool would silently drop another's access and bounce the user
+through repeated re-authorization.
 
 ---
 

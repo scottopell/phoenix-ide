@@ -77,10 +77,14 @@ entity McpServer {
 -- Persisted client identity for an authorization server. Keyed by the
 -- authorization server (not the MCP server) so resources sharing one
 -- authorization server share a single registration -- registration happens
--- once per authorization server (REQ-MCP-010).
+-- once per authorization server (REQ-MCP-010). A confidential client also
+-- persists its secret + token-endpoint auth method, needed to authenticate
+-- code exchange and refresh after a restart.
 entity OAuthRegistration {
     auth_server: String
     client_id: String
+    client_secret: String?
+    token_endpoint_auth_method: String
 }
 
 -- Persisted OAuth tokens (plaintext in SQLite, consistent with existing
@@ -139,8 +143,11 @@ surface McpControl {
 
 -- Discovery materializes a server in the connecting state. Static/no-auth
 -- servers carry their scheme from config; OAuth is discovered later via 401.
+-- Disjoint from ServerDiscoveredWithStoredToken by needs_token_restore.
 rule ServerDiscovered {
     when: ConfigServerDiscovered(name, transport, auth_scheme)
+
+    requires: not needs_token_restore(name, transport, auth_scheme)
 
     ensures: McpServer.created(
         name: name,
@@ -160,6 +167,33 @@ rule ServerDiscovered {
         -- scheme is none, so a 401 can still drive the OAuth flow.
         -- start_background_discovery / connect_one then spawns or connects
         -- (REQ-MCP-001).
+}
+
+-- Discovery of an HTTP server that has no config credential but DOES have a
+-- stored, unexpired OAuth token bound to its current resource (the
+-- authorize-once case across a restart/reload): materialize it already
+-- OAuth-authorized so HttpConnected attaches the stored bearer to the very
+-- first initialize, with no 401 round trip and no re-prompt (REQ-MCP-012).
+rule ServerDiscoveredWithStoredToken {
+    when: ConfigServerDiscovered(name, transport, auth_scheme)
+
+    requires: needs_token_restore(name, transport, auth_scheme)
+
+    ensures: McpServer.created(
+        name: name,
+        transport: transport,
+        state: connecting,
+        auth_scheme: oauth,
+        oauth_phase: authorized,
+        enabled: true
+    )
+
+    @guidance
+        -- needs_token_restore is true iff transport = http, the config carries
+        -- no explicit credential (auth_scheme = none), and a stored OAuthToken
+        -- exists whose resource matches the server's configured URI and is
+        -- unexpired. ReloadAddsServer applies the same restoration. The bearer
+        -- is loaded from the persisted token; refresh/step-up proceed normally.
 }
 
 -- A stdio server completes initialize + first tools/list and is ready.
@@ -326,7 +360,9 @@ rule OAuthClientRegistered {
 
     ensures: OAuthRegistration.created(
         auth_server: auth_server_of(srv),
-        client_id: registered_client_id(srv)
+        client_id: registered_client_id(srv),
+        client_secret: registered_client_secret(srv),
+        token_endpoint_auth_method: registered_auth_method(srv)
     )
     ensures: srv.oauth_phase = awaiting_user
     ensures: srv.pending_auth_url = authorization_url(srv)
@@ -348,6 +384,7 @@ rule OAuthAuthorized {
 
     requires: srv.oauth_phase = awaiting_user
     requires: callback_state_matches(srv, code)
+    requires: redirect_issuer_valid(srv, code)
 
     ensures: OAuthToken.created(
         server_name: srv.name,
@@ -365,7 +402,10 @@ rule OAuthAuthorized {
         -- state does not match this pending flow is rejected before any
         -- exchange (callback_state_matches), so a code from another tab or
         -- pending server cannot be persisted under the wrong server
-        -- (REQ-MCP-011). Then exchange code + PKCE verifier (plus the RFC 8707
+        -- (REQ-MCP-011). It also checks the `iss` parameter against the
+        -- validated authorization-server metadata (redirect_issuer_valid) to
+        -- reject authorization-server mix-up before the code reaches the token
+        -- endpoint. Then exchange code + PKCE verifier (plus the RFC 8707
         -- resource indicator) at the token endpoint, persist the token bound to
         -- the resource URI, clear the pending URL, and re-enter connecting so
         -- HttpConnected drives the now-authorized handshake to ready
@@ -433,9 +473,12 @@ rule InsufficientScopeStepUp {
 
     @guidance
         -- 403 insufficient_scope + WWW-Authenticate carries the required
-        -- scopes. Discard the narrow token, build an authorization URL
-        -- requesting the expanded scope, and retry the call once re-authorized
-        -- rather than surfacing a permanent tool failure (REQ-MCP-012).
+        -- scope. Discard the narrow token, build an authorization URL
+        -- requesting the UNION of the previously granted scopes and the
+        -- challenged scope (authorization_url uses the union for a step-up), and
+        -- retry the call once re-authorized -- requesting only the new scope
+        -- would drop earlier grants on servers that issue exactly the requested
+        -- set, breaking other tools and bouncing through re-auth (REQ-MCP-012).
         -- Discarding first keeps exactly one token per server when
         -- OAuthAuthorized re-creates it.
 }
@@ -485,8 +528,10 @@ rule ReloadRestartsServer {
 
 -- Reload repointed an HTTP server (URL / authorization server changed): the
 -- stored token is bound to the old resource and must not be sent to the new
--- endpoint. Discard it so reconnect re-authorizes (REQ-MCP-012). Fires
--- alongside ReloadRestartsServer.
+-- endpoint, and any in-flight authorization is now for the wrong resource.
+-- Discard the token AND cancel the pending flow so neither an old credential
+-- nor a late callback lands on the new resource (REQ-MCP-011, REQ-MCP-012).
+-- Fires alongside ReloadRestartsServer.
 rule ReloadDiscardsRepointedToken {
     when: ReloadServerConfigChanged(srv)
 
@@ -494,16 +539,31 @@ rule ReloadDiscardsRepointedToken {
     requires: resource_changed(srv)
 
     ensures: not exists OAuthToken{server_name: srv.name}
+    ensures: PendingAuthorizationCancelled(srv)
+
+    @guidance
+        -- Cancelling the pending flow rotates/invalidates the per-flow `state`
+        -- nonce and drops the pending authorization URL, so a callback from the
+        -- pre-repoint flow no longer satisfies callback_state_matches and
+        -- cannot persist a token against the newly configured resource. The
+        -- subsequent reconnect re-authorizes against the new resource from
+        -- scratch.
 }
 
--- Reload found a server gone from config: disconnect and forget it.
+-- Reload found a server gone from config: disconnect and forget it, including
+-- its stored token (otherwise it would orphan a token with no owning server,
+-- violating TokenImpliesOAuthServer). The shared OAuthRegistration is NOT
+-- deleted -- it is keyed by authorization server and may back other servers.
 rule ReloadRemovesServer {
     when: ReloadRemovedServer(srv)
 
+    ensures: not exists OAuthToken{server_name: srv.name}
     ensures: not exists srv
 
     @guidance
-        -- terminate() the connection; for HTTP also DELETE the session.
+        -- terminate() the connection; for HTTP also DELETE the session and
+        -- discard the persisted token. Leave the per-authorization-server
+        -- registration in place for servers that still share it.
 }
 
 -- Operator disables a server: stop offering its tools, keep the connection.
@@ -598,7 +658,20 @@ invariant OneTokenPerServer {
 --
 -- callback_state_matches(srv, code): Bool
 --   True iff the OAuth redirect that carried `code` presented the `state`
---   nonce issued for srv's pending flow.
+--   nonce issued for srv's still-current pending flow. A flow cancelled by
+--   ReloadDiscardsRepointedToken rotates the nonce, so a stale callback fails.
+--
+-- redirect_issuer_valid(srv, code): Bool
+--   True iff the redirect's `iss` (when the authorization server returns one or
+--   advertises authorization_response_iss_parameter_supported) matches the
+--   issuer of srv's validated authorization-server metadata. Defends against
+--   authorization-server mix-up.
+--
+-- needs_token_restore(name, transport, auth_scheme): Bool
+--   True iff transport = http, the config carries no explicit credential
+--   (auth_scheme = none), and a stored OAuthToken exists for `name` whose
+--   resource matches the configured URI and is unexpired -- the authorize-once
+--   restart case that materializes the server already OAuth-authorized.
 --
 -- auth_server_of(srv): String
 --   The identifier (issuer) of the authorization server protecting srv,
@@ -611,14 +684,19 @@ invariant OneTokenPerServer {
 --   server (pre-configured or previously registered).
 --
 -- registered_client_id(srv): String
---   The client_id obtained for srv's authorization server: pre-configured, a
---   Client ID Metadata Document value, or the RFC 7591 registration result.
+-- registered_client_secret(srv): String?
+-- registered_auth_method(srv): String
+--   The client identity obtained for srv's authorization server: pre-configured,
+--   a Client ID Metadata Document value, or the RFC 7591 registration result.
+--   The secret is null for a public client; the auth method records how the
+--   client authenticates at the token endpoint (e.g. none, client_secret_post).
 --
 -- authorization_url(srv): String
 --   The OAuth 2.1 authorization-code URL the operator opens in a browser,
 --   carrying the PKCE challenge (built only after confirming the authorization
---   server advertises code_challenge_methods_supported) and the RFC 8707
---   resource indicator for srv.
+--   server advertises code_challenge_methods_supported), the RFC 8707 resource
+--   indicator, and the `state` nonce. For a step-up (InsufficientScopeStepUp)
+--   it requests the union of previously granted and newly challenged scopes.
 --
 -- exchanged_access_token(srv, code): String
 -- exchanged_refresh_token(srv, code): String?

@@ -25,9 +25,22 @@ is not. The design separates them with an `McpTransport` trait:
 ```rust
 trait McpTransport: Send + Sync {
     async fn request(&self, method: &str, params: Value, timeout: Duration)
-        -> Result<Value, String>;
-    async fn notify(&self, notification: &Value) -> Result<(), String>;
+        -> Result<Value, TransportError>;
+    async fn notify(&self, notification: &Value) -> Result<(), TransportError>;
     // Health / recovery is transport-specific (process exit vs connection drop).
+}
+
+// Failures the lifecycle dispatches on must be typed, not stringly-encoded.
+// Each variant maps to a distinct ConnState/OAuthPhase transition, so the
+// transport classifies the failure once and the state machine never
+// string-matches to recover it.
+enum TransportError {
+    Unauthorized { www_authenticate: Option<String> }, // 401 -> OAuth discovery
+    InsufficientScope { www_authenticate: Option<String> }, // 403 -> step-up
+    SessionExpired,                                     // HTTP 404 -> re-initialize
+    Disconnected,                                       // reset/timeout/EOF -> reconnect/respawn
+    Rpc { code: i64, message: String },                 // JSON-RPC error result
+    Protocol(String),                                   // malformed frame, etc.
 }
 ```
 
@@ -158,9 +171,12 @@ the status API and UI consume.
 Two tables back the OAuth flow, alongside the existing `mcp_disabled_servers`
 table (`crates/phoenix-db/src/lib.rs`):
 
-- `mcp_oauth_registrations` -- `(auth_server, client_id, ...)`, keyed by the
-  authorization server so resources sharing one authorization server share a
-  client identity (REQ-MCP-010, `OAuthRegistration`).
+- `mcp_oauth_registrations` -- `(auth_server, client_id, client_secret?,
+  token_endpoint_auth_method)`, keyed by the authorization server so resources
+  sharing one authorization server share a client identity (REQ-MCP-010,
+  `OAuthRegistration`). The secret/auth method are persisted alongside the id:
+  a confidential client recovered after restart needs them to authenticate at
+  the token endpoint for code exchange and refresh.
 - `mcp_oauth_tokens` -- `(server_name, resource_uri, access_token,
   refresh_token, expires_at)`, looked up by MCP server name but carrying the
   canonical `resource_uri` the token is audience-bound to (`OAuthToken`). The
