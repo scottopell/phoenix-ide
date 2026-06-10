@@ -182,26 +182,26 @@ describe('ProcessInspectorPanel — output accumulation', () => {
     await renderPanel();
     expect(screen.getByText('line-0')).toBeTruthy();
 
-    // Each poll appends a batch of lines. Total appended (seed + polls) climbs
-    // well past CAP so the front must be trimmed.
-    const BATCH = 1000;
-    const POLLS = 7; // 1 (seed) + 7*1000 = 7001 lines total observed
+    // One poll delivers a batch large enough to exceed CAP in a single update,
+    // so the sliding-window trim is exercised with exactly one re-render. The
+    // earlier shape (seven polls each re-rendering a growing multi-thousand-row
+    // DOM) is what made this test time out under load — not the cap logic — so
+    // we drive the same trim deterministically with a single batch.
+    const BATCH = CAP + 1000; // seed + batch = CAP + 1001 observed, > CAP
+    const batch: [number, string][] = [];
     let offset = 1;
-    for (let p = 0; p < POLLS; p++) {
-      const batch: [number, string][] = [];
-      for (let i = 0; i < BATCH; i++) {
-        batch.push([offset, `line-${offset}`]);
-        offset++;
-      }
-      getInsp.mockResolvedValueOnce(
-        snap({ output: { start_offset: offset - BATCH, end_offset: offset, truncated_before: false, lines: lines(...batch) } }),
-      );
-      await act(async () => {
-        await vi.advanceTimersByTimeAsync(1000);
-      });
+    for (let i = 0; i < BATCH; i++) {
+      batch.push([offset, `line-${offset}`]);
+      offset++;
     }
+    getInsp.mockResolvedValueOnce(
+      snap({ output: { start_offset: 1, end_offset: offset, truncated_before: false, lines: lines(...batch) } }),
+    );
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1000);
+    });
 
-    const total = 1 + POLLS * BATCH; // 7001
+    const total = 1 + BATCH; // CAP + 1001
     const newest = total - 1; // last offset observed
     // The newest line is retained…
     expect(screen.getByText(`line-${newest}`)).toBeTruthy();

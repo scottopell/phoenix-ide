@@ -2421,17 +2421,19 @@ async fn test_browser_profile_methodology_warnings_intact_raw_samples() {
 #[tokio::test]
 async fn test_browser_profile_react_measured_path() {
     require_chrome!();
-    require_network!(); // pulls React UMD from unpkg
 
-    // Profiling build => fibers carry numeric `actualDuration` without
-    // any DevTools backend toggle (our hook does not implement that).
-    // Script order matters: react -> scheduler -> react-dom.profiling.
-    let html = r#"<!doctype html><html><head><meta charset="utf-8"></head>
-<body><div id="root"></div>
-<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/scheduler@0.23.2/umd/scheduler.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.profiling.min.js"></script>
-<script>
+    // Profiling build => fibers carry numeric `actualDuration` without any
+    // DevTools backend toggle (our hook does not implement that). Script order
+    // matters: react -> scheduler -> react-dom.profiling.
+    //
+    // UMD bundles are vendored and inlined (see `fixtures/README.md`) rather
+    // than fetched from a CDN, so this test has no off-box network dependency.
+    const REACT_UMD: &str = include_str!("fixtures/react-18.3.1.production.min.js");
+    const SCHEDULER_UMD: &str = include_str!("fixtures/scheduler-0.23.2.production.min.js");
+    const REACT_DOM_PROFILING_UMD: &str =
+        include_str!("fixtures/react-dom-18.3.1.profiling.min.js");
+    // Separate arg so its `{ }` don't collide with `format!` placeholders.
+    const APP_JS: &str = r#"
 window.__renders = 0;
 var e = React.createElement;
 function App() {
@@ -2443,9 +2445,17 @@ function App() {
     e('button', { id: 'inc', onClick: function () { set(function (x) { return x + 1; }); } }, 'n=' + n));
 }
 ReactDOM.createRoot(document.getElementById('root')).render(e(App));
-</script></body></html>"#;
+"#;
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head>\n\
+<body><div id=\"root\"></div>\n\
+<script>{REACT_UMD}</script>\n\
+<script>{SCHEDULER_UMD}</script>\n\
+<script>{REACT_DOM_PROFILING_UMD}</script>\n\
+<script>{APP_JS}</script></body></html>"
+    );
 
-    let server = TestServer::start(html).await;
+    let server = TestServer::start(&html).await;
     let (ctx, manager) = test_context("test-profile-react-measured");
 
     let nav = BrowserNavigateTool
@@ -2834,17 +2844,19 @@ async fn test_browser_profile_heap_snapshot_streaming_and_diff() {
 #[tokio::test]
 async fn test_browser_profile_react_no_profiling_build_path() {
     require_chrome!();
-    require_network!(); // pulls React UMD from unpkg
 
-    // Production react-dom => fibers do NOT carry actualDuration even
-    // though the commit hook fires. Script order: react -> scheduler ->
-    // react-dom.production.
-    let html = r#"<!doctype html><html><head><meta charset="utf-8"></head>
-<body><div id="root"></div>
-<script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/scheduler@0.23.2/umd/scheduler.production.min.js"></script>
-<script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
-<script>
+    // Production react-dom => fibers do NOT carry actualDuration even though the
+    // commit hook fires. Script order: react -> scheduler -> react-dom.production.
+    //
+    // The React/scheduler/react-dom UMD bundles are vendored and inlined (see
+    // `fixtures/README.md`) rather than fetched from a CDN, so this test has no
+    // off-box network dependency and can't flake on CDN latency.
+    const REACT_UMD: &str = include_str!("fixtures/react-18.3.1.production.min.js");
+    const SCHEDULER_UMD: &str = include_str!("fixtures/scheduler-0.23.2.production.min.js");
+    const REACT_DOM_UMD: &str = include_str!("fixtures/react-dom-18.3.1.production.min.js");
+    // Kept as a separate arg (not inlined in the template) so its `{ }` don't
+    // collide with `format!` placeholders.
+    const APP_JS: &str = r#"
 window.__renders = 0;
 var e = React.createElement;
 function App() {
@@ -2856,9 +2868,17 @@ function App() {
     e('button', { id: 'inc', onClick: function () { set(function (x) { return x + 1; }); } }, 'n=' + n));
 }
 ReactDOM.createRoot(document.getElementById('root')).render(e(App));
-</script></body></html>"#;
+"#;
+    let html = format!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"></head>\n\
+<body><div id=\"root\"></div>\n\
+<script>{REACT_UMD}</script>\n\
+<script>{SCHEDULER_UMD}</script>\n\
+<script>{REACT_DOM_UMD}</script>\n\
+<script>{APP_JS}</script></body></html>"
+    );
 
-    let server = TestServer::start(html).await;
+    let server = TestServer::start(&html).await;
     let (ctx, manager) = test_context("test-profile-react-noprof");
 
     let nav = BrowserNavigateTool
