@@ -97,17 +97,20 @@ blocking on a full pipe.
 ### REQ-MCP-004: Streamable HTTP Transport
 
 WHERE a server is HTTP
-THE SYSTEM SHALL POST JSON-RPC requests to the server's MCP endpoint and accept
-a response that is **either** `application/json` (a single JSON-RPC reply)
-**or** `text/event-stream` (a sequence of JSON-RPC messages delivered as SSE
-events), parsing both into the same JSON-RPC result.
+THE SYSTEM SHALL POST JSON-RPC requests to the server's MCP endpoint with an
+`Accept` header listing both `application/json` and `text/event-stream`, and
+accept a response that is **either** `application/json` (a single JSON-RPC
+reply) **or** `text/event-stream` (a sequence of JSON-RPC messages delivered as
+SSE events), parsing both into the same JSON-RPC result.
 
 THE SYSTEM SHALL send the negotiated `MCP-Protocol-Version` header on every
 request after the `initialize` response.
 
 **Rationale:** The Streamable HTTP transport lets a server answer a single POST
-with either a unary reply or a stream. A client that handles only one shape
-fails against conformant servers that choose the other.
+with either a unary reply or a stream. The client advertises both shapes via
+`Accept` so a conformant server or gateway can choose framing rather than
+rejecting the request; a client that handles only one shape fails against
+servers that choose the other.
 
 ---
 
@@ -171,58 +174,90 @@ plumbing and requires no interactive flow.
 WHEN an HTTP request returns HTTP 401 with a `WWW-Authenticate` header
 THE SYSTEM SHALL discover the authorization server by:
 
-- fetching the server's **Protected Resource Metadata** (RFC 9728) to learn its
-  authorization server(s)
-- fetching the **Authorization Server Metadata** (RFC 8414,
-  `.well-known/oauth-authorization-server`) to learn the authorization,
-  token, and registration endpoints
+- locating the **Protected Resource Metadata** (RFC 9728): the
+  `resource_metadata` URI from the `WWW-Authenticate` challenge when present,
+  otherwise the well-known PRM document at both the endpoint path and the host
+  root, to learn the protected resource's authorization server(s)
+- fetching the **Authorization Server Metadata** via both OAuth Authorization
+  Server Metadata (RFC 8414, `.well-known/oauth-authorization-server`) and
+  OpenID Connect Discovery (`.well-known/openid-configuration`) well-known
+  endpoints, to learn the authorization, token, and registration endpoints
 
 **Rationale:** OAuth 2.1 for MCP is discovery-driven; the client is not
-pre-configured with endpoints. A 401 is the entry point to the flow.
+pre-configured with endpoints. A 401 is the entry point. A server may signal
+its metadata via `resource_metadata` or rely on the well-known locations, and
+its authorization server may expose only OIDC discovery -- a conformant client
+handles all of these rather than assuming one.
 
 ---
 
-### REQ-MCP-010: Dynamic Client Registration
+### REQ-MCP-010: Client Identity Acquisition
 
-WHERE the authorization server advertises a registration endpoint AND no client
-registration is cached for that server
-THE SYSTEM SHALL register a client via RFC 7591 and persist the resulting client
-identifier.
+THE SYSTEM SHALL obtain a client identity for the authorization server,
+preferring in order:
 
-**Rationale:** MCP authorization servers expect clients to self-register rather
-than ship pre-provisioned credentials. The registration is reused across
-sessions, so it is persisted.
+- a pre-configured client id/secret supplied for that authorization server
+- a cached client registration previously obtained for that authorization
+  server
+- a Client ID Metadata Document, where the authorization server supports it
+- Dynamic Client Registration (RFC 7591) as the fallback, where the
+  authorization server advertises a registration endpoint
+
+A newly obtained registration is persisted, keyed by the authorization server,
+and reused across sessions and across MCP servers that share that authorization
+server.
+
+**Rationale:** The MCP authorization model prefers pre-registered or
+metadata-document client identity and treats DCR as the fallback. Keying the
+registration by the authorization server -- not the MCP server -- lets multiple
+resources behind one authorization server share a single client identity.
 
 ---
 
 ### REQ-MCP-011: Authorization Code Flow with PKCE
 
 THE SYSTEM SHALL complete the OAuth 2.1 authorization code flow with PKCE:
-generate a code verifier/challenge, surface the authorization URL for the user
-to open in a browser, receive the redirect with the authorization code, and
-exchange the code (plus verifier) for an access token at the token endpoint.
+verify the authorization server advertises `code_challenge_methods_supported`
+(and refuse to proceed if it does not), generate a code verifier/challenge,
+surface the authorization URL for the user to open in a browser, receive the
+redirect with the authorization code, and exchange the code (plus verifier) for
+an access token at the token endpoint.
+
+THE SYSTEM SHALL include the MCP server's canonical URI as the `resource`
+parameter (RFC 8707 Resource Indicators) on both the authorization request and
+the token request, so the issued token is audience-bound to that server.
 
 THE SYSTEM SHALL perform this flow natively, without delegating to an external
 process such as `mcp-remote`.
 
-**Rationale:** PKCE is mandatory under OAuth 2.1. Performing the flow natively
-removes the npm/subprocess dependency and the browser-popup-on-every-reload
-behavior of the external bridge.
+**Rationale:** PKCE is mandatory under OAuth 2.1; a server that omits
+`code_challenge_methods_supported` cannot be used safely, so the client refuses
+before the browser round trip rather than failing after it. Resource Indicators
+bind the token's audience to the MCP server, which compliant authorization and
+resource servers require. Performing the flow natively removes the
+npm/subprocess dependency and the browser-popup-on-every-reload behavior of the
+external bridge.
 
 ---
 
-### REQ-MCP-012: Token Storage, Refresh, and Invalidation
+### REQ-MCP-012: Token Storage, Refresh, Invalidation, and Step-Up
 
 THE SYSTEM SHALL persist OAuth access tokens, refresh tokens, and expiry to the
 database
 AND reuse a stored, unexpired token on reconnect without re-prompting the user
 AND, on expiry or a post-authorization 401, refresh using the refresh token
-AND, when refresh fails, return the server to an unauthorized state requiring a
-new authorization.
+AND, when refresh fails, discard the stored token and return the server to an
+unauthorized state requiring a new authorization
+AND, when a tool call returns HTTP 403 `insufficient_scope` with a
+`WWW-Authenticate` challenge, re-authorize for the expanded scope and retry
+rather than surfacing a permanent tool failure.
 
 **Rationale:** The whole value of native OAuth is silent reconnect. Tokens
-survive restarts; refresh keeps a session alive; a failed refresh is the only
-condition that re-prompts the user.
+survive restarts; refresh keeps a session alive. A failed refresh must discard
+the stale token so it cannot be reused or duplicated, and is the condition that
+re-prompts the user. A `403 insufficient_scope` is a step-up request, not a
+terminal error -- treating it as one would make scope-gated tools permanently
+unusable.
 
 ---
 

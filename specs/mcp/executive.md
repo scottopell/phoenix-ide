@@ -25,9 +25,9 @@ natively, without the `mcp-remote` subprocess bridge.
 | REQ-MCP-007 | HTTP Connection Recovery | Not started | M2. Reconnect on transport error, distinct from stdio respawn. |
 | REQ-MCP-008 | Static Token / Header Authentication | Not started | M2. Config-supplied bearer/headers attached per request. Falls out of transport header plumbing. |
 | REQ-MCP-009 | OAuth 2.1 Authorization Discovery | Not started | M3. 401 → PRM (RFC 9728) → AS metadata (RFC 8414). |
-| REQ-MCP-010 | Dynamic Client Registration | Not started | M3. RFC 7591; persisted `OAuthRegistration`. |
+| REQ-MCP-010 | Client Identity Acquisition | Not started | M3. Prefer pre-configured / cached registration / Client ID Metadata Document; RFC 7591 DCR as fallback. `OAuthRegistration` keyed by authorization server. |
 | REQ-MCP-011 | Authorization Code Flow with PKCE | Not started | M3. Native auth-code + PKCE; no `mcp-remote`. |
-| REQ-MCP-012 | Token Storage, Refresh, and Invalidation | Not started | M3. `mcp_oauth_tokens` table (plaintext SQLite); refresh; re-auth on refresh failure. |
+| REQ-MCP-012 | Token Storage, Refresh, Invalidation, and Step-Up | Not started | M3. `mcp_oauth_tokens` (plaintext SQLite); refresh; discard-and-re-auth on refresh failure; 403 `insufficient_scope` step-up. |
 | REQ-MCP-013 | Authorization Status Surfaced to the UI | Partial | `GET /api/mcp/status` exists and carries a `pending_oauth_url`, but it is scraped from an `mcp-remote` child's stderr. M3 replaces it with the native flow's structured URL. |
 | REQ-MCP-014 | Tool Exposure and Live Resolution | Complete | `tool_definitions` / `create_mcp_tool_by_name`; live resolution via `ToolRegistryExecutor`. HTTP servers ride this unchanged. |
 | REQ-MCP-015 | Config Reload Reconciliation | Complete | `reload_from_configs` (add / remove / restart / unchanged / failed). M1 extends `PartialEq` to the HTTP config variant. |

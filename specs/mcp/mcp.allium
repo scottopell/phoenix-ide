@@ -74,10 +74,12 @@ entity McpServer {
     last_error: String           when state = failed
 }
 
--- Persisted Dynamic Client Registration result (RFC 7591). Reused across
--- sessions so registration happens once per authorization server.
+-- Persisted client identity for an authorization server. Keyed by the
+-- authorization server (not the MCP server) so resources sharing one
+-- authorization server share a single registration -- registration happens
+-- once per authorization server (REQ-MCP-010).
 entity OAuthRegistration {
-    server_name: String
+    auth_server: String
     client_id: String
 }
 
@@ -291,7 +293,8 @@ rule OAuthMetadataResolved {
     ensures: srv.oauth_phase = registering
 }
 
--- A prior registration exists for this server: reuse it and prompt the user.
+-- A client identity already exists for this server's authorization server
+-- (pre-configured or previously registered): reuse it and prompt the user.
 rule OAuthClientReused {
     when: OAuthClientResolved(srv)
 
@@ -302,7 +305,8 @@ rule OAuthClientReused {
     ensures: srv.pending_auth_url = authorization_url(srv)
 }
 
--- No registration cached: register via DCR, persist the client id, prompt.
+-- No client identity for this authorization server: acquire one (DCR as the
+-- fallback), persist it keyed by the authorization server, prompt the user.
 rule OAuthClientRegistered {
     when: OAuthClientResolved(srv)
 
@@ -310,17 +314,20 @@ rule OAuthClientRegistered {
     requires: not has_registration(srv)
 
     ensures: OAuthRegistration.created(
-        server_name: srv.name,
+        auth_server: auth_server_of(srv),
         client_id: registered_client_id(srv)
     )
     ensures: srv.oauth_phase = awaiting_user
     ensures: srv.pending_auth_url = authorization_url(srv)
 
     @guidance
-        -- RFC 7591 dynamic client registration. The client id is reused on
-        -- later authorizations for this server (REQ-MCP-010). The
-        -- authorization URL carries the PKCE challenge; the verifier is held
-        -- for the token exchange (REQ-MCP-011).
+        -- Client identity preference: pre-configured / cached registration
+        -- (keyed by authorization server) -> Client ID Metadata Document ->
+        -- RFC 7591 dynamic client registration as the fallback. Reused across
+        -- MCP servers sharing the authorization server (REQ-MCP-010). The
+        -- authorization URL carries the PKCE challenge (the client first
+        -- verifies code_challenge_methods_supported) and the RFC 8707 resource
+        -- indicator; the verifier is held for the token exchange (REQ-MCP-011).
 }
 
 -- The operator completed the browser authorization; exchange the code for
@@ -341,10 +348,10 @@ rule OAuthAuthorized {
     ensures: srv.state = connecting
 
     @guidance
-        -- Exchange code + PKCE verifier at the token endpoint. Persist
-        -- tokens, clear the pending URL, and re-enter connecting so
-        -- HttpConnected drives the now-authorized handshake to ready
-        -- (REQ-MCP-011, REQ-MCP-012).
+        -- Exchange code + PKCE verifier (plus the RFC 8707 resource indicator)
+        -- at the token endpoint. Persist tokens, clear the pending URL, and
+        -- re-enter connecting so HttpConnected drives the now-authorized
+        -- handshake to ready (REQ-MCP-011, REQ-MCP-012).
 }
 
 -- A 401 on a previously authorized server: the access token expired or was
@@ -369,15 +376,48 @@ rule TokenRefreshed {
     ensures: srv.oauth_phase = authorized
 }
 
--- Refresh failed: the user must authorize again. Re-enter discovery; the
--- cached registration lets OAuthClientReused skip DCR.
+-- Refresh failed: discard the stale token so it cannot be reused or
+-- duplicated, and make the user authorize again. Re-enter discovery; the
+-- cached registration (keyed by authorization server) lets OAuthClientReused
+-- skip DCR.
 rule TokenRefreshFailed {
     when: OAuthRefreshFailed(srv)
 
     requires: srv.oauth_phase = refreshing
 
+    ensures: not exists OAuthToken{server_name: srv.name}
     ensures: srv.state = unauthorized
     ensures: srv.oauth_phase = discovering
+
+    @guidance
+        -- Delete the persisted token row before re-prompting. Without this the
+        -- stale token still satisfies the token invariants and a later
+        -- OAuthAuthorized would create a duplicate row for the same server
+        -- (REQ-MCP-012).
+}
+
+-- A tool call on an authorized server returns 403 insufficient_scope: this is
+-- a step-up request, not a terminal error. Discard the narrow token and
+-- re-authorize for the expanded scope. The cached registration is reused, so
+-- the user re-consents but no new client is registered.
+rule InsufficientScopeStepUp {
+    when: HttpInsufficientScope(srv)
+
+    requires: srv.auth_scheme = oauth
+    requires: srv.oauth_phase = authorized
+
+    ensures: not exists OAuthToken{server_name: srv.name}
+    ensures: srv.state = unauthorized
+    ensures: srv.oauth_phase = awaiting_user
+    ensures: srv.pending_auth_url = authorization_url(srv)
+
+    @guidance
+        -- 403 insufficient_scope + WWW-Authenticate carries the required
+        -- scopes. Discard the narrow token, build an authorization URL
+        -- requesting the expanded scope, and retry the call once re-authorized
+        -- rather than surfacing a permanent tool failure (REQ-MCP-012).
+        -- Discarding first keeps exactly one token per server when
+        -- OAuthAuthorized re-creates it.
 }
 
 ------------------------------------------------------------
@@ -495,6 +535,15 @@ invariant TokenImpliesOAuthServer {
         exists s in McpServers where s.name = t.server_name and s.auth_scheme = oauth
 }
 
+-- Exactly one token per server: refresh-failure and step-up discard the old
+-- token before OAuthAuthorized re-creates it, so a stale credential can never
+-- coexist with or be duplicated by a fresh one (REQ-MCP-012).
+invariant OneTokenPerServer {
+    for a in OAuthTokens:
+        for b in OAuthTokens:
+            a.server_name = b.server_name implies a = b
+}
+
 ------------------------------------------------------------
 -- Helpers
 ------------------------------------------------------------
@@ -505,15 +554,25 @@ invariant TokenImpliesOAuthServer {
 -- session_id_from_init(srv): String
 --   The Mcp-Session-Id header value on the initialize response.
 --
+-- auth_server_of(srv): String
+--   The identifier (issuer) of the authorization server protecting srv,
+--   resolved during OAuth discovery. The key under which a client
+--   registration is stored and reused.
+--
 -- has_registration(srv): Bool
---   True iff a persisted OAuthRegistration exists for srv.name.
+--   True iff a persisted OAuthRegistration exists for auth_server_of(srv) --
+--   i.e. a client identity is already available for srv's authorization
+--   server (pre-configured or previously registered).
 --
 -- registered_client_id(srv): String
---   The client_id returned by RFC 7591 dynamic client registration.
+--   The client_id obtained for srv's authorization server: pre-configured, a
+--   Client ID Metadata Document value, or the RFC 7591 registration result.
 --
 -- authorization_url(srv): String
---   The OAuth 2.1 authorization-code URL (with PKCE challenge) the operator
---   opens in a browser.
+--   The OAuth 2.1 authorization-code URL the operator opens in a browser,
+--   carrying the PKCE challenge (built only after confirming the authorization
+--   server advertises code_challenge_methods_supported) and the RFC 8707
+--   resource indicator for srv.
 --
 -- exchanged_access_token(srv, code): String
 -- exchanged_refresh_token(srv, code): String?

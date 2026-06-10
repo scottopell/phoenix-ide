@@ -87,8 +87,8 @@ entries become `Http` configs instead of being dropped.
 ## Connection Lifecycle
 
 A server moves through `connecting → ready`, with `reconnecting` and `failed`
-as recovery/terminal states and `disabled` orthogonal to all of them. The
-unified states (modeled in `mcp.allium` as `ConnState`) are:
+as recovery/terminal states. The unified states (modeled in `mcp.allium` as
+`ConnState`) are:
 
 - **connecting** -- spawning/connecting, `initialize`, first `tools/list`
 - **ready** -- handshake complete, tools cached, available to conversations
@@ -98,8 +98,11 @@ unified states (modeled in `mcp.allium` as `ConnState`) are:
   (REQ-MCP-009..012)
 - **failed** -- connection or authorization gave up; entry retained with the
   error for the UI (REQ-MCP-018)
-- **disabled** -- tools excluded from conversations, connection retained
-  (REQ-MCP-016)
+
+Enable/disable is **not** a `ConnState` value: a server can be `ready` and
+disabled simultaneously. It is modeled as the orthogonal `enabled` field
+(`mcp.allium`), gating tool exposure while the underlying connection is retained
+for instant re-enable (REQ-MCP-016).
 
 `reconnecting` unifies the two recovery paths at the state level while keeping
 their triggers and mechanisms distinct at the transport level -- a crash-like
@@ -116,18 +119,23 @@ attached on every request and a server with valid static auth goes straight to
 OAuth (REQ-MCP-009..012) is a sub-lifecycle entered on a 401, modeled in
 `mcp.allium` as `OAuthPhase`:
 
-1. **discovering** -- 401 → Protected Resource Metadata (RFC 9728) →
-   Authorization Server Metadata (RFC 8414).
-2. **registering** -- if no client registration is cached, Dynamic Client
-   Registration (RFC 7591); the client id is persisted and reused.
-3. **awaiting_user** -- an authorization URL (auth-code + PKCE) is surfaced via
-   `/api/mcp/status`; the user opens it in a browser. Phoenix receives the
-   redirect with the code on a local callback route.
+1. **discovering** -- 401 → Protected Resource Metadata (RFC 9728, from the
+   `resource_metadata` challenge or the well-known locations) → Authorization
+   Server Metadata (RFC 8414 or OIDC discovery).
+2. **registering** -- acquire a client identity for the authorization server,
+   preferring a pre-configured or cached registration (keyed by authorization
+   server), then a Client ID Metadata Document, then Dynamic Client
+   Registration (RFC 7591) as the fallback; a new registration is persisted and
+   reused.
+3. **awaiting_user** -- an authorization URL (auth-code + PKCE, with the
+   `resource` indicator) is surfaced via `/api/mcp/status`; the user opens it in
+   a browser. Phoenix receives the redirect with the code on a local callback
+   route.
 4. **authorized** -- the code + PKCE verifier are exchanged for tokens at the
    token endpoint; tokens are persisted and the connection retries to `ready`.
 5. **refreshing** -- on expiry or a post-authorization 401, the refresh token is
-   exchanged for a new access token; failure returns the server to
-   `unauthorized`.
+   exchanged for a new access token; failure discards the stored token and
+   returns the server to `unauthorized`.
 
 The native flow produces the authorization URL as structured state
 (`pending_auth_url`), rather than recovering it by watching an `mcp-remote`
@@ -136,13 +144,21 @@ the status API and UI consume.
 
 ### Token store
 
-A `mcp_oauth_tokens` table holds `(server_name, client_id, access_token,
-refresh_token, expires_at)`, alongside the existing `mcp_disabled_servers`
-table (`crates/phoenix-db/src/lib.rs`). Tokens are stored in plaintext,
-consistent with how the database already holds operator state; the database
-file's on-disk protection is the trust boundary, not per-row encryption. A
-stored, unexpired token lets reconnect skip the browser flow entirely
-(REQ-MCP-012).
+Two tables back the OAuth flow, alongside the existing `mcp_disabled_servers`
+table (`crates/phoenix-db/src/lib.rs`):
+
+- `mcp_oauth_registrations` -- `(auth_server, client_id, ...)`, keyed by the
+  authorization server so resources sharing one authorization server share a
+  client identity (REQ-MCP-010, `OAuthRegistration`).
+- `mcp_oauth_tokens` -- `(server_name, access_token, refresh_token,
+  expires_at)`, keyed by the MCP server because tokens are audience-bound to a
+  resource (`OAuthToken`). The client id is **not** duplicated here; it lives in
+  the registration table.
+
+Tokens are stored in plaintext, consistent with how the database already holds
+operator state; the database file's on-disk protection is the trust boundary,
+not per-row encryption. A stored, unexpired token lets reconnect skip the
+browser flow entirely; a failed refresh discards the row (REQ-MCP-012).
 
 ---
 
@@ -188,7 +204,7 @@ handles `text/event-stream` POST responses (REQ-MCP-004).
 ## Relationship to the Existing Tool System
 
 MCP tools are the only tools resolved live rather than from the static
-`ToolRegistry` (`Tool` trait, `crates/phoenix-tools/src/tools.rs`). HTTP support
+`ToolRegistry` (`Tool` trait, `crates/phoenix-tools/src/lib.rs`). HTTP support
 adds a transport beneath the existing MCP layer; it does not widen the tool
 feature surface. MCP **resources** and **prompts**, and server→client
 **sampling**/**elicitation**/**roots**, are out of scope -- the client consumes
