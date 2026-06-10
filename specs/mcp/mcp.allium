@@ -1,0 +1,549 @@
+-- allium: 3
+-- MCP Client Specification
+--
+-- Phoenix as an MCP client. Governs the per-server connection lifecycle
+-- across two transports (stdio, Streamable HTTP), the HTTP OAuth 2.1
+-- authorization sub-lifecycle, tool exposure, reload reconciliation, and
+-- per-server enable/disable.
+--
+-- The JSON-RPC protocol (initialize, tools/list, tools/call, notifications)
+-- is identical across transports; this spec models the lifecycle states a
+-- server moves through, not the protocol framing. Code: McpClientManager /
+-- McpServer / McpTool in crates/phoenix-tools/src/mcp.rs.
+
+------------------------------------------------------------
+-- Config
+------------------------------------------------------------
+
+config {
+    -- The deprecated two-endpoint HTTP+SSE transport (2024-11-05) is not
+    -- implemented natively; such servers are reached via the mcp-remote
+    -- stdio bridge. Held as a config constant so the decision is a checkable
+    -- invariant rather than prose (REQ-MCP-019).
+    legacy_sse_native: Boolean = false
+}
+
+------------------------------------------------------------
+-- Enumerations
+------------------------------------------------------------
+
+enum Transport { stdio | http }
+
+-- Connection state, unified across transports. `disabled` is NOT here:
+-- enable/disable is orthogonal to connection (a server can be ready and
+-- disabled at once), modeled by the `enabled` field.
+enum ConnState { connecting | ready | reconnecting | unauthorized | failed }
+
+-- HTTP authorization scheme. `none` for stdio and for HTTP servers that need
+-- no credentials; `static` for a config-supplied bearer token / headers;
+-- `oauth` once a 401 has shown the server requires OAuth 2.1.
+enum AuthScheme { none | static | oauth }
+
+-- Sub-lifecycle within auth_scheme = oauth.
+enum OAuthPhase { discovering | registering | awaiting_user | authorized | refreshing }
+
+------------------------------------------------------------
+-- Entities
+------------------------------------------------------------
+
+-- One configured MCP server connection.
+entity McpServer {
+    name: String
+    transport: Transport
+    state: ConnState
+    auth_scheme: AuthScheme
+
+    -- Whether this server's tools are offered to conversations. Disabling
+    -- retains the connection; only exposure is gated (REQ-MCP-016).
+    enabled: Boolean
+
+    -- Discovered tool names, present only once the handshake completes.
+    tools: List<String>          when state = ready
+
+    -- HTTP session id from the Mcp-Session-Id response header (REQ-MCP-005).
+    session_id: String?          when transport = http
+
+    -- OAuth flow position, present only for OAuth servers.
+    oauth_phase: OAuthPhase      when auth_scheme = oauth
+
+    -- The authorization URL the user must open, present only while blocked
+    -- on authorization (REQ-MCP-013).
+    pending_auth_url: String?    when state = unauthorized
+
+    -- Failure cause retained for the status API (REQ-MCP-018).
+    last_error: String           when state = failed
+}
+
+-- Persisted Dynamic Client Registration result (RFC 7591). Reused across
+-- sessions so registration happens once per authorization server.
+entity OAuthRegistration {
+    server_name: String
+    client_id: String
+}
+
+-- Persisted OAuth tokens (plaintext in SQLite, consistent with existing
+-- operator-state storage). A stored, unexpired token lets reconnect skip
+-- the browser flow (REQ-MCP-012).
+entity OAuthToken {
+    server_name: String
+    access_token: String
+    refresh_token: String?
+    expires_at: Timestamp
+}
+
+------------------------------------------------------------
+-- Actors
+------------------------------------------------------------
+
+-- The Phoenix server process / MCP manager. Drives connection and protocol.
+actor Server {}
+
+-- A human operator. Completes browser authorization and toggles servers.
+actor Operator {}
+
+------------------------------------------------------------
+-- Surfaces
+------------------------------------------------------------
+
+-- The operator's view of one server plus the controls they can drive.
+surface McpControl {
+    facing: Operator
+
+    context srv: McpServer
+
+    exposes:
+        srv.state
+        srv.enabled
+        srv.transport
+        srv.tools when srv.state = ready
+        srv.pending_auth_url when srv.state = unauthorized
+        srv.last_error when srv.state = failed
+
+    provides:
+        DisableServer(srv)
+            when srv.enabled
+        EnableServer(srv)
+            when not srv.enabled
+        OperatorCompletedAuthorization(srv, code)
+            when srv.state = unauthorized and srv.oauth_phase = awaiting_user
+}
+
+------------------------------------------------------------
+-- Rules: connection bring-up
+------------------------------------------------------------
+
+-- Discovery materializes a server in the connecting state. Static/no-auth
+-- servers carry their scheme from config; OAuth is discovered later via 401.
+rule ServerDiscovered {
+    when: ConfigServerDiscovered(name, transport, auth_scheme)
+
+    ensures: McpServer.created(
+        name: name,
+        transport: transport,
+        state: connecting,
+        auth_scheme: auth_scheme,
+        enabled: true
+    )
+
+    @guidance
+        -- read_all_configs classifies each mcpServers entry into a transport
+        -- (command -> stdio, type:http + url -> http) and an auth_scheme
+        -- (token/headers -> static, else none). start_background_discovery /
+        -- connect_one then spawns or connects (REQ-MCP-001).
+}
+
+-- A stdio server completes initialize + first tools/list and is ready.
+-- Covers both first connect and post-respawn reconnect.
+rule StdioConnected {
+    when: ServerInitialized(srv)
+
+    requires: srv.transport = stdio
+    requires: srv.state in { connecting, reconnecting }
+
+    ensures: srv.state = ready
+    ensures: srv.tools = discovered_tools(srv)
+
+    @guidance
+        -- McpServer::initialize (protocolVersion handshake +
+        -- notifications/initialized) then list_tools (paginated via
+        -- nextCursor). REQ-MCP-002, REQ-MCP-003.
+}
+
+-- An HTTP server completes initialize + first tools/list and is ready,
+-- capturing the session id. Covers first connect, post-reconnect, and the
+-- retry after OAuth authorization (state returns to connecting).
+rule HttpConnected {
+    when: ServerInitialized(srv)
+
+    requires: srv.transport = http
+    requires: srv.state in { connecting, reconnecting }
+
+    ensures: srv.state = ready
+    ensures: srv.tools = discovered_tools(srv)
+    ensures: srv.session_id = session_id_from_init(srv)
+
+    @guidance
+        -- POST initialize to the MCP endpoint; the response may be
+        -- application/json or text/event-stream (REQ-MCP-004). Capture
+        -- Mcp-Session-Id and send it (plus MCP-Protocol-Version) on every
+        -- subsequent request (REQ-MCP-005). A static-auth server attaches its
+        -- config bearer token / headers on every request and reaches ready
+        -- directly, never entering the OAuth sub-lifecycle (REQ-MCP-008).
+}
+
+-- Connect or handshake failed (non-auth). Entry retained with the cause.
+rule ConnectFailed {
+    when: ServerConnectFailed(srv, error)
+
+    requires: srv.state in { connecting, reconnecting }
+
+    ensures: srv.state = failed
+    ensures: srv.last_error = error
+
+    @guidance
+        -- connect_one Err. The server stays in the status response with its
+        -- error rather than vanishing; reload retries it (REQ-MCP-018).
+}
+
+------------------------------------------------------------
+-- Rules: HTTP recovery
+------------------------------------------------------------
+
+-- A transport error (reset, timeout) on a ready HTTP server reconnects
+-- rather than failing the server outright (REQ-MCP-007).
+rule HttpTransportErrorReconnects {
+    when: HttpTransportError(srv)
+
+    requires: srv.transport = http
+    requires: srv.state = ready
+
+    ensures: srv.state = reconnecting
+}
+
+-- HTTP 404 means the server-side session is gone. Drop it and re-initialize.
+rule HttpSessionExpired {
+    when: HttpSessionNotFound(srv)
+
+    requires: srv.transport = http
+    requires: srv.state = ready
+
+    ensures: srv.state = reconnecting
+    ensures: srv.session_id = null
+
+    @guidance
+        -- 404 on a session-bearing request -> treat session as expired,
+        -- re-run initialize (REQ-MCP-005).
+}
+
+-- A stdio server's process exited; respawn and reconnect (REQ-MCP-003).
+rule StdioCrashed {
+    when: StdioProcessExited(srv)
+
+    requires: srv.transport = stdio
+    requires: srv.state = ready
+
+    ensures: srv.state = reconnecting
+
+    @guidance
+        -- is_alive / is_crash_like_error detect the crash; respawn
+        -- re-initializes before the failed tools/call is retried once.
+}
+
+------------------------------------------------------------
+-- Rules: HTTP OAuth authorization
+------------------------------------------------------------
+
+-- First 401 on a server without static creds: it needs OAuth. Enter the
+-- discovery phase. Disjoint from the refresh and static-reject rules below
+-- by auth_scheme.
+rule OAuthRequired {
+    when: HttpRequestUnauthorized(srv)
+
+    requires: srv.transport = http
+    requires: srv.auth_scheme = none
+
+    ensures: srv.auth_scheme = oauth
+    ensures: srv.state = unauthorized
+    ensures: srv.oauth_phase = discovering
+
+    @guidance
+        -- 401 + WWW-Authenticate -> Protected Resource Metadata (RFC 9728)
+        -- -> Authorization Server Metadata (RFC 8414). REQ-MCP-009.
+}
+
+-- A 401 on a server using static config credentials is a hard failure --
+-- there is no interactive flow to recover into.
+rule StaticAuthRejected {
+    when: HttpRequestUnauthorized(srv)
+
+    requires: srv.auth_scheme = static
+
+    ensures: srv.state = failed
+    ensures: srv.last_error = static_auth_error(srv)
+}
+
+-- Metadata resolved: move to client registration.
+rule OAuthMetadataResolved {
+    when: OAuthMetadataReady(srv)
+
+    requires: srv.oauth_phase = discovering
+
+    ensures: srv.oauth_phase = registering
+}
+
+-- A prior registration exists for this server: reuse it and prompt the user.
+rule OAuthClientReused {
+    when: OAuthClientResolved(srv)
+
+    requires: srv.oauth_phase = registering
+    requires: has_registration(srv)
+
+    ensures: srv.oauth_phase = awaiting_user
+    ensures: srv.pending_auth_url = authorization_url(srv)
+}
+
+-- No registration cached: register via DCR, persist the client id, prompt.
+rule OAuthClientRegistered {
+    when: OAuthClientResolved(srv)
+
+    requires: srv.oauth_phase = registering
+    requires: not has_registration(srv)
+
+    ensures: OAuthRegistration.created(
+        server_name: srv.name,
+        client_id: registered_client_id(srv)
+    )
+    ensures: srv.oauth_phase = awaiting_user
+    ensures: srv.pending_auth_url = authorization_url(srv)
+
+    @guidance
+        -- RFC 7591 dynamic client registration. The client id is reused on
+        -- later authorizations for this server (REQ-MCP-010). The
+        -- authorization URL carries the PKCE challenge; the verifier is held
+        -- for the token exchange (REQ-MCP-011).
+}
+
+-- The operator completed the browser authorization; exchange the code for
+-- tokens, persist them, and retry the connection.
+rule OAuthAuthorized {
+    when: OperatorCompletedAuthorization(srv, code)
+
+    requires: srv.oauth_phase = awaiting_user
+
+    ensures: OAuthToken.created(
+        server_name: srv.name,
+        access_token: exchanged_access_token(srv, code),
+        refresh_token: exchanged_refresh_token(srv, code),
+        expires_at: token_expiry(srv, code)
+    )
+    ensures: srv.oauth_phase = authorized
+    ensures: srv.pending_auth_url = null
+    ensures: srv.state = connecting
+
+    @guidance
+        -- Exchange code + PKCE verifier at the token endpoint. Persist
+        -- tokens, clear the pending URL, and re-enter connecting so
+        -- HttpConnected drives the now-authorized handshake to ready
+        -- (REQ-MCP-011, REQ-MCP-012).
+}
+
+-- A 401 on a previously authorized server: the access token expired or was
+-- revoked. Refresh rather than re-prompt.
+rule TokenRefreshNeeded {
+    when: HttpRequestUnauthorized(srv)
+
+    requires: srv.auth_scheme = oauth
+    requires: srv.oauth_phase = authorized
+
+    ensures: srv.oauth_phase = refreshing
+}
+
+-- Refresh succeeded: update the stored token, return to authorized.
+rule TokenRefreshed {
+    when: OAuthTokenRefreshed(srv)
+
+    requires: srv.oauth_phase = refreshing
+
+    ensures: OAuthToken{server_name: srv.name}.access_token = refreshed_access_token(srv)
+    ensures: OAuthToken{server_name: srv.name}.expires_at = refreshed_expiry(srv)
+    ensures: srv.oauth_phase = authorized
+}
+
+-- Refresh failed: the user must authorize again. Re-enter discovery; the
+-- cached registration lets OAuthClientReused skip DCR.
+rule TokenRefreshFailed {
+    when: OAuthRefreshFailed(srv)
+
+    requires: srv.oauth_phase = refreshing
+
+    ensures: srv.state = unauthorized
+    ensures: srv.oauth_phase = discovering
+}
+
+------------------------------------------------------------
+-- Rules: tools, reload, enable/disable
+------------------------------------------------------------
+
+-- Server signaled notifications/tools/list_changed; refresh the tool list.
+rule ToolsListChanged {
+    when: ServerToolsListChanged(srv)
+
+    requires: srv.state = ready
+
+    ensures: srv.tools = discovered_tools(srv)
+
+    @guidance
+        -- Sets tools_changed; tool_definitions refreshes lazily on the next
+        -- read. For HTTP the notification arrives on the GET SSE stream
+        -- (REQ-MCP-006); for stdio, inline on stdout. REQ-MCP-014.
+}
+
+-- Reload found a new server in config: bring it up.
+rule ReloadAddsServer {
+    when: ReloadAddedServer(name, transport, auth_scheme)
+
+    ensures: McpServer.created(
+        name: name,
+        transport: transport,
+        state: connecting,
+        auth_scheme: auth_scheme,
+        enabled: true
+    )
+}
+
+-- Reload found a server's config changed: restart it (REQ-MCP-015).
+rule ReloadRestartsServer {
+    when: ReloadServerConfigChanged(srv)
+
+    ensures: srv.state = reconnecting
+
+    @guidance
+        -- reload_from_configs compares McpServerConfig with PartialEq across
+        -- the Stdio/Http variants; a changed command/args/env or url/headers/
+        -- auth triggers terminate + reconnect.
+}
+
+-- Reload found a server gone from config: disconnect and forget it.
+rule ReloadRemovesServer {
+    when: ReloadRemovedServer(srv)
+
+    ensures: not exists srv
+
+    @guidance
+        -- terminate() the connection; for HTTP also DELETE the session.
+}
+
+-- Operator disables a server: stop offering its tools, keep the connection.
+rule ServerDisabled {
+    when: DisableServer(srv)
+
+    requires: srv.enabled
+
+    ensures: srv.enabled = false
+
+    @guidance
+        -- disable_server adds the name to the disabled set, persisted in the
+        -- mcp_disabled_servers table. The connection is retained (REQ-MCP-016).
+}
+
+-- Operator re-enables a server: resume offering its tools.
+rule ServerEnabled {
+    when: EnableServer(srv)
+
+    requires: not srv.enabled
+
+    ensures: srv.enabled = true
+}
+
+------------------------------------------------------------
+-- Invariants
+------------------------------------------------------------
+
+-- The deprecated transport is never implemented natively (REQ-MCP-019).
+invariant LegacySseNotNative {
+    not config.legacy_sse_native
+}
+
+-- Only HTTP servers carry auth schemes; stdio is always unauthenticated.
+invariant StdioHasNoAuth {
+    for s in McpServers:
+        s.transport = stdio implies s.auth_scheme = none
+}
+
+-- A session id only exists for HTTP servers.
+invariant SessionImpliesHttp {
+    for s in McpServers:
+        s.session_id != null implies s.transport = http
+}
+
+-- A pending authorization URL only exists while blocked on authorization.
+invariant PendingUrlOnlyWhileUnauthorized {
+    for s in McpServers:
+        s.pending_auth_url != null implies s.state = unauthorized
+}
+
+-- An OAuth server that has authorized (or is refreshing) has a persisted
+-- token; a stored token belongs to an OAuth server (REQ-MCP-012).
+invariant AuthorizedImpliesToken {
+    for s in McpServers:
+        s.oauth_phase in { authorized, refreshing }
+            implies exists t in OAuthTokens where t.server_name = s.name
+}
+
+invariant TokenImpliesOAuthServer {
+    for t in OAuthTokens:
+        exists s in McpServers where s.name = t.server_name and s.auth_scheme = oauth
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+
+-- discovered_tools(srv): List<String>
+--   The tool names from the server's tools/list response (paginated).
+--
+-- session_id_from_init(srv): String
+--   The Mcp-Session-Id header value on the initialize response.
+--
+-- has_registration(srv): Bool
+--   True iff a persisted OAuthRegistration exists for srv.name.
+--
+-- registered_client_id(srv): String
+--   The client_id returned by RFC 7591 dynamic client registration.
+--
+-- authorization_url(srv): String
+--   The OAuth 2.1 authorization-code URL (with PKCE challenge) the operator
+--   opens in a browser.
+--
+-- exchanged_access_token(srv, code): String
+-- exchanged_refresh_token(srv, code): String?
+-- token_expiry(srv, code): Timestamp
+--   The token endpoint's response to exchanging the authorization code plus
+--   the PKCE verifier.
+--
+-- refreshed_access_token(srv): String
+-- refreshed_expiry(srv): Timestamp
+--   The token endpoint's response to a refresh-token grant.
+--
+-- static_auth_error(srv): String
+--   The error recorded when a static-credential server is rejected with 401.
+
+------------------------------------------------------------
+-- Deferred
+------------------------------------------------------------
+
+deferred ToolCallCancellationSafety
+    -- REQ-MCP-017. Cancellation safety and tool-error surfacing are executor
+    -- mechanics, not connection-lifecycle states: McpTool::run spawns the
+    -- tools/call as a detached task and selects on the cancellation token, so
+    -- a cancel cannot drop an in-flight stdio write mid-frame, and a server
+    -- isError result becomes a ToolOutput::Error rather than a Success. This
+    -- is emergent from the tool-execution path and the ToolOutput enum, below
+    -- the granularity of the ConnState machine modeled here.
+    -- Location: crates/phoenix-tools/src/mcp.rs (McpTool::run)
+
+------------------------------------------------------------
+-- Open Questions
+------------------------------------------------------------
+
+-- None.
