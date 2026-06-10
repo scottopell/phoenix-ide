@@ -250,6 +250,7 @@ fn arb_awaiting_recovery_state() -> impl Strategy<Value = ConvState> {
             message,
             error_kind,
             recovery_kind: super::state::RecoveryKind::Credential,
+            resume: super::state::RecoveryResumeTarget::ConversationTurn,
         }
     })
 }

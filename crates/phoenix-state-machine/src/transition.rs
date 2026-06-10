@@ -15,8 +15,9 @@ use super::effect::{compute_bash_display_data, CheckpointData};
 use super::event::{CoreEvent, ParentEvent, ParentOnlyEvent, SubAgentEvent, SubAgentOnlyEvent};
 use super::outcome::{EffectOutcome, InvalidOutcome, LlmOutcome, PersistOutcome, ToolExecOutcome};
 use super::state::{
-    AssistantMessage, ContextExhaustionBehavior, CoreState, ModeKind, ParentState, RecoveryKind,
-    SubAgentResult, SubAgentState, TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
+    AssistantMessage, ContextExhaustionBehavior, ContinuationSummaryRequest, CoreState, ModeKind,
+    ParentState, RecoveryKind, RecoveryResumeTarget, SubAgentResult, SubAgentState,
+    TaskApprovalHandoff, TaskApprovalOutcome, ToolCall, ToolInput,
 };
 use super::{ConvContext, ConvState, Effect, Event};
 use phoenix_core::domain::db_schema::{ErrorKind, ToolResult, UsageData};
@@ -1490,7 +1491,9 @@ fn handle_core_continuation(
                 attempt: *attempt,
             })
             .with_effect(Effect::RequestContinuation {
-                rejected_tool_calls: rejected_tool_calls.clone(),
+                request: ContinuationSummaryRequest {
+                    rejected_tool_calls: rejected_tool_calls.clone(),
+                },
             }))
         }
 
@@ -1503,7 +1506,9 @@ fn handle_core_continuation(
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
             .with_effect(Effect::RequestContinuation {
-                rejected_tool_calls: vec![],
+                request: ContinuationSummaryRequest {
+                    rejected_tool_calls: vec![],
+                },
             }))
         }
 
@@ -1741,13 +1746,25 @@ pub fn transition_parent(
         // Parent-only state: AwaitingRecovery (REQ-BED-030)
         // ============================================================
         (
-            ParentState::AwaitingRecovery { .. },
+            ParentState::AwaitingRecovery { resume, .. },
             ParentEvent::Parent(ParentOnlyEvent::CredentialBecameAvailable),
-        ) => Ok(
-            ParentTransitionResult::new(ParentState::Core(CoreState::LlmRequesting { attempt: 1 }))
+        ) => match resume {
+            RecoveryResumeTarget::ConversationTurn => Ok(ParentTransitionResult::new(
+                ParentState::Core(CoreState::LlmRequesting { attempt: 1 }),
+            )
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::RequestLlm)),
+            RecoveryResumeTarget::ContinuationSummary { request } => Ok(
+                ParentTransitionResult::new(ParentState::Core(CoreState::AwaitingContinuation {
+                    rejected_tool_calls: request.rejected_tool_calls.clone(),
+                    attempt: 1,
+                }))
                 .with_effect(Effect::PersistState)
-                .with_effect(Effect::RequestLlm),
-        ),
+                .with_effect(Effect::RequestContinuation {
+                    request: request.clone(),
+                }),
+            ),
+        },
 
         (
             ParentState::AwaitingRecovery { error_kind, .. },
@@ -2269,6 +2286,7 @@ pub fn transition_parent(
                 message: message.clone(),
                 error_kind: error_kind.clone(),
                 recovery_kind: RecoveryKind::Credential,
+                resume: RecoveryResumeTarget::ConversationTurn,
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change()))
@@ -2333,7 +2351,32 @@ pub fn transition_parent(
             .with_effect(Effect::NotifyContextExhausted { summary: fallback }))
         }
 
-        // LlmError during continuation - retries exhausted -> ContextExhausted
+        (
+            ParentState::Core(CoreState::AwaitingContinuation {
+                rejected_tool_calls,
+                ..
+            }),
+            ParentEvent::Core(CoreEvent::LlmError {
+                message,
+                error_kind,
+                recovery_in_progress: true,
+                ..
+            }),
+        ) if matches!(error_kind, ErrorKind::Auth) => {
+            Ok(ParentTransitionResult::new(ParentState::AwaitingRecovery {
+                message: message.clone(),
+                error_kind: error_kind.clone(),
+                recovery_kind: RecoveryKind::Credential,
+                resume: RecoveryResumeTarget::ContinuationSummary {
+                    request: ContinuationSummaryRequest {
+                        rejected_tool_calls: rejected_tool_calls.clone(),
+                    },
+                },
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::notify_state_change()))
+        }
+
         (
             ParentState::Core(CoreState::AwaitingContinuation { .. }),
             ParentEvent::Core(CoreEvent::LlmError {
@@ -2959,7 +3002,9 @@ fn handle_context_exhaustion(
             .with_effect(Effect::PersistState)
             .with_effect(Effect::notify_state_change())
             .with_effect(Effect::RequestContinuation {
-                rejected_tool_calls: tool_calls,
+                request: ContinuationSummaryRequest {
+                    rejected_tool_calls: tool_calls,
+                },
             })
         }
         ContextExhaustionBehavior::IntentionallyUnhandled => {
@@ -3056,6 +3101,229 @@ mod tests {
 
     fn test_context() -> ConvContext {
         ConvContext::new("test-conv", PathBuf::from("/tmp"), "test-model", 200_000)
+    }
+
+    fn test_tool_call(id: &str) -> ToolCall {
+        ToolCall::new(
+            id,
+            ToolInput::Think(crate::state::ThinkInput {
+                thoughts: "inspect".to_string(),
+            }),
+        )
+    }
+
+    #[test]
+    fn ordinary_llm_auth_recovery_resumes_main_turn() {
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &test_context(),
+            Event::LlmError {
+                message: "Waiting for authentication".to_string(),
+                error_kind: ErrorKind::Auth,
+                attempt: 1,
+                recovery_in_progress: true,
+                resets_at: None,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::AwaitingRecovery {
+                resume: RecoveryResumeTarget::ConversationTurn,
+                ..
+            }
+        ));
+
+        let resumed = transition(
+            &result.new_state,
+            &test_context(),
+            Event::CredentialBecameAvailable,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            resumed.new_state,
+            ConvState::LlmRequesting { attempt: 1 }
+        ));
+        assert!(resumed
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::RequestLlm)));
+    }
+
+    #[test]
+    fn continuation_auth_error_enters_recovery_with_continuation_target() {
+        let rejected_tool_calls = vec![test_tool_call("tool-1")];
+        let result = transition(
+            &ConvState::AwaitingContinuation {
+                rejected_tool_calls: rejected_tool_calls.clone(),
+                attempt: 1,
+            },
+            &test_context(),
+            Event::LlmError {
+                message: "Waiting for authentication".to_string(),
+                error_kind: ErrorKind::Auth,
+                attempt: 1,
+                recovery_in_progress: true,
+                resets_at: None,
+            },
+        )
+        .unwrap();
+
+        match result.new_state {
+            ConvState::AwaitingRecovery {
+                resume:
+                    RecoveryResumeTarget::ContinuationSummary {
+                        request:
+                            ContinuationSummaryRequest {
+                                rejected_tool_calls: carried,
+                            },
+                    },
+                ..
+            } => assert_eq!(carried, rejected_tool_calls),
+            other @ (ConvState::Idle
+            | ConvState::LlmRequesting { .. }
+            | ConvState::SeededLlmRequesting { .. }
+            | ConvState::ToolExecuting { .. }
+            | ConvState::CancellingTool { .. }
+            | ConvState::AwaitingSubAgents { .. }
+            | ConvState::CancellingSubAgents { .. }
+            | ConvState::Completed { .. }
+            | ConvState::Failed { .. }
+            | ConvState::Error { .. }
+            | ConvState::AwaitingRecovery { .. }
+            | ConvState::AwaitingContinuation { .. }
+            | ConvState::AwaitingTaskApproval { .. }
+            | ConvState::AwaitingUserResponse { .. }
+            | ConvState::ContextExhausted { .. }
+            | ConvState::HandedOff { .. }
+            | ConvState::Terminal) => {
+                panic!("expected continuation recovery target, got {other:?}")
+            }
+        }
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyContextExhausted { .. })));
+        assert!(!result.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::PersistMessage {
+                    content: phoenix_core::domain::db_schema::MessageContent::Continuation { .. },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn credential_success_from_continuation_recovery_retries_continuation() {
+        let rejected_tool_calls = vec![test_tool_call("tool-1")];
+        let state = ConvState::AwaitingRecovery {
+            message: "Waiting for authentication".to_string(),
+            error_kind: ErrorKind::Auth,
+            recovery_kind: RecoveryKind::Credential,
+            resume: RecoveryResumeTarget::ContinuationSummary {
+                request: ContinuationSummaryRequest {
+                    rejected_tool_calls: rejected_tool_calls.clone(),
+                },
+            },
+        };
+
+        let result = transition(&state, &test_context(), Event::CredentialBecameAvailable).unwrap();
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::AwaitingContinuation { attempt: 1, .. }
+        ));
+        assert!(result.effects.iter().any(|effect| matches!(
+            effect,
+            Effect::RequestContinuation {
+                request: ContinuationSummaryRequest { rejected_tool_calls: carried }
+            } if *carried == rejected_tool_calls
+        )));
+    }
+
+    #[test]
+    fn credential_failure_from_continuation_recovery_does_not_persist_fallback_summary() {
+        let state = ConvState::AwaitingRecovery {
+            message: "Waiting for authentication".to_string(),
+            error_kind: ErrorKind::Auth,
+            recovery_kind: RecoveryKind::Credential,
+            resume: RecoveryResumeTarget::ContinuationSummary {
+                request: ContinuationSummaryRequest {
+                    rejected_tool_calls: vec![test_tool_call("tool-1")],
+                },
+            },
+        };
+
+        let result = transition(
+            &state,
+            &test_context(),
+            Event::CredentialHelperFailed {
+                message: "sign-in failed".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::Error {
+                message,
+                error_kind: ErrorKind::Auth,
+            } if message == "sign-in failed"
+        ));
+        assert!(!result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyContextExhausted { .. })));
+        assert!(!result.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::PersistMessage {
+                    content: phoenix_core::domain::db_schema::MessageContent::Continuation { .. },
+                    ..
+                }
+            )
+        }));
+    }
+
+    #[test]
+    fn non_auth_continuation_failure_still_persists_fallback_summary() {
+        let result = transition(
+            &ConvState::AwaitingContinuation {
+                rejected_tool_calls: vec![],
+                attempt: MAX_RETRY_ATTEMPTS,
+            },
+            &test_context(),
+            Event::LlmError {
+                message: "invalid continuation request".to_string(),
+                error_kind: ErrorKind::InvalidRequest,
+                attempt: MAX_RETRY_ATTEMPTS,
+                recovery_in_progress: false,
+                resets_at: None,
+            },
+        )
+        .unwrap();
+
+        assert!(matches!(
+            result.new_state,
+            ConvState::ContextExhausted { .. }
+        ));
+        assert!(result
+            .effects
+            .iter()
+            .any(|effect| matches!(effect, Effect::NotifyContextExhausted { .. })));
+        assert!(result.effects.iter().any(|effect| {
+            matches!(
+                effect,
+                Effect::PersistMessage {
+                    content: phoenix_core::domain::db_schema::MessageContent::Continuation { .. },
+                    ..
+                }
+            )
+        }));
     }
 
     #[test]
@@ -3505,7 +3773,8 @@ mod tests {
         assert!(
             result.effects.iter().any(|e| matches!(
                 e,
-                Effect::RequestContinuation { rejected_tool_calls } if rejected_tool_calls.len() == 1
+                Effect::RequestContinuation { request }
+                    if request.rejected_tool_calls.len() == 1
             )),
             "Parent should request continuation with rejected tools"
         );

@@ -1,6 +1,6 @@
 // Utility functions
 
-import type { ConversationState, ToolCall, PendingSubAgent, SubAgentResult, UserQuestion } from './api';
+import type { ConversationState, RecoveryResumeTarget, ToolCall, PendingSubAgent, SubAgentResult, UserQuestion } from './api';
 import { getErrorPresentation } from './errorPresentation';
 import type { ErrorKind } from './generated/ErrorKind';
 
@@ -170,6 +170,22 @@ function serverError(message: string): ConversationState {
   return { type: 'error', message, error_kind: error.kind, error };
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function parseRecoveryResumeTarget(raw: Record<string, unknown>): RecoveryResumeTarget {
+  if (raw['type'] === 'continuation_summary' && isRecord(raw['request'])) {
+    return {
+      type: 'continuation_summary',
+      request: {
+        rejected_tool_calls: (raw['request']['rejected_tool_calls'] as ToolCall[]) ?? [],
+      },
+    };
+  }
+  return { type: 'conversation_turn' };
+}
+
 export function parseConversationState(raw: unknown): ConversationState {
   if (!raw || typeof raw !== 'object') {
     return { type: 'idle' };
@@ -254,6 +270,9 @@ export function parseConversationState(raw: unknown): ConversationState {
         type: 'awaiting_recovery',
         message: (obj['message'] as string) ?? '',
         recovery_kind: (obj['recovery_kind'] as string) ?? 'credential',
+        resume: isRecord(obj['resume'])
+          ? parseRecoveryResumeTarget(obj['resume'])
+          : { type: 'conversation_turn' },
       };
     default:
       console.warn(`Unknown conversation state type: ${String(type)}`);

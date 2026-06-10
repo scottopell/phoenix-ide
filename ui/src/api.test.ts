@@ -102,7 +102,7 @@ describe('canCancelConversationState', () => {
     [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, true],
     [{ type: 'awaiting_user_response', questions: [] }, false],
     [{ type: 'context_exhausted', summary: 's' }, false],
-    [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential' }, true],
+    [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }, true],
     [{ type: 'terminal' }, false],
     [{ type: 'handed_off', successor_conv_id: 'next' }, false],
     [{ type: 'seeded_llm_requesting', seed_message_id: 'seed', attempt: 1 }, true],
@@ -131,7 +131,7 @@ describe('canChangeModelInState (task 02713)', () => {
     [{ type: 'awaiting_task_approval', title: 't', priority: 'p1', plan: 'p' }, false],
     [{ type: 'awaiting_user_response', questions: [] }, false],
     [{ type: 'context_exhausted', summary: 's' }, false],
-    [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential' }, false],
+    [{ type: 'awaiting_recovery', message: 'm', recovery_kind: 'credential', resume: { type: 'conversation_turn' } }, false],
     [{ type: 'terminal' }, false],
   ];
 

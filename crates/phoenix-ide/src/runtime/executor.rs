@@ -1804,11 +1804,8 @@ where
                 spawn_tool_id,
             } => self.persist_sub_agent_results(results, spawn_tool_id).await,
 
-            Effect::RequestContinuation {
-                rejected_tool_calls,
-            } => {
-                // REQ-BED-020: Request continuation summary (tool-less LLM request)
-                self.request_continuation(rejected_tool_calls);
+            Effect::RequestContinuation { request } => {
+                self.request_continuation(request.rejected_tool_calls);
                 Ok(None)
             }
 

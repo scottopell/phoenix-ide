@@ -280,6 +280,14 @@ export interface QuestionOption {
   preview?: string;
 }
 
+export interface ContinuationSummaryRequest {
+  rejected_tool_calls: ToolCall[];
+}
+
+export type RecoveryResumeTarget =
+  | { type: 'conversation_turn' }
+  | { type: 'continuation_summary'; request: ContinuationSummaryRequest };
+
 export type ConversationState =
   | { type: 'idle' }
   | { type: 'awaiting_llm' }
@@ -296,7 +304,7 @@ export type ConversationState =
   | { type: 'context_exhausted'; summary: string }
   | { type: 'handed_off'; successor_conv_id: string }
   | { type: 'error'; message: string; error_kind: ErrorKind; error?: ErrorPresentation }
-  | { type: 'awaiting_recovery'; message: string; recovery_kind: string }
+  | { type: 'awaiting_recovery'; message: string; recovery_kind: string; resume: RecoveryResumeTarget }
   | { type: 'terminal' };
 
 /** Mirror of the backend `ConvState::allows_model_change`: true only for
@@ -1667,3 +1675,4 @@ export function subscribeToChainStream(
   }
   return source;
 }
+

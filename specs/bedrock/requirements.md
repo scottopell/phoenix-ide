@@ -117,7 +117,19 @@ WHEN LLM request fails after all retries exhausted
 THE SYSTEM SHALL transition to error state
 AND display actionable error message indicating retry failure
 
-WHEN LLM request fails with non-retryable error (auth, 4xx)
+WHEN a recoverable LLM operation fails with an auth error while credential recovery is in progress
+THE SYSTEM SHALL transition to awaiting recovery
+AND SHALL carry a typed resume target for the suspended operation
+
+WHEN credential recovery succeeds from awaiting recovery
+THE SYSTEM SHALL resume the operation identified by the typed resume target
+AND SHALL NOT infer the operation from display text, UI state, or the error message
+
+WHEN credential recovery fails from awaiting recovery
+THE SYSTEM SHALL transition to error state
+AND SHALL NOT fabricate continuation summaries or persist auth failure copy as continuation content
+
+WHEN LLM request fails with non-retryable error (4xx other than recoverable auth)
 THE SYSTEM SHALL transition to error state immediately
 AND display specific error message
 

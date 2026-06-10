@@ -615,6 +615,7 @@ mod tests {
                 message: "auth".into(),
                 error_kind: ErrorKind::Auth,
                 recovery_kind: RecoveryKind::Credential,
+                resume: RecoveryResumeTarget::ConversationTurn,
             },
             ConvState::AwaitingContinuation {
                 rejected_tool_calls: vec![],
@@ -804,6 +805,19 @@ pub enum RecoveryKind {
     Credential,
 }
 
+/// Operation-specific inputs for a continuation summary request.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContinuationSummaryRequest {
+    pub rejected_tool_calls: Vec<ToolCall>,
+}
+
+/// LLM operation suspended while an external recovery mechanism runs.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum RecoveryResumeTarget {
+    ConversationTurn,
+    ContinuationSummary { request: ContinuationSummaryRequest },
+}
 /// Conversation state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -901,11 +915,11 @@ pub enum ConvState {
 
     /// Recovery mechanism active — waiting for external resolution (REQ-BED-030).
     /// Distinct from `Error`: something is in flight to fix the problem.
-    /// Transitions to `LlmRequesting` on success, `Error` on failure, `Idle` on cancel.
     AwaitingRecovery {
         message: String,
         error_kind: ErrorKind,
         recovery_kind: RecoveryKind,
+        resume: RecoveryResumeTarget,
     },
 
     /// Awaiting continuation summary from LLM (tool-less request in flight)
@@ -1023,6 +1037,7 @@ pub enum ParentState {
         message: String,
         error_kind: ErrorKind,
         recovery_kind: RecoveryKind,
+        resume: RecoveryResumeTarget,
     },
     AwaitingTaskApproval {
         task_file: String,
@@ -1070,10 +1085,12 @@ impl From<ParentState> for ConvState {
                 message,
                 error_kind,
                 recovery_kind,
+                resume,
             } => ConvState::AwaitingRecovery {
                 message,
                 error_kind,
                 recovery_kind,
+                resume,
             },
             ParentState::AwaitingTaskApproval {
                 task_file,
@@ -1269,10 +1286,12 @@ impl TryFrom<ConvState> for ParentState {
                 message,
                 error_kind,
                 recovery_kind,
+                resume,
             } => Ok(ParentState::AwaitingRecovery {
                 message,
                 error_kind,
                 recovery_kind,
+                resume,
             }),
             ConvState::AwaitingTaskApproval {
                 task_file,

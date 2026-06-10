@@ -1,6 +1,8 @@
 //! Effects produced by state transitions
 
-use crate::state::{AssistantMessage, SubAgentOutcome, SubAgentResult, ToolCall};
+use crate::state::{
+    AssistantMessage, ContinuationSummaryRequest, SubAgentOutcome, SubAgentResult, ToolCall,
+};
 use chrono::{DateTime, Utc};
 use phoenix_bash_display::display_command;
 use phoenix_core::domain::db_schema::{
@@ -184,10 +186,7 @@ pub enum Effect {
     },
 
     /// Request continuation summary from LLM (no tools) - REQ-BED-020
-    RequestContinuation {
-        /// Tool calls that were requested but not executed
-        rejected_tool_calls: Vec<ToolCall>,
-    },
+    RequestContinuation { request: ContinuationSummaryRequest },
 
     /// Notify client of context exhaustion - REQ-BED-021
     NotifyContextExhausted { summary: String },

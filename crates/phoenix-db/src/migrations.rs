@@ -109,6 +109,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "rename_chain_qa_snapshot_columns",
         sql: MIGRATION_019,
     },
+    Migration {
+        version: 20,
+        name: "backfill_awaiting_recovery_resume_target",
+        sql: MIGRATION_020,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -478,6 +483,16 @@ ALTER TABLE chain_qa RENAME COLUMN snapshot_member_count TO chain_members_at_ans
 ALTER TABLE chain_qa RENAME COLUMN snapshot_total_messages TO chain_messages_at_answer;
 ";
 
+/// Backfill typed recovery resume targets for rows created before `AwaitingRecovery`
+/// carried the suspended LLM operation explicitly. Existing recovery rows could
+/// only represent ordinary conversation turns, so they resume `RequestLlm`.
+const MIGRATION_020: &str = r#"
+UPDATE conversations
+SET state = json_set(state, '$.resume', json('{"type":"conversation_turn"}'))
+WHERE json_extract(state, '$.type') = 'awaiting_recovery'
+  AND json_extract(state, '$.resume') IS NULL;
+"#;
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -597,7 +612,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 19);
+        assert_eq!(first, 20);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);

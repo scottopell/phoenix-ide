@@ -399,12 +399,26 @@ fn map_llm_outcome_to_transition(
 }
 ```
 
-Recovery from error state remains unchanged:
+Recovery from credential-helper authentication is modeled as a wrapper around the LLM operation that was suspended:
 ```rust
-// User sends message from Error state
-Error { .. } + UserMessage { .. } => AwaitingLlm
-    // Effects: PersistCheckpoint, RequestLlm
+struct ContinuationSummaryRequest {
+    rejected_tool_calls: Vec<ToolCall>,
+}
+
+enum RecoveryResumeTarget {
+    ConversationTurn,
+    ContinuationSummary { request: ContinuationSummaryRequest },
+}
+
+AwaitingRecovery {
+    message: String,
+    error_kind: ErrorKind,
+    recovery_kind: RecoveryKind,
+    resume: RecoveryResumeTarget,
+}
 ```
+
+`CredentialBecameAvailable` dispatches the effect implied by `resume`: `ConversationTurn` returns to `LlmRequesting` and emits `RequestLlm`; `ContinuationSummary` returns to `AwaitingContinuation` and emits `RequestContinuation` with the preserved `ContinuationSummaryRequest`. `CredentialHelperFailed` transitions to `Error` for every resume target and does not persist continuation fallback content. Fallback continuation summaries are only for genuine continuation-generation failures after the normal retry policy.
 
 ## Conversation Mode (REQ-BED-027, REQ-PROJ-002, REQ-PROJ-007)
 
@@ -1209,7 +1223,7 @@ enum Effect {
     
     /// Request continuation summary from LLM (no tools)
     RequestContinuation {
-        rejected_tool_calls: Vec<ToolCall>,
+        request: ContinuationSummaryRequest,
     },
     
     /// Notify client of context exhaustion
@@ -1239,7 +1253,9 @@ The check happens in `transition()` at the `(LlmRequesting, LlmResponse)` arm, B
                 })
                 .with_effect(Effect::persist_agent_message(content, Some(usage_data)))
                 .with_effect(Effect::PersistState)
-                .with_effect(Effect::RequestContinuation { rejected_tool_calls: tool_calls }));
+                .with_effect(Effect::RequestContinuation {
+                    request: ContinuationSummaryRequest { rejected_tool_calls: tool_calls },
+                }));
             }
             ContextExhaustionBehavior::IntentionallyUnhandled => {
                 // REQ-BED-024: Sub-agents fail immediately
@@ -1315,6 +1331,20 @@ fn build_continuation_prompt(rejected_tool_calls: &[ToolCall]) -> String {
     .with_effect(Effect::NotifyContextExhausted { summary }))
 }
 
+// Continuation auth error while credential recovery is in progress
+(ConvState::AwaitingContinuation { rejected_tool_calls, .. }, Event::LlmError { error_kind: Auth, recovery_in_progress: true, .. }) => {
+    Ok(TransitionResult::new(ConvState::AwaitingRecovery {
+        message,
+        error_kind: ErrorKind::Auth,
+        recovery_kind: RecoveryKind::Credential,
+        resume: RecoveryResumeTarget::ContinuationSummary {
+            request: ContinuationSummaryRequest { rejected_tool_calls },
+        },
+    })
+    .with_effect(Effect::PersistState)
+    .with_effect(Effect::NotifyStateChange))
+}
+
 // Continuation failed after retries
 (ConvState::AwaitingContinuation { trigger_usage, .. }, Event::ContinuationFailed { .. }) => {
     let fallback = "Context limit reached. The continuation summary could not be generated. \
@@ -1357,7 +1387,9 @@ Users can trigger continuation from Idle state whenever context usage has been r
         attempt: 1,
     })
     .with_effect(Effect::PersistState)
-    .with_effect(Effect::RequestContinuation { rejected_tool_calls: vec![] }))
+    .with_effect(Effect::RequestContinuation {
+        request: ContinuationSummaryRequest { rejected_tool_calls: vec![] },
+    }))
 }
 ```
 
