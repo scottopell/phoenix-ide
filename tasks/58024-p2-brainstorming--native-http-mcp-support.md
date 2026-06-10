@@ -96,57 +96,65 @@ No spec exists for MCP at all today. Write spEARS (`requirements.md`,
 `design.md`, `executive.md`). Because this has a real lifecycle (connect →
 initialize → session → reconnect/resume), an auth state machine, and a
 cross-transport contract, it warrants an **Allium** spec for the
-transport+session+auth lifecycle. Resolve the open questions below into design
-decisions here.
+transport+session+auth lifecycle.
+
+**OAuth is the headline, not an afterthought.** The value driver is reaching
+OAuth-protected remote servers (Atlassian/Slack/Linear-style) without the
+`mcp-remote` shim. Static-token/header auth is not an independently valuable
+release on its own — it falls out of the transport's header plumbing for free,
+but the first *releasable* unit is the transport **plus** OAuth (M2 + M3).
 
 **M1 — Transport abstraction refactor (no behavior change).**
 Extract `McpTransport`, move existing stdio behind it, turn `McpServerConfig`
 into an enum (stdio-only variant still the only one wired). All existing tests
 green, zero behavior change. De-risks everything after it.
 
-**M2 — Streamable HTTP transport, static/no auth.**
+**M2 — Streamable HTTP transport substrate (prerequisite, not a release).**
 Stop skipping `type: "http"`. Implement POST `initialize`/`tools/list`/
 `tools/call` handling both `application/json` and `text/event-stream`
-responses; session-id lifecycle; protocol-version header. Auth limited to
-**none + static bearer/custom headers from config**. This alone unlocks the
-majority of "internal HTTP MCP server behind an API key" use cases and lets us
-drop `mcp-remote` for those.
+responses; session-id lifecycle; protocol-version header; arbitrary request
+headers (static bearer/custom headers from config come for free here). This is
+the substrate OAuth builds on — validated against an unauthenticated or
+static-token test server, but **not shipped as a standalone feature**, because
+static auth alone isn't the point.
 
-**M3 — Server-initiated stream + resumability.**
+**M3 — OAuth 2.1 (THE value driver). First releasable unit = M2 + M3.**
+`401` + `WWW-Authenticate` → PRM (9728) → AS metadata (8414) → DCR (7591) →
+auth-code + PKCE → `Authorization: Bearer` + refresh. Token store in SQLite
+(plaintext, consistent with existing MCP state persistence). Native "Authorize"
+affordance replacing today's stderr-scraped URL. Closes task 08639. This is the
+largest chunk and the reason the epic exists; everything before it is
+scaffolding to get here.
+
+**M4 — Server-initiated stream + resumability.**
 GET SSE stream for server→client messages, `notifications/tools/list_changed`
-(the main payoff — already half-wired via `tools_changed`), reconnect with
-`Last-Event-ID`. Somewhat optional; sequenced before OAuth because OAuth reuses
-the reconnect machinery.
+(already half-wired via `tools_changed`), reconnect with `Last-Event-ID`.
+Sequenced after OAuth: the auth-code flow itself runs over POST + browser
+redirect and doesn't depend on the GET stream, so it need not block the
+headline.
 
-**M4 — OAuth 2.1.**
-PRM (9728) → AS metadata (8414) → DCR (7591) → auth-code + PKCE → bearer +
-refresh; token store in the DB; native "Authorize" affordance. Replaces
-`mcp-remote`'s OAuth entirely and closes task 08639. Largest chunk.
-
-**M5 — Legacy HTTP+SSE transport (conditional).**
-Only if we decide to support pre-2025 deployed servers. Two-endpoint flow as a
-second `HttpTransport` mode.
-
-**M6 — UI + config + ops polish.**
+**M5 — UI + config + ops polish.**
 `McpStatusPanel`: show transport type and auth state, native authorize button
 (vs today's scraped URL), surface connection errors (task 02685). Define HTTP
 reload semantics. Document the config schema.
 
+## Design decisions (resolved during scoping)
+1. **Legacy HTTP+SSE (2024-11-05): skipped entirely.** Streamable HTTP only.
+   Servers that speak only the old transport stay on the `mcp-remote` shim.
+2. **mcp-remote retained as a fallback during the transition.** The stdio +
+   `mcp-remote` path keeps working; the `type: "http"` skip is removed only
+   once native HTTP + OAuth lands.
+3. **OAuth token storage: plaintext in SQLite**, consistent with how MCP
+   enable/disable state is already persisted.
+4. **Auth does not phase.** Static bearer/header auth alone is not a shippable
+   milestone; OAuth (M3) is the value driver and rides on the same M2 transport,
+   so the first release bundles M2 + M3.
+
 ## Relationship to existing tasks
-- 08639 `native-mcp-oauth` → folded into **M4**.
-- 02685 `mcp-surface-connection-errors` → naturally lands in **M6** (and the
+- 08639 `native-mcp-oauth` → folded into **M3**.
+- 02685 `mcp-surface-connection-errors` → naturally lands in **M5** (and the
   transport refactor makes failure states cleaner to surface).
 - 08613 `mcp-dynamic-tool-resolution` (done) → HTTP tools ride the same live
   resolution path; no extra work expected.
 - 08614 / 08615 (project-local config, scoped enable/disable) are orthogonal
   (discovery & scoping), but the config-enum change in M1 should not conflict.
-
-## Open questions (resolve in M0)
-1. **Legacy HTTP+SSE (2024-11-05):** support, skip, or defer to M5? (Many
-   currently-deployed remote servers still speak only this.)
-2. **mcp-remote during transition:** keep it working as a fallback path, or cut
-   over and remove the skip-on-`type:http` once native lands?
-3. **OAuth token storage:** plaintext in SQLite (consistent with current DB
-   usage) vs OS keychain vs encrypted-at-rest. Security call.
-4. **Auth phasing:** is static bearer/header auth (M2) enough to ship value
-   before full OAuth (M4), or must they land together?
