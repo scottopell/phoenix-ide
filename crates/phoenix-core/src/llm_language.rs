@@ -249,26 +249,6 @@ pub fn mode_branch(
 // =============================================================================
 
 #[must_use]
-pub fn chain_answer_system_prompt(lang: LlmLanguage) -> &'static str {
-    match lang {
-        LlmLanguage::PhoenixNative => {
-            "You are answering a question about a Phoenix continuation chain — \
-            a sequence of conversations that were continued one into the next as the original conversation \
-            exhausted its context. The user's question is below the bundled context.
-
-Each chain member is delimited by a structural tag (e.g. [main:#abc123] or [leaf-summary:#def456]). \
-Answer ONLY from the bundled chain content. If the context does not support a confident answer, \
-say so explicitly and indicate what would be needed to answer. Do not speculate beyond the \
-provided content."
-        }
-        LlmLanguage::Caveman => {
-            "Question about long chain of caveman talk. Each member marked with tag like [main:#abc] or [leaf-summary:#def]. \
-            Answer only from chain. No guess. If chain not say, you say chain not say."
-        }
-    }
-}
-
-#[must_use]
 pub fn chain_qa_agent_system_prompt(lang: LlmLanguage) -> &'static str {
     match lang {
         LlmLanguage::PhoenixNative => {
@@ -296,23 +276,6 @@ read_conversation(conversation_id, cursor?) read one talk full, page by page wit
 Skeleton list given to start. Search, then read good ones full, then answer with plain words \
 and no tool. Only say what chain say. If chain not say, you say chain not say. You cannot \
 change anything, only look."
-        }
-    }
-}
-
-#[must_use]
-pub fn chain_leaf_summary_system_prompt(lang: LlmLanguage) -> &'static str {
-    match lang {
-        LlmLanguage::PhoenixNative => {
-            "Summarize the work done in the conversation transcript below. \
-Focus on what was attempted, what was decided, what was completed, and any open questions. \
-Aim for a concise summary (a few short paragraphs) that another LLM could use to answer \
-recall questions about this conversation. Do not include greetings, sign-offs, or commentary \
-about the summary itself — just the summary."
-        }
-        LlmLanguage::Caveman => {
-            "Read big talk. Make short story. What try, what decide, what done, what still open. \
-            No hello. No goodbye. Just story."
         }
     }
 }
