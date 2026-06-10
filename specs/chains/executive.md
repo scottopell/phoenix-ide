@@ -46,22 +46,25 @@ mid-tier model balanced for cost and accuracy.
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-CHN-001:** Recall Past Work Without Re-Explaining Context | ✅ Complete | Headline benefit; system-prompt + bundling at `crates/phoenix-ide/src/chain_qa.rs:43,569`; backend at `api.rs:43` |
+| **REQ-CHN-001:** Recall Past Work Without Re-Explaining Context | ✅ Complete | Headline benefit; answered by the read-only agent loop (`ChainQa::run_answer_invocation` in `chain_qa.rs`) over the chain-scoped retrieval tools |
 | **REQ-CHN-002:** Continuation Chains Surface as First-Class Entities | ✅ Complete | `db.rs:2771-2837` (`chain_members_forward`, `chain_root_of`); chain identity derived from existing `continued_in_conv_id` graph |
 | **REQ-CHN-003:** Chain Page as a Navigable Place | ✅ Complete | `api/chains.rs:1,78,96`; route registered at `api/handlers.rs:137` |
 | **REQ-CHN-004:** Ask the Chain, Get a Streamed Answer | ✅ Complete | `chain_runtime.rs:1` (broadcaster), `chain_qa.rs:1`, wire at `api/wire.rs:449` |
 | **REQ-CHN-005:** Q&A History Persists Per Chain | ✅ Complete | `chain_qa` table CRUD at `db.rs:2909-3008`; status enum + snapshot counters at `chain_qa.rs:145,323,520`; startup sweep `db.rs:1014` |
 | **REQ-CHN-006:** Consistent Quality As Q&A Accumulates | ✅ Complete | Stateless per-question invocation `chain_qa.rs:29,38,384`; `chain_qa_id` demux `chain_runtime.rs:8`, `api/chains.rs:119`, `api/wire.rs:463` |
 | **REQ-CHN-007:** Chain Has a User-Editable Name | ✅ Complete | Nullable `chain_name` column (`db.rs:2737`, `db.rs:3041`); whitespace clears the name (`api/chains.rs:182`) |
-| **REQ-CHN-008:** Chain Page Surfaces Work Identity Alongside Runtime Resources | Planned | Adds worktree/branch/task + PR-health facet to the existing work-scope dock (`specs/work-scope-ui/` REQ-WSUI-009); identity from `ConvMode`, PR health from the PR-status pipeline; not in `WorkScopeInventory` |
-| **REQ-CHN-009:** Chain Q&A Is a Read-Only Agentic Loop | Planned | Scope-bound search + read tools over `specs/conversation-retrieval/`; replaces summaries bundling; reframes REQ-CHN-005 staleness as an age-of-answer freshness tag |
+| **REQ-CHN-008:** Chain Page Surfaces Work Identity Alongside Runtime Resources | Planned | Adds worktree/branch/task + PR-health facet to the existing work-scope dock (`specs/work-scope-ui/` REQ-WSUI-009); identity from `ConvMode`, PR health from the PR-status pipeline; not in `WorkScopeInventory`. Tracked (with the `chain_qa` column rename below) as task 58020 |
+| **REQ-CHN-009:** Chain Q&A Is a Read-Only Agentic Loop | ✅ Complete | Read-only agent loop (`ChainQa` in `chain_qa.rs`) driving scope-bound `search_conversations` + `read_conversation` tools over `specs/conversation-retrieval/`; replaced summary bundling; reframes REQ-CHN-005 staleness as an age-of-answer freshness tag |
 
-**Progress:** v1 (REQ-CHN-001…007) shipped. REQ-CHN-008 (work-identity
-facet on the work-scope dock) and REQ-CHN-009 (read-only agentic Q&A)
-are the redesign, planned. REQ-CHN-008 builds on `specs/work-scope-ui/`
-(the chain dock + `work_scope_key`); REQ-CHN-009 depends on the new
-`specs/conversation-retrieval/` primitive, exposed to the Q&A agent as
-scope-bound tools.
+**Progress:** REQ-CHN-001…007 and REQ-CHN-009 (read-only agentic Q&A) have
+shipped, the latter built on the new `specs/conversation-retrieval/` primitive
+exposed to the Q&A agent as scope-bound tools. REQ-CHN-008 (work-identity facet
+on the work-scope dock) remains planned — it builds on `specs/work-scope-ui/`
+(the chain dock + `work_scope_key`) and is tracked, together with the `chain_qa`
+snapshot→freshness column rename, as task 58020. The freshness markers ship as
+the `snapshot_member_count` / `snapshot_total_messages` columns; `design.md`
+documents them under their post-rename names (`chain_members_at_answer` /
+`chain_messages_at_answer`), which task 58020 reconciles.
 
 The "out of scope" list below remains accurate — the deferred Allium spec for the Q&A lifecycle is recommended now that the actual transitions are observable in production.
 

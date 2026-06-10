@@ -61,19 +61,19 @@ construction.
 
 ## Status Summary
 
-This is a design specification. No requirement below is implemented
-yet; this table is the implementation tracker.
+The FTS5/BM25 backend ships REQ-RET-001 through REQ-RET-008. This table
+tracks implementation status.
 
 | Requirement | Status | Notes |
 |---|---|---|
-| **REQ-RET-001:** Scope-Filtered Retrieval Primitive | Planned | |
-| **REQ-RET-002:** One Index Over All Conversation Messages | Planned | |
-| **REQ-RET-003:** Index Is a Rebuildable Derived Cache | Planned | Migration-introduced FTS5 table + backfill |
-| **REQ-RET-004:** Text Extracted From Typed Message Content | Planned | Shared extraction with chain-qa transcript rendering |
-| **REQ-RET-005:** Retrieval Backend Is Swappable | Planned | FTS5/BM25 first; vector/hybrid behind the trait |
-| **REQ-RET-006:** Results Carry Provenance | Planned | |
-| **REQ-RET-007:** Scope Is Applied In-Query, Not Post-Hoc | Planned | |
-| **REQ-RET-008:** Scope Is Host-Bound When Retrieval Is a Tool | Planned | Agent supplies query only; host fixes scope at tool construction |
+| **REQ-RET-001:** Scope-Filtered Retrieval Primitive | ✅ Complete | `Fts5Retriever::retrieve` over `RetrievalScope` |
+| **REQ-RET-002:** One Index Over All Conversation Messages | ✅ Complete | Single `message_fts` table over all messages |
+| **REQ-RET-003:** Index Is a Rebuildable Derived Cache | ✅ Complete | Migration-introduced FTS5 table + idempotent `Fts5Retriever::reconcile` backfill |
+| **REQ-RET-004:** Text Extracted From Typed Message Content | ✅ Complete | Shared `ContentBlock::render_text` extraction, also used by the chain-qa read path |
+| **REQ-RET-005:** Retrieval Backend Is Swappable | ✅ Complete | FTS5/BM25 behind the `MessageRetriever` trait; vector/hybrid drop in behind it |
+| **REQ-RET-006:** Results Carry Provenance | ✅ Complete | `RetrievedChunk` carries conversation/message/type/timestamp |
+| **REQ-RET-007:** Scope Is Applied In-Query, Not Post-Hoc | ✅ Complete | Scope is a query predicate so `top_k` is honored after scoping |
+| **REQ-RET-008:** Scope Is Host-Bound When Retrieval Is a Tool | ✅ Complete | Agent supplies query only; host fixes scope at tool construction (`chain_qa.rs` `qa_tools` / `execute_tool`) |
 
 ## Scope
 
