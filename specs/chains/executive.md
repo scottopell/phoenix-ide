@@ -53,14 +53,14 @@ mid-tier model balanced for cost and accuracy.
 | **REQ-CHN-005:** Q&A History Persists Per Chain | ✅ Complete | `chain_qa` table CRUD at `db.rs:2909-3008`; status enum + snapshot counters at `chain_qa.rs:145,323,520`; startup sweep `db.rs:1014` |
 | **REQ-CHN-006:** Consistent Quality As Q&A Accumulates | ✅ Complete | Stateless per-question invocation `chain_qa.rs:29,38,384`; `chain_qa_id` demux `chain_runtime.rs:8`, `api/chains.rs:119`, `api/wire.rs:463` |
 | **REQ-CHN-007:** Chain Has a User-Editable Name | ✅ Complete | Nullable `chain_name` column (`db.rs:2737`, `db.rs:3041`); whitespace clears the name (`api/chains.rs:182`) |
-| **REQ-CHN-008:** Chain Page Surfaces Work Identity Alongside Runtime Resources | Planned | Adds worktree/branch/task + PR-health facet to the existing work-scope dock (`specs/work-scope-ui/` REQ-WSUI-009); identity from `ConvMode`, PR health from the PR-status pipeline; not in `WorkScopeInventory`. Tracked (with the `chain_qa` column rename below) as task 58020 |
+| **REQ-CHN-008:** Chain Page Surfaces Work Identity Alongside Runtime Resources | ✅ Complete | `ChainView.work_identity` (`api/chains.rs` `resolve_work_identity`) carries worktree/branch/base/task from the worktree-owning member's `ConvMode`; the `ChainWorkIdentityBlock` dock facet reuses the per-conversation PR-status pipeline for PR health, so nothing is added to `WorkScopeInventory` |
 | **REQ-CHN-009:** Chain Q&A Is a Read-Only Agentic Loop | ✅ Complete | Read-only agent loop (`ChainQa` in `chain_qa.rs`) driving scope-bound `search_conversations` + `read_conversation` tools over `specs/conversation-retrieval/`; replaced summary bundling; reframes REQ-CHN-005 staleness as an age-of-answer freshness tag |
 
-**Progress:** REQ-CHN-001…007 and REQ-CHN-009 (read-only agentic Q&A) have
-shipped, the latter built on the new `specs/conversation-retrieval/` primitive
-exposed to the Q&A agent as scope-bound tools. REQ-CHN-008 (work-identity facet
-on the work-scope dock) remains planned — it builds on `specs/work-scope-ui/`
-(the chain dock + `work_scope_key`) and is tracked as task 58020.
+**Progress:** All requirements have shipped. REQ-CHN-009 (read-only agentic
+Q&A) is built on the `specs/conversation-retrieval/` primitive exposed to the
+Q&A agent as scope-bound tools; REQ-CHN-008 (work-identity facet) reuses the
+chain dock + `work_scope_key` from `specs/work-scope-ui/` and the
+per-conversation PR-status pipeline from `specs/projects/` for PR health.
 
 The "out of scope" list below remains accurate — the deferred Allium spec for the Q&A lifecycle is recommended now that the actual transitions are observable in production.
 
