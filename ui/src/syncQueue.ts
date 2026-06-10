@@ -48,8 +48,21 @@ export class SyncQueue {
         await api.deleteChain(op.conversationId);
         break;
 
-      default:
+      default: {
+        // Legacy queue entries: `unarchive` / `unarchive_chain` ops that were
+        // persisted in IndexedDB before archive became a terminal lifecycle
+        // transition (the unarchive endpoints no longer exist). The cache DB
+        // schema is unchanged, so such rows can survive an upgrade. Drain them
+        // as no-ops — the conversation simply stays archived — so the row is
+        // deleted and the offline banner clears, instead of throwing
+        // `Unknown operation type` forever and wedging the pending-op queue.
+        const legacyType = (op as { type: string }).type;
+        if (legacyType === 'unarchive' || legacyType === 'unarchive_chain') {
+          console.debug('Draining legacy queue op (archive is now terminal):', legacyType);
+          break;
+        }
         throw new Error(`Unknown operation type: ${(op as PendingOperation).type}`);
+      }
     }
   }
   
