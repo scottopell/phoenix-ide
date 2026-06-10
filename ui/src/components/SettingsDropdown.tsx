@@ -6,9 +6,7 @@ import { clearCodexQuota, useCodexQuota } from '../codexQuota';
 import { CodexQuotaBlock } from './CodexQuotaBlock';
 import {
   getBrowserNotificationPermission,
-  getNotificationRuntimeSettings,
-  loadNotificationSettings,
-  updateNotificationRuntimeSettings,
+  useNotificationSettings,
 } from '../notifications';
 import { useDensity } from '../hooks/useDensity';
 
@@ -316,13 +314,11 @@ function CodexSection({
 }
 
 function NotificationsSection() {
-  const [settings, setSettings] = useState<NotificationSettings>(() => getNotificationRuntimeSettings());
+  // Settings, save ordering, and the saving/error surface all live in the
+  // notification policy reducer; this component only renders them and reads
+  // browser-owned permission state directly.
+  const { settings, saving, error, save } = useNotificationSettings();
   const [permission, setPermission] = useState<BrowserPermission>(() => getBrowserNotificationPermission());
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const latestSaveRef = useRef(0);
-  const saveChainRef = useRef(Promise.resolve());
-  const editedRef = useRef(false);
   const mountedRef = useRef(true);
 
   useEffect(() => {
@@ -330,54 +326,9 @@ function NotificationsSection() {
     return () => { mountedRef.current = false; };
   }, []);
 
-  useEffect(() => {
-    loadNotificationSettings()
-      .then((loaded) => {
-        if (!mountedRef.current || editedRef.current) return;
-        setSettings(loaded);
-      })
-      .catch((err) => {
-        if (!mountedRef.current) return;
-        setError(err instanceof Error ? err.message : 'Failed to load notification settings');
-      });
-  }, []);
-
-  // Persists `next` to the runtime mirror + server. Does NOT call
-  // setSettings for the optimistic update — the caller (setFlag) already
-  // owns that via its functional updater. Only the post-roundtrip
-  // server-confirmed value resets settings here.
-  const save = useCallback((next: NotificationSettings) => {
-    const saveId = latestSaveRef.current + 1;
-    latestSaveRef.current = saveId;
-    editedRef.current = true;
-    updateNotificationRuntimeSettings(next);
-    setSaving(true);
-    setError(null);
-    saveChainRef.current = saveChainRef.current
-      .catch(() => {})
-      .then(async () => {
-        const saved = await api.updateNotificationSettings(next);
-        // Runtime mirror update is safe post-unmount — it writes module state,
-        // not React state. setState calls are guarded.
-        updateNotificationRuntimeSettings(saved);
-        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
-        setSettings(saved);
-        setSaving(false);
-      })
-      .catch((err: unknown) => {
-        if (!mountedRef.current || latestSaveRef.current !== saveId) return;
-        setError(err instanceof Error ? err.message : 'Failed to save notification settings');
-        setSaving(false);
-      });
-  }, []);
-
   const setFlag = useCallback((key: keyof NotificationSettings, value: boolean) => {
-    setSettings((prev) => {
-      const next = { ...prev, [key]: value };
-      save(next);
-      return next;
-    });
-  }, [save]);
+    save({ ...settings, [key]: value });
+  }, [save, settings]);
 
   const requestPermission = useCallback(async () => {
     if (!('Notification' in window) || Notification.permission !== 'default') {

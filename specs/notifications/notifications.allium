@@ -22,6 +22,23 @@ enum BrowserPermission {
     denied
 }
 
+-- Load status of the server-side settings row. Delivery is gated until the
+-- value is authoritative, so notifications never fire against defaults that
+-- might contradict the user's saved preference.
+enum SettingsStatus {
+    unloaded        -- never fetched
+    loading         -- fetch in flight
+    loaded          -- server value is authoritative; delivery may proceed
+    failed          -- fetch failed; delivery stays gated until a retry loads
+}
+
+-- Outcome of attempting to deliver one NotificationEvent.
+enum DeliveryResult {
+    delivered           -- a browser notification was shown
+    suppressed_focus    -- intentionally withheld; the user is already looking
+    not_delivered       -- gated out: unloaded, disabled, permission, or construction failure
+}
+
 ------------------------------------------------------------
 -- Entities
 ------------------------------------------------------------
@@ -36,6 +53,76 @@ entity NotificationSettings {
     notify_error: Boolean = true
     notify_idle: Boolean = true
 }
+
+-- Runtime policy state, distinct from the persisted settings: load status
+-- plus the monotonic save-ordering counter.
+entity NotificationPolicy {
+    settings_status: SettingsStatus = unloaded
+    -- Monotonic id of the most recently *requested* settings save. A save
+    -- response is authoritative only while it remains the latest.
+    latest_save_id: Integer = 0
+}
+
+-- A recorded blocking-state dedupe key. Its presence means the unresolved
+-- blocking state for `conversation_id` has already reached the user (or was
+-- intentionally withheld because the user was focused) once, so neither live
+-- delivery nor catch-up fires again until it is cleared. Completions
+-- (agent_finished) are never recorded here — each is independently
+-- notification-worthy.
+entity AttentionSeen {
+    conversation_id: String
+    event_key: String     -- event_key_of(event.type) of the blocking event
+}
+
+------------------------------------------------------------
+-- Helpers
+------------------------------------------------------------
+--
+-- Allium has no formal helper-function declaration; the rules below call
+-- these by bare identifier. This block is the single source of truth for
+-- their signatures and semantics.
+--
+--   event_type_enabled(type: NotificationEventType,
+--                      settings: NotificationSettings) -> Boolean
+--       The per-event toggle selected by event type:
+--         task_approval_needed -> settings.notify_task_approval
+--         question_asked       -> settings.notify_question
+--         agent_error          -> settings.notify_error
+--         agent_finished       -> settings.notify_idle
+--
+--   is_blocking(type: NotificationEventType) -> Boolean
+--       True for the unresolved-attention events (task_approval_needed,
+--       question_asked, agent_error); false for agent_finished.
+--
+--   event_key_of(type: NotificationEventType) -> String
+--       The dedupe key component for a blocking event — its event type.
+--       Undefined for agent_finished (which is never deduped).
+--
+--   blocking_already_seen(type: NotificationEventType,
+--                         conversation: bedrock/Conversation) -> Boolean
+--       True iff is_blocking(type) and an AttentionSeen exists for
+--       {conversation_id: conversation.id, event_key: event_key_of(type)}.
+--
+--   delivery_result(type: NotificationEventType,
+--                   conversation: bedrock/Conversation) -> DeliveryResult
+--       The outcome of attempting delivery under the current settings,
+--       browser permission, and focus state. `delivered` when a browser
+--       notification is shown; `suppressed_focus` when withheld because the
+--       user is focused on the triggering conversation; `not_delivered`
+--       otherwise (settings unloaded, type disabled, permission not granted,
+--       or browser construction failure).
+--
+--   recorded_via_delivery(s: AttentionSeen) -> Boolean
+--       True iff the dedupe key `s` was recorded by RecordAttentionOnDelivery
+--       — i.e. its delivery_result was delivered or suppressed_focus, never a
+--       merely gated-out attempt.
+--
+--   notification_tag(event: NotificationEvent) -> String
+--       Blocking events: "{event.type}:{conversation.id}" — one tag per
+--       conversation+event, so a re-observed blocking state replaces in
+--       place. agent_finished: "agent_finished:{conversation.id}:{updated_at}"
+--       — a completion-specific tag, so successive completions for the same
+--       conversation are distinct browser notifications.
 
 ------------------------------------------------------------
 -- Config
@@ -93,9 +180,12 @@ rule DetectAgentError {
     )
 
     @guidance
-        -- Also fires for context_exhausted state.
+        -- Also fires for context_exhausted state, except when the
+        -- conversation has continued elsewhere (continued_in_conv_id set) --
+        -- that predecessor is no longer actionable.
         -- Implementation: check for both "error" and "context_exhausted"
-        -- in the SSE state_change handler.
+        -- in the SSE state_change handler; skip context_exhausted with a
+        -- continuation.
 }
 
 rule DetectAgentFinished {
@@ -168,6 +258,10 @@ rule EmitErrorCatchupNotification {
     when: CatchupCheckTaskApproval(conversation)
     requires: conversation.status = error
         or conversation.status = context_exhausted
+    -- A context_exhausted conversation that already continued elsewhere is
+    -- no longer actionable, so it is not notification-worthy.
+    requires: not (conversation.status = context_exhausted
+        and conversation.continued_in_conv_id != null)
 
     ensures: NotificationEvent(
         type: agent_error,
@@ -203,22 +297,68 @@ rule EmitErrorCatchupNotification {
 rule DeliverNotification {
     when: NotificationEvent(type, conversation, title, body)
 
+    -- Server settings must be authoritative before anything fires; until
+    -- then delivery is gated so a default never contradicts a saved choice.
+    requires: NotificationPolicy.settings_status = loaded
     requires: NotificationSettings.enabled
     requires: event_type_enabled(type, NotificationSettings)
     requires: BrowserPermission = granted
     requires: not tab_is_focused
+    -- Live SSE delivery and list-refresh catch-up share this gate, so an
+    -- unresolved blocking state already surfaced is never shown twice
+    -- regardless of which path observes it next.
+    requires: not blocking_already_seen(type, conversation)
 
     ensures: BrowserNotificationShown(title, body, conversation)
 
     @guidance
-        -- Implementation: new Notification(title, { body, tag: conversation.id })
-        -- The tag prevents duplicate notifications for the same conversation.
-        -- If the tab IS focused, the user is already looking -- no notification.
-        -- event_type_enabled maps:
+        -- Implementation: new Notification(title, { body, tag })
+        -- where tag = notification_tag(event). Blocking events reuse one tag
+        -- per conversation+event so a re-observed state replaces in place;
+        -- agent_finished carries a completion-specific tag so successive
+        -- completions for one conversation are distinct.
+        -- If the tab IS focused on the triggering conversation, the user is
+        -- already looking -- no notification (delivery_result =
+        -- suppressed_focus). event_type_enabled maps:
         --   task_approval_needed -> settings.notify_task_approval
         --   question_asked       -> settings.notify_question
         --   agent_error          -> settings.notify_error
         --   agent_finished       -> settings.notify_idle
+}
+
+-- The dedupe key is recorded only when the event actually reached the user
+-- or was intentionally withheld because the user was focused. An event that
+-- was merely gated out (settings unloaded, type disabled, permission not
+-- granted, or browser construction failure) records nothing, so a later
+-- attempt for the same unresolved state can still notify.
+rule RecordAttentionOnDelivery {
+    when: NotificationEvent(type, conversation, title, body)
+
+    requires: is_blocking(type)
+    requires: delivery_result(type, conversation) in { delivered, suppressed_focus }
+
+    ensures: AttentionSeen{
+        conversation_id: conversation.id,
+        event_key: event_key_of(type)
+    }
+}
+
+-- Resolving a blocking state clears its dedupe key so the next blocking
+-- state for that conversation can notify again.
+rule ClearBlockingDedupeOnResolution {
+    when: conversation: bedrock/Conversation.status
+        transitions_to idle
+
+    ensures: not exists AttentionSeen{conversation_id: conversation.id}
+
+    @guidance
+        -- Any settled non-blocking state clears the key — idle (the dominant
+        -- resolution), terminal, handed_off, or a context_exhausted that has
+        -- continued elsewhere. A transition back into a busy state
+        -- intentionally preserves the key (a brief busy blip mid-attention
+        -- must not re-arm a notification). Implementation: clearAttentionSeen
+        -- runs on the idle-from-busy branch and on the settled-else branch of
+        -- notifyConversationStateChange.
 }
 
 rule NotificationClicked {
@@ -252,6 +392,9 @@ rule OpenConversationAcknowledgesLiveNotifications {
 -- Rules: Settings Management
 ------------------------------------------------------------
 
+-- A user edit applies optimistically and allocates a fresh, larger save id.
+-- The edit also makes settings authoritative for delivery, so a save during
+-- an in-flight initial load does not wait on that load.
 rule UpdateNotificationSettings {
     when: UserUpdatesSettings(new_settings)
 
@@ -260,10 +403,28 @@ rule UpdateNotificationSettings {
     ensures: NotificationSettings.notify_question = new_settings.notify_question
     ensures: NotificationSettings.notify_error = new_settings.notify_error
     ensures: NotificationSettings.notify_idle = new_settings.notify_idle
+    ensures: NotificationPolicy.settings_status = loaded
+    ensures: NotificationPolicy.latest_save_id = NotificationPolicy.latest_save_id + 1
 
     @guidance
         -- PUT /api/settings/notifications { enabled, notify_task_approval, ... }
         -- Settings are persisted server-side (notification_settings table).
+        -- PUTs are issued in user-edit order (a serialized chain), each
+        -- tagged with the allocated save id.
+}
+
+-- The server response for a save is authoritative only while it is still the
+-- latest request. An older response cannot overwrite a newer user edit.
+rule ApplyNotificationSettingsSaveResult {
+    when: SettingsSaveResponded(request_id, saved_settings)
+
+    requires: request_id = NotificationPolicy.latest_save_id
+
+    ensures: NotificationSettings.enabled = saved_settings.enabled
+    ensures: NotificationSettings.notify_task_approval = saved_settings.notify_task_approval
+    ensures: NotificationSettings.notify_question = saved_settings.notify_question
+    ensures: NotificationSettings.notify_error = saved_settings.notify_error
+    ensures: NotificationSettings.notify_idle = saved_settings.notify_idle
 }
 
 rule RequestBrowserPermission {
@@ -332,10 +493,46 @@ invariant NoNotificationWhenFocused {
             not BrowserNotificationShown(event)
 }
 
--- Duplicate notifications for the same conversation are collapsed.
--- (Enforced by using conversation.id as the Notification tag.)
-invariant NoDuplicateNotifications {
+-- Notifications collapse by browser tag, not merely by conversation.
+-- Unresolved blocking states reuse one tag per conversation+event so they
+-- replace in place; each agent_finished completion carries a
+-- completion-specific tag (conversation + updated_at) so successive
+-- completions for one conversation remain distinct. (Enforced by
+-- notification_tag(event) as the Notification tag.)
+invariant NotificationsCollapseByTag {
     for a in BrowserNotifications:
         for b in BrowserNotifications:
-            a != b implies a.conversation != b.conversation
+            a != b implies a.tag != b.tag
+}
+
+-- Delivery is gated until the server settings row is authoritative, so a
+-- default preference never contradicts the user's saved choice.
+invariant DeliveryRequiresLoadedSettings {
+    NotificationPolicy.settings_status != loaded implies
+        for event in NotificationEvents:
+            not BrowserNotificationShown(event)
+}
+
+-- A blocking dedupe key exists only when the event reached the user or was
+-- intentionally focus-suppressed; a merely gated-out attempt records
+-- nothing, so a later attempt for the same unresolved state can still fire.
+invariant NoDedupeWithoutDelivery {
+    for s in AttentionSeen:
+        recorded_via_delivery(s)
+}
+
+-- A context_exhausted conversation that has continued elsewhere is no longer
+-- actionable and produces no notification event.
+invariant ContinuedContextExhaustedNotNotifiable {
+    for c in Conversations where c.status = context_exhausted
+        and c.continued_in_conv_id != null:
+        not exists NotificationEvent{conversation: c}
+}
+
+-- A settings save response is authoritative only while it is the latest
+-- request; an older response cannot overwrite a newer user edit.
+invariant NewerSettingsSaveWins {
+    for r in SettingsSaveResponses:
+        r.request_id != NotificationPolicy.latest_save_id implies
+            not NotificationSettingsAppliedFrom(r)
 }
