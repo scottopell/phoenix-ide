@@ -2795,9 +2795,21 @@ def cmd_check(gate: bool = True):
         # lints test/bench/example targets too, so test code is gated the same
         # as library code (a pedantic violation in a #[cfg(test)] module fails
         # CI); it composes with `-p` so the changed-crate scope still applies.
+        #
+        # CARGO_INCREMENTAL=0 is a CORRECTNESS requirement, not a perf knob.
+        # rustc/clippy emit lints as a side effect of analysis queries, and the
+        # incremental on-disk cache stores query results but does NOT replay the
+        # diagnostics those queries produced. With incremental on, an edit that
+        # reuses a cached query can leave a fresh pedantic violation un-emitted:
+        # clippy reports green here on a tree CI's clippy (cold cache, nothing to
+        # short-circuit) fails. Disabling incremental forces full re-analysis
+        # every run, so every in-scope violation is always emitted. This dir
+        # rebuilds the workspace check each run anyway, so incremental bought
+        # ~nothing.
         run_step("cargo clippy",
                  ["cargo", "clippy", *_pflags(), "--all-targets", "--", "-D", "warnings"],
-                 env_extra={"CARGO_TARGET_DIR": str(ROOT / "target" / "clippy")})
+                 env_extra={"CARGO_TARGET_DIR": str(ROOT / "target" / "clippy"),
+                            "CARGO_INCREMENTAL": "0"})
 
     def lane_ui_lint():
         """UI lint lane: eslint (TS/TSX) → stylelint (CSS).
