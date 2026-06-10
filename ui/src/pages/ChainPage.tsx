@@ -393,24 +393,15 @@ export function ChainPage() {
             });
           }
         }}
-        onArchiveToggle={async () => {
+        onArchive={async () => {
           if (!rootConvId) return;
           try {
-            if (chain.archived) {
-              await api.unarchiveChain(rootConvId);
-            } else {
-              await api.archiveChain(rootConvId);
-            }
+            await api.archiveChain(rootConvId);
             navigate('/');
           } catch (err) {
             dispatch({
               type: 'LOAD_FAIL',
-              error:
-                err instanceof Error
-                  ? err.message
-                  : chain.archived
-                    ? 'Failed to unarchive chain'
-                    : 'Failed to archive chain',
+              error: err instanceof Error ? err.message : 'Failed to archive chain',
             });
           }
         }}
@@ -531,13 +522,13 @@ function ChainWorkScopeDock({ rootConvId }: { rootConvId: string }) {
 interface ChainPageHeaderProps {
   chain: ChainView;
   onRename: (name: string | null) => Promise<void>;
-  /** Toggles the chain's archived state — Archive when chain.archived is
-   *  false, Unarchive when true. The parent picks which API call to fire. */
-  onArchiveToggle: () => void | Promise<void>;
+  /** Archives the chain. Archive is a terminal lifecycle transition; there
+   *  is no unarchive (archived chain roots 404 on the chain route). */
+  onArchive: () => void | Promise<void>;
   onDelete: () => void;
 }
 
-function ChainPageHeader({ chain, onRename, onArchiveToggle, onDelete }: ChainPageHeaderProps) {
+function ChainPageHeader({ chain, onRename, onArchive, onDelete }: ChainPageHeaderProps) {
   const [editing, setEditing] = useScopedState(chain.root_conv_id, false);
   // The text input is pre-populated with the actual override (`chain_name`),
   // not the resolved `display_name` — REQ-CHN-007 spec note: an empty input
@@ -620,9 +611,9 @@ function ChainPageHeader({ chain, onRename, onArchiveToggle, onDelete }: ChainPa
         <button
           type="button"
           className="btn-secondary"
-          onClick={() => void onArchiveToggle()}
+          onClick={() => void onArchive()}
         >
-          {chain.archived ? 'Unarchive' : 'Archive'}
+          Archive
         </button>
         <button
           type="button"

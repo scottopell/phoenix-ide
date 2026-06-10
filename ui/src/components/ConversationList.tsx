@@ -20,16 +20,14 @@ interface ConversationListProps {
   onToggleArchived: () => void;
   onNewConversation: () => void;
   onArchive: (conv: Conversation) => void;
-  onUnarchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
   onRename: (conv: Conversation) => void;
-  /** Chain-scope archive/unarchive/delete. Triggered from the chain block
+  /** Chain-scope archive/delete. Triggered from the chain block
    *  header `⋮` menu. Per-member rows never invoke these — they hide the
    *  affordance entirely so the only path to a chain lifecycle op is the
    *  chain header. The rename callback is per-member rename and reuses
    *  `onRename` (slugs stay per-conversation). */
   onArchiveChain?: (rootId: string) => void;
-  onUnarchiveChain?: (rootId: string) => void;
   onDeleteChain?: (rootId: string) => void;
   onConversationClick?: (conv: Conversation) => void;
   activeSlug?: string | null;
@@ -49,7 +47,6 @@ interface ConversationRowProps {
   onClick: (conv: Conversation) => void;
   onToggleMenu: (e: React.MouseEvent, convId: string) => void;
   onArchive: (conv: Conversation) => void;
-  onUnarchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
   onRename: (conv: Conversation) => void;
   onCloseMenu: () => void;
@@ -70,7 +67,6 @@ export const ConversationRow = memo(function ConversationRow({
   onClick,
   onToggleMenu,
   onArchive,
-  onUnarchive,
   onDelete,
   onRename,
   onCloseMenu,
@@ -181,30 +177,17 @@ export const ConversationRow = memo(function ConversationRow({
             >
               Rename
             </button>
-            {!isChainMember && (
-              showArchived ? (
-                <button
-                  className="action-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCloseMenu();
-                    onUnarchive(conv);
-                  }}
-                >
-                  Restore
-                </button>
-              ) : (
-                <button
-                  className="action-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCloseMenu();
-                    onArchive(conv);
-                  }}
-                >
-                  Archive
-                </button>
-              )
+            {!isChainMember && !showArchived && (
+              <button
+                className="action-btn"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onCloseMenu();
+                  onArchive(conv);
+                }}
+              >
+                Archive
+              </button>
             )}
             {!isChainMember && (
               <button
@@ -237,12 +220,10 @@ interface ChainBlockProps {
   onToggleChainMenu: (e: React.MouseEvent, rootId: string) => void;
   onCloseChainMenu: () => void;
   onArchiveChain?: ((rootId: string) => void) | undefined;
-  onUnarchiveChain?: ((rootId: string) => void) | undefined;
   onDeleteChain?: ((rootId: string) => void) | undefined;
   onRowClick: (conv: Conversation) => void;
   onRowToggleMenu: (e: React.MouseEvent, convId: string) => void;
   onArchive: (conv: Conversation) => void;
-  onUnarchive: (conv: Conversation) => void;
   onDelete: (conv: Conversation) => void;
   onRename: (conv: Conversation) => void;
   onCloseRowMenu: () => void;
@@ -262,12 +243,10 @@ export const ChainBlock = memo(function ChainBlock({
   onToggleChainMenu,
   onCloseChainMenu,
   onArchiveChain,
-  onUnarchiveChain,
   onDeleteChain,
   onRowClick,
   onRowToggleMenu,
   onArchive,
-  onUnarchive,
   onDelete,
   onRename,
   onCloseRowMenu,
@@ -340,18 +319,7 @@ export const ChainBlock = memo(function ChainBlock({
               >
                 Rename chain…
               </button>
-              {showArchived ? (
-                <button
-                  className="action-btn"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    onCloseChainMenu();
-                    onUnarchiveChain?.(item.rootId);
-                  }}
-                >
-                  Unarchive chain
-                </button>
-              ) : (
+              {!showArchived && (
                 <button
                   className="action-btn"
                   onClick={(e) => {
@@ -393,7 +361,6 @@ export const ChainBlock = memo(function ChainBlock({
               onClick={onRowClick}
               onToggleMenu={onRowToggleMenu}
               onArchive={onArchive}
-              onUnarchive={onUnarchive}
               onDelete={onDelete}
               onRename={onRename}
               onCloseMenu={onCloseRowMenu}
@@ -413,11 +380,9 @@ export function ConversationList({
   onToggleArchived,
   onNewConversation,
   onArchive,
-  onUnarchive,
   onDelete,
   onRename,
   onArchiveChain,
-  onUnarchiveChain,
   onDeleteChain,
   onConversationClick,
   activeSlug,
@@ -620,7 +585,6 @@ export function ConversationList({
                   onClick={handleClick}
                   onToggleMenu={toggleActions}
                   onArchive={onArchive}
-                  onUnarchive={onUnarchive}
                   onDelete={onDelete}
                   onRename={onRename}
                   onCloseMenu={closeRowMenu}
@@ -646,12 +610,10 @@ export function ConversationList({
                 onToggleChainMenu={toggleChainActions}
                 onCloseChainMenu={closeChainMenu}
                 onArchiveChain={onArchiveChain}
-                onUnarchiveChain={onUnarchiveChain}
                 onDeleteChain={onDeleteChain}
                 onRowClick={handleClick}
                 onRowToggleMenu={toggleActions}
                 onArchive={onArchive}
-                onUnarchive={onUnarchive}
                 onDelete={onDelete}
                 onRename={onRename}
                 onCloseRowMenu={closeRowMenu}

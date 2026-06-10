@@ -210,26 +210,6 @@ export function ConversationListPage() {
     }
   };
 
-  const handleUnarchive = async (conv: Conversation) => {
-    try {
-      if (isOnline) {
-        await api.unarchiveConversation(conv.id);
-        await refresh();
-      } else {
-        await queueOperation({
-          type: 'unarchive',
-          conversationId: conv.id,
-          payload: {},
-          createdAt: new Date(),
-          retryCount: 0,
-          status: 'pending'
-        });
-      }
-    } catch (err) {
-      console.error('Failed to unarchive:', err);
-    }
-  };
-
   const handleDelete = async () => {
     if (!deleteTarget) return;
     try {
@@ -242,8 +222,8 @@ export function ConversationListPage() {
   };
 
   // (Pre-08684 ConversationListPage held a chain-grouping helper here used
-  // only by the offline-queue optimistic flip in handleArchiveChain /
-  // handleUnarchiveChain. With ConversationStore as the single source of
+  // only by the offline-queue optimistic flip in handleArchiveChain.
+  // With ConversationStore as the single source of
   // truth, those handlers no longer mutate a local list — they enqueue
   // the op and let refresh() reconcile when the queue drains. The helper,
   // along with the `computeChainRoots` import it depended on, is gone.
@@ -272,27 +252,6 @@ export function ConversationListPage() {
     } catch (err) {
       console.error('Failed to archive chain:', err);
       showError(err instanceof Error ? err.message : 'Failed to archive chain', 5000);
-    }
-  };
-
-  const handleUnarchiveChain = async (rootId: string) => {
-    try {
-      if (isOnline) {
-        await api.unarchiveChain(rootId);
-        await refresh();
-      } else {
-        await queueOperation({
-          type: 'unarchive_chain',
-          conversationId: rootId,
-          payload: {},
-          createdAt: new Date(),
-          retryCount: 0,
-          status: 'pending',
-        });
-      }
-    } catch (err) {
-      console.error('Failed to unarchive chain:', err);
-      showError(err instanceof Error ? err.message : 'Failed to unarchive chain', 5000);
     }
   };
 
@@ -447,11 +406,9 @@ export function ConversationListPage() {
               onToggleArchived={handleToggleArchived}
               onNewConversation={handleNewConversation}
               onArchive={handleArchive}
-              onUnarchive={handleUnarchive}
               onDelete={handleSetDeleteTarget}
               onRename={handleSetRenameTarget}
               onArchiveChain={handleArchiveChain}
-              onUnarchiveChain={handleUnarchiveChain}
               onDeleteChain={requestDeleteChain}
               onConversationClick={handleConversationClick}
               authChip={authChip}

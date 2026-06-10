@@ -26,10 +26,6 @@ export class SyncQueue {
         await api.archiveConversation(op.conversationId);
         break;
       
-      case 'unarchive':
-        await api.unarchiveConversation(op.conversationId);
-        break;
-      
       case 'delete':
         await api.deleteConversation(op.conversationId);
         break;
@@ -46,10 +42,6 @@ export class SyncQueue {
 
       case 'archive_chain':
         await api.archiveChain(op.conversationId);
-        break;
-
-      case 'unarchive_chain':
-        await api.unarchiveChain(op.conversationId);
         break;
 
       case 'delete_chain':

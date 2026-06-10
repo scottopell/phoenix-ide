@@ -388,8 +388,10 @@ signal, no parallel representation of conversation graph state.
   (`UPDATE conversations SET archived = 1`), not hard delete. Archived
   chain roots **retain** their `chain_qa` rows; the UI hides the chain
   from sidebar grouping (sidebar already filters `archived = 0`) and
-  the chain page route returns 404 for archived roots, but the rows
-  remain so unarchive restores Q&A history along with the chain.
+  the chain page route returns 404 for archived roots. Archive is a
+  terminal lifecycle transition — there is no unarchive (REQ-API-006) —
+  so the retained rows keep the archived chain's Q&A history readable for
+  inspection, not resumption.
 - **Mid-chain hard deletion.** Phoenix's existing schema places no
   `ON DELETE` clause on `conversations.continued_in_conv_id`
   (`src/db/migrations.rs`), so the FK defaults to `NO ACTION` —

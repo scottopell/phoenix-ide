@@ -137,7 +137,6 @@ const defaultProps = {
   onToggleArchived: vi.fn(),
   onNewConversation: vi.fn(),
   onArchive: vi.fn(),
-  onUnarchive: vi.fn(),
   onDelete: vi.fn(),
   onRename: vi.fn(),
 };
@@ -417,8 +416,9 @@ function PathReader({ onPath }: { onPath: (p: string) => void }) {
 
 // Chain-atomic lifecycle (task 02701): the chain block header carries a `⋮`
 // menu with chain-scope actions. Member rows hide their own
-// Archive/Unarchive/Delete entries — only Rename remains, since lifecycle
-// ops on a chain member return 409 server-side.
+// Archive/Delete entries — only Rename remains, since lifecycle
+// ops on a chain member return 409 server-side. Archive is terminal: the
+// archived list exposes no unarchive affordance.
 describe('Chain lifecycle UI (task 02701)', () => {
   const chainConvs = (overrides: { archived?: boolean } = {}) => {
     const archivedBase = overrides.archived !== undefined
@@ -470,7 +470,7 @@ describe('Chain lifecycle UI (task 02701)', () => {
     ]);
   });
 
-  it('chain header ⋮ menu shows Unarchive in the archived list', () => {
+  it('chain header ⋮ menu omits any unarchive affordance in the archived list', () => {
     const { container } = render(
       <MemoryRouter>
         <ConversationList
@@ -492,9 +492,9 @@ describe('Chain lifecycle UI (task 02701)', () => {
         '.conv-chain-actions .action-btn',
       ),
     ).map((b) => b.textContent?.trim());
+    // Archive is terminal — no Archive/Unarchive entry on archived chains.
     expect(labels).toEqual([
       'Rename chain…',
-      'Unarchive chain',
       'Delete chain',
     ]);
   });
@@ -624,7 +624,6 @@ describe('ConversationRow — React.memo behaviour', () => {
       onClick: vi.fn(),
       onToggleMenu: vi.fn(),
       onArchive: vi.fn(),
-      onUnarchive: vi.fn(),
       onDelete: vi.fn(),
       onRename: vi.fn(),
       onCloseMenu: vi.fn(),
@@ -724,12 +723,10 @@ describe('ChainBlock — React.memo behaviour', () => {
       onToggleChainMenu: vi.fn(),
       onCloseChainMenu: vi.fn(),
       onArchiveChain: vi.fn(),
-      onUnarchiveChain: vi.fn(),
       onDeleteChain: vi.fn(),
       onRowClick: vi.fn(),
       onRowToggleMenu: vi.fn(),
       onArchive: vi.fn(),
-      onUnarchive: vi.fn(),
       onDelete: vi.fn(),
       onRename: vi.fn(),
       onCloseRowMenu: vi.fn(),

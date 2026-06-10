@@ -1107,14 +1107,6 @@ export const api = {
     return resp.json();
   },
 
-  async unarchiveConversation(convId: string): Promise<{ ok: boolean }> {
-    const resp = await fetch(`/api/conversations/${convId}/unarchive`, {
-      method: 'POST',
-    });
-    if (!resp.ok) throw new Error('Failed to unarchive');
-    return resp.json();
-  },
-
   async deleteConversation(convId: string): Promise<{ ok: boolean }> {
     const resp = await fetch(`/api/conversations/${convId}/delete`, {
       method: 'POST',
@@ -1517,18 +1509,6 @@ export const api = {
     if (!resp.ok) {
       const err = await resp.json().catch(() => ({}));
       throw new Error(err.error || 'Failed to archive chain');
-    }
-  },
-
-  /** POST /api/chains/:rootId/unarchive — unarchive every member of the
-   *  chain atomically. */
-  async unarchiveChain(rootId: string): Promise<void> {
-    const resp = await fetch(`/api/chains/${encodeURIComponent(rootId)}/unarchive`, {
-      method: 'POST',
-    });
-    if (!resp.ok) {
-      const err = await resp.json().catch(() => ({}));
-      throw new Error(err.error || 'Failed to unarchive chain');
     }
   },
 

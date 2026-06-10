@@ -194,15 +194,6 @@ export function Sidebar({
     }
   }, [onConversationCreated]);
 
-  const handleUnarchive = useCallback(async (conv: Conversation) => {
-    try {
-      await api.unarchiveConversation(conv.id);
-      onConversationCreated();
-    } catch (err) {
-      console.error('Failed to unarchive:', err);
-    }
-  }, [onConversationCreated]);
-
   const handleDelete = useCallback(async () => {
     if (!deleteTarget) return;
     try {
@@ -220,15 +211,6 @@ export function Sidebar({
       onConversationCreated();
     } catch (err) {
       console.error('Failed to archive chain:', err);
-    }
-  }, [onConversationCreated]);
-
-  const handleUnarchiveChain = useCallback(async (rootId: string) => {
-    try {
-      await api.unarchiveChain(rootId);
-      onConversationCreated();
-    } catch (err) {
-      console.error('Failed to unarchive chain:', err);
     }
   }, [onConversationCreated]);
 
@@ -376,11 +358,9 @@ export function Sidebar({
           onToggleArchived={handleToggleArchived}
           onNewConversation={handleNewClick}
           onArchive={handleArchive}
-          onUnarchive={handleUnarchive}
           onDelete={handleSetDeleteTarget}
           onRename={handleSetRenameTarget}
           onArchiveChain={handleArchiveChain}
-          onUnarchiveChain={handleUnarchiveChain}
           onDeleteChain={requestDeleteChain}
           onConversationClick={handleConversationClick}
           activeSlug={activeSlug}
