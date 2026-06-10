@@ -980,7 +980,7 @@ mod tests {
     }
 
     /// A manual paste that's missing the state parameter must NOT be
-    /// extractable. The handler refuses with 400 BAD_REQUEST so the
+    /// extractable. The handler refuses with 400 `BAD_REQUEST` so the
     /// background driver never sees a state-less code (which would skip
     /// the CSRF check). PR #57 review feedback.
     #[test]
@@ -1016,7 +1016,7 @@ mod tests {
     /// map; the spawned poll keeps running and writes auth.json on success.
     ///
     /// We exercise the pre-poll cancel path: a token already cancelled when
-    /// drive_device_code starts must error out with `Cancelled` from the
+    /// `drive_device_code` starts must error out with `Cancelled` from the
     /// `tokio::select!`, never reaching `poll_device_code` (which would hit
     /// the network) or `finalize_login` (which would write to
     /// `login_target_path()`). Asserting on the error type is what tells us

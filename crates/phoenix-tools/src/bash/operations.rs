@@ -1489,7 +1489,7 @@ mod tests {
         assert!(window.lines.iter().any(|l| l.bytes == "no-nl"));
     }
 
-    /// A reader that yields one chunk, then stalls forever (Poll::Pending).
+    /// A reader that yields one chunk, then stalls forever (`Poll::Pending`).
     /// Models a process that emits an un-newlined fragment and goes quiet.
     struct OneChunkThenStall {
         chunk: Option<Vec<u8>>,

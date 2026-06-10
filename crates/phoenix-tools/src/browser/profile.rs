@@ -2366,7 +2366,7 @@ mod tests {
         assert!(summarize_cpu_profile(&p, 5).contains("empty"));
     }
 
-    /// Structured display_data: cpu_summary payload carries path + ms-typed
+    /// Structured `display_data`: `cpu_summary` payload carries path + ms-typed
     /// hot-function rankings in the order they're rendered in text.
     #[test]
     fn cpu_summary_display_data_carries_structured_rankings() {
@@ -2407,7 +2407,7 @@ mod tests {
         assert!((hot_pct - 90.0).abs() < 0.01, "hot is 90% of total");
     }
 
-    /// hitCount fallback surfaces in display_data with the flag set; `value`
+    /// hitCount fallback surfaces in `display_data` with the flag set; `value`
     /// carries raw hit counts (units inseparable from the flag).
     #[test]
     fn cpu_summary_display_data_hitcount_fallback_flag() {
@@ -2428,7 +2428,7 @@ mod tests {
         assert!((by_self[0]["value"].as_f64().unwrap() - 7.0).abs() < 0.01);
     }
 
-    /// Empty / no-sample profiles yield no display_data — the text output
+    /// Empty / no-sample profiles yield no `display_data` — the text output
     /// already explains the absence, and a payload with empty arrays
     /// would invite the UI to render a confusing empty table.
     #[test]

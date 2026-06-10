@@ -491,7 +491,9 @@ mod tests {
         };
         match root.read_file("committed.txt") {
             FileResolution::Text(t) => assert_eq!(t, "hello from commit"),
-            _ => panic!("expected committed.txt to resolve as text"),
+            FileResolution::Binary | FileResolution::NotFound => {
+                panic!("expected committed.txt to resolve as text")
+            }
         }
         assert!(
             matches!(root.read_file("untracked.txt"), FileResolution::NotFound),
@@ -505,7 +507,9 @@ mod tests {
         let root = ResolutionRoot::working_dir(repo.path());
         match root.read_file("untracked.txt") {
             FileResolution::Text(t) => assert_eq!(t, "only on disk"),
-            _ => panic!("working dir should see untracked file"),
+            FileResolution::Binary | FileResolution::NotFound => {
+                panic!("working dir should see untracked file")
+            }
         }
     }
 
@@ -562,7 +566,9 @@ mod tests {
         );
         match root.read_file("sub/inner.txt") {
             FileResolution::Text(t) => assert_eq!(t, "leaf"),
-            _ => panic!("the blob under the dir should still resolve as text"),
+            FileResolution::Binary | FileResolution::NotFound => {
+                panic!("the blob under the dir should still resolve as text")
+            }
         }
     }
 

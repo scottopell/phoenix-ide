@@ -605,7 +605,7 @@ async fn read_conversation_accepts_hash_prefixed_id() {
     );
 }
 
-/// read_page streams the requested window without materializing the whole
+/// `read_page` streams the requested window without materializing the whole
 /// transcript, and its slicing/“more” marker match a simple full-render slice.
 #[test]
 fn read_page_paginates_large_transcript() {
@@ -623,7 +623,11 @@ fn read_page_paginates_large_transcript() {
 
     // Page 1: full window + a "more" marker pointing at the next cursor.
     let page1 = read_page(&messages, 0);
-    assert!(page1.starts_with("User: x"), "got: {}", &page1[..20]);
+    assert!(
+        page1.starts_with("User: x"),
+        "got: {}",
+        page1.chars().take(20).collect::<String>()
+    );
     assert!(page1.contains("more content"), "page 1 should signal more");
     assert!(page1.contains(&format!("cursor={READ_PAGE_CHARS}")));
 
@@ -635,7 +639,7 @@ fn read_page_paginates_large_transcript() {
     assert_eq!(read_page(&messages, 1_000_000), "(end of conversation)");
 }
 
-/// read_conversation's transcript renderer surfaces content that lives outside
+/// `read_conversation`'s transcript renderer surfaces content that lives outside
 /// plain text: expanded skill bodies, server-side tool blocks, and a visible
 /// marker for image payloads it can't render.
 #[test]

@@ -254,7 +254,9 @@ mod tests {
                 assert_eq!(*status, Status::Ready);
                 assert_eq!(slug, "fix-the-login-bug");
             }
-            other => panic!("expected Taskmd, got {other:?}"),
+            other @ TaskSource::PlainMarkdown { .. } => {
+                panic!("expected Taskmd, got {other:?}")
+            }
         }
         assert_eq!(src.priority(), Priority::P1);
         let (branch, id) = src.branch_and_id("conversation-abcdef");

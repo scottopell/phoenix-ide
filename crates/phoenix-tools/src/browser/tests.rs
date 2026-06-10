@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 fn chrome_available() -> bool {
     !matches!(
         std::env::var("PHOENIX_SKIP_BROWSER_TESTS").as_deref(),
-        Ok("1") | Ok("true"),
+        Ok("1" | "true"),
     )
 }
 
@@ -48,7 +48,7 @@ fn env_unclassified() -> bool {
 fn network_available() -> bool {
     !matches!(
         std::env::var("PHOENIX_SKIP_NETWORK_TESTS").as_deref(),
-        Ok("1") | Ok("true"),
+        Ok("1" | "true"),
     )
 }
 
@@ -167,7 +167,7 @@ impl TestServer {
 }
 
 /// Shut down browser sessions before the test server so Chrome releases its
-/// connections first, preventing server.shutdown() from hanging.
+/// connections first, preventing `server.shutdown()` from hanging.
 async fn shutdown_test(manager: Arc<BrowserSessionManager>, server: TestServer) {
     manager.shutdown_all().await;
     server.shutdown().await;
@@ -190,7 +190,7 @@ async fn test_browser_navigate_local() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-navigate-local");
+    let (ctx, manager) = test_context("test-navigate-local");
     let tool = BrowserNavigateTool;
 
     let result = tool.run(json!({"url": server.url()}), ctx).await;
@@ -202,7 +202,7 @@ async fn test_browser_navigate_local() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -218,7 +218,7 @@ async fn test_browser_eval_local() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-eval-local");
+    let (ctx, manager) = test_context("test-eval-local");
 
     // First navigate
     let nav_tool = BrowserNavigateTool;
@@ -270,7 +270,7 @@ async fn test_browser_eval_local() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 // ============================================================================
@@ -290,7 +290,7 @@ async fn test_eval_inner_text_not_undefined() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-eval-innertext");
+    let (ctx, manager) = test_context("test-eval-innertext");
     let nav_tool = BrowserNavigateTool;
     nav_tool
         .run(json!({"url": server.url()}), ctx.clone())
@@ -316,7 +316,7 @@ async fn test_eval_inner_text_not_undefined() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -331,7 +331,7 @@ async fn test_eval_inner_html_slice_not_undefined() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-eval-htmlslice");
+    let (ctx, manager) = test_context("test-eval-htmlslice");
     let nav_tool = BrowserNavigateTool;
     nav_tool
         .run(json!({"url": server.url()}), ctx.clone())
@@ -357,7 +357,7 @@ async fn test_eval_inner_html_slice_not_undefined() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -372,7 +372,7 @@ async fn test_eval_json_stringify_dom_not_undefined() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-eval-jsonstringify");
+    let (ctx, manager) = test_context("test-eval-jsonstringify");
     let nav_tool = BrowserNavigateTool;
     nav_tool
         .run(json!({"url": server.url()}), ctx.clone())
@@ -399,10 +399,13 @@ async fn test_eval_json_stringify_dom_not_undefined() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
+// Single end-to-end scenario: inline HTML fixture plus many sequential
+// eval assertions keep this test linear and over the line threshold.
+#[allow(clippy::too_many_lines)]
 async fn test_eval_complex_page_inner_text() {
     require_chrome!();
 
@@ -439,7 +442,7 @@ async fn test_eval_complex_page_inner_text() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-eval-complex");
+    let (ctx, manager) = test_context("test-eval-complex");
     let nav_tool = BrowserNavigateTool;
     nav_tool
         .run(json!({"url": server.url()}), ctx.clone())
@@ -529,7 +532,7 @@ async fn test_eval_complex_page_inner_text() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -544,7 +547,7 @@ async fn test_eval_await_false_returns_value() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-eval-await-false");
+    let (ctx, manager) = test_context("test-eval-await-false");
     let nav_tool = BrowserNavigateTool;
     nav_tool
         .run(json!({"url": server.url()}), ctx.clone())
@@ -566,7 +569,7 @@ async fn test_eval_await_false_returns_value() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -583,7 +586,7 @@ async fn test_eval_promise_chain_awaited() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-eval-promise");
+    let (ctx, manager) = test_context("test-eval-promise");
     let nav_tool = BrowserNavigateTool;
     nav_tool
         .run(json!({"url": server.url()}), ctx.clone())
@@ -614,7 +617,7 @@ async fn test_eval_promise_chain_awaited() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -630,7 +633,7 @@ async fn test_browser_console_logs_local() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-console-local");
+    let (ctx, manager) = test_context("test-console-local");
 
     // Navigate
     let nav_tool = BrowserNavigateTool;
@@ -709,7 +712,7 @@ async fn test_browser_console_logs_local() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -725,7 +728,7 @@ async fn test_browser_screenshot_local() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-screenshot-local");
+    let (ctx, manager) = test_context("test-screenshot-local");
 
     // Navigate
     let nav_tool = BrowserNavigateTool;
@@ -763,7 +766,7 @@ async fn test_browser_screenshot_local() {
         result.display_data()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -779,7 +782,7 @@ async fn test_browser_resize_local() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-resize-local");
+    let (ctx, manager) = test_context("test-resize-local");
 
     // Navigate
     let nav_tool = BrowserNavigateTool;
@@ -808,7 +811,7 @@ async fn test_browser_resize_local() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -824,7 +827,7 @@ async fn test_browser_session_persistence() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-persistence");
+    let (ctx, manager) = test_context("test-persistence");
 
     // Navigate
     let nav_tool = BrowserNavigateTool;
@@ -857,7 +860,7 @@ async fn test_browser_session_persistence() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 // ============================================================================
@@ -938,7 +941,7 @@ async fn test_browser_eval_syntax_error() {
     require_chrome!();
 
     let server = TestServer::start("<html><body></body></html>").await;
-    let (ctx, _manager) = test_context("test-eval-syntax-error");
+    let (ctx, manager) = test_context("test-eval-syntax-error");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -962,7 +965,7 @@ async fn test_browser_eval_syntax_error() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 // ============================================================================
@@ -983,7 +986,7 @@ async fn test_wait_for_selector_immediate() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-wait-immediate");
+    let (ctx, manager) = test_context("test-wait-immediate");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1002,7 +1005,7 @@ async fn test_wait_for_selector_immediate() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1026,7 +1029,7 @@ async fn test_wait_for_selector_delayed() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-wait-delayed");
+    let (ctx, manager) = test_context("test-wait-delayed");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1043,7 +1046,7 @@ async fn test_wait_for_selector_delayed() {
 
     assert!(result.is_success(), "Wait failed: {}", result.output());
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1060,7 +1063,7 @@ async fn test_wait_for_selector_timeout() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-wait-timeout");
+    let (ctx, manager) = test_context("test-wait-timeout");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1083,7 +1086,7 @@ async fn test_wait_for_selector_timeout() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1107,7 +1110,7 @@ async fn test_wait_for_selector_hidden_then_visible() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-wait-visible");
+    let (ctx, manager) = test_context("test-wait-visible");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1130,7 +1133,7 @@ async fn test_wait_for_selector_hidden_then_visible() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1138,7 +1141,7 @@ async fn test_wait_for_selector_invalid_selector() {
     require_chrome!();
 
     let server = TestServer::start("<html><body></body></html>").await;
-    let (ctx, _manager) = test_context("test-wait-invalid");
+    let (ctx, manager) = test_context("test-wait-invalid");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1159,7 +1162,7 @@ async fn test_wait_for_selector_invalid_selector() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 // ============================================================================
@@ -1182,7 +1185,7 @@ async fn test_click_button() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-click-button");
+    let (ctx, manager) = test_context("test-click-button");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1213,7 +1216,7 @@ async fn test_click_button() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1231,7 +1234,7 @@ async fn test_click_link() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-click-link");
+    let (ctx, manager) = test_context("test-click-link");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1259,7 +1262,7 @@ async fn test_click_link() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1267,7 +1270,7 @@ async fn test_click_element_not_found() {
     require_chrome!();
 
     let server = TestServer::start("<html><body><div>No buttons here</div></body></html>").await;
-    let (ctx, _manager) = test_context("test-click-not-found");
+    let (ctx, manager) = test_context("test-click-not-found");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1288,7 +1291,7 @@ async fn test_click_element_not_found() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1307,7 +1310,7 @@ async fn test_click_checkbox() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-click-checkbox");
+    let (ctx, manager) = test_context("test-click-checkbox");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1344,7 +1347,7 @@ async fn test_click_checkbox() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1373,7 +1376,7 @@ async fn test_click_with_wait() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-click-wait");
+    let (ctx, manager) = test_context("test-click-wait");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1409,7 +1412,7 @@ async fn test_click_with_wait() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 // ============================================================================
@@ -1431,7 +1434,7 @@ async fn test_type_in_input() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-type-input");
+    let (ctx, manager) = test_context("test-type-input");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1465,7 +1468,7 @@ async fn test_type_in_input() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1483,7 +1486,7 @@ async fn test_type_in_textarea() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-type-textarea");
+    let (ctx, manager) = test_context("test-type-textarea");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1517,7 +1520,7 @@ async fn test_type_in_textarea() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1546,7 +1549,7 @@ async fn test_type_triggers_react_events() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-type-react");
+    let (ctx, manager) = test_context("test-type-react");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1580,7 +1583,7 @@ async fn test_type_triggers_react_events() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1598,7 +1601,7 @@ async fn test_type_with_clear() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-type-clear");
+    let (ctx, manager) = test_context("test-type-clear");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1632,7 +1635,7 @@ async fn test_type_with_clear() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1650,7 +1653,7 @@ async fn test_type_append() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-type-append");
+    let (ctx, manager) = test_context("test-type-append");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1681,7 +1684,7 @@ async fn test_type_append() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1689,7 +1692,7 @@ async fn test_type_element_not_found() {
     require_chrome!();
 
     let server = TestServer::start("<html><body><div>No inputs here</div></body></html>").await;
-    let (ctx, _manager) = test_context("test-type-not-found");
+    let (ctx, manager) = test_context("test-type-not-found");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1713,7 +1716,7 @@ async fn test_type_element_not_found() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1731,7 +1734,7 @@ async fn test_type_special_characters() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-type-special");
+    let (ctx, manager) = test_context("test-type-special");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1765,7 +1768,7 @@ async fn test_type_special_characters() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1783,7 +1786,7 @@ async fn test_type_password_field() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-type-password");
+    let (ctx, manager) = test_context("test-type-password");
 
     let nav_tool = BrowserNavigateTool;
     nav_tool
@@ -1817,7 +1820,7 @@ async fn test_type_password_field() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 // ============================================================================
@@ -1846,7 +1849,7 @@ async fn test_key_press_escape_fires_keydown_listener() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-key-escape");
+    let (ctx, manager) = test_context("test-key-escape");
     BrowserNavigateTool
         .run(json!({"url": server.url()}), ctx.clone())
         .await;
@@ -1874,7 +1877,7 @@ async fn test_key_press_escape_fires_keydown_listener() {
         eval_result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1899,7 +1902,7 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-key-ctrl-k");
+    let (ctx, manager) = test_context("test-key-ctrl-k");
     BrowserNavigateTool
         .run(json!({"url": server.url()}), ctx.clone())
         .await;
@@ -1922,7 +1925,7 @@ async fn test_key_press_ctrl_modifier_fires_capture_listener() {
         eval_result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1947,7 +1950,7 @@ async fn test_key_press_arrow_down() {
     )
     .await;
 
-    let (ctx, _manager) = test_context("test-key-arrow-down");
+    let (ctx, manager) = test_context("test-key-arrow-down");
     BrowserNavigateTool
         .run(json!({"url": server.url()}), ctx.clone())
         .await;
@@ -1970,7 +1973,7 @@ async fn test_key_press_arrow_down() {
         eval_result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 #[tokio::test]
@@ -1978,7 +1981,7 @@ async fn test_key_press_unknown_key_returns_error() {
     require_chrome!();
 
     let server = TestServer::start("<html><body></body></html>").await;
-    let (ctx, _manager) = test_context("test-key-unknown");
+    let (ctx, manager) = test_context("test-key-unknown");
     BrowserNavigateTool
         .run(json!({"url": server.url()}), ctx.clone())
         .await;
@@ -1994,7 +1997,7 @@ async fn test_key_press_unknown_key_returns_error() {
         result.output()
     );
 
-    shutdown_test(_manager, server).await;
+    shutdown_test(manager, server).await;
 }
 
 // ============================================================================
@@ -2005,15 +2008,16 @@ async fn test_key_press_unknown_key_returns_error() {
 /// and one frame, detach and verify the broker drops cleanly.
 ///
 /// Validates the broker's lifecycle invariants in an end-to-end shape:
-///   1. attach_viewer() lazily starts the screencast on first attach.
+///   1. `attach_viewer()` lazily starts the screencast on first attach.
 ///   2. The viewer receives URL events (initial + post-navigation) and
 ///      frame events (JPEG bytes after base64 decode).
 ///   3. Dropping the last `Arc<ScreencastBroker>` stops the screencast
 ///      — verified by re-attaching and getting a new broker instance.
 #[tokio::test]
 async fn test_screencast_attach_emits_frames_and_url() {
-    require_chrome!();
     use crate::browser::screencast::ScreencastEvent;
+
+    require_chrome!();
 
     let server =
         TestServer::start("<html><body><h1 id='hdr'>screencast probe</h1></body></html>").await;
@@ -2041,8 +2045,7 @@ async fn test_screencast_attach_emits_frames_and_url() {
     assert!(
         initial_url
             .as_deref()
-            .map(|u| u.starts_with("http://"))
-            .unwrap_or(false),
+            .is_some_and(|u| u.starts_with("http://")),
         "initial url should be the navigated page, got {initial_url:?}"
     );
     assert_eq!(
@@ -2067,15 +2070,14 @@ async fn test_screencast_attach_emits_frames_and_url() {
                 );
                 got_frame = true;
             }
-            Ok(Ok(ScreencastEvent::Url(_))) => continue,
+            Ok(Ok(ScreencastEvent::Url(_))) | Err(_) => {}
             Ok(Err(_)) => break,
-            Err(_) => continue,
         }
     }
     assert!(got_frame, "never received a frame within 5s");
 
     // Second attach: same broker, viewer count goes to 2.
-    let (broker_b, mut _rx_b, _) = {
+    let (broker_b, rx_b, _) = {
         let s = session_arc.read().await;
         s.attach_viewer().await.expect("attach_viewer #2")
     };
@@ -2094,7 +2096,7 @@ async fn test_screencast_attach_emits_frames_and_url() {
     drop(broker_a);
     drop(broker_b);
     drop(rx_a);
-    drop(_rx_b);
+    drop(rx_b);
 
     // Tiny pause to let Drop run (it spawns a task to fire stopScreencast).
     tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2172,7 +2174,7 @@ async fn test_browser_profile_help_no_browser() {
     manager.shutdown_all().await;
 }
 
-/// REQ-BT-019.14 / Allium RunScenarioRejectsInlineNavigation: a
+/// REQ-BT-019.14 / Allium `RunScenarioRejectsInlineNavigation`: a
 /// `navigate` (or `reload`) step inside `steps` resets the cumulative
 /// Performance counters mid-bracket. The harness must reject it BEFORE
 /// any run — naming the offending step — and produce NO sample set.
@@ -2939,7 +2941,7 @@ ReactDOM.createRoot(document.getElementById('root')).render(e(App));
 /// burn is structurally outside the window (F3 fixed). A post-readiness
 /// ~70ms blocking task is then run as a positive control: it lands in
 /// the window and must be captured (F5 fixed — `script_ms` reflects real
-/// in-window longtask cost, where the old host-bracketed ScriptDuration
+/// in-window longtask cost, where the old host-bracketed `ScriptDuration`
 /// delta collapsed to ~0).
 #[tokio::test]
 async fn test_browser_profile_window_excludes_pre_readiness_work() {
@@ -3102,7 +3104,7 @@ async fn conversation_scope_isolated_per_id() {
 }
 
 /// Worktree and Conversation scopes with the same inner string land in
-/// disjoint namespaces (stable_key prefix). This guards against a path
+/// disjoint namespaces (`stable_key` prefix). This guards against a path
 /// that happens to look like a conversation id colliding with a real
 /// Conversation-scoped session, and vice versa.
 #[tokio::test]

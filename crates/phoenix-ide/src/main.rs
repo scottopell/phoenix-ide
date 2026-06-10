@@ -821,7 +821,7 @@ async fn reconcile_project_main_refs(db: &Database) {
 ///   a) state = `ContextExhausted` -> skipped, mode preserved
 ///   b) `continued_in_conv_id` = Some -> skipped, mode preserved
 ///   c) neither (a) nor (b), genuine orphan -> marked Terminal,
-///      mode/worktree_path/cwd preserved
+///      `mode/worktree_path/cwd` preserved
 ///
 /// These run against an on-disk `SQLite` DB (tempdir) so the project/
 /// conversation foreign keys resolve correctly through migrations.
@@ -1016,7 +1016,7 @@ mod reconcile_worktrees_tests {
 
     /// Case (c): genuine orphan — missing worktree, not exhausted, no
     /// continuation. The conversation is marked Terminal and mode/cwd/
-    /// worktree_path are preserved untouched. The user keeps the original
+    /// `worktree_path` are preserved untouched. The user keeps the original
     /// metadata for context and can hard-delete when ready.
     #[tokio::test]
     async fn marks_genuine_orphan_terminal() {
@@ -1055,7 +1055,7 @@ mod reconcile_worktrees_tests {
     }
 
     /// Branch-mode genuine orphan — same treatment as Work: marked Terminal,
-    /// mode/cwd/worktree_path preserved.
+    /// `mode/cwd/worktree_path` preserved.
     #[tokio::test]
     async fn marks_branch_orphan_terminal() {
         let (_git_tmp, repo_root) = init_repo();

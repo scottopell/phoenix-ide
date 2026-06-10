@@ -192,6 +192,8 @@ mod tests {
     use reqwest::header::HeaderValue;
 
     #[test]
+    // Parsed percentages are exact, representable values from the fixture header.
+    #[allow(clippy::float_cmp)]
     fn parses_default_codex_primary_window() {
         let mut headers = HeaderMap::new();
         headers.insert(
@@ -211,7 +213,7 @@ mod tests {
         let primary = primary.expect("primary");
         assert_eq!(primary.used_percent, 12.5);
         assert_eq!(primary.window_minutes, Some(60));
-        assert_eq!(primary.resets_at, Some(1704069000));
+        assert_eq!(primary.resets_at, Some(1_704_069_000));
         assert!(secondary.is_none());
         assert!(name.is_none());
     }
@@ -266,6 +268,8 @@ mod tests {
     }
 
     #[test]
+    // Parsed percentages are exact, representable values from the fixture header.
+    #[allow(clippy::float_cmp)]
     fn quota_from_response_headers_full() {
         let mut headers = HeaderMap::new();
         headers.insert(PLAN_TYPE_HEADER, HeaderValue::from_static("plus"));
@@ -305,7 +309,7 @@ mod tests {
         let p = q.primary.expect("primary");
         assert_eq!(p.used_percent, 12.5);
         assert_eq!(p.window_minutes, Some(300));
-        assert_eq!(p.resets_at, Some(1779756466));
+        assert_eq!(p.resets_at, Some(1_779_756_466));
         let s = q.secondary.expect("secondary");
         assert_eq!(s.used_percent, 48.0);
         assert_eq!(s.window_minutes, Some(10080));

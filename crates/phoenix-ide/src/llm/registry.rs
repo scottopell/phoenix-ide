@@ -1239,10 +1239,10 @@ mod tests {
         assert!(registry.get("gpt-5.5").is_some());
     }
 
-    /// Helper: build a CodexCredential pointing at a freshly-written valid
-    /// auth.json file so try_create_model can complete the codex branch.
-    fn fake_codex_credential(_dir: &tempfile::TempDir) -> Arc<crate::llm::CodexCredential> {
-        let path = _dir.path().join("auth.json");
+    /// Helper: build a `CodexCredential` pointing at a freshly-written valid
+    /// auth.json file so `try_create_model` can complete the codex branch.
+    fn fake_codex_credential(dir: &tempfile::TempDir) -> Arc<crate::llm::CodexCredential> {
+        let path = dir.path().join("auth.json");
         std::fs::write(
             &path,
             br#"{"auth_mode":"chatgpt","tokens":{"access_token":"x","refresh_token":"r","account_id":"acc-1"}}"#,
@@ -1251,8 +1251,8 @@ mod tests {
         crate::llm::CodexCredential::load(path).unwrap().0
     }
 
-    /// With Codex auth enabled and a valid credential, OpenAI models register
-    /// via the codex branch (no need for OPENAI_API_KEY) and are distinct from
+    /// With Codex auth enabled and a valid credential, `OpenAI` models register
+    /// via the codex branch (no need for `OPENAI_API_KEY`) and are distinct from
     /// Anthropic registration.
     #[test]
     fn test_codex_auth_registers_openai_models_without_api_key() {
@@ -1274,8 +1274,8 @@ mod tests {
         );
     }
 
-    /// With Codex auth enabled but credential load failed, OpenAI models must
-    /// not silently fall through to OPENAI_API_KEY auth.
+    /// With Codex auth enabled but credential load failed, `OpenAI` models must
+    /// not silently fall through to `OPENAI_API_KEY` auth.
     #[test]
     fn test_codex_auth_refuses_silent_fallback_when_cred_missing() {
         let config = LlmConfig {
@@ -1291,10 +1291,10 @@ mod tests {
         );
     }
 
-    /// With Codex auth disabled (no bridge intent), codex_credential is
-    /// ignored and standard OpenAI auth via `OPENAI_API_KEY` remains
+    /// With Codex auth disabled (no bridge intent), `codex_credential` is
+    /// ignored and standard `OpenAI` auth via `OPENAI_API_KEY` remains
     /// available. The bridge-intent flag — not mere credential presence —
-    /// is what diverts traffic to the ChatGPT backend.
+    /// is what diverts traffic to the `ChatGPT` backend.
     #[test]
     fn test_codex_branch_is_gated_by_intent_flag_not_just_cred_presence() {
         let dir = tempfile::tempdir().unwrap();
@@ -1312,9 +1312,9 @@ mod tests {
     }
 
     /// Task 13005: hot reload after in-app login. A registry that booted
-    /// with no Codex credential must register OpenAI bridge services after
+    /// with no Codex credential must register `OpenAI` bridge services after
     /// `reload_codex_credential_with` resolves to a valid auth file — no
-    /// Phoenix restart required for the next OpenAI request to succeed.
+    /// Phoenix restart required for the next `OpenAI` request to succeed.
     #[test]
     fn reload_registers_openai_after_first_login() {
         // Boot with no Codex creds.
@@ -1402,7 +1402,7 @@ mod tests {
         assert!(registry.get("gpt-5.5").is_some());
     }
 
-    /// Reload to None (e.g. file deleted) deregisters the OpenAI bridge.
+    /// Reload to None (e.g. file deleted) deregisters the `OpenAI` bridge.
     /// Future logout flow will rely on this contract.
     #[test]
     fn reload_to_none_deregisters_openai_bridge() {
@@ -1479,7 +1479,7 @@ mod tests {
         assert_eq!(registry.default_model_id(), "gpt-5.5");
     }
 
-    /// pick_default_model must not pin to a configured DEFAULT_MODEL that
+    /// `pick_default_model` must not pin to a configured `DEFAULT_MODEL` that
     /// isn't actually registered (e.g. DEFAULT_MODEL=gpt-5.5 with codex
     /// auth disabled and only an Anthropic key set).
     #[test]

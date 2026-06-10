@@ -236,6 +236,7 @@ impl BashHandleRegistry {
 
     /// Test-only: build a registry with custom caps.
     #[cfg(test)]
+    #[must_use]
     pub fn with_caps(ring_bytes_cap: usize, live_handle_cap: usize) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),

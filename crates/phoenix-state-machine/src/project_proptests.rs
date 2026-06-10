@@ -75,7 +75,9 @@ mod tests {
                     prop_assert!(!task_id.as_str().is_empty(),
                         "Work mode must always have a non-empty task_id");
                 }
-                _ => prop_assert!(false, "Expected Work mode"),
+                ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. } => {
+                    prop_assert!(false, "Expected Work mode");
+                }
             }
         }
 
@@ -87,7 +89,9 @@ mod tests {
                     prop_assert!(!worktree_path.as_str().is_empty(),
                         "Work mode must always have a non-empty worktree_path");
                 }
-                _ => prop_assert!(false, "Expected Work mode"),
+                ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. } => {
+                    prop_assert!(false, "Expected Work mode");
+                }
             }
         }
 
@@ -99,7 +103,9 @@ mod tests {
                     prop_assert!(!branch_name.as_str().is_empty(),
                         "Work mode must always have a non-empty branch_name");
                 }
-                _ => prop_assert!(false, "Expected Work mode"),
+                ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. } => {
+                    prop_assert!(false, "Expected Work mode");
+                }
             }
         }
     }
@@ -120,7 +126,9 @@ mod tests {
                     // Compile-time: no task_id field accessible here.
                     // If this test compiles, the invariant holds.
                 }
-                _ => prop_assert!(false, "Expected Branch mode"),
+                ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Work { .. } => {
+                    prop_assert!(false, "Expected Branch mode");
+                }
             }
         }
 
@@ -132,7 +140,9 @@ mod tests {
                     prop_assert!(!branch_name.as_str().is_empty(),
                         "Branch mode must always have a non-empty branch_name");
                 }
-                _ => prop_assert!(false, "Expected Branch mode"),
+                ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Work { .. } => {
+                    prop_assert!(false, "Expected Branch mode");
+                }
             }
         }
     }

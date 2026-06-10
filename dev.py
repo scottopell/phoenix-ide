@@ -2791,9 +2791,12 @@ def cmd_check(gate: bool = True):
         run (this dir is outside rust-cache's saved target/).
         """
         # Scope to the changed crate(s)+rdeps when gating narrowed it; otherwise
-        # lint the whole workspace. `-p` flags go before `--`.
+        # lint the whole workspace. `-p` flags go before `--`. `--all-targets`
+        # lints test/bench/example targets too, so test code is gated the same
+        # as library code (a pedantic violation in a #[cfg(test)] module fails
+        # CI); it composes with `-p` so the changed-crate scope still applies.
         run_step("cargo clippy",
-                 ["cargo", "clippy", *_pflags(), "--", "-D", "warnings"],
+                 ["cargo", "clippy", *_pflags(), "--all-targets", "--", "-D", "warnings"],
                  env_extra={"CARGO_TARGET_DIR": str(ROOT / "target" / "clippy")})
 
     def lane_ui_lint():

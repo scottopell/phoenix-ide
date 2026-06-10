@@ -730,7 +730,7 @@ mod tests {
     /// After `invalidate()` (e.g. on a 401), the next fetch must rotate via the
     /// refresh token even if the cached JWT's `exp` claim is still in the
     /// future — otherwise a server-side revocation would never get replaced.
-    /// We observe the rotation attempt by removing the refresh_token from the
+    /// We observe the rotation attempt by removing the `refresh_token` from the
     /// file: the second `get()` should fail with `NoRefreshToken`, proving we
     /// reached the refresh branch instead of returning the (revoked) token.
     #[tokio::test]
@@ -764,10 +764,10 @@ mod tests {
                 id_token: Some("old_it".into()),
                 refresh_token: Some("old_rt".into()),
                 account_id: Some("acc".into()),
-                other: Default::default(),
+                other: serde_json::Map::default(),
             }),
             last_refresh: None,
-            other: Default::default(),
+            other: serde_json::Map::default(),
         };
         let response = RefreshResponse {
             access_token: Some("new_at".into()),
@@ -793,10 +793,10 @@ mod tests {
                 id_token: Some("old_it".into()),
                 refresh_token: Some("old_rt".into()),
                 account_id: Some("acc".into()),
-                other: Default::default(),
+                other: serde_json::Map::default(),
             }),
             last_refresh: None,
-            other: Default::default(),
+            other: serde_json::Map::default(),
         };
         // Only access_token rotates; id_token and refresh_token preserved.
         let response = RefreshResponse {
@@ -820,10 +820,10 @@ mod tests {
                 id_token: None,
                 refresh_token: None,
                 account_id: None,
-                other: Default::default(),
+                other: serde_json::Map::default(),
             }),
             last_refresh: None,
-            other: Default::default(),
+            other: serde_json::Map::default(),
         };
         apply_refresh_response(
             &mut auth,
@@ -855,7 +855,9 @@ mod tests {
         fn capture() -> Self {
             // If a previous test panicked while holding the lock, the mutex is
             // poisoned but the env state is restorable; recover and continue.
-            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = ENV_MUTEX
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             Self {
                 _lock: lock,
                 home: std::env::var_os("HOME"),

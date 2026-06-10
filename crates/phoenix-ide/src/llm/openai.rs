@@ -1274,6 +1274,8 @@ mod tests {
         }
 
         #[test]
+        // Parsed percentages are exact, representable values from the fixture header.
+        #[allow(clippy::float_cmp)]
         fn usage_limit_reached_extracts_secondary_window() {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -1479,7 +1481,7 @@ mod tests {
     /// payload is authoritative — fall back to it instead of dropping the
     /// assembled message. Repro of the 2026-05-11 gateway behaviour where
     /// `support-chat-completions` produced 5 output tokens, was billed for
-    /// them, but Phoenix persisted "end_turn with empty content".
+    /// them, but Phoenix persisted "`end_turn` with empty content".
     #[test]
     fn process_event_recovers_output_from_response_completed_when_no_item_done() {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
@@ -1503,15 +1505,15 @@ mod tests {
             1,
             "fallback should recover the message from /response/output"
         );
-        assert_eq!(acc.input_tokens, 320682);
+        assert_eq!(acc.input_tokens, 320_682);
         assert_eq!(acc.output_tokens, 5);
     }
 
-    /// OpenAI reports the cached input subset under
+    /// `OpenAI` reports the cached input subset under
     /// `usage.input_tokens_details.cached_tokens`. It must reach `Usage` and
     /// must not double-count: `input_tokens` already includes the cached
-    /// portion, so `context_window_used()` (which sums input + cache_read)
-    /// stays equal to OpenAI's reported input+output.
+    /// portion, so `context_window_used()` (which sums input + `cache_read`)
+    /// stays equal to `OpenAI`'s reported input+output.
     #[test]
     fn responses_api_cached_tokens_are_threaded_without_double_counting() {
         let (tx, _rx) = tokio::sync::broadcast::channel(8);
@@ -1555,7 +1557,7 @@ mod tests {
 
     /// A gateway that omits `input_tokens_details` must not panic or shift
     /// accounting: cached defaults to 0 and `input_tokens` is unchanged.
-    /// output_tokens is 0 here — an empty, unbilled response, so the
+    /// `output_tokens` is 0 here — an empty, unbilled response, so the
     /// billed-but-empty guard does not fire.
     #[test]
     fn responses_api_usage_without_cached_details_defaults_to_zero() {
@@ -1573,7 +1575,7 @@ mod tests {
         assert_eq!(resp.usage.context_window_used(), 10);
     }
 
-    /// Billed-but-empty guard: OpenAI reporting output tokens for a
+    /// Billed-but-empty guard: `OpenAI` reporting output tokens for a
     /// response with no content block means the assembled message was
     /// lost in transit (a gateway dropping the output array). Normalization
     /// must surface a retryable error, not a silently-empty agent turn.
@@ -1623,6 +1625,9 @@ mod tests {
         .expect("a refusal is valid content, not a billed-but-empty failure");
         assert!(resp.end_turn);
         assert_eq!(resp.content.len(), 1);
+        // ContentBlock carries ~13 tool/server variants; only Text is expected here
+        // and every other variant is an equivalent test failure.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &resp.content[0] {
             ContentBlock::Text { text } => assert_eq!(text, "I can't help with that."),
             other => panic!("expected refusal surfaced as Text, got {other:?}"),

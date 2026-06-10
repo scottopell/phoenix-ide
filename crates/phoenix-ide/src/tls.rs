@@ -291,7 +291,7 @@ mod bounded_drain_tests {
     /// A drain future that completes before the deadline forwards its
     /// inner value verbatim. The contract `Some(F::Output) iff fast
     /// enough` is what both server paths rely on to decide whether to
-    /// force-abort: HTTP aborts the `axum::serve` JoinHandle when the
+    /// force-abort: HTTP aborts the `axum::serve` `JoinHandle` when the
     /// result is `None`; HTTPS discards `None`.
     #[tokio::test]
     async fn fast_drain_returns_some_with_inner_value() {

@@ -4944,6 +4944,9 @@ mod approve_task_refreshes_mode_context_tests {
     use tokio::sync::mpsc;
 
     #[tokio::test]
+    // End-to-end approval flow: repo setup, task creation, approval, and
+    // post-conditions read clearer as one linear scenario than split apart.
+    #[allow(clippy::too_many_lines)]
     async fn approve_task_sets_mode_context_to_work() {
         let (_tmp, repo_root) = init_repo();
         let conv_id = "mode-ctx-refresh-1";
@@ -5198,7 +5201,7 @@ mod steer_drain_detector_tests {
     /// `clear_steering_queue_entries_preserves_concurrent_enqueue`.
     /// Drain-all on entering Idle is processed INLINE: persists land before
     /// `apply_transition_result` returns. Assertion is via storage rather than
-    /// generated_events because the drain event no longer surfaces externally.
+    /// `generated_events` because the drain event no longer surfaces externally.
     #[tokio::test]
     async fn drain_all_on_entering_idle() {
         let queue = vec![
@@ -5280,7 +5283,7 @@ mod steer_drain_detector_tests {
     }
 
     /// Mid-turn drain from `ToolExecuting` → `LlmRequesting`: persists run
-    /// inline before the (deferred) RequestLlm, so the spawned LLM task reads
+    /// inline before the (deferred) `RequestLlm`, so the spawned LLM task reads
     /// a DB that already has the steered messages.
     #[tokio::test]
     async fn drain_all_mid_turn_from_tool_executing() {
@@ -5300,12 +5303,12 @@ mod steer_drain_detector_tests {
         assert!(matches!(rt.state, ConvState::LlmRequesting { .. }));
     }
 
-    /// Mid-turn drain with RequestLlm in the original effects list: the
-    /// executor must defer RequestLlm so persists land before the LLM task
+    /// Mid-turn drain with `RequestLlm` in the original effects list: the
+    /// executor must defer `RequestLlm` so persists land before the LLM task
     /// reads the DB. This is a smoke test that the deferred-RequestLlm path
-    /// runs without panic, persists land, and final state is LlmRequesting.
+    /// runs without panic, persists land, and final state is `LlmRequesting`.
     /// Stronger ordering is enforced by `apply_transition_result`'s sequential
-    /// awaits (persists before deferred RequestLlm spawn).
+    /// awaits (persists before deferred `RequestLlm` spawn).
     #[tokio::test]
     async fn mid_turn_drain_defers_request_llm_until_after_persists() {
         let queue = vec![mk_entry("s1", "first"), mk_entry("s2", "second")];
@@ -5431,7 +5434,7 @@ mod steer_drain_detector_tests {
         let _ = storage; // touch to silence unused warning
     }
 
-    /// `Effect::ClearSteeringQueueEntries` removes ONLY the matching message_ids
+    /// `Effect::ClearSteeringQueueEntries` removes ONLY the matching `message_ids`
     /// from storage; concurrently-enqueued entries are preserved. Models the
     /// enqueue-during-drain race.
     #[tokio::test]
@@ -5469,9 +5472,9 @@ mod steer_drain_detector_tests {
     }
 
     /// `PersistMessage` is idempotent on duplicate `message_id`. Models the
-    /// crash-recovery re-drain path: a SteerDrainedUserMessages event re-fires
+    /// crash-recovery re-drain path: a `SteerDrainedUserMessages` event re-fires
     /// after a partial drain, but messages already persisted are skipped without
-    /// allocating a new sequence_id or producing a duplicate row.
+    /// allocating a new `sequence_id` or producing a duplicate row.
     #[tokio::test]
     async fn persist_message_is_idempotent_on_duplicate_id() {
         use crate::db::{MessageContent, UserContent};
@@ -5596,7 +5599,7 @@ mod steer_drain_detector_tests {
     /// Regression: a tool result carrying typed images must survive the
     /// normal `PersistCheckpoint` round into `ToolContent.images`. Before
     /// this was threaded, `MessageContent::tool(...)` dropped the field, so
-    /// read_image (which now relies solely on the typed channel) lost its
+    /// `read_image` (which now relies solely on the typed channel) lost its
     /// image bytes for both the UI and the next LLM turn.
     #[tokio::test]
     async fn persist_checkpoint_preserves_tool_result_images() {
@@ -5866,7 +5869,7 @@ mod work_subagent_cwd_guard_tests {
     /// `agent_type` resolves against the catalog frozen on the runtime, not a
     /// fresh filesystem scan (REQ-AG-008): the worktree has no `.claude/agents`,
     /// yet a frozen-catalog agent resolves, so we reach the missing-spawn-channel
-    /// path rather than an "Unknown agent_type" rejection.
+    /// path rather than an "Unknown `agent_type`" rejection.
     #[tokio::test]
     async fn agent_type_resolves_from_frozen_catalog_not_filesystem() {
         let worktree = TempDir::new().expect("worktree tempdir");
@@ -6179,13 +6182,10 @@ mod fork_proposal_persist_tests {
     use std::sync::Arc;
     use tokio::sync::mpsc;
 
-    fn runtime_in_dir(
-        conv_id: &str,
-        working_dir: &Path,
-    ) -> (
-        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>,
-        Arc<InMemoryStorage>,
-    ) {
+    type TestRuntime =
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
+
+    fn runtime_in_dir(conv_id: &str, working_dir: &Path) -> (TestRuntime, Arc<InMemoryStorage>) {
         let storage = Arc::new(InMemoryStorage::new());
         let context = ConvContext::new(conv_id, working_dir.to_path_buf(), "test-model", 200_000);
         let (_event_tx, event_rx) = mpsc::channel(32);
@@ -6260,8 +6260,8 @@ mod fork_proposal_persist_tests {
         );
     }
 
-    /// Worktree-top origin: working_dir IS the repo root, so the stored
-    /// task_file equals the working-dir-relative path unchanged.
+    /// Worktree-top origin: `working_dir` IS the repo root, so the stored
+    /// `task_file` equals the working-dir-relative path unchanged.
     #[tokio::test]
     async fn persist_at_repo_root_keeps_task_file() {
         let (_tmp, root) = init_repo();
@@ -6288,8 +6288,8 @@ mod fork_proposal_persist_tests {
         assert_round_persisted(&storage, "conv-fork-root", "fp-root");
     }
 
-    /// Direct-in-subdir origin: working_dir is a subdir of the repo root, so
-    /// the stored task_file is prefixed with the subdir offset.
+    /// Direct-in-subdir origin: `working_dir` is a subdir of the repo root, so
+    /// the stored `task_file` is prefixed with the subdir offset.
     #[tokio::test]
     async fn persist_in_subdir_prefixes_offset() {
         let (_tmp, root) = init_repo();

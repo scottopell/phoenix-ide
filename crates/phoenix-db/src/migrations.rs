@@ -936,6 +936,9 @@ mod tests {
     /// Migration 007: top-level Explore conversations get `worktree_path`
     /// backfilled from `cwd`; sub-agents and non-Explore rows are untouched.
     #[tokio::test]
+    // reason: exhaustive table-driven backfill test covering 7 distinct seed
+    // scenarios; splitting would scatter the shared fixture setup.
+    #[allow(clippy::too_many_lines)]
     async fn migration_007_backfills_explore_worktree_path() {
         let pool = test_pool().await;
         // Need parent_conversation_id column for this migration.
@@ -1088,6 +1091,15 @@ mod tests {
 
     #[tokio::test]
     async fn migration_009_rewrites_one_million_context_model_ids_to_base() {
+        async fn model_for(pool: &SqlitePool, id: &str) -> Option<String> {
+            sqlx::query("SELECT model FROM conversations WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+                .get::<Option<String>, _>("model")
+        }
+
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
 
@@ -1113,15 +1125,6 @@ mod tests {
         }
 
         run_pending_migrations(&pool).await.unwrap();
-
-        async fn model_for(pool: &SqlitePool, id: &str) -> Option<String> {
-            sqlx::query("SELECT model FROM conversations WHERE id = ?")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .unwrap()
-                .get::<Option<String>, _>("model")
-        }
 
         assert_eq!(
             model_for(&pool, "c-opus-7-1m").await.as_deref(),
@@ -1156,6 +1159,15 @@ mod tests {
 
     #[tokio::test]
     async fn migration_010_rewrites_opus_4_5_to_4_6() {
+        async fn model_for(pool: &SqlitePool, id: &str) -> Option<String> {
+            sqlx::query("SELECT model FROM conversations WHERE id = ?")
+                .bind(id)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+                .get::<Option<String>, _>("model")
+        }
+
         let pool = test_pool().await;
         setup_conversations_table(&pool).await;
 
@@ -1177,15 +1189,6 @@ mod tests {
         }
 
         run_pending_migrations(&pool).await.unwrap();
-
-        async fn model_for(pool: &SqlitePool, id: &str) -> Option<String> {
-            sqlx::query("SELECT model FROM conversations WHERE id = ?")
-                .bind(id)
-                .fetch_one(pool)
-                .await
-                .unwrap()
-                .get::<Option<String>, _>("model")
-        }
 
         assert_eq!(
             model_for(&pool, "c-opus-5").await.as_deref(),

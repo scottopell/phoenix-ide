@@ -3099,6 +3099,9 @@ mod tests {
         )
         .unwrap();
 
+        // reason: only ContextExhausted is expected; every other ConvState variant is a
+        // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &result.new_state {
             ConvState::ContextExhausted { summary } => {
                 // Stable summary — the raw backend message must NOT leak
@@ -3805,9 +3808,14 @@ mod tests {
         let checkpoint = result
             .effects
             .iter()
-            .find_map(|e| match e {
-                Effect::PersistCheckpoint { data } => Some(data),
-                _ => None,
+            // reason: selecting one Effect variant out of ~22; listing the rest just to
+            // map them all to None would obscure the single variant of interest.
+            .find_map(|e| {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match e {
+                    Effect::PersistCheckpoint { data } => Some(data),
+                    _ => None,
+                }
             })
             .expect("should persist a tool-round checkpoint with the rejection");
         let CheckpointData::ToolRound { tool_results, .. } = checkpoint;
@@ -3819,7 +3827,9 @@ mod tests {
                     "rejection must explain task management is the parent's job, got: {output}"
                 );
             }
-            other => panic!("expected an error tool result, got {other:?}"),
+            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+                panic!("expected an error tool result, got {other:?}")
+            }
         }
         assert!(
             !result
@@ -4555,9 +4565,14 @@ mod tests {
         let persist_ids: Vec<&str> = result
             .effects
             .iter()
-            .filter_map(|e| match e {
-                Effect::PersistMessage { message_id, .. } => Some(message_id.as_str()),
-                _ => None,
+            // reason: selecting one Effect variant out of ~22; listing the rest just to
+            // map them all to None would obscure the single variant of interest.
+            .filter_map(|e| {
+                #[allow(clippy::wildcard_enum_match_arm)]
+                match e {
+                    Effect::PersistMessage { message_id, .. } => Some(message_id.as_str()),
+                    _ => None,
+                }
             })
             .collect();
         assert_eq!(
@@ -4970,6 +4985,9 @@ mod tests {
             phoenix_core::task_source::Priority,
             &String,
         )> {
+            // reason: selecting one Effect variant out of ~22; listing the rest just to
+            // map them all to None would obscure the single variant of interest.
+            #[allow(clippy::wildcard_enum_match_arm)]
             effects.iter().find_map(|e| match e {
                 Effect::PersistForkProposal {
                     proposal_id,

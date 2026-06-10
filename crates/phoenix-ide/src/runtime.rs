@@ -2465,11 +2465,11 @@ mod work_scope_derivation_tests {
         WorkScope::resolve(conv_id, work_scope_worktree.as_deref())
     }
 
-    fn assert_scopes_agree(conv_id: &str, conv_mode: &ConvMode, expected: WorkScope) {
+    fn assert_scopes_agree(conv_id: &str, conv_mode: &ConvMode, expected: &WorkScope) {
         let db = db_facing_scope(conv_id, conv_mode);
         let tool = tool_side_scope(conv_id, conv_mode);
         assert_eq!(db, tool, "tool-side and DB-facing scope must agree");
-        assert_eq!(tool, expected);
+        assert_eq!(&tool, expected);
     }
 
     #[test]
@@ -2481,7 +2481,7 @@ mod work_scope_derivation_tests {
         assert_scopes_agree(
             "explore-subagent-1",
             &mode,
-            WorkScope::Conversation("explore-subagent-1".to_string()),
+            &WorkScope::Conversation("explore-subagent-1".to_string()),
         );
     }
 
@@ -2494,7 +2494,7 @@ mod work_scope_derivation_tests {
         assert_scopes_agree(
             "explore-toplevel-1",
             &mode,
-            WorkScope::Worktree("/tmp/wt-explore".to_string()),
+            &WorkScope::Worktree("/tmp/wt-explore".to_string()),
         );
     }
 
@@ -2512,7 +2512,7 @@ mod work_scope_derivation_tests {
         assert_scopes_agree(
             "work-subagent-1",
             &mode,
-            WorkScope::Worktree("/tmp/wt-work".to_string()),
+            &WorkScope::Worktree("/tmp/wt-work".to_string()),
         );
     }
 
@@ -2526,7 +2526,7 @@ mod work_scope_derivation_tests {
         assert_scopes_agree(
             "branch-1",
             &mode,
-            WorkScope::Worktree("/tmp/wt-branch".to_string()),
+            &WorkScope::Worktree("/tmp/wt-branch".to_string()),
         );
     }
 
@@ -2535,7 +2535,7 @@ mod work_scope_derivation_tests {
         assert_scopes_agree(
             "direct-1",
             &ConvMode::Direct,
-            WorkScope::Conversation("direct-1".to_string()),
+            &WorkScope::Conversation("direct-1".to_string()),
         );
     }
 }
@@ -2953,7 +2953,7 @@ mod broadcaster_tests {
     /// allocation produce a `last_sequence_id` that exceeds what the
     /// snapshot actually covers (or, conversely, leave a snapshot entry
     /// with seq above `last_sequence_id`, violating
-    /// `sse_wire.allium` StreamOpened).
+    /// `sse_wire.allium` `StreamOpened`).
     #[test]
     fn snapshot_pending_highest_seq_bounds_entries() {
         let b = SseBroadcaster::new(64, 10);
@@ -2974,7 +2974,7 @@ mod broadcaster_tests {
         }
         assert_eq!(
             highest,
-            anchor + events.len() as i64,
+            anchor + i64::try_from(events.len()).expect("ring length fits i64"),
             "with seq 11..17 in the ring, highest is 17"
         );
     }

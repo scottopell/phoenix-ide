@@ -2080,7 +2080,9 @@ mod tests {
                 assert_eq!(observations[0].pr_number, 7);
                 assert_eq!(observations[0].state, "MERGED");
             }
-            other => panic!("expected observations on non-open error, got {other:?}"),
+            other @ (PrMonitorError::BadRequest(_) | PrMonitorError::Internal(_)) => {
+                panic!("expected observations on non-open error, got {other:?}")
+            }
         }
         assert!(!temp.path().join(".phoenix/pr-context").exists());
     }

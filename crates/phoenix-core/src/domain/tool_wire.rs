@@ -503,7 +503,7 @@ mod bash_tmux_wire_tests {
         );
     }
 
-    /// `peek` / `wait` on a handle already in kill_pending_kernel: `display`
+    /// `peek` / `wait` on a handle already in `kill_pending_kernel`: `display`
     /// carries the peek/wait label, but `signal_sent` is absent (this caller
     /// did not issue the kill) and `waited_ms` is absent (not a passive run).
     #[test]

@@ -2025,6 +2025,9 @@ mod tests {
     /// outcome-routing / main-loop tasks, which is what real production
     /// looks like.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    // A single ordering scenario: streaming token deltas must arrive before the
+    // finalized message; splitting the linear assert sequence would obscure it.
+    #[allow(clippy::too_many_lines)]
     async fn test_streaming_tokens_ordered_before_message() {
         use crate::runtime::{ConversationRuntime, SseEvent};
         use crate::state_machine::ConvContext;

@@ -3797,7 +3797,12 @@ mod tests {
         // Verify content is properly typed
         match &messages[0].content {
             MessageContent::User(u) => assert_eq!(u.text, "Hello"),
-            _ => panic!("Expected User content"),
+            MessageContent::Agent(_)
+            | MessageContent::Tool(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_)
+            | MessageContent::Skill(_) => panic!("Expected User content"),
         }
 
         let after = db.get_messages_after("conv-1", 1).await.unwrap();
@@ -4008,7 +4013,12 @@ mod tests {
                 assert!(tc.is_error);
                 assert!(tc.content.contains("interrupted"));
             }
-            _ => panic!("Expected Tool content"),
+            MessageContent::User(_)
+            | MessageContent::Agent(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_)
+            | MessageContent::Skill(_) => panic!("Expected Tool content"),
         }
     }
 
@@ -4139,7 +4149,12 @@ mod tests {
             .iter()
             .filter_map(|m| match &m.content {
                 MessageContent::Tool(tc) => Some(tc.tool_use_id.clone()),
-                _ => None,
+                MessageContent::User(_)
+                | MessageContent::Agent(_)
+                | MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Continuation(_)
+                | MessageContent::Skill(_) => None,
             })
             .collect();
         assert!(tool_ids.contains(&"tool-1".to_string()));
@@ -4400,7 +4415,10 @@ mod tests {
         let outcome = db.continue_conversation("parent-work").await.unwrap();
         let new_conv = match outcome {
             ContinueOutcome::Created(c) => c,
-            other => panic!("expected Created, got {other:?}"),
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
         };
 
         // Inheritance: every ConvMode::Work field copied verbatim.
@@ -4457,7 +4475,10 @@ mod tests {
         let outcome = db.continue_conversation("parent-branch").await.unwrap();
         let new_conv = match outcome {
             ContinueOutcome::Created(c) => c,
-            other => panic!("expected Created, got {other:?}"),
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
         };
 
         match (&parent.conv_mode, &new_conv.conv_mode) {
@@ -4507,7 +4528,10 @@ mod tests {
         let outcome = db.continue_conversation("parent-explore").await.unwrap();
         let new_conv = match outcome {
             ContinueOutcome::Created(c) => c,
-            other => panic!("expected Created, got {other:?}"),
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
         };
 
         assert!(matches!(new_conv.conv_mode, ConvMode::Explore { .. }));
@@ -4533,7 +4557,10 @@ mod tests {
         let outcome = db.continue_conversation("parent-direct").await.unwrap();
         let new_conv = match outcome {
             ContinueOutcome::Created(c) => c,
-            other => panic!("expected Created, got {other:?}"),
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
         };
 
         assert!(matches!(new_conv.conv_mode, ConvMode::Direct));
@@ -4560,12 +4587,18 @@ mod tests {
 
         let first = match db.continue_conversation("parent-double").await.unwrap() {
             ContinueOutcome::Created(c) => c,
-            other => panic!("first call should create, got {other:?}"),
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("first call should create, got {other:?}")
+            }
         };
 
         let second = match db.continue_conversation("parent-double").await.unwrap() {
             ContinueOutcome::AlreadyContinued(c) => c,
-            other => panic!("second call should return AlreadyContinued, got {other:?}"),
+            other @ (ContinueOutcome::Created(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("second call should return AlreadyContinued, got {other:?}")
+            }
         };
 
         assert_eq!(
@@ -4615,7 +4648,9 @@ mod tests {
             ContinueOutcome::ParentNotContextExhausted { state_variant } => {
                 assert_eq!(state_variant, "Idle");
             }
-            other => panic!("expected ParentNotContextExhausted, got {other:?}"),
+            other @ (ContinueOutcome::Created(_) | ContinueOutcome::AlreadyContinued(_)) => {
+                panic!("expected ParentNotContextExhausted, got {other:?}")
+            }
         }
 
         // Parent unchanged.
@@ -4652,7 +4687,10 @@ mod tests {
         // First continuation: should be "my-task-2"
         let first = match db.continue_conversation("root").await.unwrap() {
             ContinueOutcome::Created(c) => c,
-            other => panic!("expected Created, got {other:?}"),
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
         };
         assert_eq!(
             first.slug.as_deref(),
@@ -4671,7 +4709,10 @@ mod tests {
         // Second continuation: should be "my-task-3" (root slug, not parent slug)
         let second = match db.continue_conversation(&first.id).await.unwrap() {
             ContinueOutcome::Created(c) => c,
-            other => panic!("expected Created, got {other:?}"),
+            other @ (ContinueOutcome::AlreadyContinued(_)
+            | ContinueOutcome::ParentNotContextExhausted { .. }) => {
+                panic!("expected Created, got {other:?}")
+            }
         };
         assert_eq!(
             second.slug.as_deref(),
@@ -4760,7 +4801,14 @@ mod tests {
                 assert!(user.text.contains(&approval.task_file));
                 assert!(user.text.contains(&approval.branch_name));
             }
-            other => panic!("expected meta user seed message, got {other:?}"),
+            other @ (MessageContent::Agent(_)
+            | MessageContent::Tool(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_)
+            | MessageContent::Skill(_)) => {
+                panic!("expected meta user seed message, got {other:?}")
+            }
         }
         let parent_messages = db.get_messages("handoff-parent").await.unwrap();
         assert!(parent_messages.iter().any(|m| {
@@ -4780,7 +4828,9 @@ mod tests {
                 assert_eq!(task_id.as_str(), approval.task_id);
                 assert_eq!(task_title.as_str(), approval.task_title);
             }
-            other => panic!("successor should be Work mode, got {other:?}"),
+            other @ (ConvMode::Explore { .. } | ConvMode::Direct | ConvMode::Branch { .. }) => {
+                panic!("successor should be Work mode, got {other:?}")
+            }
         }
     }
 
@@ -5510,7 +5560,7 @@ mod tests {
     }
 
     /// Transition-graph negative edges out of the `dismissed` terminal
-    /// (REQ-PROJ-034, ForkProposal `transitions status`): once a proposal is
+    /// (REQ-PROJ-034, `ForkProposal` `transitions status`): once a proposal is
     /// `dismissed` it has no outbound resolution edge, so resolving it as
     /// `spawned` or `promoted` is a conflict, and a second `dismiss` is a no-op.
     /// `resolve_conflicts_on_divergent_prior_resolution` only exercises edges out
@@ -5550,7 +5600,7 @@ mod tests {
     }
 
     /// Transition-graph negative edges out of the `promoted` terminal
-    /// (REQ-PROJ-037, ForkProposal `transitions status`): `promoted` is terminal,
+    /// (REQ-PROJ-037, `ForkProposal` `transitions status`): `promoted` is terminal,
     /// so a second `promote` to a different id, a cross-resolution to `spawned`,
     /// and a `dismiss` are all rejected / no-ops. Complements
     /// `resolve_conflicts_on_divergent_prior_resolution` (spawned source) and
@@ -5617,7 +5667,7 @@ mod tests {
         assert!(p.refinement_conversation_id.is_none());
     }
 
-    /// State-dependent field invariant (ForkProposal entity): the resolution
+    /// State-dependent field invariant (`ForkProposal` entity): the resolution
     /// fields are present iff in their matching terminal state. A freshly
     /// inserted `pending` proposal carries BOTH `fork` and `refinement` absent.
     /// `fork_proposal_insert_get_roundtrip` asserts `fork` is absent; this also

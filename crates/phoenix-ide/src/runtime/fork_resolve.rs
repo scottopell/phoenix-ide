@@ -1640,7 +1640,7 @@ mod tests {
     }
 
     /// Create a project + a live Direct-mode origin conversation in it. Returns
-    /// (project_id, origin_id).
+    /// (`project_id`, `origin_id`).
     async fn seed_project_and_origin(db: &Database, repo: &Path) -> (String, String) {
         let project = db
             .find_or_create_project(&repo.to_string_lossy())

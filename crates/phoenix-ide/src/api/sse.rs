@@ -468,11 +468,11 @@ mod tests {
     }
 
     /// Init with a populated `ReplayRing` snapshot. Exercises the recursive
-    /// SseWireEvent serialisation inside `pending_events` and the parity
+    /// `SseWireEvent` serialisation inside `pending_events` and the parity
     /// of `pending_anchor_sequence_id` / `pending_truncated`.
     ///
     /// Every entry's `sequence_id` exceeds the anchor — matches what a real
-    /// `ReplayRing` snapshot can ever produce (sse_wire.allium invariant
+    /// `ReplayRing` snapshot can ever produce (`sse_wire.allium` invariant
     /// `ReplayRingEntriesAboveAnchor`). A test fixture that violates the
     /// invariant would mask ordering regressions, since the eager-Message
     /// envelope `sequence_id` equals `message.sequence_id` on the wire.
@@ -971,7 +971,7 @@ mod tests {
     }
 
     /// After a persisted Message broadcast, the ring resets and a fresh
-    /// init carries empty pending_events with the anchor advanced.
+    /// init carries empty `pending_events` with the anchor advanced.
     #[test]
     fn init_pending_is_empty_after_persisted_message() {
         use crate::runtime::SseBroadcaster;

@@ -389,6 +389,9 @@ pub(crate) fn arb_event() -> impl Strategy<Value = Event> {
 // State Validity Checkers
 // ============================================================================
 
+// reason: only two states carry validity invariants worth checking; every other
+// ConvState variant is unconditionally valid, so a wildcard is clearer than listing ~16.
+#[allow(clippy::wildcard_enum_match_arm)]
 pub(crate) fn is_valid_state(state: &ConvState) -> bool {
     match state {
         ConvState::ToolExecuting {
@@ -733,6 +736,9 @@ proptest! {
         prop_assert!(result.is_ok());
 
         let new_state = result.unwrap().new_state;
+        // reason: only ToolExecuting is expected; every other ConvState variant is a
+        // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match new_state {
             ConvState::ToolExecuting { current_tool, remaining_tools, .. } => {
                 prop_assert_eq!(&current_tool.id, &tool_calls[0].id);
@@ -762,6 +768,9 @@ proptest! {
         let result = transition(&state, &test_context(), event);
         prop_assert!(result.is_ok());
 
+        // reason: only LlmRequesting is the expected outcome; every other ConvState
+        // variant is a failure, so enumerating the ~16 remaining variants adds no clarity.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match result.unwrap().new_state {
             ConvState::LlmRequesting { attempt: new_attempt } => {
                 prop_assert_eq!(new_attempt, attempt + 1);
@@ -790,6 +799,9 @@ proptest! {
         let result = transition(&state, &test_context(), event);
         prop_assert!(result.is_ok());
 
+        // reason: only the Error state is expected; every other ConvState variant is a
+        // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match result.unwrap().new_state {
             ConvState::Error { error_kind: ek, .. } => {
                 prop_assert_eq!(ek, error_kind);
@@ -876,6 +888,9 @@ proptest! {
         let tr = result.unwrap();
 
         // Should go to CancellingTool
+        // reason: only CancellingTool is expected; every other ConvState variant is a
+        // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &tr.new_state {
             ConvState::CancellingTool {
                 tool_use_id,
@@ -1244,6 +1259,9 @@ fn test_multi_tool_chain() {
     state = result.new_state;
 
     // Should be executing tool1 with tool2, tool3 remaining
+    // reason: only ToolExecuting is expected; every other ConvState variant is a
+    // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match &state {
         ConvState::ToolExecuting {
             current_tool,
@@ -1269,6 +1287,9 @@ fn test_multi_tool_chain() {
     state = result.new_state;
 
     // Should now be executing tool2
+    // reason: only ToolExecuting is expected; every other ConvState variant is a
+    // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match &state {
         ConvState::ToolExecuting {
             current_tool,
@@ -1296,6 +1317,9 @@ fn test_multi_tool_chain() {
     state = result.new_state;
 
     // Should now be executing tool3 (last one)
+    // reason: only ToolExecuting is expected; every other ConvState variant is a
+    // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match &state {
         ConvState::ToolExecuting {
             current_tool,
@@ -1485,6 +1509,9 @@ fn test_tool_completion_advances_to_next_tool() {
     )
     .unwrap();
 
+    // reason: only ToolExecuting is expected; every other ConvState variant is a
+    // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match result.new_state {
         ConvState::ToolExecuting {
             current_tool,
@@ -1595,6 +1622,9 @@ proptest! {
         state = result.unwrap().new_state;
 
         // Check conservation at each step
+        // reason: only AwaitingSubAgents and LlmRequesting are valid here; every other
+        // ConvState variant is a failure, so enumerating the rest would obscure intent.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match &state {
             ConvState::AwaitingSubAgents {
                 pending,
@@ -1723,6 +1753,9 @@ proptest! {
 
     let result = transition(&state, &test_context(), Event::UserCancel { reason: None }).unwrap();
 
+    // reason: only CancellingSubAgents is expected; every other ConvState variant is a
+    // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match result.new_state {
         ConvState::CancellingSubAgents {
             pending: new_pending,
@@ -1810,6 +1843,9 @@ fn test_tool_complete_with_pending_agents_goes_to_awaiting() {
 
     let result = transition(&state, &test_context(), event).unwrap();
 
+    // reason: only AwaitingSubAgents is expected; every other ConvState variant is a
+    // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match result.new_state {
         ConvState::AwaitingSubAgents { pending, .. } => {
             assert_eq!(pending.len(), 2);
@@ -1863,6 +1899,9 @@ fn test_spawn_agents_complete_accumulates_ids() {
 
     let result = transition(&state, &test_context(), event).unwrap();
 
+    // reason: only ToolExecuting is expected; every other ConvState variant is a
+    // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+    #[allow(clippy::wildcard_enum_match_arm)]
     match result.new_state {
         ConvState::ToolExecuting {
             pending_sub_agents,
@@ -2048,6 +2087,9 @@ proptest! {
         let outcome = EffectOutcome::Llm(LlmOutcome::AuthError { message, recovery_in_progress: false });
         let result = handle_outcome(&state, &ctx, outcome);
         prop_assert!(result.is_ok());
+        // reason: only the Error state is expected; every other ConvState variant is a
+        // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match result.unwrap().new_state {
             ConvState::Error { error_kind, .. } => {
                 prop_assert_eq!(error_kind, ErrorKind::Auth);
@@ -2067,6 +2109,9 @@ proptest! {
         let outcome = EffectOutcome::Llm(LlmOutcome::RequestRejected { message });
         let result = handle_outcome(&state, &ctx, outcome);
         prop_assert!(result.is_ok());
+        // reason: only the Error state is expected; every other ConvState variant is a
+        // failure, so an explicit list of the ~16 remaining variants would obscure intent.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match result.unwrap().new_state {
             ConvState::Error { error_kind, .. } => {
                 prop_assert_eq!(error_kind, ErrorKind::InvalidRequest);
@@ -2086,6 +2131,9 @@ proptest! {
         let outcome = EffectOutcome::Llm(LlmOutcome::NetworkError { message });
         let result = handle_outcome(&state, &ctx, outcome);
         prop_assert!(result.is_ok());
+        // reason: only LlmRequesting (a retry) is expected; every other ConvState variant
+        // is a failure, so an explicit list of the ~16 remaining variants obscures intent.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match result.unwrap().new_state {
             ConvState::LlmRequesting { attempt: new_attempt } => {
                 prop_assert_eq!(new_attempt, attempt + 1);
@@ -2102,6 +2150,9 @@ proptest! {
         let outcome = EffectOutcome::Llm(LlmOutcome::RateLimited { retry_after: None, resets_at: None });
         let result = handle_outcome(&state, &ctx, outcome);
         prop_assert!(result.is_ok());
+        // reason: only LlmRequesting (a retry) is expected; every other ConvState variant
+        // is a failure, so an explicit list of the ~16 remaining variants obscures intent.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match result.unwrap().new_state {
             ConvState::LlmRequesting { attempt: new_attempt } => {
                 prop_assert_eq!(new_attempt, attempt + 1);

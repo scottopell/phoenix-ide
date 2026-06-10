@@ -290,6 +290,7 @@ impl TmuxRegistry {
     /// of the tool dispatch and the terminal attach fallback without
     /// requiring a host without tmux.
     #[cfg(test)]
+    #[must_use]
     pub fn with_socket_dir_and_binary(socket_dir: PathBuf, binary_available: bool) -> Self {
         Self {
             inner: RwLock::new(HashMap::new()),
@@ -305,6 +306,7 @@ impl TmuxRegistry {
     /// status transitions and cascade removal round-trip through the sink
     /// without requiring a real tmux server.
     #[cfg(test)]
+    #[must_use]
     pub fn with_socket_dir_binary_and_sink(
         socket_dir: PathBuf,
         binary_available: bool,

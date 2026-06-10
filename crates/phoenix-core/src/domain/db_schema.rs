@@ -1837,13 +1837,17 @@ mod conversation_serde_tests {
             serde_json::from_str(r#"{"type":"success","output":"ok"}"#).unwrap();
         match success {
             ToolOutcome::Success { images, .. } => assert!(images.is_empty()),
-            other => panic!("expected Success, got {other:?}"),
+            other @ (ToolOutcome::Error { .. } | ToolOutcome::Cancelled { .. }) => {
+                panic!("expected Success, got {other:?}")
+            }
         }
         let error: ToolOutcome =
             serde_json::from_str(r#"{"type":"error","output":"boom"}"#).unwrap();
         match error {
             ToolOutcome::Error { images, .. } => assert!(images.is_empty()),
-            other => panic!("expected Error, got {other:?}"),
+            other @ (ToolOutcome::Success { .. } | ToolOutcome::Cancelled { .. }) => {
+                panic!("expected Error, got {other:?}")
+            }
         }
 
         // ToolContent — old tool-result message content with no `images` key.

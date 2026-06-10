@@ -990,7 +990,10 @@ mod tests {
 
         // Substring of the real state still mismatches — guards against a
         // future regression to a permissive `starts_with` / prefix check.
-        let prefix = &session.state[..session.state.len() - 1];
+        let prefix = session
+            .state
+            .get(..session.state.len() - 1)
+            .expect("state has at least one char");
         assert!(matches!(
             validate_state(&session.state, prefix),
             Err(LoginError::StateMismatch)
@@ -1009,7 +1012,7 @@ mod tests {
         ));
     }
 
-    /// Loopback callback DoS protection (PR #57 review): a request without
+    /// Loopback callback `DoS` protection (PR #57 review): a request without
     /// a matching `state` parameter must NOT consume the one-shot sender.
     /// This guards against a local malicious process firing one bogus GET
     /// to `:1455/auth/callback` and stranding the real browser callback.
@@ -1069,7 +1072,7 @@ mod tests {
                 assert_eq!(code, "real-code");
                 assert_eq!(returned_state, "real-state");
             }
-            other => panic!("expected Success, got {other:?}"),
+            other @ CallbackPayload::Error { .. } => panic!("expected Success, got {other:?}"),
         }
     }
 

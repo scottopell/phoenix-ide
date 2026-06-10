@@ -5158,6 +5158,8 @@ mod hard_delete_cascade_tests {
     /// `proc_pid_rusage` (and Linux `/proc`) reads find live members.
     #[cfg(unix)]
     #[tokio::test]
+    // `pid` and `pgid` are the canonical Unix process/process-group names.
+    #[allow(clippy::similar_names)]
     async fn inspect_live_handle_reports_state_output_and_resources() {
         use phoenix_core::domain::work_scope_inventory::BashHandleState;
         use phoenix_tools::bash::handle::{Handle, HandleId, HandleState};
@@ -6106,7 +6108,7 @@ mod hard_delete_cascade_tests {
 
     /// Build a 2-member chain via raw SQL — same trick as the chains.rs
     /// test helper. The cascade tests only need the linkage; they don't
-    /// exercise the continue_conversation gating on context_exhausted.
+    /// exercise the `continue_conversation` gating on `context_exhausted`.
     async fn build_chain_for_test(state: &AppState, ids: &[&str]) {
         for id in ids {
             state
@@ -7298,7 +7300,9 @@ mod file_read_tests {
                 assert_eq!(file_type, "image");
                 assert_eq!(url, preview_url_for_path(&path));
             }
-            other => panic!("expected image response, got {other:?}"),
+            other @ ReadFileResponse::Text { .. } => {
+                panic!("expected image response, got {other:?}")
+            }
         }
     }
 
@@ -7324,7 +7328,9 @@ mod file_read_tests {
                 assert_eq!(encoding, "utf-8");
                 assert_eq!(file_type, "text");
             }
-            other => panic!("expected text response, got {other:?}"),
+            other @ ReadFileResponse::Image { .. } => {
+                panic!("expected text response, got {other:?}")
+            }
         }
     }
 }
@@ -7381,8 +7387,8 @@ mod attachment_storage_tests {
         let referenced = conv.join("old-but-referenced.txt");
         std::fs::write(&referenced, b"keep").expect("write referenced");
         let cutoff = SystemTime::now() + Duration::from_secs(1);
-        let references = HashSet::from([referenced.clone()]);
-        sweep_expired_attachments_blocking(root, cutoff, &references).expect("sweep");
+        let referenced_set = HashSet::from([referenced.clone()]);
+        sweep_expired_attachments_blocking(root, cutoff, &referenced_set).expect("sweep");
         assert!(referenced.exists());
         assert!(conv.exists());
     }

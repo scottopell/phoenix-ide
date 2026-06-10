@@ -565,6 +565,7 @@ impl ToolRegistry {
 
     /// Create standard tool registry (parent conversations — legacy, will be removed)
     #[cfg(test)] // Only used in tests now; production uses mode-aware constructors
+    #[must_use]
     pub fn standard() -> Self {
         Self::new_with_options(false, Vec::new())
     }
@@ -950,7 +951,7 @@ mod tests {
     /// REQ-BASH-010: the bash tool's input schema must reach every registry
     /// that exposes bash, including sub-agent registries, with the `op`
     /// discriminator + per-op value fields. Anthropic's tool-use API
-    /// rejects top-level `oneOf` / `allOf` / `anyOf` in input_schema, so
+    /// rejects top-level `oneOf` / `allOf` / `anyOf` in `input_schema`, so
     /// per-operation field requirements are validated at runtime; the
     /// schema-level surface stays clean with `op` as the only required
     /// field.

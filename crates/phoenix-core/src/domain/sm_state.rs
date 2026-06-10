@@ -453,6 +453,9 @@ mod tests {
         // here it's an integer — deserialisation fails.
         let bad_payload = serde_json::json!({ "thoughts": 42 });
         let parsed = ToolInput::from_name_and_value("think", bad_payload.clone());
+        // reason: this assertion only cares about Malformed vs. everything else;
+        // enumerating all 10+ typed-tool variants would obscure intent.
+        #[allow(clippy::wildcard_enum_match_arm)]
         match parsed {
             ToolInput::Malformed { name, input, error } => {
                 assert_eq!(name, "think");
@@ -476,7 +479,7 @@ mod tests {
     }
 
     /// `ToolInput::Malformed` must round-trip through the persisted
-    /// `_tool`-tagged JSON used for ConvState serialisation, so a tool call
+    /// `_tool`-tagged JSON used for `ConvState` serialisation, so a tool call
     /// captured mid-execution can survive a server restart with its serde
     /// error attached for surfacing on resume.
     #[test]
@@ -555,6 +558,9 @@ mod tests {
     /// explicit decision about whether a mid-state model swap is safe
     /// for that variant (correct-by-construction guard).
     #[test]
+    // reason: exhaustive per-variant ConvState construction is inherently long;
+    // splitting it would scatter the correct-by-construction guard described above.
+    #[allow(clippy::too_many_lines)]
     fn allows_model_change_only_from_idle_and_error() {
         fn err() -> ConvState {
             ConvState::Error {
