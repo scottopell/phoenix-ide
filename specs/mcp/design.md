@@ -113,7 +113,10 @@ enum StaticCred {
 }
 
 // A pre-configured OAuth client for an authorization server that disables DCR.
-// When present it short-circuits the registration step (REQ-MCP-010).
+// It is registration *metadata*, not a credential: it seeds the
+// mcp_oauth_registrations row so a later 401 reuses it instead of attempting
+// DCR. It does NOT pre-authorize the server -- there is still no token until
+// the flow completes (REQ-MCP-010).
 struct PreconfiguredClient {
     auth_server: String,
     client_id: String,
@@ -129,7 +132,12 @@ struct PreconfiguredClient {
 server (`Static(Headers)`) whose rejected key yields `StaticAuthRejected`; an
 OAuth server that *also* needs a non-auth header (the header rides every request
 under `OAuth` while the 401 still drives the flow); and an OAuth server behind a
-DCR-less authorization server (`OAuth(Some(PreconfiguredClient))`). The reload
+DCR-less authorization server (`OAuth(Some(PreconfiguredClient))`). A config
+`OAuth` server is **not** materialized pre-authorized: unless a usable stored
+token exists, it starts with no credential (`auth_scheme = none` in
+`mcp.allium`) and the `PreconfiguredClient` only seeds the registration row, so
+the first 401 runs `OAuthRequired → discovering → OAuthClientReused` (skipping
+DCR) rather than being stuck classified as already-authorized. The reload
 reconciler compares configs with `PartialEq` to decide unchanged-vs-restart; the
 comparison extends to the HTTP variant so a changed URL, header set, or auth
 scheme triggers a restart (`reload_from_configs`, REQ-MCP-015).
