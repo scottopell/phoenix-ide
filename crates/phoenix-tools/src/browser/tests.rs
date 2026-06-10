@@ -111,7 +111,7 @@ const REACT_UMD: &str = include_str!("fixtures/react-18.3.1.production.min.js");
 const SCHEDULER_UMD: &str = include_str!("fixtures/scheduler-0.23.2.production.min.js");
 const REACT_DOM_PRODUCTION_UMD: &str = include_str!("fixtures/react-dom-18.3.1.production.min.js");
 const REACT_DOM_PROFILING_UMD: &str = include_str!("fixtures/react-dom-18.3.1.profiling.min.js");
-const REACT_TEST_APP_JS: &str = r#"
+const REACT_TEST_APP_JS: &str = r"
 window.__renders = 0;
 var e = React.createElement;
 function App() {
@@ -123,7 +123,7 @@ function App() {
     e('button', { id: 'inc', onClick: function () { set(function (x) { return x + 1; }); } }, 'n=' + n));
 }
 ReactDOM.createRoot(document.getElementById('root')).render(e(App));
-"#;
+";
 
 /// Build the React-profiling test page from the vendored UMD bundles, inlining
 /// the given react-dom build (production or profiling) in load order
