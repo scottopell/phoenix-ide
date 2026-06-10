@@ -202,6 +202,24 @@ rule ServerDiscoveredWithStoredToken {
         -- is loaded from the persisted token; refresh/step-up proceed normally.
 }
 
+-- A config OAuth entry carrying a pre-configured client (for a DCR-less
+-- authorization server) seeds its OAuthRegistration at discovery, so the later
+-- 401 -> registering finds has_registration(srv) = true and OAuthClientReused
+-- skips DCR instead of attempting (and failing) registration (REQ-MCP-010).
+-- Fires alongside ServerDiscovered; idempotent per authorization server.
+rule PreconfiguredClientSeeded {
+    when: ConfigServerDiscovered(name, transport, auth_scheme)
+
+    requires: has_preconfigured_client(name)
+
+    ensures: OAuthRegistration.created(
+        auth_server: preconfigured_auth_server(name),
+        client_id: preconfigured_client_id(name),
+        client_secret: preconfigured_client_secret(name),
+        token_endpoint_auth_method: preconfigured_auth_method(name)
+    )
+}
+
 -- A stdio server completes initialize + first tools/list and is ready.
 -- Covers both first connect and post-respawn reconnect.
 rule StdioConnected {
@@ -269,6 +287,12 @@ rule OAuthFlowFailed {
 
     ensures: srv.state = failed
     ensures: srv.last_error = error
+    ensures: PendingAuthorizationCancelled(srv)
+
+    @guidance
+        -- Cancelling the pending flow clears any surfaced authorization URL, so
+        -- PendingUrlOnlyWhileUnauthorized holds once the server is `failed` and
+        -- status/UI consumers do not see a stale authorize link for a dead flow.
 }
 
 ------------------------------------------------------------
@@ -454,6 +478,13 @@ rule TokenRefreshed {
     ensures: OAuthToken{server_name: srv.name}.refresh_token = refreshed_refresh_token(srv)
     ensures: OAuthToken{server_name: srv.name}.expires_at = refreshed_expiry(srv)
     ensures: srv.oauth_phase = authorized
+
+    @guidance
+        -- The request whose 401 triggered the refresh (a tools/call or
+        -- initialize) is replayed by the executor with the refreshed bearer
+        -- once authorized, so a normal token expiry never surfaces as a tool
+        -- failure (see deferred ReAuthCallRetry). The state machine models the
+        -- refresh; holding and replaying the specific request is executor-level.
 }
 
 -- Refresh failed: discard the stale token so it cannot be reused or
@@ -502,7 +533,7 @@ rule InsufficientScopeStepUp {
         -- restart. Discarding first keeps exactly one token per server when
         -- OAuthAuthorized re-creates it. The tools/call that triggered the
         -- step-up is held by the executor and replayed once the server returns
-        -- to ready (see deferred StepUpCallRetry), so the user/LLM does not
+        -- to ready (see deferred ReAuthCallRetry), so the user/LLM does not
         -- re-invoke it.
 }
 
@@ -560,24 +591,29 @@ rule ReloadAddsServerWithStoredToken {
     )
 }
 
--- Reload found a server's config changed: restart it (REQ-MCP-015). For HTTP,
--- drop the stale session id so the fresh initialize does not echo an old
--- Mcp-Session-Id to the new/restarted endpoint.
+-- Reload found a server's config changed: restart it (REQ-MCP-015), applying
+-- the reloaded auth scheme. For HTTP, drop the stale session id so the fresh
+-- initialize does not echo an old Mcp-Session-Id to the new/restarted endpoint.
 rule ReloadRestartsServer {
-    when: ReloadServerConfigChanged(srv)
+    when: ReloadServerConfigChanged(srv, new_auth_scheme)
 
     ensures: srv.state = reconnecting
+    ensures: srv.auth_scheme = new_auth_scheme
 
     @guidance
         -- reload_from_configs compares McpServerConfig with PartialEq across
         -- the Stdio/Http variants; a changed command/args/env or url/headers/
-        -- auth triggers terminate + reconnect.
+        -- auth triggers terminate + reconnect. new_auth_scheme is the reloaded
+        -- config's scheme (none for a config OAuth server, which re-derives via
+        -- 401, or static when reconfigured to a config credential), so a server
+        -- moved OAuth->static attaches its new static credential on reconnect
+        -- rather than re-entering OAuth.
 }
 
 -- Clear the HTTP session id on restart so the next initialize starts a fresh
 -- session rather than reusing a stale one (mirrors HttpSessionExpired).
 rule ReloadClearsHttpSession {
-    when: ReloadServerConfigChanged(srv)
+    when: ReloadServerConfigChanged(srv, new_auth_scheme)
 
     requires: srv.transport = http
 
@@ -587,12 +623,12 @@ rule ReloadClearsHttpSession {
 -- Reload invalidated an OAuth server's credential: either it was repointed
 -- (resource/authorization-server changed) or its config moved away from OAuth
 -- (to static/none) without changing the URL. Either way the stored token must
--- not survive -- discard it, cancel any pending flow, and reset auth_scheme to
--- none so the reconnect starts the right scheme from scratch and
--- TokenImpliesOAuthServer is not violated (REQ-MCP-011, REQ-MCP-012). Fires
--- alongside ReloadRestartsServer.
+-- not survive -- discard it and cancel any pending flow so
+-- TokenImpliesOAuthServer is not violated (REQ-MCP-011, REQ-MCP-012). The new
+-- auth_scheme is applied by ReloadRestartsServer; this rule does not set it.
+-- Fires alongside ReloadRestartsServer.
 rule ReloadInvalidatesOAuth {
-    when: ReloadServerConfigChanged(srv)
+    when: ReloadServerConfigChanged(srv, new_auth_scheme)
 
     requires: srv.transport = http
     requires: srv.auth_scheme = oauth
@@ -600,14 +636,14 @@ rule ReloadInvalidatesOAuth {
 
     ensures: not exists OAuthToken{server_name: srv.name}
     ensures: PendingAuthorizationCancelled(srv)
-    ensures: srv.auth_scheme = none
 
     @guidance
         -- oauth_invalidated_by_reload = resource_changed OR the new config no
-        -- longer selects OAuth. Resetting auth_scheme to none drops oauth_phase,
-        -- so the token deletion does not violate AuthorizedImpliesToken and the
-        -- next 401 re-enters OAuthRequired (fresh discovery) rather than
-        -- TokenRefreshNeeded. Cancelling the pending flow rotates the per-flow
+        -- longer selects OAuth. ReloadRestartsServer sets auth_scheme to
+        -- new_auth_scheme (none for a repointed OAuth server -> the next 401
+        -- re-enters OAuthRequired; static when reconfigured to a credential).
+        -- Deleting the token before that scheme change keeps AuthorizedImplies
+        -- Token satisfied. Cancelling the pending flow rotates the per-flow
         -- `state` nonce and drops the pending URL, so a callback from the
         -- pre-repoint flow no longer satisfies callback_state_matches.
 }
@@ -616,15 +652,15 @@ rule ReloadInvalidatesOAuth {
 -- no token persisted yet: the pending flow targets the old config and must be
 -- cancelled even though there is no token to discard, or a delayed callback
 -- from the old resource could satisfy the still-current flow (REQ-MCP-011).
+-- The new auth_scheme is applied by ReloadRestartsServer.
 rule ReloadCancelsPendingAuth {
-    when: ReloadServerConfigChanged(srv)
+    when: ReloadServerConfigChanged(srv, new_auth_scheme)
 
     requires: srv.transport = http
     requires: srv.auth_scheme = oauth
     requires: srv.oauth_phase = awaiting_user
 
     ensures: PendingAuthorizationCancelled(srv)
-    ensures: srv.auth_scheme = none
 }
 
 -- Reload visited a server whose config is unchanged but which is in the failed
@@ -650,9 +686,22 @@ rule ReloadRemovesServer {
     ensures: not exists srv
 
     @guidance
-        -- terminate() the connection; for HTTP also DELETE the session and
-        -- discard the persisted token. Leave the per-authorization-server
-        -- registration in place for servers that still share it.
+        -- terminate() the connection and discard the persisted token. Leave the
+        -- per-authorization-server registration in place for servers that still
+        -- share it. HTTP session teardown is the sibling rule below.
+}
+
+-- Removing a session-bearing HTTP server ends its remote session with a DELETE
+-- before the server is forgotten, so the common config-remove path does not
+-- leak the session until expiry (REQ-MCP-005). Mirrors the shutdown teardown;
+-- fires alongside ReloadRemovesServer.
+rule ReloadDeletesRemovedHttpSession {
+    when: ReloadRemovedServer(srv)
+
+    requires: srv.transport = http
+    requires: srv.session_id != null
+
+    ensures: SessionDeleted(srv)
 }
 
 -- Operator disables a server: stop offering its tools, keep the connection,
@@ -764,6 +813,18 @@ invariant OneTokenPerServer {
 --   table). Read at discovery/reload-add so a server disabled before a restart
 --   stays disabled (REQ-MCP-016).
 --
+-- has_preconfigured_client(name): Bool
+--   True iff `name`'s config is OAuth carrying a pre-configured client
+--   (HttpAuth::OAuth(Some(PreconfiguredClient))).
+--
+-- preconfigured_auth_server(name): String
+-- preconfigured_client_id(name): String
+-- preconfigured_client_secret(name): String?
+-- preconfigured_auth_method(name): String
+--   The pre-configured client fields from `name`'s config, seeded into an
+--   OAuthRegistration so a DCR-less authorization server is reused, not
+--   re-registered (REQ-MCP-010).
+--
 -- granted_scopes(srv, code): List<String>
 --   The scope set the authorization server granted in the token response for
 --   `code` (the `scope` parameter, defaulting to the requested scopes). Stored
@@ -862,15 +923,16 @@ deferred ToolCallCancellationSafety
     -- the granularity of the ConnState machine modeled here.
     -- Location: crates/phoenix-tools/src/mcp.rs (McpTool::run)
 
-deferred StepUpCallRetry
-    -- REQ-MCP-012. The replay of the original tools/call after a 403
-    -- insufficient_scope step-up is an executor continuation, not a
-    -- connection-lifecycle state: the in-flight call future awaits the
-    -- server's return to ready (re-authorized with the union scope) and then
-    -- re-issues the same request, so the LLM never sees the step-up. The
-    -- ConnState/OAuthPhase machine models the re-authorization; holding and
-    -- replaying the specific call belongs to the tool-execution path.
-    -- Location: crates/phoenix-tools/src/mcp.rs (McpTool::run / call_tool)
+deferred ReAuthCallRetry
+    -- REQ-MCP-012. Replaying the request whose 401/403 triggered a re-auth is
+    -- an executor continuation, not a connection-lifecycle state, and covers
+    -- both re-auth paths symmetrically: a 403 insufficient_scope step-up
+    -- (re-authorized with the union scope) and a 401 silent token refresh. In
+    -- both, the in-flight request future awaits the server's return to ready
+    -- and re-issues the same request, so the LLM never sees the interruption.
+    -- The ConnState/OAuthPhase machine models the re-authorization/refresh;
+    -- holding and replaying the specific call belongs to the tool-execution
+    -- path. Location: crates/phoenix-tools/src/mcp.rs (McpTool::run / call_tool)
 
 ------------------------------------------------------------
 -- Open Questions

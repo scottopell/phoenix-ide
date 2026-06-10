@@ -170,13 +170,20 @@ recovery trigger and mechanism differ from stdio and must not be conflated.
 
 ### REQ-MCP-008: Static Token / Header Authentication
 
-WHERE an HTTP server config supplies a bearer token or arbitrary request
-headers
-THE SYSTEM SHALL attach them to every request to that server.
+WHERE an HTTP server config supplies an explicit auth credential -- a bearer
+token or one or more designated auth headers (e.g. an API-key header)
+THE SYSTEM SHALL attach it to every request to that server, and treat a 401
+against it as a hard failure rather than entering the OAuth flow.
+
+Generic non-auth headers (an org id, a beta flag) are NOT an auth credential:
+they are attached under any scheme and SHALL NOT classify the server as static
+or preempt OAuth discovery.
 
 **Rationale:** Many internal and enterprise servers gate access with a static
 API key rather than OAuth. This auth scheme falls out of the transport's header
-plumbing and requires no interactive flow.
+plumbing and requires no interactive flow. Conflating a generic header with an
+auth credential would route an OAuth server that merely needs an org header down
+the static-rejected path instead of the OAuth flow.
 
 ---
 
@@ -268,12 +275,14 @@ database, bound to the MCP server's canonical resource URI
 AND attach the access token as an `Authorization: Bearer` header on **every**
 HTTP request to that server -- `initialize` and its retries, `tools/*`, the GET
 stream, and the session `DELETE`
-AND, on startup and on reload, load a stored, unexpired token for a server and
-attach it to the `initialize` handshake -- entering the connected state without
-an unauthenticated 401 round trip or a re-prompt -- **only when** its bound
-resource URI still matches the server's configured URI; a changed URL (or
-authorization server) discards the stored token instead of sending it to the
-new endpoint
+AND, on startup and on reload, load a stored token that is unexpired **or**
+still carries a refresh token, and resume the connection from it -- attaching an
+unexpired access token to the `initialize` handshake, or taking the silent
+refresh path on the first 401 when the access token has expired offline -- in
+neither case re-prompting the user, and **only when** its bound resource URI
+still matches the server's configured URI; a changed URL (or authorization
+server), or a fully dead token (expired with no refresh token), discards the
+stored token instead of sending it to the new endpoint
 AND, on expiry or a post-authorization 401, refresh using the refresh token,
 persisting any rotated refresh token the server returns
 AND, when refresh fails, discard the stored token and return the server to an
