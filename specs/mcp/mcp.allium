@@ -95,6 +95,9 @@ entity OAuthRegistration {
 entity OAuthToken {
     server_name: String
     resource: String
+    -- The scope set granted with this token. Persisted so a step-up after a
+    -- restart can request the union of prior and challenged scopes (REQ-MCP-012).
+    scopes: List<String>
     access_token: String
     refresh_token: String?
     expires_at: Timestamp
@@ -154,7 +157,7 @@ rule ServerDiscovered {
         transport: transport,
         state: connecting,
         auth_scheme: auth_scheme,
-        enabled: true
+        enabled: not is_disabled(name)
     )
 
     @guidance
@@ -185,7 +188,7 @@ rule ServerDiscoveredWithStoredToken {
         state: connecting,
         auth_scheme: oauth,
         oauth_phase: authorized,
-        enabled: true
+        enabled: not is_disabled(name)
     )
 
     @guidance
@@ -250,6 +253,19 @@ rule ConnectFailed {
     @guidance
         -- connect_one Err. The server stays in the status response with its
         -- error rather than vanishing; reload retries it (REQ-MCP-018).
+}
+
+-- A step in the OAuth flow failed: PRM/AS metadata fetch, client registration,
+-- PKCE-support check, or code/token exchange. The server is retained as failed
+-- with the cause rather than stranded mid-flow (REQ-MCP-018). Refresh failure
+-- is handled separately (TokenRefreshFailed re-prompts rather than failing).
+rule OAuthFlowFailed {
+    when: OAuthFlowFailed(srv, error)
+
+    requires: srv.oauth_phase in { discovering, registering, awaiting_user }
+
+    ensures: srv.state = failed
+    ensures: srv.last_error = error
 }
 
 ------------------------------------------------------------
@@ -389,6 +405,7 @@ rule OAuthAuthorized {
     ensures: OAuthToken.created(
         server_name: srv.name,
         resource: server_resource(srv),
+        scopes: granted_scopes(srv, code),
         access_token: exchanged_access_token(srv, code),
         refresh_token: exchanged_refresh_token(srv, code),
         expires_at: token_expiry(srv, code)
@@ -473,13 +490,13 @@ rule InsufficientScopeStepUp {
 
     @guidance
         -- 403 insufficient_scope + WWW-Authenticate carries the required
-        -- scope. Discard the narrow token, build an authorization URL
-        -- requesting the UNION of the previously granted scopes and the
-        -- challenged scope (authorization_url uses the union for a step-up), and
-        -- retry the call once re-authorized -- requesting only the new scope
-        -- would drop earlier grants on servers that issue exactly the requested
-        -- set, breaking other tools and bouncing through re-auth (REQ-MCP-012).
-        -- Discarding first keeps exactly one token per server when
+        -- scope. The authorization URL requests the UNION of the existing
+        -- token's persisted `scopes` and the challenged scope (read before the
+        -- token is discarded), so a step-up never drops earlier grants on
+        -- servers that issue exactly the requested set -- which would break
+        -- other tools and bounce through re-auth (REQ-MCP-012). Persisting
+        -- `scopes` on the token makes the prior set available even after a
+        -- restart. Discarding first keeps exactly one token per server when
         -- OAuthAuthorized re-creates it.
 }
 
@@ -501,20 +518,45 @@ rule ToolsListChanged {
         -- (REQ-MCP-006); for stdio, inline on stdout. REQ-MCP-014.
 }
 
--- Reload found a new server in config: bring it up.
+-- Reload found a new server in config with no usable stored token: bring it
+-- up from config. Honors the persisted disabled set. Disjoint from
+-- ReloadAddsServerWithStoredToken by needs_token_restore.
 rule ReloadAddsServer {
     when: ReloadAddedServer(name, transport, auth_scheme)
+
+    requires: not needs_token_restore(name, transport, auth_scheme)
 
     ensures: McpServer.created(
         name: name,
         transport: transport,
         state: connecting,
         auth_scheme: auth_scheme,
-        enabled: true
+        enabled: not is_disabled(name)
     )
 }
 
--- Reload found a server's config changed: restart it (REQ-MCP-015).
+-- Reload added an HTTP server that already has a stored, unexpired,
+-- resource-matched token: restore it OAuth-authorized, mirroring
+-- ServerDiscoveredWithStoredToken, so the first initialize is authenticated
+-- and the user is not re-prompted (REQ-MCP-012).
+rule ReloadAddsServerWithStoredToken {
+    when: ReloadAddedServer(name, transport, auth_scheme)
+
+    requires: needs_token_restore(name, transport, auth_scheme)
+
+    ensures: McpServer.created(
+        name: name,
+        transport: transport,
+        state: connecting,
+        auth_scheme: oauth,
+        oauth_phase: authorized,
+        enabled: not is_disabled(name)
+    )
+}
+
+-- Reload found a server's config changed: restart it (REQ-MCP-015). For HTTP,
+-- drop the stale session id so the fresh initialize does not echo an old
+-- Mcp-Session-Id to the new/restarted endpoint.
 rule ReloadRestartsServer {
     when: ReloadServerConfigChanged(srv)
 
@@ -526,28 +568,53 @@ rule ReloadRestartsServer {
         -- auth triggers terminate + reconnect.
 }
 
+-- Clear the HTTP session id on restart so the next initialize starts a fresh
+-- session rather than reusing a stale one (mirrors HttpSessionExpired).
+rule ReloadClearsHttpSession {
+    when: ReloadServerConfigChanged(srv)
+
+    requires: srv.transport = http
+
+    ensures: srv.session_id = null
+}
+
 -- Reload repointed an HTTP server (URL / authorization server changed): the
 -- stored token is bound to the old resource and must not be sent to the new
 -- endpoint, and any in-flight authorization is now for the wrong resource.
--- Discard the token AND cancel the pending flow so neither an old credential
--- nor a late callback lands on the new resource (REQ-MCP-011, REQ-MCP-012).
--- Fires alongside ReloadRestartsServer.
+-- Discard the token, cancel the pending flow, and reset the auth scheme to
+-- none so the reconnect rediscovers OAuth for the new resource from scratch
+-- (REQ-MCP-011, REQ-MCP-012). Fires alongside ReloadRestartsServer.
 rule ReloadDiscardsRepointedToken {
     when: ReloadServerConfigChanged(srv)
 
     requires: srv.transport = http
+    requires: srv.auth_scheme = oauth
     requires: resource_changed(srv)
 
     ensures: not exists OAuthToken{server_name: srv.name}
     ensures: PendingAuthorizationCancelled(srv)
+    ensures: srv.auth_scheme = none
 
     @guidance
-        -- Cancelling the pending flow rotates/invalidates the per-flow `state`
-        -- nonce and drops the pending authorization URL, so a callback from the
+        -- Resetting auth_scheme to none drops oauth_phase, so AuthorizedImplies
+        -- Token is not violated by the token deletion and the next 401 on the
+        -- new endpoint re-enters OAuthRequired (fresh discovery) rather than
+        -- TokenRefreshNeeded. Cancelling the pending flow rotates the per-flow
+        -- `state` nonce and drops the pending URL, so a callback from the
         -- pre-repoint flow no longer satisfies callback_state_matches and
-        -- cannot persist a token against the newly configured resource. The
-        -- subsequent reconnect re-authorizes against the new resource from
-        -- scratch.
+        -- cannot persist a token against the newly configured resource.
+}
+
+-- Reload visited a server whose config is unchanged but which is in the failed
+-- state: retry it (clearing the retained error on the subsequent successful
+-- connect). A healthy unchanged server is left untouched -- no rule fires
+-- (REQ-MCP-018).
+rule ReloadRetriesFailedServer {
+    when: ReloadServerUnchanged(srv)
+
+    requires: srv.state = failed
+
+    ensures: srv.state = connecting
 }
 
 -- Reload found a server gone from config: disconnect and forget it, including
@@ -643,6 +710,16 @@ invariant OneTokenPerServer {
 
 -- discovered_tools(srv): List<String>
 --   The tool names from the server's tools/list response (paginated).
+--
+-- is_disabled(name): Bool
+--   True iff `name` is in the persisted disabled set (the mcp_disabled_servers
+--   table). Read at discovery/reload-add so a server disabled before a restart
+--   stays disabled (REQ-MCP-016).
+--
+-- granted_scopes(srv, code): List<String>
+--   The scope set the authorization server granted in the token response for
+--   `code` (the `scope` parameter, defaulting to the requested scopes). Stored
+--   as OAuthToken.scopes.
 --
 -- session_id_from_init(srv): String?
 --   The Mcp-Session-Id header value on the initialize response, or null for a

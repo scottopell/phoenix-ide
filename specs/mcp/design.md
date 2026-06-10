@@ -24,7 +24,13 @@ is not. The design separates them with an `McpTransport` trait:
 
 ```rust
 trait McpTransport: Send + Sync {
-    async fn request(&self, method: &str, params: Value, timeout: Duration)
+    // `sink` receives any server-initiated JSON-RPC messages (requests or
+    // notifications) that arrive on the same channel before the matching
+    // response -- e.g. notifications/tools/list_changed or progress on a
+    // text/event-stream POST reply. The transport frames and forwards them;
+    // it does not interpret them. `request` returns only the correlated result.
+    async fn request(&self, method: &str, params: Value, timeout: Duration,
+                     sink: &dyn ServerMessageSink)
         -> Result<Value, TransportError>;
     async fn notify(&self, notification: &Value) -> Result<(), TransportError>;
     // Health / recovery is transport-specific (process exit vs connection drop).
@@ -50,6 +56,12 @@ the session id, and the resolved auth. `McpServer` becomes transport-agnostic:
 it owns a `Box<dyn McpTransport>`, the cached `Vec<McpToolDef>`, the
 `tools_changed` flag, and the per-server name -- the protocol methods
 (`initialize`, `list_tools`, `call_tool`) move to operate over the trait.
+
+The `ServerMessageSink` keeps protocol dispatch in the protocol layer: a
+`text/event-stream` POST reply may carry server-initiated requests/notifications
+ahead of the response, and the transport forwards them to the sink rather than
+swallowing them or growing its own `tools/list_changed` handling (REQ-MCP-002,
+REQ-MCP-004). The same sink backs the GET stream (REQ-MCP-006).
 
 ### Why a trait and not an enum
 
@@ -87,21 +99,40 @@ enum McpServerConfig {
 // headers (org id, beta flag, …) attached under ANY scheme; they do not imply
 // auth and must not preempt OAuth.
 enum HttpAuth {
-    None,                       // no credential; a 401 starts OAuth discovery
-    Static { token: String },   // an explicit bearer token from config
-    OAuth,                      // discovered on 401 (or pre-selected in config)
+    None,                  // no credential; a 401 starts OAuth discovery
+    Static(StaticCred),    // an explicit config credential (see below)
+    OAuth(Option<PreconfiguredClient>),  // OAuth; client may be pre-configured
+}
+
+// An explicit, config-supplied auth credential -- a 401 against it is a hard
+// StaticAuthRejected, never an OAuth flow. Covers both shapes Story 2 / REQ-
+// MCP-008 allow: a bearer token, or one/more named auth headers (API key).
+enum StaticCred {
+    Bearer(String),
+    Headers(HashMap<String, String>),  // auth headers, NOT the generic `headers`
+}
+
+// A pre-configured OAuth client for an authorization server that disables DCR.
+// When present it short-circuits the registration step (REQ-MCP-010).
+struct PreconfiguredClient {
+    auth_server: String,
+    client_id: String,
+    client_secret: Option<String>,
+    token_endpoint_auth_method: String,
 }
 ```
 
 `read_all_configs` classifies each `mcpServers` entry into a variant
-(REQ-MCP-001). Crucially, presence of `headers` alone does **not** make a
-server `Static`: only an explicit auth credential does. A server carrying both a
-required non-auth header and OAuth is representable -- the header rides every
-request while the 401 still drives the OAuth flow, rather than tripping
-`StaticAuthRejected`. The reload reconciler compares configs with `PartialEq` to
-decide unchanged-vs-restart; the comparison extends to the HTTP variant so a
-changed URL, header set, or auth scheme triggers a restart
-(`reload_from_configs`, REQ-MCP-015).
+(REQ-MCP-001). Crucially, presence of the generic `headers` map alone does
+**not** make a server `Static`: only an explicit auth credential
+(`StaticCred`) does. So three cases are distinct: a header-authed internal
+server (`Static(Headers)`) whose rejected key yields `StaticAuthRejected`; an
+OAuth server that *also* needs a non-auth header (the header rides every request
+under `OAuth` while the 401 still drives the flow); and an OAuth server behind a
+DCR-less authorization server (`OAuth(Some(PreconfiguredClient))`). The reload
+reconciler compares configs with `PartialEq` to decide unchanged-vs-restart; the
+comparison extends to the HTTP variant so a changed URL, header set, or auth
+scheme triggers a restart (`reload_from_configs`, REQ-MCP-015).
 
 The `Skipping HTTP transport` branch in `read_all_configs` is removed: HTTP
 entries become `Http` configs instead of being dropped.
@@ -177,10 +208,12 @@ table (`crates/phoenix-db/src/lib.rs`):
   `OAuthRegistration`). The secret/auth method are persisted alongside the id:
   a confidential client recovered after restart needs them to authenticate at
   the token endpoint for code exchange and refresh.
-- `mcp_oauth_tokens` -- `(server_name, resource_uri, access_token,
+- `mcp_oauth_tokens` -- `(server_name, resource_uri, scopes, access_token,
   refresh_token, expires_at)`, looked up by MCP server name but carrying the
   canonical `resource_uri` the token is audience-bound to (`OAuthToken`). The
-  client id is **not** duplicated here; it lives in the registration table.
+  granted `scopes` are persisted so a post-restart `insufficient_scope` step-up
+  can request the union of prior and challenged scopes. The client id is **not**
+  duplicated here; it lives in the registration table.
 
 Tokens are stored in plaintext, consistent with how the database already holds
 operator state; the database file's on-disk protection is the trust boundary,
