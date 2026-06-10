@@ -106,8 +106,8 @@ const makeQa = (
   answer: `A ${id}`,
   model: 'sonnet-test',
   status: 'completed',
-  snapshot_member_count: 2,
-  snapshot_total_messages: 20,
+  chain_members_at_answer: 2,
+  chain_messages_at_answer: 20,
   created_at: '2026-04-28T10:00:00Z',
   completed_at: '2026-04-28T10:00:30Z',
   ...overrides,
@@ -235,8 +235,8 @@ describe('ChainPage — submit + stream', () => {
           question: 'What did we land?',
           answer: 'we landed X then Y',
           status: 'completed',
-          snapshot_member_count: 3,
-          snapshot_total_messages: 36,
+          chain_members_at_answer: 3,
+          chain_messages_at_answer: 36,
           created_at: '2026-04-29T13:00:00Z',
         }),
       ],
@@ -595,8 +595,8 @@ describe('ChainPage — snapshot staleness (REQ-CHN-005)', () => {
       makeChain({
         qa_history: [
           makeQa('q-stale', {
-            snapshot_member_count: 2,
-            snapshot_total_messages: 20,
+            chain_members_at_answer: 2,
+            chain_messages_at_answer: 20,
           }),
         ],
         // current state advanced
@@ -620,8 +620,8 @@ describe('ChainPage — snapshot staleness (REQ-CHN-005)', () => {
       makeChain({
         qa_history: [
           makeQa('q-msg-stale', {
-            snapshot_member_count: 3, // matches current
-            snapshot_total_messages: 18,
+            chain_members_at_answer: 3, // matches current
+            chain_messages_at_answer: 18,
           }),
         ],
         current_member_count: 3,
@@ -643,8 +643,8 @@ describe('ChainPage — snapshot staleness (REQ-CHN-005)', () => {
       makeChain({
         qa_history: [
           makeQa('q-fresh', {
-            snapshot_member_count: 3,
-            snapshot_total_messages: 36,
+            chain_members_at_answer: 3,
+            chain_messages_at_answer: 36,
           }),
         ],
         current_member_count: 3,

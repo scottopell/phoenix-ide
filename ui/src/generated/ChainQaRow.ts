@@ -4,4 +4,4 @@ import type { ChainQaStatus } from "./ChainQaStatus";
 /**
  * Persisted `chain_qa` row (REQ-CHN-005).
  */
-export type ChainQaRow = { id: string, root_conv_id: string, question: string, answer: string | null, model: string, status: ChainQaStatus, snapshot_member_count: number, snapshot_total_messages: number, created_at: string, completed_at: string | null, };
+export type ChainQaRow = { id: string, root_conv_id: string, question: string, answer: string | null, model: string, status: ChainQaStatus, chain_members_at_answer: number, chain_messages_at_answer: number, created_at: string, completed_at: string | null, };

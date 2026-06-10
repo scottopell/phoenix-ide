@@ -273,8 +273,8 @@ impl ChainQa {
                 root_conv_id: root_id.to_string(),
                 question: question.to_string(),
                 model: model_id.clone(),
-                snapshot_member_count: snapshot.member_count,
-                snapshot_total_messages: snapshot.total_messages,
+                chain_members_at_answer: snapshot.member_count,
+                chain_messages_at_answer: snapshot.total_messages,
                 created_at,
             })
             .await?;

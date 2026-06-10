@@ -157,7 +157,7 @@ async fn submit_question_persists_and_completes() {
     assert_eq!(row.status, ChainQaStatus::Completed);
     assert_eq!(row.question, "what happened in this chain?");
     assert_eq!(row.answer.as_deref(), Some("THE ANSWER"));
-    assert_eq!(row.snapshot_member_count, 3);
+    assert_eq!(row.chain_members_at_answer, 3);
     assert!(row.completed_at.is_some());
     assert_eq!(row.model, "claude-sonnet-4-6");
     assert_eq!(

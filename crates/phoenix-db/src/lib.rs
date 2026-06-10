@@ -2027,7 +2027,7 @@ impl Database {
         sqlx::query(
             "INSERT INTO chain_qa (
                 id, root_conv_id, question, answer, model, status,
-                snapshot_member_count, snapshot_total_messages,
+                chain_members_at_answer, chain_messages_at_answer,
                 created_at, completed_at
             ) VALUES (?1, ?2, ?3, NULL, ?4, ?5, ?6, ?7, ?8, NULL)",
         )
@@ -2036,8 +2036,8 @@ impl Database {
         .bind(&row.question)
         .bind(&row.model)
         .bind(ChainQaStatus::InFlight.as_str())
-        .bind(row.snapshot_member_count)
-        .bind(row.snapshot_total_messages)
+        .bind(row.chain_members_at_answer)
+        .bind(row.chain_messages_at_answer)
         .bind(row.created_at.to_rfc3339())
         .execute(&self.pool)
         .await?;
@@ -2060,21 +2060,21 @@ impl Database {
         &self,
         id: &str,
         answer: &str,
-        snapshot_member_count: i64,
-        snapshot_total_messages: i64,
+        chain_members_at_answer: i64,
+        chain_messages_at_answer: i64,
         completed_at: DateTime<Utc>,
     ) -> DbResult<()> {
         let result = sqlx::query(
             "UPDATE chain_qa
              SET answer = ?1, status = ?2, completed_at = ?3,
-                 snapshot_member_count = ?4, snapshot_total_messages = ?5
+                 chain_members_at_answer = ?4, chain_messages_at_answer = ?5
              WHERE id = ?6",
         )
         .bind(answer)
         .bind(ChainQaStatus::Completed.as_str())
         .bind(completed_at.to_rfc3339())
-        .bind(snapshot_member_count)
-        .bind(snapshot_total_messages)
+        .bind(chain_members_at_answer)
+        .bind(chain_messages_at_answer)
         .bind(id)
         .execute(&self.pool)
         .await?;
@@ -2113,7 +2113,7 @@ impl Database {
     pub async fn list_chain_qa(&self, root_conv_id: &str) -> DbResult<Vec<ChainQaRow>> {
         let rows = sqlx::query(
             "SELECT id, root_conv_id, question, answer, model, status,
-                    snapshot_member_count, snapshot_total_messages,
+                    chain_members_at_answer, chain_messages_at_answer,
                     created_at, completed_at
              FROM chain_qa
              WHERE root_conv_id = ?1
@@ -3296,8 +3296,8 @@ fn parse_chain_qa_row(row: SqliteRow) -> Result<ChainQaRow, sqlx::Error> {
         answer: row.try_get("answer")?,
         model: row.try_get("model")?,
         status,
-        snapshot_member_count: row.try_get("snapshot_member_count")?,
-        snapshot_total_messages: row.try_get("snapshot_total_messages")?,
+        chain_members_at_answer: row.try_get("chain_members_at_answer")?,
+        chain_messages_at_answer: row.try_get("chain_messages_at_answer")?,
         created_at: parse_datetime(&row.try_get::<String, _>("created_at")?),
         completed_at: completed_at.as_deref().map(parse_datetime),
     })
@@ -4926,8 +4926,8 @@ mod tests {
             root_conv_id: root.to_string(),
             question: "what happened in this chain?".to_string(),
             model: "claude-sonnet-4-6".to_string(),
-            snapshot_member_count: 3,
-            snapshot_total_messages: 17,
+            chain_members_at_answer: 3,
+            chain_messages_at_answer: 17,
             created_at: Utc::now(),
         }
     }
@@ -4950,8 +4950,8 @@ mod tests {
         assert_eq!(row.answer, None);
         assert_eq!(row.model, "claude-sonnet-4-6");
         assert_eq!(row.status, ChainQaStatus::InFlight);
-        assert_eq!(row.snapshot_member_count, 3);
-        assert_eq!(row.snapshot_total_messages, 17);
+        assert_eq!(row.chain_members_at_answer, 3);
+        assert_eq!(row.chain_messages_at_answer, 17);
         assert!(row.completed_at.is_none());
     }
 
@@ -4976,8 +4976,8 @@ mod tests {
         assert_eq!(row.status, ChainQaStatus::Completed);
         assert_eq!(row.answer.as_deref(), Some("the final answer"));
         assert!(row.completed_at.is_some());
-        assert_eq!(row.snapshot_member_count, 4);
-        assert_eq!(row.snapshot_total_messages, 21);
+        assert_eq!(row.chain_members_at_answer, 4);
+        assert_eq!(row.chain_messages_at_answer, 21);
     }
 
     /// REQ-CHN-005: `fail_chain_qa` preserves the question and an optional partial.

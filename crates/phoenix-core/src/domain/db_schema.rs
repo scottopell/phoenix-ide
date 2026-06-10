@@ -1430,8 +1430,8 @@ pub struct NewChainQa {
     pub root_conv_id: String,
     pub question: String,
     pub model: String,
-    pub snapshot_member_count: i64,
-    pub snapshot_total_messages: i64,
+    pub chain_members_at_answer: i64,
+    pub chain_messages_at_answer: i64,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1446,8 +1446,8 @@ pub struct ChainQaRow {
     pub answer: Option<String>,
     pub model: String,
     pub status: ChainQaStatus,
-    pub snapshot_member_count: i64,
-    pub snapshot_total_messages: i64,
+    pub chain_members_at_answer: i64,
+    pub chain_messages_at_answer: i64,
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
 }

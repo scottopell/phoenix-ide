@@ -1065,20 +1065,20 @@ function renderPersistedAnswer(
  *  snapshot matches current chain state. */
 function stalenessLabel(row: ChainQaRow, chain: ChainView): string | null {
   const memberDelta =
-    row.snapshot_member_count !== chain.current_member_count;
+    row.chain_members_at_answer !== chain.current_member_count;
   const messageDelta =
-    row.snapshot_total_messages !== chain.current_total_messages;
+    row.chain_messages_at_answer !== chain.current_total_messages;
   if (!memberDelta && !messageDelta) return null;
 
   if (memberDelta) {
     // Member count change is the more visible signal; phrase it that way and
     // collapse the message-count change into the same sentence.
-    return `answered when chain had ${row.snapshot_member_count} ${
-      row.snapshot_member_count === 1 ? 'conversation' : 'conversations'
+    return `answered when chain had ${row.chain_members_at_answer} ${
+      row.chain_members_at_answer === 1 ? 'conversation' : 'conversations'
     } (now ${chain.current_member_count})`;
   }
   // member count same, message count moved
-  return `answered with ${row.snapshot_total_messages} prior ${
-    row.snapshot_total_messages === 1 ? 'message' : 'messages'
+  return `answered with ${row.chain_messages_at_answer} prior ${
+    row.chain_messages_at_answer === 1 ? 'message' : 'messages'
   } (now ${chain.current_total_messages})`;
 }

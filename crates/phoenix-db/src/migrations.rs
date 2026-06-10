@@ -104,6 +104,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "create_message_fts",
         sql: MIGRATION_018,
     },
+    Migration {
+        version: 19,
+        name: "rename_chain_qa_snapshot_columns",
+        sql: MIGRATION_019,
+    },
 ];
 
 /// Rewrite the "Standalone" serde discriminator to "Direct" in `conv_mode` JSON,
@@ -460,6 +465,19 @@ CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
 );
 ";
 
+/// Rename the `chain_qa` chain-size markers to age-of-answer names.
+///
+/// The columns record the chain's size *at answer time* so the UI can show an
+/// age-of-answer freshness tag (`specs/chains/` REQ-CHN-005). The original
+/// `snapshot_*` names implied the answer was computed against a frozen snapshot,
+/// which contradicts the read-only agentic loop's live-content contract
+/// (REQ-CHN-009): there is no during-answer snapshot. The names now match what
+/// the integers mean.
+const MIGRATION_019: &str = r"
+ALTER TABLE chain_qa RENAME COLUMN snapshot_member_count TO chain_members_at_answer;
+ALTER TABLE chain_qa RENAME COLUMN snapshot_total_messages TO chain_messages_at_answer;
+";
+
 /// Run all pending migrations against the database.
 ///
 /// Returns the number of migrations applied.
@@ -579,7 +597,7 @@ mod tests {
         setup_conversations_table(&pool).await;
 
         let first = run_pending_migrations(&pool).await.unwrap();
-        assert_eq!(first, 18);
+        assert_eq!(first, 19);
 
         let second = run_pending_migrations(&pool).await.unwrap();
         assert_eq!(second, 0);
@@ -826,8 +844,10 @@ mod tests {
             "answer",
             "model",
             "status",
-            "snapshot_member_count",
-            "snapshot_total_messages",
+            // Renamed from snapshot_* by migration 019 (run_pending_migrations
+            // applies every migration, so the final column set is post-rename).
+            "chain_members_at_answer",
+            "chain_messages_at_answer",
             "created_at",
             "completed_at",
         ] {
@@ -849,6 +869,56 @@ mod tests {
             indexes.iter().any(|n| n == "idx_chain_qa_root"),
             "Expected idx_chain_qa_root index, got: {indexes:?}"
         );
+    }
+
+    /// Migration 019 renames the `chain_qa` chain-size markers from `snapshot_*`
+    /// to `*_at_answer` while preserving each row's recorded values.
+    #[tokio::test]
+    async fn migration_019_renames_chain_qa_snapshot_columns_preserving_data() {
+        let pool = test_pool().await;
+        setup_conversations_table(&pool).await;
+
+        sqlx::query(
+            "INSERT INTO conversations (id, conv_mode, state, cwd, user_initiated, state_updated_at, created_at, updated_at) \
+             VALUES ('root', '{\"mode\":\"Explore\"}', '{\"type\":\"idle\"}', '/tmp', 1, '2025-01-01', '2025-01-01', '2025-01-01')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        run_pending_migrations(&pool).await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO chain_qa (id, root_conv_id, question, model, status, \
+             chain_members_at_answer, chain_messages_at_answer, created_at) \
+             VALUES ('qa1', 'root', 'q?', 'm', 'completed', 3, 17, '2025-01-02')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let columns: Vec<String> = sqlx::query("PRAGMA table_info(chain_qa)")
+            .fetch_all(&pool)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect();
+        assert!(
+            !columns
+                .iter()
+                .any(|c| c == "snapshot_member_count" || c == "snapshot_total_messages"),
+            "Old snapshot_* columns should be gone after migration 019, got: {columns:?}"
+        );
+
+        let row = sqlx::query(
+            "SELECT chain_members_at_answer, chain_messages_at_answer FROM chain_qa WHERE id = 'qa1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(row.get::<i64, _>("chain_members_at_answer"), 3);
+        assert_eq!(row.get::<i64, _>("chain_messages_at_answer"), 17);
     }
 
     /// Migration 006: a chain with mixed `archived` state has every member

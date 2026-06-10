@@ -60,11 +60,7 @@ mid-tier model balanced for cost and accuracy.
 shipped, the latter built on the new `specs/conversation-retrieval/` primitive
 exposed to the Q&A agent as scope-bound tools. REQ-CHN-008 (work-identity facet
 on the work-scope dock) remains planned — it builds on `specs/work-scope-ui/`
-(the chain dock + `work_scope_key`) and is tracked, together with the `chain_qa`
-snapshot→freshness column rename, as task 58020. The freshness markers ship as
-the `snapshot_member_count` / `snapshot_total_messages` columns; `design.md`
-documents them under their post-rename names (`chain_members_at_answer` /
-`chain_messages_at_answer`), which task 58020 reconciles.
+(the chain dock + `work_scope_key`) and is tracked as task 58020.
 
 The "out of scope" list below remains accurate — the deferred Allium spec for the Q&A lifecycle is recommended now that the actual transitions are observable in production.
 
