@@ -23,7 +23,13 @@ static/dist/
 .phoenix-ide.env
 
 # Tools
-.claude/
+# Ignore local Claude state, but track the committed Claude Code on the web
+# setup hook + its registration so web sessions start with a warm toolchain.
+.claude/*
+!.claude/settings.json
+!.claude/hooks/
+.claude/hooks/*
+!.claude/hooks/session-start.sh
 .playwright-mcp/
 .phoenix/
 dogfood-output
