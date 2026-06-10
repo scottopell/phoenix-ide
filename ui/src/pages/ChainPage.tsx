@@ -527,7 +527,10 @@ function ChainWorkScopeDock({
   if (!scopeKey) return null;
   return (
     <div className="chain-work-dock">
-      <ChainWorkIdentityBlock identity={workIdentity} />
+      {/* The identity facet only shows when the dock is expanded — a collapsed
+          dock is a narrow rail with no room for it (and the runtime panel below
+          flexes into the remaining height). */}
+      {!collapsed && <ChainWorkIdentityBlock identity={workIdentity} />}
       <WorkScopePanel
         scopeKey={scopeKey}
         collapsed={collapsed}

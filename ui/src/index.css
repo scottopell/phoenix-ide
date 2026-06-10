@@ -10304,15 +10304,25 @@ html * {
 }
 
 /* Right-adjacent work dock: the work-identity facet (REQ-CHN-008) stacked
-   above the runtime-resource panel. */
+   above the runtime-resource panel. The identity block takes its natural
+   height; the panel flexes into the rest — without this the panel's own
+   `height: 100%` would stack on top of the identity block and overflow the
+   column, clipping lower resource rows. */
 .chain-work-dock {
   display: flex;
   flex-direction: column;
   min-height: 0;
 }
 
+.chain-work-dock > .ws-panel {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+}
+
 .chain-work-identity {
   display: flex;
+  flex: 0 0 auto;
   flex-direction: column;
   gap: 6px;
   padding: 10px 12px;
