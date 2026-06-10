@@ -126,6 +126,7 @@ const makeChain = (overrides: Partial<ChainView> = {}): ChainView => ({
   qa_history: [],
   current_member_count: 3,
   current_total_messages: 36,
+  work_identity: null,
   ...overrides,
 });
 

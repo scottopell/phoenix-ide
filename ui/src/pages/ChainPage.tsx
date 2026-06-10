@@ -39,12 +39,14 @@ import {
   api,
   subscribeToChainStream,
   type ChainView,
+  type ChainWorkIdentity,
   type ChainQaRow,
   type ChainMemberSummary,
   type ChainSseEventData,
 } from '../api';
 import { ChainDeleteConfirm } from '../components/ChainDeleteConfirm';
 import { WorkScopePanel } from '../components/WorkScopePanel';
+import { ChainWorkIdentityBlock } from '../components/ChainWorkIdentityBlock';
 import { useChainAtom, type InflightQa } from '../chain';
 import { useScopedState, useResizablePane } from '../hooks';
 
@@ -449,7 +451,10 @@ export function ChainPage() {
         {/* REQ-WSUI-009: the same work-scope panel as the conversation page,
             querying the ONE scope key for the chain root. No live SSE channel
             here — the panel's own initial fetch is the data source. */}
-        <ChainWorkScopeDock rootConvId={chain.root_conv_id} />
+        <ChainWorkScopeDock
+          rootConvId={chain.root_conv_id}
+          workIdentity={chain.work_identity}
+        />
       </div>
       <ChainDeleteConfirm
         visible={deleteConfirmOpen}
@@ -486,7 +491,13 @@ export function ChainPage() {
  * the chain page, so the panel's own initial fetch is the data source;
  * `liveInventory` is intentionally omitted.
  */
-function ChainWorkScopeDock({ rootConvId }: { rootConvId: string }) {
+function ChainWorkScopeDock({
+  rootConvId,
+  workIdentity,
+}: {
+  rootConvId: string;
+  workIdentity: ChainWorkIdentity | null;
+}) {
   const [scopeKey, setScopeKey] = useState<string | null>(null);
   const [collapsed, setCollapsed] = useState(true);
   const pane = useResizablePane({
@@ -515,12 +526,15 @@ function ChainWorkScopeDock({ rootConvId }: { rootConvId: string }) {
 
   if (!scopeKey) return null;
   return (
-    <WorkScopePanel
-      scopeKey={scopeKey}
-      collapsed={collapsed}
-      onToggle={() => setCollapsed((c) => !c)}
-      width={collapsed ? undefined : pane.size}
-    />
+    <div className="chain-work-dock">
+      <ChainWorkIdentityBlock identity={workIdentity} />
+      <WorkScopePanel
+        scopeKey={scopeKey}
+        collapsed={collapsed}
+        onToggle={() => setCollapsed((c) => !c)}
+        width={collapsed ? undefined : pane.size}
+      />
+    </div>
   );
 }
 

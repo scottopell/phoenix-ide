@@ -74,6 +74,40 @@ pub struct ChainView {
     pub qa_history: Vec<ChainQaRow>,
     pub current_member_count: i64,
     pub current_total_messages: i64,
+    /// The chain's work identity — worktree / branch / base / task — or `None`
+    /// when the chain has no managed work scope (REQ-CHN-008). PR health is not
+    /// carried here; the dock fetches it client-side off `work_conv_id` via the
+    /// per-conversation PR-status pipeline (see [`ChainWorkIdentity`]).
+    pub work_identity: Option<ChainWorkIdentity>,
+}
+
+/// Work-identity facet for the chain page's work-scope dock (REQ-CHN-008).
+///
+/// The durable "what unit of work is this" half of the dock: worktree, branch,
+/// base branch, and — for Managed (Work-mode) work — the task. Sourced from the
+/// chain's worktree-owning member's `ConvMode` git metadata; a chain's members
+/// share one work scope (`specs/projects/` REQ-PROJ-025), so a single member is
+/// authoritative.
+///
+/// PR health (`display_state` / checks / feedback-freshness) is deliberately
+/// absent: it rides the per-conversation PR-status pipeline that drives the
+/// `StateBar` (`specs/projects/` REQ-PROJ-011/030/031), fetched client-side keyed
+/// by `work_conv_id`, because that data is externally polled (a `gh` shell-out)
+/// and must not block chain page load. Keeping it out also honors REQ-CHN-008's
+/// rule that this facet adds no field to `WorkScopeInventory`.
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export, export_to = "../../../ui/src/generated/")]
+pub struct ChainWorkIdentity {
+    /// The worktree-owning member whose git metadata this is — and the
+    /// conversation the UI keys PR-status off.
+    pub work_conv_id: String,
+    pub worktree_path: String,
+    pub branch_name: String,
+    pub base_branch: String,
+    /// Task id + title when the chain is doing Managed (Work-mode) work; both
+    /// absent for a plain Branch worktree, which carries no task.
+    pub task_id: Option<String>,
+    pub task_title: Option<String>,
 }
 
 /// Per-member summary on the chain page (REQ-CHN-003).
@@ -435,6 +469,7 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
 
     let summaries = build_member_summaries(&members);
     let display_name = resolve_display_name(&root_conv);
+    let work_identity = resolve_work_identity(&members);
 
     Ok(ChainView {
         root_conv_id: root_conv.id.clone(),
@@ -445,6 +480,32 @@ async fn build_chain_view(state: &AppState, root_id: &str) -> Result<ChainView, 
         qa_history,
         current_member_count,
         current_total_messages,
+        work_identity,
+    })
+}
+
+/// Resolve the chain's work identity from its worktree-owning member
+/// (REQ-CHN-008).
+///
+/// A chain's members share one work scope (`specs/projects/` REQ-PROJ-025), so
+/// the latest member that owns a branch worktree is authoritative. Work and
+/// Branch modes both carry `branch_name`; managed Explore has a worktree but no
+/// branch identity, and Direct has neither, so neither qualifies. Returns `None`
+/// when no member owns a branch worktree (e.g. a chain of Direct conversations)
+/// — the dock then indicates "no managed work scope" rather than empty fields.
+fn resolve_work_identity(members: &[Conversation]) -> Option<ChainWorkIdentity> {
+    let work_member = members
+        .iter()
+        .rev()
+        .find(|c| c.conv_mode.branch_name().is_some())?;
+    let mode = &work_member.conv_mode;
+    Some(ChainWorkIdentity {
+        work_conv_id: work_member.id.clone(),
+        worktree_path: mode.worktree_path()?.to_string(),
+        branch_name: mode.branch_name()?.to_string(),
+        base_branch: mode.base_branch()?.to_string(),
+        task_id: mode.task_id().map(str::to_string),
+        task_title: mode.task_title().map(str::to_string),
     })
 }
 
@@ -607,6 +668,7 @@ mod tests {
         let current_total_messages: i64 = members.iter().map(|c| c.message_count).sum();
         let summaries = build_member_summaries(&members);
         let display_name = resolve_display_name(&root_conv);
+        let work_identity = resolve_work_identity(&members);
         Ok(ChainView {
             root_conv_id: root_conv.id.clone(),
             chain_name: root_conv.chain_name.clone(),
@@ -616,6 +678,7 @@ mod tests {
             qa_history,
             current_member_count,
             current_total_messages,
+            work_identity,
         })
     }
 
@@ -681,6 +744,60 @@ mod tests {
         assert_eq!(view.current_member_count, 3);
         assert_eq!(view.current_total_messages, 3);
         assert!(view.qa_history.is_empty());
+    }
+
+    /// REQ-CHN-008: the work identity is resolved from the chain's
+    /// worktree-owning (Work-mode) member — worktree / branch / base / task,
+    /// keyed by that member's id so the dock can fetch its PR health.
+    #[tokio::test]
+    async fn build_view_resolves_work_identity_from_work_member() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["wi-a", "wi-b"]).await;
+        add_continuation_summary(&db, "wi-a", "approved").await;
+        // The continuation member owns the worktree (managed Explore approved
+        // into a fresh Work conversation).
+        sqlx::query("UPDATE conversations SET conv_mode = ?1 WHERE id = ?2")
+            .bind(
+                r#"{"mode":"Work","branch_name":"feat-x","worktree_path":"/tmp/wt-x","base_branch":"main","task_id":"42","task_title":"Build the thing"}"#,
+            )
+            .bind("wi-b")
+            .execute(db.pool())
+            .await
+            .unwrap();
+
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+        );
+        let view = build_view_for_test(&db, &chain_qa, "wi-a").await.unwrap();
+
+        let wi = view.work_identity.expect("work identity present");
+        assert_eq!(wi.work_conv_id, "wi-b");
+        assert_eq!(wi.branch_name, "feat-x");
+        assert_eq!(wi.base_branch, "main");
+        assert_eq!(wi.worktree_path, "/tmp/wt-x");
+        assert_eq!(wi.task_id.as_deref(), Some("42"));
+        assert_eq!(wi.task_title.as_deref(), Some("Build the thing"));
+    }
+
+    /// REQ-CHN-008: a chain whose members own no branch worktree (e.g. all
+    /// Direct/Explore) has no managed work scope — the facet is absent rather
+    /// than a set of empty worktree/branch/PR fields.
+    #[tokio::test]
+    async fn build_view_omits_work_identity_without_managed_scope() {
+        let db = Database::open_in_memory().await.unwrap();
+        build_linear_chain(&db, &["wd-a", "wd-b"]).await;
+        add_continuation_summary(&db, "wd-a", "first").await;
+
+        let chain_qa = crate::chain_qa::ChainQa::new(
+            db.clone(),
+            registry_with_test_llm(),
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone())),
+        );
+        let view = build_view_for_test(&db, &chain_qa, "wd-a").await.unwrap();
+
+        assert!(view.work_identity.is_none());
     }
 
     #[tokio::test]

@@ -41,6 +41,7 @@ import {
   type ChainQaFailedData,
 } from './sseSchemas';
 export type { ChainView } from './generated/ChainView';
+export type { ChainWorkIdentity } from './generated/ChainWorkIdentity';
 export type { ChainMemberSummary } from './generated/ChainMemberSummary';
 export type { ChainPosition } from './generated/ChainPosition';
 export type { ChainQaRow } from './generated/ChainQaRow';

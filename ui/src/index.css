@@ -10303,6 +10303,96 @@ html * {
   min-height: 0;
 }
 
+/* Right-adjacent work dock: the work-identity facet (REQ-CHN-008) stacked
+   above the runtime-resource panel. */
+.chain-work-dock {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.chain-work-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border-left: 1px solid var(--border-color);
+  border-bottom: 1px solid var(--border-color);
+  background: var(--bg-primary);
+  font-size: 12px;
+}
+
+.chain-work-identity-title {
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+}
+
+.chain-work-identity--empty .chain-work-identity-empty {
+  color: var(--text-muted);
+  font-style: italic;
+}
+
+.chain-work-identity-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin: 0;
+}
+
+.chain-work-identity-field {
+  display: grid;
+  grid-template-columns: 56px 1fr;
+  gap: 6px;
+  align-items: baseline;
+}
+
+.chain-work-identity-field dt {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.chain-work-identity-field dd {
+  margin: 0;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-secondary);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.chain-work-identity-arrow {
+  color: var(--text-muted);
+}
+
+.chain-work-identity-task-id {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted);
+}
+
+.chain-work-identity-path {
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+
+.chain-work-identity-pr {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.chain-work-identity-pr-freshness {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--accent-yellow, #eab308);
+}
+
+.chain-work-identity-muted {
+  color: var(--text-muted);
+}
+
 /* Two-column body — members on the left, Q&A on the right. */
 .chain-page-body {
   display: grid;

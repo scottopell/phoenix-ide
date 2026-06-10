@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { api, type PrStatusResponse } from '../api';
 import type { ConversationPrStatusHandle } from '../hooks/useConversationPrStatus';
 import { useViewerSlot } from '../contexts/ViewerSlotContext';
+import { prFeedbackFreshnessLabel } from './prBadge';
 
 interface WorkControlBarProps {
   conversationId: string;
@@ -109,17 +110,6 @@ function WorkViewerActions() {
 
 function prRefreshUnavailableText(prStatus: PrStatusResponse): string {
   return `Resolve PR refresh issue before auto-fix: refresh unavailable (${prStatus.refresh.reason ?? 'unknown'})`;
-}
-
-function prFeedbackFreshnessLabel(prStatus: PrStatusResponse): string | null {
-  const freshness = prStatus.feedback_freshness;
-  if (!freshness) return null;
-  if (freshness.state === 'new') {
-    return typeof freshness.new_count === 'number' && freshness.new_count > 0
-      ? `${freshness.new_count} new`
-      : 'new comments';
-  }
-  return 'updated';
 }
 
 function PrRemediationActions({

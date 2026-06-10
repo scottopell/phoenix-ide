@@ -8,6 +8,7 @@ import type { ConnectionState } from '../hooks';
 import { useIsMobile } from '../hooks';
 import { getStateDescription, isAgentWorking } from '../utils';
 import { ContextIndicator } from './ContextIndicator';
+import { prBadgeClass, prBadgeLabel, prRefreshStaleText, prTooltip } from './prBadge';
 
 const CheckIcon = () => (
   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
@@ -142,49 +143,6 @@ function getProjectName(conversation: Conversation): string | null {
 
   const parts = cwd.replace(/\/$/, '').split('/');
   return parts[parts.length - 1] || null;
-}
-
-function prBadgeClass(pr: PrStatusResponse): string {
-  if (pr.display_state === 'merged') return 'pr-badge pr-badge--merged';
-  if (pr.display_state === 'closed') return 'pr-badge pr-badge--failing';
-  if (pr.display_state === 'draft') return 'pr-badge pr-badge--pending';
-  switch (pr.check_state) {
-    case 'passing': return 'pr-badge pr-badge--passing';
-    case 'failing': return 'pr-badge pr-badge--failing';
-    case 'pending': return 'pr-badge pr-badge--pending';
-    default: return 'pr-badge pr-badge--unknown';
-  }
-}
-
-function prBadgeLabel(pr: PrStatusResponse): string {
-  const n = pr.number ? `#${pr.number}` : 'PR';
-  if (pr.display_state === 'merged') return `${n} merged`;
-  if (pr.display_state === 'closed') return `${n} closed`;
-  if (pr.display_state === 'draft') return `${n} draft`;
-  if (pr.check_state === 'passing') return `${n} checks ✓`;
-  if (pr.check_state === 'failing') return `${n} checks ✗`;
-  if (pr.check_state === 'pending') return `${n} checks ...`;
-  return n;
-}
-
-function prRefreshStaleText(pr: PrStatusResponse): string {
-  if (pr.refresh.state === 'not_found') return 'no PR found for current branch';
-  if (pr.refresh.state === 'unavailable') return `refresh unavailable (${pr.refresh.reason ?? 'unknown'})`;
-  return 'refresh did not produce fresh PR data';
-}
-
-function prTooltip(pr: PrStatusResponse): string {
-  const label = pr.number ? `PR #${pr.number}` : 'PR';
-  const title = pr.title ? ` — ${pr.title}` : '';
-  const state = pr.display_state ?? 'unknown';
-  const checks = pr.check_state ?? 'unknown';
-  const freshness = pr.refresh.stale
-    ? `
-Refresh: stale (${prRefreshStaleText(pr)})`
-    : '';
-  return `${label}${title}
-State: ${state}
-Checks: ${checks}${freshness}`;
 }
 
 function prCheckStatusText(pr: PrStatusResponse): string {
