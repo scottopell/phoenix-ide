@@ -12,6 +12,7 @@ import dataclasses
 import datetime
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -4299,7 +4300,11 @@ def native_prod_deploy(version: str | None = None):
         sys.exit(1)
 
     # Refuse before building if the deploy would expose an unauthenticated server.
-    _preflight_prod_bind_auth()
+    # systemd reads its environment ONLY from .phoenix-ide.env (EnvironmentFile=),
+    # so the effective env is the file alone.
+    systemd_env: dict[str, str] = {}
+    _load_env_file(systemd_env)
+    _preflight_prod_bind_auth(systemd_env)
 
     # Build
     binary = prod_build(version)
@@ -4519,21 +4524,47 @@ def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> s
     return str(env_file)
 
 
-def _preflight_prod_bind_auth() -> None:
+def _bind_is_loopback(effective_env: dict[str, str]) -> bool:
+    """Mirror the binary's fallback-bind resolution to decide if it binds loopback.
+
+    The binary defaults the bind IP to 0.0.0.0 (non-loopback) and lets
+    PHOENIX_BIND_ADDR override it; an unparseable PHOENIX_BIND_ADDR also falls
+    back to 0.0.0.0. So the bind is loopback only when PHOENIX_BIND_ADDR is a
+    valid loopback IP (127.0.0.0/8 or ::1).
+    """
+    raw = effective_env.get("PHOENIX_BIND_ADDR")
+    if not raw:
+        return False  # default is 0.0.0.0, non-loopback
+    try:
+        return ipaddress.ip_address(raw.strip()).is_loopback
+    except ValueError:
+        return False  # binary falls back to 0.0.0.0 on an invalid value
+
+
+def _preflight_prod_bind_auth(effective_env: dict[str, str]) -> None:
     """Refuse to deploy an unauthenticated, network-reachable prod server.
 
-    Every prod launcher (systemd socket, daemon, launchd) makes Phoenix reachable
-    on all interfaces, and the binary fails closed at startup on a non-loopback
-    passwordless bind. Reading .phoenix-ide.env here turns that post-restart crash
-    into a clear deploy-time error: refuse unless the persisted env defines a
-    non-empty PHOENIX_PASSWORD, or explicitly opts into the insecure bind with
-    PHOENIX_ALLOW_INSECURE_BIND=1 (operator fronting Phoenix with their own proxy).
+    `effective_env` is the environment the deployed service will actually run
+    with, assembled the same way the calling deploy path assembles it:
+      - systemd reads its environment ONLY from .phoenix-ide.env
+        (EnvironmentFile=), and launchd bakes only the file's values into the
+        plist's EnvironmentVariables — so for those paths effective_env is the
+        file alone.
+      - the non-systemd daemon inherits the deploying shell's os.environ and
+        then layers .phoenix-ide.env on top — so effective_env is that merge.
+
+    The binary fails closed at startup on a non-loopback passwordless bind. This
+    turns that post-restart crash into a clear deploy-time error, mirroring the
+    binary's own guard exactly: a deploy is safe when the bind is loopback, OR a
+    non-empty PHOENIX_PASSWORD is set, OR PHOENIX_ALLOW_INSECURE_BIND=1 opts into
+    the insecure bind (operator fronting Phoenix with their own proxy). Only a
+    non-loopback, passwordless, non-overridden bind is refused.
     """
-    persisted: dict[str, str] = {}
-    _load_env_file(persisted)
-    if persisted.get("PHOENIX_PASSWORD"):
+    if _bind_is_loopback(effective_env):
         return
-    if persisted.get("PHOENIX_ALLOW_INSECURE_BIND") == "1":
+    if effective_env.get("PHOENIX_PASSWORD"):
+        return
+    if effective_env.get("PHOENIX_ALLOW_INSECURE_BIND") == "1":
         return
     print(
         "ERROR: refusing to deploy an unauthenticated, network-reachable Phoenix.\n"
@@ -4542,6 +4573,7 @@ def _preflight_prod_bind_auth() -> None:
         "\n"
         "  Set PHOENIX_PASSWORD=<secret> in .phoenix-ide.env (the deployed service\n"
         "  reads its environment from that file, not your shell), then redeploy.\n"
+        "  To bind loopback-only instead, set PHOENIX_BIND_ADDR=127.0.0.1.\n"
         "  To deploy passwordless anyway (e.g. Phoenix sits behind your own auth\n"
         "  proxy), set PHOENIX_ALLOW_INSECURE_BIND=1 in .phoenix-ide.env.",
         file=sys.stderr,
@@ -4692,7 +4724,12 @@ def prod_daemon_deploy():
     Daemonizes the process and returns to shell immediately.
     """
     # Refuse before building if the deploy would expose an unauthenticated server.
-    _preflight_prod_bind_auth()
+    # The daemon child inherits the deploying shell's os.environ and then layers
+    # .phoenix-ide.env on top (see env assembly below), so preflight against that
+    # same merge -- and honor PHOENIX_BIND_ADDR (a loopback bind is safe).
+    daemon_preflight_env = os.environ.copy()
+    _load_env_file(daemon_preflight_env)
+    _preflight_prod_bind_auth(daemon_preflight_env)
 
     # Build binary (keep debug symbols for debugging)
     binary = prod_build(version=None, strip=False)
@@ -5208,7 +5245,12 @@ def _launchd_stop_if_loaded():
 def launchd_prod_deploy(version: str | None = None):
     """Build and deploy to production via launchd (native macOS)."""
     # Refuse before building if the deploy would expose an unauthenticated server.
-    _preflight_prod_bind_auth()
+    # The launchd service runs with only the plist's EnvironmentVariables, which
+    # are baked from .phoenix-ide.env (not the deploying shell), so the effective
+    # env is the file alone.
+    launchd_env: dict[str, str] = {}
+    _load_env_file(launchd_env)
+    _preflight_prod_bind_auth(launchd_env)
 
     # Build native macOS binary
     binary = prod_build(version, target=None)
