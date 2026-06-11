@@ -321,6 +321,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run pending data migrations before anything reads conversation data
     db::run_pending_migrations(db.pool()).await?;
+    // The numbered migrations above may have created the `-wal`/`-shm` sidecars
+    // after `open`'s chmod ran. Re-tighten so the sidecars (which hold the same
+    // conversation data) are owner-only on a multi-user host. Best-effort.
+    db.restrict_file_permissions();
 
     // Reset all conversations to idle on startup (REQ-BED-007)
     db.reset_all_to_idle().await?;

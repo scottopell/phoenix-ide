@@ -282,6 +282,9 @@ fn work_scope_db_key(scope: &phoenix_core::work_scope::WorkScope) -> (&'static s
 #[derive(Clone)]
 pub struct Database {
     pool: SqlitePool,
+    /// Filesystem path of the on-disk DB (empty for in-memory DBs). Retained so
+    /// permissions can be re-tightened after migrations create the WAL sidecars.
+    path: String,
 }
 
 impl Database {
@@ -289,6 +292,20 @@ impl Database {
     #[must_use]
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
+    }
+
+    /// Re-tighten the on-disk DB file and its `-wal`/`-shm` sidecars to 0600.
+    ///
+    /// Idempotent and best-effort: a `chmod` failure is logged at debug and
+    /// never fails. Call after migrations have run, since the numbered
+    /// migrations are what create the WAL sidecars that an early chmod in
+    /// `open` cannot see. A no-op for in-memory DBs (empty path) and on
+    /// non-Unix platforms.
+    pub fn restrict_file_permissions(&self) {
+        if self.path.is_empty() {
+            return;
+        }
+        restrict_db_permissions(&self.path);
     }
 
     async fn work_scope_id(
@@ -524,8 +541,16 @@ impl Database {
         // can leave it world-readable, so tighten to owner-only. Best-effort:
         // a chmod failure is logged, never fatal to startup.
         restrict_db_permissions(path);
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            path: path.to_string(),
+        };
         db.run_migrations().await?;
+        // `run_migrations` may have created the `-wal`/`-shm` sidecars that the
+        // early chmod above could not see. Re-tighten now they exist. The prod
+        // path runs numbered migrations after `open` returns, so it must call
+        // `restrict_file_permissions` again afterward.
+        db.restrict_file_permissions();
         Ok(db)
     }
 
@@ -551,7 +576,10 @@ impl Database {
             .max_connections(1)
             .connect_with(opts)
             .await?;
-        let db = Self { pool };
+        let db = Self {
+            pool,
+            path: String::new(),
+        };
         db.run_migrations().await?;
         migrations::run_pending_migrations(&db.pool).await?;
         Ok(db)
@@ -4092,6 +4120,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Regression: the `-wal` sidecar that migrations create after `open`'s
+    /// early chmod must still end up 0600 after `restrict_file_permissions`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restrict_file_permissions_tightens_wal_sidecar() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("phoenix-db-wal-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("test.db");
+        let db_path_str = db_path.to_string_lossy().to_string();
+
+        // `open` connects in WAL mode and runs `run_migrations`, which writes to
+        // the DB and so materializes the `-wal`/`-shm` sidecars.
+        let db = Database::open(&db_path_str).await.unwrap();
+        let wal_path = dir.join("test.db-wal");
+        assert!(
+            wal_path.exists(),
+            "WAL sidecar should exist after migrations"
+        );
+
+        // Loosen the sidecar to simulate a permissive umask leaving it
+        // group/world-readable, then re-tighten and assert it is owner-only.
+        std::fs::set_permissions(&wal_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        db.restrict_file_permissions();
+
+        let wal_mode = std::fs::metadata(&wal_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            wal_mode, 0o600,
+            "WAL sidecar should be owner read/write only"
+        );
+        let db_mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(db_mode, 0o600, "db file should be owner read/write only");
+
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[tokio::test]
     async fn app_setting_roundtrips_through_db() {
         let db = Database::open_in_memory().await.unwrap();
@@ -6801,7 +6867,10 @@ mod tests {
         .await
         .unwrap();
 
-        let db = Database { pool };
+        let db = Database {
+            pool,
+            path: String::new(),
+        };
         db.run_migrations().await.unwrap();
 
         let columns: Vec<String> = sqlx::query("PRAGMA table_info(conversations)")
