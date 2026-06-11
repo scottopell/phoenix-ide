@@ -875,7 +875,7 @@ describe('ChainPage — per-rootConvId state isolation (task 08682)', () => {
 });
 
 describe('ChainPage — work-scope dock active-member scope (REQ-WSUI-009)', () => {
-  it('resolves the LATEST member’s conv id, not the root, when a latest member exists', async () => {
+  it('resolves the LEAF member’s conv id (last in chain order), not the root', async () => {
     const { api } = await import('../api');
     (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
       makeChain({
@@ -893,10 +893,40 @@ describe('ChainPage — work-scope dock active-member scope (REQ-WSUI-009)', () 
       expect(screen.getByText('Title m1')).toBeInTheDocument();
     });
 
-    // The dock queries the latest member's scope, not the root's.
+    // The dock queries the leaf member's scope (last in chain order), not the root's.
     await waitFor(() => {
       expect(api.getConversation as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('m3');
     });
+    expect(api.getConversation as ReturnType<typeof vi.fn>).not.toHaveBeenCalledWith(ROOT_ID);
+  });
+
+  it('uses the terminal LEAF, not the `latest` recency label, when an intermediate is newest', async () => {
+    // Direct-chain hazard: the `latest` position is the max-`updated_at`
+    // non-root member, which can be an INTERMEDIATE, not the terminal leaf.
+    // The leaf's Direct-mode resources live under its own conversation scope,
+    // so the dock must key off chain order (last member), not recency.
+    const { api } = await import('../api');
+    (api.getChain as ReturnType<typeof vi.fn>).mockResolvedValueOnce(
+      makeChain({
+        members: [
+          makeMember('m1', 'root'),
+          makeMember('m2', 'latest'), // recency label on the intermediate
+          makeMember('m3', 'continuation'), // the actual terminal leaf
+        ],
+      }),
+    );
+
+    renderAt(ROOT_ID);
+
+    await waitFor(() => {
+      expect(screen.getByText('Title m1')).toBeInTheDocument();
+    });
+
+    // Queries the leaf (m3, last in order), NOT the recency-latest m2.
+    await waitFor(() => {
+      expect(api.getConversation as ReturnType<typeof vi.fn>).toHaveBeenCalledWith('m3');
+    });
+    expect(api.getConversation as ReturnType<typeof vi.fn>).not.toHaveBeenCalledWith('m2');
     expect(api.getConversation as ReturnType<typeof vi.fn>).not.toHaveBeenCalledWith(ROOT_ID);
   });
 

@@ -271,14 +271,18 @@ function BrowserRow({ state, idleMs }: { state: 'live' | 'torn_down'; idleMs: nu
  * slower than the poll interval still completes and applies rather than being
  * perpetually superseded (and discarded) by the next interval's fetch.
  *
- * `active` gates both the per-second elapsed-time tick and the running poll:
- * callers pass `false` while the surface is collapsed so an off-screen panel
- * does no background work.
+ * Two gates, deliberately separate. `pollActive` gates the inventory poll;
+ * `visible` gates the per-second elapsed-time tick. They coincide for the
+ * SSE-backed section (both = expanded), but the SSE-less chain dock keeps
+ * `pollActive` true while collapsed (so the badge can settle with no push
+ * channel) while leaving `visible` false — an off-screen dock polls but never
+ * runs the elapsed timer.
  */
 function useWorkScopeInventory(
   scopeKey: string,
   liveInventory: WorkScopeInventory | null | undefined,
-  active: boolean,
+  pollActive: boolean,
+  visible: boolean,
 ) {
   const [displayed, setDisplayed] = useState<WorkScopeInventory | null>(null);
   const [error, setError] = useState(false);
@@ -346,11 +350,14 @@ function useWorkScopeInventory(
     }
   }, [liveInventory]);
 
+  // Elapsed-time tick: only while the surface is visible (expanded). The
+  // collapsed badge shows just a count, not elapsed times — so an off-screen
+  // SSE-less dock that keeps polling (below) must NOT also run this 1s timer.
   useEffect(() => {
-    if (!active) return;
+    if (!visible) return;
     const id = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(id);
-  }, [active]);
+  }, [visible]);
 
   // Live-resource poll: while the surface is active and the scope owns ANY
   // live resource — a running bash handle, a tmux server entry, or a live
@@ -358,7 +365,7 @@ function useWorkScopeInventory(
   // terminal and starts as soon as any resource appears. Covers values with
   // no dedicated push edge (browser `idle_ms`) and is belt-and-suspenders for
   // tmux, whose entry can be created off the conversation's own SSE channel.
-  const pollRunning = active && hasLiveResource(displayed);
+  const pollRunning = pollActive && hasLiveResource(displayed);
   useEffect(() => {
     if (!pollRunning) return;
     const id = setInterval(() => {
@@ -463,7 +470,12 @@ interface SectionProps {
  * dense resource body is the shared `WorkScopeBody`.
  */
 export function WorkScopeSection({ scopeKey, liveInventory, expanded, onToggleExpanded }: SectionProps) {
-  const { inventory, error, now, retry } = useWorkScopeInventory(scopeKey, liveInventory, expanded);
+  const { inventory, error, now, retry } = useWorkScopeInventory(
+    scopeKey,
+    liveInventory,
+    expanded,
+    expanded,
+  );
   const count = workScopeLiveCount(inventory);
 
   return (
@@ -489,11 +501,18 @@ export function WorkScopePanel({ scopeKey, liveInventory, collapsed, onToggle, w
   // An SSE-less surface (no `liveInventory`) must keep polling even while
   // collapsed so the count badge can settle: with no push channel, a resource
   // live at collapse and then exited/reaped would otherwise read as running
-  // forever until expand. The poll self-limits — `pollRunning = active &&
+  // forever until expand. The poll self-limits — `pollRunning = pollActive &&
   // hasLiveResource` — so it stops once nothing is live. An SSE-backed surface
   // still pauses when collapsed (its push channel keeps the badge fresh).
-  const active = !collapsed || liveInventory == null;
-  const { inventory, error, now, retry } = useWorkScopeInventory(scopeKey, liveInventory, active);
+  // `visible` (the elapsed-tick gate) stays `!collapsed` regardless, so an
+  // off-screen dock never runs the 1s timer even while it polls.
+  const pollActive = !collapsed || liveInventory == null;
+  const { inventory, error, now, retry } = useWorkScopeInventory(
+    scopeKey,
+    liveInventory,
+    pollActive,
+    !collapsed,
+  );
   const count = workScopeLiveCount(inventory);
   const browserGlyph = inventory?.browser?.state === 'live' ? '◉' : null;
   const tmuxLive = inventory?.tmux?.status === 'live';

@@ -440,14 +440,14 @@ export function ChainPage() {
           />
         </div>
         {/* REQ-WSUI-009: the same work-scope panel as the conversation page,
-            querying the ACTIVE (latest) member's scope. Direct-chain members
-            have distinct conversation scopes, so the latest leaf's resources
-            do not live under the root's scope. No live SSE channel here — the
-            panel's own initial fetch is the data source. */}
+            querying the active LEAF member's scope (the last member in chain
+            order). Direct-chain members resolve to distinct conversation
+            scopes, so the leaf's resources do not live under the root's; the
+            `latest` recency label can fall on an intermediate member, so chain
+            order — not recency — identifies the leaf. No SSE channel here; the
+            dock polls (see WorkScopePanel). */}
         <ChainWorkScopeDock
-          activeConvId={
-            chain.members.find((m) => m.position === 'latest')?.conv_id ?? chain.root_conv_id
-          }
+          activeConvId={chain.members.at(-1)?.conv_id ?? chain.root_conv_id}
           workIdentity={chain.work_identity}
         />
       </div>
@@ -479,16 +479,17 @@ export function ChainPage() {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolves the ACTIVE (latest) member's `work_scope_key` (one conversation
- * GET) and renders the shared `WorkScopePanel`. Worktree/Branch/Work chains
- * share one worktree scope across all members, but Direct continuation chains
+ * Resolves the active LEAF member's `work_scope_key` (one conversation GET)
+ * and renders the shared `WorkScopePanel`. Worktree/Branch/Work chains share
+ * one worktree scope across all members, but Direct continuation chains
  * resolve each member to a distinct `Conversation(<member id>)` scope — so the
- * active leaf's resources live under its own scope, not the root's. Querying
- * the latest member is correct for both kinds (its scope is the shared
- * worktree scope for the former, its own conversation scope for the latter).
- * There is no per-conversation SSE push channel on the chain page, so the
- * panel's own initial fetch is the data source; `liveInventory` is
- * intentionally omitted.
+ * active leaf's resources live under its own scope, not the root's. The leaf
+ * is the last member in chain order; the `latest` recency label can fall on an
+ * intermediate member (max `updated_at`), so it is not used here. Querying the
+ * leaf is correct for both kinds (the shared worktree scope for the former,
+ * its own conversation scope for the latter). There is no per-conversation SSE
+ * push channel on the chain page, so `liveInventory` is omitted; the panel
+ * keeps its inventory poll alive even while collapsed to refresh the badge.
  */
 function ChainWorkScopeDock({
   activeConvId,

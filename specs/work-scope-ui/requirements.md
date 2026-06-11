@@ -231,22 +231,24 @@ conversation→scope resolution the browser lifecycle bridge already performs
 ### REQ-WSUI-009: Chain Page Active-Member Scope Query
 
 WHEN the chain page renders the work-scope panel
-THE SYSTEM SHALL query the one `scope_key` of the chain's active (latest)
-member — falling back to the root when the chain has a single member — and
-render a standalone right-adjacent dock that shares the per-resource row
-vocabulary of the conversation page's section (REQ-WSUI-010)
+THE SYSTEM SHALL query the one `scope_key` of the chain's leaf member — the
+last member in chain order — falling back to the root when the chain has a
+single member, and render a standalone right-adjacent dock that shares the
+per-resource row vocabulary of the conversation page's section (REQ-WSUI-010)
 AND SHALL NOT aggregate per-member inventories.
 
 **Rationale:** A chain's members do not all share one scope. Worktree, Branch,
 and Work chains share a single worktree scope across every member, but Direct
 continuation chains resolve each member to a distinct
-`WorkScope::Conversation(<member id>)` — so the active leaf's live resources
-live under its own scope, not the root's. Querying the active (latest) member
-is correct for both kinds: for shared-worktree chains the latest member's scope
-*is* the shared worktree scope, and for Direct chains it is the leaf's own
-conversation scope where the running resources actually reside. Querying the
-root would show an empty inventory for a Direct chain whose work is on the leaf.
-A single query against the active member's `WorkScope` key is complete; a
+`WorkScope::Conversation(<member id>)` — so the leaf's live resources live under
+its own scope, not the root's. The leaf is identified by chain order (the last
+member), not by the `latest` recency label: `latest` is the max-`updated_at`
+non-root member, which can be an intermediate, so it is not a reliable leaf
+pointer. Querying the leaf is correct for both kinds: for shared-worktree chains
+the leaf's scope *is* the shared worktree scope, and for Direct chains it is the
+leaf's own conversation scope where the running resources actually reside.
+Querying the root would show an empty inventory for a Direct chain whose work is
+on the leaf. A single query against the leaf's `WorkScope` key is complete; a
 hypothetical fan-out across every member and merge would add divergence risk
 for no gain. The chain page has no left file-explorer panel to host a section,
 so it uses a standalone collapsible dock; both surfaces render the same

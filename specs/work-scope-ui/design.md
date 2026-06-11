@@ -304,23 +304,24 @@ are no unbounded background timers.
 ### Chain page (REQ-WSUI-009)
 
 The chain page has no left `FileExplorerPanel` to host a section, so it queries
-the `scope_key` of the chain's active (latest) member via the pull endpoint and
-renders the standalone right-adjacent `WorkScopePanel` dock (width via
-`useResizablePane`, collapsed by default). The active member is the one with
-`position === "latest"`; a single-member chain has no `latest`, so the dock
-falls back to the root. Both surfaces render the same per-resource rows from
-shared code in `WorkScopePanel.tsx`.
+the `scope_key` of the chain's leaf member via the pull endpoint and renders the
+standalone right-adjacent `WorkScopePanel` dock (width via `useResizablePane`,
+collapsed by default). The leaf is the last member in chain order (members are
+ordered root-first); a single-member chain has only the root, so the dock falls
+back to it. The `latest` recency label (max-`updated_at`, which can land on an
+intermediate member) is deliberately NOT used to pick the scope. Both surfaces
+render the same per-resource rows from shared code in `WorkScopePanel.tsx`.
 
-The active member, not the root, is the right scope because the chain's members
-do not all share one scope. Shared-worktree chains (Worktree / Branch / Work)
-resolve every member to the same worktree scope, but Direct continuation chains
-resolve each member to a distinct `WorkScope::Conversation(<member id>)`, so the
-leaf's live resources are under its own scope, not the root's. The latest
-member's scope is correct for both: it is the shared worktree scope for the
-former and the leaf's own conversation scope for the latter. No per-member
-aggregation is needed — one query against the active member's `WorkScope` key is
-complete; a conversation-keyed fan-out across every member with a client-side
-merge would add divergence risk for no gain.
+The leaf, not the root, is the right scope because the chain's members do not
+all share one scope. Shared-worktree chains (Worktree / Branch / Work) resolve
+every member to the same worktree scope, but Direct continuation chains resolve
+each member to a distinct `WorkScope::Conversation(<member id>)`, so the leaf's
+live resources are under its own scope, not the root's. The leaf's scope is
+correct for both: it is the shared worktree scope for the former and the leaf's
+own conversation scope for the latter. No per-member aggregation is needed — one
+query against the leaf's `WorkScope` key is complete; a conversation-keyed
+fan-out across every member with a client-side merge would add divergence risk
+for no gain.
 
 Because the chain dock has no per-conversation SSE channel (it omits
 `liveInventory`), its live-resource poll must stay active even while the dock is
