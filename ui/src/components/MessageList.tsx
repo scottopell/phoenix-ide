@@ -95,8 +95,10 @@ function SkillFileChips({ files }: { files: { original_name: string; size_bytes:
   );
 }
 
-function extractSkillArgs(trigger: string, name: string): string {
-  return trigger.replace(new RegExp(`^/?${name}\\s*`), '').trim();
+function extractSkillParts(trigger: string, name: string, fallbackArgs?: string): { token: string; args: string } {
+  const displayTrigger = trigger.trim() || [name ? `/${name}` : '/skill', fallbackArgs?.trim()].filter(Boolean).join(' ');
+  const match = displayTrigger.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+  return { token: match?.[1] ?? '/skill', args: match?.[2] ?? '' };
 }
 
 type OnOpenFile = ((filePath: string, modifiedLines: Set<number>, firstModifiedLine: number) => void) | undefined;
@@ -120,9 +122,8 @@ function renderHistoricalUnit(
         />
       );
     case 'skill': {
-      const c = unit.message.content as { name?: string; trigger?: string; files?: { original_name: string; size_bytes: number; stored_path?: string }[] };
-      const trigger = c.trigger || '';
-      const args = extractSkillArgs(trigger, c.name || '');
+      const c = unit.message.content as { name?: string; trigger?: string; args?: string; files?: { original_name: string; size_bytes: number; stored_path?: string }[] };
+      const { token, args } = extractSkillParts(c.trigger || '', c.name || '', c.args);
       return (
         <div className="message user" data-sequence-id={unit.message.sequence_id}>
           <div className="message-header">
@@ -134,12 +135,12 @@ function renderHistoricalUnit(
             )}
           </div>
           <div className="message-content">
-            <div className="skill-indicator" title={`Skill invocation: loaded instructions from /${c.name || 'skill'}/SKILL.md and delivered to the agent`}>
-              <span className="skill-label">skill: /{c.name || 'skill'}</span>
+            <span className="skill-inline" title={`Skill invocation: loaded instructions from ${token}/SKILL.md and delivered to the agent`}>
+              <span className="skill-inline-token">{token}</span>
               {args && (
-                <span className="skill-trigger">{args}</span>
+                <span className="skill-inline-args"> {args}</span>
               )}
-            </div>
+            </span>
             <SkillFileChips files={c.files ?? []} />
           </div>
         </div>

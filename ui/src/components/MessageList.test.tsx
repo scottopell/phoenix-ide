@@ -97,6 +97,47 @@ function makeMessage(sequence_id: number, message_type: Message['message_type'] 
 const idleState: ConversationState = { type: 'idle' };
 
 describe('MessageList', () => {
+  it('renders skill invocations as inline slash-command user messages with attachments', () => {
+    const skillMessage = {
+      ...makeMessage(7, 'skill'),
+      content: {
+        name: 'dogfood',
+        trigger: '/dogfood http://localhost:8042',
+        files: [
+          {
+            original_name: 'notes.txt',
+            size_bytes: 512,
+            stored_path: '/tmp/notes.txt',
+          },
+        ],
+      },
+    } as unknown as Message;
+
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={[skillMessage]}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-skill"
+        />,
+      ),
+    );
+
+    const message = container.querySelector('.message.user[data-sequence-id="7"]');
+    expect(message).not.toBeNull();
+    expect(message).toHaveTextContent('You');
+    expect(message).toHaveTextContent('/dogfood http://localhost:8042');
+    expect(message).toHaveTextContent('notes.txt');
+    expect(message).toHaveTextContent('512 B');
+    expect(message?.querySelector('.skill-inline-token')).toHaveTextContent('/dogfood');
+    expect(message?.querySelector('.skill-inline-args')).toHaveTextContent('http://localhost:8042');
+    expect(container).not.toHaveTextContent('skill:');
+    expect(container.querySelector('.skill-indicator')).toBeNull();
+  });
+
   it('pending → sent acknowledgement keeps a single keyed render unit (REQ-MLRU-001)', async () => {
     // The previous bug class: a pending_user TailUnit was promoted to a
     // user HistoricalUnit on ack, which required scroll compensation

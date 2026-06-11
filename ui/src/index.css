@@ -8885,31 +8885,18 @@ html * {
 
 /* --- Skill Invocation Messages --- */
 
-.message.skill {
-  padding: 4px 16px;
-  margin: 4px 0;
+.message-content .skill-inline {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
-.skill-indicator {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  font-size: 12px;
-  color: var(--text-muted);
-  background: var(--bg-secondary);
-  padding: 4px 12px;
-  border-radius: 12px;
-  width: fit-content;
-}
-
-.skill-label {
+.message-content .skill-inline-token {
   font-weight: 600;
   color: var(--accent-blue, #3b82f6);
 }
 
-.skill-trigger {
+.message-content .skill-inline-args {
   color: var(--text-muted);
-  opacity: 0.7;
 }
 
 /* --- System Messages (task approval, completion, etc.) --- */
