@@ -557,8 +557,7 @@ describe('SubAgentStatus inline activity', () => {
       await act(async () => { await Promise.resolve(); });
       expect(api.getConversation).toHaveBeenCalledTimes(1);
       await act(async () => {
-        vi.advanceTimersByTime(500);
-        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(500);
       });
       expect(FakeEventSource.instances).toHaveLength(1);
     } finally {

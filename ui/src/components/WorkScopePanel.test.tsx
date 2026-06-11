@@ -196,8 +196,7 @@ describe('WorkScopeSection running-handle poll', () => {
 
     // Advance one poll interval and flush the fetch.
     await act(async () => {
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
     });
 
     expect(getInv).toHaveBeenCalledTimes(2);
@@ -213,15 +212,13 @@ describe('WorkScopeSection running-handle poll', () => {
     await renderExpanded();
 
     await act(async () => {
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
     });
     expect(getInv).toHaveBeenCalledTimes(2);
 
     // No further polls: the handle is tombstoned, so the interval cleared.
     await act(async () => {
-      vi.advanceTimersByTime(10_000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(10_000);
     });
     expect(getInv).toHaveBeenCalledTimes(2);
   });
@@ -235,8 +232,7 @@ describe('WorkScopeSection running-handle poll', () => {
     await renderExpanded();
 
     await act(async () => {
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
     });
     // Initial fetch + one poll, despite there being no bash handle at all.
     expect(getInv).toHaveBeenCalledTimes(2);
@@ -248,8 +244,7 @@ describe('WorkScopeSection running-handle poll', () => {
     await renderExpanded();
 
     await act(async () => {
-      vi.advanceTimersByTime(10_000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(10_000);
     });
     // Initial fetch only — no poll.
     expect(getInv).toHaveBeenCalledTimes(1);
@@ -265,8 +260,7 @@ describe('WorkScopeSection running-handle poll', () => {
     openBashDetail();
 
     await act(async () => {
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
     });
 
     // Poll arrived after SSE → its byte count wins, despite liveInventory being set.
@@ -354,8 +348,7 @@ describe('WorkScopeSection SSE-generation guard (same-scope time ordering)', () 
     // empty pull did not strand the inventory by stopping the poll.
     getInv.mockResolvedValue(inv([bash({ cmd: 'SSE-LIVE-CMD', state: 'running' })]));
     await act(async () => {
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
     });
     expect(getInv.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
@@ -372,8 +365,7 @@ describe('WorkScopeSection SSE-generation guard (same-scope time ordering)', () 
     expect(screen.getByText('0 B')).toBeTruthy();
 
     await act(async () => {
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
     });
 
     expect(getInv).toHaveBeenCalledTimes(2);
@@ -407,8 +399,7 @@ describe('WorkScopeSection in-flight gate (slow poll, no overlap or starvation)'
     // The next poll is slow — held open across several intervals.
     getInv.mockReturnValueOnce(slowPending);
     await act(async () => {
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
     });
     // One poll issued; it is now in flight.
     expect(getInv).toHaveBeenCalledTimes(callsAfterSeed + 1);
@@ -416,10 +407,8 @@ describe('WorkScopeSection in-flight gate (slow poll, no overlap or starvation)'
     // Advance two more intervals while the slow poll is still in flight. The
     // gate must suppress these — no overlapping fetch is issued.
     await act(async () => {
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
+      await vi.advanceTimersByTimeAsync(2000);
     });
     expect(getInv).toHaveBeenCalledTimes(callsAfterSeed + 1);
 
@@ -435,8 +424,7 @@ describe('WorkScopeSection in-flight gate (slow poll, no overlap or starvation)'
       inv([bash({ cmd: 'live-cmd', state: 'running', output_bytes: 16384 })]),
     );
     await act(async () => {
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
     });
     expect(getInv).toHaveBeenCalledTimes(callsAfterSeed + 2);
     expect(screen.getByText('16.0 KB')).toBeTruthy();
