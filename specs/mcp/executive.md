@@ -17,8 +17,8 @@ natively, without the `mcp-remote` subprocess bridge.
 | Requirement | Title | Status | Notes |
 |---|---|---|---|
 | REQ-MCP-001 | Transport-Tagged Config Discovery | Partial | `read_all_configs` discovers + merges stdio entries; HTTP entries are skipped today. HTTP classification is the change. |
-| REQ-MCP-002 | Transport-Agnostic JSON-RPC Protocol | Partial | Protocol (initialize / paginated `tools/list` / `tools/call` / notifications) implemented on `McpServer`, but welded to stdio. M1 extracts the `McpTransport` trait. |
-| REQ-MCP-003 | Stdio Transport | Complete | `McpServer::spawn` / `initialize` / `list_tools`; crash detection (`is_alive`, `is_crash_like_error`) + `respawn` in `mcp.rs`. |
+| REQ-MCP-002 | Transport-Agnostic JSON-RPC Protocol | Complete | Protocol (initialize / paginated `tools/list` / `tools/call` / notification handling via `ServerMessageSink`) lives on `McpServer` over the `McpTransport` trait; failures are the typed `TransportError`. `StdioTransport` is the sole impl until M2. |
+| REQ-MCP-003 | Stdio Transport | Complete | `StdioTransport::spawn` / `McpServer::initialize` / `list_tools`; crash detection (`is_alive`, `TransportError::Disconnected` classification) + `respawn` in `mcp.rs`. |
 | REQ-MCP-004 | Streamable HTTP Transport | Not started | M2. POST + `application/json`/`text/event-stream` response handling; `MCP-Protocol-Version` header. |
 | REQ-MCP-005 | HTTP Session Lifecycle | Not started | M2. `Mcp-Session-Id` capture/echo; DELETE on shutdown; 404 → re-initialize. |
 | REQ-MCP-006 | Server-Initiated Stream and Resumability | Not started | M4. GET SSE stream; `tools/list_changed`; `Last-Event-ID` replay. |
@@ -30,7 +30,7 @@ natively, without the `mcp-remote` subprocess bridge.
 | REQ-MCP-012 | Token Storage, Refresh, Invalidation, and Step-Up | Not started | M3. `mcp_oauth_tokens` (plaintext SQLite); refresh; discard-and-re-auth on refresh failure; 403 `insufficient_scope` step-up. |
 | REQ-MCP-013 | Authorization Status Surfaced to the UI | Partial | `GET /api/mcp/status` exists and carries a `pending_oauth_url`, but it is scraped from an `mcp-remote` child's stderr. M3 replaces it with the native flow's structured URL. |
 | REQ-MCP-014 | Tool Exposure and Live Resolution | Complete | `tool_definitions` / `create_mcp_tool_by_name`; live resolution via `ToolRegistryExecutor`. HTTP servers ride this unchanged. |
-| REQ-MCP-015 | Config Reload Reconciliation | Complete | `reload_from_configs` (add / remove / restart / unchanged / failed). M1 extends `PartialEq` to the HTTP config variant. |
+| REQ-MCP-015 | Config Reload Reconciliation | Complete | `reload_from_configs` (add / remove / restart / unchanged / failed); the `PartialEq` comparison spans the `Stdio \| Http` config variants. |
 | REQ-MCP-016 | Per-Server Enable/Disable | Complete | `disable_server` / `enable_server`; persisted in `mcp_disabled_servers` (`crates/phoenix-db/src/lib.rs`). |
 | REQ-MCP-017 | Tool Call Cancellation and Error Surfacing | Complete | `McpTool::run` spawns a detached task + selects on the cancel token; `tools/call` honors `isError`. |
 | REQ-MCP-018 | Connection Failure Visibility | Not started | M5. Failed servers retained in the status response with their error, cleared on reconnect. |
@@ -38,10 +38,10 @@ natively, without the `mcp-remote` subprocess bridge.
 
 ## Milestones
 
-This spec set is M0 of the native HTTP MCP build-out. The remaining milestones:
+This spec set is M0 of the native HTTP MCP build-out. The milestones:
 
-- **M1** -- Extract the `McpTransport` trait; turn `McpServerConfig` into a
-  `Stdio | Http` enum. No behavior change (REQ-MCP-002, REQ-MCP-015).
+- **M1** (done) -- Extract the `McpTransport` trait; turn `McpServerConfig`
+  into a `Stdio | Http` enum. No behavior change (REQ-MCP-002, REQ-MCP-015).
 - **M2** -- Streamable HTTP transport substrate with static/no auth
   (REQ-MCP-004, -005, -007, -008). Prerequisite for OAuth, not an independent
   release.

@@ -335,8 +335,9 @@ rule StdioCrashed {
     ensures: srv.state = reconnecting
 
     @guidance
-        -- is_alive / is_crash_like_error detect the crash; respawn
-        -- re-initializes before the failed tools/call is retried once.
+        -- is_alive / the transport's TransportError::Disconnected
+        -- classification detect the crash; respawn re-initializes before
+        -- the failed tools/call is retried once.
 }
 
 ------------------------------------------------------------
