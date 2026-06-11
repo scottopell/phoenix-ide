@@ -79,8 +79,12 @@ entity ShareToken {
 
 -- The authenticated owner. A request is the Owner when auth is disabled,
 -- or when it carries a valid session-token cookie, or when it carries a
--- matching Bearer password. The password never identifies the Owner via a
--- cookie -- only the minted session token does.
+-- matching Bearer password AND its peer is not currently locked out by the
+-- login throttle. The password never identifies the Owner via a cookie --
+-- only the minted session token does. Session-token ownership is never gated
+-- by the throttle (token checks are not rate-limited); only the Bearer-password
+-- branch is, so a peer that has tripped the lockout cannot regain access by
+-- presenting even a correct Bearer until the window elapses.
 --
 -- Identity predicates (black-box, pure over the request and current state):
 --   session_token_valid(request)    => the request's session_cookie names a
@@ -88,11 +92,13 @@ entity ShareToken {
 --   bearer_password_matches(request) => the request's bearer_password equals
 --                                        config.password under constant-time
 --                                        comparison (see ConstantTimePasswordCheck).
+--   throttle_locked(peer)            => the peer's ThrottleBucket is locked
+--                                        (see LoginFails / ThrottleScopedToPasswordChecks).
 actor Owner {
     identified_by: Request where
         not config.auth_enabled
         or session_token_valid(request)
-        or bearer_password_matches(request)
+        or (bearer_password_matches(request) and not throttle_locked(request.peer))
 }
 
 -- An unauthenticated viewer holding a valid share token.
