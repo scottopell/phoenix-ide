@@ -1,12 +1,15 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use nono::{AccessMode, CapabilitySet, Sandbox};
 
 const TASK_DIRS_ENV: &str = "PHOENIX_SANDBOX_TASK_DIRS";
+const SENSITIVE_DIRS_ENV: &str = "PHOENIX_SANDBOX_SENSITIVE_DIRS";
 const REPO_ROOT_ENV: &str = "PHOENIX_SANDBOX_REPO_ROOT";
 const SCRATCH_ENV: &str = "PHOENIX_SANDBOX_SCRATCH";
+const HOME_ENV: &str = "PHOENIX_SANDBOX_HOME";
+const PLATFORM_TEMP_ENV: &str = "PHOENIX_SANDBOX_PLATFORM_TEMP";
 const LIST_SEPARATOR: &str = "\u{1f}";
 
 #[derive(Debug, Clone)]
@@ -14,6 +17,10 @@ pub struct ExploreReadOnlyPolicy {
     repo_root: PathBuf,
     task_dirs: Vec<PathBuf>,
     scratch_dir: PathBuf,
+    sandbox_home: PathBuf,
+    platform_temp: PathBuf,
+    sensitive_dirs: Vec<PathBuf>,
+    path: OsString,
 }
 
 impl ExploreReadOnlyPolicy {
@@ -22,7 +29,7 @@ impl ExploreReadOnlyPolicy {
     /// # Errors
     ///
     /// Returns an I/O error when the working directory cannot be canonicalized
-    /// or the scratch directory cannot be created.
+    /// or the scratch/home directories cannot be created.
     pub fn discover(working_dir: &Path) -> std::io::Result<Self> {
         let repo_root = working_dir.canonicalize()?;
         let task_dirs = taskmd_core::discover::candidates(&repo_root)
@@ -34,61 +41,86 @@ impl ExploreReadOnlyPolicy {
             .join("phoenix-ide")
             .join("explore-bash")
             .join(uuid::Uuid::new_v4().to_string());
-        std::fs::create_dir_all(&scratch_dir)?;
+        let sandbox_home = scratch_dir.join("home");
+        std::fs::create_dir_all(&sandbox_home)?;
+        let platform_temp = platform_temp_dir();
+        let path = inherited_path();
+        let sensitive_dirs = sensitive_dirs_for_home(std::env::var_os("HOME").as_deref());
         Ok(Self {
             repo_root,
             task_dirs,
             scratch_dir,
+            sandbox_home,
+            platform_temp,
+            sensitive_dirs,
+            path,
         })
     }
 
     fn to_command_env(&self, command: &mut Command) {
         command.env(REPO_ROOT_ENV, &self.repo_root);
         command.env(SCRATCH_ENV, &self.scratch_dir);
+        command.env(HOME_ENV, &self.sandbox_home);
+        command.env(PLATFORM_TEMP_ENV, &self.platform_temp);
+        command.env(TASK_DIRS_ENV, join_paths(&self.task_dirs));
+        command.env(SENSITIVE_DIRS_ENV, join_paths(&self.sensitive_dirs));
+        self.apply_child_env(command);
+    }
+
+    fn apply_child_env(&self, command: &mut Command) {
         command.env("PHOENIX_SANDBOX_SCRATCH", &self.scratch_dir);
-        command.env("TMPDIR", &self.scratch_dir);
-        command.env("HOME", &self.scratch_dir);
-        command.env("PATH", safe_path());
+        command.env("PHOENIX_SANDBOX_HOME", &self.sandbox_home);
+        command.env("HOME", &self.sandbox_home);
+        command.env("TMPDIR", &self.platform_temp);
+        command.env("PATH", &self.path);
         command.env("GIT_CONFIG_NOSYSTEM", "1");
         command.env("GIT_TERMINAL_PROMPT", "0");
+        command.env("GIT_OPTIONAL_LOCKS", "0");
         command.env("PAGER", "cat");
         command.env("NO_COLOR", "1");
-        command.env(TASK_DIRS_ENV, join_paths(&self.task_dirs));
     }
 
     fn from_env() -> Result<Self, String> {
         let repo_root = env_path(REPO_ROOT_ENV)?;
         let scratch_dir = env_path(SCRATCH_ENV)?;
+        let sandbox_home = env_path(HOME_ENV)?;
+        let platform_temp = env_path(PLATFORM_TEMP_ENV)?;
         let task_dirs = std::env::var_os(TASK_DIRS_ENV)
             .map(|value| split_paths(&value))
             .unwrap_or_default();
+        let sensitive_dirs = std::env::var_os(SENSITIVE_DIRS_ENV)
+            .map(|value| split_paths(&value))
+            .unwrap_or_default();
+        let path = inherited_path();
         Ok(Self {
             repo_root,
             task_dirs,
             scratch_dir,
+            sandbox_home,
+            platform_temp,
+            sensitive_dirs,
+            path,
         })
     }
 
     fn capability_set(&self) -> Result<CapabilitySet, String> {
         let mut caps = CapabilitySet::new()
-            .allow_path(&self.repo_root, AccessMode::Read)
+            .allow_path("/", AccessMode::Read)
             .map_err(|e| e.to_string())?
             .allow_path(&self.scratch_dir, AccessMode::ReadWrite)
             .map_err(|e| e.to_string())?;
 
-        for path in system_read_paths() {
-            if path.is_dir() {
-                caps = caps
-                    .allow_path(path, AccessMode::Read)
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-            }
-        }
         for path in system_read_write_paths() {
             if path.is_dir() {
                 caps = caps
                     .allow_path(path, AccessMode::ReadWrite)
                     .map_err(|e| format!("{}: {e}", path.display()))?;
             }
+        }
+        if self.platform_temp.is_dir() {
+            caps = caps
+                .allow_path(&self.platform_temp, AccessMode::ReadWrite)
+                .map_err(|e| format!("{}: {e}", self.platform_temp.display()))?;
         }
         for path in &self.task_dirs {
             if path.is_dir() {
@@ -97,6 +129,7 @@ impl ExploreReadOnlyPolicy {
                     .map_err(|e| format!("{}: {e}", path.display()))?;
             }
         }
+        add_sensitive_denies(&mut caps, &self.sensitive_dirs)?;
 
         Ok(caps.block_network())
     }
@@ -153,20 +186,14 @@ fn apply_and_exec(cmd: &str) -> Result<std::convert::Infallible, String> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        let err = Command::new("/bin/bash")
+        let mut command = Command::new("/bin/bash");
+        command
             .arg("-c")
             .arg(cmd)
             .current_dir(&policy.repo_root)
-            .env_clear()
-            .env("HOME", &policy.scratch_dir)
-            .env("TMPDIR", &policy.scratch_dir)
-            .env("PHOENIX_SANDBOX_SCRATCH", &policy.scratch_dir)
-            .env("PATH", safe_path())
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .env("PAGER", "cat")
-            .env("NO_COLOR", "1")
-            .exec();
+            .env_clear();
+        policy.apply_child_env(&mut command);
+        let err = command.exec();
         Err(format!("failed to exec /bin/bash: {err}"))
     }
 
@@ -201,36 +228,72 @@ fn split_paths(value: &OsString) -> Vec<PathBuf> {
         .collect()
 }
 
-fn safe_path() -> &'static str {
-    "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/opt/homebrew/sbin"
+fn inherited_path() -> OsString {
+    std::env::var_os("PATH").unwrap_or_else(|| OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))
 }
 
-fn system_read_paths() -> &'static [PathBuf] {
-    use std::sync::OnceLock;
-    static PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();
-    PATHS.get_or_init(|| {
-        [
-            "/bin",
-            "/usr/bin",
-            "/usr/lib",
-            "/usr/libexec",
-            "/usr/share",
-            "/usr/sbin",
-            "/System",
-            "/Library",
-            "/opt/homebrew/bin",
-            "/opt/homebrew/lib",
-            "/opt/homebrew/share",
-            "/opt/homebrew/Cellar",
-            "/private/var/db",
-            "/var/db",
-            "/etc",
-        ]
-        .into_iter()
-        .map(PathBuf::from)
-        .collect()
-    })
+fn platform_temp_dir() -> PathBuf {
+    std::env::temp_dir()
 }
+
+fn sensitive_dirs_for_home(home: Option<&OsStr>) -> Vec<PathBuf> {
+    let Some(home) = home else {
+        return Vec::new();
+    };
+    let home = PathBuf::from(home);
+    [
+        ".ssh",
+        ".aws",
+        ".gnupg",
+        ".password-store",
+        ".config/password-store",
+        ".config/phoenix-ide",
+        ".phoenix-ide",
+    ]
+    .into_iter()
+    .map(|relative| home.join(relative))
+    .filter(|path| path.exists())
+    .collect()
+}
+
+#[cfg(target_os = "macos")]
+fn add_sensitive_denies(
+    caps: &mut CapabilitySet,
+    sensitive_dirs: &[PathBuf],
+) -> Result<(), String> {
+    for path in sensitive_dirs {
+        let Ok(canonical) = path.canonicalize() else {
+            continue;
+        };
+        let rule = format!(
+            "(deny file-read* (subpath \"{}\"))",
+            seatbelt_escape_path(&canonical)
+        );
+        caps.add_platform_rule(rule).map_err(|e| {
+            format!(
+                "failed to add sensitive-path deny for {}: {e}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn add_sensitive_denies(
+    _caps: &mut CapabilitySet,
+    _sensitive_dirs: &[PathBuf],
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn seatbelt_escape_path(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
 fn system_read_write_paths() -> &'static [PathBuf] {
     use std::sync::OnceLock;
     static PATHS: OnceLock<Vec<PathBuf>> = OnceLock::new();

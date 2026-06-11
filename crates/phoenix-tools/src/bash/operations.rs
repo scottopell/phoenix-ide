@@ -786,7 +786,7 @@ fn exit_status_to_cause(status: std::process::ExitStatus) -> FinalCause {
             signal_number: Some(sig),
         }
     } else if let Some(code) = status.code() {
-        if (128..192).contains(&code) {
+        if (129..192).contains(&code) {
             FinalCause::Killed {
                 exit_code: Some(code),
                 signal_number: Some(code - 128),
@@ -1461,6 +1461,37 @@ mod tests {
             1234,
             RING_BUFFER_BYTES,
         )
+    }
+
+    #[test]
+    fn exit_code_128_is_not_signal_zero() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 128")
+            .status()
+            .expect("spawn shell");
+        assert!(matches!(
+            exit_status_to_cause(status),
+            FinalCause::Exited {
+                exit_code: Some(128)
+            }
+        ));
+    }
+
+    #[test]
+    fn exit_code_137_maps_to_signal_nine() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 137")
+            .status()
+            .expect("spawn shell");
+        assert!(matches!(
+            exit_status_to_cause(status),
+            FinalCause::Killed {
+                exit_code: Some(137),
+                signal_number: Some(9)
+            }
+        ));
     }
 
     #[test]

@@ -848,11 +848,20 @@ buffer, and response shaping as writable `BashTool`. The only divergent path is
 applies `nono::Sandbox::apply()` to itself, and then it execs `/bin/bash -c
 <cmd>`. The server process never applies the sandbox to itself.
 
-The Explore policy grants the worktree root read-only, each taskmd-discovered
-task proposal directory read-write, and a Phoenix-owned scratch directory
-read-write. `HOME`, `TMPDIR`, and `PHOENIX_SANDBOX_SCRATCH` all point at the
-scratch directory, and network access is blocked. The child environment is
-rebuilt from a small allowlist rather than inherited wholesale from the server.
+The Explore policy grants broad filesystem read access, task proposal
+directories read-write, a Phoenix-owned scratch directory read-write, a
+synthetic sandbox home under scratch, and platform-compatible temporary
+directory writes. `PHOENIX_SANDBOX_SCRATCH` names scratch,
+`PHOENIX_SANDBOX_HOME` and `HOME` name the synthetic home, and `TMPDIR` names
+the platform temp directory. Network access is blocked and the child
+environment is rebuilt from a small allowlist that preserves `PATH` while
+stripping ambient credential variables.
+
+Broad read is deliberate: Explore already exposes read-only tools that can read
+arbitrary user-selected paths, and sandboxed bash follows that product contract.
+The sandbox is the write/network/ambient-credential boundary. Platform backends
+that can enforce deny-within-read also receive explicit sensitive-path read
+denies for high-confidence credential stores.
 
 Platform detection is `nono::Sandbox::support_info()` at startup. When `nono`
 reports no enforceable backend, top-level Explore registries omit bash. Direct,
@@ -877,9 +886,11 @@ process's lifetime regardless of subsequent peek/wait/kill calls.
 - Error envelope shapes for each stable error id.
 
 ### Integration tests
-- Top-level Explore bash on a supported host: `git log`, `git blame`, `rg`, and
-  `cat` can read the worktree; source writes fail with kernel permission errors;
-  task proposal and scratch writes succeed; network commands fail.
+- Top-level Explore bash on a supported host: `git log`, `git status`,
+  `git blame`, `rg`, and `cat` can read the worktree and other readable local
+  files; source writes fail with kernel permission errors; task proposal,
+  scratch, synthetic-home, and platform-temp writes succeed; network commands
+  fail; configured ambient credential variables are absent.
 - Spawn → exits within wait_seconds → `status: "exited"` with exit code.
 - Spawn → wait_seconds elapses → `status: "still_running"` with handle.
 - Repeated `wait` on same handle returns same handle id on each re-timeout.

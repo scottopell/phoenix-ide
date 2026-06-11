@@ -909,7 +909,7 @@ async fn test_browser_navigate_remote() {
     require_chrome!();
     require_network!();
 
-    let (ctx, manager) = test_context("test-navigate-remote");
+    let (ctx, _manager) = test_context("test-navigate-remote");
 
     // Navigate to a real website
     let nav_tool = BrowserNavigateTool;
@@ -956,7 +956,7 @@ async fn test_browser_navigate_remote() {
 async fn test_browser_eval_before_navigate() {
     require_chrome!();
 
-    let (ctx, manager) = test_context("test-eval-no-nav");
+    let (ctx, _manager) = test_context("test-eval-no-nav");
 
     // Try to eval without navigating first - should still work on about:blank
     let eval_tool = BrowserEvalTool;

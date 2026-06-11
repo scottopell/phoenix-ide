@@ -40,8 +40,9 @@ shapes by mode: in Explore it is the blocking Explore→Work gateway; in the wri
 fully decoupled top-level Work conversation off the repository default branch (REQ-PROJ-033
 through 036). It is withheld only from Direct-not-in-a-repo and from sub-agents. Tool
 registry is configured by mode: Explore exposes read-only/planning tools plus `bash` only
-when `nono` reports an enforceable OS sandbox; the sandboxed bash can read the worktree,
-write task proposal and scratch directories, and has network blocked. `patch` is scoped
+when `nono` reports an enforceable OS sandbox; the sandboxed bash can read broadly,
+while writes are limited to task proposal, scratch, synthetic-home, and platform-temp
+locations, network is blocked, and ambient credential variables are stripped. `patch` is scoped
 to the discovered taskmd directory so the agent can draft/revise a task file
 (REQ-PROJ-003 and REQ-PROJ-037). Write tools are enabled in Work and Branch. Push is a regular bash command with no
 lifecycle side effects. Phoenix can observe PR state through `gh` to guide the

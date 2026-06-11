@@ -79,7 +79,7 @@ AND (on the user's first message) create a worktree on a temp branch off the cho
 WHILE a conversation is in Explore mode (Managed workflow)
 THE SYSTEM SHALL prevent file writes to the project via any tool
   (except drafting a task file under a taskmd-discovered task proposal directory — REQ-PROJ-003)
-AND SHALL allow unrestricted file reading and directory listing
+AND SHALL allow broad local file reading and directory listing
 AND SHALL expose `bash` only when an OS sandbox is available to enforce read-only
   command execution (REQ-BASH-012/013)
 
@@ -89,6 +89,9 @@ THE SYSTEM SHALL reject the request (Managed mode requires a git repository)
 **Rationale:** Direct mode is the natural, zero-friction starting point for most work.
 The Managed (Explore/Work) lifecycle adds value for non-trivial changes that benefit
 from plan review and worktree isolation, but should be opt-in rather than mandatory.
+Explore is read-only and network-blocked; it is not a confidentiality boundary, so
+its read tools and sandboxed bash permit broad local reads while withholding write
+and network authority until Work mode.
 
 ---
 

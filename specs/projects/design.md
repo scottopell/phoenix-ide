@@ -15,10 +15,10 @@ The isolation model has two layers:
 
 2. **OS enforcement (supported platforms):** Top-level Explore conversations
    expose `bash` only when `nono` reports an enforceable backend. Explore bash
-   runs in a child process whose sandbox makes the worktree read-only, grants
-   task proposal and scratch directories read-write, and blocks network (see
-   `specs/bash/` REQ-BASH-012/013). Without sandbox support, Explore omits
-   bash.
+   runs in a child process whose sandbox allows broad local reads, restricts
+   writes to task proposal/scratch/synthetic-home/platform-temp locations,
+   strips ambient credential variables, and blocks network (see `specs/bash/`
+   REQ-BASH-012/013). Without sandbox support, Explore omits bash.
 
 The state machine knows about `ConvMode` as a field on conversations. It does not
 know about git, worktrees, or projects — those are executor-layer concerns triggered
@@ -503,7 +503,7 @@ the porcelain command fails.
 
 | Tool | Explore mode | Work mode |
 |------|-------------|----------|
-| `bash` | Available only with `nono` sandbox support; worktree read-only, task proposal/scratch writable, network blocked | Allowed (write enabled in worktree) |
+| `bash` | Available only with `nono` sandbox support; broad local read, source/Git metadata writes denied, task proposal/scratch/synthetic-home/platform-temp writable, network blocked | Allowed (write enabled in worktree) |
 | `patch` | Scoped to discovered taskmd directory so the agent can draft a task file before `propose_task`; writes elsewhere rejected | Enabled (scoped to worktree) |
 | `think` | Allowed | Allowed |
 | `keyword_search` | Allowed | Allowed |

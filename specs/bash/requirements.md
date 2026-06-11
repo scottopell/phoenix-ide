@@ -626,13 +626,21 @@ AND SHALL NOT call `nono::Sandbox::apply()` in the long-running Phoenix server
 process
 
 THE Explore bash sandbox SHALL provide:
-- read-only filesystem access to the conversation's repository/worktree root
+- broad filesystem read access matching Explore's existing read-only tool semantics
+- explicit sensitive-path denies where the platform backend can enforce deny-within-read
+- read-only Git metadata access sufficient for linked worktree commands such as
+  `git status`, `git log`, and `git blame`
 - read-write filesystem access to taskmd-discovered task proposal directories
   under the repo root
 - read-write filesystem access to a Phoenix-owned scratch directory
-- scratch-backed `HOME`, `TMPDIR`, and `PHOENIX_SANDBOX_SCRATCH`
+- a synthetic sandbox home under scratch, exposed as `PHOENIX_SANDBOX_HOME` and
+  `HOME`
+- `PHOENIX_SANDBOX_SCRATCH` pointing at Phoenix-owned scratch
+- platform-compatible temporary directory writes, exposed as `TMPDIR`
+- inherited `PATH` preservation
 - blocked network access
-- a reduced environment that does not pass ambient secrets
+- a reduced environment that strips ambient SCM/OAuth, LLM-provider, and
+  cloud/vendor credential variables
 
 WHEN `nono` blocks an operation in Explore mode
 THE SYSTEM SHALL return the kernel error (for example EACCES or EPERM) in the
@@ -646,9 +654,12 @@ AND bash commands SHALL retain the existing writable behavior for that mode
 
 **Rationale:** Explore bash is useful for local code investigation (`git log`,
 `git blame`, `rg`, `cat`) only if the read-only promise is enforced below the
-application layer. `nono` is the sandbox abstraction; it uses the platform's
-supported backend (Landlock on Linux, Seatbelt on macOS) and reports support at
-startup.
+application layer. Explore is a read-only/network-blocked mode, not a
+confidentiality boundary: existing Explore read tools can already read arbitrary
+user-selected paths, so sandboxed bash follows the same broad-read model while
+constraining writes, network, and ambient credentials. `nono` is the sandbox
+abstraction; it uses the platform's supported backend (Landlock on Linux,
+Seatbelt on macOS) and reports support at startup.
 
 ---
 
