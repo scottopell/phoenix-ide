@@ -4304,7 +4304,7 @@ def native_prod_deploy(version: str | None = None):
     # so the effective env is the file alone.
     systemd_env: dict[str, str] = {}
     _load_env_file(systemd_env)
-    _preflight_prod_bind_auth(systemd_env)
+    _preflight_prod_bind_auth(systemd_env, socket_activated=True)
 
     # Build
     binary = prod_build(version)
@@ -4541,7 +4541,7 @@ def _bind_is_loopback(effective_env: dict[str, str]) -> bool:
         return False  # binary falls back to 0.0.0.0 on an invalid value
 
 
-def _preflight_prod_bind_auth(effective_env: dict[str, str]) -> None:
+def _preflight_prod_bind_auth(effective_env: dict[str, str], socket_activated: bool) -> None:
     """Refuse to deploy an unauthenticated, network-reachable prod server.
 
     `effective_env` is the environment the deployed service will actually run
@@ -4553,19 +4553,29 @@ def _preflight_prod_bind_auth(effective_env: dict[str, str]) -> None:
       - the non-systemd daemon inherits the deploying shell's os.environ and
         then layers .phoenix-ide.env on top — so effective_env is that merge.
 
+    `socket_activated` is True for the systemd (.socket) and launchd (Sockets)
+    paths: the listener fd comes from the init system, which binds all
+    interfaces (`ListenStream={port}` / the launchd socket), and the binary
+    IGNORES PHOENIX_BIND_ADDR. So a loopback PHOENIX_BIND_ADDR does NOT make a
+    socket-activated deploy safe — only a password or the insecure override
+    does. The non-socket-activated daemon binds via the binary's own fallback,
+    so there PHOENIX_BIND_ADDR=127.0.0.1 genuinely yields a loopback listener.
+
     The binary fails closed at startup on a non-loopback passwordless bind. This
     turns that post-restart crash into a clear deploy-time error, mirroring the
-    binary's own guard exactly: a deploy is safe when the bind is loopback, OR a
-    non-empty PHOENIX_PASSWORD is set, OR PHOENIX_ALLOW_INSECURE_BIND=1 opts into
-    the insecure bind (operator fronting Phoenix with their own proxy). Only a
-    non-loopback, passwordless, non-overridden bind is refused.
+    binary's own guard.
     """
-    if _bind_is_loopback(effective_env):
+    if not socket_activated and _bind_is_loopback(effective_env):
         return
     if effective_env.get("PHOENIX_PASSWORD"):
         return
     if effective_env.get("PHOENIX_ALLOW_INSECURE_BIND") == "1":
         return
+    loopback_hint = (
+        ""
+        if socket_activated
+        else "  To bind loopback-only instead, set PHOENIX_BIND_ADDR=127.0.0.1.\n"
+    )
     print(
         "ERROR: refusing to deploy an unauthenticated, network-reachable Phoenix.\n"
         "  The prod server binds all interfaces; without a password anyone on the\n"
@@ -4573,7 +4583,7 @@ def _preflight_prod_bind_auth(effective_env: dict[str, str]) -> None:
         "\n"
         "  Set PHOENIX_PASSWORD=<secret> in .phoenix-ide.env (the deployed service\n"
         "  reads its environment from that file, not your shell), then redeploy.\n"
-        "  To bind loopback-only instead, set PHOENIX_BIND_ADDR=127.0.0.1.\n"
+        f"{loopback_hint}"
         "  To deploy passwordless anyway (e.g. Phoenix sits behind your own auth\n"
         "  proxy), set PHOENIX_ALLOW_INSECURE_BIND=1 in .phoenix-ide.env.",
         file=sys.stderr,
@@ -4729,7 +4739,7 @@ def prod_daemon_deploy():
     # same merge -- and honor PHOENIX_BIND_ADDR (a loopback bind is safe).
     daemon_preflight_env = os.environ.copy()
     _load_env_file(daemon_preflight_env)
-    _preflight_prod_bind_auth(daemon_preflight_env)
+    _preflight_prod_bind_auth(daemon_preflight_env, socket_activated=False)
 
     # Build binary (keep debug symbols for debugging)
     binary = prod_build(version=None, strip=False)
@@ -5250,7 +5260,7 @@ def launchd_prod_deploy(version: str | None = None):
     # env is the file alone.
     launchd_env: dict[str, str] = {}
     _load_env_file(launchd_env)
-    _preflight_prod_bind_auth(launchd_env)
+    _preflight_prod_bind_auth(launchd_env, socket_activated=True)
 
     # Build native macOS binary
     binary = prod_build(version, target=None)
