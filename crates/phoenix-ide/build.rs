@@ -23,5 +23,17 @@ fn main() {
         })
         .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
 
-    println!("cargo:rustc-env=PHOENIX_GIT_SHA={sha}");
+    // "-dirty" suffix when the working tree has uncommitted changes, so a
+    // binary built from modified sources can't masquerade as the commit it
+    // was branched from. Only meaningful when the SHA itself resolved.
+    let dirty = sha != "unknown"
+        && Command::new("git")
+            .args(["status", "--porcelain"])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .is_some_and(|o| !o.stdout.is_empty());
+
+    let suffix = if dirty { "-dirty" } else { "" };
+    println!("cargo:rustc-env=PHOENIX_GIT_SHA={sha}{suffix}");
 }

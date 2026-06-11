@@ -277,6 +277,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         exe = %exe_path,
         pid = std::process::id(),
         mode = if is_prod { "production" } else { "development" },
+        git_sha = env!("PHOENIX_GIT_SHA"),
+        version = env!("CARGO_PKG_VERSION"),
         "Phoenix IDE starting"
     );
 
