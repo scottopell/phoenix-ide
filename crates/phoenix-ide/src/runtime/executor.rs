@@ -2481,57 +2481,64 @@ where
                 assistant_message,
                 tool_results,
             } => {
-                // Persist assistant message.
+                let conv_id = self.context.conversation_id.clone();
+
+                // Build the assistant message row.
                 //
-                // Uses `add_message_with_seq_at` so the DB row carries the
-                // exact `assistant_message.created_at` value the eager
-                // broadcast (`Effect::BroadcastAssistantMessage`) already
-                // delivered for this `message_id`. Single INSERT, no
-                // transient `Utc::now()` value visible to a concurrent
-                // reconnect's init read. Without this, a reconnect that
-                // landed between the INSERT and a follow-up UPDATE would
-                // see a shifted timestamp on the same message_id the UI
-                // is already displaying.
+                // `created_at` carries the exact value the eager broadcast
+                // (`Effect::BroadcastAssistantMessage`) already delivered for
+                // this `message_id`, so a reconnect that lands during persistence
+                // never sees a shifted timestamp on the message the UI displays.
                 let agent_content = MessageContent::agent(assistant_message.content);
                 let agent_seq = self.broadcast_tx.next_seq();
-                let agent_msg = self
-                    .storage
-                    .add_message_with_seq_at(
-                        &assistant_message.message_id,
-                        &self.context.conversation_id,
-                        agent_seq,
-                        &agent_content,
-                        assistant_message.display_data.as_ref(),
-                        assistant_message.usage.as_ref(),
-                        assistant_message.created_at,
-                    )
-                    .await?;
-                let _ = self.broadcast_tx.send_message(agent_msg);
+                let agent_msg = crate::db::Message {
+                    message_id: assistant_message.message_id.clone(),
+                    conversation_id: conv_id.clone(),
+                    sequence_id: agent_seq,
+                    message_type: agent_content.message_type(),
+                    content: agent_content,
+                    display_data: assistant_message.display_data.clone(),
+                    usage_data: assistant_message.usage.clone(),
+                    created_at: assistant_message.created_at,
+                };
 
-                // Persist all tool results
-                for result in tool_results {
+                // Build all tool-result rows.
+                let mut tool_msgs: Vec<crate::db::Message> = Vec::with_capacity(tool_results.len());
+                for result in &tool_results {
                     let tool_content = MessageContent::tool_with_images(
                         &result.tool_use_id,
                         result.output(),
                         result.is_error(),
                         result.images().to_vec(),
                     );
-                    let tool_msg_id = tool_result_message_id(&result.tool_use_id);
-                    let tool_seq = self.broadcast_tx.next_seq();
                     let merged_display =
                         merge_duration_into_display_data(result.display_data(), result.duration_ms);
-                    let tool_msg = self
-                        .storage
-                        .add_message_with_seq(
-                            &tool_msg_id,
-                            &self.context.conversation_id,
-                            tool_seq,
-                            &tool_content,
-                            merged_display.as_ref(),
-                            None,
-                        )
-                        .await?;
-                    let _ = self.broadcast_tx.send_message(tool_msg.clone());
+                    let tool_seq = self.broadcast_tx.next_seq();
+                    tool_msgs.push(crate::db::Message {
+                        message_id: tool_result_message_id(&result.tool_use_id),
+                        conversation_id: conv_id.clone(),
+                        sequence_id: tool_seq,
+                        message_type: tool_content.message_type(),
+                        content: tool_content,
+                        display_data: merged_display,
+                        usage_data: None,
+                        created_at: Utc::now(),
+                    });
+                }
+
+                // Persist the assistant message and every tool result in one
+                // transaction: either the full round is durable or none of it
+                // is. A partial write would leave an unpaired `tool_use` that
+                // 400s every later LLM request (REQ-BED-007, FM-2 Prevention).
+                self.storage
+                    .persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
+                    .await?;
+
+                // Broadcast the now-durable rows so connected clients render
+                // the assistant message and each tool result.
+                let _ = self.broadcast_tx.send_message(agent_msg);
+                for (msg, result) in tool_msgs.into_iter().zip(tool_results.iter()) {
+                    let _ = self.broadcast_tx.send_message(msg.clone());
                     // Emit a typed `MessageUpdated` so the live-connection reducer
                     // can populate `display_data.duration_ms` without parsing the
                     // opaque `display_data` blob. Reconnect paths read from the
@@ -2540,7 +2547,7 @@ where
                     if result.duration_ms.is_some() {
                         let _ = self.broadcast_tx.send_seq(|seq| SseEvent::MessageUpdated {
                             sequence_id: seq,
-                            message_id: tool_msg.message_id.clone(),
+                            message_id: msg.message_id.clone(),
                             display_data: None,
                             content: None,
                             duration_ms: result.duration_ms,

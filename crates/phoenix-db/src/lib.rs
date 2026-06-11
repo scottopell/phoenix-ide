@@ -2399,6 +2399,53 @@ impl Database {
         Ok(())
     }
 
+    /// Atomically persist a completed tool round: the assistant message row and
+    /// each of its tool-result rows commit in a single transaction, or none do.
+    ///
+    /// An assistant message carries one `tool_use` block per dispatched tool;
+    /// each needs a paired `tool_result`. Writing them as independent statements
+    /// (the historical shape of `persist_checkpoint`) admits a window where the
+    /// assistant row is durable but one or more tool-result rows are not — e.g.
+    /// `SQLITE_BUSY` past the busy timeout, or a crash between inserts. That
+    /// leaves an unpaired `tool_use` in history: every subsequent LLM request
+    /// 400s on the missing `tool_result`, and the restart repair sweep then
+    /// overwrites the genuinely-completed tool's real output with an
+    /// `[interrupted by server restart]` placeholder — permanent loss of work
+    /// the user already saw. Committing the whole round as one transaction makes
+    /// that partial state structurally impossible.
+    ///
+    /// Message inserts use `INSERT OR IGNORE` on `message_id` (via
+    /// `insert_message_tx`) so a crash-retry that finds rows already present is a
+    /// no-op rather than a UNIQUE failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn persist_tool_round(
+        &self,
+        conversation_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+    ) -> DbResult<()> {
+        let mut tx = self.pool.begin().await?;
+
+        insert_message_tx(&mut tx, assistant).await?;
+        for msg in tool_results {
+            insert_message_tx(&mut tx, msg).await?;
+        }
+
+        // Mirror `add_message_with_seq`'s side-effect: bump the conversation's
+        // `updated_at` so list-ordering stays current.
+        sqlx::query("UPDATE conversations SET updated_at = ?1 WHERE id = ?2")
+            .bind(Utc::now().to_rfc3339())
+            .bind(conversation_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// Fetch a fork proposal by id.
     ///
     /// # Errors
@@ -5577,6 +5624,124 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("fp-tr"),
             "ack must carry the fork_proposal_id handle"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_tool_round_commits_assistant_and_all_results() {
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-tr", "ctr", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let assistant = Message {
+            message_id: "asst-tr".to_string(),
+            conversation_id: "conv-tr".to_string(),
+            sequence_id: 10,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let result_a = Message {
+            message_id: "tool-a-result".to_string(),
+            conversation_id: "conv-tr".to_string(),
+            sequence_id: 11,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool("tool-a", "output a", false),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let result_b = Message {
+            message_id: "tool-b-result".to_string(),
+            conversation_id: "conv-tr".to_string(),
+            sequence_id: 12,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool("tool-b", "output b", false),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+
+        db.persist_tool_round("conv-tr", &assistant, &[result_a, result_b])
+            .await
+            .unwrap();
+
+        let msgs = db.get_messages("conv-tr").await.unwrap();
+        let ids: Vec<&str> = msgs.iter().map(|m| m.message_id.as_str()).collect();
+        assert!(
+            ids.contains(&"asst-tr"),
+            "assistant message must be durable"
+        );
+        assert!(
+            ids.contains(&"tool-a-result"),
+            "first tool result must be durable"
+        );
+        assert!(
+            ids.contains(&"tool-b-result"),
+            "second tool result must be durable"
+        );
+    }
+
+    #[tokio::test]
+    async fn persist_tool_round_rolls_back_assistant_when_a_result_insert_fails() {
+        // A `tool_use` with no paired `tool_result` 400s every later LLM
+        // request. `persist_tool_round` must commit the whole round or none of
+        // it. Here the second result names a non-existent conversation, so its
+        // INSERT trips the `messages.conversation_id` foreign key (FKs are on)
+        // and the transaction rolls back — the assistant message must NOT be
+        // left behind unpaired.
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-tr", "ctr", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        let assistant = Message {
+            message_id: "asst-tr".to_string(),
+            conversation_id: "conv-tr".to_string(),
+            sequence_id: 10,
+            message_type: MessageType::Agent,
+            content: MessageContent::agent(vec![]),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let good_result = Message {
+            message_id: "tool-a-result".to_string(),
+            conversation_id: "conv-tr".to_string(),
+            sequence_id: 11,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool("tool-a", "output a", false),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+        let orphan_fk_result = Message {
+            message_id: "tool-b-result".to_string(),
+            // No such conversation: FK violation on insert.
+            conversation_id: "conv-does-not-exist".to_string(),
+            sequence_id: 12,
+            message_type: MessageType::Tool,
+            content: MessageContent::tool("tool-b", "output b", false),
+            display_data: None,
+            usage_data: None,
+            created_at: Utc::now(),
+        };
+
+        let err = db
+            .persist_tool_round("conv-tr", &assistant, &[good_result, orphan_fk_result])
+            .await;
+        assert!(err.is_err(), "FK violation must surface as an error");
+
+        // Nothing from the round committed: not the assistant, not the first
+        // (otherwise-valid) result. All-or-nothing.
+        let msgs = db.get_messages("conv-tr").await.unwrap();
+        assert!(
+            msgs.is_empty(),
+            "rolled-back round must leave no rows; found {:?}",
+            msgs.iter().map(|m| &m.message_id).collect::<Vec<_>>()
         );
     }
 

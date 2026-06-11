@@ -572,6 +572,21 @@ impl MessageStore for InMemoryStorage {
         self.fork_proposals.lock().unwrap().push(proposal.clone());
         Ok(())
     }
+
+    async fn persist_tool_round(
+        &self,
+        conv_id: &str,
+        assistant: &Message,
+        tool_results: &[Message],
+    ) -> Result<(), String> {
+        let mut messages = self.messages.lock().unwrap();
+        let bucket = messages.entry(conv_id.to_string()).or_default();
+        bucket.push(assistant.clone());
+        for msg in tool_results {
+            bucket.push(msg.clone());
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
