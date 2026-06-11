@@ -2,8 +2,26 @@
 
 Research + scoping for letting Phoenix speak the MCP **Streamable HTTP**
 transport natively, instead of only stdio. This is the umbrella; each
-milestone below becomes its own task when it's picked up. This file is the
-scope of record until a `specs/mcp/` spec exists (M0).
+milestone below becomes its own task when it's picked up.
+
+## Start here (implementing agent)
+
+**M0 (scoping + spec) is done.** The authoritative design now lives in
+[`specs/mcp/`](../specs/mcp/) — `requirements.md` (REQ-MCP-001..019),
+`design.md`, `mcp.allium` (the connection + OAuth lifecycle state machine,
+`allium check`-clean), and `executive.md` (per-REQ status + the milestone map).
+That spec set is more precise than the "Architectural impact" sketch below and
+**supersedes it** wherever they differ — it was hardened over six automated
+review rounds (~51 findings), so treat it, not this file, as the source of truth
+for exact contracts (typed `TransportError`, the `ServerMessageSink`,
+authorization-server-keyed registrations, token↔resource binding, etc.).
+
+**Next actionable: M1** — extract the `McpTransport` trait and turn
+`McpServerConfig` into a `Stdio | Http` enum, *zero behavior change*. Spin it
+into its own task (`taskmd new --slug mcp-transport-trait`), implement against
+`specs/mcp/`, and keep the existing stdio tests green. Then M2 → M3 → M4 → M5
+per the milestone list. `executive.md`'s status table tracks which REQs each
+milestone covers.
 
 ## Where we are today
 
@@ -60,6 +78,13 @@ The scope is defined by the MCP transport + auth specs:
 
 ## Architectural impact
 
+> **Note:** this is the original scoping sketch. For exact contracts defer to
+> `specs/mcp/design.md` + `mcp.allium`, which refined several of these (the
+> transport returns a typed `TransportError` + a `ServerMessageSink` rather than
+> `String`; `HttpAuth` distinguishes an explicit credential from generic
+> headers; OAuth registrations are keyed by authorization server; tokens are
+> audience-bound to the resource URI).
+
 The central refactor is that `McpServer` is currently a concrete struct welded
 to a child process (`Child` + `stdin`/`stdout` mutexes). HTTP has no process.
 
@@ -91,12 +116,10 @@ to a child process (`Child` + `stdin`/`stdout` mutexes). HTTP has no process.
 
 ## Milestones
 
-**M0 — Scoping & spec (this task → `specs/mcp/`).**
-No spec exists for MCP at all today. Write spEARS (`requirements.md`,
-`design.md`, `executive.md`). Because this has a real lifecycle (connect →
-initialize → session → reconnect/resume), an auth state machine, and a
-cross-transport contract, it warrants an **Allium** spec for the
-transport+session+auth lifecycle.
+**M0 — Scoping & spec. ✅ DONE** → `specs/mcp/` (`requirements.md`,
+`design.md`, `mcp.allium`, `executive.md`). spEARS + an Allium spec for the
+transport + session + OAuth lifecycle; `allium check`-clean; reviewed over six
+rounds. This is the contract M1–M5 build against.
 
 **OAuth is the headline, not an afterthought.** The value driver is reaching
 OAuth-protected remote servers (Atlassian/Slack/Linear-style) without the
