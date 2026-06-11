@@ -296,11 +296,23 @@ variant SubAgent : Conversation {
 
 config {
     max_retry_attempts: Integer = 3
-    retry_base_delay: Duration = 1.second
     context_warning_threshold: Decimal = 0.80
     context_continuation_threshold: Decimal = 0.90
     max_sub_agents_per_spawn: Integer = 10
 }
+
+-- Automatic LLM-error retries use exponential backoff with a fixed schedule,
+-- not a runtime-configurable base delay. The delay before dispatching the retry
+-- for an already-failed attempt n is 2^n seconds. With max_retry_attempts = 3,
+-- only attempts 1 and 2 are retried, so the realised schedule is 2 seconds then
+-- 4 seconds. Exponential (rather than linear) backoff gives a transient provider
+-- outage room to clear before the second retry without lengthening the first.
+-- The schedule is a fixed design value: there is no per-deployment knob.
+--
+-- The RetryScheduled `delay` below is written as 2.seconds * attempt because the
+-- Allium expression grammar has no exponentiation operator; over the realised
+-- domain {1, 2} the exponential 2^n and this linear form coincide exactly
+-- (2, 4). The exponential 2^n is the authoritative formula — see above.
 
 ------------------------------------------------------------
 -- Rules: Core (shared by parent and sub-agent)
@@ -488,7 +500,7 @@ rule RetryableLlmError {
     requires: error_class = retryable
     requires: attempt < config.max_retry_attempts
     ensures: conversation.retry_attempt = attempt + 1
-    ensures: RetryScheduled(conversation, delay: config.retry_base_delay * attempt)
+    ensures: RetryScheduled(conversation, delay: 2.seconds * attempt)
 }
 
 rule RetryTimeoutFires {
@@ -909,12 +921,18 @@ rule UserAnswersQuestion {
     ensures: LlmRequestDispatched(conversation)
 }
 
-rule CancelDuringUserQuestion {
-    when: UserCancels(conversation)
+-- The user dismisses a pending question instead of answering it, settling the
+-- conversation back to idle without resuming the turn. This is a settle, not a
+-- resume: unlike UserAnswersQuestion (which feeds the answers back and returns
+-- to llm_requesting), dismissal abandons the turn. It is the question-banner
+-- analogue of UserDismissesError, and like that edge it persists a hidden
+-- marker so a server restart treats the conversation as a settled idle rather
+-- than auto-continuing the dismissed turn.
+rule UserDismissesQuestion {
+    when: UserDismissesQuestion(conversation)
     requires: conversation.parent_status = awaiting_user_response
-    ensures: conversation.core_status = llm_requesting
-    ensures: conversation.retry_attempt = 1
-    ensures: LlmRequestDispatched(conversation)
+    ensures: conversation.core_status = idle
+    ensures: QuestionDismissed(conversation)
 }
 
 -- ===========================================================
@@ -947,10 +965,17 @@ rule ContinuationFailed {
         "Continuation summary unavailable. Context was exhausted."
 }
 
+-- Continuation summary generation is not user-cancellable. The UserConversation
+-- surface does not expose UserCancels while awaiting_continuation, so this event
+-- never arrives from the UI. Should one reach the reducer anyway, it is an
+-- invalid transition: the conversation stays in awaiting_continuation and the
+-- in-flight continuation request is not aborted. There is no graceful absorb and
+-- no distinct cancellation signal — the defensive arm exists only to keep the
+-- in-flight request alive rather than tear it down.
 rule RejectCancelDuringContinuation {
     when: UserCancels(conversation)
     requires: conversation.core_status = awaiting_continuation
-    ensures: InvalidCancellationState(conversation)
+    ensures: TransitionRejected(conversation)
     ensures: conversation.core_status = awaiting_continuation
     ensures: not LlmAborted(conversation)
 }
@@ -961,7 +986,7 @@ rule ContinuationRetryableError {
     requires: error_class = retryable
     requires: attempt < config.max_retry_attempts
     ensures: conversation.retry_attempt = attempt + 1
-    ensures: RetryScheduled(conversation, delay: config.retry_base_delay * attempt)
+    ensures: RetryScheduled(conversation, delay: 2.seconds * attempt)
 }
 
 rule ContinuationNonRecoverableError {
@@ -1320,12 +1345,13 @@ surface UserConversation {
             when conversation.is_busy
                  or conversation.parent_status in {
                     awaiting_task_approval,
-                    awaiting_user_response,
                     awaiting_recovery
                  }
         TaskApprovalDecided(conversation, decision)
             when conversation.parent_status = awaiting_task_approval
         UserAnswersQuestion(conversation, answers, annotations?)
+            when conversation.parent_status = awaiting_user_response
+        UserDismissesQuestion(conversation)
             when conversation.parent_status = awaiting_user_response
         UserTriggersContinuation(conversation)
             when conversation.core_status = idle and conversation.context_warning
