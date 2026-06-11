@@ -1346,9 +1346,6 @@ impl RuntimeManager {
             if excluded_conv_id == Some(conv.id.as_str()) {
                 continue;
             }
-            if conv.state.is_terminal() {
-                continue;
-            }
             // An archived conversation is not a live owner even when its
             // row still reads non-terminal: archiving a Work/Branch chain
             // archives earlier members before the leaf's cleanup runs.
@@ -1357,11 +1354,100 @@ impl RuntimeManager {
             if conv.archived {
                 continue;
             }
+            if !self.conv_is_scope_owner(&conv, excluded_conv_id).await? {
+                continue;
+            }
             let conv_scope = crate::work_scope::WorkScope::resolve(
                 &conv.id,
                 conv.conv_mode.worktree_path().map(std::path::Path::new),
             );
             if &conv_scope == work_scope {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether `conv` is a live owner of its work scope — the predicate that
+    /// must agree with `reconcile_worktrees` so every cleanup path makes the
+    /// same "is this worktree still owned?" decision (REQ-BED-030/031).
+    ///
+    /// A conversation owns its scope when it is:
+    ///   - non-terminal (an in-flight conversation, or one idle/awaiting input
+    ///     after a restart with no runtime handle); or
+    ///   - `ContextExhausted` — the worktree is deliberately preserved pending
+    ///     the user's Continue / Abandon / `MarkAsMerged` decision, so it is an
+    ///     owner regardless of any continuation; or
+    ///   - `HandedOff` whose continuation chain dead-ends with nothing live —
+    ///     the row that handed off normally cedes ownership to its live
+    ///     continuation, but if the whole forward chain is gone (every member
+    ///     terminal/archived) the `HandedOff` row is the last protector of the
+    ///     preserved worktree.
+    ///
+    /// `Completed` / `Failed` / `Terminal` are never owners.
+    async fn conv_is_scope_owner(
+        &self,
+        conv: &crate::db::Conversation,
+        excluded_conv_id: Option<&str>,
+    ) -> Result<bool, crate::db::DbError> {
+        use phoenix_core::domain::sm_state::ConvState;
+        match &conv.state {
+            // ContextExhausted always owns the preserved worktree.
+            ConvState::ContextExhausted { .. } => Ok(true),
+            // HandedOff owns the worktree only when its continuation chain has
+            // gone dead — otherwise the live continuation is the owner and is
+            // counted on its own.
+            ConvState::HandedOff { .. } => Ok(!self
+                .continuation_chain_has_live_owner(&conv.id, excluded_conv_id)
+                .await?),
+            // Other terminal states (Completed / Failed / Terminal) are not owners.
+            s if s.is_terminal() => Ok(false),
+            // Non-terminal: a live owner (in-flight or handle-less post-restart).
+            _ => Ok(true),
+        }
+    }
+
+    /// Whether any conversation STRICTLY DOWNSTREAM of `conv_id` on the
+    /// continuation chain (`continued_in_conv_id` edges) is itself a live scope
+    /// owner. Used to decide whether a `HandedOff` row still protects its
+    /// preserved worktree: if a downstream continuation is live, that
+    /// continuation owns the scope and the `HandedOff` row does not.
+    ///
+    /// `excluded_conv_id` is treated as not-live: the cleanup cascade runs
+    /// BEFORE the deleted conversation's terminal-state write, so a deletion of
+    /// the live continuation must not let that doomed row keep the chain
+    /// "alive" and strip ownership from the `HandedOff` predecessor.
+    async fn continuation_chain_has_live_owner(
+        &self,
+        conv_id: &str,
+        excluded_conv_id: Option<&str>,
+    ) -> Result<bool, crate::db::DbError> {
+        let chain = self.db().chain_members_forward(conv_id).await?;
+        // `chain[0]` is `conv_id` itself (the HandedOff row); skip it and
+        // inspect only its successors.
+        for member_id in chain.into_iter().skip(1) {
+            if excluded_conv_id == Some(member_id.as_str()) {
+                continue;
+            }
+            let member = match self.db().get_conversation(&member_id).await {
+                Ok(m) => m,
+                Err(crate::db::DbError::ConversationNotFound(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if member.archived {
+                continue;
+            }
+            // A non-terminal or ContextExhausted member is a live owner. A
+            // member that is itself HandedOff is handled by its own successor
+            // appearing later in `chain`, so it need not be treated as live
+            // here — but if the chain dead-ends at such a member with nothing
+            // live after it, the ORIGINAL HandedOff row is correctly the owner.
+            if !member.state.is_terminal()
+                || matches!(
+                    member.state,
+                    phoenix_core::domain::sm_state::ConvState::ContextExhausted { .. }
+                )
+            {
                 return Ok(true);
             }
         }
@@ -3166,6 +3252,140 @@ mod scope_liveness_tests {
                 .await
                 .unwrap(),
             "with the only other owner terminal, deleting the leaf leaves no live owner"
+        );
+    }
+
+    /// Regression (REQ-BED-031): a `ContextExhausted` conversation owns its
+    /// preserved worktree pending the user's Continue / Abandon / MarkAsMerged
+    /// decision. Deleting a SIBLING sub-agent on the same worktree must NOT let
+    /// the cleanup cascade conclude the scope is unowned and force-remove the
+    /// worktree — that destroys uncommitted user work.
+    #[tokio::test]
+    async fn context_exhausted_sibling_preserves_worktree_scope() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+
+        // The parent that hit ContextExhausted — owns the preserved worktree.
+        create_handleless_work_conv(&mgr, "parent", worktree).await;
+        mgr.db()
+            .update_conversation_state(
+                "parent",
+                &ConvState::ContextExhausted {
+                    summary: "ran out of context".to_string(),
+                },
+            )
+            .await
+            .expect("set context-exhausted");
+
+        // Sibling sub-agent on the shared worktree being deleted.
+        create_handleless_work_conv(&mgr, "leaf", worktree).await;
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+
+        assert!(
+            mgr.scope_has_live_conversation_excluding(&scope, "leaf")
+                .await
+                .unwrap(),
+            "a ContextExhausted parent still owns the shared worktree — deleting a \
+             sibling must not tear it down"
+        );
+    }
+
+    /// A `HandedOff` row whose continuation has gone terminal (the whole
+    /// forward chain dead-ends) is the last protector of the preserved
+    /// worktree. Deleting a sibling must not tear it down.
+    #[tokio::test]
+    async fn handed_off_dead_end_chain_preserves_worktree_scope() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+
+        // Parent handed off to a successor that itself reached a terminal
+        // state — the chain has no live owner downstream.
+        create_handleless_work_conv(&mgr, "parent", worktree).await;
+        create_handleless_work_conv(&mgr, "successor", worktree).await;
+        mgr.db()
+            .update_conversation_state(
+                "parent",
+                &ConvState::HandedOff {
+                    successor_conv_id: "successor".to_string(),
+                },
+            )
+            .await
+            .expect("set handed-off");
+        mgr.db()
+            .update_conversation_state("successor", &ConvState::Terminal)
+            .await
+            .expect("terminate successor");
+        // Wire the continuation edge the chain walk reads.
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind("successor")
+            .bind("parent")
+            .execute(mgr.db().pool())
+            .await
+            .expect("wire continuation");
+
+        // Sibling sub-agent on the shared worktree being deleted.
+        create_handleless_work_conv(&mgr, "leaf", worktree).await;
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+
+        assert!(
+            mgr.scope_has_live_conversation_excluding(&scope, "leaf")
+                .await
+                .unwrap(),
+            "a HandedOff row whose continuation chain is dead still protects the \
+             preserved worktree"
+        );
+    }
+
+    /// Counterpart: a `HandedOff` row WITH a live continuation does NOT itself
+    /// own the scope — but the live continuation does, so the scope is still
+    /// preserved. (The point of this test is that ownership is attributed to
+    /// the continuation, matching `reconcile_worktrees` skipping the parent.)
+    #[tokio::test]
+    async fn handed_off_with_live_continuation_scope_owned_by_continuation() {
+        let mgr = test_manager().await;
+        let worktree = "/repo/.phoenix/worktrees/shared";
+
+        create_handleless_work_conv(&mgr, "parent", worktree).await;
+        create_handleless_work_conv(&mgr, "successor", worktree).await;
+        mgr.db()
+            .update_conversation_state(
+                "parent",
+                &ConvState::HandedOff {
+                    successor_conv_id: "successor".to_string(),
+                },
+            )
+            .await
+            .expect("set handed-off");
+        // successor stays non-terminal (live).
+        sqlx::query("UPDATE conversations SET continued_in_conv_id = ?1 WHERE id = ?2")
+            .bind("successor")
+            .bind("parent")
+            .execute(mgr.db().pool())
+            .await
+            .expect("wire continuation");
+
+        let scope = crate::work_scope::WorkScope::Worktree(worktree.to_string());
+
+        // Deleting the live successor leaf: the only remaining row is the
+        // HandedOff parent, whose continuation (the leaf) is being deleted.
+        // With nothing live downstream, the parent now protects the worktree.
+        assert!(
+            mgr.scope_has_live_conversation_excluding(&scope, "successor")
+                .await
+                .unwrap(),
+            "deleting the live continuation leaves the HandedOff parent as the owner"
+        );
+
+        // Deleting an unrelated leaf while the successor is still live: the
+        // successor owns the scope.
+        create_handleless_work_conv(&mgr, "leaf", worktree).await;
+        assert!(
+            mgr.scope_has_live_conversation_excluding(&scope, "leaf")
+                .await
+                .unwrap(),
+            "the live continuation owns the scope"
         );
     }
 
