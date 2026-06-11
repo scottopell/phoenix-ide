@@ -39,6 +39,74 @@ use tokio_util::sync::CancellationToken;
 /// Primary enforcement is max turns (REQ-PROJ-008). This catches stuck tool execution.
 const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 
+/// Hard byte cap on the LLM-bound text of a single tool result.
+///
+/// Per-tool caps are line-based (bash tail = 200 lines, `read_file` = 2000
+/// lines) and do not bound bytes: a `cat` of a multi-MB single-line minified
+/// file yields a handful of very long "lines" that pass every line cap, enter
+/// the tool result whole, get persisted, and are resent every subsequent turn
+/// until the context window is exceeded (`NotResumable` — conversation-fatal).
+/// This is the final backstop applied to ALL tools at the persist choke point,
+/// on top of (not instead of) the per-tool line caps. 100 KB keeps a generous
+/// amount of legitimate output while making the pathological case impossible.
+const MAX_TOOL_OUTPUT_BYTES: usize = 100 * 1024;
+
+/// Number of most-recent tool rounds whose persisted screenshots are replayed
+/// to the LLM. Older tool rounds have their base64 images replaced with a short
+/// text placeholder when history is assembled, bounding the permanent image
+/// prefix (≈30k tokens for 20 screenshots otherwise). 2 keeps the current and
+/// immediately-prior round's visual context, which is what the model usually
+/// needs to reason about a just-taken screenshot.
+const IMAGE_HISTORY_ROUNDS: usize = 2;
+
+/// Truncate `text` to at most [`MAX_TOOL_OUTPUT_BYTES`] bytes, keeping a head
+/// and tail slice joined by a marker that records how much was dropped.
+///
+/// Slice boundaries are snapped down to UTF-8 char boundaries, so the result is
+/// always valid UTF-8 and never splits a multi-byte char. Output already within
+/// the cap is returned unchanged (no allocation of a new marker).
+// string_slice: every index below is snapped to a char boundary via the
+// `is_char_boundary` loops before it is used, so the slices cannot panic.
+#[allow(clippy::string_slice)]
+fn cap_tool_output_text(text: String) -> String {
+    let total = text.len();
+    if total <= MAX_TOOL_OUTPUT_BYTES {
+        return text;
+    }
+
+    // The marker counts against the budget so the final string stays under the
+    // cap. Its byte length depends on the decimal digits of `omitted`/`total`;
+    // both are <= `total`, so an upper bound on the marker is computable up
+    // front from `total` alone (omitted <= total).
+    let marker_template = format!("\n…[truncated {total} bytes of {total} total]…\n");
+    let marker_budget = marker_template.len();
+    let content_budget = MAX_TOOL_OUTPUT_BYTES.saturating_sub(marker_budget);
+
+    // Split the content budget head-heavy. Snap the head boundary down to a
+    // char boundary.
+    let head_target = (content_budget * 3 / 4).min(content_budget);
+    let mut head_end = head_target.min(total);
+    while head_end > 0 && !text.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+
+    // Tail length is the remaining content budget; snap its start up to a char
+    // boundary.
+    let tail_len = content_budget - head_end;
+    let mut tail_start = total - tail_len;
+    while tail_start < total && !text.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+
+    let omitted = tail_start - head_end;
+    let marker = format!("\n…[truncated {omitted} bytes of {total} total]…\n");
+    let mut out = String::with_capacity(head_end + (total - tail_start) + marker.len());
+    out.push_str(&text[..head_end]);
+    out.push_str(&marker);
+    out.push_str(&text[tail_start..]);
+    out
+}
+
 /// Map a producer-side [`crate::tools::ToolOutput`] onto a persisted
 /// [`ToolOutcome`].
 ///
@@ -66,7 +134,7 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             images,
             display_data,
         } => ToolOutcome::Success {
-            output,
+            output: cap_tool_output_text(output),
             display_data,
             images: convert(images),
         },
@@ -75,7 +143,7 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
             images,
             display_data,
         } => ToolOutcome::Error {
-            output,
+            output: cap_tool_output_text(output),
             display_data,
             images: convert(images),
         },
@@ -2071,6 +2139,7 @@ where
             };
 
             // Build system prompt with AGENTS.md content + mode context
+            // TODO(task 61006): snapshot system prompt per conversation to stop mid-session cache busts
             let system_prompt = build_system_prompt(
                 &working_dir,
                 &tasks_dir_name,
@@ -2709,9 +2778,30 @@ where
 
         let db_messages = storage.get_messages(conv_id).await?;
 
+        // Prune aged screenshots from replayed history (token bound).
+        //
+        // Base64 images persisted in tool results replay in every LLM request
+        // forever; 20 screenshots is ~30k permanent prefix tokens. Keep images
+        // only for the most recent `IMAGE_HISTORY_ROUNDS` tool rounds and
+        // replace older ones with a short text placeholder. This is an
+        // in-memory transform of the LLM message build only — the DB rows and
+        // the UI rendering are untouched.
+        let tool_round_indices: Vec<usize> = db_messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| matches!(&m.content, MessageContent::Tool(_)))
+            .map(|(i, _)| i)
+            .collect();
+        // Index of the oldest tool message whose images are still kept. Tool
+        // messages strictly before this index get their images placeholdered.
+        let image_keep_from = tool_round_indices
+            .get(tool_round_indices.len().saturating_sub(IMAGE_HISTORY_ROUNDS))
+            .copied()
+            .unwrap_or(0);
+
         let mut messages = Vec::new();
 
-        for msg in db_messages {
+        for (msg_idx, msg) in db_messages.into_iter().enumerate() {
             match &msg.content {
                 MessageContent::User(user_content) => {
                     // Use llm_text when expansion occurred (REQ-IR-001, REQ-IR-006):
@@ -2751,21 +2841,35 @@ where
                     is_error,
                     images,
                 }) => {
-                    // Convert stored ToolContentImages to LLM ImageSources
-                    let image_sources: Vec<ImageSource> = images
-                        .iter()
-                        .map(|img| ImageSource::Base64 {
-                            media_type: img.media_type.clone(),
-                            data: img.data.clone(),
-                        })
-                        .collect();
+                    // Aged tool rounds drop their images: replace each with a
+                    // text placeholder and send no image blocks. Recent rounds
+                    // (>= image_keep_from) keep their images verbatim.
+                    let keep_images = msg_idx >= image_keep_from;
+                    let (text, image_sources): (String, Vec<ImageSource>) = if keep_images
+                        || images.is_empty()
+                    {
+                        let sources = images
+                            .iter()
+                            .map(|img| ImageSource::Base64 {
+                                media_type: img.media_type.clone(),
+                                data: img.data.clone(),
+                            })
+                            .collect();
+                        (content.clone(), sources)
+                    } else {
+                        let mut text = content.clone();
+                        for _ in 0..images.len() {
+                            text.push_str("\n[screenshot omitted from history]");
+                        }
+                        (text, Vec::new())
+                    };
 
                     // Tool results go in user message
                     messages.push(LlmMessage {
                         role: MessageRole::User,
                         content: vec![ContentBlock::ToolResult {
                             tool_use_id: tool_use_id.clone(),
-                            content: content.clone(),
+                            content: text,
                             images: image_sources,
                             is_error: *is_error,
                         }],
@@ -6463,5 +6567,55 @@ mod fork_proposal_persist_tests {
         );
 
         assert_round_persisted(&storage, "conv-fork-sub", "fp-sub");
+    }
+}
+
+#[cfg(test)]
+mod tool_output_cap_tests {
+    use super::{cap_tool_output_text, MAX_TOOL_OUTPUT_BYTES};
+
+    #[test]
+    fn output_within_cap_is_unchanged() {
+        let small = "a".repeat(MAX_TOOL_OUTPUT_BYTES);
+        assert_eq!(cap_tool_output_text(small.clone()), small);
+    }
+
+    #[test]
+    fn giant_single_line_is_truncated_with_marker_and_under_cap() {
+        // The pathological case: a multi-MB single line with no newlines that
+        // every line-based cap lets through.
+        let original = "x".repeat(2 * 1024 * 1024);
+        let capped = cap_tool_output_text(original);
+
+        assert!(
+            capped.len() <= MAX_TOOL_OUTPUT_BYTES,
+            "capped length {} must be <= {MAX_TOOL_OUTPUT_BYTES}",
+            capped.len()
+        );
+        assert!(
+            capped.contains("…[truncated"),
+            "truncation marker must be present: {:?}",
+            &capped[..capped.len().min(120)]
+        );
+        // String is always valid UTF-8 in Rust; assert it explicitly survives a
+        // round-trip through bytes to guard the char-boundary slicing logic.
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn truncation_does_not_split_utf8_char() {
+        // A long run of 4-byte chars (😀) ensures slice boundaries land mid-char
+        // unless snapped. If snapping were wrong, the result would be invalid
+        // UTF-8 (impossible to even construct) or drop/duplicate bytes.
+        let emoji = "😀";
+        assert_eq!(emoji.len(), 4);
+        let original = emoji.repeat(MAX_TOOL_OUTPUT_BYTES); // ~400 KB
+        let capped = cap_tool_output_text(original);
+
+        assert!(capped.len() <= MAX_TOOL_OUTPUT_BYTES);
+        assert!(std::str::from_utf8(capped.as_bytes()).is_ok());
+        // Every retained char must be a whole emoji or part of the ASCII marker;
+        // no replacement chars or partial sequences.
+        assert!(!capped.contains('\u{FFFD}'));
     }
 }
