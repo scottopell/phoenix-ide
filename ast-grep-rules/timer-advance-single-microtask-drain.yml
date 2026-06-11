@@ -1,0 +1,24 @@
+id: timer-advance-single-microtask-drain
+language: Tsx
+severity: error
+message: |
+  `vi.advanceTimersByTime(N); await Promise.resolve();` drains only ONE
+  microtask, but a polling component's reaction to a timer tick spans several
+  hops (fetch -> .then(apply) -> setState -> re-render). If the chain hasn't
+  settled before the next tick, an in-flight gate can skip the next poll —
+  deterministic locally, flaky on a loaded CI runner where the promise/timer
+  interleaving shifts.
+
+  Use `await vi.advanceTimersByTimeAsync(N)` instead: it runs each timer
+  callback and flushes pending microtasks between them, so the component fully
+  settles before the test asserts.
+note: "Anti-pattern: timer advance followed by a single-microtask flush — under-drains async reactions, flakes on CI"
+rule:
+  kind: expression_statement
+  has:
+    pattern: await Promise.resolve()
+  follows:
+    kind: expression_statement
+    has:
+      pattern: vi.advanceTimersByTime($$$)
+    stopBy: neighbor
