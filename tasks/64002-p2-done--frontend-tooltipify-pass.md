@@ -54,3 +54,27 @@ A concise summary listing:
 - Number of tooltip/aria gaps filled.
 - Files changed.
 - Any skipped/dead/ambiguous controls and why.
+
+## Result
+
+- Scanned `ui/src` with the bundled tooltipify AST scanner before and after the pass: **400 interactive elements** both times.
+- Improved scanner-covered tooltip/aria coverage from **98 to 142** elements, filling **44 gaps**.
+- Added behavior-accurate native `title` text and matching `aria-label` where appropriate across conversation list actions, chain actions, archive/new controls, settings controls, question options/navigation/notes, context usage controls, browser view close, LLM status sign-in, confirmation dialogs, and conversation-list page utility controls.
+- Kept behavior unchanged; no custom tooltip library or component was introduced.
+- Changed files:
+  - `ui/src/components/BrowserViewPanel.tsx`
+  - `ui/src/components/ConfirmDialog.tsx`
+  - `ui/src/components/ContextIndicator.tsx`
+  - `ui/src/components/ConversationList.tsx`
+  - `ui/src/components/LlmStatusBanner.tsx`
+  - `ui/src/components/QuestionPanel.tsx`
+  - `ui/src/components/SettingsDropdown.tsx`
+  - `ui/src/pages/ConversationListPage.tsx`
+- Intentional remaining scanner skips:
+  - Component invocation false positives: `ConversationRow`, `QuestionItem`, `ThemeSection`; their actual interactive children now have relevant tooltips.
+  - `QuestionPanel` root `div` with `onKeyDown`: keyboard event container, not a clickable control.
+  - Notification `label` rows in `SettingsDropdown`: associated checkbox inputs have state-aware `title` and `aria-label`; duplicate label tooltips would be redundant.
+  - `ConversationListPage` `main` touch handlers: pull-refresh gesture surface, not a button-like control.
+- Validation passed:
+  - `cd ui && pnpm exec tsc -b --noEmit && pnpm exec eslint . --ext ts,tsx --report-unused-disable-directives --max-warnings 0`
+  - `./dev.py check`
