@@ -358,9 +358,8 @@ pub async fn auth_login(
     } else {
         ""
     };
-    let cookie_value = format!(
-        "phoenix-auth={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{secure}"
-    );
+    let cookie_value =
+        format!("phoenix-auth={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{secure}");
 
     (
         StatusCode::OK,

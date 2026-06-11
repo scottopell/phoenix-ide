@@ -2795,7 +2795,11 @@ where
         // Index of the oldest tool message whose images are still kept. Tool
         // messages strictly before this index get their images placeholdered.
         let image_keep_from = tool_round_indices
-            .get(tool_round_indices.len().saturating_sub(IMAGE_HISTORY_ROUNDS))
+            .get(
+                tool_round_indices
+                    .len()
+                    .saturating_sub(IMAGE_HISTORY_ROUNDS),
+            )
             .copied()
             .unwrap_or(0);
 
@@ -2845,24 +2849,23 @@ where
                     // text placeholder and send no image blocks. Recent rounds
                     // (>= image_keep_from) keep their images verbatim.
                     let keep_images = msg_idx >= image_keep_from;
-                    let (text, image_sources): (String, Vec<ImageSource>) = if keep_images
-                        || images.is_empty()
-                    {
-                        let sources = images
-                            .iter()
-                            .map(|img| ImageSource::Base64 {
-                                media_type: img.media_type.clone(),
-                                data: img.data.clone(),
-                            })
-                            .collect();
-                        (content.clone(), sources)
-                    } else {
-                        let mut text = content.clone();
-                        for _ in 0..images.len() {
-                            text.push_str("\n[screenshot omitted from history]");
-                        }
-                        (text, Vec::new())
-                    };
+                    let (text, image_sources): (String, Vec<ImageSource>) =
+                        if keep_images || images.is_empty() {
+                            let sources = images
+                                .iter()
+                                .map(|img| ImageSource::Base64 {
+                                    media_type: img.media_type.clone(),
+                                    data: img.data.clone(),
+                                })
+                                .collect();
+                            (content.clone(), sources)
+                        } else {
+                            let mut text = content.clone();
+                            for _ in 0..images.len() {
+                                text.push_str("\n[screenshot omitted from history]");
+                            }
+                            (text, Vec::new())
+                        };
 
                     // Tool results go in user message
                     messages.push(LlmMessage {

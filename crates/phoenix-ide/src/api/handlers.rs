@@ -7519,9 +7519,16 @@ mod file_read_tests {
     /// containment check in `read_file`/`list_files` admits files under it.
     async fn state_with_root(cwd: &std::path::Path) -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
-        db.create_conversation("c-read", "read-test", &cwd.to_string_lossy(), true, None, None)
-            .await
-            .expect("seed conversation");
+        db.create_conversation(
+            "c-read",
+            "read-test",
+            &cwd.to_string_lossy(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .expect("seed conversation");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
         let platform = PlatformCapability::None;
         let mcp_manager = Arc::new(McpClientManager::new());
