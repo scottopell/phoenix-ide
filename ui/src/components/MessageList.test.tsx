@@ -227,8 +227,10 @@ describe('MessageList', () => {
     expect(messagesScroller).not.toBeNull();
     expect(messagesScroller).toBe(container.querySelector('[data-testid="mock-virtuoso"]'));
     expect(mainArea).toHaveClass('chat-main-area');
-    expect(appCss).toMatch(/#main-area\s*{[^}]*overflow:\s*hidden;/s);
-    expect(appCss).toMatch(/\.list-page\s*>\s*#main-area\s*{[^}]*overflow:\s*hidden auto;/s);
+    expect(appCss).toMatch(/#main-area\s*{[^}]*overflow:\s*hidden auto;/s);
+    expect(appCss).toMatch(/#main-area\.chat-main-area\s*{[^}]*overflow:\s*hidden;/s);
+    expect(appCss).toMatch(/\.desktop-main\s*{[^}]*overflow:\s*auto;/s);
+    expect(appCss).toMatch(/\.desktop-main:has\(\.chat-main-area\)\s*{[^}]*overflow:\s*hidden;/s);
     expect(getComputedStyle(messagesScroller!).overflowY).toBe('auto');
   });
 

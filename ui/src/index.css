@@ -515,14 +515,14 @@ body {
 #main-area {
   flex: 1 1 auto;
   min-height: 0;
-  overflow: hidden;
+  overflow: hidden auto;
   display: flex;
   flex-direction: column;
   position: relative;
 }
 
-.list-page > #main-area {
-  overflow: hidden auto;
+#main-area.chat-main-area {
+  overflow: hidden;
 }
 
 /* Views */
@@ -7009,9 +7009,13 @@ html * {
 .desktop-main {
   flex: 1 1 auto;
   min-width: 0;
-  min-height: 0;
   display: flex;
   flex-direction: column;
+  overflow: auto;
+}
+
+.desktop-main:has(.chat-main-area) {
+  min-height: 0;
   overflow: hidden;
 }
 
