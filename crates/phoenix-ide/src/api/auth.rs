@@ -8,13 +8,13 @@
 //! bypassed entirely (backward compatible).
 
 use std::collections::{HashMap, HashSet};
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{ConnectInfo, State},
     http::{header, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -65,9 +65,11 @@ impl SessionStore {
 
 /// In-memory per-client login throttle. Counts consecutive failed logins and
 /// locks a client out for a back-off window once the threshold is exceeded. The
-/// counter resets on a successful login. Keyed on best-effort client IP (from
-/// `X-Forwarded-For` / `X-Real-IP` when behind a proxy); requests without a
-/// determinable IP share a single fallback bucket.
+/// counter resets on a successful login. Keyed on the connection's real peer IP
+/// (`ConnectInfo<SocketAddr>`), so a directly-reachable deployment cannot be
+/// induced to mint a fresh bucket per request by varying client-controlled
+/// headers. Forwarded headers are trusted only when an operator opts in via
+/// `PHOENIX_TRUST_PROXY` (see [`throttle_key`]).
 #[derive(Clone, Default)]
 pub struct LoginThrottle {
     inner: Arc<Mutex<HashMap<String, AttemptRecord>>>,
@@ -130,30 +132,63 @@ impl LoginThrottle {
     }
 }
 
-/// Best-effort client identity for throttling: the first `X-Forwarded-For` hop,
-/// then `X-Real-IP`, else a shared `"direct"` bucket. We don't have
-/// `ConnectInfo` peer addresses wired through the (TLS + plain) serve loop, so
-/// direct (non-proxied) connections share one bucket — still bounds brute force,
-/// at the cost of one attacker being able to lock out other direct clients.
-fn throttle_key(req_headers: &header::HeaderMap) -> String {
-    if let Some(xff) = req_headers.get("x-forwarded-for") {
-        if let Ok(s) = xff.to_str() {
-            if let Some(first) = s.split(',').next() {
-                let first = first.trim();
-                if first.parse::<IpAddr>().is_ok() {
-                    return first.to_string();
+/// Whether forwarded client-IP headers (`X-Forwarded-For` / `X-Real-IP`) may be
+/// trusted as the throttle identity. Off unless the operator sets
+/// `PHOENIX_TRUST_PROXY` to a truthy value (`1`/`true`/`on`/`yes`), asserting
+/// that a trusted reverse proxy sets/overwrites those headers. On a
+/// directly-reachable deployment these headers are fully client-controlled, so
+/// trusting them by default lets an attacker mint a fresh throttle bucket per
+/// request and bypass the lockout entirely.
+fn trust_forwarded_headers() -> bool {
+    matches!(
+        std::env::var("PHOENIX_TRUST_PROXY")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str(),
+        "1" | "true" | "on" | "yes"
+    )
+}
+
+/// Throttle identity for a login attempt.
+///
+/// The authoritative key is the connection's real peer IP (`peer`, from
+/// `ConnectInfo<SocketAddr>`), which a client cannot spoof on a direct TCP/TLS
+/// connection. Forwarded headers are consulted **only** when the operator has
+/// opted in via `PHOENIX_TRUST_PROXY` (a trusted proxy is then responsible for
+/// setting/overwriting them); in that mode the first `X-Forwarded-For` hop, then
+/// `X-Real-IP`, take precedence over the peer (which is the proxy's address).
+///
+/// `peer` is `None` only if `ConnectInfo` was not injected by the serve loop
+/// (it is wired through both the plain and TLS paths); such requests fall back
+/// to a shared `"direct"` bucket. Header trust never applies without the opt-in,
+/// so an unauthenticated client on a direct deployment cannot vary headers to
+/// escape its peer-keyed bucket.
+fn throttle_key(req_headers: &header::HeaderMap, peer: Option<SocketAddr>) -> String {
+    if trust_forwarded_headers() {
+        if let Some(xff) = req_headers.get("x-forwarded-for") {
+            if let Ok(s) = xff.to_str() {
+                if let Some(first) = s.split(',').next() {
+                    let first = first.trim();
+                    if first.parse::<IpAddr>().is_ok() {
+                        return first.to_string();
+                    }
+                }
+            }
+        }
+        if let Some(xri) = req_headers.get("x-real-ip") {
+            if let Ok(s) = xri.to_str() {
+                if s.parse::<IpAddr>().is_ok() {
+                    return s.to_string();
                 }
             }
         }
     }
-    if let Some(xri) = req_headers.get("x-real-ip") {
-        if let Ok(s) = xri.to_str() {
-            if s.parse::<IpAddr>().is_ok() {
-                return s.to_string();
-            }
-        }
+
+    match peer {
+        Some(addr) => addr.ip().to_string(),
+        None => "direct".to_string(),
     }
-    "direct".to_string()
 }
 
 /// Constant-time string comparison to prevent timing attacks on password checks.
@@ -318,6 +353,7 @@ pub async fn auth_status(
 /// [`LoginThrottle`]).
 pub async fn auth_login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     req_headers: header::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> Response {
@@ -326,7 +362,7 @@ pub async fn auth_login(
         return (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();
     };
 
-    let key = throttle_key(&req_headers);
+    let key = throttle_key(&req_headers, Some(peer));
 
     // Reject locked-out clients before touching the password.
     if state.login_throttle.is_locked(&key) {
@@ -495,22 +531,110 @@ mod tests {
         assert!(!throttle.is_locked(key));
     }
 
+    /// Serialize tests that mutate the process-global `PHOENIX_TRUST_PROXY`
+    /// env var so they don't race each other under the parallel test runner.
+    static TRUST_PROXY_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn peer(s: &str) -> SocketAddr {
+        s.parse().unwrap()
+    }
+
+    /// By default (no trusted-proxy opt-in) the throttle key is the real peer
+    /// IP and forwarded headers are ignored entirely. This is the security
+    /// property: on a directly-reachable deployment a client cannot vary
+    /// `X-Forwarded-For` / `X-Real-IP` to escape its peer-keyed bucket.
     #[test]
-    fn throttle_key_prefers_forwarded_ip() {
+    fn throttle_key_uses_peer_and_ignores_forwarded_headers_by_default() {
+        let _guard = TRUST_PROXY_ENV_LOCK.lock().unwrap();
+        // SAFETY: env mutation guarded by TRUST_PROXY_ENV_LOCK for this test.
+        unsafe { std::env::remove_var("PHOENIX_TRUST_PROXY") };
+
+        // A spoofed XFF is ignored; the key is the peer IP.
         let mut headers = header::HeaderMap::new();
         headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
-        assert_eq!(throttle_key(&headers), "203.0.113.7");
+        assert_eq!(
+            throttle_key(&headers, Some(peer("198.51.100.9:54321"))),
+            "198.51.100.9"
+        );
+
+        // X-Real-IP is likewise ignored without the opt-in.
+        let mut headers = header::HeaderMap::new();
+        headers.insert("x-real-ip", "203.0.113.7".parse().unwrap());
+        assert_eq!(
+            throttle_key(&headers, Some(peer("198.51.100.9:1234"))),
+            "198.51.100.9"
+        );
+
+        // No peer info (ConnectInfo absent) falls back to the shared bucket.
+        assert_eq!(throttle_key(&header::HeaderMap::new(), None), "direct");
+    }
+
+    /// The bypass-is-closed regression: two login attempts that present
+    /// DIFFERENT spoofed `X-Forwarded-For` values from the SAME peer must land
+    /// in the SAME throttle bucket (both count toward lockout). Before the fix
+    /// each spoofed header minted a fresh bucket, defeating the lockout.
+    #[test]
+    fn spoofed_forwarded_headers_share_one_bucket_by_default() {
+        let _guard = TRUST_PROXY_ENV_LOCK.lock().unwrap();
+        // SAFETY: env mutation guarded by TRUST_PROXY_ENV_LOCK for this test.
+        unsafe { std::env::remove_var("PHOENIX_TRUST_PROXY") };
+
+        let attacker = peer("198.51.100.42:5555");
+
+        let mut h1 = header::HeaderMap::new();
+        h1.insert("x-forwarded-for", "1.1.1.1".parse().unwrap());
+        let mut h2 = header::HeaderMap::new();
+        h2.insert("x-forwarded-for", "2.2.2.2".parse().unwrap());
+
+        let k1 = throttle_key(&h1, Some(attacker));
+        let k2 = throttle_key(&h2, Some(attacker));
+        assert_eq!(k1, k2, "varying XFF must not mint a fresh bucket");
+        assert_eq!(k1, "198.51.100.42");
+
+        // And drive it through the throttle to prove both count toward lockout.
+        let throttle = LoginThrottle::new();
+        for _ in 0..MAX_FAILURES {
+            assert!(!throttle.is_locked(&k1));
+            // Alternate the spoofed header each attempt — same peer, same key.
+            throttle.record_failure(&throttle_key(
+                if rand::random() { &h1 } else { &h2 },
+                Some(attacker),
+            ));
+        }
+        assert!(
+            throttle.is_locked(&k2),
+            "attacker is locked out despite varying X-Forwarded-For"
+        );
+    }
+
+    /// With `PHOENIX_TRUST_PROXY` set, forwarded headers regain precedence over
+    /// the peer (which is now the trusted proxy's address): first XFF hop, then
+    /// X-Real-IP, then peer fallback.
+    #[test]
+    fn throttle_key_trusts_forwarded_headers_when_opted_in() {
+        let _guard = TRUST_PROXY_ENV_LOCK.lock().unwrap();
+        // SAFETY: env mutation guarded by TRUST_PROXY_ENV_LOCK for this test.
+        unsafe { std::env::set_var("PHOENIX_TRUST_PROXY", "1") };
+
+        let proxy = Some(peer("10.0.0.1:443"));
+
+        let mut headers = header::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        assert_eq!(throttle_key(&headers, proxy), "203.0.113.7");
 
         let mut headers = header::HeaderMap::new();
         headers.insert("x-real-ip", "198.51.100.4".parse().unwrap());
-        assert_eq!(throttle_key(&headers), "198.51.100.4");
+        assert_eq!(throttle_key(&headers, proxy), "198.51.100.4");
 
-        // No usable forwarding header — shared direct bucket.
-        assert_eq!(throttle_key(&header::HeaderMap::new()), "direct");
-
-        // A non-IP forwarding value is ignored rather than trusted as a key.
+        // A non-IP forwarding value is ignored; fall back to the peer (proxy) IP.
         let mut headers = header::HeaderMap::new();
         headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
-        assert_eq!(throttle_key(&headers), "direct");
+        assert_eq!(throttle_key(&headers, proxy), "10.0.0.1");
+
+        // No forwarding header at all — peer (proxy) IP.
+        assert_eq!(throttle_key(&header::HeaderMap::new(), proxy), "10.0.0.1");
+
+        // SAFETY: restore default for other tests; guarded by the lock.
+        unsafe { std::env::remove_var("PHOENIX_TRUST_PROXY") };
     }
 }

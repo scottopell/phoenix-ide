@@ -649,11 +649,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // graceful-shutdown hook.
         let (drain_tx, drain_rx) = tokio::sync::oneshot::channel::<()>();
         let mut server = tokio::spawn(
-            axum::serve(listener, app)
-                .with_graceful_shutdown(async move {
-                    let _ = drain_rx.await;
-                })
-                .into_future(),
+            // `into_make_service_with_connect_info` injects the real peer
+            // `SocketAddr` into each request's extensions so handlers like
+            // `auth_login` can key the login throttle on the unspoofable peer
+            // IP (the TLS path injects the same extension in `serve_https`).
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .with_graceful_shutdown(async move {
+                let _ = drain_rx.await;
+            })
+            .into_future(),
         );
         let server_abort = server.abort_handle();
 

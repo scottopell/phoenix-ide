@@ -1,4 +1,4 @@
-use axum::Router;
+use axum::{extract::ConnectInfo, Router};
 use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::graceful::GracefulShutdown,
@@ -211,6 +211,14 @@ pub async fn serve_https(
                     log_alpn(peer_addr, &stream);
 
                     let io = TokioIo::new(stream);
+                    // Inject the real peer address as `ConnectInfo<SocketAddr>`
+                    // into each request's extensions, mirroring what the plain
+                    // path's `into_make_service_with_connect_info` does. Without
+                    // this the `ConnectInfo` extractor (used by `auth_login` to
+                    // key the login throttle on the unspoofable peer IP) would
+                    // fail on every HTTPS request. Applied per-connection so the
+                    // captured `peer_addr` is the address for this connection.
+                    let app = app.layer(axum::Extension(ConnectInfo(peer_addr)));
                     let service = TowerToHyperService::new(app);
                     let conn = server.serve_connection_with_upgrades(io, service);
                     let conn = watcher.watch(conn);
