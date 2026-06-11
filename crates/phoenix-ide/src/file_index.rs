@@ -37,6 +37,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use notify::event::{CreateKind, ModifyKind, RemoveKind, RenameMode};
 use notify::RecommendedWatcher;
 use notify::{EventKind, RecursiveMode};
@@ -61,6 +62,13 @@ struct WorkspaceIndex {
     /// watches on directory removal and avoid double-registering on
     /// `Create(Folder)` events.
     watched_dirs: HashSet<PathBuf>,
+    /// Composite gitignore matcher built from every `.gitignore` file the
+    /// bootstrap walk encountered (root, `.git/info/exclude`, plus any
+    /// nested `.gitignore` files inside non-ignored directories), used to
+    /// filter watcher-driven `Create(File)` events so a freshly-written
+    /// `*.log` / `.env` / build artifact doesn't slip into the index that
+    /// the bootstrap walk's nested-gitignore handling would have excluded.
+    gitignore: Gitignore,
 }
 
 /// State held while a workspace's first bootstrap walk is in flight.
@@ -147,9 +155,10 @@ impl WorkspaceIndexer {
         root: PathBuf,
     ) -> Result<Arc<RwLock<WorkspaceIndex>>, String> {
         let walk_root = root.clone();
-        let (paths, dirs) = tokio::task::spawn_blocking(move || walk_workspace(&walk_root))
-            .await
-            .map_err(|e| format!("bootstrap walk panicked: {e}"))?;
+        let (paths, dirs, gitignore) =
+            tokio::task::spawn_blocking(move || walk_workspace(&walk_root))
+                .await
+                .map_err(|e| format!("bootstrap walk panicked: {e}"))?;
 
         let mut debouncer = self.debouncer.lock().expect("debouncer poisoned");
         for dir in &dirs {
@@ -165,7 +174,32 @@ impl WorkspaceIndexer {
         Ok(Arc::new(RwLock::new(WorkspaceIndex {
             paths,
             watched_dirs: dirs,
+            gitignore,
         })))
+    }
+
+    /// Drop a workspace from the cache and unwatch its directories. Used
+    /// when the watcher signals a rescan (events were lost; the safest
+    /// move is to throw out the index and let the next search re-bootstrap)
+    /// and when the workspace root itself is deleted. Holds neither the
+    /// cells lock nor any index lock across the debouncer mutation.
+    fn invalidate_workspace(&self, root: &Path) {
+        let cell_opt = {
+            let mut map = self.cells.lock().expect("cells poisoned");
+            map.remove(root)
+        };
+        let Some(cell) = cell_opt else { return };
+        // If the cell was never initialized there's nothing to unwatch.
+        let Some(index) = cell.get() else { return };
+        let dirs: Vec<PathBuf> = {
+            let guard = index.read().expect("index poisoned");
+            guard.watched_dirs.iter().cloned().collect()
+        };
+        let mut debouncer = self.debouncer.lock().expect("debouncer poisoned");
+        for dir in &dirs {
+            let _ = debouncer.unwatch(dir);
+        }
+        tracing::debug!(?root, watches = dirs.len(), "invalidated workspace index");
     }
 
     /// Apply one batch of debounced events. Errors are logged at debug;
@@ -183,30 +217,51 @@ impl WorkspaceIndexer {
         };
 
         for event in events {
+            // `need_rescan()` is set when the watcher dropped events (inotify
+            // queue overflow, FSEvents coalescence). Any cached path under
+            // the affected workspace may be stale; rebuild on next access
+            // instead of trying to apply individual paths.
+            if event.need_rescan() {
+                for root in self.affected_workspace_roots(&event.event.paths) {
+                    tracing::debug!(?root, "watcher signaled rescan; invalidating workspace");
+                    self.invalidate_workspace(&root);
+                }
+                continue;
+            }
             self.apply_event(&event.event);
         }
     }
 
+    /// Apply a single event to every workspace whose root prefixes one of
+    /// the event's paths. Nested workspaces (e.g. `/repo` and
+    /// `/repo/packages/app`) both index the inner path under their own
+    /// roots and both need the update; routing to "the first match" would
+    /// leave the other stale.
     fn apply_event(self: &Arc<Self>, event: &notify::Event) {
-        // Find which workspace this event belongs to. Linear scan over
-        // workspace roots is fine: a single user has on the order of tens
-        // of workspaces, not thousands.
-        let Some((root, index)) = self.find_workspace_for_paths(&event.paths) else {
-            return;
-        };
+        let targets = self.affected_workspaces(&event.paths);
+        for (root, index) in targets {
+            self.apply_event_to_workspace(&root, &index, event);
+        }
+    }
 
+    fn apply_event_to_workspace(
+        self: &Arc<Self>,
+        root: &Path,
+        index: &Arc<RwLock<WorkspaceIndex>>,
+        event: &notify::Event,
+    ) {
         match &event.kind {
             EventKind::Create(CreateKind::Folder) => {
                 for path in &event.paths {
-                    if path.starts_with(&root) {
-                        self.absorb_new_subtree(&root, path, &index);
+                    if path.starts_with(root) {
+                        self.absorb_new_subtree(root, path, index);
                     }
                 }
             }
             EventKind::Create(CreateKind::File) => {
                 for path in &event.paths {
-                    if let Some(rel) = relative_string(&root, path) {
-                        index.write().expect("index poisoned").paths.insert(rel);
+                    if path.starts_with(root) {
+                        insert_file_if_not_ignored(root, path, index);
                     }
                 }
             }
@@ -214,17 +269,15 @@ impl WorkspaceIndexer {
                 // Backend didn't tell us if it was a file or folder.
                 // Stat each path and route accordingly.
                 for path in &event.paths {
-                    if !path.starts_with(&root) {
+                    if !path.starts_with(root) {
                         continue;
                     }
                     match std::fs::metadata(path) {
                         Ok(meta) if meta.is_dir() => {
-                            self.absorb_new_subtree(&root, path, &index);
+                            self.absorb_new_subtree(root, path, index);
                         }
                         Ok(_) => {
-                            if let Some(rel) = relative_string(&root, path) {
-                                index.write().expect("poisoned").paths.insert(rel);
-                            }
+                            insert_file_if_not_ignored(root, path, index);
                         }
                         Err(_) => { /* gone already */ }
                     }
@@ -234,11 +287,11 @@ impl WorkspaceIndexer {
                 RemoveKind::Folder | RemoveKind::File | RemoveKind::Any | RemoveKind::Other,
             ) => {
                 for path in &event.paths {
-                    self.absorb_removal(&root, path, &index);
+                    self.absorb_removal(root, path, index);
                 }
             }
             EventKind::Modify(ModifyKind::Name(rename_mode)) => {
-                self.apply_rename(&root, &event.paths, *rename_mode, &index);
+                self.apply_rename(root, &event.paths, *rename_mode, index);
             }
             // Data/metadata modifies don't change the path set we index.
             EventKind::Modify(_) | EventKind::Access(_) | EventKind::Any | EventKind::Other => {}
@@ -288,6 +341,17 @@ impl WorkspaceIndexer {
         let Some(rel) = relative_string(root, gone) else {
             return;
         };
+
+        // Special case: the workspace root itself is gone. An empty `rel`
+        // means our `paths.retain(starts_with("/"))` sweep below would be a
+        // no-op (rel paths don't have leading slashes), so we'd leak the
+        // entire pre-delete file list and serve stale results once the cwd
+        // is recreated. Drop the whole workspace from the cache instead.
+        if rel.is_empty() {
+            self.invalidate_workspace(root);
+            return;
+        }
+
         let prefix = format!("{rel}/");
 
         let mut idx = index.write().expect("poisoned");
@@ -345,8 +409,12 @@ impl WorkspaceIndexer {
                     self.absorb_create_unknown_kind(root, path, index);
                 }
             }
-            // Any / Other modes: best-effort, stat each path.
-            _ => {
+            // Any / Both-with-fewer-than-two-paths / Other modes: best-effort,
+            // stat each path to decide whether it's a create or a remove. We
+            // already covered Both with paired paths and From/To above; this
+            // is the catch-all where the backend gave us less information
+            // than the standard rename variants imply.
+            RenameMode::Any | RenameMode::Both | RenameMode::Other => {
                 for path in paths {
                     if path.exists() {
                         self.absorb_create_unknown_kind(root, path, index);
@@ -367,34 +435,47 @@ impl WorkspaceIndexer {
         match std::fs::metadata(path) {
             Ok(meta) if meta.is_dir() => self.absorb_new_subtree(root, path, index),
             Ok(_) => {
-                if let Some(rel) = relative_string(root, path) {
-                    index.write().expect("poisoned").paths.insert(rel);
-                }
+                insert_file_if_not_ignored(root, path, index);
             }
             Err(_) => {}
         }
     }
 
-    fn find_workspace_for_paths(
+    /// Snapshot of (root, ready-index) pairs whose root prefixes any path
+    /// in `paths`. Empty if no indexed workspace contains the event.
+    /// Nested workspaces both appear — see `apply_event` for why.
+    fn affected_workspaces(
         &self,
         paths: &[PathBuf],
-    ) -> Option<(PathBuf, Arc<RwLock<WorkspaceIndex>>)> {
-        // Pull a snapshot of (root, cell) pairs so we don't hold the
-        // outer mutex while walking the OnceCells.
+    ) -> Vec<(PathBuf, Arc<RwLock<WorkspaceIndex>>)> {
         let pairs: Vec<(PathBuf, CellState)> = {
             let map = self.cells.lock().expect("cells poisoned");
             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
         };
-        for path in paths {
-            for (root, cell) in &pairs {
-                if path.starts_with(root) {
-                    if let Some(index) = cell.get() {
-                        return Some((root.clone(), index.clone()));
-                    }
-                }
+        let mut out: Vec<(PathBuf, Arc<RwLock<WorkspaceIndex>>)> = Vec::new();
+        for (root, cell) in &pairs {
+            let Some(index) = cell.get() else { continue };
+            let touches = paths.iter().any(|p| p.starts_with(root));
+            if touches {
+                out.push((root.clone(), index.clone()));
             }
         }
-        None
+        out
+    }
+
+    /// Roots of every workspace whose tree contains any of `paths`,
+    /// including workspaces whose `OnceCell` hasn't initialized yet
+    /// (a rescan signal still has to invalidate them so the in-flight
+    /// bootstrap can be retried with a fresh walk if needed).
+    fn affected_workspace_roots(&self, paths: &[PathBuf]) -> Vec<PathBuf> {
+        let roots: Vec<PathBuf> = {
+            let map = self.cells.lock().expect("cells poisoned");
+            map.keys().cloned().collect()
+        };
+        roots
+            .into_iter()
+            .filter(|root| paths.iter().any(|p| p.starts_with(root)))
+            .collect()
     }
 }
 
@@ -402,10 +483,27 @@ fn canonicalize_or_self(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
-/// One-pass walk that returns (sorted relative-path set, watched-dir set).
-fn walk_workspace(root: &Path) -> (BTreeSet<String>, HashSet<PathBuf>) {
+/// One-pass walk that returns (sorted relative-path set, watched-dir set,
+/// composite gitignore matcher).
+///
+/// The gitignore matcher is built from every `.gitignore` file the walk
+/// encountered (root-level, nested, plus `.git/info/exclude` and the
+/// configured global gitignore). This lets the watcher path apply the same
+/// rules `ignore::WalkBuilder` did at bootstrap when filtering events for
+/// individual files. `GitignoreBuilder::add` preserves the rule's
+/// originating directory, so a rule in `<root>/src/.gitignore` only
+/// matches paths under `<root>/src`, mirroring real `git` semantics
+/// instead of leaking across siblings.
+fn walk_workspace(root: &Path) -> (BTreeSet<String>, HashSet<PathBuf>, Gitignore) {
     let mut files = BTreeSet::new();
     let mut dirs = HashSet::new();
+    let mut gi_builder = GitignoreBuilder::new(root);
+
+    // Seed with the well-known global sources so the matcher behaves like
+    // `git status` would. Errors are non-fatal — the file may simply not
+    // exist.
+    let _ = gi_builder.add(root.join(".gitignore"));
+    let _ = gi_builder.add(root.join(".git").join("info").join("exclude"));
 
     let walker = ignore::WalkBuilder::new(root)
         .hidden(false)
@@ -427,12 +525,28 @@ fn walk_workspace(root: &Path) -> (BTreeSet<String>, HashSet<PathBuf>) {
                 if let Some(rel) = relative_string(root, path) {
                     files.insert(rel);
                 }
+                // Collect nested `.gitignore` files as we encounter them.
+                // Root-level + .git/info/exclude were added above; any
+                // additional `.gitignore` deeper in the tree gets layered
+                // on with its own per-directory scope.
+                if entry.file_name() == ".gitignore" && path != root.join(".gitignore") {
+                    let _ = gi_builder.add(path);
+                }
             }
             None => {}
         }
     }
 
-    (files, dirs)
+    let gitignore = gi_builder.build().unwrap_or_else(|err| {
+        tracing::debug!(
+            ?err,
+            ?root,
+            "failed to build composite gitignore; falling back to empty matcher"
+        );
+        Gitignore::empty()
+    });
+
+    (files, dirs, gitignore)
 }
 
 /// Walk a single new subtree, using the same gitignore rules as the
@@ -471,6 +585,26 @@ fn walk_subtree(root: &Path, subtree: &Path) -> (Vec<String>, Vec<PathBuf>) {
 fn relative_string(root: &Path, path: &Path) -> Option<String> {
     let rel = path.strip_prefix(root).ok()?;
     Some(rel.to_string_lossy().into_owned())
+}
+
+/// Insert a created file into the index iff it would have passed the
+/// bootstrap walk's gitignore filtering. Without this, a `*.log` rule that
+/// excluded files from the initial walk would silently fail to exclude the
+/// same file when it's recreated under a watched directory.
+fn insert_file_if_not_ignored(root: &Path, path: &Path, index: &Arc<RwLock<WorkspaceIndex>>) {
+    let Some(rel) = relative_string(root, path) else {
+        return;
+    };
+    // Read-lock first so the common "ignored" case (build artifacts
+    // churning) doesn't contend on the write lock.
+    let ignored = {
+        let guard = index.read().expect("index poisoned");
+        guard.gitignore.matched(path, false).is_ignore()
+    };
+    if ignored {
+        return;
+    }
+    index.write().expect("index poisoned").paths.insert(rel);
 }
 
 /// Pure scoring loop. Identical algorithm to the previous inline
@@ -714,10 +848,121 @@ mod tests {
         let cached = second.elapsed();
 
         // 200 files is tiny but the cached search should still be
-        // dramatically faster than even a cheap walk. 5ms is generous.
+        // dramatically faster than even a cheap walk over them. The
+        // bound is loose enough to avoid flakes on a noisy CI host
+        // while still failing if we accidentally regress to the
+        // bootstrap path (which would be 10-100× higher on 200 files).
         assert!(
-            cached < Duration::from_millis(5),
-            "cached search took {cached:?}, expected sub-5ms"
+            cached < Duration::from_millis(25),
+            "cached search took {cached:?}, expected sub-25ms"
+        );
+    }
+
+    /// Codex finding #1: a `Create(File)` for `*.log` should respect the
+    /// same gitignore rules the bootstrap walk used. Without the cached
+    /// `Gitignore` matcher this file would slip into the index because
+    /// individual `Create(File)` events bypass `WalkBuilder`.
+    #[tokio::test]
+    async fn gitignored_create_file_does_not_enter_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fake_git(root);
+        write(&root.join(".gitignore"), "*.log\n");
+        write(&root.join("src/main.rs"), "");
+
+        let indexer = WorkspaceIndexer::new().unwrap();
+        let _ = search(&indexer, root, "").await;
+
+        // Create a file that the bootstrap walk would have excluded.
+        write(&root.join("src/debug.log"), "noise");
+
+        // Give notify time to fire. We expect the file to NEVER appear, so
+        // we wait a window long enough for the event to be debounced
+        // (DEBOUNCE_WINDOW + slack) and then assert.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let results = search(&indexer, root, "debug").await;
+        assert!(
+            !results.iter().any(|p| p == "src/debug.log"),
+            "gitignored file leaked into index: {results:?}"
+        );
+    }
+
+    /// Codex finding #3: when two indexed workspaces overlap (parent +
+    /// nested child), a single event under the nested path must update
+    /// both indexes — not just whichever entry `HashMap` iteration hits
+    /// first.
+    #[tokio::test]
+    async fn nested_workspaces_both_see_new_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = tmp.path();
+        let child = parent.join("packages/app");
+        fs::create_dir_all(&child).unwrap();
+        write(&parent.join("README.md"), "");
+        write(&child.join("index.ts"), "");
+
+        let indexer = WorkspaceIndexer::new().unwrap();
+        // Bootstrap both workspaces.
+        let _ = search(&indexer, parent, "").await;
+        let _ = search(&indexer, &child, "").await;
+
+        write(&child.join("brand_new.ts"), "");
+
+        let parent_saw = wait_for_path(
+            &indexer,
+            parent,
+            "brand_new",
+            Duration::from_secs(2),
+            |results| results.iter().any(|p| p == "packages/app/brand_new.ts"),
+        )
+        .await;
+        let child_saw = wait_for_path(
+            &indexer,
+            &child,
+            "brand_new",
+            Duration::from_secs(2),
+            |results| results.iter().any(|p| p == "brand_new.ts"),
+        )
+        .await;
+        assert!(parent_saw, "parent workspace missed nested-path create");
+        assert!(child_saw, "child workspace missed its own-path create");
+    }
+
+    /// Codex finding #6: deleting the workspace root itself must purge the
+    /// cached path set, not silently retain it because `rel == ""` makes
+    /// the prefix sweep a no-op.
+    #[tokio::test]
+    async fn root_removal_purges_cached_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("workspace");
+        fs::create_dir_all(&root).unwrap();
+        write(&root.join("src/a.rs"), "");
+        write(&root.join("src/b.rs"), "");
+
+        let indexer = WorkspaceIndexer::new().unwrap();
+        let primed = search(&indexer, &root, "").await;
+        assert!(primed.iter().any(|p| p == "src/a.rs"));
+
+        fs::remove_dir_all(&root).unwrap();
+
+        // Re-create the directory with completely different contents. If
+        // the cache wasn't invalidated, a search would return the stale
+        // pre-delete paths because `root.exists()` is true again and the
+        // OnceCell still holds the old index.
+        fs::create_dir_all(&root).unwrap();
+        write(&root.join("src/c.rs"), "");
+
+        // Give notify time to emit the removal and our handler to
+        // invalidate the workspace.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        let after = search(&indexer, &root, "").await;
+        assert!(
+            !after.iter().any(|p| p == "src/a.rs"),
+            "stale path survived root deletion: {after:?}"
+        );
+        assert!(
+            after.iter().any(|p| p == "src/c.rs"),
+            "post-recreate path missing: {after:?}"
         );
     }
 }

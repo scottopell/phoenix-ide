@@ -92,7 +92,15 @@ pub struct AppState {
     /// indexer walks each `cwd` once on first access and then keeps the
     /// path set current via `notify`-based filesystem events; see
     /// [`crate::file_index`].
-    pub file_indexer: Arc<WorkspaceIndexer>,
+    ///
+    /// `None` only when the `notify` backend failed to initialize at
+    /// startup (e.g. the host has exhausted `fs.inotify.max_user_instances`
+    /// or is running on a filesystem with no native watcher support). In
+    /// that case the application still boots; file-search endpoints
+    /// surface a 500 with a descriptive error so the operator can see
+    /// what's wrong instead of silently re-walking the disk on every
+    /// keystroke.
+    pub file_indexer: Option<Arc<WorkspaceIndexer>>,
 }
 
 impl AppState {
@@ -164,8 +172,16 @@ impl AppState {
             .unwrap_or_default();
         let sessions = auth::SessionStore::new(db.clone(), session_password_fingerprint);
         let discovery = crate::discovery::start(crate::discovery::DiscoveryConfig::from_env());
-        let file_indexer = WorkspaceIndexer::new()
-            .expect("notify failed to initialize; cannot run without a file watcher");
+        let file_indexer = match WorkspaceIndexer::new() {
+            Ok(idx) => Some(idx),
+            Err(err) => {
+                tracing::warn!(
+                    error = %err,
+                    "notify failed to initialize; Cmd+P file search will return errors until the host's watcher backend is fixed (check fs.inotify.max_user_instances)",
+                );
+                None
+            }
+        };
         Self {
             runtime,
             llm_registry,

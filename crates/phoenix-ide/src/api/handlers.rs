@@ -4240,8 +4240,13 @@ async fn search_conversation_files(
     }
 
     let limit = query.limit.unwrap_or(50);
-    let paths = state
-        .file_indexer
+    let indexer = state.file_indexer.as_ref().ok_or_else(|| {
+        AppError::Internal(
+            "file search unavailable: the filesystem watcher failed to initialize at startup"
+                .to_string(),
+        )
+    })?;
+    let paths = indexer
         .search(root.clone(), &query.q, limit)
         .await
         .map_err(AppError::Internal)?;
@@ -5624,7 +5629,7 @@ pub(crate) mod hard_delete_cascade_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
-            file_indexer: crate::file_index::WorkspaceIndexer::new().expect("notify init"),
+            file_indexer: Some(crate::file_index::WorkspaceIndexer::new().expect("notify init")),
         }
     }
 
@@ -7872,7 +7877,7 @@ mod upgrade_model_state_guard_tests {
                 enabled: false,
                 ..crate::discovery::DiscoveryConfig::from_env()
             }),
-            file_indexer: crate::file_index::WorkspaceIndexer::new().expect("notify init"),
+            file_indexer: Some(crate::file_index::WorkspaceIndexer::new().expect("notify init")),
         }
     }
 
