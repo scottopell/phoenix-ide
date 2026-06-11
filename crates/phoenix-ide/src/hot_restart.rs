@@ -108,6 +108,7 @@ pub async fn get_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
         ));
     }
 
+    #[cfg(target_os = "macos")]
     if let Some(std_listener) = take_launchd_listener()? {
         tracing::info!("Using launchd-provided TCP listener");
         ACTIVATION.store(Activation::Launchd.as_u8(), Ordering::SeqCst);
@@ -188,11 +189,6 @@ fn take_launchd_listener() -> std::io::Result<Option<std::net::TcpListener>> {
     };
 
     Ok(Some(listener))
-}
-
-#[cfg(not(target_os = "macos"))]
-fn take_launchd_listener() -> std::io::Result<Option<std::net::TcpListener>> {
-    Ok(None)
 }
 
 /// Set TCP keepalive and user timeout on the listener socket.
