@@ -51,6 +51,14 @@ const DEFAULT_SUBAGENT_TIMEOUT: Duration = Duration::from_mins(20);
 /// amount of legitimate output while making the pathological case impossible.
 const MAX_TOOL_OUTPUT_BYTES: usize = 100 * 1024;
 
+/// Maximum number of sub-agent tasks accepted in a single `spawn_agents` call.
+/// Realises the `SpawnLimit` invariant in `specs/bedrock/bedrock.allium`
+/// (`config.max_sub_agents_per_spawn`): a single spawn must not enqueue more
+/// than this many sub-agents, bounding fan-out resource use. A call carrying
+/// more tasks is rejected wholesale (no truncation) so the LLM sees an explicit
+/// error rather than a silently-trimmed batch.
+const MAX_SUB_AGENTS_PER_SPAWN: usize = 10;
+
 /// Number of most-recent tool rounds whose persisted screenshots are replayed
 /// to the LLM. Older tool rounds have their base64 images replaced with a short
 /// text placeholder when history is assembled, bounding the permanent image
@@ -1473,7 +1481,10 @@ where
     /// 2. Send spawn requests to `RuntimeManager` for each task
     /// 3. Return `SpawnAgentsComplete` event
     #[allow(clippy::too_many_lines)]
-    async fn handle_spawn_agents_tool(&mut self, tool: ToolCall) -> Result<Option<Event>, String> {
+    pub(crate) async fn handle_spawn_agents_tool(
+        &mut self,
+        tool: ToolCall,
+    ) -> Result<Option<Event>, String> {
         use crate::state_machine::state::{PendingSubAgent, SpawnAgentsInput, SubAgentSpec};
 
         let tool_use_id = tool.id.clone();
@@ -1496,6 +1507,22 @@ where
             let result = ToolResult::error(
                 tool_use_id.clone(),
                 "At least one task is required".to_string(),
+            );
+            return Ok(Some(Event::ToolComplete {
+                tool_use_id,
+                result,
+            }));
+        }
+
+        if input.tasks.len() > MAX_SUB_AGENTS_PER_SPAWN {
+            let result = ToolResult::error(
+                tool_use_id.clone(),
+                format!(
+                    "Too many tasks: {} requested, but at most {MAX_SUB_AGENTS_PER_SPAWN} \
+                     sub-agents can be spawned per call. Split the work across multiple \
+                     spawn_agents calls.",
+                    input.tasks.len(),
+                ),
             );
             return Ok(Some(Event::ToolComplete {
                 tool_use_id,
