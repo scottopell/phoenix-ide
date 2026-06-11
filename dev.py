@@ -4704,6 +4704,21 @@ def generate_launchd_plist(
 {env_xml}
   </dict>
 
+  <key>Sockets</key>
+  <dict>
+    <key>Listeners</key>
+    <dict>
+      <key>SockFamily</key>
+      <string>IPv4v6</string>
+      <key>SockProtocol</key>
+      <string>TCP</string>
+      <key>SockServiceName</key>
+      <string>{PROD_PORT}</string>
+      <key>SockType</key>
+      <string>stream</string>
+    </dict>
+  </dict>
+
   <key>RunAtLoad</key>
   <true/>
 

@@ -226,6 +226,7 @@ falls back to `LOGNAME`.
 | Variable | Purpose |
 |----------|---------|
 | `LISTEN_FDS` / `LISTEN_PID` | systemd-style socket passing — the listening socket survives an in-place binary swap (`./dev.py restart`, `prod deploy`). Managed automatically; the binary clears them after adopting the fd. |
+| launchd `Sockets` / `Listeners` | macOS launchd socket passing — `./dev.py prod deploy` installs an IPv4/v6 dual-stack listener named `Listeners`, and the binary adopts it with `launch_activate_socket`. |
 
 ### Tests only (`cargo test`)
 
@@ -253,5 +254,6 @@ falls back to `LOGNAME`.
 ## Documentation
 
 - `specs/` — Per-tool and subsystem specs using the [spEARS methodology](SPEARS.md)
+- [LAUNCHD.md](LAUNCHD.md) — macOS launchd deployment and socket activation
 - [TLS.md](TLS.md) — HTTPS, HTTP/2, private CA, and deployment workflow
 - [AGENTS.md](AGENTS.md) — Agent architecture and conventions

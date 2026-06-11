@@ -2,28 +2,31 @@
 //!
 //! Supports three modes:
 //!
-//! 1. **Systemd socket activation** (recommended for production):
-//!    - systemd owns the socket via `phoenix-ide.socket` unit
-//!    - On SIGHUP, we exit cleanly; systemd restarts us with the same socket
+//! 1. **Socket activation** (recommended for production):
+//!    - systemd or launchd owns the socket
+//!    - On SIGHUP, we exit cleanly; the service manager restarts us with the same socket
 //!    - Zero-downtime: socket never closes during upgrade
 //!
 //! 2. **Dev mode** (normal binding):
-//!    - If no systemd socket is passed, bind fresh on startup
+//!    - If no activation socket is passed, bind fresh on startup
 //!    - SIGHUP triggers graceful shutdown without restart
 //!
-//! 3. **Daemon mode** (for non-systemd environments):
-//!    - Future: detached upgrader script handles stop/copy/start
+//! 3. **Daemon mode** (for non-socket-activated environments):
+//!    - Detached deploy flow handles stop/copy/start
 //!
-//! The mode is auto-detected based on environment variables.
+//! The mode is auto-detected from the service manager's socket-passing contract.
 
 use chrono::{DateTime, Utc};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "macos")]
+use std::os::fd::FromRawFd;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 
 /// Flag indicating SIGHUP was received (reload requested)
-static HOT_RESTART_REQUESTED: AtomicBool = AtomicBool::new(false);
+static HOT_RESTART_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Tracks process start time for uptime reporting on shutdown
 static START_TIME: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
@@ -47,27 +50,53 @@ pub fn started_at() -> Option<DateTime<Utc>> {
     START_WALL.get().copied()
 }
 
-/// Tracks whether we're running under systemd socket activation
-static SOCKET_ACTIVATED: AtomicBool = AtomicBool::new(false);
+/// Tracks how the listener was acquired.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activation {
+    None,
+    Systemd,
+    Launchd,
+}
 
-/// Get a TCP listener, either from systemd socket activation or freshly bound.
+impl Activation {
+    fn as_u8(self) -> u8 {
+        match self {
+            Activation::None => 0,
+            Activation::Systemd => 1,
+            Activation::Launchd => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => Activation::Systemd,
+            2 => Activation::Launchd,
+            _ => Activation::None,
+        }
+    }
+}
+
+/// Tracks whether the listener came from socket activation.
+static ACTIVATION: AtomicU8 = AtomicU8::new(0);
+
+/// Get a TCP listener, either from socket activation or freshly bound.
 ///
-/// Systemd socket activation is detected via the `LISTEN_FDS` environment variable.
-/// When socket-activated, the socket FD is passed at FD 3 (after stdin/stdout/stderr).
+/// Systemd socket activation is detected via `LISTEN_FDS` / `LISTEN_PID`.
+/// macOS launchd activation is detected by attempting to activate the `Listeners`
+/// socket name from the launchd plist.
 pub async fn get_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
-    // Try systemd socket activation first
     let mut listenfd = listenfd::ListenFd::from_env();
 
     if listenfd.len() > 0 {
-        // Socket activation mode
         tracing::info!(
             fd_count = listenfd.len(),
             "Detected systemd socket activation"
         );
-        SOCKET_ACTIVATED.store(true, Ordering::SeqCst);
 
         if let Some(std_listener) = listenfd.take_tcp_listener(0)? {
             tracing::info!("Using systemd-provided TCP listener");
+            ACTIVATION.store(Activation::Systemd.as_u8(), Ordering::SeqCst);
+            std_listener.set_nonblocking(true)?;
             let listener = TcpListener::from_std(std_listener)?;
             configure_tcp_options(&listener)?;
             return Ok(listener);
@@ -79,11 +108,91 @@ pub async fn get_listener(addr: SocketAddr) -> std::io::Result<TcpListener> {
         ));
     }
 
-    // Dev mode: bind fresh
+    if let Some(std_listener) = take_launchd_listener()? {
+        tracing::info!("Using launchd-provided TCP listener");
+        ACTIVATION.store(Activation::Launchd.as_u8(), Ordering::SeqCst);
+        std_listener.set_nonblocking(true)?;
+        let listener = TcpListener::from_std(std_listener)?;
+        configure_tcp_options(&listener)?;
+        return Ok(listener);
+    }
+
     tracing::debug!(addr = %addr, "Binding fresh listener (no socket activation)");
     let listener = TcpListener::bind(addr).await?;
     configure_tcp_options(&listener)?;
     Ok(listener)
+}
+
+#[cfg(target_os = "macos")]
+const LAUNCHD_SOCKET_NAME: &str = "Listeners";
+
+#[cfg(target_os = "macos")]
+unsafe extern "C" {
+    fn launch_activate_socket(
+        name: *const libc::c_char,
+        fds: *mut *mut libc::c_int,
+        cnt: *mut libc::size_t,
+    ) -> libc::c_int;
+}
+
+#[cfg(target_os = "macos")]
+fn take_launchd_listener() -> std::io::Result<Option<std::net::TcpListener>> {
+    let name = std::ffi::CString::new(LAUNCHD_SOCKET_NAME).expect("static socket name has no nul");
+    let mut fds: *mut libc::c_int = std::ptr::null_mut();
+    let mut count: libc::size_t = 0;
+
+    let rc = unsafe { launch_activate_socket(name.as_ptr(), &raw mut fds, &raw mut count) };
+    if rc == libc::ESRCH {
+        return Ok(None);
+    }
+    if rc != 0 {
+        return Err(std::io::Error::from_raw_os_error(rc));
+    }
+    if count == 0 {
+        if !fds.is_null() {
+            unsafe { libc::free(fds.cast()) };
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "launchd activated the socket name but returned no sockets",
+        ));
+    }
+    if fds.is_null() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "launchd returned sockets without an fd array",
+        ));
+    }
+
+    tracing::info!(
+        socket_name = LAUNCHD_SOCKET_NAME,
+        fd_count = count,
+        "Detected launchd socket activation"
+    );
+    if count > 1 {
+        tracing::debug!(
+            socket_name = LAUNCHD_SOCKET_NAME,
+            fd_count = count,
+            "launchd provided multiple TCP listeners; using the first"
+        );
+    }
+
+    let listener = unsafe {
+        let fd_slice = std::slice::from_raw_parts(fds, count);
+        let listener = std::net::TcpListener::from_raw_fd(fd_slice[0]);
+        for fd in &fd_slice[1..] {
+            libc::close(*fd);
+        }
+        libc::free(fds.cast());
+        listener
+    };
+
+    Ok(Some(listener))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn take_launchd_listener() -> std::io::Result<Option<std::net::TcpListener>> {
+    Ok(None)
 }
 
 /// Set TCP keepalive and user timeout on the listener socket.
@@ -115,9 +224,14 @@ fn configure_tcp_options(listener: &TcpListener) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Check if running under systemd socket activation.
+/// Check which socket activation mechanism supplied the listener.
+pub fn activation() -> Activation {
+    Activation::from_u8(ACTIVATION.load(Ordering::SeqCst))
+}
+
+/// Check if running under socket activation.
 pub fn is_socket_activated() -> bool {
-    SOCKET_ACTIVATED.load(Ordering::SeqCst)
+    activation() != Activation::None
 }
 
 /// Signal handler that triggers shutdown.
@@ -174,14 +288,19 @@ mod tests {
 
     #[test]
     fn test_socket_activation_flag() {
-        SOCKET_ACTIVATED.store(false, Ordering::SeqCst);
+        ACTIVATION.store(Activation::None.as_u8(), Ordering::SeqCst);
+        assert_eq!(activation(), Activation::None);
         assert!(!is_socket_activated());
 
-        SOCKET_ACTIVATED.store(true, Ordering::SeqCst);
+        ACTIVATION.store(Activation::Systemd.as_u8(), Ordering::SeqCst);
+        assert_eq!(activation(), Activation::Systemd);
         assert!(is_socket_activated());
 
-        // Reset for other tests
-        SOCKET_ACTIVATED.store(false, Ordering::SeqCst);
+        ACTIVATION.store(Activation::Launchd.as_u8(), Ordering::SeqCst);
+        assert_eq!(activation(), Activation::Launchd);
+        assert!(is_socket_activated());
+
+        ACTIVATION.store(Activation::None.as_u8(), Ordering::SeqCst);
     }
 
     #[tokio::test]
@@ -190,10 +309,8 @@ mod tests {
         std::env::remove_var("LISTEN_FDS");
         std::env::remove_var("LISTEN_PID");
 
-        // Reset the flag
-        SOCKET_ACTIVATED.store(false, Ordering::SeqCst);
+        ACTIVATION.store(Activation::None.as_u8(), Ordering::SeqCst);
 
-        // Use port 0 to get random available port
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
         let listener = get_listener(addr).await.expect("Should bind successfully");
 
@@ -213,7 +330,7 @@ mod tests {
         std::env::set_var("LISTEN_FDS", "0");
         std::env::set_var("LISTEN_PID", std::process::id().to_string());
 
-        SOCKET_ACTIVATED.store(false, Ordering::SeqCst);
+        ACTIVATION.store(Activation::None.as_u8(), Ordering::SeqCst);
 
         // Should fall back to normal binding since count is 0
         let addr = SocketAddr::from(([127, 0, 0, 1], 0));
