@@ -2502,31 +2502,67 @@ pub fn transition_sub_agent(
         }
 
         // ============================================================
-        // Sub-agent UserCancel during ToolExecuting -> Failed + AbortTool
+        // Sub-agent UserCancel during ToolExecuting -> CancellingTool + AbortTool
         // ============================================================
         // A sub-agent's in-flight tool (bash/patch) mutates the worktree it
-        // shares with its parent. Going straight to Failed without aborting the
-        // tool leaves it running after the parent was told the sub-agent
-        // stopped, so it keeps mutating shared state. Emit `Effect::AbortTool`
-        // for the current tool — cancelling its CancellationToken — exactly as
-        // the parent's `ToolExecuting + UserCancel` path does, before failing.
-        // Failed is terminal and absorbs the late `ToolAborted` the cancelled
-        // tool task subsequently produces, so no extra cancelling state is
-        // needed. (A sub-agent cannot itself spawn sub-agents, so there are
-        // never `pending_sub_agents` to cancel here.)
+        // shares with its parent. The sub-agent must abort the tool AND defer
+        // notifying the parent until that tool has actually settled — otherwise
+        // the parent is told the sub-agent stopped while the tool task is still
+        // mid-flight, then resumes and reads/writes the shared worktree
+        // concurrently. Route through `CancellingTool` (mirroring the parent's
+        // `ToolExecuting + UserCancel` path) and only settle to Failed +
+        // NotifyParent once the tool's `ToolAborted`/`ToolComplete` arrives.
+        // (A sub-agent cannot itself spawn sub-agents, so `pending_sub_agents`
+        // is always empty here; carry it through verbatim for shape parity.)
         (
-            SubAgentState::Core(CoreState::ToolExecuting { current_tool, .. }),
-            SubAgentEvent::Core(CoreEvent::UserCancel { reason }),
-        ) => {
-            let error = reason
-                .clone()
-                .unwrap_or_else(|| "Cancelled by parent".to_string());
+            SubAgentState::Core(CoreState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                assistant_message,
+                pending_sub_agents,
+            }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { reason: _ }),
+        ) => Ok(
+            SubAgentTransitionResult::new(SubAgentState::Core(CoreState::CancellingTool {
+                tool_use_id: current_tool.id.clone(),
+                skipped_tools: remaining_tools.clone(),
+                completed_results: completed_results.clone(),
+                assistant_message: assistant_message.clone(),
+                pending_sub_agents: pending_sub_agents.clone(),
+            }))
+            .with_effect(Effect::AbortTool {
+                tool_use_id: current_tool.id.clone(),
+            })
+            .with_effect(Effect::PersistState),
+        ),
+
+        // ============================================================
+        // Sub-agent CancellingTool + ToolAborted/ToolComplete -> Failed
+        // ============================================================
+        // The in-flight tool the sub-agent aborted has now settled. A cancelled
+        // sub-agent ends terminally Failed (the parent's analogous arm goes to
+        // Idle to resume the user's turn — wrong here, where the sub-agent has
+        // no turn of its own to resume) and notifies the parent so fan-in
+        // accounting stays correct. The tool result is discarded: the round is
+        // being cancelled, not checkpointed. Guarded on id match so a stale
+        // outcome for a different tool_use does not settle the wrong round.
+        (
+            SubAgentState::Core(CoreState::CancellingTool { tool_use_id, .. }),
+            SubAgentEvent::Core(
+                CoreEvent::ToolAborted {
+                    tool_use_id: settled_id,
+                }
+                | CoreEvent::ToolComplete {
+                    tool_use_id: settled_id,
+                    ..
+                },
+            ),
+        ) if *tool_use_id == settled_id => {
+            let error = "Cancelled by parent".to_string();
             Ok(SubAgentTransitionResult::new(SubAgentState::Failed {
                 error: error.clone(),
                 error_kind: ErrorKind::Cancelled,
-            })
-            .with_effect(Effect::AbortTool {
-                tool_use_id: current_tool.id.clone(),
             })
             .with_effect(Effect::PersistState)
             .with_effect(Effect::NotifyParent {
@@ -3792,11 +3828,14 @@ mod tests {
         }
     }
 
-    /// M2 (task 61004): a sub-agent cancelled mid-tool must abort the in-flight
-    /// tool (its bash/patch keeps mutating the shared worktree otherwise),
-    /// matching the parent's `ToolExecuting + UserCancel` path.
+    /// A sub-agent cancelled mid-tool must abort the in-flight tool (its
+    /// bash/patch keeps mutating the shared worktree otherwise) AND defer
+    /// notifying the parent until the tool has settled. It routes through
+    /// `CancellingTool` (mirroring the parent's `ToolExecuting + UserCancel`
+    /// path) rather than failing immediately, so the parent is not told the
+    /// sub-agent stopped while the tool task is still mid-flight.
     #[test]
-    fn test_subagent_cancel_during_tool_execution_aborts_tool() {
+    fn test_subagent_cancel_during_tool_execution_routes_through_cancelling_tool() {
         use crate::state::{AssistantMessage, ToolCall, ToolInput};
         use phoenix_core::domain::llm_types::ContentBlock;
 
@@ -3829,22 +3868,18 @@ mod tests {
         )
         .expect("sub-agent ToolExecuting + UserCancel must transition");
 
-        // Goes to Failed (terminal; absorbs the late ToolAborted the cancelled
-        // tool task produces).
+        // Routes through CancellingTool (waits for the tool to settle), NOT
+        // straight to Failed — so NotifyParent fires only after the tool stops.
         assert!(
             matches!(
-                result.new_state,
-                ConvState::Failed {
-                    error_kind: ErrorKind::Cancelled,
-                    ..
-                }
+                &result.new_state,
+                ConvState::CancellingTool { tool_use_id, .. } if tool_use_id == "sa-tool-1"
             ),
-            "sub-agent cancel should fail the sub-agent, got {:?}",
+            "sub-agent cancel should route through CancellingTool, got {:?}",
             result.new_state
         );
 
-        // The fix: AbortTool for the in-flight tool so it stops mutating the
-        // shared worktree.
+        // AbortTool for the in-flight tool so it stops mutating the worktree.
         let abort = result
             .effects
             .iter()
@@ -3858,13 +3893,111 @@ mod tests {
             .expect("sub-agent ToolExecuting cancel must emit AbortTool");
         assert_eq!(abort, "sa-tool-1", "AbortTool must target the current tool");
 
-        // Still notifies the parent so fan-in accounting stays correct.
+        // Crucially, the parent is NOT notified yet — that is deferred until the
+        // tool settles. Notifying now would tell the parent the sub-agent
+        // stopped while its tool task is still running.
         assert!(
-            result
+            !result
                 .effects
                 .iter()
                 .any(|e| matches!(e, Effect::NotifyParent { .. })),
-            "sub-agent cancel must still notify the parent"
+            "NotifyParent must be deferred until the tool settles, not emitted on the cancel step"
+        );
+    }
+
+    /// Once the aborted tool settles, the cancelled sub-agent fails terminally
+    /// and notifies the parent (preserving fan-in). The parent's analogous arm
+    /// goes to Idle to resume the user's turn — a sub-agent has no turn to
+    /// resume, so it must end Failed instead.
+    #[test]
+    fn test_subagent_cancelling_tool_settles_to_failed_and_notifies_parent() {
+        use crate::state::AssistantMessage;
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::tool_use(
+                "sa-tool-1",
+                "bash",
+                serde_json::json!({"op": "run", "cmd": "echo mutate"}),
+            )],
+            None,
+            None,
+        );
+
+        let cancelling = ConvState::CancellingTool {
+            tool_use_id: "sa-tool-1".to_string(),
+            skipped_tools: vec![],
+            completed_results: vec![],
+            assistant_message,
+            pending_sub_agents: vec![],
+        };
+
+        // ToolAborted (the cancel-branch outcome) settles the round.
+        let result = transition(
+            &cancelling,
+            &sub_agent_context(),
+            Event::ToolAborted {
+                tool_use_id: "sa-tool-1".to_string(),
+            },
+        )
+        .expect("sub-agent CancellingTool + ToolAborted must transition");
+
+        assert!(
+            matches!(
+                result.new_state,
+                ConvState::Failed {
+                    error_kind: ErrorKind::Cancelled,
+                    ..
+                }
+            ),
+            "settled sub-agent cancel should fail terminally, got {:?}",
+            result.new_state
+        );
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::AbortTool { .. })),
+            "the tool already settled, so no second AbortTool"
+        );
+        let notified = result
+            .effects
+            .iter()
+            .any(|e| matches!(e, Effect::NotifyParent { .. }));
+        assert!(
+            notified,
+            "settling the cancelled sub-agent must notify the parent for fan-in"
+        );
+
+        // A racing ToolComplete (process finished just as cancel landed) settles
+        // identically: Failed + NotifyParent, result discarded.
+        let result_complete = transition(
+            &cancelling,
+            &sub_agent_context(),
+            Event::ToolComplete {
+                tool_use_id: "sa-tool-1".to_string(),
+                result: ToolResult::success("sa-tool-1".to_string(), "done".to_string()),
+            },
+        )
+        .expect("sub-agent CancellingTool + ToolComplete must transition");
+        assert!(
+            matches!(
+                result_complete.new_state,
+                ConvState::Failed {
+                    error_kind: ErrorKind::Cancelled,
+                    ..
+                }
+            ),
+            "racing ToolComplete must also settle to Failed, got {:?}",
+            result_complete.new_state
+        );
+        assert!(
+            result_complete
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "racing ToolComplete settle must also notify the parent"
         );
     }
 
