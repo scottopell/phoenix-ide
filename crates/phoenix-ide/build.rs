@@ -50,14 +50,12 @@ fn main() {
     rerun_on_git_path("packed-refs");
     rerun_on_git_path("index");
 
-    let sha = git(&["rev-parse", "--short=12", "HEAD"])
-        .unwrap_or_else(|| "unknown".to_string());
+    let sha = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
 
     // "-dirty" suffix when the working tree has uncommitted changes, so a
     // binary built from modified sources can't masquerade as the commit it
     // was branched from. Only meaningful when the SHA itself resolved.
-    let dirty = sha != "unknown"
-        && git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
+    let dirty = sha != "unknown" && git(&["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
 
     let suffix = if dirty { "-dirty" } else { "" };
     println!("cargo:rustc-env=PHOENIX_GIT_SHA={sha}{suffix}");
