@@ -1525,7 +1525,7 @@ function ConversationPageContent() {
             aria-valuemax={VIEWER_PANE_MAX}
             aria-valuenow={viewerPane.collapsed ? 0 : viewerPane.size}
             tabIndex={0}
-            onPointerDown={(e) => viewerPane.startDrag(e, 'x')}
+            onPointerDown={(e) => viewerPane.startDrag(e, 'x', true)}
             onDoubleClick={() => viewerPane.setCollapsed(!viewerPane.collapsed)}
             onKeyDown={(e) => {
               // Keyboard resize for the WAI-ARIA `separator` pattern.
