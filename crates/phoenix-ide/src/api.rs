@@ -44,6 +44,12 @@ pub struct AppState {
     pub credential_helper: Option<Arc<crate::llm::CredentialHelper>>,
     /// When set, all non-exempt API endpoints require this password (REQ-AUTH-001).
     pub password: Option<String>,
+    /// Server-side store of valid browser session tokens. Login mints a random
+    /// token into this set; the password itself never travels in a cookie.
+    pub sessions: auth::SessionStore,
+    /// Per-client login attempt throttle (brute-force lockout) for
+    /// `POST /api/auth/login`.
+    pub login_throttle: auth::LoginThrottle,
     /// Active PTY terminal sessions keyed by conversation ID (REQ-TERM-003).
     pub terminals: ActiveTerminals,
     /// Chain Q&A backend (REQ-CHN-001/004/005). Owns the
@@ -124,6 +130,8 @@ impl AppState {
             mcp_manager,
             credential_helper,
             password,
+            sessions: auth::SessionStore::new(),
+            login_throttle: auth::LoginThrottle::new(),
             terminals,
             chain_qa,
             message_retriever,

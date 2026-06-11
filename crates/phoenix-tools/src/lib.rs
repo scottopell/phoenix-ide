@@ -588,26 +588,31 @@ impl ToolRegistry {
     }
 
     /// Tool registry for Explore-mode sub-agents (REQ-PROJ-008).
-    /// Read-only tools + bash + `submit_result`/`submit_error`. No tmux, no
+    /// Read-only tools + `submit_result`/`submit_error`. No bash, no tmux, no
     /// patch, no spawn, no `ask_user`, no skill, no `propose_task`.
     /// The tmux session belongs to the worktree's owning conversation, not
     /// its sub-agents (task 03001).
-    // TODO: read-only bash enforcement not yet implemented --
-    // uses regular bash. See REQ-BASH-008 for the planned sandbox approach.
+    ///
+    /// Bash is intentionally omitted so Explore read-only mode is actually
+    /// read-only — mirroring the parent `explore_no_sandbox` registry, which
+    /// also excludes bash. Once read-only/sandboxed bash exists (REQ-BASH-008),
+    /// it can be re-added here.
     #[must_use]
     pub fn for_subagent_explore() -> Self {
         let mut tools = read_only_tools();
-        tools.push(Arc::new(BashTool));
         tools.extend(browser_tools());
         tools.extend(sub_agent_terminal_tools());
         Self { tools }
     }
 
     /// Tool registry for Work-mode sub-agents (REQ-PROJ-008).
-    /// Everything Explore has PLUS patch. No spawn, no `ask_user`, no skill, no `propose_task`.
+    /// Everything Explore has PLUS bash and patch. No spawn, no `ask_user`, no
+    /// skill, no `propose_task`. Work mode is a writing mode, so unrestricted
+    /// bash is expected here (unlike read-only Explore).
     #[must_use]
     pub fn for_subagent_work() -> Self {
         let mut registry = Self::for_subagent_explore();
+        registry.tools.push(Arc::new(BashTool));
         registry.tools.push(Arc::new(PatchTool::default()));
         registry
     }
@@ -900,10 +905,15 @@ mod tests {
             );
         }
 
-        // Sub-agent Explore: read-only + bash + submit. No tmux, no patch, no spawn,
-        // no ask_user, no propose_task, no parent-terminal tools.
+        // Sub-agent Explore: read-only + submit. No bash (read-only mode must be
+        // actually read-only until sandboxed bash exists, REQ-BASH-008), no
+        // tmux, no patch, no spawn, no ask_user, no propose_task, no
+        // parent-terminal tools.
         let sub_explore = names(&ToolRegistry::for_subagent_explore());
-        assert!(sub_explore.contains("bash"));
+        assert!(
+            !sub_explore.contains("bash"),
+            "sub-agent explore must not have bash — read-only mode (REQ-BASH-008)"
+        );
         assert!(
             !sub_explore.contains("tmux_run"),
             "sub-agent explore must not have tmux_run (task 94001)"
@@ -959,7 +969,6 @@ mod tests {
     fn bash_input_schema_flows_through_to_subagent_registries() {
         for (label, registry) in [
             ("direct", ToolRegistry::direct(Vec::new())),
-            ("subagent_explore", ToolRegistry::for_subagent_explore()),
             ("subagent_work", ToolRegistry::for_subagent_work()),
         ] {
             let bash = registry

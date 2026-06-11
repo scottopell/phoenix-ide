@@ -1,7 +1,16 @@
 //! Authentication middleware and endpoints (REQ-AUTH-001 through REQ-AUTH-003)
 //!
-//! When `PHOENIX_PASSWORD` is set, all API requests require auth via cookie or
-//! Bearer token. When unset, auth is bypassed entirely (backward compatible).
+//! When `PHOENIX_PASSWORD` is set, all API requests require auth. Browsers
+//! authenticate with an opaque random **session token** minted at login and
+//! held server-side in [`SessionStore`]; the password itself never travels in a
+//! cookie. API clients may still present the password directly via
+//! `Authorization: Bearer <password>`. When `PHOENIX_PASSWORD` is unset, auth is
+//! bypassed entirely (backward compatible).
+
+use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::{
     body::Body,
@@ -11,9 +20,141 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use base64::Engine;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use super::AppState;
+
+/// Server-side set of valid session tokens. A successful login mints a random
+/// token, inserts it here, and hands it to the browser in the `phoenix-auth`
+/// cookie. Each subsequent request is authenticated by membership, so the
+/// password never leaves the server in a cookie and tokens are independently
+/// revocable. Tokens are process-lifetime (cleared on restart).
+#[derive(Clone, Default)]
+pub struct SessionStore {
+    tokens: Arc<Mutex<HashSet<String>>>,
+}
+
+impl SessionStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Mint a fresh 256-bit random session token and record it as valid.
+    fn mint(&self) -> String {
+        let mut bytes = [0u8; 32];
+        rand::rng().fill_bytes(&mut bytes);
+        let token = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+        self.tokens
+            .lock()
+            .expect("session store poisoned")
+            .insert(token.clone());
+        token
+    }
+
+    /// Constant-time-ish membership check: a token is valid iff it was minted by
+    /// this process and not yet evicted.
+    fn is_valid(&self, token: &str) -> bool {
+        self.tokens
+            .lock()
+            .expect("session store poisoned")
+            .contains(token)
+    }
+}
+
+/// In-memory per-client login throttle. Counts consecutive failed logins and
+/// locks a client out for a back-off window once the threshold is exceeded. The
+/// counter resets on a successful login. Keyed on best-effort client IP (from
+/// `X-Forwarded-For` / `X-Real-IP` when behind a proxy); requests without a
+/// determinable IP share a single fallback bucket.
+#[derive(Clone, Default)]
+pub struct LoginThrottle {
+    inner: Arc<Mutex<HashMap<String, AttemptRecord>>>,
+}
+
+#[derive(Clone)]
+struct AttemptRecord {
+    failures: u32,
+    locked_until: Option<Instant>,
+}
+
+/// Failures allowed before lockout engages.
+const MAX_FAILURES: u32 = 5;
+/// Lockout window once the threshold is crossed.
+const LOCKOUT_WINDOW: Duration = Duration::from_secs(60);
+
+impl LoginThrottle {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` if `key` is currently locked out and the attempt should be
+    /// rejected without checking the password.
+    fn is_locked(&self, key: &str) -> bool {
+        let mut guard = self.inner.lock().expect("login throttle poisoned");
+        match guard.get_mut(key) {
+            Some(rec) => match rec.locked_until {
+                Some(until) if Instant::now() < until => true,
+                Some(_) => {
+                    // Lockout window elapsed — reset and allow a fresh attempt.
+                    rec.failures = 0;
+                    rec.locked_until = None;
+                    false
+                }
+                None => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Record a failed attempt, engaging a lockout once the threshold is crossed.
+    fn record_failure(&self, key: &str) {
+        let mut guard = self.inner.lock().expect("login throttle poisoned");
+        let rec = guard.entry(key.to_string()).or_insert(AttemptRecord {
+            failures: 0,
+            locked_until: None,
+        });
+        rec.failures = rec.failures.saturating_add(1);
+        if rec.failures >= MAX_FAILURES {
+            rec.locked_until = Some(Instant::now() + LOCKOUT_WINDOW);
+        }
+    }
+
+    /// Clear a client's failure record after a successful login.
+    fn record_success(&self, key: &str) {
+        self.inner
+            .lock()
+            .expect("login throttle poisoned")
+            .remove(key);
+    }
+}
+
+/// Best-effort client identity for throttling: the first `X-Forwarded-For` hop,
+/// then `X-Real-IP`, else a shared `"direct"` bucket. We don't have
+/// `ConnectInfo` peer addresses wired through the (TLS + plain) serve loop, so
+/// direct (non-proxied) connections share one bucket — still bounds brute force,
+/// at the cost of one attacker being able to lock out other direct clients.
+fn throttle_key(req_headers: &header::HeaderMap) -> String {
+    if let Some(xff) = req_headers.get("x-forwarded-for") {
+        if let Ok(s) = xff.to_str() {
+            if let Some(first) = s.split(',').next() {
+                let first = first.trim();
+                if first.parse::<IpAddr>().is_ok() {
+                    return first.to_string();
+                }
+            }
+        }
+    }
+    if let Some(xri) = req_headers.get("x-real-ip") {
+        if let Ok(s) = xri.to_str() {
+            if s.parse::<IpAddr>().is_ok() {
+                return s.to_string();
+            }
+        }
+    }
+    "direct".to_string()
+}
 
 /// Constant-time string comparison to prevent timing attacks on password checks.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
@@ -39,19 +180,24 @@ fn extract_cookie_value(cookie_header: &str) -> Option<&str> {
 }
 
 /// Check whether a request carries a valid auth credential.
-fn request_is_authenticated(req: &Request<Body>, password: &str) -> bool {
-    // Check cookie first
+///
+/// The `phoenix-auth` cookie must hold a valid **session token** (minted at
+/// login, held in [`SessionStore`]) — never the password. The
+/// `Authorization: Bearer` header carries the password directly, for API
+/// clients that don't run the cookie login flow.
+fn request_is_authenticated(req: &Request<Body>, password: &str, sessions: &SessionStore) -> bool {
+    // Cookie carries an opaque session token.
     if let Some(cookie_header) = req.headers().get(header::COOKIE) {
         if let Ok(cookie_str) = cookie_header.to_str() {
             if let Some(cookie_value) = extract_cookie_value(cookie_str) {
-                if constant_time_eq(cookie_value.as_bytes(), password.as_bytes()) {
+                if sessions.is_valid(cookie_value) {
                     return true;
                 }
             }
         }
     }
 
-    // Check Authorization: Bearer header
+    // Bearer header carries the password directly (API clients).
     if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
         if let Ok(auth_str) = auth_header.to_str() {
             if let Some(token) = auth_str.strip_prefix("Bearer ") {
@@ -121,7 +267,7 @@ pub async fn auth_middleware(
     }
 
     // Check credentials
-    if request_is_authenticated(&req, password) {
+    if request_is_authenticated(&req, password, &state.sessions) {
         return next.run(req).await;
     }
 
@@ -158,7 +304,7 @@ pub async fn auth_status(
             authenticated: true,
         }),
         Some(password) => {
-            let authenticated = request_is_authenticated(&req, password);
+            let authenticated = request_is_authenticated(&req, password, &state.sessions);
             Json(AuthStatusResponse {
                 auth_required: true,
                 authenticated,
@@ -167,14 +313,32 @@ pub async fn auth_status(
     }
 }
 
-/// `POST /api/auth/login` — validate password and set an auth cookie on success.
-pub async fn auth_login(State(state): State<AppState>, Json(body): Json<LoginRequest>) -> Response {
+/// `POST /api/auth/login` — validate the password, mint a session token, and
+/// set it in an auth cookie on success. Rate-limited per client (see
+/// [`LoginThrottle`]).
+pub async fn auth_login(
+    State(state): State<AppState>,
+    req_headers: header::HeaderMap,
+    Json(body): Json<LoginRequest>,
+) -> Response {
     let Some(password) = &state.password else {
         // Auth not required — login is a no-op success
         return (StatusCode::OK, Json(serde_json::json!({ "ok": true }))).into_response();
     };
 
+    let key = throttle_key(&req_headers);
+
+    // Reject locked-out clients before touching the password.
+    if state.login_throttle.is_locked(&key) {
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({ "error": "Too many login attempts; try again later" })),
+        )
+            .into_response();
+    }
+
     if !constant_time_eq(body.password.as_bytes(), password.as_bytes()) {
+        state.login_throttle.record_failure(&key);
         return (
             StatusCode::UNAUTHORIZED,
             Json(serde_json::json!({ "error": "Invalid password" })),
@@ -182,9 +346,21 @@ pub async fn auth_login(State(state): State<AppState>, Json(body): Json<LoginReq
             .into_response();
     }
 
-    // Set cookie: HttpOnly, SameSite=Lax, 1-year expiry
-    let cookie_value =
-        format!("phoenix-auth={password}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000");
+    state.login_throttle.record_success(&key);
+
+    // Mint an opaque session token; the password never enters the cookie.
+    let token = state.sessions.mint();
+
+    // `Secure` only when the server terminates TLS — sending it over plain HTTP
+    // would make the cookie undeliverable and silently break login.
+    let secure = if state.deployment.tls.enabled {
+        "; Secure"
+    } else {
+        ""
+    };
+    let cookie_value = format!(
+        "phoenix-auth={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000{secure}"
+    );
 
     (
         StatusCode::OK,
@@ -243,5 +419,99 @@ mod tests {
         // Preview is NOT auth-exempt: it serves on-disk files and must sit
         // behind auth. The same-origin sandboxed iframe carries the cookie.
         assert!(!is_exempt_path("/preview/some/file.html"));
+    }
+
+    #[test]
+    fn session_token_is_opaque_and_never_the_password() {
+        let store = SessionStore::new();
+        let password = "hunter2";
+        let token = store.mint();
+
+        // The minted token must not be the password — the whole point of the
+        // scheme is that the cookie carries an opaque credential.
+        assert_ne!(token, password);
+        // A minted token validates; an arbitrary string (e.g. the password) does
+        // not, because only minted tokens are members of the store.
+        assert!(store.is_valid(&token));
+        assert!(!store.is_valid(password));
+        assert!(!store.is_valid("not-a-real-token"));
+    }
+
+    #[test]
+    fn session_tokens_are_unique_per_mint() {
+        let store = SessionStore::new();
+        let a = store.mint();
+        let b = store.mint();
+        assert_ne!(a, b);
+        assert!(store.is_valid(&a));
+        assert!(store.is_valid(&b));
+    }
+
+    #[test]
+    fn cookie_holding_a_valid_session_token_authenticates() {
+        let sessions = SessionStore::new();
+        let token = sessions.mint();
+        let req = Request::builder()
+            .header(header::COOKIE, format!("phoenix-auth={token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(request_is_authenticated(&req, "the-password", &sessions));
+    }
+
+    #[test]
+    fn cookie_holding_the_raw_password_is_rejected() {
+        // Old scheme set the cookie to the password itself. The new scheme must
+        // reject a cookie that carries the password — only session tokens count.
+        let sessions = SessionStore::new();
+        let req = Request::builder()
+            .header(header::COOKIE, "phoenix-auth=the-password")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!request_is_authenticated(&req, "the-password", &sessions));
+    }
+
+    #[test]
+    fn bearer_password_still_authenticates_for_api_clients() {
+        let sessions = SessionStore::new();
+        let req = Request::builder()
+            .header(header::AUTHORIZATION, "Bearer the-password")
+            .body(Body::empty())
+            .unwrap();
+        assert!(request_is_authenticated(&req, "the-password", &sessions));
+    }
+
+    #[test]
+    fn login_throttle_locks_out_after_threshold() {
+        let throttle = LoginThrottle::new();
+        let key = "1.2.3.4";
+        assert!(!throttle.is_locked(key));
+        for _ in 0..MAX_FAILURES {
+            assert!(!throttle.is_locked(key));
+            throttle.record_failure(key);
+        }
+        // Threshold crossed — the client is now locked out.
+        assert!(throttle.is_locked(key));
+        // A successful login clears the lockout.
+        throttle.record_success(key);
+        assert!(!throttle.is_locked(key));
+    }
+
+    #[test]
+    fn throttle_key_prefers_forwarded_ip() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert("x-forwarded-for", "203.0.113.7, 10.0.0.1".parse().unwrap());
+        assert_eq!(throttle_key(&headers), "203.0.113.7");
+
+        let mut headers = header::HeaderMap::new();
+        headers.insert("x-real-ip", "198.51.100.4".parse().unwrap());
+        assert_eq!(throttle_key(&headers), "198.51.100.4");
+
+        // No usable forwarding header — shared direct bucket.
+        assert_eq!(throttle_key(&header::HeaderMap::new()), "direct");
+
+        // A non-IP forwarding value is ignored rather than trusted as a key.
+        let mut headers = header::HeaderMap::new();
+        headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        assert_eq!(throttle_key(&headers), "direct");
     }
 }

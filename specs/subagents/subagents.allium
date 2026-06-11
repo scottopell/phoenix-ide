@@ -355,19 +355,17 @@ rule SubAgentSpecsResolved {
 -- ===========================================================
 
 -- Fresh spawn: the registry is determined by the sub-agent's mode.
--- Explore => `subagent_explore` (read-only information tools + bash +
--- browser + submit_result/submit_error). Work => `subagent_work`
--- (Explore set + patch). Both modes get the parent's MCP tool set; an
--- Explore-search-restricted MCP subset is a documented deferred
+-- Explore => `subagent_explore` (read-only information tools + browser +
+-- submit_result/submit_error; no bash). Work => `subagent_work`
+-- (Explore set + bash + patch). Both modes get the parent's MCP tool
+-- set; an Explore-search-restricted MCP subset is a documented deferred
 -- refinement (see executive.md status).
 --
--- Bash in the Explore registry is currently the full `BashTool`, NOT a
--- read-only sandbox; the spec calls it "read-only" by intent and
--- registry composition (no `patch`, no write tools), but read-only
--- bash enforcement is a deferred capability tracked under REQ-BASH-008
--- (see `crates/phoenix-ide/src/tools.rs::for_subagent_explore`). Until
--- that lands, an Explore sub-agent can still mutate state through
--- bash; this is an acknowledged gap rather than a spec contradiction.
+-- The Explore registry omits bash entirely so read-only mode cannot
+-- mutate state, matching the parent `explore_no_sandbox` registry. A
+-- read-only/sandboxed bash (REQ-BASH-008) may re-add it to the Explore
+-- set once it exists; until then bash is a write capability reserved for
+-- Work mode.
 rule SubAgentRegistryOnFreshSpawn {
     when: SubAgentSpawnSucceeded(parent, sub_agent, mode, cwd_override)
     ensures:

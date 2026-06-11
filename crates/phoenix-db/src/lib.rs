@@ -25,6 +25,32 @@ use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
 use thiserror::Error;
 
+/// Restrict the `SQLite` database file and its WAL sidecars to owner read/write
+/// (`0600`). The DB holds conversation history (command output, secrets the
+/// agent observed); the default umask can leave it group/world-readable on a
+/// shared host. Best-effort and Unix-only: a `chmod` failure is logged at debug
+/// and never fails startup; a no-op on non-Unix platforms.
+#[cfg(unix)]
+fn restrict_db_permissions(path: &str) {
+    use std::os::unix::fs::PermissionsExt;
+
+    // The `-wal` and `-shm` sidecars share the DB's sensitivity. Only files that
+    // exist are chmod'd; absent sidecars are skipped silently.
+    for suffix in ["", "-wal", "-shm"] {
+        let p = format!("{path}{suffix}");
+        match std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                tracing::debug!(path = %p, error = %e, "could not chmod db file to 0600");
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_db_permissions(_path: &str) {}
+
 fn render_approved_task_brief(
     intro: &str,
     approval: &phoenix_core::task_handoff::TaskApprovalHandoffData,
@@ -493,6 +519,11 @@ impl Database {
             .busy_timeout(std::time::Duration::from_secs(5))
             .foreign_keys(true);
         let pool = SqlitePoolOptions::new().connect_with(opts).await?;
+        // The DB (and its WAL sidecars) holds conversation history — command
+        // output, secrets the agent saw. On a multi-user host the default umask
+        // can leave it world-readable, so tighten to owner-only. Best-effort:
+        // a chmod failure is logged, never fatal to startup.
+        restrict_db_permissions(path);
         let db = Self { pool };
         db.run_migrations().await?;
         Ok(db)
@@ -3694,6 +3725,27 @@ fn parse_datetime(s: &str) -> DateTime<Utc> {
 mod tests {
     use super::*;
     use phoenix_core::llm_language::LlmLanguage;
+
+    #[cfg(unix)]
+    #[test]
+    fn restrict_db_permissions_sets_owner_only_and_skips_missing_sidecars() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join(format!("phoenix-db-perms-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db_path = dir.join("test.db");
+        std::fs::write(&db_path, b"x").unwrap();
+        // World-readable to start, so the chmod is observable.
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        // No `-wal`/`-shm` sidecars exist — the helper must not error on them.
+        restrict_db_permissions(&db_path.to_string_lossy());
+
+        let mode = std::fs::metadata(&db_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "db file should be owner read/write only");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn app_setting_roundtrips_through_db() {

@@ -3611,6 +3611,14 @@ struct PathQuery {
     path: String,
 }
 
+// `validate_cwd` and `list_directory` power the new-conversation directory
+// picker, which browses the filesystem to choose a cwd *before* any conversation
+// (and thus any preview root) exists. Confining them to `preview_roots()` would
+// make new-conversation creation impossible, so they are intentionally NOT
+// root-confined. They return only directory names and a git/exists boolean — no
+// file contents — so the recon surface is bounded to directory structure, which
+// the picker exists to expose. Content-reading handlers (`read_file`,
+// `list_files`) ARE confined via `canonicalize_within_roots`.
 async fn validate_cwd(Query(query): Query<PathQuery>) -> Json<ValidateCwdResponse> {
     // Normalize path: remove trailing slashes (except for root)
     let path_str = query.path.trim_end_matches('/');
@@ -3812,15 +3820,68 @@ fn percent_encode_path(path: &std::path::Path) -> String {
     out
 }
 
+/// Canonicalize `requested` and confine it to a directory Phoenix is actively
+/// serving. The allowed set is every conversation working directory
+/// ([`Database::preview_roots`]) plus the user's `~/.claude` config tree, which
+/// holds globally-discovered skills/tasks the file viewer legitimately reads.
+///
+/// This mirrors the containment in [`serve_preview_file`]: canonicalize first so
+/// `.`, `..`, and symlinks are resolved before the `starts_with` check, then
+/// require the resolved path to live under some allowed root. A path that does
+/// not resolve, or resolves outside every root, is reported as `NotFound` —
+/// indistinguishable from out-of-scope, so existence is never leaked.
+async fn canonicalize_within_roots(
+    state: &AppState,
+    requested: &std::path::Path,
+) -> Result<PathBuf, AppError> {
+    let path = fs::canonicalize(requested)
+        .map_err(|_| AppError::NotFound("Path does not exist".to_string()))?;
+
+    let mut roots: Vec<PathBuf> = state
+        .db
+        .preview_roots()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .collect();
+
+    // Globally-discovered skills resolve outside any conversation cwd, so the
+    // viewer must be able to read them. Scope this to the skill trees ONLY —
+    // emphatically NOT all of `~/.claude`, which also holds `.credentials.json`,
+    // settings, and conversation history that must never be readable here.
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        let home = PathBuf::from(home);
+        for skill_root in [
+            home.join(".claude").join("skills"),
+            home.join(".phoenix-ide").join("builtin-skills"),
+        ] {
+            if let Ok(dir) = fs::canonicalize(skill_root) {
+                roots.push(dir);
+            }
+        }
+    }
+
+    if roots.iter().any(|root| path.starts_with(root)) {
+        Ok(path)
+    } else {
+        Err(AppError::NotFound("Path does not exist".to_string()))
+    }
+}
+
 /// List files in a directory with metadata (REQ-PF-001, REQ-PF-002)
-async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResponse>, AppError> {
+async fn list_files(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> Result<Json<ListFilesResponse>, AppError> {
     let path_str = query.path.trim_end_matches('/');
     let path_str = if path_str.is_empty() { "/" } else { path_str };
-    let path = PathBuf::from(path_str);
+    let requested = PathBuf::from(path_str);
 
-    if !path.exists() {
-        return Err(AppError::NotFound("Directory does not exist".to_string()));
-    }
+    // Confine to allowed roots before touching the filesystem. Canonicalization
+    // resolves traversal/symlink escape; out-of-scope is reported as NotFound.
+    let path = canonicalize_within_roots(&state, &requested).await?;
+
     if !path.is_dir() {
         return Err(AppError::BadRequest("Path is not a directory".to_string()));
     }
@@ -3901,12 +3962,16 @@ async fn list_files(Query(query): Query<PathQuery>) -> Result<Json<ListFilesResp
 }
 
 /// Read file contents with an explicit text/image contract (REQ-PF-005).
-async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileResponse>, AppError> {
-    let path = PathBuf::from(&query.path);
+async fn read_file(
+    State(state): State<AppState>,
+    Query(query): Query<PathQuery>,
+) -> Result<Json<ReadFileResponse>, AppError> {
+    let requested = PathBuf::from(&query.path);
 
-    if !path.exists() {
-        return Err(AppError::NotFound("File does not exist".to_string()));
-    }
+    // Confine to allowed roots before reading bytes. Without this the handler is
+    // an arbitrary host-file read of any non-binary file <=10MB.
+    let path = canonicalize_within_roots(&state, &requested).await?;
+
     if path.is_dir() {
         return Err(AppError::BadRequest("Path is a directory".to_string()));
     }
@@ -5202,6 +5267,8 @@ mod hard_delete_cascade_tests {
             mcp_manager,
             credential_helper: None,
             password: None,
+            sessions: super::super::auth::SessionStore::new(),
+            login_throttle: super::super::auth::LoginThrottle::new(),
             terminals,
             chain_qa,
             message_retriever,
@@ -7334,6 +7401,8 @@ mod upgrade_model_state_guard_tests {
             mcp_manager,
             credential_helper: None,
             password: None,
+            sessions: super::super::auth::SessionStore::new(),
+            login_throttle: super::super::auth::LoginThrottle::new(),
             terminals,
             chain_qa,
             message_retriever,
@@ -7438,6 +7507,52 @@ mod upgrade_model_state_guard_tests {
 #[cfg(test)]
 mod file_read_tests {
     use super::*;
+    use crate::chain_qa::ChainQa;
+    use crate::db::Database;
+    use crate::llm::ModelRegistry;
+    use crate::platform::PlatformCapability;
+    use crate::runtime::RuntimeManager;
+    use crate::tools::mcp::McpClientManager;
+    use std::sync::Arc;
+
+    /// Minimal `AppState` whose `preview_roots()` contains `cwd`, so the
+    /// containment check in `read_file`/`list_files` admits files under it.
+    async fn state_with_root(cwd: &std::path::Path) -> AppState {
+        let db = Database::open_in_memory().await.expect("open db");
+        db.create_conversation("c-read", "read-test", &cwd.to_string_lossy(), true, None, None)
+            .await
+            .expect("seed conversation");
+        let llm_registry = Arc::new(ModelRegistry::new_empty());
+        let platform = PlatformCapability::None;
+        let mcp_manager = Arc::new(McpClientManager::new());
+        let runtime = Arc::new(RuntimeManager::new(
+            db.clone(),
+            llm_registry.clone(),
+            platform,
+            mcp_manager.clone(),
+            None,
+        ));
+        let terminals = runtime.terminals.clone();
+        let message_retriever: std::sync::Arc<dyn crate::db::MessageRetriever> =
+            std::sync::Arc::new(crate::db::Fts5Retriever::new(db.pool().clone()));
+        let chain_qa = ChainQa::new(db.clone(), llm_registry.clone(), message_retriever.clone());
+        AppState {
+            runtime,
+            llm_registry,
+            db,
+            platform,
+            mcp_manager,
+            credential_helper: None,
+            password: None,
+            sessions: super::super::auth::SessionStore::new(),
+            login_throttle: super::super::auth::LoginThrottle::new(),
+            terminals,
+            chain_qa,
+            message_retriever,
+            codex_login: super::super::codex_login::CodexLoginManager::new(),
+            deployment: Arc::new(super::super::deployment::DeploymentConfig::for_tests()),
+        }
+    }
 
     #[test]
     fn preview_url_percent_encodes_reserved_path_characters() {
@@ -7453,10 +7568,14 @@ mod file_read_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("screenshot.png");
         std::fs::write(&path, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).expect("png bytes");
+        let state = state_with_root(tmp.path()).await;
 
-        let Json(response) = read_file(Query(PathQuery {
-            path: path.to_string_lossy().to_string(),
-        }))
+        let Json(response) = read_file(
+            State(state),
+            Query(PathQuery {
+                path: path.to_string_lossy().to_string(),
+            }),
+        )
         .await
         .expect("image response");
 
@@ -7468,7 +7587,11 @@ mod file_read_tests {
             } => {
                 assert_eq!(mime_type, "image/png");
                 assert_eq!(file_type, "image");
-                assert_eq!(url, preview_url_for_path(&path));
+                // URL reflects the canonicalized (symlink-resolved) path.
+                assert_eq!(
+                    url,
+                    preview_url_for_path(&std::fs::canonicalize(&path).unwrap())
+                );
             }
             other @ ReadFileResponse::Text { .. } => {
                 panic!("expected image response, got {other:?}")
@@ -7481,10 +7604,14 @@ mod file_read_tests {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("notes.txt");
         std::fs::write(&path, "hello\n").expect("text");
+        let state = state_with_root(tmp.path()).await;
 
-        let Json(response) = read_file(Query(PathQuery {
-            path: path.to_string_lossy().to_string(),
-        }))
+        let Json(response) = read_file(
+            State(state),
+            Query(PathQuery {
+                path: path.to_string_lossy().to_string(),
+            }),
+        )
         .await
         .expect("text response");
 
@@ -7502,6 +7629,27 @@ mod file_read_tests {
                 panic!("expected text response, got {other:?}")
             }
         }
+    }
+
+    #[tokio::test]
+    async fn read_file_rejects_path_outside_roots() {
+        // A file that exists but lives under no conversation root must read as
+        // NotFound — existence is never leaked.
+        let root = tempfile::tempdir().expect("root tempdir");
+        let outside = tempfile::tempdir().expect("outside tempdir");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "top secret\n").expect("write secret");
+        let state = state_with_root(root.path()).await;
+
+        let err = read_file(
+            State(state),
+            Query(PathQuery {
+                path: secret.to_string_lossy().to_string(),
+            }),
+        )
+        .await
+        .expect_err("out-of-scope read must fail");
+        assert!(matches!(err, AppError::NotFound(_)));
     }
 }
 
