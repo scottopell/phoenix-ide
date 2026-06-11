@@ -2835,7 +2835,19 @@ impl Database {
         let now = Utc::now();
         let idle_state = serde_json::to_string(&ConvState::Idle).unwrap();
 
-        // First, repair any orphaned tool_use blocks
+        // Materialize the assistant turn + completed tool results that an
+        // in-flight `ToolExecuting` round holds ONLY in its state JSON, before
+        // the reset below overwrites that state with idle. The assistant message
+        // and the already-completed tools' real outputs were broadcast over SSE
+        // and seen by the user, but are not yet in `messages` (atomic
+        // persistence happens at end-of-round). Without this, a deploy/crash
+        // mid-round silently drops them and rewinds the conversation to the
+        // prior user turn (REQ-BED-007, F1).
+        self.materialize_in_flight_tool_rounds(&now).await?;
+
+        // Then repair any orphaned tool_use blocks. After materialization the
+        // round above is fully paired, so this is a no-op for it; it remains the
+        // backstop for any other orphan shape (e.g. a partial pre-fix write).
         self.repair_orphaned_tool_use(&now).await?;
 
         // Reset non-terminal conversations to idle.
@@ -2856,6 +2868,121 @@ impl Database {
         .await?;
 
         Ok(())
+    }
+
+    /// Materialize the assistant message and completed tool results that an
+    /// in-flight `ToolExecuting` round carries only in its `ConvState` JSON, so
+    /// they survive the startup reset that overwrites the state with idle.
+    ///
+    /// A `ToolExecuting` state holds:
+    ///   - `assistant_message`: the LLM turn (with one `tool_use` block per
+    ///     dispatched tool) — broadcast over SSE and seen by the user, but not
+    ///     yet in `messages`;
+    ///   - `completed_results`: real outputs of tools that already finished;
+    ///   - `current_tool`: the tool that was running when the process exited;
+    ///   - `remaining_tools`: tools queued but not yet started.
+    ///
+    /// Each `tool_use` needs exactly one paired `tool_result` or the next LLM
+    /// request 400s. We write the assistant message, then one result per
+    /// `tool_use`: completed tools contribute their real result, and the
+    /// in-flight `current_tool` plus every not-yet-started `remaining_tool` get
+    /// a synthetic interrupted error. The whole round commits atomically via
+    /// [`Database::persist_tool_round`].
+    ///
+    /// The pairing count is checked before any write: if the materialized
+    /// results don't match the assistant's `tool_use` count, we skip this
+    /// conversation rather than persist a mis-paired chain — the subsequent
+    /// reset + `repair_orphaned_tool_use` then handles it the legacy way.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    async fn materialize_in_flight_tool_rounds(&self, now: &DateTime<Utc>) -> DbResult<()> {
+        use phoenix_core::domain::sm_state::ConvState;
+
+        // Only `tool_executing` rows carry an un-persisted assistant turn.
+        let conv_rows: Vec<(String, String)> = sqlx::query(
+            "SELECT id, state FROM conversations
+             WHERE json_extract(state, '$.type') = 'tool_executing'",
+        )
+        .try_map(|row: SqliteRow| Ok((row.try_get("id")?, row.try_get("state")?)))
+        .fetch_all(&self.pool)
+        .await?;
+
+        for (conv_id, state_json) in conv_rows {
+            let state: ConvState = match serde_json::from_str(&state_json) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        conv_id = %conv_id, error = %e,
+                        "could not parse tool_executing state for materialization; \
+                         leaving to reset + orphan repair",
+                    );
+                    continue;
+                }
+            };
+
+            let ConvState::ToolExecuting {
+                current_tool,
+                remaining_tools,
+                completed_results,
+                assistant_message,
+                ..
+            } = state
+            else {
+                continue;
+            };
+
+            let start_seq = self.next_sequence_id(&conv_id).await?;
+            let (agent_msg, tool_msgs) = build_materialized_tool_round(
+                &conv_id,
+                start_seq,
+                now,
+                &assistant_message,
+                &completed_results,
+                &current_tool,
+                &remaining_tools,
+            );
+
+            // Pairing invariant: every `tool_use` in the assistant message gets
+            // exactly one result. Refuse to persist a mis-paired chain.
+            let tool_use_count = assistant_message.tool_uses().len();
+            if tool_use_count != tool_msgs.len() {
+                tracing::warn!(
+                    conv_id = %conv_id,
+                    tool_uses = tool_use_count,
+                    results = tool_msgs.len(),
+                    "in-flight tool round has mismatched tool_use/result counts; \
+                     skipping materialization, leaving to orphan repair",
+                );
+                continue;
+            }
+
+            self.persist_tool_round(&conv_id, &agent_msg, &tool_msgs)
+                .await?;
+
+            tracing::info!(
+                conv_id = %conv_id,
+                completed = completed_results.len(),
+                interrupted = tool_use_count - completed_results.len(),
+                "materialized in-flight tool round on restart",
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Allocate the next `sequence_id` for a conversation from the message
+    /// watermark (`MAX(sequence_id) + 1`). Used by the restart materialization
+    /// path, which has no live `SseBroadcaster` counter to draw from.
+    async fn next_sequence_id(&self, conversation_id: &str) -> DbResult<i64> {
+        let row = sqlx::query(
+            "SELECT COALESCE(MAX(sequence_id), 0) + 1 FROM messages WHERE conversation_id = ?1",
+        )
+        .bind(conversation_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.get(0))
     }
 
     /// Scan all conversations for orphaned `tool_use` and inject synthetic `tool_result`.
@@ -3649,6 +3776,118 @@ async fn insert_conversation_tx(
 /// Insert a seed `Message` row inside a transaction, reusing the same column
 /// mapping as [`Database::add_message_with_seq`]. `INSERT OR IGNORE` keyed on
 /// `message_id` makes a crash-retry a no-op rather than a duplicate.
+/// Derive the message ID used to persist a tool result. Must match the
+/// runtime executor's convention (`phoenix-state-machine`'s
+/// `tool_result_message_id`) so the restart-materialized result shares identity
+/// with the row the live path would have written: `{tool_use_id}-result`.
+fn tool_result_message_id(tool_use_id: &str) -> String {
+    format!("{tool_use_id}-result")
+}
+
+/// Fold a tool result's `duration_ms` into its `display_data` JSON, mirroring
+/// the runtime executor's `merge_duration_into_display_data` so a
+/// restart-materialized tool result carries the same baked-in duration the
+/// live persist path would have written.
+fn merge_duration_into_display(
+    existing: Option<&serde_json::Value>,
+    duration_ms: Option<u64>,
+) -> Option<serde_json::Value> {
+    match (existing, duration_ms) {
+        (None, None) => None,
+        (Some(v), None) => Some(v.clone()),
+        (None, Some(ms)) => Some(serde_json::json!({ "duration_ms": ms })),
+        (Some(v), Some(ms)) => {
+            let mut merged = v.clone();
+            if let Some(obj) = merged.as_object_mut() {
+                obj.insert(
+                    "duration_ms".to_string(),
+                    serde_json::Value::Number(ms.into()),
+                );
+            }
+            Some(merged)
+        }
+    }
+}
+
+/// Build the materialized message rows for an in-flight tool round recovered
+/// from a `ToolExecuting` state on restart: the assistant message followed by
+/// one tool-result row per `tool_use`, in round order. Completed tools
+/// contribute their real result; the in-flight `current_tool` and every
+/// not-yet-started `remaining_tool` get a synthetic interrupted error so each
+/// `tool_use` is paired. Sequence ids are allocated contiguously from
+/// `start_seq` (assistant lowest), matching the seq ordering the live persist
+/// path would have produced.
+fn build_materialized_tool_round(
+    conv_id: &str,
+    start_seq: i64,
+    now: &DateTime<Utc>,
+    assistant_message: &phoenix_core::domain::sm_state::AssistantMessage,
+    completed_results: &[ToolResult],
+    current_tool: &phoenix_core::domain::sm_state::ToolCall,
+    remaining_tools: &[phoenix_core::domain::sm_state::ToolCall],
+) -> (Message, Vec<Message>) {
+    let mut next_seq = start_seq;
+
+    let agent_content = MessageContent::agent(assistant_message.content.clone());
+    let agent_msg = Message {
+        message_id: assistant_message.message_id.clone(),
+        conversation_id: conv_id.to_string(),
+        sequence_id: next_seq,
+        message_type: agent_content.message_type(),
+        content: agent_content,
+        display_data: assistant_message.display_data.clone(),
+        usage_data: assistant_message.usage.clone(),
+        created_at: assistant_message.created_at,
+    };
+    next_seq += 1;
+
+    let mut tool_msgs: Vec<Message> = Vec::new();
+
+    // Completed tools keep their real output.
+    for result in completed_results {
+        let display = merge_duration_into_display(result.display_data(), result.duration_ms);
+        let content = MessageContent::tool_with_images(
+            &result.tool_use_id,
+            result.output(),
+            result.is_error(),
+            result.images().to_vec(),
+        );
+        tool_msgs.push(Message {
+            message_id: tool_result_message_id(&result.tool_use_id),
+            conversation_id: conv_id.to_string(),
+            sequence_id: next_seq,
+            message_type: content.message_type(),
+            content,
+            display_data: display,
+            usage_data: None,
+            created_at: *now,
+        });
+        next_seq += 1;
+    }
+
+    // The in-flight tool and every queued-but-unstarted tool were interrupted.
+    for tool in std::iter::once(current_tool).chain(remaining_tools.iter()) {
+        let content = MessageContent::tool(
+            &tool.id,
+            "[Tool execution interrupted by server restart]",
+            true,
+        );
+        tool_msgs.push(Message {
+            message_id: tool_result_message_id(&tool.id),
+            conversation_id: conv_id.to_string(),
+            sequence_id: next_seq,
+            message_type: content.message_type(),
+            content,
+            display_data: None,
+            usage_data: None,
+            created_at: *now,
+        });
+        next_seq += 1;
+    }
+
+    (agent_msg, tool_msgs)
+}
+
 async fn insert_message_tx(
     tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     msg: &Message,
@@ -4508,6 +4747,142 @@ mod tests {
         assert!(tool_ids.contains(&"tool-1".to_string()));
         assert!(tool_ids.contains(&"tool-2".to_string()));
         assert!(tool_ids.contains(&"tool-3".to_string()));
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)] // single end-to-end restart scenario; splitting hurts clarity
+    async fn test_reset_materializes_in_flight_tool_round() {
+        use phoenix_core::domain::db_schema::ToolResult;
+        use phoenix_core::domain::llm_types::ContentBlock;
+        use phoenix_core::domain::sm_state::{
+            AssistantMessage, ConvState, ThinkInput, ToolCall, ToolInput,
+        };
+
+        let db = Database::open_in_memory().await.unwrap();
+        db.create_conversation("conv-1", "slug-1", "/tmp", true, None, None)
+            .await
+            .unwrap();
+
+        // The user message that prompted the turn is already persisted.
+        db.add_message(
+            "msg-user",
+            "conv-1",
+            &MessageContent::user("do three things"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        // Build an in-flight ToolExecuting round: assistant message holds three
+        // tool_use blocks; tool-1 finished (real result), tool-2 is in flight
+        // (current), tool-3 is queued (remaining). The assistant message + the
+        // tool-1 result live ONLY in the state JSON — never persisted to
+        // `messages` (that happens at end-of-round checkpoint).
+        let think = |t: &str| ToolInput::Think(ThinkInput { thoughts: t.into() });
+        let assistant = AssistantMessage::new(
+            "asst-1".to_string(),
+            vec![
+                ContentBlock::text("Working on it."),
+                ContentBlock::tool_use("tool-1", "think", serde_json::json!({"thoughts": "a"})),
+                ContentBlock::tool_use("tool-2", "think", serde_json::json!({"thoughts": "b"})),
+                ContentBlock::tool_use("tool-3", "think", serde_json::json!({"thoughts": "c"})),
+            ],
+            None,
+            None,
+        );
+        let state = ConvState::ToolExecuting {
+            current_tool: ToolCall::new("tool-2", think("b")),
+            remaining_tools: vec![ToolCall::new("tool-3", think("c"))],
+            completed_results: vec![ToolResult::success(
+                "tool-1".to_string(),
+                "real output for tool-1".to_string(),
+            )],
+            pending_sub_agents: vec![],
+            assistant_message: assistant,
+        };
+        db.update_conversation_state("conv-1", &state)
+            .await
+            .unwrap();
+
+        // Only the user message is in `messages` so far.
+        assert_eq!(db.get_messages("conv-1").await.unwrap().len(), 1);
+
+        // Restart sweep.
+        db.reset_all_to_idle().await.unwrap();
+
+        // State reset to idle.
+        let conv = db.get_conversation("conv-1").await.unwrap();
+        assert!(
+            matches!(conv.state, ConvState::Idle),
+            "tool_executing must reset to idle after materialization"
+        );
+
+        let msgs = db.get_messages("conv-1").await.unwrap();
+        // user + assistant + 3 tool results.
+        assert_eq!(
+            msgs.len(),
+            5,
+            "expected user + assistant + 3 paired tool results, got {:?}",
+            msgs.iter().map(|m| &m.message_id).collect::<Vec<_>>()
+        );
+
+        // Assistant turn materialized with its three tool_use blocks intact.
+        let agent = msgs
+            .iter()
+            .find(|m| m.message_id == "asst-1")
+            .expect("assistant message must be materialized");
+        match &agent.content {
+            MessageContent::Agent(blocks) => {
+                let n_tool_uses = blocks
+                    .iter()
+                    .filter(|b| matches!(b, ContentBlock::ToolUse { .. }))
+                    .count();
+                assert_eq!(
+                    n_tool_uses, 3,
+                    "assistant must carry all three tool_use blocks"
+                );
+            }
+            MessageContent::User(_)
+            | MessageContent::Tool(_)
+            | MessageContent::System(_)
+            | MessageContent::Error(_)
+            | MessageContent::Continuation(_)
+            | MessageContent::Skill(_) => panic!("asst-1 must be agent content"),
+        }
+
+        // Exactly one tool_result per tool_use, paired by id.
+        let by_id = |id: &str| {
+            msgs.iter().find_map(|m| match &m.content {
+                MessageContent::Tool(tc) if tc.tool_use_id == id => Some(tc.clone()),
+                MessageContent::Tool(_)
+                | MessageContent::User(_)
+                | MessageContent::Agent(_)
+                | MessageContent::System(_)
+                | MessageContent::Error(_)
+                | MessageContent::Continuation(_)
+                | MessageContent::Skill(_) => None,
+            })
+        };
+        let r1 = by_id("tool-1").expect("tool-1 result present");
+        let r2 = by_id("tool-2").expect("tool-2 result present");
+        let r3 = by_id("tool-3").expect("tool-3 result present");
+
+        // Completed tool keeps its real output, not a placeholder.
+        assert_eq!(r1.content, "real output for tool-1");
+        assert!(!r1.is_error, "completed tool result must not be an error");
+
+        // In-flight + queued tools get synthetic interrupted errors.
+        assert!(r2.is_error && r2.content.contains("interrupted"));
+        assert!(r3.is_error && r3.content.contains("interrupted"));
+
+        // Idempotent: re-running the sweep must not duplicate or 400-trip.
+        db.reset_all_to_idle().await.unwrap();
+        assert_eq!(
+            db.get_messages("conv-1").await.unwrap().len(),
+            5,
+            "re-running reset must not duplicate materialized rows"
+        );
     }
 
     #[tokio::test]
