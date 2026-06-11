@@ -2927,6 +2927,12 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
             env.update(env_extra)
         buf: deque[str] = deque(maxlen=TAIL_LINES)
         truncated = False
+        # Cargo target-lock telemetry: cargo prints "Blocking waiting for
+        # file lock on <what>" the moment it blocks, and the next output line
+        # marks acquisition. Accumulating the gaps separates lock-wait from
+        # build time in the step's elapsed figure (see tasks/76001).
+        lock_wait = 0.0
+        lock_t0: float | None = None
 
         proc = subprocess.Popen(
             cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -2934,9 +2940,13 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         )
 
         def reader():
-            nonlocal truncated
+            nonlocal truncated, lock_wait, lock_t0
             assert proc.stdout is not None
             for line in proc.stdout:
+                now = time.monotonic()
+                if lock_t0 is not None:
+                    lock_wait += now - lock_t0
+                    lock_t0 = None
                 if len(buf) == buf.maxlen:
                     truncated = True
                 # Strip terminal control sequences before buffering. The env
@@ -2944,7 +2954,10 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
                 # --check diff colours via the `term` crate keyed on $TERM and
                 # ignores both NO_COLOR and CARGO_TERM_COLOR; this is the
                 # tool-agnostic backstop so the reprinted buffer stays clean.
-                buf.append(_CONTROL_SEQ_RE.sub("", line).rstrip("\n"))
+                clean = _CONTROL_SEQ_RE.sub("", line).rstrip("\n")
+                if "Blocking waiting for file lock" in clean:
+                    lock_t0 = now
+                buf.append(clean)
             proc.stdout.close()
 
         rt = threading.Thread(target=reader, daemon=True)
@@ -2970,6 +2983,14 @@ def cmd_check(gate: bool = True, lanes: str | None = None, pretty: bool = False)
         # Reader exits when stdout closes (proc termination drops the pipe).
         rt.join(timeout=5)
         elapsed = time.monotonic() - t0
+        # Still-open block (process killed while waiting): count to the end.
+        if lock_t0 is not None:
+            lock_wait += elapsed - (lock_t0 - t0)
+        if lock_wait >= 1.0:
+            reporter.info(
+                f"{name}: {lock_wait:.1f}s of {elapsed:.1f}s spent blocked "
+                "on a cargo file lock"
+            )
 
         tail = "\n".join(buf).strip()
         if timed_out:
