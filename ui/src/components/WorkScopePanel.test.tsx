@@ -461,8 +461,7 @@ describe('WorkScopePanel collapsed standalone dock keeps polling without SSE (RE
     // Advance one poll interval: despite being collapsed, the SSE-less dock
     // re-fetches and the badge settles to 0.
     await act(async () => {
-      vi.advanceTimersByTime(2000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(2000);
     });
     expect(getInv.mock.calls.length).toBeGreaterThan(1);
     expect(badge()?.textContent).toBe('0');
@@ -470,8 +469,7 @@ describe('WorkScopePanel collapsed standalone dock keeps polling without SSE (RE
     // The poll self-limits: nothing live → no further fetches.
     const callsAfterSettle = getInv.mock.calls.length;
     await act(async () => {
-      vi.advanceTimersByTime(10_000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(10_000);
     });
     expect(getInv.mock.calls.length).toBe(callsAfterSettle);
   });
@@ -493,8 +491,7 @@ describe('WorkScopePanel collapsed standalone dock keeps polling without SSE (RE
 
     const callsAfterMount = getInv.mock.calls.length;
     await act(async () => {
-      vi.advanceTimersByTime(10_000);
-      await Promise.resolve();
+      await vi.advanceTimersByTimeAsync(10_000);
     });
     // No additional polls while collapsed + SSE-backed.
     expect(getInv.mock.calls.length).toBe(callsAfterMount);
