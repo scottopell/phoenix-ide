@@ -3617,6 +3617,14 @@ struct PathQuery {
     cwd: Option<String>,
 }
 
+/// Query for `serve_preview_file`: an optional `cwd` mirroring `read_file`'s, so
+/// a file admitted only by the cwd-widened allowlist is also previewable.
+#[derive(serde::Deserialize)]
+struct PreviewQuery {
+    #[serde(default)]
+    cwd: Option<String>,
+}
+
 // `validate_cwd` and `list_directory` power the new-conversation directory
 // picker, which browses the filesystem to choose a cwd *before* any conversation
 // (and thus any preview root) exists. Confining them to `preview_roots()` would
@@ -3818,6 +3826,23 @@ fn percent_encode_path(path: &std::path::Path) -> String {
     let mut out = String::with_capacity(path_str.len());
     for &b in path_str.as_bytes() {
         if b == b'/' || b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "%{b:02X}");
+        }
+    }
+    out
+}
+
+/// Percent-encode a URL query-parameter value (e.g. the `cwd` carried on a
+/// `/preview` image URL). Unlike [`percent_encode_path`], `/` is encoded too,
+/// since this is a single opaque value, not a path.
+fn percent_encode_query_value(s: &str) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
             out.push(char::from(b));
         } else {
             let _ = write!(out, "%{b:02X}");
@@ -4074,9 +4099,21 @@ async fn read_file(
         let mime_type = mime_guess::from_path(&path)
             .first_or_octet_stream()
             .to_string();
+        // Carry `cwd` into the preview URL so an image admitted only by the
+        // cwd-widened allowlist (a fresh project's task/skill subtree, before a
+        // conversation roots it) is also servable by `serve_preview_file`, which
+        // otherwise consults only the base allowlist and would 404 it.
+        let url = match query.cwd.as_deref() {
+            Some(cwd) => format!(
+                "{}?cwd={}",
+                preview_url_for_path(&path),
+                percent_encode_query_value(cwd)
+            ),
+            None => preview_url_for_path(&path),
+        };
         return Ok(Json(ReadFileResponse::Image {
             mime_type,
-            url: preview_url_for_path(&path),
+            url,
             file_type,
         }));
     }
@@ -4110,6 +4147,7 @@ async fn read_file(
 async fn serve_preview_file(
     State(state): State<AppState>,
     Path(filepath): Path<String>,
+    Query(query): Query<PreviewQuery>,
 ) -> Result<axum::response::Response, AppError> {
     use axum::response::IntoResponse;
 
@@ -4125,9 +4163,9 @@ async fn serve_preview_file(
     // actively serving (a conversation working directory or skill tree). Without
     // this, the handler is an arbitrary host-file read — `/preview/etc/passwd`,
     // `/preview/home/<user>/.ssh/id_rsa`, the prod DB, etc. The allowlist is
-    // shared with `canonicalize_within_roots` so `read_file`-admitted skill-tree
-    // files remain previewable.
-    let roots = preview_root_allowlist(&state).await;
+    // shared with `read_file`'s `read_root_allowlist` (including the optional
+    // `cwd` widening) so any file `read_file` admits is also previewable.
+    let roots = read_root_allowlist(&state, query.cwd.as_deref()).await;
     let within_roots = |p: &std::path::Path| roots.iter().any(|root| p.starts_with(root));
 
     if !within_roots(&path) {
@@ -7660,7 +7698,55 @@ mod file_read_tests {
     #[cfg(unix)]
     async fn preview_dir(state: AppState, dir: &std::path::Path) -> Result<Response, AppError> {
         let filepath = dir.to_string_lossy().trim_start_matches('/').to_string();
-        serve_preview_file(State(state), Path(filepath)).await
+        serve_preview_file(
+            State(state),
+            Path(filepath),
+            Query(PreviewQuery { cwd: None }),
+        )
+        .await
+    }
+
+    /// Helper: request a file through `serve_preview_file` with an optional `cwd`.
+    #[cfg(unix)]
+    async fn preview_file(
+        state: AppState,
+        file: &std::path::Path,
+        cwd: Option<String>,
+    ) -> Result<Response, AppError> {
+        let filepath = file.to_string_lossy().trim_start_matches('/').to_string();
+        serve_preview_file(State(state), Path(filepath), Query(PreviewQuery { cwd })).await
+    }
+
+    /// A file admitted only by the cwd-widened allowlist (a fresh project's
+    /// task/skill subtree) is previewable when `serve_preview_file` is given the
+    /// same `cwd`, and NOT previewable without it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_serves_cwd_widened_file_only_with_cwd() {
+        let conv_root = tempfile::tempdir().expect("conv root");
+        let project = tempfile::tempdir().expect("project");
+        let skills = project.path().join(".claude").join("skills").join("s");
+        std::fs::create_dir_all(&skills).expect("skill dir");
+        let img = skills.join("diagram.png");
+        std::fs::write(&img, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).expect("png");
+
+        // No conversation roots the project, so without cwd the file is rejected.
+        let state = state_with_root(conv_root.path()).await;
+        let err = preview_file(state, &img, None)
+            .await
+            .expect_err("not previewable without cwd");
+        assert!(matches!(err, AppError::NotFound(_)));
+
+        // With the project's cwd, the same file is served.
+        let state = state_with_root(conv_root.path()).await;
+        let resp = preview_file(
+            state,
+            &img,
+            Some(project.path().to_string_lossy().into_owned()),
+        )
+        .await
+        .expect("previewable with cwd");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 
     /// Regression: a directory's `index.html` that is a symlink pointing OUTSIDE
@@ -7805,9 +7891,13 @@ mod file_read_tests {
             .to_string_lossy()
             .trim_start_matches('/')
             .to_string();
-        let resp = serve_preview_file(State(state), Path(filepath))
-            .await
-            .expect("skill-root file must be previewable");
+        let resp = serve_preview_file(
+            State(state),
+            Path(filepath),
+            Query(PreviewQuery { cwd: None }),
+        )
+        .await
+        .expect("skill-root file must be previewable");
         assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 
