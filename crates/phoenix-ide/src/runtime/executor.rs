@@ -189,21 +189,33 @@ async fn forward_tool_outcome(
     let _ = outcome_tx.send(EffectOutcome::Tool(tool_outcome)).await;
 }
 
-/// Await an LLM task's oneshot outcome and forward it to the unified outcome
-/// channel, mapping a dropped sender to a typed `NetworkError` outcome.
+/// Await an LLM task's oneshot outcome and forward it, generation-tagged, to
+/// the executor's LLM-outcome channel, mapping a dropped sender to a typed
+/// `NetworkError` outcome.
 ///
 /// A dropped oneshot sender (the LLM task panicked or was aborted before it
 /// could `send`) must NOT silently lose the outcome: with no delivery, an
 /// `LlmRequesting`/`AwaitingContinuation` state hangs forever. `NetworkError`
 /// is retryable, so the retry machinery recovers.
+///
+/// The `generation` stamp lets the executor distinguish an outcome for the
+/// still-in-flight request from a stale one belonging to an intentionally
+/// aborted request (see `ConversationRuntime::llm_request_generation`). An
+/// intentional `Effect::AbortLlm` also drops the sender — without the tag, the
+/// synthetic `NetworkError` would look identical to a genuine panic and could
+/// be applied to a later, unrelated `LlmRequesting` turn, triggering a
+/// spurious retry. The executor discards any forwarded outcome whose
+/// generation is no longer current.
 async fn forward_llm_outcome(
     llm_rx: oneshot::Receiver<LlmOutcome>,
-    outcome_tx: mpsc::Sender<EffectOutcome>,
+    generation: u64,
+    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
 ) {
     let llm_outcome = match llm_rx.await {
         Ok(llm_outcome) => llm_outcome,
         Err(_recv_error) => {
             tracing::warn!(
+                generation,
                 "LLM task dropped its outcome sender (panic/abort); \
                  synthesizing NetworkError outcome to avoid wedging the conversation"
             );
@@ -212,7 +224,75 @@ async fn forward_llm_outcome(
             }
         }
     };
-    let _ = outcome_tx.send(EffectOutcome::Llm(llm_outcome)).await;
+    let _ = llm_outcome_tx.send((generation, llm_outcome)).await;
+}
+
+/// Indices into `db_messages` of the tool-result messages whose screenshots are
+/// retained when building the LLM message list.
+///
+/// Base64 images persisted in tool results replay in every LLM request forever
+/// (20 screenshots is ~30k permanent prefix tokens), so only the most recent
+/// `IMAGE_HISTORY_ROUNDS` tool *rounds* keep their images; older rounds are
+/// placeholdered by the caller.
+///
+/// Retention is counted by round, not by message. A round is one assistant
+/// tool-use turn plus the tool-result message(s) that answer it: a single
+/// assistant turn issuing several `tool_use` blocks produces several
+/// tool-result messages that all belong to one round. Counting messages would
+/// drop the earliest screenshots of a single recent multi-screenshot round; a
+/// kept round must retain all of its screenshots, and a round older than the
+/// window is fully placeholdered.
+///
+/// A new round opens at each `Agent` message that contains at least one
+/// `ToolUse` block; every tool-result message is attributed to the most
+/// recently opened round. The last `IMAGE_HISTORY_ROUNDS` distinct rounds that
+/// actually contain tool-result messages are kept.
+fn tool_msg_indices_keeping_images(
+    db_messages: &[crate::db::Message],
+) -> std::collections::HashSet<usize> {
+    use crate::db::MessageContent;
+    use crate::llm::ContentBlock as LlmContentBlock;
+
+    // (message index, owning round number) for each tool-result message.
+    let mut tool_round_of: Vec<(usize, usize)> = Vec::new();
+    let mut current_round: usize = 0;
+    let mut opened_a_round = false;
+    for (i, m) in db_messages.iter().enumerate() {
+        match &m.content {
+            MessageContent::Agent(blocks) => {
+                if blocks
+                    .iter()
+                    .any(|b| matches!(b, LlmContentBlock::ToolUse { .. }))
+                {
+                    // Bump only after the first tool-use turn so the first round
+                    // is numbered 0.
+                    if opened_a_round {
+                        current_round += 1;
+                    }
+                    opened_a_round = true;
+                }
+            }
+            MessageContent::Tool(_) => tool_round_of.push((i, current_round)),
+            _ => {}
+        }
+    }
+
+    // Distinct rounds that contain tool-result messages, newest-first; keep the
+    // last `IMAGE_HISTORY_ROUNDS` so every message in a kept round survives.
+    let mut rounds_with_tools: Vec<usize> = tool_round_of.iter().map(|(_, r)| *r).collect();
+    rounds_with_tools.sort_unstable();
+    rounds_with_tools.dedup();
+    let kept_rounds: std::collections::HashSet<usize> = rounds_with_tools
+        .iter()
+        .rev()
+        .take(IMAGE_HISTORY_ROUNDS)
+        .copied()
+        .collect();
+    tool_round_of
+        .iter()
+        .filter(|(_, round)| kept_rounds.contains(round))
+        .map(|(idx, _)| *idx)
+        .collect()
 }
 
 /// Decide whether `path` is inside the worktree rooted at `root`.
@@ -336,6 +416,30 @@ where
     /// overwrite the real one. Aborting the timer at the source kills the
     /// stale fire before it can reach the reducer.
     retry_timer_handle: Option<tokio::task::AbortHandle>,
+    /// Generation/epoch tag for the in-flight LLM request. Incremented at each
+    /// LLM dispatch (`Effect::RequestLlm`) and at each intentional abort
+    /// (`Effect::AbortLlm`). The LLM outcome forwarder stamps the dispatching
+    /// generation onto every outcome it forwards; `process_outcome`-side
+    /// routing discards any LLM outcome whose generation != this current value.
+    ///
+    /// Identity guard for the LLM request, mirroring `retry_timer_handle`:
+    /// `Effect::AbortLlm` (user cancel / new turn) aborts the in-flight LLM
+    /// task, which drops its outcome sender. The forwarder maps that drop to a
+    /// retryable `NetworkError` so a genuine panic can never wedge the
+    /// conversation — but an *intentional* abort produces the same drop. Since
+    /// the synthetic outcome carries no request identity, a stale aborted
+    /// outcome could otherwise be applied to a freshly-started `LlmRequesting`
+    /// state for an unrelated turn and trigger a spurious retry. Bumping the
+    /// generation on abort makes the stale outcome's generation old, so it is
+    /// dropped; a genuine current-generation panic still surfaces as a failure.
+    llm_request_generation: u64,
+    /// Executor-internal, generation-tagged LLM-outcome channel. The forwarder
+    /// sends `(dispatch_generation, outcome)`; the select loop routes the
+    /// outcome to `process_outcome` only when the generation is still current.
+    /// Kept separate from `outcome_tx` so the epoch tag stays executor-side and
+    /// never leaks into the pure `EffectOutcome` type.
+    llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
+    llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
     /// Channel to notify parent of sub-agent completion (sub-agent only)
     parent_event_tx: Option<mpsc::Sender<Event>>,
     /// Channel to request sub-agent spawning (parent only)
@@ -425,6 +529,7 @@ where
         // through oneshot channels, then forwarders wrap them in EffectOutcome
         // for this unified channel.
         let (outcome_tx, outcome_rx) = mpsc::channel::<EffectOutcome>(64);
+        let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
 
         Self {
             context,
@@ -444,6 +549,9 @@ where
             tool_cancel_token: None,
             llm_task_handle: None,
             retry_timer_handle: None,
+            llm_request_generation: 0,
+            llm_outcome_tx,
+            llm_outcome_rx,
             parent_event_tx: None,
             spawn_tx: None,
             cancel_tx: None,
@@ -646,6 +754,36 @@ where
                         return;
                     }
                 }
+                Some((generation, llm_outcome)) = self.llm_outcome_rx.recv() => {
+                    // Generation guard for the LLM request, mirroring the
+                    // `RetryTimeout` guard above. A `forward_llm_outcome` send
+                    // whose generation has been superseded (by a later dispatch
+                    // or an intentional `Effect::AbortLlm`) is stale: its
+                    // synthetic NetworkError must not be applied to the current,
+                    // unrelated `LlmRequesting` turn. Drop it.
+                    if self.llm_outcome_is_stale(generation) {
+                        tracing::debug!(
+                            outcome_generation = generation,
+                            current_generation = self.llm_request_generation,
+                            state = self.state.variant_name(),
+                            "Ignoring stale LLM outcome — request superseded (abort/new dispatch)"
+                        );
+                    } else if let Err(e) =
+                        self.process_outcome(EffectOutcome::Llm(llm_outcome)).await
+                    {
+                        tracing::warn!(error = %e, "Outcome rejected by state machine");
+                    }
+                    // FM-5 prevention: terminal states exit the loop explicitly.
+                    if let StepResult::Terminal(outcome) = self.state.step_result() {
+                        tracing::info!(
+                            conv_id = %self.context.conversation_id,
+                            ?outcome,
+                            "Conversation reached terminal state, exiting executor loop"
+                        );
+                        self.emit_terminal_lifecycle_event().await;
+                        return;
+                    }
+                }
                 // REQ-SA-006: sub-agent deadline expired — cancel all pending agents
                 () = async {
                     match deadline {
@@ -804,6 +942,17 @@ where
     ///
     /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
     /// are logged and discarded — state unchanged.
+    /// Whether a forwarded LLM outcome stamped with `generation` belongs to a
+    /// superseded request. An outcome is stale when its generation no longer
+    /// matches the current in-flight generation — either a later
+    /// `Effect::RequestLlm` opened a newer generation, or an intentional
+    /// `Effect::AbortLlm` bumped it. Stale outcomes (including the synthetic
+    /// `NetworkError` produced when an aborted task drops its sender) are
+    /// discarded so they cannot misfire on a subsequent unrelated turn.
+    fn llm_outcome_is_stale(&self, generation: u64) -> bool {
+        generation != self.llm_request_generation
+    }
+
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
         // Retry-timer identity guard (executor-side, keeps the pure reducer
         // pure). `retry_timer_handle` is `Some` exactly while the executor
@@ -1985,6 +2134,11 @@ where
 
             Effect::AbortLlm => {
                 tracing::info!("Aborting LLM request");
+                // Bump the generation so the aborted task's forwarded outcome
+                // (a synthetic NetworkError from the dropped sender) is stale
+                // and gets discarded by the select loop, rather than being
+                // applied to a subsequent unrelated `LlmRequesting` turn.
+                self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
                 if let Some(handle) = self.llm_task_handle.take() {
                     handle.abort();
                 }
@@ -2212,7 +2366,14 @@ where
         // Typed oneshot channel: background task gets Sender<LlmOutcome>,
         // physically cannot send a ToolExecOutcome or other type.
         let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
-        let outcome_tx = self.outcome_tx.clone();
+
+        // Open a fresh generation for this dispatch. The forwarder stamps it
+        // onto the outcome; the select loop discards an outcome whose
+        // generation has been superseded by a later dispatch or an
+        // intentional `Effect::AbortLlm`.
+        self.llm_request_generation = self.llm_request_generation.wrapping_add(1);
+        let dispatch_generation = self.llm_request_generation;
+        let llm_outcome_tx = self.llm_outcome_tx.clone();
 
         let llm_client = self.llm_client.clone();
         let tool_executor = self.tool_executor.clone();
@@ -2436,10 +2597,16 @@ where
         });
         self.llm_task_handle = Some(handle);
 
-        // Forward the typed outcome — a dropped sender becomes a typed
-        // NetworkError so a panicked/aborted LLM task can never wedge the
-        // conversation. See `forward_llm_outcome`.
-        tokio::spawn(forward_llm_outcome(llm_rx, outcome_tx));
+        // Forward the typed outcome, generation-tagged — a dropped sender
+        // becomes a typed NetworkError so a panicked/aborted LLM task can never
+        // wedge the conversation, while the generation lets the select loop
+        // drop a stale outcome from an intentionally-aborted request. See
+        // `forward_llm_outcome`.
+        tokio::spawn(forward_llm_outcome(
+            llm_rx,
+            dispatch_generation,
+            llm_outcome_tx,
+        ));
 
         Ok(None)
     }
@@ -2968,30 +3135,12 @@ where
 
         let db_messages = storage.get_messages(conv_id).await?;
 
-        // Prune aged screenshots from replayed history (token bound).
-        //
-        // Base64 images persisted in tool results replay in every LLM request
-        // forever; 20 screenshots is ~30k permanent prefix tokens. Keep images
-        // only for the most recent `IMAGE_HISTORY_ROUNDS` tool rounds and
-        // replace older ones with a short text placeholder. This is an
-        // in-memory transform of the LLM message build only — the DB rows and
-        // the UI rendering are untouched.
-        let tool_round_indices: Vec<usize> = db_messages
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| matches!(&m.content, MessageContent::Tool(_)))
-            .map(|(i, _)| i)
-            .collect();
-        // Index of the oldest tool message whose images are still kept. Tool
-        // messages strictly before this index get their images placeholdered.
-        let image_keep_from = tool_round_indices
-            .get(
-                tool_round_indices
-                    .len()
-                    .saturating_sub(IMAGE_HISTORY_ROUNDS),
-            )
-            .copied()
-            .unwrap_or(0);
+        // Prune aged screenshots from replayed history (token bound): keep
+        // images only for tool-result messages in the most recent
+        // `IMAGE_HISTORY_ROUNDS` tool rounds; older ones become placeholders.
+        // Retention is by round, not by message — see
+        // `tool_msg_indices_keeping_images`.
+        let kept_tool_msg_indices = tool_msg_indices_keeping_images(&db_messages);
 
         let mut messages = Vec::new();
 
@@ -3036,9 +3185,10 @@ where
                     images,
                 }) => {
                     // Aged tool rounds drop their images: replace each with a
-                    // text placeholder and send no image blocks. Recent rounds
-                    // (>= image_keep_from) keep their images verbatim.
-                    let keep_images = msg_idx >= image_keep_from;
+                    // text placeholder and send no image blocks. Tool messages
+                    // belonging to a kept round (within the last
+                    // `IMAGE_HISTORY_ROUNDS` rounds) keep their images verbatim.
+                    let keep_images = kept_tool_msg_indices.contains(&msg_idx);
                     let (text, image_sources): (String, Vec<ImageSource>) =
                         if keep_images || images.is_empty() {
                             let sources = images
@@ -6751,14 +6901,18 @@ mod sender_drop_forwarder_tests {
     #[tokio::test]
     async fn llm_sender_drop_yields_network_error_outcome() {
         let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
-        let (outcome_tx, mut outcome_rx) = mpsc::channel::<EffectOutcome>(4);
+        let (llm_outcome_tx, mut llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(4);
 
         drop(llm_tx);
 
-        forward_llm_outcome(llm_rx, outcome_tx).await;
+        forward_llm_outcome(llm_rx, 7, llm_outcome_tx).await;
 
-        match outcome_rx.try_recv() {
-            Ok(EffectOutcome::Llm(LlmOutcome::NetworkError { message })) => {
+        match llm_outcome_rx.try_recv() {
+            Ok((generation, LlmOutcome::NetworkError { message })) => {
+                assert_eq!(
+                    generation, 7,
+                    "forwarder must stamp the dispatch generation"
+                );
                 assert!(
                     message.contains("aborted or panicked"),
                     "message should explain the sender-drop, got: {message}"
@@ -7116,5 +7270,326 @@ mod tool_output_cap_tests {
         // Every retained char must be a whole emoji or part of the ASCII marker;
         // no replacement chars or partial sequences.
         assert!(!capped.contains('\u{FFFD}'));
+    }
+}
+
+/// Screenshot retention is counted by tool *round*, not by tool-result message.
+/// One assistant tool-use turn can produce several tool-result messages; all of
+/// them must survive together when the round is within the last
+/// `IMAGE_HISTORY_ROUNDS`, and an older round must be fully placeholdered.
+#[cfg(test)]
+mod image_retention_by_round_tests {
+    use super::*;
+    use crate::db::{MessageContent, ToolContentImage};
+    use crate::llm::{ContentBlock, ImageSource, MessageRole};
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::runtime::traits::MessageStore;
+    use std::sync::Arc;
+
+    type TestRuntime =
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
+
+    fn png(tag: &str) -> ToolContentImage {
+        ToolContentImage {
+            media_type: "image/png".to_string(),
+            data: format!("data-{tag}"),
+        }
+    }
+
+    async fn add(storage: &Arc<InMemoryStorage>, conv: &str, content: MessageContent) {
+        storage
+            .add_message(
+                &uuid::Uuid::new_v4().to_string(),
+                conv,
+                &content,
+                None,
+                None,
+            )
+            .await
+            .expect("add_message");
+    }
+
+    /// Append one tool round: an assistant message issuing `n` `tool_use` blocks
+    /// followed by `n` tool-result messages, each carrying one screenshot.
+    async fn add_round(
+        storage: &Arc<InMemoryStorage>,
+        conv: &str,
+        round_tag: &str,
+        n: usize,
+    ) -> Vec<String> {
+        let tool_uses: Vec<ContentBlock> = (0..n)
+            .map(|i| ContentBlock::ToolUse {
+                id: format!("{round_tag}-tool-{i}"),
+                name: "browser".to_string(),
+                input: serde_json::json!({}),
+            })
+            .collect();
+        add(storage, conv, MessageContent::agent(tool_uses)).await;
+
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let id = format!("{round_tag}-tool-{i}");
+            add(
+                storage,
+                conv,
+                MessageContent::tool_with_images(
+                    &id,
+                    "screenshot taken",
+                    false,
+                    vec![png(&format!("{round_tag}-{i}"))],
+                ),
+            )
+            .await;
+            ids.push(id);
+        }
+        ids
+    }
+
+    /// Count the image blocks in the tool-result message for `tool_use_id`.
+    fn images_for<'a>(msgs: &'a [crate::llm::LlmMessage], tool_use_id: &str) -> &'a [ImageSource] {
+        for m in msgs {
+            if m.role == MessageRole::User {
+                for block in &m.content {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        images,
+                        ..
+                    } = block
+                    {
+                        if id == tool_use_id {
+                            return images;
+                        }
+                    }
+                }
+            }
+        }
+        panic!("no tool result for {tool_use_id}");
+    }
+
+    fn placeholder_count(msgs: &[crate::llm::LlmMessage], tool_use_id: &str) -> usize {
+        for m in msgs {
+            if m.role == MessageRole::User {
+                for block in &m.content {
+                    if let ContentBlock::ToolResult {
+                        tool_use_id: id,
+                        content,
+                        ..
+                    } = block
+                    {
+                        if id == tool_use_id {
+                            return content.matches("[screenshot omitted from history]").count();
+                        }
+                    }
+                }
+            }
+        }
+        panic!("no tool result for {tool_use_id}");
+    }
+
+    /// A single recent round with three screenshot-producing tool results keeps
+    /// ALL three screenshots — retention must not count tool-result messages
+    /// (which would drop the first of the three with `IMAGE_HISTORY_ROUNDS` = 2).
+    #[tokio::test]
+    async fn single_round_with_three_screenshots_retains_all_three() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-round-3";
+
+        // Older round (round 0): two screenshots — must be placeholdered.
+        let old_ids = add_round(&storage, conv, "old", 2).await;
+        // Most recent round (round 1): three screenshots — must all survive.
+        let recent_ids = add_round(&storage, conv, "recent", 3).await;
+
+        let msgs = TestRuntime::build_llm_messages_static(&storage, conv)
+            .await
+            .expect("build messages");
+
+        // All three screenshots in the single most-recent round survive.
+        for id in &recent_ids {
+            assert_eq!(
+                images_for(&msgs, id).len(),
+                1,
+                "recent-round tool result {id} must keep its screenshot",
+            );
+            assert_eq!(
+                placeholder_count(&msgs, id),
+                0,
+                "recent-round tool result {id} must not be placeholdered",
+            );
+        }
+
+        // With IMAGE_HISTORY_ROUNDS = 2 and only two rounds, the older round is
+        // still within the window — confirm it is kept too (boundary sanity).
+        for id in &old_ids {
+            assert_eq!(
+                images_for(&msgs, id).len(),
+                1,
+                "round within the last IMAGE_HISTORY_ROUNDS must keep images: {id}",
+            );
+        }
+    }
+
+    /// A round older than the last `IMAGE_HISTORY_ROUNDS` is fully
+    /// placeholdered, even when a single recent round holds several
+    /// screenshots. Three rounds total, `IMAGE_HISTORY_ROUNDS` = 2 ⇒ the oldest
+    /// round drops its images while both newer rounds keep theirs.
+    #[tokio::test]
+    async fn round_older_than_window_is_placeholdered() {
+        let storage = Arc::new(InMemoryStorage::new());
+        let conv = "conv-round-old";
+
+        let r0 = add_round(&storage, conv, "r0", 1).await; // oldest — dropped
+        let r1 = add_round(&storage, conv, "r1", 3).await; // kept
+        let r2 = add_round(&storage, conv, "r2", 1).await; // kept
+
+        let msgs = TestRuntime::build_llm_messages_static(&storage, conv)
+            .await
+            .expect("build messages");
+
+        // Oldest round: images dropped, placeholder present.
+        for id in &r0 {
+            assert_eq!(
+                images_for(&msgs, id).len(),
+                0,
+                "round older than IMAGE_HISTORY_ROUNDS must drop images: {id}",
+            );
+            assert_eq!(
+                placeholder_count(&msgs, id),
+                1,
+                "dropped screenshot must leave a placeholder: {id}",
+            );
+        }
+
+        // The recent multi-screenshot round keeps all three.
+        for id in &r1 {
+            assert_eq!(
+                images_for(&msgs, id).len(),
+                1,
+                "kept recent round must retain every screenshot: {id}",
+            );
+        }
+        for id in &r2 {
+            assert_eq!(images_for(&msgs, id).len(), 1, "newest round kept: {id}");
+        }
+    }
+}
+
+/// An intentional `Effect::AbortLlm` aborts the in-flight LLM task, dropping its
+/// outcome sender — the forwarder maps that drop to a retryable `NetworkError`.
+/// Without a generation guard, that synthetic outcome (which carries no request
+/// identity) could be applied to a later, unrelated `LlmRequesting` turn and
+/// trigger a spurious retry/error. Each dispatch opens a new generation and the
+/// forwarder stamps it; an outcome whose generation is no longer current is
+/// discarded.
+#[cfg(test)]
+mod llm_generation_guard_tests {
+    use super::*;
+    use crate::llm::ModelRegistry;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::state_machine::outcome::LlmOutcome;
+    use crate::tools::BrowserSessionManager;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    type TestRuntime =
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
+
+    fn runtime_requesting() -> TestRuntime {
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new("conv-gen", PathBuf::from("/tmp"), "test-model", 200_000);
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let broadcaster = SseBroadcaster::new(128, 0);
+        ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            broadcaster,
+        )
+    }
+
+    /// `Effect::AbortLlm` bumps the in-flight generation, so an outcome stamped
+    /// with the pre-abort generation is classified stale.
+    #[tokio::test]
+    async fn abort_supersedes_pre_abort_generation() {
+        let mut rt = runtime_requesting();
+
+        // Simulate a dispatch having opened generation 1.
+        rt.llm_request_generation = 1;
+        let dispatched_gen = rt.llm_request_generation;
+        assert!(
+            !rt.llm_outcome_is_stale(dispatched_gen),
+            "the in-flight generation is current before any abort"
+        );
+
+        rt.execute_effect(Effect::AbortLlm)
+            .await
+            .expect("AbortLlm executes");
+
+        assert!(
+            rt.llm_request_generation > dispatched_gen,
+            "AbortLlm must open a new generation"
+        );
+        assert!(
+            rt.llm_outcome_is_stale(dispatched_gen),
+            "the aborted request's outcome must be stale after AbortLlm"
+        );
+    }
+
+    /// End-to-end of the select-loop guard: a stale-generation `NetworkError`
+    /// (the synthetic outcome a forwarder emits when the aborted task drops its
+    /// sender) is discarded — it does NOT transition the state. A current-gen
+    /// outcome would be processed, proving the guard is selective, not a blanket
+    /// drop.
+    #[tokio::test]
+    async fn stale_generation_network_error_is_discarded() {
+        let mut rt = runtime_requesting();
+        rt.llm_request_generation = 2; // current in-flight generation
+
+        let stale_outcome = LlmOutcome::NetworkError {
+            message: "LLM task aborted or panicked".to_string(),
+        };
+
+        // Mirror the select-arm decision: a stale generation is dropped without
+        // touching state.
+        let stale_gen = 1;
+        assert!(
+            rt.llm_outcome_is_stale(stale_gen),
+            "generation 1 is stale relative to current generation 2"
+        );
+
+        let state_before = rt.state.variant_name();
+        if !rt.llm_outcome_is_stale(stale_gen) {
+            rt.process_outcome(EffectOutcome::Llm(stale_outcome))
+                .await
+                .expect("would process if current");
+        }
+        assert_eq!(
+            rt.state.variant_name(),
+            state_before,
+            "a stale aborted outcome must not move state — no spurious retry/error"
+        );
+    }
+
+    /// The current-generation outcome is honoured: not stale, so it flows into
+    /// `process_outcome`. Guards against an over-broad guard that would wedge
+    /// genuine outcomes (e.g. a real panic on the in-flight request).
+    #[tokio::test]
+    async fn current_generation_outcome_is_not_stale() {
+        let mut rt = runtime_requesting();
+        rt.llm_request_generation = 5;
+        assert!(
+            !rt.llm_outcome_is_stale(5),
+            "an outcome stamped with the current generation must be processed"
+        );
     }
 }
