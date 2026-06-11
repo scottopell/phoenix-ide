@@ -1366,8 +1366,14 @@ where
             }));
         }
 
-        // Bounded buffer: pre-allocate with capacity = sub-agent count (FM-6 prevention)
-        self.sub_agent_result_buffer = Vec::with_capacity(input.tasks.len());
+        // Bounded buffer: hint capacity for this batch's sub-agents (FM-6
+        // prevention). Use `reserve`, never reassign: a result buffered from an
+        // earlier batch in the same awaiting-round (e.g. tool sequence
+        // [spawn_agents A, bash, spawn_agents B], where A's result arrives while
+        // bash runs) must survive this dispatch and be drained when the parent
+        // enters AwaitingSubAgents. The drain (`mem::take`) empties the buffer,
+        // so each round still starts clean without a destructive reassignment.
+        self.sub_agent_result_buffer.reserve(input.tasks.len());
 
         // --- Named-agent resolution (REQ-AG-005, REQ-AG-007) ---
         // Resolve against the catalog frozen at conversation start — the same
@@ -5617,6 +5623,86 @@ mod steer_drain_detector_tests {
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0].message_id, "s1");
         assert!(rt.steering_queue.is_empty());
+    }
+
+    /// Regression (task 61005): a `SubAgentResult` buffered from an earlier
+    /// batch in the same awaiting-round must survive a subsequent
+    /// `spawn_agents` dispatch and be delivered when the parent enters
+    /// `AwaitingSubAgents`. The bug: `handle_spawn_agents_tool` reassigned
+    /// `sub_agent_result_buffer = Vec::with_capacity(..)` on every dispatch,
+    /// destroying any result buffered while the parent was still running a
+    /// prior tool (e.g. tool sequence `[spawn_agents A, bash, spawn_agents B]`,
+    /// where A's result arrives during `bash`). The discarded result left its
+    /// agent stuck `pending`, stalling the conversation for the full sub-agent
+    /// timeout (~20 min) before a synthetic `TimedOut`. The fix uses `reserve`,
+    /// which hints capacity without clearing buffered contents.
+    #[tokio::test]
+    async fn buffered_result_survives_second_spawn_dispatch() {
+        // Parent is mid-round running a non-spawn tool, so it cannot yet handle
+        // SubAgentResult events — they get buffered.
+        let (mut rt, _storage) =
+            build_runtime_with_state_and_queue("conv-buf-survive", mk_tool_executing(), vec![]);
+        assert!(!rt.can_handle_sub_agent_result());
+
+        // Batch A's agent ("sub-1") completes while the parent is still running
+        // `bash`. The result is buffered, not processed.
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "sub-1".to_string(),
+            outcome: SubAgentOutcome::Success {
+                result: "A's real work".to_string(),
+            },
+        })
+        .await
+        .expect("buffering a SubAgentResult must not error");
+        assert_eq!(
+            rt.sub_agent_result_buffer.len(),
+            1,
+            "earlier-batch result should be buffered while parent is not awaiting"
+        );
+
+        // A second `spawn_agents B` dispatch hints capacity for its own batch.
+        // This is exactly the operation that previously reassigned (cleared)
+        // the buffer; with the fix it must preserve the buffered batch-A result.
+        rt.sub_agent_result_buffer.reserve(3);
+        assert_eq!(
+            rt.sub_agent_result_buffer.len(),
+            1,
+            "spawn dispatch must not discard the earlier-batch buffered result"
+        );
+
+        // Parent now enters AwaitingSubAgents (still pending on sub-1). The drain
+        // must deliver batch-A's result as a generated event.
+        let generated = rt
+            .apply_transition_result(TransitionResult::new(mk_awaiting_sub_agents()))
+            .await
+            .expect("entering AwaitingSubAgents must succeed");
+
+        let drained: Vec<&Event> = generated
+            .iter()
+            .filter(|e| matches!(e, Event::SubAgentResult { .. }))
+            .collect();
+        assert_eq!(
+            drained.len(),
+            1,
+            "the buffered batch-A result must be drained on entering AwaitingSubAgents"
+        );
+        match drained[0] {
+            Event::SubAgentResult {
+                agent_id,
+                outcome: SubAgentOutcome::Success { result },
+            } => {
+                assert_eq!(agent_id, "sub-1");
+                assert_eq!(result, "A's real work");
+            }
+            other => panic!("unexpected drained event: {other:?}"),
+        }
+
+        // No cross-round leak: the drain (`mem::take`) empties the buffer, so the
+        // next genuine awaiting-round starts clean.
+        assert!(
+            rt.sub_agent_result_buffer.is_empty(),
+            "buffer must be empty after draining — no leak across rounds"
+        );
     }
 
     /// Entering `Idle` with an empty queue produces no drain event.
