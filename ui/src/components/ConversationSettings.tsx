@@ -140,7 +140,7 @@ export function ConversationSettings({
     }
     let cancelled = false;
     setTaskDetailLoading(true);
-    fetch(`/api/files/read?path=${encodeURIComponent(selectedTask.path)}`)
+    fetch(`/api/files/read?path=${encodeURIComponent(selectedTask.path)}&cwd=${encodeURIComponent(cwd)}`)
       .then(async resp => {
         if (!resp.ok) throw new Error('Failed to read task');
         return resp.json() as Promise<{ content: string }>;
@@ -155,7 +155,7 @@ export function ConversationSettings({
         if (!cancelled) setTaskDetailLoading(false);
       });
     return () => { cancelled = true; };
-  }, [selectedTask]);
+  }, [selectedTask, cwd]);
   const activeTasks = tasks.filter(t => !['done', 'wont-do'].includes(t.status));
   const hasActiveTasks = activeTasks.length > 0;
   const gitAlternatesClass = hasActiveTasks

@@ -3609,6 +3609,12 @@ async fn get_by_slug(
 #[derive(Debug, Deserialize)]
 struct PathQuery {
     path: String,
+    /// Optional project working directory whose task/skill subtrees should be
+    /// readable even before a conversation exists for it. Only `read_file`
+    /// honors this, and only to widen the allowlist by `<cwd>/tasks`,
+    /// `<cwd>/.claude/skills`, `<cwd>/.agents/skills` — never the whole cwd.
+    #[serde(default)]
+    cwd: Option<String>,
 }
 
 // `validate_cwd` and `list_directory` power the new-conversation directory
@@ -3834,10 +3840,22 @@ async fn canonicalize_within_roots(
     state: &AppState,
     requested: &std::path::Path,
 ) -> Result<PathBuf, AppError> {
+    canonicalize_within_roots_with_cwd(state, requested, None).await
+}
+
+/// As [`canonicalize_within_roots`], but additionally admits the task/skill
+/// subtrees of `cwd` (see [`read_root_allowlist`]). `cwd == None` is identical
+/// to [`canonicalize_within_roots`]; a provided cwd only ever widens the set by
+/// the three bounded subtrees, never by arbitrary directories.
+async fn canonicalize_within_roots_with_cwd(
+    state: &AppState,
+    requested: &std::path::Path,
+    cwd: Option<&str>,
+) -> Result<PathBuf, AppError> {
     let path = fs::canonicalize(requested)
         .map_err(|_| AppError::NotFound("Path does not exist".to_string()))?;
 
-    let roots = preview_root_allowlist(state).await;
+    let roots = read_root_allowlist(state, cwd).await;
 
     if roots.iter().any(|root| path.starts_with(root)) {
         Ok(path)
@@ -3874,9 +3892,43 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
         let home = PathBuf::from(home);
         for skill_root in [
             home.join(".claude").join("skills"),
+            home.join(".agents").join("skills"),
             home.join(".phoenix-ide").join("builtin-skills"),
         ] {
             if let Ok(dir) = fs::canonicalize(skill_root) {
+                roots.push(dir);
+            }
+        }
+    }
+
+    roots
+}
+
+/// The base [`preview_root_allowlist`] widened with the task/skill subtrees of an
+/// optional `cwd` — used by `read_file` so a project's tasks and skills are
+/// readable *before* any conversation exists for that project (and thus before
+/// the project dir is in [`Database::preview_roots`]). The new-conversation UI
+/// enumerates tasks (`/api/tasks?cwd=…`) and skills (`/api/skills?cwd=…`) for a
+/// freshly-picked directory, then opens a selected file via `/api/files/read`.
+///
+/// The widening is deliberately scoped to three subtrees of the provided cwd —
+/// `<cwd>/tasks`, `<cwd>/.claude/skills`, `<cwd>/.agents/skills` (each
+/// canonicalized, and only if it exists) — NEVER the whole cwd. An attacker who
+/// passes `cwd=/` gains at most `/tasks`, `/.claude/skills`, `/.agents/skills`,
+/// not arbitrary host-file read: `/etc/passwd` resolves outside all three and is
+/// still rejected. With `cwd == None` the set is exactly the base allowlist, so
+/// existing callers are unchanged.
+async fn read_root_allowlist(state: &AppState, cwd: Option<&str>) -> Vec<PathBuf> {
+    let mut roots = preview_root_allowlist(state).await;
+
+    if let Some(cwd) = cwd {
+        let cwd = PathBuf::from(cwd);
+        for subtree in [
+            cwd.join("tasks"),
+            cwd.join(".claude").join("skills"),
+            cwd.join(".agents").join("skills"),
+        ] {
+            if let Ok(dir) = fs::canonicalize(subtree) {
                 roots.push(dir);
             }
         }
@@ -3985,8 +4037,11 @@ async fn read_file(
     let requested = PathBuf::from(&query.path);
 
     // Confine to allowed roots before reading bytes. Without this the handler is
-    // an arbitrary host-file read of any non-binary file <=10MB.
-    let path = canonicalize_within_roots(&state, &requested).await?;
+    // an arbitrary host-file read of any non-binary file <=10MB. An optional
+    // `cwd` widens the allowlist by that project's task/skill subtrees only, so a
+    // freshly-picked project's tasks/skills are readable before a conversation
+    // (and thus a preview root) exists for it — without admitting arbitrary read.
+    let path = canonicalize_within_roots_with_cwd(&state, &requested, query.cwd.as_deref()).await?;
 
     if path.is_dir() {
         return Err(AppError::BadRequest("Path is a directory".to_string()));
@@ -7646,6 +7701,7 @@ mod file_read_tests {
             State(state),
             Query(PathQuery {
                 path: path.to_string_lossy().to_string(),
+                cwd: None,
             }),
         )
         .await
@@ -7682,6 +7738,7 @@ mod file_read_tests {
             State(state),
             Query(PathQuery {
                 path: path.to_string_lossy().to_string(),
+                cwd: None,
             }),
         )
         .await
@@ -7709,8 +7766,8 @@ mod file_read_tests {
     /// `serve_preview_file` must honor the same allowlist or the follow-up
     /// `<img>`/HTML preview request 404s.
     ///
-    /// `HOME` is process-global; this test mutates it, so it is marked
-    /// `serial` against the other HOME-sensitive containment tests below.
+    /// `HOME` is process-global; this test mutates it via `HomeEnvGuard`, whose
+    /// lock serializes it against the other HOME-sensitive tests.
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn preview_serves_file_under_skill_root() {
@@ -7742,21 +7799,38 @@ mod file_read_tests {
 
     /// RAII guard that overrides `HOME` for the duration of a test and restores
     /// the previous value (and keeps the tempdir alive) on drop.
+    /// Serializes every `HomeEnvGuard`-holding test. `HOME` is process-global,
+    /// and cargo runs `#[test]` functions concurrently across threads (the
+    /// `current_thread` tokio flavor only single-threads each runtime, not the
+    /// test harness), so without this lock two HOME-mutating tests interleave
+    /// and one observes the other's `HOME`.
+    #[cfg(unix)]
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(unix)]
     struct HomeEnvGuard {
         prev: Option<std::ffi::OsString>,
         dir: tempfile::TempDir,
+        // Held for the guard's lifetime so HOME stays this test's until restore.
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     #[cfg(unix)]
     impl HomeEnvGuard {
         fn set(dir: tempfile::TempDir) -> Self {
+            let lock = HOME_ENV_LOCK
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             let prev = std::env::var_os("HOME");
-            // SAFETY: tests touching HOME run single-threaded (current_thread
-            // flavor) and restore it on drop, so no other thread observes a
+            // SAFETY: the HOME_ENV_LOCK mutex serializes all HOME-mutating tests
+            // and the value is restored on drop, so no other thread observes a
             // torn value.
             unsafe { std::env::set_var("HOME", dir.path()) };
-            Self { prev, dir }
+            Self {
+                prev,
+                dir,
+                _lock: lock,
+            }
         }
 
         fn home(&self) -> std::path::PathBuf {
@@ -7791,11 +7865,127 @@ mod file_read_tests {
             State(state),
             Query(PathQuery {
                 path: secret.to_string_lossy().to_string(),
+                cwd: None,
             }),
         )
         .await
         .expect_err("out-of-scope read must fail");
         assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    /// A task file under `<cwd>/tasks` must be readable via the `cwd` query
+    /// param even when `cwd` is NOT a conversation root — this is the
+    /// new-conversation flow opening a freshly-picked project's task before any
+    /// conversation (and thus preview root) exists for it.
+    #[tokio::test]
+    async fn read_file_admits_task_under_provided_cwd() {
+        // The conversation root is unrelated to `project`; only the `cwd` param
+        // makes the task readable, proving the widening — not preview_roots — is
+        // responsible.
+        let conv_root = tempfile::tempdir().expect("conv root");
+        let project = tempfile::tempdir().expect("project");
+        let tasks_dir = project.path().join("tasks");
+        std::fs::create_dir_all(&tasks_dir).expect("tasks dir");
+        let task = tasks_dir.join("00001-p1-ready--fix.md");
+        std::fs::write(&task, "task body\n").expect("write task");
+
+        let state = state_with_root(conv_root.path()).await;
+
+        // Without cwd: rejected (not under any base root).
+        let err = read_file(
+            State(state.clone()),
+            Query(PathQuery {
+                path: task.to_string_lossy().to_string(),
+                cwd: None,
+            }),
+        )
+        .await
+        .expect_err("task outside roots without cwd must fail");
+        assert!(matches!(err, AppError::NotFound(_)));
+
+        // With cwd: admitted.
+        let Json(response) = read_file(
+            State(state),
+            Query(PathQuery {
+                path: task.to_string_lossy().to_string(),
+                cwd: Some(project.path().to_string_lossy().to_string()),
+            }),
+        )
+        .await
+        .expect("task under cwd/tasks must be readable");
+        match response {
+            ReadFileResponse::Text { content, .. } => assert_eq!(content, "task body\n"),
+            other @ ReadFileResponse::Image { .. } => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    /// Providing a `cwd` must NOT turn `read_file` into an arbitrary host-file
+    /// read: a file under `cwd` but OUTSIDE the three task/skill subtrees stays
+    /// rejected. Concretely, an attacker passing `cwd=<project>` cannot read
+    /// `<project>/secret.txt` (it is not under tasks/ or .claude/skills/ or
+    /// .agents/skills/), nor escape via `..`.
+    #[tokio::test]
+    async fn read_file_with_cwd_still_rejects_outside_subtrees() {
+        let conv_root = tempfile::tempdir().expect("conv root");
+        let project = tempfile::tempdir().expect("project");
+        // Make the subtrees exist so the widening actually adds roots, yet the
+        // requested file lives beside them, not within them.
+        std::fs::create_dir_all(project.path().join("tasks")).expect("tasks dir");
+        let secret = project.path().join("secret.txt");
+        std::fs::write(&secret, "top secret\n").expect("write secret");
+
+        let state = state_with_root(conv_root.path()).await;
+
+        let err = read_file(
+            State(state),
+            Query(PathQuery {
+                path: secret.to_string_lossy().to_string(),
+                cwd: Some(project.path().to_string_lossy().to_string()),
+            }),
+        )
+        .await
+        .expect_err("file outside the task/skill subtrees must stay rejected");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    /// A skill file under the global `$HOME/.agents/skills` tree must be
+    /// previewable through the base allowlist — `discover_skills` advertises
+    /// skills from `.agents/skills` as well as `.claude/skills`, so the viewer
+    /// must be able to read them.
+    ///
+    /// `HOME` is process-global; this test mutates it via `HomeEnvGuard`, whose
+    /// lock serializes it against the other HOME-sensitive tests.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn read_file_admits_global_agents_skill() {
+        let home_guard = HomeEnvGuard::set(tempfile::tempdir().expect("home"));
+        let skill_dir = home_guard
+            .home()
+            .join(".agents")
+            .join("skills")
+            .join("my-skill");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        let skill = skill_dir.join("SKILL.md");
+        std::fs::write(&skill, "skill prompt\n").expect("write skill");
+
+        // A conversation root that does NOT contain the skill, proving the
+        // `.agents/skills` allowance — not the cwd — admits it.
+        let root = tempfile::tempdir().expect("root");
+        let state = state_with_root(root.path()).await;
+
+        let Json(response) = read_file(
+            State(state),
+            Query(PathQuery {
+                path: skill.to_string_lossy().to_string(),
+                cwd: None,
+            }),
+        )
+        .await
+        .expect(".agents/skills file must be readable");
+        match response {
+            ReadFileResponse::Text { content, .. } => assert_eq!(content, "skill prompt\n"),
+            other @ ReadFileResponse::Image { .. } => panic!("expected text, got {other:?}"),
+        }
     }
 }
 
