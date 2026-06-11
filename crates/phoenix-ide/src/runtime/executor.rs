@@ -404,18 +404,30 @@ where
     /// Handle to the spawned LLM task — aborted on cancel to drop the HTTP connection
     llm_task_handle: Option<tokio::task::JoinHandle<()>>,
     /// Abort handle for the in-flight retry-backoff timer spawned by
-    /// `Effect::ScheduleRetry`. `Some` only while a retry is pending in
-    /// `LlmRequesting`/`AwaitingContinuation`. Aborted on any transition that
-    /// leaves the retry-scheduling state (cancel, new message, response).
-    ///
-    /// Identity guard for the retry timer: attempt numbers reset per turn, so
-    /// the reducer's `attempt == retry_attempt` check cannot distinguish a
-    /// stale timer (from a cancelled-then-resent turn) from the live one. A
-    /// stale `RetryTimeout` passing that check fires a second concurrent
-    /// `RequestLlm` — double token cost, and the duplicate response may
-    /// overwrite the real one. Aborting the timer at the source kills the
-    /// stale fire before it can reach the reducer.
+    /// `Effect::ScheduleRetry`. Kept so a transition out of the
+    /// retry-scheduling state can proactively abort the timer task before it
+    /// fires, but correctness does NOT depend on it: a stale `RetryTimeout`
+    /// that has already raced onto the channel is rejected by the
+    /// `retry_generation` match, not by handle presence (see `retry_generation`).
     retry_timer_handle: Option<tokio::task::AbortHandle>,
+    /// Generation/epoch tag for the in-flight retry-backoff timer, mirroring
+    /// `llm_request_generation`. Bumped each time a retry timer is scheduled
+    /// (`Effect::ScheduleRetry`) and each time the conversation leaves the
+    /// retry-scheduling state (cancel / response / new turn / exhaustion). The
+    /// timer task stamps the dispatching generation onto its fire; the select
+    /// loop discards a `RetryTimeout` whose generation != this current value.
+    ///
+    /// Identity guard the pure reducer cannot provide: attempt numbers reset
+    /// per turn, so the reducer's `attempt == retry_attempt` check cannot tell
+    /// a stale timer (cancelled-then-resent turn) from the live one. Handle
+    /// presence alone is insufficient too: with an OLD `RetryTimeout` already
+    /// queued AND a NEWER backoff pending (handle = `Some` for the new timer),
+    /// using presence as the guard would let the old fire clear the handle, the
+    /// reducer would then reject it on attempt mismatch, and the LIVE timer's
+    /// later fire would be dropped as "no retry pending" — wedging the turn in
+    /// backoff forever. Matching the generation honors the live fire and
+    /// discards only the genuinely stale one.
+    retry_generation: u64,
     /// Generation/epoch tag for the in-flight LLM request. Incremented at each
     /// LLM dispatch (`Effect::RequestLlm`) and at each intentional abort
     /// (`Effect::AbortLlm`). The LLM outcome forwarder stamps the dispatching
@@ -440,6 +452,14 @@ where
     /// never leaks into the pure `EffectOutcome` type.
     llm_outcome_tx: mpsc::Sender<(u64, LlmOutcome)>,
     llm_outcome_rx: mpsc::Receiver<(u64, LlmOutcome)>,
+    /// Executor-internal, generation-tagged retry-timer channel, mirroring
+    /// `llm_outcome_tx`. The backoff timer sends `(retry_generation, attempt)`;
+    /// the select loop routes a `RetryTimeout` to `process_outcome` only when
+    /// the generation is still current. Kept separate from `outcome_tx` so the
+    /// epoch tag stays executor-side and never leaks into the pure
+    /// `EffectOutcome` type.
+    retry_outcome_tx: mpsc::Sender<(u64, u32)>,
+    retry_outcome_rx: mpsc::Receiver<(u64, u32)>,
     /// Channel to notify parent of sub-agent completion (sub-agent only)
     parent_event_tx: Option<mpsc::Sender<Event>>,
     /// Channel to request sub-agent spawning (parent only)
@@ -450,6 +470,14 @@ where
     /// Buffer for `SubAgentResult` events received before entering `AwaitingSubAgents`.
     /// Pre-allocated with capacity = sub-agent count when spawning (FM-6 prevention).
     sub_agent_result_buffer: Vec<Event>,
+    /// Generation/epoch tag for the current sub-agent fan-in round, mirroring
+    /// `llm_request_generation`. Bumped on each entry to `AwaitingSubAgents`.
+    /// Used to label the buffer-drain on round entry for observability; the
+    /// drain's keep/discard decision is by `pending`-set membership (each
+    /// `agent_id` is a unique UUID belonging to exactly one round), so a late
+    /// result from a completed round is discarded rather than misapplied to the
+    /// next round.
+    sub_agent_round_gen: u64,
     /// Steering messages queued while the conversation was busy. Delivered
     /// one-at-a-time (FIFO) when the conversation next enters `Idle`.
     /// Loaded from DB at executor startup; persisted back after each enqueue
@@ -530,6 +558,7 @@ where
         // for this unified channel.
         let (outcome_tx, outcome_rx) = mpsc::channel::<EffectOutcome>(64);
         let (llm_outcome_tx, llm_outcome_rx) = mpsc::channel::<(u64, LlmOutcome)>(64);
+        let (retry_outcome_tx, retry_outcome_rx) = mpsc::channel::<(u64, u32)>(64);
 
         Self {
             context,
@@ -549,14 +578,18 @@ where
             tool_cancel_token: None,
             llm_task_handle: None,
             retry_timer_handle: None,
+            retry_generation: 0,
             llm_request_generation: 0,
             llm_outcome_tx,
             llm_outcome_rx,
+            retry_outcome_tx,
+            retry_outcome_rx,
             parent_event_tx: None,
             spawn_tx: None,
             cancel_tx: None,
             handoff_tx: None,
             sub_agent_result_buffer: Vec::new(),
+            sub_agent_round_gen: 0,
             steering_queue: Vec::new(),
             sub_agent_deadline: None,
             active_work_subagents: 0,
@@ -784,6 +817,38 @@ where
                         return;
                     }
                 }
+                Some((generation, attempt)) = self.retry_outcome_rx.recv() => {
+                    // Generation guard for the retry-backoff timer, mirroring the
+                    // LLM-outcome guard above. A fire whose generation has been
+                    // superseded (a newer `Effect::ScheduleRetry`, or leaving the
+                    // retry-scheduling state) is stale and must not double-dispatch
+                    // the LLM. Crucially, this is generation-based, not
+                    // handle-presence-based: an OLD fire arriving while a NEW timer
+                    // is pending is discarded here without disturbing the new
+                    // timer, so the live fire is still honored when it arrives.
+                    if self.retry_timeout_is_stale(generation) {
+                        tracing::debug!(
+                            outcome_generation = generation,
+                            current_generation = self.retry_generation,
+                            state = self.state.variant_name(),
+                            "Ignoring stale RetryTimeout — timer superseded (cancel/new dispatch)"
+                        );
+                    } else if let Err(e) =
+                        self.process_outcome(EffectOutcome::RetryTimeout { attempt }).await
+                    {
+                        tracing::warn!(error = %e, "Outcome rejected by state machine");
+                    }
+                    // FM-5 prevention: terminal states exit the loop explicitly.
+                    if let StepResult::Terminal(outcome) = self.state.step_result() {
+                        tracing::info!(
+                            conv_id = %self.context.conversation_id,
+                            ?outcome,
+                            "Conversation reached terminal state, exiting executor loop"
+                        );
+                        self.emit_terminal_lifecycle_event().await;
+                        return;
+                    }
+                }
                 // REQ-SA-006: sub-agent deadline expired — cancel all pending agents
                 () = async {
                     match deadline {
@@ -953,30 +1018,26 @@ where
         generation != self.llm_request_generation
     }
 
+    /// Whether a forwarded `RetryTimeout` stamped with `generation` belongs to a
+    /// superseded retry timer. Stale when its generation no longer matches the
+    /// current retry generation — a later `Effect::ScheduleRetry` opened a newer
+    /// one, or leaving the retry-scheduling state (cancel / response / new turn /
+    /// exhaustion) bumped it. The live timer's own current-generation fire still
+    /// matches and is honored; only genuinely superseded fires are discarded.
+    fn retry_timeout_is_stale(&self, generation: u64) -> bool {
+        generation != self.retry_generation
+    }
+
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
-        // Retry-timer identity guard (executor-side, keeps the pure reducer
-        // pure). `retry_timer_handle` is `Some` exactly while the executor
-        // considers a retry pending; it is cleared/aborted on any transition
-        // out of the scheduling state. A `RetryTimeout` that arrives while the
-        // handle is `None` is therefore stale — its timer was already aborted
-        // (cancel/response/new turn) but the fire had already been enqueued on
-        // `outcome_rx` before the abort ran. Drop it: the reducer's
-        // `attempt == retry_attempt` check cannot catch this because attempt
-        // numbers reset per turn, so a stale fire from a cancelled-then-resent
-        // turn would otherwise pass the check and double-dispatch the LLM.
+        // A `RetryTimeout` reaching this point has already passed the
+        // generation guard in the select loop (`retry_timeout_is_stale`), so it
+        // is the live timer firing. Its task has run to completion, leaving the
+        // stored handle spent — clear it to keep "handle is Some only while a
+        // timer task is in flight". (The subsequent `RequestLlm` keeps the
+        // state in `LlmRequesting`, so the leave-the-scheduling-state abort in
+        // `apply_transition_result` won't clear it for us.) Correctness comes
+        // from the generation match, not from this handle bookkeeping.
         if matches!(outcome, EffectOutcome::RetryTimeout { .. }) {
-            if self.retry_timer_handle.is_none() {
-                tracing::debug!(
-                    state = self.state.variant_name(),
-                    "Ignoring stale RetryTimeout — no retry pending (timer already aborted)"
-                );
-                return Ok(());
-            }
-            // Live timer firing: its task has completed, so the stored handle
-            // is spent. Clear it to keep the "Some only while a retry is
-            // pending" invariant — the subsequent `RequestLlm` keeps the state
-            // in `LlmRequesting`, so the leave-the-scheduling-state abort in
-            // `apply_transition_result` won't clear it.
             self.retry_timer_handle = None;
         }
 
@@ -1129,6 +1190,74 @@ where
         Ok(())
     }
 
+    /// Drain `sub_agent_result_buffer` for the round the parent is entering,
+    /// returning the buffered results that belong to it. Called on entry to
+    /// `AwaitingSubAgents`/`CancellingSubAgents`.
+    ///
+    /// A buffered `SubAgentResult` is valid for THIS fan-in round only if its
+    /// agent belongs to the round being entered. `agent_id` is a fresh UUID per
+    /// spawned agent, so each agent belongs to exactly one round; round
+    /// membership is therefore exactly the entering round's `pending` set.
+    ///
+    /// Two cases must be distinguished (Finding #3):
+    ///   - EARLY result for THIS round: an agent spawned in this round finished
+    ///     before the parent entered `AwaitingSubAgents` (e.g. tool sequence
+    ///     `[spawn_agents A, bash, spawn_agents B]`, where A's result arrives
+    ///     during `bash`). Its agent is in `pending` → drain it.
+    ///   - STALE result from a COMPLETED round: a timed-out/cancelled agent from
+    ///     a prior round reports its real result *after* the parent left
+    ///     `AwaitingSubAgents`. Its agent is NOT in this round's `pending` →
+    ///     discard it. Feeding it to the reducer would either misapply it to the
+    ///     wrong fan-in round or get rejected and abort the transition.
+    ///
+    /// `sub_agent_round_gen` tags the entering round for observability in the
+    /// discard log; correctness comes from the pending-set membership test.
+    fn drain_buffer_for_round(&mut self) -> Vec<Event> {
+        self.sub_agent_round_gen = self.sub_agent_round_gen.wrapping_add(1);
+        let round_gen = self.sub_agent_round_gen;
+        let round_pending: std::collections::HashSet<&str> = match &self.state {
+            ConvState::AwaitingSubAgents { pending, .. }
+            | ConvState::CancellingSubAgents { pending, .. } => {
+                pending.iter().map(|p| p.agent_id.as_str()).collect()
+            }
+            _ => std::collections::HashSet::new(),
+        };
+        let buffered = std::mem::take(&mut self.sub_agent_result_buffer);
+        let mut to_drain = Vec::with_capacity(buffered.len());
+        let mut discarded = 0usize;
+        for event in buffered {
+            let belongs = match &event {
+                Event::SubAgentResult { agent_id, .. } => round_pending.contains(agent_id.as_str()),
+                // Only SubAgentResult is ever buffered (see the push path);
+                // anything else is unexpected — keep it rather than silently
+                // drop, so a future buffered event type can't vanish.
+                _ => true,
+            };
+            if belongs {
+                to_drain.push(event);
+            } else {
+                discarded += 1;
+                if let Event::SubAgentResult { agent_id, .. } = &event {
+                    tracing::debug!(
+                        round_gen,
+                        agent_id = %agent_id,
+                        "Discarding buffered SubAgentResult from a completed round — \
+                         agent not pending in the entering round"
+                    );
+                }
+            }
+        }
+        if !to_drain.is_empty() || discarded > 0 {
+            tracing::debug!(
+                round_gen,
+                drained = to_drain.len(),
+                discarded,
+                "Drained buffered SubAgentResults on entering AwaitingSubAgents"
+            );
+        }
+        to_drain
+    }
+
     /// Apply a `TransitionResult` from either `transition()` or `handle_outcome()`.
     ///
     /// Updates state, drains sub-agent buffer if entering `AwaitingSubAgents`,
@@ -1158,25 +1287,31 @@ where
             self.state_updated_at = Utc::now();
         }
 
-        // Kill any pending retry-backoff timer when the conversation leaves the
-        // retry-scheduling context. A retry timer is only valid while the state
-        // stays `LlmRequesting`/`AwaitingContinuation` (the only states that
-        // emit `Effect::ScheduleRetry`, and where the next legitimate
+        // Retire any pending retry-backoff timer when the conversation leaves
+        // the retry-scheduling context. A retry timer is only valid while the
+        // state stays `LlmRequesting`/`AwaitingContinuation` (the only states
+        // that emit `Effect::ScheduleRetry`, and where the next legitimate
         // `RetryTimeout` is consumed — including same-state steer drains and
         // attempt increments). Any other destination — cancel (→ Idle /
         // CancellingTool), a response (→ ToolExecuting / Completed), or retry
-        // exhaustion (→ Error) — ends this retry context. Aborting here is the
-        // identity guard the pure reducer cannot provide: attempt numbers reset
-        // per turn, so a stale timer from a cancelled-then-resent turn would
-        // otherwise pass the reducer's `attempt == retry_attempt` check and
-        // fire a second concurrent `RequestLlm` (double token cost; a duplicate
-        // response can overwrite the real one).
+        // exhaustion (→ Error) — ends this retry context.
+        //
+        // Bumping `retry_generation` is the identity guard the pure reducer
+        // cannot provide: attempt numbers reset per turn, so a stale timer from
+        // a cancelled-then-resent turn would otherwise pass the reducer's
+        // `attempt == retry_attempt` check and fire a second concurrent
+        // `RequestLlm` (double token cost; a duplicate response can overwrite
+        // the real one). After the bump, any in-flight or already-queued fire
+        // from the old timer is stale and the select loop drops it. Aborting
+        // the handle is a best-effort optimization to stop the timer task
+        // early; correctness does not depend on it.
         if !matches!(
             self.state,
             ConvState::LlmRequesting { .. } | ConvState::AwaitingContinuation { .. }
         ) {
             if let Some(handle) = self.retry_timer_handle.take() {
                 handle.abort();
+                self.retry_generation = self.retry_generation.wrapping_add(1);
             }
         }
 
@@ -1236,13 +1371,9 @@ where
             ConvState::AwaitingSubAgents { .. } | ConvState::CancellingSubAgents { .. }
         );
 
-        // Drain buffer when entering AwaitingSubAgents
+        // Drain buffer when entering AwaitingSubAgents.
         if entering_awaiting {
-            let buffered = std::mem::take(&mut self.sub_agent_result_buffer);
-            if !buffered.is_empty() {
-                tracing::debug!(count = buffered.len(), "Draining buffered SubAgentResults");
-                generated_events.extend(buffered);
-            }
+            generated_events.extend(self.drain_buffer_for_round());
             // Set deadline (REQ-SA-006): timeout starts when parent enters AwaitingSubAgents
             self.sub_agent_deadline = Some(tokio::time::Instant::now() + DEFAULT_SUBAGENT_TIMEOUT);
             tracing::debug!(
@@ -1462,18 +1593,19 @@ where
     // agent — draining the parent out of `AwaitingSubAgents` — and (b) sends a
     // real cancel. The cancel later produces a *real* `SubAgentResult` that
     // arrives after the parent has already left `AwaitingSubAgents`, so it is
-    // buffered (`sub_agent_result_buffer`) and can surface a spurious result
-    // for a stale agent on a later spawn; a real success already in flight can
-    // be overwritten by the synthetic `TimedOut`. The correct shape is to inject
-    // a single `UserCancel` (→ `CancellingSubAgents`, which emits
-    // `Effect::CancelSubAgents`) and let the real cancelled results drain
-    // through `CancellingSubAgents` to `Idle`, conserving fan-in. That rewrite
-    // is deferred because it must also (1) preserve the "timed out" vs
-    // "cancelled" semantic the LLM history renders and (2) add a backstop so a
-    // cancelled sub-agent that never reports back cannot wedge the drain — the
-    // exact guarantee the current synthetic-result approach provides. A
-    // half-conversion would trade a buffered-stale-result bug for a fan-in
-    // conservation bug, which is worse.
+    // buffered (`sub_agent_result_buffer`). That late result no longer leaks
+    // into a later round: the buffer-drain on entering `AwaitingSubAgents`
+    // keeps only results whose agent is pending in the entering round and
+    // discards completed-round results. The remaining concern is that a real
+    // success already in flight can be overwritten by the synthetic `TimedOut`.
+    // The correct shape is to inject a single `UserCancel` (→
+    // `CancellingSubAgents`, which emits `Effect::CancelSubAgents`) and let the
+    // real cancelled results drain through `CancellingSubAgents` to `Idle`,
+    // conserving fan-in. That rewrite is deferred because it must also (1)
+    // preserve the "timed out" vs "cancelled" semantic the LLM history renders
+    // and (2) add a backstop so a cancelled sub-agent that never reports back
+    // cannot wedge the drain — the exact guarantee the current
+    // synthetic-result approach provides.
     async fn handle_sub_agent_timeout(&mut self) {
         self.sub_agent_deadline = None;
 
@@ -2016,22 +2148,26 @@ where
                     resets_at,
                 });
 
-                // Spawn the backoff timer. Store its abort handle so any
-                // transition out of the retry-scheduling state (cancel, new
-                // user message, response) can kill the timer before it fires a
-                // stale RetryTimeout — attempt numbers reset per turn, so the
-                // reducer's attempt-equality guard alone cannot reject a stale
-                // timer from a cancelled-then-resent turn. Abort any
-                // previously-stored timer first (defensive; normally None).
+                // Open a fresh retry generation for this timer. The timer task
+                // stamps it onto its fire; the select loop discards a fire whose
+                // generation has been superseded (a newer ScheduleRetry here, or
+                // leaving the retry-scheduling state). This is the identity guard
+                // the pure reducer cannot provide: attempt numbers reset per
+                // turn, so the reducer's attempt-equality guard alone cannot
+                // reject a stale timer from a cancelled-then-resent turn.
+                //
+                // Abort any previously-stored timer first (best-effort; normally
+                // None). The generation bump already makes the prior timer's fire
+                // stale, so the abort is purely to stop the task early.
                 if let Some(stale) = self.retry_timer_handle.take() {
                     stale.abort();
                 }
-                let outcome_tx = self.outcome_tx.clone();
+                self.retry_generation = self.retry_generation.wrapping_add(1);
+                let timer_generation = self.retry_generation;
+                let retry_outcome_tx = self.retry_outcome_tx.clone();
                 let handle = tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
-                    let _ = outcome_tx
-                        .send(EffectOutcome::RetryTimeout { attempt })
-                        .await;
+                    let _ = retry_outcome_tx.send((timer_generation, attempt)).await;
                 });
                 self.retry_timer_handle = Some(handle.abort_handle());
                 Ok(None)
@@ -6039,6 +6175,136 @@ mod steer_drain_detector_tests {
         );
     }
 
+    /// Build an `AwaitingSubAgents` state whose single pending agent has the
+    /// given `agent_id` (for cross-round drain tests).
+    fn mk_awaiting_with_pending(agent_id: &str) -> ConvState {
+        ConvState::AwaitingSubAgents {
+            pending: vec![PendingSubAgent {
+                agent_id: agent_id.to_string(),
+                task: "do thing".to_string(),
+                mode: SubAgentMode::Work,
+            }],
+            completed_results: vec![],
+            spawn_tool_id: None,
+        }
+    }
+
+    /// Finding #3: a late `SubAgentResult` from a COMPLETED round (a timed-out
+    /// agent whose real result lands after the parent left `AwaitingSubAgents`)
+    /// must NOT be drained into the NEXT round. The buffer-drain keeps only
+    /// results whose agent is pending in the entering round and discards the
+    /// rest, so the stale result can neither misapply to the wrong round nor
+    /// reject the round-entry transition.
+    #[tokio::test]
+    async fn late_result_from_completed_round_is_discarded_not_applied_to_next_round() {
+        // Parent is mid-round running a non-spawn tool, so it cannot handle
+        // SubAgentResult events — they get buffered.
+        let (mut rt, _storage) =
+            build_runtime_with_state_and_queue("conv-late-discard", mk_tool_executing(), vec![]);
+        assert!(!rt.can_handle_sub_agent_result());
+
+        // Round R's agent "old-agent" timed out earlier; its real result arrives
+        // now, after round R settled. It is buffered (parent not awaiting).
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "old-agent".to_string(),
+            outcome: SubAgentOutcome::Success {
+                result: "late work from a dead round".to_string(),
+            },
+        })
+        .await
+        .expect("buffering a late SubAgentResult must not error");
+        assert_eq!(rt.sub_agent_result_buffer.len(), 1);
+
+        // The parent now opens round R+1 awaiting a DIFFERENT agent
+        // ("new-agent"). The buffered late result belongs to "old-agent", which
+        // is not pending in this round → it must be discarded, not drained.
+        let generated = rt
+            .apply_transition_result(TransitionResult::new(mk_awaiting_with_pending("new-agent")))
+            .await
+            .expect("entering AwaitingSubAgents must succeed");
+
+        let drained: Vec<&Event> = generated
+            .iter()
+            .filter(|e| matches!(e, Event::SubAgentResult { .. }))
+            .collect();
+        assert!(
+            drained.is_empty(),
+            "a completed-round result must not be drained into the next round, got {drained:?}"
+        );
+        assert!(
+            rt.sub_agent_result_buffer.is_empty(),
+            "the buffer must be empty after the drain discards the stale result"
+        );
+        // The new round is intact and still awaiting its own agent.
+        assert!(
+            matches!(rt.state, ConvState::AwaitingSubAgents { .. }),
+            "the next round's entry transition must not be rejected, got {:?}",
+            rt.state.variant_name()
+        );
+    }
+
+    /// Finding #3 (no-regress of H1): a genuine EARLY result for the CURRENT
+    /// round still drains even when a stale completed-round result is buffered
+    /// alongside it. The current-round result survives; the stale one is dropped.
+    #[tokio::test]
+    async fn early_current_round_result_drains_while_stale_is_discarded() {
+        let (mut rt, _storage) =
+            build_runtime_with_state_and_queue("conv-mixed-buf", mk_tool_executing(), vec![]);
+
+        // A stale completed-round result for "old-agent".
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "old-agent".to_string(),
+            outcome: SubAgentOutcome::Success {
+                result: "stale".to_string(),
+            },
+        })
+        .await
+        .expect("buffering stale result must not error");
+
+        // An EARLY result for THIS round's agent "cur-agent", buffered while the
+        // parent was still running a prior tool.
+        rt.process_event(Event::SubAgentResult {
+            agent_id: "cur-agent".to_string(),
+            outcome: SubAgentOutcome::Success {
+                result: "current-round work".to_string(),
+            },
+        })
+        .await
+        .expect("buffering current-round result must not error");
+        assert_eq!(rt.sub_agent_result_buffer.len(), 2);
+
+        // Enter the round awaiting "cur-agent". Only the current-round result
+        // drains; the stale one is discarded.
+        let generated = rt
+            .apply_transition_result(TransitionResult::new(mk_awaiting_with_pending("cur-agent")))
+            .await
+            .expect("entering AwaitingSubAgents must succeed");
+
+        let drained: Vec<&Event> = generated
+            .iter()
+            .filter(|e| matches!(e, Event::SubAgentResult { .. }))
+            .collect();
+        assert_eq!(
+            drained.len(),
+            1,
+            "exactly the current-round result must drain, got {drained:?}"
+        );
+        match drained[0] {
+            Event::SubAgentResult {
+                agent_id,
+                outcome: SubAgentOutcome::Success { result },
+            } => {
+                assert_eq!(agent_id, "cur-agent");
+                assert_eq!(result, "current-round work");
+            }
+            other => panic!("unexpected drained event: {other:?}"),
+        }
+        assert!(
+            rt.sub_agent_result_buffer.is_empty(),
+            "buffer empty after drain — stale entry discarded, current entry drained"
+        );
+    }
+
     /// Entering `Idle` with an empty queue produces no drain event.
     #[tokio::test]
     async fn no_drain_when_queue_empty_idle() {
@@ -6923,12 +7189,15 @@ mod sender_drop_forwarder_tests {
     }
 }
 
-/// H2 (task 61004): a retry-backoff timer from a cancelled-then-resent turn
-/// must not fire a second concurrent LLM request. Attempt numbers reset per
-/// turn, so the reducer's `attempt == retry_attempt` guard alone cannot reject
-/// a stale timer. The executor aborts the timer on any transition out of the
-/// retry-scheduling state and ignores a `RetryTimeout` that arrives with no
-/// retry pending.
+/// A retry-backoff timer from a cancelled-then-resent turn must not fire a
+/// second concurrent LLM request. Attempt numbers reset per turn, so the
+/// reducer's `attempt == retry_attempt` guard alone cannot reject a stale
+/// timer. The executor stamps each scheduled timer with a `retry_generation`
+/// and discards a `RetryTimeout` whose generation has been superseded — by a
+/// newer timer or by leaving the retry-scheduling state. The guard is
+/// generation-based, not handle-presence-based: an old fire arriving while a
+/// newer timer is pending is discarded without disturbing the new timer, so the
+/// live fire is still honored when it arrives.
 #[cfg(test)]
 mod retry_timer_epoch_tests {
     use super::*;
@@ -6975,10 +7244,27 @@ mod retry_timer_epoch_tests {
         }
     }
 
-    /// A retryable `LlmError` schedules a backoff timer; cancelling the turn
-    /// aborts it so it can never fire across the turn boundary.
+    /// Mirror of the executor select-loop's retry-outcome arm: apply the
+    /// generation guard, then route a current-generation `RetryTimeout` to
+    /// `process_outcome`. Returns `true` if the timeout was applied, `false` if
+    /// discarded as stale. Tests use this to exercise the real guard
+    /// (`retry_timeout_is_stale`) deterministically without spinning the loop.
+    async fn route_retry_timeout(rt: &mut TestRuntime, generation: u64, attempt: u32) -> bool {
+        if rt.retry_timeout_is_stale(generation) {
+            return false;
+        }
+        rt.process_outcome(EffectOutcome::RetryTimeout { attempt })
+            .await
+            .expect("current-generation retry timeout must apply cleanly");
+        true
+    }
+
+    /// A retryable `LlmError` schedules a backoff timer (bumping
+    /// `retry_generation`); cancelling the turn bumps the generation again so
+    /// any fire from the old timer is stale and can never cross the turn
+    /// boundary.
     #[tokio::test]
-    async fn cancel_aborts_pending_retry_timer() {
+    async fn cancel_supersedes_pending_retry_timer() {
         let mut rt = runtime_requesting();
 
         rt.process_event(retryable_llm_error())
@@ -6993,6 +7279,7 @@ mod retry_timer_epoch_tests {
             rt.retry_timer_handle.is_some(),
             "a retry timer must be tracked while a retry is pending"
         );
+        let scheduled_gen = rt.retry_generation;
 
         rt.process_event(Event::UserCancel { reason: None })
             .await
@@ -7006,11 +7293,19 @@ mod retry_timer_epoch_tests {
             rt.retry_timer_handle.is_none(),
             "leaving the retry-scheduling state must abort and clear the timer handle"
         );
+        assert!(
+            rt.retry_generation > scheduled_gen,
+            "leaving the retry-scheduling state must bump the generation past the timer's"
+        );
+        assert!(
+            rt.retry_timeout_is_stale(scheduled_gen),
+            "the cancelled timer's fire must now be stale"
+        );
     }
 
-    /// A stale `RetryTimeout` that raced onto the outcome channel before the
-    /// abort ran is dropped (handle is `None`) rather than dispatching a second
-    /// LLM request.
+    /// A stale `RetryTimeout` that raced onto the channel before the cancel is
+    /// dropped by the generation guard rather than dispatching a second LLM
+    /// request.
     #[tokio::test]
     async fn stale_retry_timeout_is_ignored_after_cancel() {
         let mut rt = runtime_requesting();
@@ -7018,30 +7313,29 @@ mod retry_timer_epoch_tests {
         rt.process_event(retryable_llm_error())
             .await
             .expect("retryable error transitions");
+        let stale_gen = rt.retry_generation;
         rt.process_event(Event::UserCancel { reason: None })
             .await
             .expect("cancel transitions");
         assert!(matches!(rt.state, ConvState::Idle));
 
-        // The stale timer fires attempt 2 after the turn was cancelled. With no
-        // retry pending (handle cleared), it must be ignored and the state must
-        // stay Idle — no second RequestLlm.
-        rt.process_outcome(EffectOutcome::RetryTimeout { attempt: 2 })
-            .await
-            .expect("stale retry timeout is dropped, not an error");
+        // The stale timer fires attempt 2 after the turn was cancelled. Its
+        // generation is superseded, so the guard discards it and the state
+        // stays Idle — no second RequestLlm.
+        let applied = route_retry_timeout(&mut rt, stale_gen, 2).await;
+        assert!(
+            !applied,
+            "a superseded-generation RetryTimeout must be discarded"
+        );
         assert!(
             matches!(rt.state, ConvState::Idle),
             "stale RetryTimeout must not move state out of Idle, got {:?}",
             rt.state.variant_name()
         );
-        assert!(
-            rt.retry_timer_handle.is_none(),
-            "no retry should be pending after a stale timeout is ignored"
-        );
     }
 
-    /// The legitimate retry path is unaffected: a `RetryTimeout` that arrives
-    /// while a retry is genuinely pending dispatches the next attempt.
+    /// The legitimate retry path is unaffected: a `RetryTimeout` whose
+    /// generation matches the live timer dispatches the next attempt.
     #[tokio::test]
     async fn live_retry_timeout_still_fires() {
         let mut rt = runtime_requesting();
@@ -7050,13 +7344,13 @@ mod retry_timer_epoch_tests {
             .await
             .expect("retryable error transitions");
         assert!(rt.retry_timer_handle.is_some());
+        let live_gen = rt.retry_generation;
 
-        // The live timer fires attempt 2 while still in LlmRequesting{2}. It
-        // must be accepted (handle was Some), clear the handle, and keep the
-        // conversation progressing in LlmRequesting.
-        rt.process_outcome(EffectOutcome::RetryTimeout { attempt: 2 })
-            .await
-            .expect("live retry timeout transitions");
+        // The live timer fires attempt 2 while still in LlmRequesting{2}. Its
+        // generation is current, so it is accepted, clears the handle, and keeps
+        // the conversation progressing in LlmRequesting.
+        let applied = route_retry_timeout(&mut rt, live_gen, 2).await;
+        assert!(applied, "the live-generation RetryTimeout must be applied");
         assert!(
             matches!(rt.state, ConvState::LlmRequesting { attempt: 2 }),
             "live RetryTimeout re-requests the LLM in LlmRequesting, got {:?}",
@@ -7065,6 +7359,77 @@ mod retry_timer_epoch_tests {
         assert!(
             rt.retry_timer_handle.is_none(),
             "the spent timer handle must be cleared after a live timeout fires"
+        );
+    }
+
+    /// Finding #1: an OLD `RetryTimeout` is already queued AND a NEWER backoff
+    /// timer is pending (handle = `Some` for the new timer). The old fire must
+    /// be discarded by generation WITHOUT disturbing the new timer, and the
+    /// new (live) timer's own fire must still be honored — the turn must not be
+    /// wedged in backoff. A handle-presence guard would mishandle this: the old
+    /// fire would clear the handle, the reducer would reject it on attempt
+    /// mismatch, and the live fire would then be dropped as "no retry pending".
+    #[tokio::test]
+    async fn old_timer_does_not_wedge_a_newer_live_timer() {
+        let mut rt = runtime_requesting();
+
+        // First retryable error opens generation G1 (the OLD timer), attempt 2.
+        rt.process_event(retryable_llm_error())
+            .await
+            .expect("first retryable error transitions");
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 2 }));
+        let old_gen = rt.retry_generation;
+
+        // A second retryable error re-schedules: this supersedes the old timer
+        // (generation G2 = the NEW, live timer), attempt 3. The handle now
+        // points at the new timer, so a handle-presence guard would treat the
+        // stale old fire as live.
+        rt.process_event(retryable_llm_error())
+            .await
+            .expect("second retryable error transitions");
+        assert!(matches!(rt.state, ConvState::LlmRequesting { attempt: 3 }));
+        let live_gen = rt.retry_generation;
+        assert!(
+            live_gen > old_gen,
+            "re-scheduling must open a newer retry generation"
+        );
+        assert!(
+            rt.retry_timer_handle.is_some(),
+            "a (new) retry timer must be pending"
+        );
+
+        // The OLD timer's fire (attempt 2, generation G1) now arrives. It must
+        // be discarded by the generation guard and must NOT touch the handle.
+        let old_applied = route_retry_timeout(&mut rt, old_gen, 2).await;
+        assert!(
+            !old_applied,
+            "the old, superseded timer fire must be discarded"
+        );
+        assert!(
+            rt.retry_timer_handle.is_some(),
+            "discarding the old fire must not disturb the live timer's handle"
+        );
+        assert!(
+            matches!(rt.state, ConvState::LlmRequesting { attempt: 3 }),
+            "the stale old fire must not move the turn, got {:?}",
+            rt.state.variant_name()
+        );
+
+        // The LIVE timer's own fire (attempt 3, generation G2) arrives. It must
+        // still be honored — the turn re-requests the LLM and is not wedged.
+        let live_applied = route_retry_timeout(&mut rt, live_gen, 3).await;
+        assert!(
+            live_applied,
+            "the live timer's current-generation fire must still be honored"
+        );
+        assert!(
+            matches!(rt.state, ConvState::LlmRequesting { attempt: 3 }),
+            "the live RetryTimeout re-requests the LLM, got {:?}",
+            rt.state.variant_name()
+        );
+        assert!(
+            rt.retry_timer_handle.is_none(),
+            "the spent live timer handle is cleared after its fire is honored"
         );
     }
 }
