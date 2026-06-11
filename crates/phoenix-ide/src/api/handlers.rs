@@ -3912,24 +3912,38 @@ async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
 /// freshly-picked directory, then opens a selected file via `/api/files/read`.
 ///
 /// The widening is deliberately scoped to three subtrees of the provided cwd —
-/// `<cwd>/tasks`, `<cwd>/.claude/skills`, `<cwd>/.agents/skills` (each
-/// canonicalized, and only if it exists) — NEVER the whole cwd. An attacker who
-/// passes `cwd=/` gains at most `/tasks`, `/.claude/skills`, `/.agents/skills`,
-/// not arbitrary host-file read: `/etc/passwd` resolves outside all three and is
-/// still rejected. With `cwd == None` the set is exactly the base allowlist, so
-/// existing callers are unchanged.
+/// the project's configured task directory (via `discover_or_default`),
+/// `<cwd>/.claude/skills`, and `<cwd>/.agents/skills` — each canonicalized, kept
+/// only if it exists AND resolves INSIDE the canonical cwd, NEVER the whole cwd.
+/// The inside-cwd check is load-bearing: it rejects a subtree that is a symlink
+/// escaping the project (e.g. `tasks -> /`), which would otherwise re-open
+/// arbitrary host-file read. An attacker passing `cwd=/` gains at most the
+/// task/skill subdirs of `/`, not `/etc/passwd`. With `cwd == None` the set is
+/// exactly the base allowlist, so existing callers are unchanged.
 async fn read_root_allowlist(state: &AppState, cwd: Option<&str>) -> Vec<PathBuf> {
     let mut roots = preview_root_allowlist(state).await;
 
     if let Some(cwd) = cwd {
         let cwd = PathBuf::from(cwd);
+        // The canonical cwd anchors containment. A widened subtree is honored
+        // only if it resolves to a path INSIDE the canonical cwd — otherwise a
+        // project whose task/skill dir is a symlink to `/` or `/etc` would
+        // canonicalize to that target and re-open arbitrary host-file read.
+        let Ok(canonical_cwd) = fs::canonicalize(&cwd) else {
+            return roots;
+        };
+        // Honor the project's configured task directory (which may not be
+        // literally `tasks`), matching what `/api/tasks` enumerates.
+        let tasks_dir = taskmd_core::discover::discover_or_default(&cwd);
         for subtree in [
-            cwd.join("tasks"),
+            cwd.join(&tasks_dir),
             cwd.join(".claude").join("skills"),
             cwd.join(".agents").join("skills"),
         ] {
             if let Ok(dir) = fs::canonicalize(subtree) {
-                roots.push(dir);
+                if dir.starts_with(&canonical_cwd) {
+                    roots.push(dir);
+                }
             }
         }
     }
@@ -7945,6 +7959,36 @@ mod file_read_tests {
         )
         .await
         .expect_err("file outside the task/skill subtrees must stay rejected");
+        assert!(matches!(err, AppError::NotFound(_)));
+    }
+
+    /// Regression: a project whose task subtree is a SYMLINK escaping the
+    /// project (e.g. `tasks -> /`) must not widen the allowlist to the symlink
+    /// target — otherwise `read_file?cwd=<project>&path=<outside file>` would
+    /// re-open arbitrary host-file read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_cwd_subtree_symlinked_outside_project() {
+        let conv_root = tempfile::tempdir().expect("conv root");
+        let project = tempfile::tempdir().expect("project");
+        let outside = tempfile::tempdir().expect("outside");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "top secret\n").expect("write secret");
+        // Malicious project: its task dir is a symlink escaping the project.
+        std::os::unix::fs::symlink(outside.path(), project.path().join("tasks"))
+            .expect("symlink tasks");
+
+        let state = state_with_root(conv_root.path()).await;
+
+        let err = read_file(
+            State(state),
+            Query(PathQuery {
+                path: secret.to_string_lossy().to_string(),
+                cwd: Some(project.path().to_string_lossy().to_string()),
+            }),
+        )
+        .await
+        .expect_err("a task subtree symlinked outside the project must not widen the allowlist");
         assert!(matches!(err, AppError::NotFound(_)));
     }
 
