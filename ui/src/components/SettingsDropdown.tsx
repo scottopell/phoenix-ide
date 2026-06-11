@@ -175,6 +175,7 @@ export function SettingsDropdown({
               type="button"
               className="settings-inline-btn settings-about-link"
               onClick={() => { setOpen(false); navigate('/about'); }}
+              title="Open deployment details"
             >
               About this deployment →
             </button>
@@ -195,6 +196,7 @@ function ThemeSection({ theme, onToggle }: { theme: 'dark' | 'light'; onToggle: 
           type="button"
           className={`settings-theme-btn${theme === 'light' ? ' active' : ''}`}
           onClick={() => { if (theme !== 'light') onToggle(); }}
+          title={theme === 'light' ? 'Light theme is active' : 'Switch to light theme'}
         >
           Light
         </button>
@@ -202,6 +204,7 @@ function ThemeSection({ theme, onToggle }: { theme: 'dark' | 'light'; onToggle: 
           type="button"
           className={`settings-theme-btn${theme === 'dark' ? ' active' : ''}`}
           onClick={() => { if (theme !== 'dark') onToggle(); }}
+          title={theme === 'dark' ? 'Dark theme is active' : 'Switch to dark theme'}
         >
           Dark
         </button>
@@ -232,6 +235,7 @@ function DensitySection() {
           aria-checked={density === 'full'}
           className={`settings-theme-btn${density === 'full' ? ' active' : ''}`}
           onClick={() => setDensity('full')}
+          title={density === 'full' ? 'Full density is active' : 'Switch to full density'}
         >
           Full
         </button>
@@ -241,6 +245,7 @@ function DensitySection() {
           aria-checked={density === 'compact'}
           className={`settings-theme-btn${density === 'compact' ? ' active' : ''}`}
           onClick={() => setDensity('compact')}
+          title={density === 'compact' ? 'Compact density is active' : 'Switch to compact density'}
         >
           Compact
         </button>
@@ -303,6 +308,7 @@ function CodexSection({
           className="settings-signout-btn"
           onClick={() => { void handleSignOut(); }}
           disabled={busy}
+          title={busy ? 'Signing out of Codex…' : 'Sign out of Codex'}
         >
           {busy ? 'Signing out…' : 'Sign out'}
         </button>
@@ -347,12 +353,19 @@ function NotificationsSection() {
           type="checkbox"
           checked={settings.enabled}
           onChange={(e) => setFlag('enabled', e.target.checked)}
+          title={settings.enabled ? 'Disable browser notifications' : 'Enable browser notifications'}
+          aria-label={settings.enabled ? 'Disable browser notifications' : 'Enable browser notifications'}
         />
         Enable browser notifications
       </label>
       <div className="settings-section__hint">Browser permission: {permission}</div>
       {permission === 'default' && (
-        <button type="button" className="settings-inline-btn" onClick={requestPermission}>
+        <button
+          type="button"
+          className="settings-inline-btn"
+          onClick={requestPermission}
+          title="Ask this browser to allow Phoenix notifications"
+        >
           Grant browser permission
         </button>
       )}
@@ -364,19 +377,43 @@ function NotificationsSection() {
       )}
       <div className="settings-checkbox-group">
         <label className="settings-checkbox">
-          <input type="checkbox" checked={settings.notify_task_approval} onChange={(e) => setFlag('notify_task_approval', e.target.checked)} />
+          <input
+            type="checkbox"
+            checked={settings.notify_task_approval}
+            onChange={(e) => setFlag('notify_task_approval', e.target.checked)}
+            title={settings.notify_task_approval ? 'Stop notifying for task approvals' : 'Notify when a task needs approval'}
+            aria-label={settings.notify_task_approval ? 'Stop notifying for task approvals' : 'Notify when a task needs approval'}
+          />
           Task approval
         </label>
         <label className="settings-checkbox">
-          <input type="checkbox" checked={settings.notify_question} onChange={(e) => setFlag('notify_question', e.target.checked)} />
+          <input
+            type="checkbox"
+            checked={settings.notify_question}
+            onChange={(e) => setFlag('notify_question', e.target.checked)}
+            title={settings.notify_question ? 'Stop notifying for questions' : 'Notify when the agent asks a question'}
+            aria-label={settings.notify_question ? 'Stop notifying for questions' : 'Notify when the agent asks a question'}
+          />
           Questions
         </label>
         <label className="settings-checkbox">
-          <input type="checkbox" checked={settings.notify_error} onChange={(e) => setFlag('notify_error', e.target.checked)} />
+          <input
+            type="checkbox"
+            checked={settings.notify_error}
+            onChange={(e) => setFlag('notify_error', e.target.checked)}
+            title={settings.notify_error ? 'Stop notifying for errors and full context' : 'Notify for errors and full context'}
+            aria-label={settings.notify_error ? 'Stop notifying for errors and full context' : 'Notify for errors and full context'}
+          />
           Errors and context full
         </label>
         <label className="settings-checkbox">
-          <input type="checkbox" checked={settings.notify_idle} onChange={(e) => setFlag('notify_idle', e.target.checked)} />
+          <input
+            type="checkbox"
+            checked={settings.notify_idle}
+            onChange={(e) => setFlag('notify_idle', e.target.checked)}
+            title={settings.notify_idle ? 'Stop notifying when long tasks finish' : 'Notify when long tasks finish'}
+            aria-label={settings.notify_idle ? 'Stop notifying when long tasks finish' : 'Notify when long tasks finish'}
+          />
           Long task finished
         </label>
       </div>

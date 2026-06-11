@@ -341,7 +341,7 @@ export function ConversationListPage() {
           <h2><AlertTriangle />Storage Error</h2>
           <p>Failed to initialize local storage: {initError}</p>
           <p>Please try refreshing the page. If the problem persists, try clearing your browser data for this site.</p>
-          <button onClick={() => window.location.reload()}>Refresh Page</button>
+          <button onClick={() => window.location.reload()} title="Reload this page">Refresh Page</button>
         </div>
       </div>
     );
@@ -360,6 +360,16 @@ export function ConversationListPage() {
         ? () => setShowAuthPanel(true)
         : undefined}
       disabled={credentialStatus === 'valid' || credentialStatus === 'running'}
+      title={credentialStatus === 'valid'
+        ? 'Authentication is valid'
+        : credentialStatus === 'running'
+          ? 'Authentication check is running'
+          : 'Open authentication helper'}
+      aria-label={credentialStatus === 'valid'
+        ? 'Authentication is valid'
+        : credentialStatus === 'running'
+          ? 'Authentication check is running'
+          : 'Open authentication helper'}
     >
       {credentialStatus === 'valid' ? 'AUTH \u2713' :
        credentialStatus === 'running' ? 'AUTH ...' :
@@ -392,7 +402,7 @@ export function ConversationListPage() {
               <h2>Conversations</h2>
               <div className="view-header-actions">
                 {authChip}
-                <button className="btn-primary" disabled>+ New</button>
+                <button className="btn-primary" disabled title="Loading conversations">+ New</button>
               </div>
             </div>
             <ConversationListSkeleton count={5} />

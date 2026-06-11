@@ -98,7 +98,11 @@ export const ConversationRow = memo(function ConversationRow({
 
   return (
     <li className={classes} data-id={conv.id}>
-      <div className="conv-item-main" onClick={() => onClick(conv)}>
+      <div
+        className="conv-item-main"
+        onClick={() => onClick(conv)}
+        title={conv.slug ? `Open conversation "${conv.slug}"` : 'Open conversation'}
+      >
         <div className="conv-item-slug">
           <span
             className={`conv-state-dot ${getConvDisplayState(conv)}`}
@@ -174,6 +178,7 @@ export const ConversationRow = memo(function ConversationRow({
                 onCloseMenu();
                 onRename(conv);
               }}
+              title={conv.slug ? `Rename conversation "${conv.slug}"` : 'Rename conversation'}
             >
               Rename
             </button>
@@ -185,6 +190,7 @@ export const ConversationRow = memo(function ConversationRow({
                   onCloseMenu();
                   onArchive(conv);
                 }}
+                title={conv.slug ? `Archive conversation "${conv.slug}"` : 'Archive conversation'}
               >
                 Archive
               </button>
@@ -197,6 +203,7 @@ export const ConversationRow = memo(function ConversationRow({
                   onCloseMenu();
                   onDelete(conv);
                 }}
+                title={conv.slug ? `Delete conversation "${conv.slug}" (can't be undone)` : "Delete conversation (can't be undone)"}
               >
                 Delete
               </button>
@@ -316,6 +323,7 @@ export const ChainBlock = memo(function ChainBlock({
                   // duplicating that input. Open the chain page instead.
                   navigate(`/chains/${item.rootId}`);
                 }}
+              title={`Open chain "${item.displayName}" to rename it`}
               >
                 Rename chain…
               </button>
@@ -327,6 +335,7 @@ export const ChainBlock = memo(function ChainBlock({
                     onCloseChainMenu();
                     onArchiveChain?.(item.rootId);
                   }}
+                  title={`Archive chain "${item.displayName}"`}
                 >
                   Archive chain
                 </button>
@@ -338,6 +347,7 @@ export const ChainBlock = memo(function ChainBlock({
                   onCloseChainMenu();
                   onDeleteChain?.(item.rootId);
                 }}
+                title={`Delete chain "${item.displayName}" (can't be undone)`}
               >
                 Delete chain
               </button>
@@ -540,12 +550,18 @@ export function ConversationList({
               <button
                 className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
                 onClick={onToggleArchived}
+                title={showArchived ? 'Show active conversations' : 'Show archived conversations'}
               >
                 {showArchived ? 'Active' : `Archived (${archivedConversations.length})`}
               </button>
             )}
             {authChip}
-            <button id="new-conv-btn" className="btn-primary" onClick={onNewConversation}>
+            <button
+              id="new-conv-btn"
+              className="btn-primary"
+              onClick={onNewConversation}
+              title="Start new conversation"
+            >
               + New
             </button>
           </div>
@@ -556,6 +572,7 @@ export function ConversationList({
           <button
             className={`btn-secondary archive-toggle ${showArchived ? 'active' : ''}`}
             onClick={onToggleArchived}
+            title={showArchived ? 'Show active conversations' : 'Show archived conversations'}
           >
             {showArchived ? 'Active' : `Archived (${archivedConversations.length})`}
           </button>

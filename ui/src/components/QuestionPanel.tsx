@@ -633,7 +633,7 @@ export function QuestionPanel({
                   className={`question-breadcrumb${isCurrent ? ' current' : ''}${answered && !isCurrent ? ' answered' : ''}${!answered && !isCurrent ? ' unanswered' : ''}`}
                   onClick={() => goToStep(i)}
                   disabled={submitting}
-                  title={q.question}
+                  title={isCurrent ? q.question : `Go to question ${i + 1}: ${q.header}`}
                 >
                   {answered && !isCurrent && (
                     <Check size={12} className="question-breadcrumb-check" />
@@ -678,7 +678,7 @@ export function QuestionPanel({
           className="question-btn question-btn--dismiss-small"
           onClick={handleDismissClick}
           disabled={submitting}
-          title="Escape to dismiss"
+          title="Dismiss questions without sending an answer"
         >
           Dismiss
         </button>
@@ -821,6 +821,7 @@ function QuestionItem({
           className={`question-option${otherSelected ? ' selected' : ''}${isOtherFocused ? ' focused' : ''}`}
           onClick={() => onSelect(q.question, OTHER_SENTINEL)}
           onMouseEnter={() => onFocusIndex(otherIndex)}
+          title="Select Other"
         >
           <input
             type="radio"
@@ -848,6 +849,7 @@ function QuestionItem({
           setTimeout(() => otherInputRef.current?.focus(), 0);
         }}
         onMouseEnter={() => onFocusIndex(otherIndex)}
+        title={isMulti ? 'Toggle Other answer' : 'Select Other and write an answer'}
       >
         <input
           type={isMulti ? 'checkbox' : 'radio'}
@@ -865,6 +867,8 @@ function QuestionItem({
             setTimeout(() => otherInputRef.current?.focus(), 0);
           }}
           tabIndex={-1}
+          title={isMulti ? 'Toggle Other answer' : 'Select Other answer'}
+          aria-label={isMulti ? 'Toggle Other answer' : 'Select Other answer'}
         />
         <textarea
           ref={otherInputRef as React.RefObject<HTMLTextAreaElement>}
@@ -884,6 +888,8 @@ function QuestionItem({
           }}
           rows={1}
           tabIndex={-1}
+          title="Write a custom answer"
+          aria-label="Write a custom answer"
         />
       </div>
     );
@@ -901,6 +907,7 @@ function QuestionItem({
             className={`question-option${checked ? ' selected' : ''}${isFocused ? ' focused' : ''}`}
             onClick={() => onMultiToggle(q.question, opt.label)}
             onMouseEnter={() => onFocusIndex(index)}
+            title={`${checked ? 'Remove' : 'Select'} ${opt.label}`}
           >
             <input
               type="checkbox"
@@ -933,6 +940,7 @@ function QuestionItem({
               onFocusPreview(q.question, opt.preview);
             }
           }}
+          title={`Select ${opt.label}`}
         >
           <input
             type="radio"
@@ -981,6 +989,8 @@ function QuestionItem({
                 value={otherText}
                 onChange={(e) => onOtherText(q.question, e.target.value)}
                 autoFocus
+                title="Describe your preferred approach"
+                aria-label="Describe your preferred approach"
               />
             ) : (
               activePreview || 'Select an option to preview'
@@ -998,6 +1008,7 @@ function QuestionItem({
             className="question-notes-toggle"
             onClick={() => onToggleNotes(q.question)}
             tabIndex={-1}
+            title={notesExpanded ? 'Hide optional notes' : 'Add optional notes for the agent'}
           >
             {notesExpanded ? (
               <ChevronDown size={14} />
@@ -1012,6 +1023,8 @@ function QuestionItem({
               value={notesText}
               onChange={(e) => onSetNotes(q.question, e.target.value)}
               rows={2}
+              title="Optional notes for the agent"
+              aria-label="Optional notes for the agent"
             />
           )}
         </div>

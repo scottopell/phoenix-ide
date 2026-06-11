@@ -43,6 +43,7 @@ export function LlmStatusBanner({ models }: LlmStatusBannerProps) {
             type="button"
             className="llm-status-banner__action"
             onClick={() => setShowCodexPanel(true)}
+            title="Open Codex sign-in panel"
           >
             Sign in with Codex
           </button>

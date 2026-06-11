@@ -29,7 +29,7 @@ function UsageStatsSection({ label, totals }: { label: string; totals: UsageTota
   return (
     <div className="usage-stats-section">
       <div className="usage-stats-label">{label}</div>
-      <table className="usage-stats-table">
+      <table className="usage-stats-table" title={`${label} token usage breakdown`}>
         <tbody>
           <tr>
             <td className="usage-stat-name">Input</td>
@@ -104,6 +104,7 @@ export function ContextIndicator({ used, max, conversationId, onTriggerContinuat
       <div
         className="context-bar-wrapper"
         onClick={() => setPanelOpen(!panelOpen)}
+        title={panelOpen ? 'Hide context usage details' : 'Show context usage details'}
       >
         <div className="context-bar">
           <div className="context-fill" style={{ width: `${percent}%` }} />
@@ -136,7 +137,11 @@ export function ContextIndicator({ used, max, conversationId, onTriggerContinuat
           {canTrigger && (
             <>
               <div className="context-menu-divider" />
-              <button className="context-menu-item" onClick={handleTrigger}>
+              <button
+                className="context-menu-item"
+                onClick={handleTrigger}
+                title="End this conversation and summarize it for continuation"
+              >
                 End &amp; summarize now
               </button>
               <div className="context-menu-hint">

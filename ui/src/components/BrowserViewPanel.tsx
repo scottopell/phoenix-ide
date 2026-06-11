@@ -230,6 +230,7 @@ export function BrowserViewPanel({
             className="browser-view-panel__close"
             onClick={onClose}
             aria-label="Close browser view"
+            title="Close browser view"
           >
             ×
           </button>

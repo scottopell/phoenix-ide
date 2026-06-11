@@ -37,21 +37,28 @@ export function ConfirmDialog({
   if (!visible) return null;
 
   return (
-    <div className="modal-overlay" onClick={onCancel}>
+    <div
+      className="modal-overlay"
+      onClick={onCancel}
+      title="Cancel and close dialog"
+      aria-label="Cancel and close dialog"
+    >
       <div
         ref={dialogRef}
         className="modal confirm-dialog"
         onClick={(e) => e.stopPropagation()}
+        title={title}
       >
         <h3>{title}</h3>
         <p className="confirm-message">{message}</p>
         <div className="modal-actions">
-          <button className="btn-secondary" onClick={onCancel}>
+          <button className="btn-secondary" onClick={onCancel} title={cancelText}>
             {cancelText}
           </button>
           <button
             className={danger ? 'btn-danger' : 'btn-primary'}
             onClick={onConfirm}
+            title={danger ? `${confirmText} (can't be undone)` : confirmText}
           >
             {confirmText}
           </button>
