@@ -150,6 +150,63 @@ fn tool_output_to_outcome(out: crate::tools::ToolOutput) -> ToolOutcome {
     }
 }
 
+/// Await a tool task's oneshot outcome and forward it to the unified outcome
+/// channel, mapping a dropped sender to a typed `Failed` outcome.
+///
+/// A dropped oneshot sender (the tool task panicked or was aborted before it
+/// could `send`) must NOT silently lose the outcome: with no delivery,
+/// `ToolExecuting` never sees `ToolComplete` and a pending `CancellingTool`
+/// waits forever, rejecting all input until restart. `Failed` →
+/// `Event::ToolComplete` (an error `ToolResult`), accepted by both
+/// `ToolExecuting` and `CancellingTool`, so the conversation always progresses.
+async fn forward_tool_outcome(
+    tool_rx: oneshot::Receiver<ToolExecOutcome>,
+    tool_use_id: String,
+    outcome_tx: mpsc::Sender<EffectOutcome>,
+) {
+    let tool_outcome = match tool_rx.await {
+        Ok(tool_outcome) => tool_outcome,
+        Err(_recv_error) => {
+            tracing::warn!(
+                tool_use_id = %tool_use_id,
+                "tool task dropped its outcome sender (panic/abort); \
+                 synthesizing Failed outcome to avoid wedging the conversation"
+            );
+            ToolExecOutcome::Failed {
+                tool_use_id,
+                error: "tool task aborted or panicked".to_string(),
+            }
+        }
+    };
+    let _ = outcome_tx.send(EffectOutcome::Tool(tool_outcome)).await;
+}
+
+/// Await an LLM task's oneshot outcome and forward it to the unified outcome
+/// channel, mapping a dropped sender to a typed `NetworkError` outcome.
+///
+/// A dropped oneshot sender (the LLM task panicked or was aborted before it
+/// could `send`) must NOT silently lose the outcome: with no delivery, an
+/// `LlmRequesting`/`AwaitingContinuation` state hangs forever. `NetworkError`
+/// is retryable, so the retry machinery recovers.
+async fn forward_llm_outcome(
+    llm_rx: oneshot::Receiver<LlmOutcome>,
+    outcome_tx: mpsc::Sender<EffectOutcome>,
+) {
+    let llm_outcome = match llm_rx.await {
+        Ok(llm_outcome) => llm_outcome,
+        Err(_recv_error) => {
+            tracing::warn!(
+                "LLM task dropped its outcome sender (panic/abort); \
+                 synthesizing NetworkError outcome to avoid wedging the conversation"
+            );
+            LlmOutcome::NetworkError {
+                message: "LLM task aborted or panicked".to_string(),
+            }
+        }
+    };
+    let _ = outcome_tx.send(EffectOutcome::Llm(llm_outcome)).await;
+}
+
 /// Decide whether `path` is inside the worktree rooted at `root`.
 ///
 /// Three stages, each closing a class of bypass:
@@ -258,6 +315,19 @@ where
     tool_cancel_token: Option<CancellationToken>,
     /// Handle to the spawned LLM task — aborted on cancel to drop the HTTP connection
     llm_task_handle: Option<tokio::task::JoinHandle<()>>,
+    /// Abort handle for the in-flight retry-backoff timer spawned by
+    /// `Effect::ScheduleRetry`. `Some` only while a retry is pending in
+    /// `LlmRequesting`/`AwaitingContinuation`. Aborted on any transition that
+    /// leaves the retry-scheduling state (cancel, new message, response).
+    ///
+    /// Identity guard for the retry timer: attempt numbers reset per turn, so
+    /// the reducer's `attempt == retry_attempt` check cannot distinguish a
+    /// stale timer (from a cancelled-then-resent turn) from the live one. A
+    /// stale `RetryTimeout` passing that check fires a second concurrent
+    /// `RequestLlm` — double token cost, and the duplicate response may
+    /// overwrite the real one. Aborting the timer at the source kills the
+    /// stale fire before it can reach the reducer.
+    retry_timer_handle: Option<tokio::task::AbortHandle>,
     /// Channel to notify parent of sub-agent completion (sub-agent only)
     parent_event_tx: Option<mpsc::Sender<Event>>,
     /// Channel to request sub-agent spawning (parent only)
@@ -365,6 +435,7 @@ where
             broadcast_tx,
             tool_cancel_token: None,
             llm_task_handle: None,
+            retry_timer_handle: None,
             parent_event_tx: None,
             spawn_tx: None,
             cancel_tx: None,
@@ -726,6 +797,32 @@ where
     /// Routes through `handle_outcome()` (pure SM function). Invalid outcomes
     /// are logged and discarded — state unchanged.
     async fn process_outcome(&mut self, outcome: EffectOutcome) -> Result<(), String> {
+        // Retry-timer identity guard (executor-side, keeps the pure reducer
+        // pure). `retry_timer_handle` is `Some` exactly while the executor
+        // considers a retry pending; it is cleared/aborted on any transition
+        // out of the scheduling state. A `RetryTimeout` that arrives while the
+        // handle is `None` is therefore stale — its timer was already aborted
+        // (cancel/response/new turn) but the fire had already been enqueued on
+        // `outcome_rx` before the abort ran. Drop it: the reducer's
+        // `attempt == retry_attempt` check cannot catch this because attempt
+        // numbers reset per turn, so a stale fire from a cancelled-then-resent
+        // turn would otherwise pass the check and double-dispatch the LLM.
+        if matches!(outcome, EffectOutcome::RetryTimeout { .. }) {
+            if self.retry_timer_handle.is_none() {
+                tracing::debug!(
+                    state = self.state.variant_name(),
+                    "Ignoring stale RetryTimeout — no retry pending (timer already aborted)"
+                );
+                return Ok(());
+            }
+            // Live timer firing: its task has completed, so the stored handle
+            // is spent. Clear it to keep the "Some only while a retry is
+            // pending" invariant — the subsequent `RequestLlm` keeps the state
+            // in `LlmRequesting`, so the leave-the-scheduling-state abort in
+            // `apply_transition_result` won't clear it.
+            self.retry_timer_handle = None;
+        }
+
         let result = match handle_outcome(&self.state, &self.context, outcome) {
             Ok(r) => r,
             Err(invalid) => {
@@ -902,6 +999,28 @@ where
         // its prior value too — gating here keeps the in-memory stamp in sync.
         if self.state != old_state {
             self.state_updated_at = Utc::now();
+        }
+
+        // Kill any pending retry-backoff timer when the conversation leaves the
+        // retry-scheduling context. A retry timer is only valid while the state
+        // stays `LlmRequesting`/`AwaitingContinuation` (the only states that
+        // emit `Effect::ScheduleRetry`, and where the next legitimate
+        // `RetryTimeout` is consumed — including same-state steer drains and
+        // attempt increments). Any other destination — cancel (→ Idle /
+        // CancellingTool), a response (→ ToolExecuting / Completed), or retry
+        // exhaustion (→ Error) — ends this retry context. Aborting here is the
+        // identity guard the pure reducer cannot provide: attempt numbers reset
+        // per turn, so a stale timer from a cancelled-then-resent turn would
+        // otherwise pass the reducer's `attempt == retry_attempt` check and
+        // fire a second concurrent `RequestLlm` (double token cost; a duplicate
+        // response can overwrite the real one).
+        if !matches!(
+            self.state,
+            ConvState::LlmRequesting { .. } | ConvState::AwaitingContinuation { .. }
+        ) {
+            if let Some(handle) = self.retry_timer_handle.take() {
+                handle.abort();
+            }
         }
 
         // Log notable state transitions at INFO. "Notable" means transitions that cross
@@ -1180,6 +1299,24 @@ where
     /// Handle sub-agent timeout: cancel all pending agents and inject `TimedOut` results.
     ///
     /// Called from the executor select loop when `sub_agent_deadline` fires (REQ-SA-006).
+    ///
+    // TODO(task 61004): timeout should follow the cancellation protocol, not
+    // race it. Today this both (a) injects a synthetic `TimedOut` per pending
+    // agent — draining the parent out of `AwaitingSubAgents` — and (b) sends a
+    // real cancel. The cancel later produces a *real* `SubAgentResult` that
+    // arrives after the parent has already left `AwaitingSubAgents`, so it is
+    // buffered (`sub_agent_result_buffer`) and can surface a spurious result
+    // for a stale agent on a later spawn; a real success already in flight can
+    // be overwritten by the synthetic `TimedOut`. The correct shape is to inject
+    // a single `UserCancel` (→ `CancellingSubAgents`, which emits
+    // `Effect::CancelSubAgents`) and let the real cancelled results drain
+    // through `CancellingSubAgents` to `Idle`, conserving fan-in. That rewrite
+    // is deferred because it must also (1) preserve the "timed out" vs
+    // "cancelled" semantic the LLM history renders and (2) add a backstop so a
+    // cancelled sub-agent that never reports back cannot wedge the drain — the
+    // exact guarantee the current synthetic-result approach provides. A
+    // half-conversion would trade a buffered-stale-result bug for a fan-in
+    // conservation bug, which is worse.
     async fn handle_sub_agent_timeout(&mut self) {
         self.sub_agent_deadline = None;
 
@@ -1703,14 +1840,24 @@ where
                     resets_at,
                 });
 
-                // Typed oneshot for retry timeout
+                // Spawn the backoff timer. Store its abort handle so any
+                // transition out of the retry-scheduling state (cancel, new
+                // user message, response) can kill the timer before it fires a
+                // stale RetryTimeout — attempt numbers reset per turn, so the
+                // reducer's attempt-equality guard alone cannot reject a stale
+                // timer from a cancelled-then-resent turn. Abort any
+                // previously-stored timer first (defensive; normally None).
+                if let Some(stale) = self.retry_timer_handle.take() {
+                    stale.abort();
+                }
                 let outcome_tx = self.outcome_tx.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     tokio::time::sleep(delay).await;
                     let _ = outcome_tx
                         .send(EffectOutcome::RetryTimeout { attempt })
                         .await;
                 });
+                self.retry_timer_handle = Some(handle.abort_handle());
                 Ok(None)
             }
 
@@ -2262,12 +2409,10 @@ where
         });
         self.llm_task_handle = Some(handle);
 
-        // Forward the typed outcome to the unified outcome channel
-        tokio::spawn(async move {
-            if let Ok(llm_outcome) = llm_rx.await {
-                let _ = outcome_tx.send(EffectOutcome::Llm(llm_outcome)).await;
-            }
-        });
+        // Forward the typed outcome — a dropped sender becomes a typed
+        // NetworkError so a panicked/aborted LLM task can never wedge the
+        // conversation. See `forward_llm_outcome`.
+        tokio::spawn(forward_llm_outcome(llm_rx, outcome_tx));
 
         Ok(None)
     }
@@ -2400,6 +2545,9 @@ where
         let conv_id = self.context.conversation_id.clone();
         let tool_executor = self.tool_executor.clone();
         let tool_use_id = tool.id.clone();
+        // Retained for the outcome forwarder so a dropped sender (panicked or
+        // aborted tool task) still produces a typed outcome for this tool_use.
+        let forwarder_tool_use_id = tool.id.clone();
         let tool_name = tool.name().to_string();
         let tool_input = tool.input.to_value();
 
@@ -2464,12 +2612,14 @@ where
             let _ = tool_tx.send(tool_outcome);
         });
 
-        // Forward the typed outcome to the unified outcome channel
-        tokio::spawn(async move {
-            if let Ok(tool_outcome) = tool_rx.await {
-                let _ = outcome_tx.send(EffectOutcome::Tool(tool_outcome)).await;
-            }
-        });
+        // Forward the typed outcome — a dropped sender becomes a typed Failed
+        // outcome so a panicked/aborted tool task can never wedge the
+        // conversation. See `forward_tool_outcome`.
+        tokio::spawn(forward_tool_outcome(
+            tool_rx,
+            forwarder_tool_use_id,
+            outcome_tx,
+        ));
 
         Ok(None)
     }
@@ -6509,6 +6659,232 @@ mod tool_output_to_outcome_tests {
             }
             other => panic!("expected ToolOutcome::Error, got {other:?}"),
         }
+    }
+}
+
+/// M3 (task 61004): a dropped oneshot sender — the background tool/LLM task
+/// panicked or was aborted before it could `send` — must produce a typed
+/// failure outcome rather than silently delivering nothing. Silent loss wedges
+/// the conversation forever (`ToolExecuting` never sees `ToolComplete`;
+/// `CancellingTool` waits and rejects all input until restart).
+#[cfg(test)]
+mod sender_drop_forwarder_tests {
+    use super::{forward_llm_outcome, forward_tool_outcome};
+    use crate::state_machine::outcome::{EffectOutcome, LlmOutcome, ToolExecOutcome};
+    use tokio::sync::{mpsc, oneshot};
+
+    #[tokio::test]
+    async fn tool_sender_drop_yields_failed_outcome() {
+        let (tool_tx, tool_rx) = oneshot::channel::<ToolExecOutcome>();
+        let (outcome_tx, mut outcome_rx) = mpsc::channel::<EffectOutcome>(4);
+
+        // Simulate the spawned tool task panicking/aborting: the sender is
+        // dropped without ever sending.
+        drop(tool_tx);
+
+        forward_tool_outcome(tool_rx, "tool-use-42".to_string(), outcome_tx).await;
+
+        match outcome_rx.try_recv() {
+            Ok(EffectOutcome::Tool(ToolExecOutcome::Failed { tool_use_id, error })) => {
+                assert_eq!(tool_use_id, "tool-use-42");
+                assert!(
+                    error.contains("aborted or panicked"),
+                    "error should explain the sender-drop, got: {error}"
+                );
+            }
+            other => panic!("expected a Failed tool outcome on sender-drop, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_normal_outcome_is_forwarded_unchanged() {
+        let (tool_tx, tool_rx) = oneshot::channel::<ToolExecOutcome>();
+        let (outcome_tx, mut outcome_rx) = mpsc::channel::<EffectOutcome>(4);
+
+        tool_tx
+            .send(ToolExecOutcome::Failed {
+                tool_use_id: "real-id".to_string(),
+                error: "real error".to_string(),
+            })
+            .expect("send should succeed");
+
+        forward_tool_outcome(tool_rx, "forwarder-id".to_string(), outcome_tx).await;
+
+        match outcome_rx.try_recv() {
+            Ok(EffectOutcome::Tool(ToolExecOutcome::Failed { tool_use_id, error })) => {
+                // The forwarder must NOT clobber a real outcome with the
+                // synthetic one.
+                assert_eq!(tool_use_id, "real-id");
+                assert_eq!(error, "real error");
+            }
+            other => panic!("expected the real outcome forwarded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn llm_sender_drop_yields_network_error_outcome() {
+        let (llm_tx, llm_rx) = oneshot::channel::<LlmOutcome>();
+        let (outcome_tx, mut outcome_rx) = mpsc::channel::<EffectOutcome>(4);
+
+        drop(llm_tx);
+
+        forward_llm_outcome(llm_rx, outcome_tx).await;
+
+        match outcome_rx.try_recv() {
+            Ok(EffectOutcome::Llm(LlmOutcome::NetworkError { message })) => {
+                assert!(
+                    message.contains("aborted or panicked"),
+                    "message should explain the sender-drop, got: {message}"
+                );
+            }
+            other => panic!("expected a NetworkError LLM outcome on sender-drop, got {other:?}"),
+        }
+    }
+}
+
+/// H2 (task 61004): a retry-backoff timer from a cancelled-then-resent turn
+/// must not fire a second concurrent LLM request. Attempt numbers reset per
+/// turn, so the reducer's `attempt == retry_attempt` guard alone cannot reject
+/// a stale timer. The executor aborts the timer on any transition out of the
+/// retry-scheduling state and ignores a `RetryTimeout` that arrives with no
+/// retry pending.
+#[cfg(test)]
+mod retry_timer_epoch_tests {
+    use super::*;
+    use crate::llm::ModelRegistry;
+    use crate::runtime::testing::{InMemoryStorage, MockLlmClient, MockToolExecutor};
+    use crate::tools::BrowserSessionManager;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio::sync::mpsc;
+
+    type TestRuntime =
+        ConversationRuntime<Arc<InMemoryStorage>, Arc<MockLlmClient>, Arc<MockToolExecutor>>;
+
+    fn runtime_requesting() -> TestRuntime {
+        let storage = Arc::new(InMemoryStorage::new());
+        let context = ConvContext::new("conv-retry", PathBuf::from("/tmp"), "test-model", 200_000);
+        let (_event_tx, event_rx) = mpsc::channel(32);
+        let event_tx_dup = mpsc::channel::<Event>(1).0;
+        let broadcaster = SseBroadcaster::new(128, 0);
+        ConversationRuntime::new(
+            context,
+            ConvState::LlmRequesting { attempt: 1 },
+            storage,
+            Arc::new(MockLlmClient::new("test-model")),
+            Arc::new(MockToolExecutor::new()),
+            Arc::new(BrowserSessionManager::default()),
+            Arc::new(crate::tools::BashHandleRegistry::new()),
+            Arc::new(crate::tools::TmuxRegistry::new()),
+            Arc::new(ModelRegistry::new_empty()),
+            crate::terminal::ActiveTerminals::new(),
+            event_rx,
+            event_tx_dup,
+            broadcaster,
+        )
+    }
+
+    fn retryable_llm_error() -> Event {
+        Event::LlmError {
+            message: "connection reset".to_string(),
+            error_kind: crate::db::ErrorKind::Network,
+            attempt: 0,
+            recovery_in_progress: false,
+            resets_at: None,
+        }
+    }
+
+    /// A retryable `LlmError` schedules a backoff timer; cancelling the turn
+    /// aborts it so it can never fire across the turn boundary.
+    #[tokio::test]
+    async fn cancel_aborts_pending_retry_timer() {
+        let mut rt = runtime_requesting();
+
+        rt.process_event(retryable_llm_error())
+            .await
+            .expect("retryable error transitions");
+        assert!(
+            matches!(rt.state, ConvState::LlmRequesting { attempt: 2 }),
+            "retryable error should bump attempt and stay in LlmRequesting, got {:?}",
+            rt.state.variant_name()
+        );
+        assert!(
+            rt.retry_timer_handle.is_some(),
+            "a retry timer must be tracked while a retry is pending"
+        );
+
+        rt.process_event(Event::UserCancel { reason: None })
+            .await
+            .expect("cancel transitions");
+        assert!(
+            matches!(rt.state, ConvState::Idle),
+            "cancel from LlmRequesting goes to Idle, got {:?}",
+            rt.state.variant_name()
+        );
+        assert!(
+            rt.retry_timer_handle.is_none(),
+            "leaving the retry-scheduling state must abort and clear the timer handle"
+        );
+    }
+
+    /// A stale `RetryTimeout` that raced onto the outcome channel before the
+    /// abort ran is dropped (handle is `None`) rather than dispatching a second
+    /// LLM request.
+    #[tokio::test]
+    async fn stale_retry_timeout_is_ignored_after_cancel() {
+        let mut rt = runtime_requesting();
+
+        rt.process_event(retryable_llm_error())
+            .await
+            .expect("retryable error transitions");
+        rt.process_event(Event::UserCancel { reason: None })
+            .await
+            .expect("cancel transitions");
+        assert!(matches!(rt.state, ConvState::Idle));
+
+        // The stale timer fires attempt 2 after the turn was cancelled. With no
+        // retry pending (handle cleared), it must be ignored and the state must
+        // stay Idle — no second RequestLlm.
+        rt.process_outcome(EffectOutcome::RetryTimeout { attempt: 2 })
+            .await
+            .expect("stale retry timeout is dropped, not an error");
+        assert!(
+            matches!(rt.state, ConvState::Idle),
+            "stale RetryTimeout must not move state out of Idle, got {:?}",
+            rt.state.variant_name()
+        );
+        assert!(
+            rt.retry_timer_handle.is_none(),
+            "no retry should be pending after a stale timeout is ignored"
+        );
+    }
+
+    /// The legitimate retry path is unaffected: a `RetryTimeout` that arrives
+    /// while a retry is genuinely pending dispatches the next attempt.
+    #[tokio::test]
+    async fn live_retry_timeout_still_fires() {
+        let mut rt = runtime_requesting();
+
+        rt.process_event(retryable_llm_error())
+            .await
+            .expect("retryable error transitions");
+        assert!(rt.retry_timer_handle.is_some());
+
+        // The live timer fires attempt 2 while still in LlmRequesting{2}. It
+        // must be accepted (handle was Some), clear the handle, and keep the
+        // conversation progressing in LlmRequesting.
+        rt.process_outcome(EffectOutcome::RetryTimeout { attempt: 2 })
+            .await
+            .expect("live retry timeout transitions");
+        assert!(
+            matches!(rt.state, ConvState::LlmRequesting { attempt: 2 }),
+            "live RetryTimeout re-requests the LLM in LlmRequesting, got {:?}",
+            rt.state.variant_name()
+        );
+        assert!(
+            rt.retry_timer_handle.is_none(),
+            "the spent timer handle must be cleared after a live timeout fires"
+        );
     }
 }
 
