@@ -6691,7 +6691,7 @@ mod tool_output_cap_tests {
         assert!(
             capped.contains("…[truncated"),
             "truncation marker must be present: {:?}",
-            &capped[..capped.len().min(120)]
+            capped.chars().take(120).collect::<String>()
         );
         // String is always valid UTF-8 in Rust; assert it explicitly survives a
         // round-trip through bytes to guard the char-boundary slicing logic.

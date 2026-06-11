@@ -3256,7 +3256,7 @@ mod scope_liveness_tests {
     }
 
     /// Regression (REQ-BED-031): a `ContextExhausted` conversation owns its
-    /// preserved worktree pending the user's Continue / Abandon / MarkAsMerged
+    /// preserved worktree pending the user's `Continue` / `Abandon` / `MarkAsMerged`
     /// decision. Deleting a SIBLING sub-agent on the same worktree must NOT let
     /// the cleanup cascade conclude the scope is unowned and force-remove the
     /// worktree — that destroys uncommitted user work.
