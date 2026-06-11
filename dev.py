@@ -827,7 +827,9 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     # shared dev host (or a port-forwarded sandbox) a 0.0.0.0 bind would expose an
     # unauthenticated agent that runs arbitrary commands. A loopback bind also
     # satisfies the binary's fail-closed guard with no password and no insecure-bind
-    # override. Vite proxies to localhost, so a loopback backend is fine.
+    # override. Vite proxies to localhost, so a loopback backend is fine — and the
+    # Vite dev server itself is bound loopback in passwordless mode (see
+    # `_dev_bind_host`) so its proxy can't re-expose this backend to the network.
     env["PHOENIX_BIND_ADDR"] = "127.0.0.1"
     # Unified logging: the binary owns the log file (PHOENIX_LOG_FILE) and writes
     # JSON there directly. stdout is off so the only writer to the file is the
@@ -903,6 +905,25 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
     return phoenix_tls
 
 
+def _dev_bind_host() -> str:
+    """Network host for the Vite dev server.
+
+    Loopback by default. The Phoenix backend already binds loopback, but Vite
+    proxies `/api` and `/preview` to it, so a `0.0.0.0` Vite would re-expose the
+    unauthenticated dev API to anyone who can reach the Vite port (a shared or
+    port-forwarded host) — defeating the backend's loopback bind. Bind Vite to
+    `0.0.0.0` only when the API is actually protected (`PHOENIX_PASSWORD` set) or
+    the operator explicitly opts into the insecure bind
+    (`PHOENIX_ALLOW_INSECURE_BIND=1`), mirroring the binary's own guard.
+    """
+    env = os.environ.copy()
+    _load_env_file(env)
+    _load_env_file(env, ".phoenix-ide.dev.env")
+    if env.get("PHOENIX_PASSWORD") or env.get("PHOENIX_ALLOW_INSECURE_BIND") == "1":
+        return "0.0.0.0"
+    return "127.0.0.1"
+
+
 def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
     """Start the Vite dev server. Returns whether Vite serves over HTTPS (h2)."""
     scheme = "https" if phoenix_tls else "http"
@@ -936,10 +957,13 @@ def start_vite(port: int, phoenix_port: int, phoenix_tls: bool = False) -> bool:
         else:
             print(f"  ⚠ Vite HTTPS disabled: Phoenix TLS cert not found at {cert}")
 
-    # Start Vite in background (bind to 0.0.0.0 for external access).
+    # Start Vite in background. Host is loopback unless the API is password-
+    # protected or the insecure bind is opted into (see `_dev_bind_host`) — a
+    # `0.0.0.0` Vite proxies the unauthenticated backend to the network.
     # pnpm passes args after the script name directly — no `--` separator.
+    vite_host = _dev_bind_host()
     proc = subprocess.Popen(
-        ["pnpm", "run", "dev", "--port", str(port), "--strictPort", "--host", "0.0.0.0"],
+        ["pnpm", "run", "dev", "--port", str(port), "--strictPort", "--host", vite_host],
         cwd=UI_DIR,
         env=env,
         stdout=subprocess.DEVNULL,
