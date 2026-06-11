@@ -2502,7 +2502,43 @@ pub fn transition_sub_agent(
         }
 
         // ============================================================
-        // Sub-agent UserCancel -> Failed (from any non-terminal core state)
+        // Sub-agent UserCancel during ToolExecuting -> Failed + AbortTool
+        // ============================================================
+        // A sub-agent's in-flight tool (bash/patch) mutates the worktree it
+        // shares with its parent. Going straight to Failed without aborting the
+        // tool leaves it running after the parent was told the sub-agent
+        // stopped, so it keeps mutating shared state. Emit `Effect::AbortTool`
+        // for the current tool — cancelling its CancellationToken — exactly as
+        // the parent's `ToolExecuting + UserCancel` path does, before failing.
+        // Failed is terminal and absorbs the late `ToolAborted` the cancelled
+        // tool task subsequently produces, so no extra cancelling state is
+        // needed. (A sub-agent cannot itself spawn sub-agents, so there are
+        // never `pending_sub_agents` to cancel here.)
+        (
+            SubAgentState::Core(CoreState::ToolExecuting { current_tool, .. }),
+            SubAgentEvent::Core(CoreEvent::UserCancel { reason }),
+        ) => {
+            let error = reason
+                .clone()
+                .unwrap_or_else(|| "Cancelled by parent".to_string());
+            Ok(SubAgentTransitionResult::new(SubAgentState::Failed {
+                error: error.clone(),
+                error_kind: ErrorKind::Cancelled,
+            })
+            .with_effect(Effect::AbortTool {
+                tool_use_id: current_tool.id.clone(),
+            })
+            .with_effect(Effect::PersistState)
+            .with_effect(Effect::NotifyParent {
+                outcome: SubAgentOutcome::Failure {
+                    error,
+                    error_kind: ErrorKind::Cancelled,
+                },
+            }))
+        }
+
+        // ============================================================
+        // Sub-agent UserCancel -> Failed (from any other non-terminal core state)
         // ============================================================
         (SubAgentState::Core(_), SubAgentEvent::Core(CoreEvent::UserCancel { reason })) => {
             let error = reason
@@ -3731,6 +3767,143 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, Effect::RequestContinuation { .. })),
             "Sub-agent should NOT request continuation"
+        );
+    }
+
+    /// Build a sub-agent `ConvContext` (`is_sub_agent: true`).
+    fn sub_agent_context() -> ConvContext {
+        use crate::state::ContextExhaustionBehavior;
+        ConvContext {
+            mode_context: None,
+            conversation_id: "subagent-cancel".to_string(),
+            root_conversation_id: "test-root".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            model_id: "test-model".to_string(),
+            is_sub_agent: true,
+            context_window: 100_000,
+            context_exhaustion_behavior: ContextExhaustionBehavior::IntentionallyUnhandled,
+            max_turns: 0,
+            desired_base_branch: None,
+            mode: ModeKind::Managed,
+            work_scope_worktree: None,
+            tasks_dir_name: taskmd_core::constants::DEFAULT_TASKS_DIR_NAME.to_string(),
+            llm_language: phoenix_core::llm_language::LlmLanguage::default(),
+            persona: None,
+        }
+    }
+
+    /// M2 (task 61004): a sub-agent cancelled mid-tool must abort the in-flight
+    /// tool (its bash/patch keeps mutating the shared worktree otherwise),
+    /// matching the parent's `ToolExecuting + UserCancel` path.
+    #[test]
+    fn test_subagent_cancel_during_tool_execution_aborts_tool() {
+        use crate::state::{AssistantMessage, ToolCall, ToolInput};
+        use phoenix_core::domain::llm_types::ContentBlock;
+
+        let assistant_message = AssistantMessage::new(
+            uuid::Uuid::new_v4().to_string(),
+            vec![ContentBlock::tool_use(
+                "sa-tool-1",
+                "bash",
+                serde_json::json!({"op": "run", "cmd": "echo mutate"}),
+            )],
+            None,
+            None,
+        );
+
+        let result = transition(
+            &ConvState::ToolExecuting {
+                current_tool: ToolCall::new(
+                    "sa-tool-1",
+                    ToolInput::Bash(phoenix_core::domain::bash_types::BashToolInput::run(
+                        "echo mutate",
+                    )),
+                ),
+                remaining_tools: vec![],
+                completed_results: vec![],
+                pending_sub_agents: vec![],
+                assistant_message,
+            },
+            &sub_agent_context(),
+            Event::UserCancel { reason: None },
+        )
+        .expect("sub-agent ToolExecuting + UserCancel must transition");
+
+        // Goes to Failed (terminal; absorbs the late ToolAborted the cancelled
+        // tool task produces).
+        assert!(
+            matches!(
+                result.new_state,
+                ConvState::Failed {
+                    error_kind: ErrorKind::Cancelled,
+                    ..
+                }
+            ),
+            "sub-agent cancel should fail the sub-agent, got {:?}",
+            result.new_state
+        );
+
+        // The fix: AbortTool for the in-flight tool so it stops mutating the
+        // shared worktree.
+        let abort = result
+            .effects
+            .iter()
+            .find_map(|e| {
+                if let Effect::AbortTool { tool_use_id } = e {
+                    Some(tool_use_id.clone())
+                } else {
+                    None
+                }
+            })
+            .expect("sub-agent ToolExecuting cancel must emit AbortTool");
+        assert_eq!(abort, "sa-tool-1", "AbortTool must target the current tool");
+
+        // Still notifies the parent so fan-in accounting stays correct.
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "sub-agent cancel must still notify the parent"
+        );
+    }
+
+    /// Cancel from a non-tool sub-agent state (e.g. `LlmRequesting`) takes the
+    /// general arm: Failed + `NotifyParent`, and crucially NO `AbortTool` (there
+    /// is no tool to abort).
+    #[test]
+    fn test_subagent_cancel_outside_tool_execution_has_no_abort_tool() {
+        let result = transition(
+            &ConvState::LlmRequesting { attempt: 1 },
+            &sub_agent_context(),
+            Event::UserCancel { reason: None },
+        )
+        .expect("sub-agent LlmRequesting + UserCancel must transition");
+
+        assert!(
+            matches!(
+                result.new_state,
+                ConvState::Failed {
+                    error_kind: ErrorKind::Cancelled,
+                    ..
+                }
+            ),
+            "sub-agent cancel should fail, got {:?}",
+            result.new_state
+        );
+        assert!(
+            !result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::AbortTool { .. })),
+            "no tool is running, so there must be no AbortTool effect"
+        );
+        assert!(
+            result
+                .effects
+                .iter()
+                .any(|e| matches!(e, Effect::NotifyParent { .. })),
+            "sub-agent cancel must notify the parent"
         );
     }
 
