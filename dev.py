@@ -822,6 +822,11 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
             env["LLM_GATEWAY"] = gateway
     env["PHOENIX_PORT"] = str(port)
     env["PHOENIX_DB_PATH"] = str(db_path)
+    # The binary fails closed on a non-loopback bind with no PHOENIX_PASSWORD
+    # (it binds 0.0.0.0 by default). The dev server is the developer's own
+    # machine, so opt into the insecure bind here. Prod deploy paths
+    # deliberately do NOT set this — they must carry a password to bind broadly.
+    env["PHOENIX_ALLOW_INSECURE_BIND"] = "1"
     # Unified logging: the binary owns the log file (PHOENIX_LOG_FILE) and writes
     # JSON there directly. stdout is off so the only writer to the file is the
     # binary's appender; the Popen redirect below only captures pre-logger /

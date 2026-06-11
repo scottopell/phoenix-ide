@@ -92,11 +92,6 @@ fn is_exempt_path(path: &str) -> bool {
         return true;
     }
 
-    // Preview files (served by the static handler)
-    if path.starts_with("/preview/") {
-        return true;
-    }
-
     false
 }
 
@@ -231,11 +226,13 @@ mod tests {
         assert!(is_exempt_path("/api/auth/status"));
         assert!(is_exempt_path("/api/auth/login"));
         assert!(is_exempt_path("/s/share-token"));
-        assert!(is_exempt_path("/preview/some/file.html"));
 
         assert!(!is_exempt_path("/api/conversations"));
         assert!(!is_exempt_path("/api/conversations/new"));
         assert!(!is_exempt_path("/api/models"));
         assert!(!is_exempt_path("/api/env"));
+        // Preview is NOT auth-exempt: it serves on-disk files and must sit
+        // behind auth. The same-origin sandboxed iframe carries the cookie.
+        assert!(!is_exempt_path("/preview/some/file.html"));
     }
 }

@@ -3957,15 +3957,35 @@ async fn read_file(Query(query): Query<PathQuery>) -> Result<Json<ReadFileRespon
 /// URL: `/preview/Users/scott/dev/site/index.html`
 /// A `<link href="style.css">` resolves to `/preview/Users/scott/dev/site/style.css`
 async fn serve_preview_file(
+    State(state): State<AppState>,
     Path(filepath): Path<String>,
 ) -> Result<axum::response::Response, AppError> {
     use axum::response::IntoResponse;
 
-    let path = PathBuf::from(format!("/{filepath}"));
+    let requested = PathBuf::from(format!("/{filepath}"));
 
-    if !path.exists() {
+    // Canonicalize before any check: resolves `.`, `..`, and symlinks so the
+    // containment test below cannot be defeated by traversal. A path that does
+    // not resolve is reported as not-found, indistinguishable from out-of-scope.
+    let path = fs::canonicalize(&requested)
+        .map_err(|_| AppError::NotFound("File does not exist".to_string()))?;
+
+    // Containment: the resolved path must live inside a directory Phoenix is
+    // actively serving (a conversation working directory). Without this, the
+    // handler is an arbitrary host-file read — `/preview/etc/passwd`,
+    // `/preview/home/<user>/.ssh/id_rsa`, the prod DB, etc.
+    let in_scope = state
+        .db
+        .preview_roots()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|root| fs::canonicalize(root).ok())
+        .any(|root| path.starts_with(&root));
+    if !in_scope {
         return Err(AppError::NotFound("File does not exist".to_string()));
     }
+
     if path.is_dir() {
         // Try index.html for directory requests
         let index = path.join("index.html");

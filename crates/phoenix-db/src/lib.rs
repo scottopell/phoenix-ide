@@ -1220,6 +1220,30 @@ impl Database {
         Ok(rows)
     }
 
+    /// Working directories Phoenix is serving, for `/preview` path containment.
+    ///
+    /// Returns every conversation's `cwd` and managed `worktree_path` (archived
+    /// included — the directory may still exist on disk). A preview request is
+    /// only honoured for files resolving inside one of these roots, bounding the
+    /// preview surface to the same filesystem scope the agent's own tools reach.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`DbError`] if the underlying database operation fails.
+    pub async fn preview_roots(&self) -> DbResult<Vec<String>> {
+        let rows = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT cwd FROM conversations WHERE cwd IS NOT NULL AND cwd != ''
+             UNION
+             SELECT json_extract(conv_mode, '$.worktree_path') FROM conversations
+               WHERE json_extract(conv_mode, '$.worktree_path') IS NOT NULL
+                 AND json_extract(conv_mode, '$.worktree_path') != ''",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows.into_iter().flatten().collect())
+    }
+
     /// List archived conversations
     ///
     /// # Errors

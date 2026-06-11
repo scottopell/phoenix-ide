@@ -1,0 +1,8 @@
+Bedrock spec/code divergences found during the spiritual-core audit (2026-06-10). The reducer is faithful on the load-bearing invariants (tool_use/result pairing, fan-in conservation, hard-delete-while-busy); these are the remaining drifts. Most are spec bugs, one is an unenforced invariant.
+
+- CancelDuringUserQuestion (bedrock.allium ~912) models UserCancels in awaiting_user_response as resume-the-turn; code has no such arm and the real exit is UserQuestionDismissed -> Idle (transition.rs ~1677). Spec wrong: replace with a UserQuestionDismissed -> idle rule and drop awaiting_user_response from the UserCancels surface guard.
+- Retry backoff: spec RetryableLlmError (~485) advertises linear `config.retry_base_delay * attempt`; code is exponential `2^(attempt-1)` (transition.rs ~3061) and the config.retry_base_delay knob is fictional (hardcoded). Decide: make spec exponential or code linear; either way plumb the constants the spec advertises (retry_base_delay, CONTINUATION_THRESHOLD, MAX_RETRY_ATTEMPTS).
+- SpawnLimit invariant (max_sub_agents_per_spawn = 10, bedrock.allium ~302/~1278) is unenforced: spawn_agents validates non-empty + known agent_type but caps nothing (executor.rs ~1290). A spawn_agents with 50 tasks is accepted. Decide: enforce (reject over-cap like empty-tasks) or mark the invariant aspirational.
+- RejectCancelDuringContinuation (~950) wants graceful absorb + InvalidCancellationState; code falls to InvalidTransition (UI gates the event, low blast radius). Minor.
+
+Resolve per AGENTS.md: open questions become a code fix or an explicit design decision; do not leave as prose.

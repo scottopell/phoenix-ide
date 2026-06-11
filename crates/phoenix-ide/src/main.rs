@@ -444,6 +444,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let socket_activated = hot_restart::is_socket_activated();
     let bind_address = listener.local_addr().unwrap_or(fallback_addr);
 
+    // Fail closed: a Phoenix reachable from outside this host MUST require auth.
+    // The prod systemd socket binds all interfaces, so without a password anyone
+    // on the network can drive an agent that runs arbitrary commands as this
+    // user. Refuse any non-loopback bind unless a password is set. The escape
+    // hatch is for operators who front Phoenix with their own authenticating
+    // proxy and have deliberately accepted that responsibility.
+    if password.is_none()
+        && !bind_address.ip().is_loopback()
+        && std::env::var("PHOENIX_ALLOW_INSECURE_BIND").ok().as_deref() != Some("1")
+    {
+        return Err(format!(
+            "Refusing to start: bound to {bind_address} (non-loopback) with no PHOENIX_PASSWORD. \
+             An unauthenticated, network-reachable Phoenix lets anyone run arbitrary commands as this user. \
+             Set PHOENIX_PASSWORD, bind to 127.0.0.1, or set PHOENIX_ALLOW_INSECURE_BIND=1 if Phoenix sits behind your own auth proxy."
+        )
+        .into());
+    }
+
     // Static deployment facts served read-only by GET /api/deployment
     // (specs/deployment-info/).
     let deployment = Arc::new(build_deployment_config(
@@ -453,6 +471,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         loaded_tls.as_ref(),
         log_config.to_log_info(),
     ));
+
+    let auth_enabled = password.is_some();
 
     // Create application state
     let state = AppState::new(
@@ -467,10 +487,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await;
 
     // Create router
-    let cors = CorsLayer::new()
-        .allow_origin(Any)
-        .allow_methods(Any)
-        .allow_headers(Any);
+    //
+    // CORS posture is tied to the auth posture. A password-protected deployment
+    // is potentially network-reachable, so it must not advertise a wildcard
+    // origin: the UI is served same-origin from the embedded bundle and needs no
+    // cross-origin grant, and a wildcard would let any website drive the API
+    // (CSRF / drive-by RCE) for any user whose browser can reach the server.
+    // Without a password the server is loopback-only (enforced at bind, above),
+    // where permissive CORS lets the Vite dev server on a separate port reach the
+    // API during development.
+    let cors = if auth_enabled {
+        CorsLayer::new()
+    } else {
+        CorsLayer::new()
+            .allow_origin(Any)
+            .allow_methods(Any)
+            .allow_headers(Any)
+    };
 
     let compression = CompressionLayer::new().gzip(true).br(true);
 

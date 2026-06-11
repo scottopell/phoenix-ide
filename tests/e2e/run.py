@@ -119,6 +119,10 @@ def _server():
             "DEFAULT_MODEL": "mock",
             "PHOENIX_PORT": str(port),
             "PHOENIX_DB_PATH": str(db_path),
+            # The harness binds 0.0.0.0:<port> with no password; the binary
+            # fails closed on a non-loopback passwordless bind. This is a
+            # local, throwaway test server, so opt into the insecure bind.
+            "PHOENIX_ALLOW_INSECURE_BIND": "1",
             # Quiet logs unless a test fails (we capture stderr and print on
             # failure). RUST_LOG=warn drops the per-request access log too,
             # which would otherwise spam the harness output.
