@@ -4040,32 +4040,37 @@ async fn serve_preview_file(
     // actively serving (a conversation working directory). Without this, the
     // handler is an arbitrary host-file read — `/preview/etc/passwd`,
     // `/preview/home/<user>/.ssh/id_rsa`, the prod DB, etc.
-    let in_scope = state
+    let roots: Vec<PathBuf> = state
         .db
         .preview_roots()
         .await
         .unwrap_or_default()
         .iter()
         .filter_map(|root| fs::canonicalize(root).ok())
-        .any(|root| path.starts_with(&root));
-    if !in_scope {
+        .collect();
+    let within_roots = |p: &std::path::Path| roots.iter().any(|root| p.starts_with(root));
+
+    if !within_roots(&path) {
         return Err(AppError::NotFound("File does not exist".to_string()));
     }
 
     if path.is_dir() {
-        // Try index.html for directory requests
-        let index = path.join("index.html");
-        if index.exists() {
-            let content = fs::read(&index)
-                .map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
-            let content_type = mime_guess::from_path(&index)
-                .first_or_octet_stream()
-                .to_string();
-            return Ok(
-                ([(axum::http::header::CONTENT_TYPE, content_type)], content).into_response(),
-            );
+        // Directory request: serve index.html if present. Canonicalize the index
+        // target and re-check containment BEFORE reading — index.html may itself
+        // be a symlink pointing outside the served root, which would otherwise be
+        // an arbitrary-file-read escape through malicious project contents.
+        let Ok(index) = fs::canonicalize(path.join("index.html")) else {
+            return Err(AppError::BadRequest("Path is a directory".to_string()));
+        };
+        if !within_roots(&index) {
+            return Err(AppError::NotFound("File does not exist".to_string()));
         }
-        return Err(AppError::BadRequest("Path is a directory".to_string()));
+        let content =
+            fs::read(&index).map_err(|e| AppError::BadRequest(format!("Cannot read file: {e}")))?;
+        let content_type = mime_guess::from_path(&index)
+            .first_or_octet_stream()
+            .to_string();
+        return Ok(([(axum::http::header::CONTENT_TYPE, content_type)], content).into_response());
     }
 
     let metadata = fs::metadata(&path)
@@ -7568,6 +7573,55 @@ mod file_read_tests {
             preview_url_for_path(path),
             "/preview/tmp/screens/a%20%231%3Fraw%25.png"
         );
+    }
+
+    /// Helper: request `dir` (a directory) through `serve_preview_file`, which
+    /// triggers the index.html fallback.
+    #[cfg(unix)]
+    async fn preview_dir(state: AppState, dir: &std::path::Path) -> Result<Response, AppError> {
+        let filepath = dir.to_string_lossy().trim_start_matches('/').to_string();
+        serve_preview_file(State(state), Path(filepath)).await
+    }
+
+    /// Regression: a directory's `index.html` that is a symlink pointing OUTSIDE
+    /// the served root must not be served — otherwise malicious project contents
+    /// turn `/preview/<dir>/` into an arbitrary host-file read.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_directory_index_symlink_escape_is_rejected() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, b"TOP SECRET").expect("secret");
+
+        let site = root.path().join("site");
+        std::fs::create_dir(&site).expect("site dir");
+        std::os::unix::fs::symlink(&secret, site.join("index.html")).expect("symlink");
+
+        let state = state_with_root(root.path()).await;
+        let err = preview_dir(state, &site)
+            .await
+            .expect_err("symlinked index escaping the root must be rejected");
+        assert!(
+            matches!(err, AppError::NotFound(_)),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    /// A real `index.html` inside the served root is still served.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preview_directory_index_within_root_is_served() {
+        let root = tempfile::tempdir().expect("root");
+        let site = root.path().join("site");
+        std::fs::create_dir(&site).expect("site dir");
+        std::fs::write(site.join("index.html"), b"<html>ok</html>").expect("index");
+
+        let state = state_with_root(root.path()).await;
+        let resp = preview_dir(state, &site)
+            .await
+            .expect("in-root index must serve");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
     }
 
     #[tokio::test]
