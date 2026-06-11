@@ -578,13 +578,21 @@ pub async fn run_pending_migrations(pool: &SqlitePool) -> DbResult<u32> {
             "Applying database migration"
         );
 
-        sqlx::raw_sql(migration.sql).execute(pool).await?;
+        // Apply the migration body and its version record in one transaction so
+        // a crash mid-migration leaves the database all-or-nothing: a partially
+        // applied but unrecorded migration would fail to re-run (missing/duplicate
+        // column) and abort startup.
+        let mut tx = pool.begin().await?;
+
+        sqlx::raw_sql(migration.sql).execute(&mut *tx).await?;
 
         sqlx::query("INSERT INTO _migrations (version, name) VALUES (?, ?)")
             .bind(migration.version)
             .bind(migration.name)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
+
+        tx.commit().await?;
 
         applied += 1;
     }
