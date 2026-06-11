@@ -638,7 +638,7 @@ function MessageListImpl({
   }, [EmptyPlaceholder, SystemPromptHeaderSlot]);
 
   return (
-    <main id="main-area">
+    <main id="main-area" className="chat-main-area">
       <section id="chat-view" className="view active">
         <Virtuoso
           key={conversationId ?? '__empty__'}

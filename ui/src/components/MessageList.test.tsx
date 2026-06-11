@@ -1,3 +1,5 @@
+import '../index.css';
+import { readFileSync } from 'node:fs';
 import { createRef, forwardRef, useImperativeHandle, useLayoutEffect, useRef } from 'react';
 import { describe, expect, it, vi } from 'vitest';
 import { render, waitFor, act } from '@testing-library/react';
@@ -69,7 +71,11 @@ vi.mock('react-virtuoso', () => ({
       return () => scrollerRef?.(null);
     }, [scrollerRef]);
     return (
-      <div data-testid="mock-virtuoso" ref={containerRef}>
+      <div
+        data-testid="mock-virtuoso"
+        ref={containerRef}
+        style={{ overflowY: 'auto', height: '100%' }}
+      >
         {Header && <Header />}
         {data.map((item, i) => {
           const key = computeItemKey ? computeItemKey(i, item) : i;
@@ -93,6 +99,8 @@ function makeMessage(sequence_id: number, message_type: Message['message_type'] 
     created_at: '2024-01-01T00:00:00Z',
   } as Message;
 }
+
+const appCss = readFileSync(`${process.cwd()}/src/index.css`, 'utf8');
 
 const idleState: ConversationState = { type: 'idle' };
 
@@ -193,6 +201,35 @@ describe('MessageList', () => {
     // row, never standalone tool rows (REQ-MLRU-002).
     expect(container.querySelector('[data-sequence-id="21"]')).not.toBeNull();
     expect(container.querySelectorAll('.message.agent')).toHaveLength(1);
+  });
+
+  it('makes the stamped Virtuoso scroller the chat route scroll owner', async () => {
+    const historical = Array.from({ length: 100 }, (_, i) => makeMessage(i + 1, 'user'));
+
+    const { container } = render(
+      withConvContext(
+        <MessageList
+          messages={historical}
+          pendingMessages={[]}
+          convState={idleState}
+          onRetry={vi.fn()}
+          onOpenFile={undefined}
+          conversationId="conv-scroll-owner"
+        />,
+      ),
+    );
+
+    const mainArea = container.querySelector<HTMLElement>('#main-area');
+    await waitFor(() => expect(container.querySelector('#messages')).not.toBeNull());
+    const messagesScroller = container.querySelector<HTMLElement>('#messages');
+
+    expect(mainArea).not.toBeNull();
+    expect(messagesScroller).not.toBeNull();
+    expect(messagesScroller).toBe(container.querySelector('[data-testid="mock-virtuoso"]'));
+    expect(mainArea).toHaveClass('chat-main-area');
+    expect(appCss).toMatch(/#main-area\s*{[^}]*overflow:\s*hidden;/s);
+    expect(appCss).toMatch(/\.list-page\s*>\s*#main-area\s*{[^}]*overflow:\s*hidden auto;/s);
+    expect(getComputedStyle(messagesScroller!).overflowY).toBe('auto');
   });
 
   it('renders a 100-message conversation without throwing', () => {
