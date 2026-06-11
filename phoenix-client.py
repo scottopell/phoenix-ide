@@ -102,8 +102,17 @@ class PhoenixClient:
         # PHOENIX_TLS_INSECURE is set). Stored so every client this instance
         # builds (re-auth, SSE) uses the same policy.
         self.verify = _tls_verify(self.base_url)
-        cookies = {"phoenix-auth": password} if password else {}
-        self.http = httpx.Client(timeout=30.0, cookies=cookies, verify=self.verify)
+        self.http = httpx.Client(
+            timeout=30.0, headers=self._auth_headers(), verify=self.verify
+        )
+
+    def _auth_headers(self) -> dict:
+        """Auth headers for API clients. The server authenticates non-browser
+        clients via `Authorization: Bearer <password>`; the phoenix-auth cookie
+        holds an opaque server-minted session token, not the password, so it is
+        not a usable client credential. Empty when no password is configured,
+        preserving the auth-disabled/dev case."""
+        return {"Authorization": f"Bearer {self.password}"} if self.password else {}
 
     def check_auth(self) -> dict:
         """Check auth status. Returns { auth_required, authenticated }."""
@@ -117,7 +126,7 @@ class PhoenixClient:
         if not status.get('auth_required', False):
             return  # No auth needed
         if status.get('authenticated', False):
-            return  # Already authenticated (password in cookie worked)
+            return  # Already authenticated (Bearer password header worked)
 
         # Auth required but not authenticated
         if self.password:
@@ -131,7 +140,7 @@ class PhoenixClient:
         pw = getpass.getpass("Phoenix password: ")
         self.password = pw
         self.http = httpx.Client(
-            timeout=30.0, cookies={"phoenix-auth": pw}, verify=self.verify
+            timeout=30.0, headers=self._auth_headers(), verify=self.verify
         )
         # Verify
         status = self.check_auth()
@@ -216,8 +225,9 @@ class PhoenixClient:
             pool=10.0,
         )
 
-        cookies = {"phoenix-auth": self.password} if self.password else {}
-        with httpx.Client(timeout=sse_timeout, cookies=cookies, verify=self.verify) as client:
+        with httpx.Client(
+            timeout=sse_timeout, headers=self._auth_headers(), verify=self.verify
+        ) as client:
             with connect_sse(client, "GET", url) as event_source:
                 for event in event_source.iter_sse():
                     # Check overall timeout
