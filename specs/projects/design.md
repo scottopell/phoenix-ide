@@ -13,11 +13,12 @@ The isolation model has two layers:
    conversations on the same project occupy different directories and cannot touch
    each other's files by construction.
 
-2. **Enforcement (planned, not yet implemented):** Explore conversations can have
-   their read-only constraint enforced at kernel level via Landlock on Linux or
-   sandbox-exec on macOS (see `specs/bash/` REQ-BASH-008). On platforms without
-   sandboxing, read-only is an application-level constraint enforced by tool
-   configuration.
+2. **OS enforcement (supported platforms):** Top-level Explore conversations
+   expose `bash` only when `nono` reports an enforceable backend. Explore bash
+   runs in a child process whose sandbox makes the worktree read-only, grants
+   task proposal and scratch directories read-write, and blocks network (see
+   `specs/bash/` REQ-BASH-012/013). Without sandbox support, Explore omits
+   bash.
 
 The state machine knows about `ConvMode` as a field on conversations. It does not
 know about git, worktrees, or projects — those are executor-layer concerns triggered
@@ -27,40 +28,27 @@ by state machine effects.
 
 ### REQ-PROJ-013 — Sandbox detection and tool registry selection
 
-At startup, the server probes for kernel-level sandboxing:
+At startup, the server asks `nono::Sandbox::support_info()` whether the current
+host has an enforceable sandbox backend:
 
 ```
 PlatformCapability {
-  None,          // no sandbox available
-  Landlock,      // Linux 5.13+ with Landlock LSM enabled
-  MacOSSandbox,  // macOS with sandbox-exec available
+  None { details },          // no enforceable sandbox available
+  Nono { platform, details } // nono-backed sandbox available
 }
 ```
 
-Detection is automatic (no configuration):
-- Linux: checks `/sys/kernel/security/landlock` exists
-- macOS: checks `sandbox-exec -n no-network true` succeeds
-- Other: `None`
-
-The result gates which tool registry Explore conversations receive:
+The result gates which tool registry top-level Explore conversations receive:
 
 | `has_sandbox()` | Explore tool set | Bash available? |
 |-----------------|-----------------|-----------------|
-| `true` | `explore_with_sandbox()` — full tools including bash | Yes |
-| `false` | `explore_no_sandbox()` — restricted to ReadFile, Search, Think, keyword_search, browser tools. No bash, no patch. | No |
+| `true` | read-only/planning tools, scoped `patch`, `propose_task`, and sandboxed `bash`; browser and tmux are omitted | Yes |
+| `false` | read-only/planning tools, scoped `patch`, and `propose_task`; browser, tmux, and bash are omitted | No |
 
-**Current implementation state:** Sandbox detection works. Tool registry
-selection works. Actual bash sandboxing (Landlock wrappers, sandbox-exec
-profiles) is **not implemented**. The `explore_with_sandbox()` path gives
-bash but does not apply any kernel restrictions to bash processes. This means
-Explore mode with `has_sandbox() = true` has bash but the read-only constraint
-is enforced only by the system prompt, not by the kernel.
-
-This is an acceptable interim state: the system prompt tells the agent it is
-read-only, and the agent respects this in practice. The sandboxing
-implementation (REQ-BASH-008, REQ-BASH-009) will add defense-in-depth when
-built, without requiring any changes to the detection or registry selection
-code. The plumbing is in place — only the bash execution wrapper is missing.
+The sandboxed bash path uses a Phoenix child-process launcher. The child applies
+`nono` to itself and then execs `/bin/bash -c <cmd>`, preserving the ordinary
+bash handle semantics while avoiding irreversible sandbox application in the
+server process.
 
 ## Data Models
 
@@ -127,7 +115,7 @@ present. Worktrees are ephemeral; they are never committed or pushed.
 Task files live at `{repo_root}/{tasks_dir}/`. `{tasks_dir}` is the project's tasks
 directory, discovered at conversation startup as the first immediate child of the repo
 root containing `_TEMPLATE.md`. It falls back to the literal `tasks/` when no marker is
-found, so existing repos behave as before (task 13008).
+found, so existing repos behave as before.
 
 The task file is authored by the agent in Explore mode with the `patch` tool (whose
 allowlist in Explore mode is scoped to `{tasks_dir}/`) and referenced by path in the
@@ -515,8 +503,8 @@ the porcelain command fails.
 
 | Tool | Explore mode | Work mode |
 |------|-------------|----------|
-| `bash` | Allowed (read-only enforced per REQ-BASH-008) | Allowed (write enabled in worktree) |
-| `patch` | Scoped to project's tasks dir (typically `tasks/`, discovered per project — task 13008) so the agent can draft a task file before `propose_task`; writes elsewhere rejected | Enabled (scoped to worktree) |
+| `bash` | Available only with `nono` sandbox support; worktree read-only, task proposal/scratch writable, network blocked | Allowed (write enabled in worktree) |
+| `patch` | Scoped to discovered taskmd directory so the agent can draft a task file before `propose_task`; writes elsewhere rejected | Enabled (scoped to worktree) |
 | `think` | Allowed | Allowed |
 | `keyword_search` | Allowed | Allowed |
 | `read_image` | Allowed | Allowed |

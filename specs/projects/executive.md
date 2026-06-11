@@ -39,9 +39,11 @@ shapes by mode: in Explore it is the blocking Explore→Work gateway; in the wri
 (Work, Branch, Direct-in-a-git-repo) it is a non-blocking **fork proposal** that spawns a
 fully decoupled top-level Work conversation off the repository default branch (REQ-PROJ-033
 through 036). It is withheld only from Direct-not-in-a-repo and from sub-agents. Tool
-registry is configured by mode: unscoped writes disabled in Explore, except `patch` scoped
-to the `tasks/` dir (so the agent can draft/revise a task file — REQ-PROJ-003, and the
-Request Changes refinement of REQ-PROJ-037); write tools enabled in Work and Branch. Push is a regular bash command with no
+registry is configured by mode: Explore exposes read-only/planning tools plus `bash` only
+when `nono` reports an enforceable OS sandbox; the sandboxed bash can read the worktree,
+write task proposal and scratch directories, and has network blocked. `patch` is scoped
+to the discovered taskmd directory so the agent can draft/revise a task file
+(REQ-PROJ-003 and REQ-PROJ-037). Write tools are enabled in Work and Branch. Push is a regular bash command with no
 lifecycle side effects. Phoenix can observe PR state through `gh` to guide the
 user-visible cleanup affordance, but does not push, merge, or run unattended
 cleanup. Terminal actions remain user-initiated: verified merged PR cleanup / manual
@@ -65,7 +67,7 @@ for on-demand remote search (5-minute TTL).
 | **REQ-PROJ-010:** Abandon a Conversation | Moved | Relocated to work-lifecycle REQ-WL-001 |
 | **REQ-PROJ-011:** PR Status Is the Branch Health Indicator | Moved | Relocated to work-lifecycle REQ-WL-003 |
 | **REQ-PROJ-012:** Provide propose_task Tool to Agents | 🟡 Partial | Explore gateway shipped; the writing-mode fork registry/interception path (REQ-PROJ-033/036) is spec-only |
-| **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Task 08601 (M1) |
+| **REQ-PROJ-013:** Platform Capability Detection | ✅ Complete | Uses `nono::Sandbox::support_info()` to decide whether top-level Explore can expose sandboxed bash |
 | **REQ-PROJ-014:** Project UI | ✅ Complete | Task 08601 (M1). Project tabs, mode badges, Tasks panel |
 | **REQ-PROJ-015:** Project Worktree Registry | Descoped | ConvMode::Work serves as de facto registry |
 | **REQ-PROJ-016:** Standalone Conversation Mode | ⏭️ Superseded | Superseded by REQ-PROJ-018 (Direct Mode). `Standalone` was folded into `Direct` via migration 001; the `ConvMode::Standalone` variant no longer exists |
@@ -100,6 +102,6 @@ REQ-PROJ-018.
 ## Dependencies
 
 - `specs/bedrock/` -- REQ-BED-027, REQ-BED-028, REQ-BED-029 (mode state, approval states)
-- `specs/bash/` -- REQ-BASH-008, REQ-BASH-009 (Explore mode read-only enforcement)
+- `specs/bash/` -- REQ-BASH-012, REQ-BASH-013 (Explore mode read-only bash enforcement)
 - `specs/patch/` -- REQ-PATCH-009 (patch disabled in Explore mode)
 - `specs/prose-feedback/` -- REQ-PF-015, REQ-PF-016 (programmatic task approval trigger)

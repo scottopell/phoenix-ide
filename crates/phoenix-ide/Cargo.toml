@@ -125,7 +125,7 @@ tempfile = "3"
 # code blocks don't get expanded as file or skill references.
 pulldown-cmark = { version = "0.13", default-features = false }
 
-taskmd-core = ">=1.1,<2"
+taskmd-core = ">=1.3,<2"
 listenfd = "1.0.2"
 nucleo-matcher = "0.3.1"
 

@@ -29,6 +29,7 @@ use super::handle::{
 };
 use super::registry::{BashHandleError, LiveHandleSummary, WorkScopeHandles};
 use super::ring::{RingLine, WindowView};
+use super::sandbox::ExploreSandboxLauncher;
 use super::types::{BashOp, BashToolInput};
 use crate::{ToolContext, ToolOutput};
 use phoenix_core::domain::tool_wire::{
@@ -147,7 +148,7 @@ pub enum BashError {
         message: String,
         conflicting_args: Vec<&'static str>,
         recommended_action: String,
-        extra: Option<Value>,
+        extra: Option<Box<Value>>,
     },
 }
 
@@ -215,9 +216,11 @@ impl BashError {
                 // model these — see the `MutuallyExclusiveModes` doc on
                 // `BashErrorResponse`).
                 let mut value = serde_json::to_value(&typed_err).unwrap_or(Value::Null);
-                if let (Value::Object(obj), Some(Value::Object(extras))) = (&mut value, extra) {
-                    for (k, v) in extras {
-                        obj.insert(k, v);
+                if let (Value::Object(obj), Some(extra)) = (&mut value, extra) {
+                    if let Value::Object(extras) = *extra {
+                        for (k, v) in extras {
+                            obj.insert(k, v);
+                        }
                     }
                 }
                 let serialized = serde_json::to_string(&value).unwrap_or_else(|_| "{}".into());
@@ -408,8 +411,26 @@ fn resolve_wait_seconds(raw: Option<i64>) -> Result<u64, BashError> {
 // Top-level dispatch
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy)]
+pub enum BashSpawnMode {
+    Direct,
+    ExploreReadOnly,
+}
+
 /// Run a bash request end-to-end and produce the `ToolOutput`.
 pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::Direct).await
+}
+
+pub async fn dispatch_sandboxed(input: Value, ctx: ToolContext) -> ToolOutput {
+    dispatch_with_spawn_mode(input, ctx, BashSpawnMode::ExploreReadOnly).await
+}
+
+async fn dispatch_with_spawn_mode(
+    input: Value,
+    ctx: ToolContext,
+    spawn_mode: BashSpawnMode,
+) -> ToolOutput {
     let request = match parse_request(input) {
         Ok(r) => r,
         Err(e) => return e.into_tool_output(),
@@ -421,7 +442,7 @@ pub async fn dispatch(input: Value, ctx: ToolContext) -> ToolOutput {
             label,
             wait_seconds,
             read_args,
-        } => run_run(&cmd, label, wait_seconds, read_args, &ctx).await,
+        } => run_run(&cmd, label, wait_seconds, read_args, &ctx, spawn_mode).await,
         BashRequest::Peek {
             handle_id,
             read_args,
@@ -447,6 +468,7 @@ async fn run_run(
     wait_seconds: u64,
     read_args: ReadArgs,
     ctx: &ToolContext,
+    spawn_mode: BashSpawnMode,
 ) -> ToolOutput {
     // REQ-BASH-011: command safety is enforced upstream by the permission seam
     // (specs/permissions, the deterministic deny layer) before this tool runs,
@@ -479,7 +501,14 @@ async fn run_run(
         // from the spawned child. We hold the write lock across the spawn
         // so no other run can race the cap check, then insert below.
         // Spawn is fast (a fork+exec) so this lock-hold is bounded.
-        match spawn_child(cmd, label, ctx, handle_id.clone(), ring_bytes_cap) {
+        match spawn_child(
+            cmd,
+            label,
+            ctx,
+            handle_id.clone(),
+            ring_bytes_cap,
+            spawn_mode,
+        ) {
             Ok((handle, child)) => {
                 let inserted = handles.insert(handle.clone());
                 drop(handles);
@@ -511,6 +540,7 @@ fn spawn_child(
     ctx: &ToolContext,
     handle_id: HandleId,
     ring_bytes_cap: usize,
+    spawn_mode: BashSpawnMode,
 ) -> Result<(Arc<Handle>, tokio::process::Child), String> {
     // Per bash.allium @guidance on HandleSpawned:
     //   "Spawn child via Command::new(\"bash\").args([\"-c\", cmd]) with
@@ -529,11 +559,17 @@ fn spawn_child(
     // itself is what gets signaled — same outcome as exec'd bash. The
     // load-bearing piece is the process-group leader bit (setpgid below)
     // so that `kill(-pgid, sig)` reaches the user's processes.
-    let mut command = Command::new("bash");
+    let mut command = match spawn_mode {
+        BashSpawnMode::Direct => {
+            let mut command = Command::new("bash");
+            command.arg("-c").arg(cmd).current_dir(&ctx.working_dir);
+            command
+        }
+        BashSpawnMode::ExploreReadOnly => {
+            Command::from(ExploreSandboxLauncher::command(cmd, &ctx.working_dir)?)
+        }
+    };
     command
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(&ctx.working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

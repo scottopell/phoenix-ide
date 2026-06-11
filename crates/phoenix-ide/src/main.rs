@@ -518,6 +518,24 @@ fn install_phx_symlink(
     Ok(bin_dir)
 }
 
+fn sandbox_exec_arg() -> Option<String> {
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() != Some("--sandbox-exec") {
+        return None;
+    }
+    if args.next().as_deref() != Some("--") {
+        eprintln!("usage: phoenix_ide --sandbox-exec -- <cmd>");
+        std::process::exit(2);
+    }
+    match args.next() {
+        Some(cmd) if args.next().is_none() => Some(cmd),
+        _ => {
+            eprintln!("usage: phoenix_ide --sandbox-exec -- <cmd>");
+            std::process::exit(2);
+        }
+    }
+}
+
 #[tokio::main]
 #[allow(clippy::too_many_lines)] // Startup sequence is inherently sequential; splitting would obscure the flow.
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -527,6 +545,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // setup so the client's stdout stays clean (OSC 8 links only).
     if phx_cli::is_cli_invocation() {
         std::process::exit(phx_cli::run().await);
+    }
+
+    if let Some(cmd) = sandbox_exec_arg() {
+        crate::tools::bash::apply_explore_read_only_from_env(&cmd);
     }
 
     // Initialize logging from the configured sinks (PHOENIX_LOG_STDOUT /

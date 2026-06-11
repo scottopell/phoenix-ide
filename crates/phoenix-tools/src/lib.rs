@@ -26,7 +26,7 @@ pub mod work_scope_inventory;
 pub use ask_user_question::AskUserQuestionTool;
 pub use bash::{
     BashHandleError, BashHandleRegistry, BashLifecycleEvent, BashLifecycleSink, BashOp, BashTool,
-    BashToolInput, WorkScopeHandles as BashWorkScopeHandles,
+    BashToolInput, SandboxedBashTool, WorkScopeHandles as BashWorkScopeHandles,
 };
 pub use browser::{
     BrowserClearConsoleLogsTool, BrowserClickTool, BrowserError, BrowserEvalTool,
@@ -582,7 +582,6 @@ impl ToolRegistry {
         agents: Vec<phoenix_agents::AgentDefinition>,
     ) -> Self {
         let mut tools = read_only_tools();
-        tools.extend(browser_tools());
         tools.extend(parent_coordination_tools(agents));
         tools.push(Arc::new(PatchTool::for_task_proposal_drafts(
             tasks_dir_name,
@@ -592,22 +591,22 @@ impl ToolRegistry {
     }
 
     /// Create tool registry for Explore mode WITH sandbox.
-    /// REQ-PROJ-013: Full tool suite, bash sandboxed read-only at runtime.
-    /// Adds `propose_task` (Explore-only gateway to Work mode). Replaces
-    /// the unrestricted `patch` from the standard set with one scoped to
-    /// the project's tasks directory so Explore mode can only mutate task
-    /// files.
+    /// REQ-PROJ-013: read-only/planning tools plus OS-sandboxed bash. Browser
+    /// and tmux tools are intentionally omitted for this first sandboxed
+    /// Explore slice.
     #[must_use]
     pub fn explore_with_sandbox(
         tasks_dir_name: &str,
         agents: Vec<phoenix_agents::AgentDefinition>,
     ) -> Self {
-        let mut registry = Self::new_with_options(false, agents);
-        if let Some(idx) = registry.tools.iter().position(|t| t.name() == "patch") {
-            registry.tools[idx] = Arc::new(PatchTool::for_task_proposal_drafts(tasks_dir_name));
-        }
-        registry.tools.push(Arc::new(ProposeTaskTool));
-        registry
+        let mut tools = read_only_tools();
+        tools.push(Arc::new(SandboxedBashTool));
+        tools.extend(parent_coordination_tools(agents));
+        tools.push(Arc::new(PatchTool::for_task_proposal_drafts(
+            tasks_dir_name,
+        )));
+        tools.push(Arc::new(ProposeTaskTool));
+        Self { tools }
     }
 
     /// Create standard tool registry (parent conversations — legacy, will be removed)
@@ -945,16 +944,21 @@ mod tests {
         assert!(direct_fork.contains("bash"));
         assert!(direct_fork.contains("patch"));
 
-        // Explore (sandbox): full suite + propose_task.
+        // Explore (sandbox): read-only/planning tools + sandboxed bash.
         let work = names(&ToolRegistry::explore_with_sandbox("tasks", Vec::new()));
         assert!(work.contains("bash"));
         assert!(work.contains("patch"));
-        assert!(work.contains("tmux_run"));
-        assert!(work.contains("tmux"));
+        assert!(!work.contains("tmux_run"));
+        assert!(!work.contains("tmux"));
         assert!(work.contains("propose_task"));
         assert!(!work.contains("commission_review"));
+        assert!(work.contains("spawn_agents"));
+        assert!(work.contains("ask_user_question"));
         for tool in PARENT_TERMINAL_TOOLS {
-            assert!(work.contains(*tool), "Work missing {tool}");
+            assert!(
+                !work.contains(*tool),
+                "Explore sandbox should not have {tool}"
+            );
         }
 
         // Explore (no sandbox): read-only + propose_task + scoped patch

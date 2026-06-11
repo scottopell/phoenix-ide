@@ -63,8 +63,12 @@ so a late-arriving exit still demotes correctly.
 
 Command safety (`brush-parser` AST walk for blind git-add, force-push,
 dangerous rm) is enforced by the permission seam (specs/permissions/) before
-the bash tool runs, not inside the tool. Landlock enforcement for Explore mode
-is unchanged from the prior revision and runs on the run path only.
+the bash tool runs, not inside the tool. In Explore, `SandboxedBashTool` routes
+`op="run"` through a Phoenix child process that applies `nono` before execing
+bash; filesystem reads are broad, worktree and Git metadata writes are denied,
+task proposal/scratch/synthetic-home/platform-temp writes are allowed,
+per-command scratch is reaped at terminal state, network is blocked, and
+unsupported hosts omit Explore bash entirely.
 
 ## Status Summary
 
@@ -81,8 +85,8 @@ is unchanged from the prior revision and runs on the run path only.
 | **REQ-BASH-009:** No TTY Attached | 🔄 Carry-forward | Existing behavior; tool description points at `tmux` |
 | **REQ-BASH-010:** Tool Schema and Mutual Exclusion | 🔄 Rewrite (rev 3) | `op` discriminator with `run`/`peek`/`wait`/`kill`; `label` field added; legacy four-sibling inference, `mode` shim, `command` alias, and empty-string-as-absent tolerance retired (`deny_unknown_fields`); two narrow tolerances retained for active GPT default-fill (`since=0`, `lines+since`) |
 | **REQ-BASH-011:** Command Safety Checks | 🔄 Relocated | Enforcement moved to the permission seam (specs/permissions/); `brush-parser` AST walk (`bash_check`) unchanged, now invoked by the seam |
-| **REQ-BASH-012:** Landlock Enforcement | 🔄 Renumbered | Was REQ-BASH-008; behavior unchanged |
-| **REQ-BASH-013:** Graceful Degradation Without Landlock | 🔄 Renumbered | Was REQ-BASH-009; behavior unchanged |
+| **REQ-BASH-012:** Explore `nono` Sandbox | ✅ Complete | `SandboxedBashTool` uses a Phoenix child-process launcher; the server never applies the irreversible sandbox to itself |
+| **REQ-BASH-013:** Fail-Closed Explore Bash | ✅ Complete | Startup uses `nono::Sandbox::support_info()`; unsupported hosts omit bash from top-level Explore registries |
 | **REQ-BASH-014:** Stateless Tool with Per-WorkScope Handle Registry | 🔄 Rewrite | Was REQ-BASH-010; tool stays stateless, registry reached via `ctx.bash_handles()` matching browser pattern |
 | **REQ-BASH-WS-001:** Handle Registry Keyed by WorkScope | ❌ New | Registry keyed by `WorkScope`, not conversation id; handles survive the continuation boundary; symmetric with tmux/browser/terminal |
 | **REQ-BASH-WS-002:** Hard-Delete Cascade Respects Inheritor Scope | ❌ New | `cascade_bash_on_delete` consults inheritor `WorkScope` and skips teardown on scope match, like `cascade_terminal/browser_on_delete` |
@@ -91,7 +95,7 @@ is unchanged from the prior revision and runs on the run path only.
 **Progress:** 0 of 17 implemented under the new spec; this revision is a
 greenfield rewrite of the runtime portion. Carry-forward items (-012, -013,
 -015) and the relocated REQ-BASH-011 reuse the existing `bash_check.rs`
-(now invoked by the permission seam), Landlock integration, and display
+(now invoked by the permission seam), `nono` launcher, and display
 simplification logic; rewrite items require new code. The
 `WorkScope`-keying requirements (REQ-BASH-WS-001, -WS-002) re-key the registry
 from conversation id to `WorkScope` and bring the hard-delete cascade in line
@@ -135,6 +139,4 @@ The deferred entry `BashHandleCrossRestartPersistence` documents the
 explicit decision to drop the SQLite shadow store and `lost_in_restart`
 machinery from v1, including the panel-review reasoning that led to it.
 
-Open questions: none. All decisions resolved during the elicitation
-conversation dated April 2026 and confirmed by the panel review (see the
-`Open questions` block at the bottom of `bash.allium` for the full list).
+Open questions: none.

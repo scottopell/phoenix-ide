@@ -909,7 +909,7 @@ async fn test_browser_navigate_remote() {
     require_chrome!();
     require_network!();
 
-    let (ctx, _manager) = test_context("test-navigate-remote");
+    let (ctx, manager) = test_context("test-navigate-remote");
 
     // Navigate to a real website
     let nav_tool = BrowserNavigateTool;
@@ -956,7 +956,7 @@ async fn test_browser_navigate_remote() {
 async fn test_browser_eval_before_navigate() {
     require_chrome!();
 
-    let (ctx, _manager) = test_context("test-eval-no-nav");
+    let (ctx, manager) = test_context("test-eval-no-nav");
 
     // Try to eval without navigating first - should still work on about:blank
     let eval_tool = BrowserEvalTool;
@@ -2053,6 +2053,7 @@ async fn test_key_press_unknown_key_returns_error() {
 #[tokio::test]
 async fn test_screencast_attach_emits_frames_and_url() {
     use crate::browser::screencast::ScreencastEvent;
+    require_chrome!();
 
     require_chrome!();
 
@@ -3018,7 +3019,7 @@ setTimeout(function () {
     // F3 FIXED — the ~180ms pre-readiness burn is EXCLUDED: it ran
     // before `window.__ready`, i.e. before the readiness step that
     // opens the window. F5 FIXED — the ~70ms post-readiness blocking
-    // task IS captured (the old host-bracketed ScriptDuration delta
+    // task IS captured (the old host-bracketed `ScriptDuration` delta
     // read ~0 here). So `script_ms` must include the in-window ~70ms
     // longtask but exclude the pre-window 180ms.
     assert!(

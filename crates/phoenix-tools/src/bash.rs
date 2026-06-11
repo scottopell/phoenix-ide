@@ -23,6 +23,7 @@ pub(crate) mod operations;
 pub mod reaper;
 pub mod registry;
 pub mod ring;
+pub mod sandbox;
 
 pub use reaper::{install_reaper, shutdown_kill_tree};
 pub use registry::{
@@ -31,6 +32,7 @@ pub use registry::{
 // `types` (BashOp, BashToolInput) moved to phoenix-core. Alias the module back
 // as `types` and re-export the items so existing paths resolve unchanged.
 pub use phoenix_core::domain::bash_types::{self as types, BashOp, BashToolInput};
+pub use sandbox::{apply_explore_read_only_from_env, ExploreSandboxLauncher};
 
 use super::{Tool, ToolContext, ToolOutput};
 use async_trait::async_trait;
@@ -42,6 +44,8 @@ use serde_json::{json, Value};
 /// through `ToolContext::bash_handles()` (REQ-BASH-014). The tool
 /// instance itself is reusable across conversations.
 pub struct BashTool;
+
+pub struct SandboxedBashTool;
 
 #[async_trait]
 impl Tool for BashTool {
@@ -189,6 +193,31 @@ For complex scripts, write them to a file first and execute the file."#
 
     async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
         operations::dispatch(input, ctx).await
+    }
+}
+
+#[async_trait]
+impl Tool for SandboxedBashTool {
+    fn name(&self) -> &'static str {
+        "bash"
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "{}\n\nExplore mode sandbox: commands run under an OS-enforced nono sandbox. \
+             The repository/worktree is read-only; taskmd-discovered task \
+             proposal directories and $PHOENIX_SANDBOX_SCRATCH are writable; \
+             network access is blocked; HOME and TMPDIR point at scratch.",
+            BashTool.description()
+        )
+    }
+
+    fn input_schema(&self) -> Value {
+        BashTool.input_schema()
+    }
+
+    async fn run(&self, input: Value, ctx: ToolContext) -> ToolOutput {
+        operations::dispatch_sandboxed(input, ctx).await
     }
 }
 

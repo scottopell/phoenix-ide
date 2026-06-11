@@ -1015,7 +1015,7 @@ impl RuntimeManager {
     /// Get the detected platform capability
     #[allow(dead_code)]
     pub fn platform(&self) -> PlatformCapability {
-        self.platform
+        self.platform.clone()
     }
 
     /// Get the browser session manager
@@ -3296,7 +3296,9 @@ mod scope_liveness_tests {
         RuntimeManager::new(
             db,
             Arc::new(ModelRegistry::new_empty()),
-            PlatformCapability::None,
+            PlatformCapability::None {
+                details: "test".into(),
+            },
             Arc::new(McpClientManager::new()),
             None,
         )

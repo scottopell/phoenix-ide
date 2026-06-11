@@ -110,7 +110,7 @@ impl AppState {
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
-            platform,
+            platform.clone(),
             mcp_manager.clone(),
             credential_helper.clone(),
         ));

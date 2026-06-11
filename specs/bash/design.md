@@ -839,19 +839,28 @@ checking. Error messages suggest alternatives:
 - `permission denied: git push --force is not allowed. Use --force-with-lease for safer force pushes, or push without force`
 - `permission denied: this rm command could delete critical data (.git, home directory, or root). Specify the full path explicitly (no wildcards, ~, or $HOME)`
 
-## Landlock Enforcement (REQ-BASH-012, REQ-BASH-013)
+## Explore Read-Only Sandbox (REQ-BASH-012, REQ-BASH-013)
 
-Unchanged from the prior revision. Explore-mode conversations spawn child
-processes with Landlock restrictions applied via the `landlock` crate at
-`pre_exec` time. Work-mode conversations spawn without restrictions. The
-detection of Landlock availability runs once at startup and is cached on
-the registry. On unsupported kernels or non-Linux OSes, Explore-mode
-read-only enforcement degrades to advisory tool-level checks; Work mode
-operates normally.
+Top-level Explore conversations use a separate `SandboxedBashTool` instance
+with the same schema, parser, handle registry, peek/wait/kill operations, ring
+buffer, and response shaping as writable `BashTool`. The only divergent path is
+`op="run"`: Phoenix spawns a short-lived Phoenix child process, that child
+applies `nono::Sandbox::apply()` to itself, and then it execs `/bin/bash -c
+<cmd>`. The server process never applies the sandbox to itself.
 
-The handle model does not change Landlock semantics. A handle's process
-inherits the sandbox policy from its spawn-time mode; the policy is fixed
-for the process's lifetime regardless of subsequent peek/wait/kill calls.
+The Explore policy grants the worktree root read-only, each taskmd-discovered
+task proposal directory read-write, and a Phoenix-owned scratch directory
+read-write. `HOME`, `TMPDIR`, and `PHOENIX_SANDBOX_SCRATCH` all point at the
+scratch directory, and network access is blocked. The child environment is
+rebuilt from a small allowlist rather than inherited wholesale from the server.
+
+Platform detection is `nono::Sandbox::support_info()` at startup. When `nono`
+reports no enforceable backend, top-level Explore registries omit bash. Direct,
+Work, and Branch registries keep the ordinary writable bash behavior.
+
+The handle model does not change sandbox semantics. A handle's process inherits
+the sandbox policy from its spawn-time tool; the policy is fixed for the
+process's lifetime regardless of subsequent peek/wait/kill calls.
 
 ## Testing Strategy
 
@@ -868,6 +877,9 @@ for the process's lifetime regardless of subsequent peek/wait/kill calls.
 - Error envelope shapes for each stable error id.
 
 ### Integration tests
+- Top-level Explore bash on a supported host: `git log`, `git blame`, `rg`, and
+  `cat` can read the worktree; source writes fail with kernel permission errors;
+  task proposal and scratch writes succeed; network commands fail.
 - Spawn → exits within wait_seconds → `status: "exited"` with exit code.
 - Spawn → wait_seconds elapses → `status: "still_running"` with handle.
 - Repeated `wait` on same handle returns same handle id on each re-timeout.

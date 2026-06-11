@@ -1626,7 +1626,9 @@ mod tests {
         let rt = Arc::new(RuntimeManager::new(
             db,
             Arc::new(ModelRegistry::new_empty()),
-            PlatformCapability::None,
+            PlatformCapability::None {
+                details: "test".into(),
+            },
             Arc::new(McpClientManager::new()),
             None,
         ));

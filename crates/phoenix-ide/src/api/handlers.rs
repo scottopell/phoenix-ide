@@ -5562,12 +5562,14 @@ pub(crate) mod hard_delete_cascade_tests {
     pub(crate) async fn make_test_state() -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
         let llm_registry = Arc::new(ModelRegistry::new_empty());
-        let platform = PlatformCapability::None;
+        let platform = PlatformCapability::None {
+            details: "test".into(),
+        };
         let mcp_manager = Arc::new(McpClientManager::new());
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
-            platform,
+            platform.clone(),
             mcp_manager.clone(),
             None,
         ));
@@ -7807,12 +7809,14 @@ mod upgrade_model_state_guard_tests {
     async fn make_test_state() -> AppState {
         let db = Database::open_in_memory().await.expect("open db");
         let llm_registry = Arc::new(ModelRegistry::for_test_with_sonnet(Arc::new(StubLlm)));
-        let platform = PlatformCapability::None;
+        let platform = PlatformCapability::None {
+            details: "test".into(),
+        };
         let mcp_manager = Arc::new(McpClientManager::new());
         let runtime = Arc::new(RuntimeManager::new(
             db.clone(),
             llm_registry.clone(),
-            platform,
+            platform.clone(),
             mcp_manager.clone(),
             None,
         ));

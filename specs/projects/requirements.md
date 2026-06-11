@@ -78,8 +78,10 @@ AND (on the user's first message) create a worktree on a temp branch off the cho
 
 WHILE a conversation is in Explore mode (Managed workflow)
 THE SYSTEM SHALL prevent file writes to the project via any tool
-  (except drafting a task file under the project's tasks directory — REQ-PROJ-003)
-AND SHALL allow unrestricted file reading, directory listing, and read-only command execution
+  (except drafting a task file under a taskmd-discovered task proposal directory — REQ-PROJ-003)
+AND SHALL allow unrestricted file reading and directory listing
+AND SHALL expose `bash` only when an OS sandbox is available to enforce read-only
+  command execution (REQ-BASH-012/013)
 
 WHEN the user selects "Managed" mode for a non-git directory
 THE SYSTEM SHALL reject the request (Managed mode requires a git repository)
@@ -94,7 +96,7 @@ from plan review and worktree isolation, but should be opt-in rather than mandat
 
 WHILE a conversation is in Explore mode
 THE SYSTEM SHALL allow the agent to draft a markdown task file using the `patch`
-tool (whose Explore-mode allowlist is scoped to the project's tasks directory).
+tool (whose Explore-mode allowlist is scoped to the project's discovered tasks directory).
 The recommended form is the taskmd 1.0 convention (`NNNNN-pX-status--slug.md`, status
 one of `ready` / `in-progress` / `brainstorming`) — taskmd-named files additionally
 yield id/priority/status/slug and a `ready` → `in-progress` rename on approval
@@ -111,8 +113,8 @@ AND read the file and persist the assistant message and a synthetic tool result 
 AND transition the conversation to AwaitingTaskApproval state
 AND pause agent execution until the user responds
 
-WHEN the `task_file` name parses as a taskmd filename but the path is **not** under the
-project's tasks directory
+WHEN the task file's name parses as a taskmd filename but the path is **not** under the
+project's discovered tasks directory
 THE SYSTEM SHALL reject the call (taskmd-named files must live under the tasks dir; a
 brief that wants to live elsewhere must not use the taskmd naming)
 
@@ -243,9 +245,9 @@ only loses an optimization, never correctness.
 ### REQ-PROJ-006: Task Files as Versioned Living Contracts
 
 WHEN the agent drafts a task file in Explore mode (REQ-PROJ-003)
-THE SYSTEM SHALL place it in the project's tasks directory (typically `tasks/`,
-  discovered per-project as the first immediate child of the repo root containing
-  `_TEMPLATE.md`, falling back to literal `tasks/`; see task 13008)
+THE SYSTEM SHALL place it in the project's discovered tasks directory: Phoenix scans
+  immediate children of the repo root for taskmd sentinel files and prefers `tasks/`,
+  otherwise the lexically-first discovered taskmd directory, otherwise literal `tasks/`
 AND the filename SHALL follow the taskmd 1.0 convention `{ID}-{priority}-{status}--{slug}.md`
   where `ID` is a 5-digit `DDNNN` value (per-directory prefix + monotonic counter) and the
   agent picks the whole filename — the **filename is the sole authoritative source of the
@@ -409,26 +411,28 @@ established submit_result pattern, so no git work happens until approval.
 ### REQ-PROJ-013: Platform Capability Detection
 
 WHEN the server starts
-THE SYSTEM SHALL probe for available sandboxing capabilities:
-- Linux: check for Landlock support (kernel >= 5.13, LSM enabled)
-- macOS: check for sandbox-exec availability
-- Other: no sandbox available
+THE SYSTEM SHALL ask `nono::Sandbox::support_info()` whether the host has an
+enforceable OS sandbox backend
 
 THE SYSTEM SHALL re-check capabilities on every startup
 
 WHILE sandbox is not available
-THE SYSTEM SHALL provide Explore mode with ReadFile, Search, and Think tools only
-AND SHALL NOT provide bash or any tool that can execute arbitrary commands
+THE SYSTEM SHALL provide top-level Explore mode with read-only/planning tools,
+scoped task-proposal `patch`, and `propose_task`
+AND SHALL NOT provide `bash`, `tmux`, `tmux_run`, browser tools, or any tool that
+can execute arbitrary unsandboxed commands
 
-WHILE sandbox is available (Landlock or macOS sandbox)
-THE SYSTEM SHALL provide Explore mode with bash (sandboxed read-only) and all standard tools
-AND ReadFile and Search tools SHALL NOT be provided (bash subsumes them)
+WHILE sandbox is available
+THE SYSTEM SHALL provide top-level Explore mode with read-only/planning tools,
+scoped task-proposal `patch`, `propose_task`, and sandboxed `bash`
+AND SHALL NOT provide `tmux`, `tmux_run`, or browser tools in the first-pass
+sandboxed Explore registry
 
 **Rationale:** Capabilities are a property of the running environment, not the
-application. On systems with kernel-level sandboxing, bash is safe in Explore mode
-and more capable than ReadFile. On systems without sandboxing, the restricted tool
-set prevents writes structurally. Re-checking on startup ensures the tool set
-matches the current host.
+application. On systems with OS-level sandboxing, bash is useful in Explore mode
+for local investigation while preserving the read-only promise. On systems
+without sandboxing, withholding bash prevents writes structurally. Re-checking on
+startup ensures the tool set matches the current host.
 
 ---
 

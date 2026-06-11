@@ -617,61 +617,59 @@ only; peek/wait/kill operate on already-spawned handles. See specs/permissions/.
 
 ---
 
-### REQ-BASH-012: Landlock Enforcement for Explore Mode
+### REQ-BASH-012: `nono` Enforcement for Explore Mode
 
-WHEN conversation is in Explore mode AND Landlock is available (Linux 5.13+)
-THE SYSTEM SHALL execute bash commands under Landlock restrictions providing:
-- Read-only filesystem access (all writes blocked at kernel level)
-- No outbound network (TCP connect/bind blocked)
-- Signal scoping (kernel 6.12+): processes cannot signal outside sandbox
-- Resource limits via rlimits (memory, CPU time, process count)
+WHEN a top-level Explore conversation exposes `bash`
+THE SYSTEM SHALL execute `op="run"` commands in a Phoenix-owned child process that
+applies a `nono` OS sandbox before execing `bash -c`
+AND SHALL NOT call `nono::Sandbox::apply()` in the long-running Phoenix server
+process
 
-WHEN Landlock blocks an operation in Explore mode
-THE SYSTEM SHALL return the kernel error (EACCES, EPERM) in the ring buffer
-output as the command saw it
+THE Explore bash sandbox SHALL provide:
+- read-only filesystem access to the conversation's repository/worktree root
+- read-write filesystem access to taskmd-discovered task proposal directories
+  under the repo root
+- read-write filesystem access to a Phoenix-owned scratch directory
+- scratch-backed `HOME`, `TMPDIR`, and `PHOENIX_SANDBOX_SCRATCH`
+- blocked network access
+- a reduced environment that does not pass ambient secrets
+
+WHEN `nono` blocks an operation in Explore mode
+THE SYSTEM SHALL return the kernel error (for example EACCES or EPERM) in the
+ring buffer output as the command saw it
 AND the tool description SHALL include a clear explanation of sandbox
 constraints
 
-WHEN conversation is in Work mode
-THE SYSTEM SHALL NOT apply Landlock restrictions
-AND bash commands SHALL have write access within the conversation's worktree
-directory
+WHEN conversation is in Direct, Work, or Branch mode
+THE SYSTEM SHALL NOT apply the Explore read-only sandbox to bash
+AND bash commands SHALL retain the existing writable behavior for that mode
 
-**Rationale:** Unchanged from the prior revision. Landlock is defense-in-depth
-for Explore mode; primary isolation is git worktrees (see `specs/projects/`).
-
-> **Landlock Feature Matrix:**
-> | Kernel | ABI | Features |
-> |--------|-----|----------|
-> | 6.12+  | v6  | Full protection: filesystem, network, ioctl, signal/socket scoping |
-> | 6.10-6.11 | v5 | + Device ioctl blocking |
-> | 6.7-6.9 | v4 | Filesystem + network (TCP) |
-> | 5.13-6.6 | v1-v3 | Filesystem only |
->
-> Recommended: Kernel 6.12+ for full signal scoping; 6.7+ minimum for network
-> blocking.
+**Rationale:** Explore bash is useful for local code investigation (`git log`,
+`git blame`, `rg`, `cat`) only if the read-only promise is enforced below the
+application layer. `nono` is the sandbox abstraction; it uses the platform's
+supported backend (Landlock on Linux, Seatbelt on macOS) and reports support at
+startup.
 
 ---
 
-### REQ-BASH-013: Graceful Degradation Without Landlock
+### REQ-BASH-013: Fail-Closed Explore Bash Availability
 
-WHEN Landlock is unavailable (non-Linux OS or Linux kernel < 5.13)
+WHEN `nono::Sandbox::support_info()` reports that no enforceable sandbox backend
+is available
 THE SYSTEM SHALL detect this at startup
-AND log a warning that Explore mode read-only enforcement is advisory only
-AND continue to enforce read-only semantics at the application layer
-
-WHEN running on a non-Linux operating system
-THE SYSTEM SHALL enforce Explore mode read-only constraints at the tool level
-only
-AND indicate to users that kernel-level enforcement is unavailable
-AND note that physical worktree isolation (REQ-PROJ-005) still provides
-write-write isolation between conversations on all platforms
+AND SHALL NOT expose `bash` in top-level Explore mode
+AND SHALL continue to expose the read-only/planning Explore tool set
 
 WHEN degraded mode is active
-THE SYSTEM SHALL still apply command safety checks (REQ-BASH-011)
-AND the absence of Landlock SHALL NOT prevent Work mode from functioning
+THE SYSTEM SHALL still apply command safety checks (REQ-BASH-011) to modes that
+expose bash
+AND the absence of Explore bash SHALL NOT prevent Direct, Work, or Branch mode
+from functioning
 
-**Rationale:** Unchanged from prior revision.
+**Rationale:** A tool-level read-only convention is not a security boundary. If
+Phoenix cannot enforce the Explore bash policy at the OS boundary, Explore mode
+fails closed by withholding bash rather than presenting a writable shell with an
+advisory label.
 
 ---
 
