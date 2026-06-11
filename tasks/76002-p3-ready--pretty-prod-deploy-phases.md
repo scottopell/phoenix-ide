@@ -1,0 +1,1 @@
+The --pretty flag renders ./dev.py check (and the pre-deploy check inside prod deploy) as a live lane table. The prod build/install phases that follow the check still print raw lines. Extend the reporter event stream to cover prod_build's phases (worktree setup, vite build, cargo build, install/restart) so `./dev.py --pretty prod deploy` renders end-to-end.
