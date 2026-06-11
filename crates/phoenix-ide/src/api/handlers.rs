@@ -3837,6 +3837,30 @@ async fn canonicalize_within_roots(
     let path = fs::canonicalize(requested)
         .map_err(|_| AppError::NotFound("Path does not exist".to_string()))?;
 
+    let roots = preview_root_allowlist(state).await;
+
+    if roots.iter().any(|root| path.starts_with(root)) {
+        Ok(path)
+    } else {
+        Err(AppError::NotFound("Path does not exist".to_string()))
+    }
+}
+
+/// The canonicalized set of directories Phoenix will serve files from: every
+/// conversation working directory ([`Database::preview_roots`]) plus the two
+/// globally-discovered skill trees.
+///
+/// Both [`canonicalize_within_roots`] (file viewer / `read_file` / `list_files`)
+/// and [`serve_preview_file`] (the `/preview/*` HTTP handler) MUST consult the
+/// same allowlist: `read_file` hands the UI a `/preview<path>` URL for any file
+/// it admits, and the follow-up preview request would 404 if the two disagreed.
+///
+/// The skill trees are included because globally-discovered skills resolve
+/// outside any conversation cwd, so the viewer must be able to read them. This
+/// is scoped to the skill directories ONLY — emphatically NOT all of `~/.claude`,
+/// which also holds `.credentials.json`, settings, and conversation history that
+/// must never be readable here.
+async fn preview_root_allowlist(state: &AppState) -> Vec<PathBuf> {
     let mut roots: Vec<PathBuf> = state
         .db
         .preview_roots()
@@ -3846,10 +3870,6 @@ async fn canonicalize_within_roots(
         .filter_map(|root| fs::canonicalize(root).ok())
         .collect();
 
-    // Globally-discovered skills resolve outside any conversation cwd, so the
-    // viewer must be able to read them. Scope this to the skill trees ONLY —
-    // emphatically NOT all of `~/.claude`, which also holds `.credentials.json`,
-    // settings, and conversation history that must never be readable here.
     if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
         let home = PathBuf::from(home);
         for skill_root in [
@@ -3862,11 +3882,7 @@ async fn canonicalize_within_roots(
         }
     }
 
-    if roots.iter().any(|root| path.starts_with(root)) {
-        Ok(path)
-    } else {
-        Err(AppError::NotFound("Path does not exist".to_string()))
-    }
+    roots
 }
 
 /// List files in a directory with metadata (REQ-PF-001, REQ-PF-002)
@@ -4037,17 +4053,12 @@ async fn serve_preview_file(
         .map_err(|_| AppError::NotFound("File does not exist".to_string()))?;
 
     // Containment: the resolved path must live inside a directory Phoenix is
-    // actively serving (a conversation working directory). Without this, the
-    // handler is an arbitrary host-file read — `/preview/etc/passwd`,
-    // `/preview/home/<user>/.ssh/id_rsa`, the prod DB, etc.
-    let roots: Vec<PathBuf> = state
-        .db
-        .preview_roots()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|root| fs::canonicalize(root).ok())
-        .collect();
+    // actively serving (a conversation working directory or skill tree). Without
+    // this, the handler is an arbitrary host-file read — `/preview/etc/passwd`,
+    // `/preview/home/<user>/.ssh/id_rsa`, the prod DB, etc. The allowlist is
+    // shared with `canonicalize_within_roots` so `read_file`-admitted skill-tree
+    // files remain previewable.
+    let roots = preview_root_allowlist(&state).await;
     let within_roots = |p: &std::path::Path| roots.iter().any(|root| p.starts_with(root));
 
     if !within_roots(&path) {
@@ -7688,6 +7699,80 @@ mod file_read_tests {
             }
             other @ ReadFileResponse::Image { .. } => {
                 panic!("expected text response, got {other:?}")
+            }
+        }
+    }
+
+    /// A file under a globally-discovered skill tree (`$HOME/.claude/skills`)
+    /// must be previewable, even though it lives under no conversation cwd:
+    /// `read_file` admits skill-tree files via `canonicalize_within_roots`, so
+    /// `serve_preview_file` must honor the same allowlist or the follow-up
+    /// `<img>`/HTML preview request 404s.
+    ///
+    /// `HOME` is process-global; this test mutates it, so it is marked
+    /// `serial` against the other HOME-sensitive containment tests below.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "current_thread")]
+    async fn preview_serves_file_under_skill_root() {
+        let home_guard = HomeEnvGuard::set(tempfile::tempdir().expect("home"));
+        let skill_dir = home_guard
+            .home()
+            .join(".claude")
+            .join("skills")
+            .join("my-skill");
+        std::fs::create_dir_all(&skill_dir).expect("skill dir");
+        let img = skill_dir.join("diagram.png");
+        std::fs::write(&img, [0x89, b'P', b'N', b'G', 0, 1, 2, 3]).expect("png");
+
+        // A conversation root that does NOT contain the skill file, proving the
+        // skill file is admitted by the skill-root allowance, not the cwd.
+        let root = tempfile::tempdir().expect("root");
+        let state = state_with_root(root.path()).await;
+
+        let canonical = std::fs::canonicalize(&img).expect("canonicalize img");
+        let filepath = canonical
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .to_string();
+        let resp = serve_preview_file(State(state), Path(filepath))
+            .await
+            .expect("skill-root file must be previewable");
+        assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    }
+
+    /// RAII guard that overrides `HOME` for the duration of a test and restores
+    /// the previous value (and keeps the tempdir alive) on drop.
+    #[cfg(unix)]
+    struct HomeEnvGuard {
+        prev: Option<std::ffi::OsString>,
+        dir: tempfile::TempDir,
+    }
+
+    #[cfg(unix)]
+    impl HomeEnvGuard {
+        fn set(dir: tempfile::TempDir) -> Self {
+            let prev = std::env::var_os("HOME");
+            // SAFETY: tests touching HOME run single-threaded (current_thread
+            // flavor) and restore it on drop, so no other thread observes a
+            // torn value.
+            unsafe { std::env::set_var("HOME", dir.path()) };
+            Self { prev, dir }
+        }
+
+        fn home(&self) -> std::path::PathBuf {
+            self.dir.path().to_path_buf()
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for HomeEnvGuard {
+        fn drop(&mut self) {
+            // SAFETY: see `set`.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
             }
         }
     }
