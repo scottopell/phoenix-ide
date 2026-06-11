@@ -822,11 +822,12 @@ def start_phoenix(port: int, release: bool = True, tls: bool = False) -> bool:
             env["LLM_GATEWAY"] = gateway
     env["PHOENIX_PORT"] = str(port)
     env["PHOENIX_DB_PATH"] = str(db_path)
-    # The binary fails closed on a non-loopback bind with no PHOENIX_PASSWORD
-    # (it binds 0.0.0.0 by default). The dev server is the developer's own
-    # machine, so opt into the insecure bind here. Prod deploy paths
-    # deliberately do NOT set this — they must carry a password to bind broadly.
-    env["PHOENIX_ALLOW_INSECURE_BIND"] = "1"
+    # Bind loopback so the dev server is never network-reachable: on a remote or
+    # shared dev host (or a port-forwarded sandbox) a 0.0.0.0 bind would expose an
+    # unauthenticated agent that runs arbitrary commands. A loopback bind also
+    # satisfies the binary's fail-closed guard with no password and no insecure-bind
+    # override. Vite proxies to localhost, so a loopback backend is fine.
+    env["PHOENIX_BIND_ADDR"] = "127.0.0.1"
     # Unified logging: the binary owns the log file (PHOENIX_LOG_FILE) and writes
     # JSON there directly. stdout is off so the only writer to the file is the
     # binary's appender; the Popen redirect below only captures pre-logger /
@@ -4297,6 +4298,9 @@ def native_prod_deploy(version: str | None = None):
         print("  - This system does not have systemd available", file=sys.stderr)
         sys.exit(1)
 
+    # Refuse before building if the deploy would expose an unauthenticated server.
+    _preflight_prod_bind_auth()
+
     # Build
     binary = prod_build(version)
     
@@ -4515,6 +4519,36 @@ def _load_env_file(env: dict[str, str], filename: str = ".phoenix-ide.env") -> s
     return str(env_file)
 
 
+def _preflight_prod_bind_auth() -> None:
+    """Refuse to deploy an unauthenticated, network-reachable prod server.
+
+    Every prod launcher (systemd socket, daemon, launchd) makes Phoenix reachable
+    on all interfaces, and the binary fails closed at startup on a non-loopback
+    passwordless bind. Reading .phoenix-ide.env here turns that post-restart crash
+    into a clear deploy-time error: refuse unless the persisted env defines a
+    non-empty PHOENIX_PASSWORD, or explicitly opts into the insecure bind with
+    PHOENIX_ALLOW_INSECURE_BIND=1 (operator fronting Phoenix with their own proxy).
+    """
+    persisted: dict[str, str] = {}
+    _load_env_file(persisted)
+    if persisted.get("PHOENIX_PASSWORD"):
+        return
+    if persisted.get("PHOENIX_ALLOW_INSECURE_BIND") == "1":
+        return
+    print(
+        "ERROR: refusing to deploy an unauthenticated, network-reachable Phoenix.\n"
+        "  The prod server binds all interfaces; without a password anyone on the\n"
+        "  network can drive an agent that runs arbitrary commands as the service user.\n"
+        "\n"
+        "  Set PHOENIX_PASSWORD=<secret> in .phoenix-ide.env (the deployed service\n"
+        "  reads its environment from that file, not your shell), then redeploy.\n"
+        "  To deploy passwordless anyway (e.g. Phoenix sits behind your own auth\n"
+        "  proxy), set PHOENIX_ALLOW_INSECURE_BIND=1 in .phoenix-ide.env.",
+        file=sys.stderr,
+    )
+    sys.exit(1)
+
+
 def _env_provides_llm_config(env: dict[str, str]) -> bool:
     """True if `env` already specifies how to reach an LLM, so the deploy paths
     should not auto-detect and inject a local gateway. Counts a credential
@@ -4657,6 +4691,9 @@ def prod_daemon_deploy():
     Used when systemd is not available (containers, non-systemd Linux).
     Daemonizes the process and returns to shell immediately.
     """
+    # Refuse before building if the deploy would expose an unauthenticated server.
+    _preflight_prod_bind_auth()
+
     # Build binary (keep debug symbols for debugging)
     binary = prod_build(version=None, strip=False)
 
@@ -5170,6 +5207,9 @@ def _launchd_stop_if_loaded():
 
 def launchd_prod_deploy(version: str | None = None):
     """Build and deploy to production via launchd (native macOS)."""
+    # Refuse before building if the deploy would expose an unauthenticated server.
+    _preflight_prod_bind_auth()
+
     # Build native macOS binary
     binary = prod_build(version, target=None)
 

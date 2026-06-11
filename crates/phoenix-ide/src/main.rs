@@ -57,7 +57,7 @@ use api::{create_router, AppState};
 use db::Database;
 use llm::{LlmConfig, ModelRegistry};
 use std::future::IntoFuture;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -441,8 +441,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Bind (or adopt the systemd socket-activated) listener now, so the
     // deployment report records the address the server is actually bound to.
     // Under socket activation PHOENIX_PORT is typically unset and the real
-    // address comes from systemd, not the 0.0.0.0:PORT default.
-    let fallback_addr = SocketAddr::from(([0, 0, 0, 0], port));
+    // address comes from systemd, not the fallback default.
+    //
+    // The fallback bind IP defaults to 0.0.0.0 (all interfaces) so a
+    // non-socket-activated prod launcher (daemon/launchd) reaches the network.
+    // PHOENIX_BIND_ADDR overrides it with a specific IP; dev sets 127.0.0.1 so
+    // the dev server stays loopback-only and passes the fail-closed guard below
+    // without a password. Under socket activation the fallback isn't used.
+    let default_ip = IpAddr::from([0, 0, 0, 0]);
+    let fallback_ip: IpAddr = std::env::var("PHOENIX_BIND_ADDR")
+        .ok()
+        .and_then(|raw| {
+            if let Ok(ip) = raw.parse::<IpAddr>() {
+                Some(ip)
+            } else {
+                tracing::warn!(
+                    value = %raw,
+                    "PHOENIX_BIND_ADDR is not a valid IP address; falling back to 0.0.0.0"
+                );
+                None
+            }
+        })
+        .unwrap_or(default_ip);
+    let fallback_addr = SocketAddr::from((fallback_ip, port));
+    tracing::info!(%fallback_addr, "Resolved fallback bind address");
     let listener = hot_restart::get_listener(fallback_addr).await?;
     let socket_activated = hot_restart::is_socket_activated();
     let bind_address = listener.local_addr().unwrap_or(fallback_addr);
@@ -460,7 +482,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!(
             "Refusing to start: bound to {bind_address} (non-loopback) with no PHOENIX_PASSWORD. \
              An unauthenticated, network-reachable Phoenix lets anyone run arbitrary commands as this user. \
-             Set PHOENIX_PASSWORD, bind to 127.0.0.1, or set PHOENIX_ALLOW_INSECURE_BIND=1 if Phoenix sits behind your own auth proxy."
+             Set PHOENIX_PASSWORD, bind to 127.0.0.1, or set PHOENIX_ALLOW_INSECURE_BIND=1 if Phoenix sits behind your own auth proxy. \
+             For a prod deploy, set PHOENIX_PASSWORD in .phoenix-ide.env (the systemd unit reads its environment from there, not your shell)."
         )
         .into());
     }
