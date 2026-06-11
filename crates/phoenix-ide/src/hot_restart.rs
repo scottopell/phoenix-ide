@@ -143,7 +143,7 @@ fn take_launchd_listener() -> std::io::Result<Option<std::net::TcpListener>> {
     let mut count: libc::size_t = 0;
 
     let rc = unsafe { launch_activate_socket(name.as_ptr(), &raw mut fds, &raw mut count) };
-    if rc == libc::ESRCH {
+    if rc == libc::ESRCH || rc == libc::ENOENT {
         return Ok(None);
     }
     if rc != 0 {
@@ -165,25 +165,32 @@ fn take_launchd_listener() -> std::io::Result<Option<std::net::TcpListener>> {
         ));
     }
 
+    if count > 1 {
+        let fd_count = count;
+        unsafe {
+            let fd_slice = std::slice::from_raw_parts(fds, count);
+            for fd in fd_slice {
+                libc::close(*fd);
+            }
+            libc::free(fds.cast());
+        }
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "launchd returned {fd_count} sockets for {LAUNCHD_SOCKET_NAME}; Phoenix requires a single listener"
+            ),
+        ));
+    }
+
     tracing::info!(
         socket_name = LAUNCHD_SOCKET_NAME,
         fd_count = count,
         "Detected launchd socket activation"
     );
-    if count > 1 {
-        tracing::debug!(
-            socket_name = LAUNCHD_SOCKET_NAME,
-            fd_count = count,
-            "launchd provided multiple TCP listeners; using the first"
-        );
-    }
 
     let listener = unsafe {
-        let fd_slice = std::slice::from_raw_parts(fds, count);
-        let listener = std::net::TcpListener::from_raw_fd(fd_slice[0]);
-        for fd in &fd_slice[1..] {
-            libc::close(*fd);
-        }
+        let fd = *fds;
+        let listener = std::net::TcpListener::from_raw_fd(fd);
         libc::free(fds.cast());
         listener
     };
