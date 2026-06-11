@@ -2206,8 +2206,8 @@ def _find_chromium_binary() -> Path | None:
     """Locate a usable Chromium/Chrome binary, in this order:
 
     1. `PATH` (`google-chrome`, `chromium`, `chromium-browser`, `chrome`).
-    2. Playwright's standard install dir at `/opt/pw-browsers/chromium-*/chrome-linux/chrome`.
-    3. Playwright's per-user cache at `~/.cache/ms-playwright/chromium-*/chrome-linux/chrome`.
+    2. Playwright's standard install dir at `/opt/pw-browsers/chromium-*/chrome-linux*/chrome`.
+    3. Playwright's per-user cache at `~/.cache/ms-playwright/chromium-*/chrome-linux*/chrome`.
     4. Puppeteer's per-user cache at `~/.cache/puppeteer/chrome/*/chrome-linux*/chrome`.
     5. chromiumoxide's own cache at `~/.local/share/chromiumoxide/`.
 
@@ -2222,8 +2222,8 @@ def _find_chromium_binary() -> Path | None:
             return Path(p)
     home = Path.home()
     glob_roots: list[tuple[Path, str]] = [
-        (Path("/opt/pw-browsers"), "chromium-*/chrome-linux/chrome"),
-        (home / ".cache" / "ms-playwright", "chromium-*/chrome-linux/chrome"),
+        (Path("/opt/pw-browsers"), "chromium-*/chrome-linux*/chrome"),
+        (home / ".cache" / "ms-playwright", "chromium-*/chrome-linux*/chrome"),
         (home / ".cache" / "puppeteer" / "chrome", "*/chrome-linux*/chrome"),
         (home / ".local" / "share" / "chromiumoxide", "*/chrome-linux/chrome"),
         (home / ".local" / "share" / "chromiumoxide", "chrome-linux/chrome"),
