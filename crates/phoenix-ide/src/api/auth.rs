@@ -214,36 +214,87 @@ fn extract_cookie_value(cookie_header: &str) -> Option<&str> {
     None
 }
 
-/// Check whether a request carries a valid auth credential.
+/// Whether the request carries a valid **session-cookie** credential.
 ///
-/// The `phoenix-auth` cookie must hold a valid **session token** (minted at
-/// login, held in [`SessionStore`]) — never the password. The
-/// `Authorization: Bearer` header carries the password directly, for API
-/// clients that don't run the cookie login flow.
-fn request_is_authenticated(req: &Request<Body>, password: &str, sessions: &SessionStore) -> bool {
-    // Cookie carries an opaque session token.
+/// The `phoenix-auth` cookie must hold a valid session token (minted at login,
+/// held in [`SessionStore`]) — never the password. Cookie auth is **never**
+/// throttled: it proves prior possession of the password, so a legitimate
+/// browser user must never be locked out by an attacker brute-forcing Bearer
+/// guesses from the same peer IP.
+fn cookie_is_valid(req: &Request<Body>, sessions: &SessionStore) -> bool {
     if let Some(cookie_header) = req.headers().get(header::COOKIE) {
         if let Ok(cookie_str) = cookie_header.to_str() {
             if let Some(cookie_value) = extract_cookie_value(cookie_str) {
-                if sessions.is_valid(cookie_value) {
-                    return true;
-                }
+                return sessions.is_valid(cookie_value);
             }
         }
     }
-
-    // Bearer header carries the password directly (API clients).
-    if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
-        if let Ok(auth_str) = auth_header.to_str() {
-            if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                if constant_time_eq(token.as_bytes(), password.as_bytes()) {
-                    return true;
-                }
-            }
-        }
-    }
-
     false
+}
+
+/// Extract the `Authorization: Bearer <token>` value, if present and parseable.
+///
+/// A `Some` result means the client is presenting a Bearer **password guess** —
+/// the unit subject to throttling. `None` means no Bearer credential was offered
+/// (anonymous traffic), which must never consume throttle budget.
+fn bearer_token(req: &Request<Body>) -> Option<&str> {
+    req.headers()
+        .get(header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+/// Outcome of validating a Bearer-password credential against the throttle.
+enum BearerCheck {
+    /// No Bearer credential was offered — throttle budget untouched.
+    Absent,
+    /// Bearer matched the password — counter cleared (like a login success).
+    Valid,
+    /// Bearer was wrong — a failure was recorded against `key`.
+    Invalid,
+    /// Peer is locked out; the guess was rejected without comparison.
+    LockedOut,
+}
+
+/// Validate a Bearer-password guess against the shared per-peer [`LoginThrottle`].
+///
+/// This is the throttled counterpart to [`cookie_is_valid`]: the password-equality
+/// brute-force oracle exposed by `auth_status` and `auth_middleware` is closed by
+/// routing every Bearer check through the same per-IP budget that gates
+/// `/api/auth/login`. A correct Bearer clears the counter; a wrong one records a
+/// failure; once locked out, further guesses are rejected without comparing.
+fn check_bearer_password(
+    req: &Request<Body>,
+    password: &str,
+    throttle: &LoginThrottle,
+    key: &str,
+) -> BearerCheck {
+    let Some(token) = bearer_token(req) else {
+        return BearerCheck::Absent;
+    };
+
+    if throttle.is_locked(key) {
+        return BearerCheck::LockedOut;
+    }
+
+    if constant_time_eq(token.as_bytes(), password.as_bytes()) {
+        throttle.record_success(key);
+        BearerCheck::Valid
+    } else {
+        throttle.record_failure(key);
+        BearerCheck::Invalid
+    }
+}
+
+/// Read the connection's real peer IP from request extensions, where the serve
+/// loop injects it (`into_make_service_with_connect_info` on the plain path, an
+/// `Extension(ConnectInfo(..))` layer on the TLS path). `None` when absent —
+/// [`throttle_key`] then falls back to the shared `"direct"` bucket.
+fn peer_from_extensions(req: &Request<Body>) -> Option<SocketAddr> {
+    req.extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0)
 }
 
 /// Returns true if the request path is exempt from auth.
@@ -301,17 +352,30 @@ pub async fn auth_middleware(
         return next.run(req).await;
     }
 
-    // Check credentials
-    if request_is_authenticated(&req, password, &state.sessions) {
+    // Session cookie wins and is never throttled — a legitimate browser must
+    // not be locked out by Bearer brute-force from the same peer IP.
+    if cookie_is_valid(&req, &state.sessions) {
         return next.run(req).await;
     }
 
-    // Reject unauthenticated request
-    (
-        StatusCode::UNAUTHORIZED,
-        Json(serde_json::json!({ "error": "Authentication required" })),
-    )
-        .into_response()
+    // Bearer-password validation is throttled per peer IP, sharing the single
+    // login budget, so this 200/401 oracle cannot be used for unlimited guesses.
+    let key = throttle_key(req.headers(), peer_from_extensions(&req));
+    match check_bearer_password(&req, password, &state.login_throttle, &key) {
+        BearerCheck::Valid => next.run(req).await,
+        BearerCheck::LockedOut => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(
+                serde_json::json!({ "error": "Too many authentication attempts; try again later" }),
+            ),
+        )
+            .into_response(),
+        BearerCheck::Invalid | BearerCheck::Absent => (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({ "error": "Authentication required" })),
+        )
+            .into_response(),
+    }
 }
 
 // ---- Auth endpoints ----
@@ -339,7 +403,20 @@ pub async fn auth_status(
             authenticated: true,
         }),
         Some(password) => {
-            let authenticated = request_is_authenticated(&req, password, &state.sessions);
+            // Cookie auth is authoritative and never throttled.
+            let authenticated = if cookie_is_valid(&req, &state.sessions) {
+                true
+            } else {
+                // This endpoint is auth-exempt, so its Bearer check is an
+                // unauthenticated oracle for password equality. Route it through
+                // the shared per-peer throttle: once locked out, further guesses
+                // report `authenticated: false` without comparing.
+                let key = throttle_key(req.headers(), peer_from_extensions(&req));
+                matches!(
+                    check_bearer_password(&req, password, &state.login_throttle, &key),
+                    BearerCheck::Valid
+                )
+            };
             Json(AuthStatusResponse {
                 auth_required: true,
                 authenticated,
@@ -490,7 +567,7 @@ mod tests {
             .header(header::COOKIE, format!("phoenix-auth={token}"))
             .body(Body::empty())
             .unwrap();
-        assert!(request_is_authenticated(&req, "the-password", &sessions));
+        assert!(cookie_is_valid(&req, &sessions));
     }
 
     #[test]
@@ -502,17 +579,137 @@ mod tests {
             .header(header::COOKIE, "phoenix-auth=the-password")
             .body(Body::empty())
             .unwrap();
-        assert!(!request_is_authenticated(&req, "the-password", &sessions));
+        assert!(!cookie_is_valid(&req, &sessions));
     }
 
+    /// A correct Bearer password authenticates an API client and, as a side
+    /// effect, clears any accumulated failures for that peer.
     #[test]
     fn bearer_password_still_authenticates_for_api_clients() {
-        let sessions = SessionStore::new();
+        let throttle = LoginThrottle::new();
         let req = Request::builder()
             .header(header::AUTHORIZATION, "Bearer the-password")
             .body(Body::empty())
             .unwrap();
-        assert!(request_is_authenticated(&req, "the-password", &sessions));
+        assert!(matches!(
+            check_bearer_password(&req, "the-password", &throttle, "1.2.3.4"),
+            BearerCheck::Valid
+        ));
+    }
+
+    fn bearer_req(token: &str) -> Request<Body> {
+        Request::builder()
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    /// (a) Repeated wrong-Bearer guesses from one peer lock that peer out, and a
+    /// subsequent *correct* Bearer is rejected (without comparison) while the
+    /// lockout window is active — closing the unlimited brute-force oracle.
+    #[test]
+    fn wrong_bearer_locks_out_and_correct_bearer_rejected_while_locked() {
+        let throttle = LoginThrottle::new();
+        let key = "10.0.0.5";
+
+        for _ in 0..MAX_FAILURES {
+            assert!(matches!(
+                check_bearer_password(&bearer_req("wrong"), "the-password", &throttle, key),
+                BearerCheck::Invalid
+            ));
+        }
+
+        // Even the correct password is now rejected without comparison.
+        assert!(matches!(
+            check_bearer_password(&bearer_req("the-password"), "the-password", &throttle, key),
+            BearerCheck::LockedOut
+        ));
+    }
+
+    /// (b) A valid session cookie authenticates regardless of throttle state:
+    /// cookie auth never consults the throttle, so a locked-out peer's browser
+    /// session still works.
+    #[test]
+    fn valid_cookie_authenticates_during_lockout() {
+        let throttle = LoginThrottle::new();
+        let sessions = SessionStore::new();
+        let key = "10.0.0.6";
+
+        // Drive the peer into lockout via Bearer guesses.
+        for _ in 0..MAX_FAILURES {
+            check_bearer_password(&bearer_req("wrong"), "the-password", &throttle, key);
+        }
+        assert!(throttle.is_locked(key));
+
+        // A valid cookie from that same peer still authenticates — cookie auth
+        // is independent of the throttle.
+        let token = sessions.mint();
+        let req = Request::builder()
+            .header(header::COOKIE, format!("phoenix-auth={token}"))
+            .body(Body::empty())
+            .unwrap();
+        assert!(cookie_is_valid(&req, &sessions));
+    }
+
+    /// (c) A correct Bearer *before* the threshold clears the failure counter,
+    /// so accumulated near-misses don't strand a legitimate API client.
+    #[test]
+    fn correct_bearer_clears_counter_before_lockout() {
+        let throttle = LoginThrottle::new();
+        let key = "10.0.0.7";
+
+        // One short of lockout.
+        for _ in 0..(MAX_FAILURES - 1) {
+            check_bearer_password(&bearer_req("wrong"), "the-password", &throttle, key);
+        }
+        assert!(!throttle.is_locked(key));
+
+        // A correct Bearer clears the counter.
+        assert!(matches!(
+            check_bearer_password(&bearer_req("the-password"), "the-password", &throttle, key),
+            BearerCheck::Valid
+        ));
+
+        // The budget is fully reset: a fresh full run of failures is needed to
+        // lock out again, proving the counter was cleared rather than merely not
+        // incremented.
+        for _ in 0..(MAX_FAILURES - 1) {
+            assert!(matches!(
+                check_bearer_password(&bearer_req("wrong"), "the-password", &throttle, key),
+                BearerCheck::Invalid
+            ));
+        }
+        assert!(!throttle.is_locked(key));
+    }
+
+    /// (d) Anonymous / no-credential traffic never consumes throttle budget:
+    /// a request with neither cookie nor Bearer leaves the failure counter at
+    /// zero, so unauthenticated noise can't help (or hurt) lockout state.
+    #[test]
+    fn anonymous_traffic_does_not_consume_throttle_budget() {
+        let throttle = LoginThrottle::new();
+        let key = "10.0.0.8";
+
+        // Far more than MAX_FAILURES anonymous (no-Bearer) requests.
+        for _ in 0..(MAX_FAILURES * 4) {
+            let req = Request::builder().body(Body::empty()).unwrap();
+            assert!(matches!(
+                check_bearer_password(&req, "the-password", &throttle, key),
+                BearerCheck::Absent
+            ));
+        }
+
+        // Never locked out — anonymous traffic recorded no failures.
+        assert!(!throttle.is_locked(key));
+
+        // And the full Bearer budget is still available afterward.
+        for _ in 0..(MAX_FAILURES - 1) {
+            assert!(matches!(
+                check_bearer_password(&bearer_req("wrong"), "the-password", &throttle, key),
+                BearerCheck::Invalid
+            ));
+        }
+        assert!(!throttle.is_locked(key));
     }
 
     #[test]
